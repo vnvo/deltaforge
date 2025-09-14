@@ -3,8 +3,9 @@ resolver = "2"
 
 members = [ 
     "crates/deltaforge-config",
-    "crates/deltaforge-core"
-]
+    "crates/deltaforge-core", 
+    "crates/deltaforge-registry"
+, "crates/deltaforge-sources"]
 
 [workspace.package]
 edition = "2021"

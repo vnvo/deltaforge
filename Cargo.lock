@@ -157,6 +157,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "deltaforge-registry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "deltaforge-core",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "deltaforge-sources"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "deltaforge-core",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "diff"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
