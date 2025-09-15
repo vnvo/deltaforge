@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 
-members = [
+members = [ "crates/deltaforge-api",
     "crates/deltaforge-config",
     "crates/deltaforge-core",
     "crates/deltaforge-processor-js",
-    "crates/deltaforge-registry",
+    "crates/deltaforge-registry", "crates/deltaforge-runner",
     "crates/deltaforge-sinks",
     "crates/deltaforge-sources",
 ]
@@ -29,3 +29,5 @@ rdkafka = { version = "0.38", features = ["tokio"] }
 redis = { version = "0.32", features = ["tokio-comp"] }
 deno_core = "0.357"
 serde_v8 = "0.266"
+axum = { version = "0.8", features = ["macros", "json"] }
+parking_lot = "0.12"

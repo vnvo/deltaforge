@@ -1,0 +1,37 @@
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: orders-cdc
+  tenant: acme
+spec:
+  sharding:
+    mode: table
+  sources:
+    - type: postgres
+      id: pg-orders
+      dsn: ${PG_ORDERS_DSN}
+      publication: ${PG_PUBLICATION}
+      slot: ${PG_SLOT}
+      tables: [public.orders, public.order_items]
+    - type: mysql
+      id: mysql-orders
+      dsn: ${MYSQL_ORDERS_DSN}
+      tables: [orders, order_items]
+  processors:
+    - type: javascript
+      id: js-normalize
+      inline: |
+        // simple example: add a tag
+        event.tags = (event.tags || []).concat(["normalized"]);
+        return [event];
+      limits: { cpu_ms: 2, mem_mb: 64, timeout_ms: 50 }
+  sinks:
+    - type: kafka
+      id: kafka
+      brokers: ${KAFKA_BROKERS}
+      topic: acme.orders
+      exactlyOnce: false
+    - type: redis
+      id: redis
+      uri: ${REDIS_URI}
+      stream: acme.orders
