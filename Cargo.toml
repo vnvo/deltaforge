@@ -1,11 +1,14 @@
 [workspace]
 resolver = "2"
 
-members = [ "crates/deltaforge-api",
+members = [
+    "crates/deltaforge-metrics",
+    "crates/deltaforge-api",
     "crates/deltaforge-config",
     "crates/deltaforge-core",
     "crates/deltaforge-processor-js",
-    "crates/deltaforge-registry", "crates/deltaforge-runner",
+    "crates/deltaforge-registry",
+    "crates/deltaforge-runner",
     "crates/deltaforge-sinks",
     "crates/deltaforge-sources",
 ]
@@ -31,3 +34,5 @@ deno_core = "0.357"
 serde_v8 = "0.266"
 axum = { version = "0.8", features = ["macros", "json"] }
 parking_lot = "0.12"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.17"

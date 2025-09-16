@@ -18,3 +18,4 @@ deltaforge-sources = { path = "../deltaforge-sources" }
 deltaforge-sinks = { path = "../deltaforge-sinks" }
 deltaforge-processor-js = { path = "../deltaforge-processor-js" }
 deltaforge-api = { path = "../deltaforge-api" }
+deltaforge-metrics ={ path = "../deltaforge-metrics"}

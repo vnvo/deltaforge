@@ -7,6 +7,7 @@ use deltaforge_core::{DynProcessor, DynSink, DynSource, Pipeline};
 use deltaforge_processor_js::JsProcessor;
 use deltaforge_sinks::{kafka::KafkaSink, redis::RedisSink};
 use deltaforge_sources::{mysql::MysqlSource, postgres::PostgresSource};
+use deltaforge_metrics as metrics
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tracing::info;
@@ -23,7 +24,9 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    metrics::init();
     let args = Args::parse();
+    metrics::install_prometheus(&args.metrics_addr);    
     let spec = load_from_path(&args.config)?;
 
     // Build sources
