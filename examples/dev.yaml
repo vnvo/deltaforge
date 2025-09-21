@@ -1,0 +1,25 @@
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: df-mysql-smoke
+  tenant: acme
+
+spec:
+  sources:
+    - type: "mysql"
+      id: "mysql-shop"
+      dsn: "mysql://df:dfpw@127.0.0.1:3306"
+      tables: ["orders.order_items"]   # empty = all
+  processors:
+    - type: javascript
+      id: js-normalize
+      inline: |
+        // simple example: add a tag
+        event.tags = (event.tags || []).concat(["normalized"]);
+        return [event];
+      limits: { cpu_ms: 2, mem_mb: 64, timeout_ms: 50 }
+  sinks:
+    - type: "redis"
+      id: "r1"
+      uri: "redis://127.0.0.1:6379"
+      stream: "df.events"

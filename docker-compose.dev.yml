@@ -8,11 +8,20 @@ services:
     ports: ["5432:5432"]
   mysql:
     image: mysql:8
-    command: ["--binlog-format=ROW", "--server-id=1", "--log-bin=mysql-bin"]
+    ports: ["3306:3306"]
     environment:
       MYSQL_ROOT_PASSWORD: password
       MYSQL_DATABASE: orders
-    ports: ["3306:3306"]
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    command:
+      - --server-id=101
+      - --log-bin=/var/lib/mysql/mysql-bin.log
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     environment:
@@ -31,3 +40,6 @@ services:
   redis:
     image: redis:7
     ports: ["6379:6379"]
+
+volumes:
+  mysql_data:

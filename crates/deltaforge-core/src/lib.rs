@@ -2,15 +2,16 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Op {
     Insert,
     Update,
     Delete,
-    DDL,
+    Ddl,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +21,19 @@ pub struct SourceMeta {
     pub db: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ChangeKind {
+    Insert,
+    Update,
+    Delete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Change {
+    pub kind: ChangeKind,
+    pub before: Option<Value>,
+    pub after: Option<Value>,
+}
 // Canonical CDC event emited by Deltaforge
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
@@ -82,6 +96,60 @@ impl Event {
             self.event_id
         )
     }
+
+    pub fn new_row(
+        tenant_id: String,
+        source: SourceMeta,
+        table: String,
+        op: Op,
+        before: Option<Value>,
+        after: Option<Value>,
+        ts_ms: i64,
+    ) -> Self {
+        let ts = DateTime::<Utc>::from_timestamp_millis(ts_ms)
+            .unwrap_or_else(Utc::now);
+        Self {
+            event_id: Uuid::new_v4(),
+            tenant_id,
+            source,
+            table,
+            op,
+            tx_id: None,
+            before,
+            after,
+            schema_version: None,
+            ddl: None,
+            timestamp: ts,
+            trace_id: None,
+            tags: None,
+        }
+    }
+
+    pub fn new_ddl(
+        tenant_id: String,
+        source: SourceMeta,
+        table: String,
+        ddl: Value,
+        ts_ms: i64,
+    ) -> Self {
+        let ts = DateTime::<Utc>::from_timestamp_millis(ts_ms)
+            .unwrap_or_else(Utc::now);
+        Self {
+            event_id: Uuid::new_v4(),
+            tenant_id,
+            source,
+            table,
+            op: Op::Ddl,
+            tx_id: None,
+            before: None,
+            after: None,
+            schema_version: None,
+            ddl: Some(ddl),
+            timestamp: ts,
+            trace_id: None,
+            tags: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -123,10 +191,10 @@ pub trait SchemaRegistry: Send + Sync {
     ) -> Result<i32>;
 
     async fn latest(
-        &self, 
-        tenant: &str, 
-        db: &str, 
-        table: &str
+        &self,
+        tenant: &str,
+        db: &str,
+        table: &str,
     ) -> Result<Option<(i32, String)>>; // (version, hash)
 }
 
@@ -174,7 +242,7 @@ impl Pipeline {
 
             // dispatch to sinks (fire-n-forget)
             for e in out.into_iter() {
-                for s  in self.sinks.iter() {
+                for s in self.sinks.iter() {
                     if let Err(err) = s.send(e.clone()).await {
                         tracing::error!(error = %err, "sink send failed");
                     }
@@ -183,6 +251,5 @@ impl Pipeline {
         }
 
         Ok(())
-
     }
 }

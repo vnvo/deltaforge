@@ -6,7 +6,7 @@ use deltaforge_config::{load_from_path, ProcessorCfg, SinkCfg, SourceCfg};
 use deltaforge_core::{DynProcessor, DynSink, DynSource, Pipeline};
 use deltaforge_processor_js::JsProcessor;
 use deltaforge_sinks::{kafka::KafkaSink, redis::RedisSink};
-use deltaforge_sources::{mysql::MysqlSource, postgres::PostgresSource};
+use deltaforge_sources::{mysql::MySqlSource, postgres::PostgresSource};
 use deltaforge_metrics as metrics;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
                 }));
             }
             SourceCfg::Mysql { id, dsn, tables } => {
-                sources.push(Box::new(MysqlSource {
+                sources.push(Box::new(MySqlSource {
                     id: id.clone(),
                     dsn: dsn.clone(),
                     tables: tables.clone(),

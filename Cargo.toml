@@ -10,7 +10,7 @@ members = [
     "crates/deltaforge-registry",
     "crates/deltaforge-runner",
     "crates/deltaforge-sinks",
-    "crates/deltaforge-sources",
+    "crates/deltaforge-sources", "crates/deltaforge-checkpoints",
 ]
 
 [workspace.package]
@@ -36,3 +36,8 @@ axum = { version = "0.8", features = ["macros", "json"] }
 parking_lot = "0.12"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.17"
+etl = { git = "https://github.com/supabase/etl", package = "etl" }
+futures = "0.3"
+tokio-stream = "0.1"
+base64 = "0.22"
+url = "2.5"
