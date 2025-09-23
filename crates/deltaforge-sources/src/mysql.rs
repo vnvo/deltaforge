@@ -18,6 +18,7 @@ use std::{collections::HashMap, fmt, sync::Arc, time::Instant};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 use url::Url;
+use base64::prelude::*;
 
 use deltaforge_checkpoints::{CheckpointStore, CheckpointStoreExt};
 use deltaforge_core::{Event, Op, Source, SourceMeta};
@@ -74,7 +75,6 @@ impl Source for MySqlSource {
             "MySQL CDC: starting source"
         );
 
-        // Build client - the library supports both auth methods
         let mut client = BinlogClient::default();
         client.url = self.dsn.clone();
         client.server_id = server_id;
@@ -87,7 +87,7 @@ impl Source for MySqlSource {
             "preparing the binlogclient"
         );
 
-        // Prefer GTID, else file:pos, else resolve end via SHOW ... STATUS
+        // Prefer GTID, else file:pos, else resolve "end position" via SHOW ... STATUS
         if let Some(p) = &last_checkpoint {
             debug!(
                 chkpt_file = p.file,
@@ -193,7 +193,6 @@ impl Source for MySqlSource {
         // Binlog state
         let mut table_map: HashMap<u64, TableMapEvent> = HashMap::new();
         let mut last_file = String::new();
-        let mut last_pos: u64 = 4;
         let mut last_gtid: Option<String> = None;
 
         // Stream loop
@@ -206,7 +205,7 @@ impl Source for MySqlSource {
                     return Err(e.into());
                 }
             };
-            last_pos = header.next_event_position as u64;
+            let last_pos = header.next_event_position as u64;
 
             match data {
                 EventData::TableMap(tm) => {
@@ -535,23 +534,27 @@ fn build_object(
             ColumnValue::Enum(v) => json!(v),
             ColumnValue::String(bytes) => match std::str::from_utf8(bytes) {
                 Ok(s) => json!(s),
-                Err(_) => json!({ "_base64": base64::encode(bytes) }),
+                Err(_) => json!({ "_base64": to_b64(bytes) }),
             },
             ColumnValue::Blob(bytes) => {
-                json!({ "_base64": base64::encode(bytes) })
+                json!({ "_base64": to_b64(bytes) })
             }
             ColumnValue::Json(bytes) => {
                 if let Ok(s) = std::str::from_utf8(bytes) {
                     serde_json::from_str::<Value>(s)
                         .unwrap_or_else(|_| json!(s))
                 } else {
-                    json!({ "_base64_json": base64::encode(bytes) })
+                    json!({ "_base64_json": to_b64(bytes) })
                 }
             }
         };
         obj.insert(key.to_string(), jv);
     }
-    Value::Object(obj)
+    Value::Object(obj) 
+}
+
+fn to_b64(bytes: &Vec<u8>) -> String {
+    BASE64_STANDARD.encode(bytes)
 }
 
 fn derive_server_id(id: &str) -> u64 {

@@ -50,8 +50,9 @@ struct ModeReq {
 async fn set_connection_mode(
     State(_st): State<AppState>,
     Path(_id): Path<String>,
-    Json(_mr): Json<ModeReq>,
+    Json(mr): Json<ModeReq>,
 ) -> Json<serde_json::Value> {
     // TODO: Wire to runner coordinator to perform safe cutover shared<->dedicated
+    info!(mode=%mr.mode, "set connection mode");
     Json(serde_json::json!({"status":"accepted"}))
 }

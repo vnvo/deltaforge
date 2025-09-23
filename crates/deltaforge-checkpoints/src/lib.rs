@@ -1,9 +1,6 @@
-use std::{collections::HashMap, fs, path::PathBuf, sync::Arc};
-
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
-use tokio::sync::RwLock;
 
 #[async_trait]
 pub trait CheckpointStore: Send + Sync {
@@ -37,8 +34,6 @@ pub trait CheckpointStoreExt: CheckpointStore {
     }
 }
 impl<T: CheckpointStore + ?Sized> CheckpointStoreExt for T {}
-
-
 
 pub use file_store::FileCheckpointStore;
 
