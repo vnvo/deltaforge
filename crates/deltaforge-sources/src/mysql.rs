@@ -8,17 +8,18 @@ use mysql_binlog_connector_rust::{
     column::column_value::ColumnValue,
     event::{
         delete_rows_event::DeleteRowsEvent, event_data::EventData,
-        table_map_event::TableMapEvent,
-        update_rows_event::UpdateRowsEvent, write_rows_event::WriteRowsEvent,
+        table_map_event::TableMapEvent, update_rows_event::UpdateRowsEvent,
+        write_rows_event::WriteRowsEvent,
     },
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, fmt, sync::Arc, time::Instant};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 use url::Url;
 
-use deltaforge_checkpoints::{FsCheckpointStore, MySqlPos};
+use deltaforge_checkpoints::{CheckpointStore, CheckpointStoreExt};
 use deltaforge_core::{Event, Op, Source, SourceMeta};
 
 #[derive(Debug, Clone)]
@@ -29,14 +30,40 @@ pub struct MySqlSource {
     pub tenant: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MySqlCheckpoint {
+    pub file: String,
+    pub pos: u64,
+    pub gtid_set: Option<String>,
+}
+
+impl fmt::Display for MySqlCheckpoint {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "[file:{}, pos:{}, gtid_set:{}]",
+            self.file,
+            self.pos,
+            self.gtid_set.as_ref().map_or("", |v| v)
+        )
+    }
+}
+
 #[async_trait]
 impl Source for MySqlSource {
-    async fn run(&self, tx: mpsc::Sender<Event>) -> Result<()> {
-        // Parse host & default db (avoid logging password)
+    async fn run(
+        &self,
+        tx: mpsc::Sender<Event>,
+        checkpoint_store: Arc<dyn CheckpointStore>,
+    ) -> Result<()> {
         let url = Url::parse(&self.dsn).context("invalid MySQL DSN")?;
         let host = url.host_str().unwrap_or("localhost").to_string();
         let default_db = url.path().trim_start_matches('/').to_string();
         let server_id = derive_server_id(&self.id);
+
+        // load the previus checkpoint, if any.
+        let last_checkpoint: Option<MySqlCheckpoint> =
+            checkpoint_store.get(&self.id).await?;
 
         info!(
             source_id = %self.id,
@@ -46,10 +73,6 @@ impl Source for MySqlSource {
             //allow = %if self.tables.is_empty() { "<all>" } else { self.tables.join(",") },
             "MySQL CDC: starting source"
         );
-
-        // Checkpoint
-        let ckpt = FsCheckpointStore::new("./data/checkpoints.json")?;
-        let checkpoint = ckpt.get_mysql(&self.id).await;
 
         // Build client - the library supports both auth methods
         let mut client = BinlogClient::default();
@@ -65,7 +88,7 @@ impl Source for MySqlSource {
         );
 
         // Prefer GTID, else file:pos, else resolve end via SHOW ... STATUS
-        if let Some(p) = checkpoint {
+        if let Some(p) = &last_checkpoint {
             debug!(
                 chkpt_file = p.file,
                 chkpt_gtid_set = p.gtid_set,
@@ -73,7 +96,7 @@ impl Source for MySqlSource {
                 "reviewing last checkpoint"
             );
 
-            if let Some(gtid) = p.gtid_set {
+            if let Some(gtid) = &p.gtid_set {
                 client.gtid_enabled = true;
                 client.gtid_set = gtid.clone();
                 info!(source_id = %self.id, %gtid, "resuming via GTID");
@@ -187,9 +210,10 @@ impl Source for MySqlSource {
 
             match data {
                 EventData::TableMap(tm) => {
+                    table_map.insert(tm.table_id, tm.clone());
+
                     if allow.matchs(&tm.database_name, &tm.table_name) {
                         let is_new = !table_map.contains_key(&tm.table_id);
-                        table_map.insert(tm.table_id, tm.clone());
                         if is_new {
                             info!(
                                 source_id = %self.id,
@@ -432,10 +456,10 @@ impl Source for MySqlSource {
 
                 EventData::Xid(_x) => {
                     // persist at commit boundaries
-                    if let Err(e) = ckpt
-                        .put_mysql(
+                    if let Err(e) = checkpoint_store
+                        .put(
                             &self.id,
-                            MySqlPos {
+                            MySqlCheckpoint {
                                 file: last_file.clone(),
                                 pos: last_pos,
                                 gtid_set: last_gtid.clone(),

@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use deltaforge_checkpoints::CheckpointStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -166,7 +169,11 @@ pub enum ConnctionMode {
 
 #[async_trait]
 pub trait Source: Send + Sync {
-    async fn run(&self, tx: mpsc::Sender<Event>) -> Result<()>;
+    async fn run(
+        &self,
+        tx: mpsc::Sender<Event>,
+        checkpoint_store: Arc<dyn CheckpointStore>,
+    ) -> Result<()>;
 }
 
 #[async_trait]
@@ -198,25 +205,29 @@ pub trait SchemaRegistry: Send + Sync {
     ) -> Result<Option<(i32, String)>>; // (version, hash)
 }
 
-pub type DynSource = Box<dyn Source>;
+pub type ArcDynSource = Arc<dyn Source>;
 pub type DynProcessor = Box<dyn Processor>;
 pub type DynSink = Box<dyn Sink>;
 
 pub struct Pipeline {
-    pub sources: Vec<DynSource>,
+    pub sources: Vec<ArcDynSource>,
     pub processors: Vec<DynProcessor>,
     pub sinks: Vec<DynSink>,
 }
 
 impl Pipeline {
-    pub async fn start(self) -> Result<()> {
+    pub async fn start(
+        &self,
+        ckpt_store: Arc<dyn CheckpointStore>,
+    ) -> Result<()> {
         let (tx, mut rx) = mpsc::channel::<Event>(1024);
 
         //spawn sources
-        for src in self.sources.into_iter() {
+        for src in self.sources.iter().cloned() {
             let tx_clone = tx.clone();
+            let store = ckpt_store.clone();
             tokio::spawn(async move {
-                if let Err(e) = src.run(tx_clone).await {
+                if let Err(e) = src.run(tx_clone, store).await {
                     tracing::error!(error = %e, "source failed")
                 }
             });

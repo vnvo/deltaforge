@@ -1,52 +1,45 @@
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fs, path::PathBuf, sync::Arc};
+
+use anyhow::Result;
+use async_trait::async_trait;
+use serde::{de::DeserializeOwned, Serialize};
 use tokio::sync::RwLock;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct Checkpoints {
-    pub mysql: HashMap<String, MySqlPos>, // key: pipeline_id
+#[async_trait]
+pub trait CheckpointStore: Send + Sync {
+    async fn get_raw(&self, source_id: &str) -> Result<Option<Vec<u8>>>;
+    async fn put_raw(&self, source_id: &str, bytes: &[u8]) -> Result<()>;
+    // delete a checkpoint for a source
+    async fn delete(&self, source_id: &str) -> Result<bool>;
+    // list all source IDs that have checkpoints
+    async fn list(&self) -> Result<Vec<String>>;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MySqlPos {
-    pub file: String,
-    pub pos: u64,
-    pub gtid_set: Option<String>, // optional GTID set string (preferred)
-}
-
-#[derive(Clone)]
-pub struct FsCheckpointStore {
-    path: PathBuf,
-    state: Arc<RwLock<Checkpoints>>,
-}
-
-impl FsCheckpointStore {
-    pub fn new(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = path.into();
-        let state = if path.exists() {
-            let content = fs::read_to_string(&path).context("read checkpoints")?;
-            serde_json::from_str::<Checkpoints>(&content).context("parse checkpoints")?
-        } else {
-            Checkpoints::default()
-        };
-        Ok(Self { path, state: Arc::new(RwLock::new(state)) })
+#[async_trait]
+pub trait CheckpointStoreExt: CheckpointStore {
+    async fn get<T>(&self, source_id: &str) -> Result<Option<T>>
+    where
+        T: DeserializeOwned + Send,
+    {
+        match self.get_raw(source_id).await? {
+            Some(buf) => Ok(Some(serde_json::from_slice(&buf)?)),
+            None => Ok(None),
+        }
     }
 
-    pub async fn get_mysql(&self, pipeline_id: &str) -> Option<MySqlPos> {
-        self.state.read().await.mysql.get(pipeline_id).cloned()
-    }
-
-    pub async fn put_mysql(&self, pipeline_id: &str, pos: MySqlPos) -> Result<()> {
-        self.state.write().await.mysql.insert(pipeline_id.to_string(), pos);
-        self.flush().await
-    }
-
-    async fn flush(&self) -> Result<()> {
-        let s = self.state.read().await;
-        let tmp = self.path.with_extension("tmp");
-        fs::write(&tmp, serde_json::to_vec_pretty(&*s)?).context("write tmp")?;
-        fs::rename(tmp, &self.path).context("atomic rename")?;
-        Ok(())
+    async fn put<T>(&self, source_id: &str, checkpoint: T) -> Result<()>
+    where
+        T: Serialize + Send + 'static,
+    {
+        let buf = serde_json::to_vec(&checkpoint)?;
+        drop(checkpoint);
+        self.put_raw(source_id, &buf).await
     }
 }
+impl<T: CheckpointStore + ?Sized> CheckpointStoreExt for T {}
+
+
+
+pub use file_store::FileCheckpointStore;
+
+mod file_store;

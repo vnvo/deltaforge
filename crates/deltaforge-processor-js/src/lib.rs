@@ -4,7 +4,7 @@ use deltaforge_core::{Event, Processor};
 use deno_core::{extension, JsRuntime, RuntimeOptions};
 use deno_core::{serde_v8, v8};
 use serde_json::Value;
-use tracing::info;
+use tracing::{debug, info};
 
 extension!(df_ext, ops = [op_log],);
 
@@ -27,6 +27,8 @@ impl JsProcessor {
 #[async_trait]
 impl Processor for JsProcessor {
     async fn process(&self, event: Event) -> Result<Vec<Event>> {
+        debug!("js processed event {}", event.event_id);
+
         let ext = df_ext::init();
         let mut rt = JsRuntime::new(RuntimeOptions {
             extensions: vec![ext],
@@ -122,7 +124,7 @@ impl Processor for JsProcessor {
             _ => bail!("invalid JS return: expected object, array, or null"),
         };
 
-        info!("js processed events");
+        info!("js processed event");
         Ok(out)
     }
 }

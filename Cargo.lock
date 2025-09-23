@@ -901,6 +901,7 @@ name = "deltaforge-checkpoints"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "serde",
  "serde_json",
  "tokio",
@@ -927,6 +928,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "deltaforge-checkpoints",
  "serde",
  "serde_json",
  "tokio",
@@ -983,6 +985,7 @@ dependencies = [
  "axum",
  "clap",
  "deltaforge-api",
+ "deltaforge-checkpoints",
  "deltaforge-config",
  "deltaforge-core",
  "deltaforge-metrics",

@@ -2,13 +2,15 @@ use anyhow::Result;
 use axum::Router; // no Server in axum 0.8
 use clap::Parser;
 use deltaforge_api::{router, AppState, PipeInfo};
+use deltaforge_checkpoints::{CheckpointStore, FileCheckpointStore};
 use deltaforge_config::{load_from_path, ProcessorCfg, SinkCfg, SourceCfg};
-use deltaforge_core::{DynProcessor, DynSink, DynSource, Pipeline};
+use deltaforge_core::{DynProcessor, DynSink, ArcDynSource, Pipeline};
+use deltaforge_metrics as metrics;
 use deltaforge_processor_js::JsProcessor;
 use deltaforge_sinks::{kafka::KafkaSink, redis::RedisSink};
-use deltaforge_sources::{mysql::MySqlSource, postgres::PostgresSource};
-use deltaforge_metrics as metrics;
+use deltaforge_sources::{mysql::MySqlSource}; //, postgres::PostgresSource};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -26,11 +28,14 @@ struct Args {
 async fn main() -> Result<()> {
     metrics::init();
     let args = Args::parse();
-    metrics::install_prometheus(&args.metrics_addr);    
+    metrics::install_prometheus(&args.metrics_addr);
     let spec = load_from_path(&args.config)?;
 
+    let ckpt_store:Arc<dyn CheckpointStore> =
+        Arc::new(FileCheckpointStore::new("./data/df_checkpoints.json")?);
+
     // Build sources
-    let mut sources: Vec<DynSource> = Vec::new();
+    let mut sources: Vec<ArcDynSource> = Vec::new();
     for src in &spec.spec.sources {
         match src {
             SourceCfg::Postgres {
@@ -39,7 +44,7 @@ async fn main() -> Result<()> {
                 publication,
                 slot,
                 tables,
-            } => {
+            } => {/*
                 sources.push(Box::new(PostgresSource {
                     id: id.clone(),
                     dsn: dsn.clone(),
@@ -47,10 +52,10 @@ async fn main() -> Result<()> {
                     tables: tables.clone(),
                     publication: publication.clone(),
                     slot: slot.clone(),
-                }));
+                }));*/
             }
             SourceCfg::Mysql { id, dsn, tables } => {
-                sources.push(Box::new(MySqlSource {
+                sources.push(Arc::new(MySqlSource {
                     id: id.clone(),
                     dsn: dsn.clone(),
                     tables: tables.clone(),
@@ -102,12 +107,11 @@ async fn main() -> Result<()> {
         sinks,
     };
     tokio::spawn(async move {
-        if let Err(e) = pipeline.start().await {
+        if let Err(e) = pipeline.start(ckpt_store.clone()).await {
             tracing::error!(error = %e, "pipeline stopped with error");
         }
     });
 
-    // Start API (axum 0.8 style)
     let state = AppState::default();
     state.pipelines.write().push(PipeInfo {
         id: spec.metadata.name.clone(),
