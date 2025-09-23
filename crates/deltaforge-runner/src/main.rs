@@ -1,14 +1,14 @@
 use anyhow::Result;
-use axum::Router; // no Server in axum 0.8
+use axum::Router;
 use clap::Parser;
 use deltaforge_api::{router, AppState, PipeInfo};
 use deltaforge_checkpoints::{CheckpointStore, FileCheckpointStore};
 use deltaforge_config::{load_from_path, ProcessorCfg, SinkCfg, SourceCfg};
-use deltaforge_core::{DynProcessor, DynSink, ArcDynSource, Pipeline};
+use deltaforge_core::{ArcDynSource, DynProcessor, DynSink, Pipeline};
 use deltaforge_metrics as metrics;
 use deltaforge_processor_js::JsProcessor;
 use deltaforge_sinks::{kafka::KafkaSink, redis::RedisSink};
-use deltaforge_sources::{mysql::MySqlSource}; //, postgres::PostgresSource};
+use deltaforge_sources::mysql::MySqlSource; //, postgres::PostgresSource};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
     metrics::install_prometheus(&args.metrics_addr);
     let spec = load_from_path(&args.config)?;
 
-    let ckpt_store:Arc<dyn CheckpointStore> =
+    let ckpt_store: Arc<dyn CheckpointStore> =
         Arc::new(FileCheckpointStore::new("./data/df_checkpoints.json")?);
 
     // Build sources
@@ -44,7 +44,8 @@ async fn main() -> Result<()> {
                 publication,
                 slot,
                 tables,
-            } => {/*
+            } => {
+                /*
                 sources.push(Box::new(PostgresSource {
                     id: id.clone(),
                     dsn: dsn.clone(),
