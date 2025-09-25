@@ -38,10 +38,13 @@ impl Processor for JsProcessor {
         // prepare the wrapper
         let code = format!(
             r#"
-            globalThis.processEvent = (event) => {{
-                const userFn = (event) => {{ {source} }};
-                return userFn(event);
-            }};
+        (function () {{
+        const userFn = ({source});
+        if (typeof userFn !== "function") {{
+            throw new Error("DeltaForge JS processor: source must be a function, e.g. (event)=>event");
+        }}
+        globalThis.processEvent = userFn;
+        }})();
         "#,
             source = self.source
         );

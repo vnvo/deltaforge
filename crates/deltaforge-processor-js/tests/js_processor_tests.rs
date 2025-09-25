@@ -30,7 +30,7 @@ fn new_event() -> Event {
 
 #[tokio::test(flavor = "current_thread")]
 async fn js_returns_array_passthrough() {
-    let js = r#"return [event];"#.to_string();
+    let js = r#"(event) => {return [event];}"#.to_string();
     let proc = JsProcessor::new(js);
     let ev = new_event();
 
@@ -43,8 +43,10 @@ async fn js_returns_array_passthrough() {
 #[tokio::test(flavor = "current_thread")]
 async fn js_can_mutate_event() {
     let js = r#"
-    event.tags = (event.tags || []).concat(["normalized"]);
-    if (event.after) event.after.note = "mutated";    
+    (event) => {
+        event.tags = (event.tags || []).concat(["normalized"]);
+        if (event.after) event.after.note = "mutated";
+    }
     "#
     .to_string();
 
@@ -63,7 +65,7 @@ async fn js_calls_rust_op_log() {
     // call the rust op we have registered via the extension macro.
     // In deno_core (>= 0.357), ops are available at Deno.core.ops
     let js = r#"
-    Deno.core.ops.op_log("hello-from-js");
+    (event) => {Deno.core.ops.op_log("hello-from-js");}
     "#
     .to_string();
 
@@ -79,9 +81,11 @@ async fn js_returning_single_object_is_wrapped() {
     // JS returns a single object, not an array.
     // EXPECTATION: processor wraps it into a 1-length Vec<Event> preserving modifications.
     let js = r#"
-        if (event.after) event.after.note = "single-object";
-        event.tags = ["solo"];
-        return event; // <- not an array
+        (event) => {
+            if (event.after) event.after.note = "single-object";
+            event.tags = ["solo"];
+            return event; // <- not an array
+        }
     "#
     .to_string();
 
@@ -98,7 +102,7 @@ async fn js_returning_single_object_is_wrapped() {
 #[tokio::test(flavor = "current_thread")]
 async fn js_returning_invalid_shape_errors() {
     // returning a non-object/array (e.g., number) should error when converting to Event.
-    let js = r#"return 42;"#.to_string();
+    let js = r#"(event) => {return 42;}"#.to_string();
     let proc = JsProcessor::new(js);
     let ev = new_event();
 
