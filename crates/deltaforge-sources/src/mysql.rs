@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use base64::prelude::*;
 use crc32fast::Hasher;
 use mysql_async::{prelude::Queryable, Pool, Row};
 use mysql_binlog_connector_rust::{
@@ -12,13 +13,13 @@ use mysql_binlog_connector_rust::{
         write_rows_event::WriteRowsEvent,
     },
 };
+use mysql_common::{binlog::jsonb, io::ParseBuf, proto::MyDeserialize};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, fmt, sync::Arc, time::Instant};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 use url::Url;
-use base64::prelude::*;
 
 use deltaforge_checkpoints::{CheckpointStore, CheckpointStoreExt};
 use deltaforge_core::{Event, Op, Source, SourceMeta};
@@ -205,7 +206,16 @@ impl Source for MySqlSource {
                     return Err(e.into());
                 }
             };
+
             let last_pos = header.next_event_position as u64;
+            debug!(
+                timestamp = header.timestamp,
+                event_type = header.event_type,
+                event_length = header.event_length,
+                server_id = header.server_id,
+                next_event_pos = last_pos,
+                "mysql source, next event received"
+            );
 
             match data {
                 EventData::TableMap(tm) => {
@@ -508,6 +518,9 @@ fn build_object(
 ) -> Value {
     let mut obj = serde_json::Map::with_capacity(cols.len());
     let mut vi = 0usize;
+
+    debug!(cols=?cols, values=?values);
+
     for (idx, inc) in included.iter().enumerate() {
         if !*inc {
             continue;
@@ -539,18 +552,32 @@ fn build_object(
             ColumnValue::Blob(bytes) => {
                 json!({ "_base64": to_b64(bytes) })
             }
-            ColumnValue::Json(bytes) => {
-                if let Ok(s) = std::str::from_utf8(bytes) {
-                    serde_json::from_str::<Value>(s)
-                        .unwrap_or_else(|_| json!(s))
-                } else {
-                    json!({ "_base64_json": to_b64(bytes) })
-                }
-            }
+            ColumnValue::Json(bytes) => handle_json(bytes),
         };
         obj.insert(key.to_string(), jv);
     }
-    Value::Object(obj) 
+    Value::Object(obj)
+}
+
+fn parse_mysql_jsonb(bytes: &[u8]) -> Option<Value> {
+    // binary json - normal path
+    let mut pb = mysql_common::io::ParseBuf(bytes);
+    let v = jsonb::Value::deserialize((), &mut pb).ok()?;
+    let dom = v.parse().ok()?;
+    Some(dom.into())
+}
+
+fn handle_json(bytes: &[u8]) -> Value {
+    if let Some(v) = parse_mysql_jsonb(bytes) {
+        v
+    } else if let Ok(s) = std::str::from_utf8(bytes) {
+        //fallback, sometimes sources send textual json
+        serde_json::from_str::<Value>(s)
+            .unwrap_or_else(|_| serde_json::json!(s))
+    } else {
+        //last resort
+        serde_json::json!({"_base64_json": to_b64(&bytes.to_vec())})
+    }
 }
 
 fn to_b64(bytes: &Vec<u8>) -> String {

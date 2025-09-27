@@ -19,3 +19,10 @@ crc32fast = "1.5"
 mysql_async = "0.36"
 base64.workspace = true
 url.workspace = true
+mysql_common = {version = "0.35", features = ["binlog"]}
+
+[dev-dependencies]
+testcontainers = "0.25"
+tracing.workspace = true
+tracing-subscriber = "0.3"
+tempfile = "3"
