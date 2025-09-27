@@ -36,5 +36,7 @@ pub trait CheckpointStoreExt: CheckpointStore {
 impl<T: CheckpointStore + ?Sized> CheckpointStoreExt for T {}
 
 pub use file_store::FileCheckpointStore;
+pub use mem_store::MemCheckpointStore;
 
 mod file_store;
+mod mem_store;
