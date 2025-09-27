@@ -11,3 +11,6 @@ tracing = { workspace = true }
 rdkafka = { workspace = true }
 redis = { workspace = true }
 deltaforge-core = { path = "../deltaforge-core" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
