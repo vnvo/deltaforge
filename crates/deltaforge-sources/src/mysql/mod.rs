@@ -5,13 +5,12 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::AtomicBool,
         Arc,
     },
-    time::Instant,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use mysql_binlog_connector_rust::{
     binlog_stream::BinlogStream,
@@ -22,7 +21,6 @@ use tokio::select;
 use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
-use url::Url;
 
 use deltaforge_checkpoints::{CheckpointStore, CheckpointStoreExt};
 use deltaforge_core::{Event, Op, Source, SourceHandle, SourceMeta};

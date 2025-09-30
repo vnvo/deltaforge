@@ -4,6 +4,8 @@ use mysql_async::{prelude::Queryable, Pool, Row};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::mysql::mysql_helpers::redact_password;
+
 /// INFORMATION_SCHEMA column-name cache, with logging and latency measurement.
 #[derive(Clone)]
 pub(super) struct MySqlSchemaCache {
@@ -12,7 +14,7 @@ pub(super) struct MySqlSchemaCache {
 }
 impl MySqlSchemaCache {
     pub(super) fn new(dsn: &str) -> Self {
-        info!("creating mysql schema cache for {}", dsn);
+        info!("creating mysql schema cache for {}", redact_password(dsn));
         Self {
             pool: Pool::new(dsn),
             map: Arc::new(RwLock::new(HashMap::new())),

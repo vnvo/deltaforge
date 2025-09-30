@@ -268,8 +268,8 @@ pub(crate) fn ts_ms(ts_sec: u32) -> i64 {
     (ts_sec as i64) * 1000
 }
 
-/// Redact password from DSN for logging (used by prepare_client).
-fn redact_password(dsn: &str) -> String {
+/// Redact password from DSN for logging.
+pub(crate) fn redact_password(dsn: &str) -> String {
     if let Ok(mut url) = Url::parse(dsn) {
         if url.password().is_some() {
             let _ = url.set_password(Some("***"));
