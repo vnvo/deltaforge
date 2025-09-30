@@ -45,8 +45,8 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
 
     let container = image.start().await.expect("start mysql");
     info!("Container ID: {}", container.id());
-    // --- log followers ---
-    // stdout
+
+    // container log followers
     {
         let mut out = container.stdout(true); // follow=true
         task::spawn(async move {
@@ -64,7 +64,6 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
             }
         });
     }
-    // stderr
     {
         let mut err = container.stderr(true);
         task::spawn(async move {
@@ -82,15 +81,13 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
             }
         });
     }
+
     sleep(Duration::from_secs(8)).await;
     info!("starting .............");
     //let host = container.get_host().await?.to_string();
     let port = 3307; // container.get_host_port_ipv4(3306).await?;
     let root_dsn = format!("mysql://root:password@127.0.0.1:{}/", port);
     let dsn = "mysql://df:dfpw@127.0.0.1:3307/shop";
-
-    // Wait for readiness
-    //sleep(Duration::from_secs(8)).await;
 
     // Provision schema + user
     let pool = MySQLPool::new(root_dsn.as_str());
@@ -142,7 +139,6 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
     conn.query_drop("FLUSH PRIVILEGES").await?;
 
     // Start source with df
-    //let dsn = format!("mysql://df:dfpw@{}:{}/shop", host, port);
     let src = MySqlSource {
         id: "it-mysql".into(),
         dsn: dsn.to_string(),
@@ -150,21 +146,18 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
         tenant: "acme".into(),
     };
 
-    //let tmp = tempfile::NamedTempFile::new()?;
-    //let ckpt_path = tmp.path().to_string_lossy().to_string();
     let ckpt_store: Arc<dyn CheckpointStore> =
         Arc::new(MemCheckpointStore::new()?);
 
     let (tx, mut rx) = mpsc::channel::<Event>(128);
-    tokio::spawn(async move {
-        info!("source is running ...");
-        if let Err(e) = src.run(tx, ckpt_store).await {
-            error!("mysql source error: {e:?}");
-        }
-    });
+    let handle = src.run(tx, ckpt_store).await;
+    info!("source is running ...");
+    //tokio::spawn(async move {
+    //    info!("source is running ...");
+    //    _ = src.run(tx, ckpt_store).await
+    //});
 
     sleep(Duration::from_secs(3)).await;
-    // Produce changes AFTER the source is running
     conn.query_drop(
         r#"INSERT INTO orders VALUES (1,'sku-1','{"a":1}', X'DEADBEEF')"#,
     )
@@ -210,13 +203,11 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
                 }
             }
             Ok(None) => {
-                // source ended: stop waiting
-                break;
-            }
+                break; // source ended: stop waiting
+            } 
             Err(_elapsed) => {
-                // deadline hit: stop waiting
-                break;
-            }
+                break; // deadline hit: stop waiting
+            } 
         }
     }
 
@@ -235,7 +226,12 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
     assert_eq!(after["payload"]["a"], 1);
     assert!(after["blobz"]["_base64"].is_string());
     info!("all asserts are successful!");
-    
+
+
+    // clean shutdown for source
+    handle.stop();
+    let _  = handle.join().await;
+
     conn.disconnect().await?;
     pool.disconnect().await?;
 

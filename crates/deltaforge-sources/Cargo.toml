@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 async-trait.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 deltaforge-core = { path = "../deltaforge-core"}
 deltaforge-checkpoints = { path = "../deltaforge-checkpoints"}
 anyhow.workspace = true

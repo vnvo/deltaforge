@@ -39,5 +39,6 @@ metrics-exporter-prometheus = "0.17"
 etl = { git = "https://github.com/supabase/etl", package = "etl" }
 futures = "0.3"
 tokio-stream = "0.1"
+tokio-util = "0.7"
 base64 = "0.22"
 url = "2.5"

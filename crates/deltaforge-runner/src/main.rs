@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
                 inline,
                 limits: _,
             } => {
-                processors.push(Box::new(JsProcessor::new(inline.clone())));
+                processors.push(Arc::new(JsProcessor::new(inline.clone())));
             }
         }
     }
@@ -92,17 +92,18 @@ async fn main() -> Result<()> {
                 topic,
                 exactly_once: _,
             } => {
-                sinks.push(Box::new(KafkaSink::new(brokers, topic)?));
+                sinks.push(Arc::new(KafkaSink::new(brokers, topic)?));
             }
             // pass the configured stream instead of hardcoding "events"
             SinkCfg::Redis { id: _, uri, stream } => {
-                sinks.push(Box::new(RedisSink::new(uri, stream)?));
+                sinks.push(Arc::new(RedisSink::new(uri, stream)?));
             }
         }
     }
 
     // Start pipeline
     let pipeline = Pipeline {
+        id: spec.metadata.name.clone(),
         sources,
         processors,
         sinks,

@@ -1,12 +1,20 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use deltaforge_checkpoints::CheckpointStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::{
+    sync::{mpsc, Notify},
+    task::JoinHandle,
+};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -167,13 +175,56 @@ pub enum ConnctionMode {
     Dedicated,
 }
 
+/// SourceHandle as the control interface for a source
+/// Caller/Controller of a source should use it to interact with a running source
+pub struct SourceHandle {
+    pub cancel: CancellationToken,
+    pub paused: Arc<AtomicBool>,
+    pub pause_notify: Arc<Notify>,
+    pub join: JoinHandle<Result<()>>,
+}
+
+impl SourceHandle {
+    /// Pause the source, temporarily.
+    /// Each source decides on the mechanics and side effects of pause on its own.
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    /// Un-Pause/Resume the operation.
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.pause_notify.notify_waiters();
+    }
+
+    /// Stop/Cancel the operation completely.
+    /// Should be used on shutdowns and/or restarts.
+    /// The caller is responsible for re-initiating the source if needed.
+    /// The source is responsible for any and all required cleanups for its own scope.
+    pub fn stop(&self) {
+        self.cancel.cancel();
+        self.pause_notify.notify_waiters();
+    }
+
+    pub async fn join(self) -> Result<()> {
+        match self.join.await {
+            Ok(r) => r,
+            Err(e) => Err(anyhow::anyhow!("source task panicked: {e}")),
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+}
+
 #[async_trait]
 pub trait Source: Send + Sync {
     async fn run(
         &self,
         tx: mpsc::Sender<Event>,
         checkpoint_store: Arc<dyn CheckpointStore>,
-    ) -> Result<()>;
+    ) -> SourceHandle;
 }
 
 #[async_trait]
@@ -206,61 +257,160 @@ pub trait SchemaRegistry: Send + Sync {
 }
 
 pub type ArcDynSource = Arc<dyn Source>;
-pub type DynProcessor = Box<dyn Processor>;
-pub type DynSink = Box<dyn Sink>;
+pub type DynProcessor = Arc<dyn Processor>;
+pub type DynSink = Arc<dyn Sink>;
 
 pub struct Pipeline {
+    pub id: String,
     pub sources: Vec<ArcDynSource>,
     pub processors: Vec<DynProcessor>,
     pub sinks: Vec<DynSink>,
+}
+
+/// the handle to a running pipeline to be used by upper layers/caller
+/// to interact with a CDC pipeline
+pub struct PipelineHandle {
+    id: String,
+    cancel: CancellationToken,
+    source_handles: Vec<SourceHandle>,
+    join: JoinHandle<Result<()>>,
+}
+
+impl PipelineHandle {
+    /// Pause the pipeline operation.
+    /// It is a temporary stop for the Pipeline and its components.
+    /// The pause is forwarded to all components (sources, processors and sinks).
+    /// It is up to each component how to handle the pause but it needs to be resumable with no extra infomation.
+    pub fn pause(&self) {
+        warn!(pipeline_id = &self.id, "pausing the pipeline is requested");
+        // forward the pause to all source handles
+        let _ = &self.source_handles.iter().for_each(|h| h.pause());
+    }
+
+    pub fn resume(&self) {
+        warn!(pipeline_id = &self.id, "resuming the pipeline is requested");
+        let _ = &self.source_handles.iter().for_each(|h| h.resume());
+    }
+
+    /// Stop the pipeline and all its components.
+    /// Any in-flight events should get processed before stop is complete:
+    /// - Cancels the dispatch loop
+    /// - Cancels all the sinks, processros and sources in that order.
+    pub fn stop(&self) {
+        warn!(pipeline_id = &self.id, "stopping the pipeline is requested");
+        self.cancel.cancel();
+        let _ = &self.source_handles.iter().for_each(|h| h.stop());
+    }
+
+    /// Await the dispatcher loop to finish
+    pub async fn join(self) -> Result<()> {
+        match self.join.await {
+            Ok(r) => r,
+            Err(e) => Err(anyhow!("pipeline {} task panicked: {}", self.id, e)),
+        }
+    }
+
+    pub async fn join_all_components(self) -> Result<()> {
+        let PipelineHandle {
+            id,
+            cancel,
+            source_handles,
+            join,
+        } = self;
+
+        let mut first_err: Option<anyhow::Error> = None;
+        if let Err(e) = match join.await {
+            Ok(r) => r,
+            Err(e) => Err(anyhow!("pipeline {} task panicked: {}", id, e)),
+        } {
+            first_err = Some(e)
+        }
+
+        for h in source_handles {
+            if let Err(e) = h.join().await {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+
+        if let Some(e) = first_err {
+            Err(e)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Pipeline {
     pub async fn start(
         &self,
         ckpt_store: Arc<dyn CheckpointStore>,
-    ) -> Result<()> {
+    ) -> Result<PipelineHandle> {
         let (tx, mut rx) = mpsc::channel::<Event>(1024);
 
+        let pipeline_id = self.id.clone();
+        info!(pipeline_id = pipeline_id, "pipeline starting ...");
         //spawn sources
+        let mut source_handles: Vec<SourceHandle> =
+            Vec::with_capacity(self.sources.len());
+
         for src in self.sources.iter().cloned() {
-            let tx_clone = tx.clone();
-            let store = ckpt_store.clone();
-            tokio::spawn(async move {
-                if let Err(e) = src.run(tx_clone, store).await {
-                    tracing::error!(error = %e, "source failed")
-                }
-            });
+            let src_handle = src.run(tx.clone(), ckpt_store.clone()).await;
+            source_handles.push(src_handle);
         }
         drop(tx);
 
-        // main consumer/process/dispath loop
-        while let Some(ev) = rx.recv().await {
-            // sequetial processing
-            let mut out: Vec<Event> = vec![ev];
-            for p in self.processors.iter() {
-                let mut next = Vec::new();
-                for e in out.into_iter() {
-                    match p.process(e).await {
-                        Ok(mut produced) => next.append(&mut produced),
-                        Err(err) => {
-                            tracing::error!(error = %err, "processor error; dropping event");
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+
+        let processors = self.processors.clone();
+        let sinks = self.sinks.clone();
+
+        // main dispatcher loop
+        let join = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel_for_task.cancelled() => {
+                        break; //graceful shutdown
+                    }
+
+                    maybe_ev = rx.recv() => {
+                        let Some(ev) = maybe_ev else { break; };
+
+                        //sequential processing
+                        let mut out: Vec<Event> = vec![ev];
+                        for p in processors.iter() {
+                            let mut next = Vec::new();
+                            for e in out.drain(..) {
+                                match p.process(e).await {
+                                    Ok(produced) => next.extend(produced),
+                                    Err(err) => error!(error = %err, "processor error; dropping event"),
+                                }
+                            }
+                            out = next;
+                        }
+
+                        // dispatch to sinks
+                        for e in out.into_iter() {
+                            for s in sinks.iter() {
+                                if let Err(err) = s.send(e.clone()).await {
+                                    error!(error = %err, "sink send failed");
+                                }
+                            }
                         }
                     }
-                }
-                out = next
+                };
             }
 
-            // dispatch to sinks (fire-n-forget)
-            for e in out.into_iter() {
-                for s in self.sinks.iter() {
-                    if let Err(err) = s.send(e.clone()).await {
-                        tracing::error!(error = %err, "sink send failed");
-                    }
-                }
-            }
-        }
+            Ok(())
+        });
 
-        Ok(())
+        Ok(PipelineHandle {
+            id: pipeline_id,
+            cancel,
+            source_handles,
+            join,
+        })
     }
 }

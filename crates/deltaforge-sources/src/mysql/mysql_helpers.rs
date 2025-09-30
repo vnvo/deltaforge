@@ -14,7 +14,8 @@ use mysql_binlog_connector_rust::{
 };
 use mysql_common::{
     binlog::jsonb,
-    proto::{MyDeserialize, ParseBuf},
+    proto::{MyDeserialize },
+    io::ParseBuf
 };
 use serde_json::{json, Value};
 use std::{
@@ -56,7 +57,7 @@ pub(super) async fn prepare_client(
 
     let mut client = BinlogClient::default();
     client.url = dsn.to_string();
-    client.server_id = server_id as u32; // connector uses u32 server_id
+    client.server_id = server_id; // connector uses u32 server_id
     client.heartbeat_interval_secs = 15;
     client.timeout_secs = 60;
 
@@ -525,7 +526,7 @@ pub(super) fn build_object(
 
 fn parse_mysql_jsonb(bytes: &[u8]) -> Option<Value> {
     // Parse MySQL binary JSON (JSONB)
-    let mut pb = ParseBuf::new(bytes);
+    let mut pb = ParseBuf(bytes);
     let v = jsonb::Value::deserialize((), &mut pb).ok()?;
     let dom = v.parse().ok()?;
     Some(dom.into())
@@ -539,7 +540,7 @@ fn handle_json(bytes: &[u8]) -> Value {
         serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!(s))
     } else {
         // Last resort: base64-wrap
-        json!({ "_base64_json": to_b64(bytes) })
+        json!({ "_base64_json": to_b64(&bytes.to_vec()) })
     }
 }
 
@@ -547,7 +548,7 @@ fn to_b64(bytes: &Vec<u8>) -> String {
     BASE64_STANDARD.encode(bytes)
 }
 
-fn ts_ms(ts_sec: u32) -> i64 {
+pub(crate) fn ts_ms(ts_sec: u32) -> i64 {
     (ts_sec as i64) * 1000
 }
 

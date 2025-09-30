@@ -24,16 +24,21 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
-use deltaforge_checkpoints::CheckpointStore;
+use deltaforge_checkpoints::{CheckpointStore, CheckpointStoreExt};
 use deltaforge_core::{Event, Op, Source, SourceHandle, SourceMeta};
 
 mod mysql_helpers;
 use mysql_helpers::{
-    build_object, connect_binlog, derive_server_id, handle_event,
-    pause_until_resumed, persist_checkpoint, prepare_client,
-    resolve_binlog_tail, short_sql, ts_ms, AllowList, MySqlCheckpoint,
-    MySqlSchemaCache,
+    build_object, connect_binlog, pause_until_resumed, persist_checkpoint,
+    prepare_client, short_sql, ts_ms, AllowList, MySqlSchemaCache,
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MySqlCheckpoint {
+    pub file: String,
+    pub pos: u64,
+    pub gtid_set: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 pub struct MySqlSource {
@@ -422,6 +427,11 @@ impl Source for MySqlSource {
             res
         });
 
-        SourceHandle::new(cancel, paused, pause_notify, join)
+        SourceHandle {
+            cancel,
+            paused,
+            pause_notify,
+            join,
+        }
     }
 }
