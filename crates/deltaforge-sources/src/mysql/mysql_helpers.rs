@@ -6,11 +6,6 @@ use mysql_binlog_connector_rust::{
     binlog_client::BinlogClient,
     binlog_stream::BinlogStream,
     column::column_value::ColumnValue,
-    event::{
-        delete_rows_event::DeleteRowsEvent, event_data::EventData,
-        event_header::EventHeader, table_map_event::TableMapEvent,
-        update_rows_event::UpdateRowsEvent, write_rows_event::WriteRowsEvent,
-    },
 };
 use mysql_common::{
     binlog::jsonb,
@@ -19,7 +14,6 @@ use mysql_common::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -27,16 +21,14 @@ use std::{
     time::Instant,
 };
 use tokio::select;
-use tokio::sync::{mpsc, Notify, RwLock};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
 use deltaforge_checkpoints::{CheckpointStore, CheckpointStoreExt};
-use deltaforge_core::{Event, Op, SourceMeta};
 
 use super::MySqlCheckpoint;
-
 // ----------------------------- public helpers (to mysql.rs) -----------------------------
 
 /// Prepare BinlogClient from DSN + last checkpoint; returns (host, default_db, server_id, client).
@@ -197,282 +189,6 @@ pub(super) async fn persist_checkpoint(
     } else {
         debug!(source_id = %source_id, file = %file, pos = pos, gtid = ?gtid, "checkpoint saved");
     }
-}
-
-/// Handle a single binlog event. Returns `Some(last_pos)` at commit (XID) for checkpoint persistence.
-pub(super) async fn handle_event(
-    source_id: &str,
-    tenant: &str,
-    header: &EventHeader,
-    data: EventData,
-    allow: &AllowList,
-    schema_cache: &MySqlSchemaCache,
-    table_map: &mut HashMap<u64, TableMapEvent>,
-    host: &str,
-    default_db: &str,
-    last_file: &mut String,
-    last_gtid: &mut Option<String>,
-    tx: &mpsc::Sender<Event>,
-) -> Result<Option<u64>> {
-    let last_pos = header.next_event_position as u64;
-
-    debug!(
-        timestamp = header.timestamp,
-        event_type = header.event_type,
-        event_length = header.event_length,
-        server_id = header.server_id,
-        next_event_pos = last_pos,
-        "mysql source, next event received"
-    );
-
-    match data {
-        EventData::TableMap(tm) => {
-            let is_new = !table_map.contains_key(&tm.table_id);
-            table_map.insert(tm.table_id, tm.clone());
-
-            if allow.matchs(&tm.database_name, &tm.table_name) {
-                if is_new {
-                    info!(
-                        source_id = %source_id,
-                        table_id = tm.table_id,
-                        db = %tm.database_name,
-                        table = %tm.table_name,
-                        "table mapped"
-                    );
-                } else {
-                    debug!(
-                        source_id = %source_id,
-                        table_id = tm.table_id,
-                        db = %tm.database_name,
-                        table = %tm.table_name,
-                        "table remapped"
-                    );
-                }
-            } else {
-                debug!(
-                    source_id = %source_id,
-                    db = %tm.database_name,
-                    table = %tm.table_name,
-                    "skipping table (allow-list)"
-                );
-            }
-        }
-
-        EventData::WriteRows(WriteRowsEvent {
-            table_id,
-            included_columns,
-            rows,
-            ..
-        }) => {
-            if let Some(tm) = table_map.get(&table_id) {
-                if !allow.matchs(&tm.database_name, &tm.table_name) {
-                    return Ok(None);
-                }
-                let cols = schema_cache
-                    .column_names(&tm.database_name, &tm.table_name)
-                    .await?;
-                debug!(
-                    source_id = %source_id,
-                    db = %tm.database_name,
-                    table = %tm.table_name,
-                    rows = rows.len(),
-                    "write_rows"
-                );
-                for row in rows {
-                    let after = build_object(
-                        &cols,
-                        &included_columns,
-                        &row.column_values,
-                    );
-                    let mut ev = Event::new_row(
-                        tenant.to_string(),
-                        SourceMeta {
-                            kind: "mysql".into(),
-                            host: host.to_string(),
-                            db: tm.database_name.clone(),
-                        },
-                        format!("{}.{}", tm.database_name, tm.table_name),
-                        Op::Insert,
-                        None,
-                        Some(after),
-                        ts_ms(header.timestamp),
-                    );
-                    ev.tx_id = last_gtid.clone();
-                    let _ = tx.send(ev).await;
-                }
-            } else {
-                warn!(source_id = %source_id, table_id, "write_rows for unknown table_id");
-            }
-        }
-
-        EventData::UpdateRows(UpdateRowsEvent {
-            table_id,
-            included_columns_before,
-            included_columns_after,
-            rows,
-            ..
-        }) => {
-            if let Some(tm) = table_map.get(&table_id) {
-                if !allow.matchs(&tm.database_name, &tm.table_name) {
-                    return Ok(None);
-                }
-                let cols = schema_cache
-                    .column_names(&tm.database_name, &tm.table_name)
-                    .await?;
-                debug!(
-                    source_id = %source_id,
-                    db = %tm.database_name,
-                    table = %tm.table_name,
-                    rows = rows.len(),
-                    "update_rows"
-                );
-                for (before_row, after_row) in rows {
-                    let before = build_object(
-                        &cols,
-                        &included_columns_before,
-                        &before_row.column_values,
-                    );
-                    let after = build_object(
-                        &cols,
-                        &included_columns_after,
-                        &after_row.column_values,
-                    );
-                    let mut ev = Event::new_row(
-                        tenant.to_string(),
-                        SourceMeta {
-                            kind: "mysql".into(),
-                            host: host.to_string(),
-                            db: tm.database_name.clone(),
-                        },
-                        format!("{}.{}", tm.database_name, tm.table_name),
-                        Op::Update,
-                        Some(before),
-                        Some(after),
-                        ts_ms(header.timestamp),
-                    );
-                    ev.tx_id = last_gtid.clone();
-                    let _ = tx.send(ev).await;
-                }
-            } else {
-                warn!(source_id = %source_id, table_id, "update_rows for unknown table_id");
-            }
-        }
-
-        EventData::DeleteRows(DeleteRowsEvent {
-            table_id,
-            included_columns,
-            rows,
-            ..
-        }) => {
-            if let Some(tm) = table_map.get(&table_id) {
-                if !allow.matchs(&tm.database_name, &tm.table_name) {
-                    return Ok(None);
-                }
-                let cols = schema_cache
-                    .column_names(&tm.database_name, &tm.table_name)
-                    .await?;
-                debug!(
-                    source_id = %source_id,
-                    db = %tm.database_name,
-                    table = %tm.table_name,
-                    rows = rows.len(),
-                    "delete_rows"
-                );
-                for row in rows {
-                    let before = build_object(
-                        &cols,
-                        &included_columns,
-                        &row.column_values,
-                    );
-                    let mut ev = Event::new_row(
-                        tenant.to_string(),
-                        SourceMeta {
-                            kind: "mysql".into(),
-                            host: host.to_string(),
-                            db: tm.database_name.clone(),
-                        },
-                        format!("{}.{}", tm.database_name, tm.table_name),
-                        Op::Delete,
-                        Some(before),
-                        None,
-                        ts_ms(header.timestamp),
-                    );
-                    ev.tx_id = last_gtid.clone();
-                    let _ = tx.send(ev).await;
-                }
-            } else {
-                warn!(source_id = %source_id, table_id, "delete_rows for unknown table_id");
-            }
-        }
-
-        EventData::Query(q) => {
-            let db = if q.schema.is_empty() {
-                default_db
-            } else {
-                &q.schema
-            };
-            let short = short_sql(&q.query, 200);
-            info!(
-                source_id = %source_id,
-                db = %db,
-                sql = %short,
-                "DDL/Query event"
-            );
-
-            // crude DDL – invalidate cache for the DB
-            let lower = q.query.to_lowercase();
-            if lower.starts_with("create table")
-                || lower.starts_with("alter table")
-                || lower.starts_with("drop table")
-                || lower.starts_with("rename table")
-            {
-                schema_cache.invalidate(db, "*").await;
-            }
-
-            let mut ev = Event::new_ddl(
-                tenant.to_string(),
-                SourceMeta {
-                    kind: "mysql".into(),
-                    host: host.to_string(),
-                    db: db.to_string(),
-                },
-                db.to_string(),
-                json!({ "sql": q.query }),
-                ts_ms(header.timestamp),
-            );
-            ev.tx_id = last_gtid.clone();
-            let _ = tx.send(ev).await;
-        }
-
-        EventData::Gtid(gt) => {
-            debug!(source_id = %source_id, gtid = %gt.gtid, "gtid");
-            *last_gtid = Some(gt.gtid.clone());
-        }
-
-        EventData::Rotate(rot) => {
-            info!(source_id = %source_id, file = %rot.binlog_filename, pos = rot.binlog_position, "rotate");
-            *last_file = rot.binlog_filename.clone();
-        }
-
-        EventData::Xid(_) => {
-            // persist at commit boundaries
-            return Ok(Some(last_pos));
-        }
-
-        EventData::FormatDescription(_)
-        | EventData::PreviousGtids(_)
-        | EventData::RowsQuery(_)
-        | EventData::TransactionPayload(_)
-        | EventData::XaPrepare(_)
-        | EventData::HeartBeat
-        | EventData::NotSupported => { /* ignore */ }
-
-        _ => {
-            debug!(source_id = %source_id, "unhandled event variant");
-        }
-    }
-
-    Ok(None)
 }
 
 // ----------------------------- private helpers / utilities -----------------------------
@@ -795,75 +511,6 @@ impl AllowList {
         self.items.iter().any(|(d_opt, t)| {
             (d_opt.as_deref().map(|d| d == db).unwrap_or(true)) && t == table
         })
-    }
-}
-
-/// INFORMATION_SCHEMA column-name cache, with logging and latency measurement.
-#[derive(Clone)]
-pub(super) struct MySqlSchemaCache {
-    pool: Pool,
-    map: Arc<RwLock<HashMap<(String, String), Arc<Vec<String>>>>>,
-}
-impl MySqlSchemaCache {
-    pub(super) fn new(dsn: &str) -> Self {
-        Self {
-            pool: Pool::new(dsn),
-            map: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-    pub(super) async fn column_names(
-        &self,
-        db: &str,
-        table: &str,
-    ) -> Result<Arc<Vec<String>>> {
-        if let Some(found) = self
-            .map
-            .read()
-            .await
-            .get(&(db.to_string(), table.to_string()))
-            .cloned()
-        {
-            debug!(db = %db, table = %table, "schema cache hit");
-            return Ok(found);
-        }
-        let t0 = Instant::now();
-        let mut conn = self.pool.get_conn().await?;
-        let rows: Vec<Row> = conn
-            .exec(
-                r#"
-            SELECT COLUMN_NAME
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-            ORDER BY ORDINAL_POSITION
-            "#,
-                (db, table),
-            )
-            .await?;
-        let ms = t0.elapsed().as_millis() as u64;
-        if ms > 200 {
-            warn!(db = %db, table = %table, ms, "slow schema fetch");
-        } else {
-            debug!(db = %db, table = %table, ms, "schema fetched");
-        }
-        let cols: Vec<String> = rows
-            .into_iter()
-            .map(|mut r| r.take::<String, _>(0).unwrap())
-            .collect();
-        if cols.is_empty() {
-            warn!(db = %db, table = %table, "schema fetch returned 0 columns");
-        }
-        let arc = Arc::new(cols);
-        self.map
-            .write()
-            .await
-            .insert((db.to_string(), table.to_string()), arc.clone());
-        Ok(arc)
-    }
-    pub(super) async fn invalidate(&self, db: &str, _wild: &str) {
-        let before = self.map.read().await.len();
-        self.map.write().await.retain(|(d, _), _| d != db);
-        let after = self.map.read().await.len();
-        info!(db = %db, removed = before.saturating_sub(after), "schema cache invalidated");
     }
 }
 

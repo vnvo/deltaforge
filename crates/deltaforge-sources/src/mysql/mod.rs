@@ -30,8 +30,11 @@ use deltaforge_core::{Event, Op, Source, SourceHandle, SourceMeta};
 mod mysql_helpers;
 use mysql_helpers::{
     build_object, connect_binlog, pause_until_resumed, persist_checkpoint,
-    prepare_client, short_sql, ts_ms, AllowList, MySqlSchemaCache,
+    prepare_client, short_sql, ts_ms, AllowList,
 };
+
+mod mysql_schema;
+use mysql_schema::MySqlSchemaCache;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MySqlCheckpoint {
