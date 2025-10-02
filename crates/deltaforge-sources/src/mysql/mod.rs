@@ -27,9 +27,12 @@ use deltaforge_core::{Event, Op, Source, SourceHandle, SourceMeta};
 
 mod mysql_helpers;
 use mysql_helpers::{
-    build_object, connect_binlog, pause_until_resumed, persist_checkpoint,
+    connect_binlog, pause_until_resumed, persist_checkpoint,
     prepare_client, short_sql, ts_ms, AllowList,
 };
+
+mod object;
+use object::build_object;
 
 mod mysql_schema;
 use mysql_schema::MySqlSchemaCache;
