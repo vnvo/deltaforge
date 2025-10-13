@@ -13,7 +13,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::select;
 use tokio::sync::Notify;
@@ -22,6 +22,10 @@ use tracing::{debug, error, info, warn};
 use url::Url;
 
 use deltaforge_checkpoints::{CheckpointStore, CheckpointStoreExt};
+
+use crate::conn_utils::{
+    classify_connect_err, retry_async, retryable_connect, RetryPolicy,
+};
 
 use super::MySqlCheckpoint;
 // ----------------------------- public helpers (to mysql.rs) -----------------------------
@@ -99,6 +103,43 @@ pub(super) async fn prepare_client(
     Ok((host, default_db, server_id, client))
 }
 
+/// retry `connect_binlog`, building a new client with each attempt
+/// instead of calling connect_binlog directly, this wrapper should be used
+pub(super) async fn connect_binlog_with_retries(
+    source_id: &str,
+    make_client: impl FnMut() -> BinlogClient + Send + Clone + Send + 'static,
+    cancel: &CancellationToken,
+    default_db_for_hints: &str,
+    retry_policy: RetryPolicy,
+) -> Result<BinlogStream> {
+    let mk = make_client.clone();
+
+    let stream = retry_async(
+        move |_| {
+            let mut mk = mk.clone();
+            async move {
+                let client = mk();
+                connect_binlog(
+                    source_id,
+                    client,
+                    cancel,
+                    default_db_for_hints,
+                )
+                .await
+            }
+        },
+        |e| classify_connect_err(e, "binlog_connection"),
+        retryable_connect,
+        Duration::from_secs(30),
+        retry_policy,
+        cancel,
+        "binlog_connect",
+    )
+    .await?;
+
+    Ok(stream)
+}
+
 /// Connect to binlog with cancellation and timeout.
 pub(super) async fn connect_binlog(
     source_id: &str,
@@ -162,7 +203,7 @@ pub(super) async fn pause_until_resumed(
 }
 
 /// Persist checkpoint (best effort), with logging.
-pub(super) async fn persist_checkpoint(
+pub(crate) async fn persist_checkpoint(
     source_id: &str,
     ckpt_store: &Arc<dyn CheckpointStore>,
     file: &str,
@@ -439,7 +480,7 @@ impl AllowList {
 }
 
 /// Shorten SQL for logs
-pub(super) fn short_sql(s: &str, max: usize) -> String {
+pub(crate) fn short_sql(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {

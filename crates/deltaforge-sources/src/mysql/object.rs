@@ -8,8 +8,8 @@ use tracing::debug;
 /// Build a JSON object using the included-columns bitmap and the compact values vector.
 pub(super) fn build_object(
     cols: &Arc<Vec<String>>,
-    included: &Vec<bool>,
-    values: &Vec<ColumnValue>,
+    included: &[bool],
+    values: &[ColumnValue],
 ) -> Value {
     let mut obj = serde_json::Map::with_capacity(cols.len());
     let mut vi = 0usize;

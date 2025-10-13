@@ -17,6 +17,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+pub mod errors;
+pub use errors::SourceError;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Op {
     Insert,
@@ -174,6 +177,8 @@ pub enum ConnctionMode {
     Shared,
     Dedicated,
 }
+
+pub type SourceResult<T> = Result<T, SourceError>;
 
 /// SourceHandle as the control interface for a source
 /// Caller/Controller of a source should use it to interact with a running source

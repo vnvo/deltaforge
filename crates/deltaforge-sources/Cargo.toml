@@ -21,6 +21,7 @@ mysql_async = "0.36"
 base64.workspace = true
 url.workspace = true
 mysql_common = {version = "0.35", features = ["binlog"]}
+rand = "0.9.2"
 
 [dev-dependencies]
 testcontainers = "0.25"

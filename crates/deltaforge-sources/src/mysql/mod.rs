@@ -4,38 +4,39 @@
 
 use std::{
     collections::HashMap,
-    sync::{
-        atomic::AtomicBool,
-        Arc,
-    },
+    sync::{atomic::AtomicBool, Arc},
+    time::Duration,
 };
 
 use anyhow::Result;
 use async_trait::async_trait;
 use mysql_binlog_connector_rust::{
-    binlog_stream::BinlogStream,
-    event::{event_data::EventData, table_map_event::TableMapEvent},
+    binlog_client::BinlogClient, binlog_stream::BinlogStream,
+    event::table_map_event::TableMapEvent,
 };
 use serde::{Deserialize, Serialize};
-use tokio::select;
 use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info};
 
 use deltaforge_checkpoints::{CheckpointStore, CheckpointStoreExt};
-use deltaforge_core::{Event, Op, Source, SourceHandle, SourceMeta};
+use deltaforge_core::{Event, Source, SourceHandle};
 
 mod mysql_helpers;
-use mysql_helpers::{
-    connect_binlog, pause_until_resumed, persist_checkpoint,
-    prepare_client, short_sql, ts_ms, AllowList,
-};
+use mysql_helpers::{pause_until_resumed, prepare_client, AllowList};
 
 mod object;
-use object::build_object;
 
 mod mysql_schema;
 use mysql_schema::MySqlSchemaCache;
+
+mod mysql_event;
+use mysql_event::*;
+
+use crate::{
+    conn_utils::RetryPolicy,
+    mysql::mysql_helpers::{connect_binlog_with_retries, resolve_binlog_tail},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MySqlCheckpoint {
@@ -52,342 +53,98 @@ pub struct MySqlSource {
     pub tenant: String,
 }
 
+// shared state for mysql source
+struct RunCtx {
+    source_id: String,
+    tenant: String,
+    dsn: String,
+    host: String,
+    default_db: String,
+    server_id: u64,
+    tx: mpsc::Sender<Event>,
+    chkpt: Arc<dyn CheckpointStore>,
+    cancel: CancellationToken,
+    paused: Arc<AtomicBool>,
+    pause_notify: Arc<Notify>,
+    schema: MySqlSchemaCache,
+    allow: AllowList,
+    retry: RetryPolicy,
+    inactivity: Duration,
+    table_map: HashMap<u64, TableMapEvent>,
+    last_file: String,
+    last_pos: u64,
+    last_gtid: Option<String>,
+}
+
 impl MySqlSource {
-    /// Main processing loop
     async fn run_inner(
         &self,
         tx: mpsc::Sender<Event>,
-        checkpoint_store: Arc<dyn CheckpointStore>,
+        chkpt_store: Arc<dyn CheckpointStore>,
         cancel: CancellationToken,
         paused: Arc<AtomicBool>,
         pause_notify: Arc<Notify>,
     ) -> Result<()> {
-        let (host, default_db, _server_id, client) = prepare_client(
-            &self.dsn,
-            &self.id,
-            &self.tables,
-            &checkpoint_store,
-        )
-        .await?;
+        let (host, default_db, server_id, client) =
+            prepare_client(&self.dsn, &self.id, &self.tables, &chkpt_store)
+                .await?;
 
-        info!(
-            source_id = %self.id,
-            host = %host,
-            db = %default_db,
-            "MySQL CDC: starting source"
-        );
+        info!(source_id=%self.id, host=%host, db=%default_db, "MySQL CDC: starting source");
 
-        let mut stream: BinlogStream =
-            connect_binlog(&self.id, client, &cancel, &default_db).await?;
+        let mut ctx = RunCtx {
+            source_id: self.id.clone(),
+            tenant: self.tenant.clone(),
+            dsn: self.dsn.clone(),
+            host,
+            default_db,
+            server_id,
+            tx,
+            chkpt: chkpt_store,
+            cancel,
+            paused,
+            pause_notify,
+            schema: MySqlSchemaCache::new(&self.dsn),
+            allow: AllowList::new(&self.tables),
+            retry: RetryPolicy::default(),
+            inactivity: Duration::from_secs(60),
+            table_map: HashMap::new(),
+            last_file: String::new(),
+            last_pos: 0,
+            last_gtid: None,
+        };
 
-        let schema_cache = MySqlSchemaCache::new(&self.dsn);
-        let allow = AllowList::new(&self.tables);
-
-        let mut table_map: HashMap<u64, TableMapEvent> = HashMap::new();
-        let mut last_file = String::new();
-        let mut last_gtid: Option<String> = None;
+        let mut stream = connect_first_stream(&ctx, client).await?;
 
         info!("entering binlog read loop");
         loop {
-            // pause gate, binlog client stays connected.
-            if !pause_until_resumed(&cancel, &*paused, &*pause_notify).await {
+            if !pause_until_resumed(&ctx.cancel, &ctx.paused, &ctx.pause_notify)
+                .await
+            {
                 break;
             }
 
-            // read or cancel - stop the operation completely on cancel
-            let next = select! {
-                _ = cancel.cancelled() => break,
-                r = stream.read() => r,
-            };
-
-            let (header, data) = match next {
-                Ok(x) => x,
-                Err(e) => {
-                    if cancel.is_cancelled() {
-                        break;
-                    }
-                    error!(source_id = %self.id, error = %e, "binlog read error");
-                    return Err(e.into());
+            match read_next_event(&mut stream, &mut ctx).await {
+                Ok((header, data)) => {
+                    ctx.last_pos = header.next_event_position as u64;
+                    dispatch_event(&mut ctx, &header, data).await?;
                 }
-            };
-
-            let last_pos = header.next_event_position as u64;
-            debug!(
-                timestamp = header.timestamp,
-                event_type = header.event_type,
-                event_length = header.event_length,
-                server_id = header.server_id,
-                next_event_pos = last_pos,
-                "mysql source, event received"
-            );
-
-            // actual event processing block
-            match data {
-                EventData::TableMap(tm) => {
-                    let is_new = !table_map.contains_key(&tm.table_id);
-                    table_map.insert(tm.table_id, tm.clone());
-
-                    if allow.matchs(&tm.database_name, &tm.table_name) {
-                        if is_new {
-                            info!(
-                                source_id = %self.id,
-                                table_id = tm.table_id,
-                                db = %tm.database_name,
-                                table = %tm.table_name,
-                                "table mapped"
-                            );
-                        } else {
-                            debug!(
-                                source_id = %self.id,
-                                table_id = tm.table_id,
-                                db = %tm.database_name,
-                                table = %tm.table_name,
-                                "table re-mapped"
-                            );
-                        }
-                    } else {
-                        debug!(
-                            source_id = %self.id,
-                            db = %tm.database_name,
-                            table = %tm.table_name,
-                            "skipping table (not in allow-list)"
-                        );
-                    }
+                Err(LoopControl::Reconnect) => {
+                    stream = reconnect_stream(&mut ctx).await?;
                 }
-
-                EventData::WriteRows(wr) => {
-                    if let Some(tm) = table_map.get(&wr.table_id) {
-                        if !allow.matchs(&tm.database_name, &tm.table_name) {
-                            continue;
-                        }
-                        let cols = schema_cache
-                            .column_names(&tm.database_name, &tm.table_name)
-                            .await?;
-                        debug!(
-                            source_id = %self.id,
-                            db = %tm.database_name,
-                            table = %tm.table_name,
-                            rows = wr.rows.len(),
-                            "write_rows"
-                        );
-
-                        for row in wr.rows {
-                            let after = build_object(
-                                &cols,
-                                &wr.included_columns,
-                                &row.column_values,
-                            );
-
-                            let mut ev = Event::new_row(
-                                self.tenant.clone(),
-                                SourceMeta {
-                                    kind: "mysql".into(),
-                                    host: host.clone(),
-                                    db: tm.database_name.clone(),
-                                },
-                                format!(
-                                    "{}.{}",
-                                    tm.database_name, tm.table_name
-                                ),
-                                Op::Insert,
-                                None,
-                                Some(after),
-                                ts_ms(header.timestamp),
-                            );
-
-                            ev.tx_id = last_gtid.clone();
-                            if tx.send(ev).await.is_err() {
-                                error!(source_id = %self.id, "channel send failed (op=insert)");
-                            }
-                        }
-                    } else {
-                        warn!(source_id = %self.id, table_id = wr.table_id, "write_rows for unknown table_id");
-                    }
-                }
-
-                EventData::UpdateRows(ur) => {
-                    if let Some(tm) = table_map.get(&ur.table_id) {
-                        if !allow.matchs(&tm.database_name, &tm.table_name) {
-                            continue;
-                        }
-                        let cols = schema_cache
-                            .column_names(&tm.database_name, &tm.table_name)
-                            .await?;
-                        debug!(
-                            source_id = %self.id,
-                            db = %tm.database_name,
-                            table = %tm.table_name,
-                            rows = ur.rows.len(),
-                            "update_rows"
-                        );
-
-                        for (before_row, after_row) in ur.rows {
-                            let before = build_object(
-                                &cols,
-                                &ur.included_columns_before,
-                                &before_row.column_values,
-                            );
-                            let after = build_object(
-                                &cols,
-                                &ur.included_columns_after,
-                                &after_row.column_values,
-                            );
-                            let mut ev = Event::new_row(
-                                self.tenant.clone(),
-                                SourceMeta {
-                                    kind: "mysql".into(),
-                                    host: host.clone(),
-                                    db: tm.database_name.clone(),
-                                },
-                                format!(
-                                    "{}.{}",
-                                    tm.database_name, tm.table_name
-                                ),
-                                Op::Update,
-                                Some(before),
-                                Some(after),
-                                ts_ms(header.timestamp),
-                            );
-
-                            ev.tx_id = last_gtid.clone();
-                            if tx.send(ev).await.is_err() {
-                                error!(source_id = %self.id, "channel send failed (op=update)");
-                            }
-                        }
-                    } else {
-                        warn!(source_id = %self.id, table_id = ur.table_id, "update_rows for unknown table_id");
-                    }
-                }
-
-                EventData::DeleteRows(dr) => {
-                    if let Some(tm) = table_map.get(&dr.table_id) {
-                        if !allow.matchs(&tm.database_name, &tm.table_name) {
-                            continue;
-                        }
-                        let cols = schema_cache
-                            .column_names(&tm.database_name, &tm.table_name)
-                            .await?;
-                        debug!(
-                            source_id = %self.id,
-                            db = %tm.database_name,
-                            table = %tm.table_name,
-                            rows = dr.rows.len(),
-                            "delete_rows"
-                        );
-
-                        for row in dr.rows {
-                            let before = build_object(
-                                &cols,
-                                &dr.included_columns,
-                                &row.column_values,
-                            );
-                            let mut ev = Event::new_row(
-                                self.tenant.clone(),
-                                SourceMeta {
-                                    kind: "mysql".into(),
-                                    host: host.clone(),
-                                    db: tm.database_name.clone(),
-                                },
-                                format!(
-                                    "{}.{}",
-                                    tm.database_name, tm.table_name
-                                ),
-                                Op::Delete,
-                                Some(before),
-                                None,
-                                ts_ms(header.timestamp),
-                            );
-                            ev.tx_id = last_gtid.clone();
-                            if tx.send(ev).await.is_err() {
-                                error!(source_id = %self.id, "channel send failed (op=delete)");
-                            }
-                        }
-                    } else {
-                        warn!(source_id = %self.id, table_id = dr.table_id, "delete_rows for unknown table_id");
-                    }
-                }
-
-                EventData::Query(q) => {
-                    let db = if q.schema.is_empty() {
-                        &default_db
-                    } else {
-                        &q.schema
-                    };
-                    let short = short_sql(&q.query, 200);
-                    info!(source_id = %self.id, db = %db, sql = %short, "DDL/Query event");
-
-                    // crude DDL – invalidate cache for the DB
-                    let lower = q.query.to_lowercase();
-                    if lower.starts_with("create table")
-                        || lower.starts_with("alter table")
-                        || lower.starts_with("drop table")
-                        || lower.starts_with("rename table")
-                    {
-                        schema_cache.invalidate(db, "*").await;
-                    }
-
-                    let mut ev = Event::new_ddl(
-                        self.tenant.clone(),
-                        SourceMeta {
-                            kind: "mysql".into(),
-                            host: host.clone(),
-                            db: db.to_string(),
-                        },
-                        db.to_string(),
-                        serde_json::json!({ "sql": q.query }),
-                        ts_ms(header.timestamp),
-                    );
-
-                    ev.tx_id = last_gtid.clone();
-                    if tx.send(ev).await.is_err() {
-                        error!(source_id = %self.id, "channel send failed (op=ddl)");
-                    }
-                }
-
-                EventData::Gtid(gt) => {
-                    debug!(source_id = %self.id, gtid = %gt.gtid, "gtid");
-                    last_gtid = Some(gt.gtid.clone());
-                }
-
-                EventData::Rotate(rot) => {
-                    info!(source_id = %self.id, file = %rot.binlog_filename, pos = rot.binlog_position, "rotate");
-                    last_file = rot.binlog_filename.clone();
-                }
-
-                EventData::Xid(_) => {
-                    // definitely persist at commit boundaries
-                    persist_checkpoint(
-                        &self.id,
-                        &checkpoint_store,
-                        &last_file,
-                        last_pos,
-                        &last_gtid,
-                    )
-                    .await;
-                }
-
-                EventData::FormatDescription(_)
-                | EventData::PreviousGtids(_)
-                | EventData::RowsQuery(_)
-                | EventData::TransactionPayload(_)
-                | EventData::XaPrepare(_)
-                | EventData::HeartBeat
-                | EventData::NotSupported => { /* ignore */ }
-
-                _ => {
-                    debug!(source_id = %self.id, "unhandled event variant");
-                }
+                Err(LoopControl::Stop) => break,
+                Err(LoopControl::Fail(e)) => return Err(e),
             }
         }
 
-        // Optional best-effort final checkpoint (no pos if we didn't track one)
-        let _ = checkpoint_store
+        // best-effort final checkpoint update
+        let _ = ctx
+            .chkpt
             .put(
-                &self.id,
+                &ctx.source_id,
                 MySqlCheckpoint {
-                    file: last_file,
-                    pos: 0,
-                    gtid_set: last_gtid,
+                    file: ctx.last_file,
+                    pos: ctx.last_pos,
+                    gtid_set: ctx.last_gtid,
                 },
             )
             .await;
@@ -438,4 +195,100 @@ impl Source for MySqlSource {
             join,
         }
     }
+}
+
+/// build a factory from the inital client's resume point
+async fn connect_first_stream(
+    ctx: &RunCtx,
+    client: BinlogClient,
+) -> Result<BinlogStream> {
+    let init_gtid = client.gtid_enabled.then(|| client.gtid_set.clone());
+    let init_file = if client.gtid_enabled {
+        None
+    } else {
+        Some(client.binlog_filename.clone())
+    };
+    let init_pos = if client.gtid_enabled {
+        None
+    } else {
+        Some(client.binlog_position)
+    };
+
+    let dsn = ctx.dsn.clone();
+    let sid = ctx.server_id;
+    let make_client = move || {
+        let mut c = BinlogClient::default();
+        c.url = dsn.clone();
+        c.server_id = sid;
+        c.heartbeat_interval_secs = 15;
+        c.timeout_secs = 60;
+
+        if let Some(gtid) = init_gtid.clone() {
+            c.gtid_enabled = true;
+            c.gtid_set = gtid
+        } else if let (Some(fname), Some(pos)) = (init_file.clone(), init_pos) {
+            c.gtid_enabled = false;
+            c.binlog_filename = fname;
+            c.binlog_position = pos;
+        }
+        c
+    };
+
+    let stream = connect_binlog_with_retries(
+        &ctx.source_id,
+        make_client,
+        &ctx.cancel,
+        &ctx.default_db,
+        ctx.retry.clone(),
+    )
+    .await?;
+
+    Ok(stream)
+}
+
+async fn reconnect_stream(ctx: &mut RunCtx) -> Result<BinlogStream> {
+    //use mysql_binlog_connector_rust::binlog_client::BinlogClient;
+
+    // Choose best resume: GTID > file:pos > tail
+    let (gtid_to_use, file_to_use, pos_to_use) = if let Some(g) = &ctx.last_gtid
+    {
+        (Some(g.clone()), None, None)
+    } else if !ctx.last_file.is_empty() && ctx.last_pos > 0 {
+        (None, Some(ctx.last_file.clone()), Some(ctx.last_pos as u32))
+    } else {
+        match resolve_binlog_tail(&ctx.dsn).await {
+            Ok((f, p)) => (None, Some(f), Some(p as u32)),
+            Err(err) => return Err(err),
+        }
+    };
+
+    let dsn = ctx.dsn.clone();
+    let sid = ctx.server_id;
+    let make_client = move || {
+        let mut c = BinlogClient::default();
+        c.url = dsn.clone();
+        c.server_id = sid;
+        c.heartbeat_interval_secs = 15;
+        c.timeout_secs = 60;
+        if let Some(g) = gtid_to_use.clone() {
+            c.gtid_enabled = true;
+            c.gtid_set = g;
+        } else if let (Some(f), Some(p)) = (file_to_use.clone(), pos_to_use) {
+            c.gtid_enabled = false;
+            c.binlog_filename = f;
+            c.binlog_position = p;
+        }
+        c
+    };
+
+    let stream = connect_binlog_with_retries(
+        &ctx.source_id,
+        make_client,
+        &ctx.cancel,
+        &ctx.default_db,
+        ctx.retry.clone(),
+    )
+    .await?;
+
+    Ok(stream)
 }
