@@ -27,10 +27,10 @@ pub struct RetryPolicy {
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
-            initial: Duration::from_millis(500),
-            max: Duration::from_secs(30),
+            initial: Duration::from_millis(1000),
+            max: Duration::from_secs(300),
             jitter: 0.2,
-            max_retries: Some(3),
+            max_retries: Some(5),
         }
     }
 }
