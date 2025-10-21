@@ -183,7 +183,7 @@ impl Source for MySqlSource {
                 )
                 .await;
             if let Err(e) = &res {
-                error!(error=?e, "mysql source task ended with error");
+                error!(error=?e, "run task ended with error");
             }
             res
         });

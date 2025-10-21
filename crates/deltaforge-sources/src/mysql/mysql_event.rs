@@ -8,8 +8,8 @@ use mysql_binlog_connector_rust::{
         table_map_event::TableMapEvent,
     },
 };
-use tracing::{debug, error, info, warn};
 use tracing::instrument;
+use tracing::{debug, error, info, warn};
 
 use super::object::build_object;
 use crate::conn_utils::{retryable_stream, watchdog};
@@ -58,7 +58,7 @@ pub(super) async fn dispatch_event(
         event_length = header.event_length,
         server_id = header.server_id,
         next_event_pos = ctx.last_pos,
-        "mysql source, event received"
+        "event received"
     );
 
     match data {
@@ -102,12 +102,23 @@ async fn handle_table_map(ctx: &mut RunCtx, tm: TableMapEvent) -> Result<()> {
 
     if ctx.allow.matchs(&tm.database_name, &tm.table_name) {
         if is_new {
-            info!(source_id=%ctx.source_id, table_id=tm.table_id, db=%tm.database_name, table=%tm.table_name, "table mapped");
+            info!(
+                table_id=tm.table_id, 
+                db=%tm.database_name, 
+                table=%tm.table_name, 
+                "table mapped");
         } else {
-            debug!(source_id=%ctx.source_id, table_id=tm.table_id, db=%tm.database_name, table=%tm.table_name, "table re-mapped");
+            debug!(
+                table_id=tm.table_id, 
+                db=%tm.database_name, 
+                table=%tm.table_name, 
+                "table re-mapped");
         }
     } else {
-        debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, "skipping table (not in allow-list)");
+        debug!(
+            db=%tm.database_name, 
+            table=%tm.table_name, 
+            "skipping table (not in allow-list)");
     }
     Ok(())
 }

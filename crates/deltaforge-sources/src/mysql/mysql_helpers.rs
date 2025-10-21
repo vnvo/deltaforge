@@ -1,13 +1,9 @@
 use anyhow::{anyhow, Context, Result};
-use base64::prelude::*;
 use crc32fast::Hasher;
 use mysql_async::{prelude::Queryable, Pool, Row};
 use mysql_binlog_connector_rust::{
     binlog_client::BinlogClient, binlog_stream::BinlogStream,
-    column::column_value::ColumnValue,
 };
-use mysql_common::{binlog::jsonb, io::ParseBuf, proto::MyDeserialize};
-use serde_json::{json, Value};
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -119,13 +115,8 @@ pub(super) async fn connect_binlog_with_retries(
             let mut mk = mk.clone();
             async move {
                 let client = mk();
-                connect_binlog(
-                    source_id,
-                    client,
-                    cancel,
-                    default_db_for_hints,
-                )
-                .await
+                connect_binlog(source_id, client, cancel, default_db_for_hints)
+                    .await
             }
         },
         |e| classify_connect_err(e, "binlog_connection"),

@@ -2,7 +2,7 @@ use std::future::Future;
 use std::time::Instant;
 use std::{borrow::Cow, time::Duration};
 
-use deltaforge_core::{Source, SourceError, SourceResult};
+use deltaforge_core::{SourceError, SourceResult};
 use rand::{rng, Rng};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;

@@ -1,6 +1,6 @@
-use std::{collections::HashMap, sync::Arc, time::Instant};
 use anyhow::Result;
 use mysql_async::{prelude::Queryable, Pool, Row};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
