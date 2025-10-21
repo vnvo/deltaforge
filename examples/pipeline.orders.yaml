@@ -22,8 +22,10 @@ spec:
       id: js-normalize
       inline: |
         // simple example: add a tag
+        (event) => {
         event.tags = (event.tags || []).concat(["normalized"]);
         return [event];
+        }
       limits: { cpu_ms: 2, mem_mb: 64, timeout_ms: 50 }
   sinks:
     - type: kafka
