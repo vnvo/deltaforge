@@ -42,10 +42,11 @@ pub(super) async fn prepare_client(
     let last_checkpoint: Option<MySqlCheckpoint> =
         ckpt_store.get(source_id).await?;
 
+    info!(source_id=%source_id, url=%url, checkpoint=?last_checkpoint, "preparing client");
     let mut client = BinlogClient::default();
     client.url = dsn.to_string();
     client.server_id = server_id; // connector uses u32 server_id
-    client.heartbeat_interval_secs = 15;
+    client.heartbeat_interval_secs = 180;
     client.timeout_secs = 60;
 
     debug!(
@@ -477,4 +478,17 @@ pub(crate) fn short_sql(s: &str, max: usize) -> String {
     } else {
         format!("{}…", &s[..max])
     }
+}
+
+pub(super) async fn fetch_executed_gtid_set(dsn: &str) -> anyhow::Result<Option<String>> {
+    // Use a short-lived connection for now (simple & correct).
+    // We can optimize by keeping a Pool in RunCtx later.
+    let pool = Pool::new(dsn);
+    let mut conn = pool.get_conn().await?;
+    // Returns NULL if GTID is disabled
+    let row: Option<(Option<String>,)> = conn
+        .query_first("SELECT @@GLOBAL.gtid_executed")
+        .await?;
+    conn.disconnect().await?; // or pool.disconnect().await? depending on your version
+    Ok(row.and_then(|(s,)| s))
 }

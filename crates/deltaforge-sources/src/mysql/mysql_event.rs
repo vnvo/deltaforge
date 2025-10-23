@@ -321,12 +321,17 @@ fn handle_rotate(
 
 #[instrument(skip_all, fields(source_id=%ctx.source_id))]
 async fn handle_xid(ctx: &mut RunCtx) {
+    // Prefer the server’s executed-set; fall back to last_gtid if GTID is off
+    let gtid_set = match crate::mysql::mysql_helpers::fetch_executed_gtid_set(&ctx.dsn).await {
+        Ok(Some(s)) => Some(s),
+        _ => ctx.last_gtid.clone(), // fallback if GTID not enabled
+    };    
     persist_checkpoint(
         &ctx.source_id,
         &ctx.chkpt,
         &ctx.last_file,
         ctx.last_pos,
-        &ctx.last_gtid,
+        &gtid_set,
     )
     .await;
 }
