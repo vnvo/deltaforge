@@ -1,4 +1,4 @@
-use deltaforge_config::{load_from_path, ProcessorCfg, SinkCfg, SourceCfg};
+use deltaforge_config::{ProcessorCfg, SinkCfg, SourceCfg, load_from_path};
 use pretty_assertions::assert_eq;
 use serial_test::serial;
 use std::io::Write;
@@ -13,10 +13,13 @@ fn write_temp(contents: &str) -> tempfile::TempPath {
 #[serial] // because we mutate process env
 fn parses_minimal_postgres_pipeline_with_env_expansion() {
     // arrange
-    std::env::set_var(
-        "PG_ORDERS_DSN",
-        "postgres://pgu:pgpass@localhost:5432/orders",
-    );
+    unsafe {
+        std::env::set_var(
+            "PG_ORDERS_DSN",
+            "postgres://pgu:pgpass@localhost:5432/orders",
+        );
+    }
+
     let yaml = r#"
 apiVersion: deltaforge/v1
 kind: Pipeline
@@ -104,7 +107,12 @@ spec:
 #[test]
 #[serial]
 fn parses_mysql_and_multiple_sinks() {
-    std::env::set_var("MYSQL_ORDERS_DSN", "mysql://root:pws@localhost:3306/orders");
+    unsafe {
+        std::env::set_var(
+            "MYSQL_ORDERS_DSN",
+            "mysql://root:pws@localhost:3306/orders",
+        );
+    }
     let yaml = r#"
 apiVersion: deltaforge/v1
 kind: Pipeline
@@ -163,7 +171,9 @@ fn invalid_yaml_errors() {
     // Assert
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("parsing yaml") || msg.contains("mapping") || msg.contains("expected"),
+        msg.contains("parsing yaml")
+            || msg.contains("mapping")
+            || msg.contains("expected"),
         "unexpected error: {msg}"
     );
 }
@@ -238,8 +248,10 @@ spec:
 #[test]
 #[serial]
 fn env_expansion_honors_multiple_vars() {
-    std::env::set_var("KAFKA_BROKERS", "localhost:9092");
-    std::env::set_var("REDIS_URI", "redis://127.0.0.1:6379");
+    unsafe {
+        std::env::set_var("KAFKA_BROKERS", "localhost:9092");
+        std::env::set_var("REDIS_URI", "redis://127.0.0.1:6379");
+    }
 
     let yaml = r#"
 apiVersion: deltaforge/v1
