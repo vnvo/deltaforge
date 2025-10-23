@@ -53,6 +53,8 @@ pub struct MySqlSource {
     pub tenant: String,
 }
 
+const HEARTBEAT_INTERVAL_SECS: u64 = 15;
+const READ_TIMEOUT: u64 = 90;
 // shared state for mysql source
 struct RunCtx {
     source_id: String,
@@ -89,7 +91,11 @@ impl MySqlSource {
             prepare_client(&self.dsn, &self.id, &self.tables, &chkpt_store)
                 .await?;
 
-        info!(source_id=%self.id, host=%host, db=%default_db, "MySQL CDC: starting source");
+        info!(
+            source_id=%self.id, 
+            host=%host, 
+            db=%default_db, 
+            "MySQL CDC: starting source");
 
         let mut ctx = RunCtx {
             source_id: self.id.clone(),
@@ -220,8 +226,8 @@ async fn connect_first_stream(
         let mut c = BinlogClient::default();
         c.url = dsn.clone();
         c.server_id = sid;
-        c.heartbeat_interval_secs = 15;
-        c.timeout_secs = 60;
+        c.heartbeat_interval_secs = HEARTBEAT_INTERVAL_SECS;
+        c.timeout_secs = READ_TIMEOUT;
 
         if let Some(gtid) = init_gtid.clone() {
             c.gtid_enabled = true;
@@ -268,8 +274,8 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> Result<BinlogStream> {
         let mut c = BinlogClient::default();
         c.url = dsn.clone();
         c.server_id = sid;
-        c.heartbeat_interval_secs = 15;
-        c.timeout_secs = 60;
+        c.heartbeat_interval_secs = HEARTBEAT_INTERVAL_SECS;
+        c.timeout_secs = READ_TIMEOUT;
         if let Some(g) = gtid_to_use.clone() {
             c.gtid_enabled = true;
             c.gtid_set = g;
