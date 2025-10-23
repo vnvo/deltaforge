@@ -6,7 +6,7 @@ metadata:
 
 spec:
   sources:
-    - type: "mysql"
+    - type: mysql
       id: "mysql-shop"
       dsn: "mysql://df:dfpw@127.0.0.1:3306"
       tables: ["orders.order_items"] # empty = all
@@ -21,7 +21,12 @@ spec:
         }
       limits: { cpu_ms: 2, mem_mb: 64, timeout_ms: 50 }
   sinks:
-    - type: "redis"
+    - type: redis
       id: "r1"
       uri: "redis://127.0.0.1:6379"
       stream: "df.events"
+    - type: kafka
+      id: kafka
+      brokers: "127.0.0.1:9092"
+      topic: orders
+      exactlyOnce: false
