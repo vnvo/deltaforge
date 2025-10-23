@@ -85,14 +85,13 @@ async fn main() -> Result<()> {
     let mut sinks: Vec<DynSink> = Vec::new();
     for s in &spec.spec.sinks {
         match s {
-            // field is `exactlyOnce` in your config (camelCase); ignore it here
             SinkCfg::Kafka {
                 id: _,
                 brokers,
                 topic,
                 exactly_once: _,
             } => {
-                sinks.push(Arc::new(KafkaSink::new(brokers, topic)?));
+                sinks.push(Arc::new(KafkaSink::new(brokers, topic, false)?));
             }
             // pass the configured stream instead of hardcoding "events"
             SinkCfg::Redis { id: _, uri, stream } => {
