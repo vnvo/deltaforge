@@ -82,6 +82,9 @@ pub enum SinkCfg {
         id: String,
         brokers: String,
         topic: String,
+        #[serde(default)]
+        required: Option<bool>,
+        #[serde(default)]
         exactly_once: Option<bool>,
     },
 

@@ -91,6 +91,7 @@ async fn main() -> Result<()> {
                 id: _,
                 brokers,
                 topic,
+                required: _,
                 exactly_once: _,
             } => {
                 sinks.push(Arc::new(KafkaSink::new(brokers, topic, false)?));
