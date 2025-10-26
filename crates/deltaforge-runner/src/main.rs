@@ -12,7 +12,7 @@ use deltaforge_sources::mysql::MySqlSource; //, postgres::PostgresSource};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{debug, info};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -30,6 +30,8 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     metrics::install_prometheus(&args.metrics_addr);
     let spec = load_from_path(&args.config)?;
+
+    debug!(pipeline_spec=?spec, "pipeline spec");
 
     let ckpt_store: Arc<dyn CheckpointStore> =
         Arc::new(FileCheckpointStore::new("./data/df_checkpoints.json")?);

@@ -29,4 +29,15 @@ spec:
       id: kafka
       brokers: "127.0.0.1:9092"
       topic: orders
+      required: true
       exactlyOnce: false
+  batch:
+    max_events: 100
+    max_bytes: 8388608
+    max_ms: 200
+    respect_source_tx: true
+    max_inflight: 1
+
+  commit_policy:
+    mode: required # "all" | "required" | "quorum"
+    # quorum: 2     # only if mode: quorum
