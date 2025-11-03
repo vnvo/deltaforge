@@ -1,7 +1,8 @@
-use std::fs;
-
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tracing::error;
+use std::fs;
+use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineSpec {
@@ -21,7 +22,6 @@ pub struct Metadata {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Spec {
-
     /// Sharding config for the pipeline
     pub sharding: Option<Sharding>,
 
@@ -33,7 +33,7 @@ pub struct Spec {
 
     /// Multi sink config
     pub sinks: Vec<SinkCfg>,
-    
+
     /// Source connection policy
     pub connection_policy: Option<ConnectionPolicy>,
 
@@ -41,7 +41,7 @@ pub struct Spec {
     pub batch: Option<BatchConfig>,
 
     /// How sink acknowledgements gate checkpoint commits.
-    pub commit_policy: Option<CommitPolicy>,    
+    pub commit_policy: Option<CommitPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,7 +122,6 @@ pub struct ConnectionLimits {
     pub max_dedicated_per_source: Option<u32>,
 }
 
-
 /// The pipeline-level batch (the **commit unit**). Coordinator will build batches
 /// using these thresholds and checkpoint after a batch is accepted by sinks.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -163,13 +162,48 @@ pub enum CommitPolicy {
 }
 
 impl Default for CommitPolicy {
-    fn default() -> Self { CommitPolicy::Required }
+    fn default() -> Self {
+        CommitPolicy::Required
+    }
 }
 
-pub fn load_from_path(path: &str) -> Result<PipelineSpec> {
-    let raw = fs::read_to_string(path).with_context(|| format!("reading config {path}"))?;
+pub fn load_from_path(file_path: &str) -> Result<PipelineSpec> {
+    let raw = fs::read_to_string(file_path)
+        .with_context(|| format!("reading config {file_path}"))?;
     let with_env = shellexpand::env(&raw).unwrap().to_string();
-    let spec: PipelineSpec = serde_yaml::from_str(&with_env).with_context(|| "parsing yaml")?;
+    let spec: PipelineSpec =
+        serde_yaml::from_str(&with_env).with_context(|| "parsing yaml")?;
 
     Ok(spec)
+}
+
+pub fn load_from_dir(dir_path: &str) -> Result<Vec<PipelineSpec>> {
+    let mut specs = Vec::<PipelineSpec>::new();
+    for entry in WalkDir::new(dir_path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.metadata().unwrap().is_file())
+    {
+        if let Some(path_str) = entry.path().to_str() {
+            let spec = load_from_path(path_str)
+                .with_context(|| format!("loading pipeline from {:?}", entry.path()))?;
+            specs.push(spec);            
+        } else {
+            error!(file=%entry.path().display(), "skipping file in config dir")
+        }
+    }
+
+    Ok(specs)
+}
+
+pub fn load_cfg(path: &str) -> Result<Vec<PipelineSpec>> {
+    let cfg_path = std::path::Path::new(path);
+
+    match cfg_path.is_dir() {
+        true => load_from_dir(path),
+        false => {
+            let spec= load_from_path(path)?;
+            Ok(vec![spec])
+        }
+    }
 }
