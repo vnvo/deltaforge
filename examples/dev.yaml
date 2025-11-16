@@ -5,32 +5,37 @@ metadata:
   tenant: acme
 
 spec:
-  sources:
-    - type: mysql
-      id: "mysql-shop"
+  source:
+    type: mysql
+    config:
+      id: mysql-shop
       dsn: "mysql://df:dfpw@127.0.0.1:3306"
-      tables: ["orders.order_items"] # empty = all
+      tables: ["orders.order_items"]
+
   processors:
     - type: javascript
       id: js-normalize
       inline: |
-        // simple example: add a tag
         (event) => {
-        event.tags = (event.tags || []).concat(["normalized"]);
-        return [event];
+          event.tags = (event.tags || []).concat(["normalized"]);
+          return [event];
         }
-      limits: { cpu_ms: 2, mem_mb: 64, timeout_ms: 50 }
+
   sinks:
     - type: redis
-      id: "r1"
-      uri: "redis://127.0.0.1:6379"
-      stream: "df.events"
+      config:
+        id: r1
+        uri: "redis://127.0.0.1:6379"
+        stream: df.events
+        required: false
     - type: kafka
-      id: kafka
-      brokers: "127.0.0.1:9092"
-      topic: orders
-      required: true
-      exactlyOnce: false
+      config:
+        id: kafka
+        brokers: "127.0.0.1:9092"
+        topic: orders
+        required: true
+        exactly_once: false
+
   batch:
     max_events: 100
     max_bytes: 8388608
@@ -39,5 +44,4 @@ spec:
     max_inflight: 1
 
   commit_policy:
-    mode: required # "all" | "required" | "quorum"
-    # quorum: 2     # only if mode: quorum
+    mode: required

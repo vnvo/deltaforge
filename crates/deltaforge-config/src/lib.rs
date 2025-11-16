@@ -6,7 +6,10 @@ use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineSpec {
+    /// General metadata for pipeline
     pub metadata: Metadata,
+    
+    /// Actual pipeline config/spec
     pub spec: Spec,
 }
 
@@ -19,14 +22,13 @@ pub struct Metadata {
     pub tenant: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Spec {
     /// Sharding config for the pipeline
     pub sharding: Option<Sharding>,
 
-    /// Multi source config
-    pub sources: Vec<SourceCfg>,
+    /// Source config
+    pub source: SourceCfg,
 
     /// Multi (sequential) processors
     pub processors: Vec<ProcessorCfg>,
@@ -45,22 +47,26 @@ pub struct Spec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+pub struct PostgresSrcCfg {
+    pub id: String,
+    pub dsn: String,
+    pub publication: Option<String>,
+    pub slot: Option<String>,
+    pub tables: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MysqlSrcCfg {
+    pub id: String,
+    pub dsn: String,
+    pub tables: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "config", rename_all = "lowercase")]
 pub enum SourceCfg {
-    #[serde(rename = "postgres")]
-    Postgres {
-        id: String,
-        dsn: String,
-        publication: Option<String>,
-        slot: Option<String>,
-        tables: Vec<String>,
-    },
-    #[serde(rename = "mysql")]
-    Mysql {
-        id: String,
-        dsn: String,
-        tables: Vec<String>,
-    },
+    Postgres(PostgresSrcCfg) ,
+    Mysql(MysqlSrcCfg),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,25 +81,27 @@ pub enum ProcessorCfg {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum SinkCfg {
-    #[serde(rename = "kafka")]
-    Kafka {
-        id: String,
-        brokers: String,
-        topic: String,
-        #[serde(default)]
-        required: Option<bool>,
-        #[serde(default)]
-        exactly_once: Option<bool>,
-    },
+pub struct KafkaSinkCfg {
+    pub id: String,
+    pub brokers: String,
+    pub topic: String,
+    #[serde(default)]
+    pub required: Option<bool>,
+    #[serde(default)]
+    pub exactly_once: Option<bool>,
+}
 
-    #[serde(rename = "redis")]
-    Redis {
-        id: String,
-        uri: String,
-        stream: String,
-    },
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedisSinkCfg {
+    pub id: String,
+    pub uri: String,
+    pub stream: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content="config", rename_all = "lowercase")]
+pub enum SinkCfg {
+    Kafka(KafkaSinkCfg),
+    Redis(RedisSinkCfg),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
