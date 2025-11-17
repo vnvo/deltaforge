@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use deltaforge_core::{Event, Processor};
+use deltaforge_config::{PipelineSpec, ProcessorCfg};
+use deltaforge_core::{ArcDynProcessor, Event, Processor};
 use deno_core::{extension, JsRuntime, RuntimeOptions};
 use deno_core::{serde_v8, v8};
 use serde_json::Value;
@@ -8,7 +11,6 @@ use tracing::{debug, info};
 
 extension!(df_ext, ops = [op_log],);
 
-// Fast-call compatible op: &str + (fast)
 #[deno_core::op2(fast)]
 fn op_log(#[string] msg: &str) {
     println!("[js] {}", msg);
@@ -26,33 +28,35 @@ impl JsProcessor {
 
 #[async_trait]
 impl Processor for JsProcessor {
-    async fn process(&self, event: Event) -> Result<Vec<Event>> {
+    async fn process(&self, event: &mut Event) -> Result<Vec<Event>> {
         debug!("js processed event {}", event.event_id);
 
+        // setup the runtime
         let ext = df_ext::init();
         let mut rt = JsRuntime::new(RuntimeOptions {
             extensions: vec![ext],
             ..Default::default()
         });
 
-        // prepare the wrapper
+        // install user function as processEvent
         let code = format!(
             r#"
-        (function () {{
-        const userFn = ({source});
-        if (typeof userFn !== "function") {{
-            throw new Error("DeltaForge JS processor: source must be a function, e.g. (event)=>event");
-        }}
-        globalThis.processEvent = userFn;
-        }})();
-        "#,
+            (function () {{
+                const userFn = ({source});
+                if (typeof userFn !== "function") {{
+                    throw new Error("DeltaForge JS processor: source must be a function, e.g. (event)=>event");
+                }}
+                globalThis.processEvent = userFn;
+            }})();
+            "#,
             source = self.source
         );
-        // todo: use the process-step id, script path or something like that as the name.
         rt.execute_script("df_bootstrap.js", code)?;
 
-        // prepare call | todo: needs to become more efficient and robust
-        let ev_json = serde_json::to_value(&event)?;
+        // convert current event to JS value
+        let ev_json = serde_json::to_value(&*event)
+            .context("failed to serialize event for JS")?;
+
         let scope = &mut rt.handle_scope();
         let ctx = scope.get_current_context();
         let global = ctx.global(scope);
@@ -69,7 +73,7 @@ impl Processor for JsProcessor {
         let arg = serde_v8::to_v8(scope, ev_json)
             .context("failed to convert event to v8")?;
 
-        // call with try-catch
+        // call JS
         let mut try_catch = v8::TryCatch::new(scope);
         let call_res = func.call(&mut try_catch, global.into(), &[arg]);
         if call_res.is_none() {
@@ -88,46 +92,79 @@ impl Processor for JsProcessor {
             bail!("js error at {file}:{line}: {msg}");
         }
 
-        // convert the result to json; undefined -> Value::Null
         let result = call_res.unwrap();
         let result_val: Value = serde_v8::from_v8(&mut try_catch, result)
             .context("failed to convert JS result to JSON value")?;
 
-        // if JS returned undefined/null, fall back to the (possibly) mutated argument.
-        let effective_val: Value = if result_val.is_null() {
-            serde_v8::from_v8(&mut try_catch, arg)
-                .context("failed to read mutated event arg")?
-        } else {
-            result_val
-        };
+        // interpret JS result:
+        //    - undefined/null → JS mutated the arg in place: read arg back into `event`
+        //    - object → replace current event with that object
+        //    - array → first element (if any) replaces current event, the rest are "extra"
+        //
+        // re-read the possibly mutated arg:
+        let mutated_val: Value = serde_v8::from_v8(&mut try_catch, arg)
+            .context("failed to read mutated JS arg")?;
 
-        // map effective_val to Vec<Event>
-        let out: Vec<Event> = match effective_val {
-            Value::Null => vec![event], // (unlikely now, but keep a sane default)
-            Value::Object(_) => {
-                vec![serde_json::from_value::<Event>(effective_val)
-                    .context("invalid JS return: expected Event shape")?]
+        // helper to convert JSON -> Event
+        fn val_to_event(v: Value, ctx: &str) -> Result<Event> {
+            Ok(serde_json::from_value::<Event>(v)
+                .with_context(|| format!("invalid JS return in {ctx}: expected Event shape"))?)
+        }
+
+        let mut extra: Vec<Event> = Vec::new();
+
+        match result_val {
+            // JS returned nothing => just update our &mut Event with mutated arg
+            Value::Null => {
+                let new_ev = val_to_event(mutated_val, "mutated arg")?;
+                *event = new_ev;
             }
+
+            // JS returned single object => that's the new event
+            Value::Object(_) => {
+                let new_ev = val_to_event(result_val, "object return")?;
+                *event = new_ev;
+            }
+
+            // JS returned array => first replaces current, rest are extras
             Value::Array(arr) => {
-                if arr.is_empty() {
-                    vec![]
-                } else {
-                    let mut v = Vec::with_capacity(arr.len());
-                    for item in arr {
+                if !arr.is_empty() {
+                    // first
+                    let first_ev = val_to_event(arr[0].clone(), "array[0]")?;
+                    *event = first_ev;
+
+                    // rest = extra
+                    for (idx, item) in arr.into_iter().enumerate().skip(1) {
                         if item.is_null() {
                             continue;
                         }
-                        v.push(serde_json::from_value::<Event>(item).context(
-                            "invalid JS return: array element not an Event",
-                        )?);
+                        let ev = val_to_event(item, &format!("array[{idx}]"))?;
+                        extra.push(ev);
                     }
-                    v
+                } else {
+                    // empty array => drop event? we'll just keep mutated arg
+                    let new_ev = val_to_event(mutated_val, "empty array mutated arg")?;
+                    *event = new_ev;
                 }
             }
+
             _ => bail!("invalid JS return: expected object, array, or null"),
-        };
+        }
 
         info!("js processed event");
-        Ok(out)
+        Ok(extra)
     }
+}
+
+pub fn build_processors(ps: &PipelineSpec) -> Arc<[ArcDynProcessor]> {
+    ps.spec
+        .processors
+        .iter()
+        .map(|p| match p {
+            ProcessorCfg::Javascript { inline, .. } => {
+                Arc::new(JsProcessor::new(inline.clone())) as ArcDynProcessor
+            }
+        })
+        .collect::<Vec<_>>()
+        .into()
 }
