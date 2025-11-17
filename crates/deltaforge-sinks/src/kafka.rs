@@ -1,5 +1,6 @@
 use anyhow::{Context, Ok, Result};
 use async_trait::async_trait;
+use deltaforge_config::KafkaSinkCfg;
 use deltaforge_core::{Event, Sink};
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -13,9 +14,9 @@ pub struct KafkaSink {
 
 impl KafkaSink {
     #[instrument(skip_all)]
-    pub fn new(brokers: &str, topic: &str, exactly_once: bool) -> Result<Self> {
+    pub fn new(ks_cfg: &KafkaSinkCfg) -> Result<Self> {
         let mut cfg = ClientConfig::new();
-        cfg.set("bootstrap.servers", brokers) 
+        cfg.set("bootstrap.servers", ks_cfg.brokers.clone()) 
             .set("client.id", "deltaforge-sink")
             .set("message.timeout.ms", "60000") // producer send timeout
             .set("socket.keepalive.enable", "true")
@@ -25,7 +26,7 @@ impl KafkaSink {
             .set("request.timeout.ms", "30000")
             .set("retry.backoff.ms", "100");
 
-        if exactly_once {
+        if ks_cfg.exactly_once == Some(true) {
             cfg.set("enable.idempotence", "true")
                 .set("acks", "all")
                 .set("retries", "1000000") // librdkafka will cap appropriately
@@ -40,10 +41,10 @@ impl KafkaSink {
         let producer: FutureProducer =
             cfg.create().with_context(|| "creating kafka producer")?;
 
-        info!(brokers=%brokers, topic=%topic, "kafka client connected", );
+        info!(brokers=%ks_cfg.brokers, topic=%ks_cfg.topic, "kafka client connected", );
         Ok(Self {
             producer,
-            topic: topic.into(),
+            topic: ks_cfg.topic.clone(),
         })
     }
 }
