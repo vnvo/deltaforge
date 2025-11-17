@@ -12,6 +12,7 @@ rdkafka = { workspace = true }
 redis = { workspace = true }
 tokio = { workspace = true }
 deltaforge-core = { path = "../deltaforge-core" }
+deltaforge-config = { path = "../deltaforge-config" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
