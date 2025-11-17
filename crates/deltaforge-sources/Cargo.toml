@@ -7,6 +7,7 @@ edition.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+deltaforge-config = { path = "../deltaforge-config"}
 deltaforge-core = { path = "../deltaforge-core"}
 deltaforge-checkpoints = { path = "../deltaforge-checkpoints"}
 anyhow.workspace = true
