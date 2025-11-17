@@ -1,19 +1,28 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::Router;
 use clap::Parser;
-use deltaforge_api::{router, AppState, PipeInfo};
+use deltaforge_api::{AppState, PipeInfo, router};
 use deltaforge_checkpoints::{CheckpointStore, FileCheckpointStore};
-use deltaforge_config::{load_from_path, ProcessorCfg, SinkCfg, SourceCfg};
-use deltaforge_core::{ArcDynSource, DynProcessor, DynSink, Pipeline};
+use deltaforge_config::{PipelineSpec, load_cfg};
+use deltaforge_core::{
+    CheckpointMeta, Event, SourceHandle,
+};
 use deltaforge_metrics as metrics;
-use deltaforge_processor_js::JsProcessor;
-use deltaforge_sinks::{kafka::KafkaSink, redis::RedisSink};
-use deltaforge_sources::mysql::MySqlSource; //, postgres::PostgresSource};
+use deltaforge_processor_js::build_processors;
+use deltaforge_sinks::build_sinks;
+use deltaforge_sources::build_source;
+ //, postgres::PostgresSource};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::TcpListener;
-use tracing::{debug, info};
+use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
+use tracing::{debug, error, info};
 
+use crate::coordinator::{
+    CommitCpFn, Coordinator, ProcessBatchFn, build_batch_processor,
+    build_commit_fn,
+};
+
+mod coordinator;
 #[derive(Parser, Debug)]
 struct Args {
     #[arg(short, long)]
@@ -29,98 +38,65 @@ async fn main() -> Result<()> {
     metrics::init();
     let args = Args::parse();
     metrics::install_prometheus(&args.metrics_addr);
-    let spec = load_from_path(&args.config)?;
 
-    debug!(pipeline_spec=?spec, "pipeline spec");
+    //shared api state
+    let state = AppState::default();
 
+    let pipeline_specs =
+        load_pipeline_cfgs(&args.config).context("load pipeline specs")?;
     let ckpt_store: Arc<dyn CheckpointStore> =
         Arc::new(FileCheckpointStore::new("./data/df_checkpoints.json")?);
+    let mut running_pipelines: Vec<JoinHandle<Result<()>>> =
+        Vec::with_capacity(pipeline_specs.len());
+    let mut source_handles: Vec<SourceHandle> =
+        Vec::with_capacity(pipeline_specs.len());
 
-    // Build sources
-    let mut sources: Vec<ArcDynSource> = Vec::new();
-    for src in &spec.spec.sources {
-        match src {
-            SourceCfg::Postgres {
-                id,
-                dsn,
-                publication,
-                slot,
-                tables,
-            } => {
-                /*
-                sources.push(Box::new(PostgresSource {
-                    id: id.clone(),
-                    dsn: dsn.clone(),
-                    tenant: spec.metadata.tenant.clone(),
-                    tables: tables.clone(),
-                    publication: publication.clone(),
-                    slot: slot.clone(),
-                }));*/
+    for ps in pipeline_specs {
+        let pipeline_name = ps.metadata.name.clone();
+        let source = build_source(&ps)
+            .context(format!("build source for {pipeline_name}"))?;
+        let processors = build_processors(&ps);
+        let sinks = build_sinks(&ps);
+
+        let (event_tx, event_rx) = mpsc::channel::<Event>(4096);
+        let src_handle = source.run(event_tx, ckpt_store.clone()).await;
+        source_handles.push(src_handle);
+
+        let batch_processor: ProcessBatchFn<CheckpointMeta> =
+            build_batch_processor(processors);
+        let commit_cp: CommitCpFn<CheckpointMeta> =
+            build_commit_fn(ckpt_store.clone(), pipeline_name.clone());
+
+        let coord = Coordinator::new(
+            pipeline_name.clone(),
+            sinks,
+            ps.spec.batch.clone(),
+            ps.spec.commit_policy.clone(),
+            commit_cp,
+            batch_processor,
+        );
+
+        let pname = pipeline_name.clone();
+        let pipeline = tokio::spawn(async move {
+            info!(pipeline_name=%pname, "pipeline coordinator starting ...");
+            let res = coord.run(event_rx).await;
+            if let Err(ref e) = res {
+                error!(pipeline=%pname, error=%e, "coordinator exited with error");
+            } else {
+                info!(pipeline_name=%pname, "coordinator exited normally");
             }
-            SourceCfg::Mysql { id, dsn, tables } => {
-                sources.push(Arc::new(MySqlSource {
-                    id: id.clone(),
-                    dsn: dsn.clone(),
-                    tables: tables.clone(),
-                    tenant: spec.metadata.tenant.clone(),
-                }));
-            }
-        }
+
+            res
+        });
+
+        running_pipelines.push(pipeline);
+
+        state.pipelines.write().push(PipeInfo {
+            id: pipeline_name,
+            status: "running".into(),
+        });
     }
 
-    // Build processors
-    let mut processors: Vec<DynProcessor> = Vec::new();
-    for p in &spec.spec.processors {
-        match p {
-            // NOTE: variant is `JavaScript` (capital S) per your config crate
-            ProcessorCfg::Javascript {
-                id: _,
-                inline,
-                limits: _,
-            } => {
-                processors.push(Arc::new(JsProcessor::new(inline.clone())));
-            }
-        }
-    }
-
-    // Build sinks
-    let mut sinks: Vec<DynSink> = Vec::new();
-    for s in &spec.spec.sinks {
-        match s {
-            SinkCfg::Kafka {
-                id: _,
-                brokers,
-                topic,
-                required: _,
-                exactly_once: _,
-            } => {
-                sinks.push(Arc::new(KafkaSink::new(brokers, topic, false)?));
-            }
-            // pass the configured stream instead of hardcoding "events"
-            SinkCfg::Redis { id: _, uri, stream } => {
-                sinks.push(Arc::new(RedisSink::new(uri, stream)?));
-            }
-        }
-    }
-
-    // Start pipeline
-    let pipeline = Pipeline {
-        id: spec.metadata.name.clone(),
-        sources,
-        processors,
-        sinks,
-    };
-    tokio::spawn(async move {
-        if let Err(e) = pipeline.start(ckpt_store.clone()).await {
-            tracing::error!(error = %e, "pipeline stopped with error");
-        }
-    });
-
-    let state = AppState::default();
-    state.pipelines.write().push(PipeInfo {
-        id: spec.metadata.name.clone(),
-        status: "running".into(),
-    });
     let app: Router = router(state);
 
     let addr: SocketAddr =
@@ -128,7 +104,20 @@ async fn main() -> Result<()> {
     info!(%addr, "api listening");
 
     let listener = TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    let api_task = tokio::spawn(axum::serve(listener, app).into_future());
+
+    for p in running_pipelines {
+        p.await??;
+    }
+
+    api_task.await??;
 
     Ok(())
+}
+
+fn load_pipeline_cfgs(path: &str) -> Result<Vec<PipelineSpec>> {
+    let specs = load_cfg(path)?;
+    info!(specs_found = specs.len(), "pipeline specs loaded");
+    debug!(pipeline_specs=?specs, "pipeline spec");
+    Ok(specs)
 }

@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
+futures = { workspace = true }
+uuid ={ workspace = true}
 serde_json = { workspace = true }
 parking_lot = { workspace = true }
 anyhow = { workspace = true }

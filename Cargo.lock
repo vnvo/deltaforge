@@ -1149,6 +1149,8 @@ dependencies = [
  "serial_test",
  "shellexpand",
  "tempfile",
+ "tracing",
+ "walkdir",
 ]
 
 [[package]]
@@ -1187,6 +1189,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "criterion",
+ "deltaforge-config",
  "deltaforge-core",
  "deno_core",
  "once_cell",
@@ -1227,10 +1230,12 @@ dependencies = [
  "deltaforge-registry",
  "deltaforge-sinks",
  "deltaforge-sources",
+ "futures",
  "parking_lot",
  "serde_json",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1239,6 +1244,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "deltaforge-config",
  "deltaforge-core",
  "rdkafka",
  "redis",
@@ -1257,6 +1263,7 @@ dependencies = [
  "chrono",
  "crc32fast",
  "deltaforge-checkpoints",
+ "deltaforge-config",
  "deltaforge-core",
  "mysql-binlog-connector-rust",
  "mysql_async",
