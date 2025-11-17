@@ -94,10 +94,12 @@ spec:
             brokers,
             topic,
             exactly_once,
+            required,
         } => {
             assert_eq!(id, "k");
             assert_eq!(brokers, "localhost:9092");
             assert_eq!(topic, "unit.events");
+            assert!(required.is_none());
             assert!(exactly_once.is_none());
         }
         _ => panic!("expected kafka sink"),

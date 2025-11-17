@@ -98,6 +98,14 @@ pub struct Event {
 
     /// Free-form labels attached by processors or the platform (e.g. ["normalized", "pii:redacted", "variant:summary"]).
     pub tags: Option<Vec<String>>,
+
+    /// Event checkpoint info
+    pub checkpoint: Option<CheckpointMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CheckpointMeta {
+    Opaque(Vec<u8>)
 }
 
 impl Event {
@@ -136,6 +144,7 @@ impl Event {
             timestamp: ts,
             trace_id: None,
             tags: None,
+            checkpoint: None,
         }
     }
 
@@ -162,6 +171,7 @@ impl Event {
             timestamp: ts,
             trace_id: None,
             tags: None,
+            checkpoint: None,
         }
     }
 }
@@ -234,7 +244,7 @@ pub trait Source: Send + Sync {
 
 #[async_trait]
 pub trait Processor: Send + Sync {
-    async fn process(&self, event: Event) -> Result<Vec<Event>>;
+    async fn process(&self, event: &mut Event) -> Result<Vec<Event>>;
 }
 
 #[async_trait]
@@ -262,14 +272,14 @@ pub trait SchemaRegistry: Send + Sync {
 }
 
 pub type ArcDynSource = Arc<dyn Source>;
-pub type DynProcessor = Arc<dyn Processor>;
-pub type DynSink = Arc<dyn Sink>;
+pub type ArcDynProcessor = Arc<dyn Processor>;
+pub type ArcDynSink = Arc<dyn Sink>;
 
 pub struct Pipeline {
     pub id: String,
     pub sources: Vec<ArcDynSource>,
-    pub processors: Vec<DynProcessor>,
-    pub sinks: Vec<DynSink>,
+    pub processors: Vec<ArcDynProcessor>,
+    pub sinks: Vec<ArcDynSink>,
 }
 
 /// the handle to a running pipeline to be used by upper layers/caller
@@ -387,8 +397,8 @@ impl Pipeline {
                         let mut out: Vec<Event> = vec![ev];
                         for p in processors.iter() {
                             let mut next = Vec::new();
-                            for e in out.drain(..) {
-                                match p.process(e).await {
+                            for mut e in out.drain(..) {
+                                match p.process(&mut e).await {
                                     Ok(produced) => next.extend(produced),
                                     Err(err) => error!(error = %err, "processor error; dropping event"),
                                 }
