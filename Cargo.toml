@@ -15,6 +15,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
+rust-version = "1.89"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -43,3 +44,14 @@ tokio-util = "0.7"
 base64 = "0.22"
 url = "2.5"
 thiserror = "1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_crate_dependencies = "warn"
+rust_2018_idioms = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+cargo = "warn"
