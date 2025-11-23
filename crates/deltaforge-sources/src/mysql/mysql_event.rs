@@ -11,7 +11,7 @@ use mysql_binlog_connector_rust::{
 use tracing::instrument;
 use tracing::{debug, error, info, warn};
 
-use super::object::build_object;
+use super::mysql_object::build_object;
 use crate::conn_utils::{retryable_stream, watchdog};
 use crate::mysql::RunCtx;
 
