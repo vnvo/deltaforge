@@ -11,6 +11,7 @@ deltaforge-config = { path = "../deltaforge-config"}
 deltaforge-core = { path = "../deltaforge-core"}
 deltaforge-checkpoints = { path = "../deltaforge-checkpoints"}
 anyhow.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 uuid.workspace = true

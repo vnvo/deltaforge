@@ -20,7 +20,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use deltaforge_checkpoints::{CheckpointStore, CheckpointStoreExt};
-use deltaforge_core::{Event, Source, SourceHandle};
+use deltaforge_core::{Event, Source, SourceHandle, SourceResult, SourceError};
+
+mod mysql_errors;
 
 mod mysql_helpers;
 use mysql_helpers::{pause_until_resumed, prepare_client, AllowList};

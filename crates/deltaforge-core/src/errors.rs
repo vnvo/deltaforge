@@ -30,6 +30,9 @@ pub enum SourceError {
     #[error("incompatible configuration: {details}")]
     Incompatible { details: Cow<'static, str> },
 
+    #[error("schema issues: {details}")]
+    Schema { details: Cow<'static, str> },
+
     #[error("backpressure")]
     Backpressure,
 
