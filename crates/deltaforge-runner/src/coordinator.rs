@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use deltaforge_checkpoints::CheckpointStore;
 use deltaforge_sources::mysql::MySqlCheckpoint;
 use futures::future::BoxFuture;
+use metrics::counter;
 use tokio::time::{Instant, interval};
 use tracing::{debug, field::debug, warn};
 use uuid::Uuid;
@@ -216,6 +217,8 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
 
             let mut ok = true;
             for ev in frozen.events.iter() {
+                counter!("deltaforge_sink_events_total", "pipeline"=>self.pipeline_name.clone()).increment(1);
+
                 debug!(pipeline=%self.pipeline_name, eid=%ev.event_id, "sending to sink");
                 if let Err(e) = sink.send(ev.clone()).await {
                     tracing::warn!(error=?e, sink=%std::any::type_name::<ArcDynSink>(), batch_id=%frozen.id, "sink send failed");

@@ -4,14 +4,12 @@ use clap::Parser;
 use deltaforge_api::{AppState, PipeInfo, router};
 use deltaforge_checkpoints::{CheckpointStore, FileCheckpointStore};
 use deltaforge_config::{PipelineSpec, load_cfg};
-use deltaforge_core::{
-    CheckpointMeta, Event, SourceHandle,
-};
-use deltaforge_metrics as metrics;
+use deltaforge_core::{CheckpointMeta, Event, SourceHandle};
+use deltaforge_o11y as o11y;
 use deltaforge_processor_js::build_processors;
 use deltaforge_sinks::build_sinks;
 use deltaforge_sources::build_source;
- //, postgres::PostgresSource};
+use metrics::{counter, gauge};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
@@ -35,9 +33,22 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    metrics::init();
     let args = Args::parse();
-    metrics::install_prometheus(&args.metrics_addr);
+
+    let cfg = o11y::O11yConfig {
+        logging: o11y::logging::Config {
+            level: None,
+            json: false,
+            with_targets: false,
+        },
+        metrics: o11y::df_metrics::Config {
+            enable: true,
+            http_listener: Some(([0, 0, 0, 0], 9000).into()),
+        },
+        install_panic_hook: true,
+    };
+
+    let _ = o11y::init_all(&cfg);
 
     //shared api state
     let state = AppState::default();
@@ -52,6 +63,8 @@ async fn main() -> Result<()> {
         Vec::with_capacity(pipeline_specs.len());
 
     for ps in pipeline_specs {
+        counter!("deltaforge_pipelines_total").increment(1);
+
         let pipeline_name = ps.metadata.name.clone();
         let source = build_source(&ps)
             .context(format!("build source for {pipeline_name}"))?;
@@ -79,10 +92,16 @@ async fn main() -> Result<()> {
         let pname = pipeline_name.clone();
         let pipeline = tokio::spawn(async move {
             info!(pipeline_name=%pname, "pipeline coordinator starting ...");
+            gauge!("deltaforge_running_pipeline", "pipeline" => pname.clone())
+                .increment(1.0);
+
             let res = coord.run(event_rx).await;
+
             if let Err(ref e) = res {
+                gauge!("deltaforge_running_pipeline", "pipeline" => pname.clone()).decrement(1.0);
                 error!(pipeline=%pname, error=%e, "coordinator exited with error");
             } else {
+                gauge!("deltaforge_running_pipeline", "pipeline" => pname.clone()).decrement(1.0);
                 info!(pipeline_name=%pname, "coordinator exited normally");
             }
 
@@ -98,6 +117,7 @@ async fn main() -> Result<()> {
     }
 
     let app: Router = router(state);
+    let app = app.merge(o11y::df_metrics::router_with_metrics());
 
     let addr: SocketAddr =
         args.api_addr.parse().expect("api_addr must be host:port");

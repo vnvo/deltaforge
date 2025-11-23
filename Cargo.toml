@@ -1,23 +1,14 @@
 [workspace]
 resolver = "2"
-
-members = [
-    "crates/deltaforge-metrics",
-    "crates/deltaforge-api",
-    "crates/deltaforge-config",
-    "crates/deltaforge-core",
-    "crates/deltaforge-processor-js",
-    "crates/deltaforge-registry",
-    "crates/deltaforge-runner",
-    "crates/deltaforge-sinks",
-    "crates/deltaforge-sources", "crates/deltaforge-checkpoints",
-]
+members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
 rust-version = "1.89"
 
 [workspace.dependencies]
+tracing = "0.1"
+metrics = "0.24"
 anyhow = "1"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
@@ -26,8 +17,6 @@ chrono = { version = "0.4", features = ["serde"] }
 serde_json = "1"
 serde_yaml = "0.9"
 uuid = { version = "1", features = ["v4", "serde"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 shellexpand = "3"
 rdkafka = { version = "0.38", features = ["tokio"] }
 redis = { version = "0.32", features = ["tokio-comp"] }
@@ -35,8 +24,6 @@ deno_core = "0.357"
 serde_v8 = "0.266"
 axum = { version = "0.8", features = ["macros", "json"] }
 parking_lot = "0.12"
-metrics = "0.24"
-metrics-exporter-prometheus = "0.17"
 etl = { git = "https://github.com/supabase/etl", package = "etl" }
 futures = "0.3"
 tokio-stream = "0.1"
