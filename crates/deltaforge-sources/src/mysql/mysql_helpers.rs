@@ -1,13 +1,14 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use crc32fast::Hasher;
-use mysql_async::{prelude::Queryable, Pool, Row};
+use deltaforge_core::{SourceError, SourceResult};
+use mysql_async::{Pool, Row, prelude::Queryable};
 use mysql_binlog_connector_rust::{
     binlog_client::BinlogClient, binlog_stream::BinlogStream,
 };
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -19,11 +20,9 @@ use url::Url;
 
 use deltaforge_checkpoints::{CheckpointStore, CheckpointStoreExt};
 
-use crate::conn_utils::{
-    classify_connect_err, retry_async, retryable_connect, RetryPolicy,
-};
+use crate::conn_utils::{RetryPolicy, retry_async, retryable_connect};
 
-use super::MySqlCheckpoint;
+use super::{MySqlCheckpoint, MySqlSourceError, MySqlSourceResult};
 // ----------------------------- public helpers (to mysql.rs) -----------------------------
 
 /// Prepare BinlogClient from DSN + last checkpoint; returns (host, default_db, server_id, client).
@@ -32,15 +31,19 @@ pub(super) async fn prepare_client(
     source_id: &str,
     tables: &[String],
     ckpt_store: &Arc<dyn CheckpointStore>,
-) -> Result<(String, String, u64, BinlogClient)> {
-    let url = Url::parse(dsn).context("invalid MySQL DSN")?;
+) -> MySqlSourceResult<(String, String, u64, BinlogClient)> {
+    let url = Url::parse(dsn)
+        .map_err(|e| MySqlSourceError::InvalidDsn(e.to_string()))?;
+
     let host = url.host_str().unwrap_or("localhost").to_string();
     let default_db = url.path().trim_start_matches('/').to_string();
     let server_id = derive_server_id(source_id);
 
     // Previous checkpoint (if any)
-    let last_checkpoint: Option<MySqlCheckpoint> =
-        ckpt_store.get(source_id).await?;
+    let last_checkpoint: Option<MySqlCheckpoint> = ckpt_store
+        .get(source_id)
+        .await
+        .map_err(|e| MySqlSourceError::Checkpoint(e.to_string()))?;
 
     info!(source_id=%source_id, url=%url, checkpoint=?last_checkpoint, "preparing client");
     let mut client = BinlogClient::default();
@@ -108,7 +111,7 @@ pub(super) async fn connect_binlog_with_retries(
     cancel: &CancellationToken,
     default_db_for_hints: &str,
     retry_policy: RetryPolicy,
-) -> Result<BinlogStream> {
+) -> SourceResult<BinlogStream> {
     let mk = make_client.clone();
 
     let stream = retry_async(
@@ -120,7 +123,7 @@ pub(super) async fn connect_binlog_with_retries(
                     .await
             }
         },
-        |e| classify_connect_err(e, "binlog_connection"),
+        |e| e,
         retryable_connect,
         Duration::from_secs(30),
         retry_policy,
@@ -138,13 +141,13 @@ pub(super) async fn connect_binlog(
     mut client: BinlogClient,
     cancel: &CancellationToken,
     default_db_for_hints: &str,
-) -> Result<BinlogStream> {
+) -> SourceResult<BinlogStream> {
     debug!("connecting to binlog");
     let t0 = Instant::now();
     let connect_fut = client.connect();
 
     let stream = select! {
-        _ = cancel.cancelled() => Err(anyhow!("binlog connect cancelled")),
+        _ = cancel.cancelled() => Err(SourceError::Cancelled),
         res = tokio::time::timeout(std::time::Duration::from_secs(30), connect_fut) => {
             match res {
                 Ok(Ok(s)) => Ok(s),
@@ -162,9 +165,9 @@ pub(super) async fn connect_binlog(
                     } else if error_msg.contains("connect") || error_msg.contains("timeout") {
                         error!("Connection failed - check that MySQL is running and accessible");
                     }
-                    Err(e.into())
+                    Err(SourceError::Other(e.into()))
                 }
-                Err(_) => Err(anyhow!("binlog connection timeout")),
+                Err(_) => Err(SourceError::Timeout { action: "binlog_connect".into()}),
             }
         }
     }?;
@@ -244,7 +247,9 @@ pub(super) fn derive_server_id(id: &str) -> u64 {
 }
 
 /// Resolve end-of-binlog with comprehensive diagnostics.
-pub(super) async fn resolve_binlog_tail(dsn: &str) -> Result<(String, u64)> {
+pub(super) async fn resolve_binlog_tail(
+    dsn: &str,
+) -> MySqlSourceResult<(String, u64)> {
     info!("connecting to MySQL for binlog tail resolution");
 
     let pool = Pool::new(dsn);
@@ -262,11 +267,15 @@ pub(super) async fn resolve_binlog_tail(dsn: &str) -> Result<(String, u64)> {
         }
         Ok(Err(e)) => {
             error!("failed to connect to MySQL: {}", e);
-            return Err(anyhow!("MySQL connection failed: {}", e));
+            return Err(MySqlSourceError::BinlogConnect(format!(
+                "MySQL connection failed: {e}"
+            )));
         }
         Err(_) => {
             error!("MySQL connection timed out after 10 seconds");
-            return Err(anyhow!("MySQL connection timeout"));
+            return Err(MySqlSourceError::BinlogConnect(
+                "MySQL connection timed out".to_owned(),
+            ));
         }
     };
 
@@ -281,24 +290,43 @@ pub(super) async fn resolve_binlog_tail(dsn: &str) -> Result<(String, u64)> {
         Err(e) => {
             error!("failed to check current user: {}", e);
             pool.disconnect().await?;
-            return Err(anyhow!("failed to verify user: {}", e));
+            return Err(MySqlSourceError::BinlogConnect(format!(
+                "failed to check current user: {e}"
+            )));
         }
     }
 
     // Preferred status command
     info!("trying SHOW BINARY LOG STATUS");
-    match tokio::time::timeout(std::time::Duration::from_secs(5), conn.query_first::<Row, _>("SHOW BINARY LOG STATUS")).await {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        conn.query_first::<Row, _>("SHOW BINARY LOG STATUS"),
+    )
+    .await
+    {
         Ok(Ok(Some(mut row))) => {
-            if let (Some(file), Some(pos)) = (row.take::<String, _>(0), row.take::<u64, _>(1)) {
-                info!("successfully got binlog position: file={}, pos={}", file, pos);
+            if let (Some(file), Some(pos)) =
+                (row.take::<String, _>(0), row.take::<u64, _>(1))
+            {
+                info!(
+                    "successfully got binlog position: file={}, pos={}",
+                    file, pos
+                );
                 return Ok((file, pos));
             } else {
                 warn!("SHOW BINARY LOG STATUS returned incomplete data");
             }
         }
-        Ok(Ok(None)) => warn!("SHOW BINARY LOG STATUS returned no rows - binlog might be disabled"),
-        Ok(Err(e)) => warn!("SHOW BINARY LOG STATUS failed: {} - trying legacy syntax", e),
-        Err(_) => warn!("SHOW BINARY LOG STATUS timed out - trying legacy syntax"),
+        Ok(Ok(None)) => warn!(
+            "SHOW BINARY LOG STATUS returned no rows - binlog might be disabled"
+        ),
+        Ok(Err(e)) => warn!(
+            "SHOW BINARY LOG STATUS failed: {} - trying legacy syntax",
+            e
+        ),
+        Err(_) => {
+            warn!("SHOW BINARY LOG STATUS timed out - trying legacy syntax")
+        }
     }
 
     // Legacy fallback
@@ -313,7 +341,10 @@ pub(super) async fn resolve_binlog_tail(dsn: &str) -> Result<(String, u64)> {
             if let (Some(file), Some(pos)) =
                 (row.take::<String, _>(0), row.take::<u64, _>(1))
             {
-                info!("successfully got binlog position via legacy command: file={}, pos={}", file, pos);
+                info!(
+                    "successfully got binlog position via legacy command: file={}, pos={}",
+                    file, pos
+                );
                 pool.disconnect().await?;
                 return Ok((file, pos));
             } else {
@@ -434,12 +465,13 @@ pub(super) async fn resolve_binlog_tail(dsn: &str) -> Result<(String, u64)> {
         error!("  {}", diag);
     }
 
-    anyhow::bail!(
+    Err(MySqlSourceError::BinlogConnect(
         "Failed to resolve binlog position. Common fixes:\n\
          1) Enable binary logging: --log-bin --binlog-format=ROW\n\
-         2) Grant privileges: GRANT REPLICATION REPLICA, REPLICATION CLIENT ON *.* TO 'df'@'%';\n\
-         3) Ensure user exists: CREATE USER 'df'@'%' IDENTIFIED BY 'password';"
-    );
+         2) Grant privileges: GRANT REPLICATION REPLICA, REPLICATION CLIENT ON *.* TO ...;\n\
+         3) Ensure user exists: CREATE USER '..'@'%' IDENTIFIED BY 'password';"
+            .to_string(),
+    ))
 }
 
 /// Simple allow-list on "db.table" or just "table"
@@ -480,15 +512,16 @@ pub(crate) fn short_sql(s: &str, max: usize) -> String {
     }
 }
 
-pub(super) async fn fetch_executed_gtid_set(dsn: &str) -> anyhow::Result<Option<String>> {
+pub(super) async fn fetch_executed_gtid_set(
+    dsn: &str,
+) -> anyhow::Result<Option<String>> {
     // Use a short-lived connection for now (simple & correct).
     // We can optimize by keeping a Pool in RunCtx later.
     let pool = Pool::new(dsn);
     let mut conn = pool.get_conn().await?;
     // Returns NULL if GTID is disabled
-    let row: Option<(Option<String>,)> = conn
-        .query_first("SELECT @@GLOBAL.gtid_executed")
-        .await?;
+    let row: Option<(Option<String>,)> =
+        conn.query_first("SELECT @@GLOBAL.gtid_executed").await?;
     conn.disconnect().await?; // or pool.disconnect().await? depending on your version
     Ok(row.and_then(|(s,)| s))
 }

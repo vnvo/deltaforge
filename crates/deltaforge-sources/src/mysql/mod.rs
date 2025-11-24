@@ -37,8 +37,10 @@ use mysql_event::*;
 
 use crate::{
     conn_utils::RetryPolicy,
-    mysql::mysql_helpers::{connect_binlog_with_retries, resolve_binlog_tail},
+    mysql::{mysql_errors::MySqlSourceError, mysql_helpers::{connect_binlog_with_retries, resolve_binlog_tail}},
 };
+
+pub type MySqlSourceResult<T> = Result<T, MySqlSourceError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MySqlCheckpoint {
@@ -88,7 +90,7 @@ impl MySqlSource {
         cancel: CancellationToken,
         paused: Arc<AtomicBool>,
         pause_notify: Arc<Notify>,
-    ) -> Result<()> {
+    ) -> SourceResult<()> {
         let (host, default_db, server_id, client) =
             prepare_client(&self.dsn, &self.id, &self.tables, &chkpt_store)
                 .await?;
@@ -97,7 +99,7 @@ impl MySqlSource {
             source_id=%self.id, 
             host=%host, 
             db=%default_db, 
-            "MySQL CDC: starting source");
+            "mysql source starting ...");
 
         let mut ctx = RunCtx {
             source_id: self.id.clone(),
@@ -140,7 +142,7 @@ impl MySqlSource {
                     stream = reconnect_stream(&mut ctx).await?;
                 }
                 Err(LoopControl::Stop) => break,
-                Err(LoopControl::Fail(e)) => return Err(e),
+                Err(LoopControl::Fail(e)) => return Err(e.into()),
             }
         }
 
@@ -209,7 +211,7 @@ impl Source for MySqlSource {
 async fn connect_first_stream(
     ctx: &RunCtx,
     client: BinlogClient,
-) -> Result<BinlogStream> {
+) -> SourceResult<BinlogStream> {
     let init_gtid = client.gtid_enabled.then(|| client.gtid_set.clone());
     let init_file = if client.gtid_enabled {
         None
@@ -254,9 +256,7 @@ async fn connect_first_stream(
     Ok(stream)
 }
 
-async fn reconnect_stream(ctx: &mut RunCtx) -> Result<BinlogStream> {
-    //use mysql_binlog_connector_rust::binlog_client::BinlogClient;
-
+async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     // Choose best resume: GTID > file:pos > tail
     let (gtid_to_use, file_to_use, pos_to_use) = if let Some(g) = &ctx.last_gtid
     {
@@ -266,7 +266,7 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> Result<BinlogStream> {
     } else {
         match resolve_binlog_tail(&ctx.dsn).await {
             Ok((f, p)) => (None, Some(f), Some(p as u32)),
-            Err(err) => return Err(err),
+            Err(err) => return Err(err.into()),
         }
     };
 

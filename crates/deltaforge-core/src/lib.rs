@@ -196,7 +196,7 @@ pub struct SourceHandle {
     pub cancel: CancellationToken,
     pub paused: Arc<AtomicBool>,
     pub pause_notify: Arc<Notify>,
-    pub join: JoinHandle<Result<()>>,
+    pub join: JoinHandle<SourceResult<()>>,
 }
 
 impl SourceHandle {
@@ -223,7 +223,7 @@ impl SourceHandle {
 
     pub async fn join(self) -> Result<()> {
         match self.join.await {
-            Ok(r) => r,
+            Ok(r) => Ok(r?),
             Err(e) => Err(anyhow::anyhow!("source task panicked: {e}")),
         }
     }
