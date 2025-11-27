@@ -1150,6 +1150,7 @@ dependencies = [
  "serial_test",
  "shellexpand",
  "tempfile",
+ "thiserror 1.0.69",
  "tracing",
  "walkdir",
 ]
