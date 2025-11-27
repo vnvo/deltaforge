@@ -284,15 +284,22 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
 
 pub(crate) fn build_commit_fn(
     ckpt_store: Arc<dyn CheckpointStore>,
-    pipeline_id: String,
+    pipeline_name: String,
 ) -> CommitCpFn<CheckpointMeta> {
     use futures::FutureExt;
     Box::new(move |cp: CheckpointMeta| {
         let ckpt_store = ckpt_store.clone();
-        let pipeline_id = pipeline_id.clone();
+        let pipeline_name = pipeline_name.clone();
         async move {
-            debug!(pipeline_id=%pipeline_id, checkpoint=?cp, "checkpoint would be saved here");
-            let _ = ckpt_store;
+            let key = format!("pipeline/{pipeline_name}");
+            let bytes = serde_json::to_vec(&cp)
+                .context("serialize checkpoint to store")?;
+            ckpt_store
+                .put_raw(&key, &bytes)
+                .await
+                .context("save checkpoint")?;
+            
+            debug!(pipeline_id=%pipeline_name, checkpoint=?cp, "checkpoint saved");
             Ok(())
         }.boxed()
     })
