@@ -1,7 +1,7 @@
-use anyhow::{Context, Ok, Result};
+use anyhow::Context;
 use async_trait::async_trait;
-use deltaforge_core::{Event, Sink};
-use tokio::time::{timeout, Duration};
+use deltaforge_core::{Event, Sink, SinkError, SinkResult};
+use tokio::time::{Duration, timeout};
 use tracing::{debug, info};
 
 pub struct RedisSink {
@@ -10,7 +10,7 @@ pub struct RedisSink {
 }
 
 impl RedisSink {
-    pub fn new(uri: &str, stream: &str) -> Result<Self> {
+    pub fn new(uri: &str, stream: &str) -> anyhow::Result<Self> {
         Ok(Self {
             client: redis::Client::open(uri).context("open redis uri")?,
             stream: stream.to_string(),
@@ -20,15 +20,16 @@ impl RedisSink {
 
 #[async_trait]
 impl Sink for RedisSink {
-    async fn send(&self, event: Event) -> Result<()> {
+    async fn send(&self, event: Event) -> SinkResult<()> {
         let mut conn = self
             .client
             .get_multiplexed_async_connection()
             .await
-            .context("redis connect")?;
+            .map_err(|e| SinkError::Connect {
+                details: format!("redis connect: {e}").into(),
+            })?;
 
-        let payload = serde_json::to_string(&event)
-            .context("serialize event for redis")?;
+        let payload = serde_json::to_string(&event)?;
         let event_id = event.event_id.to_string();
 
         let _: String = timeout(Duration::from_secs(3), async {
@@ -41,11 +42,12 @@ impl Sink for RedisSink {
                 .arg(&payload)
                 .query_async::<_>(&mut conn)
                 .await
-            //.expect("redis xadd fialed");
         })
         .await
-        .map_err(|_| anyhow::anyhow!("redis send timeout"))?
-        .map_err(|e| anyhow::anyhow!("redis xadd failed: {e}"))?;
+        .map_err(|_| SinkError::Backpressure {
+            details: "redis send timeout".into(),
+        })?
+        .map_err(|e| SinkError::Other(e.into()))?;
 
         debug!(stream = %self.stream, "event sent to redis sink");
         Ok(())

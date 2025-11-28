@@ -18,7 +18,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 pub mod errors;
-pub use errors::SourceError;
+pub use errors::{SourceError, SinkError};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Op {
@@ -189,6 +189,7 @@ pub enum ConnctionMode {
 }
 
 pub type SourceResult<T> = Result<T, SourceError>;
+pub type SinkResult<T> = std::result::Result<T, SinkError>;
 
 /// SourceHandle as the control interface for a source
 /// Caller/Controller of a source should use it to interact with a running source
@@ -249,7 +250,7 @@ pub trait Processor: Send + Sync {
 
 #[async_trait]
 pub trait Sink: Send + Sync {
-    async fn send(&self, event: Event) -> Result<()>;
+    async fn send(&self, event: Event) -> SinkResult<()>;
 }
 
 #[async_trait]

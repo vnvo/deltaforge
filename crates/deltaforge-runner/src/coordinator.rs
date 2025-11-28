@@ -3,15 +3,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use deltaforge_checkpoints::CheckpointStore;
-use deltaforge_sources::mysql::MySqlCheckpoint;
 use futures::future::BoxFuture;
 use metrics::counter;
 use tokio::time::{Instant, interval};
-use tracing::{debug, field::debug, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
-use deltaforge_config::{BatchConfig, CommitPolicy, PipelineSpec, SourceCfg};
-use deltaforge_core::{ArcDynProcessor, ArcDynSink, CheckpointMeta, Event};
+use deltaforge_config::{BatchConfig, CommitPolicy};
+use deltaforge_core::{ArcDynProcessor, ArcDynSink, CheckpointMeta, Event, SinkError};
 
 /// Persist/commit the token after the batch is successfully delivered to sinks.
 pub type CommitCpFn<Tok> =
@@ -221,7 +220,22 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
 
                 debug!(pipeline=%self.pipeline_name, eid=%ev.event_id, "sending to sink");
                 if let Err(e) = sink.send(ev.clone()).await {
-                    tracing::warn!(error=?e, sink=%std::any::type_name::<ArcDynSink>(), batch_id=%frozen.id, "sink send failed");
+                    tracing::warn!(
+                        pipeline = %self.pipeline_name,
+                        sink = %std::any::type_name::<ArcDynSink>(),
+                        batch_id = %frozen.id,
+                        kind = %e.kind(),
+                        details = %e.details(),
+                        error = ?e,
+                        "sink failed"
+                    );
+
+                    counter!(
+                        "deltaforge_sink_failures_total",
+                        "pipeline" => self.pipeline_name.clone()
+                    )
+                    .increment(1);
+
                     ok = false;
                     break;
                 }

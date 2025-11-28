@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
         let source = build_source(&ps)
             .context(format!("build source for {pipeline_name}"))?;
         let processors = build_processors(&ps);
-        let sinks = build_sinks(&ps);
+        let sinks = build_sinks(&ps).context("build sinks")?;
 
         let (event_tx, event_rx) = mpsc::channel::<Event>(4096);
         let src_handle = source.run(event_tx, ckpt_store.clone()).await;
