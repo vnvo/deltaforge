@@ -18,7 +18,7 @@ pub fn build_sinks(ps: &PipelineSpec) -> anyhow::Result<Vec<ArcDynSink>> {
                     Arc::new(sink) as ArcDynSink
                 },
                 SinkCfg::Redis(redis_cfg) => {
-                    let sink = RedisSink::new(&redis_cfg.uri, &redis_cfg.stream)?; 
+                    let sink = RedisSink::new(&redis_cfg)?; 
                     Arc::new(sink) as ArcDynSink
                 },
             };

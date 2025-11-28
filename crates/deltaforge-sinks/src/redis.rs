@@ -1,25 +1,32 @@
 use anyhow::Context;
 use async_trait::async_trait;
+use deltaforge_config::RedisSinkCfg;
 use deltaforge_core::{Event, Sink, SinkError, SinkResult};
 use tokio::time::{Duration, timeout};
 use tracing::{debug, info};
 
 pub struct RedisSink {
+    id: String,
     client: redis::Client,
     stream: String,
 }
 
 impl RedisSink {
-    pub fn new(uri: &str, stream: &str) -> anyhow::Result<Self> {
+    pub fn new(cfg: &RedisSinkCfg) -> anyhow::Result<Self> {
         Ok(Self {
-            client: redis::Client::open(uri).context("open redis uri")?,
-            stream: stream.to_string(),
+            id: cfg.id.clone(),
+            client: redis::Client::open(cfg.uri.clone()).context("open redis uri")?,
+            stream: cfg.stream.to_string(),
         })
     }
 }
 
 #[async_trait]
 impl Sink for RedisSink {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
     async fn send(&self, event: Event) -> SinkResult<()> {
         let mut conn = self
             .client

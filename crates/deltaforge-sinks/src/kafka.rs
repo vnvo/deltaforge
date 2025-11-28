@@ -8,6 +8,7 @@ use std::time::Duration;
 use tracing::{debug, info, instrument};
 
 pub struct KafkaSink {
+    id: String,
     producer: FutureProducer,
     topic: String,
 }
@@ -43,6 +44,7 @@ impl KafkaSink {
 
         info!(brokers=%ks_cfg.brokers, topic=%ks_cfg.topic, "kafka client connected", );
         Ok(Self {
+            id: ks_cfg.id.clone(),
             producer,
             topic: ks_cfg.topic.clone(),
         })
@@ -51,6 +53,10 @@ impl KafkaSink {
 
 #[async_trait]
 impl Sink for KafkaSink {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
     async fn send(&self, event: Event) -> SinkResult<()> {
         let payload = serde_json::to_vec(&event)?;
         let key = event.idempotency_key();
@@ -62,10 +68,8 @@ impl Sink for KafkaSink {
                 Duration::from_secs(5),
             )
             .await
-            .map_err(|(e, _msg)| {
-                SinkError::Backpressure {
-                    details: format!("kafka send error: {e}").into(),
-                }
+            .map_err(|(e, _msg)| SinkError::Backpressure {
+                details: format!("kafka send error: {e}").into(),
             })?;
 
         debug!(topic = %self.topic, "event sent to kafka sink");

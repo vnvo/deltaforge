@@ -1,16 +1,16 @@
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use deltaforge_checkpoints::CheckpointStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
-    sync::{mpsc, Notify},
+    sync::{Notify, mpsc},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -18,7 +18,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 pub mod errors;
-pub use errors::{SourceError, SinkError};
+pub use errors::{SinkError, SourceError};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Op {
@@ -105,7 +105,7 @@ pub struct Event {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CheckpointMeta {
-    Opaque(Vec<u8>)
+    Opaque(Vec<u8>),
 }
 
 impl Event {
@@ -250,6 +250,7 @@ pub trait Processor: Send + Sync {
 
 #[async_trait]
 pub trait Sink: Send + Sync {
+    fn id(&self) -> &str;
     async fn send(&self, event: Event) -> SinkResult<()>;
 }
 

@@ -216,13 +216,17 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
 
             let mut ok = true;
             for ev in frozen.events.iter() {
-                counter!("deltaforge_sink_events_total", "pipeline"=>self.pipeline_name.clone()).increment(1);
+                counter!(
+                    "deltaforge_sink_events_total", 
+                    "pipeline"=>self.pipeline_name.clone(),
+                    "sink"=>sink.id().to_string(),
+                ).increment(1);
 
-                debug!(pipeline=%self.pipeline_name, eid=%ev.event_id, "sending to sink");
+                debug!(pipeline=%self.pipeline_name, sink_id=%sink.id(), eid=%ev.event_id, "sending to sink");
                 if let Err(e) = sink.send(ev.clone()).await {
                     tracing::warn!(
                         pipeline = %self.pipeline_name,
-                        sink = %std::any::type_name::<ArcDynSink>(),
+                        sink_id = %sink.id(),
                         batch_id = %frozen.id,
                         kind = %e.kind(),
                         details = %e.details(),
@@ -232,7 +236,8 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
 
                     counter!(
                         "deltaforge_sink_failures_total",
-                        "pipeline" => self.pipeline_name.clone()
+                        "pipeline" => self.pipeline_name.clone(),
+                        "sink"=>sink.id().to_string(),
                     )
                     .increment(1);
 
