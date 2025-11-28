@@ -1,10 +1,11 @@
 use anyhow::Result;
-use mysql_async::{prelude::Queryable, Pool, Row};
+use mysql_async::{Pool, Row, prelude::Queryable};
 use std::{collections::HashMap, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::mysql::mysql_helpers::redact_password;
+use deltaforge_core::{SourceError, SourceResult};
 
 /// INFORMATION_SCHEMA column-name cache, with logging and latency measurement.
 #[derive(Clone)]
@@ -12,6 +13,7 @@ pub(super) struct MySqlSchemaCache {
     pool: Pool,
     map: Arc<RwLock<HashMap<(String, String), Arc<Vec<String>>>>>,
 }
+
 impl MySqlSchemaCache {
     pub(super) fn new(dsn: &str) -> Self {
         info!("creating mysql schema cache for {}", redact_password(dsn));
@@ -24,7 +26,7 @@ impl MySqlSchemaCache {
         &self,
         db: &str,
         table: &str,
-    ) -> Result<Arc<Vec<String>>> {
+    ) -> SourceResult<Arc<Vec<String>>> {
         if let Some(found) = self
             .map
             .read()
@@ -36,7 +38,12 @@ impl MySqlSchemaCache {
             return Ok(found);
         }
         let t0 = Instant::now();
-        let mut conn = self.pool.get_conn().await?;
+        let mut conn = self
+            .pool
+            .get_conn()
+            .await
+            .map_err(|e| SourceError::Other(e.into()))?;
+
         let rows: Vec<Row> = conn
             .exec(
                 r#"
@@ -47,7 +54,9 @@ impl MySqlSchemaCache {
             "#,
                 (db, table),
             )
-            .await?;
+            .await
+            .map_err(|e| SourceError::Other(e.into()))?;
+
         let ms = t0.elapsed().as_millis() as u64;
         if ms > 200 {
             warn!(db = %db, table = %table, ms, "slow schema fetch");
@@ -68,6 +77,7 @@ impl MySqlSchemaCache {
             .insert((db.to_string(), table.to_string()), arc.clone());
         Ok(arc)
     }
+    
     pub(super) async fn invalidate(&self, db: &str, _wild: &str) {
         let before = self.map.read().await.len();
         self.map.write().await.retain(|(d, _), _| d != db);

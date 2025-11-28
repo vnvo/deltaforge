@@ -1,14 +1,9 @@
-//! MySQL source module.
-//! Uses binlog steaming to consume the change events
-//! and send them to the next layer (processors)
-
 use std::{
     collections::HashMap,
     sync::{atomic::AtomicBool, Arc},
     time::Duration,
 };
 
-use anyhow::Result;
 use async_trait::async_trait;
 use mysql_binlog_connector_rust::{
     binlog_client::BinlogClient, binlog_stream::BinlogStream,
@@ -20,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use deltaforge_checkpoints::{CheckpointStore, CheckpointStoreExt};
-use deltaforge_core::{Event, Source, SourceHandle, SourceResult, SourceError};
+use deltaforge_core::{Event, Source, SourceHandle, SourceResult};
 
 mod mysql_errors;
 
@@ -142,7 +137,7 @@ impl MySqlSource {
                     stream = reconnect_stream(&mut ctx).await?;
                 }
                 Err(LoopControl::Stop) => break,
-                Err(LoopControl::Fail(e)) => return Err(e.into()),
+                Err(LoopControl::Fail(e)) => return Err(e),
             }
         }
 

@@ -514,14 +514,24 @@ pub(crate) fn short_sql(s: &str, max: usize) -> String {
 
 pub(super) async fn fetch_executed_gtid_set(
     dsn: &str,
-) -> anyhow::Result<Option<String>> {
+) -> SourceResult<Option<String>> {
     // Use a short-lived connection for now (simple & correct).
     // We can optimize by keeping a Pool in RunCtx later.
     let pool = Pool::new(dsn);
-    let mut conn = pool.get_conn().await?;
+    let mut conn = pool
+        .get_conn()
+        .await
+        .map_err(|e| SourceError::Other(e.into()))?;
+    
     // Returns NULL if GTID is disabled
-    let row: Option<(Option<String>,)> =
-        conn.query_first("SELECT @@GLOBAL.gtid_executed").await?;
-    conn.disconnect().await?; // or pool.disconnect().await? depending on your version
+    let row: Option<(Option<String>,)> = conn
+        .query_first("SELECT @@GLOBAL.gtid_executed")
+        .await
+        .map_err(|e| SourceError::Other(e.into()))?;
+    
+    conn.disconnect()
+        .await
+        .map_err(|e| SourceError::Other(e.into()))?;
+
     Ok(row.and_then(|(s,)| s))
 }
