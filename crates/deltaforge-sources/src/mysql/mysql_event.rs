@@ -14,6 +14,7 @@ use crate::conn_utils::{retryable_stream, watchdog};
 use crate::mysql::RunCtx;
 
 use crate::mysql::mysql_helpers::{persist_checkpoint, short_sql, ts_ms};
+
 pub(super) enum LoopControl {
     Reconnect,
     Stop,

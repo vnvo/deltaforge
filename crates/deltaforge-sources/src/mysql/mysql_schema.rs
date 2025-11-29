@@ -1,4 +1,3 @@
-use anyhow::Result;
 use mysql_async::{Pool, Row, prelude::Queryable};
 use std::{collections::HashMap, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
@@ -77,7 +76,7 @@ impl MySqlSchemaCache {
             .insert((db.to_string(), table.to_string()), arc.clone());
         Ok(arc)
     }
-    
+
     pub(super) async fn invalidate(&self, db: &str, _wild: &str) {
         let before = self.map.read().await.len();
         self.map.write().await.retain(|(d, _), _| d != db);
