@@ -1134,6 +1134,7 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
  "tokio",
 ]
 
@@ -1149,6 +1150,7 @@ dependencies = [
  "serial_test",
  "shellexpand",
  "tempfile",
+ "thiserror 1.0.69",
  "tracing",
  "walkdir",
 ]
@@ -1277,6 +1279,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "testcontainers",
+ "thiserror 1.0.69",
  "tokio",
  "tokio-util",
  "tracing",

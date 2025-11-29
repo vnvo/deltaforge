@@ -1,14 +1,43 @@
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tracing::error;
 use std::fs;
+use thiserror::Error;
+use tracing::error;
 use walkdir::WalkDir;
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("failed to read config file {path}: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to parse config file {path}: {source}")]
+    Parse {
+        path: String,
+        #[source]
+        source: serde_yaml::Error,
+    },
+
+    #[error("failed to expand environment variables in {path}: {source}")]
+    Env {
+        path: String,
+        #[source]
+        source: shellexpand::LookupError<std::env::VarError>,
+    },
+
+    #[error("no config files found at {0}")]
+    NotFound(String),
+}
+
+pub type ConfigResult<T> = std::result::Result<T, ConfigError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineSpec {
     /// General metadata for pipeline
     pub metadata: Metadata,
-    
+
     /// Actual pipeline config/spec
     pub spec: Spec,
 }
@@ -65,7 +94,7 @@ pub struct MysqlSrcCfg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "config", rename_all = "lowercase")]
 pub enum SourceCfg {
-    Postgres(PostgresSrcCfg) ,
+    Postgres(PostgresSrcCfg),
     Mysql(MysqlSrcCfg),
 }
 
@@ -98,7 +127,7 @@ pub struct RedisSinkCfg {
     pub stream: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content="config", rename_all = "lowercase")]
+#[serde(tag = "type", content = "config", rename_all = "lowercase")]
 pub enum SinkCfg {
     Kafka(KafkaSinkCfg),
     Redis(RedisSinkCfg),
@@ -175,27 +204,37 @@ impl Default for CommitPolicy {
     }
 }
 
-pub fn load_from_path(file_path: &str) -> Result<PipelineSpec> {
-    let raw = fs::read_to_string(file_path)
-        .with_context(|| format!("reading config {file_path}"))?;
-    let with_env = shellexpand::env(&raw).unwrap().to_string();
+pub fn load_from_path(file_path: &str) -> ConfigResult<PipelineSpec> {
+    let raw = fs::read_to_string(file_path).map_err(|e| ConfigError::Io {
+        path: file_path.to_owned(),
+        source: e,
+    })?;
+
+    let with_env = shellexpand::env(&raw)
+        .map_err(|e| ConfigError::Env {
+            path: file_path.to_owned(),
+            source: e,
+        })?
+        .to_string();
     let spec: PipelineSpec =
-        serde_yaml::from_str(&with_env).with_context(|| "parsing yaml")?;
+        serde_yaml::from_str(&with_env).map_err(|e| ConfigError::Parse {
+            path: file_path.to_owned(),
+            source: e,
+        })?;
 
     Ok(spec)
 }
 
-pub fn load_from_dir(dir_path: &str) -> Result<Vec<PipelineSpec>> {
+pub fn load_from_dir(dir_path: &str) -> ConfigResult<Vec<PipelineSpec>> {
     let mut specs = Vec::<PipelineSpec>::new();
     for entry in WalkDir::new(dir_path)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.metadata().unwrap().is_file())
+        .filter(|e| e.metadata().map(|m| m.is_file()).unwrap_or(false))
     {
         if let Some(path_str) = entry.path().to_str() {
-            let spec = load_from_path(path_str)
-                .with_context(|| format!("loading pipeline from {:?}", entry.path()))?;
-            specs.push(spec);            
+            let spec = load_from_path(path_str)?;
+            specs.push(spec);
         } else {
             error!(file=%entry.path().display(), "skipping file in config dir")
         }
@@ -204,13 +243,13 @@ pub fn load_from_dir(dir_path: &str) -> Result<Vec<PipelineSpec>> {
     Ok(specs)
 }
 
-pub fn load_cfg(path: &str) -> Result<Vec<PipelineSpec>> {
+pub fn load_cfg(path: &str) -> ConfigResult<Vec<PipelineSpec>> {
     let cfg_path = std::path::Path::new(path);
 
     match cfg_path.is_dir() {
         true => load_from_dir(path),
         false => {
-            let spec= load_from_path(path)?;
+            let spec = load_from_path(path)?;
             Ok(vec![spec])
         }
     }

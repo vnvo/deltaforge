@@ -3,15 +3,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use deltaforge_checkpoints::CheckpointStore;
-use deltaforge_sources::mysql::MySqlCheckpoint;
 use futures::future::BoxFuture;
 use metrics::counter;
 use tokio::time::{Instant, interval};
-use tracing::{debug, field::debug, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
-use deltaforge_config::{BatchConfig, CommitPolicy, PipelineSpec, SourceCfg};
-use deltaforge_core::{ArcDynProcessor, ArcDynSink, CheckpointMeta, Event};
+use deltaforge_config::{BatchConfig, CommitPolicy};
+use deltaforge_core::{ArcDynProcessor, ArcDynSink, CheckpointMeta, Event, SinkError};
 
 /// Persist/commit the token after the batch is successfully delivered to sinks.
 pub type CommitCpFn<Tok> =
@@ -217,11 +216,31 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
 
             let mut ok = true;
             for ev in frozen.events.iter() {
-                counter!("deltaforge_sink_events_total", "pipeline"=>self.pipeline_name.clone()).increment(1);
+                counter!(
+                    "deltaforge_sink_events_total", 
+                    "pipeline"=>self.pipeline_name.clone(),
+                    "sink"=>sink.id().to_string(),
+                ).increment(1);
 
-                debug!(pipeline=%self.pipeline_name, eid=%ev.event_id, "sending to sink");
+                debug!(pipeline=%self.pipeline_name, sink_id=%sink.id(), eid=%ev.event_id, "sending to sink");
                 if let Err(e) = sink.send(ev.clone()).await {
-                    tracing::warn!(error=?e, sink=%std::any::type_name::<ArcDynSink>(), batch_id=%frozen.id, "sink send failed");
+                    tracing::warn!(
+                        pipeline = %self.pipeline_name,
+                        sink_id = %sink.id(),
+                        batch_id = %frozen.id,
+                        kind = %e.kind(),
+                        details = %e.details(),
+                        error = ?e,
+                        "sink failed"
+                    );
+
+                    counter!(
+                        "deltaforge_sink_failures_total",
+                        "pipeline" => self.pipeline_name.clone(),
+                        "sink"=>sink.id().to_string(),
+                    )
+                    .increment(1);
+
                     ok = false;
                     break;
                 }
@@ -284,15 +303,22 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
 
 pub(crate) fn build_commit_fn(
     ckpt_store: Arc<dyn CheckpointStore>,
-    pipeline_id: String,
+    pipeline_name: String,
 ) -> CommitCpFn<CheckpointMeta> {
     use futures::FutureExt;
     Box::new(move |cp: CheckpointMeta| {
         let ckpt_store = ckpt_store.clone();
-        let pipeline_id = pipeline_id.clone();
+        let pipeline_name = pipeline_name.clone();
         async move {
-            debug!(pipeline_id=%pipeline_id, checkpoint=?cp, "checkpoint would be saved here");
-            let _ = ckpt_store;
+            let key = format!("pipeline/{pipeline_name}");
+            let bytes = serde_json::to_vec(&cp)
+                .context("serialize checkpoint to store")?;
+            ckpt_store
+                .put_raw(&key, &bytes)
+                .await
+                .context("save checkpoint")?;
+            
+            debug!(pipeline_id=%pipeline_name, checkpoint=?cp, "checkpoint saved");
             Ok(())
         }.boxed()
     })

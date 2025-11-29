@@ -1,6 +1,10 @@
+use super::CheckpointResult;
 use super::{CheckpointStore, Result};
 use async_trait::async_trait;
-use std::{collections::HashMap, path::{Path, PathBuf}};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 use tokio::sync::Mutex;
 
 pub struct FileCheckpointStore {
@@ -9,11 +13,14 @@ pub struct FileCheckpointStore {
 }
 
 impl FileCheckpointStore {
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Ok(Self { path: path.as_ref().to_path_buf(), guard: Mutex::new(()) })
+    pub fn new<P: AsRef<Path>>(path: P) -> CheckpointResult<Self> {
+        Ok(Self {
+            path: path.as_ref().to_path_buf(),
+            guard: Mutex::new(()),
+        })
     }
 
-    async fn load(&self) -> Result<HashMap<String, Vec<u8>>> {
+    async fn load(&self) -> CheckpointResult<HashMap<String, Vec<u8>>> {
         if !tokio::fs::try_exists(&self.path).await? {
             return Ok(HashMap::new());
         }
@@ -22,7 +29,10 @@ impl FileCheckpointStore {
         Ok(map)
     }
 
-    async fn save(&self, map: &HashMap<String, Vec<u8>>) -> Result<()> {
+    async fn save(
+        &self,
+        map: &HashMap<String, Vec<u8>>,
+    ) -> CheckpointResult<()> {
         let bytes = serde_json::to_vec_pretty(map)?;
         let tmp = self.path.with_extension("tmp");
         tokio::fs::write(&tmp, &bytes).await?;
@@ -33,20 +43,27 @@ impl FileCheckpointStore {
 
 #[async_trait]
 impl CheckpointStore for FileCheckpointStore {
-    async fn get_raw(&self, source_id: &str) -> Result<Option<Vec<u8>>> {
+    async fn get_raw(
+        &self,
+        source_id: &str,
+    ) -> CheckpointResult<Option<Vec<u8>>> {
         let _g = self.guard.lock().await;
         let mut map = self.load().await?;
         Ok(map.remove(source_id))
     }
 
-    async fn put_raw(&self, source_id: &str, bytes: &[u8]) -> Result<()> {
+    async fn put_raw(
+        &self,
+        source_id: &str,
+        bytes: &[u8],
+    ) -> CheckpointResult<()> {
         let _g = self.guard.lock().await;
         let mut map = self.load().await?;
         map.insert(source_id.to_string(), bytes.to_vec());
         self.save(&map).await
     }
 
-    async fn delete(&self, source_id: &str) -> Result<bool> {
+    async fn delete(&self, source_id: &str) -> CheckpointResult<bool> {
         let _g = self.guard.lock().await;
         let mut map = self.load().await?;
         let existed = map.remove(source_id).is_some();
@@ -56,7 +73,7 @@ impl CheckpointStore for FileCheckpointStore {
         Ok(existed)
     }
 
-    async fn list(&self) -> Result<Vec<String>> {
+    async fn list(&self) -> CheckpointResult<Vec<String>> {
         let _g = self.guard.lock().await;
         let map = self.load().await?;
         Ok(map.keys().cloned().collect())

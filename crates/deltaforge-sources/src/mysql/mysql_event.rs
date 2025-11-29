@@ -1,6 +1,4 @@
-use anyhow::Result;
-
-use deltaforge_core::{Event, Op, SourceMeta};
+use deltaforge_core::{Event, Op, SourceError, SourceMeta, SourceResult};
 use mysql_binlog_connector_rust::{
     binlog_stream::BinlogStream,
     event::{
@@ -11,15 +9,16 @@ use mysql_binlog_connector_rust::{
 use tracing::instrument;
 use tracing::{debug, error, info, warn};
 
-use super::object::build_object;
+use super::mysql_object::build_object;
 use crate::conn_utils::{retryable_stream, watchdog};
 use crate::mysql::RunCtx;
 
 use crate::mysql::mysql_helpers::{persist_checkpoint, short_sql, ts_ms};
+
 pub(super) enum LoopControl {
     Reconnect,
     Stop,
-    Fail(anyhow::Error),
+    Fail(SourceError),
 }
 
 #[instrument(skip_all)]
@@ -40,7 +39,7 @@ pub(super) async fn read_next_event(
                 Err(LoopControl::Reconnect)
             } else {
                 error!(source_id=%ctx.source_id, error=%se, "non-retryable binlog read error");
-                Err(LoopControl::Fail(se.into()))
+                Err(LoopControl::Fail(se))
             }
         }
     }
@@ -51,7 +50,7 @@ pub(super) async fn dispatch_event(
     ctx: &mut RunCtx,
     header: &EventHeader,
     data: EventData,
-) -> Result<()> {
+) -> SourceResult<()> {
     debug!(
         timestamp = header.timestamp,
         event_type = header.event_type,
@@ -96,7 +95,7 @@ pub(super) async fn dispatch_event(
 }
 
 #[instrument(skip_all, fields(source_id=%ctx.source_id))]
-async fn handle_table_map(ctx: &mut RunCtx, tm: TableMapEvent) -> Result<()> {
+async fn handle_table_map(ctx: &mut RunCtx, tm: TableMapEvent) -> SourceResult<()> {
     let is_new = !ctx.table_map.contains_key(&tm.table_id);
     ctx.table_map.insert(tm.table_id, tm.clone());
 
@@ -128,7 +127,7 @@ async fn handle_write_rows(
     ctx: &mut RunCtx,
     header: &EventHeader,
     wr: mysql_binlog_connector_rust::event::write_rows_event::WriteRowsEvent,
-) -> Result<()> {
+) -> SourceResult<()> {
     if let Some(tm) = ctx.table_map.get(&wr.table_id) {
         if !ctx.allow.matchs(&tm.database_name, &tm.table_name) {
             return Ok(());
@@ -171,7 +170,7 @@ async fn handle_update_rows(
     ctx: &mut RunCtx,
     header: &EventHeader,
     ur: mysql_binlog_connector_rust::event::update_rows_event::UpdateRowsEvent,
-) -> Result<()> {
+) -> SourceResult<()> {
     if let Some(tm) = ctx.table_map.get(&ur.table_id) {
         if !ctx.allow.matchs(&tm.database_name, &tm.table_name) {
             return Ok(());
@@ -222,7 +221,7 @@ async fn handle_delete_rows(
     ctx: &mut RunCtx,
     header: &EventHeader,
     dr: mysql_binlog_connector_rust::event::delete_rows_event::DeleteRowsEvent,
-) -> Result<()> {
+) -> SourceResult<()> {
     if let Some(tm) = ctx.table_map.get(&dr.table_id) {
         if !ctx.allow.matchs(&tm.database_name, &tm.table_name) {
             return Ok(());
@@ -265,7 +264,7 @@ async fn handle_query(
     ctx: &mut RunCtx,
     header: &EventHeader,
     q: mysql_binlog_connector_rust::event::query_event::QueryEvent,
-) -> Result<()> {
+) -> SourceResult<()> {
     let db = if q.schema.is_empty() {
         &ctx.default_db
     } else {

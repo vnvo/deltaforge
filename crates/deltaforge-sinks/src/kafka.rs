@@ -1,22 +1,23 @@
-use anyhow::{Context, Ok, Result};
+use anyhow::Context;
 use async_trait::async_trait;
 use deltaforge_config::KafkaSinkCfg;
-use deltaforge_core::{Event, Sink};
+use deltaforge_core::{Event, Sink, SinkError, SinkResult};
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use std::time::Duration;
 use tracing::{debug, info, instrument};
 
 pub struct KafkaSink {
+    id: String,
     producer: FutureProducer,
     topic: String,
 }
 
 impl KafkaSink {
     #[instrument(skip_all)]
-    pub fn new(ks_cfg: &KafkaSinkCfg) -> Result<Self> {
+    pub fn new(ks_cfg: &KafkaSinkCfg) -> anyhow::Result<Self> {
         let mut cfg = ClientConfig::new();
-        cfg.set("bootstrap.servers", ks_cfg.brokers.clone()) 
+        cfg.set("bootstrap.servers", ks_cfg.brokers.clone())
             .set("client.id", "deltaforge-sink")
             .set("message.timeout.ms", "60000") // producer send timeout
             .set("socket.keepalive.enable", "true")
@@ -43,6 +44,7 @@ impl KafkaSink {
 
         info!(brokers=%ks_cfg.brokers, topic=%ks_cfg.topic, "kafka client connected", );
         Ok(Self {
+            id: ks_cfg.id.clone(),
             producer,
             topic: ks_cfg.topic.clone(),
         })
@@ -51,9 +53,12 @@ impl KafkaSink {
 
 #[async_trait]
 impl Sink for KafkaSink {
-    async fn send(&self, event: Event) -> Result<()> {
-        let payload =
-            serde_json::to_vec(&event).context("serialize event to json")?;
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    async fn send(&self, event: Event) -> SinkResult<()> {
+        let payload = serde_json::to_vec(&event)?;
         let key = event.idempotency_key();
 
         let _ = self
@@ -63,7 +68,9 @@ impl Sink for KafkaSink {
                 Duration::from_secs(5),
             )
             .await
-            .map_err(|(e, _msg)| anyhow::anyhow!("kafka send error: {e}"))?;
+            .map_err(|(e, _msg)| SinkError::Backpressure {
+                details: format!("kafka send error: {e}").into(),
+            })?;
 
         debug!(topic = %self.topic, "event sent to kafka sink");
         Ok(())

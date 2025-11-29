@@ -1,16 +1,16 @@
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use deltaforge_checkpoints::CheckpointStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
-    sync::{mpsc, Notify},
+    sync::{Notify, mpsc},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -18,7 +18,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 pub mod errors;
-pub use errors::SourceError;
+pub use errors::{SinkError, SourceError};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Op {
@@ -105,7 +105,7 @@ pub struct Event {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CheckpointMeta {
-    Opaque(Vec<u8>)
+    Opaque(Vec<u8>),
 }
 
 impl Event {
@@ -189,6 +189,7 @@ pub enum ConnctionMode {
 }
 
 pub type SourceResult<T> = Result<T, SourceError>;
+pub type SinkResult<T> = std::result::Result<T, SinkError>;
 
 /// SourceHandle as the control interface for a source
 /// Caller/Controller of a source should use it to interact with a running source
@@ -196,7 +197,7 @@ pub struct SourceHandle {
     pub cancel: CancellationToken,
     pub paused: Arc<AtomicBool>,
     pub pause_notify: Arc<Notify>,
-    pub join: JoinHandle<Result<()>>,
+    pub join: JoinHandle<SourceResult<()>>,
 }
 
 impl SourceHandle {
@@ -223,7 +224,7 @@ impl SourceHandle {
 
     pub async fn join(self) -> Result<()> {
         match self.join.await {
-            Ok(r) => r,
+            Ok(r) => Ok(r?),
             Err(e) => Err(anyhow::anyhow!("source task panicked: {e}")),
         }
     }
@@ -249,7 +250,8 @@ pub trait Processor: Send + Sync {
 
 #[async_trait]
 pub trait Sink: Send + Sync {
-    async fn send(&self, event: Event) -> Result<()>;
+    fn id(&self) -> &str;
+    async fn send(&self, event: Event) -> SinkResult<()>;
 }
 
 #[async_trait]
