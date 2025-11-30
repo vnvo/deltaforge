@@ -6,7 +6,7 @@ use deltaforge_checkpoints::{CheckpointStore, FileCheckpointStore};
 use deltaforge_config::{PipelineSpec, load_cfg};
 use deltaforge_core::{CheckpointMeta, Event, SourceHandle};
 use deltaforge_o11y as o11y;
-use deltaforge_processor_js::build_processors;
+use processors::build_processors;
 use deltaforge_sinks::build_sinks;
 use deltaforge_sources::build_source;
 use metrics::{counter, gauge};

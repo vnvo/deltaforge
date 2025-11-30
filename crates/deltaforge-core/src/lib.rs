@@ -245,7 +245,14 @@ pub trait Source: Send + Sync {
 
 #[async_trait]
 pub trait Processor: Send + Sync {
-    async fn process(&self, event: &mut Event) -> Result<Vec<Event>>;
+    /// Takes ownership of a "batch" of events and returns a new batch.
+    ///
+    /// Implementations are free to:
+    /// - modify events in place
+    /// - drop events
+    /// - add new events (duplicates / variants)
+    fn id(&self) -> &str;
+    async fn process(&self, events:  Vec<Event>) -> Result<Vec<Event>>;
 }
 
 #[async_trait]
@@ -359,75 +366,75 @@ impl PipelineHandle {
     }
 }
 
-impl Pipeline {
-    pub async fn start(
-        &self,
-        ckpt_store: Arc<dyn CheckpointStore>,
-    ) -> Result<PipelineHandle> {
-        let (tx, mut rx) = mpsc::channel::<Event>(1024);
+// impl Pipeline {
+//     pub async fn start(
+//         &self,
+//         ckpt_store: Arc<dyn CheckpointStore>,
+//     ) -> Result<PipelineHandle> {
+//         let (tx, mut rx) = mpsc::channel::<Event>(1024);
 
-        let pipeline_id = self.id.clone();
-        info!(pipeline_id = pipeline_id, "pipeline starting ...");
-        //spawn sources
-        let mut source_handles: Vec<SourceHandle> =
-            Vec::with_capacity(self.sources.len());
+//         let pipeline_id = self.id.clone();
+//         info!(pipeline_id = pipeline_id, "pipeline starting ...");
+//         //spawn sources
+//         let mut source_handles: Vec<SourceHandle> =
+//             Vec::with_capacity(self.sources.len());
 
-        for src in self.sources.iter().cloned() {
-            let src_handle = src.run(tx.clone(), ckpt_store.clone()).await;
-            source_handles.push(src_handle);
-        }
-        drop(tx);
+//         for src in self.sources.iter().cloned() {
+//             let src_handle = src.run(tx.clone(), ckpt_store.clone()).await;
+//             source_handles.push(src_handle);
+//         }
+//         drop(tx);
 
-        let cancel = CancellationToken::new();
-        let cancel_for_task = cancel.clone();
+//         let cancel = CancellationToken::new();
+//         let cancel_for_task = cancel.clone();
 
-        let processors = self.processors.clone();
-        let sinks = self.sinks.clone();
+//         let processors = self.processors.clone();
+//         let sinks = self.sinks.clone();
 
-        // main dispatcher loop
-        let join = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = cancel_for_task.cancelled() => {
-                        break; //graceful shutdown
-                    }
+//         // main dispatcher loop
+//         let join = tokio::spawn(async move {
+//             loop {
+//                 tokio::select! {
+//                     _ = cancel_for_task.cancelled() => {
+//                         break; //graceful shutdown
+//                     }
 
-                    maybe_ev = rx.recv() => {
-                        let Some(ev) = maybe_ev else { break; };
+//                     maybe_ev = rx.recv() => {
+//                         let Some(ev) = maybe_ev else { break; };
 
-                        //sequential processing
-                        let mut out: Vec<Event> = vec![ev];
-                        for p in processors.iter() {
-                            let mut next = Vec::new();
-                            for mut e in out.drain(..) {
-                                match p.process(&mut e).await {
-                                    Ok(produced) => next.extend(produced),
-                                    Err(err) => error!(error = %err, "processor error; dropping event"),
-                                }
-                            }
-                            out = next;
-                        }
+//                         //sequential processing
+//                         let mut out: Vec<Event> = vec![ev];
+//                         for p in processors.iter() {
+//                             let mut next = Vec::new();
+//                             for mut e in out.drain(..) {
+//                                 match p.process(&mut e).await {
+//                                     Ok(produced) => next.extend(produced),
+//                                     Err(err) => error!(error = %err, "processor error; dropping event"),
+//                                 }
+//                             }
+//                             out = next;
+//                         }
 
-                        // dispatch to sinks
-                        for e in out.into_iter() {
-                            for s in sinks.iter() {
-                                if let Err(err) = s.send(e.clone()).await {
-                                    error!(error = %err, "sink send failed");
-                                }
-                            }
-                        }
-                    }
-                };
-            }
+//                         // dispatch to sinks
+//                         for e in out.into_iter() {
+//                             for s in sinks.iter() {
+//                                 if let Err(err) = s.send(e.clone()).await {
+//                                     error!(error = %err, "sink send failed");
+//                                 }
+//                             }
+//                         }
+//                     }
+//                 };
+//             }
 
-            Ok(())
-        });
+//             Ok(())
+//         });
 
-        Ok(PipelineHandle {
-            id: pipeline_id,
-            cancel,
-            source_handles,
-            join,
-        })
-    }
-}
+//         Ok(PipelineHandle {
+//             id: pipeline_id,
+//             cancel,
+//             source_handles,
+//             join,
+//         })
+//     }
+// }
