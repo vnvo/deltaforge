@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use axum::Router;
 use clap::Parser;
-use deltaforge_api::{AppState, PipeInfo, router};
+use rest_api::{AppState, PipeInfo, router};
 use deltaforge_checkpoints::{CheckpointStore, FileCheckpointStore};
 use deltaforge_config::{PipelineSpec, load_cfg};
 use deltaforge_core::{CheckpointMeta, Event, SourceHandle};

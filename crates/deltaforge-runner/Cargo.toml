@@ -21,5 +21,5 @@ deltaforge-registry = { path = "../deltaforge-registry" }
 deltaforge-sources = { path = "../deltaforge-sources" }
 deltaforge-sinks = { path = "../deltaforge-sinks" }
 processors = { path = "../processors" }
-deltaforge-api = { path = "../deltaforge-api" }
+rest-api = { path = "../rest-api" }
 deltaforge-checkpoints ={ path = "../deltaforge-checkpoints"}
