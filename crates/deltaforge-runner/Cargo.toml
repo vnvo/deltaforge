@@ -20,6 +20,6 @@ deltaforge-o11y ={ path = "../deltaforge-o11y"}
 deltaforge-registry = { path = "../deltaforge-registry" }
 deltaforge-sources = { path = "../deltaforge-sources" }
 deltaforge-sinks = { path = "../deltaforge-sinks" }
-deltaforge-processor-js = { path = "../deltaforge-processor-js" }
+processors = { path = "../processors" }
 deltaforge-api = { path = "../deltaforge-api" }
 deltaforge-checkpoints ={ path = "../deltaforge-checkpoints"}

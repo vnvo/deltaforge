@@ -1187,28 +1187,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "deltaforge-processor-js"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "criterion",
- "deltaforge-config",
- "deltaforge-core",
- "deno_core",
- "once_cell",
- "pretty_assertions",
- "serde_json",
- "serde_v8",
- "serial_test",
- "tempfile",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "deltaforge-registry"
 version = "0.1.0"
 dependencies = [
@@ -1231,13 +1209,13 @@ dependencies = [
  "deltaforge-config",
  "deltaforge-core",
  "deltaforge-o11y",
- "deltaforge-processor-js",
  "deltaforge-registry",
  "deltaforge-sinks",
  "deltaforge-sources",
  "futures",
  "metrics",
  "parking_lot",
+ "processors",
  "serde_json",
  "tokio",
  "tracing",
@@ -3227,6 +3205,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "89ae43fd86e4158d6db51ad8e2b80f313af9cc74f5c0e03ccb87de09998732de"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "processors"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "criterion",
+ "deltaforge-config",
+ "deltaforge-core",
+ "deno_core",
+ "once_cell",
+ "pretty_assertions",
+ "serde_json",
+ "serde_v8",
+ "serial_test",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

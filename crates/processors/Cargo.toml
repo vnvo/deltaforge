@@ -1,5 +1,5 @@
 [package]
-name = "deltaforge-processor-js"
+name = "processors"
 version = "0.1.0"
 edition.workspace = true
 
