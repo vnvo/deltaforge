@@ -764,6 +764,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
+name = "checkpoints"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1115,30 +1127,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "deltaforge-api"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "parking_lot",
- "serde",
- "serde_json",
- "tracing",
-]
-
-[[package]]
-name = "deltaforge-checkpoints"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
 name = "deltaforge-config"
 version = "0.1.0"
 dependencies = [
@@ -1161,8 +1149,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "checkpoints",
  "chrono",
- "deltaforge-checkpoints",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -1203,9 +1191,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "checkpoints",
  "clap",
- "deltaforge-api",
- "deltaforge-checkpoints",
  "deltaforge-config",
  "deltaforge-core",
  "deltaforge-o11y",
@@ -1216,6 +1203,7 @@ dependencies = [
  "metrics",
  "parking_lot",
  "processors",
+ "rest-api",
  "serde_json",
  "tokio",
  "tracing",
@@ -1244,9 +1232,9 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "checkpoints",
  "chrono",
  "crc32fast",
- "deltaforge-checkpoints",
  "deltaforge-config",
  "deltaforge-core",
  "mysql-binlog-connector-rust",
@@ -3551,6 +3539,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71fe3824f5629716b1589be05dacd749f6aa084c87e00e016714a8cdfccc997c"
 dependencies = [
  "bytecheck",
+]
+
+[[package]]
+name = "rest-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 [package]
-name = "deltaforge-checkpoints"
+name = "checkpoints"
 version = "0.1.0"
 edition.workspace = true
 

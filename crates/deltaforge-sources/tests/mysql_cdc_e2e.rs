@@ -1,5 +1,5 @@
 use anyhow::Result;
-use deltaforge_checkpoints::{CheckpointStore, MemCheckpointStore};
+use checkpoints::{CheckpointStore, MemCheckpointStore};
 use deltaforge_core::{Event, Op, Source};
 use deltaforge_sources::mysql::MySqlSource;
 use mysql_async::{prelude::Queryable, Pool as MySQLPool};

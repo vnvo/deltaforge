@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
-use deltaforge_checkpoints::{CheckpointStore, CheckpointStoreExt};
+use checkpoints::{CheckpointStore, CheckpointStoreExt};
 
 use crate::conn_utils::{RetryPolicy, retry_async, retryable_connect};
 

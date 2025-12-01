@@ -9,7 +9,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 deltaforge-config = { path = "../deltaforge-config"}
 deltaforge-core = { path = "../deltaforge-core"}
-deltaforge-checkpoints = { path = "../deltaforge-checkpoints"}
+checkpoints = { path = "../checkpoints"}
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

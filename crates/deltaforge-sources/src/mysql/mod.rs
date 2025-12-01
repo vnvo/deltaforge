@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
-use deltaforge_checkpoints::{CheckpointStore, CheckpointStoreExt};
+use checkpoints::{CheckpointStore, CheckpointStoreExt};
 use deltaforge_core::{Event, Source, SourceHandle, SourceResult};
 
 mod mysql_errors;

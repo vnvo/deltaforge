@@ -7,7 +7,7 @@ edition.workspace = true
 metrics.workspace = true
 tokio = { workspace = true }
 futures = { workspace = true }
-uuid ={ workspace = true}
+uuid = { workspace = true }
 serde_json = { workspace = true }
 parking_lot = { workspace = true }
 anyhow = { workspace = true }
@@ -16,10 +16,10 @@ axum = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 deltaforge-core = { path = "../deltaforge-core" }
 deltaforge-config = { path = "../deltaforge-config" }
-deltaforge-o11y ={ path = "../deltaforge-o11y"}
+deltaforge-o11y = { path = "../deltaforge-o11y" }
 deltaforge-registry = { path = "../deltaforge-registry" }
 deltaforge-sources = { path = "../deltaforge-sources" }
 deltaforge-sinks = { path = "../deltaforge-sinks" }
 processors = { path = "../processors" }
 rest-api = { path = "../rest-api" }
-deltaforge-checkpoints ={ path = "../deltaforge-checkpoints"}
+checkpoints = { path = "../checkpoints" }

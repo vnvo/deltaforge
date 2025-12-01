@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use deltaforge_checkpoints::CheckpointStore;
+use checkpoints::CheckpointStore;
 use futures::future::BoxFuture;
 use metrics::counter;
 use tokio::time::{Instant, interval};
