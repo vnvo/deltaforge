@@ -1,0 +1,32 @@
+[package]
+name = "sources"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+deltaforge-config = { path = "../deltaforge-config" }
+deltaforge-core = { path = "../deltaforge-core" }
+checkpoints = { path = "../checkpoints" }
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+mysql-binlog-connector-rust = "0.3"
+crc32fast = "1.5"
+mysql_async = "0.36"
+base64.workspace = true
+url.workspace = true
+mysql_common = { version = "0.35", features = ["binlog"] }
+rand = "0.9.2"
+
+[dev-dependencies]
+testcontainers = "0.25"
+tracing.workspace = true
+tracing-subscriber = "0.3"
+tempfile = "3"

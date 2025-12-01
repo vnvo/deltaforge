@@ -764,6 +764,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
+name = "checkpoints"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1115,30 +1127,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "deltaforge-api"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "parking_lot",
- "serde",
- "serde_json",
- "tracing",
-]
-
-[[package]]
-name = "deltaforge-checkpoints"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
 name = "deltaforge-config"
 version = "0.1.0"
 dependencies = [
@@ -1161,108 +1149,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "checkpoints",
  "chrono",
- "deltaforge-checkpoints",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
  "tracing",
- "uuid",
-]
-
-[[package]]
-name = "deltaforge-o11y"
-version = "0.1.0"
-dependencies = [
- "axum",
- "metrics",
- "metrics-exporter-prometheus",
- "once_cell",
- "tokio",
- "tracing",
- "tracing-log",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "deltaforge-registry"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "deltaforge-core",
- "serde_json",
- "tracing",
-]
-
-[[package]]
-name = "deltaforge-runner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "deltaforge-api",
- "deltaforge-checkpoints",
- "deltaforge-config",
- "deltaforge-core",
- "deltaforge-o11y",
- "deltaforge-registry",
- "deltaforge-sinks",
- "deltaforge-sources",
- "futures",
- "metrics",
- "parking_lot",
- "processors",
- "serde_json",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "deltaforge-sinks"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "deltaforge-config",
- "deltaforge-core",
- "rdkafka",
- "redis",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "deltaforge-sources"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "crc32fast",
- "deltaforge-checkpoints",
- "deltaforge-config",
- "deltaforge-core",
- "mysql-binlog-connector-rust",
- "mysql_async",
- "mysql_common 0.35.5",
- "rand 0.9.2",
- "serde",
- "serde_json",
- "tempfile",
- "testcontainers",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "url",
  "uuid",
 ]
 
@@ -2882,6 +2776,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "o11y"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "once_cell",
+ "tokio",
+ "tracing",
+ "tracing-log",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "object"
 version = "0.36.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3554,6 +3462,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rest-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3594,6 +3514,31 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "checkpoints",
+ "clap",
+ "deltaforge-config",
+ "deltaforge-core",
+ "futures",
+ "metrics",
+ "o11y",
+ "parking_lot",
+ "processors",
+ "rest-api",
+ "schema-registry",
+ "serde_json",
+ "sinks",
+ "sources",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3766,6 +3711,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "891d81b926048e76efe18581bf793546b4c0eaf8448d72be8de2bbee5fd166e1"
 dependencies = [
  "windows-sys 0.61.0",
+]
+
+[[package]]
+name = "schema-registry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "deltaforge-core",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -4051,6 +4007,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
+name = "sinks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "deltaforge-config",
+ "deltaforge-core",
+ "rdkafka",
+ "redis",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sketches-ddsketch"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4104,6 +4075,35 @@ dependencies = [
  "serde_json",
  "unicode-id-start",
  "url",
+]
+
+[[package]]
+name = "sources"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "checkpoints",
+ "chrono",
+ "crc32fast",
+ "deltaforge-config",
+ "deltaforge-core",
+ "mysql-binlog-connector-rust",
+ "mysql_async",
+ "mysql_common 0.35.5",
+ "rand 0.9.2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "testcontainers",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
 ]
 
 [[package]]

@@ -6,7 +6,7 @@ use std::sync::{
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use deltaforge_checkpoints::CheckpointStore;
+use checkpoints::CheckpointStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
@@ -14,7 +14,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::warn;
 use uuid::Uuid;
 
 pub mod errors;

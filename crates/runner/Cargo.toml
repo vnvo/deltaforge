@@ -1,0 +1,25 @@
+[package]
+name = "runner"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+metrics.workspace = true
+tokio = { workspace = true }
+futures = { workspace = true }
+uuid = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+deltaforge-core = { path = "../deltaforge-core" }
+deltaforge-config = { path = "../deltaforge-config" }
+o11y = { path = "../o11y" }
+schema-registry = { path = "../schema-registry" }
+sources = { path = "../sources" }
+sinks = { path = "../sinks" }
+processors = { path = "../processors" }
+rest-api = { path = "../rest-api" }
+checkpoints = { path = "../checkpoints" }

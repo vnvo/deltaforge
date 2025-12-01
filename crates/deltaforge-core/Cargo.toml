@@ -12,6 +12,6 @@ serde_json.workspace = true
 uuid.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-deltaforge-checkpoints ={ path = "../deltaforge-checkpoints"}
 tokio-util.workspace = true
 thiserror.workspace = true
+checkpoints = { path = "../checkpoints" }

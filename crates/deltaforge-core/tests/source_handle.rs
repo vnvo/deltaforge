@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use deltaforge_checkpoints::{CheckpointStore, MemCheckpointStore};
+use checkpoints::{CheckpointStore, MemCheckpointStore};
 use deltaforge_core::{Event, Op, Source, SourceHandle, SourceMeta};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
