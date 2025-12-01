@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use deltaforge_config::RedisSinkCfg;
 use deltaforge_core::{Event, Sink, SinkError, SinkResult};
 use tokio::time::{Duration, timeout};
-use tracing::{debug, info};
+use tracing::debug;
 
 pub struct RedisSink {
     id: String,

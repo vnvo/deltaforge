@@ -6,11 +6,11 @@ use checkpoints::CheckpointStore;
 use futures::future::BoxFuture;
 use metrics::counter;
 use tokio::time::{Instant, interval};
-use tracing::{debug, warn};
+use tracing::debug;
 use uuid::Uuid;
 
 use deltaforge_config::{BatchConfig, CommitPolicy};
-use deltaforge_core::{ArcDynProcessor, ArcDynSink, CheckpointMeta, Event, SinkError};
+use deltaforge_core::{ArcDynProcessor, ArcDynSink, CheckpointMeta, Event};
 
 /// Persist/commit the token after the batch is successfully delivered to sinks.
 pub type CommitCpFn<Tok> =
@@ -61,7 +61,7 @@ fn event_size_hint(ev: &Event) -> usize {
 }
 
 /// something to fix later in the `Event`
-fn is_tx_boundary(ev: &Event) -> bool {
+fn is_tx_boundary(_ev: &Event) -> bool {
     //ev.is_tx_boundary()
     true
 }
@@ -116,7 +116,7 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
 
     /// Build - process (mutable) - freeze (Arc<[Event]>) - deliver - maybe commit.
     pub async fn run(
-        mut self,
+        self,
         mut event_rx: tokio::sync::mpsc::Receiver<Event>,
     ) -> Result<()> {
         let tick_ms = self.batch_cfg_eff.max_ms.unwrap_or(200);
@@ -160,7 +160,7 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                     let would_exceed_bytes  = cfg.max_bytes.map(|m| b.bytes + event_size_hint(&ev) >= m).unwrap_or(false);
                     let limit_hit = would_exceed_events || would_exceed_bytes;
 
-                    let respect_tx = cfg.respect_source_tx.unwrap_or(true);
+                    let _respect_tx = cfg.respect_source_tx.unwrap_or(true);
                     let boundary = is_tx_boundary(&ev);
 
                     // If limits hit, flush current (avoid splitting tx if configured).

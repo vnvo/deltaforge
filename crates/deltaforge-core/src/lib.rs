@@ -14,7 +14,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::warn;
 use uuid::Uuid;
 
 pub mod errors;

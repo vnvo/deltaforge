@@ -86,11 +86,6 @@ pub(super) async fn dispatch_event(
         | EventData::XaPrepare(_)
         | EventData::HeartBeat
         | EventData::NotSupported => Ok(()),
-
-        _ => {
-            debug!(source_id=%ctx.source_id, "unhandled event variant");
-            Ok(())
-        }
     }
 }
 

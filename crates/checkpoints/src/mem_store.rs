@@ -1,5 +1,5 @@
 use super::CheckpointResult;
-use super::{CheckpointStore, Result};
+use super::CheckpointStore;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
