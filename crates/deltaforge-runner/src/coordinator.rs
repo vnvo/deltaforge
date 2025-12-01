@@ -331,7 +331,7 @@ pub(crate) fn build_batch_processor(
 
     let procs = Arc::clone(&processors);
 
-    Arc::new(move |mut events: Vec<Event>| {
+    Arc::new(move |events: Vec<Event>| {
         let procs = Arc::clone(&procs);
 
         async move {
@@ -340,38 +340,17 @@ pub(crate) fn build_batch_processor(
                 return Ok(ProcessedBatch { events, last_checkpoint: last_cp });
             }
 
-            let mut out = Vec::with_capacity(events.len());
-            let mut last_cp: Option<CheckpointMeta> = None;
+            //let mut out = Vec::with_capacity(events.len());
+            let mut batch = events;
 
-            for mut ev in events.drain(..) {
-                let mut dropped = false;
-                let mut extras: Vec<Event> = Vec::new();
-
-                for p in procs.iter() {
-                    match p.process(&mut ev).await {
-                        Ok(mut produced) => {
-                            // append ALL extras; do not treat as replacement
-                            for e2 in produced.drain(..) {
-                                if let Some(cp) = e2.checkpoint.clone() { last_cp = Some(cp); }
-                                extras.push(e2);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error=?e, "processor failed; dropping original event");
-                            dropped = true;
-                            break;
-                        }
-                    }
-                }
-
-                if !dropped {
-                    if let Some(cp) = ev.checkpoint.clone() { last_cp = Some(cp); }
-                    out.push(ev);          // keep mutated original
-                    out.extend(extras);    // plus all extras
-                }
+            for p in procs.iter() {
+                let pid = p.id();
+                batch = p.process(batch).await.with_context(|| format!("processor {pid} failed"))?;
             }
 
-            Ok(ProcessedBatch { events: out, last_checkpoint: last_cp })
+            let last_cp = batch.iter().filter_map(|e| e.checkpoint.clone()).last();
+
+            Ok(ProcessedBatch { events: batch, last_checkpoint: last_cp })
         }
         .boxed()
     })

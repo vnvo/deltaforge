@@ -1,15 +1,15 @@
 use anyhow::{Context, Result};
 use axum::Router;
-use clap::Parser;
-use rest_api::{AppState, PipeInfo, router};
 use checkpoints::{CheckpointStore, FileCheckpointStore};
+use clap::Parser;
 use deltaforge_config::{PipelineSpec, load_cfg};
 use deltaforge_core::{CheckpointMeta, Event, SourceHandle};
 use deltaforge_o11y as o11y;
-use processors::build_processors;
 use deltaforge_sinks::build_sinks;
 use deltaforge_sources::build_source;
 use metrics::{counter, gauge};
+use processors::build_processors;
+use rest_api::{AppState, PipeInfo, router};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
         let pipeline_name = ps.metadata.name.clone();
         let source = build_source(&ps)
             .context(format!("build source for {pipeline_name}"))?;
-        let processors = build_processors(&ps);
+        let processors = build_processors(&ps)?;
         let sinks = build_sinks(&ps).context("build sinks")?;
 
         let (event_tx, event_rx) = mpsc::channel::<Event>(4096);
