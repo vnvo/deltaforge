@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
-use deltaforge_core::{Event, Op, Source, SourceHandle, SourceMeta};
+use deltaforge_core::{Event, Op, Source, SourceHandle, SourceMeta, SourceResult};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -40,9 +40,9 @@ impl Source for FakeSource {
         let pause_notify_task = pause_notify.clone();
         let tenant = self.tenant.to_string();
         let period = self.period;
-        let id = self.id.to_string();
+        let _id = self.id.to_string();
 
-        let join: JoinHandle<Result<()>> = tokio::spawn(async move {
+        let join: JoinHandle<SourceResult<()>> = tokio::spawn(async move {
             let mut n: u64 = 0;
             loop {
                 // Handle cancellation

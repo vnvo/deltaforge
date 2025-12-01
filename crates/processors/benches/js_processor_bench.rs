@@ -1,10 +1,10 @@
 use anyhow::Result;
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use deltaforge_core::{Event, Op, SourceMeta, Processor};
-use processors::JsProcessor; // <--- adjust if your crate/module name differs
+use processors::JsProcessor;
 use once_cell::sync::Lazy;
 use serde_json::json;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::runtime::Runtime;
 
 static RT: Lazy<Runtime> = Lazy::new(|| Runtime::new().unwrap());

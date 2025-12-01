@@ -27,10 +27,9 @@ metadata:
   name: unit
   tenant: test
 spec:
-  sharding: { mode: table }
-  connection_policy: { defaultMode: shared }
-  sources:
-    - type: postgres
+  source:
+    type: postgres
+    config:
       id: pg
       dsn: ${PG_ORDERS_DSN}
       publication: df_pub
@@ -43,9 +42,10 @@ spec:
         return [event];
   sinks:
     - type: kafka
-      id: k
-      brokers: localhost:9092
-      topic: unit.events
+      config:
+        id: k
+        brokers: localhost:9092
+        topic: unit.events
 "#;
     let path = write_temp(yaml);
 
@@ -58,20 +58,13 @@ spec:
     assert!(spec.spec.connection_policy.is_some());
 
     // assert source
-    assert_eq!(spec.spec.sources.len(), 1);
-    match &spec.spec.sources[0] {
-        SourceCfg::Postgres {
-            id,
-            dsn,
-            publication,
-            slot,
-            tables,
-        } => {
-            assert_eq!(id, "pg");
-            assert_eq!(dsn, "postgres://pgu:pgpass@localhost:5432/orders");
-            assert_eq!(publication.as_deref(), Some("df_pub"));
-            assert_eq!(slot.as_deref(), Some("df_slot"));
-            assert_eq!(tables, &vec!["public.t1".to_string()]);
+    match &spec.spec.source {
+        SourceCfg::Postgres(pc) => {
+            assert_eq!(pc.id, "pg");
+            assert_eq!(pc.dsn, "postgres://pgu:pgpass@localhost:5432/orders");
+            assert_eq!(pc.publication.as_deref(), Some("df_pub"));
+            assert_eq!(pc.slot.as_deref(), Some("df_slot"));
+            assert_eq!(pc.tables, vec!["public.t1".to_string()]);
         }
         _ => panic!("expected postgres source"),
     }
@@ -89,18 +82,12 @@ spec:
     // assert sink
     assert_eq!(spec.spec.sinks.len(), 1);
     match &spec.spec.sinks[0] {
-        SinkCfg::Kafka {
-            id,
-            brokers,
-            topic,
-            exactly_once,
-            required,
-        } => {
-            assert_eq!(id, "k");
-            assert_eq!(brokers, "localhost:9092");
-            assert_eq!(topic, "unit.events");
-            assert!(required.is_none());
-            assert!(exactly_once.is_none());
+        SinkCfg::Kafka(kc) => {
+            assert_eq!(kc.id, "k");
+            assert_eq!(kc.brokers, "localhost:9092");
+            assert_eq!(kc.topic, "unit.events");
+            assert!(kc.required.is_none());
+            assert!(kc.exactly_once.is_none());
         }
         _ => panic!("expected kafka sink"),
     }
@@ -120,9 +107,9 @@ apiVersion: deltaforge/v1
 kind: Pipeline
 metadata: { name: unit2, tenant: t }
 spec:
-  sharding: { mode: table }
-  sources:
-    - type: mysql
+  source:
+    type: mysql
+    config:
       id: m
       dsn: ${MYSQL_ORDERS_DSN}
       tables: [orders, order_items]
@@ -132,26 +119,28 @@ spec:
       inline: "return [event];"
   sinks:
     - type: kafka
-      id: k
-      brokers: localhost:9092
-      topic: t.orders
+      config:
+        id: k
+        brokers: localhost:9092
+        topic: t.orders
     - type: redis
-      id: r
-      uri: redis://127.0.0.1:6379
-      stream: t.orders
+      config:
+        id: r
+        uri: redis://127.0.0.1:6379
+        stream: t.orders
 "#;
 
     let path = write_temp(yaml);
     let spec = load_from_path(path.to_str().unwrap()).expect("parse ok");
 
     // source checks
-    match &spec.spec.sources[0] {
-        SourceCfg::Mysql { id, dsn, tables } => {
-            assert_eq!(id, "m");
-            assert_eq!(dsn, "mysql://root:pws@localhost:3306/orders");
+    match &spec.spec.source {
+        SourceCfg::Mysql(mc) => {
+            assert_eq!(mc.id, "m");
+            assert_eq!(mc.dsn, "mysql://root:pws@localhost:3306/orders");
             assert_eq!(
-                tables,
-                &vec!["orders".to_string(), "order_items".to_string()]
+                mc.tables,
+                vec!["orders".to_string(), "order_items".to_string()]
             );
         }
         _ => panic!("expected mysql source"),
@@ -189,7 +178,7 @@ apiVersion: deltaforge/v1
 kind: Pipeline
 metadata: { name: bad, tenant: t }
 spec:
-  sources: []
+  source: []
   processors:
     - type: javascript
       id: js
@@ -260,7 +249,7 @@ apiVersion: deltaforge/v1
 kind: Pipeline
 metadata: { name: envtest, tenant: t }
 spec:
-  sources: []
+  source: []
   processors: []
   sinks:
     - type: kafka
@@ -276,11 +265,11 @@ spec:
     let spec = load_from_path(path.to_str().unwrap()).expect("parse ok");
 
     match &spec.spec.sinks[0] {
-        SinkCfg::Kafka { brokers, .. } => assert_eq!(brokers, "localhost:9092"),
+        SinkCfg::Kafka(ks) => assert_eq!(ks.brokers, "localhost:9092"),
         _ => panic!("expected kafka"),
     }
     match &spec.spec.sinks[1] {
-        SinkCfg::Redis { uri, .. } => assert_eq!(uri, "redis://127.0.0.1:6379"),
+        SinkCfg::Redis(rc) => assert_eq!(rc.uri, "redis://127.0.0.1:6379"),
         _ => panic!("expected redis"),
     }
 }
