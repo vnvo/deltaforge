@@ -4,7 +4,7 @@ use checkpoints::{CheckpointStore, FileCheckpointStore};
 use clap::Parser;
 use deltaforge_config::{PipelineSpec, load_cfg};
 use deltaforge_core::{CheckpointMeta, Event, SourceHandle};
-use deltaforge_o11y as o11y;
+use o11y;
 use sinks::build_sinks;
 use sources::build_source;
 use metrics::{counter, gauge};

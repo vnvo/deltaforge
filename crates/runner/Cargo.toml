@@ -16,7 +16,7 @@ axum = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 deltaforge-core = { path = "../deltaforge-core" }
 deltaforge-config = { path = "../deltaforge-config" }
-deltaforge-o11y = { path = "../deltaforge-o11y" }
+o11y = { path = "../o11y" }
 schema-registry = { path = "../schema-registry" }
 sources = { path = "../sources" }
 sinks = { path = "../sinks" }

@@ -1161,20 +1161,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "deltaforge-o11y"
-version = "0.1.0"
-dependencies = [
- "axum",
- "metrics",
- "metrics-exporter-prometheus",
- "once_cell",
- "tokio",
- "tracing",
- "tracing-log",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "deno_core"
 version = "0.357.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2790,6 +2776,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "o11y"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "once_cell",
+ "tokio",
+ "tracing",
+ "tracing-log",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "object"
 version = "0.36.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3526,9 +3526,9 @@ dependencies = [
  "clap",
  "deltaforge-config",
  "deltaforge-core",
- "deltaforge-o11y",
  "futures",
  "metrics",
+ "o11y",
  "parking_lot",
  "processors",
  "rest-api",
