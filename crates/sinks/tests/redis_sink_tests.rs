@@ -1,7 +1,7 @@
 use anyhow::Result;
 use deltaforge_config::RedisSinkCfg;
 use deltaforge_core::{Event, Op, Sink, SourceMeta};
-use deltaforge_sinks::redis::RedisSink;
+use sinks::redis::RedisSink;
 use serde_json::json;
 
 #[tokio::test(flavor = "multi_thread")]

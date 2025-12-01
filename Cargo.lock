@@ -1186,31 +1186,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "deltaforge-runner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "checkpoints",
- "clap",
- "deltaforge-config",
- "deltaforge-core",
- "deltaforge-o11y",
- "deltaforge-registry",
- "deltaforge-sources",
- "futures",
- "metrics",
- "parking_lot",
- "processors",
- "rest-api",
- "serde_json",
- "sinks",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "deltaforge-sources"
 version = "0.1.0"
 dependencies = [
@@ -3579,6 +3554,31 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "checkpoints",
+ "clap",
+ "deltaforge-config",
+ "deltaforge-core",
+ "deltaforge-o11y",
+ "deltaforge-registry",
+ "deltaforge-sources",
+ "futures",
+ "metrics",
+ "parking_lot",
+ "processors",
+ "rest-api",
+ "serde_json",
+ "sinks",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
