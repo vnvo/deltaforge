@@ -19,7 +19,7 @@ deltaforge-config = { path = "../deltaforge-config" }
 deltaforge-o11y = { path = "../deltaforge-o11y" }
 deltaforge-registry = { path = "../deltaforge-registry" }
 deltaforge-sources = { path = "../deltaforge-sources" }
-deltaforge-sinks = { path = "../deltaforge-sinks" }
+sinks = { path = "../sinks" }
 processors = { path = "../processors" }
 rest-api = { path = "../rest-api" }
 checkpoints = { path = "../checkpoints" }

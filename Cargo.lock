@@ -1197,7 +1197,6 @@ dependencies = [
  "deltaforge-core",
  "deltaforge-o11y",
  "deltaforge-registry",
- "deltaforge-sinks",
  "deltaforge-sources",
  "futures",
  "metrics",
@@ -1205,24 +1204,10 @@ dependencies = [
  "processors",
  "rest-api",
  "serde_json",
+ "sinks",
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "deltaforge-sinks"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "deltaforge-config",
- "deltaforge-core",
- "rdkafka",
- "redis",
- "serde_json",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -4049,6 +4034,21 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "sinks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "deltaforge-config",
+ "deltaforge-core",
+ "rdkafka",
+ "redis",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "sketches-ddsketch"

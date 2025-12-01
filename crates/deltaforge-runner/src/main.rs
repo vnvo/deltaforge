@@ -5,7 +5,7 @@ use clap::Parser;
 use deltaforge_config::{PipelineSpec, load_cfg};
 use deltaforge_core::{CheckpointMeta, Event, SourceHandle};
 use deltaforge_o11y as o11y;
-use deltaforge_sinks::build_sinks;
+use sinks::build_sinks;
 use deltaforge_sources::build_source;
 use metrics::{counter, gauge};
 use processors::build_processors;
