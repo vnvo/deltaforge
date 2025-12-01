@@ -7,9 +7,9 @@ edition.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-deltaforge-config = { path = "../deltaforge-config"}
-deltaforge-core = { path = "../deltaforge-core"}
-checkpoints = { path = "../checkpoints"}
+deltaforge-config = { path = "../deltaforge-config" }
+deltaforge-core = { path = "../deltaforge-core" }
+checkpoints = { path = "../checkpoints" }
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -22,7 +22,7 @@ crc32fast = "1.5"
 mysql_async = "0.36"
 base64.workspace = true
 url.workspace = true
-mysql_common = {version = "0.35", features = ["binlog"]}
+mysql_common = { version = "0.35", features = ["binlog"] }
 rand = "0.9.2"
 
 [dev-dependencies]
