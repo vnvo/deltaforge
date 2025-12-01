@@ -1,7 +1,7 @@
 use anyhow::Result;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
 use deltaforge_core::{Event, Op, Source};
-use deltaforge_sources::mysql::MySqlSource;
+use sources::mysql::MySqlSource;
 use mysql_async::{prelude::Queryable, Pool as MySQLPool};
 use std::collections::HashSet;
 use std::io::BufRead;

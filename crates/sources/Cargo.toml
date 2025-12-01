@@ -1,5 +1,5 @@
 [package]
-name = "deltaforge-sources"
+name = "sources"
 version = "0.1.0"
 edition.workspace = true
 

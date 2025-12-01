@@ -6,7 +6,7 @@ use deltaforge_config::{PipelineSpec, load_cfg};
 use deltaforge_core::{CheckpointMeta, Event, SourceHandle};
 use deltaforge_o11y as o11y;
 use sinks::build_sinks;
-use deltaforge_sources::build_source;
+use sources::build_source;
 use metrics::{counter, gauge};
 use processors::build_processors;
 use rest_api::{AppState, PipeInfo, router};
