@@ -39,6 +39,11 @@ impl KafkaSink {
                 .set("max.in.flight.requests.per.connection", "5");
         }
 
+        // apply user overrides, if any
+        for (k, v) in &ks_cfg.client_conf {
+            cfg.set(k, v);
+        }
+
         let producer: FutureProducer =
             cfg.create().with_context(|| "creating kafka producer")?;
 

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::{collections::HashMap, fs};
 use thiserror::Error;
 use tracing::error;
 use walkdir::WalkDir;
@@ -118,6 +118,13 @@ pub struct KafkaSinkCfg {
     pub required: Option<bool>,
     #[serde(default)]
     pub exactly_once: Option<bool>,
+
+    /// Raw librdkafka client configuration overrides.
+    ///
+    /// Keys and values are passed directly to `rdkafka::ClientConfig::set`.
+    /// These are applied *after* DeltaForge's own defaults, so user values win.
+    #[serde(default)]
+    pub client_conf: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
