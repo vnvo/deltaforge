@@ -1,9 +1,9 @@
 use anyhow::Result;
 use deltaforge_config::RedisSinkCfg;
 use deltaforge_core::{Event, Op, Sink, SourceMeta};
+use redis::AsyncCommands;
 use serde_json::json;
 use sinks::redis::RedisSink;
-use redis::AsyncCommands;
 
 /// This test assumes a Redis instance is running on localhost:6379 (db 0)
 /// and that it's OK to create/delete the `df.test` stream.
