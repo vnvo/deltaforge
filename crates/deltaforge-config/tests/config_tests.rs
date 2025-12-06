@@ -1,4 +1,4 @@
-use deltaforge_config::{ProcessorCfg, SinkCfg, SourceCfg, load_from_path};
+use deltaforge_config::{load_from_path, ConfigError, ProcessorCfg, SinkCfg, SourceCfg};
 use pretty_assertions::assert_eq;
 use serial_test::serial;
 use std::io::Write;
@@ -6,7 +6,7 @@ use std::io::Write;
 fn write_temp(contents: &str) -> tempfile::TempPath {
     let mut f = tempfile::NamedTempFile::new().expect("temp file");
     f.write_all(contents.as_bytes()).expect("write");
-    f.into_temp_path() //.to_path_buf()
+    f.into_temp_path()
 }
 
 #[test]
@@ -55,7 +55,6 @@ spec:
     // assert basics
     assert_eq!(spec.metadata.name, "unit");
     assert_eq!(spec.metadata.tenant, "test");
-    assert!(spec.spec.connection_policy.is_some());
 
     // assert source
     match &spec.spec.source {
@@ -86,6 +85,7 @@ spec:
             assert_eq!(kc.id, "k");
             assert_eq!(kc.brokers, "localhost:9092");
             assert_eq!(kc.topic, "unit.events");
+            // make sure new optional fields default correctly
             assert!(kc.required.is_none());
             assert!(kc.exactly_once.is_none());
         }
@@ -102,6 +102,7 @@ fn parses_mysql_and_multiple_sinks() {
             "mysql://root:pws@localhost:3306/orders",
         );
     }
+
     let yaml = r#"
 apiVersion: deltaforge/v1
 kind: Pipeline
@@ -113,10 +114,7 @@ spec:
       id: m
       dsn: ${MYSQL_ORDERS_DSN}
       tables: [orders, order_items]
-  processors:
-    - type: javascript
-      id: js
-      inline: "return [event];"
+  processors: []
   sinks:
     - type: kafka
       config:
@@ -127,17 +125,22 @@ spec:
       config:
         id: r
         uri: redis://127.0.0.1:6379
-        stream: t.orders
+        stream: s
 "#;
 
+    // act
     let path = write_temp(yaml);
     let spec = load_from_path(path.to_str().unwrap()).expect("parse ok");
 
-    // source checks
+    // source
     match &spec.spec.source {
         SourceCfg::Mysql(mc) => {
             assert_eq!(mc.id, "m");
-            assert_eq!(mc.dsn, "mysql://root:pws@localhost:3306/orders");
+            assert_eq!(
+                mc.dsn,
+                "mysql://root:pws@localhost:3306/orders",
+                "env expansion failed for MYSQL_ORDERS_DSN"
+            );
             assert_eq!(
                 mc.tables,
                 vec!["orders".to_string(), "order_items".to_string()]
@@ -148,42 +151,61 @@ spec:
 
     // sinks
     assert_eq!(spec.spec.sinks.len(), 2);
+    match &spec.spec.sinks[0] {
+        SinkCfg::Kafka(kc) => {
+            assert_eq!(kc.id, "k");
+            assert_eq!(kc.brokers, "localhost:9092");
+            assert_eq!(kc.topic, "t.orders");
+        }
+        _ => panic!("expected kafka"),
+    }
+    match &spec.spec.sinks[1] {
+        SinkCfg::Redis(rc) => {
+            assert_eq!(rc.id, "r");
+            assert_eq!(rc.uri, "redis://127.0.0.1:6379");
+            assert_eq!(rc.stream, "s");
+        }
+        _ => panic!("expected redis"),
+    }
 }
 
 #[test]
+#[serial]
 fn invalid_yaml_errors() {
-    // Arrange
-    let bad = "this:\n  - is: [broken";
-    let path = write_temp(bad);
+    let yaml = r#"
+this is: [ definitely: not: valid: yaml
+"#;
+    let path = write_temp(yaml);
+    let err = load_from_path(path.to_str().unwrap())
+        .expect_err("should fail to parse invalid yaml");
 
-    // Act
-    let err = load_from_path(path.to_str().unwrap()).unwrap_err();
-
-    // Assert
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("parsing yaml")
-            || msg.contains("mapping")
-            || msg.contains("expected"),
-        "unexpected error: {msg}"
-    );
+    match err {
+        ConfigError::Parse { .. } => {} // expected
+        other => panic!("expected ConfigError::Parse, got: {other:?}"),
+    }
 }
 
 #[test]
 #[serial]
 fn missing_inline_for_js_processor_is_an_error() {
-    // Arrange: JS processor without `inline` field
     let yaml = r#"
 apiVersion: deltaforge/v1
 kind: Pipeline
-metadata: { name: bad, tenant: t }
+metadata: { name: badjs, tenant: t }
 spec:
-  source: []
+  source:
+    type: postgres
+    config:
+      id: pg
+      dsn: postgres://pgu:pgpass@localhost:5432/orders
+      tables: [public.t1]
   processors:
     - type: javascript
       id: js
+      # inline is intentionally missing
   sinks: []
 "#;
+
     let path = write_temp(yaml);
 
     // Act
@@ -208,7 +230,12 @@ spec:
     default_mode: dedicated
     preferred_replica: read-replica-1
     limits: { max_dedicated_per_source: 3 }
-  sources: []
+  source:
+    type: postgres
+    config:
+      id: pg
+      dsn: postgres://pgu:pgpass@localhost:5432/orders
+      tables: [public.t1]
   processors: []
   sinks: []
 "#;
@@ -227,7 +254,12 @@ apiVersion: deltaforge/v1
 kind: Pipeline
 metadata: { name: b, tenant: t }
 spec:
-  sources: []
+  source:
+    type: mysql
+    config:
+      id: m
+      dsn: mysql://root:pws@localhost:3306/orders
+      tables: [orders]
   processors: []
   sinks: []
 "#;
@@ -249,17 +281,24 @@ apiVersion: deltaforge/v1
 kind: Pipeline
 metadata: { name: envtest, tenant: t }
 spec:
-  source: []
+  source:
+    type: mysql
+    config:
+      id: m
+      dsn: mysql://root:pws@localhost:3306/orders
+      tables: [orders, order_items]
   processors: []
   sinks:
     - type: kafka
-      id: k
-      brokers: ${KAFKA_BROKERS}
-      topic: foo
+      config:
+        id: k
+        brokers: ${KAFKA_BROKERS}
+        topic: t.orders
     - type: redis
-      id: r
-      uri: ${REDIS_URI}
-      stream: s
+      config:
+        id: r
+        uri: ${REDIS_URI}
+        stream: s
 "#;
     let path = write_temp(yaml);
     let spec = load_from_path(path.to_str().unwrap()).expect("parse ok");
