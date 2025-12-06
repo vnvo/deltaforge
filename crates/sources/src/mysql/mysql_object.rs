@@ -1,7 +1,7 @@
 use base64::prelude::*;
 use mysql_binlog_connector_rust::column::column_value::ColumnValue;
 use mysql_common::{binlog::jsonb, io::ParseBuf, proto::MyDeserialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -74,4 +74,101 @@ fn handle_json(bytes: &[u8]) -> Value {
 
 fn to_b64(bytes: &Vec<u8>) -> String {
     BASE64_STANDARD.encode(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mysql_binlog_connector_rust::column::column_value::ColumnValue;
+    use serde_json::Value;
+    use std::sync::Arc;
+
+    #[test]
+    fn build_object_maps_basic_scalar_types() {
+        let cols = Arc::new(vec!["id".to_string(), "sku".to_string()]);
+        let included = [true, true];
+        let values = vec![
+            ColumnValue::LongLong(42),
+            ColumnValue::String(b"sku-1".to_vec()),
+        ];
+
+        let obj = build_object(&cols, &included, &values);
+        assert_eq!(obj["id"], Value::from(42_i64));
+        assert_eq!(obj["sku"], Value::from("sku-1"));
+    }
+
+    #[test]
+    fn build_object_respects_included_bitmap() {
+        let cols = Arc::new(vec![
+            "id".to_string(),
+            "ignored".to_string(),
+            "sku".to_string(),
+        ]);
+        // Only 1st and 3rd columns included; values contain only those
+        let included = [true, false, true];
+        let values = vec![
+            ColumnValue::LongLong(1),
+            ColumnValue::String(b"sku-xx".to_vec()),
+        ];
+
+        let obj = build_object(&cols, &included, &values);
+        assert_eq!(obj["id"], Value::from(1_i64));
+        assert_eq!(obj["sku"], Value::from("sku-xx"));
+        assert!(!obj.as_object().unwrap().contains_key("ignored"));
+    }
+
+    #[test]
+    fn build_object_encodes_binary_string_as_base64_wrapper() {
+        let cols = Arc::new(vec!["data".to_string()]);
+        let included = [true];
+        let bytes = vec![0xff, 0x00, 0xaa];
+        let values = vec![ColumnValue::String(bytes.clone())];
+
+        let obj = build_object(&cols, &included, &values);
+        let data = &obj["data"];
+        // Should be an object { "_base64": "..." }
+        assert!(data.is_object());
+        let base64 = &data["_base64"];
+        assert!(base64.is_string());
+        let expected = BASE64_STANDARD.encode(&bytes);
+        assert_eq!(base64.as_str().unwrap(), expected);
+    }
+
+    #[test]
+    fn build_object_encodes_blob_as_base64_wrapper() {
+        let cols = Arc::new(vec!["blobz".to_string()]);
+        let included = [true];
+        let bytes = vec![0xde, 0xad, 0xbe, 0xef];
+        let values = vec![ColumnValue::Blob(bytes.clone())];
+
+        let obj = build_object(&cols, &included, &values);
+        let data = &obj["blobz"];
+        assert!(data.is_object());
+        let base64 = &data["_base64"];
+        assert!(base64.is_string());
+        let expected = BASE64_STANDARD.encode(&bytes);
+        assert_eq!(base64.as_str().unwrap(), expected);
+    }
+
+    #[test]
+    fn handle_json_falls_back_to_textual_json() {
+        // This is NOT MySQL JSONB, so parse_mysql_jsonb will fail,
+        // but it's valid UTF-8 textual JSON.
+        let bytes = br#"{"a":1,"b":"x"}"#;
+        let v = super::handle_json(bytes);
+        assert_eq!(v["a"], Value::from(1));
+        assert_eq!(v["b"], Value::from("x"));
+    }
+
+    #[test]
+    fn handle_json_wraps_non_utf8_as_base64_json() {
+        // Neither JSONB nor UTF-8 → we expect the _base64_json wrapper
+        let bytes = [0xff, 0x00, 0x01];
+        let v = super::handle_json(&bytes);
+        assert!(v.is_object());
+        let inner = &v["_base64_json"];
+        assert!(inner.is_string());
+        let expected = BASE64_STANDARD.encode(&bytes);
+        assert_eq!(inner.as_str().unwrap(), expected);
+    }
 }
