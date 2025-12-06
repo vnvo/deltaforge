@@ -27,6 +27,7 @@ fn make_test_event() -> Event {
 
 /// This test assumes a Kafka broker is available at localhost:9092 and
 /// auto-topic-creation is enabled.
+#[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn kafka_sink_writes_to_topic() -> Result<()> {
     let cfg = KafkaSinkCfg {
@@ -64,6 +65,7 @@ async fn kafka_sink_writes_to_topic() -> Result<()> {
 
 /// Smoke test for the `exactly_once` branch in KafkaSink::new.
 /// We don't validate EOS semantics here, just that send works.
+#[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn kafka_sink_with_exactly_once_enabled() -> Result<()> {
     let cfg = KafkaSinkCfg {

@@ -7,6 +7,7 @@ use sinks::redis::RedisSink;
 
 /// This test assumes a Redis instance is running on localhost:6379 (db 0)
 /// and that it's OK to create/delete the `df.test` stream.
+#[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn redis_sink_writes_stream() -> Result<()> {
     // Arrange: config for the sink
