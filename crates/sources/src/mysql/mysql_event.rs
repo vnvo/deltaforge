@@ -329,3 +329,195 @@ async fn handle_xid(ctx: &mut RunCtx) {
     )
     .await;
 }
+
+
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::{Arc, atomic::AtomicBool}, time::Duration};
+    use tokio::sync::{Notify, mpsc};
+    use tokio_util::sync::CancellationToken;
+
+    use checkpoints::{CheckpointStore, MemCheckpointStore};
+    use mysql_binlog_connector_rust::{column::column_value::ColumnValue, event::{
+        row_event::RowEvent, write_rows_event::WriteRowsEvent,
+        update_rows_event::UpdateRowsEvent,
+        delete_rows_event::DeleteRowsEvent,
+    }};
+
+    use crate::{conn_utils::RetryPolicy, mysql::{AllowList, MySqlSchemaCache}};
+
+    use super::*;
+    
+    const TABLE_ID: u64 = 42;
+
+    fn make_table_map() -> TableMapEvent {
+        TableMapEvent { 
+            table_id: TABLE_ID, 
+            database_name: "shop".to_string(), 
+            table_name: "orders".to_string(), 
+            column_types: vec![], 
+            column_metas: vec![], 
+            null_bits: vec![] }
+    }
+
+    /// RunCtx suitable for unit-testing the row handlers:
+    /// - in-memory checkpoint store
+    /// - schema cache pre-populated for shop.orders so no DB is touched
+    /// - allow-list matching 'shop.orders' only
+
+    fn make_runctx(tx: mpsc::Sender<Event>) -> RunCtx {
+        let mut cols_map = HashMap::new();
+        cols_map.insert(
+            ("shop".to_string(), "orders".to_string()),
+            Arc::new(vec!["id".to_string(), "sku".to_string()]),
+        );
+
+        let schema = MySqlSchemaCache::from_static(cols_map);
+        let chkpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new().expect("mem checkpoint store"));
+
+        RunCtx { 
+            source_id: "mysql-unit".to_string(), 
+            tenant: "data-corp".to_string(), 
+            dsn: "mysql://localhost/ignored".to_string(), 
+            host: "localhost".to_string(), 
+            default_db: "shop".to_string(), 
+            server_id: 1, 
+            tx, 
+            chkpt, 
+            cancel: CancellationToken::new(), 
+            paused: Arc::new(AtomicBool::new(false)), 
+            pause_notify: Arc::new(Notify::new()), 
+            schema, 
+            allow: AllowList::new(&["shop.orders".to_string()]), 
+            retry: RetryPolicy::default(), 
+            inactivity: Duration::from_secs(30), 
+            table_map: {
+                let mut m = HashMap::new();
+                m.insert(TABLE_ID, make_table_map());
+                m
+            }, 
+            last_file: "mysql-bin.000001".to_string(), 
+            last_pos: 4, 
+            last_gtid: Some("GTID-UNIT".to_string()), 
+        }
+    } 
+
+    fn make_header() -> EventHeader {
+        EventHeader { timestamp: 1_700_000_000, 
+            event_type: 30, 
+            server_id: 1, 
+            event_length: 0, 
+            next_event_position: 0, 
+            event_flags: 0, 
+        }
+    }
+    
+    #[tokio::test]
+    async fn handle_write_rows_mits_insert_with_after_only() {
+        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let mut ctx = make_runctx(tx);
+        let row = RowEvent {
+            column_values: vec![
+                ColumnValue::LongLong(1),
+                ColumnValue::String(b"sku-1".to_vec()),
+            ],
+        };
+
+        let ev = WriteRowsEvent {
+            table_id: TABLE_ID,
+            included_columns: vec![true, true],
+            rows: vec![row],
+        };
+
+        handle_write_rows(&mut ctx, &make_header(), ev)
+            .await
+            .expect("write rows should succeed");
+
+        let produced = rx.recv().await.expect("expected one event");
+        assert_eq!(produced.op, Op::Insert);
+        assert!(produced.before.is_none(), "insert must not have 'before'");
+        let after = produced.after.expect("insert must have 'after'");
+        assert_eq!(after["id"], 1);
+        assert_eq!(after["sku"], "sku-1");
+        assert_eq!(produced.table, "shop.orders");
+        assert_eq!(produced.tx_id.as_deref(), Some("GTID-UNIT"));        
+
+    }
+
+    #[tokio::test]
+    async fn handle_update_rows_emits_update_with_before_and_after() {
+        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let mut ctx = make_runctx(tx);
+
+        let before_row = RowEvent {
+            column_values: vec![
+                ColumnValue::LongLong(1),
+                ColumnValue::String(b"sku-1".to_vec()),
+            ],
+        };
+        let after_row = RowEvent {
+            column_values: vec![
+                ColumnValue::LongLong(1),
+                ColumnValue::String(b"sku-1-changed".to_vec()),
+            ],
+        };
+
+        let ev = UpdateRowsEvent {
+            table_id: TABLE_ID,
+            included_columns_before: vec![true, true],
+            included_columns_after: vec![true, true],
+            rows: vec![(before_row, after_row)],
+        };
+
+        handle_update_rows(&mut ctx, &make_header(), ev)
+            .await
+            .expect("update rows should succeed");
+
+        let produced = rx.recv().await.expect("expected one event");
+        assert_eq!(produced.op, Op::Update);
+
+        let before = produced.before.expect("update must have `before`");
+        let after = produced.after.expect("update must have `after`");
+
+        assert_eq!(before["id"], 1);
+        assert_eq!(before["sku"], "sku-1");
+        assert_eq!(after["id"], 1);
+        assert_eq!(after["sku"], "sku-1-changed");
+        assert_eq!(produced.table, "shop.orders");
+        assert_eq!(produced.tx_id.as_deref(), Some("GTID-UNIT"));
+    }
+
+    #[tokio::test]
+    async fn handle_delete_rows_emits_delete_with_before_only() {
+        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let mut ctx = make_runctx(tx);
+
+        let row = RowEvent {
+            column_values: vec![
+                ColumnValue::LongLong(1),
+                ColumnValue::String(b"sku-1".to_vec()),
+            ],
+        };
+
+        let ev = DeleteRowsEvent {
+            table_id: TABLE_ID,
+            included_columns: vec![true, true],
+            rows: vec![row],
+        };
+
+        handle_delete_rows(&mut ctx, &make_header(), ev)
+            .await
+            .expect("delete rows should succeed");
+
+        let produced = rx.recv().await.expect("expected one event");
+        assert_eq!(produced.op, Op::Delete);
+        assert!(produced.after.is_none(), "delete must not have `after`");
+        let before = produced.before.expect("delete must have `before`");
+        assert_eq!(before["id"], 1);
+        assert_eq!(before["sku"], "sku-1");
+        assert_eq!(produced.table, "shop.orders");
+        assert_eq!(produced.tx_id.as_deref(), Some("GTID-UNIT"));
+    }
+
+}

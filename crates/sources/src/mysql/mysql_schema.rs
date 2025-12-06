@@ -21,6 +21,15 @@ impl MySqlSchemaCache {
             map: Arc::new(RwLock::new(HashMap::new())),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_static(cols: HashMap<(String, String), Arc<Vec<String>>>) -> Self {
+        Self {
+            pool: Pool::new("mysql://localhost/ignored"),
+            map: Arc::new(RwLock::new(cols)),
+        }
+    }
+
     pub(super) async fn column_names(
         &self,
         db: &str,
