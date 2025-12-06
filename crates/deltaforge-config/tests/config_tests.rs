@@ -1,5 +1,5 @@
 use deltaforge_config::{
-    load_from_path, ConfigError, ProcessorCfg, SinkCfg, SourceCfg, CommitPolicy,
+    load_from_path, CommitPolicy, ConfigError, ProcessorCfg, SinkCfg, SourceCfg,
 };
 use pretty_assertions::assert_eq;
 use serial_test::serial;
@@ -88,7 +88,7 @@ spec:
             assert_eq!(kc.id, "k");
             assert_eq!(kc.brokers, "localhost:9092");
             assert_eq!(kc.topic, "unit.events");
-            // new optional fields should default correctly
+            // optional fields should default correctly
             assert!(kc.required.is_none());
             assert!(kc.exactly_once.is_none());
             assert!(kc.client_conf.is_empty());
@@ -322,7 +322,7 @@ spec:
     }
 }
 
-/// NEW: batch config coverage
+/// batch config coverage
 #[test]
 #[serial]
 fn batch_config_is_optional_and_parses_when_present() {
@@ -377,7 +377,7 @@ spec:
     assert_eq!(batch.max_inflight, Some(4));
 }
 
-/// NEW: commit_policy coverage – All / Required / Quorum
+/// commit_policy coverage – All / Required / Quorum
 #[test]
 #[serial]
 fn commit_policy_parses_all_variants() {
@@ -484,4 +484,66 @@ spec:
         spec.spec.commit_policy.is_none(),
         "commit_policy should be None when omitted"
     );
+}
+
+/// Kafka client_conf: default empty map and explicit overrides
+#[test]
+#[serial]
+fn kafka_client_conf_defaults_and_overrides() {
+    let yaml = r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata: { name: kclient, tenant: t }
+spec:
+  source:
+    type: postgres
+    config:
+      id: pg
+      dsn: postgres://pgu:pgpass@localhost:5432/orders
+      tables: [public.t1]
+  processors: []
+  sinks:
+    - type: kafka
+      config:
+        id: k1
+        brokers: localhost:9092
+        topic: t.orders
+    - type: kafka
+      config:
+        id: k2
+        brokers: localhost:9092
+        topic: t.orders
+        client_conf:
+          linger.ms: "10"
+          message.max.bytes: "1048576"
+"#;
+
+    let path = write_temp(yaml);
+    let spec = load_from_path(path.to_str().unwrap()).expect("parse ok");
+
+    assert_eq!(spec.spec.sinks.len(), 2);
+
+    match &spec.spec.sinks[0] {
+        SinkCfg::Kafka(k1) => {
+            // serde(default) -> empty map when field is omitted
+            assert!(k1.client_conf.is_empty());
+        }
+        _ => panic!("expected first sink to be kafka"),
+    }
+
+    match &spec.spec.sinks[1] {
+        SinkCfg::Kafka(k2) => {
+            assert_eq!(
+                k2.client_conf.get("linger.ms").map(String::as_str),
+                Some("10")
+            );
+            assert_eq!(
+                k2.client_conf
+                    .get("message.max.bytes")
+                    .map(String::as_str),
+                Some("1048576")
+            );
+        }
+        _ => panic!("expected second sink to be kafka"),
+    }
 }
