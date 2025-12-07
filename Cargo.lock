@@ -3463,10 +3463,12 @@ dependencies = [
 
 [[package]]
 name = "rest-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
+ "deltaforge-config",
  "parking_lot",
  "serde",
  "serde_json",
