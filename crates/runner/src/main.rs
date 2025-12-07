@@ -58,12 +58,7 @@ async fn main() -> Result<()> {
         load_pipeline_cfgs(&args.config).context("load pipeline specs")?;
     let ckpt_store: Arc<dyn CheckpointStore> =
         Arc::new(FileCheckpointStore::new("./data/df_checkpoints.json")?);
-    let mut running_pipelines: Vec<JoinHandle<Result<()>>> =
-        Vec::with_capacity(pipeline_specs.len());
-    let mut source_handles: Vec<SourceHandle> =
-        Vec::with_capacity(pipeline_specs.len());
     let manager = Arc::new(PipelineManager::new(ckpt_store.clone()));
-
 
     for ps in pipeline_specs {
         manager.create(ps).await?;

@@ -12,3 +12,7 @@ parking_lot.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
 deltaforge-config = { path = "../deltaforge-config" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower = "0.5"

@@ -9,7 +9,7 @@ use futures::future::try_join_all;
 use metrics::{counter, gauge};
 use parking_lot::RwLock;
 use processors::build_processors;
-use rest_api::{PipeInfo, PipelineController, PipelineAPIError};
+use rest_api::{PipeInfo, PipelineAPIError, PipelineController};
 use serde_json::Value;
 use sinks::build_sinks;
 use sources::build_source;
@@ -284,7 +284,8 @@ fn merge_spec(
     let mut merged = serde_json::to_value(base)
         .map_err(|e| PipelineAPIError::Failed(e.into()))?;
     merge_values(&mut merged, patch);
-    serde_json::from_value(merged).map_err(|e| PipelineAPIError::Failed(e.into()))
+    serde_json::from_value(merged)
+        .map_err(|e| PipelineAPIError::Failed(e.into()))
 }
 
 fn merge_values(base: &mut Value, patch: Value) {
@@ -302,5 +303,138 @@ fn merge_values(base: &mut Value, patch: Value) {
         (base_slot, patch_value) => {
             *base_slot = patch_value;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use checkpoints::MemCheckpointStore;
+    use deltaforge_config::{
+        BatchConfig, Metadata, MysqlSrcCfg, RedisSinkCfg, SinkCfg, SourceCfg,
+        Spec,
+    };
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::Notify;
+    use tokio::time::{Duration, timeout};
+
+    fn sample_spec(name: &str) -> PipelineSpec {
+        PipelineSpec {
+            metadata: Metadata {
+                name: name.to_string(),
+                tenant: "acme".to_string(),
+            },
+            spec: Spec {
+                sharding: None,
+                source: SourceCfg::Mysql(MysqlSrcCfg {
+                    id: "mysql".to_string(),
+                    dsn: "mysql://root:root@localhost/db".to_string(),
+                    tables: vec![],
+                }),
+                processors: vec![],
+                sinks: vec![SinkCfg::Redis(RedisSinkCfg {
+                    id: "redis".to_string(),
+                    uri: "redis://localhost".to_string(),
+                    stream: "events".to_string(),
+                })],
+                connection_policy: None,
+                batch: Some(BatchConfig::default()),
+                commit_policy: None,
+            },
+        }
+    }
+
+    fn runtime_with_channel(
+        name: &str,
+    ) -> (PipelineRuntime, watch::Receiver<bool>) {
+        let spec = sample_spec(name);
+        let cancel = CancellationToken::new();
+        let (pause_tx, pause_rx) = watch::channel(false);
+
+        let source_handle = SourceHandle {
+            cancel: cancel.clone(),
+            paused: Arc::new(AtomicBool::new(false)),
+            pause_notify: Arc::new(Notify::new()),
+            join: tokio::spawn(async move { Ok(()) }),
+        };
+
+        let runtime = PipelineRuntime {
+            spec,
+            status: PipelineStatus::Running,
+            cancel,
+            pause: pause_tx,
+            sources: vec![source_handle],
+            join: Some(tokio::spawn(async move { Ok(()) })),
+        };
+
+        (runtime, pause_rx)
+    }
+
+    #[test]
+    fn merge_spec_overlays_nested_values() {
+        let base = sample_spec("pipe-1");
+        let patch = serde_json::json!({
+            "metadata": {"tenant": "beta"},
+            "spec": {
+                "batch": {"max_events": 10},
+                "sinks": [{"type": "redis", "config": {"id": "redis", "uri": "redis://changed", "stream": "updates"}}]
+            }
+        });
+
+        let merged = merge_spec(&base, patch).expect("merge should succeed");
+
+        assert_eq!(merged.metadata.name, base.metadata.name);
+        assert_eq!(merged.metadata.tenant, "beta");
+        assert_eq!(merged.spec.batch.unwrap().max_events, Some(10));
+        assert_eq!(merged.spec.sinks.len(), 1);
+    }
+
+    #[test]
+    fn merge_spec_allows_name_changes_that_callers_must_guard() {
+        let base = sample_spec("pipe-1");
+        let patch = serde_json::json!({"metadata": {"name": "renamed"}});
+
+        let merged = merge_spec(&base, patch).expect("merge should succeed");
+
+        assert_eq!(merged.metadata.name, "renamed");
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_update_runtime_state() {
+        let mgr =
+            PipelineManager::new(Arc::new(MemCheckpointStore::new().unwrap()));
+        let (runtime, mut pause_rx) = runtime_with_channel("pipe-1");
+        mgr.pipelines.write().insert("pipe-1".to_string(), runtime);
+
+        let paused = mgr.pause("pipe-1").await.expect("pause should work");
+        assert_eq!(paused.status, "paused");
+        timeout(Duration::from_millis(100), pause_rx.changed())
+            .await
+            .expect("pause signal")
+            .expect("watch change");
+        assert!(pause_rx.borrow().to_owned());
+
+        let resumed = mgr.resume("pipe-1").await.expect("resume should work");
+        assert_eq!(resumed.status, "running");
+        timeout(Duration::from_millis(100), pause_rx.changed())
+            .await
+            .expect("resume signal")
+            .expect("watch change");
+        assert!(!pause_rx.borrow().to_owned());
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_and_removes_pipeline() {
+        let mgr =
+            PipelineManager::new(Arc::new(MemCheckpointStore::new().unwrap()));
+        let (runtime, _pause_rx) = runtime_with_channel("pipe-1");
+        let source_cancel = runtime.sources[0].cancel.clone();
+
+        mgr.pipelines.write().insert("pipe-1".to_string(), runtime);
+
+        let info = mgr.stop("pipe-1").await.expect("stop should work");
+        assert_eq!(info.status, "stopped");
+        assert!(source_cancel.is_cancelled());
+        assert!(mgr.pipelines.read().is_empty());
     }
 }
