@@ -5,9 +5,12 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+
+type MemRegistry = Arc<RwLock<HashMap<(String, String, String), Vec<(i32, String, Value)>>>>;
+
 #[derive(Clone, Default)]
 pub struct InMemoryRegistry {
-    inner: Arc<RwLock<HashMap<(String, String, String), Vec<(i32, String, Value)>>>>,
+    inner: MemRegistry,
 }
 
 #[async_trait]

@@ -45,7 +45,7 @@ impl From<MySqlSourceError> for SourceError {
             MySqlSourceError::Checkpoint(msg) => {
                 SourceError::Checkpoint { details: msg.into() }
             }
-            MySqlSourceError::Io(e) => SourceError::Io(e.into()),
+            MySqlSourceError::Io(e) => SourceError::Io(e),
             MySqlSourceError::Driver(e) => SourceError::Other(e.into()),
         }
     }

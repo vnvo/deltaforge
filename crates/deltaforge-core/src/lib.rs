@@ -5,8 +5,8 @@ use std::sync::{
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use checkpoints::CheckpointStore;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
@@ -252,7 +252,7 @@ pub trait Processor: Send + Sync {
     /// - drop events
     /// - add new events (duplicates / variants)
     fn id(&self) -> &str;
-    async fn process(&self, events:  Vec<Event>) -> Result<Vec<Event>>;
+    async fn process(&self, events: Vec<Event>) -> Result<Vec<Event>>;
 }
 
 #[async_trait]
@@ -351,10 +351,10 @@ impl PipelineHandle {
         }
 
         for h in source_handles {
-            if let Err(e) = h.join().await {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
+            if let Err(e) = h.join().await
+                && first_err.is_none()
+            {
+                first_err = Some(e);
             }
         }
 

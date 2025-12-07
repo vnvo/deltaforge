@@ -128,7 +128,7 @@ impl MySqlSource {
                 break;
             }
 
-            match read_next_event(&mut stream, &mut ctx).await {
+            match read_next_event(&mut stream, &ctx).await {
                 Ok((header, data)) => {
                     ctx.last_pos = header.next_event_position as u64;
                     dispatch_event(&mut ctx, &header, data).await?;
@@ -222,11 +222,14 @@ async fn connect_first_stream(
     let dsn = ctx.dsn.clone();
     let sid = ctx.server_id;
     let make_client = move || {
-        let mut c = BinlogClient::default();
-        c.url = dsn.clone();
-        c.server_id = sid;
-        c.heartbeat_interval_secs = HEARTBEAT_INTERVAL_SECS;
-        c.timeout_secs = READ_TIMEOUT;
+
+        let mut c = BinlogClient { 
+            url: dsn.clone(), 
+            server_id: sid, 
+            heartbeat_interval_secs: HEARTBEAT_INTERVAL_SECS, 
+            timeout_secs: READ_TIMEOUT, 
+            ..Default::default()
+        };
 
         if let Some(gtid) = init_gtid.clone() {
             c.gtid_enabled = true;
@@ -268,11 +271,15 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     let dsn = ctx.dsn.clone();
     let sid = ctx.server_id;
     let make_client = move || {
-        let mut c = BinlogClient::default();
-        c.url = dsn.clone();
-        c.server_id = sid;
-        c.heartbeat_interval_secs = HEARTBEAT_INTERVAL_SECS;
-        c.timeout_secs = READ_TIMEOUT;
+
+        let mut c = BinlogClient { 
+            url: dsn.clone(), 
+            server_id: sid, 
+            heartbeat_interval_secs: HEARTBEAT_INTERVAL_SECS, 
+            timeout_secs: READ_TIMEOUT,
+            ..Default::default() 
+        };
+
         if let Some(g) = gtid_to_use.clone() {
             c.gtid_enabled = true;
             c.gtid_set = g;

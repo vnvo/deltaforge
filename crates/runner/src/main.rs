@@ -3,7 +3,6 @@ use axum::Router;
 use checkpoints::{CheckpointStore, FileCheckpointStore};
 use clap::Parser;
 use deltaforge_config::{PipelineSpec, load_cfg};
-use o11y;
 use rest_api::{AppState, PipelineController, router};
 use std::net::SocketAddr;
 use std::sync::Arc;
