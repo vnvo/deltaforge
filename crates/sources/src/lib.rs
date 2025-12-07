@@ -11,7 +11,7 @@ use crate::mysql::MySqlSource;
 
 pub fn build_source(pipeline: &PipelineSpec) -> Result<ArcDynSource> {
     match &pipeline.spec.source {
-        SourceCfg::Postgres(c) => todo!(),
+        SourceCfg::Postgres(_c) => todo!(),
         SourceCfg::Mysql(c) => Ok(Arc::new(MySqlSource {
             id: c.id.clone(),
             dsn: c.dsn.clone(),
