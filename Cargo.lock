@@ -3523,6 +3523,7 @@ name = "runner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "checkpoints",
  "clap",
@@ -3539,6 +3540,7 @@ dependencies = [
  "sinks",
  "sources",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]

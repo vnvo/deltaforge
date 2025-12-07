@@ -5,7 +5,9 @@ use anyhow::{Context, Result};
 use checkpoints::CheckpointStore;
 use futures::future::BoxFuture;
 use metrics::counter;
+use tokio::sync::watch;
 use tokio::time::{Instant, interval};
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -118,6 +120,8 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
     pub async fn run(
         self,
         mut event_rx: tokio::sync::mpsc::Receiver<Event>,
+        cancel: CancellationToken,
+        mut pause_rx: watch::Receiver<bool>,
     ) -> Result<()> {
         let tick_ms = self.batch_cfg_eff.max_ms.unwrap_or(200);
         let mut ticker = interval(Duration::from_millis(tick_ms));
@@ -126,7 +130,28 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
         let mut building: Option<BuildingBatch> = None;
 
         loop {
+            if *pause_rx.borrow() {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        break;
+                    }
+                    changed = pause_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            }
             tokio::select! {
+                _ = cancel.cancelled() => {
+                    if let Some(b) = building.take() {
+                        if !b.raw.is_empty() {
+                            self.process_deliver_and_maybe_commit(b, "cancelled").await?;
+                        }
+                    }
+                    break;
+                }
                 _ = ticker.tick() => {
                     if let Some(b) = building.take() {
                         if !b.raw.is_empty() && b.started_at.elapsed() >= Duration::from_millis(tick_ms) {
@@ -135,6 +160,13 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                             building = Some(b);
                         }
                     }
+                }
+
+                changed = pause_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    continue;
                 }
 
                 maybe_ev = event_rx.recv() => {
@@ -217,10 +249,11 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
             let mut ok = true;
             for ev in frozen.events.iter() {
                 counter!(
-                    "deltaforge_sink_events_total", 
+                    "deltaforge_sink_events_total",
                     "pipeline"=>self.pipeline_name.clone(),
                     "sink"=>sink.id().to_string(),
-                ).increment(1);
+                )
+                .increment(1);
 
                 debug!(pipeline=%self.pipeline_name, sink_id=%sink.id(), eid=%ev.event_id, "sending to sink");
                 if let Err(e) = sink.send(ev.clone()).await {
@@ -336,8 +369,12 @@ pub(crate) fn build_batch_processor(
 
         async move {
             if procs.is_empty() {
-                let last_cp = events.iter().filter_map(|e| e.checkpoint.clone()).last();
-                return Ok(ProcessedBatch { events, last_checkpoint: last_cp });
+                let last_cp =
+                    events.iter().filter_map(|e| e.checkpoint.clone()).last();
+                return Ok(ProcessedBatch {
+                    events,
+                    last_checkpoint: last_cp,
+                });
             }
 
             //let mut out = Vec::with_capacity(events.len());
@@ -345,12 +382,19 @@ pub(crate) fn build_batch_processor(
 
             for p in procs.iter() {
                 let pid = p.id();
-                batch = p.process(batch).await.with_context(|| format!("processor {pid} failed"))?;
+                batch = p
+                    .process(batch)
+                    .await
+                    .with_context(|| format!("processor {pid} failed"))?;
             }
 
-            let last_cp = batch.iter().filter_map(|e| e.checkpoint.clone()).last();
+            let last_cp =
+                batch.iter().filter_map(|e| e.checkpoint.clone()).last();
 
-            Ok(ProcessedBatch { events: batch, last_checkpoint: last_cp })
+            Ok(ProcessedBatch {
+                events: batch,
+                last_checkpoint: last_cp,
+            })
         }
         .boxed()
     })

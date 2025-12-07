@@ -4,12 +4,12 @@ use checkpoints::{CheckpointStore, FileCheckpointStore};
 use clap::Parser;
 use deltaforge_config::{PipelineSpec, load_cfg};
 use deltaforge_core::{CheckpointMeta, Event, SourceHandle};
+use metrics::{counter, gauge};
 use o11y;
+use processors::build_processors;
+use rest_api::{AppState, PipelineController, router};
 use sinks::build_sinks;
 use sources::build_source;
-use metrics::{counter, gauge};
-use processors::build_processors;
-use rest_api::{AppState, PipeInfo, router};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
@@ -20,7 +20,11 @@ use crate::coordinator::{
     build_commit_fn,
 };
 
+use crate::pipeline_manager::PipelineManager;
+
 mod coordinator;
+mod pipeline_manager;
+
 #[derive(Parser, Debug)]
 struct Args {
     #[arg(short, long)]
@@ -50,9 +54,6 @@ async fn main() -> Result<()> {
 
     let _ = o11y::init_all(&cfg);
 
-    //shared api state
-    let state = AppState::default();
-
     let pipeline_specs =
         load_pipeline_cfgs(&args.config).context("load pipeline specs")?;
     let ckpt_store: Arc<dyn CheckpointStore> =
@@ -61,60 +62,16 @@ async fn main() -> Result<()> {
         Vec::with_capacity(pipeline_specs.len());
     let mut source_handles: Vec<SourceHandle> =
         Vec::with_capacity(pipeline_specs.len());
+    let manager = Arc::new(PipelineManager::new(ckpt_store.clone()));
+
 
     for ps in pipeline_specs {
-        counter!("deltaforge_pipelines_total").increment(1);
-
-        let pipeline_name = ps.metadata.name.clone();
-        let source = build_source(&ps)
-            .context(format!("build source for {pipeline_name}"))?;
-        let processors = build_processors(&ps)?;
-        let sinks = build_sinks(&ps).context("build sinks")?;
-
-        let (event_tx, event_rx) = mpsc::channel::<Event>(4096);
-        let src_handle = source.run(event_tx, ckpt_store.clone()).await;
-        source_handles.push(src_handle);
-
-        let batch_processor: ProcessBatchFn<CheckpointMeta> =
-            build_batch_processor(processors);
-        let commit_cp: CommitCpFn<CheckpointMeta> =
-            build_commit_fn(ckpt_store.clone(), pipeline_name.clone());
-
-        let coord = Coordinator::new(
-            pipeline_name.clone(),
-            sinks,
-            ps.spec.batch.clone(),
-            ps.spec.commit_policy.clone(),
-            commit_cp,
-            batch_processor,
-        );
-
-        let pname = pipeline_name.clone();
-        let pipeline = tokio::spawn(async move {
-            info!(pipeline_name=%pname, "pipeline coordinator starting ...");
-            gauge!("deltaforge_running_pipeline", "pipeline" => pname.clone())
-                .increment(1.0);
-
-            let res = coord.run(event_rx).await;
-
-            if let Err(ref e) = res {
-                gauge!("deltaforge_running_pipeline", "pipeline" => pname.clone()).decrement(1.0);
-                error!(pipeline=%pname, error=%e, "coordinator exited with error");
-            } else {
-                gauge!("deltaforge_running_pipeline", "pipeline" => pname.clone()).decrement(1.0);
-                info!(pipeline_name=%pname, "coordinator exited normally");
-            }
-
-            res
-        });
-
-        running_pipelines.push(pipeline);
-
-        state.pipelines.write().push(PipeInfo {
-            id: pipeline_name,
-            status: "running".into(),
-        });
+        manager.create(ps).await?;
     }
+
+    let state = AppState {
+        manager: manager.clone(),
+    };
 
     let app: Router = router(state);
     let app = app.merge(o11y::df_metrics::router_with_metrics());
@@ -125,11 +82,6 @@ async fn main() -> Result<()> {
 
     let listener = TcpListener::bind(addr).await?;
     let api_task = tokio::spawn(axum::serve(listener, app).into_future());
-
-    for p in running_pipelines {
-        p.await??;
-    }
-
     api_task.await??;
 
     Ok(())
