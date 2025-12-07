@@ -337,7 +337,7 @@ impl PipelineHandle {
     pub async fn join_all_components(self) -> Result<()> {
         let PipelineHandle {
             id,
-            cancel,
+            cancel: _,
             source_handles,
             join,
         } = self;
