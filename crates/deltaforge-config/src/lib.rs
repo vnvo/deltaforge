@@ -194,21 +194,16 @@ pub struct MicrobatchConfig {
 }
 
 /// How sink acks gate checkpointing when multiple sinks are configured.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum CommitPolicy {
     /// All sinks (or all marked as required) must ack the batch.
     All,
     /// Only sinks marked as `required: true` must ack; optional sinks are best-effort.
+    #[default]
     Required,
     /// Checkpoint after at least `quorum` sinks ack (availability over consistency).
     Quorum { quorum: usize },
-}
-
-impl Default for CommitPolicy {
-    fn default() -> Self {
-        CommitPolicy::Required
-    }
 }
 
 pub fn load_from_path(file_path: &str) -> ConfigResult<PipelineSpec> {

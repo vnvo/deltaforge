@@ -15,7 +15,8 @@ impl RedisSink {
     pub fn new(cfg: &RedisSinkCfg) -> anyhow::Result<Self> {
         Ok(Self {
             id: cfg.id.clone(),
-            client: redis::Client::open(cfg.uri.clone()).context("open redis uri")?,
+            client: redis::Client::open(cfg.uri.clone())
+                .context("open redis uri")?,
             stream: cfg.stream.to_string(),
         })
     }

@@ -1,5 +1,5 @@
-pub mod logging;
 pub mod df_metrics;
+pub mod logging;
 pub mod panic;
 pub mod tracing;
 

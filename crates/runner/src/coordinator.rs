@@ -5,7 +5,9 @@ use anyhow::{Context, Result};
 use checkpoints::CheckpointStore;
 use futures::future::BoxFuture;
 use metrics::counter;
+use tokio::sync::watch;
 use tokio::time::{Instant, interval};
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -48,9 +50,10 @@ impl BuildingBatch {
 }
 
 /// After processing, freeze as Arc<[Event]> for zero-copy sharing.
+#[derive(Debug)]
 struct FrozenBatch {
     id: Uuid,
-    started_at: Instant,
+    //started_at: Instant,
     events: Arc<[Event]>,
     bytes: usize,
 }
@@ -118,6 +121,8 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
     pub async fn run(
         self,
         mut event_rx: tokio::sync::mpsc::Receiver<Event>,
+        cancel: CancellationToken,
+        mut pause_rx: watch::Receiver<bool>,
     ) -> Result<()> {
         let tick_ms = self.batch_cfg_eff.max_ms.unwrap_or(200);
         let mut ticker = interval(Duration::from_millis(tick_ms));
@@ -126,7 +131,28 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
         let mut building: Option<BuildingBatch> = None;
 
         loop {
+            if *pause_rx.borrow() {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        break;
+                    }
+                    changed = pause_rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            }
             tokio::select! {
+                _ = cancel.cancelled() => {
+                    if let Some(b) = building.take()
+                        && !b.raw.is_empty() {
+                            self.process_deliver_and_maybe_commit(b, "cancelled").await?;
+                        }
+
+                    break;
+                }
                 _ = ticker.tick() => {
                     if let Some(b) = building.take() {
                         if !b.raw.is_empty() && b.started_at.elapsed() >= Duration::from_millis(tick_ms) {
@@ -137,14 +163,21 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                     }
                 }
 
+                changed = pause_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+
                 maybe_ev = event_rx.recv() => {
                     let Some(ev) = maybe_ev else {
                         // channel closed — final flush
-                        if let Some(b) = building.take() {
-                            if !b.raw.is_empty() {
+                        if let Some(b) = building.take()
+                            && !b.raw.is_empty() {
                                 self.process_deliver_and_maybe_commit(b, "shutdown").await?;
                             }
-                        }
+
                         break;
                     };
 
@@ -164,7 +197,8 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                     let boundary = is_tx_boundary(&ev);
 
                     // If limits hit, flush current (avoid splitting tx if configured).
-                    if (limit_hit && !boundary) || (limit_hit && boundary && !b.raw.is_empty()) {
+                    //if (limit_hit && !boundary) || (limit_hit && boundary && !b.raw.is_empty()) {
+                    if (!b.raw.is_empty() || !boundary) && limit_hit {
                         self.process_deliver_and_maybe_commit(b, "limits").await?;
                         b = BuildingBatch::new();
                     }
@@ -197,7 +231,7 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
         // 2) freeze
         let frozen = FrozenBatch {
             id: Uuid::new_v4(),
-            started_at: b.started_at,
+            //started_at: b.started_at,
             bytes,
             events: Arc::<[Event]>::from(processed.events),
         };
@@ -207,7 +241,12 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
         let mut required_acks = 0usize;
         let mut total_acks = 0usize;
 
-        debug!(pipeline=%self.pipeline_name, sink_count=self.sinks.len(), event_count=frozen.events.len(), "sending batch to sink(s)");
+        debug!(
+            pipeline=%self.pipeline_name,
+            sink_count=self.sinks.len(),
+            event_count=frozen.events.len(),
+            "sending batch to sink(s)");
+
         for sink in &self.sinks {
             let required = is_sink_required(sink);
             if required {
@@ -217,10 +256,11 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
             let mut ok = true;
             for ev in frozen.events.iter() {
                 counter!(
-                    "deltaforge_sink_events_total", 
+                    "deltaforge_sink_events_total",
                     "pipeline"=>self.pipeline_name.clone(),
                     "sink"=>sink.id().to_string(),
-                ).increment(1);
+                )
+                .increment(1);
 
                 debug!(pipeline=%self.pipeline_name, sink_id=%sink.id(), eid=%ev.event_id, "sending to sink");
                 if let Err(e) = sink.send(ev.clone()).await {
@@ -281,23 +321,25 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
 
     /// Compute the effective batch configuration by applying defaults.
     fn effective(cfg: &Option<BatchConfig>) -> BatchConfig {
-        let mut out = BatchConfig::default();
-        out.max_events =
-            Some(cfg.as_ref().and_then(|c| c.max_events).unwrap_or(1000));
-        out.max_bytes = Some(
-            cfg.as_ref()
-                .and_then(|c| c.max_bytes)
-                .unwrap_or(8 * 1024 * 1024),
-        );
-        out.max_ms = Some(cfg.as_ref().and_then(|c| c.max_ms).unwrap_or(200));
-        out.respect_source_tx = Some(
-            cfg.as_ref()
-                .and_then(|c| c.respect_source_tx)
-                .unwrap_or(true),
-        );
-        out.max_inflight =
-            Some(cfg.as_ref().and_then(|c| c.max_inflight).unwrap_or(1));
-        out
+        BatchConfig {
+            max_events: Some(
+                cfg.as_ref().and_then(|c| c.max_events).unwrap_or(1000),
+            ),
+            max_bytes: Some(
+                cfg.as_ref()
+                    .and_then(|c| c.max_bytes)
+                    .unwrap_or(8 * 1024 * 1024),
+            ),
+            max_ms: Some(cfg.as_ref().and_then(|c| c.max_ms).unwrap_or(200)),
+            respect_source_tx: Some(
+                cfg.as_ref()
+                    .and_then(|c| c.respect_source_tx)
+                    .unwrap_or(true),
+            ),
+            max_inflight: Some(
+                cfg.as_ref().and_then(|c| c.max_inflight).unwrap_or(1),
+            ),
+        }
     }
 }
 
@@ -317,7 +359,6 @@ pub(crate) fn build_commit_fn(
                 .put_raw(&key, &bytes)
                 .await
                 .context("save checkpoint")?;
-            
             debug!(pipeline_id=%pipeline_name, checkpoint=?cp, "checkpoint saved");
             Ok(())
         }.boxed()
@@ -336,8 +377,14 @@ pub(crate) fn build_batch_processor(
 
         async move {
             if procs.is_empty() {
-                let last_cp = events.iter().filter_map(|e| e.checkpoint.clone()).last();
-                return Ok(ProcessedBatch { events, last_checkpoint: last_cp });
+                let last_cp = events
+                    .iter()
+                    .filter_map(|e| e.checkpoint.clone())
+                    .next_back();
+                return Ok(ProcessedBatch {
+                    events,
+                    last_checkpoint: last_cp,
+                });
             }
 
             //let mut out = Vec::with_capacity(events.len());
@@ -345,12 +392,21 @@ pub(crate) fn build_batch_processor(
 
             for p in procs.iter() {
                 let pid = p.id();
-                batch = p.process(batch).await.with_context(|| format!("processor {pid} failed"))?;
+                batch = p
+                    .process(batch)
+                    .await
+                    .with_context(|| format!("processor {pid} failed"))?;
             }
 
-            let last_cp = batch.iter().filter_map(|e| e.checkpoint.clone()).last();
+            let last_cp = batch
+                .iter()
+                .filter_map(|e| e.checkpoint.clone())
+                .next_back();
 
-            Ok(ProcessedBatch { events: batch, last_checkpoint: last_cp })
+            Ok(ProcessedBatch {
+                events: batch,
+                last_checkpoint: last_cp,
+            })
         }
         .boxed()
     })

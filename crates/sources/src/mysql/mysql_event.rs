@@ -90,22 +90,25 @@ pub(super) async fn dispatch_event(
 }
 
 #[instrument(skip_all, fields(source_id=%ctx.source_id))]
-async fn handle_table_map(ctx: &mut RunCtx, tm: TableMapEvent) -> SourceResult<()> {
+async fn handle_table_map(
+    ctx: &mut RunCtx,
+    tm: TableMapEvent,
+) -> SourceResult<()> {
     let is_new = !ctx.table_map.contains_key(&tm.table_id);
     ctx.table_map.insert(tm.table_id, tm.clone());
 
     if ctx.allow.matchs(&tm.database_name, &tm.table_name) {
         if is_new {
             info!(
-                table_id=tm.table_id, 
-                db=%tm.database_name, 
-                table=%tm.table_name, 
+                table_id=tm.table_id,
+                db=%tm.database_name,
+                table=%tm.table_name,
                 "table mapped");
         } else {
             debug!(
-                table_id=tm.table_id, 
-                db=%tm.database_name, 
-                table=%tm.table_name, 
+                table_id=tm.table_id,
+                db=%tm.database_name,
+                table=%tm.table_name,
                 "table re-mapped");
         }
     } else {
@@ -316,10 +319,13 @@ fn handle_rotate(
 #[instrument(skip_all, fields(source_id=%ctx.source_id))]
 async fn handle_xid(ctx: &mut RunCtx) {
     // Prefer the server’s executed-set; fall back to last_gtid if GTID is off
-    let gtid_set = match crate::mysql::mysql_helpers::fetch_executed_gtid_set(&ctx.dsn).await {
-        Ok(Some(s)) => Some(s),
-        _ => ctx.last_gtid.clone(), // fallback if GTID not enabled
-    };    
+    let gtid_set =
+        match crate::mysql::mysql_helpers::fetch_executed_gtid_set(&ctx.dsn)
+            .await
+        {
+            Ok(Some(s)) => Some(s),
+            _ => ctx.last_gtid.clone(), // fallback if GTID not enabled
+        };
     persist_checkpoint(
         &ctx.source_id,
         &ctx.chkpt,
@@ -330,35 +336,44 @@ async fn handle_xid(ctx: &mut RunCtx) {
     .await;
 }
 
-
-
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::{Arc, atomic::AtomicBool}, time::Duration};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, atomic::AtomicBool},
+        time::Duration,
+    };
     use tokio::sync::{Notify, mpsc};
     use tokio_util::sync::CancellationToken;
 
     use checkpoints::{CheckpointStore, MemCheckpointStore};
-    use mysql_binlog_connector_rust::{column::column_value::ColumnValue, event::{
-        row_event::RowEvent, write_rows_event::WriteRowsEvent,
-        update_rows_event::UpdateRowsEvent,
-        delete_rows_event::DeleteRowsEvent,
-    }};
+    use mysql_binlog_connector_rust::{
+        column::column_value::ColumnValue,
+        event::{
+            delete_rows_event::DeleteRowsEvent, row_event::RowEvent,
+            update_rows_event::UpdateRowsEvent,
+            write_rows_event::WriteRowsEvent,
+        },
+    };
 
-    use crate::{conn_utils::RetryPolicy, mysql::{AllowList, MySqlSchemaCache}};
+    use crate::{
+        conn_utils::RetryPolicy,
+        mysql::{AllowList, MySqlSchemaCache},
+    };
 
     use super::*;
-    
+
     const TABLE_ID: u64 = 42;
 
     fn make_table_map() -> TableMapEvent {
-        TableMapEvent { 
-            table_id: TABLE_ID, 
-            database_name: "shop".to_string(), 
-            table_name: "orders".to_string(), 
-            column_types: vec![], 
-            column_metas: vec![], 
-            null_bits: vec![] }
+        TableMapEvent {
+            table_id: TABLE_ID,
+            database_name: "shop".to_string(),
+            table_name: "orders".to_string(),
+            column_types: vec![],
+            column_metas: vec![],
+            null_bits: vec![],
+        }
     }
 
     /// RunCtx suitable for unit-testing the row handlers:
@@ -374,45 +389,47 @@ mod tests {
         );
 
         let schema = MySqlSchemaCache::from_static(cols_map);
-        let chkpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new().expect("mem checkpoint store"));
+        let chkpt: Arc<dyn CheckpointStore> =
+            Arc::new(MemCheckpointStore::new().expect("mem checkpoint store"));
 
-        RunCtx { 
-            source_id: "mysql-unit".to_string(), 
-            tenant: "data-corp".to_string(), 
-            dsn: "mysql://localhost/ignored".to_string(), 
-            host: "localhost".to_string(), 
-            default_db: "shop".to_string(), 
-            server_id: 1, 
-            tx, 
-            chkpt, 
-            cancel: CancellationToken::new(), 
-            paused: Arc::new(AtomicBool::new(false)), 
-            pause_notify: Arc::new(Notify::new()), 
-            schema, 
-            allow: AllowList::new(&["shop.orders".to_string()]), 
-            retry: RetryPolicy::default(), 
-            inactivity: Duration::from_secs(30), 
+        RunCtx {
+            source_id: "mysql-unit".to_string(),
+            tenant: "data-corp".to_string(),
+            dsn: "mysql://localhost/ignored".to_string(),
+            host: "localhost".to_string(),
+            default_db: "shop".to_string(),
+            server_id: 1,
+            tx,
+            chkpt,
+            cancel: CancellationToken::new(),
+            paused: Arc::new(AtomicBool::new(false)),
+            pause_notify: Arc::new(Notify::new()),
+            schema,
+            allow: AllowList::new(&["shop.orders".to_string()]),
+            retry: RetryPolicy::default(),
+            inactivity: Duration::from_secs(30),
             table_map: {
                 let mut m = HashMap::new();
                 m.insert(TABLE_ID, make_table_map());
                 m
-            }, 
-            last_file: "mysql-bin.000001".to_string(), 
-            last_pos: 4, 
-            last_gtid: Some("GTID-UNIT".to_string()), 
-        }
-    } 
-
-    fn make_header() -> EventHeader {
-        EventHeader { timestamp: 1_700_000_000, 
-            event_type: 30, 
-            server_id: 1, 
-            event_length: 0, 
-            next_event_position: 0, 
-            event_flags: 0, 
+            },
+            last_file: "mysql-bin.000001".to_string(),
+            last_pos: 4,
+            last_gtid: Some("GTID-UNIT".to_string()),
         }
     }
-    
+
+    fn make_header() -> EventHeader {
+        EventHeader {
+            timestamp: 1_700_000_000,
+            event_type: 30,
+            server_id: 1,
+            event_length: 0,
+            next_event_position: 0,
+            event_flags: 0,
+        }
+    }
+
     #[tokio::test]
     async fn handle_write_rows_mits_insert_with_after_only() {
         let (tx, mut rx) = mpsc::channel::<Event>(8);
@@ -441,8 +458,7 @@ mod tests {
         assert_eq!(after["id"], 1);
         assert_eq!(after["sku"], "sku-1");
         assert_eq!(produced.table, "shop.orders");
-        assert_eq!(produced.tx_id.as_deref(), Some("GTID-UNIT"));        
-
+        assert_eq!(produced.tx_id.as_deref(), Some("GTID-UNIT"));
     }
 
     #[tokio::test]
@@ -519,5 +535,4 @@ mod tests {
         assert_eq!(produced.table, "shop.orders");
         assert_eq!(produced.tx_id.as_deref(), Some("GTID-UNIT"));
     }
-
 }

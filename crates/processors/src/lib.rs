@@ -13,7 +13,8 @@ pub fn build_processors(ps: &PipelineSpec) -> Result<Arc<[ArcDynProcessor]>> {
     for p in &ps.spec.processors {
         let proc: ArcDynProcessor = match p {
             ProcessorCfg::Javascript { id, inline, .. } => {
-                Arc::new(JsProcessor::new(id.clone(), inline.clone())?) as ArcDynProcessor
+                Arc::new(JsProcessor::new(id.clone(), inline.clone())?)
+                    as ArcDynProcessor
             }
         };
         out.push(proc);

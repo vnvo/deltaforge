@@ -30,6 +30,13 @@ DB shells:
   ./dev.sh pg-sh                  # psql into Postgres (orders DB)
   ./dev.sh mysql-sh               # mysql into MySQL (orders DB)
 
+Dev:
+  ./dev.sh fmt                    # format Rust code (cargo fmt --all)
+  ./dev.sh lint                   # run clippy with warnings as errors
+  ./dev.sh test                   # run test suite
+  ./dev.sh check                  # run fmt-check + clippy + tests (what CI does)
+  ./dev.sh cov                    # run coverage (cargo llvm-cov)
+
 Notes:
 - Uses service names from docker-compose.dev.yml (kafka, redis, postgres, mysql).
 - Kafka broker advertises localhost:9092 (works from host & inside kafka container).
@@ -117,6 +124,30 @@ cmd_mysql_sh() {
   "${DC[@]}" exec -ti mysql mysql -uroot -ppassword orders
 }
 
+cmd_fmt() {
+  cargo fmt --all
+}
+
+cmd_lint() {
+  cargo clippy --workspace --all-features -- -D warnings
+}
+
+cmd_test() {
+  cargo test --workspace --all-features
+}
+
+cmd_check() {
+  # Mirror what CI does: no auto-fix, fail on issues
+  cargo fmt --all -- --check
+  cargo clippy --workspace --all-features -- -D warnings
+  cargo test --workspace --all-features
+}
+
+cmd_cov() {
+  # Requires cargo-llvm-cov to be installed
+  cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+}
+
 case "${1:-}" in
   up) shift; cmd_up "$@";;
   down) shift; cmd_down "$@";;
@@ -132,6 +163,12 @@ case "${1:-}" in
 
   pg-sh) shift; cmd_pg_sh "$@";;
   mysql-sh) shift; cmd_mysql_sh "$@";;
+
+  fmt) shift; cmd_fmt "$@";;
+  lint) shift; cmd_lint "$@";;
+  test) shift; cmd_test "$@";;
+  check) shift; cmd_check "$@";;
+  cov) shift; cmd_cov "$@";;
 
   -h|--help|help|"") usage;;
   *) echo "Unknown command: $1"; echo; usage; exit 1;;

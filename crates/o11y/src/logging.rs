@@ -1,6 +1,8 @@
 use std::sync::Once;
 use tracing_log::LogTracer;
-use tracing_subscriber::{EnvFilter, Layer, Registry, fmt, layer::SubscriberExt};
+use tracing_subscriber::{
+    EnvFilter, Layer, Registry, fmt, layer::SubscriberExt,
+};
 
 static INIT: Once = Once::new();
 
@@ -49,7 +51,6 @@ pub fn init(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
                 .with_ansi(true)
                 .boxed()
         };
-
 
         let subscriber = Registry::default().with(filter).with(fmt_layer);
         tracing::subscriber::set_global_default(subscriber)

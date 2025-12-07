@@ -45,11 +45,14 @@ pub(super) async fn prepare_client(
         .map_err(|e| MySqlSourceError::Checkpoint(e.to_string()))?;
 
     info!(source_id=%source_id, url=%url, checkpoint=?last_checkpoint, "preparing client");
-    let mut client = BinlogClient::default();
-    client.url = dsn.to_string();
-    client.server_id = server_id; // connector uses u32 server_id
-    client.heartbeat_interval_secs = 180;
-    client.timeout_secs = 60;
+
+    let mut client = BinlogClient {
+        url: dsn.to_string(),
+        server_id,
+        heartbeat_interval_secs: 180,
+        timeout_secs: 60,
+        ..Default::default()
+    };
 
     debug!(
         url = redact_password(&client.url),

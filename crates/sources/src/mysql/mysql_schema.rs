@@ -6,11 +6,13 @@ use tracing::{debug, info, warn};
 use crate::mysql::mysql_helpers::redact_password;
 use deltaforge_core::{SourceError, SourceResult};
 
+type MySqlSchemaMap = Arc<RwLock<HashMap<(String, String), Arc<Vec<String>>>>>;
+
 /// INFORMATION_SCHEMA column-name cache, with logging and latency measurement.
 #[derive(Clone)]
 pub(super) struct MySqlSchemaCache {
     pool: Pool,
-    map: Arc<RwLock<HashMap<(String, String), Arc<Vec<String>>>>>,
+    map: MySqlSchemaMap,
 }
 
 impl MySqlSchemaCache {
@@ -23,7 +25,9 @@ impl MySqlSchemaCache {
     }
 
     #[cfg(test)]
-    pub(crate) fn from_static(cols: HashMap<(String, String), Arc<Vec<String>>>) -> Self {
+    pub(crate) fn from_static(
+        cols: HashMap<(String, String), Arc<Vec<String>>>,
+    ) -> Self {
         Self {
             pool: Pool::new("mysql://localhost/ignored"),
             map: Arc::new(RwLock::new(cols)),

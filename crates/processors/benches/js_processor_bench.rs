@@ -1,8 +1,10 @@
 use anyhow::Result;
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use deltaforge_core::{Event, Op, SourceMeta, Processor};
-use processors::JsProcessor;
+use criterion::{
+    Criterion, Throughput, black_box, criterion_group, criterion_main,
+};
+use deltaforge_core::{Event, Op, Processor, SourceMeta};
 use once_cell::sync::Lazy;
+use processors::JsProcessor;
 use serde_json::json;
 use std::time::Instant;
 use tokio::runtime::Runtime;
@@ -12,7 +14,11 @@ static RT: Lazy<Runtime> = Lazy::new(|| Runtime::new().unwrap());
 fn make_small_event() -> Event {
     Event::new_row(
         "t1".into(),
-        SourceMeta { kind: "mysql".into(), host: "h".into(), db: "d".into() },
+        SourceMeta {
+            kind: "mysql".into(),
+            host: "h".into(),
+            db: "d".into(),
+        },
         "d.orders".into(),
         Op::Insert,
         None,
@@ -25,7 +31,11 @@ fn make_large_event(bytes: usize) -> Event {
     let big = "x".repeat(bytes);
     Event::new_row(
         "t1".into(),
-        SourceMeta { kind: "mysql".into(), host: "h".into(), db: "d".into() },
+        SourceMeta {
+            kind: "mysql".into(),
+            host: "h".into(),
+            db: "d".into(),
+        },
         "d.orders".into(),
         Op::Insert,
         None,
@@ -57,13 +67,14 @@ impl Processor for RustNoop {
 // (kept as a micro-benchmark to compare against the real JsProcessor)
 mod pooled {
     use super::*;
-    use deno_core::{extension, JsRuntime, RuntimeOptions};
+    use deno_core::{JsRuntime, RuntimeOptions, extension};
     use deno_core::{serde_v8, v8};
     use serde_json::Value;
 
     extension!(df_ext, ops = [op_log]);
     #[deno_core::op2(fast)]
-    fn op_log(#[string] _msg: &str) { /* no-op in bench */ }
+    fn op_log(#[string] _msg: &str) { /* no-op in bench */
+    }
 
     pub struct PooledJs {
         rt: std::sync::Mutex<JsRuntime>,
@@ -87,7 +98,9 @@ mod pooled {
                 source = source
             );
             rt.execute_script("bootstrap.js", code).unwrap();
-            Self { rt: std::sync::Mutex::new(rt) }
+            Self {
+                rt: std::sync::Mutex::new(rt),
+            }
         }
 
         pub fn call(&self, event: &Event) -> Vec<Event> {
@@ -102,7 +115,8 @@ mod pooled {
                 let val = global.get(scope, name.into()).unwrap();
                 let func = v8::Local::<v8::Function>::try_from(val).unwrap();
                 let arg = serde_v8::to_v8(scope, ev_json).unwrap();
-                let call_result = func.call(scope, global.into(), &[arg]).unwrap();
+                let call_result =
+                    func.call(scope, global.into(), &[arg]).unwrap();
                 serde_v8::from_v8(scope, call_result).unwrap()
             };
             let arr = result_val
@@ -111,7 +125,10 @@ mod pooled {
                 .unwrap_or_else(|| vec![serde_json::to_value(event).unwrap()]);
             let mut out = Vec::with_capacity(arr.len());
             for v in arr {
-                out.push(serde_json::from_value::<Event>(v).expect("valid event from JS"));
+                out.push(
+                    serde_json::from_value::<Event>(v)
+                        .expect("valid event from JS"),
+                );
             }
             out
         }
@@ -133,9 +150,11 @@ fn bench_js_current_small(c: &mut Criterion) {
             }
             return events;
         }
-    "#.to_string();
+    "#
+    .to_string();
 
-    let proc = JsProcessor::new("bench_small".to_string(), js).expect("js init ok");
+    let proc =
+        JsProcessor::new("bench_small".to_string(), js).expect("js init ok");
     let ev = make_small_event();
 
     group.bench_function("current_js_batch", |b| {
@@ -143,7 +162,8 @@ fn bench_js_current_small(c: &mut Criterion) {
             RT.block_on(async {
                 let start = Instant::now();
                 for _ in 0..iters {
-                    let _ = black_box(proc.process(vec![ev.clone()]).await).unwrap();
+                    let _ = black_box(proc.process(vec![ev.clone()]).await)
+                        .unwrap();
                 }
                 start.elapsed()
             })
@@ -162,9 +182,11 @@ fn bench_js_current_large(c: &mut Criterion) {
         function processBatch(events) {
             return events;
         }
-    "#.to_string();
+    "#
+    .to_string();
 
-    let proc = JsProcessor::new("bench_large".to_string(), js).expect("js init ok");
+    let proc =
+        JsProcessor::new("bench_large".to_string(), js).expect("js init ok");
     let ev = make_large_event(64 * 1024);
 
     group.bench_function("current_js_batch_large", |b| {
@@ -172,7 +194,8 @@ fn bench_js_current_large(c: &mut Criterion) {
             RT.block_on(async {
                 let start = Instant::now();
                 for _ in 0..iters {
-                    let _ = black_box(proc.process(vec![ev.clone()]).await).unwrap();
+                    let _ = black_box(proc.process(vec![ev.clone()]).await)
+                        .unwrap();
                 }
                 start.elapsed()
             })
@@ -196,9 +219,11 @@ fn bench_js_array_return(c: &mut Criterion) {
             }
             return out;
         }
-    "#.to_string();
+    "#
+    .to_string();
 
-    let proc = JsProcessor::new("bench_array".to_string(), js).expect("js init ok");
+    let proc =
+        JsProcessor::new("bench_array".to_string(), js).expect("js init ok");
     let ev = make_small_event();
 
     group.bench_function("current_js_batch_array_return", |b| {
@@ -206,7 +231,8 @@ fn bench_js_array_return(c: &mut Criterion) {
             RT.block_on(async {
                 let start = Instant::now();
                 for _ in 0..iters {
-                    let v = black_box(proc.process(vec![ev.clone()]).await).unwrap();
+                    let v = black_box(proc.process(vec![ev.clone()]).await)
+                        .unwrap();
                     assert_eq!(v.len(), 2);
                 }
                 start.elapsed()
@@ -228,7 +254,8 @@ fn bench_rust_noop_baseline(c: &mut Criterion) {
             RT.block_on(async {
                 let start = Instant::now();
                 for _ in 0..iters {
-                    let _ = black_box(proc.process(vec![ev.clone()]).await).unwrap();
+                    let _ = black_box(proc.process(vec![ev.clone()]).await)
+                        .unwrap();
                 }
                 start.elapsed()
             })
@@ -247,7 +274,8 @@ fn bench_pooled_js_small(c: &mut Criterion) {
     // This is the old per-event semantics: returns a new event with qty+1
     let js = r#"
         ({ ...event, after: { ...event.after, qty: (event.after.qty||0)+1 } })
-    "#.to_string();
+    "#
+    .to_string();
 
     let pooled = PooledJs::new(js);
     let ev = make_small_event();

@@ -3463,13 +3463,17 @@ dependencies = [
 
 [[package]]
 name = "rest-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
+ "deltaforge-config",
  "parking_lot",
  "serde",
  "serde_json",
+ "tokio",
+ "tower",
  "tracing",
 ]
 
@@ -3521,6 +3525,7 @@ name = "runner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "checkpoints",
  "clap",
@@ -3537,6 +3542,7 @@ dependencies = [
  "sinks",
  "sources",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
