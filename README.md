@@ -1,5 +1,9 @@
 # DeltaForge
 
+[![CI](https://github.com/vnvo/deltaforge/actions/workflows/ci.yml/badge.svg)](https://github.com/vnvo/deltaforge/actions/workflows/ci.yml)
+[![Coverage Status](https://coveralls.io/repos/github/vnvo/deltaforge/badge.svg?branch=main)](https://coveralls.io/github/vnvo/deltaforge?branch=main)
+
+
 > A modular, efficient and config-driven Change Data Capture (CDC) micro-framework.
 
 DeltaForge is a lightweight framework for building CDC pipelines that stream database changes into downstream systems such as Kafka and Redis. It focuses on:
