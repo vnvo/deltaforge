@@ -1,22 +1,24 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
-use deltaforge_core::{Event, Op, Source, SourceHandle, SourceMeta, SourceResult};
+use deltaforge_core::{
+    Event, Op, Source, SourceHandle, SourceMeta, SourceResult,
+};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use tokio::{
     select,
     sync::mpsc,
     task::JoinHandle,
-    time::{sleep, timeout, Duration, Instant},
+    time::{Duration, Instant, sleep, timeout},
 };
 use tokio_util::sync::CancellationToken;
 
 /// A tiny in-process source that emits a counter event every `period`,
 /// and honors pause/resume/stop via the SourceHandle mechanisms.
-/// 
+///
 #[derive(Clone)]
 struct FakeSource {
     id: &'static str,
@@ -91,7 +93,12 @@ impl Source for FakeSource {
             Ok(())
         });
 
-        SourceHandle{cancel, paused, pause_notify, join}
+        SourceHandle {
+            cancel,
+            paused,
+            pause_notify,
+            join,
+        }
     }
 }
 

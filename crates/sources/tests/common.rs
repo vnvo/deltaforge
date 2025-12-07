@@ -1,5 +1,5 @@
 use std::sync::Once;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 static INIT: Once = Once::new();
 

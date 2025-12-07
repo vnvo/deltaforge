@@ -2,10 +2,10 @@ pub(crate) mod conn_utils;
 pub mod mysql;
 //pub mod postgres;
 
-use std::sync::Arc;
 use anyhow::Result;
-use deltaforge_config::{SourceCfg, PipelineSpec};
+use deltaforge_config::{PipelineSpec, SourceCfg};
 use deltaforge_core::ArcDynSource;
+use std::sync::Arc;
 
 use crate::mysql::MySqlSource;
 

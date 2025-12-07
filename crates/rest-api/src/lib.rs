@@ -13,7 +13,6 @@ pub fn router(state: AppState) -> Router {
     health.merge(pipeline_mgmt)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,15 +54,24 @@ mod tests {
             Ok(self.info.clone())
         }
 
-        async fn pause(&self, _name: &str) -> Result<PipeInfo, PipelineAPIError> {
+        async fn pause(
+            &self,
+            _name: &str,
+        ) -> Result<PipeInfo, PipelineAPIError> {
             Ok(self.info.clone())
         }
 
-        async fn resume(&self, _name: &str) -> Result<PipeInfo, PipelineAPIError> {
+        async fn resume(
+            &self,
+            _name: &str,
+        ) -> Result<PipeInfo, PipelineAPIError> {
             Ok(self.info.clone())
         }
 
-        async fn stop(&self, _name: &str) -> Result<PipeInfo, PipelineAPIError> {
+        async fn stop(
+            &self,
+            _name: &str,
+        ) -> Result<PipeInfo, PipelineAPIError> {
             Ok(self.info.clone())
         }
     }
@@ -92,18 +100,27 @@ mod tests {
             Err(PipelineAPIError::NotFound("missing".to_string()))
         }
 
-        async fn pause(&self, _name: &str) -> Result<PipeInfo, PipelineAPIError> {
+        async fn pause(
+            &self,
+            _name: &str,
+        ) -> Result<PipeInfo, PipelineAPIError> {
             Err(PipelineAPIError::Failed(anyhow::anyhow!("pause failed")))
         }
 
-        async fn resume(&self, _name: &str) -> Result<PipeInfo, PipelineAPIError> {
+        async fn resume(
+            &self,
+            _name: &str,
+        ) -> Result<PipeInfo, PipelineAPIError> {
             Err(PipelineAPIError::NameMismatch {
                 expected: "demo".to_string(),
                 found: "other".to_string(),
             })
         }
 
-        async fn stop(&self, _name: &str) -> Result<PipeInfo, PipelineAPIError> {
+        async fn stop(
+            &self,
+            _name: &str,
+        ) -> Result<PipeInfo, PipelineAPIError> {
             Err(PipelineAPIError::Failed(anyhow::anyhow!("stop failed")))
         }
     }

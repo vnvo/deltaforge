@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
 
@@ -10,7 +10,7 @@ use mysql_binlog_connector_rust::{
     event::table_map_event::TableMapEvent,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
@@ -20,7 +20,7 @@ use deltaforge_core::{Event, Source, SourceHandle, SourceResult};
 mod mysql_errors;
 
 mod mysql_helpers;
-use mysql_helpers::{pause_until_resumed, prepare_client, AllowList};
+use mysql_helpers::{AllowList, pause_until_resumed, prepare_client};
 
 mod mysql_object;
 
@@ -32,7 +32,10 @@ use mysql_event::*;
 
 use crate::{
     conn_utils::RetryPolicy,
-    mysql::{mysql_errors::MySqlSourceError, mysql_helpers::{connect_binlog_with_retries, resolve_binlog_tail}},
+    mysql::{
+        mysql_errors::MySqlSourceError,
+        mysql_helpers::{connect_binlog_with_retries, resolve_binlog_tail},
+    },
 };
 
 pub type MySqlSourceResult<T> = Result<T, MySqlSourceError>;
@@ -91,9 +94,9 @@ impl MySqlSource {
                 .await?;
 
         info!(
-            source_id=%self.id, 
-            host=%host, 
-            db=%default_db, 
+            source_id=%self.id,
+            host=%host,
+            db=%default_db,
             "mysql source starting ...");
 
         let mut ctx = RunCtx {
@@ -222,12 +225,11 @@ async fn connect_first_stream(
     let dsn = ctx.dsn.clone();
     let sid = ctx.server_id;
     let make_client = move || {
-
-        let mut c = BinlogClient { 
-            url: dsn.clone(), 
-            server_id: sid, 
-            heartbeat_interval_secs: HEARTBEAT_INTERVAL_SECS, 
-            timeout_secs: READ_TIMEOUT, 
+        let mut c = BinlogClient {
+            url: dsn.clone(),
+            server_id: sid,
+            heartbeat_interval_secs: HEARTBEAT_INTERVAL_SECS,
+            timeout_secs: READ_TIMEOUT,
             ..Default::default()
         };
 
@@ -271,13 +273,12 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     let dsn = ctx.dsn.clone();
     let sid = ctx.server_id;
     let make_client = move || {
-
-        let mut c = BinlogClient { 
-            url: dsn.clone(), 
-            server_id: sid, 
-            heartbeat_interval_secs: HEARTBEAT_INTERVAL_SECS, 
+        let mut c = BinlogClient {
+            url: dsn.clone(),
+            server_id: sid,
+            heartbeat_interval_secs: HEARTBEAT_INTERVAL_SECS,
             timeout_secs: READ_TIMEOUT,
-            ..Default::default() 
+            ..Default::default()
         };
 
         if let Some(g) = gtid_to_use.clone() {

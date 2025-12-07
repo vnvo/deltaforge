@@ -1,8 +1,4 @@
-use axum::{
-    Json, Router,
-    extract::State,
-    routing::get,
-};
+use axum::{Json, Router, extract::State, routing::get};
 use serde::Serialize;
 
 use crate::pipelines::{AppState, PipeInfo};

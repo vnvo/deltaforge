@@ -1,11 +1,16 @@
 use async_trait::async_trait;
-use axum::{Json, Router, extract::{Path, State}, http::StatusCode, routing::{get, patch, post}};
+use axum::{
+    Json, Router,
+    extract::{Path, State},
+    http::StatusCode,
+    routing::{get, patch, post},
+};
 use serde_json::Value;
 use std::sync::Arc;
 
-use deltaforge_config::PipelineSpec;
-use serde::{Serialize, Deserialize};
 use crate::{PipelineAPIError, errors::pipeline_error};
+use deltaforge_config::PipelineSpec;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -22,13 +27,19 @@ pub struct PipeInfo {
 #[async_trait]
 pub trait PipelineController: Send + Sync {
     async fn list(&self) -> Vec<PipeInfo>;
-    async fn create(&self, spec: PipelineSpec) -> Result<PipeInfo, PipelineAPIError>;
-    async fn patch(&self, name: &str, patch: Value) -> Result<PipeInfo, PipelineAPIError>;
+    async fn create(
+        &self,
+        spec: PipelineSpec,
+    ) -> Result<PipeInfo, PipelineAPIError>;
+    async fn patch(
+        &self,
+        name: &str,
+        patch: Value,
+    ) -> Result<PipeInfo, PipelineAPIError>;
     async fn pause(&self, name: &str) -> Result<PipeInfo, PipelineAPIError>;
     async fn resume(&self, name: &str) -> Result<PipeInfo, PipelineAPIError>;
     async fn stop(&self, name: &str) -> Result<PipeInfo, PipelineAPIError>;
 }
-
 
 pub fn router(state: AppState) -> Router {
     Router::new()

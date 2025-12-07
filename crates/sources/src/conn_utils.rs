@@ -3,7 +3,7 @@ use std::time::Instant;
 use std::{borrow::Cow, time::Duration};
 
 use deltaforge_core::{SourceError, SourceResult};
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -210,4 +210,3 @@ pub fn retryable_stream(err: &SourceError) -> bool {
         _ => false,
     }
 }
-

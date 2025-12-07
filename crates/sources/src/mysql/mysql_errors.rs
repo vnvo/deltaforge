@@ -13,7 +13,11 @@ pub enum MySqlSourceError {
     Auth(String),
 
     #[error("schema resolution failed for table {table}: {details}")]
-    Schema { db: String, table: String, details: String },
+    Schema {
+        db: String,
+        table: String,
+        details: String,
+    },
 
     #[error("checkpoint load failed: {0}")]
     Checkpoint(String),
@@ -42,9 +46,9 @@ impl From<MySqlSourceError> for SourceError {
                     details: format!("{db}.{table}: {details}").into(),
                 }
             }
-            MySqlSourceError::Checkpoint(msg) => {
-                SourceError::Checkpoint { details: msg.into() }
-            }
+            MySqlSourceError::Checkpoint(msg) => SourceError::Checkpoint {
+                details: msg.into(),
+            },
             MySqlSourceError::Io(e) => SourceError::Io(e),
             MySqlSourceError::Driver(e) => SourceError::Other(e.into()),
         }

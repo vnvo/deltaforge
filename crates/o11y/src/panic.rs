@@ -1,7 +1,7 @@
+use metrics::counter;
 use once_cell::sync::OnceCell;
 use std::{panic, thread};
 use tracing::{error, info};
-use metrics::counter;
 
 static INSTALLED: OnceCell<()> = OnceCell::new();
 

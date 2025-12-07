@@ -1,4 +1,4 @@
-pub use tracing::{debug, error, info, instrument, span, trace, warn, Level};
+pub use tracing::{Level, debug, error, info, instrument, span, trace, warn};
 
 pub fn record_err<E: std::fmt::Display>(err: &E) {
     tracing::Span::current().record("error", tracing::field::display(err));

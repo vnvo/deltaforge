@@ -15,7 +15,7 @@ pub trait CheckpointStore: Send + Sync {
         &self,
         source_id: &str,
     ) -> CheckpointResult<Option<Vec<u8>>>;
-    
+
     async fn put_raw(
         &self,
         source_id: &str,
@@ -23,7 +23,7 @@ pub trait CheckpointStore: Send + Sync {
     ) -> CheckpointResult<()>;
 
     async fn delete(&self, source_id: &str) -> CheckpointResult<bool>;
-    
+
     async fn list(&self) -> CheckpointResult<Vec<String>>;
 }
 
@@ -39,7 +39,11 @@ pub trait CheckpointStoreExt: CheckpointStore {
         }
     }
 
-    async fn put<T>(&self, source_id: &str, checkpoint: T) -> CheckpointResult<()>
+    async fn put<T>(
+        &self,
+        source_id: &str,
+        checkpoint: T,
+    ) -> CheckpointResult<()>
     where
         T: Serialize + Send + 'static,
     {

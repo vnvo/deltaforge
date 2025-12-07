@@ -1,5 +1,5 @@
 use deltaforge_config::{
-    load_from_path, CommitPolicy, ConfigError, ProcessorCfg, SinkCfg, SourceCfg,
+    CommitPolicy, ConfigError, ProcessorCfg, SinkCfg, SourceCfg, load_from_path,
 };
 use pretty_assertions::assert_eq;
 use serial_test::serial;
@@ -144,8 +144,7 @@ spec:
         SourceCfg::Mysql(mc) => {
             assert_eq!(mc.id, "m");
             assert_eq!(
-                mc.dsn,
-                "mysql://root:pws@localhost:3306/orders",
+                mc.dsn, "mysql://root:pws@localhost:3306/orders",
                 "env expansion failed for MYSQL_ORDERS_DSN"
             );
             assert_eq!(
@@ -424,7 +423,8 @@ spec:
   sinks: []
 "#;
     let p_req = write_temp(yaml_required);
-    let spec_req = load_from_path(p_req.to_str().unwrap()).expect("parse required");
+    let spec_req =
+        load_from_path(p_req.to_str().unwrap()).expect("parse required");
     assert!(
         matches!(spec_req.spec.commit_policy, Some(CommitPolicy::Required)),
         "expected CommitPolicy::Required, got {:?}",
@@ -455,7 +455,9 @@ spec:
 
     match spec_quorum.spec.commit_policy {
         Some(CommitPolicy::Quorum { quorum }) => assert_eq!(quorum, 2),
-        other => panic!("expected CommitPolicy::Quorum {{ quorum: 2 }}, got {other:?}"),
+        other => panic!(
+            "expected CommitPolicy::Quorum {{ quorum: 2 }}, got {other:?}"
+        ),
     }
 }
 
@@ -538,9 +540,7 @@ spec:
                 Some("10")
             );
             assert_eq!(
-                k2.client_conf
-                    .get("message.max.bytes")
-                    .map(String::as_str),
+                k2.client_conf.get("message.max.bytes").map(String::as_str),
                 Some("1048576")
             );
         }

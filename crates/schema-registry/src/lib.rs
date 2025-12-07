@@ -5,8 +5,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-
-type MemRegistry = Arc<RwLock<HashMap<(String, String, String), Vec<(i32, String, Value)>>>>;
+type MemRegistry =
+    Arc<RwLock<HashMap<(String, String, String), Vec<(i32, String, Value)>>>>;
 
 #[derive(Clone, Default)]
 pub struct InMemoryRegistry {
@@ -36,7 +36,12 @@ impl SchemaRegistry for InMemoryRegistry {
         Ok(new_v)
     }
 
-    async fn latest(&self, tenant: &str, db: &str, table: &str) -> Result<Option<(i32, String)>> {
+    async fn latest(
+        &self,
+        tenant: &str,
+        db: &str,
+        table: &str,
+    ) -> Result<Option<(i32, String)>> {
         let key = (tenant.to_string(), db.to_string(), table.to_string());
         let guard = self.inner.read().unwrap();
         Ok(guard

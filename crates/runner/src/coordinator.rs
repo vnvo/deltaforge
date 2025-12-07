@@ -150,7 +150,7 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                         && !b.raw.is_empty() {
                             self.process_deliver_and_maybe_commit(b, "cancelled").await?;
                         }
-                    
+
                     break;
                 }
                 _ = ticker.tick() => {
@@ -177,7 +177,7 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                             && !b.raw.is_empty() {
                                 self.process_deliver_and_maybe_commit(b, "shutdown").await?;
                             }
-                        
+
                         break;
                     };
 
@@ -242,11 +242,11 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
         let mut total_acks = 0usize;
 
         debug!(
-            pipeline=%self.pipeline_name, 
-            sink_count=self.sinks.len(), 
+            pipeline=%self.pipeline_name,
+            sink_count=self.sinks.len(),
             event_count=frozen.events.len(),
             "sending batch to sink(s)");
-        
+
         for sink in &self.sinks {
             let required = is_sink_required(sink);
             if required {
@@ -321,28 +321,25 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
 
     /// Compute the effective batch configuration by applying defaults.
     fn effective(cfg: &Option<BatchConfig>) -> BatchConfig {
-        BatchConfig { 
+        BatchConfig {
             max_events: Some(
-                cfg.as_ref()
-                    .and_then(|c| c.max_events)
-                    .unwrap_or(1000)),
+                cfg.as_ref().and_then(|c| c.max_events).unwrap_or(1000),
+            ),
             max_bytes: Some(
                 cfg.as_ref()
                     .and_then(|c| c.max_bytes)
-                    .unwrap_or(8 * 1024 * 1024),),
-            max_ms: Some(
-                cfg.as_ref()
-                    .and_then(|c| c.max_ms)
-                    .unwrap_or(200)),
+                    .unwrap_or(8 * 1024 * 1024),
+            ),
+            max_ms: Some(cfg.as_ref().and_then(|c| c.max_ms).unwrap_or(200)),
             respect_source_tx: Some(
-                  cfg.as_ref()
-                      .and_then(|c| c.respect_source_tx)
-                      .unwrap_or(true),),
-            max_inflight: Some(
                 cfg.as_ref()
-                    .and_then(|c| c.max_inflight)
-                    .unwrap_or(1)) 
-        }       
+                    .and_then(|c| c.respect_source_tx)
+                    .unwrap_or(true),
+            ),
+            max_inflight: Some(
+                cfg.as_ref().and_then(|c| c.max_inflight).unwrap_or(1),
+            ),
+        }
     }
 }
 
@@ -362,7 +359,6 @@ pub(crate) fn build_commit_fn(
                 .put_raw(&key, &bytes)
                 .await
                 .context("save checkpoint")?;
-            
             debug!(pipeline_id=%pipeline_name, checkpoint=?cp, "checkpoint saved");
             Ok(())
         }.boxed()
@@ -381,8 +377,10 @@ pub(crate) fn build_batch_processor(
 
         async move {
             if procs.is_empty() {
-                let last_cp =
-                    events.iter().filter_map(|e| e.checkpoint.clone()).next_back();
+                let last_cp = events
+                    .iter()
+                    .filter_map(|e| e.checkpoint.clone())
+                    .next_back();
                 return Ok(ProcessedBatch {
                     events,
                     last_checkpoint: last_cp,
@@ -400,8 +398,10 @@ pub(crate) fn build_batch_processor(
                     .with_context(|| format!("processor {pid} failed"))?;
             }
 
-            let last_cp =
-                batch.iter().filter_map(|e| e.checkpoint.clone()).next_back();
+            let last_cp = batch
+                .iter()
+                .filter_map(|e| e.checkpoint.clone())
+                .next_back();
 
             Ok(ProcessedBatch {
                 events: batch,

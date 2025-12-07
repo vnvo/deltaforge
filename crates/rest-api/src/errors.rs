@@ -12,10 +12,17 @@ pub enum PipelineAPIError {
 impl std::fmt::Display for PipelineAPIError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PipelineAPIError::NotFound(name) => write!(f, "pipeline {name} not found"),
-            PipelineAPIError::AlreadyExists(name) => write!(f, "pipeline {name} already exists"),
+            PipelineAPIError::NotFound(name) => {
+                write!(f, "pipeline {name} not found")
+            }
+            PipelineAPIError::AlreadyExists(name) => {
+                write!(f, "pipeline {name} already exists")
+            }
             PipelineAPIError::NameMismatch { expected, found } => {
-                write!(f, "pipeline name mismatch: expected {expected}, got {found}")
+                write!(
+                    f,
+                    "pipeline name mismatch: expected {expected}, got {found}"
+                )
             }
             PipelineAPIError::Failed(e) => std::fmt::Display::fmt(e, f),
         }
