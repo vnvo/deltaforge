@@ -50,9 +50,10 @@ impl BuildingBatch {
 }
 
 /// After processing, freeze as Arc<[Event]> for zero-copy sharing.
+#[derive(Debug)]
 struct FrozenBatch {
     id: Uuid,
-    started_at: Instant,
+    //started_at: Instant,
     events: Arc<[Event]>,
     bytes: usize,
 }
@@ -229,7 +230,7 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
         // 2) freeze
         let frozen = FrozenBatch {
             id: Uuid::new_v4(),
-            started_at: b.started_at,
+            //started_at: b.started_at,
             bytes,
             events: Arc::<[Event]>::from(processed.events),
         };
@@ -239,7 +240,12 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
         let mut required_acks = 0usize;
         let mut total_acks = 0usize;
 
-        debug!(pipeline=%self.pipeline_name, sink_count=self.sinks.len(), event_count=frozen.events.len(), "sending batch to sink(s)");
+        debug!(
+            pipeline=%self.pipeline_name, 
+            sink_count=self.sinks.len(), 
+            event_count=frozen.events.len(),
+            "sending batch to sink(s)");
+        
         for sink in &self.sinks {
             let required = is_sink_required(sink);
             if required {

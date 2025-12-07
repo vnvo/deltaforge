@@ -147,6 +147,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 pub fn classify_connect_err(
     err: anyhow::Error,
     default_action: &'static str,

@@ -3,22 +3,12 @@ use axum::Router;
 use checkpoints::{CheckpointStore, FileCheckpointStore};
 use clap::Parser;
 use deltaforge_config::{PipelineSpec, load_cfg};
-use deltaforge_core::{CheckpointMeta, Event, SourceHandle};
-use metrics::{counter, gauge};
 use o11y;
-use processors::build_processors;
 use rest_api::{AppState, PipelineController, router};
-use sinks::build_sinks;
-use sources::build_source;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::{net::TcpListener, sync::mpsc, task::JoinHandle};
-use tracing::{debug, error, info};
-
-use crate::coordinator::{
-    CommitCpFn, Coordinator, ProcessBatchFn, build_batch_processor,
-    build_commit_fn,
-};
+use tokio::net::TcpListener;
+use tracing::{debug, info};
 
 use crate::pipeline_manager::PipelineManager;
 
