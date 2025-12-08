@@ -1,9 +1,16 @@
-# DeltaForge
-
-[![CI](https://github.com/vnvo/deltaforge/actions/workflows/ci.yml/badge.svg)](https://github.com/vnvo/deltaforge/actions/workflows/ci.yml)
-[![Coverage Status](https://coveralls.io/repos/github/vnvo/deltaforge/badge.svg?branch=main)](https://coveralls.io/github/vnvo/deltaforge?branch=main)
-![MSRV](https://img.shields.io/badge/rustc-1.89+-orange.svg)
-
+<p align="center">
+  <img src="assets/deltaforge-blc.png" width="150" alt="DeltaForge">
+</p>
+<p align="center">
+  <a href="https://github.com/vnvo/deltaforge/actions/workflows/ci.yml">
+    <img src="https://github.com/vnvo/deltaforge/actions/workflows/ci.yml/badge.svg" alt="CI">
+  </a>
+  <a href="https://coveralls.io/github/vnvo/deltaforge?branch=main">
+    <img src="https://coveralls.io/repos/github/vnvo/deltaforge/badge.svg?branch=main" alt="Coverage Status">
+  </a>
+  <img src="https://img.shields.io/badge/rustc-1.89+-orange.svg" alt="MSRV">
+  <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License">
+</p>
 
 > A modular, efficient and config-driven Change Data Capture (CDC) micro-framework.
 
