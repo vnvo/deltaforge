@@ -8,9 +8,10 @@ title = "DeltaForge User Guide"
 description = "Change Data Capture pipelines with DeltaForge: configuration, runtime behavior, and deployment tips."
 
 [build]
-default-theme = "light"
+default-theme = "navy"
 
 [output.html]
+theme = "theme"
 additional-css = []
 git-repository-url = "https://github.com/vnvo/deltaforge"
 git-repository-icon = "fa-github"
