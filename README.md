@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/vnvo/deltaforge/actions/workflows/ci.yml/badge.svg)](https://github.com/vnvo/deltaforge/actions/workflows/ci.yml)
 [![Coverage Status](https://coveralls.io/repos/github/vnvo/deltaforge/badge.svg?branch=main)](https://coveralls.io/github/vnvo/deltaforge?branch=main)
+![MSRV](https://img.shields.io/badge/rustc-1.89+-orange.svg)
 
 
 > A modular, efficient and config-driven Change Data Capture (CDC) micro-framework.
@@ -201,3 +202,17 @@ Key fields:
 - `spec.sinks` — one or more sinks; Kafka supports `required`, `exactly_once`, and raw `client_conf` overrides; Redis streams are also available.
 - `spec.batch` — optional thresholds that define the commit unit.
 - `spec.commit_policy` — how sink acknowledgements gate checkpoint commits (`all`, `required` (default), or `quorum`).
+
+
+## License
+
+Licensed under either of
+
+- **MIT License** (see [`LICENSE-MIT`](./LICENSE-MIT))
+- **Apache License, Version 2.0** (see [`LICENSE-APACHE`](./LICENSE-APACHE))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this crate by you shall be dual licensed as above, without
+additional terms or conditions.
