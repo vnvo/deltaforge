@@ -16,7 +16,7 @@
 
 DeltaForge is a lightweight framework for building CDC pipelines that stream database changes into downstream systems such as Kafka and Redis. It focuses on:
 
-- **User Control** : Using an embedded JS engine, users can full control what happens to each event.
+- **User Control** : Using an embedded JS engine, users can fully control what happens to each event.
 - **Config-driven pipelines** : YAML-defined pipelines instead of bespoke code per use-case.
 - **Cloud-Native** : CN first design and operation.
 - **Extensibility** : add your own sources, processors, and sinks.
