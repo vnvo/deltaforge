@@ -1,0 +1,242 @@
+<!DOCTYPE HTML>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Configuration - DeltaForge User Guide</title>
+        <meta content="text/html; charset=utf-8" http-equiv="Content-Type">
+        <meta name="description" content="Change Data Capture pipelines with DeltaForge: configuration, runtime behavior, and deployment tips.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+
+        <base href="">
+
+        <link rel="stylesheet" href="book.css">
+        <link href="https://fonts.googleapis.com/css?family=Open+Sans:300italic,400italic,600italic,700italic,800italic,400,300,600,700,800" rel="stylesheet" type="text/css">
+        <link href="https://fonts.googleapis.com/css?family=Source+Code+Pro:500" rel="stylesheet" type="text/css">
+
+        <link rel="shortcut icon" href="favicon.png">
+
+        <!-- Font Awesome -->
+        <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/font-awesome/4.3.0/css/font-awesome.min.css">
+
+        <link rel="stylesheet" href="highlight.css">
+        <link rel="stylesheet" href="tomorrow-night.css">
+        <link rel="stylesheet" href="ayu-highlight.css">
+
+        <!-- Custom theme -->
+        
+
+        
+
+        <!-- Fetch Clipboard.js from CDN but have a local fallback -->
+        <script src="https://cdn.jsdelivr.net/clipboard.js/1.6.1/clipboard.min.js"></script>
+        <script>
+            if (typeof Clipboard == 'undefined') {
+                document.write(unescape("%3Cscript src='clipboard.min.js'%3E%3C/script%3E"));
+            }
+        </script>
+
+        <!-- Fetch JQuery from CDN but have a local fallback -->
+        <script src="https://code.jquery.com/jquery-2.1.4.min.js"></script>
+        <script>
+            if (typeof jQuery == 'undefined') {
+                document.write(unescape("%3Cscript src='jquery.js'%3E%3C/script%3E"));
+            }
+        </script>
+
+        <!-- Fetch store.js from local - TODO add CDN when 2.x.x is available on cdnjs -->
+        <script src="store.js"></script>
+
+    </head>
+    <body class="light">
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script type="text/javascript">
+            var theme = store.get('mdbook-theme');
+            if (theme === null || theme === undefined) { theme = 'light'; }
+            $('body').removeClass().addClass(theme);
+        </script>
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script type="text/javascript">
+            var sidebar = store.get('mdbook-sidebar');
+            if (sidebar === "hidden") { $("html").addClass("sidebar-hidden") }
+            else if (sidebar === "visible") { $("html").addClass("sidebar-visible") }
+        </script>
+
+        <div id="sidebar" class="sidebar">
+            <ul class="chapter"><li><a href="introduction.html"><strong>1.</strong> Introduction</a></li><li><a href="cdc.html"><strong>2.</strong> Change Data Capture</a></li><li><a href="quickstart.html"><strong>3.</strong> Quickstart</a></li><li><a href="configuration.html" class="active"><strong>4.</strong> Configuration</a></li><li><a href="pipelines.html"><strong>5.</strong> Pipelines</a></li><li><a href="sources/README.html"><strong>6.</strong> Sources</a></li><li><ul class="section"><li><a href="sources/mysql.html"><strong>6.1.</strong> MySQL</a></li></ul></li><li><a href="sinks/README.html"><strong>7.</strong> Sinks</a></li><li><ul class="section"><li><a href="sinks/redis.html"><strong>7.1.</strong> Redis</a></li><li><a href="sinks/kafka.html"><strong>7.2.</strong> Kafka</a></li></ul></li><li><a href="checkpoints.html"><strong>8.</strong> Checkpoints</a></li><li><a href="examples/README.html"><strong>9.</strong> Examples</a></li><li><ul class="section"><li><a href="examples/mysql_to_redis.html"><strong>9.1.</strong> MySQL to Redis</a></li></ul></li><li><a href="troubleshooting.html"><strong>10.</strong> Troubleshooting</a></li><li><a href="roadmap.html"><strong>11.</strong> Roadmap</a></li></ul>
+        </div>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page" tabindex="-1">
+                
+                <div id="menu-bar" class="menu-bar">
+                    <div class="left-buttons">
+                        <i id="sidebar-toggle" class="fa fa-bars" title="Toggle sidebar"></i>
+                        <i id="theme-toggle" class="fa fa-paint-brush" title="Change theme"></i>
+                    </div>
+
+                    <h1 class="menu-title">DeltaForge User Guide</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html">
+                            <i id="print-button" class="fa fa-print" title="Print this book"></i>
+                        </a>
+                    </div>
+                </div>
+
+                <div id="content" class="content">
+                    <a class="header" href="configuration.html#configuration" id="configuration"><h1>Configuration</h1></a>
+<p>DeltaForge pipelines are defined as YAML documents that map directly to the <code>PipelineSpec</code> schema. Environment variables inside the YAML are expanded before parsing, so you can keep secrets like DSNs or broker lists outside of version control. You can also inline values directly—placeholders are optional—but <code>${VAR_NAME}</code> entries make it easy to switch between local dev secrets and production credentials without editing the files.</p>
+<ul>
+<li>🔑 <strong>Flexible substitution</strong>: environment variables extend placeholders; hardcoded values remain supported when you prefer explicit config.</li>
+</ul>
+<a class="header" href="configuration.html#loading-configuration" id="loading-configuration"><h2>Loading configuration</h2></a>
+<ul>
+<li>Pass a path with <code>--config &lt;path&gt;</code> when starting the runner.</li>
+<li>The path may be a single file or a directory. Directories are walked recursively, and every file is parsed as a pipeline spec.</li>
+<li>Multiple specs can be loaded at once; each spawns its own pipeline.</li>
+</ul>
+<pre><code class="language-bash">cargo run -p runner -- --config ./pipelines \
+  --api-addr 0.0.0.0:8080 \
+  --metrics-addr 0.0.0.0:9095
+</code></pre>
+<a class="header" href="configuration.html#pipelinespec-structure" id="pipelinespec-structure"><h2>PipelineSpec structure</h2></a>
+<a class="header" href="configuration.html#metadata" id="metadata"><h3>metadata</h3></a>
+<table><thead><tr><th> field </th><th> type </th><th> description </th></tr></thead><tbody>
+<tr><td> <code>name</code> </td><td> string (required) </td><td> Unique pipeline identifier used in API routes and metrics labels. </td></tr>
+<tr><td> <code>tenant</code> </td><td> string (required) </td><td> Business tenant or ownership label. </td></tr>
+</tbody></table>
+<a class="header" href="configuration.html#spec" id="spec"><h3>spec</h3></a>
+<table><thead><tr><th> field </th><th> type </th><th> description </th></tr></thead><tbody>
+<tr><td> <code>sharding</code> </td><td> object (optional) </td><td> Downstream partitioning hint with <code>mode</code>, optional <code>count</code>, and optional <code>key</code>. </td></tr>
+<tr><td> <code>source</code> </td><td> object (required) </td><td> CDC source definition. See <a href="sources/README.md">Sources</a>. </td></tr>
+<tr><td> <code>processors</code> </td><td> array (required, can be empty) </td><td> Ordered processors executed on each batch. See <a href="pipelines.md#processors">Processors</a>. </td></tr>
+<tr><td> <code>sinks</code> </td><td> array (required, at least one) </td><td> One or more sinks that receive each batch. See <a href="sinks/README.md">Sinks</a>. </td></tr>
+<tr><td> <code>connection_policy</code> </td><td> object (optional) </td><td> How the runtime establishes upstream connections (default mode, preferred replicas, and limits). </td></tr>
+<tr><td> <code>batch</code> </td><td> object (optional) </td><td> Commit unit thresholds. See <a href="pipelines.md#batching">Batching</a>. </td></tr>
+<tr><td> <code>commit_policy</code> </td><td> object (optional) </td><td> How sink acknowledgements gate checkpoints. See <a href="pipelines.md#commit-policy">Commit policy</a>. </td></tr>
+</tbody></table>
+<a class="header" href="configuration.html#example" id="example"><h3>Example</h3></a>
+<pre><code class="language-yaml">metadata:
+  name: orders-mysql-to-kafka
+  tenant: acme
+spec:
+  sharding:
+    mode: hash
+    count: 4
+    key: customer_id
+  source:
+    type: mysql
+    config:
+      id: orders-mysql
+      dsn: ${MYSQL_DSN}
+      tables:
+        - shop.orders
+  processors:
+    - type: javascript
+      id: transform
+      inline: |
+        function process(batch) {
+          return batch;
+        }
+      limits:
+        cpu_ms: 50
+        mem_mb: 128
+        timeout_ms: 500
+  sinks:
+    - type: kafka
+      config:
+        id: orders-kafka
+        brokers: ${KAFKA_BROKERS}
+        topic: orders
+        required: true
+        exactly_once: false
+        client_conf:
+          message.timeout.ms: &quot;5000&quot;
+    - type: redis
+      config:
+        id: orders-redis
+        uri: ${REDIS_URI}
+        stream: orders
+  batch:
+    max_events: 500
+    max_bytes: 1048576
+    max_ms: 1000
+    respect_source_tx: true
+    max_inflight: 2
+  commit_policy:
+    mode: quorum
+    quorum: 2
+</code></pre>
+
+                </div>
+
+                <!-- Mobile navigation buttons -->
+                
+                    <a rel="prev" href="quickstart.html" class="mobile-nav-chapters previous" title="Previous chapter">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+                
+
+                
+                    <a rel="next" href="pipelines.html" class="mobile-nav-chapters next" title="Next chapter">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+                
+
+            </div>
+
+            
+                <a href="quickstart.html" class="nav-chapters previous" title="You can navigate through the chapters using the arrow keys">
+                    <i class="fa fa-angle-left"></i>
+                </a>
+            
+
+            
+                <a href="pipelines.html" class="nav-chapters next" title="You can navigate through the chapters using the arrow keys">
+                    <i class="fa fa-angle-right"></i>
+                </a>
+            
+
+        </div>
+
+
+        <!-- Local fallback for Font Awesome -->
+        <script>
+            if ($(".fa").css("font-family") !== "FontAwesome") {
+                $('<link rel="stylesheet" type="text/css" href="_FontAwesome/css/font-awesome.css">').prependTo('head');
+            }
+        </script>
+
+        <!-- Livereload script (if served using the cli tool) -->
+        
+    <script type="text/javascript">
+        var socket = new WebSocket("ws://localhost:3001");
+        socket.onmessage = function (event) {
+            if (event.data === "reload") {
+                socket.close();
+                location.reload(true); // force reload from server (not from cache)
+            }
+        };
+
+        window.onbeforeunload = function() {
+            socket.close();
+        }
+    </script>
+
+
+        
+
+        
+
+        
+
+        <script src="highlight.js"></script>
+        <script src="book.js"></script>
+
+        <!-- Custom JS script -->
+        
+
+    </body>
+</html>

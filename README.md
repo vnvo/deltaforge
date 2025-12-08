@@ -56,25 +56,9 @@ Deltaforge is meant to replace tools like Debezium and similar.
   - Metrics endpoint.
 
 
+## Documentation
 
-# DeltaForge
-
-> A modular, efficient and config-driven Change Data Capture (CDC) micro-framework.
-
-DeltaForge is a lightweight framework for building CDC pipelines that stream database changes into downstream systems such as Kafka and Redis. It focuses on:
-
-- **User Control** : Using an embedded JS engine, users can full control what happens to each event.
-- **Config-driven pipelines** : YAML-defined pipelines instead of bespoke code per use-case.
-- **Cloud-Native** : CN first design and operation.
-- **Extensibility** : add your own sources, processors, and sinks.
-- **Observability** : metrics, structured logging, and panic hooks built in.
-
-However, deltaforge is NOT a DAG based stream processor.
-Deltaforge is meant to replace tools like Debezium and similar.
-
-
-> ⚠️ **Status:** Active developmemt. APIs, configuration, and semantics may change.
-
+- [mdBook](docs/src/SUMMARY.md) — browse the structured documentation locally with `mdbook serve docs`
 
 
 ## Features
@@ -136,7 +120,7 @@ be injected at runtime.
 
 ```yaml
 metadata:
-  name: orders-pg-to-kafka
+  name: orders-mysql-to-kafka
   tenant: acme
 
 spec:
@@ -146,12 +130,12 @@ spec:
     count: 4
     key: customer_id
 
-  # Source definition (Postgres or MySQL)
+  # Source definition (for MySQL)
   source:
-    type: postgres
+    type: mysql
     config:
-      id: orders-pg
-      dsn: ${PG_DSN}
+      id: orders-mysql
+      dsn: ${MYSQL_DSN}
       publication: orders_pub
       slot: orders_slot
       tables:

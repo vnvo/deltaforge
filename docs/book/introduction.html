@@ -1,0 +1,169 @@
+<!DOCTYPE HTML>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Introduction - DeltaForge User Guide</title>
+        <meta content="text/html; charset=utf-8" http-equiv="Content-Type">
+        <meta name="description" content="Change Data Capture pipelines with DeltaForge: configuration, runtime behavior, and deployment tips.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+
+        <base href="">
+
+        <link rel="stylesheet" href="book.css">
+        <link href="https://fonts.googleapis.com/css?family=Open+Sans:300italic,400italic,600italic,700italic,800italic,400,300,600,700,800" rel="stylesheet" type="text/css">
+        <link href="https://fonts.googleapis.com/css?family=Source+Code+Pro:500" rel="stylesheet" type="text/css">
+
+        <link rel="shortcut icon" href="favicon.png">
+
+        <!-- Font Awesome -->
+        <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/font-awesome/4.3.0/css/font-awesome.min.css">
+
+        <link rel="stylesheet" href="highlight.css">
+        <link rel="stylesheet" href="tomorrow-night.css">
+        <link rel="stylesheet" href="ayu-highlight.css">
+
+        <!-- Custom theme -->
+        
+
+        
+
+        <!-- Fetch Clipboard.js from CDN but have a local fallback -->
+        <script src="https://cdn.jsdelivr.net/clipboard.js/1.6.1/clipboard.min.js"></script>
+        <script>
+            if (typeof Clipboard == 'undefined') {
+                document.write(unescape("%3Cscript src='clipboard.min.js'%3E%3C/script%3E"));
+            }
+        </script>
+
+        <!-- Fetch JQuery from CDN but have a local fallback -->
+        <script src="https://code.jquery.com/jquery-2.1.4.min.js"></script>
+        <script>
+            if (typeof jQuery == 'undefined') {
+                document.write(unescape("%3Cscript src='jquery.js'%3E%3C/script%3E"));
+            }
+        </script>
+
+        <!-- Fetch store.js from local - TODO add CDN when 2.x.x is available on cdnjs -->
+        <script src="store.js"></script>
+
+    </head>
+    <body class="light">
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script type="text/javascript">
+            var theme = store.get('mdbook-theme');
+            if (theme === null || theme === undefined) { theme = 'light'; }
+            $('body').removeClass().addClass(theme);
+        </script>
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script type="text/javascript">
+            var sidebar = store.get('mdbook-sidebar');
+            if (sidebar === "hidden") { $("html").addClass("sidebar-hidden") }
+            else if (sidebar === "visible") { $("html").addClass("sidebar-visible") }
+        </script>
+
+        <div id="sidebar" class="sidebar">
+            <ul class="chapter"><li><a href="introduction.html" class="active"><strong>1.</strong> Introduction</a></li><li><a href="cdc.html"><strong>2.</strong> Change Data Capture</a></li><li><a href="quickstart.html"><strong>3.</strong> Quickstart</a></li><li><a href="configuration.html"><strong>4.</strong> Configuration</a></li><li><a href="pipelines.html"><strong>5.</strong> Pipelines</a></li><li><a href="sources/README.html"><strong>6.</strong> Sources</a></li><li><ul class="section"><li><a href="sources/mysql.html"><strong>6.1.</strong> MySQL</a></li></ul></li><li><a href="sinks/README.html"><strong>7.</strong> Sinks</a></li><li><ul class="section"><li><a href="sinks/redis.html"><strong>7.1.</strong> Redis</a></li><li><a href="sinks/kafka.html"><strong>7.2.</strong> Kafka</a></li></ul></li><li><a href="checkpoints.html"><strong>8.</strong> Checkpoints</a></li><li><a href="examples/README.html"><strong>9.</strong> Examples</a></li><li><ul class="section"><li><a href="examples/mysql_to_redis.html"><strong>9.1.</strong> MySQL to Redis</a></li></ul></li><li><a href="troubleshooting.html"><strong>10.</strong> Troubleshooting</a></li><li><a href="roadmap.html"><strong>11.</strong> Roadmap</a></li></ul>
+        </div>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page" tabindex="-1">
+                
+                <div id="menu-bar" class="menu-bar">
+                    <div class="left-buttons">
+                        <i id="sidebar-toggle" class="fa fa-bars" title="Toggle sidebar"></i>
+                        <i id="theme-toggle" class="fa fa-paint-brush" title="Change theme"></i>
+                    </div>
+
+                    <h1 class="menu-title">DeltaForge User Guide</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html">
+                            <i id="print-button" class="fa fa-print" title="Print this book"></i>
+                        </a>
+                    </div>
+                </div>
+
+                <div id="content" class="content">
+                    <a class="header" href="introduction.html#introduction" id="introduction"><h1>Introduction</h1></a>
+<p>DeltaForge is a modular, config-driven Change Data Capture (CDC) micro-framework. It streams database changes into downstream systems like Kafka and Redis while giving users control over how each event is processed. Pipelines are defined declaratively in YAML, making it straightforward to onboard new use cases without custom code.</p>
+<ul>
+<li>⚡ <strong>Powered by Rust</strong>: for predictable performance, security and reliable operations.</li>
+<li>🔌 <strong>Pluggable sources &amp; sinks</strong>: with first-class MySQL binlog CDC today and more planned for upcoming interations.</li>
+<li>🧩 <strong>Config-driven pipelines</strong>: specs capture sources, processors, sinks, batching, and commit policy.</li>
+<li>📦 <strong>Built-in checkpointing and batching</strong>: to keep sinks consistent.</li>
+<li>🛠️ <strong>Operational guardrails</strong>: structured logging, metrics, and health endpoints.</li>
+</ul>
+<p>DeltaForge is designed to enable:</p>
+<ul>
+<li>Efficient and Fast incremental data movement for modern event-driven architectures</li>
+<li>Compact and Inline ETL, making your data processing stack smaller and more cost effective.</li>
+</ul>
+<hr />
+<p><strong>DeltaForge is <em>not</em> a DAG-based stream processor; it is a focused CDC engine meant to replace tools like Debezium when you need a lighter, cloud-friendly and more customizable runtime.</strong></p>
+<hr />
+<p>This documentation will walk you through installation, configuration, and usage.</p>
+
+                </div>
+
+                <!-- Mobile navigation buttons -->
+                
+
+                
+                    <a rel="next" href="cdc.html" class="mobile-nav-chapters next" title="Next chapter">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+                
+
+            </div>
+
+            
+
+            
+                <a href="cdc.html" class="nav-chapters next" title="You can navigate through the chapters using the arrow keys">
+                    <i class="fa fa-angle-right"></i>
+                </a>
+            
+
+        </div>
+
+
+        <!-- Local fallback for Font Awesome -->
+        <script>
+            if ($(".fa").css("font-family") !== "FontAwesome") {
+                $('<link rel="stylesheet" type="text/css" href="_FontAwesome/css/font-awesome.css">').prependTo('head');
+            }
+        </script>
+
+        <!-- Livereload script (if served using the cli tool) -->
+        
+    <script type="text/javascript">
+        var socket = new WebSocket("ws://localhost:3001");
+        socket.onmessage = function (event) {
+            if (event.data === "reload") {
+                socket.close();
+                location.reload(true); // force reload from server (not from cache)
+            }
+        };
+
+        window.onbeforeunload = function() {
+            socket.close();
+        }
+    </script>
+
+
+        
+
+        
+
+        
+
+        <script src="highlight.js"></script>
+        <script src="book.js"></script>
+
+        <!-- Custom JS script -->
+        
+
+    </body>
+</html>
