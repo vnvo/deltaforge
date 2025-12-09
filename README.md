@@ -8,6 +8,9 @@
   <a href="https://coveralls.io/github/vnvo/deltaforge?branch=main">
     <img src="https://coveralls.io/repos/github/vnvo/deltaforge/badge.svg?branch=main" alt="Coverage Status">
   </a>
+  <a href="https://vnvo.github.io/deltaforge">
+    <img src="https://img.shields.io/badge/docs-online-blue.svg" alt="Docs">
+  </a>  
   <img src="https://img.shields.io/badge/rustc-1.89+-orange.svg" alt="MSRV">
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License">
 </p>
@@ -58,7 +61,8 @@ Deltaforge is meant to replace tools like Debezium and similar.
 
 ## Documentation
 
-- [mdBook](docs/src/SUMMARY.md) — browse the structured documentation locally with `mdbook serve docs`
+- 📘 Online docs: <https://vnvo.github.io/deltaforge>
+- 🛠 Local: `mdbook serve docs` (browse at <http://localhost:3000>)
 
 
 ## Features

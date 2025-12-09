@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/deltaforge-blc.png" width="450" alt="DeltaForge">
+</p>
+
 # Introduction
 
 DeltaForge is a modular, config-driven Change Data Capture (CDC) micro-framework. It streams database changes into downstream systems like Kafka and Redis while giving users control over how each event is processed. Pipelines are defined declaratively in YAML, making it straightforward to onboard new use cases without custom code.
