@@ -1,20 +1,9 @@
 [book]
-authors = ["DeltaForge Contributors"]
+title = "DeltaForge CDC Framework - User Guide"
+authors = ["Vahid Negahdari"]
 language = "en"
-multilingual = false
-src = "src"
-title = "DeltaForge User Guide"
-
-description = "Change Data Capture pipelines with DeltaForge: configuration, runtime behavior, and deployment tips."
-
-[build]
-default-theme = "navy"
 
 [output.html]
-theme = "theme"
-additional-css = []
-git-repository-url = "https://github.com/vnvo/deltaforge"
-git-repository-icon = "fa-github"
-additional-js = []
-
-[preprocessor.links]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+additional-css = ["css/custom.css"]

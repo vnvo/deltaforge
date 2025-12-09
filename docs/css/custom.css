@@ -1,0 +1,46 @@
+/* Logo above navigation */
+mdbook-sidebar-scrollbox,
+.sidebar-scrollbox {
+    padding-top: 90px !important;
+    padding-bottom: 50px;
+}
+
+.sidebar::before {
+    content: "";
+    position: absolute;
+    top: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 80px;
+    height: 80px;
+    background: url("../assets/deltaforge-blc.png") no-repeat center center;
+    background-size: contain;
+    opacity: 0.9;
+    z-index: 10;
+}
+
+/* Footer badges */
+.sidebar-footer {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    width: var(--sidebar-width);
+    padding: 10px;
+    text-align: center;
+    border-top: 1px solid var(--sidebar-separator);
+    background: var(--bg);
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 6px;
+    z-index: 10;
+}
+
+.sidebar-footer img {
+    height: 18px;
+}
+
+/* Hide footer when sidebar is hidden */
+.sidebar-hidden .sidebar-footer {
+    display: none;
+}
