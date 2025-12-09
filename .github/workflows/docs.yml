@@ -19,7 +19,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install mdBook
-        run: cargo install mdbook --version 0.4.40
+        run: cargo install mdbook --version 0.5.1
 
       - name: Build documentation
         working-directory: docs
