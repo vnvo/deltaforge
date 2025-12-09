@@ -10,7 +10,7 @@ Set `spec.source.type` to `mysql` and provide a config object:
 
 - `id` (string): logical identifier for metrics and logging.
 - `dsn` (string): MySQL connection string with replication privileges.
-- `tables` (array<string>): fully qualified tables to subscribe to.
+- `tables` (array< string >): fully qualified tables to subscribe to.
 
 ### Example
 ```yaml
