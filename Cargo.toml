@@ -33,6 +33,12 @@ base64 = "0.22"
 url = "2.5"
 thiserror = "1"
 
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "z"
+strip = true
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 unused_crate_dependencies = "warn"
