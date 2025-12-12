@@ -46,6 +46,18 @@ Point the runner at a file or directory containing one or more specs. Directorie
 cargo run -p runner -- --config ./pipelines
 ```
 
+Or run the container if you prefer a Docker-based workflow:
+
+```bash
+docker run --rm \
+  -p 8080:8080 -p 9000:9000 \
+  -v $(pwd)/examples/dev.yaml:/etc/deltaforge/pipeline.yaml:ro \
+  -v deltaforge-checkpoints:/app/data \
+  deltaforge:local \
+  --config /etc/deltaforge/pipelines.yaml
+```
+
+See the [Development guide](development.md) for image build steps, dependency containers, and additional runtime flags.
 Optional flags:
 
 - `--api-addr 0.0.0.0:8080` — REST control plane for pipeline lifecycle operations.

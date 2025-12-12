@@ -64,6 +64,18 @@ Deltaforge is meant to replace tools like Debezium and similar.
 - 📘 Online docs: <https://vnvo.github.io/deltaforge>
 - 🛠 Local: `mdbook serve docs` (browse at <http://localhost:3000>)
 
+## Local development helper
+
+Use the bundled `dev.sh` CLI to spin up the dependency stack and run common workflows consistently:
+
+```bash
+./dev.sh up     # start Postgres, MySQL, Kafka, Redis from docker-compose.dev.yml
+./dev.sh ps     # view container status
+./dev.sh check  # fmt --check + clippy + tests (matches CI)
+```
+
+See the [Development guide](docs/src/development.md) for the full layout and additional info.
+
 ## Container image
 
 Build an image for the runner with the provided multi-stage Dockerfile:

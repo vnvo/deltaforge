@@ -14,4 +14,5 @@
 - [Examples](examples/README.md)
     - [MySQL to Redis](examples/mysql_to_redis.md)
 - [Troubleshooting](troubleshooting.md)
+- [Development](development.md)
 - [Roadmap](roadmap.md)
