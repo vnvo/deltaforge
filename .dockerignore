@@ -1,0 +1,18 @@
+# Build outputs
+/target
+**/target
+
+# Git metadata
+/.git
+/.gitignore
+
+# Development tooling
+**/.env
+**/.vscode
+**/.idea
+**/.DS_Store
+
+# Docs and assets not needed at runtime
+/docs
+/assets
+/init-scripts

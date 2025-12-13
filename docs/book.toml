@@ -2,7 +2,7 @@
 title = "DeltaForge CDC Framework - User Guide"
 authors = ["Vahid Negahdari"]
 language = "en"
-description = "Documentation for DeltaForge, a modular change data capture (CDC) and streaming micro-framework in Rust"
+description = "DeltaForge is an efficient rust-based Change Data Capture (CDC) framework for streaming MySQL binlog and Postgres logical replication changes into Kafka and Redis with config-driven pipelines and inline Javascript processing."
 
 [output.html]
 default-theme = "navy"
@@ -11,7 +11,7 @@ additional-css = ["css/custom.css"]
 git-repository-url = "https://github.com/vnvo/deltaforge"
 git-repository-icon = "fab-github"
 edit-url-template = "https://github.com/vnvo/deltaforge/edit/main/docs/src/{path}"
-site-url = "/deltaforge/"
+site-url = "https://vnvo.github.io/deltaforge/"
 no-section-label = true
 
 [output.html.search]

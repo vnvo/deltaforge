@@ -64,6 +64,38 @@ Deltaforge is meant to replace tools like Debezium and similar.
 - 📘 Online docs: <https://vnvo.github.io/deltaforge>
 - 🛠 Local: `mdbook serve docs` (browse at <http://localhost:3000>)
 
+## Local development helper
+
+Use the bundled `dev.sh` CLI to spin up the dependency stack and run common workflows consistently:
+
+```bash
+./dev.sh up     # start Postgres, MySQL, Kafka, Redis from docker-compose.dev.yml
+./dev.sh ps     # view container status
+./dev.sh check  # fmt --check + clippy + tests (matches CI)
+```
+
+See the [Development guide](docs/src/development.md) for the full layout and additional info.
+
+## Container image
+
+Build an image for the runner with the provided multi-stage Dockerfile:
+
+```bash
+docker build -t deltaforge:local .
+```
+
+Run it by mounting your pipeline specs (environment variables are expanded inside the YAML) and exposing the API and metrics ports:
+
+```bash
+docker run --rm \
+  -p 8080:8080 -p 9000:9000 \
+  -v $(pwd)/examples/dev.yaml:/etc/deltaforge/pipelines.yaml:ro \
+  -v deltaforge-checkpoints:/app/data \
+  deltaforge:local \
+  --config /etc/deltaforge/pipelines.yaml
+```
+
+The container runs as a non-root user, writes checkpoints to `/app/data/df_checkpoints.json`, and listens on `0.0.0.0:8080` for the control plane API with metrics served on `:9000`.
 
 ## Features
 
