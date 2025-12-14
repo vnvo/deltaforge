@@ -53,6 +53,7 @@ pub struct MySqlSource {
     pub dsn: String,         // mysql://user:pass@host:3306/db
     pub tables: Vec<String>, // ["db.table"]; empty = all
     pub tenant: String,
+    pub pipeline: String,
 }
 
 const HEARTBEAT_INTERVAL_SECS: u64 = 15;
@@ -60,6 +61,7 @@ const READ_TIMEOUT: u64 = 90;
 // shared state for mysql source
 struct RunCtx {
     source_id: String,
+    pipeline: String,
     tenant: String,
     dsn: String,
     host: String,
@@ -101,6 +103,7 @@ impl MySqlSource {
 
         let mut ctx = RunCtx {
             source_id: self.id.clone(),
+            pipeline: self.pipeline.clone(),
             tenant: self.tenant.clone(),
             dsn: self.dsn.clone(),
             host,

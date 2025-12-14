@@ -1,4 +1,5 @@
 use deltaforge_core::{Event, Op, SourceError, SourceMeta, SourceResult};
+use metrics::counter;
 use mysql_binlog_connector_rust::{
     binlog_stream::BinlogStream,
     event::{
@@ -35,6 +36,12 @@ pub(super) async fn read_next_event(
                 return Err(LoopControl::Stop);
             }
             if retryable_stream(&se) {
+                counter!(
+                    "deltaforge_source_reconnects_total",
+                    "pipeline" => ctx.pipeline.clone(),
+                    "source" => ctx.source_id.clone(),
+                )
+                .increment(1);
                 warn!(source_id=%ctx.source_id, error=%se, "binlog read failed; scheduling reconnect");
                 Err(LoopControl::Reconnect)
             } else {
@@ -151,10 +158,23 @@ async fn handle_write_rows(
                 None,
                 Some(after),
                 ts_ms(header.timestamp),
+                header.event_length as usize,
             );
             ev.tx_id = ctx.last_gtid.clone();
-            if ctx.tx.send(ev).await.is_err() {
-                error!(source_id=%ctx.source_id, "channel send failed (op=insert)");
+            let table = format!("{}.{}", tm.database_name, tm.table_name);
+            match ctx.tx.send(ev).await {
+                Ok(_) => {
+                    counter!(
+                        "deltaforge_source_events_total",
+                        "pipeline" => ctx.pipeline.clone(),
+                        "source" => ctx.source_id.clone(),
+                        "table" => table,
+                    )
+                    .increment(1);
+                }
+                Err(_) => {
+                    error!(source_id=%ctx.source_id, "channel send failed (op=insert)");
+                }
             }
         }
     } else {
@@ -202,10 +222,23 @@ async fn handle_update_rows(
                 Some(before),
                 Some(after),
                 ts_ms(header.timestamp),
+                header.event_length as usize,
             );
             ev.tx_id = ctx.last_gtid.clone();
-            if ctx.tx.send(ev).await.is_err() {
-                error!(source_id=%ctx.source_id, "channel send failed (op=update)");
+            let table = format!("{}.{}", tm.database_name, tm.table_name);
+            match ctx.tx.send(ev).await {
+                Ok(_) => {
+                    counter!(
+                        "deltaforge_source_events_total",
+                        "pipeline" => ctx.pipeline.clone(),
+                        "source" => ctx.source_id.clone(),
+                        "table" => table,
+                    )
+                    .increment(1);
+                }
+                Err(_) => {
+                    error!(source_id=%ctx.source_id, "channel send failed (op=update)");
+                }
             }
         }
     } else {
@@ -245,10 +278,23 @@ async fn handle_delete_rows(
                 Some(before),
                 None,
                 ts_ms(header.timestamp),
+                header.event_length as usize,
             );
             ev.tx_id = ctx.last_gtid.clone();
-            if ctx.tx.send(ev).await.is_err() {
-                error!(source_id=%ctx.source_id, "channel send failed (op=delete)");
+            let table = format!("{}.{}", tm.database_name, tm.table_name);
+            match ctx.tx.send(ev).await {
+                Ok(_) => {
+                    counter!(
+                        "deltaforge_source_events_total",
+                        "pipeline" => ctx.pipeline.clone(),
+                        "source" => ctx.source_id.clone(),
+                        "table" => table,
+                    )
+                    .increment(1);
+                }
+                Err(_) => {
+                    error!(source_id=%ctx.source_id, "channel send failed (op=delete)");
+                }
             }
         }
     } else {
@@ -290,10 +336,22 @@ async fn handle_query(
         db.to_string(),
         serde_json::json!({ "sql": q.query }),
         ts_ms(header.timestamp),
+        header.event_length as usize,
     );
     ev.tx_id = ctx.last_gtid.clone();
-    if ctx.tx.send(ev).await.is_err() {
-        error!(source_id=%ctx.source_id, "channel send failed (op=ddl)");
+    match ctx.tx.send(ev).await {
+        Ok(_) => {
+            counter!(
+                "deltaforge_source_events_total",
+                "pipeline" => ctx.pipeline.clone(),
+                "source" => ctx.source_id.clone(),
+                "table" => db.to_string(),
+            )
+            .increment(1);
+        }
+        Err(_) => {
+            error!(source_id=%ctx.source_id, "channel send failed (op=ddl)");
+        }
     }
     Ok(())
 }
@@ -394,6 +452,7 @@ mod tests {
 
         RunCtx {
             source_id: "mysql-unit".to_string(),
+            pipeline: "pipe-1".to_string(),
             tenant: "data-corp".to_string(),
             dsn: "mysql://localhost/ignored".to_string(),
             host: "localhost".to_string(),

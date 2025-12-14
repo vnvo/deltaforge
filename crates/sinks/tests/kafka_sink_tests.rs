@@ -22,6 +22,7 @@ fn make_test_event() -> Event {
         None,
         Some(json!({ "id": 1 })),
         1_700_000_000_000,
+        4 as usize,
     )
 }
 

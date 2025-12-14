@@ -76,6 +76,7 @@ impl Source for FakeSource {
                     Some(serde_json::json!({ "n": n })),
                     // use wall clock; not important here
                     (chrono::Utc::now().timestamp_millis()) as i64,
+                    10 as usize,
                 );
 
                 // If the receiver is dropped, end the task.

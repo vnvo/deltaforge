@@ -4095,6 +4095,7 @@ dependencies = [
  "crc32fast",
  "deltaforge-config",
  "deltaforge-core",
+ "metrics",
  "mysql-binlog-connector-rust",
  "mysql_async",
  "mysql_common 0.35.5",

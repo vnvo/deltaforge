@@ -17,6 +17,7 @@ pub fn build_source(pipeline: &PipelineSpec) -> Result<ArcDynSource> {
             dsn: c.dsn.clone(),
             tables: c.tables.clone(),
             tenant: pipeline.metadata.tenant.clone(),
+            pipeline: pipeline.metadata.name.clone(),
         })),
     }
 }

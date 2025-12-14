@@ -24,6 +24,7 @@ fn make_small_event() -> Event {
         None,
         Some(json!({"id": 1, "sku": "ABC-1", "qty": 2})),
         1_700_000_000_000,
+        10 as usize,
     )
 }
 
@@ -46,6 +47,7 @@ fn make_large_event(bytes: usize) -> Event {
             "nested": {"k": [1,2,3,4,5]}
         })),
         1_700_000_000_000,
+        25 as usize,
     )
 }
 
