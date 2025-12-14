@@ -94,6 +94,11 @@ pub fn describe_metrics() {
         "Total number of events received from source"
     );
     describe_counter!(
+        "deltaforge_source_reconnects_total",
+        Unit::Count,
+        "Reconnects performed by a source reader"
+    );
+    describe_counter!(
         "deltaforge_sink_events_total",
         Unit::Count,
         "Total number of events sent to sink"
@@ -102,5 +107,25 @@ pub fn describe_metrics() {
         "deltaforge_stage_latency_seconds",
         Unit::Seconds,
         "Latency per pipeline stage."
+    );
+    describe_histogram!(
+        "deltaforge_processor_latency_seconds",
+        Unit::Seconds,
+        "Per-processor latency for batch execution"
+    );
+    describe_histogram!(
+        "deltaforge_sink_latency_seconds",
+        Unit::Seconds,
+        "Latency to deliver an event to a sink"
+    );
+    describe_histogram!(
+        "deltaforge_batch_events",
+        Unit::Count,
+        "Distribution of events per batch"
+    );
+    describe_histogram!(
+        "deltaforge_batch_bytes",
+        Unit::Bytes,
+        "Distribution of serialized batch sizes"
     );
 }
