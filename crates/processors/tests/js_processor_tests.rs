@@ -25,6 +25,7 @@ fn new_event() -> Event {
         trace_id: None,
         tags: None,
         checkpoint: None,
+        size_bytes: 20 as usize,
     }
 }
 

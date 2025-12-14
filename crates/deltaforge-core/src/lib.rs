@@ -101,6 +101,10 @@ pub struct Event {
 
     /// Event checkpoint info
     pub checkpoint: Option<CheckpointMeta>,
+
+    /// Byte size hint for batching (from source or estimated)
+    #[serde(default)]
+    pub size_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +123,7 @@ impl Event {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_row(
         tenant_id: String,
         source: SourceMeta,
@@ -127,6 +132,7 @@ impl Event {
         before: Option<Value>,
         after: Option<Value>,
         ts_ms: i64,
+        size_bytes: usize,
     ) -> Self {
         let ts = DateTime::<Utc>::from_timestamp_millis(ts_ms)
             .unwrap_or_else(Utc::now);
@@ -145,6 +151,7 @@ impl Event {
             trace_id: None,
             tags: None,
             checkpoint: None,
+            size_bytes,
         }
     }
 
@@ -154,6 +161,7 @@ impl Event {
         table: String,
         ddl: Value,
         ts_ms: i64,
+        size_bytes: usize,
     ) -> Self {
         let ts = DateTime::<Utc>::from_timestamp_millis(ts_ms)
             .unwrap_or_else(Utc::now);
@@ -172,6 +180,7 @@ impl Event {
             trace_id: None,
             tags: None,
             checkpoint: None,
+            size_bytes,
         }
     }
 }

@@ -105,7 +105,8 @@ impl PipelineManager {
         let (event_tx, event_rx) = mpsc::channel::<Event>(4096);
         let src_handle = source.run(event_tx, self.ckpt_store.clone()).await;
 
-        let batch_processor = build_batch_processor(processors);
+        let batch_processor =
+            build_batch_processor(processors, pipeline_name.clone());
         let commit_cp =
             build_commit_fn(self.ckpt_store.clone(), pipeline_name.clone());
 

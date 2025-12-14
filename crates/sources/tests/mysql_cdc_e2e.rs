@@ -156,6 +156,7 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
         dsn: dsn.to_string(),
         tables: vec!["shop.orders".into()],
         tenant: "acme".into(),
+        pipeline: "pipe-2".to_string(),
     };
 
     let ckpt_store: Arc<dyn CheckpointStore> =

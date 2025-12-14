@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use checkpoints::CheckpointStore;
 use futures::future::BoxFuture;
-use metrics::counter;
+use metrics::{counter, histogram};
 use tokio::sync::watch;
 use tokio::time::{Instant, interval};
 use tokio_util::sync::CancellationToken;
@@ -59,8 +59,7 @@ struct FrozenBatch {
 }
 
 fn event_size_hint(ev: &Event) -> usize {
-    // Prefer exact if Event carries raw bytes; JSON fallback is fine.
-    serde_json::to_vec(ev).map(|v| v.len()).unwrap_or(256)
+    ev.size_bytes
 }
 
 /// something to fix later in the `Event`
@@ -88,7 +87,7 @@ fn is_sink_required(_sink: &ArcDynSink) -> bool {
 }
 
 pub struct Coordinator<Tok> {
-    pipeline_name: String,
+    pipeline_name: Arc<str>,
     sinks: Vec<ArcDynSink>,
     /// Store the *effective* (defaults-applied) batch config.
     batch_cfg_eff: BatchConfig,
@@ -108,7 +107,7 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
     ) -> Self {
         let batch_cfg_eff = Self::effective(&batch_cfg_from_spec);
         Self {
-            pipeline_name: name,
+            pipeline_name: name.into(),
             sinks,
             batch_cfg_eff,
             commit_policy,
@@ -219,14 +218,32 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
         reason: &str,
     ) -> Result<()> {
         // 1) PROCESS (mutable): processors can modify/duplicate/drop events
+        let proc_start = Instant::now();
         let processed = (self.process_batch)(std::mem::take(&mut b.raw))
             .await
             .context("process batch")?;
+        histogram!(
+            "deltaforge_stage_latency_seconds",
+            "pipeline" => self.pipeline_name.clone(),
+            "stage" => "process",
+            "trigger" => reason.to_string()
+        )
+        .record(proc_start.elapsed().as_secs_f64());
         debug!(pipeline=%self.pipeline_name, processed_count=%processed.events.len(), "receveid events from processors");
 
         let last_cp = processed.last_checkpoint;
         // recompute size after processing
         let bytes = processed.events.iter().map(event_size_hint).sum();
+        histogram!(
+            "deltaforge_batch_events",
+            "pipeline" => self.pipeline_name.clone(),
+        )
+        .record(processed.events.len() as f64);
+        histogram!(
+            "deltaforge_batch_bytes",
+            "pipeline" => self.pipeline_name.clone(),
+        )
+        .record(bytes as f64);
 
         // 2) freeze
         let frozen = FrozenBatch {
@@ -255,6 +272,7 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
 
             let mut ok = true;
             for ev in frozen.events.iter() {
+                let sink_start = Instant::now();
                 counter!(
                     "deltaforge_sink_events_total",
                     "pipeline"=>self.pipeline_name.clone(),
@@ -284,6 +302,13 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                     ok = false;
                     break;
                 }
+
+                histogram!(
+                    "deltaforge_sink_latency_seconds",
+                    "pipeline" => self.pipeline_name.clone(),
+                    "sink"=>sink.id().to_string(),
+                )
+                .record(sink_start.elapsed().as_secs_f64());
             }
 
             if ok {
@@ -367,13 +392,15 @@ pub(crate) fn build_commit_fn(
 
 pub(crate) fn build_batch_processor(
     processors: Arc<[ArcDynProcessor]>,
+    pipeline: String,
 ) -> ProcessBatchFn<CheckpointMeta> {
     use futures::FutureExt;
 
-    let procs = Arc::clone(&processors);
+    let pipeline_name: Arc<str> = pipeline.into();
 
     Arc::new(move |events: Vec<Event>| {
-        let procs = Arc::clone(&procs);
+        let procs = Arc::clone(&processors);
+        let pipeline = Arc::clone(&pipeline_name);
 
         async move {
             if procs.is_empty() {
@@ -392,10 +419,17 @@ pub(crate) fn build_batch_processor(
 
             for p in procs.iter() {
                 let pid = p.id();
+                let start = Instant::now();
                 batch = p
                     .process(batch)
                     .await
                     .with_context(|| format!("processor {pid} failed"))?;
+                histogram!(
+                    "deltaforge_processor_latency_seconds",
+                    "pipeline" => pipeline.clone(),
+                    "processor" => pid.to_string(),
+                )
+                .record(start.elapsed().as_secs_f64());
             }
 
             let last_cp = batch

@@ -4,6 +4,7 @@
 - [Change Data Capture](cdc.md)
 - [Quickstart](quickstart.md)
 - [Configuration](configuration.md)
+- [Observability](observability.md)
 - [Pipelines](pipelines.md)
 - [Sources](sources/README.md)
     - [MySQL](sources/mysql.md)
