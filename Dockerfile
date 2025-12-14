@@ -19,7 +19,7 @@ COPY examples ./examples
 
 RUN cargo build --locked --release --bin runner
 
-FROM gcr.io/distroless/cc-debian12 AS runtime
+FROM gcr.io/distroless/base-debian12 AS runtime
 
 COPY --from=builder /app/target/release/runner /deltaforge
 
