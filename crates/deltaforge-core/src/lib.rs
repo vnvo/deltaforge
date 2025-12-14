@@ -123,6 +123,7 @@ impl Event {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_row(
         tenant_id: String,
         source: SourceMeta,
