@@ -1,0 +1,45 @@
+# Multi-arch debug image
+# Supports: linux/amd64, linux/arm64
+# Includes shell and debugging tools
+
+FROM rust:1.91-bookworm AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        pkg-config \
+        libssl-dev \
+        curl \
+        build-essential \
+        zlib1g-dev \
+        libsasl2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+COPY examples ./examples
+
+RUN cargo build --locked --release --bin runner
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        zlib1g \
+        curl \
+        procps \
+        net-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -u 10001 deltaforge
+
+COPY --from=builder /app/target/release/runner /usr/local/bin/deltaforge
+
+USER deltaforge
+WORKDIR /app
+
+EXPOSE 8080 9000
+ENTRYPOINT ["deltaforge"]
+CMD ["--help"]

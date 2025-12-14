@@ -1,4 +1,9 @@
+# Multi-arch minimal image - the default for production
+# Supports: linux/amd64, linux/arm64
+
 FROM rust:1.91-bookworm AS builder
+
+ARG TARGETARCH
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -19,12 +24,25 @@ COPY examples ./examples
 
 RUN cargo build --locked --release --bin runner
 
-FROM gcr.io/distroless/base-debian12 AS runtime
+# Collect runtime dependencies
+RUN mkdir -p /runtime/lib /runtime/lib64 && \
+    ldd /app/target/release/runner | grep "=>" | awk '{print $3}' | xargs -I {} cp {} /runtime/lib/ && \
+    if [ "$TARGETARCH" = "amd64" ]; then \
+        cp /lib64/ld-linux-x86-64.so.2 /runtime/lib64/; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
+        cp /lib/ld-linux-aarch64.so.1 /runtime/lib/; \
+    fi
 
+FROM scratch
+
+ARG TARGETARCH
+
+# Copy runtime libs
+COPY --from=builder /runtime/lib/* /lib/
+COPY --from=builder /runtime/lib64/* /lib64/
+
+# Copy binary
 COPY --from=builder /app/target/release/runner /deltaforge
-
-USER nonroot:nonroot
-WORKDIR /app
 
 EXPOSE 8080 9000
 ENTRYPOINT ["/deltaforge"]

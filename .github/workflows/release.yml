@@ -5,14 +5,41 @@ on:
     tags:
       - 'v*'
 
+env:
+  REGISTRY_GHCR: ghcr.io
+  REGISTRY_DOCKER: docker.io
+  IMAGE_NAME: ${{ github.repository }}
+
 jobs:
+  # ============================================================
+  # Run tests before release
+  # ============================================================
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --workspace
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          
+      - name: Run tests
+        run: cargo test --workspace --all-features
+        
+      - name: Clippy
+        run: cargo clippy --workspace --all-features -- -D warnings
 
+  # ============================================================
+  # Build and push Docker images (multi-arch)
+  # ============================================================
   docker:
     needs: test
     runs-on: ubuntu-latest
@@ -22,6 +49,9 @@ jobs:
       
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -39,7 +69,22 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract metadata
+      - name: Extract version info
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          if [[ "$VERSION" == *"-"* ]]; then
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+      # --------------------------------------------------------
+      # Minimal image (scratch-based, ~57MB)
+      # --------------------------------------------------------
+      - name: Docker meta (minimal)
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -49,26 +94,107 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ !contains(github.ref, 'rc') && !contains(github.ref, 'beta') }}
+            type=raw,value=latest,enable=${{ steps.version.outputs.is_prerelease == 'false' }}
 
-      - name: Build and push
+      - name: Build and push (minimal)
         uses: docker/build-push-action@v6
         with:
           context: .
+          file: Dockerfile
           push: true
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=minimal
+          cache-to: type=gha,mode=max,scope=minimal
 
+      # --------------------------------------------------------
+      # Debug image (debian-slim, ~140MB)
+      # --------------------------------------------------------
+      - name: Docker meta (debug)
+        id: meta-debug
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/deltaforge
+          tags: |
+            type=semver,pattern={{version}},suffix=-debug
+            type=semver,pattern={{major}}.{{minor}},suffix=-debug
+            type=raw,value=latest-debug,enable=${{ steps.version.outputs.is_prerelease == 'false' }}
+
+      - name: Build and push (debug)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.debug
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta-debug.outputs.tags }}
+          labels: ${{ steps.meta-debug.outputs.labels }}
+          cache-from: type=gha,scope=debug
+          cache-to: type=gha,mode=max,scope=debug
+
+  # ============================================================
+  # Create GitHub Release
+  # ============================================================
   release:
     needs: docker
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          TAG=${GITHUB_REF#refs/tags/}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          if [[ "$VERSION" == *"-"* ]]; then
+            echo "is_prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          {
+            echo "## Docker Images"
+            echo ""
+            echo "Both images support \`linux/amd64\` and \`linux/arm64\`."
+            echo ""
+            echo "**Minimal** (scratch-based):"
+            echo "\`\`\`bash"
+            echo "docker pull ghcr.io/vnvo/deltaforge:${{ steps.version.outputs.version }}"
+            echo "docker pull ${{ secrets.DOCKERHUB_USERNAME }}/deltaforge:${{ steps.version.outputs.version }}"
+            echo "\`\`\`"
+            echo ""
+            echo "**Debug** (includes shell):"
+            echo "\`\`\`bash"
+            echo "docker pull ghcr.io/vnvo/deltaforge:${{ steps.version.outputs.version }}-debug"
+            echo "docker pull ${{ secrets.DOCKERHUB_USERNAME }}/deltaforge:${{ steps.version.outputs.version }}-debug"
+            echo "\`\`\`"
+            echo ""
+            echo "## What's Changed"
+            echo ""
+            if [ -n "$PREV_TAG" ]; then
+              git log --pretty=format:"* %s (%h)" $PREV_TAG..HEAD
+            else
+              echo "Initial release of DeltaForge!"
+            fi
+          } > RELEASE_NOTES.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: RELEASE_NOTES.md
+          prerelease: ${{ steps.version.outputs.is_prerelease == 'true' }}
           generate_release_notes: true
