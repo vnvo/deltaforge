@@ -1,16 +1,16 @@
 # Quickstart
 
-Follow these steps to run DeltaForge with a sample pipeline definition.
+Get DeltaForge running in minutes.
 
 ## 1. Prepare a pipeline spec
-Create a YAML file that matches the `PipelineSpec` schema. Environment variables inside the YAML are expanded before parsing, so secrets and hostnames can be injected at runtime.
 
-- 🧩 **Config-first**: describe the source, processors, and sinks without code changes.
+Create a YAML file that defines your CDC pipeline. Environment variables are expanded at runtime, so secrets stay out of version control.
 
 ```yaml
 metadata:
   name: orders-mysql-to-kafka
   tenant: acme
+
 spec:
   source:
     type: mysql
@@ -19,13 +19,16 @@ spec:
       dsn: ${MYSQL_DSN}
       tables:
         - shop.orders
+
   processors:
     - type: javascript
       id: transform
       inline: |
-        function process(batch) {
-          return batch;
+        (event) => {
+          event.tags = ["processed"];
+          return [event];
         }
+
   sinks:
     - type: kafka
       config:
@@ -33,42 +36,76 @@ spec:
         brokers: ${KAFKA_BROKERS}
         topic: orders
         required: true
+
   batch:
     max_events: 500
     max_bytes: 1048576
     max_ms: 1000
 ```
 
-## 2. Start the runner
-Point the runner at a file or directory containing one or more specs. Directories are walked recursively.
+## 2. Start DeltaForge
 
-```bash
-cargo run -p runner -- --config ./pipelines
-```
-
-Or run the container if you prefer a Docker-based workflow:
+**Using Docker (recommended):**
 
 ```bash
 docker run --rm \
   -p 8080:8080 -p 9000:9000 \
-  -v $(pwd)/examples/dev.yaml:/etc/deltaforge/pipeline.yaml:ro \
+  -e MYSQL_DSN="mysql://user:pass@host:3306/db" \
+  -e KAFKA_BROKERS="kafka:9092" \
+  -v $(pwd)/pipeline.yaml:/etc/deltaforge/pipeline.yaml:ro \
   -v deltaforge-checkpoints:/app/data \
-  deltaforge:local \
-  --config /etc/deltaforge/pipelines.yaml
+  ghcr.io/vnvo/deltaforge:latest \
+  --config /etc/deltaforge/pipeline.yaml
 ```
 
-See the [Development guide](development.md) for image build steps, dependency containers, and additional runtime flags.
-Optional flags:
+**From source:**
 
-- `--api-addr 0.0.0.0:8080` — REST control plane for pipeline lifecycle operations.
-- `--metrics-addr 0.0.0.0:9095` — Prometheus metrics endpoint.
+```bash
+cargo run -p runner -- --config ./pipeline.yaml
+```
 
-## 3. Inspect health and readiness
-Use the REST endpoints to verify the runtime is healthy and discover pipeline states:
+### Runner options
 
-- `GET /healthz` — liveness probe.
-- `GET /readyz` — readiness with pipeline status and specs.
-- `GET /pipelines` — list all pipelines with their live configuration.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config` | (required) | Path to pipeline spec file or directory |
+| `--api-addr` | `0.0.0.0:8080` | REST API address |
+| `--metrics-addr` | `0.0.0.0:9095` | Prometheus metrics address |
 
-## 4. Iterate safely
-Pause, resume, or stop pipelines through the control plane while tweaking batch thresholds, sink requirements, or processor code. DeltaForge will restart pipelines automatically when specs change.
+## 3. Verify it's running
+
+Check health and pipeline status:
+
+```bash
+# Liveness probe
+curl http://localhost:8080/healthz
+
+# Readiness with pipeline status
+curl http://localhost:8080/readyz
+
+# List all pipelines
+curl http://localhost:8080/pipelines
+```
+
+## 4. Manage pipelines
+
+Control pipelines via the REST API:
+
+```bash
+# Pause a pipeline
+curl -X POST http://localhost:8080/pipelines/orders-mysql-to-kafka/pause
+
+# Resume a pipeline
+curl -X POST http://localhost:8080/pipelines/orders-mysql-to-kafka/resume
+
+# Stop a pipeline
+curl -X POST http://localhost:8080/pipelines/orders-mysql-to-kafka/stop
+```
+
+## Next steps
+
+- [CDC Overview](cdc.md) : Understand how Change Data Capture works
+- [Configuration](configuration.md) : Full pipeline spec reference
+- [Sources](sources/README.md) : MySQL and Postgres setup
+- [Sinks](sinks/README.md) : Kafka and Redis configuration
+- [Development](development.md) : Build from source, run locally

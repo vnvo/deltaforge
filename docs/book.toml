@@ -2,7 +2,8 @@
 title = "DeltaForge CDC Framework - User Guide"
 authors = ["Vahid Negahdari"]
 language = "en"
-description = "DeltaForge is an efficient rust-based Change Data Capture (CDC) framework for streaming MySQL binlog and Postgres logical replication changes into Kafka and Redis with config-driven pipelines and inline Javascript processing."
+description = "A modular, config-driven Change Data Capture (CDC) micro-framework built in Rust. Stream database changes to Kafka, Redis and etc."
+src = "src"
 
 [output.html]
 default-theme = "navy"

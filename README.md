@@ -5,6 +5,16 @@
   <a href="https://github.com/vnvo/deltaforge/actions/workflows/ci.yml">
     <img src="https://github.com/vnvo/deltaforge/actions/workflows/ci.yml/badge.svg" alt="CI">
   </a>
+  <a href="https://github.com/vnvo/deltaforge/releases">
+    <img src="https://img.shields.io/github/v/release/vnvo/deltaforge" alt="Release">
+  </a>
+  <a href="https://github.com/vnvo/deltaforge/pkgs/container/deltaforge">
+    <img src="https://img.shields.io/badge/ghcr.io-deltaforge-blue?logo=docker" alt="GHCR">
+  </a>
+  <a href="https://hub.docker.com/r/vnvohub/deltaforge">
+    <img src="https://img.shields.io/docker/pulls/vnvohub/deltaforge?logo=docker" alt="Docker Pulls">
+  </a>
+  <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-green" alt="Arch">
   <a href="https://coveralls.io/github/vnvo/deltaforge?branch=main">
     <img src="https://coveralls.io/repos/github/vnvo/deltaforge/badge.svg?branch=main" alt="Coverage Status">
   </a>
@@ -78,8 +88,20 @@ See the [Development guide](docs/src/development.md) for the full layout and add
 
 ## Container image
 
-Build an image for the runner with the provided multi-stage Dockerfile:
 
+Pre-built multi-arch images (amd64/arm64) are available:
+```bash
+# From GitHub Container Registry
+docker pull ghcr.io/vnvo/deltaforge:latest
+
+# From Docker Hub
+docker pull vnvohub/deltaforge:latest
+
+# Debug variant (includes shell)
+docker pull ghcr.io/vnvo/deltaforge:latest-debug
+```
+
+Or build locally:
 ```bash
 docker build -t deltaforge:local .
 ```
