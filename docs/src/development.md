@@ -202,3 +202,18 @@ The `dev.sh` script provides shortcuts for common tasks:
 3. Make your changes
 4. Run `./dev.sh check` to ensure CI will pass
 5. Submit a PR against `main`
+
+
+## Things to Remember
+
+### Tests
+There a few `#[ignore]` tests, run them when making deep changes to the sources, pipeline coordination and anything with impact on core functionality.
+
+### Logging hygiene
+
+- Include `pipeline`, `tenant`, `source_id`/`sink_id`, and `batch_id` fields on all warnings/errors to make traces joinable in log aggregation tools.
+- Normalize retry/backoff logs so they include the attempt count and sleep duration; consider a structured `reason` field alongside error details for dashboards.
+- Add info-level summaries on interval (e.g., every N batches) reporting batches processed, average batch size, lag, and sink latency percentiles pulled from the metrics registry to create human-friendly breadcrumbs.
+- Add metrics in a backward-compatible way: prefer new metric names over redefining existing ones to avoid breaking dashboards. Validate cardinality (bounded label sets) before merging.
+- Gate noisy logs behind levels (`debug` for per-event traces, `info` for batch summaries, `warn`/`error` for retries and failures).
+- Exercise the new metrics in integration tests by asserting counters change when sending synthetic events through pipelines.

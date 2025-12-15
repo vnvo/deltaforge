@@ -48,14 +48,3 @@ The sections below call out concrete metrics and log events to add per component
 | Ready/Liveness transitions | Logs with pipeline counts and per-pipeline status when readiness changes. | Explain probe failures in log aggregation. |
 | Pipeline lifecycle | Counters for create/patch/stop actions with success/error labels; include tenant and caller metadata in logs. | Auditable control-plane operations. |
 
-### Logging hygiene
-
-- Include `pipeline`, `tenant`, `source_id`/`sink_id`, and `batch_id` fields on all warnings/errors to make traces joinable in log aggregation tools.
-- Normalize retry/backoff logs so they include the attempt count and sleep duration; consider a structured `reason` field alongside error details for dashboards.
-- Add info-level summaries on interval (e.g., every N batches) reporting batches processed, average batch size, lag, and sink latency percentiles pulled from the metrics registry to create human-friendly breadcrumbs.
-
-## How to roll this out safely
-
-1. Add metrics in a backward-compatible way: prefer new metric names over redefining existing ones to avoid breaking dashboards. Validate cardinality (bounded label sets) before merging.
-2. Gate noisy logs behind levels (`debug` for per-event traces, `info` for batch summaries, `warn`/`error` for retries and failures).
-3. Exercise the new metrics in integration tests by asserting counters change when sending synthetic events through pipelines.
