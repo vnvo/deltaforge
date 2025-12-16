@@ -74,10 +74,10 @@ fn policy_satisfied(
     required_acks: usize,
     total_acks: usize,
 ) -> bool {
-    match policy.clone().unwrap_or(CommitPolicy::Required) {
+    match policy.as_ref().unwrap_or(&CommitPolicy::Required) {
         CommitPolicy::All => total_acks == required_total,
         CommitPolicy::Required => required_acks == required_total,
-        CommitPolicy::Quorum { quorum } => total_acks >= quorum,
+        CommitPolicy::Quorum { quorum } => total_acks >= *quorum,
     }
 }
 
@@ -224,24 +224,28 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
             .context("process batch")?;
         histogram!(
             "deltaforge_stage_latency_seconds",
-            "pipeline" => self.pipeline_name.clone(),
+            "pipeline" => self.pipeline_name.to_string(),
             "stage" => "process",
             "trigger" => reason.to_string()
         )
         .record(proc_start.elapsed().as_secs_f64());
-        debug!(pipeline=%self.pipeline_name, processed_count=%processed.events.len(), "receveid events from processors");
+        debug!(
+            pipeline=%self.pipeline_name,
+            processed_count=%processed.events.len(),
+            "receveid events from processors"
+        );
 
         let last_cp = processed.last_checkpoint;
         // recompute size after processing
         let bytes = processed.events.iter().map(event_size_hint).sum();
         histogram!(
             "deltaforge_batch_events",
-            "pipeline" => self.pipeline_name.clone(),
+            "pipeline" => self.pipeline_name.to_string(),
         )
         .record(processed.events.len() as f64);
         histogram!(
             "deltaforge_batch_bytes",
-            "pipeline" => self.pipeline_name.clone(),
+            "pipeline" => self.pipeline_name.to_string(),
         )
         .record(bytes as f64);
 
@@ -270,56 +274,58 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                 required_total += 1;
             }
 
-            let mut ok = true;
-            for ev in frozen.events.iter() {
-                let sink_start = Instant::now();
-                counter!(
-                    "deltaforge_sink_events_total",
-                    "pipeline"=>self.pipeline_name.clone(),
-                    "sink"=>sink.id().to_string(),
-                )
-                .increment(1);
+            let sink_start = Instant::now();
 
-                debug!(pipeline=%self.pipeline_name, sink_id=%sink.id(), eid=%ev.event_id, "sending to sink");
-                if let Err(e) = sink.send(ev.clone()).await {
+            // batch send
+            match sink.send_batch(&frozen.events).await {
+                Ok(()) => {
+                    total_acks += 1;
+                    if required {
+                        required_acks += 1;
+                    }
+
+                    counter!(
+                        "deltaforge_sink_events_total",
+                        "pipeline"=>self.pipeline_name.to_string(),
+                        "sink"=>sink.id().to_string(),
+                    )
+                    .increment(frozen.events.len() as u64);
+                    counter!(
+                        "deltaforge_sink_batch_total",
+                        "pipeline"=>self.pipeline_name.to_string(),
+                        "sink"=>sink.id().to_string(),
+                    )
+                    .increment(1);
+                    histogram!(
+                        "deltaforge_sink_latency_seconds",
+                        "pipeline" => self.pipeline_name.to_string(),
+                        "sink" => sink.id().to_string(),
+                    )
+                    .record(sink_start.elapsed().as_secs_f64());
+                }
+                Err(e) => {
                     tracing::warn!(
                         pipeline = %self.pipeline_name,
                         sink_id = %sink.id(),
                         batch_id = %frozen.id,
+                        event_count = frozen.events.len(),
                         kind = %e.kind(),
                         details = %e.details(),
                         error = ?e,
-                        "sink failed"
+                        "sink batch failed"
                     );
 
                     counter!(
                         "deltaforge_sink_failures_total",
-                        "pipeline" => self.pipeline_name.clone(),
-                        "sink"=>sink.id().to_string(),
+                        "pipeline" => self.pipeline_name.to_string(),
+                        "sink" => sink.id().to_string(),
                     )
                     .increment(1);
-
-                    ok = false;
-                    break;
-                }
-
-                histogram!(
-                    "deltaforge_sink_latency_seconds",
-                    "pipeline" => self.pipeline_name.clone(),
-                    "sink"=>sink.id().to_string(),
-                )
-                .record(sink_start.elapsed().as_secs_f64());
-            }
-
-            if ok {
-                total_acks += 1;
-                if required {
-                    required_acks += 1;
                 }
             }
         }
 
-        // 4) COMMIT checkpoint if policy satisfied (token from *processed* events)
+        // 4) COMMIT checkpoint if policy satisfied
         if policy_satisfied(
             &self.commit_policy,
             required_total,
@@ -344,7 +350,7 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
         Ok(())
     }
 
-    /// Compute the effective batch configuration by applying defaults.
+    /// compute the effective batch configuration by applying defaults.
     fn effective(cfg: &Option<BatchConfig>) -> BatchConfig {
         BatchConfig {
             max_events: Some(
@@ -368,7 +374,7 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
     }
 }
 
-pub(crate) fn build_commit_fn(
+pub fn build_commit_fn(
     ckpt_store: Arc<dyn CheckpointStore>,
     pipeline_name: String,
 ) -> CommitCpFn<CheckpointMeta> {
@@ -390,7 +396,7 @@ pub(crate) fn build_commit_fn(
     })
 }
 
-pub(crate) fn build_batch_processor(
+pub fn build_batch_processor(
     processors: Arc<[ArcDynProcessor]>,
     pipeline: String,
 ) -> ProcessBatchFn<CheckpointMeta> {
@@ -406,8 +412,9 @@ pub(crate) fn build_batch_processor(
             if procs.is_empty() {
                 let last_cp = events
                     .iter()
-                    .filter_map(|e| e.checkpoint.clone())
-                    .next_back();
+                    .rev()
+                    .find_map(|e| e.checkpoint.as_ref())
+                    .cloned();
                 return Ok(ProcessedBatch {
                     events,
                     last_checkpoint: last_cp,
@@ -426,7 +433,7 @@ pub(crate) fn build_batch_processor(
                     .with_context(|| format!("processor {pid} failed"))?;
                 histogram!(
                     "deltaforge_processor_latency_seconds",
-                    "pipeline" => pipeline.clone(),
+                    "pipeline" => pipeline.to_string(),
                     "processor" => pid.to_string(),
                 )
                 .record(start.elapsed().as_secs_f64());
@@ -434,8 +441,9 @@ pub(crate) fn build_batch_processor(
 
             let last_cp = batch
                 .iter()
-                .filter_map(|e| e.checkpoint.clone())
-                .next_back();
+                .rev()
+                .find_map(|e| e.checkpoint.as_ref())
+                .cloned();
 
             Ok(ProcessedBatch {
                 events: batch,

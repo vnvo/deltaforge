@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use checkpoints::CheckpointStore;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use tokio::{
     sync::{Notify, mpsc},
@@ -107,9 +107,49 @@ pub struct Event {
     pub size_bytes: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum CheckpointMeta {
-    Opaque(Vec<u8>),
+    Opaque(Arc<[u8]>),
+}
+
+impl CheckpointMeta {
+    pub fn from_vec(data: Vec<u8>) -> Self {
+        Self::Opaque(data.into())
+    }
+    pub fn from_slice(data: &[u8]) -> Self {
+        Self::Opaque(Arc::from(data))
+    }
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Opaque(data) => data,
+        }
+    }
+}
+
+// Custom Serialize: serialize as bytes (wire-compatible with Vec<u8>)
+impl Serialize for CheckpointMeta {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            CheckpointMeta::Opaque(data) => serializer.serialize_bytes(data),
+        }
+    }
+}
+
+// Custom Deserialize: deserialize from bytes into Arc<[u8]>
+impl<'de> Deserialize<'de> for CheckpointMeta {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
+        Ok(CheckpointMeta::Opaque(bytes.into()))
+    }
 }
 
 impl Event {
@@ -118,7 +158,7 @@ impl Event {
             "{}|{}|{}|{}",
             self.tenant_id,
             self.table,
-            self.tx_id.clone().unwrap_or_default(),
+            self.tx_id.as_deref().unwrap_or(""),
             self.event_id
         )
     }
@@ -267,7 +307,19 @@ pub trait Processor: Send + Sync {
 #[async_trait]
 pub trait Sink: Send + Sync {
     fn id(&self) -> &str;
-    async fn send(&self, event: Event) -> SinkResult<()>;
+
+    /// send a single event to the sink.
+    /// takes a reference to avoid cloning in multi-sink scenarios
+    async fn send(&self, event: &Event) -> SinkResult<()>;
+
+    /// send a batch of events. default implementation calls send() in a loop.
+    /// sinks can/should override for better performance
+    async fn send_batch(&self, events: &[Event]) -> SinkResult<()> {
+        for event in events {
+            self.send(event).await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -374,76 +426,3 @@ impl PipelineHandle {
         }
     }
 }
-
-// impl Pipeline {
-//     pub async fn start(
-//         &self,
-//         ckpt_store: Arc<dyn CheckpointStore>,
-//     ) -> Result<PipelineHandle> {
-//         let (tx, mut rx) = mpsc::channel::<Event>(1024);
-
-//         let pipeline_id = self.id.clone();
-//         info!(pipeline_id = pipeline_id, "pipeline starting ...");
-//         //spawn sources
-//         let mut source_handles: Vec<SourceHandle> =
-//             Vec::with_capacity(self.sources.len());
-
-//         for src in self.sources.iter().cloned() {
-//             let src_handle = src.run(tx.clone(), ckpt_store.clone()).await;
-//             source_handles.push(src_handle);
-//         }
-//         drop(tx);
-
-//         let cancel = CancellationToken::new();
-//         let cancel_for_task = cancel.clone();
-
-//         let processors = self.processors.clone();
-//         let sinks = self.sinks.clone();
-
-//         // main dispatcher loop
-//         let join = tokio::spawn(async move {
-//             loop {
-//                 tokio::select! {
-//                     _ = cancel_for_task.cancelled() => {
-//                         break; //graceful shutdown
-//                     }
-
-//                     maybe_ev = rx.recv() => {
-//                         let Some(ev) = maybe_ev else { break; };
-
-//                         //sequential processing
-//                         let mut out: Vec<Event> = vec![ev];
-//                         for p in processors.iter() {
-//                             let mut next = Vec::new();
-//                             for mut e in out.drain(..) {
-//                                 match p.process(&mut e).await {
-//                                     Ok(produced) => next.extend(produced),
-//                                     Err(err) => error!(error = %err, "processor error; dropping event"),
-//                                 }
-//                             }
-//                             out = next;
-//                         }
-
-//                         // dispatch to sinks
-//                         for e in out.into_iter() {
-//                             for s in sinks.iter() {
-//                                 if let Err(err) = s.send(e.clone()).await {
-//                                     error!(error = %err, "sink send failed");
-//                                 }
-//                             }
-//                         }
-//                     }
-//                 };
-//             }
-
-//             Ok(())
-//         });
-
-//         Ok(PipelineHandle {
-//             id: pipeline_id,
-//             cancel,
-//             source_handles,
-//             join,
-//         })
-//     }
-// }

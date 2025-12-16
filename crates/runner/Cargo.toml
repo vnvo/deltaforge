@@ -26,3 +26,10 @@ sinks = { path = "../sinks" }
 processors = { path = "../processors" }
 rest-api = { path = "../rest-api" }
 checkpoints = { path = "../checkpoints" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "pipeline_e2e"
+harness = false

@@ -2,8 +2,10 @@ use anyhow::Context;
 use async_trait::async_trait;
 use deltaforge_config::KafkaSinkCfg;
 use deltaforge_core::{Event, Sink, SinkError, SinkResult};
+use futures::future::try_join_all;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::util::Timeout;
 use std::time::Duration;
 use tracing::{debug, info, instrument};
 
@@ -62,7 +64,7 @@ impl Sink for KafkaSink {
         &self.id
     }
 
-    async fn send(&self, event: Event) -> SinkResult<()> {
+    async fn send(&self, event: &Event) -> SinkResult<()> {
         let payload = serde_json::to_vec(&event)?;
         let key = event.idempotency_key();
 
@@ -78,6 +80,43 @@ impl Sink for KafkaSink {
             })?;
 
         debug!(topic = %self.topic, "event sent to kafka sink");
+        Ok(())
+    }
+
+    /// batch send for kafka: queue all messages, then await all deliveries.
+    /// this lets rdkafka's internal batcher work optimally.
+    async fn send_batch(&self, events: &[Event]) -> SinkResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        // pre-serialize all payloads and keys
+        let serialized: Vec<(Vec<u8>, String)> = events
+            .iter()
+            .map(|e| Ok((serde_json::to_vec(e)?, e.idempotency_key())))
+            .collect::<Result<Vec<_>, SinkError>>()?;
+
+        // queue all messages to rdkafka's internal buffer
+        // send() enqueues immediately; rdkafka batches internally
+        let futures: Vec<_> = serialized
+            .iter()
+            .map(|(payload, key)| {
+                self.producer.send(
+                    FutureRecord::to(&self.topic).payload(payload).key(key),
+                    Timeout::After(Duration::from_secs(30)),
+                )
+            })
+            .collect();
+
+        // await ALL deliveries concurrently, fail fast on first error
+        try_join_all(futures.into_iter().map(|f| async move {
+            f.await.map_err(|(e, _)| SinkError::Backpressure {
+                details: format!("kafka: {e}").into(),
+            })
+        }))
+        .await?;
+
+        debug!(topic = %self.topic, count = events.len(), "batch delivered");
         Ok(())
     }
 }

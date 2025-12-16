@@ -43,7 +43,7 @@ async fn kafka_sink_writes_to_topic() -> Result<()> {
     // Produce one event via our sink
     let sink = KafkaSink::new(&cfg)?;
     let ev = make_test_event();
-    sink.send(ev).await?;
+    sink.send(&ev).await?;
 
     // Build a consumer to verify the message is on the topic
     let consumer: StreamConsumer = ClientConfig::new()
@@ -80,8 +80,59 @@ async fn kafka_sink_with_exactly_once_enabled() -> Result<()> {
 
     let sink = KafkaSink::new(&cfg)?;
     let ev = make_test_event();
-    sink.send(ev).await?;
+    sink.send(&ev).await?;
 
     // If we got here without error, producer creation + send succeeded.
+    Ok(())
+}
+
+#[ignore]
+#[tokio::test(flavor = "multi_thread")]
+async fn kafka_sink_batch_send() -> Result<()> {
+    let cfg = KafkaSinkCfg {
+        id: "test-kafka-batch".to_string(),
+        brokers: "localhost:9092".to_string(),
+        topic: "df.test.kafka.batch".to_string(),
+        required: None,
+        exactly_once: None,
+        client_conf: Default::default(),
+    };
+
+    let sink = KafkaSink::new(&cfg)?;
+
+    let events: Vec<_> = (0..100)
+        .map(|i| {
+            Event::new_row(
+                "t".into(),
+                SourceMeta {
+                    kind: "test".into(),
+                    host: "h".into(),
+                    db: "d".into(),
+                },
+                "d.t".into(),
+                Op::Insert,
+                None,
+                Some(json!({ "id": i })),
+                1_700_000_000_000,
+                64,
+            )
+        })
+        .collect();
+
+    sink.send_batch(&events).await?;
+
+    // Verify by consuming
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &cfg.brokers)
+        .set("group.id", "deltaforge-kafka-batch-test")
+        .set("auto.offset.reset", "earliest")
+        .create()?;
+
+    consumer.subscribe(&[&cfg.topic])?;
+
+    // Just verify we can read at least one message
+    let msg = timeout(Duration::from_secs(10), consumer.recv()).await??;
+    assert!(msg.payload().is_some());
+
     Ok(())
 }
