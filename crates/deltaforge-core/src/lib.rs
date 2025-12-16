@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use checkpoints::CheckpointStore;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Deserializer, Serializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use tokio::{
     sync::{Notify, mpsc},
@@ -128,7 +128,10 @@ impl CheckpointMeta {
 
 // Custom Serialize: serialize as bytes (wire-compatible with Vec<u8>)
 impl Serialize for CheckpointMeta {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -317,7 +320,6 @@ pub trait Sink: Send + Sync {
         }
         Ok(())
     }
-
 }
 
 #[async_trait]

@@ -1,8 +1,8 @@
 use anyhow::Context;
 use async_trait::async_trait;
-use futures::future::try_join_all;
 use deltaforge_config::KafkaSinkCfg;
 use deltaforge_core::{Event, Sink, SinkError, SinkResult};
+use futures::future::try_join_all;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
@@ -106,7 +106,7 @@ impl Sink for KafkaSink {
                     Timeout::After(Duration::from_secs(30)),
                 )
             })
-            .collect();  
+            .collect();
 
         // await ALL deliveries concurrently, fail fast on first error
         try_join_all(futures.into_iter().map(|f| async move {

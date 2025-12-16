@@ -110,5 +110,5 @@ impl Sink for RedisSink {
 
         debug!(stream = %self.stream, count = events.len(), "pipeline executed");
         Ok(())
-    }    
+    }
 }
