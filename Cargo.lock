@@ -4020,6 +4020,7 @@ dependencies = [
  "async-trait",
  "deltaforge-config",
  "deltaforge-core",
+ "futures",
  "rdkafka",
  "redis",
  "serde_json",

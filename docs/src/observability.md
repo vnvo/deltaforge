@@ -36,6 +36,7 @@ The sections below call out concrete metrics and log events to add per component
 | Status | Metric/log | Rationale |
 | --- | --- | --- |
 | ✅ Implemented | `deltaforge_sink_events_total{pipeline,sink}` counter and `deltaforge_sink_latency_seconds{pipeline,sink}` histogram around each send. | Throughput and responsiveness per sink. |
+| ✅ Implemented | `deltaforge_sink_batch_total{pipeline,sink}` counter for send. | Number of batches sent per sink. |
 | 🚧 Gap | Error taxonomy in `deltaforge_sink_failures_total` (add `kind`/`details`). | Easier alerting on specific failure classes (auth, timeout, schema). |
 | 🚧 Gap | Backpressure gauge for client buffers (rdkafka queue, Redis pipeline depth). | Early signal before errors occur. |
 | 🚧 Gap | Drop/skip counters from processors/sinks. | Auditing and reconciliation. |

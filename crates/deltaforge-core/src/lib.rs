@@ -267,7 +267,20 @@ pub trait Processor: Send + Sync {
 #[async_trait]
 pub trait Sink: Send + Sync {
     fn id(&self) -> &str;
-    async fn send(&self, event: Event) -> SinkResult<()>;
+
+    /// send a single event to the sink.
+    /// takes a reference to avoid cloning in multi-sink scenarios
+    async fn send(&self, event: &Event) -> SinkResult<()>;
+
+    /// send a batch of events. default implementation calls send() in a loop.
+    /// sinks can/should override for better performance
+    async fn send_batch(&self, events: &[Event]) -> SinkResult<()> {
+        for event in events {
+            self.send(event).await?;
+        }
+        Ok(())
+    }
+
 }
 
 #[async_trait]

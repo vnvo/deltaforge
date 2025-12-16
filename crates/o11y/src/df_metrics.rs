@@ -99,6 +99,11 @@ pub fn describe_metrics() {
         "Reconnects performed by a source reader"
     );
     describe_counter!(
+        "deltaforge_sink_batch_total",
+        Unit::Count,
+        "Total number of individual batches sent to sink"
+    );
+    describe_counter!(
         "deltaforge_sink_events_total",
         Unit::Count,
         "Total number of events sent to sink"
