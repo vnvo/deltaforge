@@ -374,7 +374,7 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
     }
 }
 
-pub(crate) fn build_commit_fn(
+pub fn build_commit_fn(
     ckpt_store: Arc<dyn CheckpointStore>,
     pipeline_name: String,
 ) -> CommitCpFn<CheckpointMeta> {
@@ -396,7 +396,7 @@ pub(crate) fn build_commit_fn(
     })
 }
 
-pub(crate) fn build_batch_processor(
+pub fn build_batch_processor(
     processors: Arc<[ArcDynProcessor]>,
     pipeline: String,
 ) -> ProcessBatchFn<CheckpointMeta> {
