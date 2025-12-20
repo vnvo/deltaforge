@@ -9,6 +9,7 @@ use mysql_binlog_connector_rust::{
     binlog_client::BinlogClient, binlog_stream::BinlogStream,
     event::table_map_event::TableMapEvent,
 };
+use schema_registry::InMemoryRegistry;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -24,14 +25,13 @@ use mysql_helpers::{AllowList, pause_until_resumed, prepare_client};
 
 mod mysql_object;
 
-mod mysql_schema;
-use mysql_schema::MySqlSchemaCache;
+mod mysql_schema_loader;
+pub use mysql_schema_loader::{LoadedSchema, MySqlSchemaLoader};
 
 mod mysql_event;
 use mysql_event::*;
 
 mod mysql_table_schema;
-pub use mysql_table_schema::{MySqlTableSchema, MySqlColumn};
 use crate::{
     conn_utils::RetryPolicy,
     mysql::{
@@ -39,6 +39,7 @@ use crate::{
         mysql_helpers::{connect_binlog_with_retries, resolve_binlog_tail},
     },
 };
+pub use mysql_table_schema::{MySqlColumn, MySqlTableSchema};
 
 pub type MySqlSourceResult<T> = Result<T, MySqlSourceError>;
 
@@ -56,6 +57,7 @@ pub struct MySqlSource {
     pub tables: Vec<String>, // ["db.table"]; empty = all
     pub tenant: String,
     pub pipeline: String,
+    pub registry: Arc<InMemoryRegistry>,
 }
 
 const HEARTBEAT_INTERVAL_SECS: u64 = 15;
@@ -74,7 +76,7 @@ struct RunCtx {
     cancel: CancellationToken,
     paused: Arc<AtomicBool>,
     pause_notify: Arc<Notify>,
-    schema: MySqlSchemaCache,
+    schema: MySqlSchemaLoader,
     allow: AllowList,
     retry: RetryPolicy,
     inactivity: Duration,
@@ -97,6 +99,14 @@ impl MySqlSource {
             prepare_client(&self.dsn, &self.id, &self.tables, &chkpt_store)
                 .await?;
 
+        let schema_loader = MySqlSchemaLoader::new(
+            &self.dsn,
+            self.registry.clone(),
+            &self.tenant,
+        );
+
+        let tracked = schema_loader.preload(&self.tables).await?;
+        info!(tables = tracked.len(), "schemas preloaded");        
         info!(
             source_id=%self.id,
             host=%host,
@@ -116,7 +126,7 @@ impl MySqlSource {
             cancel,
             paused,
             pause_notify,
-            schema: MySqlSchemaCache::new(&self.dsn),
+            schema: schema_loader,
             allow: AllowList::new(&self.tables),
             retry: RetryPolicy::default(),
             inactivity: Duration::from_secs(60),

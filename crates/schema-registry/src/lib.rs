@@ -21,7 +21,7 @@ pub struct SchemaVersion {
 type MemRegistry =
     Arc<RwLock<HashMap<(String, String, String), Vec<SchemaVersion>>>>;
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 pub struct InMemoryRegistry {
     inner: MemRegistry,
 }

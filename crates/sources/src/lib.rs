@@ -5,6 +5,7 @@ pub mod mysql;
 use anyhow::Result;
 use deltaforge_config::{PipelineSpec, SourceCfg};
 use deltaforge_core::ArcDynSource;
+use schema_registry::InMemoryRegistry;
 use std::sync::Arc;
 
 use crate::mysql::MySqlSource;
@@ -18,6 +19,8 @@ pub fn build_source(pipeline: &PipelineSpec) -> Result<ArcDynSource> {
             tables: c.tables.clone(),
             tenant: pipeline.metadata.tenant.clone(),
             pipeline: pipeline.metadata.name.clone(),
+            registry: Arc::new(InMemoryRegistry::new()),
+
         })),
     }
 }
