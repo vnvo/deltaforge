@@ -30,6 +30,8 @@ use mysql_schema::MySqlSchemaCache;
 mod mysql_event;
 use mysql_event::*;
 
+mod mysql_table_schema;
+pub use mysql_table_schema::{MySqlTableSchema, MySqlColumn};
 use crate::{
     conn_utils::RetryPolicy,
     mysql::{

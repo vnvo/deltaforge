@@ -12,6 +12,12 @@ pub enum CheckpointError {
     #[error("checkpoint data format error: {0}")]
     Data(String),
 
+    #[error("database error: {0}")]
+    Database(String),
+
+    #[error("operation not supported: {0}")]
+    NotSupported(String),
+        
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

@@ -7,6 +7,11 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-deltaforge-core = {path = "../deltaforge-core"}
+chrono.workspace = true
+deltaforge-core = { path = "../deltaforge-core" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
