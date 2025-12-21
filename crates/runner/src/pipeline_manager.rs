@@ -1,18 +1,29 @@
+//! Pipeline lifecycle management.
+
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use checkpoints::CheckpointStore;
-use deltaforge_config::PipelineSpec;
+use chrono::Utc;
+use deltaforge_config::{PipelineSpec, SourceCfg};
 use deltaforge_core::{Event, SourceHandle};
 use futures::future::try_join_all;
 use metrics::{counter, gauge};
 use parking_lot::RwLock;
 use processors::build_processors;
-use rest_api::{PipeInfo, PipelineAPIError, PipelineController};
+use rest_api::{
+    ColumnInfo, PipeInfo, PipelineAPIError, PipelineController, ReloadResult,
+    SchemaController, SchemaDetail, SchemaInfo, SchemaVersionInfo,
+    TableReloadStatus,
+};
+use schema_registry::InMemoryRegistry;
 use serde_json::Value;
 use sinks::build_sinks;
 use sources::build_source;
+use sources::mysql::MySqlSchemaLoader;
+
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
@@ -46,21 +57,17 @@ struct PipelineRuntime {
     pause: watch::Sender<bool>,
     sources: Vec<SourceHandle>,
     join: Option<JoinHandle<Result<()>>>,
+    schema_loader: Option<MySqlSchemaLoader>,
+    table_patterns: Vec<String>,
 }
 
 impl PipelineRuntime {
-    /// Apply pause semantics to both ends of the pipeline:
-    /// - SourceHandle.pause() stops ingress at the source boundary.
-    /// - The pause watch channel parks the coordinator so it does not drain the channel
-    ///   while sources are paused.
     fn pause(&mut self) {
         self.sources.iter().for_each(|s| s.pause());
         let _ = self.pause.send(true);
         self.status = PipelineStatus::Paused;
     }
 
-    /// Resume ingress (sources) and coordinator consumption together so the channel
-    /// backlog can unwind immediately.
     fn resume(&mut self) {
         self.sources.iter().for_each(|s| s.resume());
         let _ = self.pause.send(false);
@@ -80,6 +87,7 @@ impl PipelineRuntime {
 pub struct PipelineManager {
     pipelines: Arc<RwLock<HashMap<String, PipelineRuntime>>>,
     ckpt_store: Arc<dyn CheckpointStore>,
+    registry: Arc<InMemoryRegistry>,
 }
 
 impl PipelineManager {
@@ -87,7 +95,12 @@ impl PipelineManager {
         Self {
             pipelines: Arc::new(RwLock::new(HashMap::new())),
             ckpt_store,
+            registry: Arc::new(InMemoryRegistry::new()),
         }
+    }
+
+    pub fn registry(&self) -> Arc<InMemoryRegistry> {
+        self.registry.clone()
     }
 
     async fn spawn_pipeline(
@@ -98,9 +111,23 @@ impl PipelineManager {
 
         counter!("deltaforge_pipelines_total").increment(1);
 
-        let source = build_source(&spec).context("build source")?;
+        // Pass registry to build_source
+        let source = build_source(&spec, self.registry.clone())
+            .context("build source")?;
         let processors = build_processors(&spec).context("build processors")?;
         let sinks = build_sinks(&spec).context("build sinks")?;
+
+        let (schema_loader, table_patterns) = match &spec.spec.source {
+            SourceCfg::Mysql(cfg) => {
+                let loader = MySqlSchemaLoader::new(
+                    &cfg.dsn,
+                    self.registry.clone(),
+                    &spec.metadata.tenant,
+                );
+                (Some(loader), cfg.tables.clone())
+            }
+            SourceCfg::Postgres(_) => (None, vec![]),
+        };
 
         let (event_tx, event_rx) = mpsc::channel::<Event>(4096);
         let src_handle = source.run(event_tx, self.ckpt_store.clone()).await;
@@ -132,12 +159,10 @@ impl PipelineManager {
             let res = coord.run(event_rx, cancel_for_task, pause_rx).await;
 
             if let Err(ref e) = res {
-                gauge!("deltaforge_running_pipeline", "pipeline" => pname.clone())
-                    .decrement(1.0);
+                gauge!("deltaforge_running_pipeline", "pipeline" => pname.clone()).decrement(1.0);
                 warn!(pipeline=%pname, error=%e, "coordinator exited with error");
             } else {
-                gauge!("deltaforge_running_pipeline", "pipeline" => pname.clone())
-                    .decrement(1.0);
+                gauge!("deltaforge_running_pipeline", "pipeline" => pname.clone()).decrement(1.0);
                 info!(pipeline_name=%pname, "coordinator exited normally");
             }
 
@@ -151,6 +176,8 @@ impl PipelineManager {
             pause: pause_tx,
             sources: vec![src_handle],
             join: Some(join),
+            schema_loader,
+            table_patterns,
         })
     }
 
@@ -278,6 +305,229 @@ impl PipelineController for PipelineManager {
     }
 }
 
+#[async_trait::async_trait]
+impl SchemaController for PipelineManager {
+    async fn list_schemas(
+        &self,
+        pipeline: &str,
+    ) -> Result<Vec<SchemaInfo>, PipelineAPIError> {
+        // Clone loader before await - parking_lot guards are not Send
+        let loader = {
+            let guard = self.pipelines.read();
+            let runtime = guard.get(pipeline).ok_or_else(|| {
+                PipelineAPIError::NotFound(pipeline.to_string())
+            })?;
+
+            match &runtime.schema_loader {
+                Some(l) => l.clone(),
+                None => return Ok(vec![]),
+            }
+        };
+
+        let cached = loader.list_cached().await;
+        let schemas = cached
+            .into_iter()
+            .map(|((db, table), loaded)| SchemaInfo {
+                database: db,
+                table,
+                column_count: loaded.schema.columns.len(),
+                primary_key: loaded.schema.primary_key.clone(),
+                fingerprint: loaded.fingerprint,
+                registry_version: loaded.registry_version,
+            })
+            .collect();
+
+        Ok(schemas)
+    }
+
+    async fn get_schema(
+        &self,
+        pipeline: &str,
+        db: &str,
+        table: &str,
+    ) -> Result<SchemaDetail, PipelineAPIError> {
+        let loader = {
+            let guard = self.pipelines.read();
+            let runtime = guard.get(pipeline).ok_or_else(|| {
+                PipelineAPIError::NotFound(pipeline.to_string())
+            })?;
+
+            runtime.schema_loader.clone().ok_or_else(|| {
+                PipelineAPIError::Failed(anyhow::anyhow!(
+                    "no schema loader for this source type"
+                ))
+            })?
+        };
+
+        let loaded = loader
+            .load_schema(db, table)
+            .await
+            .map_err(|e| PipelineAPIError::Failed(anyhow::anyhow!("{}", e)))?;
+
+        let columns = loaded
+            .schema
+            .columns
+            .iter()
+            .map(|c| ColumnInfo {
+                name: c.name.clone(),
+                column_type: c.column_type.clone(),
+                data_type: c.data_type.clone(),
+                nullable: c.nullable,
+                ordinal_position: c.ordinal_position,
+                default_value: c.default_value.clone(),
+                extra: c.extra.clone(),
+                is_primary_key: loaded.schema.primary_key.contains(&c.name),
+            })
+            .collect();
+
+        Ok(SchemaDetail {
+            database: db.to_string(),
+            table: table.to_string(),
+            columns,
+            primary_key: loaded.schema.primary_key,
+            engine: loaded.schema.engine,
+            charset: loaded.schema.charset,
+            collation: loaded.schema.collation,
+            fingerprint: loaded.fingerprint,
+            registry_version: loaded.registry_version,
+            loaded_at: Utc::now(),
+        })
+    }
+
+    async fn reload_schemas(
+        &self,
+        pipeline: &str,
+    ) -> Result<ReloadResult, PipelineAPIError> {
+        let (loader, patterns) = {
+            let guard = self.pipelines.read();
+            let runtime = guard.get(pipeline).ok_or_else(|| {
+                PipelineAPIError::NotFound(pipeline.to_string())
+            })?;
+
+            let loader = runtime.schema_loader.clone().ok_or_else(|| {
+                PipelineAPIError::Failed(anyhow::anyhow!(
+                    "no schema loader for this source type"
+                ))
+            })?;
+
+            (loader, runtime.table_patterns.clone())
+        };
+
+        let t0 = Instant::now();
+
+        let tables = loader
+            .reload_all(&patterns)
+            .await
+            .map_err(|e| PipelineAPIError::Failed(anyhow::anyhow!("{}", e)))?;
+
+        let statuses: Vec<TableReloadStatus> = tables
+            .iter()
+            .map(|(db, table)| TableReloadStatus {
+                database: db.clone(),
+                table: table.clone(),
+                status: "ok".to_string(),
+                changed: true,
+                error: None,
+            })
+            .collect();
+
+        Ok(ReloadResult {
+            pipeline: pipeline.to_string(),
+            tables_reloaded: tables.len(),
+            tables: statuses,
+            elapsed_ms: t0.elapsed().as_millis() as u64,
+        })
+    }
+
+    async fn reload_table_schema(
+        &self,
+        pipeline: &str,
+        db: &str,
+        table: &str,
+    ) -> Result<SchemaDetail, PipelineAPIError> {
+        let loader = {
+            let guard = self.pipelines.read();
+            let runtime = guard.get(pipeline).ok_or_else(|| {
+                PipelineAPIError::NotFound(pipeline.to_string())
+            })?;
+
+            runtime.schema_loader.clone().ok_or_else(|| {
+                PipelineAPIError::Failed(anyhow::anyhow!(
+                    "no schema loader for this source type"
+                ))
+            })?
+        };
+
+        // Force reload
+        let loaded = loader
+            .reload_schema(db, table)
+            .await
+            .map_err(|e| PipelineAPIError::Failed(anyhow::anyhow!("{}", e)))?;
+
+        let columns = loaded
+            .schema
+            .columns
+            .iter()
+            .map(|c| ColumnInfo {
+                name: c.name.clone(),
+                column_type: c.column_type.clone(),
+                data_type: c.data_type.clone(),
+                nullable: c.nullable,
+                ordinal_position: c.ordinal_position,
+                default_value: c.default_value.clone(),
+                extra: c.extra.clone(),
+                is_primary_key: loaded.schema.primary_key.contains(&c.name),
+            })
+            .collect();
+
+        Ok(SchemaDetail {
+            database: db.to_string(),
+            table: table.to_string(),
+            columns,
+            primary_key: loaded.schema.primary_key,
+            engine: loaded.schema.engine,
+            charset: loaded.schema.charset,
+            collation: loaded.schema.collation,
+            fingerprint: loaded.fingerprint,
+            registry_version: loaded.registry_version,
+            loaded_at: Utc::now(),
+        })
+    }
+
+    async fn get_schema_versions(
+        &self,
+        pipeline: &str,
+        db: &str,
+        table: &str,
+    ) -> Result<Vec<SchemaVersionInfo>, PipelineAPIError> {
+        // Extract tenant before dropping guard
+        let tenant = {
+            let guard = self.pipelines.read();
+            let runtime = guard.get(pipeline).ok_or_else(|| {
+                PipelineAPIError::NotFound(pipeline.to_string())
+            })?;
+            runtime.spec.metadata.tenant.clone()
+        };
+
+        let versions = self.registry.list_versions(&tenant, db, table);
+
+        Ok(versions
+            .into_iter()
+            .map(|v| SchemaVersionInfo {
+                version: v.version,
+                fingerprint: v.hash,
+                column_count: v
+                    .schema_json
+                    .get("columns")
+                    .and_then(|c| c.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0),
+                registered_at: v.registered_at,
+            })
+            .collect())
+    }
+}
+
 fn merge_spec(
     base: &PipelineSpec,
     patch: Value,
@@ -366,6 +616,8 @@ mod tests {
             pause: pause_tx,
             sources: vec![source_handle],
             join: Some(tokio::spawn(async move { Ok(()) })),
+            schema_loader: None,
+            table_patterns: vec![],
         };
 
         (runtime, pause_rx)

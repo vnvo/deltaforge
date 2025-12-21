@@ -3,7 +3,9 @@ use axum::Router;
 use checkpoints::{CheckpointStore, FileCheckpointStore};
 use clap::Parser;
 use deltaforge_config::{PipelineSpec, load_cfg};
-use rest_api::{AppState, PipelineController, router};
+use rest_api::{
+    AppState, PipelineController, SchemaState, router_with_schemas,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -53,11 +55,16 @@ async fn main() -> Result<()> {
         manager.create(ps).await?;
     }
 
-    let state = AppState {
+    // Build state for both pipeline and schema routes
+    let app_state = AppState {
         manager: manager.clone(),
     };
+    let schema_state = SchemaState {
+        controller: manager.clone(),
+    };
 
-    let app: Router = router(state);
+    // Build router with all routes including schema management
+    let app: Router = router_with_schemas(app_state, schema_state);
     let app = app.merge(o11y::df_metrics::router_with_metrics());
 
     let addr: SocketAddr =
@@ -74,6 +81,6 @@ async fn main() -> Result<()> {
 fn load_pipeline_cfgs(path: &str) -> Result<Vec<PipelineSpec>> {
     let specs = load_cfg(path)?;
     info!(specs_found = specs.len(), "pipeline specs loaded");
-    debug!(pipeline_specs=?specs, "pipeline spec");
+    debug!(pipeline_specs = ?specs, "pipeline spec");
     Ok(specs)
 }
