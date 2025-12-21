@@ -5,8 +5,7 @@
 //! a common interface for fingerprinting and column access.
 
 use serde::{Serialize, de::DeserializeOwned};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use sha2::{Sha256, Digest};
 
 /// Trait for source-specific schema types.
 ///
@@ -45,9 +44,8 @@ pub trait SourceSchema: Serialize + DeserializeOwned + Send + Sync {
 /// Uses JSON serialization + hashing for deterministic fingerprint.
 pub fn compute_fingerprint<T: Serialize>(value: &T) -> String {
     let json = serde_json::to_vec(value).unwrap_or_default();
-    let mut hasher = DefaultHasher::new();
-    json.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    let hash = Sha256::digest(&json);
+    format!("sha256:{}", hex::encode(hash))
 }
 
 #[cfg(test)]
