@@ -1,21 +1,24 @@
 use async_trait::async_trait;
 use axum::{
+    Json, Router,
     extract::{Path, State},
     http::StatusCode,
     routing::{get, post},
-    Json, Router,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::errors::pipeline_error;
 use crate::PipelineAPIError;
+use crate::errors::pipeline_error;
 
 /// Schema controller trait for pipeline schema operations.
 #[async_trait]
 pub trait SchemaController: Send + Sync {
-    async fn list_schemas(&self, pipeline: &str) -> Result<Vec<SchemaInfo>, PipelineAPIError>;
+    async fn list_schemas(
+        &self,
+        pipeline: &str,
+    ) -> Result<Vec<SchemaInfo>, PipelineAPIError>;
 
     async fn get_schema(
         &self,
@@ -24,7 +27,10 @@ pub trait SchemaController: Send + Sync {
         table: &str,
     ) -> Result<SchemaDetail, PipelineAPIError>;
 
-    async fn reload_schemas(&self, pipeline: &str) -> Result<ReloadResult, PipelineAPIError>;
+    async fn reload_schemas(
+        &self,
+        pipeline: &str,
+    ) -> Result<ReloadResult, PipelineAPIError>;
 
     async fn reload_table_schema(
         &self,
@@ -195,7 +201,7 @@ async fn get_schema_versions(
 mod tests {
     use super::*;
     use axum::{
-        body::{to_bytes, Body},
+        body::{Body, to_bytes},
         http::{Method, Request, StatusCode},
     };
     use tower::ServiceExt;
@@ -205,7 +211,10 @@ mod tests {
 
     #[async_trait]
     impl SchemaController for MockController {
-        async fn list_schemas(&self, _pipeline: &str) -> Result<Vec<SchemaInfo>, PipelineAPIError> {
+        async fn list_schemas(
+            &self,
+            _pipeline: &str,
+        ) -> Result<Vec<SchemaInfo>, PipelineAPIError> {
             Ok(vec![SchemaInfo {
                 database: "orders".into(),
                 table: "items".into(),
@@ -245,7 +254,10 @@ mod tests {
             })
         }
 
-        async fn reload_schemas(&self, pipeline: &str) -> Result<ReloadResult, PipelineAPIError> {
+        async fn reload_schemas(
+            &self,
+            pipeline: &str,
+        ) -> Result<ReloadResult, PipelineAPIError> {
             Ok(ReloadResult {
                 pipeline: pipeline.into(),
                 tables_reloaded: 1,
@@ -374,7 +386,8 @@ mod tests {
 
         assert_eq!(StatusCode::OK, resp.status());
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let versions: Vec<SchemaVersionInfo> = serde_json::from_slice(&body).unwrap();
+        let versions: Vec<SchemaVersionInfo> =
+            serde_json::from_slice(&body).unwrap();
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].version, 1);
     }

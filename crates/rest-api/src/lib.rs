@@ -19,7 +19,10 @@ pub fn router(state: AppState) -> Router {
     health.merge(pipeline_mgmt)
 }
 
-pub fn router_with_schemas(app_state: AppState, schema_state: SchemaState) -> Router {
+pub fn router_with_schemas(
+    app_state: AppState,
+    schema_state: SchemaState,
+) -> Router {
     router(app_state).merge(schemas::router(schema_state))
 }
 #[cfg(test)]

@@ -71,6 +71,7 @@ impl MySqlSchemaLoader {
         let tables = self.expand_patterns(patterns).await?;
 
         info!(
+            dns=redact_password(&self.dsn),
             patterns = ?patterns,
             matched_tables = tables.len(),
             "expanded table patterns"
@@ -166,7 +167,7 @@ impl MySqlSchemaLoader {
             .registry
             .register(&self.tenant, db, table, &fingerprint, &schema_json)
             .await
-            .map_err(|e| SourceError::Other(e))?;
+            .map_err(SourceError::Other)?;
 
         let loaded = LoadedSchema {
             schema,

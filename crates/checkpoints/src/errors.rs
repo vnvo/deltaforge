@@ -17,7 +17,7 @@ pub enum CheckpointError {
 
     #[error("operation not supported: {0}")]
     NotSupported(String),
-        
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

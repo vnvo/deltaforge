@@ -99,9 +99,9 @@ impl PipelineManager {
         }
     }
 
-    pub fn registry(&self) -> Arc<InMemoryRegistry> {
-        self.registry.clone()
-    }
+    //pub fn registry(&self) -> Arc<InMemoryRegistry> {
+    //    self.registry.clone()
+    //}
 
     async fn spawn_pipeline(
         &self,

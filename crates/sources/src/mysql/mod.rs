@@ -106,7 +106,7 @@ impl MySqlSource {
         );
 
         let tracked = schema_loader.preload(&self.tables).await?;
-        info!(tables = tracked.len(), "schemas preloaded");        
+        info!(tables = tracked.len(), "schemas preloaded");
         info!(
             source_id=%self.id,
             host=%host,
