@@ -323,7 +323,7 @@ async fn handle_query(
         || lower.starts_with("drop table")
         || lower.starts_with("rename table")
     {
-        ctx.schema.invalidate(db, "*").await;
+        ctx.schema.invalidate_db(db).await;
     }
 
     let mut ev = Event::new_ddl(
@@ -416,7 +416,7 @@ mod tests {
 
     use crate::{
         conn_utils::RetryPolicy,
-        mysql::{AllowList, MySqlSchemaCache},
+        mysql::{AllowList, MySqlSchemaLoader},
     };
 
     use super::*;
@@ -446,7 +446,7 @@ mod tests {
             Arc::new(vec!["id".to_string(), "sku".to_string()]),
         );
 
-        let schema = MySqlSchemaCache::from_static(cols_map);
+        let schema = MySqlSchemaLoader::from_static(cols_map);
         let chkpt: Arc<dyn CheckpointStore> =
             Arc::new(MemCheckpointStore::new().expect("mem checkpoint store"));
 

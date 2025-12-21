@@ -2,8 +2,14 @@ use axum::Router;
 mod errors;
 mod health;
 mod pipelines;
+mod schemas;
+
 pub use errors::{PipelineAPIError, pipeline_error};
 pub use pipelines::{AppState, PipeInfo, PipelineController};
+pub use schemas::{
+    ColumnInfo, ReloadResult, SchemaController, SchemaDetail, SchemaInfo,
+    SchemaState, SchemaVersionInfo, TableReloadStatus,
+};
 
 pub fn router(state: AppState) -> Router {
     let health_state = state.clone();
@@ -13,6 +19,12 @@ pub fn router(state: AppState) -> Router {
     health.merge(pipeline_mgmt)
 }
 
+pub fn router_with_schemas(
+    app_state: AppState,
+    schema_state: SchemaState,
+) -> Router {
+    router(app_state).merge(schemas::router(schema_state))
+}
 #[cfg(test)]
 mod tests {
     use super::*;

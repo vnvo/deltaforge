@@ -2,7 +2,8 @@ use anyhow::Result;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
 use deltaforge_core::{Event, Op, Source};
 use mysql_async::{Pool as MySQLPool, prelude::Queryable};
-use sources::mysql::MySqlSource;
+use schema_registry::{InMemoryRegistry, SourceSchema};
+use sources::mysql::{MySqlSchemaLoader, MySqlSource};
 use std::sync::Arc;
 use std::time::Instant;
 use testcontainers::runners::AsyncRunner;
@@ -25,6 +26,7 @@ use common::init_test_tracing;
 /// This is intentionally a "fat" integration test:
 /// - boots a real MySQL 8 container with GTID + ROW binlog
 /// - provisions schema / user / privileges
+/// - tests schema loading with nullable columns, wildcards, registry integration
 /// - starts `MySqlSource` with an in-memory checkpoint store
 /// - performs INSERT/UPDATE/DELETE
 /// - asserts that corresponding CDC events are emitted with correct payloads.
@@ -150,6 +152,159 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
         .await?;
     conn.query_drop("FLUSH PRIVILEGES").await?;
 
+    // =========================================================================
+    // SCHEMA LOADER TESTS
+    // =========================================================================
+    info!("--- Testing schema loader ---");
+
+    let registry = Arc::new(InMemoryRegistry::new());
+    let schema_loader = MySqlSchemaLoader::new(dsn, registry.clone(), "acme");
+
+    // Test 1: Expand exact pattern
+    {
+        let tables = schema_loader
+            .expand_patterns(&["shop.orders".to_string()])
+            .await?;
+        assert_eq!(tables.len(), 1, "should find exactly one table");
+        assert_eq!(tables[0], ("shop".to_string(), "orders".to_string()));
+        info!("expand_patterns exact match works");
+    }
+
+    // Test 2: Load schema and verify columns (tests NULL handling!)
+    {
+        let loaded = schema_loader.load_schema("shop", "orders").await?;
+        let schema = &loaded.schema;
+
+        assert_eq!(
+            schema.columns.len(),
+            4,
+            "orders table should have 4 columns"
+        );
+
+        // Check column names using SourceSchema trait
+        let col_names = schema.column_names();
+        assert_eq!(col_names, vec!["id", "sku", "payload", "blobz"]);
+
+        // Check primary key
+        assert_eq!(schema.primary_key, vec!["id"]);
+
+        // Check specific column types
+        let id_col = schema.column("id").expect("id column");
+        assert_eq!(id_col.data_type, "int");
+        assert!(!id_col.nullable, "id should not be nullable (PK)");
+
+        let sku_col = schema.column("sku").expect("sku column");
+        assert_eq!(sku_col.data_type, "varchar");
+        assert!(sku_col.nullable, "sku should be nullable");
+        assert_eq!(sku_col.char_max_length, Some(64));
+
+        let payload_col = schema.column("payload").expect("payload column");
+        assert_eq!(payload_col.data_type, "json");
+
+        let blob_col = schema.column("blobz").expect("blobz column");
+        assert_eq!(blob_col.data_type, "blob");
+
+        info!("load_schema returns correct column info (NULL handling works)");
+    }
+
+    // Test 3: Schema fingerprint stability
+    {
+        let loaded1 = schema_loader.load_schema("shop", "orders").await?;
+        let loaded2 = schema_loader.load_schema("shop", "orders").await?;
+
+        assert_eq!(
+            loaded1.fingerprint, loaded2.fingerprint,
+            "fingerprint should be stable"
+        );
+        assert!(
+            !loaded1.fingerprint.is_empty(),
+            "fingerprint should not be empty"
+        );
+        info!("fingerprint is stable across loads");
+    }
+
+    // Test 4: Schema registered in registry
+    {
+        let versions = registry.list_versions("acme", "shop", "orders");
+        assert!(!versions.is_empty(), "schema should be registered");
+        assert_eq!(versions[0].version, 1);
+        info!("schema is registered with registry");
+    }
+
+    // Test 5: Preload with wildcard patterns
+    {
+        // Create another table for wildcard testing
+        conn.query_drop(
+            r#"CREATE TABLE IF NOT EXISTS order_items(
+                id INT PRIMARY KEY,
+                order_id INT,
+                product VARCHAR(64)
+            )"#,
+        )
+        .await?;
+
+        let tables =
+            schema_loader.preload(&["shop.order%".to_string()]).await?;
+        assert!(tables.len() >= 2, "should match orders and order_items");
+        assert!(tables.iter().any(|(db, t)| db == "shop" && t == "orders"));
+        assert!(
+            tables
+                .iter()
+                .any(|(db, t)| db == "shop" && t == "order_items")
+        );
+        info!("wildcard pattern expansion works");
+    }
+
+    // Test 6: Schema reload after DDL
+    {
+        let fp_before = schema_loader
+            .load_schema("shop", "orders")
+            .await?
+            .fingerprint;
+
+        // Add a column
+        conn.query_drop("ALTER TABLE orders ADD COLUMN notes TEXT")
+            .await?;
+
+        // Reload schema (force refresh)
+        let loaded = schema_loader.reload_schema("shop", "orders").await?;
+        let fp_after = loaded.fingerprint;
+
+        assert_ne!(fp_before, fp_after, "fingerprint should change after DDL");
+        assert_eq!(loaded.schema.columns.len(), 5, "should have 5 columns now");
+        assert!(
+            loaded.schema.column("notes").is_some(),
+            "notes column should exist"
+        );
+
+        // Check registry has new version
+        let versions = registry.list_versions("acme", "shop", "orders");
+        assert!(
+            versions.len() >= 2,
+            "should have multiple versions after DDL"
+        );
+
+        info!("schema reload detects DDL changes");
+    }
+
+    // Test 7: Cache behavior
+    {
+        let cached = schema_loader.list_cached().await;
+        assert!(!cached.is_empty(), "cache should not be empty");
+
+        let orders_cached = cached
+            .iter()
+            .find(|((db, t), _)| db == "shop" && t == "orders");
+        assert!(orders_cached.is_some(), "orders should be in cache");
+
+        info!("schema caching works");
+    }
+
+    // =========================================================================
+    // CDC EVENT TESTS
+    // =========================================================================
+    info!("--- Testing CDC events ---");
+
     // start source with df
     let src = MySqlSource {
         id: "it-mysql".into(),
@@ -157,6 +312,7 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
         tables: vec!["shop.orders".into()],
         tenant: "acme".into(),
         pipeline: "pipe-2".to_string(),
+        registry: Arc::new(InMemoryRegistry::new()),
     };
 
     let ckpt_store: Arc<dyn CheckpointStore> =
@@ -171,7 +327,7 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
 
     // 1) INSERT
     conn.query_drop(
-        r#"INSERT INTO orders VALUES (1,'sku-1','{"a":1}', X'DEADBEEF')"#,
+        r#"INSERT INTO orders (id, sku, payload, blobz) VALUES (1,'sku-1','{"a":1}', X'DEADBEEF')"#,
     )
     .await?;
 
