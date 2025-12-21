@@ -167,7 +167,7 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
             .await?;
         assert_eq!(tables.len(), 1, "should find exactly one table");
         assert_eq!(tables[0], ("shop".to_string(), "orders".to_string()));
-        info!("✓ expand_patterns exact match works");
+        info!("expand_patterns exact match works");
     }
 
     // Test 2: Load schema and verify columns (tests NULL handling!)
@@ -204,9 +204,7 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
         let blob_col = schema.column("blobz").expect("blobz column");
         assert_eq!(blob_col.data_type, "blob");
 
-        info!(
-            "✓ load_schema returns correct column info (NULL handling works)"
-        );
+        info!("load_schema returns correct column info (NULL handling works)");
     }
 
     // Test 3: Schema fingerprint stability
@@ -222,7 +220,7 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
             !loaded1.fingerprint.is_empty(),
             "fingerprint should not be empty"
         );
-        info!("✓ fingerprint is stable across loads");
+        info!("fingerprint is stable across loads");
     }
 
     // Test 4: Schema registered in registry
@@ -230,7 +228,7 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
         let versions = registry.list_versions("acme", "shop", "orders");
         assert!(!versions.is_empty(), "schema should be registered");
         assert_eq!(versions[0].version, 1);
-        info!("✓ schema is registered with registry");
+        info!("schema is registered with registry");
     }
 
     // Test 5: Preload with wildcard patterns
@@ -254,7 +252,7 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
                 .iter()
                 .any(|(db, t)| db == "shop" && t == "order_items")
         );
-        info!("✓ wildcard pattern expansion works");
+        info!("wildcard pattern expansion works");
     }
 
     // Test 6: Schema reload after DDL
@@ -286,7 +284,7 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
             "should have multiple versions after DDL"
         );
 
-        info!("✓ schema reload detects DDL changes");
+        info!("schema reload detects DDL changes");
     }
 
     // Test 7: Cache behavior
@@ -299,7 +297,7 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
             .find(|((db, t), _)| db == "shop" && t == "orders");
         assert!(orders_cached.is_some(), "orders should be in cache");
 
-        info!("✓ schema caching works");
+        info!("schema caching works");
     }
 
     // =========================================================================
