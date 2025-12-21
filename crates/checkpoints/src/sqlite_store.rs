@@ -3,7 +3,7 @@
 use super::{CheckpointError, CheckpointResult, CheckpointStore, VersionInfo};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -17,8 +17,8 @@ pub struct SqliteCheckpointStore {
 impl SqliteCheckpointStore {
     /// Create store at file path.
     pub fn new(path: impl AsRef<Path>) -> CheckpointResult<Self> {
-        let conn =
-            Connection::open(path.as_ref()).map_err(|e| CheckpointError::Database(e.to_string()))?;
+        let conn = Connection::open(path.as_ref())
+            .map_err(|e| CheckpointError::Database(e.to_string()))?;
         Self::init(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -27,8 +27,8 @@ impl SqliteCheckpointStore {
 
     /// Create in-memory store (for testing).
     pub fn in_memory() -> CheckpointResult<Self> {
-        let conn =
-            Connection::open_in_memory().map_err(|e| CheckpointError::Database(e.to_string()))?;
+        let conn = Connection::open_in_memory()
+            .map_err(|e| CheckpointError::Database(e.to_string()))?;
         Self::init(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -56,7 +56,10 @@ impl SqliteCheckpointStore {
 
 #[async_trait]
 impl CheckpointStore for SqliteCheckpointStore {
-    async fn get_raw(&self, source_id: &str) -> CheckpointResult<Option<Vec<u8>>> {
+    async fn get_raw(
+        &self,
+        source_id: &str,
+    ) -> CheckpointResult<Option<Vec<u8>>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT payload FROM checkpoints WHERE key = ?1 ORDER BY version DESC LIMIT 1",
@@ -67,7 +70,11 @@ impl CheckpointStore for SqliteCheckpointStore {
         .map_err(|e| CheckpointError::Database(e.to_string()))
     }
 
-    async fn put_raw(&self, source_id: &str, bytes: &[u8]) -> CheckpointResult<()> {
+    async fn put_raw(
+        &self,
+        source_id: &str,
+        bytes: &[u8],
+    ) -> CheckpointResult<()> {
         self.put_raw_versioned(source_id, bytes).await?;
         Ok(())
     }
@@ -75,7 +82,10 @@ impl CheckpointStore for SqliteCheckpointStore {
     async fn delete(&self, source_id: &str) -> CheckpointResult<bool> {
         let conn = self.conn.lock().unwrap();
         let n = conn
-            .execute("DELETE FROM checkpoints WHERE key = ?1", params![source_id])
+            .execute(
+                "DELETE FROM checkpoints WHERE key = ?1",
+                params![source_id],
+            )
             .map_err(|e| CheckpointError::Database(e.to_string()))?;
         Ok(n > 0)
     }
@@ -91,7 +101,9 @@ impl CheckpointStore for SqliteCheckpointStore {
 
         let mut keys = Vec::new();
         for row in rows {
-            keys.push(row.map_err(|e| CheckpointError::Database(e.to_string()))?);
+            keys.push(
+                row.map_err(|e| CheckpointError::Database(e.to_string()))?,
+            );
         }
         Ok(keys)
     }
@@ -107,7 +119,8 @@ impl CheckpointStore for SqliteCheckpointStore {
     ) -> CheckpointResult<Option<u64>> {
         let conn = self.conn.lock().unwrap();
 
-        let next_version: u64 = conn
+        // rusqlite only supports i64, not u64 - cast appropriately
+        let next_version: i64 = conn
             .query_row(
                 "SELECT COALESCE(MAX(version), 0) + 1 FROM checkpoints WHERE key = ?1",
                 params![source_id],
@@ -121,7 +134,7 @@ impl CheckpointStore for SqliteCheckpointStore {
         )
         .map_err(|e| CheckpointError::Database(e.to_string()))?;
 
-        Ok(Some(next_version))
+        Ok(Some(next_version as u64))
     }
 
     async fn get_version_raw(
@@ -130,16 +143,20 @@ impl CheckpointStore for SqliteCheckpointStore {
         version: u64,
     ) -> CheckpointResult<Option<Vec<u8>>> {
         let conn = self.conn.lock().unwrap();
+        let version_i64 = version as i64;
         conn.query_row(
             "SELECT payload FROM checkpoints WHERE key = ?1 AND version = ?2",
-            params![source_id, version],
+            params![source_id, version_i64],
             |row| row.get(0),
         )
         .optional()
         .map_err(|e| CheckpointError::Database(e.to_string()))
     }
 
-    async fn list_versions(&self, source_id: &str) -> CheckpointResult<Vec<VersionInfo>> {
+    async fn list_versions(
+        &self,
+        source_id: &str,
+    ) -> CheckpointResult<Vec<VersionInfo>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
@@ -150,23 +167,26 @@ impl CheckpointStore for SqliteCheckpointStore {
 
         let rows = stmt
             .query_map(params![source_id], |row| {
-                let version: u64 = row.get(0)?;
+                // rusqlite only supports i64, not u64/usize
+                let version_i64: i64 = row.get(0)?;
                 let ts_str: String = row.get(1)?;
-                let size: usize = row.get(2)?;
+                let size_i64: i64 = row.get(2)?;
                 let created_at = DateTime::parse_from_rfc3339(&ts_str)
                     .map(|dt| dt.with_timezone(&Utc))
                     .unwrap_or_else(|_| Utc::now());
                 Ok(VersionInfo {
-                    version,
+                    version: version_i64 as u64,
                     created_at,
-                    size_bytes: size,
+                    size_bytes: size_i64 as usize,
                 })
             })
             .map_err(|e| CheckpointError::Database(e.to_string()))?;
 
         let mut versions = Vec::new();
         for row in rows {
-            versions.push(row.map_err(|e| CheckpointError::Database(e.to_string()))?);
+            versions.push(
+                row.map_err(|e| CheckpointError::Database(e.to_string()))?,
+            );
         }
         Ok(versions)
     }
