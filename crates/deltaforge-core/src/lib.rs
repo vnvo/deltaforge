@@ -285,6 +285,8 @@ impl SourceHandle {
 
 #[async_trait]
 pub trait Source: Send + Sync {
+    fn checkpoint_key(&self) -> &str;
+
     async fn run(
         &self,
         tx: mpsc::Sender<Event>,

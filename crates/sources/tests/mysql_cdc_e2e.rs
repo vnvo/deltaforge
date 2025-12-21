@@ -308,6 +308,7 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
     // start source with df
     let src = MySqlSource {
         id: "it-mysql".into(),
+        checkpoint_key: "mysql-it-mysql".to_string(),
         dsn: dsn.to_string(),
         tables: vec!["shop.orders".into()],
         tenant: "acme".into(),

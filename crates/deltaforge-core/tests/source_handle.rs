@@ -28,6 +28,9 @@ struct FakeSource {
 
 #[async_trait]
 impl Source for FakeSource {
+    fn checkpoint_key(&self) -> &str {
+        "fake-source"
+    }
     async fn run(
         &self,
         tx: mpsc::Sender<Event>,

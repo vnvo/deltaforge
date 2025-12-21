@@ -14,7 +14,7 @@ use super::mysql_object::build_object;
 use crate::conn_utils::{retryable_stream, watchdog};
 use crate::mysql::RunCtx;
 
-use crate::mysql::mysql_helpers::{persist_checkpoint, short_sql, ts_ms};
+use crate::mysql::mysql_helpers::{make_checkpoint_meta, short_sql, ts_ms};
 
 pub(super) enum LoopControl {
     Reconnect,
@@ -161,6 +161,12 @@ async fn handle_write_rows(
                 header.event_length as usize,
             );
             ev.tx_id = ctx.last_gtid.clone();
+            ev.checkpoint = Some(make_checkpoint_meta(
+                &ctx.last_file,
+                ctx.last_pos,
+                &ctx.last_gtid,
+            ));
+
             let table = format!("{}.{}", tm.database_name, tm.table_name);
             match ctx.tx.send(ev).await {
                 Ok(_) => {
@@ -224,7 +230,10 @@ async fn handle_update_rows(
                 ts_ms(header.timestamp),
                 header.event_length as usize,
             );
+            
             ev.tx_id = ctx.last_gtid.clone();
+            ev.checkpoint = Some(make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid));
+
             let table = format!("{}.{}", tm.database_name, tm.table_name);
             match ctx.tx.send(ev).await {
                 Ok(_) => {
@@ -280,7 +289,10 @@ async fn handle_delete_rows(
                 ts_ms(header.timestamp),
                 header.event_length as usize,
             );
+            
             ev.tx_id = ctx.last_gtid.clone();
+            ev.checkpoint = Some(make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid));            
+            
             let table = format!("{}.{}", tm.database_name, tm.table_name);
             match ctx.tx.send(ev).await {
                 Ok(_) => {
@@ -377,21 +389,23 @@ fn handle_rotate(
 #[instrument(skip_all, fields(source_id=%ctx.source_id))]
 async fn handle_xid(ctx: &mut RunCtx) {
     // Prefer the server’s executed-set; fall back to last_gtid if GTID is off
-    let gtid_set =
-        match crate::mysql::mysql_helpers::fetch_executed_gtid_set(&ctx.dsn)
-            .await
-        {
-            Ok(Some(s)) => Some(s),
-            _ => ctx.last_gtid.clone(), // fallback if GTID not enabled
-        };
-    persist_checkpoint(
-        &ctx.source_id,
-        &ctx.chkpt,
-        &ctx.last_file,
-        ctx.last_pos,
-        &gtid_set,
-    )
-    .await;
+    match crate::mysql::mysql_helpers::fetch_executed_gtid_set(&ctx.dsn)
+        .await
+    {
+        Ok(Some(s)) => {ctx.last_gtid = Some(s);}
+        Ok(None) => {}
+        Err(e) => {
+            debug!(source_id=%ctx.source_id, error=%e, "failed to fetch executed GTID set");
+        }
+    };
+
+    debug!(
+        source_id=%ctx.source_id,
+        file=%ctx.last_file,
+        pos=ctx.last_pos,
+        gtid=?ctx.last_gtid,
+        "XID: transaction committed (checkpoint in events, will persist after sink ack)"
+    );    
 }
 
 #[cfg(test)]
@@ -416,7 +430,7 @@ mod tests {
 
     use crate::{
         conn_utils::RetryPolicy,
-        mysql::{AllowList, MySqlSchemaLoader},
+        mysql::{AllowList, MySqlCheckpoint, MySqlSchemaLoader},
     };
 
     use super::*;
@@ -593,5 +607,46 @@ mod tests {
         assert_eq!(before["sku"], "sku-1");
         assert_eq!(produced.table, "shop.orders");
         assert_eq!(produced.tx_id.as_deref(), Some("GTID-UNIT"));
+    }
+
+    #[tokio::test]
+    async fn events_carry_checkpoint_metadata() {
+        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let mut ctx = make_runctx(tx);
+        
+        // Set known position
+        ctx.last_file = "mysql-bin.000005".to_string();
+        ctx.last_pos = 12345;
+        ctx.last_gtid = Some("abc-123:1-10".to_string());
+        
+        let row = RowEvent {
+            column_values: vec![
+                ColumnValue::LongLong(1),
+                ColumnValue::String(b"test".to_vec()),
+            ],
+        };
+        
+        let ev = WriteRowsEvent {
+            table_id: TABLE_ID,
+            included_columns: vec![true, true],
+            rows: vec![row],
+        };
+        
+        handle_write_rows(&mut ctx, &make_header(), ev)
+            .await
+            .expect("write rows should succeed");
+        
+        let produced = rx.recv().await.expect("expected one event");
+        
+        // Verify checkpoint is attached
+        let cp_meta = produced.checkpoint.expect("event must have checkpoint");
+        
+        // Deserialize and verify
+        let cp: MySqlCheckpoint = serde_json::from_slice(cp_meta.as_bytes())
+            .expect("checkpoint must deserialize");
+        
+        assert_eq!(cp.file, "mysql-bin.000005");
+        assert_eq!(cp.pos, 12345);
+        assert_eq!(cp.gtid_set.as_deref(), Some("abc-123:1-10"));
     }
 }

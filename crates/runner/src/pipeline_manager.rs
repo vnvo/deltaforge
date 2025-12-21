@@ -134,8 +134,11 @@ impl PipelineManager {
 
         let batch_processor =
             build_batch_processor(processors, pipeline_name.clone());
-        let commit_cp =
-            build_commit_fn(self.ckpt_store.clone(), pipeline_name.clone());
+
+        let commit_cp = build_commit_fn(
+            self.ckpt_store.clone(),
+            source.checkpoint_key().to_string(),
+        );
 
         let (pause_tx, pause_rx) = watch::channel(false);
 

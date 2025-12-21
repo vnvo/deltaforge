@@ -1,5 +1,5 @@
 use crc32fast::Hasher;
-use deltaforge_core::{SourceError, SourceResult};
+use deltaforge_core::{SourceError, SourceResult, CheckpointMeta};
 use mysql_async::{Pool, Row, prelude::Queryable};
 use mysql_binlog_connector_rust::{
     binlog_client::BinlogClient, binlog_stream::BinlogStream,
@@ -535,4 +535,22 @@ pub(super) async fn fetch_executed_gtid_set(
         .map_err(|e| SourceError::Other(e.into()))?;
 
     Ok(row.and_then(|(s,)| s))
+}
+
+pub(crate) fn make_checkpoint_meta(
+    file: &str,
+    pos: u64,
+    gtid: &Option<String>,
+) -> CheckpointMeta {
+    let cp = MySqlCheckpoint {
+        file: file.to_string(),
+        pos,
+        gtid_set: gtid.clone(),
+    };
+
+    let bytes = serde_json::to_vec(&cp).unwrap_or_else(|e| {
+        tracing::error!(error=%e, "failed to serialize checkpoint");
+        Vec::new()
+    });
+    CheckpointMeta::from_vec(bytes)
 }

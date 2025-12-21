@@ -18,6 +18,7 @@ pub fn build_source(
         SourceCfg::Postgres(_c) => todo!("postgres source"),
         SourceCfg::Mysql(c) => Ok(Arc::new(MySqlSource {
             id: c.id.clone(),
+            checkpoint_key: format!("mysql-{}", c.id.clone()),
             dsn: c.dsn.clone(),
             tables: c.tables.clone(),
             tenant: pipeline.metadata.tenant.clone(),
