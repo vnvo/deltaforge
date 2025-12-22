@@ -20,6 +20,7 @@ fn new_event() -> Event {
         before: None,
         after: Some(json!({ "id": 1, "note": "original" })),
         schema_version: Some("v1".into()),
+        schema_sequence: Some(0),
         ddl: None,
         timestamp: Utc::now(),
         trace_id: None,
