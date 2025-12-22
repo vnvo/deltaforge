@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use deltaforge_core::{Event, Op, SourceError, SourceMeta, SourceResult};
 use metrics::counter;
 use mysql_binlog_connector_rust::{
