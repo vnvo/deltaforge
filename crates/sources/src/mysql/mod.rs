@@ -52,7 +52,7 @@ pub struct MySqlCheckpoint {
 
 #[derive(Debug, Clone)]
 pub struct MySqlSource {
-    pub id: String,          // checkpoint key + server_id seed
+    pub id: String, // checkpoint key + server_id seed
     pub checkpoint_key: String,
     pub dsn: String,         // mysql://user:pass@host:3306/db
     pub tables: Vec<String>, // ["db.table"]; empty = all
@@ -179,7 +179,6 @@ impl MySqlSource {
 
 #[async_trait]
 impl Source for MySqlSource {
-
     fn checkpoint_key(&self) -> &str {
         &self.checkpoint_key
     }

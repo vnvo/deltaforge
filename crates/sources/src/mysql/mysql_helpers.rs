@@ -1,5 +1,5 @@
 use crc32fast::Hasher;
-use deltaforge_core::{SourceError, SourceResult, CheckpointMeta};
+use deltaforge_core::{CheckpointMeta, SourceError, SourceResult};
 use mysql_async::{Pool, Row, prelude::Queryable};
 use mysql_binlog_connector_rust::{
     binlog_client::BinlogClient, binlog_stream::BinlogStream,

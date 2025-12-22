@@ -85,6 +85,9 @@ pub struct Event {
     /// Lets consumers validate compatibility across schema evolution
     pub schema_version: Option<String>,
 
+    /// Schema sequence for replay lookups
+    pub schema_sequence: Option<u64>,
+
     /// DDL payload for schema changes when `op == Op::DDL`.
     /// Usually includes fields like {"sql": "...", "normalized": "...", "diff": "..."}.
     pub ddl: Option<serde_json::Value>,
@@ -186,6 +189,7 @@ impl Event {
             before,
             after,
             schema_version: None,
+            schema_sequence: None,
             ddl: None,
             timestamp: ts,
             trace_id: None,
@@ -215,6 +219,7 @@ impl Event {
             before: None,
             after: None,
             schema_version: None,
+            schema_sequence: None,
             ddl: Some(ddl),
             timestamp: ts,
             trace_id: None,

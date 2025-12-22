@@ -24,6 +24,7 @@ pub struct LoadedSchema {
     pub schema: MySqlTableSchema,
     pub registry_version: i32,
     pub fingerprint: String,
+    pub sequence: u64,
 }
 
 /// Schema loader with caching and registry integration.
@@ -53,6 +54,10 @@ impl MySqlSchemaLoader {
             registry,
             tenant: tenant.to_string(),
         }
+    }
+
+    pub fn current_sequence(&self) -> u64 {
+        self.registry.current_sequence()
     }
 
     /// Expand wildcard patterns and preload all matching schemas.
@@ -145,7 +150,15 @@ impl MySqlSchemaLoader {
         db: &str,
         table: &str,
     ) -> SourceResult<LoadedSchema> {
-        // Check cache first
+        self.load_schema_at_checkpoint(db, table, None).await
+    }
+
+    pub async fn load_schema_at_checkpoint(
+        &self,
+        db: &str,
+        table: &str,
+        checkpoint: Option<&[u8]>,
+    ) -> SourceResult<LoadedSchema> {
         if let Some(cached) = self
             .cache
             .read()
@@ -163,16 +176,24 @@ impl MySqlSchemaLoader {
         // Register with schema registry
         let schema_json = serde_json::to_value(&schema)
             .map_err(|e| SourceError::Other(e.into()))?;
+        // Register with checkpoint
         let version = self
             .registry
-            .register(&self.tenant, db, table, &fingerprint, &schema_json)
+            .register_with_checkpoint(
+                &self.tenant,
+                db,
+                table,
+                &fingerprint,
+                &schema_json,
+                checkpoint,
+            )
             .await
-            .map_err(SourceError::Other)?;
-
+            .map_err(|e| SourceError::Other(e))?;
         let loaded = LoadedSchema {
             schema,
             registry_version: version,
             fingerprint,
+            sequence: self.registry.current_sequence(),
         };
 
         // Cache it
@@ -190,7 +211,6 @@ impl MySqlSchemaLoader {
 
         Ok(loaded)
     }
-
     /// Force reload schema from database (bypasses cache).
     pub async fn reload_schema(
         &self,
@@ -435,6 +455,7 @@ impl MySqlSchemaLoader {
                     schema,
                     registry_version: 1,
                     fingerprint,
+                    sequence: 0,
                 };
                 ((db, table), loaded)
             })

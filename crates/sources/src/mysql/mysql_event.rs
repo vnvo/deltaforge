@@ -166,6 +166,7 @@ async fn handle_write_rows(
                 ctx.last_pos,
                 &ctx.last_gtid,
             ));
+            ev.schema_sequence = Some(ctx.schema.current_sequence());
 
             let table = format!("{}.{}", tm.database_name, tm.table_name);
             match ctx.tx.send(ev).await {
@@ -230,9 +231,14 @@ async fn handle_update_rows(
                 ts_ms(header.timestamp),
                 header.event_length as usize,
             );
-            
+
             ev.tx_id = ctx.last_gtid.clone();
-            ev.checkpoint = Some(make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid));
+            ev.checkpoint = Some(make_checkpoint_meta(
+                &ctx.last_file,
+                ctx.last_pos,
+                &ctx.last_gtid,
+            ));
+            ev.schema_sequence = Some(ctx.schema.current_sequence());
 
             let table = format!("{}.{}", tm.database_name, tm.table_name);
             match ctx.tx.send(ev).await {
@@ -289,10 +295,15 @@ async fn handle_delete_rows(
                 ts_ms(header.timestamp),
                 header.event_length as usize,
             );
-            
+
             ev.tx_id = ctx.last_gtid.clone();
-            ev.checkpoint = Some(make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid));            
-            
+            ev.checkpoint = Some(make_checkpoint_meta(
+                &ctx.last_file,
+                ctx.last_pos,
+                &ctx.last_gtid,
+            ));
+            ev.schema_sequence = Some(ctx.schema.current_sequence());
+
             let table = format!("{}.{}", tm.database_name, tm.table_name);
             match ctx.tx.send(ev).await {
                 Ok(_) => {
@@ -389,10 +400,10 @@ fn handle_rotate(
 #[instrument(skip_all, fields(source_id=%ctx.source_id))]
 async fn handle_xid(ctx: &mut RunCtx) {
     // Prefer the server’s executed-set; fall back to last_gtid if GTID is off
-    match crate::mysql::mysql_helpers::fetch_executed_gtid_set(&ctx.dsn)
-        .await
-    {
-        Ok(Some(s)) => {ctx.last_gtid = Some(s);}
+    match crate::mysql::mysql_helpers::fetch_executed_gtid_set(&ctx.dsn).await {
+        Ok(Some(s)) => {
+            ctx.last_gtid = Some(s);
+        }
         Ok(None) => {}
         Err(e) => {
             debug!(source_id=%ctx.source_id, error=%e, "failed to fetch executed GTID set");
@@ -405,7 +416,7 @@ async fn handle_xid(ctx: &mut RunCtx) {
         pos=ctx.last_pos,
         gtid=?ctx.last_gtid,
         "XID: transaction committed (checkpoint in events, will persist after sink ack)"
-    );    
+    );
 }
 
 #[cfg(test)]
@@ -613,38 +624,42 @@ mod tests {
     async fn events_carry_checkpoint_metadata() {
         let (tx, mut rx) = mpsc::channel::<Event>(8);
         let mut ctx = make_runctx(tx);
-        
+
         // Set known position
         ctx.last_file = "mysql-bin.000005".to_string();
         ctx.last_pos = 12345;
         ctx.last_gtid = Some("abc-123:1-10".to_string());
-        
+
         let row = RowEvent {
             column_values: vec![
                 ColumnValue::LongLong(1),
                 ColumnValue::String(b"test".to_vec()),
             ],
         };
-        
+
         let ev = WriteRowsEvent {
             table_id: TABLE_ID,
             included_columns: vec![true, true],
             rows: vec![row],
         };
-        
+
         handle_write_rows(&mut ctx, &make_header(), ev)
             .await
             .expect("write rows should succeed");
-        
+
         let produced = rx.recv().await.expect("expected one event");
-        
+        assert!(
+            produced.schema_sequence.is_some(),
+            "event must have schema_sequence"
+        );
+
         // Verify checkpoint is attached
         let cp_meta = produced.checkpoint.expect("event must have checkpoint");
-        
+
         // Deserialize and verify
         let cp: MySqlCheckpoint = serde_json::from_slice(cp_meta.as_bytes())
             .expect("checkpoint must deserialize");
-        
+
         assert_eq!(cp.file, "mysql-bin.000005");
         assert_eq!(cp.pos, 12345);
         assert_eq!(cp.gtid_set.as_deref(), Some("abc-123:1-10"));
