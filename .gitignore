@@ -6,3 +6,5 @@
 .vscode/
 data/
 docs/book/
+flamegraph.svg
+perf.data*

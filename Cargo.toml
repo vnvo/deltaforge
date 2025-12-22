@@ -49,3 +49,7 @@ all = "warn"
 pedantic = "warn"
 nursery = "warn"
 cargo = "warn"
+
+[profile.bench]
+debug = true
+strip = false
