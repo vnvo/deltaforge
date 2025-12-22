@@ -171,7 +171,7 @@ async fn handle_write_rows(
                 ctx.last_pos,
                 &ctx.last_gtid,
             ));
-            ev.schema_version = Some(Arc::clone(&loaded.fingerprint));
+            ev.schema_version = Some(loaded.fingerprint.to_string());
             ev.schema_sequence = Some(loaded.sequence);
 
             let table = format!("{}.{}", tm.database_name, tm.table_name);
@@ -244,7 +244,7 @@ async fn handle_update_rows(
                 ctx.last_pos,
                 &ctx.last_gtid,
             ));
-            ev.schema_version = Some(Arc::clone(&loaded.fingerprint));
+            ev.schema_version = Some(loaded.fingerprint.to_string());
             ev.schema_sequence = Some(ctx.schema.current_sequence());
 
             let table = format!("{}.{}", tm.database_name, tm.table_name);
@@ -312,7 +312,7 @@ async fn handle_delete_rows(
                 ctx.last_pos,
                 &ctx.last_gtid,
             ));
-            ev.schema_version = Some(Arc::clone(&loaded.fingerprint));
+            ev.schema_version = Some(loaded.fingerprint.to_string());
             ev.schema_sequence = Some(ctx.schema.current_sequence());
 
             let table = format!("{}.{}", tm.database_name, tm.table_name);
