@@ -52,7 +52,8 @@ pub struct MySqlCheckpoint {
 
 #[derive(Debug, Clone)]
 pub struct MySqlSource {
-    pub id: String,          // checkpoint key + server_id seed
+    pub id: String, // checkpoint key + server_id seed
+    pub checkpoint_key: String,
     pub dsn: String,         // mysql://user:pass@host:3306/db
     pub tables: Vec<String>, // ["db.table"]; empty = all
     pub tenant: String,
@@ -178,6 +179,10 @@ impl MySqlSource {
 
 #[async_trait]
 impl Source for MySqlSource {
+    fn checkpoint_key(&self) -> &str {
+        &self.checkpoint_key
+    }
+
     /// start the source in a background task and return a control handle.
     /// outside callers have to use this to start a CDC source.
     /// see `SourceHandler` for available controls returned by run.

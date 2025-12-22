@@ -3796,8 +3796,10 @@ dependencies = [
  "async-trait",
  "chrono",
  "deltaforge-core",
+ "hex",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
 ]

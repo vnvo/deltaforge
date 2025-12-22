@@ -134,8 +134,11 @@ impl PipelineManager {
 
         let batch_processor =
             build_batch_processor(processors, pipeline_name.clone());
-        let commit_cp =
-            build_commit_fn(self.ckpt_store.clone(), pipeline_name.clone());
+
+        let commit_cp = build_commit_fn(
+            self.ckpt_store.clone(),
+            source.checkpoint_key().to_string(),
+        );
 
         let (pause_tx, pause_rx) = watch::channel(false);
 
@@ -332,7 +335,7 @@ impl SchemaController for PipelineManager {
                 table,
                 column_count: loaded.schema.columns.len(),
                 primary_key: loaded.schema.primary_key.clone(),
-                fingerprint: loaded.fingerprint,
+                fingerprint: loaded.fingerprint.to_string(),
                 registry_version: loaded.registry_version,
             })
             .collect();
@@ -388,7 +391,7 @@ impl SchemaController for PipelineManager {
             engine: loaded.schema.engine,
             charset: loaded.schema.charset,
             collation: loaded.schema.collation,
-            fingerprint: loaded.fingerprint,
+            fingerprint: loaded.fingerprint.to_string(),
             registry_version: loaded.registry_version,
             loaded_at: Utc::now(),
         })
@@ -488,7 +491,7 @@ impl SchemaController for PipelineManager {
             engine: loaded.schema.engine,
             charset: loaded.schema.charset,
             collation: loaded.schema.collation,
-            fingerprint: loaded.fingerprint,
+            fingerprint: loaded.fingerprint.to_string(),
             registry_version: loaded.registry_version,
             loaded_at: Utc::now(),
         })

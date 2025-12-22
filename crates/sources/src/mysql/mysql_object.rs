@@ -2,12 +2,11 @@ use base64::prelude::*;
 use mysql_binlog_connector_rust::column::column_value::ColumnValue;
 use mysql_common::{binlog::jsonb, io::ParseBuf, proto::MyDeserialize};
 use serde_json::{Value, json};
-use std::sync::Arc;
 use tracing::debug;
 
 /// Build a JSON object using the included-columns bitmap and the compact values vector.
 pub(super) fn build_object(
-    cols: &Arc<Vec<String>>,
+    cols: &[String],
     included: &[bool],
     values: &[ColumnValue],
 ) -> Value {
