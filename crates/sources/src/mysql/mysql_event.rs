@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use deltaforge_core::{Event, Op, SourceError, SourceMeta, SourceResult};
 use metrics::counter;
 use mysql_binlog_connector_rust::{
@@ -137,15 +139,18 @@ async fn handle_write_rows(
         if !ctx.allow.matchs(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
-        let cols = ctx
+        let loaded = ctx
             .schema
-            .column_names(&tm.database_name, &tm.table_name)
+            .load_schema(&tm.database_name, &tm.table_name)
             .await?;
         debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=wr.rows.len(), "write_rows");
 
         for row in wr.rows {
-            let after =
-                build_object(&cols, &wr.included_columns, &row.column_values);
+            let after = build_object(
+                &loaded.column_names,
+                &wr.included_columns,
+                &row.column_values,
+            );
             let mut ev = Event::new_row(
                 ctx.tenant.clone(),
                 SourceMeta {
@@ -166,7 +171,8 @@ async fn handle_write_rows(
                 ctx.last_pos,
                 &ctx.last_gtid,
             ));
-            ev.schema_sequence = Some(ctx.schema.current_sequence());
+            ev.schema_version = Some(Arc::clone(&loaded.fingerprint));
+            ev.schema_sequence = Some(loaded.sequence);
 
             let table = format!("{}.{}", tm.database_name, tm.table_name);
             match ctx.tx.send(ev).await {
@@ -200,20 +206,20 @@ async fn handle_update_rows(
         if !ctx.allow.matchs(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
-        let cols = ctx
+        let loaded = ctx
             .schema
-            .column_names(&tm.database_name, &tm.table_name)
+            .load_schema(&tm.database_name, &tm.table_name)
             .await?;
         debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=ur.rows.len(), "update_rows");
 
         for (before_row, after_row) in ur.rows {
             let before = build_object(
-                &cols,
+                &loaded.column_names,
                 &ur.included_columns_before,
                 &before_row.column_values,
             );
             let after = build_object(
-                &cols,
+                &loaded.column_names,
                 &ur.included_columns_after,
                 &after_row.column_values,
             );
@@ -238,6 +244,7 @@ async fn handle_update_rows(
                 ctx.last_pos,
                 &ctx.last_gtid,
             ));
+            ev.schema_version = Some(Arc::clone(&loaded.fingerprint));
             ev.schema_sequence = Some(ctx.schema.current_sequence());
 
             let table = format!("{}.{}", tm.database_name, tm.table_name);
@@ -272,15 +279,18 @@ async fn handle_delete_rows(
         if !ctx.allow.matchs(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
-        let cols = ctx
+        let loaded = ctx
             .schema
-            .column_names(&tm.database_name, &tm.table_name)
+            .load_schema(&tm.database_name, &tm.table_name)
             .await?;
         debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=dr.rows.len(), "delete_rows");
 
         for row in dr.rows {
-            let before =
-                build_object(&cols, &dr.included_columns, &row.column_values);
+            let before = build_object(
+                &loaded.column_names,
+                &dr.included_columns,
+                &row.column_values,
+            );
             let mut ev = Event::new_row(
                 ctx.tenant.clone(),
                 SourceMeta {
@@ -302,6 +312,7 @@ async fn handle_delete_rows(
                 ctx.last_pos,
                 &ctx.last_gtid,
             ));
+            ev.schema_version = Some(Arc::clone(&loaded.fingerprint));
             ev.schema_sequence = Some(ctx.schema.current_sequence());
 
             let table = format!("{}.{}", tm.database_name, tm.table_name);
@@ -663,5 +674,133 @@ mod tests {
         assert_eq!(cp.file, "mysql-bin.000005");
         assert_eq!(cp.pos, 12345);
         assert_eq!(cp.gtid_set.as_deref(), Some("abc-123:1-10"));
+    }
+
+    #[tokio::test]
+    async fn events_carry_schema_metadata() {
+        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let mut ctx = make_runctx(tx);
+
+        ctx.last_file = "mysql-bin.000005".to_string();
+        ctx.last_pos = 12345;
+        ctx.last_gtid = Some("abc-123:1-10".to_string());
+
+        let row = RowEvent {
+            column_values: vec![
+                ColumnValue::LongLong(1),
+                ColumnValue::String(b"test".to_vec()),
+            ],
+        };
+
+        let ev = WriteRowsEvent {
+            table_id: TABLE_ID,
+            included_columns: vec![true, true],
+            rows: vec![row],
+        };
+
+        handle_write_rows(&mut ctx, &make_header(), ev)
+            .await
+            .expect("write rows should succeed");
+
+        let produced = rx.recv().await.expect("expected one event");
+
+        // Verify checkpoint
+        let cp_meta = produced.checkpoint.expect("event must have checkpoint");
+        let cp: MySqlCheckpoint = serde_json::from_slice(cp_meta.as_bytes())
+            .expect("checkpoint must deserialize");
+        assert_eq!(cp.file, "mysql-bin.000005");
+        assert_eq!(cp.pos, 12345);
+        assert_eq!(cp.gtid_set.as_deref(), Some("abc-123:1-10"));
+
+        // Verify schema metadata
+        assert!(
+            produced.schema_sequence.is_some(),
+            "event must have schema_sequence"
+        );
+
+        let version = produced
+            .schema_version
+            .expect("event must have schema_version");
+        assert!(
+            version.starts_with("sha256:"),
+            "fingerprint should have sha256 prefix, got: {}",
+            version
+        );
+        assert_eq!(
+            version.len(),
+            71,
+            "fingerprint should be 71 chars (sha256: prefix + 64 hex)"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_metadata_consistent_across_ops() {
+        let (tx, mut rx) = mpsc::channel::<Event>(16);
+        let mut ctx = make_runctx(tx);
+
+        // Insert
+        let write_ev = WriteRowsEvent {
+            table_id: TABLE_ID,
+            included_columns: vec![true, true],
+            rows: vec![RowEvent {
+                column_values: vec![
+                    ColumnValue::LongLong(1),
+                    ColumnValue::String(b"sku-1".to_vec()),
+                ],
+            }],
+        };
+        handle_write_rows(&mut ctx, &make_header(), write_ev)
+            .await
+            .unwrap();
+
+        // Update
+        let update_ev = UpdateRowsEvent {
+            table_id: TABLE_ID,
+            included_columns_before: vec![true, true],
+            included_columns_after: vec![true, true],
+            rows: vec![(
+                RowEvent {
+                    column_values: vec![
+                        ColumnValue::LongLong(1),
+                        ColumnValue::String(b"sku-1".to_vec()),
+                    ],
+                },
+                RowEvent {
+                    column_values: vec![
+                        ColumnValue::LongLong(1),
+                        ColumnValue::String(b"sku-2".to_vec()),
+                    ],
+                },
+            )],
+        };
+        handle_update_rows(&mut ctx, &make_header(), update_ev)
+            .await
+            .unwrap();
+
+        // Delete
+        let delete_ev = DeleteRowsEvent {
+            table_id: TABLE_ID,
+            included_columns: vec![true, true],
+            rows: vec![RowEvent {
+                column_values: vec![
+                    ColumnValue::LongLong(1),
+                    ColumnValue::String(b"sku-2".to_vec()),
+                ],
+            }],
+        };
+        handle_delete_rows(&mut ctx, &make_header(), delete_ev)
+            .await
+            .unwrap();
+
+        // Collect all events
+        let insert = rx.recv().await.unwrap();
+        let update = rx.recv().await.unwrap();
+        let delete = rx.recv().await.unwrap();
+
+        // All should have same schema metadata (same table, same schema)
+        assert_eq!(insert.schema_version, update.schema_version);
+        assert_eq!(update.schema_version, delete.schema_version);
+        assert_eq!(insert.schema_sequence, update.schema_sequence);
+        assert_eq!(update.schema_sequence, delete.schema_sequence);
     }
 }

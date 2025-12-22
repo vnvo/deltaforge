@@ -20,6 +20,34 @@ use uuid::Uuid;
 pub mod errors;
 pub use errors::{SinkError, SourceError};
 
+mod arc_str_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::sync::Arc;
+
+    pub fn serialize<S>(
+        value: &Option<Arc<str>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(s) => serializer.serialize_some(s.as_ref()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<Option<Arc<str>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<String> = Option::deserialize(deserializer)?;
+        Ok(opt.map(|s| Arc::from(s.as_str())))
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Op {
     Insert,
@@ -83,7 +111,8 @@ pub struct Event {
 
     /// Schema registry version/hash that `before`/`after` conform to at emit time
     /// Lets consumers validate compatibility across schema evolution
-    pub schema_version: Option<String>,
+    #[serde(default, with = "arc_str_serde")]
+    pub schema_version: Option<Arc<str>>,
 
     /// Schema sequence for replay lookups
     pub schema_sequence: Option<u64>,

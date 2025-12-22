@@ -335,7 +335,7 @@ impl SchemaController for PipelineManager {
                 table,
                 column_count: loaded.schema.columns.len(),
                 primary_key: loaded.schema.primary_key.clone(),
-                fingerprint: loaded.fingerprint,
+                fingerprint: loaded.fingerprint.to_string(),
                 registry_version: loaded.registry_version,
             })
             .collect();
@@ -391,7 +391,7 @@ impl SchemaController for PipelineManager {
             engine: loaded.schema.engine,
             charset: loaded.schema.charset,
             collation: loaded.schema.collation,
-            fingerprint: loaded.fingerprint,
+            fingerprint: loaded.fingerprint.to_string(),
             registry_version: loaded.registry_version,
             loaded_at: Utc::now(),
         })
@@ -491,7 +491,7 @@ impl SchemaController for PipelineManager {
             engine: loaded.schema.engine,
             charset: loaded.schema.charset,
             collation: loaded.schema.collation,
-            fingerprint: loaded.fingerprint,
+            fingerprint: loaded.fingerprint.to_string(),
             registry_version: loaded.registry_version,
             loaded_at: Utc::now(),
         })

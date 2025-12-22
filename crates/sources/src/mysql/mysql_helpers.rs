@@ -199,31 +199,6 @@ pub(super) async fn pause_until_resumed(
     true
 }
 
-/// Persist checkpoint (best effort), with logging.
-pub(crate) async fn persist_checkpoint(
-    source_id: &str,
-    ckpt_store: &Arc<dyn CheckpointStore>,
-    file: &str,
-    pos: u64,
-    gtid: &Option<String>,
-) {
-    if let Err(e) = ckpt_store
-        .put(
-            source_id,
-            MySqlCheckpoint {
-                file: file.to_string(),
-                pos,
-                gtid_set: gtid.clone(),
-            },
-        )
-        .await
-    {
-        error!(source_id = %source_id, error = %e, "failed to persist checkpoint");
-    } else {
-        debug!(source_id = %source_id, file = %file, pos = pos, gtid = ?gtid, "checkpoint saved");
-    }
-}
-
 // ----------------------------- private helpers / utilities -----------------------------
 
 pub(crate) fn ts_ms(ts_sec: u32) -> i64 {

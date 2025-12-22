@@ -16,15 +16,16 @@ use tracing::{debug, info, warn};
 
 use super::mysql_table_schema::{MySqlColumn, MySqlTableSchema};
 use crate::mysql::mysql_helpers::redact_password;
-use deltaforge_core::{SchemaRegistry, SourceError, SourceResult};
+use deltaforge_core::{SourceError, SourceResult};
 
 /// Loaded schema with metadata.
 #[derive(Debug, Clone)]
 pub struct LoadedSchema {
     pub schema: MySqlTableSchema,
     pub registry_version: i32,
-    pub fingerprint: String,
+    pub fingerprint: Arc<str>,
     pub sequence: u64,
+    pub column_names: Arc<Vec<String>>,
 }
 
 /// Schema loader with caching and registry integration.
@@ -172,6 +173,8 @@ impl MySqlSchemaLoader {
         let t0 = Instant::now();
         let schema = self.fetch_schema(db, table).await?;
         let fingerprint = schema.fingerprint();
+        let column_names: Arc<Vec<String>> =
+            Arc::new(schema.columns.iter().map(|c| c.name.clone()).collect());
 
         // Register with schema registry
         let schema_json = serde_json::to_value(&schema)
@@ -188,12 +191,13 @@ impl MySqlSchemaLoader {
                 checkpoint,
             )
             .await
-            .map_err(|e| SourceError::Other(e))?;
+            .map_err(SourceError::Other)?;
         let loaded = LoadedSchema {
             schema,
             registry_version: version,
-            fingerprint,
+            fingerprint: fingerprint.into(),
             sequence: self.registry.current_sequence(),
+            column_names,
         };
 
         // Cache it
@@ -270,7 +274,7 @@ impl MySqlSchemaLoader {
             let cache = self.cache.read().await;
             cache
                 .get(&(db.to_string(), table.to_string()))
-                .map(|cached| cached.fingerprint != current_fp)
+                .map(|cached| cached.fingerprint != current_fp.into())
                 .unwrap_or(true)
         };
 
@@ -414,14 +418,7 @@ impl MySqlSchemaLoader {
         table: &str,
     ) -> SourceResult<Arc<Vec<String>>> {
         let loaded = self.load_schema(db, table).await?;
-        Ok(Arc::new(
-            loaded
-                .schema
-                .columns
-                .iter()
-                .map(|c| c.name.clone())
-                .collect(),
-        ))
+        Ok(Arc::clone(&loaded.column_names))
     }
 
     /// Create a loader with pre-populated cache (for testing only).
@@ -454,8 +451,9 @@ impl MySqlSchemaLoader {
                 let loaded = LoadedSchema {
                     schema,
                     registry_version: 1,
-                    fingerprint,
+                    fingerprint: fingerprint.into(),
                     sequence: 0,
+                    column_names: col_names,
                 };
                 ((db, table), loaded)
             })
