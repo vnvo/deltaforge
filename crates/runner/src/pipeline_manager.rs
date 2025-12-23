@@ -127,6 +127,7 @@ impl PipelineManager {
                 (Some(loader), cfg.tables.clone())
             }
             SourceCfg::Postgres(_) => (None, vec![]),
+            SourceCfg::Turso(turso_src_cfg) => todo!(),
         };
 
         let (event_tx, event_rx) = mpsc::channel::<Event>(4096);

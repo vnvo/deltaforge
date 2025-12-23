@@ -5,6 +5,9 @@ use tracing::error;
 use walkdir::WalkDir;
 
 mod tursodb_cfg;
+mod schema_sensing_cfg;
+
+pub use schema_sensing_cfg::{SchemaSensingConfig, TableFilter, DeepInspectConfig};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {

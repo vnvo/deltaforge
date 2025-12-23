@@ -25,5 +25,6 @@ pub fn build_source(
             pipeline: pipeline.metadata.name.clone(),
             registry,
         })),
+        SourceCfg::Turso(turso_src_cfg) => todo!(),
     }
 }
