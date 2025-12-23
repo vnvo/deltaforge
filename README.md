@@ -27,6 +27,8 @@
 
 > A modular, efficient and config-driven Change Data Capture (CDC) micro-framework.
 
+> ⚠️ **Status:** Active developmemt. APIs, configuration, and semantics may change.
+
 DeltaForge is a lightweight framework for building CDC pipelines that stream database changes into downstream systems such as Kafka and Redis. It focuses on:
 
 - **User Control** : Using an embedded JS engine, users can fully control what happens to each event.
@@ -39,20 +41,27 @@ However, deltaforge is NOT a DAG based stream processor.
 Deltaforge is meant to replace tools like Debezium and similar.
 
 
-> ⚠️ **Status:** Active developmemt. APIs, configuration, and semantics may change.
-
-
-
-
 ## Features
 
 - **Sources**
   - MySQL binlog CDC.
   - Postgres logical replication.
+  - Wildcard table patterns (`shop.order%`, `%.audit_log`)
+
+- **Schema Registry**
+  - Source-owned schema types (MySQL, PostgreSQL native semantics)
+  - SHA-256 content fingerprinting for change detection
+  - Version tracking with sequence numbers for replay
+  - Automatic DDL detection and cache invalidation
+
+- **Checkpoints**
+  - Pluggable backends (File, SQLite with versioning, in-memory)
+  - Configurable commit policies (all, required, quorum)
+  - Transaction boundary preservation
 
 - **Processors**
   - JavaScript processors using `deno_core`:
-    - Run user-provided JS to transform batches of events.
+    - Run user defined functions (UDFs) in JS to transform batches of events.
 
 - **Sinks**
   - Kafka producer sink (via `rdkafka`).
@@ -65,8 +74,9 @@ Deltaforge is meant to replace tools like Debezium and similar.
   - Multiple pipeline at the same time.
 
 - **Control plane & observability**
-  - HTTP API for health and pipeline config management.
-  - Metrics endpoint.
+  - REST API for pipeline lifecycle management
+  - Prometheus metrics endpoint
+  - Health/readiness probes
 
 
 ## Documentation
@@ -119,30 +129,31 @@ docker run --rm \
 
 The container runs as a non-root user, writes checkpoints to `/app/data/df_checkpoints.json`, and listens on `0.0.0.0:8080` for the control plane API with metrics served on `:9000`.
 
-## Features
 
-- **Sources**
-  - MySQL binlog CDC.
-  - Postgres logical replication.
+## Architecture Highlights
 
-- **Processors**
-  - JavaScript processors using `deno_core`:
-    - Run user-provided JS to transform batches of events.
+### Source-Owned Schemas
 
-- **Sinks**
-  - Kafka producer sink (via `rdkafka`).
-  - Redis stream sink.
+Unlike tools that normalize all databases to a universal type system, DeltaForge lets each source define its own schema semantics. MySQL schemas capture MySQL types (`bigint(20) unsigned`, `json`), PostgreSQL schemas preserve arrays and custom types. No lossy normalization, no universal type maintenance burden.
 
-- **Core runtime**
-  - Unified `Event` model (`before` / `after` images, DDL payloads, tx id, schema version, timestamps, etc.).
-  - Checkpointing.
-  - Batch support.
-  - Multiple pipeline at the same time.
+### Checkpoint Timing Guarantees
 
-- **Control plane & observability**
-  - HTTP API for health and pipeline config management.
-  - Metrics endpoint.
+DeltaForge guarantees at-least-once delivery through careful checkpoint ordering:
 
+```
+Source → Processor → Sink (deliver) → Checkpoint (save)
+                           │
+                    Sink acknowledges
+                    successful delivery
+                           │
+                    THEN checkpoint saved
+```
+
+Checkpoints are never saved before events are delivered. A crash between delivery and checkpoint causes replay (duplicates possible), but never loss.
+
+### Schema-Checkpoint Correlation
+
+The schema registry tracks schema versions with sequence numbers and optional checkpoint correlation. During replay, events are interpreted with the schema that was active when they were produced — even if the table structure has since changed.
 
 
 ## API
@@ -251,6 +262,17 @@ Key fields:
 - `spec.sinks` — one or more sinks; Kafka supports `required`, `exactly_once`, and raw `client_conf` overrides; Redis streams are also available.
 - `spec.batch` — optional thresholds that define the commit unit.
 - `spec.commit_policy` — how sink acknowledgements gate checkpoint commits (`all`, `required` (default), or `quorum`).
+
+
+## Roadmap
+
+- [ ] Persistent schema registry (SQLite, then PostgreSQL)
+- [ ] PostgreSQL/S3 checkpoint backends for HA
+- [ ] Turso/SQLite source
+- [ ] ClickHouse source  
+- [ ] MongoDB source
+- [ ] Event store for time-based replay
+- [ ] Distributed coordination for HA
 
 
 ## License
