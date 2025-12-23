@@ -4,10 +4,12 @@ use thiserror::Error;
 use tracing::error;
 use walkdir::WalkDir;
 
-mod tursodb_cfg;
 mod schema_sensing_cfg;
+mod tursodb_cfg;
 
-pub use schema_sensing_cfg::{SchemaSensingConfig, TableFilter, DeepInspectConfig};
+pub use schema_sensing_cfg::{
+    DeepInspectConfig, SchemaSensingConfig, TableFilter,
+};
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -174,7 +176,7 @@ pub struct ConnectionLimits {
 
 /// The pipeline-level batch (the **commit unit**). Coordinator will build batches
 /// using these thresholds and checkpoint after a batch is accepted by sinks.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BatchConfig {
     /// Flush when this many events have been accumulated.
@@ -187,6 +189,18 @@ pub struct BatchConfig {
     pub respect_source_tx: Option<bool>,
     /// How many batches may be in-flight concurrently (keep 1 until we add WAL).
     pub max_inflight: Option<usize>,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            max_events: Some(1000),
+            max_bytes: Some(3 * 1014 * 1024),
+            max_ms: Some(100),
+            respect_source_tx: Some(true),
+            max_inflight: Some(1),
+        }
+    }
 }
 
 /// Per-component performance knobs that do **not** change the commit unit.

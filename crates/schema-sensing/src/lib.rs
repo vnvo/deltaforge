@@ -38,7 +38,7 @@ mod sensor;
 
 pub use errors::{SensorError, SensorResult};
 pub use fingerprint::compute_fingerprint;
-pub use json_schema::{to_json_schema, JsonSchema, JsonSchemaType};
+pub use json_schema::{JsonSchema, JsonSchemaType, to_json_schema};
 pub use schema_state::{SchemaSnapshot, SchemaVersion, TableSchemaState};
 pub use sensor::{ObserveResult, SchemaSensor};
 

@@ -11,10 +11,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{debug, info};
 
-use crate::pipeline_manager::PipelineManager;
-
-mod coordinator;
-mod pipeline_manager;
+use runner::PipelineManager;
 
 #[derive(Parser, Debug)]
 struct Args {

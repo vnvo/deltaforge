@@ -203,11 +203,12 @@ impl TableFilter {
     /// Check if a table matches the filter.
     pub fn matches(&self, table: &str) -> bool {
         // If include list is empty, include all
-        let included = self.include.is_empty() || self.include.iter().any(|p| matches_pattern(p, table));
-        
+        let included = self.include.is_empty()
+            || self.include.iter().any(|p| matches_pattern(p, table));
+
         // Check exclusions
         let excluded = self.exclude.iter().any(|p| matches_pattern(p, table));
-        
+
         included && !excluded
     }
 }
@@ -216,11 +217,12 @@ impl ColumnFilter {
     /// Check if a column matches the filter.
     pub fn matches(&self, column: &str) -> bool {
         // If include list is empty, include all
-        let included = self.include.is_empty() || self.include.iter().any(|p| matches_pattern(p, column));
-        
+        let included = self.include.is_empty()
+            || self.include.iter().any(|p| matches_pattern(p, column));
+
         // Check exclusions
         let excluded = self.exclude.iter().any(|p| matches_pattern(p, column));
-        
+
         included && !excluded
     }
 }

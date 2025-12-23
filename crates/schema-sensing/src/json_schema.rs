@@ -32,7 +32,10 @@ pub struct JsonSchema {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
 
-    #[serde(rename = "additionalProperties", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "additionalProperties",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub additional_properties: Option<bool>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -60,7 +63,9 @@ impl JsonSchema {
     /// Create a new JSON Schema with the standard schema URI.
     pub fn new() -> Self {
         Self {
-            schema_uri: Some("https://json-schema.org/draft/2020-12/schema".to_string()),
+            schema_uri: Some(
+                "https://json-schema.org/draft/2020-12/schema".to_string(),
+            ),
             ..Default::default()
         }
     }
@@ -82,7 +87,12 @@ pub fn to_json_schema(schema: &Schema) -> JsonSchema {
 }
 
 /// Convert schema with depth limiting.
-fn convert_schema(schema: &Schema, target: &mut JsonSchema, depth: usize, max_depth: usize) {
+fn convert_schema(
+    schema: &Schema,
+    target: &mut JsonSchema,
+    depth: usize,
+    max_depth: usize,
+) {
     if depth > max_depth {
         target.description = Some("(depth limit reached)".to_string());
         return;
@@ -108,7 +118,9 @@ fn convert_schema(schema: &Schema, target: &mut JsonSchema, depth: usize, max_de
         Schema::String(ctx) => {
             target.schema_type = Some(JsonSchemaType::String);
             // Check for fixed-length strings using MinMax
-            if let (Some(min), Some(max)) = (ctx.min_max_length.min, ctx.min_max_length.max) {
+            if let (Some(min), Some(max)) =
+                (ctx.min_max_length.min, ctx.min_max_length.max)
+            {
                 if min == max && min > 0 {
                     target.description = Some(format!("Fixed length: {}", min));
                 }
@@ -140,11 +152,17 @@ fn convert_schema(schema: &Schema, target: &mut JsonSchema, depth: usize, max_de
             for (field_name, field) in fields {
                 if let Some(ref field_schema) = field.schema {
                     let mut field_js = JsonSchema::default();
-                    convert_schema(field_schema, &mut field_js, depth + 1, max_depth);
+                    convert_schema(
+                        field_schema,
+                        &mut field_js,
+                        depth + 1,
+                        max_depth,
+                    );
                     props.insert(field_name.clone(), Box::new(field_js));
 
                     // If field is never null or missing, it's required
-                    if !field.status.may_be_null && !field.status.may_be_missing {
+                    if !field.status.may_be_null && !field.status.may_be_missing
+                    {
                         required_fields.push(field_name.clone());
                     }
                 }

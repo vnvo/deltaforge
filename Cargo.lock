@@ -3632,6 +3632,8 @@ dependencies = [
  "processors",
  "rest-api",
  "schema-registry",
+ "schema-sensing",
+ "serde",
  "serde_json",
  "sinks",
  "sources",

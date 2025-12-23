@@ -93,7 +93,10 @@ fn hash_structure(schema: &Schema, hasher: &mut Sha256) {
 }
 
 /// Hash the field status flags that affect structure.
-fn hash_field_status(status: &schema_analysis::FieldStatus, hasher: &mut Sha256) {
+fn hash_field_status(
+    status: &schema_analysis::FieldStatus,
+    hasher: &mut Sha256,
+) {
     let mut flags = 0u8;
     if status.may_be_null {
         flags |= 1;
@@ -177,7 +180,10 @@ mod tests {
 
         let fp1 = compute_fingerprint(&inferred1.schema);
         let fp2 = compute_fingerprint(&inferred2.schema);
-        assert_ne!(fp1, fp2, "Different types should have different fingerprint");
+        assert_ne!(
+            fp1, fp2,
+            "Different types should have different fingerprint"
+        );
     }
 
     #[test]

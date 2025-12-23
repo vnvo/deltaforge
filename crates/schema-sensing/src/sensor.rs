@@ -75,7 +75,11 @@ impl SchemaSensor {
     ///
     /// # Returns
     /// Result indicating what happened (new schema, evolved, unchanged, etc.)
-    pub fn observe(&mut self, table: &str, json: &[u8]) -> SensorResult<ObserveResult> {
+    pub fn observe(
+        &mut self,
+        table: &str,
+        json: &[u8],
+    ) -> SensorResult<ObserveResult> {
         // Check if sensing is enabled for this table
         if !self.config.should_sense_table(table) {
             return Ok(ObserveResult::Disabled);
@@ -174,8 +178,8 @@ impl SchemaSensor {
         value: &serde_json::Value,
     ) -> SensorResult<ObserveResult> {
         // Re-serialize to bytes for schema_analysis
-        let json =
-            serde_json::to_vec(value).map_err(|e| SensorError::Serialization(e.to_string()))?;
+        let json = serde_json::to_vec(value)
+            .map_err(|e| SensorError::Serialization(e.to_string()))?;
         self.observe(table, &json)
     }
 
@@ -206,10 +210,7 @@ impl SchemaSensor {
 
     /// Get event count for a table.
     pub fn event_count(&self, table: &str) -> u64 {
-        self.schemas
-            .get(table)
-            .map(|s| s.event_count)
-            .unwrap_or(0)
+        self.schemas.get(table).map(|s| s.event_count).unwrap_or(0)
     }
 
     /// Check if a table's schema has stabilized.
