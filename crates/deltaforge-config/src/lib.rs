@@ -4,6 +4,8 @@ use thiserror::Error;
 use tracing::error;
 use walkdir::WalkDir;
 
+mod tursodb_cfg;
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config file {path}: {source}")]
@@ -96,6 +98,7 @@ pub struct MysqlSrcCfg {
 pub enum SourceCfg {
     Postgres(PostgresSrcCfg),
     Mysql(MysqlSrcCfg),
+    Turso(tursodb_cfg::TursoSrcCfg),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
