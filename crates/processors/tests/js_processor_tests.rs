@@ -27,6 +27,7 @@ fn new_event() -> Event {
         tags: None,
         checkpoint: None,
         size_bytes: 20 as usize,
+        tx_end: true,
     }
 }
 

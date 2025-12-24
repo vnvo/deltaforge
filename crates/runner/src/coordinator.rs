@@ -69,8 +69,8 @@ fn event_size_hint(ev: &Event) -> usize {
     ev.size_bytes
 }
 
-fn is_tx_boundary(_ev: &Event) -> bool {
-    true
+fn is_tx_boundary(ev: &Event) -> bool {
+    ev.tx_end
 }
 
 fn policy_satisfied(
@@ -411,7 +411,7 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
     pub fn builder(name: impl Into<String>) -> CoordinatorBuilder<Tok> {
         CoordinatorBuilder::new(name)
     }
-    
+
     /// Get access to schema sensor state (for API exposure).
     pub fn schema_sensor(&self) -> Option<&Arc<SchemaSensorState>> {
         self.schema_sensor.as_ref()

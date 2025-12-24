@@ -109,6 +109,9 @@ pub struct Event {
     /// Byte size hint for batching (from source or estimated)
     #[serde(default)]
     pub size_bytes: usize,
+
+    #[serde(default)]
+    pub tx_end: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +170,12 @@ impl Event {
         )
     }
 
+    pub fn with_tx(mut self, tx_id: Option<String>, tx_end: bool) -> Self {
+        self.tx_id = tx_id;
+        self.tx_end = tx_end;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new_row(
         tenant_id: String,
@@ -197,6 +206,7 @@ impl Event {
             tags: None,
             checkpoint: None,
             size_bytes,
+            tx_end: true,
         }
     }
 
@@ -227,6 +237,7 @@ impl Event {
             tags: None,
             checkpoint: None,
             size_bytes,
+            tx_end: true,
         }
     }
 }
