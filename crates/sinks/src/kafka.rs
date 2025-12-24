@@ -11,6 +11,7 @@ use tracing::{debug, info, instrument};
 
 pub struct KafkaSink {
     id: String,
+    cfg: KafkaSinkCfg,
     producer: FutureProducer,
     topic: String,
 }
@@ -52,6 +53,7 @@ impl KafkaSink {
         info!(brokers=%ks_cfg.brokers, topic=%ks_cfg.topic, "kafka client connected", );
         Ok(Self {
             id: ks_cfg.id.clone(),
+            cfg: ks_cfg.clone(),
             producer,
             topic: ks_cfg.topic.clone(),
         })
@@ -62,6 +64,10 @@ impl KafkaSink {
 impl Sink for KafkaSink {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn required(&self) -> bool {
+        self.cfg.required.unwrap_or(true)
     }
 
     async fn send(&self, event: &Event) -> SinkResult<()> {

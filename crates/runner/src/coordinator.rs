@@ -86,8 +86,8 @@ fn policy_satisfied(
     }
 }
 
-fn is_sink_required(_sink: &ArcDynSink) -> bool {
-    true
+fn is_sink_required(sink: &ArcDynSink) -> bool {
+    sink.required()
 }
 
 /// Schema sensing state, wrapped for interior mutability.

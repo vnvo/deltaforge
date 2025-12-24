@@ -158,6 +158,7 @@ mod tests {
                         id: "redis".to_string(),
                         uri: "redis://localhost".to_string(),
                         stream: "events".to_string(),
+                        required: Some(true)
                     })],
                     connection_policy: None,
                     batch: Some(BatchConfig::default()),

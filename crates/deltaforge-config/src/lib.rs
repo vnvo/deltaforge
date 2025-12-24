@@ -147,7 +147,10 @@ pub struct RedisSinkCfg {
     pub id: String,
     pub uri: String,
     pub stream: String,
+    #[serde(default)]
+    pub required: Option<bool>,    
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "config", rename_all = "lowercase")]
 pub enum SinkCfg {

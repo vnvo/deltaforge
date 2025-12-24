@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::schema_provider::SchemaLoaderAdapter;
 use anyhow::{Context, Result};
 use checkpoints::CheckpointStore;
 use deltaforge_config::{PipelineSpec, SourceCfg};
@@ -18,7 +19,6 @@ use schema_registry::InMemoryRegistry;
 use serde_json::Value;
 use sinks::build_sinks;
 use sources::{ArcSchemaLoader, build_schema_loader, build_source};
-use crate::schema_provider::SchemaLoaderAdapter;
 
 use tokio::{
     sync::{mpsc, watch},
@@ -577,6 +577,7 @@ mod tests {
                     id: "redis".to_string(),
                     uri: "redis://localhost".to_string(),
                     stream: "events".to_string(),
+                    required: Some(true),
                 })],
                 connection_policy: None,
                 batch: Some(BatchConfig::default()),

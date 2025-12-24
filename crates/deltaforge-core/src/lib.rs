@@ -316,6 +316,14 @@ pub trait Processor: Send + Sync {
 pub trait Sink: Send + Sync {
     fn id(&self) -> &str;
 
+    /// whether this sink must acknowledge batches for checkpoint commits.
+    /// sinks marked as required (default: true) must succeed for the commit
+    /// policy to be satisfied. Optional sinks are best-effort.
+    /// default: true (all sinks required unless explicitly marked optional)
+    fn required(&self) -> bool {
+        true
+    }
+
     /// send a single event to the sink.
     /// takes a reference to avoid cloning in multi-sink scenarios
     async fn send(&self, event: &Event) -> SinkResult<()>;
