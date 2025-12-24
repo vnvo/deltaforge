@@ -4,7 +4,7 @@
 //! from various sources (MySQL, Postgres, Turso, etc.).
 
 use std::sync::Arc;
-
+use sources::ArcSchemaLoader;
 use async_trait::async_trait;
 
 /// Information about a single column.
@@ -87,6 +87,88 @@ pub fn might_be_json(data_type: &str) -> bool {
         lower.as_str(),
         "text" | "mediumtext" | "longtext" | "clob" | "nclob"
     )
+}
+
+pub struct SchemaLoaderAdapter {
+    loader: ArcSchemaLoader,
+}
+
+impl SchemaLoaderAdapter {
+    pub fn new(loader: ArcSchemaLoader) -> Self {
+        Self { loader }
+    }
+}
+
+#[async_trait]
+impl SchemaProvider for SchemaLoaderAdapter {
+    async fn get_table_schema(&self, table: &str) -> Option<TableSchemaInfo> {
+        // Parse "db.table" format
+        let (db, tbl) = match table.split_once('.') {
+            Some((d, t)) => (d, t),
+            None => ("", table),
+        };
+
+        let loaded = self.loader.load(db, tbl).await.ok()?;
+        
+        // Convert LoadedSchema to TableSchemaInfo
+        let columns = extract_column_infos(&loaded.schema_json);
+        
+        Some(TableSchemaInfo {
+            database: loaded.database,
+            table: loaded.table,
+            columns,
+            primary_key: loaded.primary_key,
+        })
+    }
+
+    async fn list_schemas(&self) -> Vec<TableSchemaInfo> {
+        self.loader
+            .list_cached()
+            .await
+            .into_iter()
+            .filter_map(|entry| {
+                // Convert each cached entry
+                // This is a simplified version - may need async load for full info
+                None // TODO: implement if needed
+            })
+            .collect()
+    }
+}
+
+/// Extract ColumnSchemaInfo from source-specific schema JSON.
+fn extract_column_infos(schema_json: &serde_json::Value) -> Vec<ColumnSchemaInfo> {
+    let Some(cols) = schema_json.get("columns").and_then(|v| v.as_array()) else {
+        return vec![];
+    };
+
+    cols.iter()
+        .filter_map(|c| {
+            let name = c.get("name")?.as_str()?.to_string();
+            let data_type = c
+                .get("data_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let full_type = c
+                .get("column_type")
+                .or(c.get("declared_type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(&data_type)
+                .to_string();
+            let nullable = c
+                .get("nullable")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+
+            Some(ColumnSchemaInfo {
+                name,
+                data_type: data_type.clone(),
+                full_type,
+                nullable,
+                is_json_like: is_json_type(&data_type) || might_be_json(&data_type),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

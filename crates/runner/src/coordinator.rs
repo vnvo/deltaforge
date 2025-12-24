@@ -330,81 +330,88 @@ pub struct Coordinator<Tok> {
     db_schema_cache: Mutex<HashMap<String, TableSchemaInfo>>,
 }
 
-impl<Tok: Send + 'static> Coordinator<Tok> {
-    pub fn new(
-        name: String,
-        sinks: Vec<ArcDynSink>,
-        batch_cfg_from_spec: Option<BatchConfig>,
-        commit_policy: Option<CommitPolicy>,
-        commit_cp: CommitCpFn<Tok>,
-        process_batch: ProcessBatchFn<Tok>,
-    ) -> Self {
-        let batch_cfg_eff = Self::effective(&batch_cfg_from_spec);
+pub struct CoordinatorBuilder<Tok> {
+    pipeline_name: String,
+    sinks: Vec<ArcDynSink>,
+    batch_config: Option<BatchConfig>,
+    commit_policy: Option<CommitPolicy>,
+    commit_fn: Option<CommitCpFn<Tok>>,
+    process_fn: Option<ProcessBatchFn<Tok>>,
+    schema_sensor: Option<Arc<SchemaSensorState>>,
+    schema_provider: Option<ArcSchemaProvider>,
+}
+
+impl<Tok: Send + 'static> CoordinatorBuilder<Tok> {
+    pub fn new(name: impl Into<String>) -> Self {
         Self {
             pipeline_name: name.into(),
-            sinks,
-            batch_cfg_eff,
-            commit_policy,
-            commit_cp,
-            process_batch,
+            sinks: Vec::new(),
+            batch_config: None,
+            commit_policy: None,
+            commit_fn: None,
+            process_fn: None,
             schema_sensor: None,
             schema_provider: None,
-            db_schema_cache: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Create coordinator with schema sensing enabled.
-    pub fn with_schema_sensor(
-        name: String,
-        sinks: Vec<ArcDynSink>,
-        batch_cfg_from_spec: Option<BatchConfig>,
-        commit_policy: Option<CommitPolicy>,
-        commit_cp: CommitCpFn<Tok>,
-        process_batch: ProcessBatchFn<Tok>,
-        schema_sensor: Arc<SchemaSensorState>,
-    ) -> Self {
-        let batch_cfg_eff = Self::effective(&batch_cfg_from_spec);
+    pub fn sinks(mut self, sinks: Vec<ArcDynSink>) -> Self {
+        self.sinks = sinks;
+        self
+    }
 
-        Self {
-            pipeline_name: name.into(),
-            sinks,
+    pub fn batch_config(mut self, config: Option<BatchConfig>) -> Self {
+        self.batch_config = config;
+        self
+    }
+
+    pub fn commit_policy(mut self, policy: Option<CommitPolicy>) -> Self {
+        self.commit_policy = policy;
+        self
+    }
+
+    pub fn commit_fn(mut self, f: CommitCpFn<Tok>) -> Self {
+        self.commit_fn = Some(f);
+        self
+    }
+
+    pub fn process_fn(mut self, f: ProcessBatchFn<Tok>) -> Self {
+        self.process_fn = Some(f);
+        self
+    }
+
+    pub fn schema_sensor(mut self, sensor: Arc<SchemaSensorState>) -> Self {
+        self.schema_sensor = Some(sensor);
+        self
+    }
+
+    pub fn schema_provider(mut self, provider: ArcSchemaProvider) -> Self {
+        self.schema_provider = Some(provider);
+        self
+    }
+
+    pub fn build(self) -> Coordinator<Tok> {
+        let batch_cfg_eff = Coordinator::<Tok>::effective(&self.batch_config);
+
+        Coordinator {
+            pipeline_name: self.pipeline_name.into(),
+            sinks: self.sinks,
             batch_cfg_eff,
-            commit_policy,
-            commit_cp,
-            process_batch,
-            schema_sensor: Some(schema_sensor),
-            schema_provider: None,
+            commit_policy: self.commit_policy,
+            commit_cp: self.commit_fn.expect("commit_fn is required"),
+            process_batch: self.process_fn.expect("process_fn is required"),
+            schema_sensor: self.schema_sensor,
+            schema_provider: self.schema_provider,
             db_schema_cache: Mutex::new(HashMap::new()),
         }
     }
+}
 
-    /// Create coordinator with schema sensing and database schema provider.
-    /// This enables guided JSON-only sensing and drift detection.
-    pub fn with_schema_sensor_and_provider(
-        name: String,
-        sinks: Vec<ArcDynSink>,
-        batch_cfg_from_spec: Option<BatchConfig>,
-        commit_policy: Option<CommitPolicy>,
-        commit_cp: CommitCpFn<Tok>,
-        process_batch: ProcessBatchFn<Tok>,
-        schema_sensor: Arc<SchemaSensorState>,
-        schema_provider: ArcSchemaProvider,
-    ) -> Self {
-        let batch_cfg_eff = Self::effective(&batch_cfg_from_spec);
-
-        Self {
-            pipeline_name: name.into(),
-            sinks,
-            batch_cfg_eff,
-            commit_policy,
-            commit_cp,
-            process_batch,
-            schema_sensor: Some(schema_sensor),
-            schema_provider: Some(schema_provider),
-            db_schema_cache: Mutex::new(HashMap::new()),
-        }
+impl<Tok: Send + 'static> Coordinator<Tok> {
+    pub fn builder(name: impl Into<String>) -> CoordinatorBuilder<Tok> {
+        CoordinatorBuilder::new(name)
     }
-
+    
     /// Get access to schema sensor state (for API exposure).
     pub fn schema_sensor(&self) -> Option<&Arc<SchemaSensorState>> {
         self.schema_sensor.as_ref()

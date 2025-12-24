@@ -18,6 +18,7 @@ use schema_registry::InMemoryRegistry;
 use serde_json::Value;
 use sinks::build_sinks;
 use sources::{ArcSchemaLoader, build_schema_loader, build_source};
+use crate::schema_provider::SchemaLoaderAdapter;
 
 use tokio::{
     sync::{mpsc, watch},
@@ -141,25 +142,23 @@ impl PipelineManager {
             .enabled
             .then(|| Arc::new(SchemaSensorState::new(sensing_cfg)));
 
-        let coord = match sensor {
-            Some(s) => Coordinator::with_schema_sensor(
-                pipeline_name.clone(),
-                sinks,
-                spec.spec.batch.clone(),
-                spec.spec.commit_policy.clone(),
-                commit_cp,
-                batch_processor,
-                s,
-            ),
-            None => Coordinator::new(
-                pipeline_name.clone(),
-                sinks,
-                spec.spec.batch.clone(),
-                spec.spec.commit_policy.clone(),
-                commit_cp,
-                batch_processor,
-            ),
-        };
+        let mut builder = Coordinator::builder(pipeline_name.clone())
+            .sinks(sinks)
+            .batch_config(spec.spec.batch.clone())
+            .commit_policy(spec.spec.commit_policy.clone())
+            .commit_fn(commit_cp)
+            .process_fn(batch_processor);
+
+        if let Some(s) = sensor {
+            builder = builder.schema_sensor(s);
+        }
+
+        if let Some(loader) = &schema_loader {
+            let provider = Arc::new(SchemaLoaderAdapter::new(loader.clone()));
+            builder = builder.schema_provider(provider);
+        }
+
+        let coord = builder.build();
 
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
