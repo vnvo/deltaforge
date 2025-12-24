@@ -16,6 +16,9 @@ use tracing::{debug, info, warn};
 
 use super::mysql_table_schema::{MySqlColumn, MySqlTableSchema};
 use crate::mysql::mysql_helpers::redact_password;
+use crate::schema_loader::{
+    LoadedSchema as ApiLoadedSchema, SchemaListEntry, SourceSchemaLoader,
+};
 use deltaforge_core::{SourceError, SourceResult};
 
 /// Loaded schema with metadata.
@@ -521,6 +524,74 @@ fn conn_error(e: mysql_async::Error) -> SourceError {
 
 fn query_error(e: mysql_async::Error) -> SourceError {
     SourceError::Other(anyhow::anyhow!("mysql query: {}", e))
+}
+
+#[async_trait::async_trait]
+impl SourceSchemaLoader for MySqlSchemaLoader {
+    fn source_type(&self) -> &'static str {
+        "mysql"
+    }
+
+    async fn load(
+        &self,
+        db: &str,
+        table: &str,
+    ) -> anyhow::Result<ApiLoadedSchema> {
+        let loaded = self.load_schema(db, table).await?;
+        Ok(to_api_schema(db, table, &loaded))
+    }
+
+    async fn reload(
+        &self,
+        db: &str,
+        table: &str,
+    ) -> anyhow::Result<ApiLoadedSchema> {
+        let loaded = self.reload_schema(db, table).await?;
+        Ok(to_api_schema(db, table, &loaded))
+    }
+
+    async fn reload_all(
+        &self,
+        patterns: &[String],
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        // Clear cache and re-preload (reuse existing preload logic)
+        self.cache.write().await.clear();
+        self.preload(patterns).await.map_err(Into::into)
+    }
+
+    async fn list_cached(&self) -> Vec<SchemaListEntry> {
+        self.cache
+            .read()
+            .await
+            .iter()
+            .map(|((db, table), loaded)| SchemaListEntry {
+                database: db.clone(),
+                table: table.clone(),
+                column_count: loaded.schema.columns.len(),
+                primary_key: loaded.schema.primary_key.clone(),
+                fingerprint: loaded.fingerprint.to_string(),
+                registry_version: loaded.registry_version,
+            })
+            .collect()
+    }
+}
+
+/// Convert internal LoadedSchema to API LoadedSchema
+fn to_api_schema(
+    db: &str,
+    table: &str,
+    loaded: &LoadedSchema,
+) -> ApiLoadedSchema {
+    ApiLoadedSchema {
+        database: db.to_string(),
+        table: table.to_string(),
+        schema_json: serde_json::to_value(&loaded.schema).unwrap_or_default(),
+        columns: loaded.column_names.iter().cloned().collect(),
+        primary_key: loaded.schema.primary_key.clone(),
+        fingerprint: loaded.fingerprint.to_string(),
+        registry_version: loaded.registry_version,
+        loaded_at: chrono::Utc::now(),
+    }
 }
 
 #[cfg(test)]
