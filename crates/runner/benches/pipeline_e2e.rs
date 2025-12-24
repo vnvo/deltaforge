@@ -6,7 +6,6 @@ use criterion::{
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -14,15 +13,14 @@ use futures::FutureExt;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use deltaforge_config::BatchConfig;
+use deltaforge_config::{BatchConfig, SchemaSensingConfig};
 use deltaforge_core::{
-    ArcDynSink, CheckpointMeta, Event, Op, Sink, SinkError, SinkResult,
-    SourceMeta,
+    ArcDynSink, CheckpointMeta, Event, Op, Sink, SinkResult, SourceMeta,
 };
 use serde_json::json;
 
-use runner::coordinator::{
-    CommitCpFn, Coordinator, ProcessBatchFn, ProcessedBatch,
+use runner::{
+    CommitCpFn, Coordinator, ProcessBatchFn, ProcessedBatch, SchemaSensorState,
 };
 
 // =============================================================================
@@ -98,7 +96,7 @@ impl Sink for SerializingSink {
 
     async fn send(&self, event: &Event) -> SinkResult<()> {
         let data = serde_json::to_vec(event)
-            .map_err(|e| SinkError::Other(e.into()))?;
+            .map_err(|e| deltaforge_core::SinkError::Other(e.into()))?;
         self.bytes_written
             .fetch_add(data.len() as u64, Ordering::Relaxed);
         Ok(())
@@ -108,7 +106,7 @@ impl Sink for SerializingSink {
         let mut total = 0u64;
         for event in events {
             let data = serde_json::to_vec(event)
-                .map_err(|e| SinkError::Other(e.into()))?;
+                .map_err(|e| deltaforge_core::SinkError::Other(e.into()))?;
             total += data.len() as u64;
         }
         self.bytes_written.fetch_add(total, Ordering::Relaxed);
@@ -149,6 +147,50 @@ fn make_events(count: usize) -> Vec<Event> {
         .collect()
 }
 
+/// Events with JSON columns for schema sensing benchmarks
+fn make_events_with_json(count: usize) -> Vec<Event> {
+    (0..count)
+        .map(|i| {
+            let mut ev = Event::new_row(
+                "bench-tenant".into(),
+                SourceMeta {
+                    kind: "mysql".into(),
+                    host: "localhost".into(),
+                    db: "shop".into(),
+                },
+                "shop.orders".into(),
+                Op::Insert,
+                None,
+                Some(json!({
+                    "id": i,
+                    "customer_id": i % 1000,
+                    "status": "pending",
+                    "amount": 99.99 + (i as f64 * 0.01),
+                    "metadata": {
+                        "source": "web",
+                        "campaign": format!("campaign-{}", i % 10),
+                        "tags": ["promo", "featured"],
+                        "tracking": {
+                            "click_id": format!("click-{}", i),
+                            "session_id": format!("sess-{}", i % 100)
+                        }
+                    },
+                    "line_items": [
+                        {"sku": "SKU-001", "qty": 1, "price": 49.99},
+                        {"sku": "SKU-002", "qty": 2, "price": 25.00}
+                    ]
+                })),
+                1_700_000_000_000,
+                512,
+            );
+            ev.checkpoint = Some(CheckpointMeta::from_vec(
+                format!("pos-{}", i).into_bytes(),
+            ));
+            ev
+        })
+        .collect()
+}
+
 fn noop_commit_fn() -> CommitCpFn<CheckpointMeta> {
     Box::new(|_cp: CheckpointMeta| async { Ok(()) }.boxed())
 }
@@ -180,6 +222,13 @@ fn make_batch_config(max_events: usize, max_ms: u64) -> Option<BatchConfig> {
     })
 }
 
+fn make_sensing_config(enabled: bool) -> SchemaSensingConfig {
+    SchemaSensingConfig {
+        enabled,
+        ..Default::default()
+    }
+}
+
 async fn run_coordinator_bench(
     events: Vec<Event>,
     sinks: Vec<ArcDynSink>,
@@ -189,14 +238,44 @@ async fn run_coordinator_bench(
     let cancel = CancellationToken::new();
     let (_pause_tx, pause_rx) = watch::channel(false);
 
-    let coord = Coordinator::new(
-        "bench-pipeline".to_string(),
-        sinks,
-        batch_config,
-        None, // commit policy
-        noop_commit_fn(),
-        noop_process_fn(),
-    );
+    let coord = Coordinator::builder("bench-pipeline")
+        .sinks(sinks)
+        .batch_config(batch_config)
+        .commit_fn(noop_commit_fn())
+        .process_fn(noop_process_fn())
+        .build();
+
+    // Send all events
+    for ev in events {
+        tx.send(ev).await?;
+    }
+    drop(tx); // Close channel to signal completion
+
+    // Run coordinator until channel closes
+    coord.run(rx, cancel, pause_rx).await?;
+
+    Ok(())
+}
+
+async fn run_coordinator_bench_with_sensing(
+    events: Vec<Event>,
+    sinks: Vec<ArcDynSink>,
+    batch_config: Option<BatchConfig>,
+    sensing_config: SchemaSensingConfig,
+) -> Result<()> {
+    let (tx, rx) = mpsc::channel::<Event>(events.len() + 100);
+    let cancel = CancellationToken::new();
+    let (_pause_tx, pause_rx) = watch::channel(false);
+
+    let sensor = Arc::new(SchemaSensorState::new(sensing_config));
+
+    let coord = Coordinator::builder("bench-pipeline")
+        .sinks(sinks)
+        .batch_config(batch_config)
+        .commit_fn(noop_commit_fn())
+        .process_fn(noop_process_fn())
+        .schema_sensor(sensor)
+        .build();
 
     // Send all events
     for ev in events {
@@ -488,11 +567,90 @@ fn bench_event_sizes(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_schema_sensing(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("schema_sensing_overhead");
+
+    let events = make_events_with_json(10_000);
+    group.throughput(Throughput::Elements(10_000));
+
+    // Baseline: no schema sensing
+    group.bench_with_input(
+        BenchmarkId::new("sensing", "disabled"),
+        &events,
+        |b, evs| {
+            b.to_async(&rt).iter(|| async {
+                let (sink, _, _) = CountingSink::new("sink");
+                run_coordinator_bench(
+                    evs.clone(),
+                    vec![sink],
+                    make_batch_config(100, 10),
+                )
+                .await
+                .unwrap();
+            })
+        },
+    );
+
+    // With schema sensing enabled
+    group.bench_with_input(
+        BenchmarkId::new("sensing", "enabled"),
+        &events,
+        |b, evs| {
+            b.to_async(&rt).iter(|| async {
+                let (sink, _, _) = CountingSink::new("sink");
+                run_coordinator_bench_with_sensing(
+                    evs.clone(),
+                    vec![sink],
+                    make_batch_config(100, 10),
+                    make_sensing_config(true),
+                )
+                .await
+                .unwrap();
+            })
+        },
+    );
+
+    group.finish();
+}
+
+fn bench_schema_sensing_scaling(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("schema_sensing_scaling");
+
+    for event_count in [1_000, 5_000, 10_000, 25_000] {
+        let events = make_events_with_json(event_count);
+        group.throughput(Throughput::Elements(event_count as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("events_with_sensing", event_count),
+            &events,
+            |b, evs| {
+                b.to_async(&rt).iter(|| async {
+                    let (sink, _, _) = CountingSink::new("sink");
+                    run_coordinator_bench_with_sensing(
+                        evs.clone(),
+                        vec![sink],
+                        make_batch_config(100, 10),
+                        make_sensing_config(true),
+                    )
+                    .await
+                    .unwrap();
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_coordinator_throughput,
     bench_batch_sizes,
     bench_multi_sink_scaling,
     bench_event_sizes,
+    bench_schema_sensing,
+    bench_schema_sensing_scaling,
 );
 criterion_main!(benches);
