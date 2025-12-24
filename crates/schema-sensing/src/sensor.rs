@@ -8,7 +8,7 @@ use deltaforge_config::SchemaSensingConfig;
 
 use crate::errors::{SensorError, SensorResult};
 use crate::json_schema::JsonSchema;
-use crate::schema_state::{SchemaSnapshot, SchemaVersion, TableSchemaState};
+use crate::schema_state::{SchemaSnapshot, SensedSchemaVersion, TableSchemaState};
 
 /// Result of observing an event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,7 +184,7 @@ impl SchemaSensor {
     }
 
     /// Get schema version info for a table.
-    pub fn get_version(&self, table: &str) -> Option<SchemaVersion> {
+    pub fn get_version(&self, table: &str) -> Option<SensedSchemaVersion> {
         self.schemas.get(table).map(|s| s.version())
     }
 

@@ -69,8 +69,8 @@ impl TableSchemaState {
         self.stabilized = true;
     }
 
-    pub fn version(&self) -> SchemaVersion {
-        SchemaVersion {
+    pub fn version(&self) -> SensedSchemaVersion {
+        SensedSchemaVersion {
             fingerprint: self.fingerprint.clone(),
             sequence: self.sequence,
         }
@@ -79,7 +79,7 @@ impl TableSchemaState {
 
 /// Schema version information for event enrichment.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SchemaVersion {
+pub struct SensedSchemaVersion {
     /// SHA-256 fingerprint of the schema
     pub fingerprint: String,
 
@@ -87,7 +87,7 @@ pub struct SchemaVersion {
     pub sequence: u64,
 }
 
-impl Default for SchemaVersion {
+impl Default for SensedSchemaVersion {
     fn default() -> Self {
         Self {
             fingerprint: String::new(),
