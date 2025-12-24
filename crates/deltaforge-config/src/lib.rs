@@ -4,11 +4,13 @@ use thiserror::Error;
 use tracing::error;
 use walkdir::WalkDir;
 
-mod schema_sensing_cfg;
-mod tursodb_cfg;
+mod turso_cfg;
+pub use turso_cfg::{NativeCdcLevel, TursoCdcMode, TursoSrcCfg};
 
-pub use schema_sensing_cfg::{
-    DeepInspectConfig, SchemaSensingConfig, TableFilter,
+mod schema_sensing;
+pub use schema_sensing::{
+    ColumnFilter, DeepInspectConfig, SchemaSensingConfig, SensingOutputConfig, TableFilter,
+    TrackingConfig,
 };
 
 #[derive(Debug, Error)]
@@ -80,6 +82,11 @@ pub struct Spec {
 
     /// How sink acknowledgements gate checkpoint commits.
     pub commit_policy: Option<CommitPolicy>,
+
+    /// Schema sensing configuration.
+    /// When enabled, automatically infers and tracks schema from event payloads.
+    #[serde(default)]
+    pub schema_sensing: SchemaSensingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,7 +110,7 @@ pub struct MysqlSrcCfg {
 pub enum SourceCfg {
     Postgres(PostgresSrcCfg),
     Mysql(MysqlSrcCfg),
-    Turso(tursodb_cfg::TursoSrcCfg),
+    Turso(turso_cfg::TursoSrcCfg),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

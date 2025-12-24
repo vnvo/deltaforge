@@ -162,6 +162,7 @@ mod tests {
                     connection_policy: None,
                     batch: Some(BatchConfig::default()),
                     commit_policy: None,
+                    schema_sensing: Default::default(),
                 },
             },
         }
