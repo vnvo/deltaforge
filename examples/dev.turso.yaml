@@ -1,0 +1,67 @@
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: turso2kafka
+  tenant: acme
+
+spec:
+  source:
+    type: turso
+    config:
+      id: turso-main
+      # Local libSQL/Turso URL
+      url: "http://127.0.0.1:8080"
+      # For Turso cloud: url: "libsql://your-db.turso.io"
+      # auth_token: "${TURSO_AUTH_TOKEN}"
+      tables: ["users", "orders", "order_items"]
+      # Poll interval in milliseconds (Turso uses polling-based CDC)
+      poll_interval_ms: 1000
+
+  processors:
+    - type: javascript
+      id: js-enrich
+      inline: |
+        function processBatch(events) {
+          return events.map(event => {
+            event.source_type = "turso";
+            event.processed_at = new Date().toISOString();
+            return event;
+          });
+        }
+
+  sinks:
+    - type: kafka
+      config:
+        id: kafka
+        brokers: "127.0.0.1:9092"
+        topic: turso.changes
+        required: true
+        exactly_once: false
+    - type: redis
+      config:
+        id: redis
+        uri: "redis://127.0.0.1:6379"
+        stream: turso.events
+        required: false
+
+  batch:
+    max_events: 50
+    max_bytes: 1048576
+    max_ms: 100
+    respect_source_tx: false
+    max_inflight: 1
+
+  commit_policy:
+    mode: required
+
+  schema_sensing:
+    enabled: true
+    deep_inspect:
+      enabled: true
+      max_depth: 3
+      max_sample_size: 500
+    sampling:
+      warmup_events: 50
+      sample_rate: 5
+      structure_cache: true
+      structure_cache_size: 50
