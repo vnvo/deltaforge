@@ -1,8 +1,9 @@
 pub mod coordinator;
+pub mod drift_detector;
 pub mod pipeline_manager;
-
-mod drift_detector;
+mod schema_api;
 mod schema_provider;
+mod sensing_api;
 
 pub use schema_provider::{
     ArcSchemaProvider, ColumnSchemaInfo, SchemaLoaderAdapter, SchemaProvider,
@@ -15,3 +16,5 @@ pub use coordinator::{
 };
 
 pub use pipeline_manager::PipelineManager;
+pub use schema_api::SchemaApi;
+pub use sensing_api::SensingApi;

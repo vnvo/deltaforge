@@ -23,7 +23,7 @@ struct ReadyStatus {
 async fn readyz(State(st): State<AppState>) -> Json<ReadyStatus> {
     // Basic readiness surface that reflects pipeline states.
     // Future revisions can incorporate dependency checks.
-    let pipelines = st.manager.list().await;
+    let pipelines = st.controller.list().await;
     Json(ReadyStatus {
         status: "ready",
         pipelines,

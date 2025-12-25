@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub manager: Arc<dyn PipelineController>,
+    pub controller: Arc<dyn PipelineController>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -74,14 +74,14 @@ pub fn router(state: AppState) -> Router {
 type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
 
 async fn list_pipelines(State(st): State<AppState>) -> Json<Vec<PipeInfo>> {
-    Json(st.manager.list().await)
+    Json(st.controller.list().await)
 }
 
 async fn get_pipeline(
     State(st): State<AppState>,
     Path(name): Path<String>,
 ) -> ApiResult<PipeInfo> {
-    st.manager
+    st.controller
         .get(&name)
         .await
         .map(Json)
@@ -92,7 +92,7 @@ async fn create_pipeline(
     State(st): State<AppState>,
     Json(spec): Json<PipelineSpec>,
 ) -> ApiResult<PipeInfo> {
-    st.manager
+    st.controller
         .create(spec)
         .await
         .map(Json)
@@ -104,7 +104,7 @@ async fn patch_pipeline(
     Path(name): Path<String>,
     Json(patch): Json<Value>,
 ) -> ApiResult<PipeInfo> {
-    st.manager
+    st.controller
         .patch(&name, patch)
         .await
         .map(Json)
@@ -115,7 +115,7 @@ async fn pause_pipeline(
     State(st): State<AppState>,
     Path(name): Path<String>,
 ) -> ApiResult<PipeInfo> {
-    st.manager
+    st.controller
         .pause(&name)
         .await
         .map(Json)
@@ -126,7 +126,7 @@ async fn resume_pipeline(
     State(st): State<AppState>,
     Path(name): Path<String>,
 ) -> ApiResult<PipeInfo> {
-    st.manager
+    st.controller
         .resume(&name)
         .await
         .map(Json)
@@ -137,7 +137,7 @@ async fn stop_pipeline(
     State(st): State<AppState>,
     Path(name): Path<String>,
 ) -> ApiResult<PipeInfo> {
-    st.manager
+    st.controller
         .stop(&name)
         .await
         .map(Json)
@@ -148,7 +148,7 @@ async fn delete_pipeline(
     State(st): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    st.manager
+    st.controller
         .delete(&name)
         .await
         .map(|_| StatusCode::NO_CONTENT)
@@ -267,7 +267,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_pipelines() {
         let app = router(AppState {
-            manager: Arc::new(MockController {
+            controller: Arc::new(MockController {
                 info: sample_pipe_info(),
             }),
         });
@@ -293,7 +293,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_pipeline_found() {
         let app = router(AppState {
-            manager: Arc::new(MockController {
+            controller: Arc::new(MockController {
                 info: sample_pipe_info(),
             }),
         });
@@ -319,7 +319,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_pipeline_not_found() {
         let app = router(AppState {
-            manager: Arc::new(MockController {
+            controller: Arc::new(MockController {
                 info: sample_pipe_info(),
             }),
         });
@@ -341,7 +341,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_pipeline_success() {
         let app = router(AppState {
-            manager: Arc::new(MockController {
+            controller: Arc::new(MockController {
                 info: sample_pipe_info(),
             }),
         });
@@ -363,7 +363,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_pipeline_not_found() {
         let app = router(AppState {
-            manager: Arc::new(MockController {
+            controller: Arc::new(MockController {
                 info: sample_pipe_info(),
             }),
         });

@@ -425,12 +425,12 @@ pub struct DriftDetector {
 }
 
 impl DriftDetector {
-    /// Create a new drift detector.
+    /// Create a new drift detector
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Create with custom configuration.
+    /// Create with custom configuration
     pub fn with_config(config: DriftConfig) -> Self {
         Self {
             trackers: HashMap::new(),
@@ -438,7 +438,7 @@ impl DriftDetector {
         }
     }
 
-    /// Register a table schema for drift tracking.
+    /// Register a table schema for drift tracking
     pub fn register_table(&mut self, schema: TableSchemaInfo) {
         let table_key = format!("{}.{}", schema.database, schema.table);
         self.trackers.insert(
@@ -447,24 +447,29 @@ impl DriftDetector {
         );
     }
 
-    /// Observe a row for a table.
+    /// Observe a row for a table
     pub fn observe(&mut self, table: &str, row: &serde_json::Value) {
         if let Some(tracker) = self.trackers.get_mut(table) {
             tracker.observe_row(row);
         }
     }
 
-    /// Get tracker for a table.
+    /// Get tracker for a table
     pub fn tracker(&self, table: &str) -> Option<&TableDriftTracker> {
         self.trackers.get(table)
     }
 
-    /// Get all drift summaries.
+    /// Get all drift summaries
     pub fn all_summaries(&self) -> Vec<DriftSummary> {
         self.trackers.values().map(|t| t.summary()).collect()
     }
 
-    /// Check if any drift has been detected.
+    /// Get summary for a specific table
+    pub fn get_summary(&self, table: &str) -> Option<DriftSummary> {
+        self.trackers.get(table).map(|t| t.summary())
+    }
+
+    /// Check if any drift has been detected
     pub fn has_drift(&self) -> bool {
         self.trackers.values().any(|t| !t.drift_events.is_empty())
     }

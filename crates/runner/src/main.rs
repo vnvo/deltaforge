@@ -3,15 +3,13 @@ use axum::Router;
 use checkpoints::{CheckpointStore, FileCheckpointStore};
 use clap::Parser;
 use deltaforge_config::{PipelineSpec, load_cfg};
-use rest_api::{
-    AppState, PipelineController, SchemaState, router_with_schemas,
-};
+use rest_api::{AppState, PipelineController, SchemaState, SensingState, router_full};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{debug, info};
 
-use runner::PipelineManager;
+use runner::{PipelineManager, SchemaApi, SensingApi};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -46,22 +44,22 @@ async fn main() -> Result<()> {
         load_pipeline_cfgs(&args.config).context("load pipeline specs")?;
     let ckpt_store: Arc<dyn CheckpointStore> =
         Arc::new(FileCheckpointStore::new("./data/df_checkpoints.json")?);
+
+    // Create manager and API wrappers
     let manager = Arc::new(PipelineManager::new(ckpt_store.clone()));
+    let schema_api = Arc::new(SchemaApi::new(manager.clone()));
+    let sensing_api = Arc::new(SensingApi::new(manager.clone()));
 
     for ps in pipeline_specs {
         manager.create(ps).await?;
     }
 
-    // Build state for both pipeline and schema routes
-    let app_state = AppState {
-        manager: manager.clone(),
-    };
-    let schema_state = SchemaState {
-        controller: manager.clone(),
-    };
-
-    // Build router with all routes including schema management
-    let app: Router = router_with_schemas(app_state, schema_state);
+    // Build router with all routes
+    let app: Router = router_full(
+        AppState { controller: manager },
+        SchemaState { controller: schema_api },
+        SensingState { controller: sensing_api },
+    );
     let app = app.merge(o11y::df_metrics::router_with_metrics());
 
     let addr: SocketAddr =
