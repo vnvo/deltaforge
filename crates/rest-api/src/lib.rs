@@ -25,6 +25,7 @@ pub fn router_with_schemas(
 ) -> Router {
     router(app_state).merge(schemas::router(schema_state))
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,6 +50,17 @@ mod tests {
     impl PipelineController for HappyController {
         async fn list(&self) -> Vec<PipeInfo> {
             vec![self.info.clone()]
+        }
+
+        async fn get(
+            &self,
+            name: &str,
+        ) -> Result<PipeInfo, PipelineAPIError> {
+            if name == self.info.name {
+                Ok(self.info.clone())
+            } else {
+                Err(PipelineAPIError::NotFound(name.to_string()))
+            }
         }
 
         async fn create(
@@ -86,6 +98,14 @@ mod tests {
         ) -> Result<PipeInfo, PipelineAPIError> {
             Ok(self.info.clone())
         }
+
+        async fn delete(&self, name: &str) -> Result<(), PipelineAPIError> {
+            if name == self.info.name {
+                Ok(())
+            } else {
+                Err(PipelineAPIError::NotFound(name.to_string()))
+            }
+        }
     }
 
     #[derive(Clone)]
@@ -95,6 +115,13 @@ mod tests {
     impl PipelineController for ErrorController {
         async fn list(&self) -> Vec<PipeInfo> {
             vec![]
+        }
+
+        async fn get(
+            &self,
+            name: &str,
+        ) -> Result<PipeInfo, PipelineAPIError> {
+            Err(PipelineAPIError::NotFound(name.to_string()))
         }
 
         async fn create(
@@ -135,6 +162,10 @@ mod tests {
         ) -> Result<PipeInfo, PipelineAPIError> {
             Err(PipelineAPIError::Failed(anyhow::anyhow!("stop failed")))
         }
+
+        async fn delete(&self, name: &str) -> Result<(), PipelineAPIError> {
+            Err(PipelineAPIError::NotFound(name.to_string()))
+        }
     }
 
     fn sample_pipe_info() -> PipeInfo {
@@ -158,7 +189,7 @@ mod tests {
                         id: "redis".to_string(),
                         uri: "redis://localhost".to_string(),
                         stream: "events".to_string(),
-                        required: Some(true)
+                        required: Some(true),
                     })],
                     connection_policy: None,
                     batch: Some(BatchConfig::default()),
@@ -227,6 +258,7 @@ mod tests {
             manager: Arc::new(controller),
         });
 
+        // Test create conflict
         let resp = app
             .clone()
             .oneshot(
@@ -245,7 +277,9 @@ mod tests {
         let body_text = String::from_utf8(body.to_vec()).unwrap();
         assert!(body_text.contains("already exists"));
 
+        // Test patch not found
         let patch = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::PATCH)
@@ -260,5 +294,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(StatusCode::NOT_FOUND, patch.status());
+
+        // Test get not found
+        let get_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/pipelines/missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::NOT_FOUND, get_resp.status());
+
+        // Test delete not found
+        let delete_resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/pipelines/missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::NOT_FOUND, delete_resp.status());
     }
 }
