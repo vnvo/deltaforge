@@ -6,6 +6,7 @@ use criterion::{
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -13,14 +14,15 @@ use futures::FutureExt;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use deltaforge_config::{BatchConfig, SchemaSensingConfig};
+use deltaforge_config::{BatchConfig, SchemaSensingConfig, SamplingConfig};
 use deltaforge_core::{
     ArcDynSink, CheckpointMeta, Event, Op, Sink, SinkResult, SourceMeta,
 };
 use serde_json::json;
 
 use runner::{
-    CommitCpFn, Coordinator, ProcessBatchFn, ProcessedBatch, SchemaSensorState,
+    Coordinator, ProcessedBatch, SchemaSensorState,
+    CommitCpFn, ProcessBatchFn,
 };
 
 // =============================================================================
@@ -30,6 +32,7 @@ use runner::{
 /// Sink that just counts events (measures pure coordinator overhead)
 struct CountingSink {
     id: String,
+    required: bool,
     event_count: Arc<AtomicU64>,
     batch_count: Arc<AtomicU64>,
 }
@@ -41,6 +44,7 @@ impl CountingSink {
         (
             Arc::new(Self {
                 id: id.to_string(),
+                required: true,
                 event_count: event_count.clone(),
                 batch_count: batch_count.clone(),
             }),
@@ -54,6 +58,10 @@ impl CountingSink {
 impl Sink for CountingSink {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn required(&self) -> bool {
+        self.required
     }
 
     async fn send(&self, _event: &Event) -> SinkResult<()> {
@@ -72,6 +80,7 @@ impl Sink for CountingSink {
 /// Sink that serializes events (realistic workload)
 struct SerializingSink {
     id: String,
+    required: bool,
     bytes_written: Arc<AtomicU64>,
 }
 
@@ -81,6 +90,7 @@ impl SerializingSink {
         (
             Arc::new(Self {
                 id: id.to_string(),
+                required: true,
                 bytes_written: bytes_written.clone(),
             }),
             bytes_written,
@@ -92,6 +102,10 @@ impl SerializingSink {
 impl Sink for SerializingSink {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn required(&self) -> bool {
+        self.required
     }
 
     async fn send(&self, event: &Event) -> SinkResult<()> {
@@ -147,7 +161,8 @@ fn make_events(count: usize) -> Vec<Event> {
         .collect()
 }
 
-/// Events with JSON columns for schema sensing benchmarks
+/// Events with JSON columns for schema sensing benchmarks.
+/// Uses homogeneous structure for cache hit testing.
 fn make_events_with_json(count: usize) -> Vec<Event> {
     (0..count)
         .map(|i| {
@@ -182,6 +197,54 @@ fn make_events_with_json(count: usize) -> Vec<Event> {
                 })),
                 1_700_000_000_000,
                 512,
+            );
+            ev.checkpoint = Some(CheckpointMeta::from_vec(
+                format!("pos-{}", i).into_bytes(),
+            ));
+            ev
+        })
+        .collect()
+}
+
+/// Events with varying JSON structures (for cache miss testing).
+fn make_events_heterogeneous(count: usize) -> Vec<Event> {
+    (0..count)
+        .map(|i| {
+            // Vary structure based on i to prevent cache hits
+            let payload = match i % 3 {
+                0 => json!({
+                    "id": i,
+                    "type": "order",
+                    "total": 99.99
+                }),
+                1 => json!({
+                    "id": i,
+                    "type": "refund",
+                    "amount": 50.00,
+                    "reason": "damaged"
+                }),
+                _ => json!({
+                    "id": i,
+                    "type": "adjustment",
+                    "delta": -10.00,
+                    "applied_by": "system",
+                    "timestamp": "2024-01-15T10:30:00Z"
+                }),
+            };
+
+            let mut ev = Event::new_row(
+                "bench-tenant".into(),
+                SourceMeta {
+                    kind: "mysql".into(),
+                    host: "localhost".into(),
+                    db: "shop".into(),
+                },
+                "shop.transactions".into(),
+                Op::Insert,
+                None,
+                Some(payload),
+                1_700_000_000_000,
+                256,
             );
             ev.checkpoint = Some(CheckpointMeta::from_vec(
                 format!("pos-{}", i).into_bytes(),
@@ -229,6 +292,32 @@ fn make_sensing_config(enabled: bool) -> SchemaSensingConfig {
     }
 }
 
+fn make_sensing_config_with_cache(cache_enabled: bool) -> SchemaSensingConfig {
+    SchemaSensingConfig {
+        enabled: true,
+        sampling: SamplingConfig {
+            structure_cache: cache_enabled,
+            structure_cache_size: 100,
+            warmup_events: 100,
+            sample_rate: 1, // No sampling, just cache
+        },
+        ..Default::default()
+    }
+}
+
+fn make_sensing_config_with_sampling(warmup: usize, rate: usize) -> SchemaSensingConfig {
+    SchemaSensingConfig {
+        enabled: true,
+        sampling: SamplingConfig {
+            structure_cache: true,
+            structure_cache_size: 100,
+            warmup_events: warmup,
+            sample_rate: rate,
+        },
+        ..Default::default()
+    }
+}
+
 async fn run_coordinator_bench(
     events: Vec<Event>,
     sinks: Vec<ArcDynSink>,
@@ -245,13 +334,11 @@ async fn run_coordinator_bench(
         .process_fn(noop_process_fn())
         .build();
 
-    // Send all events
     for ev in events {
         tx.send(ev).await?;
     }
-    drop(tx); // Close channel to signal completion
+    drop(tx);
 
-    // Run coordinator until channel closes
     coord.run(rx, cancel, pause_rx).await?;
 
     Ok(())
@@ -277,13 +364,11 @@ async fn run_coordinator_bench_with_sensing(
         .schema_sensor(sensor)
         .build();
 
-    // Send all events
     for ev in events {
         tx.send(ev).await?;
     }
-    drop(tx); // Close channel to signal completion
+    drop(tx);
 
-    // Run coordinator until channel closes
     coord.run(rx, cancel, pause_rx).await?;
 
     Ok(())
@@ -296,12 +381,13 @@ async fn run_coordinator_bench_with_sensing(
 fn bench_coordinator_throughput(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("coordinator_throughput");
+    group.sample_size(50);
+    group.measurement_time(Duration::from_secs(8));
 
     for event_count in [1_000, 10_000, 50_000] {
         let events = make_events(event_count);
         group.throughput(Throughput::Elements(event_count as u64));
 
-        // Single counting sink
         group.bench_with_input(
             BenchmarkId::new("1_sink_counting", event_count),
             &events,
@@ -323,7 +409,6 @@ fn bench_coordinator_throughput(c: &mut Criterion) {
             },
         );
 
-        // Two counting sinks (tests multi-sink fanout)
         group.bench_with_input(
             BenchmarkId::new("2_sinks_counting", event_count),
             &events,
@@ -338,19 +423,12 @@ fn bench_coordinator_throughput(c: &mut Criterion) {
                     )
                     .await
                     .unwrap();
-                    assert_eq!(
-                        count1.load(Ordering::Relaxed),
-                        evs.len() as u64
-                    );
-                    assert_eq!(
-                        count2.load(Ordering::Relaxed),
-                        evs.len() as u64
-                    );
+                    assert_eq!(count1.load(Ordering::Relaxed), evs.len() as u64);
+                    assert_eq!(count2.load(Ordering::Relaxed), evs.len() as u64);
                 })
             },
         );
 
-        // Single serializing sink (realistic)
         group.bench_with_input(
             BenchmarkId::new("1_sink_serializing", event_count),
             &events,
@@ -368,25 +446,6 @@ fn bench_coordinator_throughput(c: &mut Criterion) {
                 })
             },
         );
-
-        // Two serializing sinks
-        group.bench_with_input(
-            BenchmarkId::new("2_sinks_serializing", event_count),
-            &events,
-            |b, evs| {
-                b.to_async(&rt).iter(|| async {
-                    let (sink1, _) = SerializingSink::new("sink-ser-1");
-                    let (sink2, _) = SerializingSink::new("sink-ser-2");
-                    run_coordinator_bench(
-                        evs.clone(),
-                        vec![sink1, sink2],
-                        make_batch_config(100, 10),
-                    )
-                    .await
-                    .unwrap();
-                })
-            },
-        );
     }
 
     group.finish();
@@ -395,6 +454,8 @@ fn bench_coordinator_throughput(c: &mut Criterion) {
 fn bench_batch_sizes(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("batch_size_impact");
+    group.sample_size(50);
+    group.measurement_time(Duration::from_secs(6));
 
     let events = make_events(10_000);
     group.throughput(Throughput::Elements(10_000));
@@ -409,11 +470,10 @@ fn bench_batch_sizes(c: &mut Criterion) {
                     run_coordinator_bench(
                         evs.clone(),
                         vec![sink],
-                        make_batch_config(batch_size, 1000), // high max_ms to force event-based batching
+                        make_batch_config(batch_size, 1000),
                     )
                     .await
                     .unwrap();
-                    // Verify batching happened
                     let batches = batch_count.load(Ordering::Relaxed);
                     assert!(batches > 0);
                 })
@@ -427,6 +487,8 @@ fn bench_batch_sizes(c: &mut Criterion) {
 fn bench_multi_sink_scaling(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("multi_sink_scaling");
+    group.sample_size(50);
+    group.measurement_time(Duration::from_secs(6));
 
     let events = make_events(10_000);
     group.throughput(Throughput::Elements(10_000));
@@ -439,19 +501,14 @@ fn bench_multi_sink_scaling(c: &mut Criterion) {
                 b.to_async(&rt).iter(|| async {
                     let sinks: Vec<ArcDynSink> = (0..sink_count)
                         .map(|i| {
-                            let (sink, _, _) =
-                                CountingSink::new(&format!("sink-{}", i));
+                            let (sink, _, _) = CountingSink::new(&format!("sink-{}", i));
                             sink as ArcDynSink
                         })
                         .collect();
 
-                    run_coordinator_bench(
-                        evs.clone(),
-                        sinks,
-                        make_batch_config(100, 10),
-                    )
-                    .await
-                    .unwrap();
+                    run_coordinator_bench(evs.clone(), sinks, make_batch_config(100, 10))
+                        .await
+                        .unwrap();
                 })
             },
         );
@@ -463,17 +520,14 @@ fn bench_multi_sink_scaling(c: &mut Criterion) {
 fn bench_event_sizes(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("event_size_impact");
+    group.sample_size(50);
+    group.measurement_time(Duration::from_secs(6));
 
-    // Small events
     let small_events: Vec<Event> = (0..5_000)
         .map(|i| {
             Event::new_row(
                 "t".into(),
-                SourceMeta {
-                    kind: "b".into(),
-                    host: "h".into(),
-                    db: "d".into(),
-                },
+                SourceMeta { kind: "b".into(), host: "h".into(), db: "d".into() },
                 "d.t".into(),
                 Op::Insert,
                 None,
@@ -484,7 +538,6 @@ fn bench_event_sizes(c: &mut Criterion) {
         })
         .collect();
 
-    // Medium events
     let medium_events: Vec<Event> = (0..5_000)
         .map(|i| {
             Event::new_row(
@@ -500,7 +553,6 @@ fn bench_event_sizes(c: &mut Criterion) {
         })
         .collect();
 
-    // Large events
     let large_events: Vec<Event> = (0..5_000)
         .map(|i| {
             let big_data: Vec<_> = (0..20)
@@ -508,11 +560,7 @@ fn bench_event_sizes(c: &mut Criterion) {
                 .collect();
             Event::new_row(
                 "tenant".into(),
-                SourceMeta {
-                    kind: "mysql".into(),
-                    host: "db.local".into(),
-                    db: "warehouse".into(),
-                },
+                SourceMeta { kind: "mysql".into(), host: "db.local".into(), db: "warehouse".into() },
                 "warehouse.inventory".into(),
                 Op::Insert,
                 None,
@@ -528,39 +576,27 @@ fn bench_event_sizes(c: &mut Criterion) {
     group.bench_function("small_events", |b| {
         b.to_async(&rt).iter(|| async {
             let (sink, _, _) = CountingSink::new("sink");
-            run_coordinator_bench(
-                small_events.clone(),
-                vec![sink],
-                make_batch_config(100, 10),
-            )
-            .await
-            .unwrap();
+            run_coordinator_bench(small_events.clone(), vec![sink], make_batch_config(100, 10))
+                .await
+                .unwrap();
         })
     });
 
     group.bench_function("medium_events", |b| {
         b.to_async(&rt).iter(|| async {
             let (sink, _, _) = CountingSink::new("sink");
-            run_coordinator_bench(
-                medium_events.clone(),
-                vec![sink],
-                make_batch_config(100, 10),
-            )
-            .await
-            .unwrap();
+            run_coordinator_bench(medium_events.clone(), vec![sink], make_batch_config(100, 10))
+                .await
+                .unwrap();
         })
     });
 
     group.bench_function("large_events", |b| {
         b.to_async(&rt).iter(|| async {
             let (sink, _, _) = CountingSink::new("sink");
-            run_coordinator_bench(
-                large_events.clone(),
-                vec![sink],
-                make_batch_config(100, 10),
-            )
-            .await
-            .unwrap();
+            run_coordinator_bench(large_events.clone(), vec![sink], make_batch_config(100, 10))
+                .await
+                .unwrap();
         })
     });
 
@@ -570,6 +606,8 @@ fn bench_event_sizes(c: &mut Criterion) {
 fn bench_schema_sensing(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("schema_sensing_overhead");
+    group.sample_size(50);
+    group.measurement_time(Duration::from_secs(8));
 
     let events = make_events_with_json(10_000);
     group.throughput(Throughput::Elements(10_000));
@@ -581,20 +619,16 @@ fn bench_schema_sensing(c: &mut Criterion) {
         |b, evs| {
             b.to_async(&rt).iter(|| async {
                 let (sink, _, _) = CountingSink::new("sink");
-                run_coordinator_bench(
-                    evs.clone(),
-                    vec![sink],
-                    make_batch_config(100, 10),
-                )
-                .await
-                .unwrap();
+                run_coordinator_bench(evs.clone(), vec![sink], make_batch_config(100, 10))
+                    .await
+                    .unwrap();
             })
         },
     );
 
-    // With schema sensing enabled
+    // With schema sensing enabled (no optimizations)
     group.bench_with_input(
-        BenchmarkId::new("sensing", "enabled"),
+        BenchmarkId::new("sensing", "enabled_no_cache"),
         &events,
         |b, evs| {
             b.to_async(&rt).iter(|| async {
@@ -603,7 +637,95 @@ fn bench_schema_sensing(c: &mut Criterion) {
                     evs.clone(),
                     vec![sink],
                     make_batch_config(100, 10),
-                    make_sensing_config(true),
+                    make_sensing_config_with_cache(false),
+                )
+                .await
+                .unwrap();
+            })
+        },
+    );
+
+    // With structure cache (homogeneous data - high cache hit rate)
+    group.bench_with_input(
+        BenchmarkId::new("sensing", "enabled_with_cache"),
+        &events,
+        |b, evs| {
+            b.to_async(&rt).iter(|| async {
+                let (sink, _, _) = CountingSink::new("sink");
+                run_coordinator_bench_with_sensing(
+                    evs.clone(),
+                    vec![sink],
+                    make_batch_config(100, 10),
+                    make_sensing_config_with_cache(true),
+                )
+                .await
+                .unwrap();
+            })
+        },
+    );
+
+    // With sampling (10% after warmup)
+    group.bench_with_input(
+        BenchmarkId::new("sensing", "enabled_with_sampling"),
+        &events,
+        |b, evs| {
+            b.to_async(&rt).iter(|| async {
+                let (sink, _, _) = CountingSink::new("sink");
+                run_coordinator_bench_with_sensing(
+                    evs.clone(),
+                    vec![sink],
+                    make_batch_config(100, 10),
+                    make_sensing_config_with_sampling(100, 10),
+                )
+                .await
+                .unwrap();
+            })
+        },
+    );
+
+    group.finish();
+}
+
+fn bench_schema_sensing_heterogeneous(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("schema_sensing_heterogeneous");
+    group.sample_size(50);
+    group.measurement_time(Duration::from_secs(8));
+
+    let events = make_events_heterogeneous(10_000);
+    group.throughput(Throughput::Elements(10_000));
+
+    // Cache with heterogeneous data (low cache hit rate)
+    group.bench_with_input(
+        BenchmarkId::new("heterogeneous", "with_cache"),
+        &events,
+        |b, evs| {
+            b.to_async(&rt).iter(|| async {
+                let (sink, _, _) = CountingSink::new("sink");
+                run_coordinator_bench_with_sensing(
+                    evs.clone(),
+                    vec![sink],
+                    make_batch_config(100, 10),
+                    make_sensing_config_with_cache(true),
+                )
+                .await
+                .unwrap();
+            })
+        },
+    );
+
+    // Sampling helps more with heterogeneous data
+    group.bench_with_input(
+        BenchmarkId::new("heterogeneous", "with_sampling"),
+        &events,
+        |b, evs| {
+            b.to_async(&rt).iter(|| async {
+                let (sink, _, _) = CountingSink::new("sink");
+                run_coordinator_bench_with_sensing(
+                    evs.clone(),
+                    vec![sink],
+                    make_batch_config(100, 10),
+                    make_sensing_config_with_sampling(100, 10),
                 )
                 .await
                 .unwrap();
@@ -617,6 +739,8 @@ fn bench_schema_sensing(c: &mut Criterion) {
 fn bench_schema_sensing_scaling(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let mut group = c.benchmark_group("schema_sensing_scaling");
+    group.sample_size(50);
+    group.measurement_time(Duration::from_secs(8));
 
     for event_count in [1_000, 5_000, 10_000, 25_000] {
         let events = make_events_with_json(event_count);
@@ -632,7 +756,7 @@ fn bench_schema_sensing_scaling(c: &mut Criterion) {
                         evs.clone(),
                         vec![sink],
                         make_batch_config(100, 10),
-                        make_sensing_config(true),
+                        make_sensing_config_with_sampling(100, 10),
                     )
                     .await
                     .unwrap();
@@ -644,13 +768,47 @@ fn bench_schema_sensing_scaling(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_coordinator_throughput,
-    bench_batch_sizes,
-    bench_multi_sink_scaling,
-    bench_event_sizes,
-    bench_schema_sensing,
-    bench_schema_sensing_scaling,
-);
+// =============================================================================
+// Criterion Configuration
+// =============================================================================
+
+criterion_group! {
+    name = benches;
+    config = Criterion::default()
+        .sample_size(50)
+        .measurement_time(Duration::from_secs(8))
+        .warm_up_time(Duration::from_secs(2));
+    targets =
+        bench_coordinator_throughput,
+        bench_batch_sizes,
+        bench_multi_sink_scaling,
+        bench_event_sizes,
+        bench_schema_sensing,
+        bench_schema_sensing_heterogeneous,
+        bench_schema_sensing_scaling
+}
+
 criterion_main!(benches);
+
+// =============================================================================
+// Throughput Summary (printed at end of benchmarks)
+// =============================================================================
+
+#[cfg(test)]
+mod summary {
+    //! Run `cargo test --release -p runner --test pipeline_e2e -- --nocapture summary`
+    //! to see the throughput summary.
+
+    #[test]
+    #[ignore]
+    fn print_throughput_summary() {
+        println!("\n");
+        println!("Notes:");
+        println!("  - Benchmarks measure coordinator throughput (in-memory → sinks)");
+        println!("  - Real-world includes binlog parsing, network I/O");
+        println!("  - Structure cache uses top-level keys only (O(k) not O(nodes))");
+        println!("  - Sampling recommended for production: warmup=1000, rate=10");
+        println!("  - Cache effective for homogeneous data (same column structure)");
+        println!("\n");
+    }
+}

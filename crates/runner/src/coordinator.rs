@@ -200,47 +200,46 @@ impl SchemaSensorState {
                 // Create a unique key for this table:column
                 let key = format!("{}:{}", table, col.name);
 
-                if let Ok(bytes) = serde_json::to_vec(json_value) {
-                    match sensor.observe(&key, &bytes) {
-                        Ok(result) => match &result {
-                            ObserveResult::Evolved {
-                                new_fingerprint,
-                                new_sequence,
-                                ..
-                            } => {
-                                evolutions += 1;
-                                info!(
-                                    table = %table,
-                                    column = %col.name,
-                                    fingerprint = %new_fingerprint,
-                                    sequence = %new_sequence,
-                                    "JSON column schema evolved"
-                                );
-                            }
-                            ObserveResult::NewSchema {
-                                fingerprint,
-                                sequence,
-                            } => {
-                                info!(
-                                    table = %table,
-                                    column = %col.name,
-                                    fingerprint = %fingerprint,
-                                    sequence = %sequence,
-                                    "new JSON column schema discovered"
-                                );
-                            }
-                            _ => {}
-                        },
-                        Err(e) => {
-                            warn!(
+                match sensor.observe_value(&key, json_value) {
+                    Ok(result) => match &result {
+                        ObserveResult::Evolved {
+                            new_fingerprint,
+                            new_sequence,
+                            ..
+                        } => {
+                            evolutions += 1;
+                            info!(
                                 table = %table,
                                 column = %col.name,
-                                error = %e,
-                                "JSON column schema sensing failed"
+                                fingerprint = %new_fingerprint,
+                                sequence = %new_sequence,
+                                "JSON column schema evolved"
                             );
                         }
+                        ObserveResult::NewSchema {
+                            fingerprint,
+                            sequence,
+                        } => {
+                            info!(
+                                table = %table,
+                                column = %col.name,
+                                fingerprint = %fingerprint,
+                                sequence = %sequence,
+                                "new JSON column schema discovered"
+                            );
+                        }
+                        _ => {}
+                    },
+                    Err(e) => {
+                        warn!(
+                            table = %table,
+                            column = %col.name,
+                            error = %e,
+                            "JSON column schema sensing failed"
+                        );
                     }
                 }
+                
             }
         }
 
@@ -254,11 +253,7 @@ impl SchemaSensorState {
         table: &str,
         row: &serde_json::Value,
     ) -> usize {
-        let Ok(bytes) = serde_json::to_vec(row) else {
-            return 0;
-        };
-
-        match sensor.observe(table, &bytes) {
+        match sensor.observe_value(table, row) {
             Ok(result) => match &result {
                 ObserveResult::Evolved {
                     new_fingerprint,

@@ -30,6 +30,10 @@ pub struct SchemaSensingConfig {
     /// Output options
     #[serde(default)]
     pub output: SensingOutputConfig,
+
+    /// Sampling configuration for performance optimization
+    #[serde(default)]
+    pub sampling: SamplingConfig,
 }
 
 /// Filter which tables to apply schema sensing to.
@@ -155,6 +159,46 @@ impl Default for SensingOutputConfig {
     }
 }
 
+/// Sampling configuration for performance optimization.
+///
+/// After warmup, sensing switches to sampling mode to reduce overhead
+/// while still detecting schema changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SamplingConfig {
+    /// Number of events to fully sense before switching to sampling mode.
+    /// During warmup, every event is analyzed to build initial schema.
+    #[serde(default = "default_warmup_events")]
+    pub warmup_events: usize,
+
+    /// Sample rate after warmup (1 = 100%, 10 = 10%, 100 = 1%).
+    /// Higher values = less CPU overhead but slower schema evolution detection.
+    #[serde(default = "default_sample_rate")]
+    pub sample_rate: usize,
+
+    /// Use structure fingerprinting to skip identical payloads.
+    /// When enabled, payloads with the same key structure as previously
+    /// seen are skipped entirely, providing significant speedup for
+    /// homogeneous data.
+    #[serde(default = "default_true")]
+    pub structure_cache: bool,
+
+    /// Maximum number of unique structures to cache per table.
+    /// Prevents unbounded memory growth for highly variable schemas.
+    #[serde(default = "default_structure_cache_size")]
+    pub structure_cache_size: usize,
+}
+
+impl Default for SamplingConfig {
+    fn default() -> Self {
+        Self {
+            warmup_events: default_warmup_events(),
+            sample_rate: default_sample_rate(),
+            structure_cache: true,
+            structure_cache_size: default_structure_cache_size(),
+        }
+    }
+}
+
 // Default value functions
 fn default_true() -> bool {
     true
@@ -170,6 +214,18 @@ fn default_sample_size() -> usize {
 
 fn default_enum_cardinality() -> usize {
     50
+}
+
+fn default_warmup_events() -> usize {
+    1000
+}
+
+fn default_sample_rate() -> usize {
+    10 // 10% sampling after warmup
+}
+
+fn default_structure_cache_size() -> usize {
+    100
 }
 
 impl SchemaSensingConfig {
@@ -196,6 +252,21 @@ impl SchemaSensingConfig {
         } else {
             1
         }
+    }
+
+    /// Check if we're in warmup phase for a given event count.
+    pub fn is_warmup(&self, event_count: u64) -> bool {
+        event_count < self.sampling.warmup_events as u64
+    }
+
+    /// Check if an event should be sampled (after warmup).
+    pub fn should_sample(&self, event_count: u64) -> bool {
+        if self.is_warmup(event_count) {
+            return true; // Always sample during warmup
+        }
+        // After warmup, sample at configured rate
+        let rate = self.sampling.sample_rate.max(1);
+        (event_count % rate as u64) == 0
     }
 }
 
@@ -320,5 +391,50 @@ mod tests {
         assert!(matches_pattern("audit_%", "audit_log"));
         assert!(matches_pattern("audit_*", "audit_log"));
         assert!(!matches_pattern("audit_%", "orders"));
+    }
+
+    #[test]
+    fn test_warmup_phase() {
+        let config = SchemaSensingConfig {
+            enabled: true,
+            sampling: SamplingConfig {
+                warmup_events: 100,
+                sample_rate: 10,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // During warmup
+        assert!(config.is_warmup(0));
+        assert!(config.is_warmup(99));
+        assert!(!config.is_warmup(100));
+        assert!(!config.is_warmup(1000));
+    }
+
+    #[test]
+    fn test_sampling_rate() {
+        let config = SchemaSensingConfig {
+            enabled: true,
+            sampling: SamplingConfig {
+                warmup_events: 10,
+                sample_rate: 5, // 20% sampling
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // During warmup - always sample
+        assert!(config.should_sample(0));
+        assert!(config.should_sample(5));
+        assert!(config.should_sample(9));
+
+        // After warmup - sample every 5th
+        assert!(config.should_sample(10)); // 10 % 5 == 0
+        assert!(!config.should_sample(11));
+        assert!(!config.should_sample(12));
+        assert!(!config.should_sample(13));
+        assert!(!config.should_sample(14));
+        assert!(config.should_sample(15)); // 15 % 5 == 0
     }
 }

@@ -9,8 +9,8 @@ pub use turso_cfg::{NativeCdcLevel, TursoCdcMode, TursoSrcCfg};
 
 mod schema_sensing;
 pub use schema_sensing::{
-    ColumnFilter, DeepInspectConfig, SchemaSensingConfig, SensingOutputConfig, TableFilter,
-    TrackingConfig,
+    ColumnFilter, DeepInspectConfig, SamplingConfig, SchemaSensingConfig,
+    SensingOutputConfig, TableFilter, TrackingConfig,
 };
 
 #[derive(Debug, Error)]
@@ -148,7 +148,7 @@ pub struct RedisSinkCfg {
     pub uri: String,
     pub stream: String,
     #[serde(default)]
-    pub required: Option<bool>,    
+    pub required: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

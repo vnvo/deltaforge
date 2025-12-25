@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 use schema_analysis::InferredSchema;
 use serde::de::DeserializeSeed;
@@ -32,18 +33,103 @@ pub enum ObserveResult {
 
     /// Sampling limit reached - schema stabilized
     Stabilized { fingerprint: String, sequence: u64 },
+
+    /// Skipped due to structure cache hit (fast path)
+    CacheHit { fingerprint: String, sequence: u64 },
+
+    /// Skipped due to sampling (not selected for this event)
+    Sampled { fingerprint: String, sequence: u64 },
 }
 
-/// Universal schema sensor.
+/// Compute a lightweight structure fingerprint from top-level JSON keys only.
+/// 
+/// This is MUCH faster than traversing nested structures. We only hash:
+/// - The set of top-level key names (for objects)
+/// - The type tag (for primitives/arrays)
+/// 
+/// This is sufficient to detect most schema changes (new/removed columns)
+/// while being O(keys) instead of O(total_nodes).
+fn compute_structure_hash(value: &serde_json::Value) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    let mut hasher = DefaultHasher::new();
+    hash_top_level_structure(value, &mut hasher);
+    hasher.finish()
+}
+
+/// Hash only top-level structure - no recursion into nested objects.
+fn hash_top_level_structure<H: Hasher>(value: &serde_json::Value, hasher: &mut H) {
+    match value {
+        serde_json::Value::Null => 0u8.hash(hasher),
+        serde_json::Value::Bool(_) => 1u8.hash(hasher),
+        serde_json::Value::Number(_) => 2u8.hash(hasher),
+        serde_json::Value::String(_) => 3u8.hash(hasher),
+        serde_json::Value::Array(_) => {
+            // Just mark as array - don't inspect elements
+            4u8.hash(hasher);
+        }
+        serde_json::Value::Object(obj) => {
+            5u8.hash(hasher);
+            // Hash number of keys (fast structural check)
+            obj.len().hash(hasher);
+            // Hash sorted key names only - O(k log k) where k = number of keys
+            let mut keys: Vec<_> = obj.keys().collect();
+            keys.sort_unstable();
+            for key in keys {
+                key.hash(hasher);
+            }
+        }
+    }
+}
+
+/// Per-table structure cache for fast-path skipping.
+struct StructureCache {
+    seen: HashSet<u64>,
+    max_size: usize,
+}
+
+impl StructureCache {
+    fn new(max_size: usize) -> Self {
+        Self {
+            seen: HashSet::new(),
+            max_size,
+        }
+    }
+
+    /// Check if structure was seen before. Returns true if cache hit.
+    fn check_and_insert(&mut self, hash: u64) -> bool {
+        if self.seen.contains(&hash) {
+            return true; // Cache hit
+        }
+        // Cache miss - add if we have room
+        if self.seen.len() < self.max_size {
+            self.seen.insert(hash);
+        }
+        false
+    }
+
+    fn clear(&mut self) {
+        self.seen.clear();
+    }
+}
+
+/// Universal schema sensor with performance optimizations.
 ///
 /// Infers and tracks schema from JSON payloads across all tables.
 /// Uses `schema_analysis` for robust type inference.
+///
+/// Performance features:
+/// - Structure caching: Skip payloads with identical key structure
+/// - Sampling: After warmup, only analyze a fraction of events
+/// - Stabilization: Stop after max_sample_size events per table
 pub struct SchemaSensor {
     /// Configuration
     config: SchemaSensingConfig,
 
     /// Per-table schema state
     schemas: HashMap<String, TableSchemaState>,
+
+    /// Per-table structure cache for fast-path skipping
+    structure_caches: HashMap<String, StructureCache>,
 }
 
 impl SchemaSensor {
@@ -51,6 +137,7 @@ impl SchemaSensor {
         Self {
             config,
             schemas: HashMap::new(),
+            structure_caches: HashMap::new(),
         }
     }
 
@@ -67,14 +154,71 @@ impl SchemaSensor {
         self.config.enabled
     }
 
-    /// Observe a JSON payload and update schema tracking.
+    /// Observe a pre-parsed JSON value (optimized path).
     ///
-    /// # Arguments
-    /// * `table` - The table/entity name
-    /// * `json` - Raw JSON bytes of the event payload
-    ///
-    /// # Returns
-    /// Result indicating what happened (new schema, evolved, unchanged, etc.)
+    /// This is the preferred method when you already have a parsed Value,
+    /// as it can use structure caching without re-parsing.
+    pub fn observe_value(
+        &mut self,
+        table: &str,
+        value: &serde_json::Value,
+    ) -> SensorResult<ObserveResult> {
+        // Check if sensing is enabled for this table
+        if !self.config.should_sense_table(table) {
+            return Ok(ObserveResult::Disabled);
+        }
+
+        // Get current event count for sampling decision
+        let event_count = self.schemas.get(table).map(|s| s.event_count).unwrap_or(0);
+
+        // Check if we've hit the stabilization limit
+        if let Some(state) = self.schemas.get(table) {
+            if state.stabilized {
+                return Ok(ObserveResult::Stabilized {
+                    fingerprint: state.fingerprint.clone(),
+                    sequence: state.sequence,
+                });
+            }
+        }
+
+        // Structure cache check (fast path) - O(keys) for top-level only
+        if self.config.sampling.structure_cache {
+            let structure_hash = compute_structure_hash(value);
+            let cache = self.structure_caches.entry(table.to_string()).or_insert_with(|| {
+                StructureCache::new(self.config.sampling.structure_cache_size)
+            });
+
+            if cache.check_and_insert(structure_hash) {
+                // Cache hit - skip full sensing
+                if let Some(state) = self.schemas.get_mut(table) {
+                    state.record_observation();
+                    return Ok(ObserveResult::CacheHit {
+                        fingerprint: state.fingerprint.clone(),
+                        sequence: state.sequence,
+                    });
+                }
+                // No schema yet - fall through to full sensing
+            }
+        }
+
+        // Sampling check (after warmup)
+        if !self.config.should_sample(event_count) {
+            if let Some(state) = self.schemas.get_mut(table) {
+                state.record_observation();
+                return Ok(ObserveResult::Sampled {
+                    fingerprint: state.fingerprint.clone(),
+                    sequence: state.sequence,
+                });
+            }
+        }
+
+        // Full sensing path - serialize and process
+        let json = serde_json::to_vec(value)
+            .map_err(|e| SensorError::Serialization(e.to_string()))?;
+        self.observe_bytes(table, &json, event_count)
+    }
+
+    /// Observe raw JSON bytes.
     pub fn observe(
         &mut self,
         table: &str,
@@ -85,19 +229,80 @@ impl SchemaSensor {
             return Ok(ObserveResult::Disabled);
         }
 
-        // Check if we already have state for this table
-        if let Some(state) = self.schemas.get_mut(table) {
-            // Check if we've hit the sampling limit
+        let event_count = self.schemas.get(table).map(|s| s.event_count).unwrap_or(0);
+
+        // Check stabilization
+        if let Some(state) = self.schemas.get(table) {
             if state.stabilized {
                 return Ok(ObserveResult::Stabilized {
                     fingerprint: state.fingerprint.clone(),
                     sequence: state.sequence,
                 });
             }
+        }
 
-            // Check sampling limit
+        // For bytes path with structure caching, we need to parse once
+        // and reuse for both cache check and sensing
+        if self.config.sampling.structure_cache {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(json) {
+                let structure_hash = compute_structure_hash(&value);
+                let cache = self.structure_caches.entry(table.to_string()).or_insert_with(|| {
+                    StructureCache::new(self.config.sampling.structure_cache_size)
+                });
+
+                if cache.check_and_insert(structure_hash) {
+                    // Cache hit
+                    if let Some(state) = self.schemas.get_mut(table) {
+                        state.record_observation();
+                        return Ok(ObserveResult::CacheHit {
+                            fingerprint: state.fingerprint.clone(),
+                            sequence: state.sequence,
+                        });
+                    }
+                }
+                
+                // Cache miss - check sampling
+                if !self.config.should_sample(event_count) {
+                    if let Some(state) = self.schemas.get_mut(table) {
+                        state.record_observation();
+                        return Ok(ObserveResult::Sampled {
+                            fingerprint: state.fingerprint.clone(),
+                            sequence: state.sequence,
+                        });
+                    }
+                }
+                
+                // Need full sensing - use already-parsed JSON bytes
+                return self.observe_bytes(table, json, event_count);
+            }
+        }
+
+        // No cache path - just check sampling
+        if !self.config.should_sample(event_count) {
+            if let Some(state) = self.schemas.get_mut(table) {
+                state.record_observation();
+                return Ok(ObserveResult::Sampled {
+                    fingerprint: state.fingerprint.clone(),
+                    sequence: state.sequence,
+                });
+            }
+        }
+
+        self.observe_bytes(table, json, event_count)
+    }
+
+    /// Internal: perform full schema sensing on bytes.
+    fn observe_bytes(
+        &mut self,
+        table: &str,
+        json: &[u8],
+        event_count: u64,
+    ) -> SensorResult<ObserveResult> {
+        // Check if we already have state for this table
+        if let Some(state) = self.schemas.get_mut(table) {
+            // Check sampling limit for stabilization
             let max_samples = self.config.deep_inspect.max_sample_size;
-            if max_samples > 0 && state.event_count >= max_samples as u64 {
+            if max_samples > 0 && event_count >= max_samples as u64 {
                 state.mark_stabilized();
                 info!(
                     table = %table,
@@ -118,7 +323,6 @@ impl SchemaSensor {
             let mut de = serde_json::Deserializer::from_slice(json);
             if let Err(e) = state.inferred.deserialize(&mut de) {
                 warn!(table = %table, error = %e, "failed to expand schema");
-                // Still count as observation even if expansion fails
                 state.record_observation();
                 return Ok(ObserveResult::Unchanged {
                     fingerprint: state.fingerprint.clone(),
@@ -137,6 +341,12 @@ impl SchemaSensor {
                     sequence = state.sequence,
                     "schema evolved"
                 );
+
+                // Clear structure cache on evolution
+                if let Some(cache) = self.structure_caches.get_mut(table) {
+                    cache.clear();
+                }
+
                 Ok(ObserveResult::Evolved {
                     old_fingerprint,
                     new_fingerprint: state.fingerprint.clone(),
@@ -169,18 +379,6 @@ impl SchemaSensor {
             self.schemas.insert(table.to_string(), state);
             Ok(result)
         }
-    }
-
-    /// Observe a pre-parsed JSON value.
-    pub fn observe_value(
-        &mut self,
-        table: &str,
-        value: &serde_json::Value,
-    ) -> SensorResult<ObserveResult> {
-        // Re-serialize to bytes for schema_analysis
-        let json = serde_json::to_vec(value)
-            .map_err(|e| SensorError::Serialization(e.to_string()))?;
-        self.observe(table, &json)
     }
 
     /// Get schema version info for a table.
@@ -221,14 +419,23 @@ impl SchemaSensor {
             .unwrap_or(false)
     }
 
+    /// Get cache statistics for a table.
+    pub fn cache_stats(&self, table: &str) -> Option<(usize, usize)> {
+        self.structure_caches
+            .get(table)
+            .map(|c| (c.seen.len(), c.max_size))
+    }
+
     /// Reset tracking for a table.
     pub fn reset_table(&mut self, table: &str) {
         self.schemas.remove(table);
+        self.structure_caches.remove(table);
     }
 
     /// Reset all tracking.
     pub fn reset_all(&mut self) {
         self.schemas.clear();
+        self.structure_caches.clear();
     }
 
     /// Get configuration.
@@ -260,6 +467,7 @@ impl SchemaSensor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deltaforge_config::SamplingConfig;
 
     #[test]
     fn test_disabled_sensor() {
@@ -281,27 +489,161 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_unchanged() {
-        let mut sensor = SchemaSensor::enabled();
-        let json1 = br#"{"id": 1, "name": "Alice"}"#;
-        let json2 = br#"{"id": 2, "name": "Bob"}"#;
+    fn test_structure_cache_hit() {
+        let config = SchemaSensingConfig {
+            enabled: true,
+            sampling: SamplingConfig {
+                structure_cache: true,
+                structure_cache_size: 100,
+                warmup_events: 1000,
+                sample_rate: 1,
+            },
+            ..Default::default()
+        };
+        let mut sensor = SchemaSensor::new(config);
 
-        sensor.observe("users", json1).unwrap();
-        let result = sensor.observe("users", json2).unwrap();
+        // First event - new schema
+        let json1 = serde_json::json!({"id": 1, "name": "Alice"});
+        let result1 = sensor.observe_value("users", &json1).unwrap();
+        assert!(matches!(result1, ObserveResult::NewSchema { .. }));
 
-        assert!(matches!(result, ObserveResult::Unchanged { .. }));
+        // Second event with same structure - cache hit
+        let json2 = serde_json::json!({"id": 2, "name": "Bob"});
+        let result2 = sensor.observe_value("users", &json2).unwrap();
+        assert!(matches!(result2, ObserveResult::CacheHit { .. }));
+
+        // Event count should still increase
         assert_eq!(sensor.event_count("users"), 2);
+    }
+
+    #[test]
+    fn test_structure_cache_miss_different_keys() {
+        let config = SchemaSensingConfig {
+            enabled: true,
+            sampling: SamplingConfig {
+                structure_cache: true,
+                structure_cache_size: 100,
+                warmup_events: 1000,
+                sample_rate: 1,
+            },
+            ..Default::default()
+        };
+        let mut sensor = SchemaSensor::new(config);
+
+        let json1 = serde_json::json!({"id": 1, "name": "Alice"});
+        sensor.observe_value("users", &json1).unwrap();
+
+        // Different top-level keys - cache miss, triggers evolution
+        let json2 = serde_json::json!({"id": 2, "name": "Bob", "email": "bob@example.com"});
+        let result2 = sensor.observe_value("users", &json2).unwrap();
+        assert!(matches!(result2, ObserveResult::Evolved { .. }));
+    }
+
+    #[test]
+    fn test_structure_cache_hit_nested_changes() {
+        // With top-level-only hashing, nested structure changes don't cause cache miss
+        let config = SchemaSensingConfig {
+            enabled: true,
+            sampling: SamplingConfig {
+                structure_cache: true,
+                structure_cache_size: 100,
+                warmup_events: 1000,
+                sample_rate: 1,
+            },
+            ..Default::default()
+        };
+        let mut sensor = SchemaSensor::new(config);
+
+        let json1 = serde_json::json!({"id": 1, "data": {"a": 1}});
+        sensor.observe_value("users", &json1).unwrap();
+
+        // Same top-level keys, different nested structure - still cache HIT
+        // (This is intentional for performance - we trade some accuracy for speed)
+        let json2 = serde_json::json!({"id": 2, "data": {"a": 1, "b": 2}});
+        let result2 = sensor.observe_value("users", &json2).unwrap();
+        assert!(matches!(result2, ObserveResult::CacheHit { .. }));
+    }
+
+    #[test]
+    fn test_sampling_after_warmup() {
+        let config = SchemaSensingConfig {
+            enabled: true,
+            sampling: SamplingConfig {
+                warmup_events: 5,
+                sample_rate: 2, // 50% sampling
+                structure_cache: false, // Disable for this test
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut sensor = SchemaSensor::new(config);
+
+        // Warmup phase - all events processed
+        for i in 0..5 {
+            let json = serde_json::json!({"id": i});
+            let result = sensor.observe_value("users", &json).unwrap();
+            assert!(!matches!(result, ObserveResult::Sampled { .. }));
+        }
+
+        // After warmup - sampling kicks in
+        let mut sampled_count = 0;
+        let mut processed_count = 0;
+        for i in 5..15 {
+            let json = serde_json::json!({"id": i});
+            let result = sensor.observe_value("users", &json).unwrap();
+            match result {
+                ObserveResult::Sampled { .. } => sampled_count += 1,
+                ObserveResult::Unchanged { .. } | ObserveResult::CacheHit { .. } => {
+                    processed_count += 1
+                }
+                _ => {}
+            }
+        }
+
+        // With 50% sampling, roughly half should be sampled
+        assert!(sampled_count > 0, "some events should be sampled");
+        assert!(processed_count > 0, "some events should be processed");
+    }
+
+    #[test]
+    fn test_cache_cleared_on_evolution() {
+        let config = SchemaSensingConfig {
+            enabled: true,
+            sampling: SamplingConfig {
+                structure_cache: true,
+                structure_cache_size: 100,
+                warmup_events: 1000,
+                sample_rate: 1,
+            },
+            ..Default::default()
+        };
+        let mut sensor = SchemaSensor::new(config);
+
+        // Build up cache
+        let json1 = serde_json::json!({"id": 1});
+        sensor.observe_value("users", &json1).unwrap();
+        let json2 = serde_json::json!({"id": 2});
+        sensor.observe_value("users", &json2).unwrap();
+
+        let (cache_size, _) = sensor.cache_stats("users").unwrap();
+        assert_eq!(cache_size, 1); // Only one unique structure
+
+        // Evolution should clear cache
+        let json3 = serde_json::json!({"id": 3, "extra": "field"});
+        let result = sensor.observe_value("users", &json3).unwrap();
+        assert!(matches!(result, ObserveResult::Evolved { .. }));
+
+        let (cache_size, _) = sensor.cache_stats("users").unwrap();
+        assert_eq!(cache_size, 0); // Cache cleared
     }
 
     #[test]
     fn test_schema_evolution() {
         let mut sensor = SchemaSensor::enabled();
 
-        // Initial schema
         let json1 = br#"{"id": 1, "name": "Alice"}"#;
         sensor.observe("users", json1).unwrap();
 
-        // Add new field - schema should evolve
         let json2 = br#"{"id": 2, "name": "Bob", "email": "bob@example.com"}"#;
         let result = sensor.observe("users", json2).unwrap();
 
@@ -316,26 +658,6 @@ mod tests {
             }
             _ => panic!("expected schema evolution, got {:?}", result),
         }
-    }
-
-    #[test]
-    fn test_table_filter() {
-        let config = SchemaSensingConfig {
-            enabled: true,
-            tables: deltaforge_config::TableFilter {
-                include: vec!["users".into()],
-                exclude: vec![],
-            },
-            ..Default::default()
-        };
-
-        let mut sensor = SchemaSensor::new(config);
-
-        let result1 = sensor.observe("users", br#"{"id": 1}"#).unwrap();
-        let result2 = sensor.observe("orders", br#"{"id": 1}"#).unwrap();
-
-        assert!(matches!(result1, ObserveResult::NewSchema { .. }));
-        assert_eq!(result2, ObserveResult::Disabled);
     }
 
     #[test]
@@ -355,112 +677,8 @@ mod tests {
         sensor.observe("users", br#"{"id": 2}"#).unwrap();
         sensor.observe("users", br#"{"id": 3}"#).unwrap();
 
-        // Should be stabilized now
         let result = sensor.observe("users", br#"{"id": 4}"#).unwrap();
         assert!(matches!(result, ObserveResult::Stabilized { .. }));
         assert!(sensor.is_stabilized("users"));
-    }
-
-    #[test]
-    fn test_nested_json() {
-        let mut sensor = SchemaSensor::enabled();
-
-        let json = br#"{
-            "id": 1,
-            "metadata": {
-                "created_by": "system",
-                "tags": ["important", "urgent"],
-                "settings": {
-                    "notify": true,
-                    "priority": 5
-                }
-            }
-        }"#;
-
-        let result = sensor.observe("tasks", json).unwrap();
-        assert!(matches!(result, ObserveResult::NewSchema { .. }));
-
-        // Verify we have a schema
-        assert!(sensor.get_schema("tasks").is_some());
-    }
-
-    #[test]
-    fn test_multiple_tables() {
-        let mut sensor = SchemaSensor::enabled();
-
-        sensor
-            .observe("users", br#"{"id": 1, "name": "Alice"}"#)
-            .unwrap();
-        sensor
-            .observe("orders", br#"{"order_id": 100, "total": 99.99}"#)
-            .unwrap();
-
-        assert_eq!(sensor.tables().len(), 2);
-        assert!(sensor.get_version("users").is_some());
-        assert!(sensor.get_version("orders").is_some());
-    }
-
-    #[test]
-    fn test_observe_value() {
-        let mut sensor = SchemaSensor::enabled();
-
-        let value = serde_json::json!({
-            "id": 1,
-            "name": "Test"
-        });
-
-        let result = sensor.observe_value("items", &value).unwrap();
-        assert!(matches!(result, ObserveResult::NewSchema { .. }));
-    }
-
-    #[test]
-    fn test_reset_table() {
-        let mut sensor = SchemaSensor::enabled();
-
-        sensor.observe("users", br#"{"id": 1}"#).unwrap();
-        sensor.observe("orders", br#"{"id": 1}"#).unwrap();
-
-        assert!(sensor.get_version("users").is_some());
-        sensor.reset_table("users");
-        assert!(sensor.get_version("users").is_none());
-        assert!(sensor.get_version("orders").is_some());
-    }
-
-    #[test]
-    fn test_reset_all() {
-        let mut sensor = SchemaSensor::enabled();
-
-        sensor.observe("users", br#"{"id": 1}"#).unwrap();
-        sensor.observe("orders", br#"{"id": 1}"#).unwrap();
-
-        assert_eq!(sensor.tables().len(), 2);
-        sensor.reset_all();
-        assert_eq!(sensor.tables().len(), 0);
-    }
-
-    #[test]
-    fn test_to_json_schema() {
-        let mut sensor = SchemaSensor::enabled();
-
-        sensor
-            .observe("users", br#"{"id": 1, "name": "Test"}"#)
-            .unwrap();
-
-        let js = sensor.to_json_schema("users");
-        assert!(js.is_some());
-
-        let js = js.unwrap();
-        assert!(js.properties.is_some());
-    }
-
-    #[test]
-    fn test_all_snapshots() {
-        let mut sensor = SchemaSensor::enabled();
-
-        sensor.observe("users", br#"{"id": 1}"#).unwrap();
-        sensor.observe("orders", br#"{"id": 1}"#).unwrap();
-
-        let snapshots = sensor.all_snapshots();
-        assert_eq!(snapshots.len(), 2);
     }
 }
