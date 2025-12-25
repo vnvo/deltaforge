@@ -9,7 +9,9 @@ use deltaforge_config::SchemaSensingConfig;
 
 use crate::errors::{SensorError, SensorResult};
 use crate::json_schema::JsonSchema;
-use crate::schema_state::{SchemaSnapshot, SensedSchemaVersion, TableSchemaState};
+use crate::schema_state::{
+    SchemaSnapshot, SensedSchemaVersion, TableSchemaState,
+};
 
 /// Result of observing an event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,11 +44,11 @@ pub enum ObserveResult {
 }
 
 /// Compute a lightweight structure fingerprint from top-level JSON keys only.
-/// 
+///
 /// This is MUCH faster than traversing nested structures. We only hash:
 /// - The set of top-level key names (for objects)
 /// - The type tag (for primitives/arrays)
-/// 
+///
 /// This is sufficient to detect most schema changes (new/removed columns)
 /// while being O(keys) instead of O(total_nodes).
 fn compute_structure_hash(value: &serde_json::Value) -> u64 {
@@ -57,7 +59,10 @@ fn compute_structure_hash(value: &serde_json::Value) -> u64 {
 }
 
 /// Hash only top-level structure - no recursion into nested objects.
-fn hash_top_level_structure<H: Hasher>(value: &serde_json::Value, hasher: &mut H) {
+fn hash_top_level_structure<H: Hasher>(
+    value: &serde_json::Value,
+    hasher: &mut H,
+) {
     match value {
         serde_json::Value::Null => 0u8.hash(hasher),
         serde_json::Value::Bool(_) => 1u8.hash(hasher),
@@ -81,10 +86,22 @@ fn hash_top_level_structure<H: Hasher>(value: &serde_json::Value, hasher: &mut H
     }
 }
 
+/// Cache statistics for a single table.
+#[derive(Debug, Clone)]
+pub struct CacheStatsEntry {
+    pub table: String,
+    pub cached_structures: usize,
+    pub max_cache_size: usize,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+}
+
 /// Per-table structure cache for fast-path skipping.
 struct StructureCache {
     seen: HashSet<u64>,
     max_size: usize,
+    hits: u64,
+    misses: u64,
 }
 
 impl StructureCache {
@@ -92,15 +109,17 @@ impl StructureCache {
         Self {
             seen: HashSet::new(),
             max_size,
+            hits: 0,
+            misses: 0,
         }
     }
 
-    /// Check if structure was seen before. Returns true if cache hit.
     fn check_and_insert(&mut self, hash: u64) -> bool {
         if self.seen.contains(&hash) {
-            return true; // Cache hit
+            self.hits += 1;
+            return true;
         }
-        // Cache miss - add if we have room
+        self.misses += 1;
         if self.seen.len() < self.max_size {
             self.seen.insert(hash);
         }
@@ -109,6 +128,10 @@ impl StructureCache {
 
     fn clear(&mut self) {
         self.seen.clear();
+    }
+
+    fn stats(&self) -> (usize, usize, u64, u64) {
+        (self.seen.len(), self.max_size, self.hits, self.misses)
     }
 }
 
@@ -169,7 +192,8 @@ impl SchemaSensor {
         }
 
         // Get current event count for sampling decision
-        let event_count = self.schemas.get(table).map(|s| s.event_count).unwrap_or(0);
+        let event_count =
+            self.schemas.get(table).map(|s| s.event_count).unwrap_or(0);
 
         // Check if we've hit the stabilization limit
         if let Some(state) = self.schemas.get(table) {
@@ -184,14 +208,30 @@ impl SchemaSensor {
         // Structure cache check (fast path) - O(keys) for top-level only
         if self.config.sampling.structure_cache {
             let structure_hash = compute_structure_hash(value);
-            let cache = self.structure_caches.entry(table.to_string()).or_insert_with(|| {
-                StructureCache::new(self.config.sampling.structure_cache_size)
-            });
+            let cache = self
+                .structure_caches
+                .entry(table.to_string())
+                .or_insert_with(|| {
+                    StructureCache::new(
+                        self.config.sampling.structure_cache_size,
+                    )
+                });
 
             if cache.check_and_insert(structure_hash) {
                 // Cache hit - skip full sensing
                 if let Some(state) = self.schemas.get_mut(table) {
                     state.record_observation();
+
+                    // Check stabilization even on cache hit
+                    let max_samples = self.config.deep_inspect.max_sample_size;
+                    if max_samples > 0 && state.event_count >= max_samples as u64 && !state.stabilized {
+                        state.mark_stabilized();
+                        return Ok(ObserveResult::Stabilized {
+                            fingerprint: state.fingerprint.clone(),
+                            sequence: state.sequence,
+                        });
+                    }
+
                     return Ok(ObserveResult::CacheHit {
                         fingerprint: state.fingerprint.clone(),
                         sequence: state.sequence,
@@ -229,7 +269,8 @@ impl SchemaSensor {
             return Ok(ObserveResult::Disabled);
         }
 
-        let event_count = self.schemas.get(table).map(|s| s.event_count).unwrap_or(0);
+        let event_count =
+            self.schemas.get(table).map(|s| s.event_count).unwrap_or(0);
 
         // Check stabilization
         if let Some(state) = self.schemas.get(table) {
@@ -244,23 +285,40 @@ impl SchemaSensor {
         // For bytes path with structure caching, we need to parse once
         // and reuse for both cache check and sensing
         if self.config.sampling.structure_cache {
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(json) {
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(json)
+            {
                 let structure_hash = compute_structure_hash(&value);
-                let cache = self.structure_caches.entry(table.to_string()).or_insert_with(|| {
-                    StructureCache::new(self.config.sampling.structure_cache_size)
-                });
+                let cache = self
+                    .structure_caches
+                    .entry(table.to_string())
+                    .or_insert_with(|| {
+                        StructureCache::new(
+                            self.config.sampling.structure_cache_size,
+                        )
+                    });
 
                 if cache.check_and_insert(structure_hash) {
                     // Cache hit
                     if let Some(state) = self.schemas.get_mut(table) {
                         state.record_observation();
+
+                        // Check stabilization even on cache hit
+                        let max_samples = self.config.deep_inspect.max_sample_size;
+                        if max_samples > 0 && state.event_count >= max_samples as u64 && !state.stabilized {
+                            state.mark_stabilized();
+                            return Ok(ObserveResult::Stabilized {
+                                fingerprint: state.fingerprint.clone(),
+                                sequence: state.sequence,
+                            });
+                        }
+
                         return Ok(ObserveResult::CacheHit {
                             fingerprint: state.fingerprint.clone(),
                             sequence: state.sequence,
                         });
                     }
                 }
-                
+
                 // Cache miss - check sampling
                 if !self.config.should_sample(event_count) {
                     if let Some(state) = self.schemas.get_mut(table) {
@@ -271,7 +329,7 @@ impl SchemaSensor {
                         });
                     }
                 }
-                
+
                 // Need full sensing - use already-parsed JSON bytes
                 return self.observe_bytes(table, json, event_count);
             }
@@ -420,10 +478,34 @@ impl SchemaSensor {
     }
 
     /// Get cache statistics for a table.
-    pub fn cache_stats(&self, table: &str) -> Option<(usize, usize)> {
+    pub fn cache_stats(&self, table: &str) -> Option<CacheStatsEntry> {
+        self.structure_caches.get(table).map(|c| {
+            let (cached, max_size, hits, misses) = c.stats();
+            CacheStatsEntry {
+                table: table.to_string(),
+                cached_structures: cached,
+                max_cache_size: max_size,
+                cache_hits: hits,
+                cache_misses: misses,
+            }
+        })
+    }
+
+    /// Get cache statistics for all tables.
+    pub fn all_cache_stats(&self) -> Vec<CacheStatsEntry> {
         self.structure_caches
-            .get(table)
-            .map(|c| (c.seen.len(), c.max_size))
+            .iter()
+            .map(|(table, cache)| {
+                let (cached, max_size, hits, misses) = cache.stats();
+                CacheStatsEntry {
+                    table: table.clone(),
+                    cached_structures: cached,
+                    max_cache_size: max_size,
+                    cache_hits: hits,
+                    cache_misses: misses,
+                }
+            })
+            .collect()
     }
 
     /// Reset tracking for a table.
@@ -570,7 +652,7 @@ mod tests {
             enabled: true,
             sampling: SamplingConfig {
                 warmup_events: 5,
-                sample_rate: 2, // 50% sampling
+                sample_rate: 2,         // 50% sampling
                 structure_cache: false, // Disable for this test
                 ..Default::default()
             },
@@ -593,9 +675,8 @@ mod tests {
             let result = sensor.observe_value("users", &json).unwrap();
             match result {
                 ObserveResult::Sampled { .. } => sampled_count += 1,
-                ObserveResult::Unchanged { .. } | ObserveResult::CacheHit { .. } => {
-                    processed_count += 1
-                }
+                ObserveResult::Unchanged { .. }
+                | ObserveResult::CacheHit { .. } => processed_count += 1,
                 _ => {}
             }
         }
@@ -625,16 +706,18 @@ mod tests {
         let json2 = serde_json::json!({"id": 2});
         sensor.observe_value("users", &json2).unwrap();
 
-        let (cache_size, _) = sensor.cache_stats("users").unwrap();
-        assert_eq!(cache_size, 1); // Only one unique structure
+        let stats = sensor.cache_stats("users").unwrap();
+        assert_eq!(stats.cached_structures, 1); // Only one unique structure
+        assert_eq!(stats.cache_hits, 1);   // Second json2 was a cache hit
+        assert_eq!(stats.cache_misses, 1); // First json1 was a miss        
 
         // Evolution should clear cache
         let json3 = serde_json::json!({"id": 3, "extra": "field"});
         let result = sensor.observe_value("users", &json3).unwrap();
         assert!(matches!(result, ObserveResult::Evolved { .. }));
 
-        let (cache_size, _) = sensor.cache_stats("users").unwrap();
-        assert_eq!(cache_size, 0); // Cache cleared
+        let stats = sensor.cache_stats("users").unwrap();
+        assert_eq!(stats.cached_structures, 0); // Cache cleared
     }
 
     #[test]

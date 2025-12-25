@@ -40,7 +40,7 @@ pub use errors::{SensorError, SensorResult};
 pub use fingerprint::compute_fingerprint;
 pub use json_schema::{JsonSchema, JsonSchemaType, to_json_schema};
 pub use schema_state::{SchemaSnapshot, SensedSchemaVersion, TableSchemaState};
-pub use sensor::{ObserveResult, SchemaSensor};
+pub use sensor::{CacheStatsEntry, ObserveResult, SchemaSensor};
 
 pub use deltaforge_config::SchemaSensingConfig;
 pub use schema_analysis::Schema as InferredSchemaType;

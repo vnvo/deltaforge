@@ -153,27 +153,28 @@ impl SensingController for SensingApi {
         let sensor_state = self.0.get_sensor(pipeline)?;
         let guard = sensor_state.sensor().lock();
 
-        // Gather stats for all tables using existing cache_stats(table) method
-        let mut tables = Vec::new();
+        // Use all_cache_stats() which returns full statistics
+        let stats = guard.all_cache_stats();
 
-        for table in guard.tables() {
-            if let Some((cached_structures, max_size)) =
-                guard.cache_stats(table)
-            {
-                tables.push(TableCacheStats {
-                    table: table.to_string(),
-                    cached_structures,
-                    max_cache_size: max_size,
-                    cache_hits: 0,   // TODO: Track in SchemaSensor
-                    cache_misses: 0, // TODO: Track in SchemaSensor
-                });
-            }
-        }
+        let total_hits: u64 = stats.iter().map(|s| s.cache_hits).sum();
+        let total_misses: u64 = stats.iter().map(|s| s.cache_misses).sum();
+        let total = total_hits + total_misses;
+        let hit_rate = if total > 0 {
+            total_hits as f64 / total as f64
+        } else {
+            0.0
+        };
 
-        // TODO: Track actual hits/misses in SchemaSensor
-        let total_hits = 0u64;
-        let total_misses = 0u64;
-        let hit_rate = 0.0;
+        let tables = stats
+            .into_iter()
+            .map(|s| TableCacheStats {
+                table: s.table,
+                cached_structures: s.cached_structures,
+                max_cache_size: s.max_cache_size,
+                cache_hits: s.cache_hits,
+                cache_misses: s.cache_misses,
+            })
+            .collect();
 
         Ok(CacheStats {
             tables,
