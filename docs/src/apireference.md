@@ -1,7 +1,7 @@
 # REST API Reference
 
-DeltaForge exposes a REST API for health checks, pipeline management, and schema
-inspection. All endpoints return JSON.
+DeltaForge exposes a REST API for health checks, pipeline management, schema
+inspection, and drift detection. All endpoints return JSON.
 
 ## Base URL
 
@@ -77,6 +77,26 @@ Returns all pipelines with current status.
 ]
 ```
 
+### Get Pipeline
+
+```http
+GET /pipelines/{name}
+```
+
+Returns a single pipeline by name.
+
+**Response:** `200 OK`
+```json
+{
+  "name": "orders-cdc",
+  "status": "running",
+  "spec": { ... }
+}
+```
+
+**Errors:**
+- `404 Not Found` - Pipeline doesn't exist
+
 ### Create Pipeline
 
 ```http
@@ -102,6 +122,7 @@ Creates a new pipeline from a full spec.
         "tables": ["shop.orders"]
       }
     },
+    "processors": [],
     "sinks": [
       {
         "type": "kafka",
@@ -126,7 +147,7 @@ Creates a new pipeline from a full spec.
 ```
 
 **Errors:**
-- `409 Conflict` — Pipeline already exists
+- `409 Conflict` - Pipeline already exists
 
 ### Update Pipeline
 
@@ -160,8 +181,22 @@ updated, and restarted.
 ```
 
 **Errors:**
-- `404 Not Found` — Pipeline doesn't exist
-- `400 Bad Request` — Name mismatch in patch
+- `404 Not Found` - Pipeline doesn't exist
+- `400 Bad Request` - Name mismatch in patch
+
+### Delete Pipeline
+
+```http
+DELETE /pipelines/{name}
+```
+
+Permanently deletes a pipeline. This removes the pipeline from the runtime
+and cannot be undone.
+
+**Response:** `204 No Content`
+
+**Errors:**
+- `404 Not Found` - Pipeline doesn't exist
 
 ### Pause Pipeline
 
@@ -203,7 +238,7 @@ Resumes a paused pipeline.
 POST /pipelines/{name}/stop
 ```
 
-Stops and removes a pipeline. Final checkpoint is saved.
+Stops a pipeline. Final checkpoint is saved.
 
 **Response:** `200 OK`
 ```json
@@ -218,13 +253,14 @@ Stops and removes a pipeline. Final checkpoint is saved.
 
 ## Schema Management
 
-### List Schemas
+### List Database Schemas
 
 ```http
 GET /pipelines/{name}/schemas
 ```
 
-Returns all tracked schemas for a pipeline.
+Returns all tracked database schemas for a pipeline. These are the schemas
+loaded directly from the source database.
 
 **Response:** `200 OK`
 ```json
@@ -264,185 +300,232 @@ Returns detailed schema information including all columns.
   "columns": [
     {
       "name": "id",
-      "column_type": "bigint(20) unsigned",
-      "data_type": "bigint",
+      "type": "bigint(20) unsigned",
       "nullable": false,
-      "ordinal_position": 1,
-      "default_value": null,
-      "extra": "auto_increment",
-      "is_primary_key": true
+      "default": null,
+      "extra": "auto_increment"
     },
     {
       "name": "customer_id",
-      "column_type": "int(11)",
-      "data_type": "int",
+      "type": "bigint(20)",
       "nullable": false,
-      "ordinal_position": 2,
-      "default_value": null,
-      "extra": null,
-      "is_primary_key": false
-    },
-    {
-      "name": "total",
-      "column_type": "decimal(10,2)",
-      "data_type": "decimal",
-      "nullable": true,
-      "ordinal_position": 3,
-      "default_value": "0.00",
-      "extra": null,
-      "is_primary_key": false
-    },
-    {
-      "name": "status",
-      "column_type": "enum('pending','shipped','delivered')",
-      "data_type": "enum",
-      "nullable": false,
-      "ordinal_position": 4,
-      "default_value": "pending",
-      "extra": null,
-      "is_primary_key": false
-    },
-    {
-      "name": "created_at",
-      "column_type": "datetime",
-      "data_type": "datetime",
-      "nullable": false,
-      "ordinal_position": 5,
-      "default_value": "CURRENT_TIMESTAMP",
-      "extra": "DEFAULT_GENERATED",
-      "is_primary_key": false
+      "default": null
     }
   ],
   "primary_key": ["id"],
-  "engine": "InnoDB",
-  "charset": null,
-  "collation": "utf8mb4_0900_ai_ci",
-  "fingerprint": "sha256:a1b2c3d4e5f6...",
-  "registry_version": 2,
-  "loaded_at": "2025-01-15T10:30:00Z"
+  "fingerprint": "sha256:a1b2c3d4..."
 }
 ```
 
-**Errors:**
-- `404 Not Found` — Pipeline doesn't exist
-- `500 Internal Server Error` — Table not found or query failed
+---
 
-### Reload All Schemas
+## Schema Sensing
 
-```http
-POST /pipelines/{name}/schemas/reload
-```
+Schema sensing automatically infers schema structure from JSON event payloads.
+This is useful for sources that don't provide schema metadata or for detecting
+schema evolution in JSON columns.
 
-Force-reloads all schemas matching the pipeline's table patterns. Use after
-out-of-band DDL changes.
-
-**Response:** `200 OK`
-```json
-{
-  "pipeline": "orders-cdc",
-  "tables_reloaded": 3,
-  "tables": [
-    {
-      "database": "shop",
-      "table": "orders",
-      "status": "ok",
-      "changed": true,
-      "error": null
-    },
-    {
-      "database": "shop",
-      "table": "customers",
-      "status": "ok",
-      "changed": false,
-      "error": null
-    },
-    {
-      "database": "shop",
-      "table": "products",
-      "status": "ok",
-      "changed": true,
-      "error": null
-    }
-  ],
-  "elapsed_ms": 245
-}
-```
-
-### Reload Single Table
+### List Inferred Schemas
 
 ```http
-POST /pipelines/{name}/schemas/{db}/{table}/reload
+GET /pipelines/{name}/sensing/schemas
 ```
 
-Reloads schema for a specific table and returns the updated details.
-
-**Response:** `200 OK`
-
-Same format as [Get Schema Details](#get-schema-details).
-
-### Get Schema Versions
-
-```http
-GET /pipelines/{name}/schemas/{db}/{table}/versions
-```
-
-Returns version history for a table's schema (newest first).
+Returns all schemas inferred via sensing for a pipeline.
 
 **Response:** `200 OK`
 ```json
 [
   {
-    "version": 2,
-    "fingerprint": "sha256:a1b2c3d4e5f6...",
-    "column_count": 5,
-    "registered_at": "2025-01-15T10:30:00Z"
-  },
-  {
-    "version": 1,
-    "fingerprint": "sha256:9876543210ab...",
-    "column_count": 4,
-    "registered_at": "2025-01-10T08:00:00Z"
+    "table": "orders",
+    "fingerprint": "sha256:abc123...",
+    "sequence": 3,
+    "event_count": 1500,
+    "stabilized": true,
+    "first_seen": "2025-01-15T10:30:00Z",
+    "last_seen": "2025-01-15T14:22:00Z"
   }
 ]
 ```
+
+| Field | Description |
+|-------|-------------|
+| `table` | Table name (or `table:column` for JSON column sensing) |
+| `fingerprint` | SHA-256 content hash of current schema |
+| `sequence` | Monotonic version number (increments on evolution) |
+| `event_count` | Total events observed |
+| `stabilized` | Whether schema has stopped sampling (structure stable) |
+| `first_seen` | First observation timestamp |
+| `last_seen` | Most recent observation timestamp |
+
+### Get Inferred Schema Details
+
+```http
+GET /pipelines/{name}/sensing/schemas/{table}
+```
+
+Returns detailed inferred schema including all fields.
+
+**Response:** `200 OK`
+```json
+{
+  "table": "orders",
+  "fingerprint": "sha256:abc123...",
+  "sequence": 3,
+  "event_count": 1500,
+  "stabilized": true,
+  "fields": [
+    {
+      "name": "id",
+      "types": ["integer"],
+      "nullable": false,
+      "optional": false
+    },
+    {
+      "name": "metadata",
+      "types": ["object"],
+      "nullable": true,
+      "optional": false,
+      "nested_field_count": 5
+    },
+    {
+      "name": "tags",
+      "types": ["array"],
+      "nullable": false,
+      "optional": true,
+      "array_element_types": ["string"]
+    }
+  ],
+  "first_seen": "2025-01-15T10:30:00Z",
+  "last_seen": "2025-01-15T14:22:00Z"
+}
+```
+
+### Export JSON Schema
+
+```http
+GET /pipelines/{name}/sensing/schemas/{table}/json-schema
+```
+
+Exports the inferred schema as a standard JSON Schema document.
+
+**Response:** `200 OK`
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "orders",
+  "type": "object",
+  "properties": {
+    "id": { "type": "integer" },
+    "metadata": { "type": ["object", "null"] },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "required": ["id", "metadata"]
+}
+```
+
+### Get Sensing Cache Statistics
+
+```http
+GET /pipelines/{name}/sensing/stats
+```
+
+Returns cache performance statistics for schema sensing.
+
+**Response:** `200 OK`
+```json
+{
+  "tables": [
+    {
+      "table": "orders",
+      "cached_structures": 3,
+      "max_cache_size": 100,
+      "cache_hits": 1450,
+      "cache_misses": 50
+    }
+  ],
+  "total_cache_hits": 1450,
+  "total_cache_misses": 50,
+  "hit_rate": 0.9667
+}
+```
+
+---
+
+## Drift Detection
+
+Drift detection compares expected database schema against observed data patterns
+to detect mismatches, unexpected nulls, and type drift.
+
+### Get Drift Results
+
+```http
+GET /pipelines/{name}/drift
+```
+
+Returns drift detection results for all tables in a pipeline.
+
+**Response:** `200 OK`
+```json
+[
+  {
+    "table": "orders",
+    "has_drift": true,
+    "columns": [
+      {
+        "column": "amount",
+        "expected_type": "decimal(10,2)",
+        "observed_types": ["string"],
+        "mismatch_count": 42,
+        "examples": ["\"99.99\""]
+      }
+    ],
+    "events_analyzed": 1500,
+    "events_with_drift": 42
+  }
+]
+```
+
+### Get Table Drift
+
+```http
+GET /pipelines/{name}/drift/{table}
+```
+
+Returns drift detection results for a specific table.
+
+**Response:** `200 OK`
+```json
+{
+  "table": "orders",
+  "has_drift": false,
+  "columns": [],
+  "events_analyzed": 1000,
+  "events_with_drift": 0
+}
+```
+
+**Errors:**
+- `404 Not Found` - Table not found or no drift data available
 
 ---
 
 ## Error Responses
 
-All errors return a plain text message with appropriate status code:
+All error responses follow this format:
 
-| Status | Meaning |
-|--------|---------|
-| `400 Bad Request` | Invalid request (e.g., name mismatch) |
-| `404 Not Found` | Pipeline or table not found |
+```json
+{
+  "error": "Description of the error"
+}
+```
+
+| Status Code | Meaning |
+|-------------|---------|
+| `400 Bad Request` | Invalid request body or parameters |
+| `404 Not Found` | Resource doesn't exist |
 | `409 Conflict` | Resource already exists |
-| `500 Internal Server Error` | Operation failed |
-
-**Example:**
-```http
-HTTP/1.1 404 Not Found
-Content-Type: text/plain
-
-pipeline orders-cdc not found
-```
-
----
-
-## Metrics
-
-Metrics are served on a separate port (default `:9000`):
-
-```http
-GET /metrics
-```
-
-Returns Prometheus-format metrics including:
-
-- `deltaforge_pipelines_total` — Total pipelines created
-- `deltaforge_running_pipeline` — Currently running pipelines (gauge)
-- `deltaforge_sink_events_total` — Events sent to sinks
-- `deltaforge_sink_batch_total` — Batches sent to sinks
-- `deltaforge_sink_latency_seconds` — Sink write latency histogram
-- `deltaforge_batch_events` — Events per batch histogram
-- `deltaforge_batch_bytes` — Bytes per batch histogram
+| `500 Internal Server Error` | Unexpected server error |

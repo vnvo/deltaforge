@@ -44,40 +44,36 @@ Deltaforge is meant to replace tools like Debezium and similar.
 ## Features
 
 - **Sources**
-  - MySQL binlog CDC.
-  - Postgres logical replication.
-  - Wildcard table patterns (`shop.order%`, `%.audit_log`)
+  - MySQL binlog CDC
+  - Turso/libSQL CDC with multiple modes:
+    - **Native**: Uses Turso's built-in CDC via `turso_cdc` table
+    - **Triggers**: Shadow tables populated by triggers (standard SQLite compatible)
+    - **Polling**: Track changes via rowid/timestamp columns
+    - **Auto**: Automatic fallback chain (native → triggers → polling)
 
 - **Schema Registry**
-  - Source-owned schema types (MySQL, PostgreSQL native semantics)
-  - SHA-256 content fingerprinting for change detection
-  - Version tracking with sequence numbers for replay
-  - Automatic DDL detection and cache invalidation
+  - Source-owned schema types (MySQL, Turso/SQLite native semantics)
+  - Schema change detection and versioning
+
+- **Schema Sensing**
+  - Automatic schema inference from JSON event payloads
+  - Deep inspection for nested JSON structures
+  - Configurable sampling with warmup and cache optimization
+  - Drift detection comparing DB schema vs observed data
+  - JSON Schema export for downstream consumers
 
 - **Checkpoints**
   - Pluggable backends (File, SQLite with versioning, in-memory)
   - Configurable commit policies (all, required, quorum)
-  - Transaction boundary preservation
+  - Transaction boundary preservation (best effort)
 
 - **Processors**
   - JavaScript processors using `deno_core`:
-    - Run user defined functions (UDFs) in JS to transform batches of events.
+    - Run user defined functions (UDFs) in JS to transform batches of events
 
 - **Sinks**
-  - Kafka producer sink (via `rdkafka`).
-  - Redis stream sink.
-
-- **Core runtime**
-  - Unified `Event` model (`before` / `after` images, DDL payloads, tx id, schema version, timestamps, etc.).
-  - Checkpointing.
-  - Batch support.
-  - Multiple pipeline at the same time.
-
-- **Control plane & observability**
-  - REST API for pipeline lifecycle management
-  - Prometheus metrics endpoint
-  - Health/readiness probes
-
+  - Kafka producer sink (via `rdkafka`)
+  - Redis stream sink
 
 ## Documentation
 
@@ -97,7 +93,6 @@ Use the bundled `dev.sh` CLI to spin up the dependency stack and run common work
 See the [Development guide](docs/src/development.md) for the full layout and additional info.
 
 ## Container image
-
 
 Pre-built multi-arch images (amd64/arm64) are available:
 ```bash
@@ -127,16 +122,28 @@ docker run --rm \
   --config /etc/deltaforge/pipelines.yaml
 ```
 
+or with env variables to be expanded inside the provided config:
+```bash
+# pull the container
+docker pull ghcr.io/vnvo/deltaforge:latest
+
+# run it
+docker run --rm \
+  -p 8080:8080 -p 9000:9000 \
+  -e MYSQL_DSN="mysql://user:pass@host:3306/db" \
+  -e KAFKA_BROKERS="kafka:9092" \
+  -v $(pwd)/pipeline.yaml:/etc/deltaforge/pipeline.yaml:ro \
+  -v deltaforge-checkpoints:/app/data \
+  ghcr.io/vnvo/deltaforge:latest \
+  --config /etc/deltaforge/pipeline.yaml
+```
+
 The container runs as a non-root user, writes checkpoints to `/app/data/df_checkpoints.json`, and listens on `0.0.0.0:8080` for the control plane API with metrics served on `:9000`.
 
 
 ## Architecture Highlights
 
-### Source-Owned Schemas
-
-Unlike tools that normalize all databases to a universal type system, DeltaForge lets each source define its own schema semantics. MySQL schemas capture MySQL types (`bigint(20) unsigned`, `json`), PostgreSQL schemas preserve arrays and custom types. No lossy normalization, no universal type maintenance burden.
-
-### Checkpoint Timing Guarantees
+### At-least-once and Checkpoint Timing Guarantees
 
 DeltaForge guarantees at-least-once delivery through careful checkpoint ordering:
 
@@ -155,6 +162,10 @@ Checkpoints are never saved before events are delivered. A crash between deliver
 
 The schema registry tracks schema versions with sequence numbers and optional checkpoint correlation. During replay, events are interpreted with the schema that was active when they were produced — even if the table structure has since changed.
 
+### Source-Owned Schemas
+
+Unlike tools that normalize all databases to a universal type system, DeltaForge lets each source define its own schema semantics. MySQL schemas capture MySQL types (`bigint(20) unsigned`, `json`), PostgreSQL schemas preserve arrays and custom types. No lossy normalization, no universal type maintenance burden.
+
 
 ## API
 
@@ -165,20 +176,30 @@ configuration.
 
 ### Health
 
-- `GET /healthz` — lightweight liveness probe returning `ok`.
-- `GET /readyz` — readiness view returning `{"status":"ready","pipelines":[...]}`
+- `GET /healthz` - lightweight liveness probe returning `ok`.
+- `GET /readyz` - readiness view returning `{"status":"ready","pipelines":[...]}`
   with the current pipeline states.
 
 ### Pipeline management
 
-- `GET /pipelines` — list all pipelines with their current status and config.
-- `POST /pipelines` — create a new pipeline from a full `PipelineSpec` document.
-- `PATCH /pipelines/{name}` — apply a partial JSON patch to an existing pipeline
+- `GET /pipelines` - list all pipelines with their current status and config.
+- `POST /pipelines` - create a new pipeline from a full `PipelineSpec` document.
+- `GET /pipelines/{name}` - get a single pipeline by name.
+- `PATCH /pipelines/{name}` - apply a partial JSON patch to an existing pipeline
   (e.g., adjust batch or connection settings) and restart it with the merged spec.
-- `POST /pipelines/{name}/pause` — pause ingestion and processing for the pipeline.
-- `POST /pipelines/{name}/resume` — resume a paused pipeline.
-- `POST /pipelines/{name}/stop` — stop a running pipeline.
+- `DELETE /pipelines/{name}` - permanently delete a pipeline.
+- `POST /pipelines/{name}/pause` - pause ingestion and processing for the pipeline.
+- `POST /pipelines/{name}/resume` - resume a paused pipeline.
+- `POST /pipelines/{name}/stop` - stop a running pipeline.
 
+### Schema endpoints
+
+- `GET /pipelines/{name}/schemas` - list DB schemas for the pipeline.
+- `GET /pipelines/{name}/sensing/schemas` - list inferred schemas (from sensing).
+- `GET /pipelines/{name}/sensing/schemas/{table}` - get inferred schema details.
+- `GET /pipelines/{name}/sensing/schemas/{table}/json-schema` - export as JSON Schema.
+- `GET /pipelines/{name}/drift` - get drift detection results.
+- `GET /pipelines/{name}/sensing/stats` - get schema sensing cache statistics.
 
 
 ## Configuration schema
@@ -199,24 +220,22 @@ spec:
     count: 4
     key: customer_id
 
-  # Source definition (for MySQL)
+  # Source definition (MySQL example)
   source:
     type: mysql
     config:
       id: orders-mysql
       dsn: ${MYSQL_DSN}
-      publication: orders_pub
-      slot: orders_slot
       tables:
-        - public.orders
+        - shop.orders
 
   # Zero or more processors
   processors:
     - type: javascript
       id: transform
       inline: |
-        function process(batch) {
-          return batch;
+        function processBatch(events) {
+          return events;
         }
       limits:
         cpu_ms: 50
@@ -240,7 +259,7 @@ spec:
         uri: ${REDIS_URI}
         stream: orders
   
-  # batch config
+  # Batch config
   batch:
     max_events: 500
     max_bytes: 1048576
@@ -248,29 +267,41 @@ spec:
     respect_source_tx: true
     max_inflight: 2
 
+  # Commit policy
   commit_policy:
     mode: quorum
     quorum: 2
+
+  # Optional: schema sensing
+  schema_sensing:
+    enabled: true
+    deep_inspect:
+      enabled: true
+      max_depth: 3
+    sampling:
+      warmup_events: 50
+      sample_rate: 5
 ```
 
 Key fields:
 
-- `metadata` — required name (used as pipeline identifier) and tenant label.
-- `spec.sharding` — optional hint for downstream distribution.
-- `spec.source` — required Postgres or MySQL configuration.
-- `spec.processors` — ordered processors; JavaScript is supported today with optional resource limits.
-- `spec.sinks` — one or more sinks; Kafka supports `required`, `exactly_once`, and raw `client_conf` overrides; Redis streams are also available.
-- `spec.batch` — optional thresholds that define the commit unit.
-- `spec.commit_policy` — how sink acknowledgements gate checkpoint commits (`all`, `required` (default), or `quorum`).
+- `metadata` - required name (used as pipeline identifier) and tenant label.
+- `spec.sharding` - optional hint for downstream distribution.
+- `spec.source` - required source configuration (MySQL, Turso, or PostgreSQL).
+- `spec.processors` - ordered processors; JavaScript is supported today with optional resource limits.
+- `spec.sinks` - one or more sinks; Kafka supports `required`, `exactly_once`, and raw `client_conf` overrides; Redis streams are also available.
+- `spec.batch` - optional thresholds that define the commit unit.
+- `spec.commit_policy` - how sink acknowledgements gate checkpoint commits (`all`, `required` (default), or `quorum`).
+- `spec.schema_sensing` - optional automatic schema inference from event payloads.
 
 
 ## Roadmap
 
+- [ ] PostgreSQL source implementation
 - [ ] Persistent schema registry (SQLite, then PostgreSQL)
 - [ ] PostgreSQL/S3 checkpoint backends for HA
-- [ ] Turso/SQLite source
-- [ ] ClickHouse source  
 - [ ] MongoDB source
+- [ ] ClickHouse sink  
 - [ ] Event store for time-based replay
 - [ ] Distributed coordination for HA
 
@@ -285,5 +316,5 @@ Licensed under either of
 at your option.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this crate by you shall be dual licensed as above, without
+for inclusion in this project by you shall be dual licensed as above, without
 additional terms or conditions.

@@ -18,8 +18,8 @@ spec:
     - type: javascript
       id: redact-email
       inline: |
-        function process(batch) {
-          return batch.map((event) => {
+        function processBatch(events) {
+          return events.map((event) => {
             if (event.after && event.after.email) {
               event.after.email = "[redacted]";
             }

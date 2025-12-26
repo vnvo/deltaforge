@@ -26,7 +26,7 @@ Processors run in the declared order for each batch. The built-in processor type
 
 - `type: javascript`
   - `id`: processor label.
-  - `inline`: JS source. Export a `process(batch)` function that returns the transformed batch.
+  - `inline`: JS source. Export a `processBatch(events)` function that returns the transformed batch.
   - `limits` (optional): resource guardrails (`cpu_ms`, `mem_mb`, `timeout_ms`).
 
 ## Batching

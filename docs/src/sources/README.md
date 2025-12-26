@@ -4,7 +4,9 @@ DeltaForge's only fully supported CDC source today is MySQL binlog ingestion. Ea
 
 Current built-in source type:
 
-- [`mysql`](mysql.md) — MySQL binlog CDC.
+- [`mysql`](mysql.md) - MySQL binlog CDC.
+- [`turso/sqlite`](turso.md) - Turso CDC.
+
 
 The source interface is pluggable; if you experiment with engines like Postgres logical replication, treat them as variations until they ship with formal support and docs.
 
