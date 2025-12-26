@@ -28,7 +28,9 @@ use schema_registry::{InMemoryRegistry, SourceSchema};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use super::turso_table_schema::{SqliteAffinity, TursoColumn, TursoTableSchema};
+use super::turso_table_schema::{
+    SqliteAffinity, TursoColumn, TursoTableSchema,
+};
 use crate::schema_loader::{
     LoadedSchema as ApiLoadedSchema, SchemaListEntry, SourceSchemaLoader,
 };
@@ -120,7 +122,10 @@ impl TursoSchemaLoader {
     ///
     /// # Returns
     /// List of table names that were successfully loaded.
-    pub async fn preload(&self, patterns: &[String]) -> SourceResult<Vec<String>> {
+    pub async fn preload(
+        &self,
+        patterns: &[String],
+    ) -> SourceResult<Vec<String>> {
         let t0 = Instant::now();
         let tables = self.expand_patterns(patterns).await?;
 
@@ -134,7 +139,9 @@ impl TursoSchemaLoader {
         for table in &tables {
             match self.load_schema(table).await {
                 Ok(_) => loaded.push(table.clone()),
-                Err(e) => warn!(table = %table, error = %e, "failed to preload schema"),
+                Err(e) => {
+                    warn!(table = %table, error = %e, "failed to preload schema")
+                }
             }
         }
 
@@ -149,7 +156,10 @@ impl TursoSchemaLoader {
     }
 
     /// Expand wildcard patterns to actual table list.
-    pub async fn expand_patterns(&self, patterns: &[String]) -> SourceResult<Vec<String>> {
+    pub async fn expand_patterns(
+        &self,
+        patterns: &[String],
+    ) -> SourceResult<Vec<String>> {
         let all_tables = self.list_all_tables().await?;
         let mut results = Vec::new();
 
@@ -177,7 +187,8 @@ impl TursoSchemaLoader {
             } else if pattern.contains('.') {
                 // db.table format - extract table name
                 let table = pattern.split('.').last().unwrap_or(pattern);
-                if all_tables.contains(&table.to_string()) && !results.contains(&table.to_string())
+                if all_tables.contains(&table.to_string())
+                    && !results.contains(&table.to_string())
                 {
                     results.push(table.to_string());
                 }
@@ -195,7 +206,7 @@ impl TursoSchemaLoader {
     /// List all user tables in the database.
     async fn list_all_tables(&self) -> SourceResult<Vec<String>> {
         use libsql::Value;
-        
+
         let mut tables = Vec::new();
 
         // Try PRAGMA table_list first (SQLite 3.37+)
@@ -300,8 +311,8 @@ impl TursoSchemaLoader {
             Arc::new(schema.columns.iter().map(|c| c.name.clone()).collect());
 
         // Register with schema registry
-        let schema_json =
-            serde_json::to_value(&schema).map_err(|e| SourceError::Other(e.into()))?;
+        let schema_json = serde_json::to_value(&schema)
+            .map_err(|e| SourceError::Other(e.into()))?;
 
         let version = self
             .registry
@@ -341,24 +352,25 @@ impl TursoSchemaLoader {
     }
 
     /// Fetch schema from database using PRAGMA commands.
-    async fn fetch_schema(&self, table: &str) -> SourceResult<TursoTableSchema> {
+    async fn fetch_schema(
+        &self,
+        table: &str,
+    ) -> SourceResult<TursoTableSchema> {
         let mut columns = Vec::new();
 
         // Get column info via PRAGMA table_info
         // Returns columns: cid, name, type, notnull, dflt_value, pk
         let sql = format!("PRAGMA table_info('{}')", escape_table_name(table));
         debug!(sql = %sql, "fetching schema");
-        
-        let mut rows = self
-            .conn
-            .query(&sql, ())
-            .await
-            .map_err(|e| SourceError::Connect {
+
+        let mut rows = self.conn.query(&sql, ()).await.map_err(|e| {
+            SourceError::Connect {
                 details: e.to_string().into(),
-            })?;
+            }
+        })?;
 
         use libsql::Value;
-        
+
         while let Ok(Some(row)) = rows.next().await {
             // Extract columns using Value enum: cid(0), name(1), type(2), notnull(3), dflt_value(4), pk(5)
             let cid = match row.get_value(0) {
@@ -393,12 +405,8 @@ impl TursoSchemaLoader {
 
             debug!(cid, name = %name, col_type = %col_type, notnull, pk, "parsed column");
 
-            let mut col = TursoColumn::new(
-                &name,
-                &col_type,
-                notnull == 0,
-                cid as usize,
-            );
+            let mut col =
+                TursoColumn::new(&name, &col_type, notnull == 0, cid as usize);
             col.default_value = dflt_value;
             col.is_primary_key = pk > 0;
             columns.push(col);
@@ -406,7 +414,11 @@ impl TursoSchemaLoader {
 
         if columns.is_empty() {
             return Err(SourceError::Schema {
-                details: format!("table '{}' not found or has no columns", table).into(),
+                details: format!(
+                    "table '{}' not found or has no columns",
+                    table
+                )
+                .into(),
             });
         }
 
@@ -424,7 +436,9 @@ impl TursoSchemaLoader {
             let upper = sql.to_uppercase();
             if upper.contains("AUTOINCREMENT") {
                 for col in &mut columns {
-                    if col.is_primary_key && col.affinity == SqliteAffinity::Integer {
+                    if col.is_primary_key
+                        && col.affinity == SqliteAffinity::Integer
+                    {
                         col.is_autoincrement = true;
                     }
                 }
@@ -507,7 +521,10 @@ impl TursoSchemaLoader {
     }
 
     /// Get the CREATE TABLE statement.
-    async fn get_create_statement(&self, table: &str) -> SourceResult<Option<String>> {
+    async fn get_create_statement(
+        &self,
+        table: &str,
+    ) -> SourceResult<Option<String>> {
         let mut rows = self
             .conn
             .query(
@@ -534,13 +551,19 @@ impl TursoSchemaLoader {
     // ========================================================================
 
     /// Force reload schema from database (bypasses cache).
-    pub async fn reload_schema(&self, table: &str) -> SourceResult<LoadedSchema> {
+    pub async fn reload_schema(
+        &self,
+        table: &str,
+    ) -> SourceResult<LoadedSchema> {
         self.cache.write().await.remove(table);
         self.load_schema(table).await
     }
 
     /// Reload all schemas matching patterns.
-    pub async fn reload_all_patterns(&self, patterns: &[String]) -> SourceResult<Vec<String>> {
+    pub async fn reload_all_patterns(
+        &self,
+        patterns: &[String],
+    ) -> SourceResult<Vec<String>> {
         self.cache.write().await.clear();
         self.preload(patterns).await
     }
@@ -571,7 +594,10 @@ impl TursoSchemaLoader {
     }
 
     /// Get column names for a table.
-    pub async fn column_names(&self, table: &str) -> SourceResult<Arc<Vec<String>>> {
+    pub async fn column_names(
+        &self,
+        table: &str,
+    ) -> SourceResult<Arc<Vec<String>>> {
         let loaded = self.load_schema(table).await?;
         Ok(Arc::clone(&loaded.column_names))
     }
@@ -587,20 +613,31 @@ impl SourceSchemaLoader for TursoSchemaLoader {
         "turso"
     }
 
-    async fn load(&self, db: &str, table: &str) -> anyhow::Result<ApiLoadedSchema> {
+    async fn load(
+        &self,
+        db: &str,
+        table: &str,
+    ) -> anyhow::Result<ApiLoadedSchema> {
         // For SQLite, db is typically "main" - we use our configured db_name
         let _ = db;
         let loaded = self.load_schema(table).await?;
         Ok(to_api_schema(&self.db_name, table, &loaded))
     }
 
-    async fn reload(&self, db: &str, table: &str) -> anyhow::Result<ApiLoadedSchema> {
+    async fn reload(
+        &self,
+        db: &str,
+        table: &str,
+    ) -> anyhow::Result<ApiLoadedSchema> {
         let _ = db;
         let loaded = self.reload_schema(table).await?;
         Ok(to_api_schema(&self.db_name, table, &loaded))
     }
 
-    async fn reload_all(&self, patterns: &[String]) -> anyhow::Result<Vec<(String, String)>> {
+    async fn reload_all(
+        &self,
+        patterns: &[String],
+    ) -> anyhow::Result<Vec<(String, String)>> {
         self.cache.write().await.clear();
         let tables = self.preload(patterns).await?;
         // Convert Vec<String> to Vec<(String, String)> with db_name
@@ -632,7 +669,11 @@ impl SourceSchemaLoader for TursoSchemaLoader {
 // ============================================================================
 
 /// Convert internal LoadedSchema to API LoadedSchema.
-fn to_api_schema(db: &str, table: &str, loaded: &LoadedSchema) -> ApiLoadedSchema {
+fn to_api_schema(
+    db: &str,
+    table: &str,
+    loaded: &LoadedSchema,
+) -> ApiLoadedSchema {
     ApiLoadedSchema {
         database: db.to_string(),
         table: table.to_string(),
@@ -695,7 +736,9 @@ mod tests {
     #[tokio::test]
     async fn test_loaded_schema_clone() {
         // Ensure LoadedSchema can be cloned efficiently
-        let schema = TursoTableSchema::new(vec![TursoColumn::new("id", "INTEGER", false, 0)]);
+        let schema = TursoTableSchema::new(vec![TursoColumn::new(
+            "id", "INTEGER", false, 0,
+        )]);
 
         let loaded = LoadedSchema {
             schema,

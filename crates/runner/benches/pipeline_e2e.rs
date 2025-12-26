@@ -14,15 +14,14 @@ use futures::FutureExt;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use deltaforge_config::{BatchConfig, SchemaSensingConfig, SamplingConfig};
+use deltaforge_config::{BatchConfig, SamplingConfig, SchemaSensingConfig};
 use deltaforge_core::{
     ArcDynSink, CheckpointMeta, Event, Op, Sink, SinkResult, SourceMeta,
 };
 use serde_json::json;
 
 use runner::{
-    Coordinator, ProcessedBatch, SchemaSensorState,
-    CommitCpFn, ProcessBatchFn,
+    CommitCpFn, Coordinator, ProcessBatchFn, ProcessedBatch, SchemaSensorState,
 };
 
 // =============================================================================
@@ -305,7 +304,10 @@ fn make_sensing_config_with_cache(cache_enabled: bool) -> SchemaSensingConfig {
     }
 }
 
-fn make_sensing_config_with_sampling(warmup: usize, rate: usize) -> SchemaSensingConfig {
+fn make_sensing_config_with_sampling(
+    warmup: usize,
+    rate: usize,
+) -> SchemaSensingConfig {
     SchemaSensingConfig {
         enabled: true,
         sampling: SamplingConfig {
@@ -423,8 +425,14 @@ fn bench_coordinator_throughput(c: &mut Criterion) {
                     )
                     .await
                     .unwrap();
-                    assert_eq!(count1.load(Ordering::Relaxed), evs.len() as u64);
-                    assert_eq!(count2.load(Ordering::Relaxed), evs.len() as u64);
+                    assert_eq!(
+                        count1.load(Ordering::Relaxed),
+                        evs.len() as u64
+                    );
+                    assert_eq!(
+                        count2.load(Ordering::Relaxed),
+                        evs.len() as u64
+                    );
                 })
             },
         );
@@ -501,14 +509,19 @@ fn bench_multi_sink_scaling(c: &mut Criterion) {
                 b.to_async(&rt).iter(|| async {
                     let sinks: Vec<ArcDynSink> = (0..sink_count)
                         .map(|i| {
-                            let (sink, _, _) = CountingSink::new(&format!("sink-{}", i));
+                            let (sink, _, _) =
+                                CountingSink::new(&format!("sink-{}", i));
                             sink as ArcDynSink
                         })
                         .collect();
 
-                    run_coordinator_bench(evs.clone(), sinks, make_batch_config(100, 10))
-                        .await
-                        .unwrap();
+                    run_coordinator_bench(
+                        evs.clone(),
+                        sinks,
+                        make_batch_config(100, 10),
+                    )
+                    .await
+                    .unwrap();
                 })
             },
         );
@@ -527,7 +540,11 @@ fn bench_event_sizes(c: &mut Criterion) {
         .map(|i| {
             Event::new_row(
                 "t".into(),
-                SourceMeta { kind: "b".into(), host: "h".into(), db: "d".into() },
+                SourceMeta {
+                    kind: "b".into(),
+                    host: "h".into(),
+                    db: "d".into(),
+                },
                 "d.t".into(),
                 Op::Insert,
                 None,
@@ -560,7 +577,11 @@ fn bench_event_sizes(c: &mut Criterion) {
                 .collect();
             Event::new_row(
                 "tenant".into(),
-                SourceMeta { kind: "mysql".into(), host: "db.local".into(), db: "warehouse".into() },
+                SourceMeta {
+                    kind: "mysql".into(),
+                    host: "db.local".into(),
+                    db: "warehouse".into(),
+                },
                 "warehouse.inventory".into(),
                 Op::Insert,
                 None,
@@ -576,27 +597,39 @@ fn bench_event_sizes(c: &mut Criterion) {
     group.bench_function("small_events", |b| {
         b.to_async(&rt).iter(|| async {
             let (sink, _, _) = CountingSink::new("sink");
-            run_coordinator_bench(small_events.clone(), vec![sink], make_batch_config(100, 10))
-                .await
-                .unwrap();
+            run_coordinator_bench(
+                small_events.clone(),
+                vec![sink],
+                make_batch_config(100, 10),
+            )
+            .await
+            .unwrap();
         })
     });
 
     group.bench_function("medium_events", |b| {
         b.to_async(&rt).iter(|| async {
             let (sink, _, _) = CountingSink::new("sink");
-            run_coordinator_bench(medium_events.clone(), vec![sink], make_batch_config(100, 10))
-                .await
-                .unwrap();
+            run_coordinator_bench(
+                medium_events.clone(),
+                vec![sink],
+                make_batch_config(100, 10),
+            )
+            .await
+            .unwrap();
         })
     });
 
     group.bench_function("large_events", |b| {
         b.to_async(&rt).iter(|| async {
             let (sink, _, _) = CountingSink::new("sink");
-            run_coordinator_bench(large_events.clone(), vec![sink], make_batch_config(100, 10))
-                .await
-                .unwrap();
+            run_coordinator_bench(
+                large_events.clone(),
+                vec![sink],
+                make_batch_config(100, 10),
+            )
+            .await
+            .unwrap();
         })
     });
 
@@ -619,9 +652,13 @@ fn bench_schema_sensing(c: &mut Criterion) {
         |b, evs| {
             b.to_async(&rt).iter(|| async {
                 let (sink, _, _) = CountingSink::new("sink");
-                run_coordinator_bench(evs.clone(), vec![sink], make_batch_config(100, 10))
-                    .await
-                    .unwrap();
+                run_coordinator_bench(
+                    evs.clone(),
+                    vec![sink],
+                    make_batch_config(100, 10),
+                )
+                .await
+                .unwrap();
             })
         },
     );
@@ -804,11 +841,19 @@ mod summary {
     fn print_throughput_summary() {
         println!("\n");
         println!("Notes:");
-        println!("  - Benchmarks measure coordinator throughput (in-memory → sinks)");
+        println!(
+            "  - Benchmarks measure coordinator throughput (in-memory → sinks)"
+        );
         println!("  - Real-world includes binlog parsing, network I/O");
-        println!("  - Structure cache uses top-level keys only (O(k) not O(nodes))");
-        println!("  - Sampling recommended for production: warmup=1000, rate=10");
-        println!("  - Cache effective for homogeneous data (same column structure)");
+        println!(
+            "  - Structure cache uses top-level keys only (O(k) not O(nodes))"
+        );
+        println!(
+            "  - Sampling recommended for production: warmup=1000, rate=10"
+        );
+        println!(
+            "  - Cache effective for homogeneous data (same column structure)"
+        );
         println!("\n");
     }
 }

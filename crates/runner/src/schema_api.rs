@@ -161,7 +161,8 @@ impl SchemaController for SchemaApi {
             .list_versions(&tenant, db, table)
             .into_iter()
             .map(|v| {
-                let col_count = v.schema_json
+                let col_count = v
+                    .schema_json
                     .get("columns")
                     .and_then(|c| c.as_array())
                     .map(|arr| arr.len())

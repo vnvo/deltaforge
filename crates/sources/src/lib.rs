@@ -1,6 +1,6 @@
 pub(crate) mod conn_utils;
-pub mod schema_loader;
 pub mod mysql;
+pub mod schema_loader;
 pub mod turso;
 
 use anyhow::Result;
@@ -10,7 +10,9 @@ use schema_registry::InMemoryRegistry;
 use std::sync::Arc;
 
 // Re-export loader types
-pub use schema_loader::{ArcSchemaLoader, LoadedSchema, SchemaListEntry, SourceSchemaLoader};
+pub use schema_loader::{
+    ArcSchemaLoader, LoadedSchema, SchemaListEntry, SourceSchemaLoader,
+};
 
 // Re-export source types
 pub use mysql::{MySqlCheckpoint, MySqlSource};
@@ -53,9 +55,11 @@ pub fn build_schema_loader(
     registry: Arc<InMemoryRegistry>,
 ) -> Option<ArcSchemaLoader> {
     match &pipeline.spec.source {
-        SourceCfg::Mysql(c) => Some(Arc::new(
-            mysql::MySqlSchemaLoader::new(&c.dsn, registry, &pipeline.metadata.tenant)
-        )),
+        SourceCfg::Mysql(c) => Some(Arc::new(mysql::MySqlSchemaLoader::new(
+            &c.dsn,
+            registry,
+            &pipeline.metadata.tenant,
+        ))),
         _ => None,
     }
 }

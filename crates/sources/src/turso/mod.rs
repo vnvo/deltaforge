@@ -26,8 +26,8 @@ pub use turso_schema_loader::{LoadedSchema, TursoSchemaLoader};
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -37,14 +37,15 @@ use checkpoints::{CheckpointStore, CheckpointStoreExt};
 use chrono::Utc;
 use deltaforge_config::{TursoCdcMode, TursoSrcCfg};
 use deltaforge_core::{
-    CheckpointMeta, Event, Op, Source, SourceError, SourceHandle, SourceMeta, SourceResult,
+    CheckpointMeta, Event, Op, Source, SourceError, SourceHandle, SourceMeta,
+    SourceResult,
 };
 use libsql::Connection;
 use metrics::counter;
 use schema_registry::InMemoryRegistry;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::{mpsc, Notify},
+    sync::{Notify, mpsc},
     time::sleep,
 };
 use tokio_util::sync::CancellationToken;
@@ -168,12 +169,11 @@ impl TursoSource {
         } else if self.cfg.url.starts_with("file://") {
             // Local SQLite file with file:// prefix
             let path = self.cfg.url.trim_start_matches("file://");
-            Builder::new_local(path)
-                .build()
-                .await
-                .map_err(|e| SourceError::Connect {
+            Builder::new_local(path).build().await.map_err(|e| {
+                SourceError::Connect {
                     details: e.to_string().into(),
-                })?
+                }
+            })?
         } else {
             // Assume it's a file path
             Builder::new_local(&self.cfg.url)
@@ -193,17 +193,15 @@ impl TursoSource {
 
     /// Get the CDC table name (default: turso_cdc).
     fn cdc_table_name(&self) -> &str {
-        self.cfg
-            .cdc_table_name
-            .as_deref()
-            .unwrap_or("turso_cdc")
+        self.cfg.cdc_table_name.as_deref().unwrap_or("turso_cdc")
     }
 
     /// Enable native CDC on the connection.
     /// Must be called before any changes you want to capture.
     async fn enable_native_cdc(&self, conn: &Connection) -> SourceResult<()> {
         let level = self.cfg.native_cdc_level.pragma_value();
-        let pragma_value = if let Some(ref table_name) = self.cfg.cdc_table_name {
+        let pragma_value = if let Some(ref table_name) = self.cfg.cdc_table_name
+        {
             format!("{},{}", level, table_name)
         } else {
             level.to_string()
@@ -216,9 +214,9 @@ impl TursoSource {
 
         debug!(pragma = %sql, "enabling native CDC");
 
-        conn.execute(&sql, ())
-            .await
-            .map_err(|e| SourceError::Other(anyhow::anyhow!("failed to enable CDC: {}", e)))?;
+        conn.execute(&sql, ()).await.map_err(|e| {
+            SourceError::Other(anyhow::anyhow!("failed to enable CDC: {}", e))
+        })?;
 
         info!(
             level = %level,
@@ -315,12 +313,22 @@ impl TursoSource {
             // Clone checkpoint to avoid borrow/move conflicts across loop iterations
             let (updated_checkpoint, changes_found) = match effective_mode {
                 TursoCdcMode::Native => {
-                    self.poll_native_cdc_changes(&conn, &tx, checkpoint.clone(), &source_meta)
-                        .await?
+                    self.poll_native_cdc_changes(
+                        &conn,
+                        &tx,
+                        checkpoint.clone(),
+                        &source_meta,
+                    )
+                    .await?
                 }
                 TursoCdcMode::Triggers => {
-                    self.poll_trigger_changes(&conn, &tx, checkpoint.clone(), &source_meta)
-                        .await?
+                    self.poll_trigger_changes(
+                        &conn,
+                        &tx,
+                        checkpoint.clone(),
+                        &source_meta,
+                    )
+                    .await?
                 }
                 TursoCdcMode::Polling => {
                     self.poll_rowid_changes(
@@ -343,10 +351,14 @@ impl TursoSource {
             // Update checkpoint with new state
             checkpoint = updated_checkpoint;
             checkpoint.timestamp_ms = Utc::now().timestamp_millis();
-            
+
             // Serialize and save using put_raw to avoid lifetime issues with generic put()
-            let checkpoint_bytes = serde_json::to_vec(&checkpoint).unwrap_or_default();
-            if let Err(e) = chkpt_store.put_raw(&self.checkpoint_key, &checkpoint_bytes).await {
+            let checkpoint_bytes =
+                serde_json::to_vec(&checkpoint).unwrap_or_default();
+            if let Err(e) = chkpt_store
+                .put_raw(&self.checkpoint_key, &checkpoint_bytes)
+                .await
+            {
                 warn!(error = %e, "failed to save checkpoint");
             }
 
@@ -364,7 +376,10 @@ impl TursoSource {
     }
 
     /// Expand table patterns to concrete table names.
-    async fn expand_table_patterns(&self, conn: &Connection) -> SourceResult<Vec<String>> {
+    async fn expand_table_patterns(
+        &self,
+        conn: &Connection,
+    ) -> SourceResult<Vec<String>> {
         let temp_loader = TursoSchemaLoader::new(
             Arc::new(conn.clone()),
             self.registry.clone(),
@@ -389,7 +404,9 @@ impl TursoSource {
                         if self.check_native_cdc_available(conn).await? {
                             Ok(TursoCdcMode::Native)
                         } else {
-                            warn!("native CDC enabled but table not found, falling back to triggers");
+                            warn!(
+                                "native CDC enabled but table not found, falling back to triggers"
+                            );
                             self.setup_cdc_triggers(conn, tables).await?;
                             Ok(TursoCdcMode::Triggers)
                         }
@@ -409,7 +426,12 @@ impl TursoSource {
             TursoCdcMode::Auto => {
                 // Try native first
                 match self.enable_native_cdc(conn).await {
-                    Ok(()) if self.check_native_cdc_available(conn).await.unwrap_or(false) => {
+                    Ok(())
+                        if self
+                            .check_native_cdc_available(conn)
+                            .await
+                            .unwrap_or(false) =>
+                    {
                         info!("auto-detected native CDC support");
                         Ok(TursoCdcMode::Native)
                     }
@@ -431,7 +453,10 @@ impl TursoSource {
     }
 
     /// Check if native CDC is available (Turso with CDC enabled).
-    async fn check_native_cdc_available(&self, conn: &Connection) -> SourceResult<bool> {
+    async fn check_native_cdc_available(
+        &self,
+        conn: &Connection,
+    ) -> SourceResult<bool> {
         let table = self.cdc_table_name();
         let sql = format!("SELECT 1 FROM {} LIMIT 0", table);
         let result = conn.query(&sql, ()).await;
@@ -439,8 +464,13 @@ impl TursoSource {
     }
 
     /// Check if CDC triggers are already set up.
-    async fn check_triggers_available(&self, conn: &Connection) -> SourceResult<bool> {
-        let result = conn.query("SELECT 1 FROM _df_cdc_changes LIMIT 0", ()).await;
+    async fn check_triggers_available(
+        &self,
+        conn: &Connection,
+    ) -> SourceResult<bool> {
+        let result = conn
+            .query("SELECT 1 FROM _df_cdc_changes LIMIT 0", ())
+            .await;
         Ok(result.is_ok())
     }
 
@@ -455,8 +485,9 @@ impl TursoSource {
         checkpoint: &TursoCheckpoint,
     ) -> Event {
         let checkpoint_bytes = checkpoint.to_bytes();
-        let size_estimate = before.as_ref().map(|v| v.to_string().len()).unwrap_or(0)
-            + after.as_ref().map(|v| v.to_string().len()).unwrap_or(0);
+        let size_estimate =
+            before.as_ref().map(|v| v.to_string().len()).unwrap_or(0)
+                + after.as_ref().map(|v| v.to_string().len()).unwrap_or(0);
 
         let mut event = Event::new_row(
             self.tenant.clone(),
@@ -509,14 +540,17 @@ impl TursoSource {
         for table_pattern in tracked_tables {
             // For wildcards, we need to query all tables and filter
             // For now, handle exact table names; wildcards can be expanded later
-            let table_name = if table_pattern == "*" || table_pattern.contains('%') {
-                // For wildcards, query without table filter and handle in Rust
-                None
-            } else {
-                Some(table_pattern.as_str())
-            };
+            let table_name =
+                if table_pattern == "*" || table_pattern.contains('%') {
+                    // For wildcards, query without table filter and handle in Rust
+                    None
+                } else {
+                    Some(table_pattern.as_str())
+                };
 
-            let (sql, params): (String, Vec<libsql::Value>) = if let Some(tbl) = table_name {
+            let (sql, params): (String, Vec<libsql::Value>) = if let Some(tbl) =
+                table_name
+            {
                 // Query with JSON conversion for specific table
                 (
                     format!(
@@ -526,7 +560,11 @@ impl TursoSource {
                          FROM {} WHERE change_id > ? AND table_name = ? ORDER BY change_id LIMIT ?",
                         tbl, tbl, cdc_table
                     ),
-                    vec![last_id.into(), tbl.into(), (batch_size as i64).into()],
+                    vec![
+                        last_id.into(),
+                        tbl.into(),
+                        (batch_size as i64).into(),
+                    ],
                 )
             } else {
                 // Query raw blobs for wildcard - we'll decode per-row
@@ -606,8 +644,14 @@ impl TursoSource {
 
                 // Create checkpoint for this event
                 let event_checkpoint = checkpoint.with_change_id(change_id);
-                let event =
-                    self.create_event(source_meta, &table, op, before, after, &event_checkpoint);
+                let event = self.create_event(
+                    source_meta,
+                    &table,
+                    op,
+                    before,
+                    after,
+                    &event_checkpoint,
+                );
 
                 if tx.send(event).await.is_err() {
                     break;
@@ -658,7 +702,9 @@ impl TursoSource {
         let mut rows = conn
             .query(&sql, libsql::params![change_id])
             .await
-            .map_err(|e| SourceError::Other(anyhow::anyhow!("blob decode failed: {}", e)))?;
+            .map_err(|e| {
+                SourceError::Other(anyhow::anyhow!("blob decode failed: {}", e))
+            })?;
 
         use libsql::Value;
         if let Ok(Some(row)) = rows.next().await {
@@ -727,12 +773,21 @@ impl TursoSource {
                 _ => continue,
             };
 
-            let after = row_data.as_ref().and_then(|s| serde_json::from_str(s).ok());
-            let before = old_data.as_ref().and_then(|s| serde_json::from_str(s).ok());
+            let after =
+                row_data.as_ref().and_then(|s| serde_json::from_str(s).ok());
+            let before =
+                old_data.as_ref().and_then(|s| serde_json::from_str(s).ok());
 
             // Create checkpoint for this event
             let event_checkpoint = checkpoint.with_change_id(id);
-            let event = self.create_event(source_meta, &table, op, before, after, &event_checkpoint);
+            let event = self.create_event(
+                source_meta,
+                &table,
+                op,
+                before,
+                after,
+                &event_checkpoint,
+            );
 
             if tx.send(event).await.is_err() {
                 break;
@@ -773,7 +828,14 @@ impl TursoSource {
 
         for table in tables {
             let (updated, count) = self
-                .poll_table_rowid(conn, tx, checkpoint, source_meta, table, schema_loader)
+                .poll_table_rowid(
+                    conn,
+                    tx,
+                    checkpoint,
+                    source_meta,
+                    table,
+                    schema_loader,
+                )
                 .await?;
             checkpoint = updated;
             total_changes += count;
@@ -793,7 +855,8 @@ impl TursoSource {
         table: &str,
         schema_loader: &TursoSchemaLoader,
     ) -> SourceResult<(TursoCheckpoint, usize)> {
-        let last_rowid = checkpoint.table_positions.get(table).copied().unwrap_or(0);
+        let last_rowid =
+            checkpoint.table_positions.get(table).copied().unwrap_or(0);
 
         // Get column names for building JSON
         let column_names = schema_loader.column_names(table).await?;
@@ -864,16 +927,22 @@ impl TursoSource {
         }
 
         if count > 0 {
-            checkpoint.table_positions.insert(table.to_string(), max_rowid);
+            checkpoint
+                .table_positions
+                .insert(table.to_string(), max_rowid);
         }
 
         Ok((checkpoint, count))
     }
 
     /// Extract a SQLite value and convert to JSON.
-    fn extract_value(&self, row: &libsql::Row, index: usize) -> SourceResult<serde_json::Value> {
+    fn extract_value(
+        &self,
+        row: &libsql::Row,
+        index: usize,
+    ) -> SourceResult<serde_json::Value> {
         use libsql::Value;
-        
+
         match row.get_value(index as i32) {
             Ok(Value::Integer(i)) => Ok(serde_json::Value::Number(i.into())),
             Ok(Value::Real(f)) => {
@@ -896,7 +965,11 @@ impl TursoSource {
     }
 
     /// Setup CDC triggers for tracked tables.
-    async fn setup_cdc_triggers(&self, conn: &Connection, tables: &[String]) -> SourceResult<()> {
+    async fn setup_cdc_triggers(
+        &self,
+        conn: &Connection,
+        tables: &[String],
+    ) -> SourceResult<()> {
         info!("setting up CDC triggers for {} tables", tables.len());
 
         // Create CDC changes table
@@ -930,7 +1003,11 @@ impl TursoSource {
     }
 
     /// Create INSERT/UPDATE/DELETE triggers for a table.
-    async fn create_triggers_for_table(&self, conn: &Connection, table: &str) -> SourceResult<()> {
+    async fn create_triggers_for_table(
+        &self,
+        conn: &Connection,
+        table: &str,
+    ) -> SourceResult<()> {
         // Get columns for this table
         let mut rows = conn
             .query(&format!("PRAGMA table_info('{}')", table), ())

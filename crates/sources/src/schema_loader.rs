@@ -73,7 +73,10 @@ pub trait SourceSchemaLoader: Send + Sync {
 
     /// Reload all schemas matching patterns.
     /// Returns (database, table) pairs that were reloaded.
-    async fn reload_all(&self, patterns: &[String]) -> Result<Vec<(String, String)>>;
+    async fn reload_all(
+        &self,
+        patterns: &[String],
+    ) -> Result<Vec<(String, String)>>;
 
     /// List cached schemas.
     async fn list_cached(&self) -> Vec<SchemaListEntry>;

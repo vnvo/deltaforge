@@ -3,7 +3,9 @@ use axum::Router;
 use checkpoints::{CheckpointStore, FileCheckpointStore};
 use clap::Parser;
 use deltaforge_config::{PipelineSpec, load_cfg};
-use rest_api::{AppState, PipelineController, SchemaState, SensingState, router_full};
+use rest_api::{
+    AppState, PipelineController, SchemaState, SensingState, router_full,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -56,9 +58,15 @@ async fn main() -> Result<()> {
 
     // Build router with all routes
     let app: Router = router_full(
-        AppState { controller: manager },
-        SchemaState { controller: schema_api },
-        SensingState { controller: sensing_api },
+        AppState {
+            controller: manager,
+        },
+        SchemaState {
+            controller: schema_api,
+        },
+        SensingState {
+            controller: sensing_api,
+        },
     );
     let app = app.merge(o11y::df_metrics::router_with_metrics());
 

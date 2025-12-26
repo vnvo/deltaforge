@@ -63,7 +63,9 @@ pub fn router(state: AppState) -> Router {
         .route("/pipelines", get(list_pipelines).post(create_pipeline))
         .route(
             "/pipelines/{name}",
-            get(get_pipeline).patch(patch_pipeline).delete(delete_pipeline),
+            get(get_pipeline)
+                .patch(patch_pipeline)
+                .delete(delete_pipeline),
         )
         .route("/pipelines/{name}/pause", post(pause_pipeline))
         .route("/pipelines/{name}/resume", post(resume_pipeline))

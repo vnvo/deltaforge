@@ -224,7 +224,10 @@ impl SchemaSensor {
 
                     // Check stabilization even on cache hit
                     let max_samples = self.config.deep_inspect.max_sample_size;
-                    if max_samples > 0 && state.event_count >= max_samples as u64 && !state.stabilized {
+                    if max_samples > 0
+                        && state.event_count >= max_samples as u64
+                        && !state.stabilized
+                    {
                         state.mark_stabilized();
                         return Ok(ObserveResult::Stabilized {
                             fingerprint: state.fingerprint.clone(),
@@ -303,8 +306,12 @@ impl SchemaSensor {
                         state.record_observation();
 
                         // Check stabilization even on cache hit
-                        let max_samples = self.config.deep_inspect.max_sample_size;
-                        if max_samples > 0 && state.event_count >= max_samples as u64 && !state.stabilized {
+                        let max_samples =
+                            self.config.deep_inspect.max_sample_size;
+                        if max_samples > 0
+                            && state.event_count >= max_samples as u64
+                            && !state.stabilized
+                        {
                             state.mark_stabilized();
                             return Ok(ObserveResult::Stabilized {
                                 fingerprint: state.fingerprint.clone(),
@@ -708,7 +715,7 @@ mod tests {
 
         let stats = sensor.cache_stats("users").unwrap();
         assert_eq!(stats.cached_structures, 1); // Only one unique structure
-        assert_eq!(stats.cache_hits, 1);   // Second json2 was a cache hit
+        assert_eq!(stats.cache_hits, 1); // Second json2 was a cache hit
         assert_eq!(stats.cache_misses, 1); // First json1 was a miss        
 
         // Evolution should clear cache

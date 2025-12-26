@@ -31,7 +31,7 @@ async fn redis_sink_writes_stream() -> Result<()> {
         id: "test-redis".to_string(),
         uri: "redis://127.0.0.1:6379/0".to_string(),
         stream: "df.test".to_string(),
-        required: Some(true)
+        required: Some(true),
     };
 
     // Clean previous data in the test stream

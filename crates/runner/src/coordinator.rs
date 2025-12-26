@@ -239,7 +239,6 @@ impl SchemaSensorState {
                         );
                     }
                 }
-                
             }
         }
 

@@ -47,7 +47,9 @@ use common::init_test_tracing;
 
 /// Create a test database with schema.
 /// Returns (Database, Connection) - must keep Database alive while using Connection!
-async fn setup_test_db(path: &str) -> Result<(libsql::Database, libsql::Connection)> {
+async fn setup_test_db(
+    path: &str,
+) -> Result<(libsql::Database, libsql::Connection)> {
     let db = Builder::new_local(path).build().await?;
     let conn = db.connect()?;
 
@@ -107,11 +109,14 @@ async fn turso_schema_loader_test() -> Result<()> {
     let conn = Arc::new(conn);
 
     let registry = Arc::new(InMemoryRegistry::new());
-    let schema_loader = TursoSchemaLoader::new(conn.clone(), registry.clone(), "acme", None);
+    let schema_loader =
+        TursoSchemaLoader::new(conn.clone(), registry.clone(), "acme", None);
 
     // Test 1: Expand patterns
     {
-        let tables = schema_loader.expand_patterns(&["users".to_string()]).await?;
+        let tables = schema_loader
+            .expand_patterns(&["users".to_string()])
+            .await?;
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0], "users");
         info!("expand_patterns exact match works");
@@ -140,7 +145,11 @@ async fn turso_schema_loader_test() -> Result<()> {
         let loaded = schema_loader.load_schema("users").await?;
         let schema = &loaded.schema;
 
-        assert_eq!(schema.columns.len(), 4, "users table should have 4 columns");
+        assert_eq!(
+            schema.columns.len(),
+            4,
+            "users table should have 4 columns"
+        );
 
         // Check column names using SourceSchema trait
         let col_names = schema.column_names();
@@ -237,7 +246,9 @@ async fn turso_schema_loader_test() -> Result<()> {
     // Test 9: Preload multiple tables
     {
         schema_loader.invalidate_all().await;
-        let loaded = schema_loader.preload(&["users".to_string(), "orders".to_string()]).await?;
+        let loaded = schema_loader
+            .preload(&["users".to_string(), "orders".to_string()])
+            .await?;
         assert_eq!(loaded.len(), 2);
 
         let cached = schema_loader.list_cached_internal().await;
@@ -281,9 +292,15 @@ async fn turso_cdc_triggers_e2e() -> Result<()> {
     };
 
     let registry = Arc::new(InMemoryRegistry::new());
-    let src = TursoSource::new(cfg, "acme".to_string(), "pipe-turso".to_string(), registry);
+    let src = TursoSource::new(
+        cfg,
+        "acme".to_string(),
+        "pipe-turso".to_string(),
+        registry,
+    );
 
-    let ckpt_store: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let ckpt_store: Arc<dyn CheckpointStore> =
+        Arc::new(MemCheckpointStore::new()?);
 
     let (tx, mut rx) = mpsc::channel::<Event>(128);
     let handle = src.run(tx, ckpt_store).await;
@@ -382,7 +399,10 @@ async fn turso_cdc_triggers_e2e() -> Result<()> {
     let del = got.iter().find(|e| e.op == Op::Delete);
     assert!(del.is_some(), "should have DELETE event");
     let del = del.unwrap();
-    assert!(del.before.is_some() || del.after.is_none(), "DELETE should have before or no after");
+    assert!(
+        del.before.is_some() || del.after.is_none(),
+        "DELETE should have before or no after"
+    );
 
     info!("all Turso CDC trigger mode assertions passed!");
 
@@ -425,9 +445,15 @@ async fn turso_cdc_polling_e2e() -> Result<()> {
     };
 
     let registry = Arc::new(InMemoryRegistry::new());
-    let src = TursoSource::new(cfg, "acme".to_string(), "pipe-poll".to_string(), registry);
+    let src = TursoSource::new(
+        cfg,
+        "acme".to_string(),
+        "pipe-poll".to_string(),
+        registry,
+    );
 
-    let ckpt_store: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let ckpt_store: Arc<dyn CheckpointStore> =
+        Arc::new(MemCheckpointStore::new()?);
 
     let (tx, mut rx) = mpsc::channel::<Event>(128);
     let handle = src.run(tx, ckpt_store).await;
@@ -437,12 +463,20 @@ async fn turso_cdc_polling_e2e() -> Result<()> {
     sleep(Duration::from_millis(500)).await;
 
     // INSERT new rows (polling mode only detects inserts)
-    conn.execute("INSERT INTO users (name, email) VALUES ('bob', 'bob@test.com')", ())
-        .await?;
-    conn.execute("INSERT INTO users (name, email) VALUES ('carol', 'carol@test.com')", ())
-        .await?;
+    conn.execute(
+        "INSERT INTO users (name, email) VALUES ('bob', 'bob@test.com')",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "INSERT INTO users (name, email) VALUES ('carol', 'carol@test.com')",
+        (),
+    )
+    .await?;
 
-    debug!("INSERTs performed - expecting CDC events (polling only sees inserts)...");
+    debug!(
+        "INSERTs performed - expecting CDC events (polling only sees inserts)..."
+    );
 
     // Collect events - polling starts from rowid 0 so will capture baseline too
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -461,7 +495,10 @@ async fn turso_cdc_polling_e2e() -> Result<()> {
     }
 
     // Assertions - polling captures all rows from start (baseline included)
-    assert!(got.len() >= 3, "should have at least 3 insert events (baseline + bob + carol)");
+    assert!(
+        got.len() >= 3,
+        "should have at least 3 insert events (baseline + bob + carol)"
+    );
     assert!(
         got.iter().all(|e| e.op == Op::Insert),
         "polling mode should only produce INSERT events"
@@ -494,7 +531,10 @@ async fn turso_cdc_polling_e2e() -> Result<()> {
             .and_then(|v| v.as_str())
             == Some("baseline")
     });
-    assert!(baseline.is_some(), "baseline row should appear (polling starts from rowid 0)");
+    assert!(
+        baseline.is_some(),
+        "baseline row should appear (polling starts from rowid 0)"
+    );
 
     info!("all Turso CDC polling mode assertions passed!");
 
@@ -519,7 +559,8 @@ async fn turso_checkpoint_resume_test() -> Result<()> {
     let (_db, conn) = setup_test_db(&db_path_str).await?;
 
     // Shared checkpoint store across runs
-    let ckpt_store: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let ckpt_store: Arc<dyn CheckpointStore> =
+        Arc::new(MemCheckpointStore::new()?);
 
     // === First run: capture some events ===
     {
@@ -538,7 +579,12 @@ async fn turso_checkpoint_resume_test() -> Result<()> {
         };
 
         let registry = Arc::new(InMemoryRegistry::new());
-        let src = TursoSource::new(cfg, "acme".to_string(), "pipe-resume".to_string(), registry);
+        let src = TursoSource::new(
+            cfg,
+            "acme".to_string(),
+            "pipe-resume".to_string(),
+            registry,
+        );
 
         let (tx, mut rx) = mpsc::channel::<Event>(128);
         let handle = src.run(tx, ckpt_store.clone()).await;
@@ -561,7 +607,10 @@ async fn turso_checkpoint_resume_test() -> Result<()> {
             }
         }
 
-        assert!(first_run_events.len() >= 2, "should capture events in first run");
+        assert!(
+            first_run_events.len() >= 2,
+            "should capture events in first run"
+        );
         info!("first run captured {} events", first_run_events.len());
 
         handle.stop();
@@ -585,7 +634,12 @@ async fn turso_checkpoint_resume_test() -> Result<()> {
         };
 
         let registry = Arc::new(InMemoryRegistry::new());
-        let src = TursoSource::new(cfg, "acme".to_string(), "pipe-resume".to_string(), registry);
+        let src = TursoSource::new(
+            cfg,
+            "acme".to_string(),
+            "pipe-resume".to_string(),
+            registry,
+        );
 
         let (tx, mut rx) = mpsc::channel::<Event>(128);
         let handle = src.run(tx, ckpt_store.clone()).await;
@@ -628,7 +682,10 @@ async fn turso_checkpoint_resume_test() -> Result<()> {
         });
         assert!(has_run2_user, "should capture new events after resume");
 
-        info!("second run captured {} events (no replay)", second_run_events.len());
+        info!(
+            "second run captured {} events (no replay)",
+            second_run_events.len()
+        );
 
         handle.stop();
         let _ = handle.join().await;
@@ -639,16 +696,16 @@ async fn turso_checkpoint_resume_test() -> Result<()> {
 }
 
 /// Test CDC with native mode (requires Turso Database - the Rust rewrite).
-/// 
+///
 /// **Important:** Native CDC is only available in "Turso Database" (the Rust SQLite rewrite),
 /// NOT in libsql-server (sqld). The Docker image `ghcr.io/tursodatabase/libsql-server` does NOT
 /// have native CDC support.
-/// 
+///
 /// To test native CDC locally:
 /// 1. Install Turso Database: `curl -sSL tur.so/install | sh`
 /// 2. Set TURSODB_PATH env var to the binary location
 /// 3. Run this test
-/// 
+///
 /// This test creates a mock `turso_cdc` table to verify our parsing logic works,
 /// but the actual `bin_record_json_object()` function won't work without the real Turso DB.
 #[tokio::test]
@@ -717,10 +774,16 @@ async fn turso_cdc_native_mock_e2e() -> Result<()> {
     .await?;
 
     // Verify the mock turso_cdc table is populated correctly
-    conn.execute("INSERT INTO users (name, email) VALUES ('test', 'test@example.com')", ())
-        .await?;
-    conn.execute("UPDATE users SET email = 'updated@example.com' WHERE name = 'test'", ())
-        .await?;
+    conn.execute(
+        "INSERT INTO users (name, email) VALUES ('test', 'test@example.com')",
+        (),
+    )
+    .await?;
+    conn.execute(
+        "UPDATE users SET email = 'updated@example.com' WHERE name = 'test'",
+        (),
+    )
+    .await?;
     conn.execute("DELETE FROM users WHERE name = 'test'", ())
         .await?;
 
@@ -736,24 +799,26 @@ async fn turso_cdc_native_mock_e2e() -> Result<()> {
             operations.push(op);
         }
     }
-    
+
     assert_eq!(operations.len(), 3, "should have 3 CDC entries");
-    
+
     // Verify operations
     assert_eq!(operations[0], "INSERT");
     assert_eq!(operations[1], "UPDATE");
     assert_eq!(operations[2], "DELETE");
 
     info!("mock turso_cdc table works correctly!");
-    info!("Note: For real native CDC, use Turso Database (Rust rewrite), not libsql-server");
+    info!(
+        "Note: For real native CDC, use Turso Database (Rust rewrite), not libsql-server"
+    );
 
     Ok(())
 }
 
 /// Native CDC test using local tursodb installation.
-/// 
+///
 /// Requires Turso Database installed: `curl -sSL tur.so/install | sh`
-/// 
+///
 /// This test verifies native CDC with the real `turso_cdc` table and
 /// `bin_record_json_object()` function.
 #[tokio::test]
@@ -762,22 +827,26 @@ async fn turso_cdc_native_local_e2e() -> Result<()> {
     info!("--- Testing Turso CDC (native mode - local tursodb) ---");
 
     // Find tursodb binary
-    let tursodb_path = std::env::var("TURSODB_PATH")
-        .ok()
-        .or_else(|| {
-            // Check common installation paths
-            let paths = [
-                std::env::var("HOME").ok().map(|h| format!("{}/.turso/tursodb", h)),
-                Some("/usr/local/bin/tursodb".to_string()),
-                Some("tursodb".to_string()), // In PATH
-            ];
-            for path in paths.into_iter().flatten() {
-                if std::process::Command::new(&path).arg("--version").output().is_ok() {
-                    return Some(path);
-                }
+    let tursodb_path = std::env::var("TURSODB_PATH").ok().or_else(|| {
+        // Check common installation paths
+        let paths = [
+            std::env::var("HOME")
+                .ok()
+                .map(|h| format!("{}/.turso/tursodb", h)),
+            Some("/usr/local/bin/tursodb".to_string()),
+            Some("tursodb".to_string()), // In PATH
+        ];
+        for path in paths.into_iter().flatten() {
+            if std::process::Command::new(&path)
+                .arg("--version")
+                .output()
+                .is_ok()
+            {
+                return Some(path);
             }
-            None
-        });
+        }
+        None
+    });
 
     let tursodb = match tursodb_path {
         Some(p) => p,
@@ -801,7 +870,7 @@ async fn turso_cdc_native_local_e2e() -> Result<()> {
     let run_sql = |sql: &str| -> std::process::Output {
         use std::io::Write;
         use std::process::Stdio;
-        
+
         let mut child = std::process::Command::new(&tursodb)
             .arg(&db_path_str)
             .stdin(Stdio::piped())
@@ -809,11 +878,11 @@ async fn turso_cdc_native_local_e2e() -> Result<()> {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn tursodb");
-        
+
         if let Some(mut stdin) = child.stdin.take() {
             writeln!(stdin, "{}", sql).expect("write sql");
         }
-        
+
         child.wait_with_output().expect("wait for tursodb")
     };
 
@@ -822,15 +891,21 @@ async fn turso_cdc_native_local_e2e() -> Result<()> {
     info!(stdout = %String::from_utf8_lossy(&output.stdout), "CDC enabled");
 
     // Create table
-    let output = run_sql("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);");
+    let output = run_sql(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);",
+    );
     assert!(output.status.success(), "create table failed: {:?}", output);
 
     // Insert
-    let output = run_sql("INSERT INTO users (name, email) VALUES ('alice', 'alice@test.com');");
+    let output = run_sql(
+        "INSERT INTO users (name, email) VALUES ('alice', 'alice@test.com');",
+    );
     assert!(output.status.success(), "insert failed");
 
     // Update
-    let output = run_sql("UPDATE users SET email = 'alice.updated@test.com' WHERE name = 'alice';");
+    let output = run_sql(
+        "UPDATE users SET email = 'alice.updated@test.com' WHERE name = 'alice';",
+    );
     assert!(output.status.success(), "update failed");
 
     // Delete
@@ -838,11 +913,15 @@ async fn turso_cdc_native_local_e2e() -> Result<()> {
     assert!(output.status.success(), "delete failed");
 
     // Query CDC table - check if it exists
-    let output = run_sql("SELECT name FROM sqlite_master WHERE type='table' AND name='turso_cdc';");
+    let output = run_sql(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='turso_cdc';",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    
+
     if !stdout.contains("turso_cdc") {
-        info!("turso_cdc table not found - CDC may not be enabled in this tursodb version");
+        info!(
+            "turso_cdc table not found - CDC may not be enabled in this tursodb version"
+        );
         info!("Make sure you have a recent version with CDC support");
         return Ok(());
     }
@@ -852,21 +931,26 @@ async fn turso_cdc_native_local_e2e() -> Result<()> {
         "SELECT id, table_name, change_type, \
          bin_record_json_object(table_columns_json_array('users'), before) as before_json, \
          bin_record_json_object(table_columns_json_array('users'), after) as after_json \
-         FROM turso_cdc ORDER BY id;"
+         FROM turso_cdc ORDER BY id;",
     );
-    
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     info!(cdc_output = %stdout, "CDC query result");
 
     // Parse and verify
     if output.status.success() && !stdout.is_empty() {
         // Count changes (each line is a change)
-        let lines: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+        let lines: Vec<&str> =
+            stdout.lines().filter(|l| !l.is_empty()).collect();
         info!(changes = lines.len(), "native CDC captured changes");
-        
+
         // Should have 3 changes: INSERT, UPDATE, DELETE
-        assert!(lines.len() >= 3, "expected at least 3 CDC entries, got {}", lines.len());
-        
+        assert!(
+            lines.len() >= 3,
+            "expected at least 3 CDC entries, got {}",
+            lines.len()
+        );
+
         info!("✅ Native CDC working correctly!");
     } else {
         info!(stderr = %String::from_utf8_lossy(&output.stderr), "CDC query output");
@@ -876,11 +960,11 @@ async fn turso_cdc_native_local_e2e() -> Result<()> {
 }
 
 /// Full native CDC test with real Turso Database binary or Cloud.
-/// 
+///
 /// This test requires either:
 /// - Turso Database installed: `curl -sSL tur.so/install | sh`
 /// - Turso Cloud with CDC enabled
-/// 
+///
 /// Set TURSO_CDC_TEST_URL for Turso Cloud, or leave unset to skip.
 #[tokio::test]
 #[ignore] // Run with: cargo test turso_cdc_native_real -- --ignored
@@ -918,9 +1002,15 @@ async fn turso_cdc_native_real_e2e() -> Result<()> {
     };
 
     let registry = Arc::new(InMemoryRegistry::new());
-    let src = TursoSource::new(cfg, "acme".to_string(), "pipe-real".to_string(), registry);
+    let src = TursoSource::new(
+        cfg,
+        "acme".to_string(),
+        "pipe-real".to_string(),
+        registry,
+    );
 
-    let ckpt_store: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let ckpt_store: Arc<dyn CheckpointStore> =
+        Arc::new(MemCheckpointStore::new()?);
 
     let (tx, mut rx) = mpsc::channel::<Event>(128);
     let handle = src.run(tx, ckpt_store).await;

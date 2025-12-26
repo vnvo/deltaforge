@@ -3,9 +3,9 @@
 //! Provides a unified interface for accessing database schema information
 //! from various sources (MySQL, Postgres, Turso, etc.).
 
-use std::sync::Arc;
-use sources::ArcSchemaLoader;
 use async_trait::async_trait;
+use sources::ArcSchemaLoader;
+use std::sync::Arc;
 
 /// Information about a single column.
 #[derive(Debug, Clone)]
@@ -109,10 +109,10 @@ impl SchemaProvider for SchemaLoaderAdapter {
         };
 
         let loaded = self.loader.load(db, tbl).await.ok()?;
-        
+
         // Convert LoadedSchema to TableSchemaInfo
         let columns = extract_column_infos(&loaded.schema_json);
-        
+
         Some(TableSchemaInfo {
             database: loaded.database,
             table: loaded.table,
@@ -136,8 +136,11 @@ impl SchemaProvider for SchemaLoaderAdapter {
 }
 
 /// Extract ColumnSchemaInfo from source-specific schema JSON.
-fn extract_column_infos(schema_json: &serde_json::Value) -> Vec<ColumnSchemaInfo> {
-    let Some(cols) = schema_json.get("columns").and_then(|v| v.as_array()) else {
+fn extract_column_infos(
+    schema_json: &serde_json::Value,
+) -> Vec<ColumnSchemaInfo> {
+    let Some(cols) = schema_json.get("columns").and_then(|v| v.as_array())
+    else {
         return vec![];
     };
 
@@ -155,17 +158,16 @@ fn extract_column_infos(schema_json: &serde_json::Value) -> Vec<ColumnSchemaInfo
                 .and_then(|v| v.as_str())
                 .unwrap_or(&data_type)
                 .to_string();
-            let nullable = c
-                .get("nullable")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
+            let nullable =
+                c.get("nullable").and_then(|v| v.as_bool()).unwrap_or(true);
 
             Some(ColumnSchemaInfo {
                 name,
                 data_type: data_type.clone(),
                 full_type,
                 nullable,
-                is_json_like: is_json_type(&data_type) || might_be_json(&data_type),
+                is_json_like: is_json_type(&data_type)
+                    || might_be_json(&data_type),
             })
         })
         .collect()
