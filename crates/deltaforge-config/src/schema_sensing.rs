@@ -266,7 +266,7 @@ impl SchemaSensingConfig {
         }
         // After warmup, sample at configured rate
         let rate = self.sampling.sample_rate.max(1);
-        (event_count % rate as u64) == 0
+        event_count.is_multiple_of(rate as u64)
     }
 }
 

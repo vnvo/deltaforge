@@ -59,6 +59,7 @@ impl BuildingBatch {
 
 /// After processing, freeze as Arc<[Event]> for zero-copy sharing.
 #[derive(Debug)]
+#[allow(dead_code)]
 struct FrozenBatch {
     id: Uuid,
     events: Arc<[Event]>,
@@ -136,10 +137,10 @@ impl SchemaSensorState {
             let Some(after) = &event.after else { continue };
 
             // Run drift detection if we have DB schema
-            if let Some(schemas) = db_schemas {
-                if let Some(_schema) = schemas.get(&event.table) {
-                    drift.observe(&event.table, after);
-                }
+            if let Some(schemas) = db_schemas
+                && let Some(_schema) = schemas.get(&event.table)
+            {
+                drift.observe(&event.table, after);
             }
 
             // Guided vs full sensing
@@ -488,11 +489,9 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
 
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    if let Some(b) = building.take() {
-                        if !b.raw.is_empty() {
+                    if let Some(b) = building.take() && !b.raw.is_empty() {
                             self.process_deliver_and_maybe_commit(b, "cancelled").await?;
                         }
-                    }
                     break;
                 }
 
@@ -515,12 +514,10 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
 
                 maybe_ev = event_rx.recv() => {
                     let Some(ev) = maybe_ev else {
-                        // Channel closed — final flush
-                        if let Some(b) = building.take() {
-                            if !b.raw.is_empty() {
+                        // Channel closed - final flush
+                        if let Some(b) = building.take() && !b.raw.is_empty() {
                                 self.process_deliver_and_maybe_commit(b, "shutdown").await?;
                             }
-                        }
                         break;
                     };
 

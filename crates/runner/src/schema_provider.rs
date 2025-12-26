@@ -126,7 +126,7 @@ impl SchemaProvider for SchemaLoaderAdapter {
             .list_cached()
             .await
             .into_iter()
-            .filter_map(|entry| {
+            .filter_map(|_entry| {
                 // Convert each cached entry
                 // This is a simplified version - may need async load for full info
                 None // TODO: implement if needed

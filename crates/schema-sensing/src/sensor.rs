@@ -196,13 +196,13 @@ impl SchemaSensor {
             self.schemas.get(table).map(|s| s.event_count).unwrap_or(0);
 
         // Check if we've hit the stabilization limit
-        if let Some(state) = self.schemas.get(table) {
-            if state.stabilized {
-                return Ok(ObserveResult::Stabilized {
-                    fingerprint: state.fingerprint.clone(),
-                    sequence: state.sequence,
-                });
-            }
+        if let Some(state) = self.schemas.get(table)
+            && state.stabilized
+        {
+            return Ok(ObserveResult::Stabilized {
+                fingerprint: state.fingerprint.clone(),
+                sequence: state.sequence,
+            });
         }
 
         // Structure cache check (fast path) - O(keys) for top-level only
@@ -245,14 +245,14 @@ impl SchemaSensor {
         }
 
         // Sampling check (after warmup)
-        if !self.config.should_sample(event_count) {
-            if let Some(state) = self.schemas.get_mut(table) {
-                state.record_observation();
-                return Ok(ObserveResult::Sampled {
-                    fingerprint: state.fingerprint.clone(),
-                    sequence: state.sequence,
-                });
-            }
+        if !self.config.should_sample(event_count)
+            && let Some(state) = self.schemas.get_mut(table)
+        {
+            state.record_observation();
+            return Ok(ObserveResult::Sampled {
+                fingerprint: state.fingerprint.clone(),
+                sequence: state.sequence,
+            });
         }
 
         // Full sensing path - serialize and process
@@ -276,81 +276,79 @@ impl SchemaSensor {
             self.schemas.get(table).map(|s| s.event_count).unwrap_or(0);
 
         // Check stabilization
-        if let Some(state) = self.schemas.get(table) {
-            if state.stabilized {
-                return Ok(ObserveResult::Stabilized {
-                    fingerprint: state.fingerprint.clone(),
-                    sequence: state.sequence,
-                });
-            }
+        if let Some(state) = self.schemas.get(table)
+            && state.stabilized
+        {
+            return Ok(ObserveResult::Stabilized {
+                fingerprint: state.fingerprint.clone(),
+                sequence: state.sequence,
+            });
         }
 
         // For bytes path with structure caching, we need to parse once
         // and reuse for both cache check and sensing
-        if self.config.sampling.structure_cache {
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(json)
-            {
-                let structure_hash = compute_structure_hash(&value);
-                let cache = self
-                    .structure_caches
-                    .entry(table.to_string())
-                    .or_insert_with(|| {
-                        StructureCache::new(
-                            self.config.sampling.structure_cache_size,
-                        )
+        if self.config.sampling.structure_cache
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(json)
+        {
+            let structure_hash = compute_structure_hash(&value);
+            let cache = self
+                .structure_caches
+                .entry(table.to_string())
+                .or_insert_with(|| {
+                    StructureCache::new(
+                        self.config.sampling.structure_cache_size,
+                    )
+                });
+
+            if cache.check_and_insert(structure_hash) {
+                // Cache hit
+                if let Some(state) = self.schemas.get_mut(table) {
+                    state.record_observation();
+
+                    // Check stabilization even on cache hit
+                    let max_samples = self.config.deep_inspect.max_sample_size;
+                    if max_samples > 0
+                        && state.event_count >= max_samples as u64
+                        && !state.stabilized
+                    {
+                        state.mark_stabilized();
+                        return Ok(ObserveResult::Stabilized {
+                            fingerprint: state.fingerprint.clone(),
+                            sequence: state.sequence,
+                        });
+                    }
+
+                    return Ok(ObserveResult::CacheHit {
+                        fingerprint: state.fingerprint.clone(),
+                        sequence: state.sequence,
                     });
-
-                if cache.check_and_insert(structure_hash) {
-                    // Cache hit
-                    if let Some(state) = self.schemas.get_mut(table) {
-                        state.record_observation();
-
-                        // Check stabilization even on cache hit
-                        let max_samples =
-                            self.config.deep_inspect.max_sample_size;
-                        if max_samples > 0
-                            && state.event_count >= max_samples as u64
-                            && !state.stabilized
-                        {
-                            state.mark_stabilized();
-                            return Ok(ObserveResult::Stabilized {
-                                fingerprint: state.fingerprint.clone(),
-                                sequence: state.sequence,
-                            });
-                        }
-
-                        return Ok(ObserveResult::CacheHit {
-                            fingerprint: state.fingerprint.clone(),
-                            sequence: state.sequence,
-                        });
-                    }
                 }
-
-                // Cache miss - check sampling
-                if !self.config.should_sample(event_count) {
-                    if let Some(state) = self.schemas.get_mut(table) {
-                        state.record_observation();
-                        return Ok(ObserveResult::Sampled {
-                            fingerprint: state.fingerprint.clone(),
-                            sequence: state.sequence,
-                        });
-                    }
-                }
-
-                // Need full sensing - use already-parsed JSON bytes
-                return self.observe_bytes(table, json, event_count);
             }
-        }
 
-        // No cache path - just check sampling
-        if !self.config.should_sample(event_count) {
-            if let Some(state) = self.schemas.get_mut(table) {
+            // Cache miss - check sampling
+            if !self.config.should_sample(event_count)
+                && let Some(state) = self.schemas.get_mut(table)
+            {
                 state.record_observation();
                 return Ok(ObserveResult::Sampled {
                     fingerprint: state.fingerprint.clone(),
                     sequence: state.sequence,
                 });
             }
+
+            // Need full sensing - use already-parsed JSON bytes
+            return self.observe_bytes(table, json, event_count);
+        }
+
+        // No cache path - just check sampling
+        if !self.config.should_sample(event_count)
+            && let Some(state) = self.schemas.get_mut(table)
+        {
+            state.record_observation();
+            return Ok(ObserveResult::Sampled {
+                fingerprint: state.fingerprint.clone(),
+                sequence: state.sequence,
+            });
         }
 
         self.observe_bytes(table, json, event_count)

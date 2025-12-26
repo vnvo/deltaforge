@@ -120,10 +120,10 @@ fn convert_schema(
             // Check for fixed-length strings using MinMax
             if let (Some(min), Some(max)) =
                 (ctx.min_max_length.min, ctx.min_max_length.max)
+                && min == max
+                && min > 0
             {
-                if min == max && min > 0 {
-                    target.description = Some(format!("Fixed length: {}", min));
-                }
+                target.description = Some(format!("Fixed length: {}", min));
             }
         }
 

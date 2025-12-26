@@ -186,7 +186,7 @@ impl TursoSchemaLoader {
                 }
             } else if pattern.contains('.') {
                 // db.table format - extract table name
-                let table = pattern.split('.').last().unwrap_or(pattern);
+                let table = pattern.split('.').next_back().unwrap_or(pattern);
                 if all_tables.contains(&table.to_string())
                     && !results.contains(&table.to_string())
                 {
@@ -511,10 +511,10 @@ impl TursoSchemaLoader {
             })?;
 
         use libsql::Value;
-        if let Ok(Some(row)) = rows.next().await {
-            if let Ok(Value::Integer(count)) = row.get_value(0) {
-                return Ok(count > 0);
-            }
+        if let Ok(Some(row)) = rows.next().await
+            && let Ok(Value::Integer(count)) = row.get_value(0)
+        {
+            return Ok(count > 0);
         }
 
         Ok(false)
@@ -537,10 +537,10 @@ impl TursoSchemaLoader {
             })?;
 
         use libsql::Value;
-        if let Ok(Some(row)) = rows.next().await {
-            if let Ok(Value::Text(sql)) = row.get_value(0) {
-                return Ok(Some(sql));
-            }
+        if let Ok(Some(row)) = rows.next().await
+            && let Ok(Value::Text(sql)) = row.get_value(0)
+        {
+            return Ok(Some(sql));
         }
 
         Ok(None)

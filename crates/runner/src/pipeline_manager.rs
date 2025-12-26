@@ -28,6 +28,7 @@ use tracing::info;
 // Pipeline Runtime (internal)
 // ============================================================================
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PipelineStatus {
     Running,

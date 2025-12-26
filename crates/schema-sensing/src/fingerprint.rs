@@ -104,7 +104,7 @@ fn hash_field_status(
     if status.may_be_missing {
         flags |= 2;
     }
-    hasher.update(&[flags]);
+    hasher.update([flags]);
 }
 
 /// Get a sort order for schema variants.
@@ -122,6 +122,7 @@ fn variant_order(schema: &Schema) -> u8 {
     }
 }
 
+#[allow(dead_code)]
 /// Compute a short fingerprint (8 chars) for display.
 pub fn compute_short_fingerprint(schema: &Schema) -> String {
     let full = compute_fingerprint(schema);

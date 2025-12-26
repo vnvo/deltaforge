@@ -78,22 +78,13 @@ impl TableSchemaState {
 }
 
 /// Schema version information for event enrichment.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SensedSchemaVersion {
     /// SHA-256 fingerprint of the schema
     pub fingerprint: String,
 
     /// Monotonic sequence number
     pub sequence: u64,
-}
-
-impl Default for SensedSchemaVersion {
-    fn default() -> Self {
-        Self {
-            fingerprint: String::new(),
-            sequence: 0,
-        }
-    }
 }
 
 /// Serializable schema snapshot for persistence/API.

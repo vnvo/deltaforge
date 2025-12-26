@@ -60,7 +60,7 @@ use tracing::{debug, error, info, warn};
 /// Tracks position using:
 /// - `last_change_id`: Position in `turso_cdc` table (native mode) or shadow table (triggers)
 /// - `table_positions`: Per-table rowid tracking (polling mode fallback)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TursoCheckpoint {
     /// Per-table tracking: table_name -> last seen rowid (for polling mode)
     pub table_positions: HashMap<String, i64>,
@@ -74,17 +74,6 @@ pub struct TursoCheckpoint {
     /// Active CDC mode (for resumption)
     #[serde(default)]
     pub active_mode: Option<String>,
-}
-
-impl Default for TursoCheckpoint {
-    fn default() -> Self {
-        Self {
-            table_positions: HashMap::new(),
-            last_change_id: None,
-            timestamp_ms: 0,
-            active_mode: None,
-        }
-    }
 }
 
 impl TursoCheckpoint {
@@ -1162,7 +1151,7 @@ fn extract_host(url: &str) -> String {
         .nth(1)
         .and_then(|s| s.split('/').next())
         .and_then(|s| s.split('?').next())
-        .and_then(|s| s.split('@').last())
+        .and_then(|s| s.split('@').next_back())
         .unwrap_or("unknown")
         .to_string()
 }

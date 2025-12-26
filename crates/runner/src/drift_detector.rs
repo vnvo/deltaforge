@@ -176,17 +176,13 @@ impl TableDriftTracker {
 
         // Check for missing columns (in schema but not in row)
         for (col_name, seen) in seen_columns {
-            if !seen {
-                if let Some(stats) = self.column_stats.get_mut(&col_name) {
-                    stats.total_count += 1;
-                    // Missing is treated as null for nullable columns
-                    if let Some(col_info) =
-                        self.expected_schema.column(&col_name)
-                    {
-                        if !col_info.nullable {
-                            stats.null_count += 1;
-                        }
-                    }
+            if !seen && let Some(stats) = self.column_stats.get_mut(&col_name) {
+                stats.total_count += 1;
+                // Missing is treated as null for nullable columns
+                if let Some(col_info) = self.expected_schema.column(&col_name)
+                    && !col_info.nullable
+                {
+                    stats.null_count += 1;
                 }
             }
         }
