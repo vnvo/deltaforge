@@ -1,0 +1,22 @@
+[package]
+name = "schema-sensing"
+version = "0.1.0"
+edition = "2024"
+description = "Universal schema inference from JSON payloads for DeltaForge"
+license.workspace = true
+
+[dependencies]
+schema_analysis = "0.5"
+schemars = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+
+deltaforge-config = { path = "../deltaforge-config" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

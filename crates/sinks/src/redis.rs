@@ -7,6 +7,7 @@ use tracing::debug;
 
 pub struct RedisSink {
     id: String,
+    cfg: RedisSinkCfg,
     pub client: redis::Client,
     stream: String,
 }
@@ -15,6 +16,7 @@ impl RedisSink {
     pub fn new(cfg: &RedisSinkCfg) -> anyhow::Result<Self> {
         Ok(Self {
             id: cfg.id.clone(),
+            cfg: cfg.clone(),
             client: redis::Client::open(cfg.uri.clone())
                 .context("open redis uri")?,
             stream: cfg.stream.to_string(),
@@ -26,6 +28,10 @@ impl RedisSink {
 impl Sink for RedisSink {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn required(&self) -> bool {
+        self.cfg.required.unwrap_or(true)
     }
 
     async fn send(&self, event: &Event) -> SinkResult<()> {

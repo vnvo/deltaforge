@@ -3,6 +3,7 @@ mod errors;
 mod health;
 mod pipelines;
 mod schemas;
+mod sensing;
 
 pub use errors::{PipelineAPIError, pipeline_error};
 pub use pipelines::{AppState, PipeInfo, PipelineController};
@@ -10,7 +11,12 @@ pub use schemas::{
     ColumnInfo, ReloadResult, SchemaController, SchemaDetail, SchemaInfo,
     SchemaState, SchemaVersionInfo, TableReloadStatus,
 };
+pub use sensing::{
+    CacheStats, ColumnDrift, DriftInfo, InferredField, InferredSchemaDetail,
+    InferredSchemaInfo, SensingController, SensingState, TableCacheStats,
+};
 
+/// Build core router with health and pipeline management routes.
 pub fn router(state: AppState) -> Router {
     let health_state = state.clone();
     let health = health::router(health_state);
@@ -19,12 +25,33 @@ pub fn router(state: AppState) -> Router {
     health.merge(pipeline_mgmt)
 }
 
+/// Build router with DB schema management routes.
 pub fn router_with_schemas(
     app_state: AppState,
     schema_state: SchemaState,
 ) -> Router {
     router(app_state).merge(schemas::router(schema_state))
 }
+
+/// Build router with schema sensing and drift detection routes.
+pub fn router_with_sensing(
+    app_state: AppState,
+    sensing_state: SensingState,
+) -> Router {
+    router(app_state).merge(sensing::router(sensing_state))
+}
+
+/// Build full router with all features.
+pub fn router_full(
+    app_state: AppState,
+    schema_state: SchemaState,
+    sensing_state: SensingState,
+) -> Router {
+    router(app_state)
+        .merge(schemas::router(schema_state))
+        .merge(sensing::router(sensing_state))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,6 +76,14 @@ mod tests {
     impl PipelineController for HappyController {
         async fn list(&self) -> Vec<PipeInfo> {
             vec![self.info.clone()]
+        }
+
+        async fn get(&self, name: &str) -> Result<PipeInfo, PipelineAPIError> {
+            if name == self.info.name {
+                Ok(self.info.clone())
+            } else {
+                Err(PipelineAPIError::NotFound(name.to_string()))
+            }
         }
 
         async fn create(
@@ -86,6 +121,14 @@ mod tests {
         ) -> Result<PipeInfo, PipelineAPIError> {
             Ok(self.info.clone())
         }
+
+        async fn delete(&self, name: &str) -> Result<(), PipelineAPIError> {
+            if name == self.info.name {
+                Ok(())
+            } else {
+                Err(PipelineAPIError::NotFound(name.to_string()))
+            }
+        }
     }
 
     #[derive(Clone)]
@@ -95,6 +138,10 @@ mod tests {
     impl PipelineController for ErrorController {
         async fn list(&self) -> Vec<PipeInfo> {
             vec![]
+        }
+
+        async fn get(&self, name: &str) -> Result<PipeInfo, PipelineAPIError> {
+            Err(PipelineAPIError::NotFound(name.to_string()))
         }
 
         async fn create(
@@ -135,6 +182,10 @@ mod tests {
         ) -> Result<PipeInfo, PipelineAPIError> {
             Err(PipelineAPIError::Failed(anyhow::anyhow!("stop failed")))
         }
+
+        async fn delete(&self, name: &str) -> Result<(), PipelineAPIError> {
+            Err(PipelineAPIError::NotFound(name.to_string()))
+        }
     }
 
     fn sample_pipe_info() -> PipeInfo {
@@ -158,10 +209,12 @@ mod tests {
                         id: "redis".to_string(),
                         uri: "redis://localhost".to_string(),
                         stream: "events".to_string(),
+                        required: Some(true),
                     })],
                     connection_policy: None,
                     batch: Some(BatchConfig::default()),
                     commit_policy: None,
+                    schema_sensing: Default::default(),
                 },
             },
         }
@@ -178,7 +231,7 @@ mod tests {
             info: sample_pipe_info(),
         };
         let app = router(AppState {
-            manager: Arc::new(controller),
+            controller: Arc::new(controller),
         });
 
         let resp = app
@@ -222,9 +275,10 @@ mod tests {
     async fn pipeline_routes_surface_errors() {
         let controller = ErrorController;
         let app = router(AppState {
-            manager: Arc::new(controller),
+            controller: Arc::new(controller),
         });
 
+        // Test create conflict
         let resp = app
             .clone()
             .oneshot(
@@ -243,7 +297,9 @@ mod tests {
         let body_text = String::from_utf8(body.to_vec()).unwrap();
         assert!(body_text.contains("already exists"));
 
+        // Test patch not found
         let patch = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::PATCH)
@@ -258,5 +314,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(StatusCode::NOT_FOUND, patch.status());
+
+        // Test get not found
+        let get_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/pipelines/missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::NOT_FOUND, get_resp.status());
+
+        // Test delete not found
+        let delete_resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/pipelines/missing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::NOT_FOUND, delete_resp.status());
     }
 }

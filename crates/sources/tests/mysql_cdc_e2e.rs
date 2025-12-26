@@ -33,6 +33,7 @@ use common::init_test_tracing;
 ///
 /// NOTE: this test requires Docker and the ability to pull/run `mysql:8.4`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires docker and significant disk space"]
 async fn mysql_cdc_end_to_end() -> Result<()> {
     init_test_tracing();
 

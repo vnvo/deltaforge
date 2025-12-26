@@ -12,6 +12,7 @@ chrono.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 uuid.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 parking_lot.workspace = true
 anyhow.workspace = true
@@ -19,6 +20,7 @@ tracing.workspace = true
 axum.workspace = true
 clap = { version = "4", features = ["derive"] }
 deltaforge-core = { path = "../deltaforge-core" }
+schema-sensing = { path = "../schema-sensing" }
 deltaforge-config = { path = "../deltaforge-config" }
 o11y = { path = "../o11y" }
 schema-registry = { path = "../schema-registry" }

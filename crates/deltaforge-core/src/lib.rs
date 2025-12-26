@@ -109,6 +109,9 @@ pub struct Event {
     /// Byte size hint for batching (from source or estimated)
     #[serde(default)]
     pub size_bytes: usize,
+
+    #[serde(default)]
+    pub tx_end: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -167,6 +170,12 @@ impl Event {
         )
     }
 
+    pub fn with_tx(mut self, tx_id: Option<String>, tx_end: bool) -> Self {
+        self.tx_id = tx_id;
+        self.tx_end = tx_end;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new_row(
         tenant_id: String,
@@ -197,6 +206,7 @@ impl Event {
             tags: None,
             checkpoint: None,
             size_bytes,
+            tx_end: true,
         }
     }
 
@@ -227,6 +237,7 @@ impl Event {
             tags: None,
             checkpoint: None,
             size_bytes,
+            tx_end: true,
         }
     }
 }
@@ -315,6 +326,14 @@ pub trait Processor: Send + Sync {
 #[async_trait]
 pub trait Sink: Send + Sync {
     fn id(&self) -> &str;
+
+    /// whether this sink must acknowledge batches for checkpoint commits.
+    /// sinks marked as required (default: true) must succeed for the commit
+    /// policy to be satisfied. Optional sinks are best-effort.
+    /// default: true (all sinks required unless explicitly marked optional)
+    fn required(&self) -> bool {
+        true
+    }
 
     /// send a single event to the sink.
     /// takes a reference to avoid cloning in multi-sink scenarios

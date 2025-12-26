@@ -4,6 +4,15 @@ use thiserror::Error;
 use tracing::error;
 use walkdir::WalkDir;
 
+mod turso_cfg;
+pub use turso_cfg::{NativeCdcLevel, TursoCdcMode, TursoSrcCfg};
+
+mod schema_sensing;
+pub use schema_sensing::{
+    ColumnFilter, DeepInspectConfig, SamplingConfig, SchemaSensingConfig,
+    SensingOutputConfig, TableFilter, TrackingConfig,
+};
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config file {path}: {source}")]
@@ -73,6 +82,11 @@ pub struct Spec {
 
     /// How sink acknowledgements gate checkpoint commits.
     pub commit_policy: Option<CommitPolicy>,
+
+    /// Schema sensing configuration.
+    /// When enabled, automatically infers and tracks schema from event payloads.
+    #[serde(default)]
+    pub schema_sensing: SchemaSensingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +110,7 @@ pub struct MysqlSrcCfg {
 pub enum SourceCfg {
     Postgres(PostgresSrcCfg),
     Mysql(MysqlSrcCfg),
+    Turso(turso_cfg::TursoSrcCfg),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,7 +147,10 @@ pub struct RedisSinkCfg {
     pub id: String,
     pub uri: String,
     pub stream: String,
+    #[serde(default)]
+    pub required: Option<bool>,
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "config", rename_all = "lowercase")]
 pub enum SinkCfg {
@@ -168,7 +186,7 @@ pub struct ConnectionLimits {
 
 /// The pipeline-level batch (the **commit unit**). Coordinator will build batches
 /// using these thresholds and checkpoint after a batch is accepted by sinks.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BatchConfig {
     /// Flush when this many events have been accumulated.
@@ -181,6 +199,18 @@ pub struct BatchConfig {
     pub respect_source_tx: Option<bool>,
     /// How many batches may be in-flight concurrently (keep 1 until we add WAL).
     pub max_inflight: Option<usize>,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            max_events: Some(1000),
+            max_bytes: Some(3 * 1014 * 1024),
+            max_ms: Some(100),
+            respect_source_tx: Some(true),
+            max_inflight: Some(1),
+        }
+    }
 }
 
 /// Per-component performance knobs that do **not** change the commit unit.

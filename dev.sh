@@ -6,6 +6,7 @@ COMPOSE="${COMPOSE_FILE:-docker-compose.dev.yml}"
 DC=(docker compose -f "$COMPOSE")
 
 BOOTSTRAP="localhost:9092"
+API_BASE="${API_BASE:-http://localhost:8080}"
 
 # Docker image settings
 IMAGE_NAME="deltaforge"
@@ -37,12 +38,28 @@ DB shells:
 Dev:
   ./dev.sh build                  # build project (debug)
   ./dev.sh build-release          # build project (release)
-  ./dev.sh run                    # run with examples/dev.yaml
+  ./dev.sh run [config]           # run with config (default: examples/dev.yaml)
+  ./dev.sh run-turso              # run with Turso example config
+  ./dev.sh run-pg                 # run with Postgres example config
   ./dev.sh fmt                    # format Rust code (cargo fmt --all)
   ./dev.sh lint                   # run clippy with warnings as errors
   ./dev.sh test                   # run test suite
   ./dev.sh check                  # run fmt-check + clippy + tests (what CI does)
   ./dev.sh cov                    # run coverage (cargo llvm-cov)
+
+API:
+  ./dev.sh api-health             # check API health
+  ./dev.sh api-ready              # check API readiness + pipeline status
+  ./dev.sh api-list               # list all pipelines
+  ./dev.sh api-get <pipeline>     # get pipeline details
+  ./dev.sh api-pause <pipeline>   # pause a pipeline
+  ./dev.sh api-resume <pipeline>  # resume a pipeline
+  ./dev.sh api-stop <pipeline>    # stop a pipeline
+  ./dev.sh api-delete <pipeline>  # delete a pipeline
+  ./dev.sh api-schemas <pipeline> # list DB schemas for pipeline
+  ./dev.sh api-sensing <pipeline> # list inferred schemas (sensing)
+  ./dev.sh api-drift <pipeline>   # get drift detection results
+  ./dev.sh api-stats <pipeline>   # get cache statistics
 
 Docker:
   ./dev.sh docker                 # build minimal image (~57MB)
@@ -64,6 +81,7 @@ Release:
 Notes:
 - Uses service names from docker-compose.dev.yml (kafka, redis, postgres, mysql).
 - Kafka broker advertises localhost:9092 (works from host & inside kafka container).
+- API defaults to http://localhost:8080 (set API_BASE to override).
 EOF
 }
 
@@ -163,7 +181,16 @@ cmd_build_release() {
 }
 
 cmd_run() {
-  cargo run -p runner -- --config examples/dev.yaml
+  local config="${1:-examples/dev.yaml}"
+  cargo run -p runner -- --config "$config"
+}
+
+cmd_run_turso() {
+  cargo run -p runner -- --config examples/turso.yaml
+}
+
+cmd_run_pg() {
+  cargo run -p runner -- --config examples/postgres.yaml
 }
 
 cmd_fmt() {
@@ -188,6 +215,92 @@ cmd_check() {
 cmd_cov() {
   # Requires cargo-llvm-cov to be installed
   cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+}
+
+# ============================================================
+# API commands
+# ============================================================
+api_curl() {
+  curl -s "$@" | jq . 2>/dev/null || curl -s "$@"
+}
+
+cmd_api_health() {
+  echo "GET $API_BASE/healthz"
+  curl -s "$API_BASE/healthz"
+  echo
+}
+
+cmd_api_ready() {
+  echo "GET $API_BASE/readyz"
+  api_curl "$API_BASE/readyz"
+}
+
+cmd_api_list() {
+  echo "GET $API_BASE/pipelines"
+  api_curl "$API_BASE/pipelines"
+}
+
+cmd_api_get() {
+  local pipeline="${1:-}"
+  if [[ -z "$pipeline" ]]; then echo "Usage: ./dev.sh api-get <pipeline>"; exit 1; fi
+  echo "GET $API_BASE/pipelines/$pipeline"
+  api_curl "$API_BASE/pipelines/$pipeline"
+}
+
+cmd_api_pause() {
+  local pipeline="${1:-}"
+  if [[ -z "$pipeline" ]]; then echo "Usage: ./dev.sh api-pause <pipeline>"; exit 1; fi
+  echo "POST $API_BASE/pipelines/$pipeline/pause"
+  api_curl -X POST "$API_BASE/pipelines/$pipeline/pause"
+}
+
+cmd_api_resume() {
+  local pipeline="${1:-}"
+  if [[ -z "$pipeline" ]]; then echo "Usage: ./dev.sh api-resume <pipeline>"; exit 1; fi
+  echo "POST $API_BASE/pipelines/$pipeline/resume"
+  api_curl -X POST "$API_BASE/pipelines/$pipeline/resume"
+}
+
+cmd_api_stop() {
+  local pipeline="${1:-}"
+  if [[ -z "$pipeline" ]]; then echo "Usage: ./dev.sh api-stop <pipeline>"; exit 1; fi
+  echo "POST $API_BASE/pipelines/$pipeline/stop"
+  api_curl -X POST "$API_BASE/pipelines/$pipeline/stop"
+}
+
+cmd_api_delete() {
+  local pipeline="${1:-}"
+  if [[ -z "$pipeline" ]]; then echo "Usage: ./dev.sh api-delete <pipeline>"; exit 1; fi
+  echo "DELETE $API_BASE/pipelines/$pipeline"
+  curl -s -X DELETE "$API_BASE/pipelines/$pipeline" -w "\nHTTP %{http_code}\n"
+}
+
+cmd_api_schemas() {
+  local pipeline="${1:-}"
+  if [[ -z "$pipeline" ]]; then echo "Usage: ./dev.sh api-schemas <pipeline>"; exit 1; fi
+  echo "GET $API_BASE/pipelines/$pipeline/schemas"
+  api_curl "$API_BASE/pipelines/$pipeline/schemas"
+}
+
+cmd_api_sensing() {
+  local pipeline="${1:-}"
+  if [[ -z "$pipeline" ]]; then echo "Usage: ./dev.sh api-sensing <pipeline>"; exit 1; fi
+  echo "GET $API_BASE/pipelines/$pipeline/sensing/schemas"
+  api_curl "$API_BASE/pipelines/$pipeline/sensing/schemas"
+}
+
+cmd_api_drift() {
+  local pipeline="${1:-}"
+  if [[ -z "$pipeline" ]]; then echo "Usage: ./dev.sh api-drift <pipeline>"; exit 1; fi
+  echo "GET $API_BASE/pipelines/$pipeline/drift"
+  api_curl "$API_BASE/pipelines/$pipeline/drift"
+}
+
+cmd_api_stats() {
+  local pipeline="${1:-}"
+  if [[ -z "$pipeline" ]]; then echo "Usage: ./dev.sh api-stats <pipeline>"; exit 1; fi
+  echo "GET $API_BASE/pipelines/$pipeline/sensing/stats"
+  api_curl "$API_BASE/pipelines/$pipeline/sensing/stats"
 }
 
 # ============================================================
@@ -303,11 +416,27 @@ case "${1:-}" in
   build) shift; cmd_build "$@";;
   build-release) shift; cmd_build_release "$@";;
   run) shift; cmd_run "$@";;
+  run-turso) shift; cmd_run_turso "$@";;
+  run-pg) shift; cmd_run_pg "$@";;
   fmt) shift; cmd_fmt "$@";;
   lint) shift; cmd_lint "$@";;
   test) shift; cmd_test "$@";;
   check) shift; cmd_check "$@";;
   cov) shift; cmd_cov "$@";;
+
+  # API
+  api-health) shift; cmd_api_health "$@";;
+  api-ready) shift; cmd_api_ready "$@";;
+  api-list) shift; cmd_api_list "$@";;
+  api-get) shift; cmd_api_get "$@";;
+  api-pause) shift; cmd_api_pause "$@";;
+  api-resume) shift; cmd_api_resume "$@";;
+  api-stop) shift; cmd_api_stop "$@";;
+  api-delete) shift; cmd_api_delete "$@";;
+  api-schemas) shift; cmd_api_schemas "$@";;
+  api-sensing) shift; cmd_api_sensing "$@";;
+  api-drift) shift; cmd_api_drift "$@";;
+  api-stats) shift; cmd_api_stats "$@";;
 
   # Docker
   docker) shift; cmd_docker "$@";;

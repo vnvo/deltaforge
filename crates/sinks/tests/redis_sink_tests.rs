@@ -31,6 +31,7 @@ async fn redis_sink_writes_stream() -> Result<()> {
         id: "test-redis".to_string(),
         uri: "redis://127.0.0.1:6379/0".to_string(),
         stream: "df.test".to_string(),
+        required: Some(true),
     };
 
     // Clean previous data in the test stream
@@ -87,6 +88,7 @@ async fn test_batch_send() -> anyhow::Result<()> {
         id: "test".into(),
         uri: "redis://127.0.0.1:6379/0".into(),
         stream: "df.test.batch".into(),
+        required: None,
     };
 
     let sink = RedisSink::new(&cfg)?;

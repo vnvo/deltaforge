@@ -1,7 +1,7 @@
 apiVersion: deltaforge/v1
 kind: Pipeline
 metadata:
-  name: mysql-smoke
+  name: df-mysql-simple
   tenant: acme
 
 spec:
@@ -12,16 +12,8 @@ spec:
       dsn: "mysql://df:dfpw@127.0.0.1:3306"
       tables: ["orders.order_items", "orders.orders"]
 
-  processors:
-    - type: javascript
-      id: js-normalize
-      inline: |
-        function processBatch(events) {
-          return events.map(event => {
-            event.tags = (event.tags || []).concat(["normalized"]);
-            return event;
-          });
-        }
+  # No processors - direct passthrough
+  processors: []
 
   sinks:
     - type: redis
@@ -49,13 +41,4 @@ spec:
     mode: required
 
   schema_sensing:
-    enabled: true
-    deep_inspect:
-      enabled: true
-      max_depth: 5
-      max_sample_size: 10
-    sampling:
-      warmup_events: 2
-      sample_rate: 2
-      structure_cache: true
-      structure_cache_size: 100
+    enabled: false
