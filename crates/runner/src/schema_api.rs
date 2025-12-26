@@ -160,11 +160,18 @@ impl SchemaController for SchemaApi {
             .registry()
             .list_versions(&tenant, db, table)
             .into_iter()
-            .map(|v| SchemaVersionInfo {
-                version: v.version,
-                fingerprint: v.hash,
-                column_count: 0,
-                registered_at: v.registered_at,
+            .map(|v| {
+                let col_count = v.schema_json
+                    .get("columns")
+                    .and_then(|c| c.as_array())
+                    .map(|arr| arr.len())
+                    .unwrap_or(0);
+                SchemaVersionInfo {
+                    version: v.version,
+                    fingerprint: v.hash,
+                    column_count: col_count,
+                    registered_at: v.registered_at,
+                }
             })
             .collect())
     }
