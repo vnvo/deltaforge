@@ -1,0 +1,3380 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>DeltaForge CDC Framework - User Guide</title>
+        <meta name="robots" content="noindex">
+
+
+        <!-- Custom HTML head -->
+        <!-- SEO Meta Tags -->
+        <meta name="author" content="Vahid Negahdari">
+        <meta name="keywords" content="CDC, Change Data Capture, Rust, Kafka, Redis, MySQL, Postgres, streaming, data pipeline, real-time, Debezium alternative, ETL">
+        <meta name="robots" content="index, follow">
+        <link rel="canonical" href="https://vnvo.github.io/deltaforge/">
+        
+        <!-- Open Graph / Facebook -->
+        <meta property="og:type" content="website">
+        <meta property="og:url" content="https://vnvo.github.io/deltaforge/">
+        <meta property="og:title" content="DeltaForge - CDC Framework">
+        <meta property="og:description" content="A modular, config-driven Change Data Capture (CDC) micro-framework built in Rust. Stream database changes to Kafka and Redis.">
+        <meta property="og:image" content="https://vnvo.github.io/deltaforge/assets/deltaforge-blc.png">
+        <meta property="og:site_name" content="DeltaForge Documentation">
+        
+        <!-- Twitter Card -->
+        <meta name="twitter:card" content="summary_large_image">
+        <meta name="twitter:url" content="https://vnvo.github.io/deltaforge/">
+        <meta name="twitter:title" content="DeltaForge - CDC Framework">
+        <meta name="twitter:description" content="A modular, config-driven Change Data Capture (CDC) micro-framework built in Rust. Stream database changes to Kafka and Redis.">
+        <meta name="twitter:image" content="https://vnvo.github.io/deltaforge/assets/deltaforge-blc.png">
+        
+        <!-- Structured Data (JSON-LD) -->
+        <script type="application/ld+json">
+        {
+          "@context": "https://schema.org",
+          "@type": "SoftwareSourceCode",
+          "name": "DeltaForge",
+          "description": "A modular, config-driven Change Data Capture (CDC) micro-framework built in Rust",
+          "url": "https://github.com/vnvo/deltaforge",
+          "codeRepository": "https://github.com/vnvo/deltaforge",
+          "programmingLanguage": "Rust",
+          "license": "https://opensource.org/licenses/MIT",
+          "author": {
+            "@type": "Person",
+            "name": "Vahid Negahdari",
+            "url": "https://github.com/vnvo"
+          },
+          "keywords": ["CDC", "Change Data Capture", "Rust", "Kafka", "Redis", "MySQL", "Postgres", "streaming"]
+        }
+        </script>
+        
+        <!-- Analytics -->
+        <script defer src="https://cloud.umami.is/script.js" data-website-id="79f2e1d8-af64-4b83-87f1-0db9b0b926fa"></script>
+        <meta name="description" content="A modular, config-driven Change Data Capture (CDC) micro-framework built in Rust. Stream database changes to Kafka, Redis and etc.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="css/custom-55d982ab.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-e5f3ccc1.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-4ab68d44.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div class="sidebar-footer">
+                <a href="https://github.com/vnvo/deltaforge/blob/main/LICENSE-MIT">
+                    <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License">
+                </a>
+                <a href="https://github.com/vnvo/deltaforge/pkgs/container/deltaforge">
+                    <img src="https://img.shields.io/badge/ghcr.io-deltaforge-blue?logo=docker" alt="GHCR">
+                </a>
+                <a href="https://hub.docker.com/r/vnvohub/deltaforge">
+                    <img src="https://img.shields.io/docker/pulls/vnvohub/deltaforge?logo=docker" alt="Docker Pulls">
+                </a>
+                <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-green" alt="Arch">
+                <img src="https://img.shields.io/badge/rustc-1.89+-orange.svg" alt="MSRV">
+                <a href="https://github.com/vnvo/deltaforge">
+                    <img src="https://img.shields.io/github/stars/vnvo/deltaforge?style=flat" alt="GitHub Stars">
+                </a>
+            </div>            
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">DeltaForge CDC Framework - User Guide</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/vnvo/deltaforge" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <p align="center">
+  <img src="assets/deltaforge-blc.png" width="450" alt="DeltaForge">
+  <br><br>
+  <a href="https://github.com/vnvo/deltaforge/releases">
+    <img src="https://img.shields.io/github/v/release/vnvo/deltaforge?label=version" alt="Version">
+  </a>
+  <a href="https://github.com/vnvo/deltaforge">
+    <img src="https://img.shields.io/github/stars/vnvo/deltaforge?style=flat" alt="GitHub Stars">
+  </a>
+  <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License">
+</p>
+
+<h1 id="introduction"><a class="header" href="#introduction">Introduction</a></h1>
+<p>DeltaForge is a modular, config-driven <a href="#change-data-capture-cdc">Change Data Capture</a> (CDC) micro-framework built in Rust. It streams database changes into downstream systems like Kafka and Redis while giving you full control over how each event is processed.</p>
+<p>Pipelines are defined declaratively in YAML, making it straightforward to onboard new use cases without custom code.</p>
+<h2 id="why-deltaforge"><a class="header" href="#why-deltaforge">Why DeltaForge?</a></h2>
+<ul>
+<li>⚡ <strong>Powered by Rust</strong> : Predictable performance, memory safety, and reliable operations.</li>
+<li>🔌 <strong>Pluggable sources &amp; sinks</strong> : MySQL binlog and Postgres logical replication today, with more planned.</li>
+<li>🧩 <strong>Config-driven pipelines</strong> : Define sources, processors, sinks, batching, and commit policies in YAML.</li>
+<li>📦 <strong>Built-in checkpointing</strong> : Resume safely after restarts with exactly-once delivery semantics.</li>
+<li>🛠️ <strong>Operational guardrails</strong> : Structured logging, Prometheus metrics, and health endpoints out of the box.</li>
+</ul>
+<h2 id="use-cases"><a class="header" href="#use-cases">Use Cases</a></h2>
+<p>DeltaForge is designed for:</p>
+<ul>
+<li><strong>Real-time data synchronization</strong> : Keep caches, search indexes, and analytics systems in sync.</li>
+<li><strong>Event-driven architectures</strong> : Stream database changes to Kafka for downstream consumers.</li>
+<li><strong>Lightweight ETL</strong> : Transform and route data without heavyweight infrastructure.</li>
+</ul>
+<blockquote>
+<p><strong>DeltaForge is <em>not</em> a DAG-based stream processor.</strong> It is a focused CDC engine meant to replace tools like Debezium when you need a lighter, cloud-native, and more customizable runtime.</p>
+</blockquote>
+<h2 id="getting-started"><a class="header" href="#getting-started">Getting Started</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Guide</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><a href="#quickstart">Quickstart</a></td><td>Get DeltaForge running in minutes</td></tr>
+<tr><td><a href="#change-data-capture-cdc">CDC Overview</a></td><td>Understand Change Data Capture concepts</td></tr>
+<tr><td><a href="#configuration">Configuration</a></td><td>Pipeline spec reference</td></tr>
+<tr><td><a href="#development-guide">Development</a></td><td>Build from source, contribute</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="quick-example"><a class="header" href="#quick-example">Quick Example</a></h2>
+<pre><code class="language-yaml">metadata:
+  name: orders-to-kafka
+  tenant: acme
+
+spec:
+  source:
+    type: mysql
+    config:
+      dsn: ${MYSQL_DSN}
+      tables: [shop.orders]
+
+  processors:
+    - type: javascript
+      inline: |
+        (event) =&gt; {
+          event.processed_at = Date.now();
+          return [event];
+        }
+
+  sinks:
+    - type: kafka
+      config:
+        brokers: ${KAFKA_BROKERS}
+        topic: order-events
+</code></pre>
+<h2 id="installation"><a class="header" href="#installation">Installation</a></h2>
+<p><strong>Docker (recommended):</strong></p>
+<pre><code class="language-bash">docker pull ghcr.io/vnvo/deltaforge:latest
+</code></pre>
+<p><strong>From source:</strong></p>
+<pre><code class="language-bash">git clone https://github.com/vnvo/deltaforge.git
+cd deltaforge
+cargo build --release
+</code></pre>
+<p>See the <a href="#development-guide">Development Guide</a> for detailed build instructions and available Docker image variants.</p>
+<h2 id="license"><a class="header" href="#license">License</a></h2>
+<p>DeltaForge is dual-licensed under <a href="https://github.com/vnvo/deltaforge/blob/main/LICENSE-MIT">MIT</a> and <a href="https://github.com/vnvo/deltaforge/blob/main/LICENSE-APACHE">Apache 2.0</a>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="change-data-capture-cdc"><a class="header" href="#change-data-capture-cdc">Change Data Capture (CDC)</a></h1>
+<p>Change Data Capture (CDC) is the practice of streaming database mutations as ordered events so downstream systems can stay in sync without periodic full loads. Rather than asking “what does my data look like now?”, CDC answers “what changed, and when?”</p>
+<p>DeltaForge is a CDC engine built to make log-based change streams reliable, observable, and operationally simple in modern, containerized environments. It focuses on <strong>row-level CDC</strong> from MySQL binlog and Postgres logical replication to keep consumers accurate and latency-aware while minimizing impact on source databases.</p>
+<blockquote>
+<p><strong>In short</strong>: DeltaForge tails committed transactions from MySQL and Postgres logs, preserves ordering and transaction boundaries, and delivers events to Kafka and Redis with checkpointed delivery, configurable batching, and Prometheus metrics—without requiring a JVM or distributed coordinator.</p>
+</blockquote>
+<hr>
+<h2 id="why-cdc-matters"><a class="header" href="#why-cdc-matters">Why CDC matters</a></h2>
+<p>Traditional data integration relies on periodic batch jobs that query source systems, compare snapshots, and push differences downstream. This approach worked for decades, but modern architectures demand something better.</p>
+<p><strong>The batch ETL problem</strong>: A nightly sync means your analytics are always a day stale. An hourly sync still leaves gaps and hammers your production database with expensive <code>SELECT *</code> queries during business hours. As data volumes grow, these jobs take longer, fail more often, and compete for the same resources your customers need.</p>
+<p>CDC flips the model. Instead of pulling data on a schedule, you subscribe to changes as they happen.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Aspect</th><th>Batch ETL</th><th>CDC</th></tr>
+</thead>
+<tbody>
+<tr><td>Latency</td><td>Minutes to hours</td><td>Seconds to milliseconds</td></tr>
+<tr><td>Source load</td><td>High (repeated scans)</td><td>Minimal (log tailing)</td></tr>
+<tr><td>Data freshness</td><td>Stale between runs</td><td>Near real-time</td></tr>
+<tr><td>Failure recovery</td><td>Re-run entire job</td><td>Resume from checkpoint</td></tr>
+<tr><td>Change detection</td><td>Diff comparison</td><td>Native from source</td></tr>
+</tbody>
+</table>
+</div>
+<p>These benefits compound as systems scale and teams decentralize:</p>
+<ul>
+<li><strong>Deterministic replay</strong>: Ordered events allow consumers to reconstruct state or power exactly-once delivery with checkpointing.</li>
+<li><strong>Polyglot delivery</strong>: The same change feed can serve caches, queues, warehouses, and search indexes simultaneously without additional source queries.</li>
+</ul>
+<hr>
+<h2 id="how-cdc-works"><a class="header" href="#how-cdc-works">How CDC works</a></h2>
+<p>All CDC implementations share a common goal: detect changes and emit them as events. The approaches differ in how they detect those changes.</p>
+<h3 id="log-based-cdc"><a class="header" href="#log-based-cdc">Log-based CDC</a></h3>
+<p>Databases maintain transaction logs (MySQL binlog, Postgres WAL) that record every committed change for durability and replication. Log-based CDC reads these logs directly, capturing changes without touching application tables.</p>
+<pre><code>┌─────────────┐    commits    ┌─────────────┐    tails     ┌─────────────┐
+│ Application │──────────────▶│  Database   │─────────────▶│ CDC Engine  │
+└─────────────┘               │   + WAL     │              └──────┬──────┘
+                              └─────────────┘                     │
+                                                                  ▼
+                                                           ┌─────────────┐
+                                                           │   Kafka /   │
+                                                           │   Redis     │
+                                                           └─────────────┘
+</code></pre>
+<p><strong>Advantages</strong>:</p>
+<ul>
+<li>Zero impact on source table performance</li>
+<li>Captures all changes including those from triggers and stored procedures</li>
+<li>Preserves transaction boundaries and ordering</li>
+<li>Can capture deletes without soft-delete columns</li>
+</ul>
+<p><strong>Trade-offs</strong>:</p>
+<ul>
+<li>Requires database configuration (replication slots, binlog retention)</li>
+<li>Schema changes need careful handling</li>
+<li>Log retention limits how far back you can replay</li>
+</ul>
+<p><strong>DeltaForge uses log-based CDC exclusively.</strong> This allows DeltaForge to provide stronger ordering guarantees, lower source impact, and simpler operational semantics than hybrid approaches that mix log tailing with polling or triggers.</p>
+<h3 id="trigger-based-cdc"><a class="header" href="#trigger-based-cdc">Trigger-based CDC</a></h3>
+<p>Database triggers fire on INSERT, UPDATE, and DELETE operations, writing change records to a shadow table that a separate process polls.</p>
+<p><strong>Advantages</strong>:</p>
+<ul>
+<li>Works on databases without accessible transaction logs</li>
+<li>Can capture application-level context unavailable in logs</li>
+</ul>
+<p><strong>Trade-offs</strong>:</p>
+<ul>
+<li>Adds write overhead to every transaction</li>
+<li>Triggers can be disabled or forgotten during schema migrations</li>
+<li>Shadow tables require maintenance and can grow unbounded</li>
+</ul>
+<h3 id="polling-based-cdc"><a class="header" href="#polling-based-cdc">Polling-based CDC</a></h3>
+<p>A process periodically queries tables for rows modified since the last check, typically using an <code>updated_at</code> timestamp or incrementing ID.</p>
+<p><strong>Advantages</strong>:</p>
+<ul>
+<li>Simple to implement</li>
+<li>No special database configuration required</li>
+</ul>
+<p><strong>Trade-offs</strong>:</p>
+<ul>
+<li>Cannot reliably detect deletes</li>
+<li>Requires <code>updated_at</code> columns on every table</li>
+<li>Polling frequency trades off latency against database load</li>
+<li>Clock skew and transaction visibility can cause missed or duplicate events</li>
+</ul>
+<hr>
+<h2 id="anatomy-of-a-cdc-event"><a class="header" href="#anatomy-of-a-cdc-event">Anatomy of a CDC event</a></h2>
+<p>A well-designed CDC event contains everything downstream consumers need to process the change correctly.</p>
+<pre><code class="language-json">{
+  "id": "evt_01J7K9X2M3N4P5Q6R7S8T9U0V1",
+  "source": {
+    "database": "shop",
+    "table": "orders",
+    "server_id": "mysql-prod-1"
+  },
+  "operation": "update",
+  "timestamp": "2025-01-15T14:32:01.847Z",
+  "transaction": {
+    "id": "gtid:3E11FA47-71CA-11E1-9E33-C80AA9429562:42",
+    "position": 15847293
+  },
+  "before": {
+    "id": 12345,
+    "status": "pending",
+    "total": 99.99,
+    "updated_at": "2025-01-15T14:30:00.000Z"
+  },
+  "after": {
+    "id": 12345,
+    "status": "shipped",
+    "total": 99.99,
+    "updated_at": "2025-01-15T14:32:01.000Z"
+  },
+  "schema_version": "v3"
+}
+</code></pre>
+<p>Key components:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>operation</code></td><td>INSERT, UPDATE, DELETE, or DDL</td></tr>
+<tr><td><code>before</code> / <code>after</code></td><td>Row state before and after the change (enables diff logic)</td></tr>
+<tr><td><code>transaction</code></td><td>Groups changes from the same database transaction</td></tr>
+<tr><td><code>timestamp</code></td><td>When the change was committed at the source</td></tr>
+<tr><td><code>schema_version</code></td><td>Helps consumers handle schema evolution</td></tr>
+</tbody>
+</table>
+</div>
+<p>Not all fields are present for every operation—<code>before</code> is omitted for INSERTs, <code>after</code> is omitted for DELETEs—but the event envelope and metadata fields are consistent across MySQL and Postgres sources.</p>
+<hr>
+<h2 id="real-world-use-cases"><a class="header" href="#real-world-use-cases">Real-world use cases</a></h2>
+<h3 id="cache-invalidation-and-population"><a class="header" href="#cache-invalidation-and-population">Cache invalidation and population</a></h3>
+<p><strong>Problem</strong>: Your Redis cache serves product catalog data, but cache invalidation logic is scattered across dozens of services. Some forget to invalidate, others invalidate too aggressively, and debugging staleness issues takes hours.</p>
+<p><strong>CDC solution</strong>: Stream changes from the <code>products</code> table to a message queue. A dedicated consumer reads the stream and updates or deletes cache keys based on the operation type. This centralizes invalidation logic, provides replay capability for cache rebuilds, and removes cache concerns from application code entirely.</p>
+<pre><code>┌──────────┐     CDC      ┌─────────────┐   consumer   ┌─────────────┐
+│  MySQL   │─────────────▶│   Stream    │─────────────▶│ Cache Keys  │
+│ products │              │  (Kafka/    │              │ product:123 │
+└──────────┘              │   Redis)    │              └─────────────┘
+                          └─────────────┘
+</code></pre>
+<h3 id="event-driven-microservices"><a class="header" href="#event-driven-microservices">Event-driven microservices</a></h3>
+<p><strong>Problem</strong>: Your order service needs to notify inventory, shipping, billing, and analytics whenever an order changes state. Direct service-to-service calls create tight coupling and cascade failures.</p>
+<p><strong>CDC solution</strong>: Publish order changes to a durable message queue. Each downstream service subscribes independently, processes at its own pace, and can replay events after failures or during onboarding. The order service doesn’t need to know about its consumers.</p>
+<pre><code>┌─────────────┐     CDC      ┌─────────────┐
+│   Orders    │─────────────▶│   Message   │
+│   Database  │              │   Queue     │
+└─────────────┘              └──────┬──────┘
+                    ┌───────────────┼───────────────┐
+                    ▼               ▼               ▼
+             ┌───────────┐   ┌───────────┐   ┌───────────┐
+             │ Inventory │   │ Shipping  │   │ Analytics │
+             └───────────┘   └───────────┘   └───────────┘
+</code></pre>
+<h3 id="search-index-synchronization"><a class="header" href="#search-index-synchronization">Search index synchronization</a></h3>
+<p><strong>Problem</strong>: Your Elasticsearch index drifts from the source of truth. Full reindexing takes hours and blocks search updates during the process.</p>
+<p><strong>CDC solution</strong>: Stream changes continuously to keep the index synchronized. Use the <code>before</code> image to remove old documents and the <code>after</code> image to index new content.</p>
+<h3 id="data-warehouse-incremental-loads"><a class="header" href="#data-warehouse-incremental-loads">Data warehouse incremental loads</a></h3>
+<p><strong>Problem</strong>: Nightly full loads into your warehouse take 6 hours and block analysts until noon. Business users complain that dashboards show yesterday’s numbers.</p>
+<p><strong>CDC solution</strong>: Stream changes to a staging topic, then micro-batch into your warehouse every few minutes. Analysts get near real-time data without impacting source systems.</p>
+<h3 id="audit-logging-and-compliance"><a class="header" href="#audit-logging-and-compliance">Audit logging and compliance</a></h3>
+<p><strong>Problem</strong>: Regulations require you to maintain a complete history of changes to sensitive data. Application-level audit logging is inconsistent and can be bypassed.</p>
+<p><strong>CDC solution</strong>: The transaction log captures every committed change regardless of how it was made—application code, admin scripts, or direct SQL. Stream these events to immutable storage for compliance.</p>
+<h3 id="cross-region-replication"><a class="header" href="#cross-region-replication">Cross-region replication</a></h3>
+<p><strong>Problem</strong>: You need to replicate data to a secondary region for disaster recovery, but built-in replication doesn’t support the transformations you need.</p>
+<p><strong>CDC solution</strong>: Stream changes through a CDC pipeline that filters, transforms, and routes events to the target region’s databases or message queues.</p>
+<hr>
+<h2 id="architecture-patterns"><a class="header" href="#architecture-patterns">Architecture patterns</a></h2>
+<h3 id="the-outbox-pattern"><a class="header" href="#the-outbox-pattern">The outbox pattern</a></h3>
+<p>When you need to update a database and publish an event atomically, the outbox pattern provides exactly-once semantics without distributed transactions.</p>
+<pre><code>┌─────────────────────────────────────────┐
+│              Single Transaction         │
+│  ┌─────────────┐    ┌─────────────────┐ │
+│  │ UPDATE      │    │ INSERT INTO     │ │
+│  │ orders SET  │ +  │ outbox (event)  │ │
+│  │ status=...  │    │                 │ │
+│  └─────────────┘    └─────────────────┘ │
+└─────────────────────────────────────────┘
+                      │
+                      ▼ CDC
+               ┌─────────────┐
+               │   Kafka     │
+               └─────────────┘
+</code></pre>
+<ol>
+<li>The application writes business data and an event record in the same transaction.</li>
+<li>CDC tails the outbox table and publishes events to Kafka.</li>
+<li>A cleanup process (or CDC itself) removes processed outbox rows.</li>
+</ol>
+<p>This guarantees that events are published if and only if the transaction commits.</p>
+<p><strong>When to skip the outbox</strong>: If your only requirement is to react to committed database state (not application intent), direct CDC from business tables is often simpler than introducing an outbox. The outbox pattern adds value when you need custom event payloads, explicit event versioning, or when the event schema differs significantly from table structure.</p>
+<h3 id="event-sourcing-integration"><a class="header" href="#event-sourcing-integration">Event sourcing integration</a></h3>
+<p>CDC complements event sourcing by bridging legacy systems that weren’t built event-first. Stream changes from existing tables into event stores, then gradually migrate to native event sourcing.</p>
+<h3 id="cqrs-command-query-responsibility-segregation"><a class="header" href="#cqrs-command-query-responsibility-segregation">CQRS (Command Query Responsibility Segregation)</a></h3>
+<p>CDC naturally supports CQRS by populating read-optimized projections from the write model. Changes flow through the CDC pipeline to update denormalized views, search indexes, or cache layers.</p>
+<hr>
+<h2 id="challenges-and-solutions"><a class="header" href="#challenges-and-solutions">Challenges and solutions</a></h2>
+<h3 id="schema-evolution"><a class="header" href="#schema-evolution">Schema evolution</a></h3>
+<p>Databases change. Columns get added, renamed, or removed. Types change. CDC pipelines need to handle this gracefully.</p>
+<p><strong>Strategies</strong>:</p>
+<ul>
+<li><strong>Schema registry</strong>: Store and version schemas centrally (e.g., Confluent Schema Registry with Avro/Protobuf).</li>
+<li><strong>Forward compatibility</strong>: Add columns as nullable; avoid removing columns that consumers depend on.</li>
+<li><strong>Consumer tolerance</strong>: Design consumers to ignore unknown fields and handle missing optional fields.</li>
+<li><strong>Processor transforms</strong>: Use DeltaForge’s JavaScript processors to normalize schemas before sinks.</li>
+</ul>
+<h3 id="ordering-guarantees"><a class="header" href="#ordering-guarantees">Ordering guarantees</a></h3>
+<p>Events must arrive in the correct order for consumers to reconstruct state accurately. A DELETE arriving before its corresponding INSERT would be catastrophic.</p>
+<p><strong>DeltaForge guarantees</strong>:</p>
+<ul>
+<li>Source-order preservation per table partition (always enabled)</li>
+<li>Transaction boundary preservation when <code>respect_source_tx: true</code> is configured in batch settings</li>
+</ul>
+<p>Kafka sink uses consistent partitioning by primary key to maintain ordering within a partition at the consumer.</p>
+<h3 id="exactly-once-delivery"><a class="header" href="#exactly-once-delivery">Exactly-once delivery</a></h3>
+<p>Network failures, process crashes, and consumer restarts can cause duplicates or gaps. True exactly-once semantics require coordination between source, pipeline, and sink.</p>
+<p><strong>DeltaForge approach</strong>:</p>
+<ul>
+<li>Checkpoints track the last committed position in the source log.</li>
+<li>Configurable commit policies (<code>all</code>, <code>required</code>, <code>quorum</code>) control when checkpoints advance.</li>
+<li>Kafka sink supports idempotent producers; transactional writes available via <code>exactly_once: true</code>.</li>
+</ul>
+<p><strong>Default behavior</strong>: DeltaForge provides at-least-once delivery out of the box. Exactly-once semantics require sink support and explicit configuration.</p>
+<h3 id="high-availability"><a class="header" href="#high-availability">High availability</a></h3>
+<p>Production CDC pipelines need to handle failures without data loss or extended downtime.</p>
+<p><strong>Best practices</strong>:</p>
+<ul>
+<li>Run multiple pipeline instances with leader election.</li>
+<li>Store checkpoints in durable storage (DeltaForge persists to local files, mountable volumes in containers).</li>
+<li>Monitor lag between source position and checkpoint position.</li>
+<li>Set up alerts for pipeline failures and excessive lag.</li>
+</ul>
+<p><strong>Expectations</strong>: DeltaForge checkpoints ensure no data loss on restart, but does not currently include built-in leader election. For HA deployments, use external coordination (Kubernetes leader election, etcd locks) or run active-passive with health-check-based failover.</p>
+<h3 id="backpressure"><a class="header" href="#backpressure">Backpressure</a></h3>
+<p>When sinks can’t keep up with the change rate, pipelines need to slow down gracefully rather than dropping events or exhausting memory.</p>
+<p><strong>DeltaForge handles backpressure through</strong>:</p>
+<ul>
+<li>Configurable batch sizes (<code>max_events</code>, <code>max_bytes</code>, <code>max_ms</code>).</li>
+<li>In-flight limits (<code>max_inflight</code>) that bound concurrent sink writes.</li>
+<li>Blocking reads from source when batches queue up.</li>
+</ul>
+<hr>
+<h2 id="performance-considerations"><a class="header" href="#performance-considerations">Performance considerations</a></h2>
+<h3 id="batching-trade-offs"><a class="header" href="#batching-trade-offs">Batching trade-offs</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Setting</th><th>Low value</th><th>High value</th></tr>
+</thead>
+<tbody>
+<tr><td><code>max_events</code></td><td>Lower latency, more overhead</td><td>Higher throughput, more latency</td></tr>
+<tr><td><code>max_ms</code></td><td>Faster flush, smaller batches</td><td>Larger batches, delayed flush</td></tr>
+<tr><td><code>max_bytes</code></td><td>Memory-safe, frequent commits</td><td>Efficient for large rows</td></tr>
+</tbody>
+</table>
+</div>
+<p>Start with DeltaForge defaults and tune based on observed latency and throughput.</p>
+<h3 id="source-database-impact"><a class="header" href="#source-database-impact">Source database impact</a></h3>
+<p>Log-based CDC has minimal impact, but consider:</p>
+<ul>
+<li><strong>Replication slot retention</strong>: Paused pipelines cause WAL/binlog accumulation.</li>
+<li><strong>Connection limits</strong>: Each pipeline holds a replication connection.</li>
+<li><strong>Network bandwidth</strong>: High-volume tables generate significant log traffic.</li>
+</ul>
+<h3 id="sink-throughput"><a class="header" href="#sink-throughput">Sink throughput</a></h3>
+<ul>
+<li><strong>Kafka</strong>: Tune <code>batch.size</code>, <code>linger.ms</code>, and compression in <code>client_conf</code>.</li>
+<li><strong>Redis</strong>: Use pipelining and connection pooling for high-volume streams.</li>
+</ul>
+<hr>
+<h2 id="monitoring-and-observability"><a class="header" href="#monitoring-and-observability">Monitoring and observability</a></h2>
+<p>CDC pipelines are long-running, stateful processes; without metrics and alerts, failures are silent by default. A healthy pipeline requires visibility into lag, throughput, and errors.</p>
+<h3 id="key-metrics-to-track"><a class="header" href="#key-metrics-to-track">Key metrics to track</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Metric</th><th>Description</th><th>Alert threshold</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cdc_lag_seconds</code></td><td>Time between event timestamp and processing</td><td>&gt; 60s</td></tr>
+<tr><td><code>events_processed_total</code></td><td>Throughput counter</td><td>Sudden drops</td></tr>
+<tr><td><code>checkpoint_lag_events</code></td><td>Events since last checkpoint</td><td>&gt; 10,000</td></tr>
+<tr><td><code>sink_errors_total</code></td><td>Failed sink writes</td><td>Any sustained errors</td></tr>
+<tr><td><code>batch_size_avg</code></td><td>Events per batch</td><td>Outside expected range</td></tr>
+</tbody>
+</table>
+</div>
+<p>DeltaForge exposes Prometheus metrics on the configurable metrics endpoint (default <code>:9000</code>).</p>
+<h3 id="health-checks"><a class="header" href="#health-checks">Health checks</a></h3>
+<ul>
+<li><code>GET /healthz</code>: Liveness probe—is the process running?</li>
+<li><code>GET /readyz</code>: Readiness probe—are pipelines connected and processing?</li>
+<li><code>GET /pipelines</code>: Detailed status of each pipeline including configuration.</li>
+</ul>
+<hr>
+<h2 id="choosing-a-cdc-solution"><a class="header" href="#choosing-a-cdc-solution">Choosing a CDC solution</a></h2>
+<p>When evaluating CDC tools, consider:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Factor</th><th>Questions to ask</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Source support</strong></td><td>Does it support your databases? MySQL binlog? Postgres logical replication?</td></tr>
+<tr><td><strong>Sink flexibility</strong></td><td>Can it write to your target systems? Kafka, Redis, HTTP, custom?</td></tr>
+<tr><td><strong>Transformation</strong></td><td>Can you filter, enrich, or reshape events in-flight?</td></tr>
+<tr><td><strong>Operational overhead</strong></td><td>How much infrastructure does it require? JVM? Distributed coordinator?</td></tr>
+<tr><td><strong>Resource efficiency</strong></td><td>What’s the memory/CPU footprint per pipeline?</td></tr>
+<tr><td><strong>Cloud-native</strong></td><td>Does it containerize cleanly? Support health checks? Emit metrics?</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="where-deltaforge-fits"><a class="header" href="#where-deltaforge-fits">Where DeltaForge fits</a></h3>
+<p>DeltaForge intentionally avoids the operational complexity of JVM-based CDC stacks (Kafka Connect-style deployments with Zookeeper, Connect workers, and converter configurations) while remaining compatible with Kafka-centric architectures.</p>
+<p><strong>DeltaForge is designed for teams that want</strong>:</p>
+<ul>
+<li><strong>Lightweight runtime</strong>: Single binary, minimal memory footprint, no JVM warmup.</li>
+<li><strong>Config-driven pipelines</strong>: YAML specs instead of code for common patterns.</li>
+<li><strong>Inline transformation</strong>: JavaScript processors for custom logic without recompilation.</li>
+<li><strong>Container-native operations</strong>: Built for Kubernetes with health endpoints and Prometheus metrics.</li>
+</ul>
+<p><strong>DeltaForge is not designed for</strong>:</p>
+<ul>
+<li>Complex DAG-based stream processing with windowed aggregations</li>
+<li>Stateful joins across multiple streams</li>
+<li>Sources beyond MySQL and Postgres (currently)</li>
+<li>Built-in schema registry integration (use external registries)</li>
+</ul>
+<p>If you need those capabilities, consider dedicated stream processors or the broader Kafka ecosystem. DeltaForge excels at getting data out of databases and into your event infrastructure reliably and efficiently.</p>
+<hr>
+<h2 id="getting-started-1"><a class="header" href="#getting-started-1">Getting started</a></h2>
+<p>Ready to try CDC with DeltaForge? Head to the <a href="#quickstart">Quickstart guide</a> to run your first pipeline in minutes.</p>
+<p>For production deployments, review the <a href="#development-guide">Development guide</a> for container builds and operational best practices.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="quickstart"><a class="header" href="#quickstart">Quickstart</a></h1>
+<p>Get DeltaForge running in minutes.</p>
+<h2 id="1-prepare-a-pipeline-spec"><a class="header" href="#1-prepare-a-pipeline-spec">1. Prepare a pipeline spec</a></h2>
+<p>Create a YAML file that defines your CDC pipeline. Environment variables are expanded at runtime, so secrets stay out of version control.</p>
+<pre><code class="language-yaml">metadata:
+  name: orders-mysql-to-kafka
+  tenant: acme
+
+spec:
+  source:
+    type: mysql
+    config:
+      id: orders-mysql
+      dsn: ${MYSQL_DSN}
+      tables:
+        - shop.orders
+
+  processors:
+    - type: javascript
+      id: transform
+      inline: |
+        (event) =&gt; {
+          event.tags = ["processed"];
+          return [event];
+        }
+
+  sinks:
+    - type: kafka
+      config:
+        id: orders-kafka
+        brokers: ${KAFKA_BROKERS}
+        topic: orders
+        required: true
+
+  batch:
+    max_events: 500
+    max_bytes: 1048576
+    max_ms: 1000
+</code></pre>
+<h2 id="2-start-deltaforge"><a class="header" href="#2-start-deltaforge">2. Start DeltaForge</a></h2>
+<p><strong>Using Docker (recommended):</strong></p>
+<pre><code class="language-bash">docker run --rm \
+  -p 8080:8080 -p 9000:9000 \
+  -e MYSQL_DSN="mysql://user:pass@host:3306/db" \
+  -e KAFKA_BROKERS="kafka:9092" \
+  -v $(pwd)/pipeline.yaml:/etc/deltaforge/pipeline.yaml:ro \
+  -v deltaforge-checkpoints:/app/data \
+  ghcr.io/vnvo/deltaforge:latest \
+  --config /etc/deltaforge/pipeline.yaml
+</code></pre>
+<p><strong>From source:</strong></p>
+<pre><code class="language-bash">cargo run -p runner -- --config ./pipeline.yaml
+</code></pre>
+<h3 id="runner-options"><a class="header" href="#runner-options">Runner options</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--config</code></td><td>(required)</td><td>Path to pipeline spec file or directory</td></tr>
+<tr><td><code>--api-addr</code></td><td><code>0.0.0.0:8080</code></td><td>REST API address</td></tr>
+<tr><td><code>--metrics-addr</code></td><td><code>0.0.0.0:9095</code></td><td>Prometheus metrics address</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="3-verify-its-running"><a class="header" href="#3-verify-its-running">3. Verify it’s running</a></h2>
+<p>Check health and pipeline status:</p>
+<pre><code class="language-bash"># Liveness probe
+curl http://localhost:8080/healthz
+
+# Readiness with pipeline status
+curl http://localhost:8080/readyz
+
+# List all pipelines
+curl http://localhost:8080/pipelines
+</code></pre>
+<h2 id="4-manage-pipelines"><a class="header" href="#4-manage-pipelines">4. Manage pipelines</a></h2>
+<p>Control pipelines via the REST API:</p>
+<pre><code class="language-bash"># Pause a pipeline
+curl -X POST http://localhost:8080/pipelines/orders-mysql-to-kafka/pause
+
+# Resume a pipeline
+curl -X POST http://localhost:8080/pipelines/orders-mysql-to-kafka/resume
+
+# Stop a pipeline
+curl -X POST http://localhost:8080/pipelines/orders-mysql-to-kafka/stop
+</code></pre>
+<h2 id="next-steps"><a class="header" href="#next-steps">Next steps</a></h2>
+<ul>
+<li><a href="#change-data-capture-cdc">CDC Overview</a> : Understand how Change Data Capture works</li>
+<li><a href="#configuration">Configuration</a> : Full pipeline spec reference</li>
+<li><a href="sources/README.html">Sources</a> : MySQL and Postgres setup</li>
+<li><a href="sinks/README.html">Sinks</a> : Kafka and Redis configuration</li>
+<li><a href="#development-guide">Development</a> : Build from source, run locally</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="configuration"><a class="header" href="#configuration">Configuration</a></h1>
+<p>Pipelines are defined as YAML documents that map directly to the <code>PipelineSpec</code> type. Environment variables are expanded before parsing using <code>${VAR}</code> syntax, so secrets and connection strings can be injected at runtime.</p>
+<h2 id="document-structure"><a class="header" href="#document-structure">Document structure</a></h2>
+<pre><code class="language-yaml">apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: &lt;pipeline-name&gt;
+  tenant: &lt;tenant-id&gt;
+spec:
+  source: { ... }
+  processors: [ ... ]
+  sinks: [ ... ]
+  batch: { ... }
+  commit_policy: { ... }
+  schema_sensing: { ... }
+</code></pre>
+<h2 id="metadata"><a class="header" href="#metadata">Metadata</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Required</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>name</code></td><td>string</td><td>Yes</td><td>Unique pipeline identifier. Used in API routes and metrics.</td></tr>
+<tr><td><code>tenant</code></td><td>string</td><td>Yes</td><td>Business-oriented tenant label for multi-tenancy.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="spec-fields"><a class="header" href="#spec-fields">Spec fields</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Required</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>source</code></td><td>object</td><td>Yes</td><td>Database source configuration. See <a href="#sources">Sources</a>.</td></tr>
+<tr><td><code>processors</code></td><td>array</td><td>No</td><td>Ordered list of processors. See <a href="#processors">Processors</a>.</td></tr>
+<tr><td><code>sinks</code></td><td>array</td><td>Yes (at least one)</td><td>One or more sinks that receive each batch. See <a href="#sinks">Sinks</a>.</td></tr>
+<tr><td><code>sharding</code></td><td>object</td><td>No</td><td>Optional hint for downstream distribution.</td></tr>
+<tr><td><code>connection_policy</code></td><td>object</td><td>No</td><td>How the runtime establishes upstream connections.</td></tr>
+<tr><td><code>batch</code></td><td>object</td><td>No</td><td>Commit unit thresholds. See <a href="#batching">Batching</a>.</td></tr>
+<tr><td><code>commit_policy</code></td><td>object</td><td>No</td><td>How sink acknowledgements gate checkpoints. See <a href="#commit-policy">Commit policy</a>.</td></tr>
+<tr><td><code>schema_sensing</code></td><td>object</td><td>No</td><td>Automatic schema inference from event payloads. See <a href="#schema-sensing">Schema sensing</a>.</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="sources"><a class="header" href="#sources">Sources</a></h2>
+<h3 id="mysql"><a class="header" href="#mysql">MySQL</a></h3>
+<pre><code class="language-yaml">source:
+  type: mysql
+  config:
+    id: orders-mysql
+    dsn: ${MYSQL_DSN}
+    tables:
+      - shop.orders
+      - shop.order_items
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Required</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>id</code></td><td>string</td><td>Yes</td><td>Logical identifier for metrics and logging</td></tr>
+<tr><td><code>dsn</code></td><td>string</td><td>Yes</td><td>MySQL connection string</td></tr>
+<tr><td><code>tables</code></td><td>array</td><td>Yes</td><td>Tables to capture (supports wildcards like <code>shop.order%</code>)</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="turso"><a class="header" href="#turso">Turso</a></h3>
+<pre><code class="language-yaml">source:
+  type: turso
+  config:
+    id: turso-main
+    url: "libsql://your-db.turso.io"
+    auth_token: ${TURSO_AUTH_TOKEN}
+    tables: ["users", "orders"]
+    cdc_mode: auto
+    poll_interval_ms: 1000
+    native_cdc:
+      level: data
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>id</code></td><td>string</td><td>Yes</td><td>—</td><td>Logical identifier for metrics and logging</td></tr>
+<tr><td><code>url</code></td><td>string</td><td>Yes</td><td>—</td><td>Database URL (<code>libsql://</code>, <code>http://</code>, or file path)</td></tr>
+<tr><td><code>auth_token</code></td><td>string</td><td>No</td><td>—</td><td>Authentication token for Turso cloud</td></tr>
+<tr><td><code>tables</code></td><td>array</td><td>Yes</td><td>—</td><td>Tables to track (supports wildcards)</td></tr>
+<tr><td><code>cdc_mode</code></td><td>string</td><td>No</td><td><code>auto</code></td><td>CDC mode: <code>native</code>, <code>triggers</code>, <code>polling</code>, <code>auto</code></td></tr>
+<tr><td><code>poll_interval_ms</code></td><td>integer</td><td>No</td><td><code>1000</code></td><td>Polling interval in milliseconds</td></tr>
+<tr><td><code>native_cdc.level</code></td><td>string</td><td>No</td><td><code>data</code></td><td>Native CDC level: <code>binlog</code> or <code>data</code></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="postgresql"><a class="header" href="#postgresql">PostgreSQL</a></h3>
+<blockquote>
+<p><strong>Note:</strong> PostgreSQL configuration is parsed but the source implementation is not yet complete.</p>
+</blockquote>
+<pre><code class="language-yaml">source:
+  type: postgres
+  config:
+    id: pg-main
+    dsn: ${POSTGRES_DSN}
+    publication: my_pub
+    slot: my_slot
+    tables:
+      - public.orders
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Required</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>id</code></td><td>string</td><td>Yes</td><td>Logical identifier</td></tr>
+<tr><td><code>dsn</code></td><td>string</td><td>Yes</td><td>PostgreSQL connection string</td></tr>
+<tr><td><code>publication</code></td><td>string</td><td>No</td><td>Logical replication publication name</td></tr>
+<tr><td><code>slot</code></td><td>string</td><td>No</td><td>Replication slot name</td></tr>
+<tr><td><code>tables</code></td><td>array</td><td>Yes</td><td>Tables to capture</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="processors"><a class="header" href="#processors">Processors</a></h2>
+<p>Processors transform batches of events before delivery to sinks.</p>
+<h3 id="javascript"><a class="header" href="#javascript">JavaScript</a></h3>
+<pre><code class="language-yaml">processors:
+  - type: javascript
+    id: transform
+    inline: |
+      function processBatch(events) {
+        return events.map(event =&gt; {
+          event.tags = (event.tags || []).concat(["processed"]);
+          return event;
+        });
+      }
+    limits:
+      cpu_ms: 50
+      mem_mb: 128
+      timeout_ms: 500
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Required</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>id</code></td><td>string</td><td>Yes</td><td>Processor identifier</td></tr>
+<tr><td><code>inline</code></td><td>string</td><td>Yes</td><td>JavaScript source defining <code>processBatch(events)</code></td></tr>
+<tr><td><code>limits.cpu_ms</code></td><td>integer</td><td>No</td><td>CPU time limit per batch</td></tr>
+<tr><td><code>limits.mem_mb</code></td><td>integer</td><td>No</td><td>Memory limit</td></tr>
+<tr><td><code>limits.timeout_ms</code></td><td>integer</td><td>No</td><td>Execution timeout</td></tr>
+</tbody>
+</table>
+</div>
+<p>The <code>processBatch(events)</code> function receives an array of events and can return:</p>
+<ul>
+<li>An array of events (modified, filtered, or expanded)</li>
+<li>A single event object (wrapped in array automatically)</li>
+<li><code>null</code> or <code>undefined</code> to use the mutated input array</li>
+<li>Empty array <code>[]</code> to drop all events</li>
+</ul>
+<hr>
+<h2 id="sinks"><a class="header" href="#sinks">Sinks</a></h2>
+<h3 id="kafka"><a class="header" href="#kafka">Kafka</a></h3>
+<pre><code class="language-yaml">sinks:
+  - type: kafka
+    config:
+      id: orders-kafka
+      brokers: ${KAFKA_BROKERS}
+      topic: orders
+      required: true
+      exactly_once: false
+      client_conf:
+        message.timeout.ms: "5000"
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>id</code></td><td>string</td><td>Yes</td><td>—</td><td>Sink identifier</td></tr>
+<tr><td><code>brokers</code></td><td>string</td><td>Yes</td><td>—</td><td>Comma-separated broker list</td></tr>
+<tr><td><code>topic</code></td><td>string</td><td>Yes</td><td>—</td><td>Destination topic</td></tr>
+<tr><td><code>required</code></td><td>bool</td><td>No</td><td><code>true</code></td><td>Whether this sink gates checkpoints</td></tr>
+<tr><td><code>exactly_once</code></td><td>bool</td><td>No</td><td><code>false</code></td><td>Enable EOS semantics</td></tr>
+<tr><td><code>client_conf</code></td><td>map</td><td>No</td><td><code>{}</code></td><td>Raw librdkafka configuration overrides</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="redis"><a class="header" href="#redis">Redis</a></h3>
+<pre><code class="language-yaml">sinks:
+  - type: redis
+    config:
+      id: orders-redis
+      uri: ${REDIS_URI}
+      stream: orders
+      required: true
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>id</code></td><td>string</td><td>Yes</td><td>—</td><td>Sink identifier</td></tr>
+<tr><td><code>uri</code></td><td>string</td><td>Yes</td><td>—</td><td>Redis connection URI</td></tr>
+<tr><td><code>stream</code></td><td>string</td><td>Yes</td><td>—</td><td>Redis stream key</td></tr>
+<tr><td><code>required</code></td><td>bool</td><td>No</td><td><code>true</code></td><td>Whether this sink gates checkpoints</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="batching"><a class="header" href="#batching">Batching</a></h2>
+<pre><code class="language-yaml">batch:
+  max_events: 500
+  max_bytes: 1048576
+  max_ms: 1000
+  respect_source_tx: true
+  max_inflight: 2
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>max_events</code></td><td>integer</td><td><code>500</code></td><td>Flush after this many events</td></tr>
+<tr><td><code>max_bytes</code></td><td>integer</td><td><code>1048576</code></td><td>Flush after serialized size reaches this limit</td></tr>
+<tr><td><code>max_ms</code></td><td>integer</td><td><code>1000</code></td><td>Flush after this much time (milliseconds)</td></tr>
+<tr><td><code>respect_source_tx</code></td><td>bool</td><td><code>true</code></td><td>Never split a source transaction across batches</td></tr>
+<tr><td><code>max_inflight</code></td><td>integer</td><td><code>2</code></td><td>Maximum concurrent batches being processed</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="commit-policy"><a class="header" href="#commit-policy">Commit policy</a></h2>
+<pre><code class="language-yaml">commit_policy:
+  mode: required
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Mode</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>all</code></td><td>Every sink must acknowledge before checkpoint</td></tr>
+<tr><td><code>required</code></td><td>Only sinks with <code>required: true</code> must acknowledge (default)</td></tr>
+<tr><td><code>quorum</code></td><td>Checkpoint after <code>quorum</code> sinks acknowledge</td></tr>
+</tbody>
+</table>
+</div>
+<p>For quorum mode:</p>
+<pre><code class="language-yaml">commit_policy:
+  mode: quorum
+  quorum: 2
+</code></pre>
+<hr>
+<h2 id="schema-sensing"><a class="header" href="#schema-sensing">Schema sensing</a></h2>
+<pre><code class="language-yaml">schema_sensing:
+  enabled: true
+  deep_inspect:
+    enabled: true
+    max_depth: 3
+    max_sample_size: 500
+  sampling:
+    warmup_events: 50
+    sample_rate: 5
+    structure_cache: true
+    structure_cache_size: 50
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable schema sensing</td></tr>
+<tr><td><code>deep_inspect.enabled</code></td><td>bool</td><td><code>true</code></td><td>Inspect nested JSON structures</td></tr>
+<tr><td><code>deep_inspect.max_depth</code></td><td>integer</td><td><code>10</code></td><td>Maximum nesting depth</td></tr>
+<tr><td><code>deep_inspect.max_sample_size</code></td><td>integer</td><td><code>1000</code></td><td>Max events to sample for deep analysis</td></tr>
+<tr><td><code>sampling.warmup_events</code></td><td>integer</td><td><code>1000</code></td><td>Events to fully analyze before sampling</td></tr>
+<tr><td><code>sampling.sample_rate</code></td><td>integer</td><td><code>10</code></td><td>After warmup, analyze 1 in N events</td></tr>
+<tr><td><code>sampling.structure_cache</code></td><td>bool</td><td><code>true</code></td><td>Cache structure fingerprints</td></tr>
+<tr><td><code>sampling.structure_cache_size</code></td><td>integer</td><td><code>100</code></td><td>Max cached structures per table</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="complete-example"><a class="header" href="#complete-example">Complete example</a></h2>
+<pre><code class="language-yaml">apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: orders-mysql-to-kafka
+  tenant: acme
+
+spec:
+  source:
+    type: mysql
+    config:
+      id: orders-mysql
+      dsn: ${MYSQL_DSN}
+      tables:
+        - shop.orders
+
+  processors:
+    - type: javascript
+      id: transform
+      inline: |
+        function processBatch(events) {
+          return events.map(event =&gt; {
+            event.tags = (event.tags || []).concat(["normalized"]);
+            return event;
+          });
+        }
+      limits:
+        cpu_ms: 50
+        mem_mb: 128
+        timeout_ms: 500
+
+  sinks:
+    - type: kafka
+      config:
+        id: orders-kafka
+        brokers: ${KAFKA_BROKERS}
+        topic: orders
+        required: true
+        exactly_once: false
+        client_conf:
+          message.timeout.ms: "5000"
+    - type: redis
+      config:
+        id: orders-redis
+        uri: ${REDIS_URI}
+        stream: orders
+        required: false
+
+  batch:
+    max_events: 500
+    max_bytes: 1048576
+    max_ms: 1000
+    respect_source_tx: true
+    max_inflight: 2
+
+  commit_policy:
+    mode: required
+
+  schema_sensing:
+    enabled: true
+    deep_inspect:
+      enabled: true
+      max_depth: 3
+    sampling:
+      warmup_events: 50
+      sample_rate: 5
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="rest-api-reference"><a class="header" href="#rest-api-reference">REST API Reference</a></h1>
+<p>DeltaForge exposes a REST API for health checks, pipeline management, schema
+inspection, and drift detection. All endpoints return JSON.</p>
+<h2 id="base-url"><a class="header" href="#base-url">Base URL</a></h2>
+<p>Default: <code>http://localhost:8080</code></p>
+<p>Configure with <code>--api-addr</code>:</p>
+<pre><code class="language-bash">deltaforge --config pipelines.yaml --api-addr 0.0.0.0:9090
+</code></pre>
+<hr>
+<h2 id="health-endpoints"><a class="header" href="#health-endpoints">Health Endpoints</a></h2>
+<h3 id="liveness-probe"><a class="header" href="#liveness-probe">Liveness Probe</a></h3>
+<pre><code class="language-http">GET /healthz
+</code></pre>
+<p>Returns <code>ok</code> if the process is running. Use for Kubernetes liveness probes.</p>
+<p><strong>Response:</strong> <code>200 OK</code></p>
+<pre><code>ok
+</code></pre>
+<h3 id="readiness-probe"><a class="header" href="#readiness-probe">Readiness Probe</a></h3>
+<pre><code class="language-http">GET /readyz
+</code></pre>
+<p>Returns pipeline states. Use for Kubernetes readiness probes.</p>
+<p><strong>Response:</strong> <code>200 OK</code></p>
+<pre><code class="language-json">{
+  "status": "ready",
+  "pipelines": [
+    {
+      "name": "orders-cdc",
+      "status": "running",
+      "spec": { ... }
+    }
+  ]
+}
+</code></pre>
+<hr>
+<h2 id="pipeline-management"><a class="header" href="#pipeline-management">Pipeline Management</a></h2>
+<h3 id="list-pipelines"><a class="header" href="#list-pipelines">List Pipelines</a></h3>
+<pre><code class="language-http">GET /pipelines
+</code></pre>
+<p>Returns all pipelines with current status.</p>
+<p><strong>Response:</strong> <code>200 OK</code></p>
+<pre><code class="language-json">[
+  {
+    "name": "orders-cdc",
+    "status": "running",
+    "spec": {
+      "metadata": { "name": "orders-cdc", "tenant": "acme" },
+      "spec": { ... }
+    }
+  }
+]
+</code></pre>
+<h3 id="get-pipeline"><a class="header" href="#get-pipeline">Get Pipeline</a></h3>
+<pre><code class="language-http">GET /pipelines/{name}
+</code></pre>
+<p>Returns a single pipeline by name.</p>
+<p><strong>Response:</strong> <code>200 OK</code></p>
+<pre><code class="language-json">{
+  "name": "orders-cdc",
+  "status": "running",
+  "spec": { ... }
+}
+</code></pre>
+<p><strong>Errors:</strong></p>
+<ul>
+<li><code>404 Not Found</code> - Pipeline doesn’t exist</li>
+</ul>
+<h3 id="create-pipeline"><a class="header" href="#create-pipeline">Create Pipeline</a></h3>
+<pre><code class="language-http">POST /pipelines
+Content-Type: application/json
+</code></pre>
+<p>Creates a new pipeline from a full spec.</p>
+<p><strong>Request:</strong></p>
+<pre><code class="language-json">{
+  "metadata": {
+    "name": "orders-cdc",
+    "tenant": "acme"
+  },
+  "spec": {
+    "source": {
+      "type": "mysql",
+      "config": {
+        "id": "mysql-1",
+        "dsn": "mysql://user:pass@host/db",
+        "tables": ["shop.orders"]
+      }
+    },
+    "processors": [],
+    "sinks": [
+      {
+        "type": "kafka",
+        "config": {
+          "id": "kafka-1",
+          "brokers": "localhost:9092",
+          "topic": "orders"
+        }
+      }
+    ]
+  }
+}
+</code></pre>
+<p><strong>Response:</strong> <code>200 OK</code></p>
+<pre><code class="language-json">{
+  "name": "orders-cdc",
+  "status": "running",
+  "spec": { ... }
+}
+</code></pre>
+<p><strong>Errors:</strong></p>
+<ul>
+<li><code>409 Conflict</code> - Pipeline already exists</li>
+</ul>
+<h3 id="update-pipeline"><a class="header" href="#update-pipeline">Update Pipeline</a></h3>
+<pre><code class="language-http">PATCH /pipelines/{name}
+Content-Type: application/json
+</code></pre>
+<p>Applies a partial update to an existing pipeline. The pipeline is stopped,
+updated, and restarted.</p>
+<p><strong>Request:</strong></p>
+<pre><code class="language-json">{
+  "spec": {
+    "batch": {
+      "max_events": 1000,
+      "max_ms": 500
+    }
+  }
+}
+</code></pre>
+<p><strong>Response:</strong> <code>200 OK</code></p>
+<pre><code class="language-json">{
+  "name": "orders-cdc",
+  "status": "running",
+  "spec": { ... }
+}
+</code></pre>
+<p><strong>Errors:</strong></p>
+<ul>
+<li><code>404 Not Found</code> - Pipeline doesn’t exist</li>
+<li><code>400 Bad Request</code> - Name mismatch in patch</li>
+</ul>
+<h3 id="delete-pipeline"><a class="header" href="#delete-pipeline">Delete Pipeline</a></h3>
+<pre><code class="language-http">DELETE /pipelines/{name}
+</code></pre>
+<p>Permanently deletes a pipeline. This removes the pipeline from the runtime
+and cannot be undone.</p>
+<p><strong>Response:</strong> <code>204 No Content</code></p>
+<p><strong>Errors:</strong></p>
+<ul>
+<li><code>404 Not Found</code> - Pipeline doesn’t exist</li>
+</ul>
+<h3 id="pause-pipeline"><a class="header" href="#pause-pipeline">Pause Pipeline</a></h3>
+<pre><code class="language-http">POST /pipelines/{name}/pause
+</code></pre>
+<p>Pauses ingestion. Events in the buffer are not processed until resumed.</p>
+<p><strong>Response:</strong> <code>200 OK</code></p>
+<pre><code class="language-json">{
+  "name": "orders-cdc",
+  "status": "paused",
+  "spec": { ... }
+}
+</code></pre>
+<h3 id="resume-pipeline"><a class="header" href="#resume-pipeline">Resume Pipeline</a></h3>
+<pre><code class="language-http">POST /pipelines/{name}/resume
+</code></pre>
+<p>Resumes a paused pipeline.</p>
+<p><strong>Response:</strong> <code>200 OK</code></p>
+<pre><code class="language-json">{
+  "name": "orders-cdc",
+  "status": "running",
+  "spec": { ... }
+}
+</code></pre>
+<h3 id="stop-pipeline"><a class="header" href="#stop-pipeline">Stop Pipeline</a></h3>
+<pre><code class="language-http">POST /pipelines/{name}/stop
+</code></pre>
+<p>Stops a pipeline. Final checkpoint is saved.</p>
+<p><strong>Response:</strong> <code>200 OK</code></p>
+<pre><code class="language-json">{
+  "name": "orders-cdc",
+  "status": "stopped",
+  "spec": { ... }
+}
+</code></pre>
+<hr>
+<h2 id="schema-management"><a class="header" href="#schema-management">Schema Management</a></h2>
+<h3 id="list-database-schemas"><a class="header" href="#list-database-schemas">List Database Schemas</a></h3>
+<pre><code class="language-http">GET /pipelines/{name}/schemas
+</code></pre>
+<p>Returns all tracked database schemas for a pipeline. These are the schemas
+loaded directly from the source database.</p>
+<p><strong>Response:</strong> <code>200 OK</code></p>
+<pre><code class="language-json">[
+  {
+    "database": "shop",
+    "table": "orders",
+    "column_count": 5,
+    "primary_key": ["id"],
+    "fingerprint": "sha256:a1b2c3d4e5f6...",
+    "registry_version": 2
+  },
+  {
+    "database": "shop",
+    "table": "customers",
+    "column_count": 8,
+    "primary_key": ["id"],
+    "fingerprint": "sha256:f6e5d4c3b2a1...",
+    "registry_version": 1
+  }
+]
+</code></pre>
+<h3 id="get-schema-details"><a class="header" href="#get-schema-details">Get Schema Details</a></h3>
+<pre><code class="language-http">GET /pipelines/{name}/schemas/{db}/{table}
+</code></pre>
+<p>Returns detailed schema information including all columns.</p>
+<p><strong>Response:</strong> <code>200 OK</code></p>
+<pre><code class="language-json">{
+  "database": "shop",
+  "table": "orders",
+  "columns": [
+    {
+      "name": "id",
+      "type": "bigint(20) unsigned",
+      "nullable": false,
+      "default": null,
+      "extra": "auto_increment"
+    },
+    {
+      "name": "customer_id",
+      "type": "bigint(20)",
+      "nullable": false,
+      "default": null
+    }
+  ],
+  "primary_key": ["id"],
+  "fingerprint": "sha256:a1b2c3d4..."
+}
+</code></pre>
+<hr>
+<h2 id="schema-sensing-1"><a class="header" href="#schema-sensing-1">Schema Sensing</a></h2>
+<p>Schema sensing automatically infers schema structure from JSON event payloads.
+This is useful for sources that don’t provide schema metadata or for detecting
+schema evolution in JSON columns.</p>
+<h3 id="list-inferred-schemas"><a class="header" href="#list-inferred-schemas">List Inferred Schemas</a></h3>
+<pre><code class="language-http">GET /pipelines/{name}/sensing/schemas
+</code></pre>
+<p>Returns all schemas inferred via sensing for a pipeline.</p>
+<p><strong>Response:</strong> <code>200 OK</code></p>
+<pre><code class="language-json">[
+  {
+    "table": "orders",
+    "fingerprint": "sha256:abc123...",
+    "sequence": 3,
+    "event_count": 1500,
+    "stabilized": true,
+    "first_seen": "2025-01-15T10:30:00Z",
+    "last_seen": "2025-01-15T14:22:00Z"
+  }
+]
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>table</code></td><td>Table name (or <code>table:column</code> for JSON column sensing)</td></tr>
+<tr><td><code>fingerprint</code></td><td>SHA-256 content hash of current schema</td></tr>
+<tr><td><code>sequence</code></td><td>Monotonic version number (increments on evolution)</td></tr>
+<tr><td><code>event_count</code></td><td>Total events observed</td></tr>
+<tr><td><code>stabilized</code></td><td>Whether schema has stopped sampling (structure stable)</td></tr>
+<tr><td><code>first_seen</code></td><td>First observation timestamp</td></tr>
+<tr><td><code>last_seen</code></td><td>Most recent observation timestamp</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="get-inferred-schema-details"><a class="header" href="#get-inferred-schema-details">Get Inferred Schema Details</a></h3>
+<pre><code class="language-http">GET /pipelines/{name}/sensing/schemas/{table}
+</code></pre>
+<p>Returns detailed inferred schema including all fields.</p>
+<p><strong>Response:</strong> <code>200 OK</code></p>
+<pre><code class="language-json">{
+  "table": "orders",
+  "fingerprint": "sha256:abc123...",
+  "sequence": 3,
+  "event_count": 1500,
+  "stabilized": true,
+  "fields": [
+    {
+      "name": "id",
+      "types": ["integer"],
+      "nullable": false,
+      "optional": false
+    },
+    {
+      "name": "metadata",
+      "types": ["object"],
+      "nullable": true,
+      "optional": false,
+      "nested_field_count": 5
+    },
+    {
+      "name": "tags",
+      "types": ["array"],
+      "nullable": false,
+      "optional": true,
+      "array_element_types": ["string"]
+    }
+  ],
+  "first_seen": "2025-01-15T10:30:00Z",
+  "last_seen": "2025-01-15T14:22:00Z"
+}
+</code></pre>
+<h3 id="export-json-schema"><a class="header" href="#export-json-schema">Export JSON Schema</a></h3>
+<pre><code class="language-http">GET /pipelines/{name}/sensing/schemas/{table}/json-schema
+</code></pre>
+<p>Exports the inferred schema as a standard JSON Schema document.</p>
+<p><strong>Response:</strong> <code>200 OK</code></p>
+<pre><code class="language-json">{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "orders",
+  "type": "object",
+  "properties": {
+    "id": { "type": "integer" },
+    "metadata": { "type": ["object", "null"] },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "required": ["id", "metadata"]
+}
+</code></pre>
+<h3 id="get-sensing-cache-statistics"><a class="header" href="#get-sensing-cache-statistics">Get Sensing Cache Statistics</a></h3>
+<pre><code class="language-http">GET /pipelines/{name}/sensing/stats
+</code></pre>
+<p>Returns cache performance statistics for schema sensing.</p>
+<p><strong>Response:</strong> <code>200 OK</code></p>
+<pre><code class="language-json">{
+  "tables": [
+    {
+      "table": "orders",
+      "cached_structures": 3,
+      "max_cache_size": 100,
+      "cache_hits": 1450,
+      "cache_misses": 50
+    }
+  ],
+  "total_cache_hits": 1450,
+  "total_cache_misses": 50,
+  "hit_rate": 0.9667
+}
+</code></pre>
+<hr>
+<h2 id="drift-detection"><a class="header" href="#drift-detection">Drift Detection</a></h2>
+<p>Drift detection compares expected database schema against observed data patterns
+to detect mismatches, unexpected nulls, and type drift.</p>
+<h3 id="get-drift-results"><a class="header" href="#get-drift-results">Get Drift Results</a></h3>
+<pre><code class="language-http">GET /pipelines/{name}/drift
+</code></pre>
+<p>Returns drift detection results for all tables in a pipeline.</p>
+<p><strong>Response:</strong> <code>200 OK</code></p>
+<pre><code class="language-json">[
+  {
+    "table": "orders",
+    "has_drift": true,
+    "columns": [
+      {
+        "column": "amount",
+        "expected_type": "decimal(10,2)",
+        "observed_types": ["string"],
+        "mismatch_count": 42,
+        "examples": ["\"99.99\""]
+      }
+    ],
+    "events_analyzed": 1500,
+    "events_with_drift": 42
+  }
+]
+</code></pre>
+<h3 id="get-table-drift"><a class="header" href="#get-table-drift">Get Table Drift</a></h3>
+<pre><code class="language-http">GET /pipelines/{name}/drift/{table}
+</code></pre>
+<p>Returns drift detection results for a specific table.</p>
+<p><strong>Response:</strong> <code>200 OK</code></p>
+<pre><code class="language-json">{
+  "table": "orders",
+  "has_drift": false,
+  "columns": [],
+  "events_analyzed": 1000,
+  "events_with_drift": 0
+}
+</code></pre>
+<p><strong>Errors:</strong></p>
+<ul>
+<li><code>404 Not Found</code> - Table not found or no drift data available</li>
+</ul>
+<hr>
+<h2 id="error-responses"><a class="header" href="#error-responses">Error Responses</a></h2>
+<p>All error responses follow this format:</p>
+<pre><code class="language-json">{
+  "error": "Description of the error"
+}
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Status Code</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>400 Bad Request</code></td><td>Invalid request body or parameters</td></tr>
+<tr><td><code>404 Not Found</code></td><td>Resource doesn’t exist</td></tr>
+<tr><td><code>409 Conflict</code></td><td>Resource already exists</td></tr>
+<tr><td><code>500 Internal Server Error</code></td><td>Unexpected server error</td></tr>
+</tbody>
+</table>
+</div>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="pipelines"><a class="header" href="#pipelines">Pipelines</a></h1>
+<p>Each pipeline is created from a single <code>PipelineSpec</code>. The runtime spawns the source, processors, and sinks defined in the spec and coordinates them with batching and checkpointing.</p>
+<ul>
+<li>🔄 <strong>Live control</strong>: pause, resume, or stop pipelines through the REST API without redeploying.</li>
+<li>📦 <strong>Coordinated delivery</strong>: batching and commit policy keep sinks consistent even when multiple outputs are configured.</li>
+</ul>
+<h2 id="lifecycle-controls"><a class="header" href="#lifecycle-controls">Lifecycle controls</a></h2>
+<p>The REST API addresses pipelines by <code>metadata.name</code> and returns <code>PipeInfo</code> records containing the live spec and status.</p>
+<ul>
+<li><code>GET /healthz</code> — liveness probe.</li>
+<li><code>GET /readyz</code> — readiness with pipeline states.</li>
+<li><code>GET /pipelines</code> — list pipelines.</li>
+<li><code>POST /pipelines</code> — create from a full spec.</li>
+<li><code>PATCH /pipelines/{name}</code> — merge a partial spec (for example, adjust batch thresholds) and restart the pipeline.</li>
+<li><code>POST /pipelines/{name}/pause</code> — pause ingestion and coordination.</li>
+<li><code>POST /pipelines/{name}/resume</code> — resume a paused pipeline.</li>
+<li><code>POST /pipelines/{name}/stop</code> — stop a running pipeline.</li>
+</ul>
+<p>Pausing halts both source ingestion and the coordinator. Resuming re-enables both ends so buffered events can drain cleanly.</p>
+<h2 id="processors-1"><a class="header" href="#processors-1">Processors</a></h2>
+<p>Processors run in the declared order for each batch. The built-in processor type is JavaScript, powered by <code>deno_core</code>.</p>
+<ul>
+<li><code>type: javascript</code>
+<ul>
+<li><code>id</code>: processor label.</li>
+<li><code>inline</code>: JS source. Export a <code>processBatch(events)</code> function that returns the transformed batch.</li>
+<li><code>limits</code> (optional): resource guardrails (<code>cpu_ms</code>, <code>mem_mb</code>, <code>timeout_ms</code>).</li>
+</ul>
+</li>
+</ul>
+<h2 id="batching-1"><a class="header" href="#batching-1">Batching</a></h2>
+<p>The coordinator builds batches using soft thresholds:</p>
+<ul>
+<li><code>max_events</code>: flush after this many events.</li>
+<li><code>max_bytes</code>: flush after the serialized size reaches this limit.</li>
+<li><code>max_ms</code>: flush after this much time has elapsed since the batch started.</li>
+<li><code>respect_source_tx</code>: when true, never split a single source transaction across batches.</li>
+<li><code>max_inflight</code>: cap the number of batches being processed concurrently.</li>
+</ul>
+<h2 id="commit-policy-1"><a class="header" href="#commit-policy-1">Commit policy</a></h2>
+<p>When multiple sinks are configured, checkpoints can wait for different acknowledgement rules:</p>
+<ul>
+<li><code>all</code>: every sink must acknowledge.</li>
+<li><code>required</code> (default): only sinks marked <code>required: true</code> must acknowledge; others are best-effort.</li>
+<li><code>quorum</code>: checkpoint after at least <code>quorum</code> sinks acknowledge.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="sources-1"><a class="header" href="#sources-1">Sources</a></h1>
+<p>DeltaForge’s only fully supported CDC source today is MySQL binlog ingestion. Each source is configured under <code>spec.source</code> with a <code>type</code> field and a <code>config</code> object. Environment variables are expanded before parsing, so DSNs can be supplied at runtime.</p>
+<p>Current built-in source type:</p>
+<ul>
+<li><a href="#mysql-source"><code>mysql</code></a> - MySQL binlog CDC.</li>
+<li><a href="#turso-source"><code>turso/sqlite</code></a> - Turso CDC.</li>
+</ul>
+<p>The source interface is pluggable; if you experiment with engines like Postgres logical replication, treat them as variations until they ship with formal support and docs.</p>
+<p>All sources honor the pipeline’s batching and commit policy once events enter the coordinator.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="mysql-source"><a class="header" href="#mysql-source">MySQL source</a></h1>
+<p>DeltaForge tails the MySQL binlog to capture row-level changes.</p>
+<ul>
+<li>🛡️ <strong>Replication-safe</strong>: built for MySQL first, using binlog subscriptions with table filters.</li>
+</ul>
+<h2 id="configuration-1"><a class="header" href="#configuration-1">Configuration</a></h2>
+<p>Set <code>spec.source.type</code> to <code>mysql</code> and provide a config object:</p>
+<ul>
+<li><code>id</code> (string): logical identifier for metrics and logging.</li>
+<li><code>dsn</code> (string): MySQL connection string with replication privileges.</li>
+<li><code>tables</code> (array&lt; string &gt;): fully qualified tables to subscribe to.</li>
+</ul>
+<h3 id="example"><a class="header" href="#example">Example</a></h3>
+<pre><code class="language-yaml">source:
+  type: mysql
+  config:
+    id: orders-mysql
+    dsn: ${MYSQL_DSN}
+    tables:
+      - shop.orders
+      - shop.order_items
+</code></pre>
+<h2 id="notes"><a class="header" href="#notes">Notes</a></h2>
+<ul>
+<li>Table filters are applied before events are handed to processors and sinks.</li>
+<li>Batches respect <code>respect_source_tx</code> to avoid splitting a single binlog transaction across multiple commits.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="turso-source"><a class="header" href="#turso-source">Turso Source</a></h1>
+<p>The Turso source captures changes from Turso and libSQL databases. It supports multiple CDC modes to work with different database configurations and Turso versions.</p>
+<h2 id="cdc-modes"><a class="header" href="#cdc-modes">CDC Modes</a></h2>
+<p>DeltaForge supports four CDC modes for Turso/libSQL:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Mode</th><th>Description</th><th>Requirements</th></tr>
+</thead>
+<tbody>
+<tr><td><code>native</code></td><td>Uses Turso’s built-in CDC via <code>turso_cdc</code> table</td><td>Turso v0.1.2+ with CDC enabled</td></tr>
+<tr><td><code>triggers</code></td><td>Shadow tables populated by database triggers</td><td>Standard SQLite/libSQL</td></tr>
+<tr><td><code>polling</code></td><td>Tracks changes via rowid comparison</td><td>Any SQLite/libSQL (inserts only)</td></tr>
+<tr><td><code>auto</code></td><td>Automatic fallback: native → triggers → polling</td><td>Any</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="native-mode"><a class="header" href="#native-mode">Native Mode</a></h3>
+<p>Native mode uses Turso’s built-in CDC capabilities. This is the most efficient mode when available.</p>
+<p><strong>Requirements:</strong></p>
+<ul>
+<li>Turso database with CDC enabled</li>
+<li>Turso server v0.1.2 or later</li>
+</ul>
+<p><strong>How it works:</strong></p>
+<ol>
+<li>Queries the <code>turso_cdc</code> system table for changes</li>
+<li>Uses <code>bin_record_json_object()</code> to extract row data as JSON</li>
+<li>Tracks position via change ID in checkpoints</li>
+</ol>
+<p>You can find a more detailed description about this mode at <a href="https://turso.tech/blog/introducing-change-data-capture-in-turso-sqlite-rewrite">Turso Blog</a>.</p>
+<h3 id="triggers-mode"><a class="header" href="#triggers-mode">Triggers Mode</a></h3>
+<p>Triggers mode uses shadow tables and database triggers to capture changes. This works with standard SQLite and libSQL without requiring native CDC support.</p>
+<p><strong>How it works:</strong></p>
+<ol>
+<li>Creates shadow tables (<code>_df_cdc_{table}</code>) for each tracked table</li>
+<li>Installs INSERT/UPDATE/DELETE triggers that write to shadow tables</li>
+<li>Polls shadow tables for new change records</li>
+<li>Cleans up processed records periodically</li>
+</ol>
+<h3 id="polling-mode"><a class="header" href="#polling-mode">Polling Mode</a></h3>
+<p>Polling mode uses rowid tracking to detect new rows. This is the simplest mode but only captures inserts (not updates or deletes).</p>
+<p><strong>How it works:</strong></p>
+<ol>
+<li>Tracks the maximum rowid seen per table</li>
+<li>Queries for rows with rowid greater than last seen</li>
+<li>Emits insert events for new rows</li>
+</ol>
+<p><strong>Limitations:</strong></p>
+<ul>
+<li>Only captures INSERT operations</li>
+<li>Cannot detect UPDATE or DELETE</li>
+<li>Requires tables to have accessible rowid (not WITHOUT ROWID tables)</li>
+</ul>
+<h3 id="auto-mode"><a class="header" href="#auto-mode">Auto Mode</a></h3>
+<p>Auto mode tries each CDC mode in order and uses the first one that works:</p>
+<ol>
+<li>Try native mode (check for <code>turso_cdc</code> table)</li>
+<li>Try triggers mode (check for existing CDC triggers)</li>
+<li>Fall back to polling mode</li>
+</ol>
+<p>This is useful for deployments where the database capabilities may vary.</p>
+<h2 id="configuration-2"><a class="header" href="#configuration-2">Configuration</a></h2>
+<pre><code class="language-yaml">source:
+  type: turso
+  config:
+    id: turso-main
+    url: "libsql://your-db.turso.io"
+    auth_token: "${TURSO_AUTH_TOKEN}"
+    tables: ["users", "orders", "order_items"]
+    cdc_mode: auto
+    poll_interval_ms: 1000
+    native_cdc:
+      level: data
+</code></pre>
+<h3 id="configuration-options"><a class="header" href="#configuration-options">Configuration Options</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Required</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>id</code></td><td>string</td><td>Yes</td><td>—</td><td>Logical identifier for metrics and logging</td></tr>
+<tr><td><code>url</code></td><td>string</td><td>Yes</td><td>—</td><td>Database URL (<code>libsql://</code>, <code>http://</code>, or file path)</td></tr>
+<tr><td><code>auth_token</code></td><td>string</td><td>No</td><td>—</td><td>Authentication token for Turso cloud</td></tr>
+<tr><td><code>tables</code></td><td>array</td><td>Yes</td><td>—</td><td>Tables to track (supports wildcards)</td></tr>
+<tr><td><code>cdc_mode</code></td><td>string</td><td>No</td><td><code>auto</code></td><td>CDC mode: <code>native</code>, <code>triggers</code>, <code>polling</code>, <code>auto</code></td></tr>
+<tr><td><code>poll_interval_ms</code></td><td>integer</td><td>No</td><td><code>1000</code></td><td>Polling interval in milliseconds</td></tr>
+<tr><td><code>native_cdc.level</code></td><td>string</td><td>No</td><td><code>data</code></td><td>Native CDC level: <code>binlog</code> or <code>data</code></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="table-patterns"><a class="header" href="#table-patterns">Table Patterns</a></h3>
+<p>The <code>tables</code> field supports patterns:</p>
+<pre><code class="language-yaml">tables:
+  - users              # Exact match
+  - order%             # Prefix match (order, orders, order_items)
+  - "*"                # All tables (excluding system tables)
+</code></pre>
+<p>System tables and DeltaForge infrastructure tables are automatically excluded:</p>
+<ul>
+<li><code>sqlite_*</code> — SQLite system tables</li>
+<li><code>_df_*</code> — DeltaForge CDC shadow tables</li>
+<li><code>_litestream*</code> — Litestream replication tables</li>
+<li><code>_turso*</code> — Turso internal tables</li>
+<li><code>turso_cdc</code> — Turso CDC system table</li>
+</ul>
+<h3 id="native-cdc-levels"><a class="header" href="#native-cdc-levels">Native CDC Levels</a></h3>
+<p>When using native mode, you can choose the CDC level:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Level</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>data</code></td><td>Only row data changes (default, more efficient)</td></tr>
+<tr><td><code>binlog</code></td><td>Full binlog-style events with additional metadata</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="examples"><a class="header" href="#examples">Examples</a></h2>
+<h3 id="local-development"><a class="header" href="#local-development">Local Development</a></h3>
+<pre><code class="language-yaml">source:
+  type: turso
+  config:
+    id: local-dev
+    url: "http://127.0.0.1:8080"
+    tables: ["users", "orders"]
+    cdc_mode: auto
+    poll_interval_ms: 500
+</code></pre>
+<h3 id="turso-cloud"><a class="header" href="#turso-cloud">Turso Cloud</a></h3>
+<pre><code class="language-yaml">source:
+  type: turso
+  config:
+    id: turso-prod
+    url: "libsql://mydb-myorg.turso.io"
+    auth_token: "${TURSO_AUTH_TOKEN}"
+    tables: ["*"]
+    cdc_mode: native
+    poll_interval_ms: 1000
+</code></pre>
+<h3 id="sqlite-file-polling-only"><a class="header" href="#sqlite-file-polling-only">SQLite File (Polling Only)</a></h3>
+<pre><code class="language-yaml">source:
+  type: turso
+  config:
+    id: sqlite-file
+    url: "file:./data/myapp.db"
+    tables: ["events", "audit_log"]
+    cdc_mode: polling
+    poll_interval_ms: 2000
+</code></pre>
+<h2 id="checkpoints"><a class="header" href="#checkpoints">Checkpoints</a></h2>
+<p>Turso checkpoints track position differently depending on the CDC mode:</p>
+<pre><code class="language-json">{
+  "mode": "native",
+  "last_change_id": 12345,
+  "table_positions": {}
+}
+</code></pre>
+<p>For polling mode, positions are tracked per-table:</p>
+<pre><code class="language-json">{
+  "mode": "polling",
+  "last_change_id": null,
+  "table_positions": {
+    "users": 1000,
+    "orders": 2500
+  }
+}
+</code></pre>
+<h2 id="schema-loading"><a class="header" href="#schema-loading">Schema Loading</a></h2>
+<p>The Turso source includes a schema loader that:</p>
+<ul>
+<li>Queries <code>PRAGMA table_info()</code> for column metadata</li>
+<li>Detects SQLite type affinities (INTEGER, TEXT, REAL, BLOB, NUMERIC)</li>
+<li>Identifies primary keys and autoincrement columns</li>
+<li>Handles WITHOUT ROWID tables</li>
+<li>Checks for existing CDC triggers</li>
+</ul>
+<p>Schema information is available via the REST API at <code>/pipelines/{name}/schemas</code>.</p>
+<h2 id="notes-1"><a class="header" href="#notes-1">Notes</a></h2>
+<ul>
+<li><strong>WITHOUT ROWID tables</strong>: Polling mode cannot track WITHOUT ROWID tables. Use triggers or native mode instead.</li>
+<li><strong>Type affinity</strong>: SQLite uses type affinity rather than strict types. The schema loader maps declared types to SQLite affinities.</li>
+<li><strong>Trigger cleanup</strong>: In triggers mode, processed change records are cleaned up automatically based on checkpoint position.</li>
+<li><strong>Connection handling</strong>: The source maintains a single connection and reconnects automatically on failure.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="sinks-1"><a class="header" href="#sinks-1">Sinks</a></h1>
+<p>Sinks receive batches from the coordinator after processors run. Each sink lives under <code>spec.sinks</code> and can be marked as required or best-effort via the <code>required</code> flag. Checkpoint behavior is governed by the pipeline’s commit policy.</p>
+<p>Current built-in sinks:</p>
+<ul>
+<li><a href="#redis-sink"><code>redis</code></a> — Redis stream sink.</li>
+<li><a href="#kafka-sink"><code>kafka</code></a> — Kafka producer sink.</li>
+</ul>
+<p>You can combine multiple sinks in one pipeline to fan out events.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="redis-sink"><a class="header" href="#redis-sink">Redis sink</a></h1>
+<p>The Redis sink writes each batch as entries in a Redis stream.</p>
+<h2 id="configuration-3"><a class="header" href="#configuration-3">Configuration</a></h2>
+<ul>
+<li><code>id</code> (string): logical identifier for metrics and logging.</li>
+<li><code>uri</code> (string): Redis connection URI.</li>
+<li><code>stream</code> (string): Redis stream key to append events to.</li>
+<li><code>required</code> (bool, default <code>true</code>): whether acknowledgements from this sink gate checkpoints.</li>
+</ul>
+<h3 id="example-1"><a class="header" href="#example-1">Example</a></h3>
+<pre><code class="language-yaml">sinks:
+  - type: redis
+    config:
+      id: orders-redis
+      uri: ${REDIS_URI}
+      stream: orders
+      required: true
+</code></pre>
+<h2 id="notes-2"><a class="header" href="#notes-2">Notes</a></h2>
+<ul>
+<li>Redis streams preserve event order per pipeline and are well-suited for lightweight consumers.</li>
+<li>Combine with other sinks (for example, Kafka) by marking only the critical ones as <code>required</code> if you want checkpoints to proceed without waiting for every sink.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="kafka-sink"><a class="header" href="#kafka-sink">Kafka sink</a></h1>
+<p>The Kafka sink publishes batches to a Kafka topic using <code>rdkafka</code>.</p>
+<h2 id="configuration-4"><a class="header" href="#configuration-4">Configuration</a></h2>
+<ul>
+<li><code>id</code> (string): logical identifier for metrics and logging.</li>
+<li><code>brokers</code> (string): comma-separated broker list.</li>
+<li><code>topic</code> (string): destination topic.</li>
+<li><code>required</code> (bool, default <code>true</code>): whether acknowledgements from this sink gate checkpoints.</li>
+<li><code>exactly_once</code> (bool, default <code>false</code>): enable EOS semantics when supported by the cluster.</li>
+<li><code>client_conf</code> (map, optional): raw <code>librdkafka</code> configuration overrides.</li>
+</ul>
+<h3 id="example-2"><a class="header" href="#example-2">Example</a></h3>
+<pre><code class="language-yaml">sinks:
+  - type: kafka
+    config:
+      id: orders-kafka
+      brokers: ${KAFKA_BROKERS}
+      topic: orders
+      required: true
+      exactly_once: false
+      client_conf:
+        message.timeout.ms: "5000"
+</code></pre>
+<h2 id="notes-3"><a class="header" href="#notes-3">Notes</a></h2>
+<ul>
+<li>Combine Kafka with other sinks to fan out data. Use the commit policy to decide whether non-critical sinks should block checkpoints.</li>
+<li>Adjust <code>client_conf</code> for durability (for example, <code>acks=all</code>) or performance based on your cluster.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="architecture"><a class="header" href="#architecture">Architecture</a></h1>
+<p>This document describes DeltaForge’s internal architecture, design decisions, and how the major components interact.</p>
+<h2 id="design-principles"><a class="header" href="#design-principles">Design Principles</a></h2>
+<h3 id="source-owned-semantics"><a class="header" href="#source-owned-semantics">Source-Owned Semantics</a></h3>
+<p>DeltaForge avoids imposing a universal data model on all sources. Instead, each database source defines and owns its schema semantics:</p>
+<ul>
+<li><strong>MySQL</strong> captures MySQL-specific types, collations, and engine information</li>
+<li><strong>Future sources</strong> (PostgreSQL, MongoDB, ClickHouse, Turso) will capture their native semantics</li>
+</ul>
+<p>This approach means downstream consumers receive schemas that accurately reflect the source database rather than a lowest-common-denominator normalization.</p>
+<h3 id="delivery-guarantees-first"><a class="header" href="#delivery-guarantees-first">Delivery Guarantees First</a></h3>
+<p>The checkpoint system is designed around a single invariant:</p>
+<blockquote>
+<p>Checkpoints are only saved after events have been successfully delivered.</p>
+</blockquote>
+<p>This ordering guarantees at-least-once delivery. A crash between checkpoint and delivery would lose events; DeltaForge prevents this by always checkpointing after sink acknowledgment.</p>
+<h3 id="configuration-over-code"><a class="header" href="#configuration-over-code">Configuration Over Code</a></h3>
+<p>Pipelines are defined declaratively in YAML. This enables:</p>
+<ul>
+<li>Version-controlled pipeline definitions</li>
+<li>Environment-specific configuration via variable expansion</li>
+<li>Rapid iteration without recompilation</li>
+</ul>
+<h2 id="component-overview"><a class="header" href="#component-overview">Component Overview</a></h2>
+<pre><code>┌─────────────────────────────────────────────────────────────────┐
+│                        DeltaForge Runtime                       │
+├─────────────┬─────────────┬─────────────┬─────────────┬─────────┤
+│   Sources   │   Schema    │ Coordinator │    Sinks    │ Control │
+│             │  Registry   │  + Batch    │             │  Plane  │
+├─────────────┼─────────────┼─────────────┼─────────────┼─────────┤
+│ MySQL       │ InMemory    │ Batching    │ Kafka       │ REST API│
+│ PostgreSQL  │ Registry    │ Commit      │ Redis       │ Metrics │
+│ (future)    │             │ Policy      │ (future)    │ Health  │
+└─────────────┴─────────────┴─────────────┴─────────────┴─────────┘
+                               │
+                    ┌──────────┴──────────┐
+                    │  Checkpoint Store   │
+                    │  (File/SQLite/Mem)  │
+                    └─────────────────────┘
+</code></pre>
+<h2 id="data-flow"><a class="header" href="#data-flow">Data Flow</a></h2>
+<h3 id="event-lifecycle"><a class="header" href="#event-lifecycle">Event Lifecycle</a></h3>
+<pre><code>1. Source reads from database log (binlog/WAL)
+        │
+        ▼
+2. Schema loader maps table_id to schema
+        │
+        ▼
+3. Event constructed with before/after images
+        │
+        ▼
+4. Event sent to coordinator via channel
+        │
+        ▼
+5. Coordinator batches events
+        │
+        ▼
+6. Processors transform batch (JavaScript)
+        │
+        ▼
+7. Sinks deliver batch concurrently
+        │
+        ▼
+8. Commit policy evaluated
+        │
+        ▼
+9. Checkpoint saved (if policy satisfied)
+</code></pre>
+<h3 id="event-structure"><a class="header" href="#event-structure">Event Structure</a></h3>
+<p>Every CDC event shares a common structure:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub struct Event {
+    pub source_id: String,          // Source identifier
+    pub database: String,           // Database name
+    pub table: String,              // Table name
+    pub op: Op,                     // Insert, Update, Delete, Ddl
+    pub tx_id: Option&lt;u64&gt;,         // Source transaction ID
+    pub before: Option&lt;Value&gt;,      // Previous row state
+    pub after: Option&lt;Value&gt;,       // New row state
+    pub schema_version: Option&lt;String&gt;,  // Schema fingerprint
+    pub schema_sequence: Option&lt;u64&gt;,    // For replay lookups
+    pub ddl: Option&lt;Value&gt;,         // DDL payload if op == Ddl
+    pub timestamp: DateTime&lt;Utc&gt;,   // Event timestamp
+    pub checkpoint: Option&lt;CheckpointMeta&gt;,  // Position info
+    pub size_bytes: usize,          // For batching
+}
+<span class="boring">}</span></code></pre>
+<h2 id="schema-registry"><a class="header" href="#schema-registry">Schema Registry</a></h2>
+<h3 id="role"><a class="header" href="#role">Role</a></h3>
+<p>The schema registry serves three purposes:</p>
+<ol>
+<li><strong>Map table IDs to schemas</strong>: Binlog events reference tables by ID; the registry resolves these to full schema metadata</li>
+<li><strong>Detect schema changes</strong>: Fingerprint comparison identifies when DDL has modified a table</li>
+<li><strong>Enable replay</strong>: Sequence numbers correlate events with the schema active when they were produced</li>
+</ol>
+<h3 id="schema-registration-flow"><a class="header" href="#schema-registration-flow">Schema Registration Flow</a></h3>
+<pre><code>1. Schema loader fetches from INFORMATION_SCHEMA
+        │
+        ▼
+2. Compute fingerprint (SHA-256 of structure)
+        │
+        ▼
+3. Check registry for existing schema with same fingerprint
+        │
+        ├── Found: Return existing version (idempotent)
+        │
+        └── Not found: Allocate new version number
+                │
+                ▼
+4. Store with: version, fingerprint, JSON, timestamp, sequence, checkpoint
+</code></pre>
+<h3 id="sequence-numbers"><a class="header" href="#sequence-numbers">Sequence Numbers</a></h3>
+<p>The registry maintains a global monotonic counter. Each schema version receives a sequence number at registration. Events carry this sequence, enabling accurate schema lookup during replay:</p>
+<pre><code>Timeline:
+─────────────────────────────────────────────────────────────►
+     │              │                    │
+Schema v1      Schema v2           Schema v3
+(seq=1)        (seq=15)            (seq=42)
+     │              │                    │
+     └──events 1-14─┘──events 15-41─────┘──events 42+──►
+
+Replay at seq=20: Use schema v2 (registered at seq=15, before seq=42)
+</code></pre>
+<h2 id="checkpoint-store"><a class="header" href="#checkpoint-store">Checkpoint Store</a></h2>
+<h3 id="timing-guarantee"><a class="header" href="#timing-guarantee">Timing Guarantee</a></h3>
+<p>The checkpoint is saved only after sinks acknowledge delivery:</p>
+<pre><code>┌────────┐   events   ┌────────┐   ack    ┌────────────┐
+│ Source │ ─────────▶ │  Sink  │ ───────▶ │ Checkpoint │
+└────────┘            └────────┘          │   Store    │
+                                          └────────────┘
+</code></pre>
+<p>If the process crashes after sending to sink but before checkpoint, events will be replayed. This is the “at-least-once” guarantee — duplicates are possible, but loss is not.</p>
+<h3 id="storage-backends"><a class="header" href="#storage-backends">Storage Backends</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Backend</th><th>Versioning</th><th>Persistence</th><th>Use Case</th></tr>
+</thead>
+<tbody>
+<tr><td><code>FileCheckpointStore</code></td><td>No</td><td>Yes</td><td>Production (simple)</td></tr>
+<tr><td><code>SqliteCheckpointStore</code></td><td>Yes</td><td>Yes</td><td>Development, debugging</td></tr>
+<tr><td><code>MemCheckpointStore</code></td><td>No</td><td>No</td><td>Testing</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="checkpoint-schema-correlation"><a class="header" href="#checkpoint-schema-correlation">Checkpoint-Schema Correlation</a></h3>
+<p>When registering schemas, the current checkpoint can be attached:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>registry.register_with_checkpoint(
+    tenant, db, table,
+    &amp;fingerprint,
+    &amp;schema_json,
+    Some(&amp;checkpoint_bytes),  // Current binlog position
+).await?;
+<span class="boring">}</span></code></pre>
+<p>This creates a link between schema versions and source positions, enabling coordinated rollback and point-in-time schema queries.</p>
+<h2 id="coordinator"><a class="header" href="#coordinator">Coordinator</a></h2>
+<p>The coordinator orchestrates event flow between source and sinks:</p>
+<h3 id="batching-2"><a class="header" href="#batching-2">Batching</a></h3>
+<p>Events are accumulated until a threshold triggers flush:</p>
+<ul>
+<li><code>max_events</code>: Event count limit</li>
+<li><code>max_bytes</code>: Total serialized size limit</li>
+<li><code>max_ms</code>: Time since batch started</li>
+<li><code>respect_source_tx</code>: Never split source transactions</li>
+</ul>
+<h3 id="commit-policy-2"><a class="header" href="#commit-policy-2">Commit Policy</a></h3>
+<p>When multiple sinks are configured, the commit policy determines when the checkpoint advances:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>match policy {
+    All =&gt; required_acks == total_sinks,
+    Required =&gt; required_acks == sinks.filter(|s| s.required).count(),
+    Quorum(n) =&gt; required_acks &gt;= n,
+}
+<span class="boring">}</span></code></pre>
+<h3 id="processor-pipeline"><a class="header" href="#processor-pipeline">Processor Pipeline</a></h3>
+<p>Processors run in declared order, transforming batches:</p>
+<pre><code>events ──▶ Processor 1 ──▶ Processor 2 ──▶ ... ──▶ transformed events
+</code></pre>
+<p>Each processor can filter, transform, or enrich events. The JavaScript processor uses <code>deno_core</code> for sandboxed execution.</p>
+<h3 id="hot-paths"><a class="header" href="#hot-paths">Hot Paths</a></h3>
+<p>Critical performance paths have been optimized:</p>
+<ol>
+<li><strong>Event construction</strong> — Minimal allocations, reuse buffers</li>
+<li><strong>Checkpoint serialization</strong> — Opaque bytes avoid repeated JSON encoding</li>
+<li><strong>Sink delivery</strong> — Batch operations reduce round trips</li>
+<li><strong>Schema lookup</strong> — In-memory cache with stable fingerprints</li>
+</ol>
+<h3 id="benchmarking"><a class="header" href="#benchmarking">Benchmarking</a></h3>
+<p>Performance is tracked via:</p>
+<ul>
+<li><strong>Micro-benchmarks</strong> for specific operations</li>
+<li><strong>End-to-end benchmarks</strong> using the Coordinator component</li>
+<li><strong>Regression detection</strong> in CI</li>
+</ul>
+<h2 id="future-architecture"><a class="header" href="#future-architecture">Future Architecture</a></h2>
+<p>Planned enhancements:</p>
+<ul>
+<li><strong>Persistent schema registry</strong>: SQLite backend initially, mirroring the checkpoint storage pattern</li>
+<li><strong>Production storage backends</strong>: PostgreSQL, S3/GCS for cloud-native and HA deployments</li>
+<li><strong>Event store</strong>: Time-based replay and schema evolution</li>
+<li><strong>Distributed coordination</strong>: Leader election for HA deployments</li>
+<li><strong>Additional sources</strong>: Turso/SQLite, ClickHouse, MongoDB</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="checkpoints-1"><a class="header" href="#checkpoints-1">Checkpoints</a></h1>
+<p>Checkpoints record pipeline progress so ingestion can resume from the last successfully delivered position. DeltaForge’s checkpoint system is designed to guarantee <strong>at-least-once delivery</strong> by carefully coordinating when checkpoints are saved relative to event delivery.</p>
+<h2 id="core-guarantee-at-least-once-delivery"><a class="header" href="#core-guarantee-at-least-once-delivery">Core Guarantee: At-Least-Once Delivery</a></h2>
+<p>The fundamental rule of DeltaForge checkpointing:</p>
+<blockquote>
+<p><strong>Checkpoints are only saved after events have been successfully delivered to sinks.</strong></p>
+</blockquote>
+<p>This ordering is critical. If a checkpoint were saved before events were delivered, a crash between checkpoint save and delivery would cause those events to be lost - the pipeline would resume from a position past events that were never delivered.</p>
+<pre><code>┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   Source    │────▶│  Processor  │────▶│    Sink     │────▶│ Checkpoint  │
+│   (read)    │     │ (transform) │     │  (deliver)  │     │   (save)    │
+└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+                                               │
+                                               ▼
+                                        Sink acknowledges
+                                        successful delivery
+                                               │
+                                               ▼
+                                        Then checkpoint
+                                        is saved
+</code></pre>
+<h3 id="what-this-means-in-practice"><a class="header" href="#what-this-means-in-practice">What This Means in Practice</a></h3>
+<ul>
+<li><strong>On clean shutdown</strong>: All buffered events are flushed and checkpointed</li>
+<li><strong>On crash</strong>: Events since the last checkpoint are replayed (hence “at-least-once”)</li>
+<li><strong>Duplicate handling</strong>: Consumers should be idempotent or use deduplication</li>
+</ul>
+<h2 id="checkpoint-storage"><a class="header" href="#checkpoint-storage">Checkpoint Storage</a></h2>
+<h3 id="storage-backends-1"><a class="header" href="#storage-backends-1">Storage Backends</a></h3>
+<p>DeltaForge supports pluggable checkpoint storage:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Backend</th><th>Description</th><th>Use Case</th></tr>
+</thead>
+<tbody>
+<tr><td><code>FileCheckpointStore</code></td><td>JSON file on disk</td><td>Development, simple deployments</td></tr>
+<tr><td><code>MemCheckpointStore</code></td><td>In-memory (ephemeral)</td><td>Testing</td></tr>
+<tr><td><code>SqliteCheckpointStore</code></td><td>SQLite with versioning</td><td>Single-instance production</td></tr>
+</tbody>
+</table>
+</div>
+<p>The default stores checkpoints to <code>./data/df_checkpoints.json</code>.</p>
+<p>For HA deployments requiring shared state across instances, additional backends (PostgreSQL, S3/GCS) are planned but not yet implemented.</p>
+<h3 id="storage-interface"><a class="header" href="#storage-interface">Storage Interface</a></h3>
+<p>All backends implement the <code>CheckpointStore</code> trait:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>#[async_trait]
+pub trait CheckpointStore: Send + Sync {
+    /// Get raw checkpoint bytes
+    async fn get_raw(&amp;self, source_id: &amp;str) -&gt; CheckpointResult&lt;Option&lt;Vec&lt;u8&gt;&gt;&gt;;
+    
+    /// Store raw checkpoint bytes
+    async fn put_raw(&amp;self, source_id: &amp;str, bytes: &amp;[u8]) -&gt; CheckpointResult&lt;()&gt;;
+    
+    /// Delete checkpoint
+    async fn delete(&amp;self, source_id: &amp;str) -&gt; CheckpointResult&lt;bool&gt;;
+    
+    /// List all checkpoint keys
+    async fn list(&amp;self) -&gt; CheckpointResult&lt;Vec&lt;String&gt;&gt;;
+    
+    /// Whether this backend supports versioning
+    fn supports_versioning(&amp;self) -&gt; bool;
+}
+<span class="boring">}</span></code></pre>
+<h3 id="typed-access"><a class="header" href="#typed-access">Typed Access</a></h3>
+<p>The <code>CheckpointStoreExt</code> trait provides convenient typed access:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>// Store typed checkpoint (automatically serialized to JSON)
+store.put("pipeline-1", MySqlCheckpoint { 
+    file: "binlog.000042".into(),
+    pos: 12345,
+    gtid_set: None,
+}).await?;
+
+// Retrieve typed checkpoint
+let cp: Option&lt;MySqlCheckpoint&gt; = store.get("pipeline-1").await?;
+<span class="boring">}</span></code></pre>
+<h2 id="checkpoint-contents"><a class="header" href="#checkpoint-contents">Checkpoint Contents</a></h2>
+<h3 id="mysql-checkpoints"><a class="header" href="#mysql-checkpoints">MySQL Checkpoints</a></h3>
+<p>MySQL checkpoints track binlog position:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub struct MySqlCheckpoint {
+    pub file: String,        // e.g., "binlog.000042"
+    pub pos: u64,            // Byte position in binlog file
+    pub gtid_set: Option&lt;String&gt;,  // GTID set if enabled
+}
+<span class="boring">}</span></code></pre>
+<p>The checkpoint is taken from the last event in a successfully delivered batch, ensuring resumption starts exactly where delivery left off.</p>
+<h3 id="checkpoint-in-events"><a class="header" href="#checkpoint-in-events">Checkpoint in Events</a></h3>
+<p>Events carry checkpoint metadata for end-to-end tracking:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub struct Event {
+    // ... other fields ...
+    
+    /// Checkpoint info from source
+    pub checkpoint: Option&lt;CheckpointMeta&gt;,
+}
+
+pub enum CheckpointMeta {
+    Opaque(Arc&lt;[u8]&gt;),  // Serialized source-specific checkpoint
+}
+<span class="boring">}</span></code></pre>
+<p>Using <code>Arc&lt;[u8]&gt;</code> allows zero-copy sharing of checkpoint data across the pipeline without repeated allocations.</p>
+<h2 id="commit-policy-3"><a class="header" href="#commit-policy-3">Commit Policy</a></h2>
+<p>When multiple sinks are configured, the commit policy determines when checkpoints advance:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Policy</th><th>Behavior</th></tr>
+</thead>
+<tbody>
+<tr><td><code>all</code></td><td>Every sink must acknowledge</td></tr>
+<tr><td><code>required</code></td><td>Only <code>required: true</code> sinks must acknowledge</td></tr>
+<tr><td><code>quorum</code></td><td>At least N sinks must acknowledge</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="configuration-5"><a class="header" href="#configuration-5">Configuration</a></h3>
+<pre><code class="language-yaml">spec:
+  batch:
+    commit_policy: required  # or: all, quorum
+    quorum: 2                # for quorum policy
+
+  sinks:
+    - type: kafka
+      required: true  # Must succeed for checkpoint
+      config: { ... }
+    
+    - type: redis
+      required: false  # Best-effort, doesn't block checkpoint
+      config: { ... }
+</code></pre>
+<h3 id="commit-logic"><a class="header" href="#commit-logic">Commit Logic</a></h3>
+<p>The coordinator tracks acknowledgments from each sink and only advances the checkpoint when the policy is satisfied:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>// Simplified commit logic
+let required_acks = sinks.iter().filter(|s| s.required).count();
+let actual_acks = batch.acknowledgments.iter().filter(|a| a.success).count();
+
+if actual_acks &gt;= required_acks {
+    checkpoint_store.put(&amp;key, batch.last_checkpoint).await?;
+} else {
+    warn!("commit policy not satisfied; checkpoint NOT advanced");
+}
+<span class="boring">}</span></code></pre>
+<h2 id="batching-and-checkpoints"><a class="header" href="#batching-and-checkpoints">Batching and Checkpoints</a></h2>
+<p>Checkpoints are saved at batch boundaries, not per-event. This provides:</p>
+<ul>
+<li><strong>Efficiency</strong>: Fewer checkpoint writes</li>
+<li><strong>Atomicity</strong>: Batch success or failure is all-or-nothing</li>
+<li><strong>Transaction preservation</strong>: <code>respect_source_tx: true</code> keeps source transactions in single batches</li>
+</ul>
+<h3 id="batch-configuration"><a class="header" href="#batch-configuration">Batch Configuration</a></h3>
+<pre><code class="language-yaml">spec:
+  batch:
+    max_events: 1000      # Flush after N events
+    max_bytes: 8388608    # Flush after 8MB
+    max_ms: 200           # Flush after 200ms
+    respect_source_tx: true  # Never split source transactions
+    max_inflight: 1       # Concurrent batches in flight
+</code></pre>
+<h3 id="checkpoint-timing-in-batches"><a class="header" href="#checkpoint-timing-in-batches">Checkpoint Timing in Batches</a></h3>
+<p>Within a batch:</p>
+<ol>
+<li>Events are collected until a threshold is reached</li>
+<li>Processors transform the batch</li>
+<li>Sinks receive and deliver events</li>
+<li>Sinks acknowledge success/failure</li>
+<li>Commit policy is evaluated</li>
+<li>If satisfied, checkpoint advances to the last event’s position</li>
+</ol>
+<h2 id="versioned-checkpoints"><a class="header" href="#versioned-checkpoints">Versioned Checkpoints</a></h2>
+<p>The SQLite backend supports checkpoint versioning for:</p>
+<ul>
+<li><strong>Rollback</strong>: Return to a previous checkpoint position</li>
+<li><strong>Audit</strong>: Track checkpoint progression over time</li>
+<li><strong>Debugging</strong>: Understand checkpoint history during incident analysis</li>
+</ul>
+<h3 id="version-operations"><a class="header" href="#version-operations">Version Operations</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>// Store with versioning
+let version = store.put_raw_versioned("pipeline-1", bytes).await?;
+
+// Get specific version
+let old_bytes = store.get_version_raw("pipeline-1", version - 1).await?;
+
+// List all versions
+let versions = store.list_versions("pipeline-1").await?;
+
+// Rollback to previous version
+store.rollback("pipeline-1", target_version).await?;
+<span class="boring">}</span></code></pre>
+<h3 id="version-metadata"><a class="header" href="#version-metadata">Version Metadata</a></h3>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub struct VersionInfo {
+    pub version: u64,
+    pub created_at: DateTime&lt;Utc&gt;,
+    pub size_bytes: usize,
+}
+<span class="boring">}</span></code></pre>
+<h2 id="schema-checkpoint-correlation"><a class="header" href="#schema-checkpoint-correlation">Schema-Checkpoint Correlation</a></h2>
+<p>For replay scenarios, DeltaForge correlates schemas with checkpoints. When a schema is registered, it can optionally include the current checkpoint position:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>registry.register_with_checkpoint(
+    tenant, db, table,
+    &amp;fingerprint,
+    &amp;schema_json,
+    Some(checkpoint_bytes),  // Binlog position when schema was observed
+).await?;
+<span class="boring">}</span></code></pre>
+<p>This enables:</p>
+<ul>
+<li><strong>Accurate replay</strong>: Events are interpreted with the schema active at their checkpoint position</li>
+<li><strong>Schema time-travel</strong>: Find what schema was active at any checkpoint</li>
+<li><strong>Coordinated rollback</strong>: Roll back both checkpoint and schema state together</li>
+</ul>
+<h2 id="operational-considerations"><a class="header" href="#operational-considerations">Operational Considerations</a></h2>
+<h3 id="clean-shutdown"><a class="header" href="#clean-shutdown">Clean Shutdown</a></h3>
+<p>Before maintenance, cleanly stop pipelines to flush checkpoints:</p>
+<pre><code class="language-bash"># Pause ingestion
+curl -X POST http://localhost:8080/pipelines/{name}/pause
+
+# Wait for in-flight batches to complete
+sleep 5
+
+# Stop pipeline
+curl -X POST http://localhost:8080/pipelines/{name}/stop
+</code></pre>
+<h3 id="checkpoint-inspection"><a class="header" href="#checkpoint-inspection">Checkpoint Inspection</a></h3>
+<p>View current checkpoint state:</p>
+<pre><code class="language-bash"># List all checkpoints
+curl http://localhost:8080/checkpoints
+
+# Get specific pipeline checkpoint
+curl http://localhost:8080/checkpoints/{pipeline-name}
+</code></pre>
+<h3 id="monitoring"><a class="header" href="#monitoring">Monitoring</a></h3>
+<p>Key metrics to monitor:</p>
+<ul>
+<li><code>deltaforge_checkpoint_lag_seconds</code>: Time since last checkpoint</li>
+<li><code>deltaforge_checkpoint_bytes</code>: Size of last checkpoint</li>
+<li><code>deltaforge_batch_commit_total</code>: Successful batch commits</li>
+<li><code>deltaforge_batch_commit_failed_total</code>: Failed commits (policy not satisfied)</li>
+</ul>
+<h3 id="recovery-scenarios"><a class="header" href="#recovery-scenarios">Recovery Scenarios</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Scenario</th><th>Behavior</th></tr>
+</thead>
+<tbody>
+<tr><td>Process crash</td><td>Resume from last checkpoint, replay events</td></tr>
+<tr><td>Network partition (sink unreachable)</td><td>Retry delivery, checkpoint doesn’t advance</td></tr>
+<tr><td>Corrupt checkpoint file</td><td>Manual intervention required</td></tr>
+<tr><td>Source unavailable at checkpoint</td><td>Retry connection with backoff</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="best-practices"><a class="header" href="#best-practices">Best Practices</a></h2>
+<ol>
+<li><strong>Use durable storage</strong> for production checkpoint backends (not in-memory)</li>
+<li><strong>Monitor checkpoint lag</strong> to detect stuck pipelines</li>
+<li><strong>Configure appropriate batch sizes</strong> — smaller batches mean more frequent checkpoints but more overhead</li>
+<li><strong>Set <code>required: true</code></strong> only on sinks that must succeed for correctness</li>
+<li><strong>Test recovery</strong> by killing pipelines and verifying no events are lost</li>
+<li><strong>Back up checkpoint files</strong> if using file-based storage</li>
+</ol>
+<h2 id="future-enhancements"><a class="header" href="#future-enhancements">Future Enhancements</a></h2>
+<p>Planned checkpoint improvements:</p>
+<ul>
+<li><strong>PostgreSQL backend</strong> for HA deployments with shared state</li>
+<li><strong>S3/GCS backends</strong> for cloud-native deployments</li>
+<li><strong>Distributed coordination</strong> for multi-instance leader election</li>
+<li><strong>Checkpoint compression</strong> for large state</li>
+<li><strong>Point-in-time recovery</strong> with event store integration</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="schema-registry-1"><a class="header" href="#schema-registry-1">Schema Registry</a></h1>
+<p>DeltaForge’s schema registry tracks table schemas across time, enabling accurate event interpretation during replay and providing change detection for DDL operations.</p>
+<h2 id="design-philosophy-source-owned-schemas"><a class="header" href="#design-philosophy-source-owned-schemas">Design Philosophy: Source-Owned Schemas</a></h2>
+<p>DeltaForge takes a fundamentally different approach to schema handling than many CDC tools. Rather than normalizing all database schemas into a universal type system, <strong>each source defines and owns its schema semantics</strong>.</p>
+<p>This means:</p>
+<ul>
+<li><strong>MySQL schemas capture MySQL semantics</strong> - column types like <code>bigint(20) unsigned</code>, <code>varchar(255)</code>, and <code>json</code> are preserved exactly as MySQL defines them</li>
+<li><strong>PostgreSQL schemas capture PostgreSQL semantics</strong> - arrays, custom types, and pg-specific attributes remain intact</li>
+<li><strong>No lossy normalization</strong> - you don’t lose precision or database-specific information by forcing everything into a common format</li>
+</ul>
+<p>This design avoids the maintenance burden of keeping a universal type system synchronized across all databases, and it ensures that downstream consumers receive schemas that accurately reflect the source database’s capabilities and constraints.</p>
+<h2 id="the-sourceschema-trait"><a class="header" href="#the-sourceschema-trait">The SourceSchema Trait</a></h2>
+<p>Every CDC source implements the <code>SourceSchema</code> trait, which provides a common interface for fingerprinting and column access while allowing source-specific schema representations:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub trait SourceSchema: Serialize + DeserializeOwned + Send + Sync {
+    /// Source type identifier (e.g., "mysql", "postgres", "mongodb").
+    fn source_kind(&amp;self) -&gt; &amp;'static str;
+
+    /// Content-addressable fingerprint for change detection.
+    /// Two schemas with the same fingerprint are identical.
+    fn fingerprint(&amp;self) -&gt; String;
+
+    /// Column/field names in ordinal order.
+    fn column_names(&amp;self) -&gt; Vec&lt;&amp;str&gt;;
+
+    /// Primary key column names.
+    fn primary_key(&amp;self) -&gt; Vec&lt;&amp;str&gt;;
+
+    /// Human-readable description.
+    fn describe(&amp;self) -&gt; String;
+}
+<span class="boring">}</span></code></pre>
+<h3 id="fingerprinting"><a class="header" href="#fingerprinting">Fingerprinting</a></h3>
+<p>Schema fingerprints use SHA-256 hashing over JSON-serialized content to provide:</p>
+<ul>
+<li><strong>Stability</strong> - the same schema always produces the same fingerprint</li>
+<li><strong>Change detection</strong> - any structural change produces a different fingerprint</li>
+<li><strong>Content-addressability</strong> - fingerprints can be used as cache keys or deduplication identifiers</li>
+</ul>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub fn compute_fingerprint&lt;T: Serialize&gt;(value: &amp;T) -&gt; String {
+    let json = serde_json::to_vec(value).unwrap_or_default();
+    let hash = Sha256::digest(&amp;json);
+    format!("sha256:{}", hex::encode(hash))
+}
+<span class="boring">}</span></code></pre>
+<p>The fingerprint only includes structurally significant fields. For MySQL, this means columns and primary key are included, but engine and charset are excluded since they don’t affect how CDC events should be interpreted.</p>
+<h2 id="mysql-schema-implementation"><a class="header" href="#mysql-schema-implementation">MySQL Schema Implementation</a></h2>
+<p>The <code>MySqlTableSchema</code> struct captures comprehensive MySQL table metadata:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub struct MySqlTableSchema {
+    /// Columns in ordinal order
+    pub columns: Vec&lt;MySqlColumn&gt;,
+    
+    /// Primary key column names
+    pub primary_key: Vec&lt;String&gt;,
+    
+    /// Storage engine (InnoDB, MyISAM, etc.)
+    pub engine: Option&lt;String&gt;,
+    
+    /// Default charset
+    pub charset: Option&lt;String&gt;,
+    
+    /// Default collation
+    pub collation: Option&lt;String&gt;,
+}
+
+pub struct MySqlColumn {
+    pub name: String,
+    pub column_type: String,      // e.g., "bigint(20) unsigned"
+    pub data_type: String,        // e.g., "bigint"
+    pub nullable: bool,
+    pub ordinal_position: u32,
+    pub default_value: Option&lt;String&gt;,
+    pub extra: Option&lt;String&gt;,    // e.g., "auto_increment"
+    pub comment: Option&lt;String&gt;,
+    pub char_max_length: Option&lt;i64&gt;,
+    pub numeric_precision: Option&lt;i64&gt;,
+    pub numeric_scale: Option&lt;i64&gt;,
+}
+<span class="boring">}</span></code></pre>
+<p>Schema information is fetched from <code>INFORMATION_SCHEMA</code> at startup and cached for the pipeline’s lifetime.</p>
+<h2 id="schema-registry-architecture"><a class="header" href="#schema-registry-architecture">Schema Registry Architecture</a></h2>
+<p>The schema registry serves three core functions:</p>
+<ol>
+<li><strong>Version tracking</strong> - maintains a history of schema versions per table</li>
+<li><strong>Change detection</strong> - compares fingerprints to detect DDL changes</li>
+<li><strong>Replay correlation</strong> - associates schemas with checkpoint positions for accurate replay</li>
+</ol>
+<h3 id="schema-versions"><a class="header" href="#schema-versions">Schema Versions</a></h3>
+<p>Each registered schema version includes:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>version</code></td><td>Per-table version number (starts at 1)</td></tr>
+<tr><td><code>hash</code></td><td>Content fingerprint for deduplication</td></tr>
+<tr><td><code>schema_json</code></td><td>Full schema as JSON</td></tr>
+<tr><td><code>registered_at</code></td><td>Registration timestamp</td></tr>
+<tr><td><code>sequence</code></td><td>Global monotonic sequence number</td></tr>
+<tr><td><code>checkpoint</code></td><td>Source checkpoint at registration time</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="sequence-numbers-for-replay"><a class="header" href="#sequence-numbers-for-replay">Sequence Numbers for Replay</a></h3>
+<p>The registry maintains a global monotonic sequence counter. When a schema is registered, it receives the next sequence number. Events carry this sequence number, enabling the replay engine to look up the correct schema version:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>// During replay: find schema active at event's sequence
+let schema = registry.get_at_sequence(tenant, db, table, event.schema_sequence);
+<span class="boring">}</span></code></pre>
+<p>This ensures events are always interpreted with the schema that was active when they were produced, even if the table structure has since changed.</p>
+<h3 id="checkpoint-correlation"><a class="header" href="#checkpoint-correlation">Checkpoint Correlation</a></h3>
+<p>Schemas can be registered with an associated checkpoint, creating a correlation between schema versions and source positions:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>registry.register_with_checkpoint(
+    tenant, db, table, 
+    &amp;fingerprint, 
+    &amp;schema_json,
+    Some(checkpoint_bytes),  // Optional: binlog position when schema was observed
+).await?;
+<span class="boring">}</span></code></pre>
+<p>This correlation supports scenarios like:</p>
+<ul>
+<li>Replaying events from a specific checkpoint with the correct schema</li>
+<li>Determining which schema was active at a particular binlog position</li>
+<li>Rolling back schema state along with checkpoint rollback</li>
+</ul>
+<h2 id="schema-loader"><a class="header" href="#schema-loader">Schema Loader</a></h2>
+<p>The <code>MySqlSchemaLoader</code> handles schema discovery and caching:</p>
+<h3 id="pattern-expansion"><a class="header" href="#pattern-expansion">Pattern Expansion</a></h3>
+<p>Tables are specified using patterns that support wildcards:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Pattern</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>db.table</code></td><td>Exact match</td></tr>
+<tr><td><code>db.*</code></td><td>All tables in database</td></tr>
+<tr><td><code>db.prefix%</code></td><td>Tables starting with prefix</td></tr>
+<tr><td><code>%.table</code></td><td>Table in any database</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="preloading"><a class="header" href="#preloading">Preloading</a></h3>
+<p>At startup, the loader expands patterns and preloads all matching schemas:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>let schema_loader = MySqlSchemaLoader::new(dsn, registry, tenant);
+let tracked_tables = schema_loader.preload(&amp;["shop.orders", "shop.order_%"]).await?;
+<span class="boring">}</span></code></pre>
+<p>This ensures schemas are available before the first CDC event arrives.</p>
+<h3 id="caching"><a class="header" href="#caching">Caching</a></h3>
+<p>Loaded schemas are cached to avoid repeated <code>INFORMATION_SCHEMA</code> queries:</p>
+<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>// Fast path: return cached schema
+if let Some(cached) = cache.get(&amp;(db, table)) {
+    return Ok(cached.clone());
+}
+
+// Slow path: fetch from database, register, cache
+let schema = fetch_schema(db, table).await?;
+let version = registry.register(...).await?;
+cache.insert((db, table), loaded_schema);
+<span class="boring">}</span></code></pre>
+<h2 id="ddl-handling"><a class="header" href="#ddl-handling">DDL Handling</a></h2>
+<p>When the binlog contains DDL events, the schema loader responds:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>DDL Type</th><th>Action</th></tr>
+</thead>
+<tbody>
+<tr><td><code>CREATE TABLE</code></td><td>Schema loaded on first row event</td></tr>
+<tr><td><code>ALTER TABLE</code></td><td>Cache invalidated, reloaded on next row</td></tr>
+<tr><td><code>DROP TABLE</code></td><td>Cache entry removed</td></tr>
+<tr><td><code>TRUNCATE</code></td><td>No schema change</td></tr>
+<tr><td><code>RENAME TABLE</code></td><td>Old removed, new loaded on first row</td></tr>
+</tbody>
+</table>
+</div>
+<p>DDL detection uses the <code>QueryEvent</code> type in the binlog. On DDL, the entire database’s schema cache is invalidated since MySQL doesn’t always specify the exact table in DDL events.</p>
+<h2 id="api-endpoints"><a class="header" href="#api-endpoints">API Endpoints</a></h2>
+<h3 id="reload-schemas"><a class="header" href="#reload-schemas">Reload Schemas</a></h3>
+<p>Force reload schemas from the database:</p>
+<pre><code class="language-bash">curl -X POST http://localhost:8080/pipelines/{name}/schemas/reload
+</code></pre>
+<p>This clears the cache and re-fetches schemas for all tracked tables.</p>
+<h3 id="list-cached-schemas"><a class="header" href="#list-cached-schemas">List Cached Schemas</a></h3>
+<p>View currently cached schemas:</p>
+<pre><code class="language-bash">curl http://localhost:8080/pipelines/{name}/schemas
+</code></pre>
+<h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
+<ul>
+<li><strong>In-memory registry</strong> - Schema versions are lost on restart. Persistent backends (SQLite, then PostgreSQL for HA) are planned.</li>
+<li><strong>No cross-pipeline sharing</strong> - Each pipeline maintains its own registry instance</li>
+<li><strong>Pattern expansion at startup</strong> - New tables matching patterns require pipeline restart or reload</li>
+</ul>
+<h2 id="best-practices-1"><a class="header" href="#best-practices-1">Best Practices</a></h2>
+<ol>
+<li><strong>Use explicit table patterns</strong> in production to avoid accidentally capturing unwanted tables</li>
+<li><strong>Monitor schema reload times</strong> - slow reloads may indicate overly broad patterns</li>
+<li><strong>Trigger schema reload after DDL</strong> if your deployment process modifies schemas</li>
+<li><strong>Include schema version in downstream events</strong> for consumers that need schema evolution awareness</li>
+</ol>
+<h2 id="troubleshooting"><a class="header" href="#troubleshooting">Troubleshooting</a></h2>
+<h3 id="unknown-table_id-errors"><a class="header" href="#unknown-table_id-errors">Unknown table_id Errors</a></h3>
+<pre><code>WARN write_rows for unknown table_id, table_id=42
+</code></pre>
+<p>The binlog contains row events for a table not in the table_map. This happens when:</p>
+<ul>
+<li>A table was created after the CDC stream started</li>
+<li>Table patterns don’t match the table</li>
+</ul>
+<p>Solution: Trigger a schema reload via the REST API.</p>
+<h3 id="schema-fetch-returned-0-columns"><a class="header" href="#schema-fetch-returned-0-columns">Schema Fetch Returned 0 Columns</a></h3>
+<pre><code>WARN schema fetch returned 0 columns, db=shop, table=orders
+</code></pre>
+<p>Usually indicates:</p>
+<ul>
+<li>Table doesn’t exist</li>
+<li>MySQL user lacks <code>SELECT</code> privilege on <code>INFORMATION_SCHEMA</code></li>
+<li>Table was dropped between detection and schema load</li>
+</ul>
+<h3 id="slow-schema-loading"><a class="header" href="#slow-schema-loading">Slow Schema Loading</a></h3>
+<pre><code>WARN slow schema fetch, db=shop, table=orders, ms=350
+</code></pre>
+<p>Consider:</p>
+<ul>
+<li>Narrowing table patterns to reduce the number of tables</li>
+<li>Using exact table names instead of wildcards</li>
+<li>Verifying network latency to the MySQL server</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="schema-sensing-2"><a class="header" href="#schema-sensing-2">Schema Sensing</a></h1>
+<p>Schema sensing automatically infers and tracks schema structure from JSON event payloads. This complements the schema registry by discovering schema from data rather than database metadata.</p>
+<h2 id="when-to-use-schema-sensing"><a class="header" href="#when-to-use-schema-sensing">When to Use Schema Sensing</a></h2>
+<p>Schema sensing is useful when:</p>
+<ul>
+<li><strong>Source doesn’t provide schema</strong>: Some sources emit JSON without metadata</li>
+<li><strong>JSON columns</strong>: Database JSON/JSONB columns have dynamic structure</li>
+<li><strong>Schema evolution tracking</strong>: Detect when payload structure changes over time</li>
+<li><strong>Downstream integration</strong>: Generate JSON Schema for consumers</li>
+</ul>
+<h2 id="how-it-works"><a class="header" href="#how-it-works">How It Works</a></h2>
+<pre><code>┌──────────────┐     ┌─────────────────┐     ┌──────────────────┐
+│    Event     │────▶│  Schema Sensor  │────▶│  Inferred Schema │
+│   Payload    │     │   (sampling)    │     │   + Fingerprint  │
+└──────────────┘     └─────────────────┘     └──────────────────┘
+                              │
+                              ▼
+                     ┌─────────────────┐
+                     │ Structure Cache │
+                     └─────────────────┘
+</code></pre>
+<ol>
+<li><strong>Observation</strong>: Events flow through the sensor during batch processing</li>
+<li><strong>Sampling</strong>: Not every event is fully analyzed (configurable rate)</li>
+<li><strong>Deep inspection</strong>: Nested JSON structures are recursively analyzed</li>
+<li><strong>Fingerprinting</strong>: Schema changes are detected via SHA-256 fingerprints</li>
+<li><strong>Caching</strong>: Repeated structures skip full analysis for performance</li>
+</ol>
+<h2 id="configuration-6"><a class="header" href="#configuration-6">Configuration</a></h2>
+<p>Enable schema sensing in your pipeline spec:</p>
+<pre><code class="language-yaml">spec:
+  schema_sensing:
+    enabled: true
+    
+    # Deep inspection for nested JSON
+    deep_inspect:
+      enabled: true
+      max_depth: 3
+      max_sample_size: 500
+    
+    # Sampling configuration
+    sampling:
+      warmup_events: 50
+      sample_rate: 5
+      structure_cache: true
+      structure_cache_size: 50
+    
+    # Output configuration
+    output:
+      include_stats: true
+</code></pre>
+<h3 id="configuration-options-1"><a class="header" href="#configuration-options-1">Configuration Options</a></h3>
+<h4 id="top-level"><a class="header" href="#top-level">Top Level</a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable schema sensing</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="deep-inspection-deep_inspect"><a class="header" href="#deep-inspection-deep_inspect">Deep Inspection (<code>deep_inspect</code>)</a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable deep inspection of nested objects</td></tr>
+<tr><td><code>max_depth</code></td><td>integer</td><td><code>3</code></td><td>Maximum nesting depth to analyze</td></tr>
+<tr><td><code>max_sample_size</code></td><td>integer</td><td><code>500</code></td><td>Max events to sample for deep analysis</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="sampling-sampling"><a class="header" href="#sampling-sampling">Sampling (<code>sampling</code>)</a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>warmup_events</code></td><td>integer</td><td><code>50</code></td><td>Events to analyze before sampling kicks in</td></tr>
+<tr><td><code>sample_rate</code></td><td>integer</td><td><code>5</code></td><td>Analyze 1 in N events after warmup</td></tr>
+<tr><td><code>structure_cache</code></td><td>bool</td><td><code>true</code></td><td>Cache structure hashes for performance</td></tr>
+<tr><td><code>structure_cache_size</code></td><td>integer</td><td><code>50</code></td><td>Max cached structures per table</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="inferred-types"><a class="header" href="#inferred-types">Inferred Types</a></h2>
+<p>Schema sensing infers these JSON types:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Type</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>null</code></td><td>JSON null value</td></tr>
+<tr><td><code>boolean</code></td><td>true/false</td></tr>
+<tr><td><code>integer</code></td><td>Whole numbers</td></tr>
+<tr><td><code>number</code></td><td>Floating point numbers</td></tr>
+<tr><td><code>string</code></td><td>Text values</td></tr>
+<tr><td><code>array</code></td><td>JSON arrays (element types tracked)</td></tr>
+<tr><td><code>object</code></td><td>Nested objects (fields recursively analyzed)</td></tr>
+</tbody>
+</table>
+</div>
+<p>For fields with varying types across events, all observed types are recorded.</p>
+<h2 id="schema-evolution-1"><a class="header" href="#schema-evolution-1">Schema Evolution</a></h2>
+<p>When schema structure changes, the sensor:</p>
+<ol>
+<li><strong>Detects change</strong>: Fingerprint differs from previous version</li>
+<li><strong>Increments sequence</strong>: Monotonic version number increases</li>
+<li><strong>Logs evolution</strong>: Emits structured log with old/new fingerprints</li>
+<li><strong>Updates cache</strong>: New structure becomes current</li>
+</ol>
+<p>Evolution events are available via the REST API and can trigger alerts.</p>
+<h2 id="stabilization"><a class="header" href="#stabilization">Stabilization</a></h2>
+<p>After observing enough events, a schema “stabilizes”:</p>
+<ul>
+<li>Warmup phase completes</li>
+<li>Structure stops changing</li>
+<li>Sampling rate takes effect</li>
+<li>Cache hit rate increases</li>
+</ul>
+<p>Stabilized schemas have <code>stabilized: true</code> in API responses.</p>
+<h2 id="api-access"><a class="header" href="#api-access">API Access</a></h2>
+<h3 id="list-inferred-schemas-1"><a class="header" href="#list-inferred-schemas-1">List Inferred Schemas</a></h3>
+<pre><code class="language-bash">curl http://localhost:8080/pipelines/my-pipeline/sensing/schemas
+</code></pre>
+<h3 id="get-schema-details-1"><a class="header" href="#get-schema-details-1">Get Schema Details</a></h3>
+<pre><code class="language-bash">curl http://localhost:8080/pipelines/my-pipeline/sensing/schemas/orders
+</code></pre>
+<h3 id="export-as-json-schema"><a class="header" href="#export-as-json-schema">Export as JSON Schema</a></h3>
+<pre><code class="language-bash">curl http://localhost:8080/pipelines/my-pipeline/sensing/schemas/orders/json-schema
+</code></pre>
+<h3 id="cache-statistics"><a class="header" href="#cache-statistics">Cache Statistics</a></h3>
+<pre><code class="language-bash">curl http://localhost:8080/pipelines/my-pipeline/sensing/stats
+</code></pre>
+<h2 id="drift-detection-1"><a class="header" href="#drift-detection-1">Drift Detection</a></h2>
+<p>Schema sensing integrates with drift detection to compare:</p>
+<ul>
+<li><strong>Expected schema</strong>: From database metadata (schema registry)</li>
+<li><strong>Observed schema</strong>: From event payloads (schema sensing)</li>
+</ul>
+<p>When mismatches occur, drift events are recorded:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Drift Type</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>unexpected_null</code></td><td>Non-nullable column has null values</td></tr>
+<tr><td><code>type_mismatch</code></td><td>Observed type differs from declared type</td></tr>
+<tr><td><code>undeclared_column</code></td><td>Field in data not in schema</td></tr>
+<tr><td><code>missing_column</code></td><td>Schema field never seen in data</td></tr>
+<tr><td><code>json_structure_change</code></td><td>JSON column structure changed</td></tr>
+</tbody>
+</table>
+</div>
+<p>Access drift data via:</p>
+<pre><code class="language-bash">curl http://localhost:8080/pipelines/my-pipeline/drift
+</code></pre>
+<h2 id="performance-considerations-1"><a class="header" href="#performance-considerations-1">Performance Considerations</a></h2>
+<h3 id="sampling-tradeoffs"><a class="header" href="#sampling-tradeoffs">Sampling Tradeoffs</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Setting</th><th>Effect</th></tr>
+</thead>
+<tbody>
+<tr><td>Higher <code>warmup_events</code></td><td>Better initial accuracy, slower stabilization</td></tr>
+<tr><td>Higher <code>sample_rate</code></td><td>Lower CPU usage, slower evolution detection</td></tr>
+<tr><td>Larger <code>structure_cache_size</code></td><td>More memory, better hit rate</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="recommended-settings"><a class="header" href="#recommended-settings">Recommended Settings</a></h3>
+<p><strong>High-throughput pipelines</strong> (&gt;10k events/sec):</p>
+<pre><code class="language-yaml">sampling:
+  warmup_events: 100
+  sample_rate: 10
+  structure_cache: true
+  structure_cache_size: 100
+</code></pre>
+<p><strong>Schema evolution monitoring</strong>:</p>
+<pre><code class="language-yaml">sampling:
+  warmup_events: 25
+  sample_rate: 2
+  structure_cache: true
+</code></pre>
+<p><strong>Development/debugging</strong>:</p>
+<pre><code class="language-yaml">sampling:
+  warmup_events: 10
+  sample_rate: 1  # Analyze every event
+</code></pre>
+<h2 id="example-json-column-sensing"><a class="header" href="#example-json-column-sensing">Example: JSON Column Sensing</a></h2>
+<p>For tables with JSON columns, sensing reveals the internal structure:</p>
+<pre><code class="language-yaml"># Database schema shows: metadata JSON
+# Sensing reveals:
+fields:
+  - name: "metadata.user_agent"
+    types: ["string"]
+    nullable: false
+  - name: "metadata.ip_address"
+    types: ["string"]
+    nullable: true
+  - name: "metadata.tags"
+    types: ["array"]
+    array_element_types: ["string"]
+</code></pre>
+<p>This enables downstream consumers to understand JSON column structure without manual documentation.</p>
+<h2 id="metrics"><a class="header" href="#metrics">Metrics</a></h2>
+<p>Schema sensing emits these metrics:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Metric</th><th>Type</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>deltaforge_schema_evolutions_total{pipeline}</code></td><td>Counter</td><td>Schema evolution events detected</td></tr>
+<tr><td><code>deltaforge_schema_drift_detected{pipeline}</code></td><td>Counter</td><td>Incremented when drift is detected in a batch</td></tr>
+<tr><td><code>deltaforge_stage_latency_seconds{pipeline,stage="schema_sensing"}</code></td><td>Histogram</td><td>Time spent in schema sensing per batch</td></tr>
+</tbody>
+</table>
+</div>
+<p>Cache statistics (hits, misses, hit rate) are available via the REST API at <code>/pipelines/{name}/sensing/stats</code> but are not currently exposed as Prometheus metrics.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="observability-playbook"><a class="header" href="#observability-playbook">Observability playbook</a></h1>
+<p>DeltaForge already ships a Prometheus exporter, structured logging, and a panic hook. The runtime now emits source ingress counters, batching/processor histograms, and sink latency/throughput so operators can build production dashboards immediately. The tables below capture what is wired today and the remaining gaps to make the platform production ready for data and infra engineers.</p>
+<h2 id="what-exists-today"><a class="header" href="#what-exists-today">What exists today</a></h2>
+<ul>
+<li>Prometheus endpoint served at <code>/metrics</code> (default <code>0.0.0.0:9000</code>) with descriptors for pipeline counts, source/sink counters, and a stage latency histogram. The recorder is installed automatically when metrics are enabled.</li>
+<li>Structured logging via <code>tracing_subscriber</code> with JSON output by default, optional targets, and support for <code>RUST_LOG</code> overrides.</li>
+<li>Panic hook increments a <code>deltaforge_panics_total</code> counter and logs captured panics before delegating to the default hook.</li>
+</ul>
+<h2 id="instrumentation-gaps-and-recommendations"><a class="header" href="#instrumentation-gaps-and-recommendations">Instrumentation gaps and recommendations</a></h2>
+<p>The sections below call out concrete metrics and log events to add per component. All metrics should include <code>pipeline</code>, <code>tenant</code>, and component identifiers where applicable so users can aggregate across fleets.</p>
+<h3 id="sources-mysqlpostgres"><a class="header" href="#sources-mysqlpostgres">Sources (MySQL/Postgres)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Status</th><th>Metric/log</th><th>Rationale</th></tr>
+</thead>
+<tbody>
+<tr><td>✅ Implemented</td><td><code>deltaforge_source_events_total{pipeline,source,table}</code> counter increments when MySQL events are handed to the coordinator.</td><td>Surfaces ingress per table and pipeline.</td></tr>
+<tr><td>✅ Implemented</td><td><code>deltaforge_source_reconnects_total{pipeline,source}</code> counter when binlog reads reconnect.</td><td>Makes retry storms visible.</td></tr>
+<tr><td>🚧 Gap</td><td><code>deltaforge_source_lag_seconds{pipeline,source}</code> gauge based on binlog/WAL position vs. server time.</td><td>Alert when sources fall behind.</td></tr>
+<tr><td>🚧 Gap</td><td><code>deltaforge_source_idle_seconds{pipeline,source}</code> gauge updated when no events arrive within the inactivity window.</td><td>Catch stuck readers before downstream backlogs form.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="coordinator-and-batching"><a class="header" href="#coordinator-and-batching">Coordinator and batching</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Status</th><th>Metric/log</th><th>Rationale</th></tr>
+</thead>
+<tbody>
+<tr><td>✅ Implemented</td><td><code>deltaforge_batch_events{pipeline}</code> and <code>deltaforge_batch_bytes{pipeline}</code> histograms in <code>Coordinator::process_deliver_and_maybe_commit</code>.</td><td>Tune batching policies with data.</td></tr>
+<tr><td>✅ Implemented</td><td><code>deltaforge_stage_latency_seconds{pipeline,stage,trigger}</code> histogram for processor stage.</td><td>Provides batch timing per trigger (timer/limits/shutdown).</td></tr>
+<tr><td>✅ Implemented</td><td><code>deltaforge_processor_latency_seconds{pipeline,processor}</code> histogram around every processor invocation.</td><td>Identify slow user functions.</td></tr>
+<tr><td>🚧 Gap</td><td><code>deltaforge_pipeline_channel_depth{pipeline}</code> gauge from <code>mpsc::Sender::capacity()</code>/<code>len()</code>.</td><td>Detect backpressure between sources and coordinator.</td></tr>
+<tr><td>🚧 Gap</td><td>Checkpoint outcome counters/logs (<code>deltaforge_checkpoint_success_total</code> / <code>_failure_total</code>).</td><td>Alert on persistence regressions and correlate to data loss risk.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="sinks-kafkarediscustom"><a class="header" href="#sinks-kafkarediscustom">Sinks (Kafka/Redis/custom)</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Status</th><th>Metric/log</th><th>Rationale</th></tr>
+</thead>
+<tbody>
+<tr><td>✅ Implemented</td><td><code>deltaforge_sink_events_total{pipeline,sink}</code> counter and <code>deltaforge_sink_latency_seconds{pipeline,sink}</code> histogram around each send.</td><td>Throughput and responsiveness per sink.</td></tr>
+<tr><td>✅ Implemented</td><td><code>deltaforge_sink_batch_total{pipeline,sink}</code> counter for send.</td><td>Number of batches sent per sink.</td></tr>
+<tr><td>🚧 Gap</td><td>Error taxonomy in <code>deltaforge_sink_failures_total</code> (add <code>kind</code>/<code>details</code>).</td><td>Easier alerting on specific failure classes (auth, timeout, schema).</td></tr>
+<tr><td>🚧 Gap</td><td>Backpressure gauge for client buffers (rdkafka queue, Redis pipeline depth).</td><td>Early signal before errors occur.</td></tr>
+<tr><td>🚧 Gap</td><td>Drop/skip counters from processors/sinks.</td><td>Auditing and reconciliation.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="control-plane-and-health-endpoints"><a class="header" href="#control-plane-and-health-endpoints">Control plane and health endpoints</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Need</th><th>Suggested metric/log</th><th>Rationale</th></tr>
+</thead>
+<tbody>
+<tr><td>API request accounting</td><td><code>deltaforge_api_requests_total{route,method,status}</code> counter and latency histogram using Axum middleware.</td><td>Production-grade visibility of operator actions.</td></tr>
+<tr><td>Ready/Liveness transitions</td><td>Logs with pipeline counts and per-pipeline status when readiness changes.</td><td>Explain probe failures in log aggregation.</td></tr>
+<tr><td>Pipeline lifecycle</td><td>Counters for create/patch/stop actions with success/error labels; include tenant and caller metadata in logs.</td><td>Auditable control-plane operations.</td></tr>
+</tbody>
+</table>
+</div>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="examples-1"><a class="header" href="#examples-1">Examples</a></h1>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="mysql-to-redis"><a class="header" href="#mysql-to-redis">MySQL to Redis</a></h1>
+<p>This example streams MySQL binlog events into a Redis stream with an inline JavaScript transformation.</p>
+<pre><code class="language-yaml">metadata:
+  name: orders-mysql-to-redis
+  tenant: acme
+spec:
+  source:
+    type: mysql
+    config:
+      id: orders-mysql
+      dsn: ${MYSQL_DSN}
+      tables:
+        - shop.orders
+  processors:
+    - type: javascript
+      id: redact-email
+      inline: |
+        function processBatch(events) {
+          return events.map((event) =&gt; {
+            if (event.after &amp;&amp; event.after.email) {
+              event.after.email = "[redacted]";
+            }
+            return event;
+          });
+        }
+      limits:
+        timeout_ms: 500
+  sinks:
+    - type: redis
+      config:
+        id: orders-redis
+        uri: ${REDIS_URI}
+        stream: orders
+        required: true
+  batch:
+    max_events: 500
+    max_bytes: 1048576
+    max_ms: 1000
+  commit_policy:
+    mode: required
+</code></pre>
+<p>Feel free to add a Kafka sink alongside Redis. Mark only the critical sink as <code>required</code> if you want checkpoints to proceed when optional sinks are unavailable.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="example-turso-to-kafka"><a class="header" href="#example-turso-to-kafka">Example: Turso to Kafka</a></h1>
+<p>This example demonstrates streaming changes from a Turso database to Kafka with schema sensing enabled.</p>
+<h2 id="use-case"><a class="header" href="#use-case">Use Case</a></h2>
+<p>You have a Turso database (or local libSQL) and want to:</p>
+<ul>
+<li>Stream table changes to a Kafka topic</li>
+<li>Automatically detect schema structure from JSON payloads</li>
+<li>Transform events with JavaScript before publishing</li>
+</ul>
+<h2 id="pipeline-configuration"><a class="header" href="#pipeline-configuration">Pipeline Configuration</a></h2>
+<pre><code class="language-yaml">apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: turso2kafka
+  tenant: acme
+
+spec:
+  source:
+    type: turso
+    config:
+      id: turso-main
+      # Local libSQL for development
+      url: "http://127.0.0.1:8080"
+      # For Turso cloud:
+      # url: "libsql://your-db.turso.io"
+      # auth_token: "${TURSO_AUTH_TOKEN}"
+      tables: ["users", "orders", "order_items"]
+      poll_interval_ms: 1000
+      cdc_mode: auto
+
+  processors:
+    - type: javascript
+      id: enrich
+      inline: |
+        function processBatch(events) {
+          return events.map(event =&gt; {
+            // Add custom metadata to events
+            event.source_type = "turso";
+            event.processed_at = new Date().toISOString();
+            return event;
+          });
+        }
+
+  sinks:
+    - type: kafka
+      config:
+        id: kafka-main
+        brokers: "${KAFKA_BROKERS}"
+        topic: turso.changes
+        required: true
+        exactly_once: false
+        client_conf:
+          message.timeout.ms: "5000"
+          acks: "all"
+
+  batch:
+    max_events: 100
+    max_bytes: 1048576
+    max_ms: 500
+    respect_source_tx: false
+    max_inflight: 2
+
+  commit_policy:
+    mode: required
+
+  schema_sensing:
+    enabled: true
+    deep_inspect:
+      enabled: true
+      max_depth: 3
+    sampling:
+      warmup_events: 50
+      sample_rate: 5
+      structure_cache: true
+</code></pre>
+<h2 id="running-the-example"><a class="header" href="#running-the-example">Running the Example</a></h2>
+<h3 id="1-start-infrastructure"><a class="header" href="#1-start-infrastructure">1. Start Infrastructure</a></h3>
+<pre><code class="language-bash"># Start Kafka and other services
+./dev.sh up
+
+# Create the target topic
+./dev.sh k-create turso.changes 6
+</code></pre>
+<h3 id="2-start-local-libsql-optional"><a class="header" href="#2-start-local-libsql-optional">2. Start Local libSQL (Optional)</a></h3>
+<p>For local development without Turso cloud:</p>
+<pre><code class="language-bash"># Using sqld (libSQL server)
+sqld --http-listen-addr 127.0.0.1:8080
+
+# Or with Docker
+docker run -p 8080:8080 ghcr.io/libsql/sqld:latest
+</code></pre>
+<h3 id="3-create-test-tables"><a class="header" href="#3-create-test-tables">3. Create Test Tables</a></h3>
+<pre><code class="language-sql">CREATE TABLE users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  email TEXT UNIQUE,
+  metadata TEXT  -- JSON column
+);
+
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  total REAL NOT NULL,
+  status TEXT DEFAULT 'pending',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+</code></pre>
+<h3 id="4-run-deltaforge"><a class="header" href="#4-run-deltaforge">4. Run DeltaForge</a></h3>
+<pre><code class="language-bash"># Save config as turso-kafka.yaml
+cargo run -p runner -- --config turso-kafka.yaml
+</code></pre>
+<h3 id="5-insert-test-data"><a class="header" href="#5-insert-test-data">5. Insert Test Data</a></h3>
+<pre><code class="language-sql">INSERT INTO users (name, email, metadata) 
+VALUES ('Alice', 'alice@example.com', '{"role": "admin", "tags": ["vip"]}');
+
+INSERT INTO orders (user_id, total, status) 
+VALUES (1, 99.99, 'completed');
+</code></pre>
+<h3 id="6-verify-events-in-kafka"><a class="header" href="#6-verify-events-in-kafka">6. Verify Events in Kafka</a></h3>
+<pre><code class="language-bash">./dev.sh k-consume turso.changes --from-beginning
+</code></pre>
+<p>You should see events like:</p>
+<pre><code class="language-json">{
+  "event_id": "550e8400-e29b-41d4-a716-446655440000",
+  "tenant_id": "acme",
+  "table": "users",
+  "op": "insert",
+  "after": {
+    "id": 1,
+    "name": "Alice",
+    "email": "alice@example.com",
+    "metadata": "{\"role\": \"admin\", \"tags\": [\"vip\"]}"
+  },
+  "source_type": "turso",
+  "processed_at": "2025-01-15T10:30:00.000Z",
+  "timestamp": "2025-01-15T10:30:00.123Z"
+}
+</code></pre>
+<h2 id="monitoring-1"><a class="header" href="#monitoring-1">Monitoring</a></h2>
+<h3 id="check-pipeline-status"><a class="header" href="#check-pipeline-status">Check Pipeline Status</a></h3>
+<pre><code class="language-bash">curl http://localhost:8080/pipelines/turso2kafka
+</code></pre>
+<h3 id="view-inferred-schemas"><a class="header" href="#view-inferred-schemas">View Inferred Schemas</a></h3>
+<pre><code class="language-bash"># List all inferred schemas
+curl http://localhost:8080/pipelines/turso2kafka/sensing/schemas
+
+# Get details for users table
+curl http://localhost:8080/pipelines/turso2kafka/sensing/schemas/users
+
+# Export as JSON Schema
+curl http://localhost:8080/pipelines/turso2kafka/sensing/schemas/users/json-schema
+</code></pre>
+<h3 id="check-drift-detection"><a class="header" href="#check-drift-detection">Check Drift Detection</a></h3>
+<pre><code class="language-bash">curl http://localhost:8080/pipelines/turso2kafka/drift
+</code></pre>
+<h2 id="turso-cloud-configuration"><a class="header" href="#turso-cloud-configuration">Turso Cloud Configuration</a></h2>
+<p>For production with Turso cloud:</p>
+<pre><code class="language-yaml">source:
+  type: turso
+  config:
+    id: turso-prod
+    url: "libsql://mydb-myorg.turso.io"
+    auth_token: "${TURSO_AUTH_TOKEN}"
+    tables: ["*"]
+    cdc_mode: native
+    poll_interval_ms: 1000
+    native_cdc:
+      level: data
+</code></pre>
+<p>Set the auth token via environment variable:</p>
+<pre><code class="language-bash">export TURSO_AUTH_TOKEN="your-token-here"
+</code></pre>
+<h2 id="notes-4"><a class="header" href="#notes-4">Notes</a></h2>
+<ul>
+<li><strong>CDC Mode</strong>: <code>auto</code> tries native CDC first, then falls back to triggers or polling</li>
+<li><strong>Poll Interval</strong>: Lower values reduce latency but increase database load</li>
+<li><strong>Schema Sensing</strong>: Automatically discovers JSON structure in text columns</li>
+<li><strong>Exactly Once</strong>: Set to <code>false</code> for higher throughput; use <code>true</code> if Kafka cluster supports EOS</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="troubleshooting-1"><a class="header" href="#troubleshooting-1">Troubleshooting</a></h1>
+<p>Common issues and quick checks when running DeltaForge.</p>
+<ul>
+<li>🩺 <strong>Health-first</strong>: start with <code>/healthz</code> and <code>/readyz</code> to pinpoint failing components.</li>
+</ul>
+<h2 id="runner-fails-to-start"><a class="header" href="#runner-fails-to-start">Runner fails to start</a></h2>
+<ul>
+<li>Confirm the config path passed to <code>--config</code> exists and is readable.</li>
+<li>Validate YAML syntax and that required fields like <code>metadata.name</code> and <code>spec.source</code> are present.</li>
+<li>Ensure environment variables referenced in the spec are set (<code>dsn</code>, <code>brokers</code>, <code>uri</code>, etc.).</li>
+</ul>
+<h2 id="pipelines-remain-unready"><a class="header" href="#pipelines-remain-unready">Pipelines remain unready</a></h2>
+<ul>
+<li>Check the <code>/readyz</code> endpoint for per-pipeline status and error messages.</li>
+<li>Verify upstream credentials allow replication (MySQL binlog). Other engines are experimental unless explicitly documented.</li>
+<li>Inspect sink connectivity; a required sink that cannot connect will block checkpoints.</li>
+</ul>
+<h2 id="slow-throughput"><a class="header" href="#slow-throughput">Slow throughput</a></h2>
+<ul>
+<li>Increase <code>batch.max_events</code> or <code>batch.max_bytes</code> to reduce flush frequency.</li>
+<li>Adjust <code>max_inflight</code> to allow more concurrent batches if sinks can handle parallelism.</li>
+<li>Reduce processor work or add guardrails (<code>limits</code>) to prevent slow JavaScript from stalling the pipeline.</li>
+</ul>
+<h2 id="checkpoints-not-advancing"><a class="header" href="#checkpoints-not-advancing">Checkpoints not advancing</a></h2>
+<ul>
+<li>Review the commit policy: <code>mode: all</code> or <code>required</code> sinks that are unavailable will block progress.</li>
+<li>Look for sink-specific errors (for example, Kafka broker unreachability or Redis backpressure).</li>
+<li>Pause and resume the pipeline to force a clean restart after addressing the underlying issue.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<p align="center">
+  <img src="assets/deltaforge-dev.png" width="250" alt="DeltaForge">
+</p>
+
+<h1 id="development-guide"><a class="header" href="#development-guide">Development Guide</a></h1>
+<p>Use this guide to build, test, and extend DeltaForge. It covers local workflows, optional dependency containers, and how to work with Docker images.</p>
+<p>All contributions are welcome and highly appreciated.</p>
+<h2 id="local-prerequisites"><a class="header" href="#local-prerequisites">Local prerequisites</a></h2>
+<ul>
+<li>Rust toolchain 1.89+ (install via <a href="https://rustup.rs"><code>rustup</code></a>).</li>
+<li>Optional: Docker or Podman for running the dev dependency stack and the container image.</li>
+</ul>
+<h2 id="workspace-layout"><a class="header" href="#workspace-layout">Workspace layout</a></h2>
+<ul>
+<li><code>crates/deltaforge-core</code> : shared event model, pipeline engine, and checkpointing primitives.</li>
+<li><code>crates/sources</code> : database CDC readers (MySQL binlog, Postgres logical replication) implemented as pluggable sources.</li>
+<li><code>crates/processors</code> : JavaScript-based processors and support code for transforming batches.</li>
+<li><code>crates/sinks</code> : sink implementations (Kafka producer, Redis streams) plus sink utilities.</li>
+<li><code>crates/rest-api</code> : HTTP control plane with health/readiness and pipeline lifecycle endpoints.</li>
+<li><code>crates/runner</code> : CLI entrypoint that wires the runtime, metrics, and control plane together.</li>
+</ul>
+<p>Use these crate boundaries as reference points when adding new sources, sinks, or pipeline behaviors.</p>
+<h2 id="start-dev-dependencies"><a class="header" href="#start-dev-dependencies">Start dev dependencies</a></h2>
+<p>Bring up the optional backing services (MySQL, Kafka, Redis) with Docker Compose:</p>
+<pre><code class="language-bash">docker compose -f docker-compose.dev.yml up -d
+</code></pre>
+<p>Each service is exposed on localhost for local runs (<code>5432</code>, <code>3306</code>, <code>9092</code>, <code>6379</code>). The MySQL container seeds demo data from <code>./init-scripts</code> and configures binlog settings required for CDC.</p>
+<p>Prefer the convenience <code>dev.sh</code> wrapper to keep common tasks consistent:</p>
+<pre><code class="language-bash">./dev.sh up     # start the dependency stack
+./dev.sh down   # stop and remove it
+./dev.sh ps     # see container status
+</code></pre>
+<h2 id="build-and-test-locally"><a class="header" href="#build-and-test-locally">Build and test locally</a></h2>
+<p>Run the usual Rust workflow from the repo root:</p>
+<pre><code class="language-bash">cargo fmt --all
+cargo clippy --workspace --all-targets --all-features
+cargo test --workspace
+</code></pre>
+<p>Or use the helper script for a single command that mirrors CI expectations:</p>
+<pre><code class="language-bash">./dev.sh build         # build project (debug)
+./dev.sh build-release # build project (release)
+./dev.sh run           # run with examples/dev.yaml
+./dev.sh fmt           # format code
+./dev.sh lint          # clippy with warnings as errors
+./dev.sh test          # full test suite
+./dev.sh check         # fmt --check + clippy + tests (mirrors CI)
+./dev.sh cov           # generate coverage report
+</code></pre>
+<h2 id="docker-images"><a class="header" href="#docker-images">Docker images</a></h2>
+<h3 id="use-pre-built-images"><a class="header" href="#use-pre-built-images">Use pre-built images</a></h3>
+<p>Multi-arch images (amd64/arm64) are published to GHCR and Docker Hub:</p>
+<pre><code class="language-bash"># Minimal (~57MB, scratch-based, no shell)
+docker pull ghcr.io/vnvo/deltaforge:latest
+docker pull vnvohub/deltaforge:latest
+
+# Debug (~140MB, includes shell for troubleshooting)
+docker pull ghcr.io/vnvo/deltaforge:latest-debug
+docker pull vnvohub/deltaforge:latest-debug
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variant</th><th>Size</th><th>Base</th><th>Use case</th></tr>
+</thead>
+<tbody>
+<tr><td><code>latest</code></td><td>~57MB</td><td>scratch</td><td>Production</td></tr>
+<tr><td><code>latest-debug</code></td><td>~140MB</td><td>debian-slim</td><td>Troubleshooting, has shell</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="build-locally"><a class="header" href="#build-locally">Build locally</a></h3>
+<p>Two Dockerfiles are provided:</p>
+<pre><code class="language-bash"># Minimal image (~57MB)
+docker build -t deltaforge:local .
+
+# Debug image (~140MB, includes shell)
+docker build -t deltaforge:local-debug -f Dockerfile.debug .
+</code></pre>
+<p>Or use the dev helper:</p>
+<pre><code class="language-bash">./dev.sh docker            # build minimal image
+./dev.sh docker-debug      # build debug image
+./dev.sh docker-test       # test minimal image runs
+./dev.sh docker-test-debug # test debug image runs
+./dev.sh docker-all        # build and test all variants
+./dev.sh docker-shell      # open shell in debug container
+</code></pre>
+<h3 id="build-multi-arch-locally"><a class="header" href="#build-multi-arch-locally">Build multi-arch locally</a></h3>
+<p>To build for both amd64 and arm64:</p>
+<pre><code class="language-bash">./dev.sh docker-multi-setup  # create buildx builder (once)
+./dev.sh docker-multi        # build both architectures
+</code></pre>
+<p>Note: Multi-arch builds use QEMU emulation and take ~30-35 minutes. The images are not loaded locally - use <code>--push</code> to push to a registry.</p>
+<h3 id="run-the-image"><a class="header" href="#run-the-image">Run the image</a></h3>
+<p>Run the container by mounting your pipeline specs and exposing the API and metrics ports:</p>
+<pre><code class="language-bash">docker run --rm \
+  -p 8080:8080 -p 9000:9000 \
+  -v $(pwd)/examples/dev.yaml:/etc/deltaforge/pipeline.yaml:ro \
+  -v deltaforge-checkpoints:/app/data \
+  ghcr.io/vnvo/deltaforge:latest \
+  --config /etc/deltaforge/pipeline.yaml
+</code></pre>
+<p>Notes:</p>
+<ul>
+<li>The container listens on <code>0.0.0.0:8080</code> for the control plane API with metrics on <code>:9000</code>.</li>
+<li>Checkpoints are written to <code>/app/data/df_checkpoints.json</code>; mount a volume to persist them across restarts.</li>
+<li>Environment variables inside the YAML are expanded before parsing.</li>
+<li>Pass any other runner flags as needed (e.g., <code>--api-addr</code> or <code>--metrics-addr</code>).</li>
+</ul>
+<h3 id="debug-a-running-container"><a class="header" href="#debug-a-running-container">Debug a running container</a></h3>
+<p>Use the debug image to troubleshoot:</p>
+<pre><code class="language-bash"># Run with shell access
+docker run --rm -it --entrypoint /bin/bash ghcr.io/vnvo/deltaforge:latest-debug
+
+# Exec into a running container
+docker exec -it &lt;container_id&gt; /bin/bash
+</code></pre>
+<h2 id="dev-helper-commands"><a class="header" href="#dev-helper-commands">Dev helper commands</a></h2>
+<p>The <code>dev.sh</code> script provides shortcuts for common tasks:</p>
+<pre><code class="language-bash">./dev.sh help  # show all commands
+</code></pre>
+<h3 id="infrastructure"><a class="header" href="#infrastructure">Infrastructure</a></h3>
+<pre><code class="language-bash">./dev.sh up           # start MySQL, Kafka, Redis
+./dev.sh down         # stop and remove containers
+./dev.sh ps           # list running services
+</code></pre>
+<h3 id="kafka-1"><a class="header" href="#kafka-1">Kafka</a></h3>
+<pre><code class="language-bash">./dev.sh k-list                         # list topics
+./dev.sh k-create &lt;topic&gt;               # create topic
+./dev.sh k-consume &lt;topic&gt; --from-beginning
+./dev.sh k-produce &lt;topic&gt;              # interactive producer
+</code></pre>
+<h3 id="redis-1"><a class="header" href="#redis-1">Redis</a></h3>
+<pre><code class="language-bash">./dev.sh redis-cli                      # open redis-cli
+./dev.sh redis-read &lt;stream&gt;            # read from stream
+</code></pre>
+<h3 id="database-shells"><a class="header" href="#database-shells">Database shells</a></h3>
+<pre><code class="language-bash">./dev.sh pg-sh       # psql into Postgres
+./dev.sh mysql-sh    # mysql into MySQL
+</code></pre>
+<h3 id="documentation"><a class="header" href="#documentation">Documentation</a></h3>
+<pre><code class="language-bash">./dev.sh docs        # serve docs locally (opens browser)
+./dev.sh docs-build  # build docs
+</code></pre>
+<h3 id="pre-release-checks"><a class="header" href="#pre-release-checks">Pre-release checks</a></h3>
+<pre><code class="language-bash">./dev.sh release-check  # run all checks + build all Docker variants
+</code></pre>
+<h2 id="contributing"><a class="header" href="#contributing">Contributing</a></h2>
+<ol>
+<li>Fork the repository</li>
+<li>Create a branch from <code>main</code> (e.g., <code>feature/new-sink</code>, <code>fix/checkpoint-bug</code>)</li>
+<li>Make your changes</li>
+<li>Run <code>./dev.sh check</code> to ensure CI will pass</li>
+<li>Submit a PR against <code>main</code></li>
+</ol>
+<h2 id="things-to-remember"><a class="header" href="#things-to-remember">Things to Remember</a></h2>
+<h3 id="tests"><a class="header" href="#tests">Tests</a></h3>
+<p>There a few <code>#[ignore]</code> tests, run them when making deep changes to the sources, pipeline coordination and anything with impact on core functionality.</p>
+<h3 id="logging-hygiene"><a class="header" href="#logging-hygiene">Logging hygiene</a></h3>
+<ul>
+<li>Include <code>pipeline</code>, <code>tenant</code>, <code>source_id</code>/<code>sink_id</code>, and <code>batch_id</code> fields on all warnings/errors to make traces joinable in log aggregation tools.</li>
+<li>Normalize retry/backoff logs so they include the attempt count and sleep duration; consider a structured <code>reason</code> field alongside error details for dashboards.</li>
+<li>Add info-level summaries on interval (e.g., every N batches) reporting batches processed, average batch size, lag, and sink latency percentiles pulled from the metrics registry to create human-friendly breadcrumbs.</li>
+<li>Add metrics in a backward-compatible way: prefer new metric names over redefining existing ones to avoid breaking dashboards. Validate cardinality (bounded label sets) before merging.</li>
+<li>Gate noisy logs behind levels (<code>debug</code> for per-event traces, <code>info</code> for batch summaries, <code>warn</code>/<code>error</code> for retries and failures).</li>
+<li>Exercise the new metrics in integration tests by asserting counters change when sending synthetic events through pipelines.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="roadmap"><a class="header" href="#roadmap">Roadmap</a></h1>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+        <script>
+        window.addEventListener('load', function() {
+            window.setTimeout(window.print, 100);
+        });
+        </script>
+
+
+    </div>
+    </body>
+</html>
