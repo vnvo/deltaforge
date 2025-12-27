@@ -21,6 +21,7 @@ type JsJob = (Vec<Event>, oneshot::Sender<Result<Vec<Event>>>);
 pub struct JsProcessor {
     id: String,
     tx: mpsc::Sender<JsJob>,
+    worker_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl JsProcessor {
@@ -36,7 +37,7 @@ impl JsProcessor {
         // Move script into thread
         let script = inline.clone();
 
-        thread::Builder::new()
+        let worker_handle = thread::Builder::new()
             .name(format!("df-js-{}", id_clone))
             .spawn(move || {
                 if let Err(e) = js_worker_thread(id_clone, script, &mut rx) {
@@ -45,7 +46,18 @@ impl JsProcessor {
             })
             .context("spawn js processor thread")?;
 
-        Ok(Self { id, tx })
+        Ok(Self {
+            id,
+            tx,
+            worker_handle: Some(worker_handle),
+        })
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.worker_handle
+            .as_ref()
+            .map(|h| !h.is_finished())
+            .unwrap_or(false)
     }
 }
 
@@ -177,6 +189,10 @@ impl Processor for JsProcessor {
     }
 
     async fn process(&self, events: Vec<Event>) -> Result<Vec<Event>> {
+        if !self.is_alive() {
+            bail!("JS processor worker has crashed");
+        }
+
         let (reply_tx, reply_rx) = oneshot::channel();
         // send job to worker thread
         self.tx
@@ -184,7 +200,12 @@ impl Processor for JsProcessor {
             .await
             .context("send batch to JS worker failed")?;
 
+        tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx)
+            .await
+            .context("JS processor timed out after 5s")?
+            .context("JS worker dropped reply channel")?
+
         // await result
-        reply_rx.await.context("JS worker dropped reply channel")?
+        //reply_rx.await.context("JS worker dropped reply channel")?
     }
 }
