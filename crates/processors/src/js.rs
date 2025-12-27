@@ -95,11 +95,33 @@ fn js_worker_thread(
 
     // Main loop: handle jobs
     while let Some((events, reply_tx)) = rx.blocking_recv() {
+        let start = std::time::Instant::now();
+        let input_len = events.len();
         let res = process_batch_in_runtime(&mut rt, &id, events);
         if let Err(ref e) = res {
             error!(processor_id=%id, error=%e, "JS batch processing failed");
         }
-        // It's okay if receiver is gone.
+
+        match &res {
+            Ok(out) => {
+                debug!(
+                    processor_id=%id,
+                    events_count=input_len,
+                    out_count=out.len(),
+                    elapsed_us=start.elapsed().as_micros(),
+                    "JS batch processed"
+                );
+            }
+            Err(e) => {
+                error!(
+                    processor_id=%id,
+                    error=%e,
+                    elapsed_us=start.elapsed().as_micros(),
+                    "JS processing failre"
+                );
+            }
+        }
+
         let _ = reply_tx.send(res);
     }
 
@@ -142,7 +164,8 @@ fn process_batch_in_runtime(
         let msg = v8::Exception::create_message(&mut try_catch, exc)
             .get(&mut try_catch)
             .to_rust_string_lossy(&mut try_catch);
-        bail!("js processor threw: {msg}");
+        error!(processor_id=%id, msg=%msg, "JS exception");
+        bail!("JS processor can not continue");
     }
 
     let result = call_res.unwrap();
