@@ -104,10 +104,11 @@ pub struct Event {
     pub tags: Option<Vec<String>>,
 
     /// Event checkpoint info
+    #[serde(skip_serializing)]
     pub checkpoint: Option<CheckpointMeta>,
 
     /// Byte size hint for batching (from source or estimated)
-    #[serde(default)]
+    #[serde(skip_serializing)]
     pub size_bytes: usize,
 
     #[serde(default)]
