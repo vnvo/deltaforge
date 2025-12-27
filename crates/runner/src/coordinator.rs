@@ -557,9 +557,18 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
     ) -> Result<()> {
         // 1) PROCESS: processors can modify/duplicate/drop events
         let proc_start = Instant::now();
-        let processed = (self.process_batch)(std::mem::take(&mut b.raw))
-            .await
-            .context("process batch")?;
+        let processed = match (self.process_batch)(std::mem::take(&mut b.raw)).await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    pipeline=%self.pipeline_name,
+                    error=%e,
+                    reason=%reason,
+                    "processor failed, NOT saving checkpoint"
+                );
+                return Err(e).context("process batch");
+            }
+        };        
 
         histogram!(
             "deltaforge_stage_latency_seconds",
@@ -789,12 +798,13 @@ pub fn build_batch_processor(
         let pipeline = Arc::clone(&pipeline_name);
 
         async move {
+            let last_cp = events
+                .iter()
+                .rev()
+                .find_map(|e| e.checkpoint.as_ref())
+                .cloned();
+
             if procs.is_empty() {
-                let last_cp = events
-                    .iter()
-                    .rev()
-                    .find_map(|e| e.checkpoint.as_ref())
-                    .cloned();
                 return Ok(ProcessedBatch {
                     events,
                     last_checkpoint: last_cp,
@@ -819,11 +829,11 @@ pub fn build_batch_processor(
                 .record(start.elapsed().as_secs_f64());
             }
 
-            let last_cp = batch
-                .iter()
-                .rev()
-                .find_map(|e| e.checkpoint.as_ref())
-                .cloned();
+            // let last_cp = batch
+            //     .iter()
+            //     .rev()
+            //     .find_map(|e| e.checkpoint.as_ref())
+            //     .cloned();
 
             Ok(ProcessedBatch {
                 events: batch,

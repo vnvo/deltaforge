@@ -341,16 +341,6 @@ impl TursoSource {
             checkpoint = updated_checkpoint;
             checkpoint.timestamp_ms = Utc::now().timestamp_millis();
 
-            // Serialize and save using put_raw to avoid lifetime issues with generic put()
-            let checkpoint_bytes =
-                serde_json::to_vec(&checkpoint).unwrap_or_default();
-            if let Err(e) = chkpt_store
-                .put_raw(&self.checkpoint_key, &checkpoint_bytes)
-                .await
-            {
-                warn!(error = %e, "failed to save checkpoint");
-            }
-
             // If no changes, sleep before next poll
             if !changes_found {
                 tokio::select! {
