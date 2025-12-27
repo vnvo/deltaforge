@@ -84,6 +84,9 @@ fn js_worker_thread(
     // Main loop: handle jobs
     while let Some((events, reply_tx)) = rx.blocking_recv() {
         let res = process_batch_in_runtime(&mut rt, &id, events);
+        if let Err(ref e) = res {
+            error!(processor_id=%id, error=%e, "JS batch processing failed");
+        }
         // It's okay if receiver is gone.
         let _ = reply_tx.send(res);
     }
