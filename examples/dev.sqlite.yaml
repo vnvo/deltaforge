@@ -1,0 +1,88 @@
+# DeltaForge - SQLite File CDC Example
+#
+# This is the SIMPLEST way to test Turso/SQLite CDC - just uses a local
+# SQLite file, no sqld server or Turso account needed.
+#
+# Quick start:
+#   ./dev.sh up                  # start Kafka, Redis
+#   ./dev.sh k-create sqlite.changes
+#   ./dev.sh sqlite-init         # create test DB with sample tables
+#   ./dev.sh sqlite-run          # run this pipeline
+#
+# Then in another terminal:
+#   ./dev.sh sqlite-shell        # insert data and watch events flow
+#   sqlite> INSERT INTO users (name, email) VALUES ('Bob', 'bob@test.com');
+#
+# Watch events:
+#   ./dev.sh k-consume sqlite.changes --from-beginning
+
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: sqlite-local
+  tenant: dev
+
+spec:
+  source:
+    type: turso
+    config:
+      id: sqlite-file
+      # Local SQLite file - no server needed!
+      url: "file:${SQLITE_DB_PATH}"
+      
+      # Capture all tables, or specify: ["users", "orders"]
+      tables: ["*"]
+      
+      # For SQLite files, polling mode works best
+      # (triggers mode also works but requires write access)
+      cdc_mode: polling
+      
+      # Poll interval in milliseconds
+      poll_interval_ms: 500
+
+  processors:
+    - type: javascript
+      id: js-enrich
+      inline: |
+        function processBatch(events) {
+          return events.map(event => {
+            event.source_type = "sqlite-file";
+            event.processed_at = new Date().toISOString();
+            return event;
+          });
+        }
+
+  sinks:
+    - type: kafka
+      config:
+        id: kafka
+        brokers: "${KAFKA_BROKERS}"
+        topic: sqlite.changes
+        required: true
+        exactly_once: false
+    - type: redis
+      config:
+        id: redis
+        uri: "${REDIS_URI}"
+        stream: sqlite.events
+        required: false
+
+  batch:
+    max_events: 50
+    max_bytes: 1048576
+    max_ms: 200
+    respect_source_tx: false
+    max_inflight: 1
+
+  commit_policy:
+    mode: required
+
+  schema_sensing:
+    enabled: true
+    deep_inspect:
+      enabled: true
+      max_depth: 3
+    sampling:
+      warmup_events: 10
+      sample_rate: 2
+      structure_cache: true

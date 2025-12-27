@@ -12,6 +12,10 @@ API_BASE="${API_BASE:-http://localhost:8080}"
 IMAGE_NAME="deltaforge"
 IMAGE_TAG="dev"
 
+# Turso local settings
+TURSO_LOCAL_PORT="${TURSO_LOCAL_PORT:-8079}"
+TURSO_LOCAL_DATA="${TURSO_LOCAL_DATA:-/tmp/deltaforge-turso}"
+
 usage() {
   cat <<'EOF'
 DeltaForge dev helper
@@ -39,13 +43,28 @@ Dev:
   ./dev.sh build                  # build project (debug)
   ./dev.sh build-release          # build project (release)
   ./dev.sh run [config]           # run with config (default: examples/dev.yaml)
-  ./dev.sh run-turso              # run with Turso example config
+  ./dev.sh run-turso              # run with Turso cloud (see turso-setup first)
   ./dev.sh run-pg                 # run with Postgres example config
   ./dev.sh fmt                    # format Rust code (cargo fmt --all)
   ./dev.sh lint                   # run clippy with warnings as errors
   ./dev.sh test                   # run test suite
   ./dev.sh check                  # run fmt-check + clippy + tests (what CI does)
   ./dev.sh cov                    # run coverage (cargo llvm-cov)
+
+Turso/SQLite:
+  ./dev.sh turso-setup            # check requirements for Turso cloud testing
+  ./dev.sh turso-cloud-run        # run DeltaForge with Turso cloud (needs env vars)
+  
+  # Local libSQL server (sqld in Docker):
+  ./dev.sh turso-local-up         # start local libSQL server (sqld)
+  ./dev.sh turso-local-down       # stop local libSQL server
+  ./dev.sh turso-local-shell      # open SQL shell to local libSQL
+  ./dev.sh turso-local-run        # run DeltaForge with local libSQL
+  
+  # SQLite file (simplest - no Docker needed):
+  ./dev.sh sqlite-init            # create test SQLite DB with sample tables
+  ./dev.sh sqlite-shell           # open sqlite3 shell to test DB
+  ./dev.sh sqlite-run             # run DeltaForge with SQLite file
 
 API:
   ./dev.sh api-health             # check API health
@@ -186,7 +205,7 @@ cmd_run() {
 }
 
 cmd_run_turso() {
-  cargo run -p runner -- --config examples/turso.yaml
+  cmd_turso_cloud_run
 }
 
 cmd_run_pg() {
@@ -215,6 +234,359 @@ cmd_check() {
 cmd_cov() {
   # Requires cargo-llvm-cov to be installed
   cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+}
+
+# ============================================================
+# Turso commands
+# ============================================================
+cmd_turso_setup() {
+  echo "═══════════════════════════════════════════════════════════════"
+  echo "  DeltaForge Turso Setup Guide"
+  echo "═══════════════════════════════════════════════════════════════"
+  echo ""
+  
+  local all_good=true
+  
+  # Check 1: Dev services running
+  echo "1. Checking dev services (Kafka, Redis)..."
+  if "${DC[@]}" ps 2>/dev/null | grep -q "kafka.*Up"; then
+    echo "   ✅ Kafka is running"
+  else
+    echo "   ❌ Kafka is not running"
+    echo "      Run: ./dev.sh up"
+    all_good=false
+  fi
+  
+  if "${DC[@]}" ps 2>/dev/null | grep -q "redis.*Up"; then
+    echo "   ✅ Redis is running"
+  else
+    echo "   ❌ Redis is not running"
+    echo "      Run: ./dev.sh up"
+    all_good=false
+  fi
+  echo ""
+  
+  # Check 2: Turso CLI (optional but helpful)
+  echo "2. Checking Turso CLI (optional)..."
+  if command -v turso &>/dev/null; then
+    echo "   ✅ Turso CLI installed: $(turso --version 2>/dev/null | head -1)"
+  else
+    echo "   ⚠️  Turso CLI not installed (optional)"
+    echo "      Install: curl -sSfL https://get.tur.so/install.sh | bash"
+  fi
+  echo ""
+  
+  # Check 3: Environment variables for cloud
+  echo "3. Checking Turso cloud environment variables..."
+  if [[ -n "${TURSO_URL:-}" ]]; then
+    echo "   ✅ TURSO_URL is set: $TURSO_URL"
+  else
+    echo "   ⚠️  TURSO_URL not set (needed for Turso cloud)"
+    echo "      Example: export TURSO_URL=\"libsql://your-db.turso.io\""
+  fi
+  
+  if [[ -n "${TURSO_AUTH_TOKEN:-}" ]]; then
+    echo "   ✅ TURSO_AUTH_TOKEN is set: ${TURSO_AUTH_TOKEN:0:20}..."
+  else
+    echo "   ⚠️  TURSO_AUTH_TOKEN not set (needed for Turso cloud)"
+    echo "      Get token: turso db tokens create <db-name>"
+  fi
+  echo ""
+  
+  # Check 4: Kafka topic
+  echo "4. Checking Kafka topic..."
+  if "${DC[@]}" exec kafka kafka-topics --list --bootstrap-server localhost:9092 2>/dev/null | grep -q "turso.changes"; then
+    echo "   ✅ Topic 'turso.changes' exists"
+  else
+    echo "   ⚠️  Topic 'turso.changes' not found"
+    echo "      Create: ./dev.sh k-create turso.changes"
+  fi
+  echo ""
+  
+  # Summary
+  echo "═══════════════════════════════════════════════════════════════"
+  if $all_good; then
+    echo "  ✅ Basic requirements met!"
+  else
+    echo "  ⚠️  Some requirements missing - see above"
+  fi
+  echo ""
+  echo "  Quick Start Options (easiest first):"
+  echo ""
+  echo "  A) SQLITE FILE (simplest - just need sqlite3):"
+  echo "     ./dev.sh sqlite-init         # create test DB"
+  echo "     ./dev.sh k-create sqlite.changes"
+  echo "     ./dev.sh sqlite-run          # run DeltaForge"
+  echo "     ./dev.sh sqlite-shell        # insert data in another terminal"
+  echo ""
+  echo "  B) LOCAL LIBSQL SERVER (sqld in Docker):"
+  echo "     ./dev.sh turso-local-up      # start local libSQL"
+  echo "     ./dev.sh turso-local-shell   # create tables"
+  echo "     ./dev.sh turso-local-run     # run DeltaForge"
+  echo ""
+  echo "  C) TURSO CLOUD:"
+  echo "     export TURSO_URL=\"libsql://your-db.turso.io\""
+  echo "     export TURSO_AUTH_TOKEN=\"your-token\""
+  echo "     ./dev.sh turso-cloud-run"
+  echo "═══════════════════════════════════════════════════════════════"
+}
+
+cmd_turso_local_up() {
+  echo "Starting local libSQL server (sqld)..."
+  
+  # Create data directory
+  mkdir -p "$TURSO_LOCAL_DATA"
+  
+  # Check if already running
+  if docker ps | grep -q deltaforge-sqld; then
+    echo "⚠️  Local libSQL already running"
+    echo "   Stop it with: ./dev.sh turso-local-down"
+    return 0
+  fi
+  
+  # Start sqld container
+  docker run -d \
+    --name deltaforge-sqld \
+    --network deltaforge_default \
+    -p ${TURSO_LOCAL_PORT}:8080 \
+    -v "${TURSO_LOCAL_DATA}:/var/lib/sqld" \
+    ghcr.io/tursodatabase/libsql-server:latest \
+    sqld --http-listen-addr 0.0.0.0:8080
+  
+  echo "✅ Local libSQL started on port ${TURSO_LOCAL_PORT}"
+  echo ""
+  echo "Next steps:"
+  echo "  1. Create tables:    ./dev.sh turso-local-shell"
+  echo "  2. Run DeltaForge:   ./dev.sh turso-local-run"
+  echo ""
+  echo "Sample SQL to create test tables:"
+  echo "  CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);"
+  echo "  CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL);"
+  echo "  INSERT INTO users (name, email) VALUES ('Alice', 'alice@test.com');"
+}
+
+cmd_turso_local_down() {
+  echo "Stopping local libSQL server..."
+  docker rm -f deltaforge-sqld 2>/dev/null || true
+  echo "✅ Local libSQL stopped"
+}
+
+cmd_turso_local_shell() {
+  # Check if sqld is running
+  if ! docker ps | grep -q deltaforge-sqld; then
+    echo "❌ Local libSQL not running. Start it with: ./dev.sh turso-local-up"
+    exit 1
+  fi
+  
+  # Check if sqlite3 is available
+  if command -v sqlite3 &>/dev/null; then
+    echo "Connecting to local libSQL via HTTP..."
+    echo "Type SQL commands, or use these to get started:"
+    echo ""
+    echo "  CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);"
+    echo "  CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL, status TEXT);"
+    echo "  INSERT INTO users (name, email) VALUES ('Alice', 'alice@test.com');"
+    echo "  INSERT INTO orders (user_id, total, status) VALUES (1, 99.99, 'completed');"
+    echo "  .tables"
+    echo "  .quit"
+    echo ""
+    # Use docker exec to run sqlite3 inside the container
+    docker exec -it deltaforge-sqld sqlite3 /var/lib/sqld/data/data
+  else
+    echo "sqlite3 not found. You can:"
+    echo "  1. Install sqlite3"
+    echo "  2. Use curl to send SQL:"
+    echo ""
+    echo "     curl -s http://localhost:${TURSO_LOCAL_PORT} -d '{\"statements\": [\"SELECT * FROM users\"]}'"
+    echo ""
+    echo "  3. Or exec into the container:"
+    echo "     docker exec -it deltaforge-sqld sqlite3 /var/lib/sqld/data/data"
+  fi
+}
+
+cmd_turso_local_run() {
+  echo "Running DeltaForge with local libSQL..."
+  
+  # Check if sqld is running
+  if ! docker ps | grep -q deltaforge-sqld; then
+    echo "❌ Local libSQL not running."
+    echo "   Start it with: ./dev.sh turso-local-up"
+    exit 1
+  fi
+  
+  # Check if dev services are up
+  ensure_up
+  
+  # Check if config exists
+  if [[ ! -f "examples/dev.turso-local.yaml" ]]; then
+    echo "❌ Config file not found: examples/dev.turso-local.yaml"
+    exit 1
+  fi
+  
+  echo "✅ Local libSQL running on port ${TURSO_LOCAL_PORT}"
+  echo "✅ Kafka and Redis running"
+  echo ""
+  echo "Starting DeltaForge..."
+  echo "─────────────────────────────────────────────────────────────"
+  
+  TURSO_LOCAL_URL="http://localhost:${TURSO_LOCAL_PORT}" \
+  KAFKA_BROKERS="localhost:9092" \
+  REDIS_URI="redis://localhost:6379" \
+    cargo run -p runner -- --config examples/dev.turso-local.yaml
+}
+
+cmd_turso_cloud_run() {
+  echo "Running DeltaForge with Turso cloud..."
+  
+  # Check environment variables
+  local missing=false
+  
+  if [[ -z "${TURSO_URL:-}" ]]; then
+    echo "❌ TURSO_URL not set"
+    echo "   export TURSO_URL=\"libsql://your-db.turso.io\""
+    missing=true
+  fi
+  
+  if [[ -z "${TURSO_AUTH_TOKEN:-}" ]]; then
+    echo "❌ TURSO_AUTH_TOKEN not set"
+    echo "   export TURSO_AUTH_TOKEN=\"your-token\""
+    echo "   Get token: turso db tokens create <db-name>"
+    missing=true
+  fi
+  
+  if $missing; then
+    echo ""
+    echo "Run './dev.sh turso-setup' for full setup guide"
+    exit 1
+  fi
+  
+  # Check if dev services are up
+  ensure_up
+  
+  echo "✅ TURSO_URL: $TURSO_URL"
+  echo "✅ TURSO_AUTH_TOKEN: ${TURSO_AUTH_TOKEN:0:20}..."
+  echo "✅ Kafka and Redis running"
+  echo ""
+  echo "Starting DeltaForge..."
+  echo "─────────────────────────────────────────────────────────────"
+  
+  KAFKA_BROKERS="localhost:9092" \
+  REDIS_URI="redis://localhost:6379" \
+    cargo run -p runner -- --config examples/dev.turso.yaml
+}
+
+# ============================================================
+# SQLite file commands (simplest - no Docker/sqld needed)
+# ============================================================
+SQLITE_DB_PATH="${SQLITE_DB_PATH:-/tmp/deltaforge-test.db}"
+
+cmd_sqlite_init() {
+  echo "Creating test SQLite database at: $SQLITE_DB_PATH"
+  
+  # Check if sqlite3 is available
+  if ! command -v sqlite3 &>/dev/null; then
+    echo "❌ sqlite3 not found. Install it:"
+    echo "   macOS:  brew install sqlite"
+    echo "   Ubuntu: sudo apt install sqlite3"
+    exit 1
+  fi
+  
+  # Create database with test tables
+  sqlite3 "$SQLITE_DB_PATH" <<'SQL'
+-- Users table
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  email TEXT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Orders table
+CREATE TABLE IF NOT EXISTS orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER,
+  total REAL NOT NULL,
+  status TEXT DEFAULT 'pending',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Insert sample data
+INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com');
+INSERT INTO users (name, email) VALUES ('Bob', 'bob@example.com');
+INSERT INTO orders (user_id, total, status) VALUES (1, 99.99, 'completed');
+INSERT INTO orders (user_id, total, status) VALUES (2, 149.50, 'pending');
+
+-- Show what was created
+.tables
+SELECT 'Users:' as '';
+SELECT * FROM users;
+SELECT 'Orders:' as '';
+SELECT * FROM orders;
+SQL
+
+  echo ""
+  echo "✅ Database created at: $SQLITE_DB_PATH"
+  echo ""
+  echo "Next steps:"
+  echo "  1. Create Kafka topic:  ./dev.sh k-create sqlite.changes"
+  echo "  2. Run DeltaForge:      ./dev.sh sqlite-run"
+  echo "  3. Insert more data:    ./dev.sh sqlite-shell"
+  echo "     sqlite> INSERT INTO users (name, email) VALUES ('Charlie', 'charlie@test.com');"
+  echo "  4. Watch events:        ./dev.sh k-consume sqlite.changes --from-beginning"
+}
+
+cmd_sqlite_shell() {
+  if ! command -v sqlite3 &>/dev/null; then
+    echo "❌ sqlite3 not found"
+    exit 1
+  fi
+  
+  if [[ ! -f "$SQLITE_DB_PATH" ]]; then
+    echo "❌ Database not found: $SQLITE_DB_PATH"
+    echo "   Create it with: ./dev.sh sqlite-init"
+    exit 1
+  fi
+  
+  echo "Opening SQLite shell..."
+  echo "Try: INSERT INTO users (name, email) VALUES ('Test', 'test@test.com');"
+  echo ""
+  sqlite3 "$SQLITE_DB_PATH"
+}
+
+cmd_sqlite_run() {
+  echo "Running DeltaForge with SQLite file..."
+  
+  # Check if database exists
+  if [[ ! -f "$SQLITE_DB_PATH" ]]; then
+    echo "❌ Database not found: $SQLITE_DB_PATH"
+    echo "   Create it with: ./dev.sh sqlite-init"
+    exit 1
+  fi
+  
+  # Check if dev services are up
+  ensure_up
+  
+  # Check if config exists
+  if [[ ! -f "examples/dev.sqlite.yaml" ]]; then
+    echo "❌ Config file not found: examples/dev.sqlite.yaml"
+    exit 1
+  fi
+  
+  echo "✅ SQLite database: $SQLITE_DB_PATH"
+  echo "✅ Kafka and Redis running"
+  echo ""
+  echo "Starting DeltaForge..."
+  echo "─────────────────────────────────────────────────────────────"
+  echo "Tip: In another terminal, insert data with:"
+  echo "     ./dev.sh sqlite-shell"
+  echo "     sqlite> INSERT INTO users (name, email) VALUES ('New', 'new@test.com');"
+  echo "─────────────────────────────────────────────────────────────"
+  echo ""
+  
+  SQLITE_DB_PATH="$SQLITE_DB_PATH" \
+  KAFKA_BROKERS="localhost:9092" \
+  REDIS_URI="redis://localhost:6379" \
+    cargo run -p runner -- --config examples/dev.sqlite.yaml
 }
 
 # ============================================================
@@ -423,6 +795,19 @@ case "${1:-}" in
   test) shift; cmd_test "$@";;
   check) shift; cmd_check "$@";;
   cov) shift; cmd_cov "$@";;
+
+  # Turso
+  turso-setup) shift; cmd_turso_setup "$@";;
+  turso-local-up) shift; cmd_turso_local_up "$@";;
+  turso-local-down) shift; cmd_turso_local_down "$@";;
+  turso-local-shell) shift; cmd_turso_local_shell "$@";;
+  turso-local-run) shift; cmd_turso_local_run "$@";;
+  turso-cloud-run) shift; cmd_turso_cloud_run "$@";;
+
+  # SQLite (simplest)
+  sqlite-init) shift; cmd_sqlite_init "$@";;
+  sqlite-shell) shift; cmd_sqlite_shell "$@";;
+  sqlite-run) shift; cmd_sqlite_run "$@";;
 
   # API
   api-health) shift; cmd_api_health "$@";;

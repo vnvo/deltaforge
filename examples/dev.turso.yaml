@@ -10,12 +10,12 @@ spec:
     config:
       id: turso-main
       # Local libSQL/Turso URL
-      url: "http://127.0.0.1:8080"
+      url: "${TURSO_URL}"
       # For Turso cloud: url: "libsql://your-db.turso.io"
-      # auth_token: "${TURSO_AUTH_TOKEN}"
+      auth_token: "${TURSO_AUTH_TOKEN}"
       tables: ["users", "orders", "order_items"]
       # Poll interval in milliseconds (Turso uses polling-based CDC)
-      poll_interval_ms: 1000
+      poll_interval_ms: 3000
 
   processors:
     - type: javascript
@@ -23,7 +23,7 @@ spec:
       inline: |
         function processBatch(events) {
           return events.map(event => {
-            event.source_type = "turso";
+            event.tags = ['source_type:turso'];
             event.processed_at = new Date().toISOString();
             return event;
           });
@@ -33,14 +33,14 @@ spec:
     - type: kafka
       config:
         id: kafka
-        brokers: "127.0.0.1:9092"
+        brokers: "${KAFKA_BROKERS}"
         topic: turso.changes
         required: true
         exactly_once: false
     - type: redis
       config:
         id: redis
-        uri: "redis://127.0.0.1:6379"
+        uri: "${REDIS_URI}"
         stream: turso.events
         required: false
 
