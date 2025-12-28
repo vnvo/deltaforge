@@ -337,7 +337,8 @@ async fn turso_cdc_native_local_e2e() -> Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create database: {}", e))?;
 
-        let conn = db.connect()
+        let conn = db
+            .connect()
             .map_err(|e| anyhow::anyhow!("Failed to connect: {}", e))?;
 
         // Enable CDC on this connection
@@ -353,7 +354,7 @@ async fn turso_cdc_native_local_e2e() -> Result<()> {
             "SELECT name FROM sqlite_master WHERE type='table' AND name='turso_cdc'",
             ()
         ).await?;
-        
+
         if rows.next().await?.is_none() {
             return Err(anyhow::anyhow!(
                 "CDC table 'turso_cdc' not created. libsql may not have CDC support."
@@ -393,7 +394,10 @@ async fn turso_cdc_native_local_e2e() -> Result<()> {
         if let Some(row) = rows.next().await? {
             let count: i64 = row.get(0)?;
             info!(count = count, "CDC entries captured");
-            assert!(count >= 3, "Expected at least 3 CDC entries (INSERT, UPDATE, DELETE)");
+            assert!(
+                count >= 3,
+                "Expected at least 3 CDC entries (INSERT, UPDATE, DELETE)"
+            );
         }
 
         info!("Connection with CDC closed, changes captured to turso_cdc");
@@ -464,11 +468,14 @@ async fn turso_cdc_native_local_e2e() -> Result<()> {
     info!("Received {} events total", got.len());
 
     // Must receive events
-    assert!(!got.is_empty(), "No CDC events received from turso_cdc table");
+    assert!(
+        !got.is_empty(),
+        "No CDC events received from turso_cdc table"
+    );
     assert!(seen_insert, "Missing INSERT event");
     assert!(seen_update, "Missing UPDATE event");
     assert!(seen_delete, "Missing DELETE event");
-    
+
     info!("✅ Native CDC working correctly!");
     Ok(())
 }
@@ -507,7 +514,7 @@ async fn turso_cdc_event_parsing_test() -> Result<()> {
 
     // Insert mock CDC records
     // change_type: 1 = INSERT, 0 = UPDATE, -1 = DELETE
-    
+
     // INSERT event
     conn.execute(
         "INSERT INTO turso_cdc (change_type, table_name, id, after) \
@@ -576,7 +583,8 @@ async fn turso_cdc_event_parsing_test() -> Result<()> {
     assert_eq!(table, "users");
     assert!(before.is_none());
     assert!(after.is_some());
-    let after_json: serde_json::Value = serde_json::from_str(after.as_ref().unwrap())?;
+    let after_json: serde_json::Value =
+        serde_json::from_str(after.as_ref().unwrap())?;
     assert_eq!(after_json["name"], "alice");
 
     // Verify UPDATE (change_type = 0)
@@ -584,8 +592,10 @@ async fn turso_cdc_event_parsing_test() -> Result<()> {
     assert_eq!(*ct, 0);
     assert!(before.is_some());
     assert!(after.is_some());
-    let before_json: serde_json::Value = serde_json::from_str(before.as_ref().unwrap())?;
-    let after_json: serde_json::Value = serde_json::from_str(after.as_ref().unwrap())?;
+    let before_json: serde_json::Value =
+        serde_json::from_str(before.as_ref().unwrap())?;
+    let after_json: serde_json::Value =
+        serde_json::from_str(after.as_ref().unwrap())?;
     assert_eq!(before_json["email"], "alice@test.com");
     assert_eq!(after_json["email"], "alice.updated@test.com");
 

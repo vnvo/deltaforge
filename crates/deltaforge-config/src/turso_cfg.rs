@@ -129,11 +129,11 @@ impl NativeCdcLevel {
 impl TursoSrcCfg {
     /// Returns true if this is a local file path
     pub fn is_local_file(&self) -> bool {
-        !self.url.starts_with("libsql://") 
-            && !self.url.starts_with("http://") 
+        !self.url.starts_with("libsql://")
+            && !self.url.starts_with("http://")
             && !self.url.starts_with("https://")
     }
-    
+
     /// Returns true if this is a Turso cloud connection
     pub fn is_turso_cloud(&self) -> bool {
         self.url.starts_with("libsql://") && self.url.contains(".turso.io")

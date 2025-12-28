@@ -557,18 +557,19 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
     ) -> Result<()> {
         // 1) PROCESS: processors can modify/duplicate/drop events
         let proc_start = Instant::now();
-        let processed = match (self.process_batch)(std::mem::take(&mut b.raw)).await {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(
-                    pipeline=%self.pipeline_name,
-                    error=%e,
-                    reason=%reason,
-                    "processor failed, NOT saving checkpoint"
-                );
-                return Err(e).context("process batch");
-            }
-        };        
+        let processed =
+            match (self.process_batch)(std::mem::take(&mut b.raw)).await {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(
+                        pipeline=%self.pipeline_name,
+                        error=%e,
+                        reason=%reason,
+                        "processor failed, NOT saving checkpoint"
+                    );
+                    return Err(e).context("process batch");
+                }
+            };
 
         histogram!(
             "deltaforge_stage_latency_seconds",

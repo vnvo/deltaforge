@@ -163,7 +163,7 @@ impl TursoSource {
         use libsql::Builder;
 
         let url = &self.cfg.url;
-        
+
         let db = if url.starts_with("libsql://")
             || url.starts_with("http://")
             || url.starts_with("https://")
@@ -177,13 +177,18 @@ impl TursoSource {
             .build()
             .await
             .map_err(|e| SourceError::Connect {
-                details: format!("Failed to connect to {}: {}", redact_auth(url), e).into(),
+                details: format!(
+                    "Failed to connect to {}: {}",
+                    redact_auth(url),
+                    e
+                )
+                .into(),
             })?
         } else {
             // Local file path
             let path = url.strip_prefix("file://").unwrap_or(url);
             debug!(path = %path, "opening local database file");
-            
+
             // Check file exists
             if !std::path::Path::new(path).exists() {
                 return Err(SourceError::Connect {
@@ -191,16 +196,16 @@ impl TursoSource {
                         "Database file not found: {}. \
                          Create it with: tursodb {}",
                         path, path
-                    ).into(),
+                    )
+                    .into(),
                 });
             }
-            
-            Builder::new_local(path)
-                .build()
-                .await
-                .map_err(|e| SourceError::Connect {
+
+            Builder::new_local(path).build().await.map_err(|e| {
+                SourceError::Connect {
                     details: format!("Failed to open {}: {}", path, e).into(),
-                })?
+                }
+            })?
         };
 
         let conn = db.connect().map_err(|e| SourceError::Connect {
@@ -221,24 +226,31 @@ impl TursoSource {
     /// reads from the resulting `turso_cdc` table.
     async fn verify_cdc_table(&self, conn: &Connection) -> SourceResult<()> {
         let cdc_table = self.cdc_table_name();
-        
+
         // Check if CDC table exists
         let check_sql = format!(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='{}'",
             cdc_table
         );
-        
+
         let mut rows = conn.query(&check_sql, ()).await.map_err(|e| {
             SourceError::Connect {
                 details: format!("Failed to check for CDC table: {}", e).into(),
             }
         })?;
 
-        if rows.next().await.map_err(|e| {
-            SourceError::Connect {
-                details: format!("Failed to read CDC table check result: {}", e).into(),
-            }
-        })?.is_none() {
+        if rows
+            .next()
+            .await
+            .map_err(|e| SourceError::Connect {
+                details: format!(
+                    "Failed to read CDC table check result: {}",
+                    e
+                )
+                .into(),
+            })?
+            .is_none()
+        {
             return Err(SourceError::Connect {
                 details: format!(
                     "CDC table '{}' not found. The application must enable CDC with:\n\
@@ -300,7 +312,9 @@ impl TursoSource {
         // For remote connections, keep connection alive and create schema loader
         // For local files, we'll reconnect each poll to avoid locking
         let persistent_conn = if self.is_local_file() {
-            info!("using open/close pattern for local file (avoids lock contention)");
+            info!(
+                "using open/close pattern for local file (avoids lock contention)"
+            );
             drop(init_conn); // Close initial connection
             None
         } else {
@@ -316,7 +330,7 @@ impl TursoSource {
             if let Err(e) = schema_loader.preload(&self.cfg.tables).await {
                 warn!(error = %e, "schema preload failed, continuing anyway");
             }
-            
+
             Some(init_conn)
         };
 
@@ -356,7 +370,9 @@ impl TursoSource {
             }
 
             // Get connection (reuse for remote, reconnect for local)
-            let poll_conn: Arc<Connection> = if let Some(ref conn) = persistent_conn {
+            let poll_conn: Arc<Connection> = if let Some(ref conn) =
+                persistent_conn
+            {
                 conn.clone()
             } else {
                 // Reconnect for local files
@@ -375,7 +391,12 @@ impl TursoSource {
 
             // Poll for changes
             let poll_result = self
-                .poll_cdc_changes(&*poll_conn, &tx, checkpoint.clone(), &source_meta)
+                .poll_cdc_changes(
+                    &*poll_conn,
+                    &tx,
+                    checkpoint.clone(),
+                    &source_meta,
+                )
                 .await;
 
             // For local files, drop connection immediately after poll
@@ -472,13 +493,16 @@ impl TursoSource {
 
         // Query each tracked table separately for JSON conversion
         for table_pattern in tracked_tables {
-            let table_name = if table_pattern == "*" || table_pattern.contains('%') {
-                None // Wildcard - query all
-            } else {
-                Some(table_pattern.as_str())
-            };
+            let table_name =
+                if table_pattern == "*" || table_pattern.contains('%') {
+                    None // Wildcard - query all
+                } else {
+                    Some(table_pattern.as_str())
+                };
 
-            let (sql, params): (String, Vec<libsql::Value>) = if let Some(tbl) = table_name {
+            let (sql, params): (String, Vec<libsql::Value>) = if let Some(tbl) =
+                table_name
+            {
                 // Query with JSON conversion for specific table
                 (
                     format!(
