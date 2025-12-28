@@ -1,22 +1,57 @@
 //! TursoDB CDC source implementation.
 //!
-//! **Requires Turso/libSQL with native CDC support.**
+//! **STATUS: EXPERIMENTAL / PAUSED**
 //!
-//! Native CDC uses `PRAGMA unstable_capture_data_changes_conn` to automatically
-//! capture all changes to tracked tables. Changes are stored in a system table
-//! (`turso_cdc` by default) with full before/after row images.
+//! This source is not yet ready for production use. Native CDC in Turso/libSQL
+//! is still evolving and has limitations:
+//! - CDC is per-connection (only changes from the enabling connection are captured)
+//! - File locking prevents concurrent access (DeltaForge uses open/close pattern)
+//! - sqld Docker image doesn't have CDC support yet
 //!
-//! # Features
+//! The code is kept for future development when Turso CDC stabilizes.
 //!
-//! - Full CDC: INSERT, UPDATE, DELETE with before/after images
-//! - Schema-aware: Uses Turso's `bin_record_json_object()` for JSON conversion
-//! - Checkpoint-based: Resume from last processed change
-//! - Wildcard tables: Track `*` or `orders%` patterns
+//! ---
 //!
-//! # Requirements
+//! **Architecture (when enabled)**
 //!
-//! - Turso Cloud with CDC enabled, or
-//! - Local sqld server with `--enable-cdc` flag
+//! The application must enable CDC on its connection with:
+//! ```sql
+//! PRAGMA unstable_capture_data_changes_conn('full');
+//! ```
+//!
+//! DeltaForge then reads from the `turso_cdc` table to capture changes.
+//! This is per-connection - only changes made by connections that enabled
+//! the pragma are captured.
+//!
+//! # Architecture
+//!
+//! 1. Application opens database and enables CDC on its connection
+//! 2. Application makes changes (INSERT/UPDATE/DELETE)
+//! 3. Changes are logged to `turso_cdc` table
+//! 4. DeltaForge polls `turso_cdc` and streams events to sinks
+//!
+//! # Supported URLs
+//!
+//! - Local file: `/path/to/database.db` or `file:///path/to/database.db`
+//! - Remote HTTP: `http://localhost:8080` or `https://...`
+//! - Turso libsql: `libsql://your-db.turso.io`
+//!
+//! # Example
+//!
+//! ```bash
+//! # Create database and enable CDC with tursodb CLI
+//! tursodb /tmp/myapp.db
+//! > PRAGMA unstable_capture_data_changes_conn('full');
+//! > CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+//! > INSERT INTO users (name) VALUES ('Alice');
+//!
+//! # DeltaForge config
+//! source:
+//!   type: turso
+//!   config:
+//!     url: "/tmp/myapp.db"
+//!     tables: ["users"]
+//! ```
 
 mod turso_schema_loader;
 mod turso_table_schema;
@@ -119,29 +154,53 @@ impl TursoSource {
     }
 
     /// Establish connection to Turso/SQLite database.
+    ///
+    /// Supports:
+    /// - Local files: `/path/to/db.sqlite` or `file:///path/to/db.sqlite`
+    /// - Remote HTTP: `http://localhost:8080`
+    /// - Turso cloud: `libsql://your-db.turso.io`
     async fn connect(&self) -> SourceResult<Connection> {
         use libsql::Builder;
 
-        let db = if self.cfg.url.starts_with("libsql://")
-            || self.cfg.url.starts_with("http://")
-            || self.cfg.url.starts_with("https://")
+        let url = &self.cfg.url;
+        
+        let db = if url.starts_with("libsql://")
+            || url.starts_with("http://")
+            || url.starts_with("https://")
         {
             // Remote: Turso cloud or libsql server
+            debug!(url = %redact_auth(url), "connecting to remote database");
             Builder::new_remote(
-                self.cfg.url.clone(),
+                url.clone(),
                 self.cfg.auth_token.clone().unwrap_or_default(),
             )
             .build()
             .await
             .map_err(|e| SourceError::Connect {
-                details: e.to_string().into(),
+                details: format!("Failed to connect to {}: {}", redact_auth(url), e).into(),
             })?
         } else {
-            return Err(SourceError::Connect {
-                details: "Turso source requires remote connection (libsql:// or http://). \
-                         Local SQLite files do not support native CDC."
-                    .into(),
-            });
+            // Local file path
+            let path = url.strip_prefix("file://").unwrap_or(url);
+            debug!(path = %path, "opening local database file");
+            
+            // Check file exists
+            if !std::path::Path::new(path).exists() {
+                return Err(SourceError::Connect {
+                    details: format!(
+                        "Database file not found: {}. \
+                         Create it with: tursodb {}",
+                        path, path
+                    ).into(),
+                });
+            }
+            
+            Builder::new_local(path)
+                .build()
+                .await
+                .map_err(|e| SourceError::Connect {
+                    details: format!("Failed to open {}: {}", path, e).into(),
+                })?
         };
 
         let conn = db.connect().map_err(|e| SourceError::Connect {
@@ -156,54 +215,43 @@ impl TursoSource {
         self.cfg.cdc_table_name.as_deref().unwrap_or("turso_cdc")
     }
 
-    /// Enable native CDC on the connection.
-    async fn enable_native_cdc(&self, conn: &Connection) -> SourceResult<()> {
-        let level = self.cfg.native_cdc_level.pragma_value();
-        let pragma_value = if let Some(ref table_name) = self.cfg.cdc_table_name
-        {
-            format!("{},{}", level, table_name)
-        } else {
-            level.to_string()
-        };
-
-        let sql = format!(
-            "PRAGMA unstable_capture_data_changes_conn('{}');",
-            pragma_value
+    /// Verify the CDC table exists.
+    ///
+    /// The application must enable CDC on its connection. DeltaForge just
+    /// reads from the resulting `turso_cdc` table.
+    async fn verify_cdc_table(&self, conn: &Connection) -> SourceResult<()> {
+        let cdc_table = self.cdc_table_name();
+        
+        // Check if CDC table exists
+        let check_sql = format!(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='{}'",
+            cdc_table
         );
-
-        debug!(pragma = %sql, "enabling native CDC");
-
-        conn.execute(&sql, ()).await.map_err(|e| {
+        
+        let mut rows = conn.query(&check_sql, ()).await.map_err(|e| {
             SourceError::Connect {
-                details: format!(
-                    "Failed to enable native CDC: {}. \
-                     Ensure you're using Turso/libSQL with CDC support enabled.",
-                    e
-                )
-                .into(),
+                details: format!("Failed to check for CDC table: {}", e).into(),
             }
         })?;
 
-        // Verify CDC table exists
-        let cdc_table = self.cdc_table_name();
-        let check_sql = format!("SELECT 1 FROM {} LIMIT 0", cdc_table);
-        conn.query(&check_sql, ())
-            .await
-            .map_err(|e| SourceError::Connect {
+        if rows.next().await.map_err(|e| {
+            SourceError::Connect {
+                details: format!("Failed to read CDC table check result: {}", e).into(),
+            }
+        })?.is_none() {
+            return Err(SourceError::Connect {
                 details: format!(
-                    "CDC table '{}' not found after enabling CDC: {}. \
-                     Native CDC may not be supported on this connection.",
-                    cdc_table, e
-                )
-                .into(),
-            })?;
+                    "CDC table '{}' not found. The application must enable CDC with:\n\
+                     \n\
+                     PRAGMA unstable_capture_data_changes_conn('full');\n\
+                     \n\
+                     Run this in your app or via tursodb CLI before making changes.",
+                    cdc_table
+                ).into(),
+            });
+        }
 
-        info!(
-            level = %level,
-            table = %cdc_table,
-            "native CDC enabled"
-        );
-
+        info!(table = %cdc_table, "CDC table found");
         Ok(())
     }
 
@@ -214,6 +262,13 @@ impl TursoSource {
             host: extract_host(&self.cfg.url),
             db: "main".into(),
         }
+    }
+
+    /// Check if this is a local file (requires open/close pattern to avoid locking)
+    fn is_local_file(&self) -> bool {
+        !self.cfg.url.starts_with("libsql://")
+            && !self.cfg.url.starts_with("http://")
+            && !self.cfg.url.starts_with("https://")
     }
 
     /// Main run loop.
@@ -228,31 +283,42 @@ impl TursoSource {
         info!(
             source_id = %self.id,
             url = %redact_auth(&self.cfg.url),
+            local_file = %self.is_local_file(),
             "connecting to Turso"
         );
 
-        let conn = self.connect().await?;
-        let conn = Arc::new(conn);
+        // Initial connection to verify CDC table and discover tables
+        let init_conn = Arc::new(self.connect().await?);
 
-        // Enable native CDC - fail if not available
-        self.enable_native_cdc(&conn).await?;
+        // Verify CDC table exists (app must have enabled CDC)
+        self.verify_cdc_table(&*init_conn).await?;
 
         // Expand table patterns to get tracked tables
-        let tracked = self.expand_table_patterns(&conn).await?;
+        let tracked = self.expand_table_patterns(&init_conn).await?;
         info!(tables = tracked.len(), "tables discovered");
 
-        // Create schema loader for API access
-        let schema_loader = TursoSchemaLoader::new(
-            conn.clone(),
-            self.registry.clone(),
-            &self.tenant,
-            None,
-        );
+        // For remote connections, keep connection alive and create schema loader
+        // For local files, we'll reconnect each poll to avoid locking
+        let persistent_conn = if self.is_local_file() {
+            info!("using open/close pattern for local file (avoids lock contention)");
+            drop(init_conn); // Close initial connection
+            None
+        } else {
+            // Create schema loader for API access (remote only)
+            let schema_loader = TursoSchemaLoader::new(
+                init_conn.clone(),
+                self.registry.clone(),
+                &self.tenant,
+                None,
+            );
 
-        // Preload schemas for API
-        if let Err(e) = schema_loader.preload(&self.cfg.tables).await {
-            warn!(error = %e, "schema preload failed, continuing anyway");
-        }
+            // Preload schemas for API
+            if let Err(e) = schema_loader.preload(&self.cfg.tables).await {
+                warn!(error = %e, "schema preload failed, continuing anyway");
+            }
+            
+            Some(init_conn)
+        };
 
         // Load checkpoint
         let mut checkpoint: TursoCheckpoint = chkpt_store
@@ -289,11 +355,35 @@ impl TursoSource {
                 break;
             }
 
-            // Poll for changes
-            let (updated_checkpoint, changes_found) = self
-                .poll_cdc_changes(&conn, &tx, checkpoint.clone(), &source_meta)
-                .await?;
+            // Get connection (reuse for remote, reconnect for local)
+            let poll_conn: Arc<Connection> = if let Some(ref conn) = persistent_conn {
+                conn.clone()
+            } else {
+                // Reconnect for local files
+                match self.connect().await {
+                    Ok(c) => Arc::new(c),
+                    Err(e) => {
+                        warn!(error = %e, "reconnect failed, retrying after interval");
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            _ = sleep(poll_interval) => {}
+                        }
+                        continue;
+                    }
+                }
+            };
 
+            // Poll for changes
+            let poll_result = self
+                .poll_cdc_changes(&*poll_conn, &tx, checkpoint.clone(), &source_meta)
+                .await;
+
+            // For local files, drop connection immediately after poll
+            if persistent_conn.is_none() {
+                drop(poll_conn);
+            }
+
+            let (updated_checkpoint, changes_found) = poll_result?;
             checkpoint = updated_checkpoint;
 
             // Sleep if no changes
@@ -312,10 +402,10 @@ impl TursoSource {
     /// Expand table patterns to concrete table names.
     async fn expand_table_patterns(
         &self,
-        conn: &Connection,
+        conn: &Arc<Connection>,
     ) -> SourceResult<Vec<String>> {
         let temp_loader = TursoSchemaLoader::new(
-            Arc::new(conn.clone()),
+            conn.clone(),
             self.registry.clone(),
             &self.tenant,
             None,
@@ -382,16 +472,13 @@ impl TursoSource {
 
         // Query each tracked table separately for JSON conversion
         for table_pattern in tracked_tables {
-            let table_name =
-                if table_pattern == "*" || table_pattern.contains('%') {
-                    None // Wildcard - query all
-                } else {
-                    Some(table_pattern.as_str())
-                };
+            let table_name = if table_pattern == "*" || table_pattern.contains('%') {
+                None // Wildcard - query all
+            } else {
+                Some(table_pattern.as_str())
+            };
 
-            let (sql, params): (String, Vec<libsql::Value>) = if let Some(tbl) =
-                table_name
-            {
+            let (sql, params): (String, Vec<libsql::Value>) = if let Some(tbl) = table_name {
                 // Query with JSON conversion for specific table
                 (
                     format!(

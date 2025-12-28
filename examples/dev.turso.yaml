@@ -1,3 +1,35 @@
+# DeltaForge Turso CDC Pipeline
+#
+# STATUS: EXPERIMENTAL / PAUSED
+#
+# This config is for internal development only. The Turso source
+# is not yet ready for production use due to:
+# - CDC is per-connection (only captures changes from enabling connection)
+# - File locking issues with concurrent access
+# - sqld Docker image doesn't have CDC support
+#
+# ---
+#
+# Uses local tursodb database with native CDC.
+#
+# IMPORTANT: The application must enable CDC on its connection!
+# DeltaForge only reads from the turso_cdc table.
+#
+# Quick Start:
+#   # 1. Create database and enable CDC
+#   tursodb /tmp/deltaforge-test.db
+#   > PRAGMA unstable_capture_data_changes_conn('full');
+#   > CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);
+#   > INSERT INTO users (name, email) VALUES ('Alice', 'alice@test.com');
+#   > .quit
+#
+#   # 2. Start infrastructure
+#   ./dev.sh up
+#   ./dev.sh k-create turso.changes
+#
+#   # 3. Run DeltaForge
+#   ./dev.sh turso-run
+
 apiVersion: deltaforge/v1
 kind: Pipeline
 metadata:
@@ -9,13 +41,24 @@ spec:
     type: turso
     config:
       id: turso-main
-      # Local libSQL/Turso URL
-      url: "${TURSO_URL}"
-      # For Turso cloud: url: "libsql://your-db.turso.io"
-      auth_token: "${TURSO_AUTH_TOKEN}"
-      tables: ["users", "orders", "order_items"]
-      # Poll interval in milliseconds (Turso uses polling-based CDC)
-      poll_interval_ms: 3000
+      
+      # Local database file (must have CDC enabled by the app)
+      url: "${TURSO_DB_PATH:-/tmp/deltaforge-test.db}"
+      
+      # Tables to track (supports wildcards: "*", "orders%")
+      tables:
+        - users
+        - orders
+      
+      # Recommended CDC level for the app to use
+      # The app must run: PRAGMA unstable_capture_data_changes_conn('full');
+      native_cdc_level: full
+      
+      # Poll interval in milliseconds
+      poll_interval_ms: 1000
+      
+      # Batch size for CDC queries
+      batch_size: 1000
 
   processors:
     - type: javascript
@@ -23,8 +66,8 @@ spec:
       inline: |
         function processBatch(events) {
           return events.map(event => {
-            event.tags = ['source_type:turso'];
-            event.processed_at = new Date().toISOString();
+            event.tags = event.tags || [];
+            event.tags.push('source:turso');
             return event;
           });
         }
@@ -33,23 +76,14 @@ spec:
     - type: kafka
       config:
         id: kafka
-        brokers: "${KAFKA_BROKERS}"
+        brokers: "${KAFKA_BROKERS:-localhost:9092}"
         topic: turso.changes
         required: true
-        exactly_once: false
-    - type: redis
-      config:
-        id: redis
-        uri: "${REDIS_URI}"
-        stream: turso.events
-        required: false
 
   batch:
-    max_events: 50
+    max_events: 100
     max_bytes: 1048576
-    max_ms: 100
-    respect_source_tx: false
-    max_inflight: 1
+    max_ms: 200
 
   commit_policy:
     mode: required
@@ -59,9 +93,3 @@ spec:
     deep_inspect:
       enabled: true
       max_depth: 3
-      max_sample_size: 500
-    sampling:
-      warmup_events: 50
-      sample_rate: 5
-      structure_cache: true
-      structure_cache_size: 50

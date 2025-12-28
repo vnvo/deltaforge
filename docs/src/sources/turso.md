@@ -1,5 +1,17 @@
 # Turso Source
 
+> ⚠️ **STATUS: EXPERIMENTAL / PAUSED**
+>
+> The Turso source is not yet ready for production use. Native CDC in Turso/libSQL
+> is still evolving and has limitations:
+> - CDC is per-connection (only changes from the enabling connection are captured)
+> - File locking prevents concurrent access
+> - sqld Docker image doesn't have CDC support yet
+>
+> This documentation is retained for reference. The code exists but is not officially supported.
+
+---
+
 The Turso source captures changes from Turso and libSQL databases. It supports multiple CDC modes to work with different database configurations and Turso versions.
 
 ## CDC Modes
@@ -25,9 +37,6 @@ Native mode uses Turso's built-in CDC capabilities. This is the most efficient m
 1. Queries the `turso_cdc` system table for changes
 2. Uses `bin_record_json_object()` to extract row data as JSON
 3. Tracks position via change ID in checkpoints
-
-You can find a more detailed description about this mode at [Turso Blog](https://turso.tech/blog/introducing-change-data-capture-in-turso-sqlite-rewrite).
-
 
 ### Triggers Mode
 

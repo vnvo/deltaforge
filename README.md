@@ -45,14 +45,10 @@ Deltaforge is meant to replace tools like Debezium and similar.
 
 - **Sources**
   - MySQL binlog CDC
-  - Turso/libSQL CDC with multiple modes:
-    - **Native**: Uses Turso's built-in CDC via `turso_cdc` table
-    - **Triggers**: Shadow tables populated by triggers (standard SQLite compatible)
-    - **Polling**: Track changes via rowid/timestamp columns
-    - **Auto**: Automatic fallback chain (native → triggers → polling)
+  - Experimental Turso/libSQL CDC
 
 - **Schema Registry**
-  - Source-owned schema types (MySQL, Turso/SQLite native semantics)
+  - Source-owned schema types (source native semantics)
   - Schema change detection and versioning
 
 - **Schema Sensing**

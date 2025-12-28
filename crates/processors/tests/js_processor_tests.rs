@@ -243,7 +243,7 @@ async fn js_throwing_error_is_propagated() {
     let err = proc.process(vec![ev]).await.expect_err("should fail");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("boom") || msg.contains("js processor threw"),
+        msg.contains("boom") || msg.contains("JS processor threw"),
         "unexpected error: {msg}"
     );
 }

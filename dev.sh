@@ -12,10 +12,6 @@ API_BASE="${API_BASE:-http://localhost:8080}"
 IMAGE_NAME="deltaforge"
 IMAGE_TAG="dev"
 
-# Turso local settings
-TURSO_LOCAL_PORT="${TURSO_LOCAL_PORT:-8079}"
-TURSO_LOCAL_DATA="${TURSO_LOCAL_DATA:-/tmp/deltaforge-turso}"
-
 usage() {
   cat <<'EOF'
 DeltaForge dev helper
@@ -43,23 +39,12 @@ Dev:
   ./dev.sh build                  # build project (debug)
   ./dev.sh build-release          # build project (release)
   ./dev.sh run [config]           # run with config (default: examples/dev.yaml)
-  ./dev.sh run-turso              # run with Turso cloud (see turso-setup first)
   ./dev.sh run-pg                 # run with Postgres example config
   ./dev.sh fmt                    # format Rust code (cargo fmt --all)
   ./dev.sh lint                   # run clippy with warnings as errors
   ./dev.sh test                   # run test suite
   ./dev.sh check                  # run fmt-check + clippy + tests (what CI does)
   ./dev.sh cov                    # run coverage (cargo llvm-cov)
-
-Turso (requires native CDC support):
-  ./dev.sh turso-setup            # check requirements for Turso testing
-  ./dev.sh turso-cloud-run        # run DeltaForge with Turso cloud
-  
-  # Local sqld server (requires CDC-enabled build):
-  ./dev.sh turso-local-up         # start local libSQL server (sqld)
-  ./dev.sh turso-local-down       # stop local libSQL server
-  ./dev.sh turso-local-shell      # open SQL shell to local libSQL
-  ./dev.sh turso-local-run        # run DeltaForge with local libSQL
 
 API:
   ./dev.sh api-health             # check API health
@@ -96,7 +81,7 @@ Notes:
 - Uses service names from docker-compose.dev.yml (kafka, redis, postgres, mysql).
 - Kafka broker advertises localhost:9092 (works from host & inside kafka container).
 - API defaults to http://localhost:8080 (set API_BASE to override).
-- Turso source requires native CDC support (Turso Cloud or sqld with --enable-cdc).
+- Turso source uses native CDC via local libSQL server.
 EOF
 }
 
@@ -200,10 +185,6 @@ cmd_run() {
   cargo run -p runner -- --config "$config"
 }
 
-cmd_run_turso() {
-  cmd_turso_cloud_run
-}
-
 cmd_run_pg() {
   cargo run -p runner -- --config examples/postgres.yaml
 }
@@ -233,26 +214,36 @@ cmd_cov() {
 }
 
 # ============================================================
-# Turso commands (native CDC only)
+# Turso commands (local tursodb with native CDC)
 # ============================================================
+
+# Default database path
+TURSO_DB_PATH="${TURSO_DB_PATH:-/tmp/deltaforge-test.db}"
+
 cmd_turso_setup() {
   echo "═══════════════════════════════════════════════════════════════"
   echo "  DeltaForge Turso Setup Guide"
   echo "═══════════════════════════════════════════════════════════════"
   echo ""
-  echo "  ⚠️  IMPORTANT: Turso source requires NATIVE CDC support"
-  echo ""
-  echo "  Native CDC is available in:"
-  echo "    • Turso Cloud (with CDC enabled)"
-  echo "    • sqld server with --enable-cdc flag"
-  echo ""
-  echo "  Local SQLite files do NOT support native CDC."
+  echo "  Turso CDC requires the tursodb CLI (not sqld Docker image)."
+  echo "  CDC is per-connection: your app must enable it."
   echo ""
   
   local all_good=true
   
-  # Check 1: Dev services running
-  echo "1. Checking dev services (Kafka, Redis)..."
+  # Check 1: tursodb CLI
+  echo "1. Checking tursodb CLI..."
+  if command -v tursodb &>/dev/null; then
+    echo "   ✅ tursodb installed: $(tursodb --version 2>/dev/null | head -1)"
+  else
+    echo "   ❌ tursodb not found"
+    echo "      Install: curl -sSL tur.so/install | sh"
+    all_good=false
+  fi
+  echo ""
+  
+  # Check 2: Dev services running
+  echo "2. Checking dev services (Kafka, Redis)..."
   if "${DC[@]}" ps 2>/dev/null | grep -q "kafka.*Up"; then
     echo "   ✅ Kafka is running"
   else
@@ -270,30 +261,13 @@ cmd_turso_setup() {
   fi
   echo ""
   
-  # Check 2: Turso CLI (optional but helpful)
-  echo "2. Checking Turso CLI (optional)..."
-  if command -v turso &>/dev/null; then
-    echo "   ✅ Turso CLI installed: $(turso --version 2>/dev/null | head -1)"
+  # Check 3: Test database
+  echo "3. Checking test database..."
+  if [[ -f "$TURSO_DB_PATH" ]]; then
+    echo "   ✅ Database exists: $TURSO_DB_PATH"
   else
-    echo "   ⚠️  Turso CLI not installed (optional)"
-    echo "      Install: curl -sSfL https://get.tur.so/install.sh | bash"
-  fi
-  echo ""
-  
-  # Check 3: Environment variables for cloud
-  echo "3. Checking Turso cloud environment variables..."
-  if [[ -n "${TURSO_URL:-}" ]]; then
-    echo "   ✅ TURSO_URL is set: $TURSO_URL"
-  else
-    echo "   ⚠️  TURSO_URL not set (needed for Turso cloud)"
-    echo "      Example: export TURSO_URL=\"libsql://your-db.turso.io\""
-  fi
-  
-  if [[ -n "${TURSO_AUTH_TOKEN:-}" ]]; then
-    echo "   ✅ TURSO_AUTH_TOKEN is set: ${TURSO_AUTH_TOKEN:0:20}..."
-  else
-    echo "   ⚠️  TURSO_AUTH_TOKEN not set (needed for Turso cloud)"
-    echo "      Get token: turso db tokens create <db-name>"
+    echo "   ⚠️  Database not found: $TURSO_DB_PATH"
+    echo "      Create: ./dev.sh turso-init"
   fi
   echo ""
   
@@ -310,105 +284,152 @@ cmd_turso_setup() {
   # Summary
   echo "═══════════════════════════════════════════════════════════════"
   if $all_good; then
-    echo "  ✅ Basic requirements met!"
+    echo "  ✅ Requirements met!"
   else
     echo "  ⚠️  Some requirements missing - see above"
   fi
   echo ""
-  echo "  Quick Start Options:"
+  echo "  Quick Start:"
   echo ""
-  echo "  A) TURSO CLOUD (recommended):"
-  echo "     export TURSO_URL=\"libsql://your-db.turso.io\""
-  echo "     export TURSO_AUTH_TOKEN=\"your-token\""
-  echo "     ./dev.sh k-create turso.changes"
-  echo "     ./dev.sh turso-cloud-run"
+  echo "    1. Install tursodb:       curl -sSL tur.so/install | sh"
+  echo "    2. Start infrastructure:  ./dev.sh up"
+  echo "    3. Create Kafka topic:    ./dev.sh k-create turso.changes"
+  echo "    4. Create test database:  ./dev.sh turso-init"
+  echo "    5. Make changes:          ./dev.sh turso-shell"
+  echo "    6. Run DeltaForge:        ./dev.sh turso-run"
+  echo "    7. Watch events:          ./dev.sh k-consume turso.changes --from-beginning"
   echo ""
-  echo "  B) LOCAL SQLD WITH CDC (experimental):"
-  echo "     # Requires sqld built with CDC support"
-  echo "     ./dev.sh turso-local-up"
-  echo "     ./dev.sh turso-local-shell   # create tables"
-  echo "     ./dev.sh turso-local-run"
-  echo ""
-  echo "  Note: Standard sqld Docker image may not have CDC enabled."
-  echo "        Check Turso docs for CDC-enabled builds."
+  echo "  IMPORTANT: CDC is per-connection!"
+  echo "  The turso-shell command enables CDC. Changes made there are captured."
+  echo "  Your app must also run: PRAGMA unstable_capture_data_changes_conn('full');"
   echo "═══════════════════════════════════════════════════════════════"
 }
 
-cmd_turso_local_up() {
-  echo "Starting local libSQL server (sqld)..."
-  echo ""
-  echo "⚠️  Note: Standard sqld may not have CDC enabled."
-  echo "   DeltaForge requires native CDC support."
-  echo "   If CDC fails, use Turso Cloud instead."
-  echo ""
+cmd_turso_init() {
+  echo "Creating test database with CDC table..."
   
-  # Create data directory
-  mkdir -p "$TURSO_LOCAL_DATA"
-  
-  # Check if already running
-  if docker ps | grep -q deltaforge-sqld; then
-    echo "⚠️  Local libSQL already running"
-    echo "   Stop it with: ./dev.sh turso-local-down"
-    return 0
-  fi
-  
-  # Start sqld container
-  # Note: Add --enable-cdc if available in your sqld build
-  docker run -d \
-    --name deltaforge-sqld \
-    --network deltaforge_default \
-    -p ${TURSO_LOCAL_PORT}:8080 \
-    -v "${TURSO_LOCAL_DATA}:/var/lib/sqld" \
-    ghcr.io/tursodatabase/libsql-server:latest \
-    sqld --http-listen-addr 0.0.0.0:8080
-  
-  echo "✅ Local libSQL started on port ${TURSO_LOCAL_PORT}"
-  echo ""
-  echo "Next steps:"
-  echo "  1. Create tables:    ./dev.sh turso-local-shell"
-  echo "  2. Run DeltaForge:   ./dev.sh turso-local-run"
-  echo ""
-  echo "Sample SQL to create test tables:"
-  echo "  CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);"
-  echo "  CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL);"
-  echo "  INSERT INTO users (name, email) VALUES ('Alice', 'alice@test.com');"
-}
-
-cmd_turso_local_down() {
-  echo "Stopping local libSQL server..."
-  docker rm -f deltaforge-sqld 2>/dev/null || true
-  echo "✅ Local libSQL stopped"
-}
-
-cmd_turso_local_shell() {
-  # Check if sqld is running
-  if ! docker ps | grep -q deltaforge-sqld; then
-    echo "❌ Local libSQL not running. Start it with: ./dev.sh turso-local-up"
+  # Check tursodb is available
+  if ! command -v tursodb &>/dev/null; then
+    echo "❌ tursodb not found"
+    echo "   Install: curl -sSL tur.so/install | sh"
     exit 1
   fi
   
-  echo "Connecting to local libSQL..."
-  echo "Type SQL commands, or use these to get started:"
-  echo ""
-  echo "  CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);"
-  echo "  CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL, status TEXT);"
-  echo "  INSERT INTO users (name, email) VALUES ('Alice', 'alice@test.com');"
-  echo "  INSERT INTO orders (user_id, total, status) VALUES (1, 99.99, 'completed');"
-  echo "  .tables"
-  echo "  .quit"
-  echo ""
+  # Remove existing database if present
+  if [[ -f "$TURSO_DB_PATH" ]]; then
+    echo "Removing existing database: $TURSO_DB_PATH"
+    rm -f "$TURSO_DB_PATH"
+  fi
   
-  # Use docker exec to run sqlite3 inside the container
-  docker exec -it deltaforge-sqld sqlite3 /var/lib/sqld/data/data
+  # Create database with CDC enabled and sample tables
+  tursodb "$TURSO_DB_PATH" <<'SQL'
+-- Enable CDC for this connection
+PRAGMA unstable_capture_data_changes_conn('full');
+
+-- Create test tables
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  email TEXT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE orders (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER,
+  total REAL NOT NULL,
+  status TEXT DEFAULT 'pending',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Insert sample data (these will be in turso_cdc)
+INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com');
+INSERT INTO users (name, email) VALUES ('Bob', 'bob@example.com');
+INSERT INTO orders (user_id, total, status) VALUES (1, 99.99, 'completed');
+INSERT INTO orders (user_id, total, status) VALUES (2, 149.50, 'pending');
+
+-- Show what was created
+SELECT 'Users:' as info;
+SELECT * FROM users;
+SELECT 'Orders:' as info;
+SELECT * FROM orders;
+SELECT 'CDC entries:' as info;
+SELECT change_id, change_type, table_name FROM turso_cdc;
+SQL
+
+  echo ""
+  echo "✅ Database created: $TURSO_DB_PATH"
+  echo ""
+  echo "Next steps:"
+  echo "  1. Make more changes:  ./dev.sh turso-shell"
+  echo "  2. Run DeltaForge:     ./dev.sh turso-run"
 }
 
-cmd_turso_local_run() {
-  echo "Running DeltaForge with local libSQL..."
+cmd_turso_shell() {
+  # Check tursodb is available
+  if ! command -v tursodb &>/dev/null; then
+    echo "❌ tursodb not found"
+    echo "   Install: curl -sSL tur.so/install | sh"
+    exit 1
+  fi
   
-  # Check if sqld is running
-  if ! docker ps | grep -q deltaforge-sqld; then
-    echo "❌ Local libSQL not running."
-    echo "   Start it with: ./dev.sh turso-local-up"
+  # Check database exists
+  if [[ ! -f "$TURSO_DB_PATH" ]]; then
+    echo "❌ Database not found: $TURSO_DB_PATH"
+    echo "   Create it with: ./dev.sh turso-init"
+    exit 1
+  fi
+  
+  echo "Opening tursodb shell with CDC enabled..."
+  echo "Database: $TURSO_DB_PATH"
+  echo ""
+  echo "CDC is enabled - all changes will be captured to turso_cdc table."
+  echo ""
+  echo "Example commands:"
+  echo "  INSERT INTO users (name, email) VALUES ('Charlie', 'charlie@test.com');"
+  echo "  UPDATE users SET email = 'alice.new@test.com' WHERE name = 'Alice';"
+  echo "  DELETE FROM users WHERE name = 'Bob';"
+  echo "  SELECT * FROM turso_cdc;  -- see captured changes"
+  echo "─────────────────────────────────────────────────────────────"
+  
+  # Run tursodb with CDC enabled
+  # Using -e to echo commands and piping the pragma first
+  echo "PRAGMA unstable_capture_data_changes_conn('full');" | tursodb "$TURSO_DB_PATH" -q
+  tursodb "$TURSO_DB_PATH"
+}
+
+cmd_turso_sql() {
+  local sql="${1:-}"
+  if [[ -z "$sql" ]]; then
+    echo "Usage: ./dev.sh turso-sql \"SELECT * FROM users\""
+    exit 1
+  fi
+  
+  # Check tursodb is available
+  if ! command -v tursodb &>/dev/null; then
+    echo "❌ tursodb not found"
+    echo "   Install: curl -sSL tur.so/install | sh"
+    exit 1
+  fi
+  
+  # Check database exists
+  if [[ ! -f "$TURSO_DB_PATH" ]]; then
+    echo "❌ Database not found: $TURSO_DB_PATH"
+    echo "   Create it with: ./dev.sh turso-init"
+    exit 1
+  fi
+  
+  # Run SQL with CDC enabled
+  echo -e "PRAGMA unstable_capture_data_changes_conn('full');\n$sql" | tursodb "$TURSO_DB_PATH" -q
+}
+
+cmd_turso_run() {
+  echo "Running DeltaForge with local Turso..."
+  
+  # Check database exists
+  if [[ ! -f "$TURSO_DB_PATH" ]]; then
+    echo "❌ Database not found: $TURSO_DB_PATH"
+    echo "   Create it with: ./dev.sh turso-init"
     exit 1
   fi
   
@@ -416,61 +437,31 @@ cmd_turso_local_run() {
   ensure_up
   
   # Check if config exists
-  if [[ ! -f "examples/dev.turso-local.yaml" ]]; then
-    echo "❌ Config file not found: examples/dev.turso-local.yaml"
+  if [[ ! -f "examples/dev.turso.yaml" ]]; then
+    echo "❌ Config file not found: examples/dev.turso.yaml"
     exit 1
   fi
   
-  echo "✅ Local libSQL running on port ${TURSO_LOCAL_PORT}"
-  echo "✅ Kafka and Redis running"
-  echo ""
-  echo "⚠️  Note: If CDC initialization fails, your sqld build may not"
-  echo "   have CDC support. Use Turso Cloud instead."
-  echo ""
-  echo "Starting DeltaForge..."
-  echo "─────────────────────────────────────────────────────────────"
-  
-  TURSO_LOCAL_URL="http://localhost:${TURSO_LOCAL_PORT}" \
-  KAFKA_BROKERS="localhost:9092" \
-  REDIS_URI="redis://localhost:6379" \
-    cargo run -p runner -- --config examples/dev.turso-local.yaml
-}
-
-cmd_turso_cloud_run() {
-  echo "Running DeltaForge with Turso cloud..."
-  
-  # Check environment variables
-  local missing=false
-  
-  if [[ -z "${TURSO_URL:-}" ]]; then
-    echo "❌ TURSO_URL not set"
-    echo "   export TURSO_URL=\"libsql://your-db.turso.io\""
-    missing=true
-  fi
-  
-  if [[ -z "${TURSO_AUTH_TOKEN:-}" ]]; then
-    echo "❌ TURSO_AUTH_TOKEN not set"
-    echo "   export TURSO_AUTH_TOKEN=\"your-token\""
-    echo "   Get token: turso db tokens create <db-name>"
-    missing=true
-  fi
-  
-  if $missing; then
-    echo ""
-    echo "Run './dev.sh turso-setup' for full setup guide"
+  # Check if turso_cdc table exists
+  if ! tursodb "$TURSO_DB_PATH" -q "SELECT 1 FROM turso_cdc LIMIT 1" 2>/dev/null; then
+    echo "❌ CDC table 'turso_cdc' not found in database"
+    echo "   The database may not have been initialized with CDC enabled."
+    echo "   Recreate with: ./dev.sh turso-init"
     exit 1
   fi
   
-  # Check if dev services are up
-  ensure_up
-  
-  echo "✅ TURSO_URL: $TURSO_URL"
-  echo "✅ TURSO_AUTH_TOKEN: ${TURSO_AUTH_TOKEN:0:20}..."
+  echo "✅ Database: $TURSO_DB_PATH"
+  echo "✅ CDC table found"
   echo "✅ Kafka and Redis running"
   echo ""
   echo "Starting DeltaForge..."
   echo "─────────────────────────────────────────────────────────────"
+  echo ""
+  echo "To make changes, run in another terminal:"
+  echo "  ./dev.sh turso-shell"
+  echo ""
   
+  TURSO_DB_PATH="$TURSO_DB_PATH" \
   KAFKA_BROKERS="localhost:9092" \
   REDIS_URI="redis://localhost:6379" \
     cargo run -p runner -- --config examples/dev.turso.yaml
@@ -675,7 +666,6 @@ case "${1:-}" in
   build) shift; cmd_build "$@";;
   build-release) shift; cmd_build_release "$@";;
   run) shift; cmd_run "$@";;
-  run-turso) shift; cmd_run_turso "$@";;
   run-pg) shift; cmd_run_pg "$@";;
   fmt) shift; cmd_fmt "$@";;
   lint) shift; cmd_lint "$@";;
@@ -683,13 +673,14 @@ case "${1:-}" in
   check) shift; cmd_check "$@";;
   cov) shift; cmd_cov "$@";;
 
-  # Turso (native CDC only)
+  # Turso (hidden - experimental, not documented)
+  # Commands still work but not shown in help
   turso-setup) shift; cmd_turso_setup "$@";;
-  turso-local-up) shift; cmd_turso_local_up "$@";;
-  turso-local-down) shift; cmd_turso_local_down "$@";;
-  turso-local-shell) shift; cmd_turso_local_shell "$@";;
-  turso-local-run) shift; cmd_turso_local_run "$@";;
-  turso-cloud-run) shift; cmd_turso_cloud_run "$@";;
+  turso-init) shift; cmd_turso_init "$@";;
+  turso-shell) shift; cmd_turso_shell "$@";;
+  turso-sql) shift; cmd_turso_sql "$@";;
+  turso-run) shift; cmd_turso_run "$@";;
+  run-turso) shift; cmd_turso_run "$@";;
 
   # API
   api-health) shift; cmd_api_health "$@";;

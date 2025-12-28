@@ -1,17 +1,44 @@
 //! Configuration for TursoDB CDC source.
 //!
-//! Requires Turso/libSQL with native CDC support enabled.
-//! Native CDC uses `PRAGMA unstable_capture_data_changes_conn` to capture
-//! all changes to a `turso_cdc` table automatically.
+//! **STATUS: EXPERIMENTAL / PAUSED**
+//!
+//! See turso/mod.rs for details on why this is paused.
+//!
+//! ---
+//!
+//! The application must enable CDC on its connection with:
+//! ```sql
+//! PRAGMA unstable_capture_data_changes_conn('full');
+//! ```
+//!
+//! DeltaForge then reads from the resulting `turso_cdc` table.
 
 use serde::{Deserialize, Serialize};
 
 /// Configuration for TursoDB CDC source.
 ///
-/// **Requires Turso with native CDC support.**
+/// **The application must enable CDC** - DeltaForge only reads from the CDC table.
 ///
-/// Native CDC captures INSERT, UPDATE, and DELETE operations automatically
-/// with full before/after row images. Schema changes are captured inline.
+/// CDC is per-connection: only changes made by connections that run the CDC
+/// pragma are captured. Use `native_cdc_pragma()` to get the PRAGMA statement
+/// to run in your application.
+///
+/// # Supported URLs
+///
+/// - Local file: `/path/to/database.db`
+/// - Remote HTTP: `http://localhost:8080`
+/// - Turso cloud: `libsql://your-db.turso.io` (requires auth_token)
+///
+/// # Example
+///
+/// ```yaml
+/// source:
+///   type: turso
+///   config:
+///     id: turso-main
+///     url: "/tmp/myapp.db"
+///     tables: ["users", "orders"]
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TursoSrcCfg {
     /// Unique identifier for this source instance
@@ -20,8 +47,9 @@ pub struct TursoSrcCfg {
     /// Connection URL for Turso/LibSQL
     ///
     /// Formats:
+    /// - `/path/to/database.db` (local file)
+    /// - `http://localhost:8080` (local sqld server)
     /// - `libsql://your-db.turso.io` (Turso cloud - requires auth_token)
-    /// - `http://localhost:8080` (local sqld server with CDC enabled)
     pub url: String,
 
     /// Auth token for Turso cloud connections
@@ -34,12 +62,15 @@ pub struct TursoSrcCfg {
     /// Supports wildcards: `orders%`, `*`
     pub tables: Vec<String>,
 
-    /// Native CDC capture level
+    /// Recommended CDC capture level for the application.
+    ///
+    /// This tells the application what PRAGMA to use. DeltaForge doesn't
+    /// enable CDC - the app must do it on its own connection.
     ///
     /// Options:
-    /// - `id`: Capture only the rowid of changed rows (minimal overhead)
-    /// - `before`: Capture row state before changes (for updates/deletes)
-    /// - `after`: Capture row state after changes (for inserts/updates)
+    /// - `id`: Capture only the rowid (minimal overhead)
+    /// - `before`: Capture row state before changes
+    /// - `after`: Capture row state after changes
     /// - `full` (default): Capture both before and after states
     #[serde(default)]
     pub native_cdc_level: NativeCdcLevel,
@@ -96,6 +127,13 @@ impl NativeCdcLevel {
 }
 
 impl TursoSrcCfg {
+    /// Returns true if this is a local file path
+    pub fn is_local_file(&self) -> bool {
+        !self.url.starts_with("libsql://") 
+            && !self.url.starts_with("http://") 
+            && !self.url.starts_with("https://")
+    }
+    
     /// Returns true if this is a Turso cloud connection
     pub fn is_turso_cloud(&self) -> bool {
         self.url.starts_with("libsql://") && self.url.contains(".turso.io")
@@ -106,7 +144,7 @@ impl TursoSrcCfg {
         self.cdc_table_name.as_deref().unwrap_or("turso_cdc")
     }
 
-    /// Returns the PRAGMA statement to enable native CDC
+    /// Returns the PRAGMA statement the application should run to enable CDC
     pub fn native_cdc_pragma(&self) -> String {
         match &self.cdc_table_name {
             Some(table) => format!(

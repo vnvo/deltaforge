@@ -165,7 +165,7 @@ fn process_batch_in_runtime(
             .get(&mut try_catch)
             .to_rust_string_lossy(&mut try_catch);
         error!(processor_id=%id, msg=%msg, "JS exception");
-        bail!("JS processor can not continue");
+        bail!("JS processor threw");
     }
 
     let result = call_res.unwrap();

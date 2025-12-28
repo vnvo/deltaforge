@@ -1,13 +1,19 @@
 //! End-to-end CDC tests for the Turso source.
 //!
+//! **STATUS: EXPERIMENTAL / PAUSED**
+//!
+//! These tests are for internal development only. The Turso source
+//! is not yet ready for production use.
+//!
 //! ## Requirements
 //!
-//! Turso native CDC requires:
-//! - **Turso Cloud** with CDC enabled, OR
-//! - **Local sqld** with `--enable-cdc` flag
+//! Turso native CDC requires the tursodb CLI.
+//! Install with: curl -sSL tur.so/install | sh
 //!
-//! Native CDC uses `PRAGMA unstable_capture_data_changes_conn` to capture all
-//! changes to a `turso_cdc` table automatically.
+//! ## Architecture
+//!
+//! CDC is per-connection. The application enables CDC on its connection,
+//! and DeltaForge reads from the resulting `turso_cdc` table.
 //!
 //! ## Running Tests
 //!
@@ -16,18 +22,13 @@
 //! cargo test turso_schema --features turso
 //!
 //! # Run native CDC test with local tursodb
-//! TURSODB_PATH=/path/to/tursodb cargo test turso_cdc_native_local -- --ignored
-//!
-//! # Run native CDC test with Turso Cloud
-//! TURSO_CDC_TEST_URL="libsql://mydb.turso.io" \
-//! TURSO_CDC_TEST_TOKEN="eyJ..." \
-//! cargo test turso_cdc_native_cloud -- --ignored
+//! cargo test turso_cdc_native_local -- --ignored
 //! ```
 
 use anyhow::Result;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
 use deltaforge_config::{NativeCdcLevel, TursoSrcCfg};
-use deltaforge_core::{Event, Source};
+use deltaforge_core::{Event, Op, Source};
 use libsql::Builder;
 use schema_registry::{InMemoryRegistry, SourceSchema};
 use sources::turso::{TursoSchemaLoader, TursoSource};
@@ -38,7 +39,7 @@ use tokio::{
     sync::mpsc,
     time::{Duration, timeout},
 };
-use tracing::info;
+use tracing::{debug, info};
 
 mod common;
 use common::init_test_tracing;
@@ -304,187 +305,112 @@ async fn turso_source_schema_loader_trait_test() -> Result<()> {
 }
 
 // ============================================================================
-// Native CDC Tests (require Turso with CDC support)
+// Native CDC Tests (require tursodb CLI)
 // ============================================================================
 
-/// Native CDC test using local tursodb installation.
+/// Native CDC test using local database file.
 ///
-/// Requires Turso Database installed: `curl -sSL tur.so/install | sh`
+/// This test:
+/// 1. Creates a temp database
+/// 2. Uses a connection to enable CDC and make changes (simulating the app)
+/// 3. Closes that connection
+/// 4. Opens DeltaForge source to read from turso_cdc table
 ///
-/// This test verifies native CDC with the real `turso_cdc` table and
-/// `bin_record_json_object()` function.
+/// Install tursodb: curl -sSL tur.so/install | sh
 #[tokio::test]
 #[ignore] // Run with: cargo test turso_cdc_native_local -- --ignored
 async fn turso_cdc_native_local_e2e() -> Result<()> {
     init_test_tracing();
-    info!("--- Testing Turso CDC (native mode - local tursodb) ---");
+    info!("--- Testing Turso CDC (native mode - local file) ---");
 
-    // Find tursodb binary
-    let tursodb_path = std::env::var("TURSODB_PATH").ok().or_else(|| {
-        // Check common installation paths
-        let paths = [
-            std::env::var("HOME")
-                .ok()
-                .map(|h| format!("{}/.turso/tursodb", h)),
-            Some("/usr/local/bin/tursodb".to_string()),
-            Some("tursodb".to_string()), // In PATH
-        ];
-        for path in paths.into_iter().flatten() {
-            if std::process::Command::new(&path)
-                .arg("--version")
-                .output()
-                .is_ok()
-            {
-                return Some(path);
-            }
-        }
-        None
-    });
-
-    let tursodb = match tursodb_path {
-        Some(p) => p,
-        None => {
-            info!("tursodb not found, skipping native CDC test");
-            info!("Install with: curl -sSL tur.so/install | sh");
-            info!("Or set TURSODB_PATH environment variable");
-            return Ok(());
-        }
-    };
-
-    info!(path = %tursodb, "found tursodb");
-
-    // Create temp database
     let temp_dir = TempDir::new()?;
-    let db_path = temp_dir.path().join("native_cdc_test.db");
+    let db_path = temp_dir.path().join("cdc_test.db");
     let db_path_str = db_path.to_string_lossy().to_string();
 
-    // Helper to run SQL via tursodb CLI
-    let run_sql = |sql: &str| -> std::process::Output {
-        use std::io::Write;
-        use std::process::Stdio;
+    info!(path = %db_path_str, "Creating test database");
 
-        let mut child = std::process::Command::new(&tursodb)
-            .arg(&db_path_str)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn tursodb");
+    // Step 1: Create database and populate via connection with CDC enabled
+    // This simulates the application enabling CDC and making changes
+    {
+        let db = Builder::new_local(&db_path_str)
+            .build()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to create database: {}", e))?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            writeln!(stdin, "{}", sql).expect("write sql");
+        let conn = db.connect()
+            .map_err(|e| anyhow::anyhow!("Failed to connect: {}", e))?;
+
+        // Enable CDC on this connection
+        info!("Enabling CDC on connection");
+        conn.execute("PRAGMA unstable_capture_data_changes_conn('full')", ())
+            .await
+            .map_err(|e| anyhow::anyhow!(
+                "Failed to enable CDC. Is this libsql with CDC support? Error: {}", e
+            ))?;
+
+        // Verify CDC table was created
+        let mut rows = conn.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='turso_cdc'",
+            ()
+        ).await?;
+        
+        if rows.next().await?.is_none() {
+            return Err(anyhow::anyhow!(
+                "CDC table 'turso_cdc' not created. libsql may not have CDC support."
+            ));
         }
 
-        child.wait_with_output().expect("wait for tursodb")
-    };
+        // Create test table
+        conn.execute(
+            "CREATE TABLE cdc_test_users (
+                id INTEGER PRIMARY KEY,
+                name TEXT,
+                email TEXT
+            )",
+            (),
+        )
+        .await?;
 
-    // Enable CDC
-    let output = run_sql("PRAGMA unstable_capture_data_changes_conn('full');");
-    info!(stdout = %String::from_utf8_lossy(&output.stdout), "CDC enabled");
+        // Make changes that will be captured
+        info!("Making changes (INSERT, UPDATE, DELETE)");
+        conn.execute(
+            "INSERT INTO cdc_test_users (name, email) VALUES ('Alice', 'alice@test.com')",
+            (),
+        )
+        .await?;
 
-    // Create table
-    let output = run_sql(
-        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);",
-    );
-    assert!(output.status.success(), "create table failed: {:?}", output);
+        conn.execute(
+            "UPDATE cdc_test_users SET email = 'alice.updated@test.com' WHERE name = 'Alice'",
+            (),
+        )
+        .await?;
 
-    // INSERT
-    let output = run_sql(
-        "INSERT INTO users (name, email) VALUES ('alice', 'alice@test.com');",
-    );
-    assert!(output.status.success(), "insert failed");
+        conn.execute("DELETE FROM cdc_test_users WHERE name = 'Alice'", ())
+            .await?;
 
-    // UPDATE
-    let output = run_sql(
-        "UPDATE users SET email = 'alice.updated@test.com' WHERE name = 'alice';",
-    );
-    assert!(output.status.success(), "update failed");
-
-    // DELETE
-    let output = run_sql("DELETE FROM users WHERE name = 'alice';");
-    assert!(output.status.success(), "delete failed");
-
-    // Query CDC table - check if it exists
-    let output = run_sql(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='turso_cdc';",
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    if !stdout.contains("turso_cdc") {
-        info!(
-            "turso_cdc table not found - CDC may not be enabled in this tursodb version"
-        );
-        info!("Make sure you have a recent version with CDC support");
-        return Ok(());
-    }
-
-    // Query CDC with JSON helpers
-    let output = run_sql(
-        "SELECT id, table_name, change_type, \
-         bin_record_json_object(table_columns_json_array('users'), before) as before_json, \
-         bin_record_json_object(table_columns_json_array('users'), after) as after_json \
-         FROM turso_cdc ORDER BY id;",
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    info!(cdc_output = %stdout, "CDC query result");
-
-    // Parse and verify
-    if output.status.success() && !stdout.is_empty() {
-        let lines: Vec<&str> =
-            stdout.lines().filter(|l| !l.is_empty()).collect();
-        info!(changes = lines.len(), "native CDC captured changes");
-
-        // Should have 3 changes: INSERT, UPDATE, DELETE
-        assert!(
-            lines.len() >= 3,
-            "expected at least 3 CDC entries, got {}",
-            lines.len()
-        );
-
-        info!("✅ Native CDC working correctly!");
-    } else {
-        info!(stderr = %String::from_utf8_lossy(&output.stderr), "CDC query output");
-    }
-
-    Ok(())
-}
-
-/// Full native CDC test with Turso Cloud or sqld with CDC enabled.
-///
-/// Set environment variables:
-/// - TURSO_CDC_TEST_URL: Connection URL (libsql:// or http://)
-/// - TURSO_CDC_TEST_TOKEN: Auth token (for Turso Cloud)
-#[tokio::test]
-#[ignore] // Run with: cargo test turso_cdc_native_cloud -- --ignored
-async fn turso_cdc_native_cloud_e2e() -> Result<()> {
-    init_test_tracing();
-
-    let url = match std::env::var("TURSO_CDC_TEST_URL") {
-        Ok(u) => u,
-        Err(_) => {
-            info!("TURSO_CDC_TEST_URL not set, skipping native CDC test");
-            info!("To test native CDC with Turso Cloud:");
-            info!("  TURSO_CDC_TEST_URL=libsql://mydb.turso.io \\");
-            info!("  TURSO_CDC_TEST_TOKEN=eyJ... \\");
-            info!("  cargo test turso_cdc_native_cloud -- --ignored");
-            return Ok(());
+        // Verify changes were captured
+        let mut rows = conn.query("SELECT COUNT(*) FROM turso_cdc", ()).await?;
+        if let Some(row) = rows.next().await? {
+            let count: i64 = row.get(0)?;
+            info!(count = count, "CDC entries captured");
+            assert!(count >= 3, "Expected at least 3 CDC entries (INSERT, UPDATE, DELETE)");
         }
-    };
 
-    let token = std::env::var("TURSO_CDC_TEST_TOKEN").ok();
+        info!("Connection with CDC closed, changes captured to turso_cdc");
+        // Connection drops here
+    }
 
-    info!("--- Testing Turso CDC (native mode - cloud) ---");
-    info!("Using Turso URL: {}", url.split('?').next().unwrap_or(&url));
+    // Step 2: Now test DeltaForge reading from the CDC table
+    info!("Starting DeltaForge source to read CDC table");
 
     let cfg = TursoSrcCfg {
-        id: "turso-native-cloud".to_string(),
-        url: url.clone(),
-        auth_token: token,
-        tables: vec!["*".to_string()],
+        id: "turso-native-local".to_string(),
+        url: db_path_str.clone(),
+        auth_token: None,
+        tables: vec!["cdc_test_users".to_string()],
         native_cdc_level: NativeCdcLevel::Full,
         cdc_table_name: None,
-        poll_interval_ms: 500,
+        poll_interval_ms: 200,
         batch_size: 1000,
     };
 
@@ -492,7 +418,7 @@ async fn turso_cdc_native_cloud_e2e() -> Result<()> {
     let src = TursoSource::new(
         cfg,
         "acme".to_string(),
-        "pipe-cloud".to_string(),
+        "pipe-local".to_string(),
         registry,
     );
 
@@ -501,91 +427,49 @@ async fn turso_cdc_native_cloud_e2e() -> Result<()> {
 
     let (tx, mut rx) = mpsc::channel::<Event>(128);
     let handle = src.run(tx, ckpt_store).await;
-    info!("source started with Turso connection...");
+    info!("source started...");
 
-    // Wait for any events
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Collect events
+    let deadline = Instant::now() + Duration::from_secs(5);
     let mut got = Vec::new();
+    let mut seen_insert = false;
+    let mut seen_update = false;
+    let mut seen_delete = false;
 
     while Instant::now() < deadline {
-        match timeout(Duration::from_secs(1), rx.recv()).await {
+        match timeout(Duration::from_millis(500), rx.recv()).await {
             Ok(Some(e)) => {
                 info!(?e.op, table = %e.table, "CDC event received");
+                match e.op {
+                    Op::Insert => seen_insert = true,
+                    Op::Update => seen_update = true,
+                    Op::Delete => seen_delete = true,
+                    Op::Ddl => {}
+                }
                 got.push(e);
+
+                if seen_insert && seen_update && seen_delete {
+                    info!("All expected events received!");
+                    break;
+                }
             }
             Ok(None) => break,
             Err(_) => continue,
         }
     }
 
-    info!("received {} events from Turso CDC", got.len());
-
     handle.stop();
     let _ = handle.join().await;
 
-    info!("native CDC cloud test completed!");
-    Ok(())
-}
+    info!("Received {} events total", got.len());
 
-/// Test that source fails gracefully when native CDC is not available.
-#[tokio::test]
-async fn turso_native_cdc_unavailable_test() -> Result<()> {
-    init_test_tracing();
-    info!("--- Testing Turso CDC unavailable error handling ---");
-
-    let temp_dir = TempDir::new()?;
-    let db_path = temp_dir.path().join("test_no_cdc.db");
-    let db_path_str = db_path.to_string_lossy().to_string();
-
-    // Create a regular SQLite database (no CDC support)
-    let (_db, _conn) = setup_test_db(&db_path_str).await?;
-
-    // Try to create source with local file - should fail with clear error
-    let cfg = TursoSrcCfg {
-        id: "turso-no-cdc".to_string(),
-        url: db_path_str.clone(), // Local file, not libsql:// or http://
-        auth_token: None,
-        tables: vec!["users".to_string()],
-        native_cdc_level: NativeCdcLevel::Full,
-        cdc_table_name: None,
-        poll_interval_ms: 100,
-        batch_size: 1000,
-    };
-
-    let registry = Arc::new(InMemoryRegistry::new());
-    let src = TursoSource::new(
-        cfg,
-        "acme".to_string(),
-        "pipe-fail".to_string(),
-        registry,
-    );
-
-    let ckpt_store: Arc<dyn CheckpointStore> =
-        Arc::new(MemCheckpointStore::new()?);
-
-    let (tx, _rx) = mpsc::channel::<Event>(128);
-    let handle = src.run(tx, ckpt_store).await;
-
-    // Wait for source to fail
-    let result = handle.join().await;
-
-    // Should have failed with a clear error about CDC not being available
-    assert!(result.is_err(), "source should fail when CDC unavailable");
-
-    let err = result.unwrap_err();
-    let err_str = format!("{:?}", err);
-    info!(error = %err_str, "got expected error");
-
-    // Error should mention CDC or remote connection requirement
-    assert!(
-        err_str.contains("CDC")
-            || err_str.contains("remote")
-            || err_str.contains("libsql"),
-        "error should mention CDC or remote requirement: {}",
-        err_str
-    );
-
-    info!("✅ Graceful error when CDC unavailable");
+    // Must receive events
+    assert!(!got.is_empty(), "No CDC events received from turso_cdc table");
+    assert!(seen_insert, "Missing INSERT event");
+    assert!(seen_update, "Missing UPDATE event");
+    assert!(seen_delete, "Missing DELETE event");
+    
+    info!("✅ Native CDC working correctly!");
     Ok(())
 }
 
@@ -623,7 +507,7 @@ async fn turso_cdc_event_parsing_test() -> Result<()> {
 
     // Insert mock CDC records
     // change_type: 1 = INSERT, 0 = UPDATE, -1 = DELETE
-
+    
     // INSERT event
     conn.execute(
         "INSERT INTO turso_cdc (change_type, table_name, id, after) \
@@ -692,8 +576,7 @@ async fn turso_cdc_event_parsing_test() -> Result<()> {
     assert_eq!(table, "users");
     assert!(before.is_none());
     assert!(after.is_some());
-    let after_json: serde_json::Value =
-        serde_json::from_str(after.as_ref().unwrap())?;
+    let after_json: serde_json::Value = serde_json::from_str(after.as_ref().unwrap())?;
     assert_eq!(after_json["name"], "alice");
 
     // Verify UPDATE (change_type = 0)
@@ -701,10 +584,8 @@ async fn turso_cdc_event_parsing_test() -> Result<()> {
     assert_eq!(*ct, 0);
     assert!(before.is_some());
     assert!(after.is_some());
-    let before_json: serde_json::Value =
-        serde_json::from_str(before.as_ref().unwrap())?;
-    let after_json: serde_json::Value =
-        serde_json::from_str(after.as_ref().unwrap())?;
+    let before_json: serde_json::Value = serde_json::from_str(before.as_ref().unwrap())?;
+    let after_json: serde_json::Value = serde_json::from_str(after.as_ref().unwrap())?;
     assert_eq!(before_json["email"], "alice@test.com");
     assert_eq!(after_json["email"], "alice.updated@test.com");
 
