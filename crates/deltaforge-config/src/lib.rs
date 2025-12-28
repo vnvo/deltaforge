@@ -5,7 +5,7 @@ use tracing::error;
 use walkdir::WalkDir;
 
 mod turso_cfg;
-pub use turso_cfg::{NativeCdcLevel, TursoCdcMode, TursoSrcCfg};
+pub use turso_cfg::{NativeCdcLevel, TursoSrcCfg};
 
 mod schema_sensing;
 pub use schema_sensing::{

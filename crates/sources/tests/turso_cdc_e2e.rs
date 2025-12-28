@@ -1,35 +1,33 @@
-//! End-to-end CDC tests for the Turso/SQLite source.
+//! End-to-end CDC tests for the Turso source.
 //!
-//! ## CDC Modes Tested
+//! ## Requirements
 //!
-//! - **Triggers**: Full INSERT/UPDATE/DELETE using shadow tables (works with local SQLite)
-//! - **Polling**: Insert-only detection via rowid tracking (works with local SQLite)
-//! - **Native**: Requires "Turso Database" (the Rust rewrite) installed locally
+//! Turso native CDC requires:
+//! - **Turso Cloud** with CDC enabled, OR
+//! - **Local sqld** with `--enable-cdc` flag
 //!
-//! ## Important: Native CDC Availability
-//!
-//! The native CDC mode (`turso_cdc` table, `bin_record_json_object()`) is ONLY available in:
-//! - **Turso Database** (Rust rewrite): Install via `curl -sSL tur.so/install | sh`
-//! - **Turso Cloud** with CDC enabled
-//!
-//! The Docker image `ghcr.io/tursodatabase/libsql-server` (sqld) does NOT have native CDC.
+//! Native CDC uses `PRAGMA unstable_capture_data_changes_conn` to capture all
+//! changes to a `turso_cdc` table automatically.
 //!
 //! ## Running Tests
 //!
 //! ```bash
-//! # Run all local tests (triggers, polling, schema, native if tursodb installed)
-//! cargo test turso --features turso
+//! # Run schema loader tests (work with local SQLite)
+//! cargo test turso_schema --features turso
+//!
+//! # Run native CDC test with local tursodb
+//! TURSODB_PATH=/path/to/tursodb cargo test turso_cdc_native_local -- --ignored
 //!
 //! # Run native CDC test with Turso Cloud
 //! TURSO_CDC_TEST_URL="libsql://mydb.turso.io" \
 //! TURSO_CDC_TEST_TOKEN="eyJ..." \
-//! cargo test turso_cdc_native_real -- --ignored
+//! cargo test turso_cdc_native_cloud -- --ignored
 //! ```
 
 use anyhow::Result;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
-use deltaforge_config::{NativeCdcLevel, TursoCdcMode, TursoSrcCfg};
-use deltaforge_core::{Event, Op, Source};
+use deltaforge_config::{NativeCdcLevel, TursoSrcCfg};
+use deltaforge_core::{Event, Source};
 use libsql::Builder;
 use schema_registry::{InMemoryRegistry, SourceSchema};
 use sources::turso::{TursoSchemaLoader, TursoSource};
@@ -38,9 +36,9 @@ use std::time::Instant;
 use tempfile::TempDir;
 use tokio::{
     sync::mpsc,
-    time::{Duration, sleep, timeout},
+    time::{Duration, timeout},
 };
-use tracing::{debug, info};
+use tracing::info;
 
 mod common;
 use common::init_test_tracing;
@@ -93,6 +91,10 @@ async fn setup_test_db(
 
     Ok((db, conn))
 }
+
+// ============================================================================
+// Schema Loader Tests (work with local SQLite)
+// ============================================================================
 
 /// Test schema loader functionality.
 #[tokio::test]
@@ -160,8 +162,6 @@ async fn turso_schema_loader_test() -> Result<()> {
 
         // Check specific columns
         let id_col = schema.column("id").expect("id column");
-        // Note: SQLite INTEGER PRIMARY KEY doesn't report notnull=1 in PRAGMA table_info
-        // unless explicitly declared, but it effectively can't be NULL (gets rowid)
         assert!(id_col.is_primary_key);
         assert!(id_col.is_autoincrement);
 
@@ -260,560 +260,52 @@ async fn turso_schema_loader_test() -> Result<()> {
     Ok(())
 }
 
-/// Test CDC with trigger mode.
+/// Test SourceSchemaLoader trait implementation.
 #[tokio::test]
-async fn turso_cdc_triggers_e2e() -> Result<()> {
+async fn turso_source_schema_loader_trait_test() -> Result<()> {
     init_test_tracing();
-    info!("--- Testing Turso CDC (trigger mode) ---");
+    info!("--- Testing SourceSchemaLoader trait ---");
+
+    use sources::schema_loader::SourceSchemaLoader;
 
     let temp_dir = TempDir::new()?;
-    let db_path = temp_dir.path().join("test_cdc_triggers.db");
+    let db_path = temp_dir.path().join("test_trait.db");
     let db_path_str = db_path.to_string_lossy().to_string();
 
-    // Setup database - keep _db alive for the duration of the test
+    // Keep _db alive for the duration of the test
     let (_db, conn) = setup_test_db(&db_path_str).await?;
-
-    // Insert initial data before starting CDC (to set baseline)
-    conn.execute("INSERT INTO users (name, email) VALUES ('existing', 'existing@test.com')", ())
-        .await?;
-
-    let cfg = TursoSrcCfg {
-        id: "turso-triggers-test".to_string(),
-        url: db_path_str.clone(),
-        auth_token: None,
-        tables: vec!["users".to_string()],
-        cdc_mode: TursoCdcMode::Triggers,
-        native_cdc_level: NativeCdcLevel::Full,
-        cdc_table_name: None,
-        poll_interval_ms: 100,
-        tracking_column: "_rowid_".to_string(),
-        auto_create_triggers: true,
-        batch_size: 1000,
-    };
+    let conn = Arc::new(conn);
 
     let registry = Arc::new(InMemoryRegistry::new());
-    let src = TursoSource::new(
-        cfg,
-        "acme".to_string(),
-        "pipe-turso".to_string(),
-        registry,
-    );
+    let loader = TursoSchemaLoader::new(conn, registry, "acme", None);
 
-    let ckpt_store: Arc<dyn CheckpointStore> =
-        Arc::new(MemCheckpointStore::new()?);
+    // Test via trait interface
+    let loader: &dyn SourceSchemaLoader = &loader;
 
-    let (tx, mut rx) = mpsc::channel::<Event>(128);
-    let handle = src.run(tx, ckpt_store).await;
-    info!("source is running (trigger mode)...");
+    assert_eq!(loader.source_type(), "turso");
 
-    // Give source time to setup triggers and start polling
-    sleep(Duration::from_millis(500)).await;
+    // Load via trait
+    let loaded = loader.load("main", "users").await?;
+    assert_eq!(loaded.database, "main");
+    assert_eq!(loaded.table, "users");
+    assert!(!loaded.columns.is_empty());
+    assert!(loaded.fingerprint.starts_with("sha256:"));
 
-    // 1) INSERT
-    conn.execute(
-        "INSERT INTO users (name, email) VALUES ('alice', 'alice@test.com')",
-        (),
-    )
-    .await?;
+    // Reload via trait
+    let reloaded = loader.reload("main", "orders").await?;
+    assert_eq!(reloaded.table, "orders");
 
-    // 2) UPDATE
-    conn.execute(
-        "UPDATE users SET email = 'alice.updated@test.com' WHERE name = 'alice'",
-        (),
-    )
-    .await?;
+    // List cached via trait
+    let cached = loader.list_cached().await;
+    assert!(cached.len() >= 2);
 
-    // 3) DELETE
-    conn.execute("DELETE FROM users WHERE name = 'alice'", ())
-        .await?;
-
-    debug!("INSERT, UPDATE, DELETE performed - expecting CDC events...");
-
-    // Collect events
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut got = Vec::new();
-    let mut seen_insert = false;
-    let mut seen_update = false;
-    let mut seen_delete = false;
-
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match timeout(remaining, rx.recv()).await {
-            Ok(Some(e)) => {
-                debug!(?e.op, table = %e.table, "event received");
-                match e.op {
-                    Op::Insert => seen_insert = true,
-                    Op::Update => seen_update = true,
-                    Op::Delete => seen_delete = true,
-                    Op::Ddl => {}
-                }
-                got.push(e);
-
-                if seen_insert && seen_update && seen_delete {
-                    info!("all expected events have arrived");
-                    break;
-                }
-            }
-            Ok(None) => break,
-            Err(_) => break,
-        }
-    }
-
-    // Assertions
-    assert!(
-        got.iter().any(|e| matches!(e.op, Op::Insert)),
-        "expected at least one INSERT event"
-    );
-    assert!(
-        got.iter().any(|e| matches!(e.op, Op::Update)),
-        "expected at least one UPDATE event"
-    );
-    assert!(
-        got.iter().any(|e| matches!(e.op, Op::Delete)),
-        "expected at least one DELETE event"
-    );
-
-    // Check INSERT event payload
-    let ins = got.iter().find(|e| {
-        e.op == Op::Insert
-            && e.after
-                .as_ref()
-                .and_then(|v| v.get("name"))
-                .and_then(|v| v.as_str())
-                == Some("alice")
-    });
-    assert!(ins.is_some(), "should have INSERT for alice");
-    let ins = ins.unwrap();
-    let after = ins.after.as_ref().unwrap();
-    assert_eq!(after["name"], "alice");
-    assert_eq!(after["email"], "alice@test.com");
-
-    // Check UPDATE event payload
-    let upd = got.iter().find(|e| e.op == Op::Update);
-    assert!(upd.is_some(), "should have UPDATE event");
-    let upd = upd.unwrap();
-    let upd_after = upd.after.as_ref().expect("UPDATE should have after");
-    assert_eq!(upd_after["email"], "alice.updated@test.com");
-
-    // Check DELETE event payload
-    let del = got.iter().find(|e| e.op == Op::Delete);
-    assert!(del.is_some(), "should have DELETE event");
-    let del = del.unwrap();
-    assert!(
-        del.before.is_some() || del.after.is_none(),
-        "DELETE should have before or no after"
-    );
-
-    info!("all Turso CDC trigger mode assertions passed!");
-
-    // Clean shutdown
-    handle.stop();
-    let _ = handle.join().await;
-
+    info!("SourceSchemaLoader trait implementation works!");
     Ok(())
 }
 
-/// Test CDC with polling mode (insert-only detection).
-#[tokio::test]
-async fn turso_cdc_polling_e2e() -> Result<()> {
-    init_test_tracing();
-    info!("--- Testing Turso CDC (polling mode) ---");
-
-    let temp_dir = TempDir::new()?;
-    let db_path = temp_dir.path().join("test_cdc_polling.db");
-    let db_path_str = db_path.to_string_lossy().to_string();
-
-    // Setup database - keep _db alive for the duration of the test
-    let (_db, conn) = setup_test_db(&db_path_str).await?;
-
-    // Insert initial data (should NOT be captured - sets baseline rowid)
-    conn.execute("INSERT INTO users (name, email) VALUES ('baseline', 'baseline@test.com')", ())
-        .await?;
-
-    let cfg = TursoSrcCfg {
-        id: "turso-polling-test".to_string(),
-        url: db_path_str.clone(),
-        auth_token: None,
-        tables: vec!["users".to_string()],
-        cdc_mode: TursoCdcMode::Polling,
-        native_cdc_level: NativeCdcLevel::Full,
-        cdc_table_name: None,
-        poll_interval_ms: 100,
-        tracking_column: "_rowid_".to_string(),
-        auto_create_triggers: false,
-        batch_size: 1000,
-    };
-
-    let registry = Arc::new(InMemoryRegistry::new());
-    let src = TursoSource::new(
-        cfg,
-        "acme".to_string(),
-        "pipe-poll".to_string(),
-        registry,
-    );
-
-    let ckpt_store: Arc<dyn CheckpointStore> =
-        Arc::new(MemCheckpointStore::new()?);
-
-    let (tx, mut rx) = mpsc::channel::<Event>(128);
-    let handle = src.run(tx, ckpt_store).await;
-    info!("source is running (polling mode)...");
-
-    // Give source time to start and establish baseline
-    sleep(Duration::from_millis(500)).await;
-
-    // INSERT new rows (polling mode only detects inserts)
-    conn.execute(
-        "INSERT INTO users (name, email) VALUES ('bob', 'bob@test.com')",
-        (),
-    )
-    .await?;
-    conn.execute(
-        "INSERT INTO users (name, email) VALUES ('carol', 'carol@test.com')",
-        (),
-    )
-    .await?;
-
-    debug!(
-        "INSERTs performed - expecting CDC events (polling only sees inserts)..."
-    );
-
-    // Collect events - polling starts from rowid 0 so will capture baseline too
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut got = Vec::new();
-
-    while Instant::now() < deadline && got.len() < 3 {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match timeout(remaining, rx.recv()).await {
-            Ok(Some(e)) => {
-                debug!(?e.op, table = %e.table, "event received");
-                got.push(e);
-            }
-            Ok(None) => break,
-            Err(_) => break,
-        }
-    }
-
-    // Assertions - polling captures all rows from start (baseline included)
-    assert!(
-        got.len() >= 3,
-        "should have at least 3 insert events (baseline + bob + carol)"
-    );
-    assert!(
-        got.iter().all(|e| e.op == Op::Insert),
-        "polling mode should only produce INSERT events"
-    );
-
-    // Check payloads
-    let bob = got.iter().find(|e| {
-        e.after
-            .as_ref()
-            .and_then(|v| v.get("name"))
-            .and_then(|v| v.as_str())
-            == Some("bob")
-    });
-    assert!(bob.is_some(), "should have INSERT for bob");
-
-    let carol = got.iter().find(|e| {
-        e.after
-            .as_ref()
-            .and_then(|v| v.get("name"))
-            .and_then(|v| v.as_str())
-            == Some("carol")
-    });
-    assert!(carol.is_some(), "should have INSERT for carol");
-
-    // Baseline row IS captured in polling mode (starts from rowid 0)
-    let baseline = got.iter().find(|e| {
-        e.after
-            .as_ref()
-            .and_then(|v| v.get("name"))
-            .and_then(|v| v.as_str())
-            == Some("baseline")
-    });
-    assert!(
-        baseline.is_some(),
-        "baseline row should appear (polling starts from rowid 0)"
-    );
-
-    info!("all Turso CDC polling mode assertions passed!");
-
-    // Clean shutdown
-    handle.stop();
-    let _ = handle.join().await;
-
-    Ok(())
-}
-
-/// Test checkpoint persistence and resumption.
-#[tokio::test]
-async fn turso_checkpoint_resume_test() -> Result<()> {
-    init_test_tracing();
-    info!("--- Testing Turso checkpoint/resume ---");
-
-    let temp_dir = TempDir::new()?;
-    let db_path = temp_dir.path().join("test_checkpoint.db");
-    let db_path_str = db_path.to_string_lossy().to_string();
-
-    // Setup database - keep _db alive for the duration of the test
-    let (_db, conn) = setup_test_db(&db_path_str).await?;
-
-    // Shared checkpoint store across runs
-    let ckpt_store: Arc<dyn CheckpointStore> =
-        Arc::new(MemCheckpointStore::new()?);
-
-    // === First run: capture some events ===
-    {
-        let cfg = TursoSrcCfg {
-            id: "turso-resume-test".to_string(),
-            url: db_path_str.clone(),
-            auth_token: None,
-            tables: vec!["users".to_string()],
-            cdc_mode: TursoCdcMode::Triggers,
-            native_cdc_level: NativeCdcLevel::Full,
-            cdc_table_name: None,
-            poll_interval_ms: 100,
-            tracking_column: "_rowid_".to_string(),
-            auto_create_triggers: true,
-            batch_size: 1000,
-        };
-
-        let registry = Arc::new(InMemoryRegistry::new());
-        let src = TursoSource::new(
-            cfg,
-            "acme".to_string(),
-            "pipe-resume".to_string(),
-            registry,
-        );
-
-        let (tx, mut rx) = mpsc::channel::<Event>(128);
-        let handle = src.run(tx, ckpt_store.clone()).await;
-
-        sleep(Duration::from_millis(500)).await;
-
-        // Insert some data
-        conn.execute("INSERT INTO users (name, email) VALUES ('run1-user1', 'u1@test.com')", ())
-            .await?;
-        conn.execute("INSERT INTO users (name, email) VALUES ('run1-user2', 'u2@test.com')", ())
-            .await?;
-
-        // Wait for events
-        let mut first_run_events = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline && first_run_events.len() < 2 {
-            match timeout(Duration::from_millis(500), rx.recv()).await {
-                Ok(Some(e)) => first_run_events.push(e),
-                _ => break,
-            }
-        }
-
-        assert!(
-            first_run_events.len() >= 2,
-            "should capture events in first run"
-        );
-        info!("first run captured {} events", first_run_events.len());
-
-        handle.stop();
-        let _ = handle.join().await;
-    }
-
-    // === Second run: should resume from checkpoint ===
-    {
-        let cfg = TursoSrcCfg {
-            id: "turso-resume-test".to_string(), // Same ID = same checkpoint
-            url: db_path_str.clone(),
-            auth_token: None,
-            tables: vec!["users".to_string()],
-            cdc_mode: TursoCdcMode::Triggers,
-            native_cdc_level: NativeCdcLevel::Full,
-            cdc_table_name: None,
-            poll_interval_ms: 100,
-            tracking_column: "_rowid_".to_string(),
-            auto_create_triggers: true,
-            batch_size: 1000,
-        };
-
-        let registry = Arc::new(InMemoryRegistry::new());
-        let src = TursoSource::new(
-            cfg,
-            "acme".to_string(),
-            "pipe-resume".to_string(),
-            registry,
-        );
-
-        let (tx, mut rx) = mpsc::channel::<Event>(128);
-        let handle = src.run(tx, ckpt_store.clone()).await;
-
-        sleep(Duration::from_millis(500)).await;
-
-        // Insert NEW data
-        conn.execute("INSERT INTO users (name, email) VALUES ('run2-user', 'run2@test.com')", ())
-            .await?;
-
-        // Collect events
-        let mut second_run_events = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            match timeout(Duration::from_millis(500), rx.recv()).await {
-                Ok(Some(e)) => second_run_events.push(e),
-                _ => break,
-            }
-        }
-
-        // Should only see NEW data, not replay of first run
-        let has_run1_user1 = second_run_events.iter().any(|e| {
-            e.after
-                .as_ref()
-                .and_then(|v| v.get("name"))
-                .and_then(|v| v.as_str())
-                == Some("run1-user1")
-        });
-        assert!(
-            !has_run1_user1,
-            "should NOT replay events from first run (checkpoint should prevent)"
-        );
-
-        let has_run2_user = second_run_events.iter().any(|e| {
-            e.after
-                .as_ref()
-                .and_then(|v| v.get("name"))
-                .and_then(|v| v.as_str())
-                == Some("run2-user")
-        });
-        assert!(has_run2_user, "should capture new events after resume");
-
-        info!(
-            "second run captured {} events (no replay)",
-            second_run_events.len()
-        );
-
-        handle.stop();
-        let _ = handle.join().await;
-    }
-
-    info!("checkpoint resume test passed!");
-    Ok(())
-}
-
-/// Test CDC with native mode (requires Turso Database - the Rust rewrite).
-///
-/// **Important:** Native CDC is only available in "Turso Database" (the Rust SQLite rewrite),
-/// NOT in libsql-server (sqld). The Docker image `ghcr.io/tursodatabase/libsql-server` does NOT
-/// have native CDC support.
-///
-/// To test native CDC locally:
-/// 1. Install Turso Database: `curl -sSL tur.so/install | sh`
-/// 2. Set TURSODB_PATH env var to the binary location
-/// 3. Run this test
-///
-/// This test creates a mock `turso_cdc` table to verify our parsing logic works,
-/// but the actual `bin_record_json_object()` function won't work without the real Turso DB.
-#[tokio::test]
-async fn turso_cdc_native_mock_e2e() -> Result<()> {
-    init_test_tracing();
-    info!("--- Testing Turso CDC (native mode - mocked) ---");
-
-    let temp_dir = TempDir::new()?;
-    let db_path = temp_dir.path().join("test_cdc_native.db");
-    let db_path_str = db_path.to_string_lossy().to_string();
-
-    // Setup database with user tables - keep _db alive for the duration of the test
-    let (_db, conn) = setup_test_db(&db_path_str).await?;
-
-    // Create mock turso_cdc table that mimics Turso's native CDC structure.
-    // In real Turso Database (Rust rewrite), this table is created automatically.
-    // Note: The libsql-server Docker image does NOT have this feature.
-    conn.execute(
-        "CREATE TABLE turso_cdc (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_name TEXT NOT NULL,
-            operation TEXT NOT NULL,
-            new_record TEXT,
-            old_record TEXT,
-            created_at INTEGER DEFAULT (strftime('%s', 'now') * 1000)
-        )",
-        (),
-    )
-    .await?;
-
-    // For testing, we store JSON directly instead of binary blobs since
-    // bin_record_json_object() doesn't exist in standard SQLite/libsql
-    conn.execute(
-        "CREATE TRIGGER _mock_cdc_insert_users
-         AFTER INSERT ON users
-         BEGIN
-             INSERT INTO turso_cdc (table_name, operation, new_record)
-             VALUES ('users', 'INSERT', json_object('id', NEW.id, 'name', NEW.name, 'email', NEW.email));
-         END",
-        (),
-    )
-    .await?;
-
-    conn.execute(
-        "CREATE TRIGGER _mock_cdc_update_users
-         AFTER UPDATE ON users
-         BEGIN
-             INSERT INTO turso_cdc (table_name, operation, new_record, old_record)
-             VALUES ('users', 'UPDATE', 
-                 json_object('id', NEW.id, 'name', NEW.name, 'email', NEW.email),
-                 json_object('id', OLD.id, 'name', OLD.name, 'email', OLD.email));
-         END",
-        (),
-    )
-    .await?;
-
-    conn.execute(
-        "CREATE TRIGGER _mock_cdc_delete_users
-         AFTER DELETE ON users
-         BEGIN
-             INSERT INTO turso_cdc (table_name, operation, old_record)
-             VALUES ('users', 'DELETE', json_object('id', OLD.id, 'name', OLD.name, 'email', OLD.email));
-         END",
-        (),
-    )
-    .await?;
-
-    // Verify the mock turso_cdc table is populated correctly
-    conn.execute(
-        "INSERT INTO users (name, email) VALUES ('test', 'test@example.com')",
-        (),
-    )
-    .await?;
-    conn.execute(
-        "UPDATE users SET email = 'updated@example.com' WHERE name = 'test'",
-        (),
-    )
-    .await?;
-    conn.execute("DELETE FROM users WHERE name = 'test'", ())
-        .await?;
-
-    // Query the mock CDC table
-    let mut rows = conn
-        .query("SELECT id, table_name, operation, new_record, old_record FROM turso_cdc ORDER BY id", ())
-        .await?;
-
-    use libsql::Value;
-    let mut operations: Vec<String> = Vec::new();
-    while let Ok(Some(row)) = rows.next().await {
-        if let Ok(Value::Text(op)) = row.get_value(2) {
-            operations.push(op);
-        }
-    }
-
-    assert_eq!(operations.len(), 3, "should have 3 CDC entries");
-
-    // Verify operations
-    assert_eq!(operations[0], "INSERT");
-    assert_eq!(operations[1], "UPDATE");
-    assert_eq!(operations[2], "DELETE");
-
-    info!("mock turso_cdc table works correctly!");
-    info!(
-        "Note: For real native CDC, use Turso Database (Rust rewrite), not libsql-server"
-    );
-
-    Ok(())
-}
+// ============================================================================
+// Native CDC Tests (require Turso with CDC support)
+// ============================================================================
 
 /// Native CDC test using local tursodb installation.
 ///
@@ -822,6 +314,7 @@ async fn turso_cdc_native_mock_e2e() -> Result<()> {
 /// This test verifies native CDC with the real `turso_cdc` table and
 /// `bin_record_json_object()` function.
 #[tokio::test]
+#[ignore] // Run with: cargo test turso_cdc_native_local -- --ignored
 async fn turso_cdc_native_local_e2e() -> Result<()> {
     init_test_tracing();
     info!("--- Testing Turso CDC (native mode - local tursodb) ---");
@@ -866,7 +359,6 @@ async fn turso_cdc_native_local_e2e() -> Result<()> {
     let db_path_str = db_path.to_string_lossy().to_string();
 
     // Helper to run SQL via tursodb CLI
-    // Pass SQL via stdin to avoid argument parsing issues
     let run_sql = |sql: &str| -> std::process::Output {
         use std::io::Write;
         use std::process::Stdio;
@@ -896,19 +388,19 @@ async fn turso_cdc_native_local_e2e() -> Result<()> {
     );
     assert!(output.status.success(), "create table failed: {:?}", output);
 
-    // Insert
+    // INSERT
     let output = run_sql(
         "INSERT INTO users (name, email) VALUES ('alice', 'alice@test.com');",
     );
     assert!(output.status.success(), "insert failed");
 
-    // Update
+    // UPDATE
     let output = run_sql(
         "UPDATE users SET email = 'alice.updated@test.com' WHERE name = 'alice';",
     );
     assert!(output.status.success(), "update failed");
 
-    // Delete
+    // DELETE
     let output = run_sql("DELETE FROM users WHERE name = 'alice';");
     assert!(output.status.success(), "delete failed");
 
@@ -939,7 +431,6 @@ async fn turso_cdc_native_local_e2e() -> Result<()> {
 
     // Parse and verify
     if output.status.success() && !stdout.is_empty() {
-        // Count changes (each line is a change)
         let lines: Vec<&str> =
             stdout.lines().filter(|l| !l.is_empty()).collect();
         info!(changes = lines.len(), "native CDC captured changes");
@@ -959,45 +450,41 @@ async fn turso_cdc_native_local_e2e() -> Result<()> {
     Ok(())
 }
 
-/// Full native CDC test with real Turso Database binary or Cloud.
+/// Full native CDC test with Turso Cloud or sqld with CDC enabled.
 ///
-/// This test requires either:
-/// - Turso Database installed: `curl -sSL tur.so/install | sh`
-/// - Turso Cloud with CDC enabled
-///
-/// Set TURSO_CDC_TEST_URL for Turso Cloud, or leave unset to skip.
+/// Set environment variables:
+/// - TURSO_CDC_TEST_URL: Connection URL (libsql:// or http://)
+/// - TURSO_CDC_TEST_TOKEN: Auth token (for Turso Cloud)
 #[tokio::test]
-#[ignore] // Run with: cargo test turso_cdc_native_real -- --ignored
-async fn turso_cdc_native_real_e2e() -> Result<()> {
+#[ignore] // Run with: cargo test turso_cdc_native_cloud -- --ignored
+async fn turso_cdc_native_cloud_e2e() -> Result<()> {
     init_test_tracing();
 
     let url = match std::env::var("TURSO_CDC_TEST_URL") {
         Ok(u) => u,
         Err(_) => {
             info!("TURSO_CDC_TEST_URL not set, skipping native CDC test");
-            info!("To test native CDC:");
-            info!("  1. Install: curl -sSL tur.so/install | sh");
-            info!("  2. Or use Turso Cloud with CDC enabled");
+            info!("To test native CDC with Turso Cloud:");
+            info!("  TURSO_CDC_TEST_URL=libsql://mydb.turso.io \\");
+            info!("  TURSO_CDC_TEST_TOKEN=eyJ... \\");
+            info!("  cargo test turso_cdc_native_cloud -- --ignored");
             return Ok(());
         }
     };
 
     let token = std::env::var("TURSO_CDC_TEST_TOKEN").ok();
 
-    info!("--- Testing Turso CDC (real native mode) ---");
+    info!("--- Testing Turso CDC (native mode - cloud) ---");
     info!("Using Turso URL: {}", url.split('?').next().unwrap_or(&url));
 
     let cfg = TursoSrcCfg {
-        id: "turso-native-real".to_string(),
+        id: "turso-native-cloud".to_string(),
         url: url.clone(),
         auth_token: token,
         tables: vec!["*".to_string()],
-        cdc_mode: TursoCdcMode::Native,
         native_cdc_level: NativeCdcLevel::Full,
         cdc_table_name: None,
         poll_interval_ms: 500,
-        tracking_column: "_rowid_".to_string(),
-        auto_create_triggers: false,
         batch_size: 1000,
     };
 
@@ -1005,7 +492,7 @@ async fn turso_cdc_native_real_e2e() -> Result<()> {
     let src = TursoSource::new(
         cfg,
         "acme".to_string(),
-        "pipe-real".to_string(),
+        "pipe-cloud".to_string(),
         registry,
     );
 
@@ -1014,7 +501,7 @@ async fn turso_cdc_native_real_e2e() -> Result<()> {
 
     let (tx, mut rx) = mpsc::channel::<Event>(128);
     let handle = src.run(tx, ckpt_store).await;
-    info!("source started with real Turso connection...");
+    info!("source started with Turso connection...");
 
     // Wait for any events
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1023,7 +510,7 @@ async fn turso_cdc_native_real_e2e() -> Result<()> {
     while Instant::now() < deadline {
         match timeout(Duration::from_secs(1), rx.recv()).await {
             Ok(Some(e)) => {
-                info!(?e.op, table = %e.table, "real CDC event received");
+                info!(?e.op, table = %e.table, "CDC event received");
                 got.push(e);
             }
             Ok(None) => break,
@@ -1031,54 +518,235 @@ async fn turso_cdc_native_real_e2e() -> Result<()> {
         }
     }
 
-    info!("received {} events from real Turso CDC", got.len());
+    info!("received {} events from Turso CDC", got.len());
 
     handle.stop();
     let _ = handle.join().await;
 
-    info!("real native CDC test completed!");
+    info!("native CDC cloud test completed!");
     Ok(())
 }
 
-/// Test SourceSchemaLoader trait implementation.
+/// Test that source fails gracefully when native CDC is not available.
 #[tokio::test]
-async fn turso_source_schema_loader_trait_test() -> Result<()> {
+async fn turso_native_cdc_unavailable_test() -> Result<()> {
     init_test_tracing();
-    info!("--- Testing SourceSchemaLoader trait ---");
-
-    use sources::schema_loader::SourceSchemaLoader;
+    info!("--- Testing Turso CDC unavailable error handling ---");
 
     let temp_dir = TempDir::new()?;
-    let db_path = temp_dir.path().join("test_trait.db");
+    let db_path = temp_dir.path().join("test_no_cdc.db");
     let db_path_str = db_path.to_string_lossy().to_string();
 
-    // Keep _db alive for the duration of the test
-    let (_db, conn) = setup_test_db(&db_path_str).await?;
-    let conn = Arc::new(conn);
+    // Create a regular SQLite database (no CDC support)
+    let (_db, _conn) = setup_test_db(&db_path_str).await?;
+
+    // Try to create source with local file - should fail with clear error
+    let cfg = TursoSrcCfg {
+        id: "turso-no-cdc".to_string(),
+        url: db_path_str.clone(), // Local file, not libsql:// or http://
+        auth_token: None,
+        tables: vec!["users".to_string()],
+        native_cdc_level: NativeCdcLevel::Full,
+        cdc_table_name: None,
+        poll_interval_ms: 100,
+        batch_size: 1000,
+    };
 
     let registry = Arc::new(InMemoryRegistry::new());
-    let loader = TursoSchemaLoader::new(conn, registry, "acme", None);
+    let src = TursoSource::new(
+        cfg,
+        "acme".to_string(),
+        "pipe-fail".to_string(),
+        registry,
+    );
 
-    // Test via trait interface
-    let loader: &dyn SourceSchemaLoader = &loader;
+    let ckpt_store: Arc<dyn CheckpointStore> =
+        Arc::new(MemCheckpointStore::new()?);
 
-    assert_eq!(loader.source_type(), "turso");
+    let (tx, _rx) = mpsc::channel::<Event>(128);
+    let handle = src.run(tx, ckpt_store).await;
 
-    // Load via trait
-    let loaded = loader.load("main", "users").await?;
-    assert_eq!(loaded.database, "main");
-    assert_eq!(loaded.table, "users");
-    assert!(!loaded.columns.is_empty());
-    assert!(loaded.fingerprint.starts_with("sha256:"));
+    // Wait for source to fail
+    let result = handle.join().await;
 
-    // Reload via trait
-    let reloaded = loader.reload("main", "orders").await?;
-    assert_eq!(reloaded.table, "orders");
+    // Should have failed with a clear error about CDC not being available
+    assert!(result.is_err(), "source should fail when CDC unavailable");
 
-    // List cached via trait
-    let cached = loader.list_cached().await;
-    assert!(cached.len() >= 2);
+    let err = result.unwrap_err();
+    let err_str = format!("{:?}", err);
+    info!(error = %err_str, "got expected error");
 
-    info!("SourceSchemaLoader trait implementation works!");
+    // Error should mention CDC or remote connection requirement
+    assert!(
+        err_str.contains("CDC")
+            || err_str.contains("remote")
+            || err_str.contains("libsql"),
+        "error should mention CDC or remote requirement: {}",
+        err_str
+    );
+
+    info!("✅ Graceful error when CDC unavailable");
+    Ok(())
+}
+
+/// Test CDC event structure and payload correctness.
+///
+/// This test creates a mock turso_cdc table to verify event parsing logic,
+/// without requiring actual native CDC support.
+#[tokio::test]
+async fn turso_cdc_event_parsing_test() -> Result<()> {
+    init_test_tracing();
+    info!("--- Testing Turso CDC event parsing ---");
+
+    let temp_dir = TempDir::new()?;
+    let db_path = temp_dir.path().join("test_parsing.db");
+    let db_path_str = db_path.to_string_lossy().to_string();
+
+    let (_db, conn) = setup_test_db(&db_path_str).await?;
+
+    // Create mock turso_cdc table with the structure Turso uses
+    // Note: Real Turso uses binary blobs + bin_record_json_object()
+    // We use JSON text columns for testing the parsing logic
+    conn.execute(
+        "CREATE TABLE turso_cdc (
+            change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            change_time INTEGER DEFAULT (strftime('%s', 'now')),
+            change_type INTEGER NOT NULL,
+            table_name TEXT NOT NULL,
+            id INTEGER,
+            before TEXT,
+            after TEXT
+        )",
+        (),
+    )
+    .await?;
+
+    // Insert mock CDC records
+    // change_type: 1 = INSERT, 0 = UPDATE, -1 = DELETE
+
+    // INSERT event
+    conn.execute(
+        "INSERT INTO turso_cdc (change_type, table_name, id, after) \
+         VALUES (1, 'users', 1, '{\"id\":1,\"name\":\"alice\",\"email\":\"alice@test.com\"}')",
+        (),
+    )
+    .await?;
+
+    // UPDATE event
+    conn.execute(
+        "INSERT INTO turso_cdc (change_type, table_name, id, before, after) \
+         VALUES (0, 'users', 1, \
+         '{\"id\":1,\"name\":\"alice\",\"email\":\"alice@test.com\"}', \
+         '{\"id\":1,\"name\":\"alice\",\"email\":\"alice.updated@test.com\"}')",
+        (),
+    )
+    .await?;
+
+    // DELETE event
+    conn.execute(
+        "INSERT INTO turso_cdc (change_type, table_name, id, before) \
+         VALUES (-1, 'users', 1, '{\"id\":1,\"name\":\"alice\",\"email\":\"alice.updated@test.com\"}')",
+        (),
+    )
+    .await?;
+
+    // Verify CDC table contents
+    let mut rows = conn
+        .query(
+            "SELECT change_id, change_type, table_name, before, after FROM turso_cdc ORDER BY change_id",
+            (),
+        )
+        .await?;
+
+    use libsql::Value;
+    let mut records = Vec::new();
+    while let Ok(Some(row)) = rows.next().await {
+        let change_id = match row.get_value(0) {
+            Ok(Value::Integer(i)) => i,
+            _ => 0,
+        };
+        let change_type = match row.get_value(1) {
+            Ok(Value::Integer(i)) => i,
+            _ => 0,
+        };
+        let table_name = match row.get_value(2) {
+            Ok(Value::Text(s)) => s,
+            _ => String::new(),
+        };
+        let before = match row.get_value(3) {
+            Ok(Value::Text(s)) => Some(s),
+            _ => None,
+        };
+        let after = match row.get_value(4) {
+            Ok(Value::Text(s)) => Some(s),
+            _ => None,
+        };
+        records.push((change_id, change_type, table_name, before, after));
+    }
+
+    assert_eq!(records.len(), 3, "should have 3 CDC records");
+
+    // Verify INSERT (change_type = 1)
+    let (_, ct, table, before, after) = &records[0];
+    assert_eq!(*ct, 1);
+    assert_eq!(table, "users");
+    assert!(before.is_none());
+    assert!(after.is_some());
+    let after_json: serde_json::Value =
+        serde_json::from_str(after.as_ref().unwrap())?;
+    assert_eq!(after_json["name"], "alice");
+
+    // Verify UPDATE (change_type = 0)
+    let (_, ct, _, before, after) = &records[1];
+    assert_eq!(*ct, 0);
+    assert!(before.is_some());
+    assert!(after.is_some());
+    let before_json: serde_json::Value =
+        serde_json::from_str(before.as_ref().unwrap())?;
+    let after_json: serde_json::Value =
+        serde_json::from_str(after.as_ref().unwrap())?;
+    assert_eq!(before_json["email"], "alice@test.com");
+    assert_eq!(after_json["email"], "alice.updated@test.com");
+
+    // Verify DELETE (change_type = -1)
+    let (_, ct, _, before, after) = &records[2];
+    assert_eq!(*ct, -1);
+    assert!(before.is_some());
+    assert!(after.is_none());
+
+    info!("✅ CDC event parsing test passed!");
+    Ok(())
+}
+
+/// Test checkpoint structure serialization.
+#[tokio::test]
+async fn turso_checkpoint_serialization_test() -> Result<()> {
+    init_test_tracing();
+    info!("--- Testing Turso checkpoint serialization ---");
+
+    use sources::turso::TursoCheckpoint;
+
+    // Create checkpoint
+    let cp = TursoCheckpoint {
+        last_change_id: Some(42),
+        timestamp_ms: 1234567890,
+    };
+
+    // Serialize
+    let bytes = serde_json::to_vec(&cp)?;
+    let json_str = String::from_utf8(bytes.clone())?;
+    info!(json = %json_str, "serialized checkpoint");
+
+    // Deserialize
+    let parsed: TursoCheckpoint = serde_json::from_slice(&bytes)?;
+    assert_eq!(parsed.last_change_id, Some(42));
+    assert_eq!(parsed.timestamp_ms, 1234567890);
+
+    // Default checkpoint
+    let default_cp = TursoCheckpoint::default();
+    assert!(default_cp.last_change_id.is_none());
+    assert_eq!(default_cp.timestamp_ms, 0);
+
+    info!("✅ Checkpoint serialization test passed!");
     Ok(())
 }

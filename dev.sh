@@ -51,20 +51,15 @@ Dev:
   ./dev.sh check                  # run fmt-check + clippy + tests (what CI does)
   ./dev.sh cov                    # run coverage (cargo llvm-cov)
 
-Turso/SQLite:
-  ./dev.sh turso-setup            # check requirements for Turso cloud testing
-  ./dev.sh turso-cloud-run        # run DeltaForge with Turso cloud (needs env vars)
+Turso (requires native CDC support):
+  ./dev.sh turso-setup            # check requirements for Turso testing
+  ./dev.sh turso-cloud-run        # run DeltaForge with Turso cloud
   
-  # Local libSQL server (sqld in Docker):
+  # Local sqld server (requires CDC-enabled build):
   ./dev.sh turso-local-up         # start local libSQL server (sqld)
   ./dev.sh turso-local-down       # stop local libSQL server
   ./dev.sh turso-local-shell      # open SQL shell to local libSQL
   ./dev.sh turso-local-run        # run DeltaForge with local libSQL
-  
-  # SQLite file (simplest - no Docker needed):
-  ./dev.sh sqlite-init            # create test SQLite DB with sample tables
-  ./dev.sh sqlite-shell           # open sqlite3 shell to test DB
-  ./dev.sh sqlite-run             # run DeltaForge with SQLite file
 
 API:
   ./dev.sh api-health             # check API health
@@ -101,6 +96,7 @@ Notes:
 - Uses service names from docker-compose.dev.yml (kafka, redis, postgres, mysql).
 - Kafka broker advertises localhost:9092 (works from host & inside kafka container).
 - API defaults to http://localhost:8080 (set API_BASE to override).
+- Turso source requires native CDC support (Turso Cloud or sqld with --enable-cdc).
 EOF
 }
 
@@ -237,12 +233,20 @@ cmd_cov() {
 }
 
 # ============================================================
-# Turso commands
+# Turso commands (native CDC only)
 # ============================================================
 cmd_turso_setup() {
   echo "═══════════════════════════════════════════════════════════════"
   echo "  DeltaForge Turso Setup Guide"
   echo "═══════════════════════════════════════════════════════════════"
+  echo ""
+  echo "  ⚠️  IMPORTANT: Turso source requires NATIVE CDC support"
+  echo ""
+  echo "  Native CDC is available in:"
+  echo "    • Turso Cloud (with CDC enabled)"
+  echo "    • sqld server with --enable-cdc flag"
+  echo ""
+  echo "  Local SQLite files do NOT support native CDC."
   echo ""
   
   local all_good=true
@@ -311,28 +315,32 @@ cmd_turso_setup() {
     echo "  ⚠️  Some requirements missing - see above"
   fi
   echo ""
-  echo "  Quick Start Options (easiest first):"
+  echo "  Quick Start Options:"
   echo ""
-  echo "  A) SQLITE FILE (simplest - just need sqlite3):"
-  echo "     ./dev.sh sqlite-init         # create test DB"
-  echo "     ./dev.sh k-create sqlite.changes"
-  echo "     ./dev.sh sqlite-run          # run DeltaForge"
-  echo "     ./dev.sh sqlite-shell        # insert data in another terminal"
-  echo ""
-  echo "  B) LOCAL LIBSQL SERVER (sqld in Docker):"
-  echo "     ./dev.sh turso-local-up      # start local libSQL"
-  echo "     ./dev.sh turso-local-shell   # create tables"
-  echo "     ./dev.sh turso-local-run     # run DeltaForge"
-  echo ""
-  echo "  C) TURSO CLOUD:"
+  echo "  A) TURSO CLOUD (recommended):"
   echo "     export TURSO_URL=\"libsql://your-db.turso.io\""
   echo "     export TURSO_AUTH_TOKEN=\"your-token\""
+  echo "     ./dev.sh k-create turso.changes"
   echo "     ./dev.sh turso-cloud-run"
+  echo ""
+  echo "  B) LOCAL SQLD WITH CDC (experimental):"
+  echo "     # Requires sqld built with CDC support"
+  echo "     ./dev.sh turso-local-up"
+  echo "     ./dev.sh turso-local-shell   # create tables"
+  echo "     ./dev.sh turso-local-run"
+  echo ""
+  echo "  Note: Standard sqld Docker image may not have CDC enabled."
+  echo "        Check Turso docs for CDC-enabled builds."
   echo "═══════════════════════════════════════════════════════════════"
 }
 
 cmd_turso_local_up() {
   echo "Starting local libSQL server (sqld)..."
+  echo ""
+  echo "⚠️  Note: Standard sqld may not have CDC enabled."
+  echo "   DeltaForge requires native CDC support."
+  echo "   If CDC fails, use Turso Cloud instead."
+  echo ""
   
   # Create data directory
   mkdir -p "$TURSO_LOCAL_DATA"
@@ -345,6 +353,7 @@ cmd_turso_local_up() {
   fi
   
   # Start sqld container
+  # Note: Add --enable-cdc if available in your sqld build
   docker run -d \
     --name deltaforge-sqld \
     --network deltaforge_default \
@@ -378,30 +387,19 @@ cmd_turso_local_shell() {
     exit 1
   fi
   
-  # Check if sqlite3 is available
-  if command -v sqlite3 &>/dev/null; then
-    echo "Connecting to local libSQL via HTTP..."
-    echo "Type SQL commands, or use these to get started:"
-    echo ""
-    echo "  CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);"
-    echo "  CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL, status TEXT);"
-    echo "  INSERT INTO users (name, email) VALUES ('Alice', 'alice@test.com');"
-    echo "  INSERT INTO orders (user_id, total, status) VALUES (1, 99.99, 'completed');"
-    echo "  .tables"
-    echo "  .quit"
-    echo ""
-    # Use docker exec to run sqlite3 inside the container
-    docker exec -it deltaforge-sqld sqlite3 /var/lib/sqld/data/data
-  else
-    echo "sqlite3 not found. You can:"
-    echo "  1. Install sqlite3"
-    echo "  2. Use curl to send SQL:"
-    echo ""
-    echo "     curl -s http://localhost:${TURSO_LOCAL_PORT} -d '{\"statements\": [\"SELECT * FROM users\"]}'"
-    echo ""
-    echo "  3. Or exec into the container:"
-    echo "     docker exec -it deltaforge-sqld sqlite3 /var/lib/sqld/data/data"
-  fi
+  echo "Connecting to local libSQL..."
+  echo "Type SQL commands, or use these to get started:"
+  echo ""
+  echo "  CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT);"
+  echo "  CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, total REAL, status TEXT);"
+  echo "  INSERT INTO users (name, email) VALUES ('Alice', 'alice@test.com');"
+  echo "  INSERT INTO orders (user_id, total, status) VALUES (1, 99.99, 'completed');"
+  echo "  .tables"
+  echo "  .quit"
+  echo ""
+  
+  # Use docker exec to run sqlite3 inside the container
+  docker exec -it deltaforge-sqld sqlite3 /var/lib/sqld/data/data
 }
 
 cmd_turso_local_run() {
@@ -425,6 +423,9 @@ cmd_turso_local_run() {
   
   echo "✅ Local libSQL running on port ${TURSO_LOCAL_PORT}"
   echo "✅ Kafka and Redis running"
+  echo ""
+  echo "⚠️  Note: If CDC initialization fails, your sqld build may not"
+  echo "   have CDC support. Use Turso Cloud instead."
   echo ""
   echo "Starting DeltaForge..."
   echo "─────────────────────────────────────────────────────────────"
@@ -473,120 +474,6 @@ cmd_turso_cloud_run() {
   KAFKA_BROKERS="localhost:9092" \
   REDIS_URI="redis://localhost:6379" \
     cargo run -p runner -- --config examples/dev.turso.yaml
-}
-
-# ============================================================
-# SQLite file commands (simplest - no Docker/sqld needed)
-# ============================================================
-SQLITE_DB_PATH="${SQLITE_DB_PATH:-/tmp/deltaforge-test.db}"
-
-cmd_sqlite_init() {
-  echo "Creating test SQLite database at: $SQLITE_DB_PATH"
-  
-  # Check if sqlite3 is available
-  if ! command -v sqlite3 &>/dev/null; then
-    echo "❌ sqlite3 not found. Install it:"
-    echo "   macOS:  brew install sqlite"
-    echo "   Ubuntu: sudo apt install sqlite3"
-    exit 1
-  fi
-  
-  # Create database with test tables
-  sqlite3 "$SQLITE_DB_PATH" <<'SQL'
--- Users table
-CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  email TEXT,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-
--- Orders table
-CREATE TABLE IF NOT EXISTS orders (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER,
-  total REAL NOT NULL,
-  status TEXT DEFAULT 'pending',
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-
--- Insert sample data
-INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com');
-INSERT INTO users (name, email) VALUES ('Bob', 'bob@example.com');
-INSERT INTO orders (user_id, total, status) VALUES (1, 99.99, 'completed');
-INSERT INTO orders (user_id, total, status) VALUES (2, 149.50, 'pending');
-
--- Show what was created
-.tables
-SELECT 'Users:' as '';
-SELECT * FROM users;
-SELECT 'Orders:' as '';
-SELECT * FROM orders;
-SQL
-
-  echo ""
-  echo "✅ Database created at: $SQLITE_DB_PATH"
-  echo ""
-  echo "Next steps:"
-  echo "  1. Create Kafka topic:  ./dev.sh k-create sqlite.changes"
-  echo "  2. Run DeltaForge:      ./dev.sh sqlite-run"
-  echo "  3. Insert more data:    ./dev.sh sqlite-shell"
-  echo "     sqlite> INSERT INTO users (name, email) VALUES ('Charlie', 'charlie@test.com');"
-  echo "  4. Watch events:        ./dev.sh k-consume sqlite.changes --from-beginning"
-}
-
-cmd_sqlite_shell() {
-  if ! command -v sqlite3 &>/dev/null; then
-    echo "❌ sqlite3 not found"
-    exit 1
-  fi
-  
-  if [[ ! -f "$SQLITE_DB_PATH" ]]; then
-    echo "❌ Database not found: $SQLITE_DB_PATH"
-    echo "   Create it with: ./dev.sh sqlite-init"
-    exit 1
-  fi
-  
-  echo "Opening SQLite shell..."
-  echo "Try: INSERT INTO users (name, email) VALUES ('Test', 'test@test.com');"
-  echo ""
-  sqlite3 "$SQLITE_DB_PATH"
-}
-
-cmd_sqlite_run() {
-  echo "Running DeltaForge with SQLite file..."
-  
-  # Check if database exists
-  if [[ ! -f "$SQLITE_DB_PATH" ]]; then
-    echo "❌ Database not found: $SQLITE_DB_PATH"
-    echo "   Create it with: ./dev.sh sqlite-init"
-    exit 1
-  fi
-  
-  # Check if dev services are up
-  ensure_up
-  
-  # Check if config exists
-  if [[ ! -f "examples/dev.sqlite.yaml" ]]; then
-    echo "❌ Config file not found: examples/dev.sqlite.yaml"
-    exit 1
-  fi
-  
-  echo "✅ SQLite database: $SQLITE_DB_PATH"
-  echo "✅ Kafka and Redis running"
-  echo ""
-  echo "Starting DeltaForge..."
-  echo "─────────────────────────────────────────────────────────────"
-  echo "Tip: In another terminal, insert data with:"
-  echo "     ./dev.sh sqlite-shell"
-  echo "     sqlite> INSERT INTO users (name, email) VALUES ('New', 'new@test.com');"
-  echo "─────────────────────────────────────────────────────────────"
-  echo ""
-  
-  SQLITE_DB_PATH="$SQLITE_DB_PATH" \
-  KAFKA_BROKERS="localhost:9092" \
-  REDIS_URI="redis://localhost:6379" \
-    cargo run -p runner -- --config examples/dev.sqlite.yaml
 }
 
 # ============================================================
@@ -796,18 +683,13 @@ case "${1:-}" in
   check) shift; cmd_check "$@";;
   cov) shift; cmd_cov "$@";;
 
-  # Turso
+  # Turso (native CDC only)
   turso-setup) shift; cmd_turso_setup "$@";;
   turso-local-up) shift; cmd_turso_local_up "$@";;
   turso-local-down) shift; cmd_turso_local_down "$@";;
   turso-local-shell) shift; cmd_turso_local_shell "$@";;
   turso-local-run) shift; cmd_turso_local_run "$@";;
   turso-cloud-run) shift; cmd_turso_cloud_run "$@";;
-
-  # SQLite (simplest)
-  sqlite-init) shift; cmd_sqlite_init "$@";;
-  sqlite-shell) shift; cmd_sqlite_shell "$@";;
-  sqlite-run) shift; cmd_sqlite_run "$@";;
 
   # API
   api-health) shift; cmd_api_health "$@";;
