@@ -303,7 +303,7 @@ impl TursoSource {
         let init_conn = Arc::new(self.connect().await?);
 
         // Verify CDC table exists (app must have enabled CDC)
-        self.verify_cdc_table(&*init_conn).await?;
+        self.verify_cdc_table(&init_conn).await?;
 
         // Expand table patterns to get tracked tables
         let tracked = self.expand_table_patterns(&init_conn).await?;
@@ -392,7 +392,7 @@ impl TursoSource {
             // Poll for changes
             let poll_result = self
                 .poll_cdc_changes(
-                    &*poll_conn,
+                    &poll_conn,
                     &tx,
                     checkpoint.clone(),
                     &source_meta,
