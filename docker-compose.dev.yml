@@ -1,20 +1,36 @@
 version: "3.9"
 services:
   postgres:
-    image: postgres:16
+    image: postgres:17
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: orders
     ports: ["5432:5432"]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts/pg_cdc_setup.sql:/docker-entrypoint-initdb.d/01_cdc_setup.sql
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d orders"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   mysql:
     image: mysql:8
     ports: ["3306:3306"]
     environment:
       MYSQL_ROOT_PASSWORD: password
-      MYSQL_DATABASE: orders
     volumes:
       - mysql_data:/var/lib/mysql
-      - ./init-scripts:/docker-entrypoint-initdb.d
+      - ./init-scripts/init-db.sql:/docker-entrypoint-initdb.d/01_init.sql
     command:
       - --server-id=101
       - --log-bin=/var/lib/mysql/mysql-bin.log
@@ -22,11 +38,18 @@ services:
       - --binlog-row-image=FULL
       - --gtid-mode=ON
       - --enforce-gtid-consistency=ON
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-ppassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
     ports: ["2181:2181"]
+
   kafka:
     image: confluentinc/cp-kafka:7.5.0
     depends_on: [zookeeper]
@@ -39,9 +62,21 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: EXTERNAL:PLAINTEXT,INTERNAL:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
   redis:
     image: redis:7
     ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
 volumes:
+  postgres_data:
   mysql_data:

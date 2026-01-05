@@ -31,15 +31,31 @@ Redis:
   ./dev.sh redis-cli              # open redis-cli
   ./dev.sh redis-read <stream> [count=10] [id=0-0]
 
-DB shells:
+PostgreSQL:
   ./dev.sh pg-sh                  # psql into Postgres (orders DB)
+  ./dev.sh pg-status              # check CDC status (wal_level, slots, publications)
+  ./dev.sh pg-slots               # list replication slots
+  ./dev.sh pg-pub                 # show publication tables
+  ./dev.sh pg-insert              # insert test data
+  ./dev.sh pg-update              # update test data
+  ./dev.sh pg-delete              # delete test data
+  ./dev.sh pg-reset-slot [slot]   # drop replication slot (default: deltaforge_*)
+
+MySQL:
   ./dev.sh mysql-sh               # mysql into MySQL (orders DB)
+  ./dev.sh mysql-sh-inv           # mysql into MySQL (inventory DB)
+  ./dev.sh mysql-sh-users         # mysql into MySQL (users DB)
+  ./dev.sh mysql-status           # check binlog status
+  ./dev.sh mysql-insert           # insert test data
+  ./dev.sh mysql-update           # update test data
+  ./dev.sh mysql-delete           # delete test data
 
 Dev:
   ./dev.sh build                  # build project (debug)
   ./dev.sh build-release          # build project (release)
   ./dev.sh run [config]           # run with config (default: examples/dev.yaml)
   ./dev.sh run-pg                 # run with Postgres example config
+  ./dev.sh run-mysql              # run with MySQL example config
   ./dev.sh fmt                    # format Rust code (cargo fmt --all)
   ./dev.sh lint                   # run clippy with warnings as errors
   ./dev.sh test                   # run test suite
@@ -81,7 +97,8 @@ Notes:
 - Uses service names from docker-compose.dev.yml (kafka, redis, postgres, mysql).
 - Kafka broker advertises localhost:9092 (works from host & inside kafka container).
 - API defaults to http://localhost:8080 (set API_BASE to override).
-- Turso source uses native CDC via local libSQL server.
+- PostgreSQL configured with wal_level=logical for CDC.
+- MySQL configured with GTID + ROW binlog for CDC.
 EOF
 }
 
@@ -89,6 +106,20 @@ ensure_up() {
   # quick check: kafka + redis should be Up
   if ! "${DC[@]}" ps | grep -q "kafka.*Up"; then
     echo "⚠️  Services not up. Start them with: ./dev.sh up" >&2
+    exit 1
+  fi
+}
+
+ensure_pg() {
+  if ! "${DC[@]}" ps | grep -q "postgres.*Up"; then
+    echo "⚠️  PostgreSQL not up. Start with: ./dev.sh up" >&2
+    exit 1
+  fi
+}
+
+ensure_mysql() {
+  if ! "${DC[@]}" ps | grep -q "mysql.*Up"; then
+    echo "⚠️  MySQL not up. Start with: ./dev.sh up" >&2
     exit 1
   fi
 }
@@ -159,14 +190,141 @@ cmd_redis_read() {
   "${DC[@]}" exec redis redis-cli XREAD COUNT "$count" STREAMS "$stream" "$id"
 }
 
+# ============================================================
+# PostgreSQL commands
+# ============================================================
 cmd_pg_sh() {
-  ensure_up
+  ensure_pg
   "${DC[@]}" exec -ti postgres psql -U postgres -d orders
 }
 
+cmd_pg_status() {
+  ensure_pg
+  echo "=== PostgreSQL CDC Status ==="
+  echo ""
+  echo "WAL Level:"
+  "${DC[@]}" exec postgres psql -U postgres -d orders -c "SHOW wal_level;"
+  echo ""
+  echo "Replication Slots:"
+  "${DC[@]}" exec postgres psql -U postgres -d orders -c \
+    "SELECT slot_name, plugin, slot_type, active, restart_lsn, confirmed_flush_lsn FROM pg_replication_slots;"
+  echo ""
+  echo "Publications:"
+  "${DC[@]}" exec postgres psql -U postgres -d orders -c \
+    "SELECT pubname, puballtables, pubinsert, pubupdate, pubdelete FROM pg_publication;"
+  echo ""
+  echo "Publication Tables:"
+  "${DC[@]}" exec postgres psql -U postgres -d orders -c \
+    "SELECT * FROM pg_publication_tables WHERE pubname = 'deltaforge_pub';"
+}
+
+cmd_pg_slots() {
+  ensure_pg
+  "${DC[@]}" exec postgres psql -U postgres -d orders -c \
+    "SELECT slot_name, plugin, slot_type, active, restart_lsn, confirmed_flush_lsn, 
+            pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) as lag
+     FROM pg_replication_slots;"
+}
+
+cmd_pg_pub() {
+  ensure_pg
+  "${DC[@]}" exec postgres psql -U postgres -d orders -c \
+    "SELECT schemaname, tablename FROM pg_publication_tables WHERE pubname = 'deltaforge_pub';"
+}
+
+cmd_pg_insert() {
+  ensure_pg
+  local price=$((RANDOM % 1000 + 1))
+  echo "Inserting test order..."
+  "${DC[@]}" exec postgres psql -U postgres -d orders -c \
+    "INSERT INTO orders (customer_id, status, total) VALUES (1, 'pending', $price.99) RETURNING *;"
+}
+
+cmd_pg_update() {
+  ensure_pg
+  echo "Updating latest order..."
+  "${DC[@]}" exec postgres psql -U postgres -d orders -c \
+    "UPDATE orders SET status = 'shipped', updated_at = NOW() WHERE id = (SELECT MAX(id) FROM orders) RETURNING *;"
+}
+
+cmd_pg_delete() {
+  ensure_pg
+  echo "Deleting latest order..."
+  "${DC[@]}" exec postgres psql -U postgres -d orders -c \
+    "DELETE FROM orders WHERE id = (SELECT MAX(id) FROM orders) RETURNING *;"
+}
+
+cmd_pg_reset_slot() {
+  ensure_pg
+  local slot="${1:-}"
+  if [[ -z "$slot" ]]; then
+    echo "Dropping all deltaforge slots..."
+    "${DC[@]}" exec postgres psql -U postgres -d orders -c \
+      "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name LIKE 'deltaforge_%';"
+  else
+    echo "Dropping slot: $slot"
+    "${DC[@]}" exec postgres psql -U postgres -d orders -c \
+      "SELECT pg_drop_replication_slot('$slot');"
+  fi
+  echo "✅ Slot(s) dropped"
+  cmd_pg_slots
+}
+
+# ============================================================
+# MySQL commands
+# ============================================================
 cmd_mysql_sh() {
-  ensure_up
-  "${DC[@]}" exec -ti mysql mysql -uroot -ppassword orders
+  ensure_mysql
+  "${DC[@]}" exec -ti mysql mysql -udf -pdfpw orders
+}
+
+cmd_mysql_sh_inv() {
+  ensure_mysql
+  "${DC[@]}" exec -ti mysql mysql -udf -pdfpw inventory
+}
+
+cmd_mysql_sh_users() {
+  ensure_mysql
+  "${DC[@]}" exec -ti mysql mysql -udf -pdfpw users
+}
+
+cmd_mysql_status() {
+  ensure_mysql
+  echo "=== MySQL CDC Status ==="
+  echo ""
+  echo "Binary Log Status:"
+  "${DC[@]}" exec mysql mysql -uroot -ppassword -e "SHOW MASTER STATUS\G"
+  echo ""
+  echo "GTID Mode:"
+  "${DC[@]}" exec mysql mysql -uroot -ppassword -e "SELECT @@gtid_mode, @@enforce_gtid_consistency;"
+  echo ""
+  echo "Binary Log Format:"
+  "${DC[@]}" exec mysql mysql -uroot -ppassword -e "SELECT @@binlog_format, @@binlog_row_image;"
+  echo ""
+  echo "Databases:"
+  "${DC[@]}" exec mysql mysql -udf -pdfpw -e "SHOW DATABASES;"
+}
+
+cmd_mysql_insert() {
+  ensure_mysql
+  local price=$((RANDOM % 1000 + 1))
+  echo "Inserting test order_item..."
+  "${DC[@]}" exec mysql mysql -udf -pdfpw orders -e \
+    "INSERT INTO order_items (order_id, product_name, quantity, price) VALUES ('ORD-$RANDOM', 'Test Product', 1, $price.99); SELECT * FROM order_items ORDER BY id DESC LIMIT 1;"
+}
+
+cmd_mysql_update() {
+  ensure_mysql
+  echo "Updating latest order_item..."
+  "${DC[@]}" exec mysql mysql -udf -pdfpw orders -e \
+    "UPDATE order_items SET quantity = quantity + 1 WHERE id = (SELECT id FROM (SELECT MAX(id) as id FROM order_items) t); SELECT * FROM order_items ORDER BY id DESC LIMIT 1;"
+}
+
+cmd_mysql_delete() {
+  ensure_mysql
+  echo "Deleting latest order_item..."
+  "${DC[@]}" exec mysql mysql -udf -pdfpw orders -e \
+    "DELETE FROM order_items WHERE id = (SELECT id FROM (SELECT MAX(id) as id FROM order_items) t); SELECT 'Deleted' as status;"
 }
 
 # ============================================================
@@ -186,7 +344,12 @@ cmd_run() {
 }
 
 cmd_run_pg() {
-  cargo run -p runner -- --config examples/postgres.yaml
+  POSTGRES_DSN="${POSTGRES_DSN:-postgres://postgres:postgres@localhost:5432/orders}" \
+    cargo run -p runner -- --config examples/dev.postgres.yaml
+}
+
+cmd_run_mysql() {
+  cargo run -p runner -- --config examples/mysql.yaml
 }
 
 cmd_fmt() {
@@ -261,200 +424,92 @@ cmd_turso_setup() {
   fi
   echo ""
   
-  # Check 3: Test database
-  echo "3. Checking test database..."
-  if [[ -f "$TURSO_DB_PATH" ]]; then
-    echo "   ✅ Database exists: $TURSO_DB_PATH"
-  else
-    echo "   ⚠️  Database not found: $TURSO_DB_PATH"
-    echo "      Create: ./dev.sh turso-init"
-  fi
-  echo ""
-  
-  # Check 4: Kafka topic
-  echo "4. Checking Kafka topic..."
-  if "${DC[@]}" exec kafka kafka-topics --list --bootstrap-server localhost:9092 2>/dev/null | grep -q "turso.changes"; then
-    echo "   ✅ Topic 'turso.changes' exists"
-  else
-    echo "   ⚠️  Topic 'turso.changes' not found"
-    echo "      Create: ./dev.sh k-create turso.changes"
-  fi
-  echo ""
-  
-  # Summary
-  echo "═══════════════════════════════════════════════════════════════"
   if $all_good; then
-    echo "  ✅ Requirements met!"
+    echo "✅ All prerequisites met!"
+    echo ""
+    echo "Next steps:"
+    echo "  1. ./dev.sh turso-init     # Create test database with sample data"
+    echo "  2. ./dev.sh turso-run      # Run DeltaForge with Turso source"
+    echo "  3. ./dev.sh turso-shell    # Open SQL shell to make changes"
   else
-    echo "  ⚠️  Some requirements missing - see above"
+    echo "❌ Some prerequisites missing. Please install/start them first."
   fi
-  echo ""
-  echo "  Quick Start:"
-  echo ""
-  echo "    1. Install tursodb:       curl -sSL tur.so/install | sh"
-  echo "    2. Start infrastructure:  ./dev.sh up"
-  echo "    3. Create Kafka topic:    ./dev.sh k-create turso.changes"
-  echo "    4. Create test database:  ./dev.sh turso-init"
-  echo "    5. Make changes:          ./dev.sh turso-shell"
-  echo "    6. Run DeltaForge:        ./dev.sh turso-run"
-  echo "    7. Watch events:          ./dev.sh k-consume turso.changes --from-beginning"
-  echo ""
-  echo "  IMPORTANT: CDC is per-connection!"
-  echo "  The turso-shell command enables CDC. Changes made there are captured."
-  echo "  Your app must also run: PRAGMA unstable_capture_data_changes_conn('full');"
-  echo "═══════════════════════════════════════════════════════════════"
 }
 
 cmd_turso_init() {
-  echo "Creating test database with CDC table..."
+  echo "Creating Turso test database at: $TURSO_DB_PATH"
   
-  # Check tursodb is available
-  if ! command -v tursodb &>/dev/null; then
-    echo "❌ tursodb not found"
-    echo "   Install: curl -sSL tur.so/install | sh"
-    exit 1
-  fi
+  # Remove existing database
+  rm -f "$TURSO_DB_PATH" "$TURSO_DB_PATH-wal" "$TURSO_DB_PATH-shm"
   
-  # Remove existing database if present
-  if [[ -f "$TURSO_DB_PATH" ]]; then
-    echo "Removing existing database: $TURSO_DB_PATH"
-    rm -f "$TURSO_DB_PATH"
-  fi
-  
-  # Create database with CDC enabled and sample tables
+  # Create database with schema and sample data
   tursodb "$TURSO_DB_PATH" <<'SQL'
--- Enable CDC for this connection
-PRAGMA unstable_capture_data_changes_conn('full');
-
--- Create test tables
-CREATE TABLE users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  email TEXT,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    total REAL NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE TABLE orders (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER,
-  total REAL NOT NULL,
-  status TEXT DEFAULT 'pending',
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE IF NOT EXISTS order_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL REFERENCES orders(id),
+    product_id INTEGER NOT NULL,
+    sku TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    price REAL NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Insert sample data (these will be in turso_cdc)
-INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com');
-INSERT INTO users (name, email) VALUES ('Bob', 'bob@example.com');
-INSERT INTO orders (user_id, total, status) VALUES (1, 99.99, 'completed');
-INSERT INTO orders (user_id, total, status) VALUES (2, 149.50, 'pending');
+INSERT INTO orders (customer_id, status, total) VALUES
+    (1, 'completed', 150.00),
+    (1, 'pending', 75.50),
+    (2, 'shipped', 200.00);
 
--- Show what was created
-SELECT 'Users:' as info;
-SELECT * FROM users;
-SELECT 'Orders:' as info;
-SELECT * FROM orders;
-SELECT 'CDC entries:' as info;
-SELECT change_id, change_type, table_name FROM turso_cdc;
+INSERT INTO order_items (order_id, product_id, sku, quantity, price) VALUES
+    (1, 101, 'WIDGET-001', 2, 50.00),
+    (1, 102, 'GADGET-002', 1, 50.00),
+    (2, 101, 'WIDGET-001', 1, 75.50),
+    (3, 103, 'THING-003', 4, 50.00);
+
+SELECT 'orders' as tbl, COUNT(*) as cnt FROM orders
+UNION ALL
+SELECT 'order_items', COUNT(*) FROM order_items;
 SQL
 
   echo ""
   echo "✅ Database created: $TURSO_DB_PATH"
   echo ""
-  echo "Next steps:"
-  echo "  1. Make more changes:  ./dev.sh turso-shell"
-  echo "  2. Run DeltaForge:     ./dev.sh turso-run"
+  echo "To run DeltaForge: ./dev.sh turso-run"
+  echo "To open SQL shell: ./dev.sh turso-shell"
 }
 
 cmd_turso_shell() {
-  # Check tursodb is available
-  if ! command -v tursodb &>/dev/null; then
-    echo "❌ tursodb not found"
-    echo "   Install: curl -sSL tur.so/install | sh"
-    exit 1
-  fi
-  
-  # Check database exists
-  if [[ ! -f "$TURSO_DB_PATH" ]]; then
-    echo "❌ Database not found: $TURSO_DB_PATH"
-    echo "   Create it with: ./dev.sh turso-init"
-    exit 1
-  fi
-  
-  echo "Opening tursodb shell with CDC enabled..."
-  echo "Database: $TURSO_DB_PATH"
+  echo "Opening Turso shell (database: $TURSO_DB_PATH)"
+  echo "Type SQL commands, .quit to exit"
   echo ""
-  echo "CDC is enabled - all changes will be captured to turso_cdc table."
-  echo ""
-  echo "Example commands:"
-  echo "  INSERT INTO users (name, email) VALUES ('Charlie', 'charlie@test.com');"
-  echo "  UPDATE users SET email = 'alice.new@test.com' WHERE name = 'Alice';"
-  echo "  DELETE FROM users WHERE name = 'Bob';"
-  echo "  SELECT * FROM turso_cdc;  -- see captured changes"
-  echo "─────────────────────────────────────────────────────────────"
-  
-  # Run tursodb with CDC enabled
-  # Using -e to echo commands and piping the pragma first
-  echo "PRAGMA unstable_capture_data_changes_conn('full');" | tursodb "$TURSO_DB_PATH" -q
   tursodb "$TURSO_DB_PATH"
 }
 
 cmd_turso_sql() {
   local sql="${1:-}"
   if [[ -z "$sql" ]]; then
-    echo "Usage: ./dev.sh turso-sql \"SELECT * FROM users\""
+    echo "Usage: ./dev.sh turso-sql 'SELECT * FROM orders'"
     exit 1
   fi
-  
-  # Check tursodb is available
-  if ! command -v tursodb &>/dev/null; then
-    echo "❌ tursodb not found"
-    echo "   Install: curl -sSL tur.so/install | sh"
-    exit 1
-  fi
-  
-  # Check database exists
-  if [[ ! -f "$TURSO_DB_PATH" ]]; then
-    echo "❌ Database not found: $TURSO_DB_PATH"
-    echo "   Create it with: ./dev.sh turso-init"
-    exit 1
-  fi
-  
-  # Run SQL with CDC enabled
-  echo -e "PRAGMA unstable_capture_data_changes_conn('full');\n$sql" | tursodb "$TURSO_DB_PATH" -q
+  tursodb "$TURSO_DB_PATH" "$sql"
 }
 
 cmd_turso_run() {
-  echo "Running DeltaForge with local Turso..."
-  
-  # Check database exists
-  if [[ ! -f "$TURSO_DB_PATH" ]]; then
-    echo "❌ Database not found: $TURSO_DB_PATH"
-    echo "   Create it with: ./dev.sh turso-init"
-    exit 1
-  fi
-  
-  # Check if dev services are up
   ensure_up
   
-  # Check if config exists
-  if [[ ! -f "examples/dev.turso.yaml" ]]; then
-    echo "❌ Config file not found: examples/dev.turso.yaml"
-    exit 1
-  fi
-  
-  # Check if turso_cdc table exists
-  if ! tursodb "$TURSO_DB_PATH" -q "SELECT 1 FROM turso_cdc LIMIT 1" 2>/dev/null; then
-    echo "❌ CDC table 'turso_cdc' not found in database"
-    echo "   The database may not have been initialized with CDC enabled."
-    echo "   Recreate with: ./dev.sh turso-init"
-    exit 1
-  fi
-  
-  echo "✅ Database: $TURSO_DB_PATH"
-  echo "✅ CDC table found"
-  echo "✅ Kafka and Redis running"
-  echo ""
-  echo "Starting DeltaForge..."
+  echo "Starting DeltaForge with Turso source..."
+  echo "─────────────────────────────────────────────────────────────"
+  echo "  Database: $TURSO_DB_PATH"
+  echo "  Kafka:    localhost:9092"
+  echo "  Redis:    localhost:6379"
   echo "─────────────────────────────────────────────────────────────"
   echo ""
   echo "To make changes, run in another terminal:"
@@ -658,15 +713,31 @@ case "${1:-}" in
   redis-cli) shift; cmd_redis_cli "$@";;
   redis-read) shift; cmd_redis_read "$@";;
 
-  # DB shells
+  # PostgreSQL
   pg-sh) shift; cmd_pg_sh "$@";;
+  pg-status) shift; cmd_pg_status "$@";;
+  pg-slots) shift; cmd_pg_slots "$@";;
+  pg-pub) shift; cmd_pg_pub "$@";;
+  pg-insert) shift; cmd_pg_insert "$@";;
+  pg-update) shift; cmd_pg_update "$@";;
+  pg-delete) shift; cmd_pg_delete "$@";;
+  pg-reset-slot) shift; cmd_pg_reset_slot "$@";;
+
+  # MySQL
   mysql-sh) shift; cmd_mysql_sh "$@";;
+  mysql-sh-inv) shift; cmd_mysql_sh_inv "$@";;
+  mysql-sh-users) shift; cmd_mysql_sh_users "$@";;
+  mysql-status) shift; cmd_mysql_status "$@";;
+  mysql-insert) shift; cmd_mysql_insert "$@";;
+  mysql-update) shift; cmd_mysql_update "$@";;
+  mysql-delete) shift; cmd_mysql_delete "$@";;
 
   # Dev
   build) shift; cmd_build "$@";;
   build-release) shift; cmd_build_release "$@";;
   run) shift; cmd_run "$@";;
   run-pg) shift; cmd_run_pg "$@";;
+  run-mysql) shift; cmd_run_mysql "$@";;
   fmt) shift; cmd_fmt "$@";;
   lint) shift; cmd_lint "$@";;
   test) shift; cmd_test "$@";;

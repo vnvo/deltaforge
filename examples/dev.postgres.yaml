@@ -1,0 +1,66 @@
+# slot and publication should be pre-created by user:
+#
+# -- Create publication
+# CREATE PUBLICATION deltaforge_pub FOR TABLE public.orders, public.order_items, public.customers;
+#
+# -- Create replication slot
+# SELECT pg_create_logical_replication_slot('deltaforge_slot', 'pgoutput');
+#
+
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: postgres-smoke
+  tenant: acme
+
+spec:
+  source:
+    type: postgres
+    config:
+      id: orders-pg
+      dsn: "${POSTGRES_DSN}"
+      slot: deltaforge_slot        # ← Missing!
+      publication: deltaforge_pub
+      tables:
+        - public.orders
+        - public.order_items
+        - public.customers
+
+  processors: []
+
+  sinks:
+    - type: redis
+      config:
+        id: r1
+        uri: ${REDIS_URI}
+        stream: df.pg.events
+        required: false
+    - type: kafka
+      config:
+        id: kafka
+        brokers: ${KAFKA_BROKERS}
+        topic: orders.cdc
+        required: true
+        exactly_once: false
+
+  batch:
+    max_events: 100
+    max_bytes: 8388608
+    max_ms: 200
+    respect_source_tx: true
+    max_inflight: 1
+
+  commit_policy:
+    mode: required
+
+  schema_sensing:
+    enabled: true
+    deep_inspect:
+      enabled: true
+      max_depth: 5
+      max_sample_size: 10
+    sampling:
+      warmup_events: 2
+      sample_rate: 2
+      structure_cache: true
+      structure_cache_size: 100

@@ -1,5 +1,17 @@
+//! CDC source implementations for DeltaForge.
+//!
+//! This crate provides database CDC sources that implement the `Source` trait:
+//!
+//! - **MySQL**: Binlog-based CDC using `mysql_binlog_connector_rust`
+//! - **PostgreSQL**: Logical replication using pgoutput protocol
+//! - **Turso**: Experimental SQLite CDC (paused)
+//!
+//! Each source captures row-level changes and emits them as `Event`s
+//! to be processed by the pipeline coordinator.
+
 pub(crate) mod conn_utils;
 pub mod mysql;
+pub mod postgres;
 pub mod schema_loader;
 pub mod turso;
 
@@ -14,8 +26,13 @@ pub use schema_loader::{
     ArcSchemaLoader, LoadedSchema, SchemaListEntry, SourceSchemaLoader,
 };
 
-// Re-export source types
-pub use mysql::{MySqlCheckpoint, MySqlSource};
+// Re-export MySQL types
+pub use mysql::{MySqlCheckpoint, MySqlSchemaLoader, MySqlSource};
+
+// Re-export PostgreSQL types
+pub use postgres::{PostgresCheckpoint, PostgresSource};
+
+// Re-export Turso types (experimental)
 pub use turso::{TursoCheckpoint, TursoSource};
 
 /// Build a CDC source from pipeline configuration.
@@ -24,9 +41,17 @@ pub fn build_source(
     registry: Arc<InMemoryRegistry>,
 ) -> Result<ArcDynSource> {
     match &pipeline.spec.source {
-        SourceCfg::Postgres(_) => {
-            anyhow::bail!("postgres source not yet implemented")
-        }
+        SourceCfg::Postgres(c) => Ok(Arc::new(postgres::PostgresSource {
+            id: c.id.clone(),
+            checkpoint_key: format!("pg-{}", c.id),
+            dsn: c.dsn.clone(),
+            slot: c.slot.clone(),
+            publication: c.publication.clone(),
+            tables: c.tables.clone(),
+            pipeline: pipeline.metadata.name.clone(),
+            tenant: pipeline.metadata.tenant.clone(),
+            registry,
+        })),
 
         SourceCfg::Mysql(c) => Ok(Arc::new(mysql::MySqlSource {
             id: c.id.clone(),
@@ -55,11 +80,20 @@ pub fn build_schema_loader(
     registry: Arc<InMemoryRegistry>,
 ) -> Option<ArcSchemaLoader> {
     match &pipeline.spec.source {
+        SourceCfg::Postgres(c) => {
+            Some(Arc::new(postgres::PostgresSchemaLoader::new(
+                &c.dsn,
+                registry,
+                &pipeline.metadata.tenant,
+            )))
+        }
+
         SourceCfg::Mysql(c) => Some(Arc::new(mysql::MySqlSchemaLoader::new(
             &c.dsn,
             registry,
             &pipeline.metadata.tenant,
         ))),
-        _ => None,
+
+        SourceCfg::Turso(_) => None, // Turso handles schemas internally
     }
 }

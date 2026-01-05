@@ -93,11 +93,33 @@ pub struct Spec {
 pub struct PostgresSrcCfg {
     pub id: String,
     pub dsn: String,
-    pub publication: Option<String>,
-    pub slot: Option<String>,
+    pub publication: String,
+    pub slot: String,
     pub tables: Vec<String>,
+    /// Starting position when no checkpoint exists.
+    /// - "earliest" (default) starts from the beginning (LSN 0 / publication snapshot)
+    /// - "latest" starts from pg_current_wal_lsn()
+    /// - {"lsn": "..."} starts from a specific LSN string (e.g., "0/16B6C50")
+    #[serde(default)]
+    pub start_position: PostgresStartPosition,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PostgresStartPosition {
+    Earliest,
+    Latest,
+    #[serde(rename = "lsn")]
+    Lsn {
+        lsn: String,
+    },
+}
+
+impl Default for PostgresStartPosition {
+    fn default() -> Self {
+        PostgresStartPosition::Earliest
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MysqlSrcCfg {
     pub id: String,

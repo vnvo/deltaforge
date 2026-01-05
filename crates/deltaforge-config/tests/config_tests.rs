@@ -64,8 +64,8 @@ spec:
         SourceCfg::Postgres(pc) => {
             assert_eq!(pc.id, "pg");
             assert_eq!(pc.dsn, "postgres://pgu:pgpass@localhost:5432/orders");
-            assert_eq!(pc.publication.as_deref(), Some("df_pub"));
-            assert_eq!(pc.slot.as_deref(), Some("df_slot"));
+            assert_eq!(pc.publication, "df_pub");
+            assert_eq!(pc.slot, "df_slot");
             assert_eq!(pc.tables, vec!["public.t1".to_string()]);
         }
         _ => panic!("expected postgres source"),
