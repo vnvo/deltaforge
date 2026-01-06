@@ -22,30 +22,39 @@ pub struct RetryPolicy {
 
     /// stop after N attempts. `None` = forever until cancelled
     pub max_retries: Option<u32>,
+
+    /// Current backoff (for stateful reties)
+    current_backoff: Duration,
 }
 
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
             initial: Duration::from_millis(1000),
-            max: Duration::from_secs(300),
+            max: Duration::from_secs(60),
             jitter: 0.2,
-            max_retries: Some(5),
+            max_retries: None, // retry forever by default
+            current_backoff: Duration::from_millis(1000),
         }
     }
 }
 
-fn next_backoff(cur: Duration, policy: &RetryPolicy) -> Duration {
-    let mut next = cur.saturating_mul(2);
-    if next > policy.max {
-        next = policy.max;
+impl RetryPolicy {
+    /// Get next backoff duration and advance internal state.
+    pub fn next_backoff(&mut self) -> Duration {
+        let current = self.current_backoff;
+        // Exponential increase, capped at max
+        self.current_backoff = current.saturating_mul(2).min(self.max);
+
+        // Apply jitter to returned value
+        let j = 1.0 + rand::rng().random_range(-self.jitter..self.jitter);
+        current.mul_f64(j).max(Duration::from_nanos(1))
     }
 
-    // apply symmetric jitter
-    let j = 1.0 + rng().random_range(-policy.jitter..policy.jitter);
-    let jittered = next.mul_f64(j);
-
-    jittered.max(Duration::from_nanos(1))
+    /// Reset backoff to initial value (call after successful operation).
+    pub fn reset(&mut self) {
+        self.current_backoff = self.initial;
+    }
 }
 
 /// Generic async retry helper with attempt timeout and cancellation.
@@ -60,7 +69,7 @@ pub async fn retry_async<T, E, Fut, Op, Classify, Retryable>(
     classify: Classify,
     should_retry: Retryable,
     attempt_timeout: Duration,
-    policy: RetryPolicy,
+    mut policy: RetryPolicy,
     cancel: &CancellationToken,
     label: &'static str,
 ) -> SourceResult<T>
@@ -121,7 +130,7 @@ where
         if Instant::now() > until {
             debug!(label, attempt, "backoff sleep complete");
         }
-        backoff = next_backoff(backoff, &policy);
+        backoff = policy.next_backoff();
     }
 }
 
@@ -144,42 +153,6 @@ where
                 Err(_) => Err(SourceError::Timeout { action: Cow::Borrowed(label) }),
             }
         }
-    }
-}
-
-#[allow(dead_code)]
-pub fn classify_connect_err(
-    err: anyhow::Error,
-    default_action: &'static str,
-) -> SourceError {
-    let s = err.to_string();
-    if s.contains("Access denied") || s.contains("authentication") {
-        SourceError::Auth {
-            details: Cow::Owned(s),
-        }
-    } else if s.contains("permission") || s.contains("denied") {
-        SourceError::Permission {
-            details: Cow::Owned(s),
-        }
-    } else if s.contains("not found") {
-        SourceError::NotFound {
-            details: Cow::Owned(s),
-        }
-    } else if s.contains("timeout") {
-        SourceError::Timeout {
-            action: Cow::Borrowed(default_action),
-        }
-    } else if s.contains("io error")
-        || s.contains("Connection reset")
-        || s.contains("Broken pipe")
-        || s.contains("EOF")
-        || s.contains("connect")
-    {
-        SourceError::Connect {
-            details: Cow::Owned(s),
-        }
-    } else {
-        SourceError::Other(err)
     }
 }
 
