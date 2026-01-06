@@ -167,7 +167,7 @@ mod tests {
         assert!(v.is_object());
         let inner = &v["_base64_json"];
         assert!(inner.is_string());
-        let expected = BASE64_STANDARD.encode(&bytes);
+        let expected = BASE64_STANDARD.encode(bytes);
         assert_eq!(inner.as_str().unwrap(), expected);
     }
 }

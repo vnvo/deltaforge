@@ -55,7 +55,7 @@ pub use postgres_errors::PostgresSourceError;
 mod postgres_helpers;
 use postgres_helpers::{
     AllowList, connect_replication_with_retries, ensure_slot_and_publication,
-    parse_dsn, pause_until_resumed, prepare_replication_client,
+    pause_until_resumed, prepare_replication_client,
 };
 
 mod postgres_object;
@@ -127,16 +127,17 @@ pub(super) struct RunCtx {
     pub host: String,
     pub default_schema: String,
     pub tx: mpsc::Sender<Event>,
+    #[allow(dead_code)]
     pub chkpt: Arc<dyn CheckpointStore>,
     pub cancel: CancellationToken,
     pub paused: Arc<AtomicBool>,
     pub pause_notify: Arc<Notify>,
     pub schema: PostgresSchemaLoader,
-    pub allow: AllowList,
+    pub(in crate::postgres) allow: AllowList,
     pub retry: RetryPolicy,
     pub inactivity: Duration,
     /// Relation metadata cache
-    pub relation_map: HashMap<u32, RelationInfo>,
+    pub(in crate::postgres) relation_map: HashMap<u32, RelationInfo>,
     /// Current LSN position
     pub last_lsn: Lsn,
     /// Current transaction ID (during transaction)

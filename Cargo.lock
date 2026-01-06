@@ -1254,10 +1254,8 @@ dependencies = [
 name = "deltaforge-config"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "pretty_assertions",
  "serde",
- "serde_json",
  "serde_yaml",
  "serial_test",
  "shellexpand",
@@ -4428,7 +4426,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -4883,14 +4880,12 @@ dependencies = [
  "crc32fast",
  "deltaforge-config",
  "deltaforge-core",
- "futures",
  "hex",
  "libsql",
  "metrics",
  "mysql-binlog-connector-rust",
  "mysql_async",
  "mysql_common 0.35.5",
- "parking_lot",
  "pgwire-replication",
  "rand 0.9.2",
  "schema-registry",
@@ -4906,7 +4901,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "uuid",
 ]
 
 [[package]]

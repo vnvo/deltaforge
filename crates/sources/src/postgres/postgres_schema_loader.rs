@@ -44,7 +44,11 @@ pub struct PostgresSchemaLoader {
 
 impl PostgresSchemaLoader {
     /// Create a new schema loader.
-    pub fn new(dsn: &str, registry: Arc<InMemoryRegistry>, tenant: &str) -> Self {
+    pub fn new(
+        dsn: &str,
+        registry: Arc<InMemoryRegistry>,
+        tenant: &str,
+    ) -> Self {
         info!(
             "creating postgres schema loader for {}",
             redact_password(dsn)
@@ -267,12 +271,15 @@ impl PostgresSchemaLoader {
     }
 
     /// Get cached schema (without loading from DB).
-    pub fn get_cached(&self, schema: &str, table: &str) -> Option<LoadedSchema> {
+    pub fn get_cached(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> Option<LoadedSchema> {
         // Note: This is sync because we're using try_read to avoid blocking
-        self.cache
-            .try_read()
-            .ok()
-            .and_then(|c| c.get(&(schema.to_string(), table.to_string())).cloned())
+        self.cache.try_read().ok().and_then(|c| {
+            c.get(&(schema.to_string(), table.to_string())).cloned()
+        })
     }
 
     /// Fetch full schema from information_schema.
@@ -311,7 +318,11 @@ impl PostgresSchemaLoader {
 
         if col_rows.is_empty() {
             return Err(SourceError::Schema {
-                details: format!("table {}.{} not found", schema_name, table_name).into(),
+                details: format!(
+                    "table {}.{} not found",
+                    schema_name, table_name
+                )
+                .into(),
             });
         }
 
@@ -385,7 +396,8 @@ impl PostgresSchemaLoader {
             .await
             .map_err(query_error)?;
 
-        let primary_key: Vec<String> = pk_rows.iter().map(|r| r.get(0)).collect();
+        let primary_key: Vec<String> =
+            pk_rows.iter().map(|r| r.get(0)).collect();
 
         // Fetch replica identity
         let identity_row = client
@@ -444,6 +456,7 @@ impl PostgresSchemaLoader {
 
     /// Create a loader with pre-populated cache (for testing only).
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn from_static(
         cols: HashMap<(String, String), Arc<Vec<String>>>,
     ) -> Self {
@@ -495,7 +508,8 @@ fn parse_pattern(pattern: &str) -> (String, String) {
 /// Build SQL query for pattern matching.
 fn build_pattern_query(schema_pattern: &str, table_pattern: &str) -> String {
     let schema_clause = if schema_pattern == "*" || schema_pattern == "%" {
-        "table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')".to_string()
+        "table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')"
+            .to_string()
     } else if schema_pattern.contains('%') || schema_pattern.contains('_') {
         format!("table_schema LIKE '{}'", escape_like(schema_pattern))
     } else {
@@ -536,17 +550,28 @@ impl SourceSchemaLoader for PostgresSchemaLoader {
         "postgres"
     }
 
-    async fn load(&self, schema: &str, table: &str) -> anyhow::Result<ApiLoadedSchema> {
+    async fn load(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> anyhow::Result<ApiLoadedSchema> {
         let loaded = self.load_schema(schema, table).await?;
         Ok(to_api_schema(schema, table, &loaded))
     }
 
-    async fn reload(&self, schema: &str, table: &str) -> anyhow::Result<ApiLoadedSchema> {
+    async fn reload(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> anyhow::Result<ApiLoadedSchema> {
         let loaded = self.reload_schema(schema, table).await?;
         Ok(to_api_schema(schema, table, &loaded))
     }
 
-    async fn reload_all(&self, patterns: &[String]) -> anyhow::Result<Vec<(String, String)>> {
+    async fn reload_all(
+        &self,
+        patterns: &[String],
+    ) -> anyhow::Result<Vec<(String, String)>> {
         // Clear cache and re-preload
         self.cache.write().await.clear();
         self.preload(patterns).await.map_err(Into::into)
@@ -570,7 +595,11 @@ impl SourceSchemaLoader for PostgresSchemaLoader {
 }
 
 /// Convert internal LoadedSchema to API LoadedSchema
-fn to_api_schema(schema: &str, table: &str, loaded: &LoadedSchema) -> ApiLoadedSchema {
+fn to_api_schema(
+    schema: &str,
+    table: &str,
+    loaded: &LoadedSchema,
+) -> ApiLoadedSchema {
     ApiLoadedSchema {
         database: schema.to_string(),
         table: table.to_string(),
@@ -589,8 +618,14 @@ mod tests {
 
     #[test]
     fn test_parse_pattern() {
-        assert_eq!(parse_pattern("public.users"), ("public".into(), "users".into()));
-        assert_eq!(parse_pattern("myschema.*"), ("myschema".into(), "*".into()));
+        assert_eq!(
+            parse_pattern("public.users"),
+            ("public".into(), "users".into())
+        );
+        assert_eq!(
+            parse_pattern("myschema.*"),
+            ("myschema".into(), "*".into())
+        );
         assert_eq!(parse_pattern("%.audit"), ("%".into(), "audit".into()));
         assert_eq!(parse_pattern("orders"), ("public".into(), "orders".into()));
     }

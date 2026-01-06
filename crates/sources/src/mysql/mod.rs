@@ -13,7 +13,7 @@ use schema_registry::InMemoryRegistry;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use checkpoints::{CheckpointStore, CheckpointStoreExt};
 use deltaforge_core::{Event, Source, SourceHandle, SourceResult};

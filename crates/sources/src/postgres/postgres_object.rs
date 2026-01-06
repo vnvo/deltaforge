@@ -27,11 +27,14 @@ pub enum PgColumnValue {
 pub struct RelationColumn {
     pub name: String,
     pub type_oid: u32,
+    #[allow(dead_code)]
     pub type_modifier: i32,
     /// Flags: 1 = part of key
+    #[allow(dead_code)]
     pub flags: u8,
 }
 
+#[cfg(test)]
 impl RelationColumn {
     pub fn is_key(&self) -> bool {
         self.flags & 1 != 0
@@ -64,6 +67,7 @@ pub fn build_object(
 }
 
 /// Build a JSON object with only key columns.
+#[cfg(test)]
 pub fn build_key_object(
     columns: &[RelationColumn],
     values: &[PgColumnValue],
@@ -190,9 +194,9 @@ fn parse_array_elements(s: &str) -> Vec<Value> {
     let mut current = String::new();
     let mut in_quotes = false;
     let mut escape_next = false;
-    let mut chars = s.chars().peekable();
+    let chars = s.chars().peekable();
 
-    while let Some(c) = chars.next() {
+    for c in chars {
         if escape_next {
             current.push(c);
             escape_next = false;
@@ -397,7 +401,7 @@ mod tests {
     fn test_convert_numbers() {
         assert_eq!(convert_text_value("42", 23), json!(42));
         assert_eq!(convert_text_value("-100", 20), json!(-100));
-        assert_eq!(convert_text_value("3.14", 701), json!(3.14));
+        assert_eq!(convert_text_value("3.15", 701), json!(3.15));
     }
 
     #[test]

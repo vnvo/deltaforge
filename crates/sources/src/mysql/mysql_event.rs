@@ -472,7 +472,6 @@ mod tests {
     /// - in-memory checkpoint store
     /// - schema cache pre-populated for shop.orders so no DB is touched
     /// - allow-list matching 'shop.orders' only
-
     fn make_runctx(tx: mpsc::Sender<Event>) -> RunCtx {
         let mut cols_map = HashMap::new();
         cols_map.insert(

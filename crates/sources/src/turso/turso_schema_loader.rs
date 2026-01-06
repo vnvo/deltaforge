@@ -709,7 +709,7 @@ mod tests {
     #[test]
     fn test_pattern_matching_logic() {
         // Test the pattern matching logic without database
-        let all_tables = vec![
+        let all_tables = [
             "users".to_string(),
             "orders".to_string(),
             "order_items".to_string(),
@@ -729,7 +729,7 @@ mod tests {
 
         // db.table format
         let pattern = "main.users";
-        let table = pattern.split('.').last().unwrap();
+        let table = pattern.split('.').next_back().unwrap();
         assert_eq!(table, "users");
     }
 

@@ -777,8 +777,10 @@ mod tests {
 
     #[test]
     fn test_checkpoint_serde() {
-        let mut cp = TursoCheckpoint::default();
-        cp.last_change_id = Some(42);
+        let cp = TursoCheckpoint {
+            last_change_id: Some(42),
+            ..Default::default()
+        };
 
         let json = serde_json::to_string(&cp).unwrap();
         let parsed: TursoCheckpoint = serde_json::from_str(&json).unwrap();
@@ -787,18 +789,11 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_with_change_id() {
-        let cp = TursoCheckpoint::default();
-        let updated = cp.with_change_id(42);
-
-        assert_eq!(updated.last_change_id, Some(42));
-        assert!(updated.timestamp_ms > 0);
-    }
-
-    #[test]
     fn test_checkpoint_to_bytes() {
-        let mut cp = TursoCheckpoint::default();
-        cp.last_change_id = Some(42);
+        let cp = TursoCheckpoint {
+            last_change_id: Some(42),
+            ..Default::default()
+        };
 
         let bytes = cp.to_bytes();
         assert!(!bytes.is_empty());

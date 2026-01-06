@@ -24,11 +24,13 @@ pub(super) enum LoopControl {
 /// Relation metadata from pgoutput.
 #[derive(Debug, Clone)]
 pub(super) struct RelationInfo {
+    #[allow(dead_code)]
     pub id: u32,
     pub schema: String,
     pub table: String,
     pub columns: Vec<RelationColumn>,
     /// Replica identity: d=default, n=nothing, f=full, i=index
+    #[allow(dead_code)]
     pub replica_identity: char,
 }
 

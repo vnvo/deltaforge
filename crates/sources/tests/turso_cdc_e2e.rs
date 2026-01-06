@@ -39,7 +39,7 @@ use tokio::{
     sync::mpsc,
     time::{Duration, timeout},
 };
-use tracing::{debug, info};
+use tracing::info;
 
 mod common;
 use common::init_test_tracing;

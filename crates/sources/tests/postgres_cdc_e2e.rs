@@ -600,7 +600,7 @@ async fn postgres_cdc_extended_types() -> Result<()> {
         ])
         .with_mapped_port(5434, 5432.tcp());
 
-    let container = image.start().await.expect("start postgres");
+    let _container = image.start().await.expect("start postgres");
     sleep(Duration::from_secs(5)).await;
 
     let port = 5434;
@@ -790,7 +790,7 @@ async fn postgres_replica_identity_modes() -> Result<()> {
         ])
         .with_mapped_port(5435, 5432.tcp());
 
-    let container = image.start().await.expect("start postgres");
+    let _container = image.start().await.expect("start postgres");
     sleep(Duration::from_secs(5)).await;
 
     let port = 5435;

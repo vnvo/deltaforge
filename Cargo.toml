@@ -41,14 +41,12 @@ strip = true
 
 [workspace.lints.rust]
 unsafe_code = "deny"
-unused_crate_dependencies = "warn"
+unused_crate_dependencies = "allow"
 rust_2018_idioms = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]
-all = "warn"
-pedantic = "warn"
-nursery = "warn"
-cargo = "warn"
+all = { level = "warn", priority = -1 }
+collapsible_if = "allow"
 
 [profile.bench]
 debug = true

@@ -9,7 +9,9 @@ use std::{
 };
 
 use deltaforge_core::{CheckpointMeta, SourceError, SourceResult};
-use pgwire_replication::{Lsn, ReplicationClient, ReplicationConfig, TlsConfig};
+use pgwire_replication::{
+    Lsn, ReplicationClient, ReplicationConfig, TlsConfig,
+};
 use tokio::select;
 use tokio::sync::Notify;
 use tokio_postgres::NoTls;
@@ -105,7 +107,11 @@ pub(super) async fn prepare_replication_client(
     slot: &str,
     publication: &str,
     ckpt_store: &Arc<dyn CheckpointStore>,
-) -> PostgresSourceResult<(DsnComponents, ReplicationConfig, Option<PostgresCheckpoint>)> {
+) -> PostgresSourceResult<(
+    DsnComponents,
+    ReplicationConfig,
+    Option<PostgresCheckpoint>,
+)> {
     let components = parse_dsn(dsn)?;
 
     // Previous checkpoint (if any)
@@ -196,7 +202,7 @@ pub(super) async fn connect_replication(
                 Ok(Err(e)) => {
                     let error_msg = e.to_string();
                     error!(source_id = %source_id, error = %error_msg, "replication connect failed");
-                    
+
                     if error_msg.contains("password") || error_msg.contains("authentication") {
                         error!("PostgreSQL auth issue hints:");
                         error!("  1) Ensure pg_hba.conf allows replication connections");
@@ -208,7 +214,7 @@ pub(super) async fn connect_replication(
                         error!("Publication issue hints:");
                         error!("  1) Create publication: CREATE PUBLICATION pub FOR ALL TABLES;");
                     }
-                    
+
                     Err(SourceError::Other(e.into()))
                 }
                 Err(_) => Err(SourceError::Timeout { action: "replication_connect".into() }),
@@ -221,7 +227,7 @@ pub(super) async fn connect_replication(
         ms = t0.elapsed().as_millis() as u64,
         "connected to postgres replication"
     );
-    
+
     Ok(client)
 }
 
@@ -232,10 +238,11 @@ pub(super) async fn ensure_slot_and_publication(
     publication: &str,
     tables: &[String],
 ) -> SourceResult<Lsn> {
-    let (client, conn) = tokio_postgres::connect(dsn, NoTls)
-        .await
-        .map_err(|e| SourceError::Connect {
-            details: format!("control plane connect: {}", e).into(),
+    let (client, conn) =
+        tokio_postgres::connect(dsn, NoTls).await.map_err(|e| {
+            SourceError::Connect {
+                details: format!("control plane connect: {}", e).into(),
+            }
         })?;
 
     tokio::spawn(async move {
@@ -314,7 +321,9 @@ pub(super) async fn ensure_slot_and_publication(
 }
 
 /// Get current WAL LSN.
-async fn get_current_wal_lsn(client: &tokio_postgres::Client) -> SourceResult<Lsn> {
+async fn get_current_wal_lsn(
+    client: &tokio_postgres::Client,
+) -> SourceResult<Lsn> {
     let row = client
         .query_one("SELECT pg_current_wal_lsn()::text", &[])
         .await
@@ -342,11 +351,6 @@ pub(super) async fn pause_until_resumed(
 }
 
 // ----------------------------- Utility Functions -----------------------------
-
-/// Convert timestamp micros to milliseconds.
-pub(crate) fn ts_micros_to_ms(ts_micros: i64) -> i64 {
-    ts_micros / 1000
-}
 
 /// PostgreSQL epoch (2000-01-01) to Unix epoch offset in microseconds.
 pub const PG_EPOCH_OFFSET_MICROS: i64 = 946_684_800_000_000;
@@ -382,7 +386,10 @@ pub(crate) fn redact_password(dsn: &str) -> String {
 }
 
 /// Build checkpoint metadata from LSN.
-pub(crate) fn make_checkpoint_meta(lsn: &Lsn, tx_id: Option<u32>) -> CheckpointMeta {
+pub(crate) fn make_checkpoint_meta(
+    lsn: &Lsn,
+    tx_id: Option<u32>,
+) -> CheckpointMeta {
     let cp = PostgresCheckpoint {
         lsn: lsn.to_string(),
         tx_id,
@@ -397,7 +404,7 @@ pub(crate) fn make_checkpoint_meta(lsn: &Lsn, tx_id: Option<u32>) -> CheckpointM
 
 /// Simple allow-list on "schema.table" patterns.
 #[derive(Clone)]
-pub(super) struct AllowList {
+pub(in crate::postgres) struct AllowList {
     items: Vec<(Option<String>, String)>,
 }
 
@@ -422,7 +429,8 @@ impl AllowList {
             return true;
         }
         self.items.iter().any(|(s_opt, t)| {
-            let schema_match = s_opt.as_ref().map(|s| s == schema).unwrap_or(true);
+            let schema_match =
+                s_opt.as_ref().map(|s| s == schema).unwrap_or(true);
             let table_match = t == table || t == "*" || t == "%";
             schema_match && table_match
         })
@@ -468,10 +476,8 @@ mod tests {
 
     #[test]
     fn test_allow_list() {
-        let list = AllowList::new(&[
-            "public.users".to_string(),
-            "orders".to_string(),
-        ]);
+        let list =
+            AllowList::new(&["public.users".to_string(), "orders".to_string()]);
 
         assert!(list.matches("public", "users"));
         assert!(list.matches("any_schema", "orders"));

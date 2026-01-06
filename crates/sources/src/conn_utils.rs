@@ -3,7 +3,7 @@ use std::time::Instant;
 use std::{borrow::Cow, time::Duration};
 
 use deltaforge_core::{SourceError, SourceResult};
-use rand::{Rng, rng};
+use rand::Rng;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};

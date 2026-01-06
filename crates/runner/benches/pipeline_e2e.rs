@@ -284,12 +284,12 @@ fn make_batch_config(max_events: usize, max_ms: u64) -> Option<BatchConfig> {
     })
 }
 
-fn make_sensing_config(enabled: bool) -> SchemaSensingConfig {
+/* fn make_sensing_config(enabled: bool) -> SchemaSensingConfig {
     SchemaSensingConfig {
         enabled,
         ..Default::default()
     }
-}
+} */
 
 fn make_sensing_config_with_cache(cache_enabled: bool) -> SchemaSensingConfig {
     SchemaSensingConfig {
