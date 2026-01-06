@@ -32,10 +32,10 @@ jobs:
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           
       - name: Run tests
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace
         
       - name: Clippy
-        run: cargo clippy --workspace --all-features -- -D warnings
+        run: cargo clippy --workspace -- -D warnings
 
   # ============================================================
   # Build and push Docker images (multi-arch)

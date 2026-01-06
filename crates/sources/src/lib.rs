@@ -13,6 +13,7 @@ pub(crate) mod conn_utils;
 pub mod mysql;
 pub mod postgres;
 pub mod schema_loader;
+#[cfg(feature = "turso")]
 pub mod turso;
 
 use anyhow::Result;
@@ -26,13 +27,9 @@ pub use schema_loader::{
     ArcSchemaLoader, LoadedSchema, SchemaListEntry, SourceSchemaLoader,
 };
 
-// Re-export MySQL types
 pub use mysql::{MySqlCheckpoint, MySqlSchemaLoader, MySqlSource};
-
-// Re-export PostgreSQL types
 pub use postgres::{PostgresCheckpoint, PostgresSource};
-
-// Re-export Turso types (experimental)
+#[cfg(feature = "turso")]
 pub use turso::{TursoCheckpoint, TursoSource};
 
 /// Build a CDC source from pipeline configuration.
@@ -62,7 +59,7 @@ pub fn build_source(
             pipeline: pipeline.metadata.name.clone(),
             registry,
         })),
-
+        #[cfg(feature = "turso")]
         SourceCfg::Turso(c) => Ok(Arc::new(turso::TursoSource::new(
             c.clone(),
             pipeline.metadata.tenant.clone(),
@@ -94,6 +91,7 @@ pub fn build_schema_loader(
             &pipeline.metadata.tenant,
         ))),
 
+        #[cfg(feature = "turso")]
         SourceCfg::Turso(_) => None, // Turso handles schemas internally
     }
 }

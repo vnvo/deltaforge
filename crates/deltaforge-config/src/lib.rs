@@ -4,7 +4,9 @@ use thiserror::Error;
 use tracing::error;
 use walkdir::WalkDir;
 
+#[cfg(feature = "turso")]
 mod turso_cfg;
+#[cfg(feature = "turso")]
 pub use turso_cfg::{NativeCdcLevel, TursoSrcCfg};
 
 mod schema_sensing;
@@ -126,6 +128,7 @@ pub struct MysqlSrcCfg {
 pub enum SourceCfg {
     Postgres(PostgresSrcCfg),
     Mysql(MysqlSrcCfg),
+    #[cfg(feature = "turso")]
     Turso(turso_cfg::TursoSrcCfg),
 }
 

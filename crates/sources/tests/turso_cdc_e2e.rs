@@ -1,3 +1,5 @@
+#![cfg(feature = "turso")]
+
 //! End-to-end CDC tests for the Turso source.
 //!
 //! **STATUS: EXPERIMENTAL / PAUSED**

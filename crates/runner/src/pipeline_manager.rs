@@ -154,8 +154,9 @@ impl PipelineManager {
 
         let table_patterns = match &spec.spec.source {
             SourceCfg::Mysql(c) => c.tables.clone(),
-            SourceCfg::Turso(c) => c.tables.clone(),
             SourceCfg::Postgres(_) => vec![],
+            #[cfg(feature = "turso")]
+            SourceCfg::Turso(c) => c.tables.clone(),
         };
 
         let (event_tx, event_rx) = mpsc::channel::<Event>(4096);
