@@ -99,6 +99,22 @@ impl MySqlSchemaLoader {
             "schema preload complete"
         );
 
+        let mut conn = self.pool.get_conn().await.map_err(conn_error)?;
+        let row_image: String = conn
+            .query_first("SELECT @@binlog_row_image")
+            .await
+            .map_err(query_error)?
+            .unwrap();
+
+        if row_image.to_lowercase() != "full" {
+            warn!(
+                dns=redact_password(&self.dsn),
+                binlog_row_image = %row_image,
+                "binlog_row_image is not FULL - before images may be incomplete. \
+                Consider: SET GLOBAL binlog_row_image = 'FULL'"
+            );
+        }
+
         Ok(tables)
     }
 
@@ -252,16 +268,6 @@ impl MySqlSchemaLoader {
         self.cache.try_read().ok().and_then(|guard| {
             guard.get(&(db.to_string(), table.to_string())).cloned()
         })
-    }
-
-    /// Get all cached schemas.
-    pub async fn list_cached(&self) -> Vec<((String, String), LoadedSchema)> {
-        self.cache
-            .read()
-            .await
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
     }
 
     /// Check if schema has changed and update if needed.
