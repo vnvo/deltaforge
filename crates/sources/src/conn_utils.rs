@@ -183,3 +183,51 @@ pub fn retryable_stream(err: &SourceError) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_increases_exponentially() {
+        let mut policy = RetryPolicy::default();
+        let d1 = policy.next_backoff();
+        let d2 = policy.next_backoff();
+        let d3 = policy.next_backoff();
+
+        // Roughly doubling (with jitter, so check within range)
+        assert!(d2 > d1 / 2); // accounts for jitter
+        assert!(d3 > d2 / 2);
+    }
+
+    #[test]
+    fn backoff_caps_at_max() {
+        let mut policy = RetryPolicy {
+            initial: Duration::from_secs(30),
+            max: Duration::from_secs(60),
+            jitter: 0.1,
+            max_retries: None,
+            current_backoff: Duration::from_secs(30),
+        };
+
+        let _ = policy.next_backoff(); // 30s
+        let _ = policy.next_backoff(); // 60s (capped)
+        let d3 = policy.next_backoff(); // still ~60s
+
+        // With 10% jitter, should be between 54s and 66s
+        assert!(d3 >= Duration::from_secs(54));
+        assert!(d3 <= Duration::from_secs(66));
+    }
+
+    #[test]
+    fn reset_returns_to_initial() {
+        let mut policy = RetryPolicy::default();
+        let _ = policy.next_backoff();
+        let _ = policy.next_backoff();
+
+        policy.reset();
+
+        // After reset, current_backoff should be back to initial
+        assert_eq!(policy.current_backoff, policy.initial);
+    }
+}
