@@ -16,13 +16,66 @@ DeltaForge is a modular, config-driven [Change Data Capture](cdc.md) (CDC) micro
 
 Pipelines are defined declaratively in YAML, making it straightforward to onboard new use cases without custom code.
 
+<table>
+  <tr>
+    <td align="center" width="140">
+      <b>Built with</b>
+    </td>
+    <td align="center" width="140">
+      <b>Sources</b>
+    </td>
+    <td align="center" width="140">
+      <b>Processors</b>
+    </td>
+    <td align="center" width="140">
+      <b>Sinks</b>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/rust/rust-original.svg" width="40" height="40" alt="Rust">
+      <br><sub>Rust</sub>
+    </td>
+    <td align="center">
+      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/mysql/mysql-original.svg" width="40" height="40" alt="MySQL">
+      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/postgresql/postgresql-original.svg" width="40" height="40" alt="PostgreSQL">
+      <br><sub>MySQL · PostgreSQL</sub>
+    </td>
+    <td align="center">
+      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/javascript/javascript-original.svg" width="40" height="40" alt="JavaScript">
+      <br><sub>JavaScript</sub>
+    </td>
+    <td align="center">
+      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/apachekafka/apachekafka-original.svg" width="40" height="40" alt="Kafka">
+      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/redis/redis-original.svg" width="40" height="40" alt="Redis">
+      <br><sub>Kafka · Redis</sub>
+    </td>
+  </tr>
+</table>
+
 ## Why DeltaForge?
 
-- ⚡ **Powered by Rust** : Predictable performance, memory safety, and reliable operations.
-- 🔌 **Pluggable sources & sinks** : MySQL binlog and Postgres logical replication today, with more planned.
-- 🧩 **Config-driven pipelines** : Define sources, processors, sinks, batching, and commit policies in YAML.
-- 📦 **Built-in checkpointing** : Resume safely after restarts with exactly-once delivery semantics.
-- 🛠️ **Operational guardrails** : Structured logging, Prometheus metrics, and health endpoints out of the box.
+### Core Strengths
+
+- ⚡ **Powered by Rust** : Predictable performance, memory safety, and minimal resource footprint.
+- 🔌 **Pluggable architecture** : Sources, processors, and sinks are modular and independently extensible.
+- 🧩 **Declarative pipelines** : Define sources, transforms, sinks, and commit policies in version-controlled YAML with environment variable expansion for secrets.
+- 📦 **Reliable checkpointing** : Resume safely after restarts with at-least-once delivery guarantees.
+- 🛠️ **Cloud-native ready** : Single binary, Docker images, JSON logs, Prometheus metrics, and liveness/readiness probes for Kubernetes.
+
+
+### Schema Intelligence
+
+- 🔍 **Schema sensing** : Automatically infer and track schema from event payloads, including deep inspection of nested JSON structures.
+- 🏷️ **Schema fingerprinting** : SHA-256 based change detection with schema-to-checkpoint correlation for reliable replay.
+- 🗃️ **Source-owned semantics** : Preserves native database types (PostgreSQL arrays, MySQL JSON, etc.) instead of normalizing to a universal type system.
+
+### Operational Features
+
+- 🔄 **Automatic reconnection** : Exponential backoff with jitter for resilient connections.
+- 🎯 **Flexible table selection** : Wildcard patterns (`db.*`, `schema.prefix%`) for easy onboarding.
+- 🔀 **Transaction boundaries** : Optionally keep source transactions intact across batches.
+- ⚙️ **Commit policies** : Control checkpoint behavior with `all`, `required`, or `quorum` modes across multiple sinks.
 
 ## Use Cases
 

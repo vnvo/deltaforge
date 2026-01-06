@@ -43,7 +43,9 @@ spec:
 
 ## Sources
 
-### MySQL
+### <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/mysql/mysql-original.svg" width="24" height="24" style="vertical-align: middle;"> MySQL
+
+Captures row-level changes via binlog replication. See [MySQL source documentation](mysql.md) for prerequisites and detailed configuration.
 
 ```yaml
 source:
@@ -58,9 +60,15 @@ source:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `id` | string | Yes | Logical identifier for metrics and logging |
-| `dsn` | string | Yes | MySQL connection string |
-| `tables` | array | Yes | Tables to capture (supports wildcards like `shop.order%`) |
+| `id` | string | Yes | Unique identifier for checkpoints, server_id derivation, and metrics |
+| `dsn` | string | Yes | MySQL connection string with replication privileges |
+| `tables` | array | No | Table patterns to capture; omit to capture all user tables |
+
+**Table patterns** support SQL LIKE syntax:
+- `db.table` — exact match
+- `db.prefix%` — tables matching prefix
+- `db.*` — all tables in database
+- `%.table` — table in any database
 
 ### Turso
 
@@ -88,29 +96,39 @@ source:
 | `poll_interval_ms` | integer | No | `1000` | Polling interval in milliseconds |
 | `native_cdc.level` | string | No | `data` | Native CDC level: `binlog` or `data` |
 
-### PostgreSQL
+### <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/postgresql/postgresql-original.svg" width="24" height="24" style="vertical-align: middle;"> PostgreSQL
 
-> **Note:** PostgreSQL configuration is parsed but the source implementation is not yet complete.
+Captures row-level changes via logical replication using the pgoutput plugin. See [PostgreSQL source documentation](postgres.md) for prerequisites and detailed configuration.
 
 ```yaml
 source:
   type: postgres
   config:
-    id: pg-main
+    id: orders-postgres
     dsn: ${POSTGRES_DSN}
-    publication: my_pub
-    slot: my_slot
+    slot: deltaforge_orders
+    publication: orders_pub
     tables:
       - public.orders
+      - public.order_items
+    start_position: earliest
 ```
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `id` | string | Yes | Logical identifier |
-| `dsn` | string | Yes | PostgreSQL connection string |
-| `publication` | string | No | Logical replication publication name |
-| `slot` | string | No | Replication slot name |
-| `tables` | array | Yes | Tables to capture |
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `id` | string | Yes | — | Unique identifier for checkpoints and metrics |
+| `dsn` | string | Yes | — | PostgreSQL connection string (URL or key=value format) |
+| `slot` | string | Yes | — | Replication slot name |
+| `publication` | string | Yes | — | Publication name |
+| `tables` | array | Yes | — | Table patterns to capture |
+| `start_position` | string/object | No | `earliest` | Start position when no checkpoint: `earliest`, `latest`, or `{lsn: "X/Y"}` |
+
+**Table patterns** support SQL LIKE syntax (same as MySQL):
+- `schema.table` — exact match
+- `schema.prefix%` — tables matching prefix
+- `schema.*` — all tables in schema
+- `%.table` — table in any schema
+- `table` — defaults to `public.table`
 
 ---
 
@@ -118,7 +136,7 @@ source:
 
 Processors transform batches of events before delivery to sinks.
 
-### JavaScript
+### <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/javascript/javascript-original.svg" width="24" height="24" style="vertical-align: middle;"> JavaScript
 
 ```yaml
 processors:
@@ -155,7 +173,7 @@ The `processBatch(events)` function receives an array of events and can return:
 
 ## Sinks
 
-### Kafka
+### <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/apachekafka/apachekafka-original.svg" width="24" height="24" style="vertical-align: middle;"> Kafka
 
 ```yaml
 sinks:
@@ -179,7 +197,7 @@ sinks:
 | `exactly_once` | bool | No | `false` | Enable EOS semantics |
 | `client_conf` | map | No | `{}` | Raw librdkafka configuration overrides |
 
-### Redis
+### <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/redis/redis-original.svg" width="24" height="24" style="vertical-align: middle;"> Redis
 
 ```yaml
 sinks:
@@ -274,6 +292,8 @@ schema_sensing:
 
 ## Complete example
 
+### MySQL to Kafka
+
 ```yaml
 apiVersion: deltaforge/v1
 kind: Pipeline
@@ -340,4 +360,43 @@ spec:
     sampling:
       warmup_events: 50
       sample_rate: 5
+```
+
+### PostgreSQL to Kafka
+
+```yaml
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: users-postgres-to-kafka
+  tenant: acme
+
+spec:
+  source:
+    type: postgres
+    config:
+      id: users-postgres
+      dsn: ${POSTGRES_DSN}
+      slot: deltaforge_users
+      publication: users_pub
+      tables:
+        - public.users
+        - public.user_sessions
+      start_position: earliest
+
+  sinks:
+    - type: kafka
+      config:
+        id: users-kafka
+        brokers: ${KAFKA_BROKERS}
+        topic: user-events
+        required: true
+
+  batch:
+    max_events: 500
+    max_ms: 1000
+    respect_source_tx: true
+
+  commit_policy:
+    mode: required
 ```
