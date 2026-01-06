@@ -16,3 +16,6 @@ tracing.workspace = true
 tokio-util.workspace = true
 thiserror.workspace = true
 checkpoints = { path = "../checkpoints" }
+
+[lints]
+workspace = true

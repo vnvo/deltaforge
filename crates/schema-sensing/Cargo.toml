@@ -20,3 +20,6 @@ deltaforge-config = { path = "../deltaforge-config" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

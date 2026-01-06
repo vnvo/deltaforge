@@ -7,9 +7,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 walkdir ={ version = "2.5"}
 thiserror.workspace = true
-anyhow.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 serde_yaml.workspace = true
 shellexpand.workspace = true
 tracing.workspace = true
@@ -18,3 +16,6 @@ tracing.workspace = true
 tempfile = "3"
 pretty_assertions = "1"
 serial_test = "3"
+
+[lints]
+workspace = true

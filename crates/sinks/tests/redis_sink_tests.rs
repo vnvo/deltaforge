@@ -54,7 +54,7 @@ async fn redis_sink_writes_stream() -> Result<()> {
         None,
         Some(json!({"id":1})),
         1_700_000_000_000,
-        4 as usize,
+        4_usize,
     );
 
     // Act: send the event into the Redis sink

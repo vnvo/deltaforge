@@ -104,20 +104,16 @@ pub struct PostgresSrcCfg {
     pub start_position: PostgresStartPosition,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PostgresStartPosition {
+    #[default]
     Earliest,
     Latest,
     #[serde(rename = "lsn")]
     Lsn(String),
 }
 
-impl Default for PostgresStartPosition {
-    fn default() -> Self {
-        PostgresStartPosition::Earliest
-    }
-}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MysqlSrcCfg {
     pub id: String,

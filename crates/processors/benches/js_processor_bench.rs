@@ -24,7 +24,7 @@ fn make_small_event() -> Event {
         None,
         Some(json!({"id": 1, "sku": "ABC-1", "qty": 2})),
         1_700_000_000_000,
-        10 as usize,
+        10_usize,
     )
 }
 
@@ -47,7 +47,7 @@ fn make_large_event(bytes: usize) -> Event {
             "nested": {"k": [1,2,3,4,5]}
         })),
         1_700_000_000_000,
-        25 as usize,
+        25_usize,
     )
 }
 
@@ -57,7 +57,7 @@ struct RustNoop;
 #[async_trait::async_trait]
 impl Processor for RustNoop {
     fn id(&self) -> &str {
-        "noop".into()
+        "noop"
     }
     async fn process(&self, events: Vec<Event>) -> Result<Vec<Event>> {
         // Just pass the same Vec through without touching it.

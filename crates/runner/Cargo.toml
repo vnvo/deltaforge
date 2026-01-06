@@ -36,3 +36,6 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 [[bench]]
 name = "pipeline_e2e"
 harness = false
+
+[lints]
+workspace = true

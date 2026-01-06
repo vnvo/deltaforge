@@ -7,8 +7,6 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 metrics.workspace = true
 async-trait.workspace = true
-futures.workspace = true
-parking_lot.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 deltaforge-config = { path = "../deltaforge-config" }
@@ -19,7 +17,6 @@ anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 chrono.workspace = true
-uuid.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 mysql-binlog-connector-rust = "0.3"
@@ -45,3 +42,6 @@ tracing-subscriber = { version = "0.3", features = [
     "json",
 ] }
 tempfile = "3"
+
+[lints]
+workspace = true

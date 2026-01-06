@@ -13,6 +13,7 @@ fn write_temp(contents: &str) -> tempfile::TempPath {
 
 #[test]
 #[serial]
+#[allow(unsafe_code)]
 fn parses_minimal_postgres_pipeline_with_env_expansion() {
     unsafe {
         std::env::set_var(
@@ -94,6 +95,7 @@ spec:
 
 #[test]
 #[serial]
+#[allow(unsafe_code)]
 fn parses_mysql_and_multiple_sinks() {
     unsafe {
         std::env::set_var(
@@ -238,7 +240,10 @@ spec:
 "#;
     let p_all = write_temp(yaml_all);
     let spec_all = load_from_path(p_all.to_str().unwrap()).expect("parse all");
-    assert!(matches!(spec_all.spec.commit_policy, Some(CommitPolicy::All)));
+    assert!(matches!(
+        spec_all.spec.commit_policy,
+        Some(CommitPolicy::All)
+    ));
 
     // Required
     let yaml_required = r#"
@@ -260,8 +265,12 @@ spec:
   sinks: []
 "#;
     let p_req = write_temp(yaml_required);
-    let spec_req = load_from_path(p_req.to_str().unwrap()).expect("parse required");
-    assert!(matches!(spec_req.spec.commit_policy, Some(CommitPolicy::Required)));
+    let spec_req =
+        load_from_path(p_req.to_str().unwrap()).expect("parse required");
+    assert!(matches!(
+        spec_req.spec.commit_policy,
+        Some(CommitPolicy::Required)
+    ));
 
     // Quorum
     let yaml_quorum = r#"
@@ -284,11 +293,14 @@ spec:
   sinks: []
 "#;
     let p_quorum = write_temp(yaml_quorum);
-    let spec_quorum = load_from_path(p_quorum.to_str().unwrap()).expect("parse quorum");
+    let spec_quorum =
+        load_from_path(p_quorum.to_str().unwrap()).expect("parse quorum");
 
     match spec_quorum.spec.commit_policy {
         Some(CommitPolicy::Quorum { quorum }) => assert_eq!(quorum, 2),
-        other => panic!("expected CommitPolicy::Quorum {{ quorum: 2 }}, got {other:?}"),
+        other => panic!(
+            "expected CommitPolicy::Quorum {{ quorum: 2 }}, got {other:?}"
+        ),
     }
 }
 
@@ -321,7 +333,10 @@ spec:
     let cp = spec.spec.connection_policy.as_ref().expect("present");
     assert_eq!(cp.default_mode.as_deref(), Some("dedicated"));
     assert_eq!(cp.preferred_replica.as_deref(), Some("read-replica-1"));
-    assert_eq!(cp.limits.as_ref().unwrap().max_dedicated_per_source, Some(3));
+    assert_eq!(
+        cp.limits.as_ref().unwrap().max_dedicated_per_source,
+        Some(3)
+    );
 }
 
 #[test]
@@ -371,7 +386,10 @@ spec:
 
     match &spec.spec.sinks[1] {
         SinkCfg::Kafka(k2) => {
-            assert_eq!(k2.client_conf.get("linger.ms").map(String::as_str), Some("10"));
+            assert_eq!(
+                k2.client_conf.get("linger.ms").map(String::as_str),
+                Some("10")
+            );
             assert_eq!(
                 k2.client_conf.get("message.max.bytes").map(String::as_str),
                 Some("1048576")
@@ -444,10 +462,14 @@ spec:
   processors: []
   sinks: []
 "#;
-    let spec = load_from_path(write_temp(yaml_default).to_str().unwrap()).unwrap();
+    let spec =
+        load_from_path(write_temp(yaml_default).to_str().unwrap()).unwrap();
     match &spec.spec.source {
         SourceCfg::Postgres(pc) => {
-            assert!(matches!(pc.start_position, deltaforge_config::PostgresStartPosition::Earliest));
+            assert!(matches!(
+                pc.start_position,
+                deltaforge_config::PostgresStartPosition::Earliest
+            ));
         }
         _ => panic!("expected postgres"),
     }
@@ -470,10 +492,14 @@ spec:
   processors: []
   sinks: []
 "#;
-    let spec = load_from_path(write_temp(yaml_latest).to_str().unwrap()).unwrap();
+    let spec =
+        load_from_path(write_temp(yaml_latest).to_str().unwrap()).unwrap();
     match &spec.spec.source {
         SourceCfg::Postgres(pc) => {
-            assert!(matches!(pc.start_position, deltaforge_config::PostgresStartPosition::Latest));
+            assert!(matches!(
+                pc.start_position,
+                deltaforge_config::PostgresStartPosition::Latest
+            ));
         }
         _ => panic!("expected postgres"),
     }
