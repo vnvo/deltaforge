@@ -13,7 +13,7 @@ use schema_registry::InMemoryRegistry;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use checkpoints::{CheckpointStore, CheckpointStoreExt};
 use deltaforge_core::{Event, Source, SourceHandle, SourceResult};
@@ -153,7 +153,20 @@ impl MySqlSource {
                     dispatch_event(&mut ctx, &header, data).await?;
                 }
                 Err(LoopControl::Reconnect) => {
+                    let delay = ctx.retry.next_backoff();
+                    tracing::warn!(
+                        source_id = %ctx.source_id,
+                        delay_ms = delay.as_millis(),
+                        "scheduling reconnect after backoff"
+                    );
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = ctx.cancel.cancelled() => break,
+                    }
+
                     stream = reconnect_stream(&mut ctx).await?;
+                    ctx.retry.reset();
                 }
                 Err(LoopControl::Stop) => break,
                 Err(LoopControl::Fail(e)) => return Err(e),
@@ -320,6 +333,8 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
         ctx.retry.clone(),
     )
     .await?;
+
+    ctx.retry.reset();
 
     Ok(stream)
 }
