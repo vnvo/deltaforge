@@ -48,7 +48,11 @@ pub fn build_object(
 ) -> Value {
     let mut obj = serde_json::Map::with_capacity(columns.len());
 
-    debug!(columns = columns.len(), values = values.len(), "building object");
+    debug!(
+        columns = columns.len(),
+        values = values.len(),
+        "building object"
+    );
 
     for (idx, col) in columns.iter().enumerate() {
         let value = values.get(idx).unwrap_or(&PgColumnValue::Null);
@@ -107,9 +111,7 @@ fn convert_text_value(s: &str, type_oid: u32) -> Value {
             // Keep as string to preserve precision
             json!(s)
         }
-        JSON | JSONB => {
-            serde_json::from_str::<Value>(s).unwrap_or(json!(s))
-        }
+        JSON | JSONB => serde_json::from_str::<Value>(s).unwrap_or(json!(s)),
         BYTEA => {
             // bytea in text format is hex-escaped: \x...
             if let Some(hex) = s.strip_prefix("\\x") {
@@ -123,9 +125,7 @@ fn convert_text_value(s: &str, type_oid: u32) -> Value {
             }
         }
         // Array types (PostgreSQL array OIDs are base type + offset)
-        oid if is_array_type(oid) => {
-            parse_pg_array(s)
-        }
+        oid if is_array_type(oid) => parse_pg_array(s),
         // UUID
         UUID => json!(s),
         // Timestamps - keep as string for ISO 8601 format
@@ -160,14 +160,14 @@ fn is_array_type(oid: u32) -> bool {
         1015 |  // varchar[]
         2951 |  // uuid[]
         3802 |  // jsonb[]
-        199     // json[]
+        199 // json[]
     )
 }
 
 /// Parse PostgreSQL array literal to JSON array.
 fn parse_pg_array(s: &str) -> Value {
     let s = s.trim();
-    
+
     // Empty array
     if s == "{}" {
         return json!([]);
@@ -180,7 +180,7 @@ fn parse_pg_array(s: &str) -> Value {
 
     let inner = &s[1..s.len() - 1];
     let elements = parse_array_elements(inner);
-    
+
     Value::Array(elements)
 }
 
@@ -227,9 +227,16 @@ fn parse_array_elements(s: &str) -> Vec<Value> {
 /// Parse a single array element.
 fn parse_array_element(s: &str) -> Value {
     let s = s.trim();
-    
+
     if s.eq_ignore_ascii_case("null") {
         return Value::Null;
+    }
+
+    // Handle booleans (PostgreSQL uses t/f in arrays)
+    match s.to_lowercase().as_str() {
+        "t" | "true" => return json!(true),
+        "f" | "false" => return json!(false),
+        _ => {}
     }
 
     // Try to parse as number
@@ -239,14 +246,17 @@ fn parse_array_element(s: &str) -> Value {
     if let Ok(f) = s.parse::<f64>() {
         return json!(f);
     }
-    
+
     // Keep as string
     json!(s)
 }
 
 /// Parse tuple data from pgoutput message.
 /// Returns (values, bytes_consumed).
-pub fn parse_tuple_data(data: &Bytes, column_count: usize) -> (Vec<PgColumnValue>, usize) {
+pub fn parse_tuple_data(
+    data: &Bytes,
+    column_count: usize,
+) -> (Vec<PgColumnValue>, usize) {
     let mut values = Vec::with_capacity(column_count);
     let mut offset = 0;
     let data = data.as_ref();
@@ -284,7 +294,8 @@ pub fn parse_tuple_data(data: &Bytes, column_count: usize) -> (Vec<PgColumnValue
                 if offset + len > data.len() {
                     break;
                 }
-                let text = String::from_utf8_lossy(&data[offset..offset + len]).to_string();
+                let text = String::from_utf8_lossy(&data[offset..offset + len])
+                    .to_string();
                 offset += len;
                 PgColumnValue::Text(text)
             }
@@ -419,10 +430,7 @@ mod tests {
             parse_pg_array(r#"{"hello","world"}"#),
             json!(["hello", "world"])
         );
-        assert_eq!(
-            parse_pg_array("{1,NULL,3}"),
-            json!([1, Value::Null, 3])
-        );
+        assert_eq!(parse_pg_array("{1,NULL,3}"), json!([1, Value::Null, 3]));
     }
 
     #[test]
