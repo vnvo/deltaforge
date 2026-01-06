@@ -110,9 +110,7 @@ pub enum PostgresStartPosition {
     Earliest,
     Latest,
     #[serde(rename = "lsn")]
-    Lsn {
-        lsn: String,
-    },
+    Lsn(String),
 }
 
 impl Default for PostgresStartPosition {
