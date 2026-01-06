@@ -4,6 +4,7 @@ use deltaforge_core::{Event, Op, Source};
 use mysql_async::{Pool as MySQLPool, prelude::Queryable};
 use schema_registry::{InMemoryRegistry, SourceSchema};
 use sources::mysql::{MySqlSchemaLoader, MySqlSource};
+use sources::SourceSchemaLoader;
 use std::sync::Arc;
 use std::time::Instant;
 use testcontainers::runners::AsyncRunner;
@@ -187,7 +188,7 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
         assert_eq!(col_names, vec!["id", "sku", "payload", "blobz"]);
 
         // Check primary key
-        assert_eq!(schema.primary_key, vec!["id"]);
+        assert_eq!(schema.primary_key, vec!["id".to_string()]);
 
         // Check specific column types
         let id_col = schema.column("id").expect("id column");
@@ -295,7 +296,7 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
 
         let orders_cached = cached
             .iter()
-            .find(|((db, t), _)| db == "shop" && t == "orders");
+            .find(|entry| entry.database == "shop" && entry.table == "orders");
         assert!(orders_cached.is_some(), "orders should be in cache");
 
         info!("schema caching works");
