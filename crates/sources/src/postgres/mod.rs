@@ -276,6 +276,21 @@ impl PostgresSource {
                 Err(LoopControl::Reconnect) => {
                     // Reconnect logic
                     info!(source_id = %self.id, "reconnecting to replication...");
+                    let delay = ctx.retry.next_backoff();
+                    warn!(
+                        source_id = %self.id,
+                        delay_ms = delay.as_millis(),
+                        "scheduling reconnect after backoff"
+                    );
+
+                    // Wait with cancellation support
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = ctx.cancel.cancelled() => {
+                            info!(source_id = %self.id, "cancelled during reconnect backoff");
+                            break;
+                        }
+                    }
 
                     let reconnect_config =
                         pgwire_replication::ReplicationConfig {
@@ -283,15 +298,23 @@ impl PostgresSource {
                             ..config.clone()
                         };
 
-                    let new_client = connect_replication_with_retries(
+                    match connect_replication_with_retries(
                         &self.id,
                         reconnect_config,
                         &ctx.cancel,
                         ctx.retry.clone(),
                     )
-                    .await?;
-
-                    *ctx.repl_client.lock().await = new_client;
+                    .await
+                    {
+                        Ok(new_client) => {
+                            *ctx.repl_client.lock().await = new_client;
+                            ctx.retry.reset(); // Reset backoff on successful reconnect
+                        }
+                        Err(e) => {
+                            error!(source_id = %self.id, error = %e, "reconnect failed after retries");
+                            return Err(e);
+                        }
+                    }
                 }
                 Err(LoopControl::Stop) => break,
                 Err(LoopControl::Fail(e)) => return Err(e),
