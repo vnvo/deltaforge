@@ -117,7 +117,10 @@ impl PostgresTableSchema {
     }
 
     /// Set replica identity.
-    pub fn with_replica_identity(mut self, identity: impl Into<String>) -> Self {
+    pub fn with_replica_identity(
+        mut self,
+        identity: impl Into<String>,
+    ) -> Self {
         self.replica_identity = Some(identity.into());
         self
     }
@@ -326,8 +329,13 @@ mod tests {
                 .with_type_oid(type_oids::VARCHAR)
                 .with_char_max_length(255),
             PostgresColumn::new("tags", "text[]", true, 3).as_array("text"),
-            PostgresColumn::new("created_at", "timestamp with time zone", false, 4)
-                .with_type_oid(type_oids::TIMESTAMPTZ),
+            PostgresColumn::new(
+                "created_at",
+                "timestamp with time zone",
+                false,
+                4,
+            )
+            .with_type_oid(type_oids::TIMESTAMPTZ),
         ])
         .with_primary_key(vec!["id".into()])
         .with_replica_identity("full")
@@ -362,7 +370,8 @@ mod tests {
     fn test_fingerprint_changes_with_columns() {
         let s1 = test_schema();
         let mut s2 = test_schema();
-        s2.columns.push(PostgresColumn::new("email", "text", true, 5));
+        s2.columns
+            .push(PostgresColumn::new("email", "text", true, 5));
 
         assert_ne!(s1.fingerprint(), s2.fingerprint());
     }
@@ -391,8 +400,7 @@ mod tests {
         let col_array = PostgresColumn::new("a", "integer[]", true, 2);
         assert_eq!(col_array.base_type(), "integer");
 
-        let col_numeric =
-            PostgresColumn::new("n", "numeric(10,2)", true, 3);
+        let col_numeric = PostgresColumn::new("n", "numeric(10,2)", true, 3);
         assert_eq!(col_numeric.base_type(), "numeric");
     }
 

@@ -52,20 +52,26 @@ impl From<PostgresSourceError> for SourceError {
             PostgresSourceError::InvalidDsn(dsn) => SourceError::Incompatible {
                 details: format!("invalid PostgreSQL DSN: {dsn}").into(),
             },
-            PostgresSourceError::ReplicationConnect(msg) => SourceError::Connect {
-                details: msg.into(),
-            },
+            PostgresSourceError::ReplicationConnect(msg) => {
+                SourceError::Connect {
+                    details: msg.into(),
+                }
+            }
             PostgresSourceError::Auth(msg) => SourceError::Auth {
                 details: msg.into(),
             },
             PostgresSourceError::PublicationNotFound { publication } => {
                 SourceError::Incompatible {
-                    details: format!("publication '{publication}' not found").into(),
+                    details: format!("publication '{publication}' not found")
+                        .into(),
                 }
             }
-            PostgresSourceError::SlotNotFound { slot } => SourceError::Incompatible {
-                details: format!("replication slot '{slot}' not found").into(),
-            },
+            PostgresSourceError::SlotNotFound { slot } => {
+                SourceError::Incompatible {
+                    details: format!("replication slot '{slot}' not found")
+                        .into(),
+                }
+            }
             PostgresSourceError::Schema {
                 schema,
                 table,
@@ -79,7 +85,9 @@ impl From<PostgresSourceError> for SourceError {
             PostgresSourceError::LsnParse(msg) => SourceError::Incompatible {
                 details: format!("LSN parse error: {msg}").into(),
             },
-            PostgresSourceError::Protocol(msg) => SourceError::Other(anyhow::anyhow!(msg)),
+            PostgresSourceError::Protocol(msg) => {
+                SourceError::Other(anyhow::anyhow!(msg))
+            }
             PostgresSourceError::Io(e) => SourceError::Io(e),
             PostgresSourceError::Database(msg) => {
                 SourceError::Other(anyhow::anyhow!("database error: {msg}"))

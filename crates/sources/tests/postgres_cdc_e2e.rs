@@ -2,12 +2,14 @@ use anyhow::Result;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
 use deltaforge_core::{Event, Op, Source};
 use schema_registry::{InMemoryRegistry, SourceSchema};
-use sources::postgres::{PostgresSchemaLoader, PostgresSource};
 use sources::SourceSchemaLoader;
+use sources::postgres::{PostgresSchemaLoader, PostgresSource};
 use std::sync::Arc;
 use std::time::Instant;
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt, core::IntoContainerPort, core::WaitFor};
+use testcontainers::{
+    GenericImage, ImageExt, core::IntoContainerPort, core::WaitFor,
+};
 use tokio::{
     io::AsyncBufReadExt,
     sync::mpsc,
@@ -102,8 +104,12 @@ async fn postgres_cdc_end_to_end() -> Result<()> {
     info!("starting PostgreSQL CDC e2e test ...");
 
     let port = 5433;
-    let dsn = format!("host=127.0.0.1 port={} user=postgres password=password dbname=shop", port);
-    let dsn_url = format!("postgres://postgres:password@127.0.0.1:{}/shop", port);
+    let dsn = format!(
+        "host=127.0.0.1 port={} user=postgres password=password dbname=shop",
+        port
+    );
+    let dsn_url =
+        format!("postgres://postgres:password@127.0.0.1:{}/shop", port);
 
     // Connect for setup
     let (client, conn) = tokio_postgres::connect(&dsn, NoTls).await?;
@@ -114,14 +120,9 @@ async fn postgres_cdc_end_to_end() -> Result<()> {
     });
 
     // Sanity-check that wal_level is logical
-    let row = client
-        .query_one("SHOW wal_level", &[])
-        .await?;
+    let row = client.query_one("SHOW wal_level", &[]).await?;
     let wal_level: &str = row.get(0);
-    assert_eq!(
-        wal_level, "logical",
-        "wal_level must be 'logical' for CDC"
-    );
+    assert_eq!(wal_level, "logical", "wal_level must be 'logical' for CDC");
     info!("wal_level = {}", wal_level);
 
     // Create schema
@@ -141,10 +142,7 @@ async fn postgres_cdc_end_to_end() -> Result<()> {
 
     // Create replication user with proper privileges
     client
-        .execute(
-            "CREATE USER df WITH REPLICATION PASSWORD 'dfpw'",
-            &[],
-        )
+        .execute("CREATE USER df WITH REPLICATION PASSWORD 'dfpw'", &[])
         .await
         .ok(); // Ignore if exists
     debug!("user `df` created");
@@ -161,10 +159,7 @@ async fn postgres_cdc_end_to_end() -> Result<()> {
         .execute("DROP PUBLICATION IF EXISTS deltaforge_pub", &[])
         .await?;
     client
-        .execute(
-            "CREATE PUBLICATION deltaforge_pub FOR TABLE orders",
-            &[],
-        )
+        .execute("CREATE PUBLICATION deltaforge_pub FOR TABLE orders", &[])
         .await?;
     debug!("publication `deltaforge_pub` created");
 
@@ -176,7 +171,7 @@ async fn postgres_cdc_end_to_end() -> Result<()> {
         )
         .await
         .ok(); // Ignore errors
-    
+
     // Drop slot if exists (cleaner approach)
     let slot_exists: bool = client
         .query_one(
@@ -185,7 +180,7 @@ async fn postgres_cdc_end_to_end() -> Result<()> {
         )
         .await?
         .get(0);
-    
+
     if slot_exists {
         client
             .execute("SELECT pg_drop_replication_slot('deltaforge_slot')", &[])
@@ -212,7 +207,8 @@ async fn postgres_cdc_end_to_end() -> Result<()> {
     info!("--- Testing schema loader ---");
 
     let registry = Arc::new(InMemoryRegistry::new());
-    let schema_loader = PostgresSchemaLoader::new(&dsn_url, registry.clone(), "acme");
+    let schema_loader =
+        PostgresSchemaLoader::new(&dsn_url, registry.clone(), "acme");
 
     // Test 1: Expand exact pattern
     {
@@ -304,7 +300,11 @@ async fn postgres_cdc_end_to_end() -> Result<()> {
             .await?;
         assert!(tables.len() >= 2, "wildcard should match at least 2 tables");
         assert!(tables.iter().any(|(s, t)| s == "public" && t == "orders"));
-        assert!(tables.iter().any(|(s, t)| s == "public" && t == "order_items"));
+        assert!(
+            tables
+                .iter()
+                .any(|(s, t)| s == "public" && t == "order_items")
+        );
         info!("wildcard pattern expansion works");
     }
 
@@ -346,9 +346,9 @@ async fn postgres_cdc_end_to_end() -> Result<()> {
         let cached = schema_loader.list_cached().await;
         assert!(!cached.is_empty(), "cache should not be empty");
 
-        let orders_cached = cached
-            .iter()
-            .find(|entry| entry.database == "public" && entry.table == "orders");
+        let orders_cached = cached.iter().find(|entry| {
+            entry.database == "public" && entry.table == "orders"
+        });
         assert!(orders_cached.is_some(), "orders should be in cache");
 
         info!("schema caching works");
@@ -375,7 +375,8 @@ async fn postgres_cdc_end_to_end() -> Result<()> {
         registry: Arc::new(InMemoryRegistry::new()),
     };
 
-    let ckpt_store: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let ckpt_store: Arc<dyn CheckpointStore> =
+        Arc::new(MemCheckpointStore::new()?);
 
     let (tx, mut rx) = mpsc::channel::<Event>(128);
     let handle = src.run(tx, ckpt_store).await;
@@ -399,7 +400,9 @@ async fn postgres_cdc_end_to_end() -> Result<()> {
 
     // 3) DELETE
     client.execute("DELETE FROM orders WHERE id=1", &[]).await?;
-    debug!("insert, update and delete performed on `orders` - expecting CDC events ...");
+    debug!(
+        "insert, update and delete performed on `orders` - expecting CDC events ..."
+    );
 
     // Expect at least 3 events (insert/update/delete for our row), but there
     // may be additional events from DDL or other internal activity. We collect
@@ -564,7 +567,8 @@ async fn postgres_cdc_end_to_end() -> Result<()> {
     let _ = handle.join().await;
 
     // Cleanup: drop slot to prevent WAL accumulation
-    let (cleanup_client, cleanup_conn) = tokio_postgres::connect(&dsn, NoTls).await?;
+    let (cleanup_client, cleanup_conn) =
+        tokio_postgres::connect(&dsn, NoTls).await?;
     tokio::spawn(async move {
         let _ = cleanup_conn.await;
     });
@@ -608,7 +612,8 @@ async fn postgres_cdc_extended_types() -> Result<()> {
         "host=127.0.0.1 port={} user=postgres password=password dbname=testdb",
         port
     );
-    let dsn_url = format!("postgres://postgres:password@127.0.0.1:{}/testdb", port);
+    let dsn_url =
+        format!("postgres://postgres:password@127.0.0.1:{}/testdb", port);
 
     let (client, conn) = tokio_postgres::connect(&dsn, NoTls).await?;
     tokio::spawn(async move {
@@ -663,7 +668,8 @@ async fn postgres_cdc_extended_types() -> Result<()> {
 
     // Test schema loading with extended types
     let registry = Arc::new(InMemoryRegistry::new());
-    let schema_loader = PostgresSchemaLoader::new(&dsn_url, registry.clone(), "acme");
+    let schema_loader =
+        PostgresSchemaLoader::new(&dsn_url, registry.clone(), "acme");
 
     let loaded = schema_loader
         .load_schema("public", "extended_types")
@@ -701,7 +707,8 @@ async fn postgres_cdc_extended_types() -> Result<()> {
         registry: Arc::new(InMemoryRegistry::new()),
     };
 
-    let ckpt_store: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let ckpt_store: Arc<dyn CheckpointStore> =
+        Arc::new(MemCheckpointStore::new()?);
     let (tx, mut rx) = mpsc::channel::<Event>(128);
     let handle = src.run(tx, ckpt_store).await;
 
@@ -798,7 +805,8 @@ async fn postgres_replica_identity_modes() -> Result<()> {
         "host=127.0.0.1 port={} user=postgres password=password dbname=testdb",
         port
     );
-    let dsn_url = format!("postgres://postgres:password@127.0.0.1:{}/testdb", port);
+    let dsn_url =
+        format!("postgres://postgres:password@127.0.0.1:{}/testdb", port);
 
     let (client, conn) = tokio_postgres::connect(&dsn, NoTls).await?;
     tokio::spawn(async move {
@@ -857,9 +865,11 @@ async fn postgres_replica_identity_modes() -> Result<()> {
 
     // Verify schema loader captures replica identity
     let registry = Arc::new(InMemoryRegistry::new());
-    let schema_loader = PostgresSchemaLoader::new(&dsn_url, registry.clone(), "acme");
+    let schema_loader =
+        PostgresSchemaLoader::new(&dsn_url, registry.clone(), "acme");
 
-    let default_schema = schema_loader.load_schema("public", "ri_default").await?;
+    let default_schema =
+        schema_loader.load_schema("public", "ri_default").await?;
     assert_eq!(
         default_schema.schema.replica_identity,
         Some("default".to_string())
@@ -889,7 +899,8 @@ async fn postgres_replica_identity_modes() -> Result<()> {
         registry: Arc::new(InMemoryRegistry::new()),
     };
 
-    let ckpt_store: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let ckpt_store: Arc<dyn CheckpointStore> =
+        Arc::new(MemCheckpointStore::new()?);
     let (tx, mut rx) = mpsc::channel::<Event>(128);
     let handle = src.run(tx, ckpt_store).await;
 
@@ -903,10 +914,7 @@ async fn postgres_replica_identity_modes() -> Result<()> {
         )
         .await?;
     client
-        .execute(
-            "INSERT INTO ri_full (id, data) VALUES (1, 'original')",
-            &[],
-        )
+        .execute("INSERT INTO ri_full (id, data) VALUES (1, 'original')", &[])
         .await?;
 
     client
