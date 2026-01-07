@@ -41,6 +41,9 @@ ARG TARGETARCH
 COPY --from=builder /runtime/lib/* /lib/
 COPY --from=builder /runtime/lib64/* /lib64/
 
+# Copy CA certificates for TLS connections
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+
 # Copy binary
 COPY --from=builder /app/target/release/runner /deltaforge
 
