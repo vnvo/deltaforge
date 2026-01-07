@@ -27,7 +27,7 @@
 
 > A modular, efficient and config-driven Change Data Capture (CDC) micro-framework.
 
-> ⚠️ **Status:** Active developmemt. APIs, configuration, and semantics may change.
+> ⚠️ **Status:** Active development. APIs, configuration, and semantics may change.
 
 DeltaForge is a lightweight framework for building CDC pipelines that stream database changes into downstream systems such as Kafka and Redis. It focuses on:
 
@@ -35,21 +35,52 @@ DeltaForge is a lightweight framework for building CDC pipelines that stream dat
 - **Config-driven pipelines** : YAML-defined pipelines instead of bespoke code per use-case.
 - **Cloud-Native** : CN first design and operation.
 - **Extensibility** : add your own sources, processors, and sinks.
-- **Observability** : metrics, structured logging, and panic hooks built in.
 
-However, deltaforge is NOT a DAG based stream processor.
-Deltaforge is meant to replace tools like Debezium and similar.
+However, DeltaForge is NOT a DAG based stream processor.
+DeltaForge is meant to replace tools like Debezium and similar.
 
+## Supported Technologies
+
+<table>
+  <tr>
+    <td align="center" width="140"><b>Built with</b></td>
+    <td align="center" width="140"><b>Sources</b></td>
+    <td align="center" width="140"><b>Processors</b></td>
+    <td align="center" width="140"><b>Sinks</b></td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/rust/rust-original.svg" width="40" height="40" alt="Rust">
+      <br><sub>Rust</sub>
+    </td>
+    <td align="center">
+      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/mysql/mysql-original.svg" width="40" height="40" alt="MySQL">
+      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/postgresql/postgresql-original.svg" width="40" height="40" alt="PostgreSQL">
+      <br><sub>MySQL · PostgreSQL</sub>
+    </td>
+    <td align="center">
+      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/javascript/javascript-original.svg" width="40" height="40" alt="JavaScript">
+      <br><sub>JavaScript</sub>
+    </td>
+    <td align="center">
+      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/apachekafka/apachekafka-original.svg" width="40" height="40" alt="Kafka">
+      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/redis/redis-original.svg" width="40" height="40" alt="Redis">
+      <br><sub>Kafka · Redis</sub>
+    </td>
+  </tr>
+</table>
 
 ## Features
 
 - **Sources**
-  - MySQL binlog CDC
-  - Experimental Turso/libSQL CDC
+  - MySQL binlog CDC with GTID support
+  - PostgreSQL logical replication via pgoutput
+  - Turso/libSQL CDC (experimental, behind `turso` feature flag)
 
 - **Schema Registry**
   - Source-owned schema types (source native semantics)
   - Schema change detection and versioning
+  - SHA-256 fingerprinting for stable change detection
 
 - **Schema Sensing**
   - Automatic schema inference from JSON event payloads
@@ -204,6 +235,61 @@ Pipelines are defined as YAML documents that map directly to the `PipelineSpec`
 type. Environment variables are expanded before parsing, so secrets and URLs can
 be injected at runtime.
 
+### MySQL source example
+
+```yaml
+metadata:
+  name: orders-mysql-to-kafka
+  tenant: acme
+
+spec:
+  source:
+    type: mysql
+    config:
+      id: orders-mysql
+      dsn: ${MYSQL_DSN}
+      tables:
+        - shop.orders
+        - shop.order_items
+
+  sinks:
+    - type: kafka
+      config:
+        id: orders-kafka
+        brokers: ${KAFKA_BROKERS}
+        topic: orders
+```
+
+### PostgreSQL source example
+
+```yaml
+metadata:
+  name: users-postgres-to-kafka
+  tenant: acme
+
+spec:
+  source:
+    type: postgres
+    config:
+      id: users-postgres
+      dsn: ${POSTGRES_DSN}
+      slot: deltaforge_users
+      publication: users_pub
+      tables:
+        - public.users
+        - public.user_sessions
+      start_position: earliest
+
+  sinks:
+    - type: kafka
+      config:
+        id: users-kafka
+        brokers: ${KAFKA_BROKERS}
+        topic: user-events
+```
+
+### Full configuration example
+
 ```yaml
 metadata:
   name: orders-mysql-to-kafka
@@ -216,7 +302,7 @@ spec:
     count: 4
     key: customer_id
 
-  # Source definition (MySQL example)
+  # Source definition
   source:
     type: mysql
     config:
@@ -283,7 +369,7 @@ Key fields:
 
 - `metadata` - required name (used as pipeline identifier) and tenant label.
 - `spec.sharding` - optional hint for downstream distribution.
-- `spec.source` - required source configuration (MySQL, Turso, or PostgreSQL).
+- `spec.source` - required source configuration (MySQL, PostgreSQL, or Turso).
 - `spec.processors` - ordered processors; JavaScript is supported today with optional resource limits.
 - `spec.sinks` - one or more sinks; Kafka supports `required`, `exactly_once`, and raw `client_conf` overrides; Redis streams are also available.
 - `spec.batch` - optional thresholds that define the commit unit.
@@ -293,7 +379,6 @@ Key fields:
 
 ## Roadmap
 
-- [ ] PostgreSQL source implementation
 - [ ] Persistent schema registry (SQLite, then PostgreSQL)
 - [ ] PostgreSQL/S3 checkpoint backends for HA
 - [ ] MongoDB source
