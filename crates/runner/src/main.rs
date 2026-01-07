@@ -13,7 +13,12 @@ use tracing::{debug, info};
 
 use runner::{PipelineManager, SchemaApi, SensingApi};
 
+mod version;
+
 #[derive(Parser, Debug)]
+#[command(name = "deltaforge")]
+#[command(version = version::VERSION)]
+#[command(about = "High-performance Change Data Capture Engine")]
 struct Args {
     #[arg(short, long)]
     config: String,
@@ -26,6 +31,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    eprintln!("{}", version::startup_banner());
 
     let cfg = o11y::O11yConfig {
         logging: o11y::logging::Config {
