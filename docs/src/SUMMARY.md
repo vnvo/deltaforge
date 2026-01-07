@@ -8,6 +8,7 @@
 - [Pipelines](pipelines.md)
 - [Sources](sources/README.md)
     - [MySQL](sources/mysql.md)
+    - [Postgres](sources/postgres.md)
     - [Turso](sources/turso.md)
 - [Sinks](sinks/README.md)
     - [Redis](sinks/redis.md)
