@@ -43,8 +43,8 @@ use tokio::{
 };
 use tracing::info;
 
-mod common;
-use common::init_test_tracing;
+mod test_common;
+use test_common::init_test_tracing;
 
 /// Create a test database with schema.
 /// Returns (Database, Connection) - must keep Database alive while using Connection!

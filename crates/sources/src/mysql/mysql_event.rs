@@ -1,4 +1,8 @@
-use deltaforge_core::{Event, Op, SourceError, SourceMeta, SourceResult};
+use super::mysql_object::build_object;
+use crate::mysql::LoopControl;
+use crate::mysql::RunCtx;
+use common::{ts_sec_to_ms, watchdog};
+use deltaforge_core::{Event, Op, SourceMeta, SourceResult};
 use metrics::counter;
 use mysql_binlog_connector_rust::{
     binlog_stream::BinlogStream,
@@ -10,17 +14,7 @@ use mysql_binlog_connector_rust::{
 use tracing::instrument;
 use tracing::{debug, error, info, warn};
 
-use super::mysql_object::build_object;
-use crate::conn_utils::{retryable_stream, watchdog};
-use crate::mysql::RunCtx;
-
-use crate::mysql::mysql_helpers::{make_checkpoint_meta, short_sql, ts_ms};
-
-pub(super) enum LoopControl {
-    Reconnect,
-    Stop,
-    Fail(SourceError),
-}
+use crate::mysql::mysql_helpers::{make_checkpoint_meta, short_sql};
 
 #[instrument(skip_all)]
 pub(super) async fn read_next_event(
@@ -30,24 +24,20 @@ pub(super) async fn read_next_event(
     match watchdog(stream.read(), ctx.inactivity, &ctx.cancel, "binlog_read")
         .await
     {
-        Ok(x) => Ok(x),
-        Err(se) => {
-            if ctx.cancel.is_cancelled() {
-                return Err(LoopControl::Stop);
-            }
-            if retryable_stream(&se) {
+        Ok(event) => Ok(event),
+        Err(outcome) => {
+            let control = LoopControl::from_binlog_outcome(outcome);
+
+            if control.is_retryable() {
                 counter!(
                     "deltaforge_source_reconnects_total",
                     "pipeline" => ctx.pipeline.clone(),
                     "source" => ctx.source_id.clone(),
                 )
                 .increment(1);
-                warn!(source_id=%ctx.source_id, error=%se, "binlog read failed; scheduling reconnect");
-                Err(LoopControl::Reconnect)
-            } else {
-                error!(source_id=%ctx.source_id, error=%se, "non-retryable binlog read error");
-                Err(LoopControl::Fail(se))
             }
+
+            Err(control)
         }
     }
 }
@@ -104,7 +94,7 @@ async fn handle_table_map(
     let is_new = !ctx.table_map.contains_key(&tm.table_id);
     ctx.table_map.insert(tm.table_id, tm.clone());
 
-    if ctx.allow.matchs(&tm.database_name, &tm.table_name) {
+    if ctx.allow.matches(&tm.database_name, &tm.table_name) {
         if is_new {
             info!(
                 table_id=tm.table_id,
@@ -121,7 +111,7 @@ async fn handle_table_map(
     } else {
         debug!(
             db=%tm.database_name, 
-            table=%tm.table_name, 
+            table=%tm.table_name,
             "skipping table (not in allow-list)");
     }
     Ok(())
@@ -134,7 +124,7 @@ async fn handle_write_rows(
     wr: mysql_binlog_connector_rust::event::write_rows_event::WriteRowsEvent,
 ) -> SourceResult<()> {
     if let Some(tm) = ctx.table_map.get(&wr.table_id) {
-        if !ctx.allow.matchs(&tm.database_name, &tm.table_name) {
+        if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
         let loaded = ctx
@@ -160,7 +150,7 @@ async fn handle_write_rows(
                 Op::Insert,
                 None,
                 Some(after),
-                ts_ms(header.timestamp),
+                ts_sec_to_ms(header.timestamp),
                 header.event_length as usize,
             );
             ev.tx_id = ctx.last_gtid.clone();
@@ -201,7 +191,7 @@ async fn handle_update_rows(
     ur: mysql_binlog_connector_rust::event::update_rows_event::UpdateRowsEvent,
 ) -> SourceResult<()> {
     if let Some(tm) = ctx.table_map.get(&ur.table_id) {
-        if !ctx.allow.matchs(&tm.database_name, &tm.table_name) {
+        if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
         let loaded = ctx
@@ -232,7 +222,7 @@ async fn handle_update_rows(
                 Op::Update,
                 Some(before),
                 Some(after),
-                ts_ms(header.timestamp),
+                ts_sec_to_ms(header.timestamp),
                 header.event_length as usize,
             );
 
@@ -274,7 +264,7 @@ async fn handle_delete_rows(
     dr: mysql_binlog_connector_rust::event::delete_rows_event::DeleteRowsEvent,
 ) -> SourceResult<()> {
     if let Some(tm) = ctx.table_map.get(&dr.table_id) {
-        if !ctx.allow.matchs(&tm.database_name, &tm.table_name) {
+        if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
         let loaded = ctx
@@ -300,7 +290,7 @@ async fn handle_delete_rows(
                 Op::Delete,
                 Some(before),
                 None,
-                ts_ms(header.timestamp),
+                ts_sec_to_ms(header.timestamp),
                 header.event_length as usize,
             );
 
@@ -367,7 +357,7 @@ async fn handle_query(
         },
         db.to_string(),
         serde_json::json!({ "sql": q.query }),
-        ts_ms(header.timestamp),
+        ts_sec_to_ms(header.timestamp),
         header.event_length as usize,
     );
     ev.tx_id = ctx.last_gtid.clone();
@@ -438,7 +428,9 @@ mod tests {
     use tokio::sync::{Notify, mpsc};
     use tokio_util::sync::CancellationToken;
 
+    use crate::mysql::{AllowList, MySqlCheckpoint, MySqlSchemaLoader};
     use checkpoints::{CheckpointStore, MemCheckpointStore};
+    use common::RetryPolicy;
     use mysql_binlog_connector_rust::{
         column::column_value::ColumnValue,
         event::{
@@ -446,11 +438,6 @@ mod tests {
             update_rows_event::UpdateRowsEvent,
             write_rows_event::WriteRowsEvent,
         },
-    };
-
-    use crate::{
-        conn_utils::RetryPolicy,
-        mysql::{AllowList, MySqlCheckpoint, MySqlSchemaLoader},
     };
 
     use super::*;

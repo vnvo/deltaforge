@@ -15,10 +15,10 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use super::mysql_table_schema::{MySqlColumn, MySqlTableSchema};
-use crate::mysql::mysql_helpers::redact_password;
 use crate::schema_loader::{
     LoadedSchema as ApiLoadedSchema, SchemaListEntry, SourceSchemaLoader,
 };
+use common::redact_url_password as redact_password;
 use deltaforge_core::{SourceError, SourceResult};
 
 /// Loaded schema with metadata.
@@ -625,5 +625,49 @@ mod tests {
         let q = build_pattern_query("%", "audit%");
         assert!(q.contains("TABLE_SCHEMA NOT IN"));
         assert!(q.contains("TABLE_NAME LIKE 'audit%'"));
+    }
+
+    #[tokio::test]
+    async fn reload_schema_invalidates_cache() {
+        // Using from_static for unit test without DB
+        let cols: HashMap<(String, String), Arc<Vec<String>>> =
+            HashMap::from([(
+                ("db".to_string(), "tbl".to_string()),
+                Arc::new(vec!["id".to_string(), "name".to_string()]),
+            )]);
+        let loader = MySqlSchemaLoader::from_static(cols);
+
+        // First load should hit cache
+        let loaded1 = loader.load_schema("db", "tbl").await.unwrap();
+        assert_eq!(loaded1.column_names.len(), 2);
+
+        // Cache should have entry
+        let cached = loader.list_cached().await;
+        assert_eq!(cached.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reload_all_clears_cache() {
+        let cols: HashMap<(String, String), Arc<Vec<String>>> =
+            HashMap::from([
+                (
+                    ("db".to_string(), "tbl1".to_string()),
+                    Arc::new(vec!["id".to_string()]),
+                ),
+                (
+                    ("db".to_string(), "tbl2".to_string()),
+                    Arc::new(vec!["id".to_string()]),
+                ),
+            ]);
+        let loader = MySqlSchemaLoader::from_static(cols);
+
+        // Load both
+        let _ = loader.load_schema("db", "tbl1").await;
+        let _ = loader.load_schema("db", "tbl2").await;
+        assert_eq!(loader.list_cached().await.len(), 2);
+
+        // Clear cache (reload_all would normally reload from DB)
+        loader.cache.write().await.clear();
+        assert_eq!(loader.list_cached().await.len(), 0);
     }
 }

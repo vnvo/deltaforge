@@ -13,15 +13,16 @@ use schema_registry::InMemoryRegistry;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use checkpoints::{CheckpointStore, CheckpointStoreExt};
+use common::{AllowList, RetryPolicy, pause_until_resumed};
 use deltaforge_core::{Event, Source, SourceHandle, SourceResult};
-
 mod mysql_errors;
+pub use mysql_errors::{LoopControl, MySqlSourceError, MySqlSourceResult};
 
 mod mysql_helpers;
-use mysql_helpers::{AllowList, pause_until_resumed, prepare_client};
+use mysql_helpers::prepare_client;
 
 mod mysql_object;
 
@@ -32,16 +33,12 @@ mod mysql_event;
 use mysql_event::*;
 
 mod mysql_table_schema;
-use crate::{
-    conn_utils::RetryPolicy,
-    mysql::{
-        mysql_errors::MySqlSourceError,
-        mysql_helpers::{connect_binlog_with_retries, resolve_binlog_tail},
-    },
+use crate::mysql::mysql_helpers::{
+    connect_binlog_with_retries, resolve_binlog_tail,
 };
 pub use mysql_table_schema::{MySqlColumn, MySqlTableSchema};
 
-pub type MySqlSourceResult<T> = Result<T, MySqlSourceError>;
+//pub type MySqlSourceResult<T> = Result<T, MySqlSourceError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MySqlCheckpoint {
@@ -97,9 +94,9 @@ impl MySqlSource {
         pause_notify: Arc<Notify>,
     ) -> SourceResult<()> {
         let (host, default_db, server_id, client) =
-            prepare_client(&self.dsn, &self.id, &self.tables, &chkpt_store)
-                .await?;
+            prepare_client(&self.dsn, &self.id, &chkpt_store).await?;
 
+        info!(source_id=%self.id, "prepare_client finished, loading schemas");
         let schema_loader = MySqlSchemaLoader::new(
             &self.dsn,
             self.registry.clone(),
@@ -107,7 +104,7 @@ impl MySqlSource {
         );
 
         let tracked = schema_loader.preload(&self.tables).await?;
-        info!(tables = tracked.len(), "schemas preloaded");
+        info!(source_id=%self.id, tables = tracked.len(), "schemas preloaded");
         info!(
             source_id=%self.id,
             host=%host,
@@ -137,6 +134,7 @@ impl MySqlSource {
             last_gtid: None,
         };
 
+        info!(source_id=%self.id, "connecting for binlog stream ..");
         let mut stream = connect_first_stream(&ctx, client).await?;
 
         info!("entering binlog read loop");
@@ -144,13 +142,23 @@ impl MySqlSource {
             if !pause_until_resumed(&ctx.cancel, &ctx.paused, &ctx.pause_notify)
                 .await
             {
+                info!(source_id=%self.id, "resuming ..");
                 break;
             }
 
+            debug!(source_id=%self.id, "reading the next event ..");
             match read_next_event(&mut stream, &ctx).await {
                 Ok((header, data)) => {
                     ctx.last_pos = header.next_event_position as u64;
                     dispatch_event(&mut ctx, &header, data).await?;
+                }
+                Err(LoopControl::ReloadSchema { db, table }) => {
+                    if let (Some(d), Some(t)) = (db, table) {
+                        let _ = ctx.schema.reload_schema(&d, &t).await?;
+                    } else {
+                        let _ = ctx.schema.reload_all(&self.tables).await?;
+                    }
+                    stream = reconnect_stream(&mut ctx).await?;
                 }
                 Err(LoopControl::Reconnect) => {
                     let delay = ctx.retry.next_backoff();
@@ -166,7 +174,6 @@ impl MySqlSource {
                     }
 
                     stream = reconnect_stream(&mut ctx).await?;
-                    ctx.retry.reset();
                 }
                 Err(LoopControl::Stop) => break,
                 Err(LoopControl::Fail(e)) => return Err(e),

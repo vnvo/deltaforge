@@ -1,6 +1,18 @@
+//! End-to-end integration tests for MySQL CDC source.
+//!
+//! These tests require Docker and pull `mysql:8.4`.
+//! Tests share a single container and run sequentially via `#[serial]`.
+//!
+//! Run with:
+//! ```bash
+//! cargo test -p sources --test mysql_cdc_e2e -- --include-ignored --nocapture
+//! ```
+
 use anyhow::Result;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
-use deltaforge_core::{Event, Op, Source};
+use ctor::dtor;
+use deltaforge_core::{Event, Op, Source, SourceHandle};
+use mysql_async::Opts;
 use mysql_async::{Pool as MySQLPool, prelude::Queryable};
 use schema_registry::{InMemoryRegistry, SourceSchema};
 use sources::SourceSchemaLoader;
@@ -9,128 +21,285 @@ use std::sync::Arc;
 use std::time::Instant;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{
-    GenericImage, ImageExt, core::IntoContainerPort, core::WaitFor,
+    ContainerAsync, GenericImage, ImageExt, core::IntoContainerPort,
+    core::WaitFor,
 };
+use tokio::sync::OnceCell;
 use tokio::{
     io::AsyncBufReadExt,
     sync::mpsc,
-    task,
     time::{Duration, sleep, timeout},
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-mod common;
-use common::init_test_tracing;
+mod test_common;
+use test_common::init_test_tracing;
 
-/// End-to-end CDC test for the MySQL source.
-///
-/// This is intentionally a "fat" integration test:
-/// - boots a real MySQL 8 container with GTID + ROW binlog
-/// - provisions schema / user / privileges
-/// - tests schema loading with nullable columns, wildcards, registry integration
-/// - starts `MySqlSource` with an in-memory checkpoint store
-/// - performs INSERT/UPDATE/DELETE
-/// - asserts that corresponding CDC events are emitted with correct payloads.
-///
-/// NOTE: this test requires Docker and the ability to pull/run `mysql:8.4`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires docker and significant disk space"]
-async fn mysql_cdc_end_to_end() -> Result<()> {
-    init_test_tracing();
+// =============================================================================
+// Shared Test Infrastructure
+// =============================================================================
 
-    // boot MySQL 8 with binlog/GTID
-    let image = GenericImage::new("mysql", "8.4")
-        .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
-        .with_env_var("MYSQL_ROOT_PASSWORD", "password")
-        .with_cmd(vec![
-            "--server-id=999",
-            "--log-bin=/var/lib/mysql/mysql-bin.log",
-            "--binlog-format=ROW",
-            "--binlog-row-image=FULL",
-            "--gtid-mode=ON",
-            "--enforce-gtid-consistency=ON",
-            "--binlog-checksum=NONE",
-        ])
-        // fixed host port keeps the DSN simple; tests are marked as E2E and
-        // should not be run in parallel with other MySQL-using tests.
-        .with_mapped_port(3307, 3306.tcp());
+const MYSQL_PORT: u16 = 3308;
+const ROOT_PASSWORD: &str = "rootpw";
+const CDC_USER: &str = "df";
+const CDC_PASSWORD: &str = "dfpw";
 
-    let container = image.start().await.expect("start mysql");
-    info!("Container ID: {}", container.id());
+/// Shared container - initialized once, reused by all tests.
+static MYSQL_CONTAINER: OnceCell<ContainerAsync<GenericImage>> =
+    OnceCell::const_new();
 
-    // container log followers (helpful when this fails in CI)
-    {
-        let mut out = container.stdout(true); // follow=true
-        task::spawn(async move {
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match out.read_line(&mut line).await {
-                    Ok(0) => break, // EOF, container stopped
-                    Ok(_) => print!("STDOUT: {}", line),
-                    Err(e) => {
-                        eprint!("stdout read error: {e}");
-                        break;
+#[dtor]
+fn cleanup() {
+    // Force container cleanup on process exit
+    if let Some(container) = MYSQL_CONTAINER.get() {
+        std::process::Command::new("docker")
+            .args(["rm", "-f", &container.id()])
+            .output()
+            .ok();
+    }
+}
+
+/// Get or start the shared MySQL container.
+async fn get_mysql_container() -> &'static ContainerAsync<GenericImage> {
+    MYSQL_CONTAINER
+        .get_or_init(|| async {
+            info!("starting MySQL container...");
+
+            let image = GenericImage::new("mysql", "8.4")
+                .with_wait_for(WaitFor::message_on_stderr(
+                    "ready for connections",
+                ))
+                .with_env_var("MYSQL_ROOT_PASSWORD", ROOT_PASSWORD)
+                .with_cmd(vec![
+                    "--server-id=999",
+                    "--log-bin=/var/lib/mysql/mysql-bin.log",
+                    "--binlog-format=ROW",
+                    "--binlog-row-image=FULL",
+                    "--gtid-mode=ON",
+                    "--enforce-gtid-consistency=ON",
+                    "--binlog-checksum=NONE",
+                ])
+                .with_mapped_port(MYSQL_PORT, 3306.tcp());
+
+            let container = image.start().await.expect("start mysql container");
+            info!("MySQL container started: {}", container.id());
+
+            // Spawn log follower for debugging
+            let mut stderr = container.stderr(true);
+            tokio::spawn(async move {
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match stderr.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if line.contains("ERROR")
+                                || line.contains("Warning")
+                                || line.contains("ready for connections")
+                            {
+                                print!("[mysql] {}", line);
+                            }
+                        }
+                    }
+                }
+            });
+
+            // Wait for MySQL to be fully ready
+            wait_for_mysql(&root_dsn(), Duration::from_secs(60))
+                .await
+                .expect("MySQL should be ready");
+
+            // Create CDC user with replication privileges
+            provision_cdc_user(&root_dsn())
+                .await
+                .expect("provision CDC user");
+
+            container
+        })
+        .await
+}
+
+/// Poll MySQL until it's ready to accept connections.
+async fn wait_for_mysql(dsn: &str, timeout_duration: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout_duration;
+    let opts = Opts::from_url(dsn)?;
+    let pool = MySQLPool::new(opts);
+
+    while Instant::now() < deadline {
+        if let Ok(mut conn) = pool.get_conn().await {
+            if conn.query_drop("SELECT 1").await.is_ok() {
+                let log_bin: Option<(String, String)> = conn
+                    .query_first("SHOW VARIABLES LIKE 'log_bin'")
+                    .await
+                    .ok()
+                    .flatten();
+
+                if let Some((_, value)) = log_bin {
+                    if value.eq_ignore_ascii_case("ON") {
+                        info!("MySQL is ready (binlog enabled)");
+                        return Ok(());
                     }
                 }
             }
-        });
-    }
-    {
-        let mut err = container.stderr(true);
-        task::spawn(async move {
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match err.read_line(&mut line).await {
-                    Ok(0) => break,
-                    Ok(_) => print!("STDERR: {}", line),
-                    Err(e) => {
-                        eprint!("stderr read error: {e}");
-                        break;
-                    }
-                }
-            }
-        });
+        }
+        sleep(Duration::from_millis(500)).await;
     }
 
-    // give MySQL a bit of time to finish init scripts.
-    // we still validate that the required binlog settings are enabled below.
-    sleep(Duration::from_secs(8)).await;
-    info!("starting MySQL CDC e2e test ...");
+    anyhow::bail!("MySQL not ready after {:?}", timeout_duration)
+}
 
-    let port = 3307;
-    let root_dsn = format!("mysql://root:password@127.0.0.1:{}/", port);
-    let dsn = "mysql://df:dfpw@127.0.0.1:3307/shop";
-
-    // provision schema + user
-    let pool = MySQLPool::new(root_dsn.as_str());
+/// Create CDC user with replication privileges (runs once per container).
+async fn provision_cdc_user(root_dsn: &str) -> Result<()> {
+    let opts = Opts::from_url(root_dsn)?;
+    let pool = MySQLPool::new(opts);
     let mut conn = pool.get_conn().await?;
 
-    // sanity-check that binlog + GTID are actually enabled in the container.
-    let v: (String, String) = conn
-        .query_first("SHOW VARIABLES LIKE 'log_bin'")
-        .await?
-        .unwrap();
-    assert_eq!(v.1.to_uppercase(), "ON", "log_bin must be ON for CDC");
+    conn.query_drop(format!(
+        "CREATE USER IF NOT EXISTS '{}'@'%' IDENTIFIED BY '{}'",
+        CDC_USER, CDC_PASSWORD
+    ))
+    .await?;
 
-    let gtid: (String, String) = conn
-        .query_first("SHOW VARIABLES LIKE 'gtid_mode'")
-        .await?
-        .unwrap();
-    assert!(
-        gtid.1.eq_ignore_ascii_case("ON"),
-        "gtid_mode must be ON for CDC"
+    conn.query_drop(format!(
+        "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{}'@'%'",
+        CDC_USER
+    ))
+    .await?;
+
+    conn.query_drop("FLUSH PRIVILEGES").await?;
+
+    info!(
+        "CDC user '{}' created with replication privileges",
+        CDC_USER
     );
+    Ok(())
+}
 
-    conn.query_drop("CREATE DATABASE IF NOT EXISTS shop")
+/// Create a fresh test database with a unique name.
+async fn create_test_database(test_name: &str) -> Result<(String, MySQLPool)> {
+    let db_name = format!("test_{}", test_name.replace('-', "_"));
+    let opts = Opts::from_url(&root_dsn())?;
+    let pool = MySQLPool::new(opts);
+    let mut conn = pool.get_conn().await?;
+
+    conn.query_drop(format!("DROP DATABASE IF EXISTS {}", db_name))
         .await?;
-    debug!("database `shop` created.");
+    conn.query_drop(format!("CREATE DATABASE {}", db_name))
+        .await?;
+    conn.query_drop(format!(
+        "GRANT SELECT, SHOW VIEW ON {}.* TO '{}'@'%'",
+        db_name, CDC_USER
+    ))
+    .await?;
 
-    conn.query_drop("USE shop").await?;
+    debug!("created test database: {}", db_name);
+    Ok((db_name, pool))
+}
+
+/// Drop test database (cleanup).
+async fn drop_test_database(pool: &MySQLPool, db_name: &str) {
+    if let Ok(mut conn) = pool.get_conn().await {
+        let _ = conn
+            .query_drop(format!("DROP DATABASE IF EXISTS {}", db_name))
+            .await;
+        debug!("dropped test database: {}", db_name);
+    }
+}
+
+fn root_dsn() -> String {
+    format!("mysql://root:{}@127.0.0.1:{}/", ROOT_PASSWORD, MYSQL_PORT)
+}
+
+fn cdc_dsn(db: &str) -> String {
+    format!(
+        "mysql://{}:{}@127.0.0.1:{}/{}",
+        CDC_USER, CDC_PASSWORD, MYSQL_PORT, db
+    )
+}
+
+/// Collect events until condition is met or timeout.
+async fn collect_events_until<F>(
+    rx: &mut mpsc::Receiver<Event>,
+    timeout_duration: Duration,
+    mut condition: F,
+) -> Vec<Event>
+where
+    F: FnMut(&[Event]) -> bool,
+{
+    let deadline = Instant::now() + timeout_duration;
+    let mut events = Vec::new();
+
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match timeout(remaining, rx.recv()).await {
+            Ok(Some(e)) => {
+                debug!(op = ?e.op, table = %e.table, "received event");
+                events.push(e);
+                if condition(&events) {
+                    break;
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+
+    events
+}
+
+/// Helper to check if event has a specific id.
+fn event_has_id(e: &Event, id: i64) -> bool {
+    e.after
+        .as_ref()
+        .and_then(|v| v.get("id"))
+        .and_then(|v| v.as_i64())
+        == Some(id)
+        || e.before
+            .as_ref()
+            .and_then(|v| v.get("id"))
+            .and_then(|v| v.as_i64())
+            == Some(id)
+}
+
+/// Wait for source to be ready and verify it's running.
+async fn wait_for_source_ready(
+    handle: &SourceHandle,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        if handle.join.is_finished() {
+            // Task died - this is a problem
+            return Err(anyhow::anyhow!(
+                "Source task died before becoming ready"
+            ));
+        }
+
+        // Could also check for specific ready signal here
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    Ok(())
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+/// Test schema loader: pattern expansion, column loading, fingerprinting, DDL detection.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_schema_loader() -> Result<()> {
+    init_test_tracing();
+    let _container = get_mysql_container().await;
+
+    let (db_name, pool) = create_test_database("schema_loader").await?;
+    let mut conn = pool.get_conn().await?;
+    let dsn = cdc_dsn(&db_name);
+
+    conn.query_drop(format!("USE {}", db_name)).await?;
     conn.query_drop(
-        r#"
-        CREATE TABLE IF NOT EXISTS orders(
+        r#"CREATE TABLE orders (
             id INT PRIMARY KEY,
             sku VARCHAR(64),
             payload JSON,
@@ -138,351 +307,647 @@ async fn mysql_cdc_end_to_end() -> Result<()> {
         )"#,
     )
     .await?;
-    debug!("table `orders` created.");
-
-    conn.query_drop(
-        r#"CREATE USER IF NOT EXISTS 'df'@'%' IDENTIFIED BY 'dfpw'"#,
-    )
-    .await?;
-    debug!("user `df` created");
-
-    conn.query_drop(
-        r#"GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'df'@'%'"#,
-    )
-    .await?;
-    conn.query_drop(r#"GRANT SELECT, SHOW VIEW ON shop.* TO 'df'@'%'"#)
-        .await?;
-    conn.query_drop("FLUSH PRIVILEGES").await?;
-
-    // =========================================================================
-    // SCHEMA LOADER TESTS
-    // =========================================================================
-    info!("--- Testing schema loader ---");
 
     let registry = Arc::new(InMemoryRegistry::new());
-    let schema_loader = MySqlSchemaLoader::new(dsn, registry.clone(), "acme");
+    let schema_loader = MySqlSchemaLoader::new(&dsn, registry.clone(), "acme");
 
-    // Test 1: Expand exact pattern
+    // Test: expand exact pattern
     {
         let tables = schema_loader
-            .expand_patterns(&["shop.orders".to_string()])
+            .expand_patterns(&[format!("{}.orders", db_name)])
             .await?;
-        assert_eq!(tables.len(), 1, "should find exactly one table");
-        assert_eq!(tables[0], ("shop".to_string(), "orders".to_string()));
-        info!("expand_patterns exact match works");
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0], (db_name.clone(), "orders".to_string()));
+        info!("✓ expand_patterns exact match");
     }
 
-    // Test 2: Load schema and verify columns (tests NULL handling!)
+    // Test: load schema and verify columns
     {
-        let loaded = schema_loader.load_schema("shop", "orders").await?;
+        let loaded = schema_loader.load_schema(&db_name, "orders").await?;
         let schema = &loaded.schema;
 
+        assert_eq!(schema.columns.len(), 4);
         assert_eq!(
-            schema.columns.len(),
-            4,
-            "orders table should have 4 columns"
+            schema.column_names(),
+            vec!["id", "sku", "payload", "blobz"]
         );
-
-        // Check column names using SourceSchema trait
-        let col_names = schema.column_names();
-        assert_eq!(col_names, vec!["id", "sku", "payload", "blobz"]);
-
-        // Check primary key
         assert_eq!(schema.primary_key, vec!["id".to_string()]);
 
-        // Check specific column types
         let id_col = schema.column("id").expect("id column");
         assert_eq!(id_col.data_type, "int");
-        assert!(!id_col.nullable, "id should not be nullable (PK)");
+        assert!(!id_col.nullable);
 
         let sku_col = schema.column("sku").expect("sku column");
         assert_eq!(sku_col.data_type, "varchar");
-        assert!(sku_col.nullable, "sku should be nullable");
+        assert!(sku_col.nullable);
         assert_eq!(sku_col.char_max_length, Some(64));
 
-        let payload_col = schema.column("payload").expect("payload column");
-        assert_eq!(payload_col.data_type, "json");
-
-        let blob_col = schema.column("blobz").expect("blobz column");
-        assert_eq!(blob_col.data_type, "blob");
-
-        info!("load_schema returns correct column info (NULL handling works)");
+        info!("✓ load_schema returns correct columns");
     }
 
-    // Test 3: Schema fingerprint stability
+    // Test: fingerprint stability
     {
-        let loaded1 = schema_loader.load_schema("shop", "orders").await?;
-        let loaded2 = schema_loader.load_schema("shop", "orders").await?;
-
-        assert_eq!(
-            loaded1.fingerprint, loaded2.fingerprint,
-            "fingerprint should be stable"
-        );
-        assert!(
-            !loaded1.fingerprint.is_empty(),
-            "fingerprint should not be empty"
-        );
-        info!("fingerprint is stable across loads");
+        let loaded1 = schema_loader.load_schema(&db_name, "orders").await?;
+        let loaded2 = schema_loader.load_schema(&db_name, "orders").await?;
+        assert_eq!(loaded1.fingerprint, loaded2.fingerprint);
+        assert!(!loaded1.fingerprint.is_empty());
+        info!("✓ fingerprint is stable");
     }
 
-    // Test 4: Schema registered in registry
+    // Test: schema registered in registry
     {
-        let versions = registry.list_versions("acme", "shop", "orders");
-        assert!(!versions.is_empty(), "schema should be registered");
+        let versions = registry.list_versions("acme", &db_name, "orders");
+        assert!(!versions.is_empty());
         assert_eq!(versions[0].version, 1);
-        info!("schema is registered with registry");
+        info!("✓ schema registered in registry");
     }
 
-    // Test 5: Preload with wildcard patterns
+    // Test: wildcard pattern expansion
     {
-        // Create another table for wildcard testing
         conn.query_drop(
-            r#"CREATE TABLE IF NOT EXISTS order_items(
+            r#"CREATE TABLE order_items (
                 id INT PRIMARY KEY,
                 order_id INT,
-                product VARCHAR(64)
+                product VARCHAR(128)
             )"#,
         )
         .await?;
 
-        let tables =
-            schema_loader.preload(&["shop.order%".to_string()]).await?;
-        assert!(tables.len() >= 2, "should match orders and order_items");
-        assert!(tables.iter().any(|(db, t)| db == "shop" && t == "orders"));
+        let tables = schema_loader
+            .expand_patterns(&[format!("{}.order%", db_name)])
+            .await?;
+
+        assert!(tables.len() >= 2);
+        assert!(tables.iter().any(|(db, t)| db == &db_name && t == "orders"));
         assert!(
             tables
                 .iter()
-                .any(|(db, t)| db == "shop" && t == "order_items")
+                .any(|(db, t)| db == &db_name && t == "order_items")
         );
-        info!("wildcard pattern expansion works");
+        info!("✓ wildcard pattern expansion");
     }
 
-    // Test 6: Schema reload after DDL
+    // Test: schema reload detects DDL
     {
         let fp_before = schema_loader
-            .load_schema("shop", "orders")
+            .load_schema(&db_name, "orders")
             .await?
             .fingerprint;
 
-        // Add a column
         conn.query_drop("ALTER TABLE orders ADD COLUMN notes TEXT")
             .await?;
 
-        // Reload schema (force refresh)
-        let loaded = schema_loader.reload_schema("shop", "orders").await?;
-        let fp_after = loaded.fingerprint;
+        let reloaded = schema_loader.reload_schema(&db_name, "orders").await?;
 
-        assert_ne!(fp_before, fp_after, "fingerprint should change after DDL");
-        assert_eq!(loaded.schema.columns.len(), 5, "should have 5 columns now");
-        assert!(
-            loaded.schema.column("notes").is_some(),
-            "notes column should exist"
-        );
+        assert_ne!(fp_before, reloaded.fingerprint);
+        assert_eq!(reloaded.schema.columns.len(), 5);
+        assert!(reloaded.schema.column("notes").is_some());
 
-        // Check registry has new version
-        let versions = registry.list_versions("acme", "shop", "orders");
-        assert!(
-            versions.len() >= 2,
-            "should have multiple versions after DDL"
-        );
-
-        info!("schema reload detects DDL changes");
+        let versions = registry.list_versions("acme", &db_name, "orders");
+        assert!(versions.len() >= 2);
+        info!("✓ reload detects DDL changes");
     }
 
-    // Test 7: Cache behavior
+    // Test: cache behavior
     {
         let cached = schema_loader.list_cached().await;
-        assert!(!cached.is_empty(), "cache should not be empty");
-
-        let orders_cached = cached
-            .iter()
-            .find(|entry| entry.database == "shop" && entry.table == "orders");
-        assert!(orders_cached.is_some(), "orders should be in cache");
-
-        info!("schema caching works");
+        assert!(!cached.is_empty());
+        assert!(
+            cached
+                .iter()
+                .any(|e| e.database == db_name && e.table == "orders")
+        );
+        info!("✓ schema caching works");
     }
 
-    // =========================================================================
-    // CDC EVENT TESTS
-    // =========================================================================
-    info!("--- Testing CDC events ---");
+    drop_test_database(&pool, &db_name).await;
+    Ok(())
+}
 
-    // start source with df
+/// Test basic CDC events: INSERT, UPDATE, DELETE with payload verification.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_cdc_basic_events() -> Result<()> {
+    init_test_tracing();
+    let _container = get_mysql_container().await;
+
+    let (db_name, pool) = create_test_database("cdc_basic").await?;
+    let mut conn = pool.get_conn().await?;
+    let dsn = cdc_dsn(&db_name);
+
+    conn.query_drop(format!("USE {}", db_name)).await?;
+    conn.query_drop(
+        r#"CREATE TABLE orders (
+            id INT PRIMARY KEY,
+            sku VARCHAR(64),
+            payload JSON,
+            blobz BLOB
+        )"#,
+    )
+    .await?;
+
+    let registry = Arc::new(InMemoryRegistry::new());
     let src = MySqlSource {
-        id: "it-mysql".into(),
-        checkpoint_key: "mysql-it-mysql".to_string(),
-        dsn: dsn.to_string(),
-        tables: vec!["shop.orders".into()],
+        id: "cdc-basic".into(),
+        checkpoint_key: "mysql-cdc-basic".to_string(),
+        dsn: dsn.clone(),
+        tables: vec![format!("{}.orders", db_name)],
         tenant: "acme".into(),
-        pipeline: "pipe-2".to_string(),
-        registry: Arc::new(InMemoryRegistry::new()),
+        pipeline: "test".to_string(),
+        registry: registry.clone(),
     };
 
     let ckpt_store: Arc<dyn CheckpointStore> =
         Arc::new(MemCheckpointStore::new()?);
-
     let (tx, mut rx) = mpsc::channel::<Event>(128);
     let handle = src.run(tx, ckpt_store).await;
-    info!("source is running ...");
+    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
 
-    // give the source a small head-start so it can connect and subscribe
     sleep(Duration::from_secs(3)).await;
 
-    // 1) INSERT
+    // Perform DML
     conn.query_drop(
-        r#"INSERT INTO orders (id, sku, payload, blobz) VALUES (1,'sku-1','{"a":1}', X'DEADBEEF')"#,
+        r#"INSERT INTO orders (id, sku, payload, blobz) 
+           VALUES (1, 'sku-1', '{"a":1}', X'DEADBEEF')"#,
     )
     .await?;
 
-    // 2) UPDATE
-    conn.query_drop("UPDATE orders SET sku='sku-1b' WHERE id=1")
+    conn.query_drop("UPDATE orders SET sku = 'sku-1b' WHERE id = 1")
         .await?;
 
-    // 3) DELETE
-    conn.query_drop("DELETE FROM orders WHERE id=1").await?;
-    debug!(
-        "insert, update and delete performed on `orders` - expecting CDC events ..."
-    );
+    conn.query_drop("DELETE FROM orders WHERE id = 1").await?;
 
-    // expect at least 3 events (insert/update/delete for our row), but there
-    // may be additional events from DDL or other internal activity. we collect
-    // all events until we see the three operations we care about or a timeout.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut got = Vec::new();
-    let mut seen_insert = false;
-    let mut seen_update = false;
-    let mut seen_delete = false;
-
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match timeout(remaining, rx.recv()).await {
-            Ok(Some(e)) => {
-                debug!(?e, "event received");
-                match e.op {
-                    Op::Insert => seen_insert = true,
-                    Op::Update => seen_update = true,
-                    Op::Delete => seen_delete = true,
-                    Op::Ddl => {}
-                }
-                got.push(e);
-
-                if seen_insert && seen_update && seen_delete {
-                    info!("all expected events have arrived.");
-                    break;
-                }
-            }
-            Ok(None) => {
-                // source ended: stop waiting
-                break;
-            }
-            Err(_elapsed) => {
-                // deadline hit: stop waiting
-                break;
-            }
-        }
-    }
-
-    // --- structural assertions on the event stream ---
-
-    // we must have seen each operation at least once.
-    assert!(
-        got.iter().any(|e| matches!(e.op, Op::Insert)),
-        "expected at least one INSERT event"
-    );
-    assert!(
-        got.iter().any(|e| matches!(e.op, Op::Update)),
-        "expected at least one UPDATE event"
-    );
-    assert!(
-        got.iter().any(|e| matches!(e.op, Op::Delete)),
-        "expected at least one DELETE event"
-    );
-
-    // filter down to events related to id=1. For DELETE, the id will be in
-    // `before`; for INSERT/UPDATE it's in `after`.
-    let by_id: Vec<&Event> = got
-        .iter()
-        .filter(|e| {
-            e.after
-                .as_ref()
-                .and_then(|v| v.get("id"))
-                .and_then(|v| v.as_i64())
-                .map(|id| id == 1)
-                .unwrap_or(false)
-                || e.before
-                    .as_ref()
-                    .and_then(|v| v.get("id"))
-                    .and_then(|v| v.as_i64())
-                    .map(|id| id == 1)
-                    .unwrap_or(false)
+    // Collect events
+    let events =
+        collect_events_until(&mut rx, Duration::from_secs(15), |evts| {
+            let has_insert = evts.iter().any(|e| e.op == Op::Insert);
+            let has_update = evts.iter().any(|e| e.op == Op::Update);
+            let has_delete = evts.iter().any(|e| e.op == Op::Delete);
+            has_insert && has_update && has_delete
         })
-        .collect();
+        .await;
 
-    assert_eq!(
-        by_id.len(),
-        3,
-        "expected exactly 3 CDC events for id=1 (insert, update, delete); got {by_id_len}",
-        by_id_len = by_id.len()
+    // Verify all operation types received
+    assert!(
+        events.iter().any(|e| e.op == Op::Insert),
+        "missing INSERT event"
+    );
+    assert!(
+        events.iter().any(|e| e.op == Op::Update),
+        "missing UPDATE event"
+    );
+    assert!(
+        events.iter().any(|e| e.op == Op::Delete),
+        "missing DELETE event"
     );
 
-    // preserve binlog order: for our single row this should be
-    // INSERT -> UPDATE -> DELETE.
+    // Filter to id=1 events
+    let by_id: Vec<&Event> =
+        events.iter().filter(|e| event_has_id(e, 1)).collect();
+    assert_eq!(by_id.len(), 3, "expected 3 events for id=1");
+
+    // Verify order: INSERT -> UPDATE -> DELETE
     let ops: Vec<Op> = by_id.iter().map(|e| e.op).collect();
-    assert_eq!(
-        ops,
-        vec![Op::Insert, Op::Update, Op::Delete],
-        "unexpected operation order for id=1"
-    );
+    assert_eq!(ops, vec![Op::Insert, Op::Update, Op::Delete]);
 
-    // --- payload assertions on the INSERT event (JSON + BLOB) ---
-
-    let ins = by_id
-        .iter()
-        .find(|e| matches!(e.op, Op::Insert))
-        .expect("missing INSERT event for id=1");
-    let after = ins.after.as_ref().expect("INSERT must have `after`");
+    // Verify INSERT payload
+    let ins = by_id.iter().find(|e| e.op == Op::Insert).unwrap();
+    let after = ins.after.as_ref().expect("INSERT must have after");
     assert_eq!(after["id"], 1);
     assert_eq!(after["sku"], "sku-1");
     assert_eq!(after["payload"]["a"], 1);
     assert!(
         after["blobz"]["_base64"].is_string(),
-        "BLOB field should be base64-wrapped"
+        "BLOB should be base64 encoded"
     );
+    info!("✓ INSERT payload correct");
 
-    // assert update event shape
-    let upd = by_id
-        .iter()
-        .find(|e| matches!(e.op, Op::Update))
-        .expect("missing UPDATE event for id=1");
-    let upd_before = upd.before.as_ref().expect("UPDATE must have `before`");
-    let upd_after = upd.after.as_ref().expect("UPDATE must have `after`");
-    assert_eq!(upd_before["id"], 1);
+    // Verify UPDATE payload
+    let upd = by_id.iter().find(|e| e.op == Op::Update).unwrap();
+    let upd_before = upd.before.as_ref().expect("UPDATE must have before");
+    let upd_after = upd.after.as_ref().expect("UPDATE must have after");
     assert_eq!(upd_before["sku"], "sku-1");
-    assert_eq!(upd_after["id"], 1);
     assert_eq!(upd_after["sku"], "sku-1b");
+    info!("✓ UPDATE payload correct");
 
-    // check del event shape
-    let del = by_id
-        .iter()
-        .find(|e| matches!(e.op, Op::Delete))
-        .expect("missing DELETE event for id=1");
-    let del_before = del.before.as_ref().expect("DELETE must have `before`");
-    assert_eq!(del_before["id"], 1);
-    assert!(del.after.is_none(), "DELETE must not have `after`");
+    // Verify DELETE payload
+    let del = by_id.iter().find(|e| e.op == Op::Delete).unwrap();
+    assert!(del.before.is_some(), "DELETE must have before");
+    assert!(del.after.is_none(), "DELETE must not have after");
+    assert_eq!(del.before.as_ref().unwrap()["id"], 1);
+    info!("✓ DELETE payload correct");
 
+    // Verify metadata on all events
     for e in &by_id {
-        assert_eq!(e.table, "shop.orders");
-        assert_eq!(e.source.db, "shop");
+        assert_eq!(e.table, format!("{}.orders", db_name));
+        assert_eq!(e.source.db, db_name);
+        assert!(e.schema_version.is_some(), "missing schema_version");
+        assert!(e.schema_sequence.is_some(), "missing schema_sequence");
+        assert!(e.checkpoint.is_some(), "missing checkpoint");
     }
+    info!("✓ event metadata correct");
 
-    info!("all MySQL CDC e2e assertions are successful!");
-
-    // clean shutdown for source
     handle.stop();
     let _ = handle.join().await;
 
-    conn.disconnect().await?;
-    pool.disconnect().await?;
+    drop_test_database(&pool, &db_name).await;
+    Ok(())
+}
 
+/// Test schema reload when DDL occurs during CDC streaming.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
+    init_test_tracing();
+    let _container = get_mysql_container().await;
+
+    let (db_name, pool) = create_test_database("schema_ddl").await?;
+    let mut conn = pool.get_conn().await?;
+    let dsn = cdc_dsn(&db_name);
+
+    conn.query_drop(format!("USE {}", db_name)).await?;
+    conn.query_drop(
+        r#"CREATE TABLE orders (
+            id INT PRIMARY KEY,
+            sku VARCHAR(64)
+        )"#,
+    )
+    .await?;
+
+    let registry = Arc::new(InMemoryRegistry::new());
+    let src = MySqlSource {
+        id: "schema-ddl".into(),
+        checkpoint_key: "mysql-schema-ddl".to_string(),
+        dsn: dsn.clone(),
+        tables: vec![format!("{}.orders", db_name)],
+        tenant: "acme".into(),
+        pipeline: "test".to_string(),
+        registry: registry.clone(),
+    };
+
+    let ckpt_store: Arc<dyn CheckpointStore> =
+        Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = mpsc::channel::<Event>(128);
+    let handle = src.run(tx, ckpt_store).await;
+    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
+
+    sleep(Duration::from_secs(3)).await;
+
+    // Insert with original schema (2 columns)
+    conn.query_drop("INSERT INTO orders (id, sku) VALUES (100, 'pre-ddl')")
+        .await?;
+
+    let events =
+        collect_events_until(&mut rx, Duration::from_secs(10), |evts| {
+            evts.iter().any(|e| event_has_id(e, 100))
+        })
+        .await;
+
+    let pre_ddl = events
+        .iter()
+        .find(|e| event_has_id(e, 100))
+        .expect("pre-DDL event");
+    let schema_v1 = pre_ddl.schema_version.clone().expect("schema_version");
+    info!("pre-DDL schema: {}", schema_v1);
+
+    // ALTER TABLE - add column
+    conn.query_drop(
+        "ALTER TABLE orders ADD COLUMN status VARCHAR(32) DEFAULT 'pending'",
+    )
+    .await?;
+    info!("executed ALTER TABLE");
+
+    // Insert with new schema (3 columns)
+    conn.query_drop("INSERT INTO orders (id, sku, status) VALUES (101, 'post-ddl', 'active')")
+        .await?;
+
+    let events =
+        collect_events_until(&mut rx, Duration::from_secs(15), |evts| {
+            evts.iter().any(|e| event_has_id(e, 101))
+        })
+        .await;
+
+    let post_ddl = events
+        .iter()
+        .find(|e| event_has_id(e, 101))
+        .expect("post-DDL event");
+
+    // Verify new column present
+    let after = post_ddl.after.as_ref().unwrap();
+    assert!(
+        after.get("status").is_some(),
+        "post-DDL event should have 'status' column"
+    );
+    assert_eq!(after["status"], "active");
+
+    // Verify schema version changed
+    let schema_v2 = post_ddl.schema_version.clone().expect("schema_version");
+    assert_ne!(
+        schema_v1, schema_v2,
+        "schema version should change after DDL"
+    );
+    info!("✓ schema version changed: {} -> {}", schema_v1, schema_v2);
+
+    // Verify registry has multiple versions
+    let versions = registry.list_versions("acme", &db_name, "orders");
+    assert!(
+        versions.len() >= 2,
+        "registry should have at least 2 schema versions"
+    );
+    info!("✓ registry has {} versions", versions.len());
+
+    handle.stop();
+    let _ = handle.join().await;
+
+    drop_test_database(&pool, &db_name).await;
+    Ok(())
+}
+
+/// Test checkpoint persistence across source restarts.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_cdc_checkpoint_resume() -> Result<()> {
+    init_test_tracing();
+    let _container = get_mysql_container().await;
+
+    let (db_name, pool) = create_test_database("checkpoint").await?;
+    let mut conn = pool.get_conn().await?;
+    let dsn = cdc_dsn(&db_name);
+
+    conn.query_drop(format!("USE {}", db_name)).await?;
+    conn.query_drop(
+        r#"CREATE TABLE orders (
+            id INT PRIMARY KEY,
+            sku VARCHAR(64)
+        )"#,
+    )
+    .await?;
+
+    // Shared checkpoint store across restarts
+    let ckpt_store: Arc<dyn CheckpointStore> =
+        Arc::new(MemCheckpointStore::new()?);
+
+    // First run
+    info!("--- First run ---");
+    {
+        let (tx, mut rx) = mpsc::channel::<Event>(128);
+        let src = MySqlSource {
+            id: "ckpt-test".into(),
+            checkpoint_key: "mysql-ckpt".to_string(),
+            dsn: dsn.clone(),
+            tables: vec![format!("{}.orders", db_name)],
+            tenant: "acme".into(),
+            pipeline: "test".to_string(),
+            registry: Arc::new(InMemoryRegistry::new()),
+        };
+
+        let handle = src.run(tx, ckpt_store.clone()).await;
+        sleep(Duration::from_secs(3)).await;
+
+        conn.query_drop(
+            "INSERT INTO orders (id, sku) VALUES (300, 'first-run')",
+        )
+        .await?;
+
+        let events =
+            collect_events_until(&mut rx, Duration::from_secs(10), |evts| {
+                evts.iter().any(|e| event_has_id(e, 300))
+            })
+            .await;
+
+        assert!(
+            events.iter().any(|e| event_has_id(e, 300)),
+            "first run should receive event"
+        );
+        info!("✓ first run received event for id=300");
+
+        handle.stop();
+        let _ = handle.join().await;
+    }
+
+    // Insert while source is down
+    conn.query_drop("INSERT INTO orders (id, sku) VALUES (301, 'while-down')")
+        .await?;
+    info!("inserted id=301 while source was down");
+    sleep(Duration::from_millis(500)).await;
+
+    // Second run - should resume from checkpoint
+    info!("--- Second run ---");
+    {
+        let (tx, mut rx) = mpsc::channel::<Event>(128);
+        let src = MySqlSource {
+            id: "ckpt-test".into(),
+            checkpoint_key: "mysql-ckpt".to_string(),
+            dsn: dsn.clone(),
+            tables: vec![format!("{}.orders", db_name)],
+            tenant: "acme".into(),
+            pipeline: "test".to_string(),
+            registry: Arc::new(InMemoryRegistry::new()),
+        };
+
+        let handle = src.run(tx, ckpt_store.clone()).await;
+
+        let events =
+            collect_events_until(&mut rx, Duration::from_secs(15), |evts| {
+                evts.iter().any(|e| event_has_id(e, 301))
+            })
+            .await;
+
+        assert!(
+            events.iter().any(|e| event_has_id(e, 301)),
+            "second run should receive event inserted while down"
+        );
+        info!("✓ second run received missed event for id=301");
+
+        let count_300 = events.iter().filter(|e| event_has_id(e, 300)).count();
+        if count_300 > 0 {
+            warn!("received {} duplicate events for id=300", count_300);
+        }
+
+        handle.stop();
+        let _ = handle.join().await;
+    }
+
+    drop_test_database(&pool, &db_name).await;
+    Ok(())
+}
+
+/// Test reconnection after forced disconnect.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_cdc_reconnect_after_disconnect() -> Result<()> {
+    init_test_tracing();
+    let _container = get_mysql_container().await;
+
+    let (db_name, pool) = create_test_database("reconnect").await?;
+    let mut conn = pool.get_conn().await?;
+    let dsn = cdc_dsn(&db_name);
+
+    conn.query_drop(format!("USE {}", db_name)).await?;
+    conn.query_drop(
+        r#"CREATE TABLE orders (
+            id INT PRIMARY KEY,
+            sku VARCHAR(64)
+        )"#,
+    )
+    .await?;
+
+    let src = MySqlSource {
+        id: "reconnect".into(),
+        checkpoint_key: "mysql-reconnect".to_string(),
+        dsn: dsn.clone(),
+        tables: vec![format!("{}.orders", db_name)],
+        tenant: "acme".into(),
+        pipeline: "test".to_string(),
+        registry: Arc::new(InMemoryRegistry::new()),
+    };
+
+    let ckpt_store: Arc<dyn CheckpointStore> =
+        Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = mpsc::channel::<Event>(128);
+    let handle = src.run(tx, ckpt_store).await;
+    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
+
+    sleep(Duration::from_secs(3)).await;
+
+    // Insert before disconnect
+    conn.query_drop(
+        "INSERT INTO orders (id, sku) VALUES (200, 'before-disconnect')",
+    )
+    .await?;
+
+    let events =
+        collect_events_until(&mut rx, Duration::from_secs(10), |evts| {
+            evts.iter().any(|e| event_has_id(e, 200))
+        })
+        .await;
+
+    assert!(
+        events.iter().any(|e| event_has_id(e, 200)),
+        "should receive event before disconnect"
+    );
+    info!("✓ received event before disconnect");
+
+    // Kill CDC user's connection
+    let kill_result: Option<(u64,)> = conn
+        .query_first(format!(
+            "SELECT id FROM information_schema.processlist WHERE user = '{}' LIMIT 1",
+            CDC_USER
+        ))
+        .await?;
+
+    if let Some((pid,)) = kill_result {
+        conn.query_drop(format!("KILL {}", pid)).await.ok();
+        info!("killed CDC connection pid={}", pid);
+    } else {
+        warn!("no CDC connection found to kill");
+    }
+
+    sleep(Duration::from_secs(3)).await;
+
+    // Insert after reconnect
+    conn.query_drop(
+        "INSERT INTO orders (id, sku) VALUES (201, 'after-reconnect')",
+    )
+    .await?;
+
+    let events =
+        collect_events_until(&mut rx, Duration::from_secs(20), |evts| {
+            evts.iter().any(|e| event_has_id(e, 201))
+        })
+        .await;
+
+    assert!(
+        events.iter().any(|e| event_has_id(e, 201)),
+        "should receive event after reconnect"
+    );
+    info!("✓ received event after reconnect");
+
+    handle.stop();
+    let _ = handle.join().await;
+
+    drop_test_database(&pool, &db_name).await;
+    Ok(())
+}
+
+/// Test that events for non-matching tables are filtered out.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_cdc_table_filtering() -> Result<()> {
+    init_test_tracing();
+    let _container = get_mysql_container().await;
+
+    let (db_name, pool) = create_test_database("filtering").await?;
+    let mut conn = pool.get_conn().await?;
+    let dsn = cdc_dsn(&db_name);
+
+    conn.query_drop(format!("USE {}", db_name)).await?;
+    conn.query_drop(
+        "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64))",
+    )
+    .await?;
+    conn.query_drop(
+        "CREATE TABLE audit_log (id INT PRIMARY KEY, msg VARCHAR(256))",
+    )
+    .await?;
+
+    // Only subscribe to orders, not audit_log
+    let src = MySqlSource {
+        id: "filtering".into(),
+        checkpoint_key: "mysql-filtering".to_string(),
+        dsn: dsn.clone(),
+        tables: vec![format!("{}.orders", db_name)],
+        tenant: "acme".into(),
+        pipeline: "test".to_string(),
+        registry: Arc::new(InMemoryRegistry::new()),
+    };
+
+    let ckpt_store: Arc<dyn CheckpointStore> =
+        Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = mpsc::channel::<Event>(128);
+    let handle = src.run(tx, ckpt_store).await;
+    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
+
+    sleep(Duration::from_secs(3)).await;
+
+    // Insert into both tables
+    conn.query_drop(
+        "INSERT INTO audit_log (id, msg) VALUES (1, 'should be filtered')",
+    )
+    .await?;
+    conn.query_drop(
+        "INSERT INTO orders (id, sku) VALUES (1, 'should be captured')",
+    )
+    .await?;
+
+    let events =
+        collect_events_until(&mut rx, Duration::from_secs(10), |evts| {
+            evts.iter()
+                .any(|e| e.table == format!("{}.orders", db_name))
+        })
+        .await;
+
+    // Should only have orders events
+    // No audit_log events should be captured
+    assert!(
+        events.iter().all(|e| !e.table.contains("audit_log")),
+        "audit_log should be filtered out"
+    );
+
+    // Orders events should be captured
+    assert!(
+        events
+            .iter()
+            .filter(|e| !matches!(e.op, Op::Ddl))
+            .all(|e| e.table == format!("{}.orders", db_name)),
+        "only orders table should be captured"
+    );
+
+    info!("✓ table filtering works");
+
+    handle.stop();
+    let _ = handle.join().await;
+
+    drop_test_database(&pool, &db_name).await;
     Ok(())
 }

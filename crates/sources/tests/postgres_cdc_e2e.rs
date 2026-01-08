@@ -19,8 +19,8 @@ use tokio::{
 use tokio_postgres::NoTls;
 use tracing::{debug, info};
 
-mod common;
-use common::init_test_tracing;
+mod test_common;
+use test_common::init_test_tracing;
 
 /// End-to-end CDC test for the PostgreSQL source.
 ///

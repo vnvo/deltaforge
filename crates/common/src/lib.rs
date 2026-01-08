@@ -50,7 +50,5 @@ pub use dsn::{
 };
 pub use patterns::AllowList;
 pub use pause::pause_until_resumed;
-pub use retry::{
-    RetryPolicy, retry_async, retryable_connect, retryable_io, watchdog,
-};
+pub use retry::{RetryOutcome, RetryPolicy, retry_async, watchdog};
 pub use time::{PG_EPOCH_OFFSET_MICROS, pg_timestamp_to_unix_ms, ts_sec_to_ms};
