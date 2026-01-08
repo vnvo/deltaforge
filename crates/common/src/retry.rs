@@ -359,7 +359,7 @@ impl RetryPolicy {
     /// - `max_retries` is `None` (unlimited), or
     /// - `attempt <= max_retries`
     pub fn should_retry(&self, attempt: u32) -> bool {
-        self.max_retries.map_or(true, |max| attempt <= max)
+        self.max_retries.is_none_or(|max| attempt <= max)
     }
 }
 

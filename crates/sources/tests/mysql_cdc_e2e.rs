@@ -53,7 +53,7 @@ fn cleanup() {
     // Force container cleanup on process exit
     if let Some(container) = MYSQL_CONTAINER.get() {
         std::process::Command::new("docker")
-            .args(["rm", "-f", &container.id()])
+            .args(["rm", "-f", container.id()])
             .output()
             .ok();
     }
