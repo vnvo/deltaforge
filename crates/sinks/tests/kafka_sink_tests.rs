@@ -11,11 +11,11 @@ use anyhow::Result;
 use ctor::dtor;
 use deltaforge_config::KafkaSinkCfg;
 use deltaforge_core::{Event, Op, Sink, SourceMeta};
+use rdkafka::Message;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
-use rdkafka::Message;
 use serde_json::json;
 use sinks::kafka::KafkaSink;
 use std::collections::HashMap;
@@ -42,7 +42,8 @@ const KAFKA_PORT: u16 = 9192;
 const KAFKA_INTERNAL_PORT: u16 = 29092;
 
 /// Shared Kafka container - initialized once, reused by all tests.
-static KAFKA_CONTAINER: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
+static KAFKA_CONTAINER: OnceCell<ContainerAsync<GenericImage>> =
+    OnceCell::const_new();
 
 #[dtor]
 fn cleanup() {
@@ -101,21 +102,27 @@ async fn get_kafka_container() -> &'static ContainerAsync<GenericImage> {
 }
 
 /// Poll Kafka until it's ready to accept connections.
-async fn wait_for_kafka(brokers: &str, timeout_duration: Duration) -> Result<()> {
+async fn wait_for_kafka(
+    brokers: &str,
+    timeout_duration: Duration,
+) -> Result<()> {
     let deadline = Instant::now() + timeout_duration;
 
     while Instant::now() < deadline {
         // Try to create an admin client and list topics
-        let admin_result: Result<AdminClient<DefaultClientContext>, _> = ClientConfig::new()
-            .set("bootstrap.servers", brokers)
-            .set("socket.timeout.ms", "5000")
-            .set("request.timeout.ms", "5000")
-            .create();
+        let admin_result: Result<AdminClient<DefaultClientContext>, _> =
+            ClientConfig::new()
+                .set("bootstrap.servers", brokers)
+                .set("socket.timeout.ms", "5000")
+                .set("request.timeout.ms", "5000")
+                .create();
 
         if let Ok(admin) = admin_result {
             // Try to fetch metadata
             let metadata_result = tokio::task::spawn_blocking(move || {
-                admin.inner().fetch_metadata(None, std::time::Duration::from_secs(5))
+                admin
+                    .inner()
+                    .fetch_metadata(None, std::time::Duration::from_secs(5))
             })
             .await;
 
@@ -142,14 +149,20 @@ fn test_topic(test_name: &str) -> String {
 }
 
 /// Create a topic with proper configuration.
-async fn create_topic(brokers: &str, topic: &str, partitions: i32) -> Result<()> {
+async fn create_topic(
+    brokers: &str,
+    topic: &str,
+    partitions: i32,
+) -> Result<()> {
     let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
         .set("bootstrap.servers", brokers)
         .create()?;
 
-    let new_topic = NewTopic::new(topic, partitions, TopicReplication::Fixed(1));
+    let new_topic =
+        NewTopic::new(topic, partitions, TopicReplication::Fixed(1));
 
-    let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(10)));
+    let opts =
+        AdminOptions::new().operation_timeout(Some(Duration::from_secs(10)));
 
     let results = admin.create_topics(&[new_topic], &opts).await?;
 
@@ -176,7 +189,8 @@ async fn delete_topic(brokers: &str, topic: &str) -> Result<()> {
         .set("bootstrap.servers", brokers)
         .create()?;
 
-    let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(10)));
+    let opts =
+        AdminOptions::new().operation_timeout(Some(Duration::from_secs(10)));
     let _ = admin.delete_topics(&[topic], &opts).await;
     debug!("deleted topic: {}", topic);
     Ok(())
@@ -220,7 +234,11 @@ fn make_large_event(id: i64, size_bytes: usize) -> Event {
 }
 
 /// Create a consumer for reading messages from a topic.
-fn create_consumer(brokers: &str, topic: &str, group_id: &str) -> Result<StreamConsumer> {
+fn create_consumer(
+    brokers: &str,
+    topic: &str,
+    group_id: &str,
+) -> Result<StreamConsumer> {
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", brokers)
         .set("group.id", group_id)
@@ -300,7 +318,10 @@ async fn kafka_sink_sends_single_event() -> Result<()> {
 
     // Consume and verify
     let consumer = create_consumer(&brokers, &topic, "test-single-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| !msgs.is_empty()).await;
+    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
+        !msgs.is_empty()
+    })
+    .await;
 
     assert!(!messages.is_empty(), "should receive at least one message");
 
@@ -342,7 +363,10 @@ async fn kafka_sink_sends_batch() -> Result<()> {
 
     // Consume all messages
     let consumer = create_consumer(&brokers, &topic, "test-batch-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(30), |msgs| msgs.len() >= 100).await;
+    let messages = consume_until(&consumer, Duration::from_secs(30), |msgs| {
+        msgs.len() >= 100
+    })
+    .await;
 
     assert_eq!(messages.len(), 100, "should receive all 100 messages");
 
@@ -417,8 +441,12 @@ async fn kafka_sink_idempotent_mode() -> Result<()> {
         sink.send(&event).await?;
     }
 
-    let consumer = create_consumer(&brokers, &topic, "test-idempotent-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| msgs.len() >= 10).await;
+    let consumer =
+        create_consumer(&brokers, &topic, "test-idempotent-consumer")?;
+    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
+        msgs.len() >= 10
+    })
+    .await;
 
     assert_eq!(messages.len(), 10, "should receive all 10 messages");
 
@@ -457,7 +485,10 @@ async fn kafka_sink_exactly_once_mode() -> Result<()> {
     sink.send(&event).await?;
 
     let consumer = create_consumer(&brokers, &topic, "test-eos-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| !msgs.is_empty()).await;
+    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
+        !msgs.is_empty()
+    })
+    .await;
 
     assert!(!messages.is_empty(), "should receive message in EOS mode");
 
@@ -532,7 +563,10 @@ async fn kafka_sink_large_events() -> Result<()> {
     sink.send(&large_event).await?;
 
     let consumer = create_consumer(&brokers, &topic, "test-large-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| !msgs.is_empty()).await;
+    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
+        !msgs.is_empty()
+    })
+    .await;
 
     assert!(!messages.is_empty(), "large event should be delivered");
 
@@ -588,10 +622,18 @@ async fn kafka_sink_concurrent_sends() -> Result<()> {
     }
 
     // Consume and verify
-    let consumer = create_consumer(&brokers, &topic, "test-concurrent-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(30), |msgs| msgs.len() >= 100).await;
+    let consumer =
+        create_consumer(&brokers, &topic, "test-concurrent-consumer")?;
+    let messages = consume_until(&consumer, Duration::from_secs(30), |msgs| {
+        msgs.len() >= 100
+    })
+    .await;
 
-    assert_eq!(messages.len(), 100, "all concurrent events should be delivered");
+    assert_eq!(
+        messages.len(),
+        100,
+        "all concurrent events should be delivered"
+    );
 
     info!("✓ 100 concurrent events sent successfully");
     delete_topic(&brokers, &topic).await?;
@@ -634,9 +676,15 @@ async fn kafka_sink_custom_config() -> Result<()> {
     sink.send(&event).await?;
 
     let consumer = create_consumer(&brokers, &topic, "test-custom-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| !msgs.is_empty()).await;
+    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
+        !msgs.is_empty()
+    })
+    .await;
 
-    assert!(!messages.is_empty(), "message should be delivered with custom config");
+    assert!(
+        !messages.is_empty(),
+        "message should be delivered with custom config"
+    );
 
     info!("✓ custom client configuration works");
     delete_topic(&brokers, &topic).await?;
@@ -712,7 +760,7 @@ async fn kafka_sink_optional() -> Result<()> {
 #[ignore = "requires docker"]
 async fn kafka_sink_recovers_after_restart() -> Result<()> {
     init_test_tracing();
-    
+
     // Start a dedicated container for this test (not shared)
     let restart_port: u16 = 9193;
     let image = GenericImage::new("confluentinc/cp-kafka", "7.5.0")
@@ -742,7 +790,7 @@ async fn kafka_sink_recovers_after_restart() -> Result<()> {
 
     let container = image.start().await?;
     let brokers = format!("localhost:{}", restart_port);
-    
+
     wait_for_kafka(&brokers, Duration::from_secs(60)).await?;
 
     let topic = "df-test-restart";
@@ -789,7 +837,11 @@ async fn kafka_sink_recovers_after_restart() -> Result<()> {
 
     // The send should eventually succeed (give it extra time for broker recovery)
     let result = timeout(Duration::from_secs(60), send_handle).await??;
-    assert!(result.is_ok(), "send should succeed after Kafka recovers: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "send should succeed after Kafka recovers: {:?}",
+        result.err()
+    );
 
     info!("✓ sink recovered after Kafka restart");
     Ok(())
@@ -842,7 +894,10 @@ async fn kafka_sink_handles_broker_hiccup() -> Result<()> {
 
     // Verify by consuming
     let consumer = create_consumer(&brokers, &topic, "test-hiccup-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(30), |msgs| msgs.len() >= 50).await;
+    let messages = consume_until(&consumer, Duration::from_secs(30), |msgs| {
+        msgs.len() >= 50
+    })
+    .await;
 
     assert_eq!(messages.len(), 50, "all 50 messages should be consumable");
 
@@ -880,14 +935,18 @@ async fn kafka_sink_batch_resilience() -> Result<()> {
         let events: Vec<Event> = (0..20)
             .map(|i| make_test_event(batch_num * 100 + i))
             .collect();
-        
+
         sink.send_batch(&events).await?;
         debug!("batch {} delivered", batch_num);
     }
 
     // Verify all messages
-    let consumer = create_consumer(&brokers, &topic, "test-batch-resilience-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(30), |msgs| msgs.len() >= 100).await;
+    let consumer =
+        create_consumer(&brokers, &topic, "test-batch-resilience-consumer")?;
+    let messages = consume_until(&consumer, Duration::from_secs(30), |msgs| {
+        msgs.len() >= 100
+    })
+    .await;
 
     assert_eq!(messages.len(), 100, "all 100 messages should be delivered");
 
