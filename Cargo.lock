@@ -4832,14 +4832,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "common",
+ "ctor",
  "deltaforge-config",
  "deltaforge-core",
  "futures",
  "rdkafka",
  "redis",
  "serde_json",
+ "testcontainers",
  "tokio",
+ "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

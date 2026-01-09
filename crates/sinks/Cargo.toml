@@ -13,11 +13,21 @@ tracing = { workspace = true }
 rdkafka = { workspace = true }
 redis = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 deltaforge-core = { path = "../deltaforge-core" }
 deltaforge-config = { path = "../deltaforge-config" }
+common = { path = "../common" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+ctor = "0.6"
+testcontainers = "0.25"
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = [
+    "env-filter",
+    "fmt",
+    "json",
+] }
 
 [lints]
 workspace = true

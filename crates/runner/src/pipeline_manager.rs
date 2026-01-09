@@ -146,10 +146,14 @@ impl PipelineManager {
         let pipeline_name = spec.metadata.name.clone();
         counter!("deltaforge_pipelines_total").increment(1);
 
+        // Create cancellation token early so it can be shared with sinks
+        let cancel = CancellationToken::new();
+
         let source = build_source(&spec, self.registry.clone())
             .context("build source")?;
         let processors = build_processors(&spec).context("build processors")?;
-        let sinks = build_sinks(&spec).context("build sinks")?;
+        let sinks =
+            build_sinks(&spec, cancel.clone()).context("build sinks")?;
         let schema_loader = build_schema_loader(&spec, self.registry.clone());
 
         let table_patterns = match &spec.spec.source {
@@ -195,7 +199,6 @@ impl PipelineManager {
         }
 
         let coord = builder.build();
-        let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
         let pname = pipeline_name.clone();
 
@@ -412,6 +415,9 @@ mod tests {
                     uri: "redis://localhost".to_string(),
                     stream: "events".to_string(),
                     required: Some(true),
+                    send_timeout_secs: None,
+                    batch_timeout_secs: None,
+                    connect_timeout_secs: None,
                 })],
                 connection_policy: None,
                 batch: Some(BatchConfig::default()),

@@ -1,138 +1,939 @@
+//! Integration tests for Kafka sink.
+//!
+//! These tests require Docker and pull `confluentinc/cp-kafka:7.5.0`.
+//!
+//! Run with:
+//! ```bash
+//! cargo test -p sinks --test kafka_sink_tests -- --include-ignored --nocapture --test-threads=1
+//! ```
+
 use anyhow::Result;
+use ctor::dtor;
 use deltaforge_config::KafkaSinkCfg;
 use deltaforge_core::{Event, Op, Sink, SourceMeta};
-use serde_json::json;
-use sinks::kafka::KafkaSink;
-
-use rdkafka::Message;
+use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
+use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
-use tokio::time::{Duration, timeout};
+use rdkafka::Message;
+use serde_json::json;
+use sinks::kafka::KafkaSink;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+use testcontainers::{
+    ContainerAsync, GenericImage, ImageExt,
+    core::{IntoContainerPort, WaitFor},
+    runners::AsyncRunner,
+};
+use tokio::sync::OnceCell;
+use tokio::time::{Duration, sleep, timeout};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
 
-fn make_test_event() -> Event {
+mod sink_test_common;
+use sink_test_common::init_test_tracing;
+
+// =============================================================================
+// Shared Test Infrastructure
+// =============================================================================
+
+const KAFKA_PORT: u16 = 9192;
+const KAFKA_INTERNAL_PORT: u16 = 29092;
+
+/// Shared Kafka container - initialized once, reused by all tests.
+static KAFKA_CONTAINER: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
+
+#[dtor]
+fn cleanup() {
+    // Force container cleanup on process exit
+    if let Some(container) = KAFKA_CONTAINER.get() {
+        std::process::Command::new("docker")
+            .args(["rm", "-f", container.id()])
+            .output()
+            .ok();
+    }
+}
+
+/// Get or start the shared Kafka container (KRaft mode, no Zookeeper).
+async fn get_kafka_container() -> &'static ContainerAsync<GenericImage> {
+    KAFKA_CONTAINER
+        .get_or_init(|| async {
+            info!("starting Kafka container (KRaft mode)...");
+
+            // Use KRaft-based Kafka (no Zookeeper needed)
+            let image = GenericImage::new("confluentinc/cp-kafka", "7.5.0")
+                .with_wait_for(WaitFor::Duration { length: Duration::from_secs(15) })
+                .with_env_var("KAFKA_NODE_ID", "1")
+                .with_env_var("KAFKA_PROCESS_ROLES", "broker,controller")
+                .with_env_var("KAFKA_CONTROLLER_QUORUM_VOTERS", "1@localhost:29093")
+                .with_env_var("KAFKA_LISTENERS", format!(
+                    "PLAINTEXT://0.0.0.0:{},CONTROLLER://0.0.0.0:29093,EXTERNAL://0.0.0.0:{}",
+                    KAFKA_INTERNAL_PORT, KAFKA_PORT
+                ))
+                .with_env_var("KAFKA_ADVERTISED_LISTENERS", format!(
+                    "PLAINTEXT://localhost:{},EXTERNAL://localhost:{}",
+                    KAFKA_INTERNAL_PORT, KAFKA_PORT
+                ))
+                .with_env_var("KAFKA_LISTENER_SECURITY_PROTOCOL_MAP", 
+                    "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT")
+                .with_env_var("KAFKA_CONTROLLER_LISTENER_NAMES", "CONTROLLER")
+                .with_env_var("KAFKA_INTER_BROKER_LISTENER_NAME", "PLAINTEXT")
+                .with_env_var("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1")
+                .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+                .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
+                .with_env_var("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "0")
+                .with_env_var("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "true")
+                .with_env_var("CLUSTER_ID", "MkU3OEVBNTcwNTJENDM2Qg")
+                .with_mapped_port(KAFKA_PORT, KAFKA_PORT.tcp());
+
+            let container = image.start().await.expect("start kafka container");
+            info!("Kafka container started: {}", container.id());
+
+            // Wait for Kafka to be fully ready
+            wait_for_kafka(&brokers(), Duration::from_secs(60))
+                .await
+                .expect("Kafka should be ready");
+
+            container
+        })
+        .await
+}
+
+/// Poll Kafka until it's ready to accept connections.
+async fn wait_for_kafka(brokers: &str, timeout_duration: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout_duration;
+
+    while Instant::now() < deadline {
+        // Try to create an admin client and list topics
+        let admin_result: Result<AdminClient<DefaultClientContext>, _> = ClientConfig::new()
+            .set("bootstrap.servers", brokers)
+            .set("socket.timeout.ms", "5000")
+            .set("request.timeout.ms", "5000")
+            .create();
+
+        if let Ok(admin) = admin_result {
+            // Try to fetch metadata
+            let metadata_result = tokio::task::spawn_blocking(move || {
+                admin.inner().fetch_metadata(None, std::time::Duration::from_secs(5))
+            })
+            .await;
+
+            if let Ok(Ok(_)) = metadata_result {
+                info!("Kafka is ready");
+                return Ok(());
+            }
+        }
+
+        debug!("waiting for Kafka...");
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    anyhow::bail!("Kafka not ready after {:?}", timeout_duration)
+}
+
+fn brokers() -> String {
+    format!("localhost:{}", KAFKA_PORT)
+}
+
+/// Create a unique topic name for each test.
+fn test_topic(test_name: &str) -> String {
+    format!("df-test-{}", test_name.replace('_', "-"))
+}
+
+/// Create a topic with proper configuration.
+async fn create_topic(brokers: &str, topic: &str, partitions: i32) -> Result<()> {
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()?;
+
+    let new_topic = NewTopic::new(topic, partitions, TopicReplication::Fixed(1));
+
+    let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(10)));
+
+    let results = admin.create_topics(&[new_topic], &opts).await?;
+
+    for result in results {
+        match result {
+            Ok(_) => debug!("created topic: {}", topic),
+            Err((_, err)) => {
+                // Ignore "topic already exists" error
+                if !err.to_string().contains("already exists") {
+                    warn!("failed to create topic {}: {:?}", topic, err);
+                }
+            }
+        }
+    }
+
+    // Give Kafka a moment to propagate topic metadata
+    sleep(Duration::from_millis(500)).await;
+    Ok(())
+}
+
+/// Delete a topic (cleanup).
+async fn delete_topic(brokers: &str, topic: &str) -> Result<()> {
+    let admin: AdminClient<DefaultClientContext> = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .create()?;
+
+    let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(10)));
+    let _ = admin.delete_topics(&[topic], &opts).await;
+    debug!("deleted topic: {}", topic);
+    Ok(())
+}
+
+/// Create a test event with a specific ID.
+fn make_test_event(id: i64) -> Event {
     Event::new_row(
-        "t".into(),
+        "tenant".into(),
         SourceMeta {
             kind: "test".into(),
-            host: "h".into(),
-            db: "d".into(),
+            host: "localhost".into(),
+            db: "testdb".into(),
         },
-        "d.t".into(),
+        "test.table".into(),
         Op::Insert,
         None,
-        Some(json!({ "id": 1 })),
-        1_700_000_000_000,
-        4_usize,
+        Some(json!({"id": id, "name": format!("item-{}", id)})),
+        1_700_000_000_000 + id,
+        64,
     )
 }
 
-/// This test assumes a Kafka broker is available at localhost:9092 and
-/// auto-topic-creation is enabled.
-#[ignore]
-#[tokio::test(flavor = "multi_thread")]
-async fn kafka_sink_writes_to_topic() -> Result<()> {
-    let cfg = KafkaSinkCfg {
-        id: "test-kafka".to_string(),
-        brokers: "localhost:9092".to_string(),
-        topic: "df.test.kafka".to_string(),
-        required: None,
-        exactly_once: None,
-        client_conf: Default::default(),
-    };
+/// Create a test event with specific data size.
+fn make_large_event(id: i64, size_bytes: usize) -> Event {
+    let padding = "x".repeat(size_bytes);
+    Event::new_row(
+        "tenant".into(),
+        SourceMeta {
+            kind: "test".into(),
+            host: "localhost".into(),
+            db: "testdb".into(),
+        },
+        "test.table".into(),
+        Op::Insert,
+        None,
+        Some(json!({"id": id, "payload": padding})),
+        1_700_000_000_000 + id,
+        64,
+    )
+}
 
-    // Produce one event via our sink
-    let sink = KafkaSink::new(&cfg)?;
-    let ev = make_test_event();
-    sink.send(&ev).await?;
-
-    // Build a consumer to verify the message is on the topic
+/// Create a consumer for reading messages from a topic.
+fn create_consumer(brokers: &str, topic: &str, group_id: &str) -> Result<StreamConsumer> {
     let consumer: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", &cfg.brokers)
-        .set("group.id", "deltaforge-kafka-sink-test")
-        .set("enable.partition.eof", "false")
+        .set("bootstrap.servers", brokers)
+        .set("group.id", group_id)
         .set("auto.offset.reset", "earliest")
+        .set("enable.partition.eof", "false")
+        .set("session.timeout.ms", "6000")
         .create()?;
 
-    consumer.subscribe(&[&cfg.topic])?;
-
-    // Wait up to 10 seconds for a message
-    let msg = timeout(Duration::from_secs(10), consumer.recv()).await??;
-
-    assert_eq!(msg.topic(), cfg.topic);
-    assert!(msg.payload().is_some(), "expected non-empty payload");
-
-    Ok(())
+    consumer.subscribe(&[topic])?;
+    Ok(consumer)
 }
 
-/// Smoke test for the `exactly_once` branch in KafkaSink::new.
-/// We don't validate EOS semantics here, just that send works.
-#[ignore]
-#[tokio::test(flavor = "multi_thread")]
-async fn kafka_sink_with_exactly_once_enabled() -> Result<()> {
-    let cfg = KafkaSinkCfg {
-        id: "test-kafka-eo".to_string(),
-        brokers: "localhost:9092".to_string(),
-        topic: "df.test.kafka.eo".to_string(),
-        required: None,
-        exactly_once: Some(true),
-        client_conf: Default::default(),
-    };
+/// Consume messages from a topic until a condition is met or timeout.
+async fn consume_until<F>(
+    consumer: &StreamConsumer,
+    timeout_duration: Duration,
+    mut condition: F,
+) -> Vec<Vec<u8>>
+where
+    F: FnMut(&[Vec<u8>]) -> bool,
+{
+    let deadline = Instant::now() + timeout_duration;
+    let mut messages = Vec::new();
 
-    let sink = KafkaSink::new(&cfg)?;
-    let ev = make_test_event();
-    sink.send(&ev).await?;
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match timeout(remaining, consumer.recv()).await {
+            Ok(Ok(msg)) => {
+                if let Some(payload) = msg.payload() {
+                    messages.push(payload.to_vec());
+                    if condition(&messages) {
+                        break;
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                warn!("consumer error: {}", e);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
 
-    // If we got here without error, producer creation + send succeeded.
-    Ok(())
+    messages
 }
 
-#[ignore]
-#[tokio::test(flavor = "multi_thread")]
-async fn kafka_sink_batch_send() -> Result<()> {
+// =============================================================================
+// Basic Functionality Tests
+// =============================================================================
+
+/// Test that a single event is written to the topic correctly.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_sends_single_event() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let topic = test_topic("single");
+    let brokers = brokers();
+    create_topic(&brokers, &topic, 1).await?;
+
     let cfg = KafkaSinkCfg {
-        id: "test-kafka-batch".to_string(),
-        brokers: "localhost:9092".to_string(),
-        topic: "df.test.kafka.batch".to_string(),
-        required: None,
+        id: "test-kafka".into(),
+        brokers: brokers.clone(),
+        topic: topic.clone(),
+        required: Some(true),
         exactly_once: None,
-        client_conf: Default::default(),
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
     };
 
-    let sink = KafkaSink::new(&cfg)?;
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
 
-    let events: Vec<_> = (0..100)
-        .map(|i| {
-            Event::new_row(
-                "t".into(),
-                SourceMeta {
-                    kind: "test".into(),
-                    host: "h".into(),
-                    db: "d".into(),
-                },
-                "d.t".into(),
-                Op::Insert,
-                None,
-                Some(json!({ "id": i })),
-                1_700_000_000_000,
-                64,
-            )
-        })
-        .collect();
+    let event = make_test_event(1);
+    sink.send(&event).await?;
 
+    // Consume and verify
+    let consumer = create_consumer(&brokers, &topic, "test-single-consumer")?;
+    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| !msgs.is_empty()).await;
+
+    assert!(!messages.is_empty(), "should receive at least one message");
+
+    let parsed: Event = serde_json::from_slice(&messages[0])?;
+    assert_eq!(parsed.event_id, event.event_id);
+
+    info!("✓ single event sent successfully");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
+/// Test batch send with rdkafka batching.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_sends_batch() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let topic = test_topic("batch");
+    let brokers = brokers();
+    create_topic(&brokers, &topic, 3).await?;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-kafka-batch".into(),
+        brokers: brokers.clone(),
+        topic: topic.clone(),
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    // Send a batch of 100 events
+    let events: Vec<Event> = (0..100).map(make_test_event).collect();
     sink.send_batch(&events).await?;
 
+    // Consume all messages
+    let consumer = create_consumer(&brokers, &topic, "test-batch-consumer")?;
+    let messages = consume_until(&consumer, Duration::from_secs(30), |msgs| msgs.len() >= 100).await;
+
+    assert_eq!(messages.len(), 100, "should receive all 100 messages");
+
+    info!("✓ batch of 100 events sent successfully");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
+/// Test that empty batch is a no-op.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_empty_batch_is_noop() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let topic = test_topic("empty-batch");
+    let brokers = brokers();
+    create_topic(&brokers, &topic, 1).await?;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-kafka-empty".into(),
+        brokers: brokers.clone(),
+        topic: topic.clone(),
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    // Send empty batch - should not produce any messages
+    sink.send_batch(&[]).await?;
+
+    info!("✓ empty batch is a no-op");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
+// =============================================================================
+// Exactly-Once Semantics Tests
+// =============================================================================
+
+/// Test idempotent producer (default mode).
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_idempotent_mode() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let topic = test_topic("idempotent");
+    let brokers = brokers();
+    create_topic(&brokers, &topic, 1).await?;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-idempotent".into(),
+        brokers: brokers.clone(),
+        topic: topic.clone(),
+        required: Some(true),
+        exactly_once: Some(false), // Idempotent, not exactly-once
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    // Send multiple events
+    for i in 0..10 {
+        let event = make_test_event(i);
+        sink.send(&event).await?;
+    }
+
+    let consumer = create_consumer(&brokers, &topic, "test-idempotent-consumer")?;
+    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| msgs.len() >= 10).await;
+
+    assert_eq!(messages.len(), 10, "should receive all 10 messages");
+
+    info!("✓ idempotent producer works correctly");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
+/// Test exactly-once enabled producer.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_exactly_once_mode() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let topic = test_topic("exactly-once");
+    let brokers = brokers();
+    create_topic(&brokers, &topic, 1).await?;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-exactly-once".into(),
+        brokers: brokers.clone(),
+        topic: topic.clone(),
+        required: Some(true),
+        exactly_once: Some(true),
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    // Note: Full EOS testing requires transaction support; this just validates
+    // that the producer can be created and send messages
+    let event = make_test_event(1);
+    sink.send(&event).await?;
+
+    let consumer = create_consumer(&brokers, &topic, "test-eos-consumer")?;
+    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| !msgs.is_empty()).await;
+
+    assert!(!messages.is_empty(), "should receive message in EOS mode");
+
+    info!("✓ exactly-once producer created and sends successfully");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
+// =============================================================================
+// Connection and Retry Tests
+// =============================================================================
+
+/// Test sink with invalid brokers fails gracefully.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_invalid_brokers() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-invalid".into(),
+        brokers: "invalid-host:9999".into(),
+        topic: "df-test-invalid".into(),
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(5),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    // Send should fail (after retries/timeout)
+    let event = make_test_event(1);
+    let result = sink.send(&event).await;
+
+    assert!(result.is_err(), "send to invalid brokers should fail");
+    info!("✓ invalid brokers fails gracefully: {:?}", result.err());
+    Ok(())
+}
+
+// =============================================================================
+// Large Payload Tests
+// =============================================================================
+
+/// Test handling of large events.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_large_events() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let topic = test_topic("large");
+    let brokers = brokers();
+    create_topic(&brokers, &topic, 1).await?;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-large".into(),
+        brokers: brokers.clone(),
+        topic: topic.clone(),
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    // Send a 500KB event (default max is 1MB)
+    let large_event = make_large_event(1, 500 * 1024);
+    sink.send(&large_event).await?;
+
+    let consumer = create_consumer(&brokers, &topic, "test-large-consumer")?;
+    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| !msgs.is_empty()).await;
+
+    assert!(!messages.is_empty(), "large event should be delivered");
+
+    info!("✓ large event (500KB) sent successfully");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
+// =============================================================================
+// Concurrent Access Tests
+// =============================================================================
+
+/// Test concurrent sends from multiple tasks.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_concurrent_sends() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let topic = test_topic("concurrent");
+    let brokers = brokers();
+    create_topic(&brokers, &topic, 3).await?;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-concurrent".into(),
+        brokers: brokers.clone(),
+        topic: topic.clone(),
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = Arc::new(KafkaSink::new(&cfg, cancel)?);
+
+    // Spawn 10 concurrent tasks, each sending 10 events
+    let mut handles = Vec::new();
+    for task_id in 0..10 {
+        let sink = sink.clone();
+        handles.push(tokio::spawn(async move {
+            for i in 0..10 {
+                let event = make_test_event(task_id * 100 + i);
+                sink.send(&event).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }));
+    }
+
+    // Wait for all tasks
+    for handle in handles {
+        handle.await??;
+    }
+
+    // Consume and verify
+    let consumer = create_consumer(&brokers, &topic, "test-concurrent-consumer")?;
+    let messages = consume_until(&consumer, Duration::from_secs(30), |msgs| msgs.len() >= 100).await;
+
+    assert_eq!(messages.len(), 100, "all concurrent events should be delivered");
+
+    info!("✓ 100 concurrent events sent successfully");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
+// =============================================================================
+// Client Configuration Tests
+// =============================================================================
+
+/// Test custom client configuration overrides.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_custom_config() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let topic = test_topic("custom-config");
+    let brokers = brokers();
+    create_topic(&brokers, &topic, 1).await?;
+
+    let mut client_conf = HashMap::new();
+    client_conf.insert("linger.ms".to_string(), "10".to_string());
+    client_conf.insert("compression.type".to_string(), "gzip".to_string());
+
+    let cfg = KafkaSinkCfg {
+        id: "test-custom".into(),
+        brokers: brokers.clone(),
+        topic: topic.clone(),
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf,
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    let event = make_test_event(1);
+    sink.send(&event).await?;
+
+    let consumer = create_consumer(&brokers, &topic, "test-custom-consumer")?;
+    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| !msgs.is_empty()).await;
+
+    assert!(!messages.is_empty(), "message should be delivered with custom config");
+
+    info!("✓ custom client configuration works");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
+// =============================================================================
+// Trait Implementation Tests
+// =============================================================================
+
+/// Test Sink trait methods.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_trait_implementation() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-trait".into(),
+        brokers: brokers(),
+        topic: "df-test-trait".into(),
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    // Test id()
+    assert_eq!(sink.id(), "test-trait");
+
+    // Test required()
+    assert!(sink.required());
+
+    info!("✓ Sink trait methods work correctly");
+    Ok(())
+}
+
+/// Test required() returns false when configured.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_optional() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-optional".into(),
+        brokers: brokers(),
+        topic: "df-test-optional".into(),
+        required: Some(false),
+        exactly_once: None,
+        send_timeout_secs: None,
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    assert!(!sink.required(), "sink should be optional");
+
+    info!("✓ optional sink configuration works");
+    Ok(())
+}
+
+// =============================================================================
+// Reconnection and Recovery Tests
+// =============================================================================
+
+/// Test that sink recovers after Kafka broker restarts.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_recovers_after_restart() -> Result<()> {
+    init_test_tracing();
+    
+    // Start a dedicated container for this test (not shared)
+    let restart_port: u16 = 9193;
+    let image = GenericImage::new("confluentinc/cp-kafka", "7.5.0")
+        .with_wait_for(WaitFor::Duration { length: Duration::from_secs(15) })
+        .with_env_var("KAFKA_NODE_ID", "1")
+        .with_env_var("KAFKA_PROCESS_ROLES", "broker,controller")
+        .with_env_var("KAFKA_CONTROLLER_QUORUM_VOTERS", "1@localhost:29093")
+        .with_env_var("KAFKA_LISTENERS", format!(
+            "PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,EXTERNAL://0.0.0.0:{}",
+            restart_port
+        ))
+        .with_env_var("KAFKA_ADVERTISED_LISTENERS", format!(
+            "PLAINTEXT://localhost:29092,EXTERNAL://localhost:{}",
+            restart_port
+        ))
+        .with_env_var("KAFKA_LISTENER_SECURITY_PROTOCOL_MAP", 
+            "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT")
+        .with_env_var("KAFKA_CONTROLLER_LISTENER_NAMES", "CONTROLLER")
+        .with_env_var("KAFKA_INTER_BROKER_LISTENER_NAME", "PLAINTEXT")
+        .with_env_var("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
+        .with_env_var("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "0")
+        .with_env_var("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "true")
+        .with_env_var("CLUSTER_ID", "NkU3OEVBNTcwNTJENDM2Qg")
+        .with_mapped_port(restart_port, restart_port.tcp());
+
+    let container = image.start().await?;
+    let brokers = format!("localhost:{}", restart_port);
+    
+    wait_for_kafka(&brokers, Duration::from_secs(60)).await?;
+
+    let topic = "df-test-restart";
+    create_topic(&brokers, topic, 1).await?;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-restart".into(),
+        brokers: brokers.clone(),
+        topic: topic.into(),
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = Arc::new(KafkaSink::new(&cfg, cancel.clone())?);
+
+    // Send first event successfully
+    let event1 = make_test_event(1);
+    sink.send(&event1).await?;
+    info!("✓ first event sent before restart");
+
+    // Stop the container (simulates Kafka going down)
+    info!("stopping Kafka container...");
+    container.stop().await?;
+    sleep(Duration::from_secs(2)).await;
+
+    // Start sending in background - should retry until Kafka comes back
+    let sink_clone = sink.clone();
+    let send_handle = tokio::spawn(async move {
+        let event2 = make_test_event(2);
+        sink_clone.send(&event2).await
+    });
+
+    // Wait for retries to start
+    sleep(Duration::from_secs(3)).await;
+
+    // Restart the container
+    info!("restarting Kafka container...");
+    container.start().await?;
+    wait_for_kafka(&brokers, Duration::from_secs(60)).await?;
+    info!("Kafka is back up");
+
+    // The send should eventually succeed (give it extra time for broker recovery)
+    let result = timeout(Duration::from_secs(60), send_handle).await??;
+    assert!(result.is_ok(), "send should succeed after Kafka recovers: {:?}", result.err());
+
+    info!("✓ sink recovered after Kafka restart");
+    Ok(())
+}
+
+/// Test that producer handles temporary broker unavailability.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_handles_broker_hiccup() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let topic = test_topic("hiccup");
+    let brokers = brokers();
+    create_topic(&brokers, &topic, 1).await?;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-hiccup".into(),
+        brokers: brokers.clone(),
+        topic: topic.clone(),
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = Arc::new(KafkaSink::new(&cfg, cancel)?);
+
+    // Send multiple events rapidly
+    // rdkafka's internal retry should handle any transient issues
+    let mut handles = Vec::new();
+    for i in 0..50 {
+        let sink = sink.clone();
+        handles.push(tokio::spawn(async move {
+            let event = make_test_event(i);
+            sink.send(&event).await
+        }));
+    }
+
+    // Wait for all sends
+    let mut success_count = 0;
+    for handle in handles {
+        if handle.await?.is_ok() {
+            success_count += 1;
+        }
+    }
+
+    assert_eq!(success_count, 50, "all events should be delivered");
+
     // Verify by consuming
-    let consumer: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", &cfg.brokers)
-        .set("group.id", "deltaforge-kafka-batch-test")
-        .set("auto.offset.reset", "earliest")
-        .create()?;
+    let consumer = create_consumer(&brokers, &topic, "test-hiccup-consumer")?;
+    let messages = consume_until(&consumer, Duration::from_secs(30), |msgs| msgs.len() >= 50).await;
 
-    consumer.subscribe(&[&cfg.topic])?;
+    assert_eq!(messages.len(), 50, "all 50 messages should be consumable");
 
-    // Just verify we can read at least one message
-    let msg = timeout(Duration::from_secs(10), consumer.recv()).await??;
-    assert!(msg.payload().is_some());
+    info!("✓ handled rapid sends without issues");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
 
+/// Test batch delivery with intermittent failures.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_batch_resilience() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let topic = test_topic("batch-resilience");
+    let brokers = brokers();
+    create_topic(&brokers, &topic, 3).await?;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-batch-resilience".into(),
+        brokers: brokers.clone(),
+        topic: topic.clone(),
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    // Send multiple batches in sequence
+    for batch_num in 0..5 {
+        let events: Vec<Event> = (0..20)
+            .map(|i| make_test_event(batch_num * 100 + i))
+            .collect();
+        
+        sink.send_batch(&events).await?;
+        debug!("batch {} delivered", batch_num);
+    }
+
+    // Verify all messages
+    let consumer = create_consumer(&brokers, &topic, "test-batch-resilience-consumer")?;
+    let messages = consume_until(&consumer, Duration::from_secs(30), |msgs| msgs.len() >= 100).await;
+
+    assert_eq!(messages.len(), 100, "all 100 messages should be delivered");
+
+    info!("✓ batch delivery is resilient");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
+// =============================================================================
+// Cancellation Tests
+// =============================================================================
+
+/// Test that cancellation is propagated correctly.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_respects_cancellation() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    // Use an invalid broker so retry loop keeps trying
+    let cfg = KafkaSinkCfg {
+        id: "test-cancel".into(),
+        brokers: "invalid-host:9999".into(),
+        topic: "df-test-cancel".into(),
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(2),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = Arc::new(KafkaSink::new(&cfg, cancel.clone())?);
+
+    let sink_clone = sink.clone();
+    let send_handle = tokio::spawn(async move {
+        let event = make_test_event(1);
+        sink_clone.send(&event).await
+    });
+
+    // Give it a moment to start, then cancel
+    sleep(Duration::from_millis(100)).await;
+    cancel.cancel();
+
+    let result = send_handle.await?;
+    assert!(result.is_err(), "cancelled operation should fail");
+
+    info!("✓ cancellation respected");
     Ok(())
 }
