@@ -9,7 +9,6 @@
 //! Each source captures row-level changes and emits them as `Event`s
 //! to be processed by the pipeline coordinator.
 
-pub(crate) mod conn_utils;
 pub mod mysql;
 pub mod postgres;
 pub mod schema_loader;
