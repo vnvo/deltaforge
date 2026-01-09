@@ -244,10 +244,10 @@ fn print_connection_hints(err: &PgWireError) {
 }
 
 /// Verify publication exists and ensure slot exists, get start LSN.
-/// 
+///
 /// Publications must be pre-created by a DBA - this function will NOT auto-create them.
 /// Slots will be auto-created if missing (safe, no ownership issues).
-/// 
+///
 /// Returns LoopControl::Reconnect for missing publication (retryable - admin can create it).
 /// Returns LoopControl::Fail for fatal errors (auth, incompatible config).
 pub(super) async fn ensure_slot_and_publication(
@@ -257,7 +257,7 @@ pub(super) async fn ensure_slot_and_publication(
     tables: &[String],
 ) -> Result<Lsn, super::postgres_errors::LoopControl> {
     use super::postgres_errors::LoopControl;
-    
+
     let (client, conn) =
         tokio_postgres::connect(dsn, NoTls).await.map_err(|e| {
             error!(error = %e, "control plane connect failed");
@@ -289,7 +289,7 @@ pub(super) async fn ensure_slot_and_publication(
         } else {
             tables.join(", ")
         };
-        
+
         error!(
             publication = %publication,
             tables = %table_list,
@@ -299,10 +299,15 @@ pub(super) async fn ensure_slot_and_publication(
         if tables.is_empty() {
             error!("  CREATE PUBLICATION {} FOR ALL TABLES;", publication);
         } else {
-            error!("  CREATE PUBLICATION {} FOR TABLE {};", publication, table_list);
+            error!(
+                "  CREATE PUBLICATION {} FOR TABLE {};",
+                publication, table_list
+            );
         }
-        error!("DeltaForge will retry and pick up the publication once created.");
-        
+        error!(
+            "DeltaForge will retry and pick up the publication once created."
+        );
+
         return Err(LoopControl::Reconnect);
     }
 
@@ -324,10 +329,12 @@ pub(super) async fn ensure_slot_and_publication(
 
         confirmed
             .or(restart)
-            .map(|s| Lsn::parse(&s).map_err(|e| {
-                error!(error = %e, lsn = %s, "failed to parse LSN");
-                LoopControl::Fail(SourceError::Other(e.into()))
-            }))
+            .map(|s| {
+                Lsn::parse(&s).map_err(|e| {
+                    error!(error = %e, lsn = %s, "failed to parse LSN");
+                    LoopControl::Fail(SourceError::Other(e.into()))
+                })
+            })
             .transpose()?
             .unwrap_or(get_current_wal_lsn(&client).await?)
     } else {
@@ -356,7 +363,7 @@ async fn get_current_wal_lsn(
     client: &tokio_postgres::Client,
 ) -> Result<Lsn, super::postgres_errors::LoopControl> {
     use super::postgres_errors::LoopControl;
-    
+
     let row = client
         .query_one("SELECT pg_current_wal_lsn()::text", &[])
         .await

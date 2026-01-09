@@ -287,7 +287,7 @@ impl PostgresSchemaLoader {
         }
 
         let columns: Vec<PostgresColumn> =
-            col_rows.iter().map(|row| build_column(row)).collect();
+            col_rows.iter().map(build_column).collect();
 
         let pk_rows = client
             .query(
@@ -358,7 +358,7 @@ impl PostgresSchemaLoader {
         ))
     }
 
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn from_static(
         cols: HashMap<(String, String), Arc<Vec<String>>>,
     ) -> Self {

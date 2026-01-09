@@ -83,10 +83,8 @@ impl From<tokio_postgres::Error> for PostgresSourceError {
     }
 }
 
-// NOTE: No From<PgWireError> here - use LoopControl::from_pgwire_error() in the event loop
-
 // =============================================================================
-// LoopControl - for event loop control flow (mirrors MySQL)
+// LoopControl - for event loop control flow
 // =============================================================================
 
 #[derive(Debug)]
@@ -116,6 +114,7 @@ impl LoopControl {
     }
 
     /// Classify PgWireError (main event loop errors).
+    #[allow(dead_code)]
     pub fn from_pgwire_error(err: pgwire_replication::PgWireError) -> Self {
         use pgwire_replication::PgWireError::*;
 

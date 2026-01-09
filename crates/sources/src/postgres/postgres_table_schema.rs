@@ -282,20 +282,24 @@ impl SourceSchema for PostgresTableSchema {
 pub mod type_oids {
     pub const BOOL: u32 = 16;
     pub const BYTEA: u32 = 17;
+    #[allow(dead_code)]
     pub const CHAR: u32 = 18;
     pub const INT8: u32 = 20;
     pub const INT2: u32 = 21;
     pub const INT4: u32 = 23;
+    #[allow(dead_code)]
     pub const TEXT: u32 = 25;
     pub const OID: u32 = 26;
     pub const JSON: u32 = 114;
     pub const FLOAT4: u32 = 700;
     pub const FLOAT8: u32 = 701;
+    #[allow(dead_code)]
     pub const VARCHAR: u32 = 1043;
     pub const DATE: u32 = 1082;
     pub const TIME: u32 = 1083;
     pub const TIMESTAMP: u32 = 1114;
     pub const TIMESTAMPTZ: u32 = 1184;
+    #[allow(dead_code)]
     pub const INTERVAL: u32 = 1186;
     pub const NUMERIC: u32 = 1700;
     pub const UUID: u32 = 2950;

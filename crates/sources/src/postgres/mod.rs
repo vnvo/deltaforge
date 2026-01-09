@@ -19,8 +19,8 @@ use common::{AllowList, RetryPolicy, pause_until_resumed};
 use deltaforge_core::{Event, Source, SourceError, SourceHandle, SourceResult};
 
 mod postgres_errors;
-pub use postgres_errors::{PostgresSourceError, PostgresSourceResult};
 use postgres_errors::LoopControl;
+pub use postgres_errors::{PostgresSourceError, PostgresSourceResult};
 
 mod postgres_helpers;
 use postgres_helpers::{
@@ -34,8 +34,8 @@ mod postgres_schema_loader;
 pub use postgres_schema_loader::{LoadedSchema, PostgresSchemaLoader};
 
 mod postgres_event;
-use postgres_event::*;
 pub use postgres_event::RelationInfo;
+use postgres_event::*;
 
 mod postgres_table_schema;
 pub use postgres_table_schema::{PostgresColumn, PostgresTableSchema};
@@ -127,10 +127,19 @@ impl PostgresSource {
         let mut startup_retry = RetryPolicy::default();
         let start_lsn = if last_checkpoint.is_none() {
             loop {
-                match ensure_slot_and_publication(&self.dsn, &self.slot, &self.publication, &self.tables).await {
+                match ensure_slot_and_publication(
+                    &self.dsn,
+                    &self.slot,
+                    &self.publication,
+                    &self.tables,
+                )
+                .await
+                {
                     Ok(lsn) => break lsn,
                     Err(LoopControl::Reconnect) => {
-                        let delay = startup_retry.next_backoff().min(Duration::from_secs(MAX_STARTUP_BACKOFF_SECS));
+                        let delay = startup_retry
+                            .next_backoff()
+                            .min(Duration::from_secs(MAX_STARTUP_BACKOFF_SECS));
                         warn!(
                             source_id = %self.id,
                             delay_secs = delay.as_secs(),
@@ -162,9 +171,16 @@ impl PostgresSource {
             config.start_lsn
         };
 
-        let config = pgwire_replication::ReplicationConfig { start_lsn, ..config };
+        let config = pgwire_replication::ReplicationConfig {
+            start_lsn,
+            ..config
+        };
 
-        let schema_loader = PostgresSchemaLoader::new(&self.dsn, self.registry.clone(), &self.tenant);
+        let schema_loader = PostgresSchemaLoader::new(
+            &self.dsn,
+            self.registry.clone(),
+            &self.tenant,
+        );
         let tracked = schema_loader.preload(&self.tables).await?;
         info!(tables = tracked.len(), "schemas preloaded");
 
@@ -187,7 +203,13 @@ impl PostgresSource {
             "postgres source starting"
         );
 
-        let client = connect_replication_with_retries(&self.id, config.clone(), &cancel, RetryPolicy::default()).await?;
+        let client = connect_replication_with_retries(
+            &self.id,
+            config.clone(),
+            &cancel,
+            RetryPolicy::default(),
+        )
+        .await?;
 
         let mut ctx = RunCtx {
             source_id: self.id.clone(),
@@ -213,12 +235,14 @@ impl PostgresSource {
 
         info!("entering replication loop");
         loop {
-            if !pause_until_resumed(&ctx.cancel, &ctx.paused, &ctx.pause_notify).await {
+            if !pause_until_resumed(&ctx.cancel, &ctx.paused, &ctx.pause_notify)
+                .await
+            {
                 break;
             }
 
             debug!(source_id = %self.id, "reading next event");
-            
+
             // Read next event, may return LoopControl on error
             let event_result = match read_next_event(&ctx).await {
                 Ok(Some(event)) => {
@@ -258,12 +282,20 @@ impl PostgresSource {
                         }
                     }
 
-                    let reconnect_config = pgwire_replication::ReplicationConfig {
-                        start_lsn: ctx.last_lsn,
-                        ..config.clone()
-                    };
+                    let reconnect_config =
+                        pgwire_replication::ReplicationConfig {
+                            start_lsn: ctx.last_lsn,
+                            ..config.clone()
+                        };
 
-                    match connect_replication_with_retries(&self.id, reconnect_config, &ctx.cancel, ctx.retry.clone()).await {
+                    match connect_replication_with_retries(
+                        &self.id,
+                        reconnect_config,
+                        &ctx.cancel,
+                        ctx.retry.clone(),
+                    )
+                    .await
+                    {
                         Ok(new_client) => {
                             *ctx.repl_client.lock().await = new_client;
                             ctx.retry.reset();
@@ -288,7 +320,13 @@ impl PostgresSource {
 
         // Best-effort final checkpoint
         let _ = chkpt_store
-            .put(&self.id, PostgresCheckpoint { lsn: ctx.last_lsn.to_string(), tx_id: None })
+            .put(
+                &self.id,
+                PostgresCheckpoint {
+                    lsn: ctx.last_lsn.to_string(),
+                    tx_id: None,
+                },
+            )
             .await;
 
         // Shutdown replication client
@@ -306,7 +344,11 @@ impl Source for PostgresSource {
         &self.checkpoint_key
     }
 
-    async fn run(&self, tx: mpsc::Sender<Event>, chkpt_store: Arc<dyn CheckpointStore>) -> SourceHandle {
+    async fn run(
+        &self,
+        tx: mpsc::Sender<Event>,
+        chkpt_store: Arc<dyn CheckpointStore>,
+    ) -> SourceHandle {
         let cancel = CancellationToken::new();
         let paused = Arc::new(AtomicBool::new(false));
         let pause_notify = Arc::new(Notify::new());
@@ -318,7 +360,13 @@ impl Source for PostgresSource {
 
         let join = tokio::spawn(async move {
             let res = this
-                .run_inner(tx, chkpt_store, cancel_for_task, paused_for_task, pause_notify_for_task)
+                .run_inner(
+                    tx,
+                    chkpt_store,
+                    cancel_for_task,
+                    paused_for_task,
+                    pause_notify_for_task,
+                )
                 .await;
             if let Err(e) = &res {
                 error!(error = ?e, "postgres source ended with error");
@@ -326,6 +374,11 @@ impl Source for PostgresSource {
             res
         });
 
-        SourceHandle { cancel, paused, pause_notify, join }
+        SourceHandle {
+            cancel,
+            paused,
+            pause_notify,
+            join,
+        }
     }
 }
