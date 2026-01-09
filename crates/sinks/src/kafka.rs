@@ -441,9 +441,9 @@ fn outcome_to_sink_error(outcome: RetryOutcome<KafkaRetryError>) -> SinkError {
             KafkaRetryError::Auth(msg) => SinkError::Connect {
                 details: msg.into(),
             },
-            KafkaRetryError::MessageTooLarge => SinkError::Other(
-                anyhow::anyhow!("message too large for Kafka"),
-            ),
+            KafkaRetryError::MessageTooLarge => {
+                SinkError::Other(anyhow::anyhow!("message too large for Kafka"))
+            }
             _ => SinkError::Connect {
                 details: e.to_string().into(),
             },
