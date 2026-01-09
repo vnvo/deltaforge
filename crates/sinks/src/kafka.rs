@@ -415,7 +415,7 @@ fn redact_brokers(brokers: &str) -> String {
 fn outcome_to_sink_error(outcome: RetryOutcome<KafkaRetryError>) -> SinkError {
     match outcome {
         RetryOutcome::Cancelled => {
-            SinkError::Other(anyhow::anyhow!("operation cancelled").into())
+            SinkError::Other(anyhow::anyhow!("operation cancelled"))
         }
         RetryOutcome::Timeout { action } => SinkError::Backpressure {
             details: format!("timeout: {}", action).into(),
@@ -442,7 +442,7 @@ fn outcome_to_sink_error(outcome: RetryOutcome<KafkaRetryError>) -> SinkError {
                 details: msg.into(),
             },
             KafkaRetryError::MessageTooLarge => SinkError::Other(
-                anyhow::anyhow!("message too large for Kafka").into(),
+                anyhow::anyhow!("message too large for Kafka"),
             ),
             _ => SinkError::Connect {
                 details: e.to_string().into(),

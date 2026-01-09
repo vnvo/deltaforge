@@ -466,7 +466,7 @@ fn is_permanent_failure(msg: &str) -> bool {
 fn outcome_to_sink_error(outcome: RetryOutcome<RedisRetryError>) -> SinkError {
     match outcome {
         RetryOutcome::Cancelled => {
-            SinkError::Other(anyhow::anyhow!("operation cancelled").into())
+            SinkError::Other(anyhow::anyhow!("operation cancelled"))
         }
         RetryOutcome::Timeout { action } => SinkError::Backpressure {
             details: format!("timeout: {}", action).into(),

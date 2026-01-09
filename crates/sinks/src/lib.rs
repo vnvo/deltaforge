@@ -138,6 +138,7 @@ pub fn build_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deltaforge_config::{KafkaSinkCfg, RedisSinkCfg};
 
     // Note: Integration tests for sinks require running infrastructure
     // (Kafka, Redis) and are in the tests/ directory.
@@ -155,6 +156,3 @@ mod tests {
         ) -> anyhow::Result<RedisSink> = RedisSink::new;
     }
 }
-
-// Re-export config types for convenience
-use deltaforge_config::{KafkaSinkCfg, RedisSinkCfg};
