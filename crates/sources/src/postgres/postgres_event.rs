@@ -4,137 +4,81 @@
 //! converts them to DeltaForge events.
 
 use bytes::Bytes;
-use deltaforge_core::{Event, Op, SourceError, SourceMeta, SourceResult};
+use deltaforge_core::{Event, Op, SourceMeta, SourceResult};
 use metrics::counter;
 use pgwire_replication::{Lsn, client::ReplicationEvent};
 use tracing::{debug, error, info, instrument, warn};
 
+use common::watchdog;
+
 use super::RunCtx;
+use super::postgres_errors::LoopControl;
 use super::postgres_helpers::{make_checkpoint_meta, pg_timestamp_to_unix_ms};
 use super::postgres_object::{RelationColumn, build_object, parse_tuple_data};
-use crate::conn_utils::{retryable_stream, watchdog};
-
-/// Control flow for the replication loop.
-pub(super) enum LoopControl {
-    Reconnect,
-    Stop,
-    Fail(SourceError),
-}
 
 /// Relation metadata from pgoutput.
 #[derive(Debug, Clone)]
-pub(super) struct RelationInfo {
-    #[allow(dead_code)]
+pub struct RelationInfo {
     pub id: u32,
     pub schema: String,
     pub table: String,
     pub columns: Vec<RelationColumn>,
     /// Replica identity: d=default, n=nothing, f=full, i=index
-    #[allow(dead_code)]
     pub replica_identity: char,
 }
 
 /// Read next replication event with watchdog timeout.
 #[instrument(skip_all)]
-pub(super) async fn read_next_event(
-    ctx: &RunCtx,
-) -> Result<Option<ReplicationEvent>, LoopControl> {
+pub(super) async fn read_next_event(ctx: &RunCtx) -> Result<Option<ReplicationEvent>, LoopControl> {
     let mut client = ctx.repl_client.lock().await;
 
-    match watchdog(client.recv(), ctx.inactivity, &ctx.cancel, "repl_recv")
-        .await
-    {
+    match watchdog(client.recv(), ctx.inactivity, &ctx.cancel, "repl_recv").await {
         Ok(Some(event)) => Ok(Some(event)),
         Ok(None) => {
-            info!(source_id=%ctx.source_id, "replication stream ended");
+            info!(source_id = %ctx.source_id, "replication stream ended");
             Ok(None)
         }
-        Err(se) => {
+        Err(outcome) => {
             if ctx.cancel.is_cancelled() {
                 return Err(LoopControl::Stop);
             }
-            if retryable_stream(&se) {
+
+            let control = LoopControl::from_replication_outcome(outcome);
+            if control.is_retryable() {
                 counter!(
                     "deltaforge_source_reconnects_total",
                     "pipeline" => ctx.pipeline.clone(),
                     "source" => ctx.source_id.clone(),
                 )
                 .increment(1);
-                warn!(source_id=%ctx.source_id, error=%se, "replication read failed; scheduling reconnect");
-                Err(LoopControl::Reconnect)
-            } else {
-                error!(source_id=%ctx.source_id, error=%se, "non-retryable replication error");
-                Err(LoopControl::Fail(se))
             }
+            Err(control)
         }
     }
 }
 
 /// Dispatch a replication event to appropriate handler.
+/// Returns LoopControl to signal schema reload or fatal errors.
 #[instrument(skip_all)]
-pub(super) async fn dispatch_event(
-    ctx: &mut RunCtx,
-    event: ReplicationEvent,
-) -> SourceResult<()> {
+pub(super) async fn dispatch_event(ctx: &mut RunCtx, event: ReplicationEvent) -> Result<(), LoopControl> {
     match event {
-        ReplicationEvent::XLogData {
-            wal_start,
-            wal_end,
-            data,
-            ..
-        } => {
-            debug!(
-                wal_start = %wal_start,
-                wal_end = %wal_end,
-                bytes = data.len(),
-                "xlog data received"
-            );
-
-            // Update position
+        ReplicationEvent::XLogData { wal_start, wal_end, data, .. } => {
+            debug!(wal_start = %wal_start, wal_end = %wal_end, bytes = data.len(), "xlog data");
             ctx.last_lsn = wal_end;
-
-            // Process the pgoutput message
             handle_pgoutput_message(ctx, &data, wal_end).await?;
-
-            // Update applied LSN
-            let client = ctx.repl_client.lock().await;
-            client.update_applied_lsn(wal_end);
+            ctx.repl_client.lock().await.update_applied_lsn(wal_end);
         }
-        ReplicationEvent::KeepAlive {
-            wal_end,
-            reply_requested,
-            ..
-        } => {
-            debug!(
-                wal_end = %wal_end,
-                reply_requested = reply_requested,
-                "keepalive"
-            );
+        ReplicationEvent::KeepAlive { wal_end, reply_requested, .. } => {
+            debug!(wal_end = %wal_end, reply_requested, "keepalive");
             ctx.last_lsn = wal_end;
         }
-        ReplicationEvent::Begin {
-            final_lsn,
-            commit_time_micros,
-            xid,
-        } => {
-            debug!(
-                final_lsn = %final_lsn,
-                xid = xid,
-                "transaction begin"
-            );
+        ReplicationEvent::Begin { final_lsn, commit_time_micros, xid } => {
+            debug!(final_lsn = %final_lsn, xid, "transaction begin");
             ctx.current_tx_id = Some(xid);
             ctx.current_tx_commit_time = Some(commit_time_micros);
         }
-        ReplicationEvent::Commit {
-            lsn,
-            end_lsn,
-            commit_time_micros: _,
-        } => {
-            debug!(
-                commit_lsn = %lsn,
-                end_lsn = %end_lsn,
-                "transaction commit"
-            );
+        ReplicationEvent::Commit { lsn, end_lsn, .. } => {
+            debug!(commit_lsn = %lsn, end_lsn = %end_lsn, "transaction commit");
             ctx.last_lsn = end_lsn;
             ctx.current_tx_id = None;
             ctx.current_tx_commit_time = None;
@@ -143,16 +87,11 @@ pub(super) async fn dispatch_event(
             info!(reached = %reached, "replication stopped at target LSN");
         }
     }
-
     Ok(())
 }
 
 /// Parse and handle pgoutput protocol messages.
-async fn handle_pgoutput_message(
-    ctx: &mut RunCtx,
-    data: &Bytes,
-    wal_lsn: Lsn,
-) -> SourceResult<()> {
+async fn handle_pgoutput_message(ctx: &mut RunCtx, data: &Bytes, wal_lsn: Lsn) -> Result<(), LoopControl> {
     if data.is_empty() {
         return Ok(());
     }
@@ -161,85 +100,48 @@ async fn handle_pgoutput_message(
     let payload = &data[1..];
 
     match msg_type {
-        b'R' => handle_relation(ctx, payload).await,
-        b'I' => handle_insert(ctx, payload, wal_lsn).await,
-        b'U' => handle_update(ctx, payload, wal_lsn).await,
-        b'D' => handle_delete(ctx, payload, wal_lsn).await,
-        b'T' => handle_truncate(ctx, payload, wal_lsn).await,
-        b'B' => {
-            // Begin (already handled in ReplicationEvent::Begin)
-            Ok(())
-        }
-        b'C' => {
-            // Commit (already handled in ReplicationEvent::Commit)
-            Ok(())
-        }
-        b'O' => {
-            // Origin - informational
-            debug!("origin message received");
-            Ok(())
-        }
-        b'Y' => {
-            // Type - custom type definition
-            debug!("type message received");
-            Ok(())
-        }
-        b'M' => {
-            // Message - user-defined logical decoding message
-            debug!("logical message received");
-            Ok(())
-        }
-        _ => {
-            debug!(
-                msg_type = msg_type.to_string(),
-                "unknown pgoutput message type"
-            );
-            Ok(())
-        }
+        b'R' => handle_relation(ctx, payload),
+        b'I' => handle_insert(ctx, payload, wal_lsn).await.map_err(LoopControl::Fail),
+        b'U' => handle_update(ctx, payload, wal_lsn).await.map_err(LoopControl::Fail),
+        b'D' => handle_delete(ctx, payload, wal_lsn).await.map_err(LoopControl::Fail),
+        b'T' => handle_truncate(ctx, payload, wal_lsn).await.map_err(LoopControl::Fail),
+        b'B' | b'C' => Ok(()), // Begin/Commit handled in ReplicationEvent
+        b'O' => { debug!("origin message"); Ok(()) }
+        b'Y' => { debug!("type message"); Ok(()) }
+        b'M' => { debug!("logical message"); Ok(()) }
+        _ => { debug!(msg_type = %msg_type, "unknown pgoutput message"); Ok(()) }
     }
 }
 
 /// Handle relation (table metadata) message.
-async fn handle_relation(ctx: &mut RunCtx, payload: &[u8]) -> SourceResult<()> {
+/// Returns LoopControl::ReloadSchema if schema changed and needs reload.
+fn handle_relation(ctx: &mut RunCtx, payload: &[u8]) -> Result<(), LoopControl> {
     if payload.len() < 8 {
         return Ok(());
     }
 
-    let relation_id =
-        u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let relation_id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
     let mut offset = 4;
 
-    // Schema name (null-terminated)
     let schema = read_cstring(payload, &mut offset);
-    // Table name (null-terminated)
     let table = read_cstring(payload, &mut offset);
 
-    // Replica identity
-    let replica_identity = if offset < payload.len() {
-        payload[offset] as char
-    } else {
-        'd'
-    };
+    let replica_identity = if offset < payload.len() { payload[offset] as char } else { 'd' };
     offset += 1;
 
     if replica_identity != 'f' {
         warn!(
-            schema = %schema,
-            table = %table,
-            identity = %replica_identity,
+            schema = %schema, table = %table, identity = %replica_identity,
             "table does not have REPLICA IDENTITY FULL - before images will be incomplete"
         );
     }
 
-    // Column count
     if offset + 2 > payload.len() {
         return Ok(());
     }
-    let col_count =
-        u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+    let col_count = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
     offset += 2;
 
-    // Parse columns
     let mut columns = Vec::with_capacity(col_count);
     for _ in 0..col_count {
         if offset >= payload.len() {
@@ -254,95 +156,80 @@ async fn handle_relation(ctx: &mut RunCtx, payload: &[u8]) -> SourceResult<()> {
         if offset + 8 > payload.len() {
             break;
         }
-        let type_oid = u32::from_be_bytes([
-            payload[offset],
-            payload[offset + 1],
-            payload[offset + 2],
-            payload[offset + 3],
-        ]);
+        let type_oid = u32::from_be_bytes([payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3]]);
         offset += 4;
 
-        let type_modifier = i32::from_be_bytes([
-            payload[offset],
-            payload[offset + 1],
-            payload[offset + 2],
-            payload[offset + 3],
-        ]);
+        let type_modifier = i32::from_be_bytes([payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3]]);
         offset += 4;
 
-        columns.push(RelationColumn {
-            name,
-            type_oid,
-            type_modifier,
-            flags,
-        });
+        columns.push(RelationColumn { name, type_oid, type_modifier, flags });
     }
 
-    let is_new = !ctx.relation_map.contains_key(&relation_id);
+    // Check if this relation already exists and if schema changed
+    let existing = ctx.relation_map.get(&relation_id);
+    let is_new = existing.is_none();
+    let schema_changed = existing
+        .map(|r| r.columns.len() != columns.len() || columns_differ(&r.columns, &columns))
+        .unwrap_or(false);
 
+    // Update relation map with new column info
     ctx.relation_map.insert(
         relation_id,
-        RelationInfo {
-            id: relation_id,
-            schema: schema.clone(),
-            table: table.clone(),
-            columns,
-            replica_identity,
-        },
+        RelationInfo { id: relation_id, schema: schema.clone(), table: table.clone(), columns, replica_identity },
     );
 
     if ctx.allow.matches(&schema, &table) {
         if is_new {
-            info!(
-                relation_id = relation_id,
-                schema = %schema,
-                table = %table,
-                "relation mapped"
-            );
+            info!(relation_id, schema = %schema, table = %table, "relation mapped");
         } else {
-            debug!(
-                relation_id = relation_id,
-                schema = %schema,
-                table = %table,
-                "relation re-mapped"
-            );
+            debug!(relation_id, schema = %schema, table = %table, "relation re-mapped");
         }
-    } else {
-        debug!(
-            schema = %schema,
-            table = %table,
-            "skipping relation (not in allow-list)"
+    }
+
+    // If schema changed, signal main loop to reload (like MySQL does)
+    if schema_changed && ctx.allow.matches(&schema, &table) {
+        info!(
+            relation_id, schema = %schema, table = %table,
+            "schema changed, requesting reload"
         );
+        return Err(LoopControl::ReloadSchema {
+            schema: Some(schema),
+            table: Some(table),
+        });
     }
 
     Ok(())
 }
 
+/// Check if columns differ (by name or type).
+fn columns_differ(old: &[RelationColumn], new: &[RelationColumn]) -> bool {
+    if old.len() != new.len() {
+        return true;
+    }
+    for (o, n) in old.iter().zip(new.iter()) {
+        if o.name != n.name || o.type_oid != n.type_oid {
+            return true;
+        }
+    }
+    false
+}
+
 /// Handle INSERT message.
-async fn handle_insert(
-    ctx: &mut RunCtx,
-    payload: &[u8],
-    wal_lsn: Lsn,
-) -> SourceResult<()> {
+async fn handle_insert(ctx: &mut RunCtx, payload: &[u8], wal_lsn: Lsn) -> SourceResult<()> {
     if payload.len() < 5 {
         return Ok(());
     }
 
-    let relation_id =
-        u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let relation_id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
     let tuple_marker = payload[4];
 
     if tuple_marker != b'N' {
-        // N = new tuple
-        warn!(
-            marker = tuple_marker.to_string(),
-            "unexpected insert tuple marker"
-        );
+        warn!(marker = %char::from(tuple_marker), "unexpected insert tuple marker");
         return Ok(());
     }
 
     let Some(relation) = ctx.relation_map.get(&relation_id) else {
-        warn!(relation_id = relation_id, "insert for unknown relation");
+        warn!(relation_id, "insert for unknown relation");
         return Ok(());
     };
 
@@ -350,29 +237,19 @@ async fn handle_insert(
         return Ok(());
     }
 
-    // Load schema
-    let loaded = ctx
-        .schema
-        .load_schema(&relation.schema, &relation.table)
-        .await?;
+    let loaded = ctx.schema.load_schema(&relation.schema, &relation.table).await?;
 
-    // Parse tuple data
     let tuple_data = Bytes::copy_from_slice(&payload[5..]);
     let (values, _) = parse_tuple_data(&tuple_data, relation.columns.len());
     let after = build_object(&relation.columns, &values);
 
-    let timestamp_ms = ctx
-        .current_tx_commit_time
+    let timestamp_ms = ctx.current_tx_commit_time
         .map(pg_timestamp_to_unix_ms)
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
     let mut ev = Event::new_row(
         ctx.tenant.clone(),
-        SourceMeta {
-            kind: "postgres".into(),
-            host: ctx.host.clone(),
-            db: relation.schema.clone(),
-        },
+        SourceMeta { kind: "postgres".into(), host: ctx.host.clone(), db: relation.schema.clone() },
         format!("{}.{}", relation.schema, relation.table),
         Op::Insert,
         None,
@@ -386,41 +263,21 @@ async fn handle_insert(
     ev.schema_version = Some(loaded.fingerprint.to_string());
     ev.schema_sequence = Some(loaded.sequence);
 
-    let table = format!("{}.{}", relation.schema, relation.table);
-    match ctx.tx.send(ev).await {
-        Ok(_) => {
-            counter!(
-                "deltaforge_source_events_total",
-                "pipeline" => ctx.pipeline.clone(),
-                "source" => ctx.source_id.clone(),
-                "table" => table,
-            )
-            .increment(1);
-        }
-        Err(_) => {
-            error!(source_id=%ctx.source_id, "channel send failed (op=insert)");
-        }
-    }
-
+    send_event(ctx, ev, &relation.schema, &relation.table, "insert").await;
     Ok(())
 }
 
 /// Handle UPDATE message.
-async fn handle_update(
-    ctx: &mut RunCtx,
-    payload: &[u8],
-    wal_lsn: Lsn,
-) -> SourceResult<()> {
+async fn handle_update(ctx: &mut RunCtx, payload: &[u8], wal_lsn: Lsn) -> SourceResult<()> {
     if payload.len() < 5 {
         return Ok(());
     }
 
-    let relation_id =
-        u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let relation_id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
     let mut offset = 4;
 
     let Some(relation) = ctx.relation_map.get(&relation_id) else {
-        warn!(relation_id = relation_id, "update for unknown relation");
+        warn!(relation_id, "update for unknown relation");
         return Ok(());
     };
 
@@ -428,7 +285,11 @@ async fn handle_update(
         return Ok(());
     }
 
-    // Parse optional old tuple (K or O) and new tuple (N)
+    // Clone what we need before the mutable borrow ends
+    let schema = relation.schema.clone();
+    let table = relation.table.clone();
+    let columns = relation.columns.clone();
+
     let mut before_values = None;
     let mut after_values = None;
 
@@ -438,18 +299,14 @@ async fn handle_update(
 
         match marker {
             b'K' | b'O' => {
-                // Key tuple or Old tuple
                 let tuple_data = Bytes::copy_from_slice(&payload[offset..]);
-                let (values, consumed) =
-                    parse_tuple_data(&tuple_data, relation.columns.len());
+                let (values, consumed) = parse_tuple_data(&tuple_data, columns.len());
                 before_values = Some(values);
-                offset += consumed; // Advance by actual bytes consumed
+                offset += consumed;
             }
             b'N' => {
-                // New tuple
                 let tuple_data = Bytes::copy_from_slice(&payload[offset..]);
-                let (values, _) =
-                    parse_tuple_data(&tuple_data, relation.columns.len());
+                let (values, _) = parse_tuple_data(&tuple_data, columns.len());
                 after_values = Some(values);
                 break;
             }
@@ -462,28 +319,19 @@ async fn handle_update(
         return Ok(());
     };
 
-    // Load schema
-    let loaded = ctx
-        .schema
-        .load_schema(&relation.schema, &relation.table)
-        .await?;
+    let loaded = ctx.schema.load_schema(&schema, &table).await?;
 
-    let before = before_values.map(|v| build_object(&relation.columns, &v));
-    let after = build_object(&relation.columns, &after_vals);
+    let before = before_values.map(|v| build_object(&columns, &v));
+    let after = build_object(&columns, &after_vals);
 
-    let timestamp_ms = ctx
-        .current_tx_commit_time
+    let timestamp_ms = ctx.current_tx_commit_time
         .map(pg_timestamp_to_unix_ms)
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
     let mut ev = Event::new_row(
         ctx.tenant.clone(),
-        SourceMeta {
-            kind: "postgres".into(),
-            host: ctx.host.clone(),
-            db: relation.schema.clone(),
-        },
-        format!("{}.{}", relation.schema, relation.table),
+        SourceMeta { kind: "postgres".into(), host: ctx.host.clone(), db: schema.clone() },
+        format!("{}.{}", schema, table),
         Op::Update,
         before,
         Some(after),
@@ -496,41 +344,21 @@ async fn handle_update(
     ev.schema_version = Some(loaded.fingerprint.to_string());
     ev.schema_sequence = Some(loaded.sequence);
 
-    let table = format!("{}.{}", relation.schema, relation.table);
-    match ctx.tx.send(ev).await {
-        Ok(_) => {
-            counter!(
-                "deltaforge_source_events_total",
-                "pipeline" => ctx.pipeline.clone(),
-                "source" => ctx.source_id.clone(),
-                "table" => table,
-            )
-            .increment(1);
-        }
-        Err(_) => {
-            error!(source_id=%ctx.source_id, "channel send failed (op=update)");
-        }
-    }
-
+    send_event(ctx, ev, &schema, &table, "update").await;
     Ok(())
 }
 
 /// Handle DELETE message.
-async fn handle_delete(
-    ctx: &mut RunCtx,
-    payload: &[u8],
-    wal_lsn: Lsn,
-) -> SourceResult<()> {
+async fn handle_delete(ctx: &mut RunCtx, payload: &[u8], wal_lsn: Lsn) -> SourceResult<()> {
     if payload.len() < 5 {
         return Ok(());
     }
 
-    let relation_id =
-        u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let relation_id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
     let tuple_marker = payload[4];
 
     let Some(relation) = ctx.relation_map.get(&relation_id) else {
-        warn!(relation_id = relation_id, "delete for unknown relation");
+        warn!(relation_id, "delete for unknown relation");
         return Ok(());
     };
 
@@ -538,39 +366,30 @@ async fn handle_delete(
         return Ok(());
     }
 
-    // K = key tuple, O = old tuple
     if tuple_marker != b'K' && tuple_marker != b'O' {
-        warn!(
-            marker = tuple_marker.to_string(),
-            "unexpected delete tuple marker"
-        );
+        warn!(marker = %char::from(tuple_marker), "unexpected delete tuple marker");
         return Ok(());
     }
 
-    // Load schema
-    let loaded = ctx
-        .schema
-        .load_schema(&relation.schema, &relation.table)
-        .await?;
+    // Clone what we need
+    let schema = relation.schema.clone();
+    let table = relation.table.clone();
+    let columns = relation.columns.clone();
 
-    // Parse tuple data
+    let loaded = ctx.schema.load_schema(&schema, &table).await?;
+
     let tuple_data = Bytes::copy_from_slice(&payload[5..]);
-    let (values, _) = parse_tuple_data(&tuple_data, relation.columns.len());
-    let before = build_object(&relation.columns, &values);
+    let (values, _) = parse_tuple_data(&tuple_data, columns.len());
+    let before = build_object(&columns, &values);
 
-    let timestamp_ms = ctx
-        .current_tx_commit_time
+    let timestamp_ms = ctx.current_tx_commit_time
         .map(pg_timestamp_to_unix_ms)
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
     let mut ev = Event::new_row(
         ctx.tenant.clone(),
-        SourceMeta {
-            kind: "postgres".into(),
-            host: ctx.host.clone(),
-            db: relation.schema.clone(),
-        },
-        format!("{}.{}", relation.schema, relation.table),
+        SourceMeta { kind: "postgres".into(), host: ctx.host.clone(), db: schema.clone() },
+        format!("{}.{}", schema, table),
         Op::Delete,
         Some(before),
         None,
@@ -583,37 +402,17 @@ async fn handle_delete(
     ev.schema_version = Some(loaded.fingerprint.to_string());
     ev.schema_sequence = Some(loaded.sequence);
 
-    let table = format!("{}.{}", relation.schema, relation.table);
-    match ctx.tx.send(ev).await {
-        Ok(_) => {
-            counter!(
-                "deltaforge_source_events_total",
-                "pipeline" => ctx.pipeline.clone(),
-                "source" => ctx.source_id.clone(),
-                "table" => table,
-            )
-            .increment(1);
-        }
-        Err(_) => {
-            error!(source_id=%ctx.source_id, "channel send failed (op=delete)");
-        }
-    }
-
+    send_event(ctx, ev, &schema, &table, "delete").await;
     Ok(())
 }
 
 /// Handle TRUNCATE message.
-async fn handle_truncate(
-    ctx: &mut RunCtx,
-    payload: &[u8],
-    wal_lsn: Lsn,
-) -> SourceResult<()> {
+async fn handle_truncate(ctx: &mut RunCtx, payload: &[u8], wal_lsn: Lsn) -> SourceResult<()> {
     if payload.len() < 9 {
         return Ok(());
     }
 
-    let relation_count =
-        u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let relation_count = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
     let options = payload[4];
     let cascade = (options & 1) != 0;
     let restart_identity = (options & 2) != 0;
@@ -625,12 +424,7 @@ async fn handle_truncate(
         if offset + 4 > payload.len() {
             break;
         }
-        let rel_id = u32::from_be_bytes([
-            payload[offset],
-            payload[offset + 1],
-            payload[offset + 2],
-            payload[offset + 3],
-        ]);
+        let rel_id = u32::from_be_bytes([payload[offset], payload[offset + 1], payload[offset + 2], payload[offset + 3]]);
         offset += 4;
 
         if let Some(rel) = ctx.relation_map.get(&rel_id) {
@@ -638,23 +432,12 @@ async fn handle_truncate(
         }
     }
 
-    info!(
-        tables = ?tables,
-        cascade = cascade,
-        restart_identity = restart_identity,
-        lsn = %wal_lsn,
-        "truncate received"
-    );
+    info!(tables = ?tables, cascade, restart_identity, lsn = %wal_lsn, "truncate received");
 
-    // Emit truncate events for each table
     for table_name in &tables {
         let mut ev = Event::new_ddl(
             ctx.tenant.clone(),
-            SourceMeta {
-                kind: "postgres".into(),
-                host: ctx.host.clone(),
-                db: ctx.default_schema.clone(),
-            },
+            SourceMeta { kind: "postgres".into(), host: ctx.host.clone(), db: ctx.default_schema.clone() },
             table_name.clone(),
             "TRUNCATE".into(),
             chrono::Utc::now().timestamp_millis(),
@@ -663,11 +446,29 @@ async fn handle_truncate(
 
         ev.tx_id = ctx.current_tx_id.map(|id| id.to_string());
         ev.checkpoint = Some(make_checkpoint_meta(&wal_lsn, ctx.current_tx_id));
-
         let _ = ctx.tx.send(ev).await;
     }
 
     Ok(())
+}
+
+/// Send event and update metrics.
+async fn send_event(ctx: &RunCtx, ev: Event, schema: &str, table: &str, op: &str) {
+    let table_name = format!("{}.{}", schema, table);
+    match ctx.tx.send(ev).await {
+        Ok(_) => {
+            counter!(
+                "deltaforge_source_events_total",
+                "pipeline" => ctx.pipeline.clone(),
+                "source" => ctx.source_id.clone(),
+                "table" => table_name,
+            )
+            .increment(1);
+        }
+        Err(_) => {
+            error!(source_id = %ctx.source_id, op, "channel send failed");
+        }
+    }
 }
 
 /// Read null-terminated C string from buffer.
@@ -678,7 +479,7 @@ fn read_cstring(data: &[u8], offset: &mut usize) -> String {
     }
     let s = String::from_utf8_lossy(&data[start..*offset]).to_string();
     if *offset < data.len() {
-        *offset += 1; // Skip null terminator
+        *offset += 1;
     }
     s
 }
@@ -698,20 +499,32 @@ mod tests {
 
     #[test]
     fn test_relation_column_is_key() {
-        let key_col = RelationColumn {
-            name: "id".to_string(),
-            type_oid: 23,
-            type_modifier: -1,
-            flags: 1,
-        };
+        let key_col = RelationColumn { name: "id".into(), type_oid: 23, type_modifier: -1, flags: 1 };
         assert!(key_col.is_key());
 
-        let non_key_col = RelationColumn {
-            name: "name".to_string(),
-            type_oid: 25,
-            type_modifier: -1,
-            flags: 0,
-        };
+        let non_key_col = RelationColumn { name: "name".into(), type_oid: 25, type_modifier: -1, flags: 0 };
         assert!(!non_key_col.is_key());
+    }
+
+    #[test]
+    fn test_columns_differ() {
+        let cols1 = vec![
+            RelationColumn { name: "id".into(), type_oid: 23, type_modifier: -1, flags: 1 },
+            RelationColumn { name: "name".into(), type_oid: 25, type_modifier: -1, flags: 0 },
+        ];
+
+        let cols2 = vec![
+            RelationColumn { name: "id".into(), type_oid: 23, type_modifier: -1, flags: 1 },
+            RelationColumn { name: "name".into(), type_oid: 25, type_modifier: -1, flags: 0 },
+        ];
+
+        let cols3 = vec![
+            RelationColumn { name: "id".into(), type_oid: 23, type_modifier: -1, flags: 1 },
+            RelationColumn { name: "name".into(), type_oid: 25, type_modifier: -1, flags: 0 },
+            RelationColumn { name: "status".into(), type_oid: 25, type_modifier: -1, flags: 0 },
+        ];
+
+        assert!(!columns_differ(&cols1, &cols2));
+        assert!(columns_differ(&cols1, &cols3));
     }
 }

@@ -1,7 +1,6 @@
 //! End-to-end integration tests for MySQL CDC source.
 //!
 //! These tests require Docker and pull `mysql:8.4`.
-//! Tests share a single container and run sequentially via `#[serial]`.
 //!
 //! Run with:
 //! ```bash

@@ -1,36 +1,4 @@
 //! PostgreSQL CDC source implementation using logical replication.
-//!
-//! This source uses the pgwire-replication crate to connect to PostgreSQL's
-//! logical replication protocol and stream changes via the pgoutput plugin.
-//!
-//! # Requirements
-//!
-//! PostgreSQL must be configured for logical replication:
-//! ```sql
-//! -- postgresql.conf
-//! wal_level = logical
-//! max_replication_slots = 10
-//! max_wal_senders = 10
-//!
-//! -- Create replication slot and publication
-//! SELECT pg_create_logical_replication_slot('my_slot', 'pgoutput');
-//! CREATE PUBLICATION my_pub FOR ALL TABLES;
-//! ```
-//!
-//! # Example Configuration
-//!
-//! ```yaml
-//! source:
-//!   type: postgres
-//!   config:
-//!     id: orders-postgres
-//!     dsn: "postgres://user:pass@localhost:5432/mydb"
-//!     slot: my_slot
-//!     publication: my_pub
-//!     tables:
-//!       - public.orders
-//!       - public.order_items
-//! ```
 
 use std::{
     collections::HashMap,
@@ -44,18 +12,20 @@ use schema_registry::InMemoryRegistry;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use checkpoints::{CheckpointStore, CheckpointStoreExt};
-use deltaforge_core::{Event, Source, SourceHandle, SourceResult};
+use common::{AllowList, RetryPolicy, pause_until_resumed};
+use deltaforge_core::{Event, Source, SourceError, SourceHandle, SourceResult};
 
 mod postgres_errors;
-pub use postgres_errors::PostgresSourceError;
+pub use postgres_errors::{PostgresSourceError, PostgresSourceResult};
+use postgres_errors::LoopControl;
 
 mod postgres_helpers;
 use postgres_helpers::{
-    AllowList, connect_replication_with_retries, ensure_slot_and_publication,
-    pause_until_resumed, prepare_replication_client,
+    connect_replication_with_retries, ensure_slot_and_publication,
+    prepare_replication_client,
 };
 
 mod postgres_object;
@@ -65,26 +35,19 @@ pub use postgres_schema_loader::{LoadedSchema, PostgresSchemaLoader};
 
 mod postgres_event;
 use postgres_event::*;
+pub use postgres_event::RelationInfo;
 
 mod postgres_table_schema;
 pub use postgres_table_schema::{PostgresColumn, PostgresTableSchema};
-
-use crate::conn_utils::RetryPolicy;
-
-pub type PostgresSourceResult<T> = Result<T, PostgresSourceError>;
 
 // ============================================================================
 // Checkpoint
 // ============================================================================
 
 /// PostgreSQL checkpoint structure.
-///
-/// Tracks position using LSN (Log Sequence Number).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostgresCheckpoint {
-    /// WAL LSN in format "X/Y" (e.g., "0/16B6C50")
     pub lsn: String,
-    /// Transaction ID (if within a transaction)
     pub tx_id: Option<u32>,
 }
 
@@ -95,23 +58,14 @@ pub struct PostgresCheckpoint {
 /// PostgreSQL CDC source.
 #[derive(Debug, Clone)]
 pub struct PostgresSource {
-    /// Source identifier (used for checkpoints and metrics)
     pub id: String,
-    /// Checkpoint storage key
     pub checkpoint_key: String,
-    /// PostgreSQL DSN (URL or key=value format)
     pub dsn: String,
-    /// Replication slot name
     pub slot: String,
-    /// Publication name
     pub publication: String,
-    /// Tables to capture (supports wildcards)
     pub tables: Vec<String>,
-    /// Tenant identifier
     pub tenant: String,
-    /// Pipeline name
     pub pipeline: String,
-    /// Schema registry
     pub registry: Arc<InMemoryRegistry>,
 }
 
@@ -120,7 +74,7 @@ pub struct PostgresSource {
 // ============================================================================
 
 /// Shared state for the PostgreSQL source run loop.
-pub(super) struct RunCtx {
+pub(crate) struct RunCtx {
     pub source_id: String,
     pub pipeline: String,
     pub tenant: String,
@@ -133,24 +87,22 @@ pub(super) struct RunCtx {
     pub paused: Arc<AtomicBool>,
     pub pause_notify: Arc<Notify>,
     pub schema: PostgresSchemaLoader,
-    pub(in crate::postgres) allow: AllowList,
+    pub allow: AllowList,
     pub retry: RetryPolicy,
     pub inactivity: Duration,
-    /// Relation metadata cache
-    pub(in crate::postgres) relation_map: HashMap<u32, RelationInfo>,
-    /// Current LSN position
+    pub relation_map: HashMap<u32, RelationInfo>,
     pub last_lsn: Lsn,
-    /// Current transaction ID (during transaction)
     pub current_tx_id: Option<u32>,
-    /// Current transaction commit time
     pub current_tx_commit_time: Option<i64>,
-    /// Replication client (wrapped in mutex for interior mutability)
     pub repl_client: Arc<Mutex<ReplicationClient>>,
 }
 
 // ============================================================================
 // Source Implementation
 // ============================================================================
+
+/// Maximum backoff for startup retries (publication/slot verification).
+const MAX_STARTUP_BACKOFF_SECS: u64 = 60;
 
 impl PostgresSource {
     async fn run_inner(
@@ -161,7 +113,6 @@ impl PostgresSource {
         paused: Arc<AtomicBool>,
         pause_notify: Arc<Notify>,
     ) -> SourceResult<()> {
-        // Parse DSN and prepare configuration
         let (components, config, last_checkpoint) = prepare_replication_client(
             &self.dsn,
             &self.id,
@@ -171,33 +122,49 @@ impl PostgresSource {
         )
         .await?;
 
-        // Ensure publication and slot exist if no checkpoint
+        // Verify publication exists and ensure slot exists.
+        // Retries with backoff if publication missing (admin can create it).
+        let mut startup_retry = RetryPolicy::default();
         let start_lsn = if last_checkpoint.is_none() {
-            ensure_slot_and_publication(
-                &self.dsn,
-                &self.slot,
-                &self.publication,
-                &self.tables,
-            )
-            .await?
+            loop {
+                match ensure_slot_and_publication(&self.dsn, &self.slot, &self.publication, &self.tables).await {
+                    Ok(lsn) => break lsn,
+                    Err(LoopControl::Reconnect) => {
+                        let delay = startup_retry.next_backoff().min(Duration::from_secs(MAX_STARTUP_BACKOFF_SECS));
+                        warn!(
+                            source_id = %self.id,
+                            delay_secs = delay.as_secs(),
+                            "startup check failed, retrying after backoff"
+                        );
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            _ = cancel.cancelled() => {
+                                info!(source_id = %self.id, "cancelled during startup retry");
+                                return Err(SourceError::Cancelled);
+                            }
+                        }
+                    }
+                    Err(LoopControl::Stop) => {
+                        info!(source_id = %self.id, "stop requested during startup");
+                        return Err(SourceError::Cancelled);
+                    }
+                    Err(LoopControl::Fail(e)) => {
+                        error!(source_id = %self.id, error = %e, "fatal error during startup");
+                        return Err(e);
+                    }
+                    Err(LoopControl::ReloadSchema { .. }) => {
+                        // Shouldn't happen during startup, treat as retry
+                        continue;
+                    }
+                }
+            }
         } else {
             config.start_lsn
         };
 
-        // Update config with start LSN
-        let config = pgwire_replication::ReplicationConfig {
-            start_lsn,
-            ..config
-        };
+        let config = pgwire_replication::ReplicationConfig { start_lsn, ..config };
 
-        // Create schema loader
-        let schema_loader = PostgresSchemaLoader::new(
-            &self.dsn,
-            self.registry.clone(),
-            &self.tenant,
-        );
-
-        // Preload schemas
+        let schema_loader = PostgresSchemaLoader::new(&self.dsn, self.registry.clone(), &self.tenant);
         let tracked = schema_loader.preload(&self.tables).await?;
         info!(tables = tracked.len(), "schemas preloaded");
 
@@ -206,12 +173,8 @@ impl PostgresSource {
                 if let Some(ref identity) = loaded.schema.replica_identity {
                     if identity != "full" {
                         warn!(
-                            schema = %schema,
-                            table = %table,
-                            replica_identity = %identity,
-                            "table does not have REPLICA IDENTITY FULL - before images will be incomplete. \
-                            Consider: ALTER TABLE {}.{} REPLICA IDENTITY FULL",
-                            schema, table
+                            schema = %schema, table = %table, replica_identity = %identity,
+                            "table does not have REPLICA IDENTITY FULL - before images will be incomplete"
                         );
                     }
                 }
@@ -219,22 +182,12 @@ impl PostgresSource {
         }
 
         info!(
-            source_id = %self.id,
-            host = %components.host,
-            slot = %self.slot,
-            publication = %self.publication,
-            start_lsn = %start_lsn,
-            "postgres source starting ..."
+            source_id = %self.id, host = %components.host, slot = %self.slot,
+            publication = %self.publication, start_lsn = %start_lsn,
+            "postgres source starting"
         );
 
-        // Connect to replication
-        let client = connect_replication_with_retries(
-            &self.id,
-            config.clone(),
-            &cancel,
-            RetryPolicy::default(),
-        )
-        .await?;
+        let client = connect_replication_with_retries(&self.id, config.clone(), &cancel, RetryPolicy::default()).await?;
 
         let mut ctx = RunCtx {
             source_id: self.id.clone(),
@@ -260,31 +213,43 @@ impl PostgresSource {
 
         info!("entering replication loop");
         loop {
-            if !pause_until_resumed(&ctx.cancel, &ctx.paused, &ctx.pause_notify)
-                .await
-            {
+            if !pause_until_resumed(&ctx.cancel, &ctx.paused, &ctx.pause_notify).await {
                 break;
             }
 
-            match read_next_event(&ctx).await {
+            debug!(source_id = %self.id, "reading next event");
+            
+            // Read next event, may return LoopControl on error
+            let event_result = match read_next_event(&ctx).await {
                 Ok(Some(event)) => {
-                    dispatch_event(&mut ctx, event).await?;
+                    // Dispatch event, may return LoopControl for schema reload
+                    dispatch_event(&mut ctx, event).await
                 }
                 Ok(None) => {
                     info!(source_id = %self.id, "replication stream ended");
                     break;
                 }
-                Err(LoopControl::Reconnect) => {
-                    // Reconnect logic
-                    info!(source_id = %self.id, "reconnecting to replication...");
-                    let delay = ctx.retry.next_backoff();
-                    warn!(
-                        source_id = %self.id,
-                        delay_ms = delay.as_millis(),
-                        "scheduling reconnect after backoff"
-                    );
+                Err(ctrl) => Err(ctrl),
+            };
 
-                    // Wait with cancellation support
+            // Handle LoopControl from either read or dispatch
+            match event_result {
+                Ok(()) => {}
+                Err(LoopControl::ReloadSchema { schema, table }) => {
+                    if let (Some(s), Some(t)) = (schema, table) {
+                        info!(schema = %s, table = %t, "reloading schema");
+                        let _ = ctx.schema.reload_schema(&s, &t).await;
+                    } else {
+                        info!("reloading all schemas");
+                        let _ = ctx.schema.reload_all(&self.tables).await;
+                    }
+                    // Continue without reconnect for schema changes detected in-stream
+                    // (the relation message already updated our relation_map)
+                }
+                Err(LoopControl::Reconnect) => {
+                    let delay = ctx.retry.next_backoff();
+                    warn!(source_id = %self.id, delay_ms = delay.as_millis(), "scheduling reconnect after backoff");
+
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
                         _ = ctx.cancel.cancelled() => {
@@ -293,23 +258,16 @@ impl PostgresSource {
                         }
                     }
 
-                    let reconnect_config =
-                        pgwire_replication::ReplicationConfig {
-                            start_lsn: ctx.last_lsn,
-                            ..config.clone()
-                        };
+                    let reconnect_config = pgwire_replication::ReplicationConfig {
+                        start_lsn: ctx.last_lsn,
+                        ..config.clone()
+                    };
 
-                    match connect_replication_with_retries(
-                        &self.id,
-                        reconnect_config,
-                        &ctx.cancel,
-                        ctx.retry.clone(),
-                    )
-                    .await
-                    {
+                    match connect_replication_with_retries(&self.id, reconnect_config, &ctx.cancel, ctx.retry.clone()).await {
                         Ok(new_client) => {
                             *ctx.repl_client.lock().await = new_client;
-                            ctx.retry.reset(); // Reset backoff on successful reconnect
+                            ctx.retry.reset();
+                            info!(source_id = %self.id, "reconnected successfully");
                         }
                         Err(e) => {
                             error!(source_id = %self.id, error = %e, "reconnect failed after retries");
@@ -317,26 +275,25 @@ impl PostgresSource {
                         }
                     }
                 }
-                Err(LoopControl::Stop) => break,
-                Err(LoopControl::Fail(e)) => return Err(e),
+                Err(LoopControl::Stop) => {
+                    info!(source_id = %self.id, "stop requested");
+                    break;
+                }
+                Err(LoopControl::Fail(e)) => {
+                    error!(source_id = %self.id, error = %e, "unrecoverable error");
+                    return Err(e);
+                }
             }
         }
 
-        // Best-effort final checkpoint update
+        // Best-effort final checkpoint
         let _ = chkpt_store
-            .put(
-                &self.id,
-                PostgresCheckpoint {
-                    lsn: ctx.last_lsn.to_string(),
-                    tx_id: None,
-                },
-            )
+            .put(&self.id, PostgresCheckpoint { lsn: ctx.last_lsn.to_string(), tx_id: None })
             .await;
 
-        // Stop the replication client
-        {
-            let mut client = ctx.repl_client.lock().await;
-            client.shutdown().await.map_err(PostgresSourceError::from)?;
+        // Shutdown replication client
+        if let Err(e) = ctx.repl_client.lock().await.shutdown().await {
+            warn!(error = %e, "error during replication client shutdown");
         }
 
         Ok(())
@@ -349,12 +306,7 @@ impl Source for PostgresSource {
         &self.checkpoint_key
     }
 
-    /// Start the source in a background task and return a control handle.
-    async fn run(
-        &self,
-        tx: mpsc::Sender<Event>,
-        chkpt_store: Arc<dyn CheckpointStore>,
-    ) -> SourceHandle {
+    async fn run(&self, tx: mpsc::Sender<Event>, chkpt_store: Arc<dyn CheckpointStore>) -> SourceHandle {
         let cancel = CancellationToken::new();
         let paused = Arc::new(AtomicBool::new(false));
         let pause_notify = Arc::new(Notify::new());
@@ -366,25 +318,14 @@ impl Source for PostgresSource {
 
         let join = tokio::spawn(async move {
             let res = this
-                .run_inner(
-                    tx,
-                    chkpt_store,
-                    cancel_for_task,
-                    paused_for_task,
-                    pause_notify_for_task,
-                )
+                .run_inner(tx, chkpt_store, cancel_for_task, paused_for_task, pause_notify_for_task)
                 .await;
             if let Err(e) = &res {
-                error!(error = ?e, "run task ended with error");
+                error!(error = ?e, "postgres source ended with error");
             }
             res
         });
 
-        SourceHandle {
-            cancel,
-            paused,
-            pause_notify,
-            join,
-        }
+        SourceHandle { cancel, paused, pause_notify, join }
     }
 }

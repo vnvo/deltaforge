@@ -12,10 +12,6 @@ use schema_registry::{SourceSchema, compute_fingerprint};
 use serde::{Deserialize, Serialize};
 
 /// PostgreSQL table schema with full type information.
-///
-/// This captures PostgreSQL semantics rather than normalizing to a
-/// universal type system. Downstream consumers receive schemas that
-/// accurately reflect PostgreSQL's type system.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PostgresTableSchema {
     /// Columns in ordinal order.
@@ -110,13 +106,13 @@ impl PostgresTableSchema {
         }
     }
 
-    /// Set primary key.
+    #[must_use]
     pub fn with_primary_key(mut self, pk: Vec<String>) -> Self {
         self.primary_key = pk;
         self
     }
 
-    /// Set replica identity.
+    #[must_use]
     pub fn with_replica_identity(
         mut self,
         identity: impl Into<String>,
@@ -125,13 +121,13 @@ impl PostgresTableSchema {
         self
     }
 
-    /// Set schema namespace.
+    #[must_use]
     pub fn with_schema_name(mut self, schema: impl Into<String>) -> Self {
         self.schema_name = Some(schema.into());
         self
     }
 
-    /// Set table OID.
+    #[must_use]
     pub fn with_oid(mut self, oid: u32) -> Self {
         self.oid = Some(oid);
         self
@@ -180,39 +176,39 @@ impl PostgresColumn {
         }
     }
 
-    /// Builder: set type OID.
+    #[must_use]
     pub fn with_type_oid(mut self, oid: u32) -> Self {
         self.type_oid = Some(oid);
         self
     }
 
-    /// Builder: set default value.
+    #[must_use]
     pub fn with_default(mut self, default: impl Into<String>) -> Self {
         self.default_value = Some(default.into());
         self
     }
 
-    /// Builder: mark as array type.
+    #[must_use]
     pub fn as_array(mut self, element_type: impl Into<String>) -> Self {
         self.is_array = true;
         self.element_type = Some(element_type.into());
         self
     }
 
-    /// Builder: set character max length.
+    #[must_use]
     pub fn with_char_max_length(mut self, len: i32) -> Self {
         self.char_max_length = Some(len);
         self
     }
 
-    /// Builder: set numeric precision and scale.
+    #[must_use]
     pub fn with_numeric(mut self, precision: i32, scale: i32) -> Self {
         self.numeric_precision = Some(precision);
         self.numeric_scale = Some(scale);
         self
     }
 
-    /// Builder: mark as identity column.
+    #[must_use]
     pub fn with_identity(mut self, generation: impl Into<String>) -> Self {
         self.is_identity = true;
         self.identity_generation = Some(generation.into());
@@ -238,15 +234,8 @@ impl PostgresColumn {
 
     /// Get base type name (without array brackets or length modifiers).
     pub fn base_type(&self) -> &str {
-        let t = &self.data_type;
-        // Strip array suffix
-        let t = t.strip_suffix("[]").unwrap_or(t);
-        // Strip length/precision modifiers
-        if let Some(idx) = t.find('(') {
-            &t[..idx]
-        } else {
-            t
-        }
+        let t = self.data_type.strip_suffix("[]").unwrap_or(&self.data_type);
+        t.find('(').map(|idx| &t[..idx]).unwrap_or(t)
     }
 }
 
@@ -256,7 +245,6 @@ impl SourceSchema for PostgresTableSchema {
     }
 
     fn fingerprint(&self) -> String {
-        // Only columns and PK affect fingerprint (not replica_identity/oid)
         #[derive(Serialize)]
         struct FingerprintData<'a> {
             columns: &'a [PostgresColumn],
@@ -277,11 +265,10 @@ impl SourceSchema for PostgresTableSchema {
     }
 
     fn describe(&self) -> String {
-        let identity = self.replica_identity.as_deref().unwrap_or("default");
         format!(
             "postgres({} cols, replica_identity={}, pk=[{}])",
             self.columns.len(),
-            identity,
+            self.replica_identity.as_deref().unwrap_or("default"),
             self.primary_key.join(",")
         )
     }
@@ -292,7 +279,6 @@ impl SourceSchema for PostgresTableSchema {
 // ============================================================================
 
 /// Common PostgreSQL type OIDs for reference.
-#[allow(dead_code)]
 pub mod type_oids {
     pub const BOOL: u32 = 16;
     pub const BYTEA: u32 = 17;
@@ -361,8 +347,6 @@ mod tests {
         let s1 = test_schema();
         let mut s2 = test_schema();
         s2.replica_identity = Some("index".into());
-
-        // Replica identity doesn't affect fingerprint
         assert_eq!(s1.fingerprint(), s2.fingerprint());
     }
 
@@ -372,7 +356,6 @@ mod tests {
         let mut s2 = test_schema();
         s2.columns
             .push(PostgresColumn::new("email", "text", true, 5));
-
         assert_ne!(s1.fingerprint(), s2.fingerprint());
     }
 
@@ -393,15 +376,19 @@ mod tests {
 
     #[test]
     fn test_base_type() {
-        let col_varchar =
-            PostgresColumn::new("v", "character varying(100)", true, 1);
-        assert_eq!(col_varchar.base_type(), "character varying");
-
-        let col_array = PostgresColumn::new("a", "integer[]", true, 2);
-        assert_eq!(col_array.base_type(), "integer");
-
-        let col_numeric = PostgresColumn::new("n", "numeric(10,2)", true, 3);
-        assert_eq!(col_numeric.base_type(), "numeric");
+        assert_eq!(
+            PostgresColumn::new("v", "character varying(100)", true, 1)
+                .base_type(),
+            "character varying"
+        );
+        assert_eq!(
+            PostgresColumn::new("a", "integer[]", true, 2).base_type(),
+            "integer"
+        );
+        assert_eq!(
+            PostgresColumn::new("n", "numeric(10,2)", true, 3).base_type(),
+            "numeric"
+        );
     }
 
     #[test]

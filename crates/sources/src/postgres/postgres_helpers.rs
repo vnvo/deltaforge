@@ -1,27 +1,21 @@
 //! PostgreSQL source helper utilities.
 
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use deltaforge_core::{CheckpointMeta, SourceError, SourceResult};
 use pgwire_replication::{
-    Lsn, ReplicationClient, ReplicationConfig, TlsConfig,
+    Lsn, PgWireError, ReplicationClient, ReplicationConfig, TlsConfig,
 };
-use tokio::select;
-use tokio::sync::Notify;
 use tokio_postgres::NoTls;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
 use checkpoints::{CheckpointStore, CheckpointStoreExt};
-
-use crate::conn_utils::{RetryPolicy, retry_async, retryable_connect};
+use common::{DsnComponents, RetryOutcome, RetryPolicy, retry_async};
 
 use super::{PostgresCheckpoint, PostgresSourceError, PostgresSourceResult};
 
@@ -35,69 +29,14 @@ pub const BUFFER_EVENTS: usize = 8192;
 
 /// Parse DSN and extract connection components.
 pub(super) fn parse_dsn(dsn: &str) -> PostgresSourceResult<DsnComponents> {
-    // Handle both URL-style and key=value style DSNs
     if dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
-        parse_url_dsn(dsn)
+        DsnComponents::from_url(dsn, 5432)
+            .map_err(PostgresSourceError::InvalidDsn)
     } else {
-        parse_keyvalue_dsn(dsn)
+        Ok(DsnComponents::from_keyvalue(
+            dsn, 5432, "postgres", "postgres",
+        ))
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct DsnComponents {
-    pub host: String,
-    pub port: u16,
-    pub user: String,
-    pub password: String,
-    pub database: String,
-}
-
-fn parse_url_dsn(dsn: &str) -> PostgresSourceResult<DsnComponents> {
-    let url = Url::parse(dsn)
-        .map_err(|e| PostgresSourceError::InvalidDsn(e.to_string()))?;
-
-    let host = url.host_str().unwrap_or("localhost").to_string();
-    let port = url.port().unwrap_or(5432);
-    let user = url.username().to_string();
-    let password = url.password().unwrap_or("").to_string();
-    let database = url.path().trim_start_matches('/').to_string();
-
-    Ok(DsnComponents {
-        host,
-        port,
-        user,
-        password,
-        database,
-    })
-}
-
-fn parse_keyvalue_dsn(dsn: &str) -> PostgresSourceResult<DsnComponents> {
-    let mut host = "localhost".to_string();
-    let mut port = 5432u16;
-    let mut user = "postgres".to_string();
-    let mut password = String::new();
-    let mut database = "postgres".to_string();
-
-    for part in dsn.split_whitespace() {
-        if let Some((key, value)) = part.split_once('=') {
-            match key.to_lowercase().as_str() {
-                "host" => host = value.to_string(),
-                "port" => port = value.parse().unwrap_or(5432),
-                "user" => user = value.to_string(),
-                "password" => password = value.to_string(),
-                "dbname" | "database" => database = value.to_string(),
-                _ => {}
-            }
-        }
-    }
-
-    Ok(DsnComponents {
-        host,
-        port,
-        user,
-        password,
-        database,
-    })
 }
 
 /// Prepare ReplicationClient from DSN + last checkpoint.
@@ -114,7 +53,6 @@ pub(super) async fn prepare_replication_client(
 )> {
     let components = parse_dsn(dsn)?;
 
-    // Previous checkpoint (if any)
     let last_checkpoint: Option<PostgresCheckpoint> = ckpt_store
         .get(source_id)
         .await
@@ -127,7 +65,6 @@ pub(super) async fn prepare_replication_client(
         "preparing replication client"
     );
 
-    // Determine start LSN
     let start_lsn = if let Some(ref cp) = last_checkpoint {
         Lsn::parse(&cp.lsn).map_err(|e| {
             PostgresSourceError::LsnParse(format!(
@@ -136,7 +73,6 @@ pub(super) async fn prepare_replication_client(
             ))
         })?
     } else {
-        // No checkpoint, will get start position from slot
         Lsn::parse("0/0").unwrap()
     };
 
@@ -146,7 +82,7 @@ pub(super) async fn prepare_replication_client(
         user: components.user.clone(),
         password: components.password.clone(),
         database: components.database.clone(),
-        tls: TlsConfig::disabled(), // TODO: make configurable
+        tls: TlsConfig::disabled(),
         slot: slot.to_string(),
         publication: publication.to_string(),
         start_lsn,
@@ -166,83 +102,166 @@ pub(super) async fn connect_replication_with_retries(
     cancel: &CancellationToken,
     retry_policy: RetryPolicy,
 ) -> SourceResult<ReplicationClient> {
+    let source_id = source_id.to_string();
     let cfg = config.clone();
 
-    let client = retry_async(
+    retry_async(
         move |_| {
             let cfg = cfg.clone();
-            async move { connect_replication(source_id, cfg, cancel).await }
+            let source_id = source_id.clone();
+            async move { connect_replication(&source_id, cfg).await }
         },
-        |e| e,
-        retryable_connect,
+        is_retryable_source_error,
         Duration::from_secs(30),
         retry_policy,
         cancel,
         "replication_connect",
     )
-    .await?;
-
-    Ok(client)
+    .await
+    .map_err(|outcome| match outcome {
+        RetryOutcome::Cancelled => SourceError::Cancelled,
+        RetryOutcome::Timeout { action } => SourceError::Timeout { action },
+        RetryOutcome::Exhausted {
+            last_error,
+            attempts,
+        } => {
+            warn!(
+                attempts = attempts,
+                "replication connection exhausted retries"
+            );
+            last_error
+        }
+        RetryOutcome::Failed(e) => e,
+    })
 }
 
-/// Connect to PostgreSQL replication with cancellation and timeout.
-pub(super) async fn connect_replication(
+/// Determine if a SourceError is worth retrying.
+fn is_retryable_source_error(e: &SourceError) -> bool {
+    match e {
+        SourceError::Timeout { .. }
+        | SourceError::Connect { .. }
+        | SourceError::Io(_) => true,
+        SourceError::Cancelled | SourceError::Auth { .. } => false,
+        SourceError::Other(inner) => {
+            let msg = inner.to_string().to_lowercase();
+            msg.contains("connection")
+                || msg.contains("timeout")
+                || msg.contains("reset")
+                || msg.contains("refused")
+                || msg.contains("already active")
+        }
+        _ => false,
+    }
+}
+
+/// Connect to PostgreSQL replication with timeout.
+async fn connect_replication(
     source_id: &str,
     config: ReplicationConfig,
-    cancel: &CancellationToken,
 ) -> SourceResult<ReplicationClient> {
-    debug!("connecting to postgres replication");
+    debug!(source_id = %source_id, host = %config.host, "connecting to postgres replication");
     let t0 = Instant::now();
 
-    let client = select! {
-        _ = cancel.cancelled() => Err(SourceError::Cancelled),
-        res = tokio::time::timeout(Duration::from_secs(30), ReplicationClient::connect(config)) => {
-            match res {
-                Ok(Ok(client)) => Ok(client),
-                Ok(Err(e)) => {
-                    let error_msg = e.to_string();
-                    error!(source_id = %source_id, error = %error_msg, "replication connect failed");
-
-                    if error_msg.contains("password") || error_msg.contains("authentication") {
-                        error!("PostgreSQL auth issue hints:");
-                        error!("  1) Ensure pg_hba.conf allows replication connections");
-                        error!("  2) Verify user has REPLICATION role: ALTER ROLE user REPLICATION;");
-                    } else if error_msg.contains("slot") {
-                        error!("Replication slot issue hints:");
-                        error!("  1) Create slot: SELECT pg_create_logical_replication_slot('slot','pgoutput');");
-                    } else if error_msg.contains("publication") {
-                        error!("Publication issue hints:");
-                        error!("  1) Create publication: CREATE PUBLICATION pub FOR ALL TABLES;");
-                    }
-
-                    Err(SourceError::Other(e.into()))
-                }
-                Err(_) => Err(SourceError::Timeout { action: "replication_connect".into() }),
-            }
+    match tokio::time::timeout(
+        Duration::from_secs(30),
+        ReplicationClient::connect(config),
+    )
+    .await
+    {
+        Ok(Ok(client)) => {
+            info!(source_id = %source_id, ms = t0.elapsed().as_millis() as u64, "connected to postgres replication");
+            Ok(client)
         }
-    }?;
-
-    info!(
-        source_id = %source_id,
-        ms = t0.elapsed().as_millis() as u64,
-        "connected to postgres replication"
-    );
-
-    Ok(client)
+        Ok(Err(e)) => {
+            error!(source_id = %source_id, error = %e, "replication connect failed");
+            print_connection_hints(&e);
+            Err(pgwire_error_to_source_error(e))
+        }
+        Err(_) => Err(SourceError::Timeout {
+            action: "replication_connect".into(),
+        }),
+    }
 }
 
-/// Ensure publication and slot exist, get start LSN.
+/// Convert PgWireError to SourceError for connection phase.
+/// Note: This is different from LoopControl which is used in the event loop.
+fn pgwire_error_to_source_error(e: PgWireError) -> SourceError {
+    use PgWireError::*;
+    match e {
+        Auth(msg) => SourceError::Auth {
+            details: msg.into(),
+        },
+        Io(msg) | Task(msg) => SourceError::Connect {
+            details: msg.into(),
+        },
+        Tls(msg) => SourceError::Incompatible {
+            details: format!("TLS: {msg}").into(),
+        },
+        Server(msg) | Protocol(msg) => SourceError::Connect {
+            details: msg.into(),
+        },
+        Internal(msg) => {
+            SourceError::Other(anyhow::anyhow!("pgwire internal: {}", msg))
+        }
+    }
+}
+
+/// Print helpful hints for common connection errors.
+fn print_connection_hints(err: &PgWireError) {
+    let msg = err.to_string();
+
+    if err.is_auth()
+        || msg.contains("password")
+        || msg.contains("authentication")
+    {
+        error!("PostgreSQL auth issue hints:");
+        error!("  1) Ensure pg_hba.conf allows replication connections");
+        error!(
+            "  2) Verify user has REPLICATION role: ALTER ROLE user REPLICATION;"
+        );
+        error!("  3) Grant usage: GRANT USAGE ON SCHEMA public TO user;");
+    } else if msg.contains("slot") && msg.contains("does not exist") {
+        error!("Replication slot issue hints:");
+        error!(
+            "  1) Create slot: SELECT pg_create_logical_replication_slot('slot','pgoutput');"
+        );
+    } else if msg.contains("slot") && msg.contains("already active") {
+        warn!("Slot is in use by another connection - will retry");
+    } else if msg.contains("publication") {
+        error!("Publication issue hints:");
+        error!(
+            "  1) Create publication: CREATE PUBLICATION pub FOR ALL TABLES;"
+        );
+    } else if msg.contains("wal_level") {
+        error!("WAL level issue hints:");
+        error!("  1) Set wal_level=logical in postgresql.conf");
+        error!("  2) Restart PostgreSQL after changing");
+    } else if err.is_tls() {
+        error!("TLS issue hints:");
+        error!("  1) Check SSL certificates are valid");
+        error!("  2) Try disabling TLS if not required");
+    }
+}
+
+/// Verify publication exists and ensure slot exists, get start LSN.
+/// 
+/// Publications must be pre-created by a DBA - this function will NOT auto-create them.
+/// Slots will be auto-created if missing (safe, no ownership issues).
+/// 
+/// Returns LoopControl::Reconnect for missing publication (retryable - admin can create it).
+/// Returns LoopControl::Fail for fatal errors (auth, incompatible config).
 pub(super) async fn ensure_slot_and_publication(
     dsn: &str,
     slot: &str,
     publication: &str,
     tables: &[String],
-) -> SourceResult<Lsn> {
+) -> Result<Lsn, super::postgres_errors::LoopControl> {
+    use super::postgres_errors::LoopControl;
+    
     let (client, conn) =
         tokio_postgres::connect(dsn, NoTls).await.map_err(|e| {
-            SourceError::Connect {
-                details: format!("control plane connect: {}", e).into(),
-            }
+            error!(error = %e, "control plane connect failed");
+            LoopControl::from_tokio_postgres_error(&e)
         })?;
 
     tokio::spawn(async move {
@@ -251,67 +270,79 @@ pub(super) async fn ensure_slot_and_publication(
         }
     });
 
-    // Check if publication exists
+    // Check publication exists (do NOT auto-create)
     let pub_exists = client
         .query_opt(
             "SELECT 1 FROM pg_publication WHERE pubname = $1",
             &[&publication],
         )
         .await
-        .map_err(|e| SourceError::Other(e.into()))?
+        .map_err(|e| {
+            error!(error = %e, "failed to check publication");
+            LoopControl::from_tokio_postgres_error(&e)
+        })?
         .is_some();
 
     if !pub_exists {
-        // Create publication for specified tables
         let table_list = if tables.is_empty() {
             "ALL TABLES".to_string()
         } else {
-            format!("TABLE {}", tables.join(", "))
+            tables.join(", ")
         };
-
-        client
-            .batch_execute(&format!(
-                "CREATE PUBLICATION {} FOR {}",
-                publication, table_list
-            ))
-            .await
-            .map_err(|e| SourceError::Other(e.into()))?;
-
-        info!(publication = %publication, tables = ?tables, "created publication");
+        
+        error!(
+            publication = %publication,
+            tables = %table_list,
+            "Publication does not exist. DeltaForge requires a pre-created publication."
+        );
+        error!("To create it, run as superuser or table owner:");
+        if tables.is_empty() {
+            error!("  CREATE PUBLICATION {} FOR ALL TABLES;", publication);
+        } else {
+            error!("  CREATE PUBLICATION {} FOR TABLE {};", publication, table_list);
+        }
+        error!("DeltaForge will retry and pick up the publication once created.");
+        
+        return Err(LoopControl::Reconnect);
     }
 
-    // Check if slot exists
+    // Check/create slot (auto-creation is safe - no ownership issues)
     let slot_row = client
         .query_opt(
-            "SELECT confirmed_flush_lsn::text, restart_lsn::text 
-             FROM pg_replication_slots 
-             WHERE slot_name = $1",
+            "SELECT confirmed_flush_lsn::text, restart_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
             &[&slot],
         )
         .await
-        .map_err(|e| SourceError::Other(e.into()))?;
+        .map_err(|e| {
+            error!(error = %e, slot = %slot, "failed to check replication slot");
+            LoopControl::from_tokio_postgres_error(&e)
+        })?;
 
     let start_lsn = if let Some(row) = slot_row {
-        // Slot exists, get confirmed LSN
         let confirmed: Option<String> = row.get(0);
         let restart: Option<String> = row.get(1);
 
-        if let Some(s) = confirmed {
-            Lsn::parse(&s).map_err(|e| SourceError::Other(e.into()))?
-        } else if let Some(s) = restart {
-            Lsn::parse(&s).map_err(|e| SourceError::Other(e.into()))?
-        } else {
-            get_current_wal_lsn(&client).await?
-        }
+        confirmed
+            .or(restart)
+            .map(|s| Lsn::parse(&s).map_err(|e| {
+                error!(error = %e, lsn = %s, "failed to parse LSN");
+                LoopControl::Fail(SourceError::Other(e.into()))
+            }))
+            .transpose()?
+            .unwrap_or(get_current_wal_lsn(&client).await?)
     } else {
-        // Create slot
+        // Auto-create slot (safe - only requires REPLICATION privilege)
         client
             .batch_execute(&format!(
                 "SELECT * FROM pg_create_logical_replication_slot('{}', 'pgoutput')",
                 slot
             ))
             .await
-            .map_err(|e| SourceError::Other(e.into()))?;
+            .map_err(|e| {
+                error!(error = %e, slot = %slot, "failed to create replication slot");
+                error!("Ensure user has REPLICATION privilege: ALTER ROLE username REPLICATION;");
+                LoopControl::from_tokio_postgres_error(&e)
+            })?;
 
         info!(slot = %slot, "created replication slot");
         get_current_wal_lsn(&client).await?
@@ -323,42 +354,25 @@ pub(super) async fn ensure_slot_and_publication(
 /// Get current WAL LSN.
 async fn get_current_wal_lsn(
     client: &tokio_postgres::Client,
-) -> SourceResult<Lsn> {
+) -> Result<Lsn, super::postgres_errors::LoopControl> {
+    use super::postgres_errors::LoopControl;
+    
     let row = client
         .query_one("SELECT pg_current_wal_lsn()::text", &[])
         .await
-        .map_err(|e| SourceError::Other(e.into()))?;
+        .map_err(|e| {
+            error!(error = %e, "failed to get current WAL LSN");
+            LoopControl::from_tokio_postgres_error(&e)
+        })?;
 
     let lsn_str: String = row.get(0);
-    Lsn::parse(&lsn_str).map_err(|e| SourceError::Other(e.into()))
-}
-
-/// Pause gate: wait until resume or cancel. Returns false if cancelled, true otherwise.
-pub(super) async fn pause_until_resumed(
-    cancel: &CancellationToken,
-    paused: &AtomicBool,
-    notify: &Notify,
-) -> bool {
-    if !paused.load(Ordering::SeqCst) {
-        return true;
-    }
-    debug!("paused");
-    select! {
-        _ = cancel.cancelled() => return false,
-        _ = notify.notified() => {}
-    }
-    true
+    Lsn::parse(&lsn_str).map_err(|e| {
+        error!(error = %e, lsn = %lsn_str, "failed to parse WAL LSN");
+        LoopControl::Fail(SourceError::Other(e.into()))
+    })
 }
 
 // ----------------------------- Utility Functions -----------------------------
-
-/// PostgreSQL epoch (2000-01-01) to Unix epoch offset in microseconds.
-pub const PG_EPOCH_OFFSET_MICROS: i64 = 946_684_800_000_000;
-
-/// Convert PostgreSQL timestamp to Unix timestamp in milliseconds.
-pub(crate) fn pg_timestamp_to_unix_ms(pg_micros: i64) -> i64 {
-    (pg_micros + PG_EPOCH_OFFSET_MICROS) / 1000
-}
 
 /// Redact password from DSN for logging.
 pub(crate) fn redact_password(dsn: &str) -> String {
@@ -370,15 +384,12 @@ pub(crate) fn redact_password(dsn: &str) -> String {
             return url.to_string();
         }
     }
-    // For key=value style, simple regex-like replacement
-    let parts: Vec<&str> = dsn.split_whitespace().collect();
-    parts
-        .iter()
+    dsn.split_whitespace()
         .map(|p| {
             if p.to_lowercase().starts_with("password=") {
                 "password=***"
             } else {
-                *p
+                p
             }
         })
         .collect::<Vec<_>>()
@@ -394,47 +405,17 @@ pub(crate) fn make_checkpoint_meta(
         lsn: lsn.to_string(),
         tx_id,
     };
-
     let bytes = serde_json::to_vec(&cp).unwrap_or_else(|e| {
-        tracing::error!(error=%e, "failed to serialize checkpoint");
+        error!(error=%e, "failed to serialize checkpoint");
         Vec::new()
     });
     CheckpointMeta::from_vec(bytes)
 }
 
-/// Simple allow-list on "schema.table" patterns.
-#[derive(Clone)]
-pub(in crate::postgres) struct AllowList {
-    items: Vec<(Option<String>, String)>,
-}
-
-impl AllowList {
-    pub(super) fn new(list: &[String]) -> Self {
-        let items = list
-            .iter()
-            .map(|s| {
-                if let Some((schema, table)) = s.split_once('.') {
-                    (Some(schema.to_string()), table.to_string())
-                } else {
-                    // No schema specified, match any schema
-                    (None, s.to_string())
-                }
-            })
-            .collect();
-        Self { items }
-    }
-
-    pub(super) fn matches(&self, schema: &str, table: &str) -> bool {
-        if self.items.is_empty() {
-            return true;
-        }
-        self.items.iter().any(|(s_opt, t)| {
-            let schema_match =
-                s_opt.as_ref().map(|s| s == schema).unwrap_or(true);
-            let table_match = t == table || t == "*" || t == "%";
-            schema_match && table_match
-        })
-    }
+/// Convert PostgreSQL epoch timestamp (microseconds since 2000-01-01) to Unix milliseconds.
+pub(crate) fn pg_timestamp_to_unix_ms(pg_timestamp_us: i64) -> i64 {
+    const PG_EPOCH_OFFSET_MS: i64 = 946_684_800_000;
+    (pg_timestamp_us / 1000) + PG_EPOCH_OFFSET_MS
 }
 
 #[cfg(test)]
@@ -442,60 +423,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_url_dsn() {
-        let dsn = "postgres://user:pass@localhost:5433/mydb";
-        let comp = parse_dsn(dsn).unwrap();
-        assert_eq!(comp.host, "localhost");
-        assert_eq!(comp.port, 5433);
-        assert_eq!(comp.user, "user");
-        assert_eq!(comp.password, "pass");
-        assert_eq!(comp.database, "mydb");
-    }
-
-    #[test]
-    fn test_parse_keyvalue_dsn() {
-        let dsn = "host=127.0.0.1 port=5432 user=postgres password=secret dbname=test";
-        let comp = parse_dsn(dsn).unwrap();
-        assert_eq!(comp.host, "127.0.0.1");
-        assert_eq!(comp.port, 5432);
-        assert_eq!(comp.user, "postgres");
-        assert_eq!(comp.password, "secret");
-        assert_eq!(comp.database, "test");
-    }
-
-    #[test]
-    fn test_redact_password() {
-        let dsn1 = "postgres://user:secret@localhost/db";
-        assert!(redact_password(dsn1).contains("***"));
-        assert!(!redact_password(dsn1).contains("secret"));
-
-        let dsn2 = "host=localhost password=secret user=test";
-        assert!(redact_password(dsn2).contains("***"));
-        assert!(!redact_password(dsn2).contains("secret"));
-    }
-
-    #[test]
-    fn test_allow_list() {
-        let list =
-            AllowList::new(&["public.users".to_string(), "orders".to_string()]);
-
-        assert!(list.matches("public", "users"));
-        assert!(list.matches("any_schema", "orders"));
-        assert!(!list.matches("public", "other"));
-    }
-
-    #[test]
-    fn test_allow_list_empty() {
-        let list = AllowList::new(&[]);
-        assert!(list.matches("any", "table"));
-    }
-
-    #[test]
     fn test_pg_timestamp_conversion() {
-        // 2020-01-01 00:00:00 UTC in PostgreSQL epoch microseconds
-        let pg_ts = 631_152_000_000_000i64;
-        let unix_ms = pg_timestamp_to_unix_ms(pg_ts);
-        // Should be 2020-01-01 00:00:00 UTC in Unix ms
-        assert_eq!(unix_ms, 1_577_836_800_000);
+        let pg_ts = 631_152_000_000_000i64; // 2020-01-01 in PG epoch
+        assert_eq!(pg_timestamp_to_unix_ms(pg_ts), 1_577_836_800_000);
+    }
+
+    #[test]
+    fn test_is_retryable_source_error() {
+        assert!(is_retryable_source_error(&SourceError::Timeout {
+            action: "x".into()
+        }));
+        assert!(is_retryable_source_error(&SourceError::Connect {
+            details: "failed".into()
+        }));
+        assert!(!is_retryable_source_error(&SourceError::Cancelled));
+        assert!(!is_retryable_source_error(&SourceError::Auth {
+            details: "denied".into()
+        }));
+    }
+
+    #[test]
+    fn test_pgwire_error_to_source_error() {
+        assert!(matches!(
+            pgwire_error_to_source_error(PgWireError::Auth("x".into())),
+            SourceError::Auth { .. }
+        ));
+        assert!(matches!(
+            pgwire_error_to_source_error(PgWireError::Io("x".into())),
+            SourceError::Connect { .. }
+        ));
+        assert!(matches!(
+            pgwire_error_to_source_error(PgWireError::Tls("x".into())),
+            SourceError::Incompatible { .. }
+        ));
     }
 }
