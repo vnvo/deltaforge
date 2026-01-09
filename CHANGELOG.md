@@ -15,12 +15,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Wildcard table patterns (`schema.*`, `schema.prefix%`)
   - Proper handling of PostgreSQL arrays and JSONB types
   - Connection retry with exponential backoff
+- **Sink resilience** - Retry logic with exponential backoff for Kafka and Redis sinks
+  - Connection pooling for Redis sink with automatic reconnection
+  - Error classification for smart retry decisions (auth errors fail fast, transient errors retry)
+  - Graceful shutdown via `CancellationToken`
+- **Configurable sink timeouts** - New configuration options:
+  - `KafkaSinkCfg.send_timeout_secs` - per-message send timeout (default: 30s)
+  - `RedisSinkCfg.send_timeout_secs` - per-XADD timeout (default: 5s)
+  - `RedisSinkCfg.batch_timeout_secs` - pipeline batch timeout (default: 30s)
+  - `RedisSinkCfg.connect_timeout_secs` - connection establishment timeout (default: 10s)
+- **Sink integration tests** - Comprehensive testcontainers-based tests for Redis and Kafka sinks
+  - Connection recovery after restart
+  - Connection drop handling
+  - Cancellation token respect
+  - Large payload and concurrent access tests
 - **Version information** - Build version, git commit, and target displayed at startup ([de27d74](https://github.com/vnvo/deltaforge/commit/de27d748fff5c822d53a5581cdd6aa3438bf9d1a))
 - JavaScript processor timeout and health monitoring ([11a89bc](https://github.com/vnvo/deltaforge/commit/11a89bcc80b15ac7e1b1dd43254a1fba9f28b953))
 - Turso/libSQL source (experimental, behind feature flag) ([729bfe7](https://github.com/vnvo/deltaforge/commit/729bfe71cf1cefe434b6fbcf432c65ba621b5284))
 
 ### Changed
 
+- **`build_sinks()` signature** - Now requires `CancellationToken` parameter for graceful shutdown
+- **`common` crate exports** - Added `is_retryable_message`, `is_permanent_failure`, `Retryable` trait, `PauseResult`, and additional time utilities
 - Coordinator now owns checkpoint saving (ensures events reach sinks before checkpointing) ([54c98b2](https://github.com/vnvo/deltaforge/commit/54c98b27ccee77cba3f15bac91ef96c29fb1862d))
 - Turso source hidden behind `turso` feature flag ([696d840](https://github.com/vnvo/deltaforge/commit/696d840da1c17e295c3cc7ed441faf7b6066c83c))
 - Cleaned up retry policy with better default parameters ([8549899](https://github.com/vnvo/deltaforge/commit/8549899271d547ca247ec9e4440ae852dea75cc0))
@@ -28,10 +44,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Credential safety** - All sink connection strings are now redacted in logs
 - PostgreSQL boolean array handling ([c6dc3c4](https://github.com/vnvo/deltaforge/commit/c6dc3c4c07fd4cf23caf5a18d25c5f51ec1219cb))
 - MySQL binlog_row_image validation now warns if not set to FULL ([39c86f4](https://github.com/vnvo/deltaforge/commit/39c86f46c3734c381018de8ffe0d2f6c10bdc7a4))
 - MySQL source retry handling ([501a418](https://github.com/vnvo/deltaforge/commit/501a418b2e8e844022c90095d62a669ea4148bf5))
 - JavaScript processor error propagation ([2ba29d1](https://github.com/vnvo/deltaforge/commit/2ba29d18ff6690c645c8181a4469f5118231514c))
+- Checkpointing now handled by coordinator ([54c98b2](https://github.com/vnvo/deltaforge/commit/54c98b27ccee77cba3f15bac91ef96c29fb1862d))
+
+### Refactoring
+
+- **Shared utilities (`common` crate)** - Consolidated common functionality ([e6b1eb9](https://github.com/vnvo/deltaforge/commit/e6b1eb9e77afcf1ae3a8bd778a8c0773d354726f))
+  - DSN parsing and credential redaction
+  - Retry logic with exponential backoff
+  - Pattern matching for tables/topics
+  - Pause gates and async utilities
+- MySQL source updated to use common utilities ([066d0b3](https://github.com/vnvo/deltaforge/commit/066d0b31b3a9540fa7e96defd781ff08ca24f766))
+- PostgreSQL source updated to use common utilities ([526b042](https://github.com/vnvo/deltaforge/commit/526b042ffe3cd4f2a64a8bf69b644cbbee2af507))
+- Removed deprecated `conn_utils` module ([ad9c2ef](https://github.com/vnvo/deltaforge/commit/ad9c2efc33d88cf6217adf93cd123e0cd5bd562c))
+- Sinks updated to use common utilities ([85b411e](https://github.com/vnvo/deltaforge/commit/85b411e53938948a1759855ddf4d11370e9f8781))
 
 ### Infrastructure
 
