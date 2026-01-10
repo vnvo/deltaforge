@@ -6,14 +6,15 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 futures.workspace = true
-anyhow = { workspace = true }
-async-trait = { workspace = true }
-serde_json = { workspace = true }
-tracing = { workspace = true }
-rdkafka = { workspace = true }
-redis = { workspace = true }
-tokio = { workspace = true }
-tokio-util = { workspace = true }
+anyhow.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+rdkafka.workspace = true
+redis.workspace = true
+async-nats = "0.38"
+tokio.workspace = true
+tokio-util.workspace = true
 deltaforge-core = { path = "../deltaforge-core" }
 deltaforge-config = { path = "../deltaforge-config" }
 common = { path = "../common" }
@@ -21,6 +22,8 @@ common = { path = "../common" }
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ctor = "0.6"
+chrono.workspace = true
+uuid.workspace = true
 testcontainers = "0.25"
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = [

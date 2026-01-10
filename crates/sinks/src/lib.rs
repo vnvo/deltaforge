@@ -39,10 +39,12 @@ use deltaforge_core::ArcDynSink;
 use tokio_util::sync::CancellationToken;
 
 pub mod kafka;
+pub mod nats;
 pub mod redis;
 
 // Re-export sink types for direct usage
 pub use kafka::KafkaSink;
+pub use nats::NatsSink;
 pub use redis::RedisSink;
 
 /// Build all sinks from a pipeline specification.
@@ -104,6 +106,10 @@ pub fn build_sinks(
                     let sink = RedisSink::new(redis_cfg, cancel.clone())?;
                     Arc::new(sink) as ArcDynSink
                 }
+                SinkCfg::Nats(nats_sink_cfg) => {
+                    let sink = NatsSink::new(nats_sink_cfg, cancel.clone())?;
+                    Arc::new(sink) as ArcDynSink
+                }
             };
             Ok(sink)
         })
@@ -130,6 +136,9 @@ pub fn build_sink(
         }
         SinkCfg::Redis(redis_cfg) => {
             Arc::new(RedisSink::new(redis_cfg, cancel)?) as ArcDynSink
+        }
+        SinkCfg::Nats(nats_sink_cfg) => {
+            Arc::new(NatsSink::new(nats_sink_cfg, cancel)?) as ArcDynSink
         }
     };
     Ok(sink)
