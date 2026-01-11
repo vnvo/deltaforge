@@ -161,7 +161,7 @@ The checkpoint is saved only after sinks acknowledge delivery:
                                           └────────────┘
 ```
 
-If the process crashes after sending to sink but before checkpoint, events will be replayed. This is the "at-least-once" guarantee — duplicates are possible, but loss is not.
+If the process crashes after sending to sink but before checkpoint, events will be replayed. This is the "at-least-once" guarantee - duplicates are possible, but loss is not.
 
 ### Storage Backends
 
@@ -225,10 +225,10 @@ Each processor can filter, transform, or enrich events. The JavaScript processor
 
 Critical performance paths have been optimized:
 
-1. **Event construction** — Minimal allocations, reuse buffers
-2. **Checkpoint serialization** — Opaque bytes avoid repeated JSON encoding
-3. **Sink delivery** — Batch operations reduce round trips
-4. **Schema lookup** — In-memory cache with stable fingerprints
+1. **Event construction** - Minimal allocations, reuse buffers
+2. **Checkpoint serialization** - Opaque bytes avoid repeated JSON encoding
+3. **Sink delivery** - Batch operations reduce round trips
+4. **Schema lookup** - In-memory cache with stable fingerprints
 
 ### Benchmarking
 

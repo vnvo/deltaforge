@@ -47,6 +47,10 @@ spec:
 
 Captures row-level changes via binlog replication. See [MySQL source documentation](mysql.md) for prerequisites and detailed configuration.
 
+<table>
+<tr>
+<td>
+
 ```yaml
 source:
   type: mysql
@@ -58,19 +62,30 @@ source:
       - shop.order_items
 ```
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `id` | string | Yes | Unique identifier for checkpoints, server_id derivation, and metrics |
-| `dsn` | string | Yes | MySQL connection string with replication privileges |
-| `tables` | array | No | Table patterns to capture; omit to capture all user tables |
+</td>
+<td>
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Unique identifier for checkpoints and metrics |
+| `dsn` | string | MySQL connection string with replication privileges |
+| `tables` | array | Table patterns to capture; omit for all tables |
+
+</td>
+</tr>
+</table>
 
 **Table patterns** support SQL LIKE syntax:
-- `db.table` — exact match
-- `db.prefix%` — tables matching prefix
-- `db.*` — all tables in database
-- `%.table` — table in any database
+- `db.table` - exact match
+- `db.prefix%` - tables matching prefix
+- `db.*` - all tables in database
+- `%.table` - table in any database
 
 ### Turso
+
+<table>
+<tr>
+<td>
 
 ```yaml
 source:
@@ -86,19 +101,30 @@ source:
       level: data
 ```
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `id` | string | Yes | — | Logical identifier for metrics and logging |
-| `url` | string | Yes | — | Database URL (`libsql://`, `http://`, or file path) |
-| `auth_token` | string | No | — | Authentication token for Turso cloud |
-| `tables` | array | Yes | — | Tables to track (supports wildcards) |
-| `cdc_mode` | string | No | `auto` | CDC mode: `native`, `triggers`, `polling`, `auto` |
-| `poll_interval_ms` | integer | No | `1000` | Polling interval in milliseconds |
-| `native_cdc.level` | string | No | `data` | Native CDC level: `binlog` or `data` |
+</td>
+<td>
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `id` | string | — | Logical identifier |
+| `url` | string | — | Database URL |
+| `auth_token` | string | — | Turso cloud token |
+| `tables` | array | — | Tables to track |
+| `cdc_mode` | string | `auto` | `native`, `triggers`, `polling`, `auto` |
+| `poll_interval_ms` | int | `1000` | Polling interval |
+| `native_cdc.level` | string | `data` | `binlog` or `data` |
+
+</td>
+</tr>
+</table>
 
 ### <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/postgresql/postgresql-original.svg" width="24" height="24" style="vertical-align: middle;"> PostgreSQL
 
 Captures row-level changes via logical replication using the pgoutput plugin. See [PostgreSQL source documentation](postgres.md) for prerequisites and detailed configuration.
+
+<table>
+<tr>
+<td>
 
 ```yaml
 source:
@@ -114,21 +140,28 @@ source:
     start_position: earliest
 ```
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `id` | string | Yes | — | Unique identifier for checkpoints and metrics |
-| `dsn` | string | Yes | — | PostgreSQL connection string (URL or key=value format) |
-| `slot` | string | Yes | — | Replication slot name |
-| `publication` | string | Yes | — | Publication name |
-| `tables` | array | Yes | — | Table patterns to capture |
-| `start_position` | string/object | No | `earliest` | Start position when no checkpoint: `earliest`, `latest`, or `{lsn: "X/Y"}` |
+</td>
+<td>
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `id` | string | — | Unique identifier |
+| `dsn` | string | — | PostgreSQL connection string |
+| `slot` | string | — | Replication slot name |
+| `publication` | string | — | Publication name |
+| `tables` | array | — | Table patterns to capture |
+| `start_position` | string | `earliest` | `earliest`, `latest`, or `{lsn: "X/Y"}` |
+
+</td>
+</tr>
+</table>
 
 **Table patterns** support SQL LIKE syntax (same as MySQL):
-- `schema.table` — exact match
-- `schema.prefix%` — tables matching prefix
-- `schema.*` — all tables in schema
-- `%.table` — table in any schema
-- `table` — defaults to `public.table`
+- `schema.table` - exact match
+- `schema.prefix%` - tables matching prefix
+- `schema.*` - all tables in schema
+- `%.table` - table in any schema
+- `table` - defaults to `public.table`
 
 ---
 
@@ -138,6 +171,10 @@ Processors transform batches of events before delivery to sinks.
 
 ### <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/javascript/javascript-original.svg" width="24" height="24" style="vertical-align: middle;"> JavaScript
 
+<table>
+<tr>
+<td>
+
 ```yaml
 processors:
   - type: javascript
@@ -145,7 +182,7 @@ processors:
     inline: |
       function processBatch(events) {
         return events.map(event => {
-          event.tags = (event.tags || []).concat(["processed"]);
+          event.tags = ["processed"];
           return event;
         });
       }
@@ -155,13 +192,20 @@ processors:
       timeout_ms: 500
 ```
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `id` | string | Yes | Processor identifier |
-| `inline` | string | Yes | JavaScript source defining `processBatch(events)` |
-| `limits.cpu_ms` | integer | No | CPU time limit per batch |
-| `limits.mem_mb` | integer | No | Memory limit |
-| `limits.timeout_ms` | integer | No | Execution timeout |
+</td>
+<td>
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Processor identifier |
+| `inline` | string | JS source defining `processBatch(events)` |
+| `limits.cpu_ms` | int | CPU time limit per batch |
+| `limits.mem_mb` | int | Memory limit |
+| `limits.timeout_ms` | int | Execution timeout |
+
+</td>
+</tr>
+</table>
 
 The `processBatch(events)` function receives an array of events and can return:
 - An array of events (modified, filtered, or expanded)
@@ -174,6 +218,10 @@ The `processBatch(events)` function receives an array of events and can return:
 ## Sinks
 
 ### <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/apachekafka/apachekafka-original.svg" width="24" height="24" style="vertical-align: middle;"> Kafka
+
+<table>
+<tr>
+<td>
 
 ```yaml
 sinks:
@@ -188,16 +236,27 @@ sinks:
         message.timeout.ms: "5000"
 ```
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `id` | string | Yes | — | Sink identifier |
-| `brokers` | string | Yes | — | Comma-separated broker list |
-| `topic` | string | Yes | — | Destination topic |
-| `required` | bool | No | `true` | Whether this sink gates checkpoints |
-| `exactly_once` | bool | No | `false` | Enable EOS semantics |
-| `client_conf` | map | No | `{}` | Raw librdkafka configuration overrides |
+</td>
+<td>
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `id` | string | — | Sink identifier |
+| `brokers` | string | — | Comma-separated broker list |
+| `topic` | string | — | Destination topic |
+| `required` | bool | `true` | Whether this sink gates checkpoints |
+| `exactly_once` | bool | `false` | Enable EOS semantics |
+| `client_conf` | map | `{}` | Raw librdkafka config overrides |
+
+</td>
+</tr>
+</table>
 
 ### <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/redis/redis-original.svg" width="24" height="24" style="vertical-align: middle;"> Redis
+
+<table>
+<tr>
+<td>
 
 ```yaml
 sinks:
@@ -209,16 +268,68 @@ sinks:
       required: true
 ```
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `id` | string | Yes | — | Sink identifier |
-| `uri` | string | Yes | — | Redis connection URI |
-| `stream` | string | Yes | — | Redis stream key |
-| `required` | bool | No | `true` | Whether this sink gates checkpoints |
+</td>
+<td>
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `id` | string | — | Sink identifier |
+| `uri` | string | — | Redis connection URI |
+| `stream` | string | — | Redis stream key |
+| `required` | bool | `true` | Whether this sink gates checkpoints |
+
+</td>
+</tr>
+</table>
+
+### <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/nats/nats-original.svg" width="24" height="24" style="vertical-align: middle;"> NATS
+
+<table>
+<tr>
+<td>
+
+```yaml
+sinks:
+  - type: nats
+    config:
+      id: orders-nats
+      url: ${NATS_URL}
+      subject: orders.events
+      stream: ORDERS
+      required: true
+      send_timeout_secs: 5
+      batch_timeout_secs: 30
+```
+
+</td>
+<td>
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `id` | string | — | Sink identifier |
+| `url` | string | — | NATS server URL |
+| `subject` | string | — | Subject to publish to |
+| `stream` | string | — | JetStream stream name |
+| `required` | bool | `true` | Gates checkpoints |
+| `send_timeout_secs` | int | `5` | Publish timeout |
+| `batch_timeout_secs` | int | `30` | Batch timeout |
+| `connect_timeout_secs` | int | `10` | Connection timeout |
+| `credentials_file` | string | — | NATS credentials file |
+| `username` | string | — | Auth username |
+| `password` | string | — | Auth password |
+| `token` | string | — | Auth token |
+
+</td>
+</tr>
+</table>
 
 ---
 
 ## Batching
+
+<table>
+<tr>
+<td>
 
 ```yaml
 batch:
@@ -229,39 +340,59 @@ batch:
   max_inflight: 2
 ```
 
+</td>
+<td>
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_events` | integer | `500` | Flush after this many events |
-| `max_bytes` | integer | `1048576` | Flush after serialized size reaches this limit |
-| `max_ms` | integer | `1000` | Flush after this much time (milliseconds) |
-| `respect_source_tx` | bool | `true` | Never split a source transaction across batches |
-| `max_inflight` | integer | `2` | Maximum concurrent batches being processed |
+| `max_events` | int | `500` | Flush after this many events |
+| `max_bytes` | int | `1048576` | Flush after size reaches limit |
+| `max_ms` | int | `1000` | Flush after time (ms) |
+| `respect_source_tx` | bool | `true` | Never split source transactions |
+| `max_inflight` | int | `2` | Max concurrent batches |
+
+</td>
+</tr>
+</table>
 
 ---
 
 ## Commit policy
 
+<table>
+<tr>
+<td>
+
 ```yaml
 commit_policy:
   mode: required
-```
 
-| Mode | Description |
-|------|-------------|
-| `all` | Every sink must acknowledge before checkpoint |
-| `required` | Only sinks with `required: true` must acknowledge (default) |
-| `quorum` | Checkpoint after `quorum` sinks acknowledge |
-
-For quorum mode:
-```yaml
+# For quorum mode:
 commit_policy:
   mode: quorum
   quorum: 2
 ```
 
+</td>
+<td>
+
+| Mode | Description |
+|------|-------------|
+| `all` | Every sink must acknowledge before checkpoint |
+| `required` | Only `required: true` sinks must acknowledge (default) |
+| `quorum` | Checkpoint after `quorum` sinks acknowledge |
+
+</td>
+</tr>
+</table>
+
 ---
 
 ## Schema sensing
+
+<table>
+<tr>
+<td>
 
 ```yaml
 schema_sensing:
@@ -277,16 +408,23 @@ schema_sensing:
     structure_cache_size: 50
 ```
 
+</td>
+<td>
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Enable schema sensing |
-| `deep_inspect.enabled` | bool | `true` | Inspect nested JSON structures |
-| `deep_inspect.max_depth` | integer | `10` | Maximum nesting depth |
-| `deep_inspect.max_sample_size` | integer | `1000` | Max events to sample for deep analysis |
-| `sampling.warmup_events` | integer | `1000` | Events to fully analyze before sampling |
-| `sampling.sample_rate` | integer | `10` | After warmup, analyze 1 in N events |
+| `deep_inspect.enabled` | bool | `true` | Inspect nested JSON |
+| `deep_inspect.max_depth` | int | `10` | Max nesting depth |
+| `deep_inspect.max_sample_size` | int | `1000` | Max events for deep analysis |
+| `sampling.warmup_events` | int | `1000` | Events to fully analyze first |
+| `sampling.sample_rate` | int | `10` | After warmup, analyze 1 in N |
 | `sampling.structure_cache` | bool | `true` | Cache structure fingerprints |
-| `sampling.structure_cache_size` | integer | `100` | Max cached structures per table |
+| `sampling.structure_cache_size` | int | `100` | Max cached structures |
+
+</td>
+</tr>
+</table>
 
 ---
 
@@ -390,6 +528,43 @@ spec:
         id: users-kafka
         brokers: ${KAFKA_BROKERS}
         topic: user-events
+        required: true
+
+  batch:
+    max_events: 500
+    max_ms: 1000
+    respect_source_tx: true
+
+  commit_policy:
+    mode: required
+```
+
+### MySQL to NATS
+
+```yaml
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: orders-mysql-to-nats
+  tenant: acme
+
+spec:
+  source:
+    type: mysql
+    config:
+      id: orders-mysql
+      dsn: ${MYSQL_DSN}
+      tables:
+        - shop.orders
+        - shop.order_items
+
+  sinks:
+    - type: nats
+      config:
+        id: orders-nats
+        url: ${NATS_URL}
+        subject: orders.events
+        stream: ORDERS
         required: true
 
   batch:

@@ -82,9 +82,9 @@ source:
 
 DeltaForge automatically checkpoints progress and resumes from the last position on restart. The resume strategy follows this priority:
 
-1. **GTID** — Preferred if the MySQL server has GTID enabled. Provides the most reliable resume across binlog rotations and failovers.
-2. **File:position** — Used when GTID is not available. Resumes from the exact binlog file and byte offset.
-3. **Binlog tail** — On first run with no checkpoint, starts from the current end of the binlog (no historical replay).
+1. **GTID** - Preferred if the MySQL server has GTID enabled. Provides the most reliable resume across binlog rotations and failovers.
+2. **File:position** - Used when GTID is not available. Resumes from the exact binlog file and byte offset.
+3. **Binlog tail** - On first run with no checkpoint, starts from the current end of the binlog (no historical replay).
 
 Checkpoints are stored using the `id` field as the key.
 

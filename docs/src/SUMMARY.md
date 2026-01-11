@@ -13,6 +13,7 @@
 - [Sinks](sinks/README.md)
     - [Redis](sinks/redis.md)
     - [Kafka](sinks/kafka.md)
+    - [NATS](sinks/nats.md)
 - [Architecture](architecture.md)
     - [Checkpoints](checkpoints.md)
     - [Schema Registry](schemaregistry.md)

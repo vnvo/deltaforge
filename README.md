@@ -29,7 +29,7 @@
 
 > ⚠️ **Status:** Active development. APIs, configuration, and semantics may change.
 
-DeltaForge is a lightweight framework for building CDC pipelines that stream database changes into downstream systems such as Kafka and Redis. It focuses on:
+DeltaForge is a lightweight framework for building CDC pipelines that stream database changes into downstream systems such as Kafka, Redis, and NATS. It focuses on:
 
 - **User Control** : Using an embedded JS engine, users can fully control what happens to each event.
 - **Config-driven pipelines** : YAML-defined pipelines instead of bespoke code per use-case.
@@ -65,7 +65,8 @@ DeltaForge is meant to replace tools like Debezium and similar.
     <td align="center">
       <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/apachekafka/apachekafka-original.svg" width="40" height="40" alt="Kafka">
       <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/redis/redis-original.svg" width="40" height="40" alt="Redis">
-      <br><sub>Kafka · Redis</sub>
+      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/nats/nats-original.svg" width="40" height="40" alt="NATS">
+      <br><sub>Kafka · Redis · NATS</sub>
     </td>
   </tr>
 </table>
@@ -101,6 +102,7 @@ DeltaForge is meant to replace tools like Debezium and similar.
 - **Sinks**
   - Kafka producer sink (via `rdkafka`)
   - Redis stream sink
+  - NATS JetStream sink (via `async_nats`)
 
 ## Documentation
 
@@ -112,7 +114,7 @@ DeltaForge is meant to replace tools like Debezium and similar.
 Use the bundled `dev.sh` CLI to spin up the dependency stack and run common workflows consistently:
 
 ```bash
-./dev.sh up     # start Postgres, MySQL, Kafka, Redis from docker-compose.dev.yml
+./dev.sh up     # start Postgres, MySQL, Kafka, Redis, NATS from docker-compose.dev.yml
 ./dev.sh ps     # view container status
 ./dev.sh check  # fmt --check + clippy + tests (matches CI)
 ```
@@ -187,7 +189,7 @@ Checkpoints are never saved before events are delivered. A crash between deliver
 
 ### Schema-Checkpoint Correlation
 
-The schema registry tracks schema versions with sequence numbers and optional checkpoint correlation. During replay, events are interpreted with the schema that was active when they were produced — even if the table structure has since changed.
+The schema registry tracks schema versions with sequence numbers and optional checkpoint correlation. During replay, events are interpreted with the schema that was active when they were produced - even if the table structure has since changed.
 
 ### Source-Owned Schemas
 
@@ -288,6 +290,32 @@ spec:
         topic: user-events
 ```
 
+### NATS JetStream sink example
+
+```yaml
+metadata:
+  name: orders-mysql-to-nats
+  tenant: acme
+
+spec:
+  source:
+    type: mysql
+    config:
+      id: orders-mysql
+      dsn: ${MYSQL_DSN}
+      tables:
+        - shop.orders
+
+  sinks:
+    - type: nats
+      config:
+        id: orders-nats
+        url: ${NATS_URL}
+        subject: orders.events
+        stream: ORDERS
+        required: true
+```
+
 ### Full configuration example
 
 ```yaml
@@ -340,6 +368,12 @@ spec:
         id: orders-redis
         uri: ${REDIS_URI}
         stream: orders
+    - type: nats
+      config:
+        id: orders-nats
+        url: ${NATS_URL}
+        subject: orders.events
+        stream: ORDERS
   
   # Batch config
   batch:
@@ -371,7 +405,7 @@ Key fields:
 - `spec.sharding` - optional hint for downstream distribution.
 - `spec.source` - required source configuration (MySQL, PostgreSQL, or Turso).
 - `spec.processors` - ordered processors; JavaScript is supported today with optional resource limits.
-- `spec.sinks` - one or more sinks; Kafka supports `required`, `exactly_once`, and raw `client_conf` overrides; Redis streams are also available.
+- `spec.sinks` - one or more sinks; Kafka supports `required`, `exactly_once`, and raw `client_conf` overrides; Redis streams and NATS JetStream are also available.
 - `spec.batch` - optional thresholds that define the commit unit.
 - `spec.commit_policy` - how sink acknowledgements gate checkpoint commits (`all`, `required` (default), or `quorum`).
 - `spec.schema_sensing` - optional automatic schema inference from event payloads.

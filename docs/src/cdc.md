@@ -4,7 +4,7 @@ Change Data Capture (CDC) is the practice of streaming database mutations as ord
 
 DeltaForge is a CDC engine built to make log-based change streams reliable, observable, and operationally simple in modern, containerized environments. It focuses on **row-level CDC** from MySQL binlog and Postgres logical replication to keep consumers accurate and latency-aware while minimizing impact on source databases.
 
-> **In short**: DeltaForge tails committed transactions from MySQL and Postgres logs, preserves ordering and transaction boundaries, and delivers events to Kafka and Redis with checkpointed delivery, configurable batching, and Prometheus metrics—without requiring a JVM or distributed coordinator.
+> **In short**: DeltaForge tails committed transactions from MySQL and Postgres logs, preserves ordering and transaction boundaries, and delivers events to Kafka and Redis with checkpointed delivery, configurable batching, and Prometheus metrics - without requiring a JVM or distributed coordinator.
 
 ---
 
@@ -137,7 +137,7 @@ Key components:
 | `timestamp` | When the change was committed at the source |
 | `schema_version` | Helps consumers handle schema evolution |
 
-Not all fields are present for every operation—`before` is omitted for INSERTs, `after` is omitted for DELETEs—but the event envelope and metadata fields are consistent across MySQL and Postgres sources.
+Not all fields are present for every operation-`before` is omitted for INSERTs, `after` is omitted for DELETEs - but the event envelope and metadata fields are consistent across MySQL and Postgres sources.
 
 ---
 
@@ -191,7 +191,7 @@ Not all fields are present for every operation—`before` is omitted for INSERTs
 
 **Problem**: Regulations require you to maintain a complete history of changes to sensitive data. Application-level audit logging is inconsistent and can be bypassed.
 
-**CDC solution**: The transaction log captures every committed change regardless of how it was made—application code, admin scripts, or direct SQL. Stream these events to immutable storage for compliance.
+**CDC solution**: The transaction log captures every committed change regardless of how it was made - application code, admin scripts, or direct SQL. Stream these events to immutable storage for compliance.
 
 ### Cross-region replication
 
@@ -341,8 +341,8 @@ DeltaForge exposes Prometheus metrics on the configurable metrics endpoint (defa
 
 ### Health checks
 
-- `GET /healthz`: Liveness probe—is the process running?
-- `GET /readyz`: Readiness probe—are pipelines connected and processing?
+- `GET /healthz`: Liveness probe - is the process running?
+- `GET /readyz`: Readiness probe - are pipelines connected and processing?
 - `GET /pipelines`: Detailed status of each pipeline including configuration.
 
 ---

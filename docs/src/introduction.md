@@ -4,15 +4,13 @@
   <a href="https://github.com/vnvo/deltaforge/releases">
     <img src="https://img.shields.io/github/v/release/vnvo/deltaforge?label=version" alt="Version">
   </a>
-  <a href="https://github.com/vnvo/deltaforge">
-    <img src="https://img.shields.io/github/stars/vnvo/deltaforge?style=flat" alt="GitHub Stars">
-  </a>
+  <img src="https://img.shields.io/badge/arch-amd64|arm64-blue" alt="Arch">
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License">
 </p>
 
 # Introduction
 
-DeltaForge is a modular, config-driven [Change Data Capture](cdc.md) (CDC) micro-framework built in Rust. It streams database changes into downstream systems like Kafka and Redis while giving you full control over how each event is processed.
+DeltaForge is a modular, config-driven [Change Data Capture](cdc.md) (CDC) micro-framework built in Rust. It streams database changes into downstream systems like Kafka, Redis, and NATS while giving you full control over how each event is processed.
 
 Pipelines are defined declaratively in YAML, making it straightforward to onboard new use cases without custom code.
 
@@ -48,7 +46,8 @@ Pipelines are defined declaratively in YAML, making it straightforward to onboar
     <td align="center">
       <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/apachekafka/apachekafka-original.svg" width="40" height="40" alt="Kafka">
       <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/redis/redis-original.svg" width="40" height="40" alt="Redis">
-      <br><sub>Kafka · Redis</sub>
+      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/nats/nats-original.svg" width="40" height="40" alt="NATS">
+      <br><sub>Kafka · Redis · NATS</sub>
     </td>
   </tr>
 </table>
@@ -74,7 +73,7 @@ Pipelines are defined declaratively in YAML, making it straightforward to onboar
 
 - 🔄 **Automatic reconnection** : Exponential backoff with jitter for resilient connections.
 - 🎯 **Flexible table selection** : Wildcard patterns (`db.*`, `schema.prefix%`) for easy onboarding.
-- 🔀 **Transaction boundaries** : Optionally keep source transactions intact across batches.
+- 📀 **Transaction boundaries** : Optionally keep source transactions intact across batches.
 - ⚙️ **Commit policies** : Control checkpoint behavior with `all`, `required`, or `quorum` modes across multiple sinks.
 
 ## Use Cases
@@ -82,7 +81,7 @@ Pipelines are defined declaratively in YAML, making it straightforward to onboar
 DeltaForge is designed for:
 
 - **Real-time data synchronization** : Keep caches, search indexes, and analytics systems in sync.
-- **Event-driven architectures** : Stream database changes to Kafka for downstream consumers.
+- **Event-driven architectures** : Stream database changes to Kafka or NATS for downstream consumers.
 - **Lightweight ETL** : Transform and route data without heavyweight infrastructure.
 
 > **DeltaForge is _not_ a DAG-based stream processor.** It is a focused CDC engine meant to replace tools like Debezium when you need a lighter, cloud-native, and more customizable runtime.

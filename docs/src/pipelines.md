@@ -9,14 +9,14 @@ Each pipeline is created from a single `PipelineSpec`. The runtime spawns the so
 
 The REST API addresses pipelines by `metadata.name` and returns `PipeInfo` records containing the live spec and status.
 
-- `GET /healthz` — liveness probe.
-- `GET /readyz` — readiness with pipeline states.
-- `GET /pipelines` — list pipelines.
-- `POST /pipelines` — create from a full spec.
-- `PATCH /pipelines/{name}` — merge a partial spec (for example, adjust batch thresholds) and restart the pipeline.
-- `POST /pipelines/{name}/pause` — pause ingestion and coordination.
-- `POST /pipelines/{name}/resume` — resume a paused pipeline.
-- `POST /pipelines/{name}/stop` — stop a running pipeline.
+- `GET /healthz` - liveness probe.
+- `GET /readyz` - readiness with pipeline states.
+- `GET /pipelines` - list pipelines.
+- `POST /pipelines` - create from a full spec.
+- `PATCH /pipelines/{name}` - merge a partial spec (for example, adjust batch thresholds) and restart the pipeline.
+- `POST /pipelines/{name}/pause` - pause ingestion and coordination.
+- `POST /pipelines/{name}/resume` - resume a paused pipeline.
+- `POST /pipelines/{name}/stop` - stop a running pipeline.
 
 Pausing halts both source ingestion and the coordinator. Resuming re-enables both ends so buffered events can drain cleanly.
 

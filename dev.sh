@@ -31,6 +31,15 @@ Redis:
   ./dev.sh redis-cli              # open redis-cli
   ./dev.sh redis-read <stream> [count=10] [id=0-0]
 
+NATS:
+  ./dev.sh nats-sub <subject>     # subscribe to subject
+  ./dev.sh nats-pub <subject> <msg>  # publish a message
+  ./dev.sh nats-stream-add <n> <subjects>  # create JetStream stream
+  ./dev.sh nats-stream-ls         # list all streams
+  ./dev.sh nats-stream-info <n>   # show stream details
+  ./dev.sh nats-stream-rm <n>     # delete a stream
+  ./dev.sh nats-stream-view <n> [count=10]  # view messages
+
 PostgreSQL:
   ./dev.sh pg-sh                  # psql into Postgres (orders DB)
   ./dev.sh pg-status              # check CDC status (wal_level, slots, publications)
@@ -56,6 +65,7 @@ Dev:
   ./dev.sh run [config]           # run with config (default: examples/dev.yaml)
   ./dev.sh run-pg                 # run with Postgres example config
   ./dev.sh run-mysql              # run with MySQL example config
+  ./dev.sh run-nats               # run with NATS example config
   ./dev.sh fmt                    # format Rust code (cargo fmt --all)
   ./dev.sh lint                   # run clippy with warnings as errors
   ./dev.sh test                   # run test suite
@@ -94,8 +104,9 @@ Release:
   ./dev.sh release-check          # run all checks before release
 
 Notes:
-- Uses service names from docker-compose.dev.yml (kafka, redis, postgres, mysql).
+- Uses service names from docker-compose.dev.yml (kafka, redis, postgres, mysql, nats).
 - Kafka broker advertises localhost:9092 (works from host & inside kafka container).
+- NATS server on localhost:4222 with JetStream enabled.
 - API defaults to http://localhost:8080 (set API_BASE to override).
 - PostgreSQL configured with wal_level=logical for CDC.
 - MySQL configured with GTID + ROW binlog for CDC.
@@ -120,6 +131,13 @@ ensure_pg() {
 ensure_mysql() {
   if ! "${DC[@]}" ps | grep -q "mysql.*Up"; then
     echo "⚠️  MySQL not up. Start with: ./dev.sh up" >&2
+    exit 1
+  fi
+}
+
+ensure_nats() {
+  if ! "${DC[@]}" ps | grep -q "nats.*Up"; then
+    echo "⚠️  NATS not up. Start with: ./dev.sh up" >&2
     exit 1
   fi
 }
@@ -188,6 +206,76 @@ cmd_redis_read() {
   local id="${1:-0-0}"
   if [[ -z "$stream" ]]; then echo "Usage: ./dev.sh redis-read <stream> [count=10] [id=0-0]"; exit 1; fi
   "${DC[@]}" exec redis redis-cli XREAD COUNT "$count" STREAMS "$stream" "$id"
+}
+
+# ============================================================
+# NATS commands
+# ============================================================
+cmd_nats_sub() {
+  ensure_nats
+  local subject="${1:-}"
+  if [[ -z "$subject" ]]; then echo "Usage: ./dev.sh nats-sub <subject>"; exit 1; fi
+  echo "Subscribing to $subject (Ctrl+C to exit)..."
+  "${DC[@]}" exec nats nats sub "$subject"
+}
+
+cmd_nats_pub() {
+  ensure_nats
+  local subject="${1:-}"; shift || true
+  local message="${1:-}"
+  if [[ -z "$subject" || -z "$message" ]]; then
+    echo "Usage: ./dev.sh nats-pub <subject> <message>"
+    exit 1
+  fi
+  "${DC[@]}" exec nats nats pub "$subject" "$message"
+  echo "✅ Published to $subject"
+}
+
+cmd_nats_stream_add() {
+  ensure_nats
+  local stream="${1:-}"; shift || true
+  local subjects="${1:-}"
+  if [[ -z "$stream" || -z "$subjects" ]]; then
+    echo "Usage: ./dev.sh nats-stream-add <stream> <subjects>"
+    echo "Example: ./dev.sh nats-stream-add ORDERS 'orders.>'"
+    exit 1
+  fi
+  "${DC[@]}" exec nats nats stream add "$stream" \
+    --subjects "$subjects" \
+    --retention limits \
+    --storage file \
+    --replicas 1 \
+    --max-age 7d \
+    --discard old
+  echo "✅ Stream created: $stream"
+}
+
+cmd_nats_stream_ls() {
+  ensure_nats
+  "${DC[@]}" exec nats nats stream list
+}
+
+cmd_nats_stream_info() {
+  ensure_nats
+  local stream="${1:-}"
+  if [[ -z "$stream" ]]; then echo "Usage: ./dev.sh nats-stream-info <stream>"; exit 1; fi
+  "${DC[@]}" exec nats nats stream info "$stream"
+}
+
+cmd_nats_stream_rm() {
+  ensure_nats
+  local stream="${1:-}"
+  if [[ -z "$stream" ]]; then echo "Usage: ./dev.sh nats-stream-rm <stream>"; exit 1; fi
+  "${DC[@]}" exec nats nats stream delete "$stream" -f
+  echo "✅ Stream deleted: $stream"
+}
+
+cmd_nats_stream_view() {
+  ensure_nats
+  local stream="${1:-}"; shift || true
+  local count="${1:-10}"
+  if [[ -z "$stream" ]]; then echo "Usage: ./dev.sh nats-stream-view <stream> [count=10]"; exit 1; fi
+  "${DC[@]}" exec nats nats stream view "$stream" --last "$count"
 }
 
 # ============================================================
@@ -350,6 +438,10 @@ cmd_run_pg() {
 
 cmd_run_mysql() {
   cargo run -p runner -- --config examples/mysql.yaml
+}
+
+cmd_run_nats() {
+  cargo run -p runner -- --config examples/dev.nats.yaml
 }
 
 cmd_fmt() {
@@ -713,6 +805,15 @@ case "${1:-}" in
   redis-cli) shift; cmd_redis_cli "$@";;
   redis-read) shift; cmd_redis_read "$@";;
 
+  # NATS
+  nats-sub) shift; cmd_nats_sub "$@";;
+  nats-pub) shift; cmd_nats_pub "$@";;
+  nats-stream-add) shift; cmd_nats_stream_add "$@";;
+  nats-stream-ls) shift; cmd_nats_stream_ls "$@";;
+  nats-stream-info) shift; cmd_nats_stream_info "$@";;
+  nats-stream-rm) shift; cmd_nats_stream_rm "$@";;
+  nats-stream-view) shift; cmd_nats_stream_view "$@";;
+
   # PostgreSQL
   pg-sh) shift; cmd_pg_sh "$@";;
   pg-status) shift; cmd_pg_status "$@";;
@@ -738,6 +839,7 @@ case "${1:-}" in
   run) shift; cmd_run "$@";;
   run-pg) shift; cmd_run_pg "$@";;
   run-mysql) shift; cmd_run_mysql "$@";;
+  run-nats) shift; cmd_run_nats "$@";;
   fmt) shift; cmd_fmt "$@";;
   lint) shift; cmd_lint "$@";;
   test) shift; cmd_test "$@";;
