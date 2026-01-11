@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **NATS sink** - Functioning sink with tests ([21d7800](https://github.com/vnvo/deltaforge/commit/21d7800f2604570ad305e573b9353929cc256ad6))
 - **PostgreSQL source** - Full CDC support via logical replication with pgoutput plugin ([72ac4bc](https://github.com/vnvo/deltaforge/commit/72ac4bc3d30bae608a1dc4f7c8762cfbaaf4e731))
   - Automatic slot and publication creation
   - LSN-based checkpointing with configurable start position
@@ -32,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Version information** - Build version, git commit, and target displayed at startup ([de27d74](https://github.com/vnvo/deltaforge/commit/de27d748fff5c822d53a5581cdd6aa3438bf9d1a))
 - JavaScript processor timeout and health monitoring ([11a89bc](https://github.com/vnvo/deltaforge/commit/11a89bcc80b15ac7e1b1dd43254a1fba9f28b953))
 - Turso/libSQL source (experimental, behind feature flag) ([729bfe7](https://github.com/vnvo/deltaforge/commit/729bfe71cf1cefe434b6fbcf432c65ba621b5284))
+
+### Documentation
+
+- docs: updated sink docs:([39e32c7](https://github.com/vnvo/deltaforge/commit/39e32c74837e7a7bb3e33488b525baa802ea6a85))
+
 
 ### Changed
 
