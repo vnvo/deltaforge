@@ -7,9 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.1.0-beta.6] - 2025-01-11
+
 ### Added
 
-- **NATS sink** - Functioning sink with tests ([21d7800](https://github.com/vnvo/deltaforge/commit/21d7800f2604570ad305e573b9353929cc256ad6))
+- **NATS sink** - JetStream sink with durable delivery ([21d7800](https://github.com/vnvo/deltaforge/commit/21d7800f2604570ad305e573b9353929cc256ad6))
+  - JetStream stream verification at startup
+  - Multiple authentication methods (credentials file, username/password, token)
+  - Configurable timeouts for send, batch, and connection
+  - Comprehensive integration tests
 - **PostgreSQL source** - Full CDC support via logical replication with pgoutput plugin ([72ac4bc](https://github.com/vnvo/deltaforge/commit/72ac4bc3d30bae608a1dc4f7c8762cfbaaf4e731))
   - Automatic slot and publication creation
   - LSN-based checkpointing with configurable start position
@@ -36,8 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
-- docs: updated sink docs:([39e32c7](https://github.com/vnvo/deltaforge/commit/39e32c74837e7a7bb3e33488b525baa802ea6a85))
-
+- Updated sink documentation with use cases, pros/cons, and failure modes ([39e32c7](https://github.com/vnvo/deltaforge/commit/39e32c74837e7a7bb3e33488b525baa802ea6a85))
+- Added NATS sink documentation
+- Expanded multi-sink configuration guide with `required` flag and commit policy details
 
 ### Changed
 
@@ -181,7 +190,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Links
 
-- [Unreleased]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.5...HEAD
+- [Unreleased]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.6...HEAD
+- [0.1.0-beta.6]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.5...v0.1.0-beta.6
 - [0.1.0-beta.5]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.4...v0.1.0-beta.5
 - [0.1.0-beta.4]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.2...v0.1.0-beta.4
 - [0.1.0-beta.2]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.1...v0.1.0-beta.2
