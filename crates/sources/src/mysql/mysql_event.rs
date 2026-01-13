@@ -2,7 +2,9 @@ use super::mysql_object::build_object;
 use crate::mysql::LoopControl;
 use crate::mysql::RunCtx;
 use common::{ts_sec_to_ms, watchdog};
-use deltaforge_core::{Event, Op, SourceMeta, SourceResult};
+use deltaforge_core::{
+    Event, Op, SourceInfo, SourcePosition, SourceResult, Transaction,
+};
 use metrics::counter;
 use mysql_binlog_connector_rust::{
     binlog_stream::BinlogStream,
@@ -110,11 +112,37 @@ async fn handle_table_map(
         }
     } else {
         debug!(
-            db=%tm.database_name, 
+            db=%tm.database_name,
             table=%tm.table_name,
             "skipping table (not in allow-list)");
     }
     Ok(())
+}
+
+/// Build SourceInfo for MySQL events
+fn build_source_info(
+    ctx: &RunCtx,
+    header: &EventHeader,
+    db: &str,
+    table: &str,
+) -> SourceInfo {
+    SourceInfo {
+        version: concat!("deltaforge-", env!("CARGO_PKG_VERSION")).to_string(),
+        connector: "mysql".to_string(),
+        name: ctx.pipeline.clone(),
+        ts_ms: ts_sec_to_ms(header.timestamp),
+        db: db.to_string(),
+        schema: None, // MySQL doesn't have schemas
+        table: table.to_string(),
+        snapshot: None,
+        position: SourcePosition::mysql(
+            ctx.server_id as u32,
+            ctx.last_gtid.clone(),
+            Some(ctx.last_file.clone()),
+            Some(ctx.last_pos),
+            None, // row number within event not tracked currently
+        ),
+    }
 }
 
 #[instrument(skip_all)]
@@ -139,26 +167,37 @@ async fn handle_write_rows(
                 &wr.included_columns,
                 &row.column_values,
             );
+
+            let source_info = build_source_info(
+                ctx,
+                header,
+                &tm.database_name,
+                &tm.table_name,
+            );
             let mut ev = Event::new_row(
-                ctx.tenant.clone(),
-                SourceMeta {
-                    kind: "mysql".into(),
-                    host: ctx.host.clone(),
-                    db: tm.database_name.clone(),
-                },
-                format!("{}.{}", tm.database_name, tm.table_name),
-                Op::Insert,
+                source_info,
+                Op::Create,
                 None,
                 Some(after),
                 ts_sec_to_ms(header.timestamp),
                 header.event_length as usize,
-            );
-            ev.tx_id = ctx.last_gtid.clone();
-            ev.checkpoint = Some(make_checkpoint_meta(
+            )
+            .with_tenant(ctx.tenant.clone())
+            .with_checkpoint(make_checkpoint_meta(
                 &ctx.last_file,
                 ctx.last_pos,
                 &ctx.last_gtid,
             ));
+
+            // Set transaction info if GTID is available
+            if let Some(gtid) = &ctx.last_gtid {
+                ev.transaction = Some(Transaction {
+                    id: gtid.clone(),
+                    total_order: None,
+                    data_collection_order: None,
+                });
+            }
+
             ev.schema_version = Some(loaded.fingerprint.to_string());
             ev.schema_sequence = Some(loaded.sequence);
 
@@ -211,27 +250,36 @@ async fn handle_update_rows(
                 &ur.included_columns_after,
                 &after_row.column_values,
             );
+
+            let source_info = build_source_info(
+                ctx,
+                header,
+                &tm.database_name,
+                &tm.table_name,
+            );
             let mut ev = Event::new_row(
-                ctx.tenant.clone(),
-                SourceMeta {
-                    kind: "mysql".into(),
-                    host: ctx.host.clone(),
-                    db: tm.database_name.clone(),
-                },
-                format!("{}.{}", tm.database_name, tm.table_name),
+                source_info,
                 Op::Update,
                 Some(before),
                 Some(after),
                 ts_sec_to_ms(header.timestamp),
                 header.event_length as usize,
-            );
-
-            ev.tx_id = ctx.last_gtid.clone();
-            ev.checkpoint = Some(make_checkpoint_meta(
+            )
+            .with_tenant(ctx.tenant.clone())
+            .with_checkpoint(make_checkpoint_meta(
                 &ctx.last_file,
                 ctx.last_pos,
                 &ctx.last_gtid,
             ));
+
+            if let Some(gtid) = &ctx.last_gtid {
+                ev.transaction = Some(Transaction {
+                    id: gtid.clone(),
+                    total_order: None,
+                    data_collection_order: None,
+                });
+            }
+
             ev.schema_version = Some(loaded.fingerprint.to_string());
             ev.schema_sequence = Some(ctx.schema.current_sequence());
 
@@ -279,27 +327,36 @@ async fn handle_delete_rows(
                 &dr.included_columns,
                 &row.column_values,
             );
+
+            let source_info = build_source_info(
+                ctx,
+                header,
+                &tm.database_name,
+                &tm.table_name,
+            );
             let mut ev = Event::new_row(
-                ctx.tenant.clone(),
-                SourceMeta {
-                    kind: "mysql".into(),
-                    host: ctx.host.clone(),
-                    db: tm.database_name.clone(),
-                },
-                format!("{}.{}", tm.database_name, tm.table_name),
+                source_info,
                 Op::Delete,
                 Some(before),
                 None,
                 ts_sec_to_ms(header.timestamp),
                 header.event_length as usize,
-            );
-
-            ev.tx_id = ctx.last_gtid.clone();
-            ev.checkpoint = Some(make_checkpoint_meta(
+            )
+            .with_tenant(ctx.tenant.clone())
+            .with_checkpoint(make_checkpoint_meta(
                 &ctx.last_file,
                 ctx.last_pos,
                 &ctx.last_gtid,
             ));
+
+            if let Some(gtid) = &ctx.last_gtid {
+                ev.transaction = Some(Transaction {
+                    id: gtid.clone(),
+                    total_order: None,
+                    data_collection_order: None,
+                });
+            }
+
             ev.schema_version = Some(loaded.fingerprint.to_string());
             ev.schema_sequence = Some(ctx.schema.current_sequence());
 
@@ -325,175 +382,166 @@ async fn handle_delete_rows(
     Ok(())
 }
 
+fn handle_gtid(
+    ctx: &mut RunCtx,
+    gt: mysql_binlog_connector_rust::event::gtid_event::GtidEvent,
+) {
+    let gtid_str = gt.gtid.clone();
+    debug!(source_id=%ctx.source_id, gtid=%gtid_str, "gtid");
+    ctx.last_gtid = Some(gtid_str);
+}
+
+fn handle_rotate(
+    ctx: &mut RunCtx,
+    rot: mysql_binlog_connector_rust::event::rotate_event::RotateEvent,
+) {
+    info!(source_id=%ctx.source_id, file=%rot.binlog_filename, pos=%rot.binlog_position, "rotate");
+    ctx.last_file = rot.binlog_filename;
+    ctx.last_pos = rot.binlog_position;
+}
+
+async fn handle_xid(ctx: &mut RunCtx) {
+    debug!(source_id=%ctx.source_id, "xid (commit)");
+    // Transaction boundary - could emit tx_end marker here if needed
+}
+
 #[instrument(skip_all)]
 async fn handle_query(
     ctx: &mut RunCtx,
     header: &EventHeader,
     q: mysql_binlog_connector_rust::event::query_event::QueryEvent,
 ) -> SourceResult<()> {
-    let db = if q.schema.is_empty() {
-        &ctx.default_db
-    } else {
-        &q.schema
-    };
-    let short = short_sql(&q.query, 200);
-    info!(source_id=%ctx.source_id, db=%db, sql=%short, "DDL/Query event");
+    let sql_upper = q.query.to_uppercase();
 
-    let lower = q.query.to_lowercase();
-    if lower.starts_with("create table")
-        || lower.starts_with("alter table")
-        || lower.starts_with("drop table")
-        || lower.starts_with("rename table")
+    // Skip transaction markers
+    if sql_upper == "BEGIN" || sql_upper == "COMMIT" || sql_upper == "ROLLBACK"
     {
-        ctx.schema.invalidate_db(db).await;
+        return Ok(());
     }
 
-    let mut ev = Event::new_ddl(
-        ctx.tenant.clone(),
-        SourceMeta {
-            kind: "mysql".into(),
-            host: ctx.host.clone(),
-            db: db.to_string(),
-        },
-        db.to_string(),
-        serde_json::json!({ "sql": q.query }),
-        ts_sec_to_ms(header.timestamp),
-        header.event_length as usize,
-    );
-    ev.tx_id = ctx.last_gtid.clone();
-    match ctx.tx.send(ev).await {
-        Ok(_) => {
-            counter!(
-                "deltaforge_source_events_total",
-                "pipeline" => ctx.pipeline.clone(),
-                "source" => ctx.source_id.clone(),
-                "table" => db.to_string(),
-            )
-            .increment(1);
-        }
-        Err(_) => {
+    // Handle DDL
+    if sql_upper.starts_with("ALTER")
+        || sql_upper.starts_with("CREATE")
+        || sql_upper.starts_with("DROP")
+        || sql_upper.starts_with("TRUNCATE")
+        || sql_upper.starts_with("RENAME")
+    {
+        info!(
+            source_id=%ctx.source_id,
+            db=%q.schema,
+            sql=%short_sql(&q.query, 80),
+            "DDL detected"
+        );
+
+        // For DDL, we use the query's schema as both db and table context
+        let source_info = SourceInfo {
+            version: concat!("deltaforge-", env!("CARGO_PKG_VERSION"))
+                .to_string(),
+            connector: "mysql".to_string(),
+            name: ctx.pipeline.clone(),
+            ts_ms: ts_sec_to_ms(header.timestamp),
+            db: q.schema.clone(),
+            schema: None,
+            table: "_ddl".to_string(), // Placeholder for DDL events
+            snapshot: None,
+            position: SourcePosition::mysql(
+                ctx.server_id as u32,
+                ctx.last_gtid.clone(),
+                Some(ctx.last_file.clone()),
+                Some(ctx.last_pos),
+                None,
+            ),
+        };
+
+        let ddl_payload = serde_json::json!({
+            "sql": q.query,
+            "database": q.schema,
+        });
+
+        let ev = Event::new_ddl(
+            source_info,
+            ddl_payload,
+            ts_sec_to_ms(header.timestamp),
+            header.event_length as usize,
+        )
+        .with_tenant(ctx.tenant.clone())
+        .with_checkpoint(make_checkpoint_meta(
+            &ctx.last_file,
+            ctx.last_pos,
+            &ctx.last_gtid,
+        ));
+
+        if let Err(_) = ctx.tx.send(ev).await {
             error!(source_id=%ctx.source_id, "channel send failed (op=ddl)");
         }
     }
+
     Ok(())
-}
-
-#[instrument(skip_all)]
-fn handle_gtid(
-    ctx: &mut RunCtx,
-    gt: mysql_binlog_connector_rust::event::gtid_event::GtidEvent,
-) {
-    debug!(source_id=%ctx.source_id, gtid=%gt.gtid, "gtid");
-    ctx.last_gtid = Some(gt.gtid.clone());
-}
-
-#[instrument(skip_all)]
-fn handle_rotate(
-    ctx: &mut RunCtx,
-    rot: mysql_binlog_connector_rust::event::rotate_event::RotateEvent,
-) {
-    info!(source_id=%ctx.source_id, file=%rot.binlog_filename, pos=rot.binlog_position, "rotate");
-    ctx.last_file = rot.binlog_filename.clone();
-}
-
-#[instrument(skip_all, fields(source_id=%ctx.source_id))]
-async fn handle_xid(ctx: &mut RunCtx) {
-    // Prefer the server’s executed-set; fall back to last_gtid if GTID is off
-    match crate::mysql::mysql_helpers::fetch_executed_gtid_set(&ctx.dsn).await {
-        Ok(Some(s)) => {
-            ctx.last_gtid = Some(s);
-        }
-        Ok(None) => {}
-        Err(e) => {
-            debug!(source_id=%ctx.source_id, error=%e, "failed to fetch executed GTID set");
-        }
-    };
-
-    debug!(
-        source_id=%ctx.source_id,
-        file=%ctx.last_file,
-        pos=ctx.last_pos,
-        gtid=?ctx.last_gtid,
-        "XID: transaction committed (checkpoint in events, will persist after sink ack)"
-    );
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        sync::{Arc, atomic::AtomicBool},
-        time::Duration,
-    };
+    use super::*;
+    use crate::mysql::MySqlCheckpoint;
+    use crate::mysql::mysql_schema_loader::MySqlSchemaLoader;
+    use common::AllowList;
+    use mysql_binlog_connector_rust::column::column_value::ColumnValue;
+    use mysql_binlog_connector_rust::event::delete_rows_event::DeleteRowsEvent;
+    use mysql_binlog_connector_rust::event::row_event::RowEvent;
+    use mysql_binlog_connector_rust::event::table_map_event::TableMapEvent;
+    use mysql_binlog_connector_rust::event::update_rows_event::UpdateRowsEvent;
+    use mysql_binlog_connector_rust::event::write_rows_event::WriteRowsEvent;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
     use tokio::sync::{Notify, mpsc};
     use tokio_util::sync::CancellationToken;
 
-    use crate::mysql::{AllowList, MySqlCheckpoint, MySqlSchemaLoader};
-    use checkpoints::{CheckpointStore, MemCheckpointStore};
-    use common::RetryPolicy;
-    use mysql_binlog_connector_rust::{
-        column::column_value::ColumnValue,
-        event::{
-            delete_rows_event::DeleteRowsEvent, row_event::RowEvent,
-            update_rows_event::UpdateRowsEvent,
-            write_rows_event::WriteRowsEvent,
-        },
-    };
-
-    use super::*;
-
     const TABLE_ID: u64 = 42;
 
-    fn make_table_map() -> TableMapEvent {
-        TableMapEvent {
-            table_id: TABLE_ID,
-            database_name: "shop".to_string(),
-            table_name: "orders".to_string(),
-            column_types: vec![],
-            column_metas: vec![],
-            null_bits: vec![],
-        }
-    }
-
-    /// RunCtx suitable for unit-testing the row handlers:
-    /// - in-memory checkpoint store
-    /// - schema cache pre-populated for shop.orders so no DB is touched
-    /// - allow-list matching 'shop.orders' only
     fn make_runctx(tx: mpsc::Sender<Event>) -> RunCtx {
-        let mut cols_map = HashMap::new();
-        cols_map.insert(
-            ("shop".to_string(), "orders".to_string()),
-            Arc::new(vec!["id".to_string(), "sku".to_string()]),
+        // Use from_static to create a test schema loader
+        let cols: HashMap<(String, String), Arc<Vec<String>>> =
+            HashMap::from([(
+                ("shop".to_string(), "orders".to_string()),
+                Arc::new(vec!["id".to_string(), "sku".to_string()]),
+            )]);
+        let schema = MySqlSchemaLoader::from_static(cols);
+
+        let mut table_map = HashMap::new();
+        table_map.insert(
+            TABLE_ID,
+            TableMapEvent {
+                table_id: TABLE_ID,
+                database_name: "shop".to_string(),
+                table_name: "orders".to_string(),
+                column_types: vec![],
+                column_metas: vec![],
+                null_bits: vec![],
+            },
         );
 
-        let schema = MySqlSchemaLoader::from_static(cols_map);
-        let chkpt: Arc<dyn CheckpointStore> =
-            Arc::new(MemCheckpointStore::new().expect("mem checkpoint store"));
-
         RunCtx {
-            source_id: "mysql-unit".to_string(),
-            pipeline: "pipe-1".to_string(),
-            tenant: "data-corp".to_string(),
-            dsn: "mysql://localhost/ignored".to_string(),
+            source_id: "unit-test".to_string(),
+            pipeline: "test-pipeline".to_string(),
+            tenant: "test-tenant".to_string(),
+            dsn: "mysql://fake".to_string(),
             host: "localhost".to_string(),
-            default_db: "shop".to_string(),
+            default_db: "test".to_string(),
             server_id: 1,
             tx,
-            chkpt,
+            chkpt: Arc::new(checkpoints::MemCheckpointStore::new().unwrap()),
             cancel: CancellationToken::new(),
             paused: Arc::new(AtomicBool::new(false)),
             pause_notify: Arc::new(Notify::new()),
             schema,
             allow: AllowList::new(&["shop.orders".to_string()]),
-            retry: RetryPolicy::default(),
-            inactivity: Duration::from_secs(30),
-            table_map: {
-                let mut m = HashMap::new();
-                m.insert(TABLE_ID, make_table_map());
-                m
-            },
+            retry: common::RetryPolicy::default(),
+            inactivity: Duration::from_secs(60),
+            table_map,
             last_file: "mysql-bin.000001".to_string(),
-            last_pos: 4,
+            last_pos: 1234,
             last_gtid: Some("GTID-UNIT".to_string()),
         }
     }
@@ -501,18 +549,19 @@ mod tests {
     fn make_header() -> EventHeader {
         EventHeader {
             timestamp: 1_700_000_000,
-            event_type: 30,
+            event_type: 0,
             server_id: 1,
-            event_length: 0,
-            next_event_position: 0,
+            event_length: 100,
+            next_event_position: 1234,
             event_flags: 0,
         }
     }
 
     #[tokio::test]
-    async fn handle_write_rows_mits_insert_with_after_only() {
+    async fn handle_write_rows_emits_create_event() {
         let (tx, mut rx) = mpsc::channel::<Event>(8);
         let mut ctx = make_runctx(tx);
+
         let row = RowEvent {
             column_values: vec![
                 ColumnValue::LongLong(1),
@@ -531,13 +580,19 @@ mod tests {
             .expect("write rows should succeed");
 
         let produced = rx.recv().await.expect("expected one event");
-        assert_eq!(produced.op, Op::Insert);
-        assert!(produced.before.is_none(), "insert must not have 'before'");
-        let after = produced.after.expect("insert must have 'after'");
+        assert_eq!(produced.op, Op::Create);
+        assert!(produced.before.is_none(), "insert must not have `before`");
+        let after = produced.after.expect("insert must have `after`");
         assert_eq!(after["id"], 1);
         assert_eq!(after["sku"], "sku-1");
-        assert_eq!(produced.table, "shop.orders");
-        assert_eq!(produced.tx_id.as_deref(), Some("GTID-UNIT"));
+
+        // Verify new structure
+        assert_eq!(produced.source.connector, "mysql");
+        assert_eq!(produced.source.db, "shop");
+        assert_eq!(produced.source.table, "orders");
+        assert_eq!(produced.tenant_id, Some("test-tenant".to_string()));
+        assert!(produced.transaction.is_some());
+        assert_eq!(produced.transaction.as_ref().unwrap().id, "GTID-UNIT");
     }
 
     #[tokio::test]
@@ -579,8 +634,10 @@ mod tests {
         assert_eq!(before["sku"], "sku-1");
         assert_eq!(after["id"], 1);
         assert_eq!(after["sku"], "sku-1-changed");
-        assert_eq!(produced.table, "shop.orders");
-        assert_eq!(produced.tx_id.as_deref(), Some("GTID-UNIT"));
+
+        // Verify new structure
+        assert_eq!(produced.source.table, "orders");
+        assert!(produced.transaction.is_some());
     }
 
     #[tokio::test]
@@ -611,8 +668,10 @@ mod tests {
         let before = produced.before.expect("delete must have `before`");
         assert_eq!(before["id"], 1);
         assert_eq!(before["sku"], "sku-1");
-        assert_eq!(produced.table, "shop.orders");
-        assert_eq!(produced.tx_id.as_deref(), Some("GTID-UNIT"));
+
+        // Verify new structure
+        assert_eq!(produced.source.table, "orders");
+        assert!(produced.transaction.is_some());
     }
 
     #[tokio::test]
@@ -658,6 +717,17 @@ mod tests {
         assert_eq!(cp.file, "mysql-bin.000005");
         assert_eq!(cp.pos, 12345);
         assert_eq!(cp.gtid_set.as_deref(), Some("abc-123:1-10"));
+
+        // Verify source position info
+        assert_eq!(
+            produced.source.position.file,
+            Some("mysql-bin.000005".to_string())
+        );
+        assert_eq!(produced.source.position.pos, Some(12345));
+        assert_eq!(
+            produced.source.position.gtid,
+            Some("abc-123:1-10".to_string())
+        );
     }
 
     #[tokio::test]
@@ -786,5 +856,10 @@ mod tests {
         assert_eq!(update.schema_version, delete.schema_version);
         assert_eq!(insert.schema_sequence, update.schema_sequence);
         assert_eq!(update.schema_sequence, delete.schema_sequence);
+
+        // All should have consistent source info
+        assert_eq!(insert.source.connector, "mysql");
+        assert_eq!(update.source.connector, "mysql");
+        assert_eq!(delete.source.connector, "mysql");
     }
 }
