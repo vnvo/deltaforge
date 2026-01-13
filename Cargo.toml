@@ -32,6 +32,7 @@ tokio-util = "0.7"
 base64 = "0.22"
 url = "2.5"
 thiserror = "1"
+bytes = "1"
 
 [profile.release]
 lto = true
