@@ -9,7 +9,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use checkpoints::CheckpointStore;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
+pub mod encoding;
 pub mod envelope;
 pub mod errors;
 pub use errors::{SinkError, SourceError};
@@ -48,13 +49,18 @@ pub enum Op {
 }
 
 impl Serialize for Op {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S: Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.as_str())
     }
 }
 
 impl<'de> Deserialize<'de> for Op {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         Self::from_str(&s).ok_or_else(|| {
             serde::de::Error::unknown_variant(&s, &["c", "u", "d", "r", "t"])
@@ -209,7 +215,11 @@ impl SourcePosition {
     }
 
     /// Create PostgreSQL position info
-    pub fn postgres(lsn: String, tx_id: Option<i64>, xmin: Option<i64>) -> Self {
+    pub fn postgres(
+        lsn: String,
+        tx_id: Option<i64>,
+        xmin: Option<i64>,
+    ) -> Self {
         Self {
             lsn: Some(lsn),
             tx_id,
@@ -242,7 +252,10 @@ pub struct Transaction {
     pub total_order: Option<u64>,
 
     /// Ordering within this transaction's data collections
-    #[serde(rename = "data_collection_order", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "data_collection_order",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub data_collection_order: Option<u64>,
 }
 
@@ -383,7 +396,12 @@ impl Event {
     }
 
     /// Create a new DDL/schema change event.
-    pub fn new_ddl(source: SourceInfo, ddl: Value, ts_ms: i64, size_bytes: usize) -> Self {
+    pub fn new_ddl(
+        source: SourceInfo,
+        ddl: Value,
+        ts_ms: i64,
+        size_bytes: usize,
+    ) -> Self {
         Self {
             before: None,
             after: None,
@@ -432,7 +450,11 @@ impl Event {
     }
 
     /// Set transaction metadata.
-    pub fn with_transaction(mut self, transaction: Transaction, tx_end: bool) -> Self {
+    pub fn with_transaction(
+        mut self,
+        transaction: Transaction,
+        tx_end: bool,
+    ) -> Self {
         self.transaction = Some(transaction);
         self.tx_end = tx_end;
         self
@@ -504,7 +526,10 @@ impl CheckpointMeta {
 }
 
 impl Serialize for CheckpointMeta {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+    fn serialize<S: Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
         match self {
             CheckpointMeta::Opaque(data) => serializer.serialize_bytes(data),
         }
@@ -512,7 +537,9 @@ impl Serialize for CheckpointMeta {
 }
 
 impl<'de> Deserialize<'de> for CheckpointMeta {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    fn deserialize<D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
         let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
         Ok(CheckpointMeta::Opaque(bytes.into()))
     }
