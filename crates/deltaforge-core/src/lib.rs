@@ -1,3 +1,9 @@
+//! DeltaForge Core Types
+//!
+//! This crate defines the core CDC event structure and traits used throughout DeltaForge.
+//! The Event structure is designed to be Debezium-compatible at the payload level, enabling
+//! seamless integration with existing CDC consumers and tooling.
+
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -6,7 +12,6 @@ use std::sync::{
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use checkpoints::CheckpointStore;
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use tokio::{
@@ -20,101 +25,483 @@ use uuid::Uuid;
 pub mod errors;
 pub use errors::{SinkError, SourceError};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+// ============================================================================
+// Operation Type
+// ============================================================================
+
+/// CDC operation type.
+///
+/// Serializes to Debezium-compatible single-character codes:
+/// - `Create` → "c" (insert)
+/// - `Update` → "u"
+/// - `Delete` → "d"
+/// - `Read` → "r" (snapshot)
+/// - `Truncate` → "t"
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Op {
-    Insert,
+    Create,
     Update,
     Delete,
-    Ddl,
+    Read,
+    Truncate,
 }
 
+impl Serialize for Op {
+    fn serialize<S: Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Op {
+    fn deserialize<D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Self::from_str(&s).ok_or_else(|| {
+            serde::de::Error::unknown_variant(&s, &["c", "u", "d", "r", "t"])
+        })
+    }
+}
+
+impl Op {
+    /// Returns the Debezium-compatible string code.
+    #[inline]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Op::Create => "c",
+            Op::Update => "u",
+            Op::Delete => "d",
+            Op::Read => "r",
+            Op::Truncate => "t",
+        }
+    }
+
+    /// Parse from Debezium string code.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "c" => Some(Op::Create),
+            "u" => Some(Op::Update),
+            "d" => Some(Op::Delete),
+            "r" => Some(Op::Read),
+            "t" => Some(Op::Truncate),
+            _ => None,
+        }
+    }
+}
+
+// ============================================================================
+// Source Metadata (Debezium-compatible)
+// ============================================================================
+
+/// Source metadata block - matches Debezium's `source` structure.
+///
+/// Contains information about where the event originated, including
+/// connector-specific position information for resume/replay.
+///
+/// Named `SourceInfo` to avoid collision with the `Source` trait.
+/// Serializes to the `"source"` field in the Event JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SourceMeta {
-    pub kind: String,
-    pub host: String,
+pub struct SourceInfo {
+    /// DeltaForge version string (e.g., "deltaforge-0.1.0")
+    #[serde(default = "default_version")]
+    pub version: String,
+
+    /// Connector type: "mysql", "postgresql", "mongodb", etc.
+    pub connector: String,
+
+    /// Logical server/pipeline name - primary identifier for consumers
+    pub name: String,
+
+    /// Source event timestamp in milliseconds since epoch
+    pub ts_ms: i64,
+
+    /// Database name
     pub db: String,
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum ChangeKind {
-    Insert,
-    Update,
-    Delete,
-}
+    /// Schema name (PostgreSQL) - None for MySQL
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Change {
-    pub kind: ChangeKind,
-    pub before: Option<Value>,
-    pub after: Option<Value>,
-}
-// Canonical CDC event emited by Deltaforge
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Event {
-    /// Stable, globally unique ID for this emitted event (used for dedupe, tracing, audit, etc)
-    pub event_id: Uuid,
-
-    /// Tenant that owns this data/pipeline (used for isolation, routing, quotas, etc)
-    /// This is a static value set by the pipeline creator at the moment.
-    pub tenant_id: String,
-
-    /// Source data source metadata (e.g, {kind: "mysql"|"postgres", host, db})
-    /// See `SourceMeta` for exact fields.
-    pub source: SourceMeta,
-
-    /// Logical table name that produced that change.
-    /// Postgres: "schema.table"; MySQL: "db.table"
+    /// Table name (without schema/db prefix)
     pub table: String,
 
-    /// Operation type: Insert | Update | Delte | DDL
-    pub op: Op,
+    /// Snapshot marker: "true", "first", "last", or None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
 
-    /// Data source transaction ID if known (PG XID, MySQL XID/GTID, ...)
-    /// Useful for grouping events from the same commit, etc
-    pub tx_id: Option<String>,
-
-    /// Row image *before* the change (when available)
-    /// Typically present for Update/Delete may be partial depending on WAL/binlog/etc config.
-    pub before: Option<serde_json::Value>,
-
-    /// Row image *after* the change (when available).
-    /// Present for Insert/Update; null for Delete. Can reflect transforms done by the pipeline processors.
-    pub after: Option<serde_json::Value>,
-
-    /// Schema registry version/hash that `before`/`after` conform to at emit time
-    /// Lets consumers validate compatibility across schema evolution
-    //#[serde(default, with = "arc_str_serde")]
-    pub schema_version: Option<String>,
-
-    /// Schema sequence for replay lookups
-    pub schema_sequence: Option<u64>,
-
-    /// DDL payload for schema changes when `op == Op::DDL`.
-    /// Usually includes fields like {"sql": "...", "normalized": "...", "diff": "..."}.
-    pub ddl: Option<serde_json::Value>,
-
-    /// Event timestamp in UTC.
-    /// Prefer the source commit time when available; otherwise the capture/ingest time.
-    pub timestamp: DateTime<Utc>,
-
-    /// Dist tracing corelation ID
-    pub trace_id: Option<String>,
-
-    /// Free-form labels attached by processors or the platform (e.g. ["normalized", "pii:redacted", "variant:summary"]).
-    pub tags: Option<Vec<String>>,
-
-    /// Event checkpoint info
-    #[serde(skip_serializing, default)]
-    pub checkpoint: Option<CheckpointMeta>,
-
-    /// Byte size hint for batching (from source or estimated)
-    #[serde(skip_serializing, default)]
-    pub size_bytes: usize,
-
-    #[serde(default)]
-    pub tx_end: bool,
+    /// Connector-specific position fields (flattened into source block)
+    #[serde(flatten)]
+    pub position: SourcePosition,
 }
 
+fn default_version() -> String {
+    concat!("deltaforge-", env!("CARGO_PKG_VERSION")).to_string()
+}
+
+impl SourceInfo {
+    /// Returns the fully-qualified table name (schema.table or db.table)
+    pub fn full_table_name(&self) -> String {
+        match &self.schema {
+            Some(schema) => format!("{}.{}", schema, self.table),
+            None => format!("{}.{}", self.db, self.table),
+        }
+    }
+}
+
+// ============================================================================
+// Source Position (Connector-specific)
+// ============================================================================
+
+/// Connector-specific position information.
+///
+/// Flattened into the `source` block to match Debezium's format where
+/// position fields appear alongside other source metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SourcePosition {
+    // MySQL-specific fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<u32>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gtid: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pos: Option<u64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row: Option<u32>,
+
+    // PostgreSQL-specific fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lsn: Option<String>,
+
+    #[serde(rename = "txId", skip_serializing_if = "Option::is_none")]
+    pub tx_id: Option<i64>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub xmin: Option<i64>,
+
+    // Generic sequence (for other sources)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<String>,
+}
+
+impl SourcePosition {
+    /// Create MySQL position info
+    pub fn mysql(
+        server_id: u32,
+        gtid: Option<String>,
+        file: Option<String>,
+        pos: Option<u64>,
+        row: Option<u32>,
+    ) -> Self {
+        Self {
+            server_id: Some(server_id),
+            gtid,
+            file,
+            pos,
+            row,
+            ..Default::default()
+        }
+    }
+
+    /// Create PostgreSQL position info
+    pub fn postgres(
+        lsn: String,
+        tx_id: Option<i64>,
+        xmin: Option<i64>,
+    ) -> Self {
+        Self {
+            lsn: Some(lsn),
+            tx_id,
+            xmin,
+            ..Default::default()
+        }
+    }
+
+    /// Create generic position info
+    pub fn generic(sequence: String) -> Self {
+        Self {
+            sequence: Some(sequence),
+            ..Default::default()
+        }
+    }
+}
+
+// ============================================================================
+// Transaction Metadata
+// ============================================================================
+
+/// Transaction metadata for event grouping.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Transaction {
+    /// Transaction identifier (GTID, XID, etc.)
+    pub id: String,
+
+    /// Global ordering across all transactions
+    #[serde(rename = "total_order", skip_serializing_if = "Option::is_none")]
+    pub total_order: Option<u64>,
+
+    /// Ordering within this transaction's data collections
+    #[serde(
+        rename = "data_collection_order",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub data_collection_order: Option<u64>,
+}
+
+// ============================================================================
+// CDC Event (Debezium-compatible payload)
+// ============================================================================
+
+/// CDC Event - Debezium-compatible at the payload level.
+///
+/// The struct is designed so that `serde_json::to_vec(&event)` produces
+/// JSON that Debezium consumers can parse directly. DeltaForge-specific
+/// extensions are additive and ignored by standard Debezium consumers.
+///
+/// # Wire Format
+///
+/// Native serialization produces Debezium's payload structure:
+/// ```json
+/// {
+///   "before": null,
+///   "after": {"id": 1, "name": "Alice"},
+///   "source": {
+///     "version": "deltaforge-0.1.0",
+///     "connector": "mysql",
+///     "name": "prod-db",
+///     "ts_ms": 1700000000000,
+///     "db": "inventory",
+///     "table": "customers",
+///     "gtid": "abc:123"
+///   },
+///   "op": "c",
+///   "ts_ms": 1700000000000
+/// }
+/// ```
+///
+/// For full Debezium envelope format `{"payload": {...}}`, use the
+/// envelope module at serialization time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Event {
+    // ========================================================================
+    // Debezium-standard fields (ordered to match Debezium output)
+    // ========================================================================
+    /// Row image before the change (Update/Delete)
+    pub before: Option<Value>,
+
+    /// Row image after the change (Create/Update)
+    pub after: Option<Value>,
+
+    /// Source metadata (Debezium-compatible structure)
+    pub source: SourceInfo,
+
+    /// Operation type: "c", "u", "d", "r", "t"
+    pub op: Op,
+
+    /// Event timestamp in milliseconds since epoch
+    pub ts_ms: i64,
+
+    /// Transaction metadata
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transaction: Option<Transaction>,
+
+    // ========================================================================
+    // DeltaForge extensions (Debezium consumers ignore unknown fields)
+    // ========================================================================
+    /// Globally unique event ID for deduplication and tracing
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<Uuid>,
+
+    /// Tenant ID for multi-tenant deployments
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+
+    /// Schema registry version/fingerprint
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<String>,
+
+    /// Schema sequence number for replay correlation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_sequence: Option<u64>,
+
+    /// DDL payload for schema change events
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ddl: Option<Value>,
+
+    /// Distributed tracing correlation ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+
+    /// Processing tags (e.g., ["pii:redacted", "transformed"])
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+
+    /// Transaction boundary marker (true = last event in transaction)
+    /// Useful for batching decisions in the coordinator.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tx_end: bool,
+
+    // ========================================================================
+    // Internal fields (never serialized to wire)
+    // ========================================================================
+    /// Checkpoint data for resumption (internal use only)
+    #[serde(skip)]
+    pub checkpoint: Option<CheckpointMeta>,
+
+    /// Estimated event size in bytes for batching
+    #[serde(skip)]
+    pub size_bytes: usize,
+}
+
+impl Event {
+    /// Create a new row-change event.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_row(
+        source: SourceInfo,
+        op: Op,
+        before: Option<Value>,
+        after: Option<Value>,
+        ts_ms: i64,
+        size_bytes: usize,
+    ) -> Self {
+        Self {
+            before,
+            after,
+            source,
+            op,
+            ts_ms,
+            transaction: None,
+            event_id: Some(Uuid::new_v4()),
+            tenant_id: None,
+            schema_version: None,
+            schema_sequence: None,
+            ddl: None,
+            trace_id: None,
+            tags: None,
+            tx_end: true,
+            checkpoint: None,
+            size_bytes,
+        }
+    }
+
+    /// Create a new DDL/schema change event.
+    pub fn new_ddl(
+        source: SourceInfo,
+        ddl: Value,
+        ts_ms: i64,
+        size_bytes: usize,
+    ) -> Self {
+        Self {
+            before: None,
+            after: None,
+            source,
+            op: Op::Read, // DDL events use "r" in Debezium
+            ts_ms,
+            transaction: None,
+            event_id: Some(Uuid::new_v4()),
+            tenant_id: None,
+            schema_version: None,
+            schema_sequence: None,
+            ddl: Some(ddl),
+            trace_id: None,
+            tags: None,
+            tx_end: true,
+            checkpoint: None,
+            size_bytes,
+        }
+    }
+
+    /// Create a snapshot read event.
+    pub fn new_snapshot(
+        source: SourceInfo,
+        after: Value,
+        ts_ms: i64,
+        size_bytes: usize,
+    ) -> Self {
+        Self {
+            before: None,
+            after: Some(after),
+            source,
+            op: Op::Read,
+            ts_ms,
+            transaction: None,
+            event_id: Some(Uuid::new_v4()),
+            tenant_id: None,
+            schema_version: None,
+            schema_sequence: None,
+            ddl: None,
+            trace_id: None,
+            tags: None,
+            tx_end: true,
+            checkpoint: None,
+            size_bytes,
+        }
+    }
+
+    /// Set transaction metadata.
+    pub fn with_transaction(
+        mut self,
+        transaction: Transaction,
+        tx_end: bool,
+    ) -> Self {
+        self.transaction = Some(transaction);
+        self.tx_end = tx_end;
+        self
+    }
+
+    /// Set tenant ID.
+    pub fn with_tenant(mut self, tenant_id: impl Into<String>) -> Self {
+        self.tenant_id = Some(tenant_id.into());
+        self
+    }
+
+    /// Set checkpoint metadata (internal use).
+    pub fn with_checkpoint(mut self, checkpoint: CheckpointMeta) -> Self {
+        self.checkpoint = Some(checkpoint);
+        self
+    }
+
+    /// Generate idempotency key for deduplication.
+    pub fn idempotency_key(&self) -> String {
+        format!(
+            "{}|{}.{}|{}|{}",
+            self.tenant_id.as_deref().unwrap_or("_"),
+            self.source.db,
+            self.source.table,
+            self.transaction
+                .as_ref()
+                .map(|t| t.id.as_str())
+                .unwrap_or(""),
+            self.event_id
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| "_".to_string())
+        )
+    }
+
+    /// Returns the fully-qualified table name.
+    #[inline]
+    pub fn full_table_name(&self) -> String {
+        self.source.full_table_name()
+    }
+}
+
+// ============================================================================
+// Checkpoint (Internal)
+// ============================================================================
+
+/// Opaque checkpoint data for source resumption.
+///
+/// This is internal bookkeeping data, not part of the wire format.
+/// Each source defines its own checkpoint structure serialized as bytes.
 #[derive(Debug, Clone)]
 pub enum CheckpointMeta {
     Opaque(Arc<[u8]>),
@@ -124,9 +511,11 @@ impl CheckpointMeta {
     pub fn from_vec(data: Vec<u8>) -> Self {
         Self::Opaque(data.into())
     }
+
     pub fn from_slice(data: &[u8]) -> Self {
         Self::Opaque(Arc::from(data))
     }
+
     pub fn as_bytes(&self) -> &[u8] {
         match self {
             Self::Opaque(data) => data,
@@ -134,114 +523,29 @@ impl CheckpointMeta {
     }
 }
 
-// Custom Serialize: serialize as bytes (wire-compatible with Vec<u8>)
 impl Serialize for CheckpointMeta {
-    fn serialize<S>(
+    fn serialize<S: Serializer>(
         &self,
         serializer: S,
-    ) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
+    ) -> Result<S::Ok, S::Error> {
         match self {
             CheckpointMeta::Opaque(data) => serializer.serialize_bytes(data),
         }
     }
 }
 
-// Custom Deserialize: deserialize from bytes into Arc<[u8]>
 impl<'de> Deserialize<'de> for CheckpointMeta {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
+    fn deserialize<D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
         let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
         Ok(CheckpointMeta::Opaque(bytes.into()))
     }
 }
 
-impl Event {
-    pub fn idempotency_key(&self) -> String {
-        format!(
-            "{}|{}|{}|{}",
-            self.tenant_id,
-            self.table,
-            self.tx_id.as_deref().unwrap_or(""),
-            self.event_id
-        )
-    }
-
-    pub fn with_tx(mut self, tx_id: Option<String>, tx_end: bool) -> Self {
-        self.tx_id = tx_id;
-        self.tx_end = tx_end;
-        self
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_row(
-        tenant_id: String,
-        source: SourceMeta,
-        table: String,
-        op: Op,
-        before: Option<Value>,
-        after: Option<Value>,
-        ts_ms: i64,
-        size_bytes: usize,
-    ) -> Self {
-        let ts = DateTime::<Utc>::from_timestamp_millis(ts_ms)
-            .unwrap_or_else(Utc::now);
-        Self {
-            event_id: Uuid::new_v4(),
-            tenant_id,
-            source,
-            table,
-            op,
-            tx_id: None,
-            before,
-            after,
-            schema_version: None,
-            schema_sequence: None,
-            ddl: None,
-            timestamp: ts,
-            trace_id: None,
-            tags: None,
-            checkpoint: None,
-            size_bytes,
-            tx_end: true,
-        }
-    }
-
-    pub fn new_ddl(
-        tenant_id: String,
-        source: SourceMeta,
-        table: String,
-        ddl: Value,
-        ts_ms: i64,
-        size_bytes: usize,
-    ) -> Self {
-        let ts = DateTime::<Utc>::from_timestamp_millis(ts_ms)
-            .unwrap_or_else(Utc::now);
-        Self {
-            event_id: Uuid::new_v4(),
-            tenant_id,
-            source,
-            table,
-            op: Op::Ddl,
-            tx_id: None,
-            before: None,
-            after: None,
-            schema_version: None,
-            schema_sequence: None,
-            ddl: Some(ddl),
-            timestamp: ts,
-            trace_id: None,
-            tags: None,
-            checkpoint: None,
-            size_bytes,
-            tx_end: true,
-        }
-    }
-}
+// ============================================================================
+// Supporting Types
+// ============================================================================
 
 #[derive(Debug, Clone)]
 pub struct ShardCtx {
@@ -250,7 +554,7 @@ pub struct ShardCtx {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum ConnctionMode {
+pub enum ConnectionMode {
     Shared,
     Dedicated,
 }
@@ -258,8 +562,11 @@ pub enum ConnctionMode {
 pub type SourceResult<T> = Result<T, SourceError>;
 pub type SinkResult<T> = std::result::Result<T, SinkError>;
 
-/// SourceHandle as the control interface for a source
-/// Caller/Controller of a source should use it to interact with a running source
+// ============================================================================
+// Source Handle
+// ============================================================================
+
+/// Control handle for a running source.
 pub struct SourceHandle {
     pub cancel: CancellationToken,
     pub paused: Arc<AtomicBool>,
@@ -268,31 +575,28 @@ pub struct SourceHandle {
 }
 
 impl SourceHandle {
-    /// Pause the source, temporarily.
-    /// Each source decides on the mechanics and side effects of pause on its own.
+    /// Pause the source temporarily.
     pub fn pause(&self) {
         self.paused.store(true, Ordering::SeqCst);
     }
 
-    /// Un-Pause/Resume the operation.
+    /// Resume a paused source.
     pub fn resume(&self) {
         self.paused.store(false, Ordering::SeqCst);
         self.pause_notify.notify_waiters();
     }
 
-    /// Stop/Cancel the operation completely.
-    /// Should be used on shutdowns and/or restarts.
-    /// The caller is responsible for re-initiating the source if needed.
-    /// The source is responsible for any and all required cleanups for its own scope.
+    /// Stop the source completely.
     pub fn stop(&self) {
         self.cancel.cancel();
         self.pause_notify.notify_waiters();
     }
 
+    /// Wait for the source task to complete.
     pub async fn join(self) -> Result<()> {
         match self.join.await {
             Ok(r) => Ok(r?),
-            Err(e) => Err(anyhow::anyhow!("source task panicked: {e}")),
+            Err(e) => Err(anyhow!("source task panicked: {e}")),
         }
     }
 
@@ -300,6 +604,10 @@ impl SourceHandle {
         self.paused.load(Ordering::SeqCst)
     }
 }
+
+// ============================================================================
+// Traits
+// ============================================================================
 
 #[async_trait]
 pub trait Source: Send + Sync {
@@ -314,12 +622,6 @@ pub trait Source: Send + Sync {
 
 #[async_trait]
 pub trait Processor: Send + Sync {
-    /// Takes ownership of a "batch" of events and returns a new batch.
-    ///
-    /// Implementations are free to:
-    /// - modify events in place
-    /// - drop events
-    /// - add new events (duplicates / variants)
     fn id(&self) -> &str;
     async fn process(&self, events: Vec<Event>) -> Result<Vec<Event>>;
 }
@@ -328,20 +630,12 @@ pub trait Processor: Send + Sync {
 pub trait Sink: Send + Sync {
     fn id(&self) -> &str;
 
-    /// whether this sink must acknowledge batches for checkpoint commits.
-    /// sinks marked as required (default: true) must succeed for the commit
-    /// policy to be satisfied. Optional sinks are best-effort.
-    /// default: true (all sinks required unless explicitly marked optional)
     fn required(&self) -> bool {
         true
     }
 
-    /// send a single event to the sink.
-    /// takes a reference to avoid cloning in multi-sink scenarios
     async fn send(&self, event: &Event) -> SinkResult<()>;
 
-    /// send a batch of events. default implementation calls send() in a loop.
-    /// sinks can/should override for better performance
     async fn send_batch(&self, events: &[Event]) -> SinkResult<()> {
         for event in events {
             self.send(event).await?;
@@ -358,7 +652,7 @@ pub trait SchemaRegistry: Send + Sync {
         db: &str,
         table: &str,
         hash: &str,
-        schema_json: &serde_json::Value,
+        schema_json: &Value,
     ) -> Result<i32>;
 
     async fn latest(
@@ -366,8 +660,12 @@ pub trait SchemaRegistry: Send + Sync {
         tenant: &str,
         db: &str,
         table: &str,
-    ) -> Result<Option<(i32, String)>>; // (version, hash)
+    ) -> Result<Option<(i32, String)>>;
 }
+
+// ============================================================================
+// Pipeline Types
+// ============================================================================
 
 pub type ArcDynSource = Arc<dyn Source>;
 pub type ArcDynProcessor = Arc<dyn Processor>;
@@ -380,8 +678,7 @@ pub struct Pipeline {
     pub sinks: Vec<ArcDynSink>,
 }
 
-/// the handle to a running pipeline to be used by upper layers/caller
-/// to interact with a CDC pipeline
+/// Handle for controlling a running pipeline.
 pub struct PipelineHandle {
     id: String,
     cancel: CancellationToken,
@@ -390,32 +687,36 @@ pub struct PipelineHandle {
 }
 
 impl PipelineHandle {
-    /// Pause the pipeline operation.
-    /// It is a temporary stop for the Pipeline and its components.
-    /// The pause is forwarded to all components (sources, processors and sinks).
-    /// It is up to each component how to handle the pause but it needs to be resumable with no extra infomation.
+    pub fn new(
+        id: String,
+        cancel: CancellationToken,
+        source_handles: Vec<SourceHandle>,
+        join: JoinHandle<Result<()>>,
+    ) -> Self {
+        Self {
+            id,
+            cancel,
+            source_handles,
+            join,
+        }
+    }
+
     pub fn pause(&self) {
-        warn!(pipeline_id = &self.id, "pausing the pipeline is requested");
-        // forward the pause to all source handles
-        let _ = &self.source_handles.iter().for_each(|h| h.pause());
+        warn!(pipeline_id = %self.id, "pausing pipeline");
+        self.source_handles.iter().for_each(|h| h.pause());
     }
 
     pub fn resume(&self) {
-        warn!(pipeline_id = &self.id, "resuming the pipeline is requested");
-        let _ = &self.source_handles.iter().for_each(|h| h.resume());
+        warn!(pipeline_id = %self.id, "resuming pipeline");
+        self.source_handles.iter().for_each(|h| h.resume());
     }
 
-    /// Stop the pipeline and all its components.
-    /// Any in-flight events should get processed before stop is complete:
-    /// - Cancels the dispatch loop
-    /// - Cancels all the sinks, processros and sources in that order.
     pub fn stop(&self) {
-        warn!(pipeline_id = &self.id, "stopping the pipeline is requested");
+        warn!(pipeline_id = %self.id, "stopping pipeline");
         self.cancel.cancel();
-        let _ = &self.source_handles.iter().for_each(|h| h.stop());
+        self.source_handles.iter().for_each(|h| h.stop());
     }
 
-    /// Await the dispatcher loop to finish
     pub async fn join(self) -> Result<()> {
         match self.join.await {
             Ok(r) => r,
@@ -432,25 +733,116 @@ impl PipelineHandle {
         } = self;
 
         let mut first_err: Option<anyhow::Error> = None;
+
         if let Err(e) = match join.await {
             Ok(r) => r,
             Err(e) => Err(anyhow!("pipeline {} task panicked: {}", id, e)),
         } {
-            first_err = Some(e)
+            first_err = Some(e);
         }
 
         for h in source_handles {
-            if let Err(e) = h.join().await
-                && first_err.is_none()
-            {
-                first_err = Some(e);
+            if let Err(e) = h.join().await {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
             }
         }
 
-        if let Some(e) = first_err {
-            Err(e)
-        } else {
-            Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn test_source() -> SourceInfo {
+        SourceInfo {
+            version: "deltaforge-0.1.0".to_string(),
+            connector: "mysql".to_string(),
+            name: "prod-db".to_string(),
+            ts_ms: 1700000000000,
+            db: "inventory".to_string(),
+            schema: None,
+            table: "customers".to_string(),
+            snapshot: None,
+            position: SourcePosition::mysql(
+                1,
+                Some("abc:123".to_string()),
+                Some("mysql-bin.000001".to_string()),
+                Some(12345),
+                Some(0),
+            ),
+        }
+    }
+
+    #[test]
+    fn op_serializes_to_debezium_codes() {
+        assert_eq!(serde_json::to_string(&Op::Create).unwrap(), r#""c""#);
+        assert_eq!(serde_json::to_string(&Op::Update).unwrap(), r#""u""#);
+        assert_eq!(serde_json::to_string(&Op::Delete).unwrap(), r#""d""#);
+        assert_eq!(serde_json::to_string(&Op::Read).unwrap(), r#""r""#);
+        assert_eq!(serde_json::to_string(&Op::Truncate).unwrap(), r#""t""#);
+    }
+
+    #[test]
+    fn event_serializes_to_debezium_structure() {
+        let event = Event::new_row(
+            test_source(),
+            Op::Create,
+            None,
+            Some(json!({"id": 1, "name": "Alice"})),
+            1700000000000,
+            128,
+        );
+
+        let json = serde_json::to_value(&event).unwrap();
+
+        // Verify Debezium-standard fields
+        assert_eq!(json["op"], "c");
+        assert_eq!(json["ts_ms"], 1700000000000i64);
+        assert!(json["before"].is_null());
+        assert_eq!(json["after"]["name"], "Alice");
+
+        // Verify source block structure
+        assert_eq!(json["source"]["connector"], "mysql");
+        assert_eq!(json["source"]["db"], "inventory");
+        assert_eq!(json["source"]["table"], "customers");
+
+        // Verify position fields are flattened into source
+        assert_eq!(json["source"]["gtid"], "abc:123");
+        assert_eq!(json["source"]["file"], "mysql-bin.000001");
+        assert_eq!(json["source"]["pos"], 12345);
+    }
+
+    #[test]
+    fn event_roundtrip() {
+        let original = Event::new_row(
+            test_source(),
+            Op::Update,
+            Some(json!({"id": 1, "name": "Alice"})),
+            Some(json!({"id": 1, "name": "Alice Smith"})),
+            1700000000000,
+            256,
+        )
+        .with_tenant("acme");
+
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: Event = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.op, Op::Update);
+        assert_eq!(parsed.tenant_id, Some("acme".to_string()));
+        assert_eq!(parsed.source.connector, "mysql");
+        assert_eq!(parsed.before.unwrap()["name"], "Alice");
+        assert_eq!(parsed.after.unwrap()["name"], "Alice Smith");
     }
 }
