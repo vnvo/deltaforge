@@ -15,6 +15,7 @@ serde.workspace = true
 serde_yaml.workspace = true
 shellexpand.workspace = true
 tracing.workspace = true
+deltaforge-core = { path = "../deltaforge-core"}
 
 [dev-dependencies]
 tempfile = "3"

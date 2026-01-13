@@ -1,6 +1,62 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+// ============================================================================
+// Envelope Configuration
+// ============================================================================
+
+/// Envelope format for sink serialization.
+///
+/// Controls the outer structure of serialized events.
+/// Since Event is Debezium-compatible at the payload level, envelopes
+/// are thin wrappers that add minimal overhead.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum EnvelopeCfg {
+    /// Direct Event serialization (Debezium payload structure).
+    /// Output: `{"before":..., "after":..., "source":..., "op":"c", ...}`
+    #[default]
+    Native,
+
+    /// Full Debezium envelope with payload wrapper.
+    /// Output: `{"payload": {"before":..., "after":..., ...}}`
+    Debezium,
+
+    /// CloudEvents 1.0 specification.
+    /// Output: `{"specversion":"1.0", "type":"prefix.created", "data":{...}}`
+    CloudEvents {
+        /// Type prefix for the CloudEvents `type` field.
+        /// Example: "com.example.cdc" produces "com.example.cdc.created"
+        type_prefix: String,
+    },
+}
+
+// ============================================================================
+// Encoding Configuration
+// ============================================================================
+
+/// Wire encoding format for sink serialization.
+///
+/// Controls how the envelope structure is serialized to bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EncodingCfg {
+    /// JSON encoding (UTF-8).
+    #[default]
+    Json,
+    // Future:
+    // /// Avro encoding with Schema Registry.
+    // Avro {
+    //     schema_registry: String,
+    //     #[serde(default)]
+    //     subject_strategy: SubjectStrategy,
+    // },
+}
+
+// ============================================================================
+// Sink Configurations
+// ============================================================================
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "config", rename_all = "lowercase")]
 pub enum SinkCfg {
@@ -20,12 +76,29 @@ pub enum SinkCfg {
 ///       id: kafka-events
 ///       brokers: localhost:9092
 ///       topic: deltaforge-events
+///       envelope: debezium
+///       encoding: json
 ///       required: true
 ///       exactly_once: false
 ///       send_timeout_secs: 30
 ///       client_conf:
 ///         security.protocol: SASL_SSL
 ///         sasl.mechanism: PLAIN
+/// ```
+///
+/// # CloudEvents Example
+///
+/// ```yaml
+/// sinks:
+///   - type: kafka
+///     config:
+///       id: kafka-cloudevents
+///       brokers: localhost:9092
+///       topic: events
+///       envelope:
+///         type: cloudevents
+///         type_prefix: "com.example.cdc"
+///       encoding: json
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KafkaSinkCfg {
@@ -38,6 +111,16 @@ pub struct KafkaSinkCfg {
 
     /// Target Kafka topic for CDC events.
     pub topic: String,
+
+    /// Envelope format for event serialization.
+    /// Default: native (Debezium payload structure)
+    #[serde(default)]
+    pub envelope: EnvelopeCfg,
+
+    /// Wire encoding format.
+    /// Default: json
+    #[serde(default)]
+    pub encoding: EncodingCfg,
 
     /// Whether this sink must succeed for checkpoint to proceed.
     /// Default: true
@@ -80,10 +163,9 @@ pub struct KafkaSinkCfg {
 ///       id: redis-events
 ///       uri: redis://localhost:6379
 ///       stream: deltaforge-events
+///       envelope: native
+///       encoding: json
 ///       required: true
-///       send_timeout_secs: 5
-///       batch_timeout_secs: 30
-///       connect_timeout_secs: 10
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisSinkCfg {
@@ -97,6 +179,16 @@ pub struct RedisSinkCfg {
 
     /// Target Redis Stream name for CDC events.
     pub stream: String,
+
+    /// Envelope format for event serialization.
+    /// Default: native (Debezium payload structure)
+    #[serde(default)]
+    pub envelope: EnvelopeCfg,
+
+    /// Wire encoding format.
+    /// Default: json
+    #[serde(default)]
+    pub encoding: EncodingCfg,
 
     /// Whether this sink must succeed for checkpoint to proceed.
     /// Default: true
@@ -120,6 +212,19 @@ pub struct RedisSinkCfg {
 }
 
 /// NATS JetStream sink configuration.
+///
+/// # Example
+///
+/// ```yaml
+/// sinks:
+///   - type: nats
+///     config:
+///       id: nats-events
+///       url: nats://localhost:4222
+///       subject: cdc.events
+///       envelope: native
+///       encoding: json
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NatsSinkCfg {
     /// Unique identifier for this sink.
@@ -131,6 +236,16 @@ pub struct NatsSinkCfg {
 
     /// Subject to publish events to.
     pub subject: String,
+
+    /// Envelope format for event serialization.
+    /// Default: native (Debezium payload structure)
+    #[serde(default)]
+    pub envelope: EnvelopeCfg,
+
+    /// Wire encoding format.
+    /// Default: json
+    #[serde(default)]
+    pub encoding: EncodingCfg,
 
     /// Optional JetStream stream name to verify exists.
     /// If provided, the sink will log a warning if the stream doesn't exist.
@@ -172,4 +287,97 @@ pub struct NatsSinkCfg {
     /// Token for token-based authentication.
     #[serde(default)]
     pub token: Option<String>,
+}
+
+// ============================================================================
+// Conversion helpers (config → core types)
+// ============================================================================
+
+impl EnvelopeCfg {
+    /// Convert to core envelope type.
+    pub fn to_envelope_type(&self) -> deltaforge_core::envelope::EnvelopeType {
+        match self {
+            EnvelopeCfg::Native => deltaforge_core::envelope::EnvelopeType::Native,
+            EnvelopeCfg::Debezium => deltaforge_core::envelope::EnvelopeType::Debezium,
+            EnvelopeCfg::CloudEvents { type_prefix } => {
+                deltaforge_core::envelope::EnvelopeType::CloudEvents {
+                    type_prefix: type_prefix.clone(),
+                }
+            }
+        }
+    }
+}
+
+impl EncodingCfg {
+    /// Convert to core encoding type.
+    pub fn to_encoding_type(&self) -> deltaforge_core::encoding::EncodingType {
+        match self {
+            EncodingCfg::Json => deltaforge_core::encoding::EncodingType::Json,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_native_envelope() {
+        let yaml = r#"
+            type: native
+        "#;
+        let cfg: EnvelopeCfg = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg, EnvelopeCfg::Native);
+    }
+
+    #[test]
+    fn parse_debezium_envelope() {
+        let yaml = r#"
+            type: debezium
+        "#;
+        let cfg: EnvelopeCfg = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg, EnvelopeCfg::Debezium);
+    }
+
+    #[test]
+    fn parse_cloudevents_envelope() {
+        let yaml = r#"
+            type: cloudevents
+            type_prefix: "com.example.cdc"
+        "#;
+        let cfg: EnvelopeCfg = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            cfg,
+            EnvelopeCfg::CloudEvents {
+                type_prefix: "com.example.cdc".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_kafka_sink_with_envelope() {
+        let yaml = r#"
+            id: test-kafka
+            brokers: localhost:9092
+            topic: events
+            envelope:
+              type: debezium
+            encoding: json
+        "#;
+        let cfg: KafkaSinkCfg = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.envelope, EnvelopeCfg::Debezium);
+        assert_eq!(cfg.encoding, EncodingCfg::Json);
+    }
+
+    #[test]
+    fn kafka_sink_defaults() {
+        let yaml = r#"
+            id: test-kafka
+            brokers: localhost:9092
+            topic: events
+        "#;
+        let cfg: KafkaSinkCfg = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.envelope, EnvelopeCfg::Native);
+        assert_eq!(cfg.encoding, EncodingCfg::Json);
+    }
 }
