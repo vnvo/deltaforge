@@ -52,8 +52,8 @@ pub enum SinkError {
     #[error("i/o error: {0}")]
     Io(#[from] io::Error),
 
-    #[error("serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
+    #[error("serialization error: {details}")]
+    Serialization { details: Cow<'static, str> },
 
     #[error("backpressure: {details}")]
     Backpressure { details: Cow<'static, str> },
@@ -68,7 +68,7 @@ impl SinkError {
             SinkError::Connect { .. } => "connect error",
             SinkError::Auth { .. } => "auth error",
             SinkError::Io(_) => "io error",
-            SinkError::Serialization(_) => "serialization error",
+            SinkError::Serialization { .. } => "serialization error",
             SinkError::Backpressure { .. } => "backpressure",
             SinkError::Other(_) => "other error",
         }
@@ -79,9 +79,18 @@ impl SinkError {
             SinkError::Connect { details } => details.to_string(),
             SinkError::Auth { details } => details.to_string(),
             SinkError::Backpressure { details } => details.to_string(),
+            SinkError::Serialization { details } => details.to_string(),
             SinkError::Io(e) => e.to_string(),
-            SinkError::Serialization(e) => e.to_string(),
             SinkError::Other(e) => e.to_string(),
+        }
+    }
+}
+
+// Convenience conversion from serde_json::Error
+impl From<serde_json::Error> for SinkError {
+    fn from(e: serde_json::Error) -> Self {
+        SinkError::Serialization {
+            details: e.to_string().into(),
         }
     }
 }

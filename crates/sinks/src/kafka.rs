@@ -10,6 +10,8 @@
 //! - **Batching**: Leverages rdkafka's internal batching with concurrent delivery awaits
 //! - **Compression**: LZ4 compression by default
 //! - **Graceful shutdown**: Respects cancellation tokens
+//! - **Configurable envelope**: Native, Debezium, or CloudEvents
+//! - **Configurable encoding**: JSON (Avro/Protobuf planned)
 //!
 //! # Configuration
 //!
@@ -19,6 +21,8 @@
 //!       id: kafka-events
 //!       brokers: localhost:9092
 //!       topic: deltaforge-events
+//!       envelope: debezium          # native | debezium | cloudevents
+//!       encoding: json              # json (avro, protobuf planned)
 //!       exactly_once: false
 //!       required: true
 //!       send_timeout_secs: 30
@@ -33,6 +37,8 @@ use anyhow::Context;
 use async_trait::async_trait;
 use common::{RetryOutcome, RetryPolicy, retry_async};
 use deltaforge_config::KafkaSinkCfg;
+use deltaforge_core::envelope::{Envelope, EnvelopeType};
+use deltaforge_core::encoding::EncodingType;
 use deltaforge_core::{Event, Sink, SinkError, SinkResult};
 use futures::future::try_join_all;
 use rdkafka::config::ClientConfig;
@@ -54,6 +60,11 @@ pub struct KafkaSink {
     cfg: KafkaSinkCfg,
     producer: FutureProducer,
     topic: String,
+    /// Envelope for wrapping events (Native, Debezium, CloudEvents)
+    envelope: Box<dyn Envelope>,
+    /// Encoding type (currently just JSON, used for content-type headers)
+    #[allow(dead_code)]
+    encoding: EncodingType,
     /// Cancellation token for graceful shutdown.
     cancel: CancellationToken,
     /// Per-message send timeout.
@@ -137,9 +148,15 @@ impl KafkaSink {
             .map(|s| Duration::from_secs(s as u64))
             .unwrap_or(DEFAULT_SEND_TIMEOUT);
 
+        // Build envelope and encoding from config
+        let envelope_type = cfg.envelope.to_envelope_type();
+        let encoding_type = cfg.encoding.to_encoding_type();
+
         info!(
             brokers = %redact_brokers(&cfg.brokers),
             topic = %cfg.topic,
+            envelope = %envelope_type.name(),
+            encoding = encoding_type.name(),
             exactly_once = cfg.exactly_once.unwrap_or(false),
             send_timeout_ms = send_timeout.as_millis(),
             "kafka sink created"
@@ -150,9 +167,21 @@ impl KafkaSink {
             cfg: cfg.clone(),
             producer,
             topic: cfg.topic.clone(),
+            envelope: envelope_type.build(),
+            encoding: encoding_type,
             cancel,
             send_timeout,
         })
+    }
+
+    /// Serialize event using configured envelope.
+    fn serialize_event(&self, event: &Event) -> SinkResult<Vec<u8>> {
+        self.envelope
+            .serialize(event)
+            .map(|b| b.to_vec())
+            .map_err(|e| SinkError::Serialization {
+                details: e.to_string().into(),
+            })
     }
 
     /// Send a single message with retry logic.
@@ -212,10 +241,10 @@ impl Sink for KafkaSink {
         self.cfg.required.unwrap_or(true)
     }
 
-    #[instrument(skip_all, fields(sink_id = %self.id, event_id = %event.event_id))]
+    #[instrument(skip_all, fields(sink_id = %self.id))]
     async fn send(&self, event: &Event) -> SinkResult<()> {
-        // Pre-serialize to separate serialization from network errors
-        let payload = serde_json::to_vec(event)?;
+        // Serialize using configured envelope
+        let payload = self.serialize_event(event)?;
         let key = event.idempotency_key();
 
         self.send_with_retry(payload, key).await?;
@@ -239,15 +268,13 @@ impl Sink for KafkaSink {
             return Ok(());
         }
 
-        // Phase 1: Pre-serialize all payloads
-        // This separates serialization errors from network errors
+        // Phase 1: Pre-serialize all payloads using configured envelope
         let serialized: Vec<(Vec<u8>, String)> = events
             .iter()
-            .map(|e| Ok((serde_json::to_vec(e)?, e.idempotency_key())))
+            .map(|e| Ok((self.serialize_event(e)?, e.idempotency_key())))
             .collect::<Result<Vec<_>, SinkError>>()?;
 
-        // Phase 2: Queue all messages to rdkafka's internal buffer
-        // send() enqueues immediately; rdkafka batches internally based on linger.ms
+        // Phase 2: Enqueue all messages to rdkafka's buffer
         let futures: Vec<_> = serialized
             .iter()
             .map(|(payload, key)| {

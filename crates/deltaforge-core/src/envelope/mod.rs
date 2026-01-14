@@ -10,6 +10,8 @@
 //! - [`Debezium`] — Wraps in `{"payload": <event>}` for full Debezium envelope
 //! - [`CloudEvents`] — Restructures to CloudEvents 1.0 spec
 
+use std::borrow::Cow;
+
 mod native;
 mod debezium;
 mod cloudevents;
@@ -59,6 +61,21 @@ pub enum EnvelopeType {
         type_prefix: String,
     },
 }
+
+impl EnvelopeType {
+    /// Envelop identifier for logging/metrics.
+    pub fn name(&self) -> Cow<'_, str> {
+        match self {
+            EnvelopeType::Native => Cow::Borrowed("native"),
+            EnvelopeType::Debezium => Cow::Borrowed("debezium"),
+            EnvelopeType::CloudEvents { type_prefix } => {
+                Cow::Owned(format!("cloudevents-{}", type_prefix))
+            }            
+        }
+    }
+
+}
+
 
 impl EnvelopeType {
     /// Create the envelope instance.

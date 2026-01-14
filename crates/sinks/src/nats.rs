@@ -9,6 +9,8 @@
 //! - **Automatic reconnection**: Exponential backoff with jitter on failures
 //! - **Batch optimization**: Publishes batches concurrently for throughput
 //! - **Graceful shutdown**: Respects cancellation tokens during operations
+//! - **Configurable envelope**: Native, Debezium, or CloudEvents
+//! - **Configurable encoding**: JSON (Avro/Protobuf planned)
 //!
 //! # Configuration
 //!
@@ -19,6 +21,8 @@
 //!       url: nats://localhost:4222
 //!       subject: deltaforge.events
 //!       stream: DELTAFORGE          # Optional: JetStream stream name
+//!       envelope: cloudevents       # native | debezium | cloudevents
+//!       encoding: json              # json (avro, protobuf planned)
 //!       required: true
 //!       send_timeout_secs: 5        # Per-message timeout
 //!       batch_timeout_secs: 30      # Batch publish timeout
@@ -34,6 +38,8 @@ use async_nats::jetstream::{self, Context as JetStreamContext};
 use async_trait::async_trait;
 use common::{RetryOutcome, RetryPolicy, retry_async};
 use deltaforge_config::NatsSinkCfg;
+use deltaforge_core::encoding::EncodingType;
+use deltaforge_core::envelope::Envelope;
 use deltaforge_core::{Event, Sink, SinkError, SinkResult};
 use futures::future::try_join_all;
 use tokio::sync::RwLock;
@@ -62,6 +68,11 @@ pub struct NatsSink {
     id: String,
     cfg: NatsSinkCfg,
     subject: String,
+    /// Envelope for wrapping events (Native, Debezium, CloudEvents)
+    envelope: Box<dyn Envelope>,
+    /// Encoding type (currently just JSON)
+    #[allow(dead_code)]
+    encoding: EncodingType,
     /// Cached NATS client and JetStream context with RwLock for interior mutability.
     /// Using Option to allow lazy initialization and reconnection.
     client: RwLock<Option<ClientState>>,
@@ -113,10 +124,16 @@ impl NatsSink {
             .map(|s| Duration::from_secs(s as u64))
             .unwrap_or(DEFAULT_CONNECT_TIMEOUT);
 
+        // Build envelope and encoding from config
+        let envelope_type = cfg.envelope.to_envelope_type();
+        let encoding_type = cfg.encoding.to_encoding_type();
+
         info!(
             url = %redact_nats_url(&cfg.url),
             subject = %cfg.subject,
             stream = ?cfg.stream,
+            envelope = %envelope_type.name(),
+            encoding = encoding_type.name(),
             send_timeout_ms = send_timeout.as_millis(),
             batch_timeout_ms = batch_timeout.as_millis(),
             "nats sink created"
@@ -126,12 +143,24 @@ impl NatsSink {
             id: cfg.id.clone(),
             cfg: cfg.clone(),
             subject: cfg.subject.clone(),
+            envelope: envelope_type.build(),
+            encoding: encoding_type,
             client: RwLock::new(None),
             cancel,
             send_timeout,
             batch_timeout,
             connect_timeout,
         })
+    }
+
+    /// Serialize event using configured envelope.
+    fn serialize_event(&self, event: &Event) -> SinkResult<Vec<u8>> {
+        self.envelope
+            .serialize(event)
+            .map(|b| b.to_vec())
+            .map_err(|e| SinkError::Serialization {
+                details: e.to_string().into(),
+            })
     }
 
     /// Get or establish a NATS connection with retry logic.
@@ -237,11 +266,11 @@ impl NatsSink {
     async fn publish_single(
         &self,
         jetstream: &JetStreamContext,
-        payload: &[u8],
+        payload: Vec<u8>,
     ) -> Result<(), NatsRetryError> {
         let result = tokio::time::timeout(self.send_timeout, async {
             jetstream
-                .publish(self.subject.clone(), payload.to_vec().into())
+                .publish(self.subject.clone(), payload.into())
                 .await
                 .map_err(|e| NatsRetryError::Publish(e.to_string()))?
                 .await
@@ -257,53 +286,36 @@ impl NatsSink {
     }
 }
 
-/// Establish a NATS connection and JetStream context.
+/// Connect to NATS and create JetStream context.
 async fn connect_nats(cfg: &NatsSinkCfg) -> anyhow::Result<ClientState> {
-    let mut connect_opts = async_nats::ConnectOptions::new();
+    let mut options = async_nats::ConnectOptions::new();
 
     // Apply credentials if provided
     if let Some(ref creds_file) = cfg.credentials_file {
-        connect_opts = connect_opts
-            .credentials_file(creds_file)
-            .await
-            .with_context(|| {
-                format!("failed to load credentials from {}", creds_file)
-            })?;
+        options =
+            options
+                .credentials_file(creds_file)
+                .await
+                .with_context(|| {
+                    format!("loading credentials from {}", creds_file)
+                })?;
     }
 
     // Apply username/password if provided
     if let (Some(user), Some(pass)) = (&cfg.username, &cfg.password) {
-        connect_opts =
-            connect_opts.user_and_password(user.clone(), pass.clone());
+        options = options.user_and_password(user.clone(), pass.clone());
     }
 
     // Apply token if provided
     if let Some(ref token) = cfg.token {
-        connect_opts = connect_opts.token(token.clone());
+        options = options.token(token.clone());
     }
 
-    let client = connect_opts.connect(&cfg.url).await.with_context(|| {
-        format!("failed to connect to NATS at {}", redact_nats_url(&cfg.url))
+    let client = options.connect(&cfg.url).await.with_context(|| {
+        format!("connecting to NATS at {}", redact_nats_url(&cfg.url))
     })?;
 
     let jetstream = jetstream::new(client.clone());
-
-    // Optionally verify stream exists if stream name is provided
-    if let Some(ref stream_name) = cfg.stream {
-        // Try to get stream info to verify it exists
-        match jetstream.get_stream(stream_name).await {
-            Ok(_) => {
-                debug!(stream = %stream_name, "verified jetstream stream exists");
-            }
-            Err(e) => {
-                warn!(
-                    stream = %stream_name,
-                    error = %e,
-                    "jetstream stream not found - messages may not be persisted"
-                );
-            }
-        }
-    }
 
     Ok(ClientState {
         _client: client,
@@ -321,10 +333,10 @@ impl Sink for NatsSink {
         self.cfg.required.unwrap_or(true)
     }
 
-    #[instrument(skip_all, fields(sink_id = %self.id, event_id = %event.event_id))]
+    #[instrument(skip_all, fields(sink_id = %self.id))]
     async fn send(&self, event: &Event) -> SinkResult<()> {
-        // Pre-serialize to separate serialization errors from network errors
-        let payload = serde_json::to_vec(event)?;
+        // Serialize using configured envelope
+        let payload = self.serialize_event(event)?;
 
         // Retry loop for transient failures
         let policy = RetryPolicy::new(
@@ -345,10 +357,9 @@ impl Sink for NatsSink {
                         .await
                         .map_err(|e| NatsRetryError::Connect(e.to_string()))?;
 
-                    match self.publish_single(&jetstream, &payload).await {
+                    match self.publish_single(&jetstream, payload).await {
                         Ok(_) => Ok(()),
                         Err(e) => {
-                            // Invalidate connection on error to force reconnect
                             self.invalidate_connection().await;
                             Err(e)
                         }
@@ -378,10 +389,10 @@ impl Sink for NatsSink {
             return Ok(());
         }
 
-        // Pre-serialize all payloads to separate serialization from network errors
+        // Pre-serialize all payloads using configured envelope
         let serialized: Vec<Vec<u8>> = events
             .iter()
-            .map(serde_json::to_vec)
+            .map(|e| self.serialize_event(e))
             .collect::<Result<Vec<_>, _>>()?;
 
         // Retry loop for transient failures
