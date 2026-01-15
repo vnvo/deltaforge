@@ -405,6 +405,109 @@ async fn handle_xid(ctx: &mut RunCtx) {
     // Transaction boundary - could emit tx_end marker here if needed
 }
 
+/// Extract table name from DDL statement.
+/// Handles: ALTER TABLE t, CREATE TABLE t, DROP TABLE t, TRUNCATE TABLE t, RENAME TABLE t
+fn extract_table_from_ddl(sql: &str) -> Option<String> {
+    let sql_upper = sql.to_uppercase();
+    let sql_trimmed = sql.trim();
+
+    // Find the position after TABLE keyword
+    let table_pos = if sql_upper.starts_with("ALTER TABLE")
+        || sql_upper.starts_with("CREATE TABLE")
+        || sql_upper.starts_with("DROP TABLE")
+        || sql_upper.starts_with("TRUNCATE TABLE")
+    {
+        // Skip "XXX TABLE " prefix
+        sql_upper.find("TABLE").map(|p| p + 6)
+    } else if sql_upper.starts_with("RENAME TABLE") {
+        sql_upper.find("TABLE").map(|p| p + 6)
+    } else if sql_upper.starts_with("TRUNCATE ")
+        && !sql_upper.starts_with("TRUNCATE TABLE")
+    {
+        // TRUNCATE without TABLE keyword
+        Some(9)
+    } else {
+        None
+    }?;
+
+    // Extract the table name (possibly with backticks or schema prefix)
+    let remaining = sql_trimmed.get(table_pos..)?.trim_start();
+
+    // Handle IF EXISTS / IF NOT EXISTS
+    let remaining = if remaining.to_uppercase().starts_with("IF EXISTS ") {
+        remaining.get(10..)?.trim_start()
+    } else if remaining.to_uppercase().starts_with("IF NOT EXISTS ") {
+        remaining.get(14..)?.trim_start()
+    } else {
+        remaining
+    };
+
+    // Extract identifier (handles `backticks`, schema.table, and plain names)
+    let table_name = extract_identifier(remaining)?;
+
+    // If it's schema.table format, take only the table part
+    if let Some(dot_pos) = table_name.find('.') {
+        Some(table_name[dot_pos + 1..].trim_matches('`').to_string())
+    } else {
+        Some(table_name.trim_matches('`').to_string())
+    }
+}
+
+/// Extract an SQL identifier (table/schema name), handling backticks.
+fn extract_identifier(s: &str) -> Option<String> {
+    let s = s.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+
+    if s.starts_with('`') {
+        // Backtick-quoted identifier, possibly with schema: `schema`.`table` or `table`
+        let mut result = String::new();
+        let mut chars = s.chars().peekable();
+        chars.next(); // skip opening backtick
+
+        // Collect first identifier
+        while let Some(&c) = chars.peek() {
+            if c == '`' {
+                chars.next();
+                break;
+            }
+            result.push(c);
+            chars.next();
+        }
+
+        // Check for schema.table pattern
+        if chars.peek() == Some(&'.') {
+            chars.next(); // skip dot
+            result.push('.');
+            if chars.peek() == Some(&'`') {
+                chars.next(); // skip opening backtick
+                while let Some(&c) = chars.peek() {
+                    if c == '`' {
+                        break;
+                    }
+                    result.push(c);
+                    chars.next();
+                }
+            }
+        }
+
+        Some(result)
+    } else {
+        // Unquoted identifier - take until whitespace or special char
+        let end = s
+            .find(|c: char| {
+                c.is_whitespace() || c == '(' || c == ';' || c == ','
+            })
+            .unwrap_or(s.len());
+        if end == 0 {
+            None
+        } else {
+            Some(s[..end].to_string())
+        }
+    }
+}
+
 #[instrument(skip_all)]
 async fn handle_query(
     ctx: &mut RunCtx,
@@ -473,6 +576,29 @@ async fn handle_query(
 
         if let Err(_) = ctx.tx.send(ev).await {
             error!(source_id=%ctx.source_id, "channel send failed (op=ddl)");
+        }
+
+        // Reload schema after DDL to pick up changes
+        // Try to extract table name from DDL for targeted reload
+        if let Some(table_name) = extract_table_from_ddl(&q.query) {
+            let db = if q.schema.is_empty() {
+                &ctx.default_db
+            } else {
+                &q.schema
+            };
+            info!(
+                source_id=%ctx.source_id,
+                db=%db,
+                table=%table_name,
+                "reloading schema after DDL"
+            );
+            if let Err(e) = ctx.schema.reload_schema(db, &table_name).await {
+                warn!(
+                    source_id=%ctx.source_id,
+                    error=?e,
+                    "failed to reload schema after DDL"
+                );
+            }
         }
     }
 
@@ -861,5 +987,83 @@ mod tests {
         assert_eq!(insert.source.connector, "mysql");
         assert_eq!(update.source.connector, "mysql");
         assert_eq!(delete.source.connector, "mysql");
+    }
+
+    #[test]
+    fn extract_table_from_ddl_alter_table() {
+        assert_eq!(
+            extract_table_from_ddl(
+                "ALTER TABLE orders ADD COLUMN status VARCHAR(32)"
+            ),
+            Some("orders".to_string())
+        );
+        assert_eq!(
+            extract_table_from_ddl(
+                "ALTER TABLE `orders` ADD COLUMN status VARCHAR(32)"
+            ),
+            Some("orders".to_string())
+        );
+        assert_eq!(
+            extract_table_from_ddl(
+                "ALTER TABLE shop.orders ADD COLUMN status VARCHAR(32)"
+            ),
+            Some("orders".to_string())
+        );
+        assert_eq!(
+            extract_table_from_ddl(
+                "ALTER TABLE `shop`.`orders` ADD COLUMN status VARCHAR(32)"
+            ),
+            Some("orders".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_table_from_ddl_create_table() {
+        assert_eq!(
+            extract_table_from_ddl("CREATE TABLE users (id INT PRIMARY KEY)"),
+            Some("users".to_string())
+        );
+        assert_eq!(
+            extract_table_from_ddl("CREATE TABLE IF NOT EXISTS users (id INT)"),
+            Some("users".to_string())
+        );
+        assert_eq!(
+            extract_table_from_ddl("CREATE TABLE `my_db`.`users` (id INT)"),
+            Some("users".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_table_from_ddl_drop_table() {
+        assert_eq!(
+            extract_table_from_ddl("DROP TABLE orders"),
+            Some("orders".to_string())
+        );
+        assert_eq!(
+            extract_table_from_ddl("DROP TABLE IF EXISTS orders"),
+            Some("orders".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_table_from_ddl_truncate() {
+        assert_eq!(
+            extract_table_from_ddl("TRUNCATE TABLE orders"),
+            Some("orders".to_string())
+        );
+        assert_eq!(
+            extract_table_from_ddl("TRUNCATE orders"),
+            Some("orders".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_table_from_ddl_non_ddl() {
+        assert_eq!(extract_table_from_ddl("SELECT * FROM orders"), None);
+        assert_eq!(
+            extract_table_from_ddl("INSERT INTO orders VALUES (1)"),
+            None
+        );
+        assert_eq!(extract_table_from_ddl("BEGIN"), None);
     }
 }
