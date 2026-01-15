@@ -138,18 +138,18 @@ impl SchemaSensorState {
 
             // Run drift detection if we have DB schema
             if let Some(schemas) = db_schemas
-                && let Some(_schema) = schemas.get(&event.table)
+                && let Some(_schema) = schemas.get(&event.source.table)
             {
-                drift.observe(&event.table, after);
+                drift.observe(&event.source.table, after);
             }
 
             // Guided vs full sensing
             if let Some(schemas) = db_schemas {
-                if let Some(schema) = schemas.get(&event.table) {
+                if let Some(schema) = schemas.get(&event.source.table) {
                     // Guided: only observe JSON columns
                     evolutions += self.observe_json_columns(
                         &mut sensor,
-                        &event.table,
+                        &event.source.table,
                         after,
                         schema,
                     );
@@ -157,18 +157,21 @@ impl SchemaSensorState {
                     // No schema for this table - observe full payload
                     evolutions += self.observe_full_payload(
                         &mut sensor,
-                        &event.table,
+                        &event.source.table,
                         after,
                     );
                 }
             } else {
                 // No DB schemas at all - observe full payload
-                evolutions +=
-                    self.observe_full_payload(&mut sensor, &event.table, after);
+                evolutions += self.observe_full_payload(
+                    &mut sensor,
+                    &event.source.table,
+                    after,
+                );
             }
 
             // Enrich event with schema version info
-            if let Some(version) = sensor.get_version(&event.table) {
+            if let Some(version) = sensor.get_version(&event.source.table) {
                 event.schema_version = Some(version.fingerprint.clone());
                 event.schema_sequence = Some(version.sequence);
             }
@@ -596,7 +599,7 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
             let db_schemas = if self.schema_provider.is_some() {
                 // Collect unique table names in this batch
                 let tables: std::collections::HashSet<&str> =
-                    events.iter().map(|e| e.table.as_str()).collect();
+                    events.iter().map(|e| e.source.table.as_str()).collect();
 
                 // Fetch schemas for each table
                 let mut schema_map = HashMap::new();
