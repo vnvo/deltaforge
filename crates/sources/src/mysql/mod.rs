@@ -66,6 +66,7 @@ struct RunCtx {
     pipeline: String,
     tenant: String,
     dsn: String,
+    #[allow(dead_code)]
     host: String,
     default_db: String,
     server_id: u64,

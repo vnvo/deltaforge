@@ -798,7 +798,7 @@ async fn postgres_cdc_extended_types() -> Result<()> {
 
     // Use is_create_op for Debezium-compatible check
     let events = collect_until(&mut rx, Duration::from_secs(10), |e| {
-        e.iter().any(|x| is_create_op(x))
+        e.iter().any(is_create_op)
     })
     .await;
     let ins = events.iter().find(|e| is_create_op(e)).unwrap();

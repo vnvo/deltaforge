@@ -457,7 +457,7 @@ async fn js_payload_integers_become_floats() {
     let mut ev = new_event();
     ev.after = Some(json!({
         "int_field": 42,
-        "float_field": 3.14,
+        "float_field": 3.17,
         "big_int": 9007199254740991_i64  // JS MAX_SAFE_INTEGER
     }));
 
@@ -467,7 +467,7 @@ async fn js_payload_integers_become_floats() {
     // Integers become floats (42 -> 42.0)
     assert!(after["int_field"].is_number());
     // Original floats preserved
-    assert_eq!(after["float_field"], 3.14);
+    assert_eq!(after["float_field"], 3.17);
     // Large integers within safe range preserved as floats
     assert!(after["big_int"].is_number());
 

@@ -468,6 +468,7 @@ pub(crate) fn short_sql(s: &str, max: usize) -> String {
     }
 }
 
+#[allow(dead_code)]
 pub(super) async fn fetch_executed_gtid_set(
     dsn: &str,
 ) -> SourceResult<Option<String>> {

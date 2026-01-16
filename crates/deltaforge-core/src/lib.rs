@@ -4,6 +4,7 @@
 //! The Event structure is designed to be Debezium-compatible at the payload level, enabling
 //! seamless integration with existing CDC consumers and tooling.
 
+use std::str::FromStr;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -62,7 +63,7 @@ impl<'de> Deserialize<'de> for Op {
         deserializer: D,
     ) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
-        Self::from_str(&s).ok_or_else(|| {
+        s.parse().map_err(|_| {
             serde::de::Error::unknown_variant(&s, &["c", "u", "d", "r", "t"])
         })
     }
@@ -80,16 +81,32 @@ impl Op {
             Op::Truncate => "t",
         }
     }
+}
+
+/// Error type for parsing Op from string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseOpError(String);
+
+impl std::fmt::Display for ParseOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unknown operation code: '{}'", self.0)
+    }
+}
+
+impl std::error::Error for ParseOpError {}
+
+impl FromStr for Op {
+    type Err = ParseOpError;
 
     /// Parse from Debezium string code.
-    pub fn from_str(s: &str) -> Option<Self> {
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "c" => Some(Op::Create),
-            "u" => Some(Op::Update),
-            "d" => Some(Op::Delete),
-            "r" => Some(Op::Read),
-            "t" => Some(Op::Truncate),
-            _ => None,
+            "c" => Ok(Op::Create),
+            "u" => Ok(Op::Update),
+            "d" => Ok(Op::Delete),
+            "r" => Ok(Op::Read),
+            "t" => Ok(Op::Truncate),
+            _ => Err(ParseOpError(s.to_string())),
         }
     }
 }

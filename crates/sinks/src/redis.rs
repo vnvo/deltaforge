@@ -35,7 +35,7 @@ use async_trait::async_trait;
 use common::{RetryOutcome, RetryPolicy, redact_url_password, retry_async};
 use deltaforge_config::RedisSinkCfg;
 use deltaforge_core::encoding::EncodingType;
-use deltaforge_core::envelope::{Envelope, EnvelopeType};
+use deltaforge_core::envelope::Envelope;
 use deltaforge_core::{Event, Sink, SinkError, SinkResult};
 use redis::aio::MultiplexedConnection;
 use tokio::sync::RwLock;

@@ -169,7 +169,7 @@ async fn read_stream_messages(
     let stream = js.get_stream(stream_name).await?;
 
     let mut messages = Vec::new();
-    let mut consumer = stream
+    let consumer = stream
         .create_consumer(async_nats::jetstream::consumer::pull::Config {
             durable_name: Some(format!("test-consumer-{}", stream_name)),
             ..Default::default()

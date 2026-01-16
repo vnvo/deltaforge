@@ -574,7 +574,7 @@ async fn handle_query(
             &ctx.last_gtid,
         ));
 
-        if let Err(_) = ctx.tx.send(ev).await {
+        if (ctx.tx.send(ev).await).is_err() {
             error!(source_id=%ctx.source_id, "channel send failed (op=ddl)");
         }
 

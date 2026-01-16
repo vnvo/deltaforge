@@ -78,6 +78,7 @@ pub(crate) struct RunCtx {
     pub source_id: String,
     pub pipeline: String,
     pub tenant: String,
+    #[allow(dead_code)]
     pub host: String,
     pub default_schema: String,
     pub tx: mpsc::Sender<Event>,

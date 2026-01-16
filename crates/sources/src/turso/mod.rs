@@ -72,8 +72,8 @@ use checkpoints::{CheckpointStore, CheckpointStoreExt};
 use chrono::Utc;
 use deltaforge_config::TursoSrcCfg;
 use deltaforge_core::{
-    CheckpointMeta, Event, Op, Source, SourceError, SourceHandle, SourceMeta,
-    SourceResult,
+    CheckpointMeta, Event, Op, Source, SourceError, SourceHandle, SourceInfo,
+    SourcePosition, SourceResult,
 };
 use libsql::Connection;
 use metrics::counter;
@@ -267,12 +267,18 @@ impl TursoSource {
         Ok(())
     }
 
-    /// Create source metadata for events.
-    fn source_meta(&self) -> SourceMeta {
-        SourceMeta {
-            kind: "turso".into(),
-            host: extract_host(&self.cfg.url),
+    /// Create source info for an event.
+    fn build_source_info(&self, table: &str, change_id: i64) -> SourceInfo {
+        SourceInfo {
+            version: concat!("deltaforge-", env!("CARGO_PKG_VERSION")).to_string(),
+            connector: "turso".into(),
+            name: self.pipeline.clone(),
+            ts_ms: Utc::now().timestamp_millis(),
             db: "main".into(),
+            schema: None,
+            table: table.to_string(),
+            snapshot: None,
+            position: SourcePosition::generic(change_id.to_string()),
         }
     }
 
@@ -349,7 +355,6 @@ impl TursoSource {
         );
 
         let poll_interval = Duration::from_millis(self.cfg.poll_interval_ms);
-        let source_meta = self.source_meta();
 
         // Main CDC loop
         loop {
@@ -395,7 +400,6 @@ impl TursoSource {
                     &poll_conn,
                     &tx,
                     checkpoint.clone(),
-                    &source_meta,
                 )
                 .await;
 
@@ -437,7 +441,6 @@ impl TursoSource {
     /// Create an event with proper structure.
     fn create_event(
         &self,
-        source_meta: &SourceMeta,
         table: &str,
         op: Op,
         before: Option<serde_json::Value>,
@@ -449,17 +452,20 @@ impl TursoSource {
             before.as_ref().map(|v| v.to_string().len()).unwrap_or(0)
                 + after.as_ref().map(|v| v.to_string().len()).unwrap_or(0);
 
+        let change_id = checkpoint.last_change_id.unwrap_or(0);
+        let source_info = self.build_source_info(table, change_id);
+        let ts_ms = source_info.ts_ms;
+
         let mut event = Event::new_row(
-            self.tenant.clone(),
-            source_meta.clone(),
-            table.to_string(),
+            source_info,
             op,
             before,
             after,
-            Utc::now().timestamp_millis(),
+            ts_ms,
             size_estimate,
         );
 
+        event.tenant_id = Some(self.tenant.clone());
         event.checkpoint = Some(CheckpointMeta::from_vec(checkpoint_bytes));
         event.schema_sequence = Some(self.registry.current_sequence());
 
@@ -481,7 +487,6 @@ impl TursoSource {
         conn: &Connection,
         tx: &mpsc::Sender<Event>,
         mut checkpoint: TursoCheckpoint,
-        source_meta: &SourceMeta,
     ) -> SourceResult<(TursoCheckpoint, bool)> {
         let last_id = checkpoint.last_change_id.unwrap_or(0);
         let cdc_table = self.cdc_table_name();
@@ -584,7 +589,7 @@ impl TursoSource {
 
                 // Convert change_type to Op
                 let op = match change_type {
-                    1 => Op::Insert,
+                    1 => Op::Create,
                     0 => Op::Update,
                     -1 => Op::Delete,
                     _ => {
@@ -595,7 +600,6 @@ impl TursoSource {
 
                 let event_checkpoint = checkpoint.with_change_id(change_id);
                 let event = self.create_event(
-                    source_meta,
                     &table,
                     op,
                     before,
@@ -732,6 +736,7 @@ fn redact_auth(url: &str) -> String {
 }
 
 /// Extract host from URL for source metadata.
+#[allow(dead_code)]
 fn extract_host(url: &str) -> String {
     url.split("://")
         .nth(1)
