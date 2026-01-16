@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
 use deltaforge_core::{
-    Event, Op, Source, SourceHandle, SourceMeta, SourceResult,
+    Event, Op, Source, SourceHandle, SourceInfo, SourcePosition, SourceResult,
 };
 use std::sync::{
     Arc,
@@ -66,20 +66,29 @@ impl Source for FakeSource {
                 }
 
                 // Emit one event
+                let ts_ms = chrono::Utc::now().timestamp_millis();
+                let source_info = SourceInfo {
+                    version: concat!("deltaforge-", env!("CARGO_PKG_VERSION"))
+                        .to_string(),
+                    connector: "fake".to_string(),
+                    name: "test-pipeline".to_string(),
+                    ts_ms,
+                    db: "mem".to_string(),
+                    schema: None,
+                    table: "ticks".to_string(),
+                    snapshot: None,
+                    position: SourcePosition::default(),
+                };
+
                 let ev = Event::new_row(
-                    tenant.clone(),
-                    SourceMeta {
-                        kind: "fake".into(),
-                        host: "local".into(),
-                        db: "mem".into(),
-                    },
-                    "mem.ticks".into(),
-                    Op::Insert,
+                    source_info,
+                    Op::Create,
                     None,
                     Some(serde_json::json!({ "n": n })),
-                    chrono::Utc::now().timestamp_millis(),
+                    ts_ms,
                     10_usize,
-                );
+                )
+                .with_tenant(tenant.clone());
 
                 // If the receiver is dropped, end the task.
                 if tx.send(ev).await.is_err() {

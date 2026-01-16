@@ -9,8 +9,8 @@
 
 use anyhow::Result;
 use ctor::dtor;
-use deltaforge_config::RedisSinkCfg;
-use deltaforge_core::{Event, Op, Sink, SourceMeta};
+use deltaforge_config::{EncodingCfg, EnvelopeCfg, RedisSinkCfg};
+use deltaforge_core::{Event, Op, Sink, SourceInfo, SourcePosition};
 use redis::AsyncCommands;
 use serde_json::json;
 use sinks::redis::RedisSink;
@@ -116,14 +116,18 @@ async fn cleanup_stream(uri: &str, stream: &str) -> Result<()> {
 /// Create a test event with a specific ID.
 fn make_test_event(id: i64) -> Event {
     Event::new_row(
-        "tenant".into(),
-        SourceMeta {
-            kind: "test".into(),
-            host: "localhost".into(),
+        SourceInfo {
+            version: "deltaforge-test".into(),
+            connector: "test".into(),
+            name: "test-db".into(),
+            ts_ms: 1_700_000_000_000 + id,
             db: "testdb".into(),
+            schema: None,
+            table: "table".into(),
+            snapshot: None,
+            position: SourcePosition::default(),
         },
-        "test.table".into(),
-        Op::Insert,
+        Op::Create,
         None,
         Some(json!({"id": id, "name": format!("item-{}", id)})),
         1_700_000_000_000 + id,
@@ -135,14 +139,18 @@ fn make_test_event(id: i64) -> Event {
 fn make_large_event(id: i64, size_bytes: usize) -> Event {
     let padding = "x".repeat(size_bytes);
     Event::new_row(
-        "tenant".into(),
-        SourceMeta {
-            kind: "test".into(),
-            host: "localhost".into(),
+        SourceInfo {
+            version: "deltaforge-test".into(),
+            connector: "test".into(),
+            name: "test-db".into(),
+            ts_ms: 1_700_000_000_000 + id,
             db: "testdb".into(),
+            schema: None,
+            table: "table".into(),
+            snapshot: None,
+            position: SourcePosition::default(),
         },
-        "test.table".into(),
-        Op::Insert,
+        Op::Create,
         None,
         Some(json!({"id": id, "payload": padding})),
         1_700_000_000_000 + id,
@@ -198,6 +206,8 @@ async fn redis_sink_sends_single_event() -> Result<()> {
         id: "test-redis".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         send_timeout_secs: Some(5),
         batch_timeout_secs: Some(30),
@@ -222,8 +232,21 @@ async fn redis_sink_sends_single_event() -> Result<()> {
     assert!(df_event.is_some(), "expected df-event field");
 
     let payload = &df_event.unwrap().1;
-    let parsed: Event = serde_json::from_str(payload)?;
-    assert_eq!(parsed.event_id, event.event_id);
+    let parsed: serde_json::Value = serde_json::from_str(payload)?;
+
+    // Verify native envelope format (no payload wrapper)
+    assert!(
+        parsed.get("op").is_some(),
+        "native format should have 'op' at top level"
+    );
+    assert!(
+        parsed.get("source").is_some(),
+        "native format should have 'source' at top level"
+    );
+    assert!(
+        parsed.get("payload").is_none(),
+        "native format should NOT have 'payload' wrapper"
+    );
 
     info!("✓ single event sent successfully");
     cleanup_stream(&uri, &stream).await?;
@@ -245,6 +268,8 @@ async fn redis_sink_sends_batch() -> Result<()> {
         id: "test-redis-batch".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         send_timeout_secs: Some(5),
         batch_timeout_secs: Some(30),
@@ -282,6 +307,8 @@ async fn redis_sink_empty_batch_is_noop() -> Result<()> {
         id: "test-redis-empty".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         send_timeout_secs: Some(5),
         batch_timeout_secs: Some(30),
@@ -299,6 +326,514 @@ async fn redis_sink_empty_batch_is_noop() -> Result<()> {
     assert_eq!(len, 0, "stream should be empty after empty batch");
 
     info!("✓ empty batch is a no-op");
+    Ok(())
+}
+
+// =============================================================================
+// Envelope Format Tests
+// =============================================================================
+
+/// Test Native envelope format (direct Event serialization).
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn redis_sink_native_envelope() -> Result<()> {
+    init_test_tracing();
+    let _container = get_redis_container().await;
+
+    let stream = test_stream("native_envelope");
+    let uri = redis_uri();
+    cleanup_stream(&uri, &stream).await?;
+
+    let cfg = RedisSinkCfg {
+        id: "test-native".into(),
+        uri: uri.clone(),
+        stream: stream.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        send_timeout_secs: Some(5),
+        batch_timeout_secs: Some(30),
+        connect_timeout_secs: Some(10),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = RedisSink::new(&cfg, cancel)?;
+
+    let event = make_test_event(1);
+    sink.send(&event).await?;
+
+    let entries = read_stream_entries(&uri, &stream).await?;
+    assert_eq!(entries.len(), 1, "expected one entry");
+
+    let (_id, fields) = &entries[0];
+    let df_event = fields.iter().find(|(k, _)| k == "df-event").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&df_event.1)?;
+
+    // Verify native format
+    assert!(
+        parsed.get("op").is_some(),
+        "native format should have 'op' at top level"
+    );
+    assert!(
+        parsed.get("source").is_some(),
+        "native format should have 'source' at top level"
+    );
+    assert!(
+        parsed.get("payload").is_none(),
+        "native format should NOT have 'payload' wrapper"
+    );
+
+    // Verify op is valid Debezium code
+    let op = parsed.get("op").and_then(|v| v.as_str());
+    assert!(
+        matches!(
+            op,
+            Some("c") | Some("u") | Some("d") | Some("r") | Some("t")
+        ),
+        "op should be a valid Debezium operation code, got: {:?}",
+        op
+    );
+
+    info!("✓ native envelope format works correctly");
+    cleanup_stream(&uri, &stream).await?;
+    Ok(())
+}
+
+/// Test Debezium envelope format (payload wrapper).
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn redis_sink_debezium_envelope() -> Result<()> {
+    init_test_tracing();
+    let _container = get_redis_container().await;
+
+    let stream = test_stream("debezium_envelope");
+    let uri = redis_uri();
+    cleanup_stream(&uri, &stream).await?;
+
+    let cfg = RedisSinkCfg {
+        id: "test-debezium".into(),
+        uri: uri.clone(),
+        stream: stream.clone(),
+        envelope: EnvelopeCfg::Debezium,
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        send_timeout_secs: Some(5),
+        batch_timeout_secs: Some(30),
+        connect_timeout_secs: Some(10),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = RedisSink::new(&cfg, cancel)?;
+
+    let event = make_test_event(1);
+    sink.send(&event).await?;
+
+    let entries = read_stream_entries(&uri, &stream).await?;
+    assert_eq!(entries.len(), 1, "expected one entry");
+
+    let (_id, fields) = &entries[0];
+    let df_event = fields.iter().find(|(k, _)| k == "df-event").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&df_event.1)?;
+
+    // Verify Debezium format has payload wrapper
+    assert!(
+        parsed.get("payload").is_some(),
+        "debezium format must have 'payload' wrapper"
+    );
+    assert!(
+        parsed.get("payload").unwrap().is_object(),
+        "payload must be an object"
+    );
+
+    // Verify payload contains event fields
+    let payload = parsed.get("payload").unwrap();
+    assert!(
+        payload.get("op").is_some(),
+        "payload should contain 'op' field"
+    );
+    assert!(
+        payload.get("source").is_some(),
+        "payload should contain 'source' field"
+    );
+
+    // Verify op is valid Debezium code
+    let op = payload.get("op").and_then(|v| v.as_str());
+    assert!(
+        matches!(
+            op,
+            Some("c") | Some("u") | Some("d") | Some("r") | Some("t")
+        ),
+        "op should be a valid Debezium operation code, got: {:?}",
+        op
+    );
+
+    info!("✓ debezium envelope format works correctly");
+    cleanup_stream(&uri, &stream).await?;
+    Ok(())
+}
+
+/// Test CloudEvents envelope format.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn redis_sink_cloudevents_envelope() -> Result<()> {
+    init_test_tracing();
+    let _container = get_redis_container().await;
+
+    let stream = test_stream("cloudevents_envelope");
+    let uri = redis_uri();
+    cleanup_stream(&uri, &stream).await?;
+
+    let cfg = RedisSinkCfg {
+        id: "test-cloudevents".into(),
+        uri: uri.clone(),
+        stream: stream.clone(),
+        envelope: EnvelopeCfg::CloudEvents {
+            type_prefix: "com.deltaforge.cdc".to_string(),
+        },
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        send_timeout_secs: Some(5),
+        batch_timeout_secs: Some(30),
+        connect_timeout_secs: Some(10),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = RedisSink::new(&cfg, cancel)?;
+
+    let event = make_test_event(1);
+    sink.send(&event).await?;
+
+    let entries = read_stream_entries(&uri, &stream).await?;
+    assert_eq!(entries.len(), 1, "expected one entry");
+
+    let (_id, fields) = &entries[0];
+    let df_event = fields.iter().find(|(k, _)| k == "df-event").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&df_event.1)?;
+
+    // Verify CloudEvents 1.0 required attributes
+    assert_eq!(
+        parsed.get("specversion").and_then(|v| v.as_str()),
+        Some("1.0"),
+        "CloudEvents must have specversion 1.0"
+    );
+    assert!(
+        parsed.get("id").is_some(),
+        "CloudEvents must have 'id' attribute"
+    );
+    assert!(
+        parsed.get("source").is_some(),
+        "CloudEvents must have 'source' attribute"
+    );
+    assert!(
+        parsed.get("type").is_some(),
+        "CloudEvents must have 'type' attribute"
+    );
+
+    // Verify source format: deltaforge/{name}/{full_table_name}
+    let source = parsed.get("source").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        source.starts_with("deltaforge/"),
+        "CloudEvents source should start with 'deltaforge/', got: {}",
+        source
+    );
+
+    // Verify type format: {prefix}.{op_suffix}
+    let type_field = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        type_field.starts_with("com.deltaforge.cdc."),
+        "CloudEvents type should start with configured prefix, got: {}",
+        type_field
+    );
+    let valid_suffixes =
+        ["created", "updated", "deleted", "snapshot", "truncated"];
+    let has_valid_suffix =
+        valid_suffixes.iter().any(|s| type_field.ends_with(s));
+    assert!(
+        has_valid_suffix,
+        "CloudEvents type should end with valid op suffix, got: {}",
+        type_field
+    );
+
+    // Verify optional attributes
+    assert_eq!(
+        parsed.get("datacontenttype").and_then(|v| v.as_str()),
+        Some("application/json"),
+        "CloudEvents should have datacontenttype application/json"
+    );
+    assert!(
+        parsed.get("time").is_some(),
+        "CloudEvents should have 'time' attribute"
+    );
+
+    // Verify data payload
+    assert!(
+        parsed.get("data").is_some(),
+        "CloudEvents must have 'data' attribute"
+    );
+    let data = parsed.get("data").unwrap();
+    let data_op = data.get("op").and_then(|v| v.as_str());
+    assert!(
+        matches!(
+            data_op,
+            Some("c") | Some("u") | Some("d") | Some("r") | Some("t")
+        ),
+        "data.op should be a valid Debezium operation code, got: {:?}",
+        data_op
+    );
+
+    info!("✓ cloudevents envelope format works correctly");
+    cleanup_stream(&uri, &stream).await?;
+    Ok(())
+}
+
+/// Test batch send with Debezium envelope.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn redis_sink_debezium_envelope_batch() -> Result<()> {
+    init_test_tracing();
+    let _container = get_redis_container().await;
+
+    let stream = test_stream("debezium_batch");
+    let uri = redis_uri();
+    cleanup_stream(&uri, &stream).await?;
+
+    let cfg = RedisSinkCfg {
+        id: "test-debezium-batch".into(),
+        uri: uri.clone(),
+        stream: stream.clone(),
+        envelope: EnvelopeCfg::Debezium,
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        send_timeout_secs: Some(5),
+        batch_timeout_secs: Some(30),
+        connect_timeout_secs: Some(10),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = RedisSink::new(&cfg, cancel)?;
+
+    let events: Vec<Event> = (0..50).map(make_test_event).collect();
+    sink.send_batch(&events).await?;
+
+    let entries = read_stream_entries(&uri, &stream).await?;
+    assert_eq!(entries.len(), 50, "should have 50 entries");
+
+    // Verify all entries have Debezium envelope
+    for (_id, fields) in &entries {
+        let df_event = fields.iter().find(|(k, _)| k == "df-event").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&df_event.1)?;
+        assert!(
+            parsed.get("payload").is_some(),
+            "all batch messages should have Debezium payload wrapper"
+        );
+    }
+
+    info!("✓ debezium envelope batch works correctly");
+    cleanup_stream(&uri, &stream).await?;
+    Ok(())
+}
+
+/// Test CloudEvents envelope with different operation types.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn redis_sink_cloudevents_operations() -> Result<()> {
+    init_test_tracing();
+    let _container = get_redis_container().await;
+
+    let stream = test_stream("cloudevents_ops");
+    let uri = redis_uri();
+    cleanup_stream(&uri, &stream).await?;
+
+    let cfg = RedisSinkCfg {
+        id: "test-cloudevents-ops".into(),
+        uri: uri.clone(),
+        stream: stream.clone(),
+        envelope: EnvelopeCfg::CloudEvents {
+            type_prefix: "io.deltaforge.test".to_string(),
+        },
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        send_timeout_secs: Some(5),
+        batch_timeout_secs: Some(30),
+        connect_timeout_secs: Some(10),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = RedisSink::new(&cfg, cancel)?;
+
+    // Create events with different operations
+    let create_event = Event::new_row(
+        SourceInfo {
+            version: "deltaforge-test".into(),
+            connector: "test".into(),
+            name: "test-db".into(),
+            ts_ms: 1_700_000_000_000,
+            db: "testdb".into(),
+            schema: None,
+            table: "table".into(),
+            snapshot: None,
+            position: SourcePosition::default(),
+        },
+        Op::Create,
+        None,
+        Some(json!({"id": 1})),
+        1_700_000_000_000,
+        64,
+    );
+
+    let update_event = Event::new_row(
+        SourceInfo {
+            version: "deltaforge-test".into(),
+            connector: "test".into(),
+            name: "test-db".into(),
+            ts_ms: 1_700_000_000_001,
+            db: "testdb".into(),
+            schema: None,
+            table: "table".into(),
+            snapshot: None,
+            position: SourcePosition::default(),
+        },
+        Op::Update,
+        Some(json!({"id": 2, "name": "old"})),
+        Some(json!({"id": 2, "name": "new"})),
+        1_700_000_000_001,
+        64,
+    );
+
+    let delete_event = Event::new_row(
+        SourceInfo {
+            version: "deltaforge-test".into(),
+            connector: "test".into(),
+            name: "test-db".into(),
+            ts_ms: 1_700_000_000_002,
+            db: "testdb".into(),
+            schema: None,
+            table: "table".into(),
+            snapshot: None,
+            position: SourcePosition::default(),
+        },
+        Op::Delete,
+        Some(json!({"id": 3})),
+        None,
+        1_700_000_000_002,
+        64,
+    );
+
+    sink.send(&create_event).await?;
+    sink.send(&update_event).await?;
+    sink.send(&delete_event).await?;
+
+    let entries = read_stream_entries(&uri, &stream).await?;
+    assert_eq!(entries.len(), 3, "should have 3 entries");
+
+    // Collect all type suffixes
+    let mut type_suffixes: Vec<String> = Vec::new();
+    for (_id, fields) in &entries {
+        let df_event = fields.iter().find(|(k, _)| k == "df-event").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&df_event.1)?;
+
+        assert_eq!(
+            parsed.get("specversion").and_then(|v| v.as_str()),
+            Some("1.0"),
+            "all messages should be CloudEvents 1.0"
+        );
+
+        let type_field =
+            parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            type_field.starts_with("io.deltaforge.test."),
+            "type should have configured prefix"
+        );
+
+        let suffix =
+            type_field.strip_prefix("io.deltaforge.test.").unwrap_or("");
+        type_suffixes.push(suffix.to_string());
+
+        // Verify data has valid op
+        let data = parsed.get("data").expect("should have data");
+        let op = data.get("op").and_then(|v| v.as_str());
+        assert!(
+            matches!(
+                op,
+                Some("c") | Some("u") | Some("d") | Some("r") | Some("t")
+            ),
+            "data.op should be a valid Debezium code, got: {:?}",
+            op
+        );
+    }
+
+    // Verify we got all three operation type suffixes
+    assert!(
+        type_suffixes.contains(&"created".to_string()),
+        "should have 'created' type for Op::Create, found: {:?}",
+        type_suffixes
+    );
+    assert!(
+        type_suffixes.contains(&"updated".to_string()),
+        "should have 'updated' type for Op::Update, found: {:?}",
+        type_suffixes
+    );
+    assert!(
+        type_suffixes.contains(&"deleted".to_string()),
+        "should have 'deleted' type for Op::Delete, found: {:?}",
+        type_suffixes
+    );
+
+    info!("✓ cloudevents envelope handles all operation types correctly");
+    cleanup_stream(&uri, &stream).await?;
+    Ok(())
+}
+
+/// Test that default envelope is Native.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn redis_sink_default_envelope_is_native() -> Result<()> {
+    init_test_tracing();
+    let _container = get_redis_container().await;
+
+    let stream = test_stream("default_envelope");
+    let uri = redis_uri();
+    cleanup_stream(&uri, &stream).await?;
+
+    let cfg = RedisSinkCfg {
+        id: "test-default".into(),
+        uri: uri.clone(),
+        stream: stream.clone(),
+        envelope: EnvelopeCfg::default(),
+        encoding: EncodingCfg::default(),
+        required: Some(true),
+        send_timeout_secs: Some(5),
+        batch_timeout_secs: Some(30),
+        connect_timeout_secs: Some(10),
+    };
+
+    // Verify defaults
+    assert_eq!(cfg.envelope, EnvelopeCfg::Native);
+    assert_eq!(cfg.encoding, EncodingCfg::Json);
+
+    let cancel = CancellationToken::new();
+    let sink = RedisSink::new(&cfg, cancel)?;
+
+    let event = make_test_event(1);
+    sink.send(&event).await?;
+
+    let entries = read_stream_entries(&uri, &stream).await?;
+    let (_id, fields) = &entries[0];
+    let df_event = fields.iter().find(|(k, _)| k == "df-event").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&df_event.1)?;
+
+    // Verify native format (no payload wrapper)
+    assert!(
+        parsed.get("payload").is_none(),
+        "default (native) envelope should NOT have payload wrapper"
+    );
+    assert!(
+        parsed.get("op").is_some(),
+        "default (native) envelope should have 'op' at top level"
+    );
+
+    info!("✓ default envelope is Native");
+    cleanup_stream(&uri, &stream).await?;
     Ok(())
 }
 
@@ -321,6 +856,8 @@ async fn redis_sink_connection_reuse() -> Result<()> {
         id: "test-conn-reuse".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         send_timeout_secs: Some(5),
         batch_timeout_secs: Some(30),
@@ -355,6 +892,8 @@ async fn redis_sink_invalid_uri() -> Result<()> {
         id: "test-invalid".into(),
         uri: "redis://invalid-host:9999/0".into(),
         stream: "df.test.invalid".into(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         send_timeout_secs: Some(2),
         batch_timeout_secs: Some(5),
@@ -389,6 +928,8 @@ async fn redis_sink_respects_cancellation() -> Result<()> {
         id: "test-cancel".into(),
         uri: "redis://invalid-host:9999/0".into(),
         stream: "df.test.cancel".into(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         send_timeout_secs: Some(1),
         batch_timeout_secs: Some(5),
@@ -434,6 +975,8 @@ async fn redis_sink_large_events() -> Result<()> {
         id: "test-large".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         send_timeout_secs: Some(10),
         batch_timeout_secs: Some(60),
@@ -470,6 +1013,8 @@ async fn redis_sink_large_batch() -> Result<()> {
         id: "test-large-batch".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         send_timeout_secs: Some(10),
         batch_timeout_secs: Some(60),
@@ -511,6 +1056,8 @@ async fn redis_sink_concurrent_sends() -> Result<()> {
         id: "test-concurrent".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         send_timeout_secs: Some(10),
         batch_timeout_secs: Some(30),
@@ -574,6 +1121,8 @@ async fn redis_sink_recovers_after_restart() -> Result<()> {
         id: "test-restart".into(),
         uri: uri.clone(),
         stream: stream.into(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         send_timeout_secs: Some(5),
         batch_timeout_secs: Some(30),
@@ -636,6 +1185,8 @@ async fn redis_sink_handles_connection_drop() -> Result<()> {
         id: "test-conn-drop".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         send_timeout_secs: Some(5),
         batch_timeout_secs: Some(30),
@@ -700,6 +1251,8 @@ async fn redis_sink_batch_retries_on_failure() -> Result<()> {
         id: "test-batch-retry".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         send_timeout_secs: Some(5),
         batch_timeout_secs: Some(30),
@@ -753,6 +1306,8 @@ async fn redis_sink_trait_implementation() -> Result<()> {
         id: "test-trait".into(),
         uri: redis_uri(),
         stream: "df.test.trait".into(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         send_timeout_secs: Some(5),
         batch_timeout_secs: Some(30),
@@ -783,6 +1338,8 @@ async fn redis_sink_optional() -> Result<()> {
         id: "test-optional".into(),
         uri: redis_uri(),
         stream: "df.test.optional".into(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(false),
         send_timeout_secs: None,
         batch_timeout_secs: None,

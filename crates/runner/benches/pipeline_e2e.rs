@@ -1,5 +1,15 @@
 //! End-to-end pipeline benchmarks using actual Coordinator
+//!
 //! Run with: cargo bench -p runner --bench pipeline_e2e
+//!
+//! # Benchmark Groups
+//!
+//! - `coordinator_throughput`: Core coordinator overhead with various sink configs
+//! - `batch_size_impact`: How batch sizing affects throughput
+//! - `multi_sink_scaling`: Performance with multiple parallel sinks
+//! - `event_size_impact`: Small/medium/large event payload overhead
+//! - `envelope_overhead`: Serialization cost of Native vs Debezium vs CloudEvents
+//! - `schema_sensing_*`: Schema inference overhead benchmarks
 
 use criterion::{
     BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
@@ -16,7 +26,9 @@ use tokio_util::sync::CancellationToken;
 
 use deltaforge_config::{BatchConfig, SamplingConfig, SchemaSensingConfig};
 use deltaforge_core::{
-    ArcDynSink, CheckpointMeta, Event, Op, Sink, SinkResult, SourceMeta,
+    ArcDynSink, CheckpointMeta, Event, Op, Sink, SinkResult, SourceInfo,
+    SourcePosition,
+    envelope::{Envelope, EnvelopeType},
 };
 use serde_json::json;
 
@@ -25,10 +37,10 @@ use runner::{
 };
 
 // =============================================================================
-// Dummy Sinks
+// Test Sinks
 // =============================================================================
 
-/// Sink that just counts events (measures pure coordinator overhead)
+/// Sink that just counts events (measures pure coordinator overhead).
 struct CountingSink {
     id: String,
     required: bool,
@@ -76,7 +88,7 @@ impl Sink for CountingSink {
     }
 }
 
-/// Sink that serializes events (realistic workload)
+/// Sink that serializes events using direct JSON (baseline).
 struct SerializingSink {
     id: String,
     required: bool,
@@ -127,22 +139,122 @@ impl Sink for SerializingSink {
     }
 }
 
+/// Sink that serializes events using configurable envelope format.
+///
+/// This provides realistic benchmarks for different envelope configurations
+/// that sinks would use in production.
+struct EnvelopeSink {
+    id: String,
+    required: bool,
+    envelope: Box<dyn Envelope>,
+    bytes_written: Arc<AtomicU64>,
+    event_count: Arc<AtomicU64>,
+}
+
+impl EnvelopeSink {
+    fn new(
+        id: &str,
+        envelope_type: EnvelopeType,
+    ) -> (Arc<Self>, Arc<AtomicU64>, Arc<AtomicU64>) {
+        let bytes_written = Arc::new(AtomicU64::new(0));
+        let event_count = Arc::new(AtomicU64::new(0));
+        (
+            Arc::new(Self {
+                id: id.to_string(),
+                required: true,
+                envelope: envelope_type.build(),
+                bytes_written: bytes_written.clone(),
+                event_count: event_count.clone(),
+            }),
+            bytes_written,
+            event_count,
+        )
+    }
+
+    fn native(id: &str) -> (Arc<Self>, Arc<AtomicU64>, Arc<AtomicU64>) {
+        Self::new(id, EnvelopeType::Native)
+    }
+
+    fn debezium(id: &str) -> (Arc<Self>, Arc<AtomicU64>, Arc<AtomicU64>) {
+        Self::new(id, EnvelopeType::Debezium)
+    }
+
+    fn cloudevents(
+        id: &str,
+        type_prefix: &str,
+    ) -> (Arc<Self>, Arc<AtomicU64>, Arc<AtomicU64>) {
+        Self::new(
+            id,
+            EnvelopeType::CloudEvents {
+                type_prefix: type_prefix.to_string(),
+            },
+        )
+    }
+}
+
+#[async_trait]
+impl Sink for EnvelopeSink {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn required(&self) -> bool {
+        self.required
+    }
+
+    async fn send(&self, event: &Event) -> SinkResult<()> {
+        let data = self
+            .envelope
+            .serialize(event)
+            .map_err(|e| deltaforge_core::SinkError::Other(e.into()))?;
+        self.bytes_written
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.event_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn send_batch(&self, events: &[Event]) -> SinkResult<()> {
+        let mut total_bytes = 0u64;
+        for event in events {
+            let data = self
+                .envelope
+                .serialize(event)
+                .map_err(|e| deltaforge_core::SinkError::Other(e.into()))?;
+            total_bytes += data.len() as u64;
+        }
+        self.bytes_written.fetch_add(total_bytes, Ordering::Relaxed);
+        self.event_count
+            .fetch_add(events.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 // =============================================================================
-// Helpers
+// Event Factories (Debezium-compatible format)
 // =============================================================================
 
+/// Create a SourceInfo for benchmark events.
+fn make_source_info(db: &str, table: &str, connector: &str) -> SourceInfo {
+    SourceInfo {
+        version: "1.0.0".into(),
+        connector: connector.into(),
+        name: "bench-source".into(),
+        ts_ms: 1_700_000_000_000,
+        db: db.into(),
+        schema: None,
+        table: table.into(),
+        snapshot: None,
+        position: SourcePosition::default(),
+    }
+}
+
+/// Generate standard benchmark events.
 fn make_events(count: usize) -> Vec<Event> {
     (0..count)
         .map(|i| {
             let mut ev = Event::new_row(
-                "bench-tenant".into(),
-                SourceMeta {
-                    kind: "bench".into(),
-                    host: "localhost".into(),
-                    db: "benchdb".into(),
-                },
-                "benchdb.events".into(),
-                Op::Insert,
+                make_source_info("benchdb", "events", "bench"),
+                Op::Create,
                 None,
                 Some(json!({
                     "id": i,
@@ -166,14 +278,8 @@ fn make_events_with_json(count: usize) -> Vec<Event> {
     (0..count)
         .map(|i| {
             let mut ev = Event::new_row(
-                "bench-tenant".into(),
-                SourceMeta {
-                    kind: "mysql".into(),
-                    host: "localhost".into(),
-                    db: "shop".into(),
-                },
-                "shop.orders".into(),
-                Op::Insert,
+                make_source_info("shop", "orders", "mysql"),
+                Op::Create,
                 None,
                 Some(json!({
                     "id": i,
@@ -232,14 +338,8 @@ fn make_events_heterogeneous(count: usize) -> Vec<Event> {
             };
 
             let mut ev = Event::new_row(
-                "bench-tenant".into(),
-                SourceMeta {
-                    kind: "mysql".into(),
-                    host: "localhost".into(),
-                    db: "shop".into(),
-                },
-                "shop.transactions".into(),
-                Op::Insert,
+                make_source_info("shop", "transactions", "mysql"),
+                Op::Create,
                 None,
                 Some(payload),
                 1_700_000_000_000,
@@ -252,6 +352,61 @@ fn make_events_heterogeneous(count: usize) -> Vec<Event> {
         })
         .collect()
 }
+
+/// Small events (minimal payload).
+fn make_small_events(count: usize) -> Vec<Event> {
+    (0..count)
+        .map(|i| {
+            Event::new_row(
+                make_source_info("d", "t", "b"),
+                Op::Create,
+                None,
+                Some(json!({"id": i})),
+                1_700_000_000_000,
+                32,
+            )
+        })
+        .collect()
+}
+
+/// Medium events (typical CRUD payload).
+fn make_medium_events(count: usize) -> Vec<Event> {
+    (0..count)
+        .map(|i| {
+            Event::new_row(
+                make_source_info("shop", "orders", "mysql"),
+                Op::Update,
+                Some(json!({"id": i, "status": "pending", "amount": 99.99})),
+                Some(json!({"id": i, "status": "shipped", "amount": 99.99, "shipped_at": "2024-01-15"})),
+                1_700_000_000_000,
+                256,
+            )
+        })
+        .collect()
+}
+
+/// Large events (nested arrays, complex payloads).
+fn make_large_events(count: usize) -> Vec<Event> {
+    (0..count)
+        .map(|i| {
+            let big_data: Vec<_> = (0..20)
+                .map(|j| json!({"idx": j, "data": "x".repeat(50)}))
+                .collect();
+            Event::new_row(
+                make_source_info("warehouse", "inventory", "mysql"),
+                Op::Create,
+                None,
+                Some(json!({"id": i, "items": big_data})),
+                1_700_000_000_000,
+                2048,
+            )
+        })
+        .collect()
+}
+
+// =============================================================================
+// Coordinator Helpers
+// =============================================================================
 
 fn noop_commit_fn() -> CommitCpFn<CheckpointMeta> {
     Box::new(|_cp: CheckpointMeta| async { Ok(()) }.boxed())
@@ -283,13 +438,6 @@ fn make_batch_config(max_events: usize, max_ms: u64) -> Option<BatchConfig> {
         max_inflight: Some(1),
     })
 }
-
-/* fn make_sensing_config(enabled: bool) -> SchemaSensingConfig {
-    SchemaSensingConfig {
-        enabled,
-        ..Default::default()
-    }
-} */
 
 fn make_sensing_config_with_cache(cache_enabled: bool) -> SchemaSensingConfig {
     SchemaSensingConfig {
@@ -536,61 +684,9 @@ fn bench_event_sizes(c: &mut Criterion) {
     group.sample_size(50);
     group.measurement_time(Duration::from_secs(6));
 
-    let small_events: Vec<Event> = (0..5_000)
-        .map(|i| {
-            Event::new_row(
-                "t".into(),
-                SourceMeta {
-                    kind: "b".into(),
-                    host: "h".into(),
-                    db: "d".into(),
-                },
-                "d.t".into(),
-                Op::Insert,
-                None,
-                Some(json!({"id": i})),
-                1_700_000_000_000,
-                32,
-            )
-        })
-        .collect();
-
-    let medium_events: Vec<Event> = (0..5_000)
-        .map(|i| {
-            Event::new_row(
-                "tenant".into(),
-                SourceMeta { kind: "mysql".into(), host: "db.local".into(), db: "shop".into() },
-                "shop.orders".into(),
-                Op::Update,
-                Some(json!({"id": i, "status": "pending", "amount": 99.99})),
-                Some(json!({"id": i, "status": "shipped", "amount": 99.99, "shipped_at": "2024-01-15"})),
-                1_700_000_000_000,
-                256,
-            )
-        })
-        .collect();
-
-    let large_events: Vec<Event> = (0..5_000)
-        .map(|i| {
-            let big_data: Vec<_> = (0..20)
-                .map(|j| json!({"idx": j, "data": "x".repeat(50)}))
-                .collect();
-            Event::new_row(
-                "tenant".into(),
-                SourceMeta {
-                    kind: "mysql".into(),
-                    host: "db.local".into(),
-                    db: "warehouse".into(),
-                },
-                "warehouse.inventory".into(),
-                Op::Insert,
-                None,
-                Some(json!({"id": i, "items": big_data})),
-                1_700_000_000_000,
-                2048,
-            )
-        })
-        .collect();
+    let small_events = make_small_events(5_000);
+    let medium_events = make_medium_events(5_000);
+    let large_events = make_large_events(5_000);
 
     group.throughput(Throughput::Elements(5_000));
 
@@ -632,6 +728,250 @@ fn bench_event_sizes(c: &mut Criterion) {
             .unwrap();
         })
     });
+
+    group.finish();
+}
+
+/// Benchmark envelope serialization overhead.
+///
+/// Compares Native (direct), Debezium (payload wrapper), and CloudEvents formats.
+fn bench_envelope_overhead(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("envelope_overhead");
+    group.sample_size(50);
+    group.measurement_time(Duration::from_secs(8));
+
+    let events = make_events(10_000);
+    group.throughput(Throughput::Elements(10_000));
+
+    // Native envelope (baseline - direct Event serialization)
+    group.bench_with_input(
+        BenchmarkId::new("envelope", "native"),
+        &events,
+        |b, evs| {
+            b.to_async(&rt).iter(|| async {
+                let (sink, bytes, count) = EnvelopeSink::native("sink-native");
+                run_coordinator_bench(
+                    evs.clone(),
+                    vec![sink],
+                    make_batch_config(100, 10),
+                )
+                .await
+                .unwrap();
+                assert_eq!(count.load(Ordering::Relaxed), evs.len() as u64);
+                assert!(bytes.load(Ordering::Relaxed) > 0);
+            })
+        },
+    );
+
+    // Debezium envelope (payload wrapper)
+    group.bench_with_input(
+        BenchmarkId::new("envelope", "debezium"),
+        &events,
+        |b, evs| {
+            b.to_async(&rt).iter(|| async {
+                let (sink, bytes, count) =
+                    EnvelopeSink::debezium("sink-debezium");
+                run_coordinator_bench(
+                    evs.clone(),
+                    vec![sink],
+                    make_batch_config(100, 10),
+                )
+                .await
+                .unwrap();
+                assert_eq!(count.load(Ordering::Relaxed), evs.len() as u64);
+                assert!(bytes.load(Ordering::Relaxed) > 0);
+            })
+        },
+    );
+
+    // CloudEvents envelope (restructured format)
+    group.bench_with_input(
+        BenchmarkId::new("envelope", "cloudevents"),
+        &events,
+        |b, evs| {
+            b.to_async(&rt).iter(|| async {
+                let (sink, bytes, count) =
+                    EnvelopeSink::cloudevents("sink-ce", "com.example.cdc");
+                run_coordinator_bench(
+                    evs.clone(),
+                    vec![sink],
+                    make_batch_config(100, 10),
+                )
+                .await
+                .unwrap();
+                assert_eq!(count.load(Ordering::Relaxed), evs.len() as u64);
+                assert!(bytes.load(Ordering::Relaxed) > 0);
+            })
+        },
+    );
+
+    group.finish();
+}
+
+/// Benchmark envelope serialization with different event sizes.
+fn bench_envelope_with_event_sizes(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("envelope_event_sizes");
+    group.sample_size(50);
+    group.measurement_time(Duration::from_secs(6));
+
+    let small = make_small_events(5_000);
+    let medium = make_medium_events(5_000);
+    let large = make_large_events(5_000);
+
+    group.throughput(Throughput::Elements(5_000));
+
+    // Test each envelope with different payload sizes
+    for (name, events) in
+        [("small", &small), ("medium", &medium), ("large", &large)]
+    {
+        group.bench_with_input(
+            BenchmarkId::new("native", name),
+            events,
+            |b, evs| {
+                b.to_async(&rt).iter(|| async {
+                    let (sink, _, _) = EnvelopeSink::native("sink");
+                    run_coordinator_bench(
+                        evs.clone(),
+                        vec![sink],
+                        make_batch_config(100, 10),
+                    )
+                    .await
+                    .unwrap();
+                })
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("debezium", name),
+            events,
+            |b, evs| {
+                b.to_async(&rt).iter(|| async {
+                    let (sink, _, _) = EnvelopeSink::debezium("sink");
+                    run_coordinator_bench(
+                        evs.clone(),
+                        vec![sink],
+                        make_batch_config(100, 10),
+                    )
+                    .await
+                    .unwrap();
+                })
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("cloudevents", name),
+            events,
+            |b, evs| {
+                b.to_async(&rt).iter(|| async {
+                    let (sink, _, _) =
+                        EnvelopeSink::cloudevents("sink", "com.example");
+                    run_coordinator_bench(
+                        evs.clone(),
+                        vec![sink],
+                        make_batch_config(100, 10),
+                    )
+                    .await
+                    .unwrap();
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
+/// Benchmark multi-sink with different envelope configurations.
+///
+/// Real-world scenario: same events going to Kafka (Debezium) and
+/// webhook (CloudEvents) simultaneously.
+fn bench_multi_sink_mixed_envelopes(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut group = c.benchmark_group("multi_sink_mixed_envelopes");
+    group.sample_size(50);
+    group.measurement_time(Duration::from_secs(6));
+
+    let events = make_events(10_000);
+    group.throughput(Throughput::Elements(10_000));
+
+    // Single sink baselines
+    group.bench_with_input(
+        BenchmarkId::new("single", "native"),
+        &events,
+        |b, evs| {
+            b.to_async(&rt).iter(|| async {
+                let (sink, _, _) = EnvelopeSink::native("sink");
+                run_coordinator_bench(
+                    evs.clone(),
+                    vec![sink],
+                    make_batch_config(100, 10),
+                )
+                .await
+                .unwrap();
+            })
+        },
+    );
+
+    // Dual sink: same envelope
+    group.bench_with_input(
+        BenchmarkId::new("dual", "both_native"),
+        &events,
+        |b, evs| {
+            b.to_async(&rt).iter(|| async {
+                let (sink1, _, _) = EnvelopeSink::native("sink1");
+                let (sink2, _, _) = EnvelopeSink::native("sink2");
+                run_coordinator_bench(
+                    evs.clone(),
+                    vec![sink1, sink2],
+                    make_batch_config(100, 10),
+                )
+                .await
+                .unwrap();
+            })
+        },
+    );
+
+    // Dual sink: mixed envelopes (Kafka + webhook scenario)
+    group.bench_with_input(
+        BenchmarkId::new("dual", "debezium_plus_cloudevents"),
+        &events,
+        |b, evs| {
+            b.to_async(&rt).iter(|| async {
+                let (kafka_sink, _, _) = EnvelopeSink::debezium("kafka");
+                let (webhook_sink, _, _) =
+                    EnvelopeSink::cloudevents("webhook", "com.example.cdc");
+                run_coordinator_bench(
+                    evs.clone(),
+                    vec![kafka_sink, webhook_sink],
+                    make_batch_config(100, 10),
+                )
+                .await
+                .unwrap();
+            })
+        },
+    );
+
+    // Triple sink: all three envelope types
+    group.bench_with_input(
+        BenchmarkId::new("triple", "all_envelope_types"),
+        &events,
+        |b, evs| {
+            b.to_async(&rt).iter(|| async {
+                let (native, _, _) = EnvelopeSink::native("native");
+                let (debezium, _, _) = EnvelopeSink::debezium("debezium");
+                let (cloudevents, _, _) =
+                    EnvelopeSink::cloudevents("cloudevents", "com.example");
+                run_coordinator_bench(
+                    evs.clone(),
+                    vec![native, debezium, cloudevents],
+                    make_batch_config(100, 10),
+                )
+                .await
+                .unwrap();
+            })
+        },
+    );
 
     group.finish();
 }
@@ -812,14 +1152,17 @@ fn bench_schema_sensing_scaling(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = Criterion::default()
-        .sample_size(50)
-        .measurement_time(Duration::from_secs(8))
-        .warm_up_time(Duration::from_secs(2));
+        .sample_size(30)
+        .measurement_time(Duration::from_secs(12))
+        .warm_up_time(Duration::from_secs(5));
     targets =
         bench_coordinator_throughput,
         bench_batch_sizes,
         bench_multi_sink_scaling,
         bench_event_sizes,
+        bench_envelope_overhead,
+        bench_envelope_with_event_sizes,
+        bench_multi_sink_mixed_envelopes,
         bench_schema_sensing,
         bench_schema_sensing_heterogeneous,
         bench_schema_sensing_scaling
@@ -840,11 +1183,29 @@ mod summary {
     #[ignore]
     fn print_throughput_summary() {
         println!("\n");
+        println!("Benchmark Groups:");
+        println!("  - coordinator_throughput: Core coordinator overhead");
+        println!("  - batch_size_impact: Batch sizing effects");
+        println!("  - multi_sink_scaling: Parallel sink performance");
+        println!("  - event_size_impact: Payload size overhead");
+        println!("  - envelope_overhead: Native vs Debezium vs CloudEvents");
+        println!("  - envelope_event_sizes: Envelope cost by payload size");
+        println!(
+            "  - multi_sink_mixed_envelopes: Real-world multi-format scenarios"
+        );
+        println!("  - schema_sensing_*: Schema inference overhead");
+        println!();
         println!("Notes:");
         println!(
             "  - Benchmarks measure coordinator throughput (in-memory → sinks)"
         );
         println!("  - Real-world includes binlog parsing, network I/O");
+        println!(
+            "  - Native envelope is baseline; Debezium adds ~12 bytes wrapper"
+        );
+        println!(
+            "  - CloudEvents restructures event (higher overhead, serverless compat)"
+        );
         println!(
             "  - Structure cache uses top-level keys only (O(k) not O(nodes))"
         );

@@ -297,8 +297,12 @@ impl EnvelopeCfg {
     /// Convert to core envelope type.
     pub fn to_envelope_type(&self) -> deltaforge_core::envelope::EnvelopeType {
         match self {
-            EnvelopeCfg::Native => deltaforge_core::envelope::EnvelopeType::Native,
-            EnvelopeCfg::Debezium => deltaforge_core::envelope::EnvelopeType::Debezium,
+            EnvelopeCfg::Native => {
+                deltaforge_core::envelope::EnvelopeType::Native
+            }
+            EnvelopeCfg::Debezium => {
+                deltaforge_core::envelope::EnvelopeType::Debezium
+            }
             EnvelopeCfg::CloudEvents { type_prefix } => {
                 deltaforge_core::envelope::EnvelopeType::CloudEvents {
                     type_prefix: type_prefix.clone(),

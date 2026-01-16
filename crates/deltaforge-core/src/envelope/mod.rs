@@ -12,13 +12,13 @@
 
 use std::borrow::Cow;
 
-mod native;
-mod debezium;
 mod cloudevents;
+mod debezium;
+mod native;
 
-pub use native::Native;
-pub use debezium::Debezium;
 pub use cloudevents::CloudEvents;
+pub use debezium::Debezium;
+pub use native::Native;
 
 use crate::Event;
 use bytes::Bytes;
@@ -70,12 +70,10 @@ impl EnvelopeType {
             EnvelopeType::Debezium => Cow::Borrowed("debezium"),
             EnvelopeType::CloudEvents { type_prefix } => {
                 Cow::Owned(format!("cloudevents-{}", type_prefix))
-            }            
+            }
         }
     }
-
 }
-
 
 impl EnvelopeType {
     /// Create the envelope instance.

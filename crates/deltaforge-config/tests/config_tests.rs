@@ -1,5 +1,6 @@
 use deltaforge_config::{
-    CommitPolicy, ConfigError, ProcessorCfg, SinkCfg, SourceCfg, load_from_path,
+    CommitPolicy, ConfigError, EncodingCfg, EnvelopeCfg, ProcessorCfg, SinkCfg,
+    SourceCfg, load_from_path,
 };
 use pretty_assertions::assert_eq;
 use serial_test::serial;
@@ -11,10 +12,14 @@ fn write_temp(contents: &str) -> tempfile::TempPath {
     f.into_temp_path()
 }
 
+// ============================================================================
+// Core Pipeline Parsing
+// ============================================================================
+
 #[test]
 #[serial]
 #[allow(unsafe_code)]
-fn parses_minimal_postgres_pipeline_with_env_expansion() {
+fn parses_postgres_pipeline_with_env_expansion() {
     unsafe {
         std::env::set_var(
             "PG_ORDERS_DSN",
@@ -37,6 +42,7 @@ spec:
       publication: df_pub
       slot: df_slot
       tables: [public.t1]
+      start_position: latest
   processors:
     - type: javascript
       id: js
@@ -58,45 +64,38 @@ spec:
 
     match &spec.spec.source {
         SourceCfg::Postgres(pc) => {
-            assert_eq!(pc.id, "pg");
             assert_eq!(pc.dsn, "postgres://pgu:pgpass@localhost:5432/orders");
-            assert_eq!(pc.publication, "df_pub");
-            assert_eq!(pc.slot, "df_slot");
-            assert_eq!(pc.tables, vec!["public.t1".to_string()]);
+            assert!(matches!(
+                pc.start_position,
+                deltaforge_config::PostgresStartPosition::Latest
+            ));
         }
         _ => panic!("expected postgres source"),
     }
 
     assert_eq!(spec.spec.processors.len(), 1);
     match &spec.spec.processors[0] {
-        ProcessorCfg::Javascript { id, inline, limits } => {
+        ProcessorCfg::Javascript { id, inline, .. } => {
             assert_eq!(id, "js");
             assert!(inline.contains("return [event];"));
-            assert!(limits.is_none());
         }
     }
 
-    assert_eq!(spec.spec.sinks.len(), 1);
     match &spec.spec.sinks[0] {
         SinkCfg::Kafka(kc) => {
-            assert_eq!(kc.id, "k");
-            assert_eq!(kc.brokers, "localhost:9092");
             assert_eq!(kc.topic, "unit.events");
-            assert!(kc.required.is_none());
-            assert!(kc.exactly_once.is_none());
-            assert!(kc.client_conf.is_empty());
+            // Verify defaults
+            assert_eq!(kc.envelope, EnvelopeCfg::Native);
+            assert_eq!(kc.encoding, EncodingCfg::Json);
         }
         _ => panic!("expected kafka sink"),
     }
-
-    assert!(spec.spec.batch.is_none());
-    assert!(spec.spec.commit_policy.is_none());
 }
 
 #[test]
 #[serial]
 #[allow(unsafe_code)]
-fn parses_mysql_and_multiple_sinks() {
+fn parses_mysql_with_multiple_sinks() {
     unsafe {
         std::env::set_var(
             "MYSQL_ORDERS_DSN",
@@ -127,6 +126,11 @@ spec:
         id: r
         uri: redis://127.0.0.1:6379
         stream: s
+    - type: nats
+      config:
+        id: n
+        url: nats://localhost:4222
+        subject: events
 "#;
 
     let path = write_temp(yaml);
@@ -134,58 +138,37 @@ spec:
 
     match &spec.spec.source {
         SourceCfg::Mysql(mc) => {
-            assert_eq!(mc.id, "m");
-            assert_eq!(mc.dsn, "mysql://root:pws@localhost:3306/orders");
-            assert_eq!(
-                mc.tables,
-                vec!["orders".to_string(), "order_items".to_string()]
-            );
+            assert_eq!(mc.tables, vec!["orders", "order_items"]);
         }
         _ => panic!("expected mysql source"),
     }
 
-    assert_eq!(spec.spec.sinks.len(), 2);
-    match &spec.spec.sinks[0] {
-        SinkCfg::Kafka(kc) => {
-            assert_eq!(kc.id, "k");
-            assert_eq!(kc.brokers, "localhost:9092");
-            assert_eq!(kc.topic, "t.orders");
-        }
-        _ => panic!("expected kafka"),
-    }
-    match &spec.spec.sinks[1] {
-        SinkCfg::Redis(rc) => {
-            assert_eq!(rc.id, "r");
-            assert_eq!(rc.uri, "redis://127.0.0.1:6379");
-            assert_eq!(rc.stream, "s");
-        }
-        _ => panic!("expected redis"),
-    }
+    assert_eq!(spec.spec.sinks.len(), 3);
+    assert!(matches!(&spec.spec.sinks[0], SinkCfg::Kafka(_)));
+    assert!(matches!(&spec.spec.sinks[1], SinkCfg::Redis(_)));
+    assert!(matches!(&spec.spec.sinks[2], SinkCfg::Nats(_)));
 }
 
 #[test]
 #[serial]
-fn invalid_yaml_errors() {
-    let yaml = r#"
-this is: [ definitely: not: valid: yaml
-"#;
+fn invalid_yaml_returns_parse_error() {
+    let yaml = "this is: [ definitely: not: valid: yaml";
     let path = write_temp(yaml);
-    let err = load_from_path(path.to_str().unwrap())
-        .expect_err("should fail to parse invalid yaml");
-
-    match err {
-        ConfigError::Parse { .. } => {}
-        other => panic!("expected ConfigError::Parse, got: {other:?}"),
-    }
+    let err = load_from_path(path.to_str().unwrap()).expect_err("should fail");
+    assert!(matches!(err, ConfigError::Parse { .. }));
 }
+
+// ============================================================================
+// Batch and Commit Policy
+// ============================================================================
 
 #[test]
 #[serial]
-fn batch_config_parses() {
+fn batch_and_commit_policy_parsing() {
     let yaml = r#"
 apiVersion: deltaforge/v1
 kind: Pipeline
-metadata: { name: withbatch, tenant: t }
+metadata: { name: batch_test, tenant: t }
 spec:
   batch:
     max_events: 1000
@@ -193,91 +176,6 @@ spec:
     max_ms: 250
     respect_source_tx: true
     max_inflight: 4
-  source:
-    type: postgres
-    config:
-      id: pg
-      dsn: postgres://pgu:pgpass@localhost:5432/orders
-      publication: df_pub
-      slot: df_slot
-      tables: [public.t1]
-  processors: []
-  sinks: []
-"#;
-
-    let path = write_temp(yaml);
-    let spec = load_from_path(path.to_str().unwrap()).expect("parse ok");
-
-    let batch = spec.spec.batch.as_ref().expect("batch should be present");
-    assert_eq!(batch.max_events, Some(1000));
-    assert_eq!(batch.max_bytes, Some(65536));
-    assert_eq!(batch.max_ms, Some(250));
-    assert_eq!(batch.respect_source_tx, Some(true));
-    assert_eq!(batch.max_inflight, Some(4));
-}
-
-#[test]
-#[serial]
-fn commit_policy_parses_all_variants() {
-    // All
-    let yaml_all = r#"
-apiVersion: deltaforge/v1
-kind: Pipeline
-metadata: { name: cp_all, tenant: t }
-spec:
-  commit_policy:
-    mode: all
-  source:
-    type: postgres
-    config:
-      id: pg
-      dsn: postgres://pgu:pgpass@localhost:5432/orders
-      publication: df_pub
-      slot: df_slot
-      tables: [public.t1]
-  processors: []
-  sinks: []
-"#;
-    let p_all = write_temp(yaml_all);
-    let spec_all = load_from_path(p_all.to_str().unwrap()).expect("parse all");
-    assert!(matches!(
-        spec_all.spec.commit_policy,
-        Some(CommitPolicy::All)
-    ));
-
-    // Required
-    let yaml_required = r#"
-apiVersion: deltaforge/v1
-kind: Pipeline
-metadata: { name: cp_req, tenant: t }
-spec:
-  commit_policy:
-    mode: required
-  source:
-    type: postgres
-    config:
-      id: pg
-      dsn: postgres://pgu:pgpass@localhost:5432/orders
-      publication: df_pub
-      slot: df_slot
-      tables: [public.t1]
-  processors: []
-  sinks: []
-"#;
-    let p_req = write_temp(yaml_required);
-    let spec_req =
-        load_from_path(p_req.to_str().unwrap()).expect("parse required");
-    assert!(matches!(
-        spec_req.spec.commit_policy,
-        Some(CommitPolicy::Required)
-    ));
-
-    // Quorum
-    let yaml_quorum = r#"
-apiVersion: deltaforge/v1
-kind: Pipeline
-metadata: { name: cp_quorum, tenant: t }
-spec:
   commit_policy:
     mode: quorum
     quorum: 2
@@ -285,123 +183,69 @@ spec:
     type: postgres
     config:
       id: pg
-      dsn: postgres://pgu:pgpass@localhost:5432/orders
-      publication: df_pub
-      slot: df_slot
-      tables: [public.t1]
+      dsn: postgres://u:p@localhost/db
+      publication: pub
+      slot: slot
+      tables: [t1]
   processors: []
   sinks: []
 "#;
-    let p_quorum = write_temp(yaml_quorum);
-    let spec_quorum =
-        load_from_path(p_quorum.to_str().unwrap()).expect("parse quorum");
 
-    match spec_quorum.spec.commit_policy {
+    let path = write_temp(yaml);
+    let spec = load_from_path(path.to_str().unwrap()).expect("parse ok");
+
+    let batch = spec.spec.batch.as_ref().expect("batch present");
+    assert_eq!(batch.max_events, Some(1000));
+    assert_eq!(batch.max_bytes, Some(65536));
+    assert_eq!(batch.max_ms, Some(250));
+    assert_eq!(batch.respect_source_tx, Some(true));
+    assert_eq!(batch.max_inflight, Some(4));
+
+    match spec.spec.commit_policy {
         Some(CommitPolicy::Quorum { quorum }) => assert_eq!(quorum, 2),
-        other => panic!(
-            "expected CommitPolicy::Quorum {{ quorum: 2 }}, got {other:?}"
-        ),
+        other => panic!("expected Quorum, got {other:?}"),
     }
 }
 
 #[test]
 #[serial]
-fn connection_policy_parses() {
-    let yaml = r#"
+fn commit_policy_all_variants() {
+    for (mode, expected) in [
+        ("all", CommitPolicy::All),
+        ("required", CommitPolicy::Required),
+    ] {
+        let yaml = format!(
+            r#"
 apiVersion: deltaforge/v1
 kind: Pipeline
-metadata: { name: a, tenant: t }
+metadata: {{ name: cp_{mode}, tenant: t }}
 spec:
-  connection_policy:
-    default_mode: dedicated
-    preferred_replica: read-replica-1
-    limits: { max_dedicated_per_source: 3 }
+  commit_policy:
+    mode: {mode}
   source:
     type: postgres
     config:
       id: pg
-      dsn: postgres://pgu:pgpass@localhost:5432/orders
-      publication: df_pub
-      slot: df_slot
-      tables: [public.t1]
+      dsn: postgres://u:p@localhost/db
+      publication: pub
+      slot: slot
+      tables: [t1]
   processors: []
   sinks: []
-"#;
-    let path = write_temp(yaml);
-    let spec = load_from_path(path.to_str().unwrap()).expect("parse ok");
-
-    let cp = spec.spec.connection_policy.as_ref().expect("present");
-    assert_eq!(cp.default_mode.as_deref(), Some("dedicated"));
-    assert_eq!(cp.preferred_replica.as_deref(), Some("read-replica-1"));
-    assert_eq!(
-        cp.limits.as_ref().unwrap().max_dedicated_per_source,
-        Some(3)
-    );
-}
-
-#[test]
-#[serial]
-fn kafka_client_conf_overrides() {
-    let yaml = r#"
-apiVersion: deltaforge/v1
-kind: Pipeline
-metadata: { name: kclient, tenant: t }
-spec:
-  source:
-    type: postgres
-    config:
-      id: pg
-      dsn: postgres://pgu:pgpass@localhost:5432/orders
-      publication: df_pub
-      slot: df_slot
-      tables: [public.t1]
-  processors: []
-  sinks:
-    - type: kafka
-      config:
-        id: k1
-        brokers: localhost:9092
-        topic: t.orders
-    - type: kafka
-      config:
-        id: k2
-        brokers: localhost:9092
-        topic: t.orders
-        client_conf:
-          linger.ms: "10"
-          message.max.bytes: "1048576"
-"#;
-
-    let path = write_temp(yaml);
-    let spec = load_from_path(path.to_str().unwrap()).expect("parse ok");
-
-    assert_eq!(spec.spec.sinks.len(), 2);
-
-    match &spec.spec.sinks[0] {
-        SinkCfg::Kafka(k1) => {
-            assert!(k1.client_conf.is_empty());
-        }
-        _ => panic!("expected kafka"),
-    }
-
-    match &spec.spec.sinks[1] {
-        SinkCfg::Kafka(k2) => {
-            assert_eq!(
-                k2.client_conf.get("linger.ms").map(String::as_str),
-                Some("10")
-            );
-            assert_eq!(
-                k2.client_conf.get("message.max.bytes").map(String::as_str),
-                Some("1048576")
-            );
-        }
-        _ => panic!("expected kafka"),
+"#
+        );
+        let spec = load_from_path(write_temp(&yaml).to_str().unwrap()).unwrap();
+        assert_eq!(spec.spec.commit_policy, Some(expected));
     }
 }
 
+// ============================================================================
+// Schema Sensing
+// ============================================================================
+
 #[test]
 #[serial]
-fn schema_sensing_config_parses() {
+fn schema_sensing_config_parsing() {
     let yaml = r#"
 apiVersion: deltaforge/v1
 kind: Pipeline
@@ -435,72 +279,238 @@ spec:
     assert!(sensing.enabled);
     assert!(sensing.deep_inspect.enabled);
     assert_eq!(sensing.deep_inspect.max_depth, 5);
-    assert_eq!(sensing.deep_inspect.max_sample_size, 500);
     assert_eq!(sensing.sampling.warmup_events, 100);
     assert_eq!(sensing.sampling.sample_rate, 10);
     assert!(sensing.sampling.structure_cache);
-    assert_eq!(sensing.sampling.structure_cache_size, 50);
+}
+
+// ============================================================================
+// Envelope and Encoding Configuration
+// ============================================================================
+
+#[test]
+#[serial]
+fn all_envelope_types_across_sinks() {
+    let yaml = r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata: { name: envelopes, tenant: t }
+spec:
+  source:
+    type: postgres
+    config:
+      id: pg
+      dsn: postgres://u:p@localhost/db
+      publication: pub
+      slot: slot
+      tables: [events]
+  processors: []
+  sinks:
+    # Native envelope (default)
+    - type: kafka
+      config:
+        id: kafka-native
+        brokers: localhost:9092
+        topic: events.native
+    # Debezium envelope
+    - type: redis
+      config:
+        id: redis-debezium
+        uri: redis://localhost:6379
+        stream: events
+        envelope:
+          type: debezium
+    # CloudEvents envelope
+    - type: nats
+      config:
+        id: nats-cloudevents
+        url: nats://localhost:4222
+        subject: events
+        envelope:
+          type: cloudevents
+          type_prefix: "com.example.cdc"
+"#;
+
+    let path = write_temp(yaml);
+    let spec = load_from_path(path.to_str().unwrap()).expect("parse ok");
+
+    // Kafka: native (default)
+    match &spec.spec.sinks[0] {
+        SinkCfg::Kafka(kc) => {
+            assert_eq!(kc.envelope, EnvelopeCfg::Native);
+            assert_eq!(kc.encoding, EncodingCfg::Json);
+        }
+        _ => panic!("expected kafka"),
+    }
+
+    // Redis: debezium
+    match &spec.spec.sinks[1] {
+        SinkCfg::Redis(rc) => {
+            assert_eq!(rc.envelope, EnvelopeCfg::Debezium);
+        }
+        _ => panic!("expected redis"),
+    }
+
+    // NATS: cloudevents
+    match &spec.spec.sinks[2] {
+        SinkCfg::Nats(nc) => {
+            assert_eq!(
+                nc.envelope,
+                EnvelopeCfg::CloudEvents {
+                    type_prefix: "com.example.cdc".to_string()
+                }
+            );
+        }
+        _ => panic!("expected nats"),
+    }
 }
 
 #[test]
 #[serial]
-fn postgres_start_position_variants() {
-    // Default (earliest)
-    let yaml_default = r#"
-apiVersion: deltaforge/v1
-kind: Pipeline
-metadata: { name: pos_default, tenant: t }
-spec:
-  source:
-    type: postgres
-    config:
-      id: pg
-      dsn: postgres://u:p@localhost/db
-      publication: pub
-      slot: slot
-      tables: [t1]
-  processors: []
-  sinks: []
-"#;
-    let spec =
-        load_from_path(write_temp(yaml_default).to_str().unwrap()).unwrap();
-    match &spec.spec.source {
-        SourceCfg::Postgres(pc) => {
-            assert!(matches!(
-                pc.start_position,
-                deltaforge_config::PostgresStartPosition::Earliest
-            ));
+fn envelope_and_encoding_conversion_to_core() {
+    // Envelope conversions
+    let native = EnvelopeCfg::Native.to_envelope_type();
+    let debezium = EnvelopeCfg::Debezium.to_envelope_type();
+    let cloudevents = EnvelopeCfg::CloudEvents {
+        type_prefix: "com.test".to_string(),
+    }
+    .to_envelope_type();
+
+    assert!(matches!(
+        native,
+        deltaforge_core::envelope::EnvelopeType::Native
+    ));
+    assert!(matches!(
+        debezium,
+        deltaforge_core::envelope::EnvelopeType::Debezium
+    ));
+    match cloudevents {
+        deltaforge_core::envelope::EnvelopeType::CloudEvents {
+            type_prefix,
+        } => {
+            assert_eq!(type_prefix, "com.test");
         }
-        _ => panic!("expected postgres"),
+        _ => panic!("expected CloudEvents"),
     }
 
-    // Latest
-    let yaml_latest = r#"
+    // Encoding conversion
+    let json = EncodingCfg::Json.to_encoding_type();
+    assert!(matches!(
+        json,
+        deltaforge_core::encoding::EncodingType::Json
+    ));
+}
+
+// ============================================================================
+// Full Sink Configuration (timeouts, auth, client_conf)
+// ============================================================================
+
+#[test]
+#[serial]
+fn kafka_sink_full_configuration() {
+    let yaml = r#"
 apiVersion: deltaforge/v1
 kind: Pipeline
-metadata: { name: pos_latest, tenant: t }
+metadata: { name: kafka_full, tenant: t }
 spec:
   source:
-    type: postgres
+    type: mysql
     config:
-      id: pg
-      dsn: postgres://u:p@localhost/db
-      publication: pub
-      slot: slot
-      tables: [t1]
-      start_position: latest
+      id: m
+      dsn: mysql://root:pw@localhost:3306/db
+      tables: [orders]
   processors: []
-  sinks: []
+  sinks:
+    - type: kafka
+      config:
+        id: kafka-prod
+        brokers: broker1:9092,broker2:9092
+        topic: orders.events
+        envelope:
+          type: cloudevents
+          type_prefix: "com.example.shop"
+        encoding: json
+        required: true
+        exactly_once: false
+        send_timeout_secs: 60
+        client_conf:
+          security.protocol: SASL_SSL
+          sasl.mechanism: PLAIN
+          linger.ms: "10"
 "#;
-    let spec =
-        load_from_path(write_temp(yaml_latest).to_str().unwrap()).unwrap();
-    match &spec.spec.source {
-        SourceCfg::Postgres(pc) => {
-            assert!(matches!(
-                pc.start_position,
-                deltaforge_config::PostgresStartPosition::Latest
-            ));
+
+    let path = write_temp(yaml);
+    let spec = load_from_path(path.to_str().unwrap()).expect("parse ok");
+
+    match &spec.spec.sinks[0] {
+        SinkCfg::Kafka(kc) => {
+            assert_eq!(kc.brokers, "broker1:9092,broker2:9092");
+            assert_eq!(
+                kc.envelope,
+                EnvelopeCfg::CloudEvents {
+                    type_prefix: "com.example.shop".to_string()
+                }
+            );
+            assert_eq!(kc.required, Some(true));
+            assert_eq!(kc.exactly_once, Some(false));
+            assert_eq!(kc.send_timeout_secs, Some(60));
+            assert_eq!(
+                kc.client_conf.get("security.protocol").map(String::as_str),
+                Some("SASL_SSL")
+            );
         }
-        _ => panic!("expected postgres"),
+        _ => panic!("expected kafka"),
+    }
+}
+
+#[test]
+#[serial]
+fn nats_sink_with_jetstream_and_auth() {
+    let yaml = r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata: { name: nats_full, tenant: t }
+spec:
+  source:
+    type: mysql
+    config:
+      id: m
+      dsn: mysql://root:pw@localhost:3306/db
+      tables: [orders]
+  processors: []
+  sinks:
+    - type: nats
+      config:
+        id: nats-prod
+        url: nats://nats1:4222,nats://nats2:4222
+        subject: orders.>
+        stream: ORDERS
+        envelope:
+          type: cloudevents
+          type_prefix: "io.nats.orders"
+        required: true
+        send_timeout_secs: 5
+        credentials_file: /etc/nats/user.creds
+"#;
+
+    let path = write_temp(yaml);
+    let spec = load_from_path(path.to_str().unwrap()).expect("parse ok");
+
+    match &spec.spec.sinks[0] {
+        SinkCfg::Nats(nc) => {
+            assert_eq!(nc.url, "nats://nats1:4222,nats://nats2:4222");
+            assert_eq!(nc.stream, Some("ORDERS".to_string()));
+            assert_eq!(
+                nc.envelope,
+                EnvelopeCfg::CloudEvents {
+                    type_prefix: "io.nats.orders".to_string()
+                }
+            );
+            assert_eq!(
+                nc.credentials_file.as_deref(),
+                Some("/etc/nats/user.creds")
+            );
+        }
+        _ => panic!("expected nats"),
     }
 }

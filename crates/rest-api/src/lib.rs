@@ -213,6 +213,8 @@ mod tests {
                         send_timeout_secs: Some(3),
                         batch_timeout_secs: Some(3),
                         connect_timeout_secs: Some(3),
+                        envelope: deltaforge_config::EnvelopeCfg::Debezium,
+                        encoding: deltaforge_config::EncodingCfg::Json,
                     })],
                     connection_policy: None,
                     batch: Some(BatchConfig::default()),
