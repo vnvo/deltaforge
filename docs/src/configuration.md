@@ -45,7 +45,7 @@ spec:
 
 ### <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/mysql/mysql-original.svg" width="24" height="24" style="vertical-align: middle;"> MySQL
 
-Captures row-level changes via binlog replication. See [MySQL source documentation](mysql.md) for prerequisites and detailed configuration.
+Captures row-level changes via binlog replication. See [MySQL source documentation](sources/mysql.md) for prerequisites and detailed configuration.
 
 <table>
 <tr>
@@ -78,49 +78,11 @@ source:
 **Table patterns** support SQL LIKE syntax:
 - `db.table` - exact match
 - `db.prefix%` - tables matching prefix
-- `db.*` - all tables in database
-- `%.table` - table in any database
-
-### Turso
-
-<table>
-<tr>
-<td>
-
-```yaml
-source:
-  type: turso
-  config:
-    id: turso-main
-    url: "libsql://your-db.turso.io"
-    auth_token: ${TURSO_AUTH_TOKEN}
-    tables: ["users", "orders"]
-    cdc_mode: auto
-    poll_interval_ms: 1000
-    native_cdc:
-      level: data
-```
-
-</td>
-<td>
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `id` | string | — | Logical identifier |
-| `url` | string | — | Database URL |
-| `auth_token` | string | — | Turso cloud token |
-| `tables` | array | — | Tables to track |
-| `cdc_mode` | string | `auto` | `native`, `triggers`, `polling`, `auto` |
-| `poll_interval_ms` | int | `1000` | Polling interval |
-| `native_cdc.level` | string | `data` | `binlog` or `data` |
-
-</td>
-</tr>
-</table>
+- `db.%` - all tables in database
 
 ### <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/postgresql/postgresql-original.svg" width="24" height="24" style="vertical-align: middle;"> PostgreSQL
 
-Captures row-level changes via logical replication using the pgoutput plugin. See [PostgreSQL source documentation](postgres.md) for prerequisites and detailed configuration.
+Captures row-level changes via logical replication. See [PostgreSQL source documentation](sources/postgres.md) for prerequisites and detailed configuration.
 
 <table>
 <tr>
@@ -130,46 +92,39 @@ Captures row-level changes via logical replication using the pgoutput plugin. Se
 source:
   type: postgres
   config:
-    id: orders-postgres
+    id: users-postgres
     dsn: ${POSTGRES_DSN}
-    slot: deltaforge_orders
-    publication: orders_pub
+    slot: deltaforge_users
+    publication: users_pub
     tables:
-      - public.orders
-      - public.order_items
+      - public.users
+      - public.sessions
     start_position: earliest
 ```
 
 </td>
 <td>
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `id` | string | — | Unique identifier |
-| `dsn` | string | — | PostgreSQL connection string |
-| `slot` | string | — | Replication slot name |
-| `publication` | string | — | Publication name |
-| `tables` | array | — | Table patterns to capture |
-| `start_position` | string | `earliest` | `earliest`, `latest`, or `{lsn: "X/Y"}` |
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Unique identifier |
+| `dsn` | string | PostgreSQL connection string |
+| `slot` | string | Replication slot name |
+| `publication` | string | Publication name |
+| `tables` | array | Table patterns to capture |
+| `start_position` | string | `earliest`, `latest`, or `lsn` |
 
 </td>
 </tr>
 </table>
 
-**Table patterns** support SQL LIKE syntax (same as MySQL):
-- `schema.table` - exact match
-- `schema.prefix%` - tables matching prefix
-- `schema.*` - all tables in schema
-- `%.table` - table in any schema
-- `table` - defaults to `public.table`
-
 ---
 
 ## Processors
 
-Processors transform batches of events before delivery to sinks.
+Processors transform events between source and sinks. They run in order and can filter, enrich, or modify events.
 
-### <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/javascript/javascript-original.svg" width="24" height="24" style="vertical-align: middle;"> JavaScript
+### JavaScript
 
 <table>
 <tr>
@@ -181,9 +136,9 @@ processors:
     id: transform
     inline: |
       function processBatch(events) {
-        return events.map(event => {
-          event.tags = ["processed"];
-          return event;
+        return events.map(e => {
+          e.tags = ["processed"];
+          return e;
         });
       }
     limits:
@@ -198,8 +153,8 @@ processors:
 | Field | Type | Description |
 |-------|------|-------------|
 | `id` | string | Processor identifier |
-| `inline` | string | JS source defining `processBatch(events)` |
-| `limits.cpu_ms` | int | CPU time limit per batch |
+| `inline` | string | JavaScript code |
+| `limits.cpu_ms` | int | CPU time limit |
 | `limits.mem_mb` | int | Memory limit |
 | `limits.timeout_ms` | int | Execution timeout |
 
@@ -207,17 +162,44 @@ processors:
 </tr>
 </table>
 
-The `processBatch(events)` function receives an array of events and can return:
-- An array of events (modified, filtered, or expanded)
-- A single event object (wrapped in array automatically)
-- `null` or `undefined` to use the mutated input array
-- Empty array `[]` to drop all events
-
 ---
 
 ## Sinks
 
+Sinks deliver events to downstream systems. Each sink supports configurable [envelope formats and wire encodings](envelopes.md) to match consumer expectations. See the [Sinks documentation](sinks/README.md) for detailed information on multi-sink patterns, commit policies, and failure handling.
+
+### Envelope and encoding
+
+All sinks support these serialization options:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `envelope` | object | `native` | Output structure format. See [Envelopes](envelopes.md). |
+| `encoding` | string | `json` | Wire encoding format |
+
+**Envelope types:**
+- `native` - Direct Debezium payload structure (default, most efficient)
+- `debezium` - Full `{"payload": ...}` wrapper
+- `cloudevents` - CloudEvents 1.0 specification (requires `type_prefix`)
+
+```yaml
+# Native (default)
+envelope:
+  type: native
+
+# Debezium wrapper
+envelope:
+  type: debezium
+
+# CloudEvents
+envelope:
+  type: cloudevents
+  type_prefix: "com.example.cdc"
+```
+
 ### <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/apachekafka/apachekafka-original.svg" width="24" height="24" style="vertical-align: middle;"> Kafka
+
+See [Kafka sink documentation](sinks/kafka.md) for detailed configuration options and best practices.
 
 <table>
 <tr>
@@ -230,10 +212,14 @@ sinks:
       id: orders-kafka
       brokers: ${KAFKA_BROKERS}
       topic: orders
+      envelope:
+        type: debezium
+      encoding: json
       required: true
       exactly_once: false
+      send_timeout_secs: 30
       client_conf:
-        message.timeout.ms: "5000"
+        security.protocol: SASL_SSL
 ```
 
 </td>
@@ -242,17 +228,37 @@ sinks:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `id` | string | — | Sink identifier |
-| `brokers` | string | — | Comma-separated broker list |
-| `topic` | string | — | Destination topic |
-| `required` | bool | `true` | Whether this sink gates checkpoints |
-| `exactly_once` | bool | `false` | Enable EOS semantics |
-| `client_conf` | map | `{}` | Raw librdkafka config overrides |
+| `brokers` | string | — | Kafka broker addresses |
+| `topic` | string | — | Target topic |
+| `envelope` | object | `native` | Output format |
+| `encoding` | string | `json` | Wire encoding |
+| `required` | bool | `true` | Gates checkpoints |
+| `exactly_once` | bool | `false` | Transactional mode |
+| `send_timeout_secs` | int | `30` | Send timeout |
+| `client_conf` | map | — | librdkafka overrides |
 
 </td>
 </tr>
 </table>
 
+**CloudEvents example:**
+
+```yaml
+sinks:
+  - type: kafka
+    config:
+      id: events-kafka
+      brokers: ${KAFKA_BROKERS}
+      topic: events
+      envelope:
+        type: cloudevents
+        type_prefix: "com.acme.cdc"
+      encoding: json
+```
+
 ### <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/redis/redis-original.svg" width="24" height="24" style="vertical-align: middle;"> Redis
+
+See [Redis sink documentation](sinks/redis.md) for detailed configuration options and best practices.
 
 <table>
 <tr>
@@ -265,6 +271,9 @@ sinks:
       id: orders-redis
       uri: ${REDIS_URI}
       stream: orders
+      envelope:
+        type: native
+      encoding: json
       required: true
 ```
 
@@ -276,13 +285,20 @@ sinks:
 | `id` | string | — | Sink identifier |
 | `uri` | string | — | Redis connection URI |
 | `stream` | string | — | Redis stream key |
-| `required` | bool | `true` | Whether this sink gates checkpoints |
+| `envelope` | object | `native` | Output format |
+| `encoding` | string | `json` | Wire encoding |
+| `required` | bool | `true` | Gates checkpoints |
+| `send_timeout_secs` | int | `5` | XADD timeout |
+| `batch_timeout_secs` | int | `30` | Pipeline timeout |
+| `connect_timeout_secs` | int | `10` | Connection timeout |
 
 </td>
 </tr>
 </table>
 
 ### <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/nats/nats-original.svg" width="24" height="24" style="vertical-align: middle;"> NATS
+
+See [NATS sink documentation](sinks/nats.md) for detailed configuration options and best practices.
 
 <table>
 <tr>
@@ -296,6 +312,9 @@ sinks:
       url: ${NATS_URL}
       subject: orders.events
       stream: ORDERS
+      envelope:
+        type: native
+      encoding: json
       required: true
       send_timeout_secs: 5
       batch_timeout_secs: 30
@@ -310,6 +329,8 @@ sinks:
 | `url` | string | — | NATS server URL |
 | `subject` | string | — | Subject to publish to |
 | `stream` | string | — | JetStream stream name |
+| `envelope` | object | `native` | Output format |
+| `encoding` | string | `json` | Wire encoding |
 | `required` | bool | `true` | Gates checkpoints |
 | `send_timeout_secs` | int | `5` | Publish timeout |
 | `batch_timeout_secs` | int | `30` | Batch timeout |
@@ -390,6 +411,14 @@ commit_policy:
 
 ## Schema sensing
 
+Schema sensing automatically infers and tracks schema from event payloads. See the [Schema Sensing documentation](schemasensing.md) for detailed information on how it works, drift detection, and API endpoints.
+
+> **Performance tip**: Schema sensing can be CPU-intensive, especially with deep JSON inspection. Consider your throughput requirements when configuring:
+> - Set `enabled: false` if you don't need runtime schema inference
+> - Limit `deep_inspect.max_depth` to avoid traversing deeply nested structures
+> - Increase `sampling.sample_rate` to analyze fewer events (e.g., 1 in 100 instead of 1 in 10)
+> - Reduce `sampling.warmup_events` if you're confident in schema stability
+
 <table>
 <tr>
 <td>
@@ -428,9 +457,9 @@ schema_sensing:
 
 ---
 
-## Complete example
+## Complete examples
 
-### MySQL to Kafka
+### MySQL to Kafka with Debezium envelope
 
 ```yaml
 apiVersion: deltaforge/v1
@@ -469,16 +498,13 @@ spec:
         id: orders-kafka
         brokers: ${KAFKA_BROKERS}
         topic: orders
+        envelope:
+          type: debezium
+        encoding: json
         required: true
         exactly_once: false
         client_conf:
           message.timeout.ms: "5000"
-    - type: redis
-      config:
-        id: orders-redis
-        uri: ${REDIS_URI}
-        stream: orders
-        required: false
 
   batch:
     max_events: 500
@@ -489,18 +515,9 @@ spec:
 
   commit_policy:
     mode: required
-
-  schema_sensing:
-    enabled: true
-    deep_inspect:
-      enabled: true
-      max_depth: 3
-    sampling:
-      warmup_events: 50
-      sample_rate: 5
 ```
 
-### PostgreSQL to Kafka
+### PostgreSQL to Kafka with CloudEvents
 
 ```yaml
 apiVersion: deltaforge/v1
@@ -528,7 +545,70 @@ spec:
         id: users-kafka
         brokers: ${KAFKA_BROKERS}
         topic: user-events
+        envelope:
+          type: cloudevents
+          type_prefix: "com.acme.users"
+        encoding: json
         required: true
+
+  batch:
+    max_events: 500
+    max_ms: 1000
+    respect_source_tx: true
+
+  commit_policy:
+    mode: required
+```
+
+### Multi-sink with different formats
+
+```yaml
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: orders-multi-sink
+  tenant: acme
+
+spec:
+  source:
+    type: mysql
+    config:
+      id: orders-mysql
+      dsn: ${MYSQL_DSN}
+      tables:
+        - shop.orders
+
+  sinks:
+    # Kafka Connect expects Debezium format
+    - type: kafka
+      config:
+        id: connect-sink
+        brokers: ${KAFKA_BROKERS}
+        topic: connect-events
+        envelope:
+          type: debezium
+        required: true
+
+    # Lambda expects CloudEvents
+    - type: kafka
+      config:
+        id: lambda-sink
+        brokers: ${KAFKA_BROKERS}
+        topic: lambda-events
+        envelope:
+          type: cloudevents
+          type_prefix: "com.acme.cdc"
+        required: false
+
+    # Redis cache uses native format
+    - type: redis
+      config:
+        id: cache-redis
+        uri: ${REDIS_URI}
+        stream: orders-cache
+        envelope:
+          type: native
+        required: false
 
   batch:
     max_events: 500
@@ -565,6 +645,9 @@ spec:
         url: ${NATS_URL}
         subject: orders.events
         stream: ORDERS
+        envelope:
+          type: native
+        encoding: json
         required: true
 
   batch:

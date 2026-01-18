@@ -103,6 +103,8 @@ DeltaForge is meant to replace tools like Debezium and similar.
   - Kafka producer sink (via `rdkafka`)
   - Redis stream sink
   - NATS JetStream sink (via `async_nats`)
+  - Configurable envelope formats: Native, Debezium, CloudEvents
+  - JSON wire encoding (Avro planned and more to come)
 
 ## Documentation
 
@@ -233,90 +235,55 @@ configuration.
 
 ## Configuration schema
 
-Pipelines are defined as YAML documents that map directly to the `PipelineSpec`
-type. Environment variables are expanded before parsing, so secrets and URLs can
-be injected at runtime.
+Pipelines are defined as YAML documents that map directly to the internal `PipelineSpec` type. 
+Environment variables are expanded before parsing, so secrets and URLs can be injected at runtime.
 
-### MySQL source example
+<table>
+<tr>
+<td width="50%" valign="top">
 
-```yaml
-metadata:
-  name: orders-mysql-to-kafka
-  tenant: acme
+### Key fields
 
-spec:
-  source:
-    type: mysql
-    config:
-      id: orders-mysql
-      dsn: ${MYSQL_DSN}
-      tables:
-        - shop.orders
-        - shop.order_items
+| Field | Description |
+|-------|-------------|
+| **`metadata`** | |
+| `name` | Pipeline identifier (used in API routes and metrics) |
+| `tenant` | Business-oriented tenant label |
+| **`spec.source`** | Database source - [MySQL](docs/src/sources/mysql.md), [PostgreSQL](docs/src/sources/postgres.md), etc. |
+| `type` | `mysql`, `postgres`, etc. |
+| `config.id` | Unique identifier for checkpoints |
+| `config.dsn` | Connection string (supports `${ENV_VAR}`) |
+| `config.tables` | Table patterns to capture |
+| **`spec.processors`** | Optional transforms - see [Processors](docs/src/configuration.md#processors) |
+| `type` | `javascript` |
+| `inline` | JavaScript code for batch processing |
+| `limits` | CPU, memory, and timeout limits |
+| **`spec.sinks`** | One or more sinks - see [Sinks](docs/src/sinks/README.md) |
+| `type` | `kafka`, `redis`, or `nats` |
+| `config.envelope` | Output format: `native`, `debezium`, or `cloudevents` - see [Envelopes](docs/src/envelopes.md) |
+| `config.encoding` | Wire encoding: `json` (default) |
+| `config.required` | Whether sink must ack for checkpoint (`true` default) |
+| **`spec.batch`** | Commit unit thresholds - see [Batching](docs/src/configuration.md#batching) |
+| `max_events` | Flush after N events (default: 500) |
+| `max_bytes` | Flush after size limit (default: 1MB) |
+| `max_ms` | Flush after time (default: 1000ms) |
+| `respect_source_tx` | Keep source transactions intact (`true` default) |
+| **`spec.commit_policy`** | Checkpoint gating - see [Commit policy](docs/src/configuration.md#commit-policy) |
+| `mode` | `all`, `required` (default), or `quorum` |
+| `quorum` | Number of sinks for quorum mode |
+| **`spec.schema_sensing`** | Runtime schema inference - see [Schema sensing](docs/src/schemasensing.md) |
+| `enabled` | Enable schema sensing (`false` default) |
+| `deep_inspect` | Nested JSON inspection settings |
+| `sampling` | Sampling rate and warmup config |
 
-  sinks:
-    - type: kafka
-      config:
-        id: orders-kafka
-        brokers: ${KAFKA_BROKERS}
-        topic: orders
-```
+📘 Full reference: [Configuration docs](docs/src/configuration.md)
 
-### PostgreSQL source example
+View some examples: [Example Configurations](docs/src/examples/README.md)
 
-```yaml
-metadata:
-  name: users-postgres-to-kafka
-  tenant: acme
+</td>
+<td width="50%" valign="top">
 
-spec:
-  source:
-    type: postgres
-    config:
-      id: users-postgres
-      dsn: ${POSTGRES_DSN}
-      slot: deltaforge_users
-      publication: users_pub
-      tables:
-        - public.users
-        - public.user_sessions
-      start_position: earliest
-
-  sinks:
-    - type: kafka
-      config:
-        id: users-kafka
-        brokers: ${KAFKA_BROKERS}
-        topic: user-events
-```
-
-### NATS JetStream sink example
-
-```yaml
-metadata:
-  name: orders-mysql-to-nats
-  tenant: acme
-
-spec:
-  source:
-    type: mysql
-    config:
-      id: orders-mysql
-      dsn: ${MYSQL_DSN}
-      tables:
-        - shop.orders
-
-  sinks:
-    - type: nats
-      config:
-        id: orders-nats
-        url: ${NATS_URL}
-        subject: orders.events
-        stream: ORDERS
-        required: true
-```
-
-### Full configuration example
+### Full Example
 
 ```yaml
 metadata:
@@ -324,13 +291,11 @@ metadata:
   tenant: acme
 
 spec:
-  # Optional: shard downstream processing
   sharding:
     mode: hash
     count: 4
     key: customer_id
 
-  # Source definition
   source:
     type: mysql
     config:
@@ -339,10 +304,9 @@ spec:
       tables:
         - shop.orders
 
-  # Zero or more processors
   processors:
     - type: javascript
-      id: transform
+      id: my-custom-transform
       inline: |
         function processBatch(events) {
           return events;
@@ -352,43 +316,35 @@ spec:
         mem_mb: 128
         timeout_ms: 500
 
-  # One or more sinks
   sinks:
     - type: kafka
       config:
         id: orders-kafka
         brokers: ${KAFKA_BROKERS}
         topic: orders
+        envelope:
+          type: debezium
+        encoding: json
         required: true
         exactly_once: false
-        client_conf:
-          message.timeout.ms: "5000"
     - type: redis
       config:
         id: orders-redis
         uri: ${REDIS_URI}
         stream: orders
-    - type: nats
-      config:
-        id: orders-nats
-        url: ${NATS_URL}
-        subject: orders.events
-        stream: ORDERS
+        envelope:
+          type: native
   
-  # Batch config
   batch:
     max_events: 500
     max_bytes: 1048576
     max_ms: 1000
     respect_source_tx: true
-    max_inflight: 2
 
-  # Commit policy
   commit_policy:
     mode: quorum
     quorum: 2
 
-  # Optional: schema sensing
   schema_sensing:
     enabled: true
     deep_inspect:
@@ -399,17 +355,9 @@ spec:
       sample_rate: 5
 ```
 
-Key fields:
-
-- `metadata` - required name (used as pipeline identifier) and tenant label.
-- `spec.sharding` - optional hint for downstream distribution.
-- `spec.source` - required source configuration (MySQL, PostgreSQL, or Turso).
-- `spec.processors` - ordered processors; JavaScript is supported today with optional resource limits.
-- `spec.sinks` - one or more sinks; Kafka supports `required`, `exactly_once`, and raw `client_conf` overrides; Redis streams and NATS JetStream are also available.
-- `spec.batch` - optional thresholds that define the commit unit.
-- `spec.commit_policy` - how sink acknowledgements gate checkpoint commits (`all`, `required` (default), or `quorum`).
-- `spec.schema_sensing` - optional automatic schema inference from event payloads.
-
+</td>
+</tr>
+</table>
 
 ## Roadmap
 
