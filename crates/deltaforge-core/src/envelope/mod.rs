@@ -21,7 +21,10 @@ pub use debezium::Debezium;
 pub use native::Native;
 
 use crate::Event;
-use bytes::Bytes;
+//use bytes::Bytes;
+use cloudevents::CloudEventsWrapper;
+use debezium::DebeziumWrapper;
+use serde::Serialize;
 
 /// Envelope serialization trait.
 ///
@@ -31,16 +34,16 @@ pub trait Envelope: Send + Sync {
     /// Envelope identifier for logging/metrics.
     fn name(&self) -> &'static str;
 
-    /// Serialize an event to bytes.
-    fn serialize(&self, event: &Event) -> Result<Bytes, EnvelopeError>;
+    /// Build an envelope-ready payload for encoding.
+    fn wrap<'a>(
+        &'a self,
+        event: &'a Event,
+    ) -> Result<EnvelopeData<'a>, EnvelopeError>;
 }
 
 /// Envelope serialization error.
 #[derive(Debug, thiserror::Error)]
 pub enum EnvelopeError {
-    #[error("serialization failed: {0}")]
-    Serialization(#[from] serde_json::Error),
-
     #[error("envelope error: {0}")]
     Other(String),
 }
@@ -60,6 +63,26 @@ pub enum EnvelopeType {
         /// Type prefix for event type field (e.g., "com.example.cdc")
         type_prefix: String,
     },
+}
+
+/// Envelope payloads ready for encoding.
+pub enum EnvelopeData<'a> {
+    Native(&'a Event),
+    Debezium(DebeziumWrapper<'a>),
+    CloudEvents(CloudEventsWrapper<'a>),
+}
+
+impl Serialize for EnvelopeData<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            EnvelopeData::Native(event) => event.serialize(serializer),
+            EnvelopeData::Debezium(wrapper) => wrapper.serialize(serializer),
+            EnvelopeData::CloudEvents(wrapper) => wrapper.serialize(serializer),
+        }
+    }
 }
 
 impl EnvelopeType {

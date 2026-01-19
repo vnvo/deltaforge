@@ -176,8 +176,14 @@ impl KafkaSink {
 
     /// Serialize event using configured envelope.
     fn serialize_event(&self, event: &Event) -> SinkResult<Vec<u8>> {
-        self.envelope
-            .serialize(event)
+        let envelope = self.envelope.wrap(event).map_err(|e| {
+            SinkError::Serialization {
+                details: e.to_string().into(),
+            }
+        })?;
+
+        self.encoding
+            .encode(&envelope)
             .map(|b| b.to_vec())
             .map_err(|e| SinkError::Serialization {
                 details: e.to_string().into(),

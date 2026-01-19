@@ -3,10 +3,9 @@
 //! Some Debezium consumers expect the outer envelope structure.
 //! This adds minimal overhead (~12 bytes) around the native Event.
 
-use bytes::Bytes;
 use serde::Serialize;
 
-use super::{Envelope, EnvelopeError};
+use super::{Envelope, EnvelopeData, EnvelopeError};
 use crate::Event;
 
 /// Debezium envelope - wraps Event in `{"payload": <event>}`.
@@ -28,7 +27,7 @@ pub struct Debezium;
 
 /// Wrapper struct for serialization.
 #[derive(Serialize)]
-struct DebeziumWrapper<'a> {
+pub struct DebeziumWrapper<'a> {
     payload: &'a Event,
 }
 
@@ -38,10 +37,12 @@ impl Envelope for Debezium {
     }
 
     #[inline]
-    fn serialize(&self, event: &Event) -> Result<Bytes, EnvelopeError> {
+    fn wrap<'a>(
+        &'a self,
+        event: &'a Event,
+    ) -> Result<EnvelopeData<'a>, EnvelopeError> {
         let wrapper = DebeziumWrapper { payload: event };
-        let bytes = serde_json::to_vec(&wrapper)?;
-        Ok(Bytes::from(bytes))
+        Ok(EnvelopeData::Debezium(wrapper))
     }
 }
 
@@ -73,8 +74,8 @@ mod tests {
         );
 
         let envelope = Debezium;
-        let bytes = envelope.serialize(&event).unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = envelope.wrap(&event).unwrap();
+        let json = serde_json::to_value(&data).unwrap();
 
         // Verify wrapper structure
         assert!(json["payload"].is_object());

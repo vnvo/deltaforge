@@ -4,9 +4,7 @@
 //! this is the most efficient option for consumers that don't need
 //! the outer `{"payload": ...}` wrapper.
 
-use bytes::Bytes;
-
-use super::{Envelope, EnvelopeError};
+use super::{Envelope, EnvelopeData, EnvelopeError};
 use crate::Event;
 
 /// Native envelope - serializes Event directly.
@@ -30,9 +28,11 @@ impl Envelope for Native {
     }
 
     #[inline]
-    fn serialize(&self, event: &Event) -> Result<Bytes, EnvelopeError> {
-        let bytes = serde_json::to_vec(event)?;
-        Ok(Bytes::from(bytes))
+    fn wrap<'a>(
+        &'a self,
+        event: &'a Event,
+    ) -> Result<EnvelopeData<'a>, EnvelopeError> {
+        Ok(EnvelopeData::Native(event))
     }
 }
 
@@ -64,8 +64,8 @@ mod tests {
         );
 
         let envelope = Native;
-        let bytes = envelope.serialize(&event).unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = envelope.wrap(&event).unwrap();
+        let json = serde_json::to_value(&data).unwrap();
 
         assert_eq!(json["op"], "c");
         assert_eq!(json["source"]["connector"], "mysql");

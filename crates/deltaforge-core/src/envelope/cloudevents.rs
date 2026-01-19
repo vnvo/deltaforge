@@ -3,11 +3,10 @@
 //! CloudEvents is a common format for serverless/event-driven architectures.
 //! This envelope restructures the Event to match the CloudEvents spec.
 
-use bytes::Bytes;
 use serde::Serialize;
 use uuid::Uuid;
 
-use super::{Envelope, EnvelopeError};
+use super::{Envelope, EnvelopeData, EnvelopeError};
 use crate::{Event, Op};
 
 /// CloudEvents envelope - restructures Event to CloudEvents 1.0.
@@ -42,7 +41,7 @@ impl CloudEvents {
 
 /// CloudEvents wire format.
 #[derive(Serialize)]
-struct CloudEventsWrapper<'a> {
+pub struct CloudEventsWrapper<'a> {
     specversion: &'static str,
     id: String,
     source: String,
@@ -56,7 +55,7 @@ struct CloudEventsWrapper<'a> {
 }
 
 #[derive(Serialize)]
-struct CloudEventsData<'a> {
+pub(crate) struct CloudEventsData<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     before: Option<&'a serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,7 +68,10 @@ impl Envelope for CloudEvents {
         "cloudevents"
     }
 
-    fn serialize(&self, event: &Event) -> Result<Bytes, EnvelopeError> {
+    fn wrap<'a>(
+        &'a self,
+        event: &'a Event,
+    ) -> Result<EnvelopeData<'a>, EnvelopeError> {
         let op_suffix = match event.op {
             Op::Create => "created",
             Op::Update => "updated",
@@ -102,8 +104,7 @@ impl Envelope for CloudEvents {
             },
         };
 
-        let bytes = serde_json::to_vec(&wrapper)?;
-        Ok(Bytes::from(bytes))
+        Ok(EnvelopeData::CloudEvents(wrapper))
     }
 }
 
@@ -135,8 +136,8 @@ mod tests {
         );
 
         let envelope = CloudEvents::new("com.example.cdc");
-        let bytes = envelope.serialize(&event).unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = envelope.wrap(&event).unwrap();
+        let json = serde_json::to_value(&data).unwrap();
 
         // Verify CloudEvents structure
         assert_eq!(json["specversion"], "1.0");

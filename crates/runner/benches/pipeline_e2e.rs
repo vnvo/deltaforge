@@ -28,6 +28,7 @@ use deltaforge_config::{BatchConfig, SamplingConfig, SchemaSensingConfig};
 use deltaforge_core::{
     ArcDynSink, CheckpointMeta, Event, Op, Sink, SinkResult, SourceInfo,
     SourcePosition,
+    encoding::EncodingType,
     envelope::{Envelope, EnvelopeType},
 };
 use serde_json::json;
@@ -147,6 +148,7 @@ struct EnvelopeSink {
     id: String,
     required: bool,
     envelope: Box<dyn Envelope>,
+    encoding: EncodingType,
     bytes_written: Arc<AtomicU64>,
     event_count: Arc<AtomicU64>,
 }
@@ -163,6 +165,7 @@ impl EnvelopeSink {
                 id: id.to_string(),
                 required: true,
                 envelope: envelope_type.build(),
+                encoding: EncodingType::Json,
                 bytes_written: bytes_written.clone(),
                 event_count: event_count.clone(),
             }),
@@ -205,7 +208,11 @@ impl Sink for EnvelopeSink {
     async fn send(&self, event: &Event) -> SinkResult<()> {
         let data = self
             .envelope
-            .serialize(event)
+            .wrap(event)
+            .map_err(|e| deltaforge_core::SinkError::Other(e.into()))?;
+        let data = self
+            .encoding
+            .encode(&data)
             .map_err(|e| deltaforge_core::SinkError::Other(e.into()))?;
         self.bytes_written
             .fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -218,7 +225,11 @@ impl Sink for EnvelopeSink {
         for event in events {
             let data = self
                 .envelope
-                .serialize(event)
+                .wrap(event)
+                .map_err(|e| deltaforge_core::SinkError::Other(e.into()))?;
+            let data = self
+                .encoding
+                .encode(&data)
                 .map_err(|e| deltaforge_core::SinkError::Other(e.into()))?;
             total_bytes += data.len() as u64;
         }
