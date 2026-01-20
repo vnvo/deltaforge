@@ -270,7 +270,8 @@ impl TursoSource {
     /// Create source info for an event.
     fn build_source_info(&self, table: &str, change_id: i64) -> SourceInfo {
         SourceInfo {
-            version: concat!("deltaforge-", env!("CARGO_PKG_VERSION")).to_string(),
+            version: concat!("deltaforge-", env!("CARGO_PKG_VERSION"))
+                .to_string(),
             connector: "turso".into(),
             name: self.pipeline.clone(),
             ts_ms: Utc::now().timestamp_millis(),
@@ -396,11 +397,7 @@ impl TursoSource {
 
             // Poll for changes
             let poll_result = self
-                .poll_cdc_changes(
-                    &poll_conn,
-                    &tx,
-                    checkpoint.clone(),
-                )
+                .poll_cdc_changes(&poll_conn, &tx, checkpoint.clone())
                 .await;
 
             // For local files, drop connection immediately after poll

@@ -28,6 +28,7 @@ pub struct Debezium;
 /// Wrapper struct for serialization.
 #[derive(Serialize)]
 pub struct DebeziumWrapper<'a> {
+    schema: serde_json::Value,
     payload: &'a Event,
 }
 
@@ -41,7 +42,10 @@ impl Envelope for Debezium {
         &'a self,
         event: &'a Event,
     ) -> Result<EnvelopeData<'a>, EnvelopeError> {
-        let wrapper = DebeziumWrapper { payload: event };
+        let wrapper = DebeziumWrapper {
+            schema: serde_json::Value::Null,
+            payload: event,
+        };
         Ok(EnvelopeData::Debezium(wrapper))
     }
 }
@@ -78,6 +82,7 @@ mod tests {
         let json = serde_json::to_value(&data).unwrap();
 
         // Verify wrapper structure
+        assert!(json["schema"].is_null());
         assert!(json["payload"].is_object());
         assert_eq!(json["payload"]["op"], "c");
         assert_eq!(json["payload"]["source"]["connector"], "mysql");

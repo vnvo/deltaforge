@@ -19,7 +19,8 @@ Event -> Envelope (structure) -> Encoding (bytes) -> Sink
 
 The native envelope serializes events directly with minimal overhead. This is DeltaForge's own format, optimized for efficiency and practical use cases.
 
-> **Note**: The native envelope format may evolve over time as we adapt to user needs and optimize for the lowest possible overhead. If you need a stable, standardized format, consider using `debezium` or `cloudevents` envelopes which follow their respective established specifications.
+>[!NOTE] 
+> The native envelope format may evolve over time as we adapt to user needs and optimize for the lowest possible overhead. If you need a stable, standardized format, consider using `debezium` or `cloudevents` envelopes which follow their respective established specifications.
 
 ```yaml
 sinks:
@@ -62,8 +63,12 @@ sinks:
 
 ### Debezium
 
-The Debezium envelope wraps the event in a `{"payload": ...}` structure, following the [Debezium event format specification](https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-events). This format is guaranteed to remain compatible with the Debezium ecosystem.
+The Debezium envelope wraps the event in a `{"schema": null, "payload": ...}` structure, 
+following the [Debezium event format specification](https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-events). 
 
+This uses **schemaless mode** (`schema: null`), which is equivalent to Debezium's 
+`JsonConverter` with `schemas.enable=false`. This is the recommended configuration 
+for most production deployments as it avoids the overhead of inline schemas.
 ```yaml
 sinks:
   - type: kafka
@@ -76,9 +81,9 @@ sinks:
 ```
 
 **Output:**
-
 ```json
 {
+  "schema": null,
   "payload": {
     "before": null,
     "after": {"id": 1, "name": "Alice", "email": "alice@example.com"},
@@ -101,6 +106,9 @@ sinks:
 - Existing Debezium-based pipelines you're migrating from
 - Tools that specifically parse the `payload` wrapper
 - When you need a stable, well-documented format with broad ecosystem support
+
+> **Note:** For Schema Registry integration with Avro encoding (planned), schema handling 
+> will move to the encoding layer where schema IDs are embedded in the wire format.
 
 ### CloudEvents
 
@@ -294,8 +302,8 @@ These codes appear in the `op` field regardless of envelope format.
 
 | Envelope | Overhead | Format Stability | Use Case |
 |----------|----------|------------------|----------|
-| Native | Minimal | May evolve | High-throughput, internal systems |
-| Debezium | ~12 bytes | Stable (follows Debezium spec) | Kafka Connect, Debezium ecosystem |
+| Native | Baseline (minimal) | May evolve | High-throughput, internal systems |
+| Debezium | ~14 bytes | Stable (follows Debezium spec) | Kafka Connect, Debezium ecosystem |
 | CloudEvents | ~150-200 bytes | Stable (follows CNCF spec) | Serverless, event-driven architectures |
 
 The native envelope is recommended for maximum throughput when you control both ends of the pipeline. For interoperability with external systems or when format stability is critical, use `debezium` or `cloudevents`.

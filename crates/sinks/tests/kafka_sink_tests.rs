@@ -539,6 +539,14 @@ async fn kafka_sink_debezium_envelope() -> Result<()> {
 
     // Verify Debezium format has payload wrapper
     assert!(
+        parsed.get("schema").is_some(),
+        "debezium format must have 'schema' field"
+    );
+    assert!(
+        parsed.get("schema").unwrap().is_null(),
+        "debezium schema should be null (schemaless mode)"
+    );
+    assert!(
         parsed.get("payload").is_some(),
         "debezium format must have 'payload' wrapper"
     );
@@ -577,6 +585,57 @@ async fn kafka_sink_debezium_envelope() -> Result<()> {
     );
 
     info!("✓ debezium envelope format works correctly");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
+/// Verify exact wire format for Debezium envelope.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_debezium_wire_format() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let topic = test_topic("debezium-wire-format");
+    let brokers = brokers();
+    create_topic(&brokers, &topic, 1).await?;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-wire-format".into(),
+        brokers: brokers.clone(),
+        topic: topic.clone(),
+        envelope: EnvelopeCfg::Debezium,
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    let event = make_test_event(1);
+    sink.send(&event).await?;
+
+    let consumer =
+        create_consumer(&brokers, &topic, "test-wire-format-consumer")?;
+    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
+        !msgs.is_empty()
+    })
+    .await;
+
+    let raw = String::from_utf8_lossy(&messages[0]);
+
+    // Verify wire format starts with expected structure
+    // This catches field ordering changes and unexpected fields
+    assert!(
+        raw.starts_with(r#"{"schema":null,"payload":{"#),
+        "Debezium wire format should start with {{\"schema\":null,\"payload\":{{, got: {}",
+        &raw[..raw.len().min(100)]
+    );
+
+    info!("✓ debezium wire format matches spec");
     delete_topic(&brokers, &topic).await?;
     Ok(())
 }
