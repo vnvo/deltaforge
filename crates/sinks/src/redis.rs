@@ -9,6 +9,8 @@
 //! - **Automatic reconnection**: Exponential backoff with jitter on failures
 //! - **Pipelining**: Batch operations use Redis pipelines for single round-trip
 //! - **Graceful shutdown**: Respects cancellation tokens during operations
+//! - **Configurable envelope**: Native, Debezium, or CloudEvents
+//! - **Configurable encoding**: JSON (Avro/Protobuf planned)
 //!
 //! # Configuration
 //!
@@ -18,6 +20,8 @@
 //!       id: redis-events
 //!       uri: redis://localhost:6379
 //!       stream: deltaforge-events
+//!       envelope: native            # native | debezium | cloudevents
+//!       encoding: json              # json (avro, protobuf planned)
 //!       required: true
 //!       send_timeout_secs: 5        # Per-message timeout
 //!       batch_timeout_secs: 30      # Batch pipeline timeout
@@ -30,6 +34,8 @@ use anyhow::Context;
 use async_trait::async_trait;
 use common::{RetryOutcome, RetryPolicy, redact_url_password, retry_async};
 use deltaforge_config::RedisSinkCfg;
+use deltaforge_core::encoding::EncodingType;
+use deltaforge_core::envelope::Envelope;
 use deltaforge_core::{Event, Sink, SinkError, SinkResult};
 use redis::aio::MultiplexedConnection;
 use tokio::sync::RwLock;
@@ -59,6 +65,11 @@ pub struct RedisSink {
     cfg: RedisSinkCfg,
     client: redis::Client,
     stream: String,
+    /// Envelope for wrapping events (Native, Debezium, CloudEvents)
+    envelope: Box<dyn Envelope>,
+    /// Encoding type (currently just JSON)
+    #[allow(dead_code)]
+    encoding: EncodingType,
     /// Cached multiplexed connection with RwLock for interior mutability.
     /// Using Option to allow lazy initialization and reconnection.
     conn: RwLock<Option<MultiplexedConnection>>,
@@ -109,8 +120,14 @@ impl RedisSink {
             .map(|s| Duration::from_secs(s as u64))
             .unwrap_or(DEFAULT_CONNECT_TIMEOUT);
 
+        // Build envelope and encoding from config
+        let envelope_type = cfg.envelope.to_envelope_type();
+        let encoding_type = cfg.encoding.to_encoding_type();
+
         info!(
             uri = %redact_url_password(&cfg.uri),
+            envelope = %envelope_type.name(),
+            encoding = encoding_type.name(),
             send_timeout_ms = send_timeout.as_millis(),
             batch_timeout_ms = batch_timeout.as_millis(),
             "redis sink created"
@@ -121,12 +138,30 @@ impl RedisSink {
             cfg: cfg.clone(),
             client,
             stream: cfg.stream.clone(),
+            envelope: envelope_type.build(),
+            encoding: encoding_type,
             conn: RwLock::new(None),
             cancel,
             send_timeout,
             batch_timeout,
             connect_timeout,
         })
+    }
+
+    /// Serialize event using configured envelope.
+    fn serialize_event(&self, event: &Event) -> SinkResult<Vec<u8>> {
+        let envelope = self.envelope.wrap(event).map_err(|e| {
+            SinkError::Serialization {
+                details: e.to_string().into(),
+            }
+        })?;
+
+        self.encoding
+            .encode(&envelope)
+            .map(|b| b.to_vec())
+            .map_err(|e| SinkError::Serialization {
+                details: e.to_string().into(),
+            })
     }
 
     /// Get or establish a multiplexed connection with retry logic.
@@ -233,7 +268,7 @@ impl RedisSink {
         &self,
         conn: &mut MultiplexedConnection,
         event_id: &str,
-        payload: &str,
+        payload: &[u8],
     ) -> Result<(), RedisRetryError> {
         let result = tokio::time::timeout(self.send_timeout, async {
             redis::cmd("XADD")
@@ -243,7 +278,7 @@ impl RedisSink {
                 .arg(event_id)
                 .arg("df-event")
                 .arg(payload)
-                .query_async::<String>(conn)
+                .query_async::<()>(conn)
                 .await
         })
         .await;
@@ -255,26 +290,25 @@ impl RedisSink {
         }
     }
 
-    /// Execute a batch pipeline with timeout.
+    /// Execute a batch of XADD commands using a pipeline.
     async fn execute_pipeline(
         &self,
         conn: &mut MultiplexedConnection,
-        serialized: &[(String, String)],
+        items: &[(String, Vec<u8>)],
     ) -> Result<(), RedisRetryError> {
-        let mut pipe = redis::pipe();
-
-        for (event_id, payload) in serialized {
-            pipe.cmd("XADD")
-                .arg(&self.stream)
-                .arg("*")
-                .arg("event_id")
-                .arg(event_id)
-                .arg("df-event")
-                .arg(payload)
-                .ignore();
-        }
-
         let result = tokio::time::timeout(self.batch_timeout, async {
+            let mut pipe = redis::pipe();
+
+            for (event_id, payload) in items {
+                pipe.cmd("XADD")
+                    .arg(&self.stream)
+                    .arg("*")
+                    .arg("event_id")
+                    .arg(event_id)
+                    .arg("df-event")
+                    .arg(payload);
+            }
+
             pipe.query_async::<()>(conn).await
         })
         .await;
@@ -297,11 +331,12 @@ impl Sink for RedisSink {
         self.cfg.required.unwrap_or(true)
     }
 
-    #[instrument(skip_all, fields(sink_id = %self.id, event_id = %event.event_id))]
+    #[instrument(skip_all, fields(sink_id = %self.id))]
     async fn send(&self, event: &Event) -> SinkResult<()> {
-        // Pre-serialize to separate serialization errors from network errors
-        let payload = serde_json::to_string(event)?;
-        let event_id = event.event_id.to_string();
+        // Serialize using configured envelope
+        let payload = self.serialize_event(event)?;
+        let event_id =
+            event.event_id.map(|id| id.to_string()).unwrap_or_default();
 
         // Retry loop for transient failures
         let policy = RetryPolicy::new(
@@ -357,10 +392,15 @@ impl Sink for RedisSink {
             return Ok(());
         }
 
-        // Pre-serialize all payloads to separate serialization from network errors
-        let serialized: Vec<(String, String)> = events
+        // Pre-serialize all payloads using configured envelope
+        let serialized: Vec<(String, Vec<u8>)> = events
             .iter()
-            .map(|e| Ok((e.event_id.to_string(), serde_json::to_string(e)?)))
+            .map(|e| {
+                Ok((
+                    e.event_id.map(|id| id.to_string()).unwrap_or_default(),
+                    self.serialize_event(e)?,
+                ))
+            })
             .collect::<Result<Vec<_>, SinkError>>()?;
 
         // Retry loop for transient failures

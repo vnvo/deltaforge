@@ -4,7 +4,7 @@
 //!
 //! Run with:
 //! ```bash
-//! cargo test -p sources --test mysql_cdc_e2e -- --include-ignored --nocapture
+//! cargo test -p sources --test mysql_cdc_e2e -- --include-ignored --nocapture --test-threads=1
 //! ```
 
 use anyhow::Result;
@@ -232,7 +232,7 @@ where
         let remaining = deadline.saturating_duration_since(Instant::now());
         match timeout(remaining, rx.recv()).await {
             Ok(Some(e)) => {
-                debug!(op = ?e.op, table = %e.table, "received event");
+                debug!(op = ?e.op, table = %e.source.full_table_name(), "received event");
                 events.push(e);
                 if condition(&events) {
                     break;
@@ -479,7 +479,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
     // Collect events
     let events =
         collect_events_until(&mut rx, Duration::from_secs(15), |evts| {
-            let has_insert = evts.iter().any(|e| e.op == Op::Insert);
+            let has_insert = evts.iter().any(|e| e.op == Op::Create);
             let has_update = evts.iter().any(|e| e.op == Op::Update);
             let has_delete = evts.iter().any(|e| e.op == Op::Delete);
             has_insert && has_update && has_delete
@@ -488,7 +488,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
 
     // Verify all operation types received
     assert!(
-        events.iter().any(|e| e.op == Op::Insert),
+        events.iter().any(|e| e.op == Op::Create),
         "missing INSERT event"
     );
     assert!(
@@ -507,10 +507,10 @@ async fn mysql_cdc_basic_events() -> Result<()> {
 
     // Verify order: INSERT -> UPDATE -> DELETE
     let ops: Vec<Op> = by_id.iter().map(|e| e.op).collect();
-    assert_eq!(ops, vec![Op::Insert, Op::Update, Op::Delete]);
+    assert_eq!(ops, vec![Op::Create, Op::Update, Op::Delete]);
 
     // Verify INSERT payload
-    let ins = by_id.iter().find(|e| e.op == Op::Insert).unwrap();
+    let ins = by_id.iter().find(|e| e.op == Op::Create).unwrap();
     let after = ins.after.as_ref().expect("INSERT must have after");
     assert_eq!(after["id"], 1);
     assert_eq!(after["sku"], "sku-1");
@@ -538,7 +538,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
 
     // Verify metadata on all events
     for e in &by_id {
-        assert_eq!(e.table, format!("{}.orders", db_name));
+        assert_eq!(e.source.full_table_name(), format!("{}.orders", db_name));
         assert_eq!(e.source.db, db_name);
         assert!(e.schema_version.is_some(), "missing schema_version");
         assert!(e.schema_sequence.is_some(), "missing schema_sequence");
@@ -921,15 +921,18 @@ async fn mysql_cdc_table_filtering() -> Result<()> {
 
     let events =
         collect_events_until(&mut rx, Duration::from_secs(10), |evts| {
-            evts.iter()
-                .any(|e| e.table == format!("{}.orders", db_name))
+            evts.iter().any(|e| {
+                e.source.full_table_name() == format!("{}.orders", db_name)
+            })
         })
         .await;
 
     // Should only have orders events
     // No audit_log events should be captured
     assert!(
-        events.iter().all(|e| !e.table.contains("audit_log")),
+        events
+            .iter()
+            .all(|e| !e.source.full_table_name().contains("audit_log")),
         "audit_log should be filtered out"
     );
 
@@ -937,8 +940,10 @@ async fn mysql_cdc_table_filtering() -> Result<()> {
     assert!(
         events
             .iter()
-            .filter(|e| !matches!(e.op, Op::Ddl))
-            .all(|e| e.table == format!("{}.orders", db_name)),
+            .filter(|e| e.ddl.is_none())
+            .all(
+                |e| e.source.full_table_name() == format!("{}.orders", db_name)
+            ),
         "only orders table should be captured"
     );
 

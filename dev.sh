@@ -20,12 +20,14 @@ Usage:
   ./dev.sh up                     # start local stack
   ./dev.sh down                   # stop & remove
   ./dev.sh ps                     # list services
+  ./dev.sh status                 # check all services health
 
 Kafka:
   ./dev.sh k-list
   ./dev.sh k-create <topic> [partitions=6] [replication=1]
   ./dev.sh k-consume <topic> [--from-beginning] [--keys]
   ./dev.sh k-produce <topic>
+  ./dev.sh k-inspect <topic> [count=1]  # consume and pretty-print JSON
 
 Redis:
   ./dev.sh redis-cli              # open redis-cli
@@ -39,6 +41,9 @@ NATS:
   ./dev.sh nats-stream-info <n>   # show stream details
   ./dev.sh nats-stream-rm <n>     # delete a stream
   ./dev.sh nats-stream-view <n> [count=10]  # view messages
+  ./dev.sh nats-consumer-add <stream> <consumer>  # create durable consumer
+  ./dev.sh nats-consumer-ls <stream>              # list consumers
+  ./dev.sh nats-consumer-next <stream> <consumer> # fetch next message  
 
 PostgreSQL:
   ./dev.sh pg-sh                  # psql into Postgres (orders DB)
@@ -66,9 +71,11 @@ Dev:
   ./dev.sh run-pg                 # run with Postgres example config
   ./dev.sh run-mysql              # run with MySQL example config
   ./dev.sh run-nats               # run with NATS example config
+  ./dev.sh run-envelopes          # run with envelope test config
   ./dev.sh fmt                    # format Rust code (cargo fmt --all)
   ./dev.sh lint                   # run clippy with warnings as errors
   ./dev.sh test                   # run test suite
+  ./dev.sh test-envelopes         # run envelope integration tests
   ./dev.sh check                  # run fmt-check + clippy + tests (what CI does)
   ./dev.sh cov                    # run coverage (cargo llvm-cov)
 
@@ -114,9 +121,21 @@ EOF
 }
 
 ensure_up() {
-  # quick check: kafka + redis should be Up
+  local missing=()
+  
   if ! "${DC[@]}" ps | grep -q "kafka.*Up"; then
-    echo "⚠️  Services not up. Start them with: ./dev.sh up" >&2
+    missing+=("kafka")
+  fi
+  if ! "${DC[@]}" ps | grep -q "redis.*Up"; then
+    missing+=("redis")
+  fi
+  if ! "${DC[@]}" ps | grep -q "nats.*Up"; then
+    missing+=("nats")
+  fi
+  
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "⚠️  dev services not up: ${missing[*]}" >&2
+    echo "   start them with: ./dev.sh up" >&2
     exit 1
   fi
 }
@@ -148,6 +167,59 @@ ensure_nats() {
 cmd_up()    { "${DC[@]}" up -d; }
 cmd_down()  { "${DC[@]}" down -v; }
 cmd_ps()    { "${DC[@]}" ps; }
+
+cmd_status() {
+  echo "=== DeltaForge Dev Stack Status ==="
+  echo ""
+  
+  # Docker services
+  echo "Docker Services:"
+  "${DC[@]}" ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || "${DC[@]}" ps
+  echo ""
+  
+  # Kafka
+  if "${DC[@]}" ps | grep -q "kafka.*Up"; then
+    echo "✅ Kafka: localhost:9092"
+    local topics
+    topics=$("${DC[@]}" exec -T kafka kafka-topics --list --bootstrap-server localhost:9092 2>/dev/null | wc -l)
+    echo "   Topics: $topics"
+  else
+    echo "❌ Kafka: not running"
+  fi
+  
+  # Redis
+  if "${DC[@]}" ps | grep -q "redis.*Up"; then
+    echo "✅ Redis: localhost:6379"
+  else
+    echo "❌ Redis: not running"
+  fi
+  
+  # NATS
+  if "${DC[@]}" ps | grep -q "nats.*Up"; then
+    echo "✅ NATS: localhost:4222"
+    local streams
+    streams=$("${DC[@]}" exec -T nats nats stream list --json 2>/dev/null | grep -c '"name"' || echo "0")
+    echo "   Streams: $streams"
+  else
+    echo "❌ NATS: not running"
+  fi
+  
+  # PostgreSQL
+  if "${DC[@]}" ps | grep -q "postgres.*Up"; then
+    echo "✅ PostgreSQL: localhost:5432"
+  else
+    echo "⚪ PostgreSQL: not running (optional)"
+  fi
+  
+  # MySQL
+  if "${DC[@]}" ps | grep -q "mysql.*Up"; then
+    echo "✅ MySQL: localhost:3306"
+  else
+    echo "⚪ MySQL: not running (optional)"
+  fi
+  
+  echo ""
+}
 
 cmd_k_list() {
   ensure_up
@@ -185,6 +257,22 @@ cmd_k_consume() {
     --bootstrap-server "$BOOTSTRAP" --topic "$topic" $from "${props[@]}"
 }
 
+cmd_k_inspect() {
+  ensure_up
+  local topic="${1:-}"; shift || true
+  local count="${1:-1}"
+  if [[ -z "$topic" ]]; then echo "Usage: ./dev.sh k-inspect <topic> [count=1]"; exit 1; fi
+  
+  echo "Inspecting $count message(s) from $topic..."
+  "${DC[@]}" exec -e KAFKA_OPTS="" kafka kafka-console-consumer \
+    --bootstrap-server "$BOOTSTRAP" \
+    --topic "$topic" \
+    --from-beginning \
+    --max-messages "$count" 2>/dev/null | while read -r line; do
+      echo "$line" | python3 -m json.tool 2>/dev/null || echo "$line"
+    done
+}
+
 cmd_k_produce() {
   ensure_up
   local topic="${1:-}"; shift || true
@@ -211,6 +299,41 @@ cmd_redis_read() {
 # ============================================================
 # NATS commands
 # ============================================================
+cmd_nats_consumer_add() {
+  ensure_nats
+  local stream="${1:-}"; shift || true
+  local consumer="${1:-}"
+  if [[ -z "$stream" || -z "$consumer" ]]; then
+    echo "Usage: ./dev.sh nats-consumer-add <stream> <consumer>"
+    exit 1
+  fi
+  "${DC[@]}" exec nats nats consumer add "$stream" "$consumer" \
+    --ack explicit \
+    --deliver all \
+    --replay instant \
+    --filter "" \
+    --max-deliver 3
+  echo "✅ Consumer created: $consumer on stream $stream"
+}
+
+cmd_nats_consumer_ls() {
+  ensure_nats
+  local stream="${1:-}"
+  if [[ -z "$stream" ]]; then echo "Usage: ./dev.sh nats-consumer-ls <stream>"; exit 1; fi
+  "${DC[@]}" exec nats nats consumer list "$stream"
+}
+
+cmd_nats_consumer_next() {
+  ensure_nats
+  local stream="${1:-}"; shift || true
+  local consumer="${1:-}"
+  if [[ -z "$stream" || -z "$consumer" ]]; then
+    echo "Usage: ./dev.sh nats-consumer-next <stream> <consumer>"
+    exit 1
+  fi
+  "${DC[@]}" exec nats nats consumer next "$stream" "$consumer" --count 1
+}
+
 cmd_nats_sub() {
   ensure_nats
   local subject="${1:-}"
@@ -413,6 +536,25 @@ cmd_mysql_delete() {
   echo "Deleting latest order_item..."
   "${DC[@]}" exec mysql mysql -udf -pdfpw orders -e \
     "DELETE FROM order_items WHERE id = (SELECT id FROM (SELECT MAX(id) as id FROM order_items) t); SELECT 'Deleted' as status;"
+}
+
+
+# ============================================================
+# Envelope commands
+# ============================================================
+cmd_test_envelopes() {
+  echo "Running envelope integration tests..."
+  cargo test -p sinks --test kafka_sink_tests -- \
+    --include-ignored \
+    --test-threads=1 \
+    kafka_sink_native_envelope \
+    kafka_sink_debezium_envelope \
+    kafka_sink_cloudevents_envelope
+  echo "✅ Envelope tests passed"
+}
+
+cmd_run_envelopes() {
+  cargo run -p runner -- --config examples/dev.envelopes.yaml
 }
 
 # ============================================================
@@ -794,12 +936,14 @@ case "${1:-}" in
   up) shift; cmd_up "$@";;
   down) shift; cmd_down "$@";;
   ps) shift; cmd_ps "$@";;
+  status) shift; cmd_status "$@";;
 
   # Kafka
   k-list) shift; cmd_k_list "$@";;
   k-create) shift; cmd_k_create "$@";;
   k-consume) shift; cmd_k_consume "$@";;
   k-produce) shift; cmd_k_produce "$@";;
+  k-inspect) shift; cmd_k_inspect "$@";;
 
   # Redis
   redis-cli) shift; cmd_redis_cli "$@";;
@@ -813,6 +957,9 @@ case "${1:-}" in
   nats-stream-info) shift; cmd_nats_stream_info "$@";;
   nats-stream-rm) shift; cmd_nats_stream_rm "$@";;
   nats-stream-view) shift; cmd_nats_stream_view "$@";;
+  nats-consumer-add) shift; cmd_nats_consumer_add "$@";;
+  nats-consumer-ls) shift; cmd_nats_consumer_ls "$@";;
+  nats-consumer-next) shift; cmd_nats_consumer_next "$@";;
 
   # PostgreSQL
   pg-sh) shift; cmd_pg_sh "$@";;
@@ -836,15 +983,18 @@ case "${1:-}" in
   # Dev
   build) shift; cmd_build "$@";;
   build-release) shift; cmd_build_release "$@";;
-  run) shift; cmd_run "$@";;
+  run) shift; cmd_run "$@";;  
   run-pg) shift; cmd_run_pg "$@";;
   run-mysql) shift; cmd_run_mysql "$@";;
   run-nats) shift; cmd_run_nats "$@";;
+  run-envelopes) shift; cmd_run_envelopes "$@";;
+  test-envelopes) shift; cmd_test_envelopes "$@";;  
   fmt) shift; cmd_fmt "$@";;
   lint) shift; cmd_lint "$@";;
   test) shift; cmd_test "$@";;
   check) shift; cmd_check "$@";;
   cov) shift; cmd_cov "$@";;
+
 
   # Turso (hidden - experimental, not documented)
   # Commands still work but not shown in help

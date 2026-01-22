@@ -212,7 +212,7 @@ pub struct MicrobatchConfig {
 }
 
 /// How sink acks gate checkpointing when multiple sinks are configured.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum CommitPolicy {
     /// All sinks (or all marked as required) must ack the batch.

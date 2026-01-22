@@ -1,8 +1,15 @@
+//! JS Processor benchmarks.
+//!
+//! Measures JS processor overhead compared to Rust baseline and different
+//! processing patterns (passthrough, mutation, expansion).
+//!
+//! Run with: cargo bench -p processors --bench js_processor_bench
+
 use anyhow::Result;
 use criterion::{
     Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
-use deltaforge_core::{Event, Op, Processor, SourceMeta};
+use deltaforge_core::{Event, Op, Processor, SourceInfo, SourcePosition};
 use once_cell::sync::Lazy;
 use processors::JsProcessor;
 use serde_json::json;
@@ -11,47 +18,67 @@ use tokio::runtime::Runtime;
 
 static RT: Lazy<Runtime> = Lazy::new(|| Runtime::new().unwrap());
 
+fn make_source_info() -> SourceInfo {
+    SourceInfo {
+        version: "1.0.0".into(),
+        connector: "mysql".into(),
+        name: "bench-db".into(),
+        ts_ms: 1_700_000_000_000,
+        db: "shop".into(),
+        schema: None,
+        table: "orders".into(),
+        snapshot: None,
+        position: SourcePosition::default(),
+    }
+}
+
 fn make_small_event() -> Event {
     Event::new_row(
-        "t1".into(),
-        SourceMeta {
-            kind: "mysql".into(),
-            host: "h".into(),
-            db: "d".into(),
-        },
-        "d.orders".into(),
-        Op::Insert,
+        make_source_info(),
+        Op::Create,
         None,
         Some(json!({"id": 1, "sku": "ABC-1", "qty": 2})),
         1_700_000_000_000,
-        10_usize,
+        64,
     )
 }
 
 fn make_large_event(bytes: usize) -> Event {
     let big = "x".repeat(bytes);
     Event::new_row(
-        "t1".into(),
-        SourceMeta {
-            kind: "mysql".into(),
-            host: "h".into(),
-            db: "d".into(),
-        },
-        "d.orders".into(),
-        Op::Insert,
+        make_source_info(),
+        Op::Create,
         None,
         Some(json!({
             "id": 1,
             "desc": big,
-            "tags": ["a","b","c"],
-            "nested": {"k": [1,2,3,4,5]}
+            "tags": ["a", "b", "c"],
+            "nested": {"k": [1, 2, 3, 4, 5]}
         })),
         1_700_000_000_000,
-        25_usize,
+        bytes,
     )
 }
 
-// A tiny Rust baseline processor (does nothing, in-place)
+fn make_batch(size: usize) -> Vec<Event> {
+    (0..size)
+        .map(|i| {
+            Event::new_row(
+                make_source_info(),
+                Op::Create,
+                None,
+                Some(json!({"id": i, "sku": format!("SKU-{}", i), "qty": i % 10})),
+                1_700_000_000_000,
+                64,
+            )
+        })
+        .collect()
+}
+
+// ============================================================================
+// Rust Baseline Processor
+// ============================================================================
+
 struct RustNoop;
 
 #[async_trait::async_trait]
@@ -60,106 +87,22 @@ impl Processor for RustNoop {
         "noop"
     }
     async fn process(&self, events: Vec<Event>) -> Result<Vec<Event>> {
-        // Just pass the same Vec through without touching it.
         Ok(events)
     }
 }
 
-// -------- Pooled JS prototype (single runtime, per-event) --------
-// (kept as a micro-benchmark to compare against the real JsProcessor)
-mod pooled {
-    use super::*;
-    use deno_core::{JsRuntime, RuntimeOptions, extension};
-    use deno_core::{serde_v8, v8};
-    use serde_json::Value;
+// ============================================================================
+// Benchmarks
+// ============================================================================
 
-    extension!(df_ext, ops = [op_log]);
-    #[deno_core::op2(fast)]
-    fn op_log(#[string] _msg: &str) { /* no-op in bench */
-    }
-
-    pub struct PooledJs {
-        rt: std::sync::Mutex<JsRuntime>,
-    }
-
-    impl PooledJs {
-        pub fn new(source: String) -> Self {
-            let ext = df_ext::init();
-            let mut rt = JsRuntime::new(RuntimeOptions {
-                extensions: vec![ext],
-                ..Default::default()
-            });
-            // Install compiled function once
-            let code = format!(
-                r#"
-                globalThis.processEvent = (event) => {{
-                    const userFn = (event) => {{ {source} }};
-                    return userFn(event);
-                }};
-                "#,
-                source = source
-            );
-            rt.execute_script("bootstrap.js", code).unwrap();
-            Self {
-                rt: std::sync::Mutex::new(rt),
-            }
-        }
-
-        pub fn call(&self, event: &Event) -> Vec<Event> {
-            let ev_json: Value = serde_json::to_value(event).unwrap();
-            let mut rt = self.rt.lock().unwrap();
-            // Call processEvent(event)
-            let result_val: Value = {
-                let scope = &mut rt.handle_scope();
-                let ctx = scope.get_current_context();
-                let global = ctx.global(scope);
-                let name = v8::String::new(scope, "processEvent").unwrap();
-                let val = global.get(scope, name.into()).unwrap();
-                let func = v8::Local::<v8::Function>::try_from(val).unwrap();
-                let arg = serde_v8::to_v8(scope, ev_json).unwrap();
-                let call_result =
-                    func.call(scope, global.into(), &[arg]).unwrap();
-                serde_v8::from_v8(scope, call_result).unwrap()
-            };
-            let arr = result_val
-                .as_array()
-                .cloned()
-                .unwrap_or_else(|| vec![serde_json::to_value(event).unwrap()]);
-            let mut out = Vec::with_capacity(arr.len());
-            for v in arr {
-                out.push(
-                    serde_json::from_value::<Event>(v)
-                        .expect("valid event from JS"),
-                );
-            }
-            out
-        }
-    }
-}
-
-// -------- Bench cases --------
-
-fn bench_js_current_small(c: &mut Criterion) {
-    let mut group = c.benchmark_group("js_current_small");
+fn bench_rust_noop_baseline(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rust_noop_baseline");
     group.throughput(Throughput::Elements(1));
 
-    // JS: increment qty in-place and return the batch
-    let js = r#"
-        function processBatch(events) {
-            for (const event of events) {
-                const qty = (event.after && event.after.qty) || 0;
-                event.after = { ...event.after, qty: qty + 1 };
-            }
-            return events;
-        }
-    "#
-    .to_string();
-
-    let proc =
-        JsProcessor::new("bench_small".to_string(), js).expect("js init ok");
+    let proc = RustNoop;
     let ev = make_small_event();
 
-    group.bench_function("current_js_batch", |b| {
+    group.bench_function("rust_noop", |b| {
         b.iter_custom(|iters| {
             RT.block_on(async {
                 let start = Instant::now();
@@ -175,23 +118,21 @@ fn bench_js_current_small(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_js_current_large(c: &mut Criterion) {
-    let mut group = c.benchmark_group("js_current_large_64k");
-    group.throughput(Throughput::Bytes(64 * 1024));
+fn bench_js_passthrough(c: &mut Criterion) {
+    let mut group = c.benchmark_group("js_passthrough");
+    group.throughput(Throughput::Elements(1));
 
-    // JS: identity batch
     let js = r#"
         function processBatch(events) {
             return events;
         }
-    "#
-    .to_string();
+    "#;
 
     let proc =
-        JsProcessor::new("bench_large".to_string(), js).expect("js init ok");
-    let ev = make_large_event(64 * 1024);
+        JsProcessor::new("passthrough".into(), js.into()).expect("init ok");
+    let ev = make_small_event();
 
-    group.bench_function("current_js_batch_large", |b| {
+    group.bench_function("passthrough", |b| {
         b.iter_custom(|iters| {
             RT.block_on(async {
                 let start = Instant::now();
@@ -207,28 +148,64 @@ fn bench_js_current_large(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_js_array_return(c: &mut Criterion) {
-    let mut group = c.benchmark_group("js_array_return");
-    group.throughput(Throughput::Elements(2)); // returns two events per input
+fn bench_js_mutation(c: &mut Criterion) {
+    let mut group = c.benchmark_group("js_mutation");
+    group.throughput(Throughput::Elements(1));
 
-    // JS: for each event, return two variants
+    let js = r#"
+        function processBatch(events) {
+            for (const ev of events) {
+                if (ev.after) {
+                    ev.after.qty = (ev.after.qty || 0) + 1;
+                    ev.after.processed = true;
+                }
+            }
+            return null; // use mutated input
+        }
+    "#;
+
+    let proc = JsProcessor::new("mutation".into(), js.into()).expect("init ok");
+    let ev = make_small_event();
+
+    group.bench_function("mutation", |b| {
+        b.iter_custom(|iters| {
+            RT.block_on(async {
+                let start = Instant::now();
+                for _ in 0..iters {
+                    let _ = black_box(proc.process(vec![ev.clone()]).await)
+                        .unwrap();
+                }
+                start.elapsed()
+            })
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_js_expansion(c: &mut Criterion) {
+    let mut group = c.benchmark_group("js_expansion");
+    group.throughput(Throughput::Elements(2)); // 1 in, 2 out
+
     let js = r#"
         function processBatch(events) {
             const out = [];
-            for (const event of events) {
-                out.push({ ...event, tags: ["a"] });
-                out.push({ ...event, tags: ["b"] });
+            for (const ev of events) {
+                out.push(ev);
+                const clone = JSON.parse(JSON.stringify(ev));
+                clone.after = clone.after || {};
+                clone.after.is_audit = true;
+                out.push(clone);
             }
             return out;
         }
-    "#
-    .to_string();
+    "#;
 
     let proc =
-        JsProcessor::new("bench_array".to_string(), js).expect("js init ok");
+        JsProcessor::new("expansion".into(), js.into()).expect("init ok");
     let ev = make_small_event();
 
-    group.bench_function("current_js_batch_array_return", |b| {
+    group.bench_function("expansion_1to2", |b| {
         b.iter_custom(|iters| {
             RT.block_on(async {
                 let start = Instant::now();
@@ -245,13 +222,50 @@ fn bench_js_array_return(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_rust_noop_baseline(c: &mut Criterion) {
-    let mut group = c.benchmark_group("rust_noop_baseline");
-    group.throughput(Throughput::Elements(1));
-    let proc = RustNoop;
-    let ev = make_small_event();
+fn bench_js_filtering(c: &mut Criterion) {
+    let mut group = c.benchmark_group("js_filtering");
 
-    group.bench_function("rust_noop_batch", |b| {
+    let js = r#"
+        function processBatch(events) {
+            return events.filter(ev => ev.after && ev.after.qty > 5);
+        }
+    "#;
+
+    let proc =
+        JsProcessor::new("filtering".into(), js.into()).expect("init ok");
+    let batch = make_batch(100);
+    group.throughput(Throughput::Elements(100));
+
+    group.bench_function("filter_100_events", |b| {
+        b.iter_custom(|iters| {
+            RT.block_on(async {
+                let start = Instant::now();
+                for _ in 0..iters {
+                    let _ =
+                        black_box(proc.process(batch.clone()).await).unwrap();
+                }
+                start.elapsed()
+            })
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_js_large_payload(c: &mut Criterion) {
+    let mut group = c.benchmark_group("js_large_payload");
+    group.throughput(Throughput::Bytes(64 * 1024));
+
+    let js = r#"
+        function processBatch(events) {
+            return events;
+        }
+    "#;
+
+    let proc = JsProcessor::new("large".into(), js.into()).expect("init ok");
+    let ev = make_large_event(64 * 1024);
+
+    group.bench_function("64kb_passthrough", |b| {
         b.iter_custom(|iters| {
             RT.block_on(async {
                 let start = Instant::now();
@@ -267,30 +281,37 @@ fn bench_rust_noop_baseline(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_pooled_js_small(c: &mut Criterion) {
-    use pooled::PooledJs;
+fn bench_js_batch_sizes(c: &mut Criterion) {
+    let mut group = c.benchmark_group("js_batch_sizes");
 
-    let mut group = c.benchmark_group("pooled_js_small");
-    group.throughput(Throughput::Elements(1));
-
-    // This is the old per-event semantics: returns a new event with qty+1
     let js = r#"
-        ({ ...event, after: { ...event.after, qty: (event.after.qty||0)+1 } })
-    "#
-    .to_string();
-
-    let pooled = PooledJs::new(js);
-    let ev = make_small_event();
-
-    group.bench_function("pooled_single_runtime_per_event", |b| {
-        b.iter_custom(|iters| {
-            let start = Instant::now();
-            for _ in 0..iters {
-                let _ = black_box(pooled.call(&ev));
+        function processBatch(events) {
+            for (const ev of events) {
+                if (ev.after) ev.after.processed = true;
             }
-            start.elapsed()
-        })
-    });
+            return null;
+        }
+    "#;
+
+    let proc = JsProcessor::new("batch".into(), js.into()).expect("init ok");
+
+    for size in [1, 10, 50, 100, 500] {
+        let batch = make_batch(size);
+        group.throughput(Throughput::Elements(size as u64));
+
+        group.bench_function(format!("batch_{}", size), |b| {
+            b.iter_custom(|iters| {
+                RT.block_on(async {
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        let _ = black_box(proc.process(batch.clone()).await)
+                            .unwrap();
+                    }
+                    start.elapsed()
+                })
+            })
+        });
+    }
 
     group.finish();
 }
@@ -298,9 +319,11 @@ fn bench_pooled_js_small(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_rust_noop_baseline,
-    bench_js_current_small,
-    bench_js_array_return,
-    bench_js_current_large,
-    bench_pooled_js_small,
+    bench_js_passthrough,
+    bench_js_mutation,
+    bench_js_expansion,
+    bench_js_filtering,
+    bench_js_large_payload,
+    bench_js_batch_sizes,
 );
 criterion_main!(benches);

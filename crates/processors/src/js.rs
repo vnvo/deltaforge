@@ -1,3 +1,37 @@
+//! JavaScript processor using Deno runtime.
+//!
+//! # Number Type Limitations
+//!
+//! JavaScript represents all numbers as IEEE 754 double-precision floats (f64).
+//! When events pass through the JS processor, integer fields undergo conversion:
+//!
+//! ```text
+//! Rust i64 → serde_v8 → V8 Number (f64) → serde_v8 → Rust f64
+//! ```
+//!
+//! **This affects ALL numeric values**, even if the JS code doesn't modify them.
+//! Simply returning the input array causes integer→float conversion because
+//! V8 stores all numbers as f64 internally.
+//!
+//! ## Event Struct Fields
+//!
+//! Event metadata fields (`ts_ms`, `size_bytes`, etc.) use lenient deserialization
+//! that accepts both integers and whole-number floats, so they round-trip correctly.
+//!
+//! ## Payload Fields (before/after)
+//!
+//! Payload fields are NOT normalized to preserve user data schema. This means:
+//! - Integer values may become floats: `{"id": 1}` → `{"id": 1.0}`
+//! - Precision loss for large integers (>2^53-1): `9007199254740993` → `9007199254740992.0`
+//! - Original float values are preserved: `{"price": 10.5}` → `{"price": 10.5}`
+//!
+//! ## Recommendations
+//!
+//! - Use JS processor for routing, filtering, and metadata-based transforms
+//! - Avoid modifying numeric payload fields when downstream systems require strict types
+//! - For tables with BIGINT primary keys, consider filtering those events from JS processing
+//! - Use native Rust processors when numeric precision is critical
+
 use std::thread;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -25,16 +59,28 @@ pub struct JsProcessor {
 }
 
 impl JsProcessor {
-    /// `inline` is full JS source.
-    /// It must define a global function:
-    ///   function processBatch(events) { ... }
+    /// Create a new JS processor.
+    ///
+    /// `inline` is full JS source that must define a global function:
+    /// ```javascript
+    /// function processBatch(events) {
+    ///     // Process events and return array, single event, or null (use mutated input)
+    ///     return events;
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns error if:
+    /// - JS syntax is invalid
+    /// - `processBatch` function is not defined
+    /// - Thread spawn fails
     pub fn new(id: String, inline: String) -> Result<Self> {
         // Channel to send jobs to JS thread
         let (tx, mut rx) = mpsc::channel::<JsJob>(1024);
 
         // Clone things needed in the thread
         let id_clone = id.clone();
-        // Move script into thread
         let script = inline.clone();
 
         let worker_handle = thread::Builder::new()
@@ -45,6 +91,9 @@ impl JsProcessor {
                 }
             })
             .context("spawn js processor thread")?;
+
+        // Give thread time to initialize and validate script
+        std::thread::sleep(std::time::Duration::from_millis(10));
 
         Ok(Self {
             id,
@@ -117,7 +166,7 @@ fn js_worker_thread(
                     processor_id=%id,
                     error=%e,
                     elapsed_us=start.elapsed().as_micros(),
-                    "JS processing failre"
+                    "JS processing failure"
                 );
             }
         }
@@ -129,7 +178,11 @@ fn js_worker_thread(
     Ok(())
 }
 
-/// Runs one batch inside the JsRuntime (single-threaded)
+/// Runs one batch inside the JsRuntime (single-threaded).
+///
+/// Note: All numeric values pass through V8's f64 representation.
+/// Event struct fields are normalized back to i64, but payload fields
+/// (before/after) retain their JS-converted types. See module docs.
 fn process_batch_in_runtime(
     rt: &mut JsRuntime,
     id: &str,
@@ -165,7 +218,7 @@ fn process_batch_in_runtime(
             .get(&mut try_catch)
             .to_rust_string_lossy(&mut try_catch);
         error!(processor_id=%id, msg=%msg, "JS exception");
-        bail!("JS processor threw");
+        bail!("JS processor threw: {msg}");
     }
 
     let result = call_res.unwrap();
@@ -174,35 +227,105 @@ fn process_batch_in_runtime(
     if result.is_null_or_undefined() {
         let mutated_val: Value = serde_v8::from_v8(&mut try_catch, arg)
             .context("failed to read mutated JS events arg")?;
-        let out: Vec<Event> = serde_json::from_value(mutated_val)
-            .context("failed to decode mutated events from JS")?;
-        return Ok(out);
+        return deserialize_events_lenient(mutated_val);
     }
 
     // Interpret return value
     let ret_json: Value = serde_v8::from_v8(&mut try_catch, result)
         .context("failed to convert JS return value to JSON")?;
 
-    let out_events = match ret_json {
-        Value::Array(_) => {
-            let out: Vec<Event> = serde_json::from_value(ret_json)
-                .context("failed to decode events array from JS")?;
-            out
-        }
+    match ret_json {
+        Value::Array(_) => deserialize_events_lenient(ret_json),
         Value::Object(_) => {
-            let ev: Event = serde_json::from_value(ret_json)
-                .context("failed to decode single event from JS object")?;
-            vec![ev]
+            let events =
+                deserialize_events_lenient(Value::Array(vec![ret_json]))?;
+            Ok(events)
         }
         other => {
             bail!(
-                "js processor returned unsupported type: {other:?} (expected array, object, or null)"
+                "JS processor returned unsupported type: {} (expected array, object, or null)",
+                value_type_name(&other)
             );
         }
-    };
+    }
+}
 
-    debug!(processor_id=%id, out_len=out_events.len(), "JS returned batch");
-    Ok(out_events)
+/// Deserialize events with lenient number handling.
+///
+/// Event struct fields (ts_ms, size_bytes, etc.) accept both i64 and f64,
+/// converting whole-number floats back to integers. Payload fields (before/after)
+/// are left unchanged to preserve user data schema.
+fn deserialize_events_lenient(mut val: Value) -> Result<Vec<Event>> {
+    // Normalize only Event struct fields, not payloads
+    if let Value::Array(ref mut arr) = val {
+        for event in arr.iter_mut() {
+            if let Value::Object(obj) = event {
+                normalize_event_fields(obj);
+            }
+        }
+    }
+
+    serde_json::from_value(val).context("failed to decode events from JS")
+}
+
+/// Normalize numeric fields in Event struct (not payloads).
+///
+/// Converts whole-number floats back to integers for known Event fields.
+/// Leaves `before` and `after` payloads untouched.
+fn normalize_event_fields(obj: &mut serde_json::Map<String, Value>) {
+    // Top-level Event fields that should be i64
+    for key in ["ts_ms", "size_bytes"] {
+        if let Some(val) = obj.get_mut(key) {
+            normalize_to_i64(val);
+        }
+    }
+
+    // Nested source.ts_ms
+    if let Some(Value::Object(source)) = obj.get_mut("source") {
+        if let Some(val) = source.get_mut("ts_ms") {
+            normalize_to_i64(val);
+        }
+        // source.position fields if any are numeric
+        if let Some(Value::Object(pos)) = source.get_mut("position") {
+            for val in pos.values_mut() {
+                normalize_to_i64(val);
+            }
+        }
+    }
+
+    // transaction.total_order, transaction.data_collection_order
+    if let Some(Value::Object(tx)) = obj.get_mut("transaction") {
+        for key in ["total_order", "data_collection_order"] {
+            if let Some(val) = tx.get_mut(key) {
+                normalize_to_i64(val);
+            }
+        }
+    }
+
+    // Note: `before` and `after` are intentionally NOT normalized
+    // to preserve user data schema
+}
+
+/// Convert a whole-number float to i64.
+fn normalize_to_i64(val: &mut Value) {
+    if let Value::Number(n) = val {
+        if let Some(f) = n.as_f64() {
+            if f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_991.0 {
+                *val = Value::Number(serde_json::Number::from(f as i64));
+            }
+        }
+    }
+}
+
+fn value_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 #[async_trait]
@@ -217,7 +340,6 @@ impl Processor for JsProcessor {
         }
 
         let (reply_tx, reply_rx) = oneshot::channel();
-        // send job to worker thread
         self.tx
             .send((events, reply_tx))
             .await
@@ -227,8 +349,5 @@ impl Processor for JsProcessor {
             .await
             .context("JS processor timed out after 5s")?
             .context("JS worker dropped reply channel")?
-
-        // await result
-        //reply_rx.await.context("JS worker dropped reply channel")?
     }
 }

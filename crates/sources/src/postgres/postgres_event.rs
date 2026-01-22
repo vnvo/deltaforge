@@ -4,7 +4,9 @@
 //! converts them to DeltaForge events.
 
 use bytes::Bytes;
-use deltaforge_core::{Event, Op, SourceMeta, SourceResult};
+use deltaforge_core::{
+    Event, Op, SourceInfo, SourcePosition, SourceResult, Transaction,
+};
 use metrics::counter;
 use pgwire_replication::{Lsn, client::ReplicationEvent};
 use tracing::{debug, error, info, instrument, warn};
@@ -291,6 +293,31 @@ fn columns_differ(old: &[RelationColumn], new: &[RelationColumn]) -> bool {
     false
 }
 
+/// Build SourceInfo for PostgreSQL events
+fn build_source_info(
+    ctx: &RunCtx,
+    wal_lsn: &Lsn,
+    schema: &str,
+    table: &str,
+    timestamp_ms: i64,
+) -> SourceInfo {
+    SourceInfo {
+        version: concat!("deltaforge-", env!("CARGO_PKG_VERSION")).to_string(),
+        connector: "postgresql".to_string(),
+        name: ctx.pipeline.clone(),
+        ts_ms: timestamp_ms,
+        db: ctx.default_schema.clone(), // database name
+        schema: Some(schema.to_string()),
+        table: table.to_string(),
+        snapshot: None,
+        position: SourcePosition::postgres(
+            wal_lsn.to_string(),
+            ctx.current_tx_id.map(|id| id as i64),
+            None, // xmin not tracked currently
+        ),
+    }
+}
+
 /// Handle INSERT message.
 async fn handle_insert(
     ctx: &mut RunCtx,
@@ -319,41 +346,47 @@ async fn handle_insert(
         return Ok(());
     }
 
-    let loaded = ctx
-        .schema
-        .load_schema(&relation.schema, &relation.table)
-        .await?;
+    // Clone what we need
+    let schema = relation.schema.clone();
+    let table = relation.table.clone();
+    let columns = relation.columns.clone();
+
+    let loaded = ctx.schema.load_schema(&schema, &table).await?;
 
     let tuple_data = Bytes::copy_from_slice(&payload[5..]);
-    let (values, _) = parse_tuple_data(&tuple_data, relation.columns.len());
-    let after = build_object(&relation.columns, &values);
+    let (values, _) = parse_tuple_data(&tuple_data, columns.len());
+    let after = build_object(&columns, &values);
 
     let timestamp_ms = ctx
         .current_tx_commit_time
         .map(pg_timestamp_to_unix_ms)
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
+    let source_info =
+        build_source_info(ctx, &wal_lsn, &schema, &table, timestamp_ms);
     let mut ev = Event::new_row(
-        ctx.tenant.clone(),
-        SourceMeta {
-            kind: "postgres".into(),
-            host: ctx.host.clone(),
-            db: relation.schema.clone(),
-        },
-        format!("{}.{}", relation.schema, relation.table),
-        Op::Insert,
+        source_info,
+        Op::Create,
         None,
         Some(after),
         timestamp_ms,
         payload.len(),
-    );
+    )
+    .with_tenant(ctx.tenant.clone())
+    .with_checkpoint(make_checkpoint_meta(&wal_lsn, ctx.current_tx_id));
 
-    ev.tx_id = ctx.current_tx_id.map(|id| id.to_string());
-    ev.checkpoint = Some(make_checkpoint_meta(&wal_lsn, ctx.current_tx_id));
+    if let Some(tx_id) = ctx.current_tx_id {
+        ev.transaction = Some(Transaction {
+            id: tx_id.to_string(),
+            total_order: None,
+            data_collection_order: None,
+        });
+    }
+
     ev.schema_version = Some(loaded.fingerprint.to_string());
     ev.schema_sequence = Some(loaded.sequence);
 
-    send_event(ctx, ev, &relation.schema, &relation.table, "insert").await;
+    send_event(ctx, ev, &schema, &table, "insert").await;
     Ok(())
 }
 
@@ -425,23 +458,27 @@ async fn handle_update(
         .map(pg_timestamp_to_unix_ms)
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
+    let source_info =
+        build_source_info(ctx, &wal_lsn, &schema, &table, timestamp_ms);
     let mut ev = Event::new_row(
-        ctx.tenant.clone(),
-        SourceMeta {
-            kind: "postgres".into(),
-            host: ctx.host.clone(),
-            db: schema.clone(),
-        },
-        format!("{}.{}", schema, table),
+        source_info,
         Op::Update,
         before,
         Some(after),
         timestamp_ms,
         payload.len(),
-    );
+    )
+    .with_tenant(ctx.tenant.clone())
+    .with_checkpoint(make_checkpoint_meta(&wal_lsn, ctx.current_tx_id));
 
-    ev.tx_id = ctx.current_tx_id.map(|id| id.to_string());
-    ev.checkpoint = Some(make_checkpoint_meta(&wal_lsn, ctx.current_tx_id));
+    if let Some(tx_id) = ctx.current_tx_id {
+        ev.transaction = Some(Transaction {
+            id: tx_id.to_string(),
+            total_order: None,
+            data_collection_order: None,
+        });
+    }
+
     ev.schema_version = Some(loaded.fingerprint.to_string());
     ev.schema_sequence = Some(loaded.sequence);
 
@@ -493,23 +530,27 @@ async fn handle_delete(
         .map(pg_timestamp_to_unix_ms)
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
+    let source_info =
+        build_source_info(ctx, &wal_lsn, &schema, &table, timestamp_ms);
     let mut ev = Event::new_row(
-        ctx.tenant.clone(),
-        SourceMeta {
-            kind: "postgres".into(),
-            host: ctx.host.clone(),
-            db: schema.clone(),
-        },
-        format!("{}.{}", schema, table),
+        source_info,
         Op::Delete,
         Some(before),
         None,
         timestamp_ms,
         payload.len(),
-    );
+    )
+    .with_tenant(ctx.tenant.clone())
+    .with_checkpoint(make_checkpoint_meta(&wal_lsn, ctx.current_tx_id));
 
-    ev.tx_id = ctx.current_tx_id.map(|id| id.to_string());
-    ev.checkpoint = Some(make_checkpoint_meta(&wal_lsn, ctx.current_tx_id));
+    if let Some(tx_id) = ctx.current_tx_id {
+        ev.transaction = Some(Transaction {
+            id: tx_id.to_string(),
+            total_order: None,
+            data_collection_order: None,
+        });
+    }
+
     ev.schema_version = Some(loaded.fingerprint.to_string());
     ev.schema_sequence = Some(loaded.sequence);
 
@@ -549,28 +590,50 @@ async fn handle_truncate(
         offset += 4;
 
         if let Some(rel) = ctx.relation_map.get(&rel_id) {
-            tables.push(format!("{}.{}", rel.schema, rel.table));
+            tables.push((rel.schema.clone(), rel.table.clone()));
         }
     }
 
     info!(tables = ?tables, cascade, restart_identity, lsn = %wal_lsn, "truncate received");
 
-    for table_name in &tables {
-        let mut ev = Event::new_ddl(
-            ctx.tenant.clone(),
-            SourceMeta {
-                kind: "postgres".into(),
-                host: ctx.host.clone(),
-                db: ctx.default_schema.clone(),
-            },
-            table_name.clone(),
-            "TRUNCATE".into(),
-            chrono::Utc::now().timestamp_millis(),
-            0,
-        );
+    let timestamp_ms = chrono::Utc::now().timestamp_millis();
 
-        ev.tx_id = ctx.current_tx_id.map(|id| id.to_string());
-        ev.checkpoint = Some(make_checkpoint_meta(&wal_lsn, ctx.current_tx_id));
+    for (schema, table) in &tables {
+        let source_info = SourceInfo {
+            version: concat!("deltaforge-", env!("CARGO_PKG_VERSION"))
+                .to_string(),
+            connector: "postgresql".to_string(),
+            name: ctx.pipeline.clone(),
+            ts_ms: timestamp_ms,
+            db: ctx.default_schema.clone(),
+            schema: Some(schema.clone()),
+            table: table.clone(),
+            snapshot: None,
+            position: SourcePosition::postgres(
+                wal_lsn.to_string(),
+                ctx.current_tx_id.map(|id| id as i64),
+                None,
+            ),
+        };
+
+        let ddl_payload = serde_json::json!({
+            "sql": "TRUNCATE",
+            "cascade": cascade,
+            "restart_identity": restart_identity,
+        });
+
+        let mut ev = Event::new_ddl(source_info, ddl_payload, timestamp_ms, 0)
+            .with_tenant(ctx.tenant.clone())
+            .with_checkpoint(make_checkpoint_meta(&wal_lsn, ctx.current_tx_id));
+
+        if let Some(tx_id) = ctx.current_tx_id {
+            ev.transaction = Some(Transaction {
+                id: tx_id.to_string(),
+                total_order: None,
+                data_collection_order: None,
+            });
+        }
+
         let _ = ctx.tx.send(ev).await;
     }
 

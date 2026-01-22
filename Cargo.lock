@@ -1359,6 +1359,7 @@ dependencies = [
 name = "deltaforge-config"
 version = "0.1.0"
 dependencies = [
+ "deltaforge-core",
  "pretty_assertions",
  "serde",
  "serde_yaml",
@@ -1376,6 +1377,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "checkpoints",
  "chrono",
  "serde",

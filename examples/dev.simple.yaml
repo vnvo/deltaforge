@@ -12,7 +12,6 @@ spec:
       dsn: "mysql://df:dfpw@127.0.0.1:3306"
       tables: ["orders.order_items", "orders.orders"]
 
-  # No processors - direct passthrough
   processors: []
 
   sinks:
@@ -21,12 +20,17 @@ spec:
         id: r1
         uri: "redis://127.0.0.1:6379"
         stream: df.events
+        # envelope: native (default)
+        # encoding: json (default)
         required: false
+
     - type: kafka
       config:
         id: kafka
         brokers: "127.0.0.1:9092"
         topic: orders
+        # envelope: native (default)
+        # encoding: json (default)
         required: true
         exactly_once: false
 

@@ -1,5 +1,11 @@
 //! PostgreSQL CDC e2e tests. Run with:
 //! `cargo test -p sources --test postgres_cdc_e2e -- --include-ignored --nocapture --test-threads=1`
+//!
+//! Updated for Debezium-compatible Event structure with:
+//! - Op::Create instead of Op::Insert (Debezium uses 'c' for create)
+//! - SourceInfo envelope with connector, name, ts_ms, table, position fields
+//! - Transaction metadata support
+//! - SourcePosition with PostgreSQL-specific LSN tracking
 
 use anyhow::Result;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
@@ -234,6 +240,57 @@ fn has_id(e: &Event, id: i32) -> bool {
 }
 
 // =============================================================================
+// DEBEZIUM-COMPATIBLE ENVELOPE HELPERS
+// =============================================================================
+
+/// Helper to check if event is a create/insert operation.
+/// Debezium uses Op::Create ('c') for insert operations.
+fn is_create_op(e: &Event) -> bool {
+    matches!(e.op, Op::Create)
+}
+
+/// Helper to verify Debezium-compatible source info envelope.
+/// Validates the required fields in the source block.
+fn verify_source_envelope(e: &Event, expected_connector: &str) {
+    // Verify source info fields (Debezium-compatible envelope)
+    assert_eq!(
+        e.source.connector, expected_connector,
+        "connector should be {}",
+        expected_connector
+    );
+    assert!(
+        !e.source.name.is_empty(),
+        "source name (pipeline) should not be empty"
+    );
+    assert!(e.source.ts_ms > 0, "source timestamp should be positive");
+    assert!(
+        !e.source.table.is_empty(),
+        "source table should not be empty"
+    );
+
+    // Position should have LSN for PostgreSQL
+    if let Some(ref lsn) = e.source.position.lsn {
+        assert!(!lsn.is_empty(), "LSN should not be empty when present");
+    }
+}
+
+/// Helper to verify transaction metadata when present.
+fn verify_transaction_if_present(e: &Event) {
+    if let Some(ref tx) = e.transaction {
+        assert!(
+            !tx.id.is_empty(),
+            "transaction id should not be empty when transaction is present"
+        );
+    }
+}
+
+/// Verify complete event structure including envelope and optional transaction.
+fn verify_event_envelope(e: &Event, expected_connector: &str) {
+    verify_source_envelope(e, expected_connector);
+    verify_transaction_if_present(e);
+}
+
+// =============================================================================
 // TESTS
 // =============================================================================
 
@@ -329,10 +386,54 @@ async fn postgres_cdc_basic_events() -> Result<()> {
     .await;
     let by_id: Vec<_> = events.iter().filter(|e| has_id(e, 1)).collect();
 
-    assert!(by_id.iter().any(|e| matches!(e.op, Op::Insert)));
-    assert!(by_id.iter().any(|e| matches!(e.op, Op::Update)));
-    assert!(by_id.iter().any(|e| matches!(e.op, Op::Delete)));
-    info!("✓ INSERT/UPDATE/DELETE verified");
+    // Debezium uses Op::Create ('c') for inserts
+    assert!(
+        by_id.iter().any(|e| is_create_op(e)),
+        "should have CREATE event"
+    );
+    assert!(
+        by_id.iter().any(|e| matches!(e.op, Op::Update)),
+        "should have UPDATE event"
+    );
+    assert!(
+        by_id.iter().any(|e| matches!(e.op, Op::Delete)),
+        "should have DELETE event"
+    );
+    info!("✓ CREATE/UPDATE/DELETE verified");
+
+    // Verify Debezium-compatible envelope on all events
+    for e in &by_id {
+        verify_event_envelope(e, "postgresql");
+    }
+    info!("✓ Debezium-compatible envelope verified");
+
+    // Verify CREATE event structure
+    if let Some(create_ev) = by_id.iter().find(|e| is_create_op(e)) {
+        assert!(create_ev.before.is_none(), "CREATE should not have before");
+        assert!(create_ev.after.is_some(), "CREATE should have after");
+        let after = create_ev.after.as_ref().unwrap();
+        assert_eq!(after["id"], 1);
+        assert_eq!(after["sku"], "sku-1");
+        info!("✓ CREATE event payload verified");
+    }
+
+    // Verify UPDATE event structure
+    if let Some(update_ev) = by_id.iter().find(|e| matches!(e.op, Op::Update)) {
+        assert!(update_ev.before.is_some(), "UPDATE should have before");
+        assert!(update_ev.after.is_some(), "UPDATE should have after");
+        let before = update_ev.before.as_ref().unwrap();
+        let after = update_ev.after.as_ref().unwrap();
+        assert_eq!(before["sku"], "sku-1");
+        assert_eq!(after["sku"], "sku-1b");
+        info!("✓ UPDATE event payload verified");
+    }
+
+    // Verify DELETE event structure
+    if let Some(delete_ev) = by_id.iter().find(|e| matches!(e.op, Op::Delete)) {
+        assert!(delete_ev.before.is_some(), "DELETE should have before");
+        assert!(delete_ev.after.is_none(), "DELETE should not have after");
+        info!("✓ DELETE event payload verified");
+    }
 
     handle.stop();
     handle.join().await.ok();
@@ -410,6 +511,10 @@ async fn postgres_cdc_schema_evolution() -> Result<()> {
     assert!(post.after.as_ref().unwrap().get("status").is_some());
     assert_ne!(v1, post.schema_version);
     info!("✓ schema evolution detected");
+
+    // Verify envelope on schema-evolved event
+    verify_event_envelope(post, "postgresql");
+    info!("✓ envelope intact after schema evolution");
 
     handle.stop();
     handle.join().await.ok();
@@ -572,11 +677,11 @@ async fn postgres_cdc_table_filtering() -> Result<()> {
         .await?;
 
     let events = collect_until(&mut rx, Duration::from_secs(10), |e| {
-        e.iter().any(|x| x.table.contains("orders"))
+        e.iter().any(|x| x.source.table.contains("orders"))
     })
     .await;
-    assert!(events.iter().all(|e| e.table.contains("orders")));
-    assert!(!events.iter().any(|e| e.table.contains("audit_log")));
+    assert!(events.iter().all(|e| e.source.table.contains("orders")));
+    assert!(!events.iter().any(|e| e.source.table.contains("audit_log")));
     info!("✓ table filtering ok");
 
     handle.stop();
@@ -691,17 +796,22 @@ async fn postgres_cdc_extended_types() -> Result<()> {
 
     client.execute("INSERT INTO complex (uuid_col, tags, metadata, amount) VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', ARRAY['a','b'], '{\"k\":1}', 123.4567)", &[]).await?;
 
+    // Use is_create_op for Debezium-compatible check
     let events = collect_until(&mut rx, Duration::from_secs(10), |e| {
-        e.iter().any(|x| matches!(x.op, Op::Insert))
+        e.iter().any(is_create_op)
     })
     .await;
-    let ins = events.iter().find(|e| matches!(e.op, Op::Insert)).unwrap();
+    let ins = events.iter().find(|e| is_create_op(e)).unwrap();
     let after = ins.after.as_ref().unwrap();
     assert!(after.get("uuid_col").is_some());
     assert!(after.get("tags").is_some());
     assert!(after.get("metadata").is_some());
     assert!(after.get("amount").is_some());
     info!("✓ extended types ok");
+
+    // Verify envelope for extended types
+    verify_event_envelope(ins, "postgresql");
+    info!("✓ envelope verified for extended types");
 
     handle.stop();
     handle.join().await.ok();
@@ -831,11 +941,9 @@ async fn postgres_cdc_auth_failure() -> Result<()> {
 
     match result {
         Ok(Ok(())) => {
-            // Task exited - expected for fatal auth error
             info!("✓ auth failure caused source to exit");
         }
         Ok(Err(e)) => {
-            // Task panicked - also acceptable for fatal error
             info!("✓ auth failure caused panic: {}", e);
         }
         Err(_) => {
@@ -887,7 +995,7 @@ async fn postgres_cdc_slot_auto_created() -> Result<()> {
         id: "slot-auto".into(),
         checkpoint_key: "pg-slot-auto".into(),
         dsn: cdc_dsn(&db),
-        slot: "auto_slot".into(), // This slot doesn't exist - should be auto-created
+        slot: "auto_slot".into(),
         publication: "pub_auto".into(),
         tables: vec!["public.orders".into()],
         tenant: "acme".into(),
@@ -899,10 +1007,8 @@ async fn postgres_cdc_slot_auto_created() -> Result<()> {
     let (tx, mut rx) = mpsc::channel(128);
     let handle = src.run(tx, ckpt).await;
 
-    // Give source time to start and create slot
     sleep(Duration::from_secs(2)).await;
 
-    // Verify slot was auto-created
     let slot_exists: bool = client
         .query_one("SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = 'auto_slot')", &[])
         .await?
@@ -910,21 +1016,24 @@ async fn postgres_cdc_slot_auto_created() -> Result<()> {
     assert!(slot_exists, "slot should be auto-created by source");
     info!("✓ slot auto-created");
 
-    // Insert data and verify we capture it
     client
         .execute("INSERT INTO orders (id, name) VALUES (1, 'test')", &[])
         .await?;
 
     let event = timeout(Duration::from_secs(10), rx.recv())
         .await?
-        .expect("should receive insert event");
-    assert_eq!(event.op, Op::Insert);
-    info!("✓ captured insert event after slot auto-creation");
+        .expect("should receive create event");
+    // Debezium uses Op::Create for inserts
+    assert!(is_create_op(&event), "should be CREATE op");
+    info!("✓ captured create event after slot auto-creation");
+
+    // Verify envelope
+    verify_event_envelope(&event, "postgresql");
+    info!("✓ envelope verified");
 
     handle.stop();
     let _ = timeout(Duration::from_secs(5), handle.join()).await;
 
-    // Cleanup
     client
         .batch_execute("SELECT pg_drop_replication_slot('auto_slot')")
         .await
@@ -954,14 +1063,12 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
         .execute(&format!("GRANT SELECT ON orders TO {CDC_USER}"), &[])
         .await?;
 
-    // Create slot but NO publication - source should retry until publication exists
     client
         .execute("DROP PUBLICATION IF EXISTS missing_pub", &[])
         .await?;
     client.batch_execute("SELECT pg_drop_replication_slot('slot_missing_pub') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='slot_missing_pub')").await.ok();
     client.batch_execute("SELECT pg_create_logical_replication_slot('slot_missing_pub', 'pgoutput')").await?;
 
-    // Verify publication doesn't exist
     let pub_exists: bool = client
         .query_one("SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = 'missing_pub')", &[])
         .await?
@@ -973,7 +1080,7 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
         checkpoint_key: "pg-pub-missing".into(),
         dsn: cdc_dsn(&db),
         slot: "slot_missing_pub".into(),
-        publication: "missing_pub".into(), // This publication doesn't exist yet
+        publication: "missing_pub".into(),
         tables: vec!["public.orders".into()],
         tenant: "acme".into(),
         pipeline: "test".into(),
@@ -984,10 +1091,8 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
     let (tx, mut rx) = mpsc::channel(128);
     let handle = src.run(tx, ckpt).await;
 
-    // Give source time to enter retry loop (it should be retrying because pub doesn't exist)
     sleep(Duration::from_secs(3)).await;
 
-    // Publication still doesn't exist (source is in retry loop, not auto-creating)
     let pub_exists: bool = client
         .query_one("SELECT EXISTS(SELECT 1 FROM pg_publication WHERE pubname = 'missing_pub')", &[])
         .await?
@@ -998,29 +1103,27 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
     );
     info!("✓ verified source does not auto-create publication");
 
-    // Simulate admin creating the publication
     client
         .execute("CREATE PUBLICATION missing_pub FOR TABLE orders", &[])
         .await?;
     info!("✓ admin created publication");
 
-    // Insert data - source should pick up publication on next retry and capture this
-    sleep(Duration::from_secs(2)).await; // Wait for retry to pick up publication
+    sleep(Duration::from_secs(2)).await;
     client
         .execute("INSERT INTO orders (id, name) VALUES (1, 'test')", &[])
         .await?;
 
-    // Source should now work and capture the event
     let event = timeout(Duration::from_secs(15), rx.recv())
         .await?
-        .expect("should receive insert event after publication created");
-    assert_eq!(event.op, Op::Insert);
-    info!("✓ captured insert event after admin created publication");
+        .expect("should receive create event after publication created");
+    assert!(is_create_op(&event), "should be CREATE op");
+    info!("✓ captured create event after admin created publication");
+
+    verify_event_envelope(&event, "postgresql");
 
     handle.stop();
     let _ = timeout(Duration::from_secs(5), handle.join()).await;
 
-    // Cleanup
     client
         .batch_execute("SELECT pg_drop_replication_slot('slot_missing_pub')")
         .await
@@ -1042,7 +1145,7 @@ async fn postgres_cdc_invalid_dsn() -> Result<()> {
     let src = PostgresSource {
         id: "bad-dsn".into(),
         checkpoint_key: "pg-bad-dsn".into(),
-        dsn: "not-a-valid-dsn-at-all".into(), // Invalid DSN
+        dsn: "not-a-valid-dsn-at-all".into(),
         slot: "any_slot".into(),
         publication: "any_pub".into(),
         tables: vec!["public.orders".into()],
@@ -1073,7 +1176,6 @@ async fn postgres_cdc_connection_refused() -> Result<()> {
     init_test_tracing();
     let _ = get_container().await;
 
-    // Use a port that nothing is listening on
     let bad_dsn =
         format!("postgres://{CDC_USER}:{CDC_PASS}@127.0.0.1:59999/testdb");
 
@@ -1093,7 +1195,6 @@ async fn postgres_cdc_connection_refused() -> Result<()> {
     let (tx, _rx) = mpsc::channel(128);
     let handle = src.run(tx, ckpt).await;
 
-    // Source may retry on connection errors - timeout is acceptable
     let result = timeout(Duration::from_secs(10), handle.join()).await;
 
     match result {
@@ -1117,7 +1218,6 @@ async fn postgres_cdc_replica_identity_modes() -> Result<()> {
     let _ = get_container().await;
     let (db, client) = create_db("replica_id").await?;
 
-    // Table with DEFAULT replica identity (only PK in before)
     client
         .execute(
             "CREATE TABLE ri_default (id INT PRIMARY KEY, data TEXT)",
@@ -1125,7 +1225,6 @@ async fn postgres_cdc_replica_identity_modes() -> Result<()> {
         )
         .await?;
 
-    // Table with FULL replica identity (all columns in before)
     client
         .execute("CREATE TABLE ri_full (id INT PRIMARY KEY, data TEXT)", &[])
         .await?;
@@ -1142,7 +1241,6 @@ async fn postgres_cdc_replica_identity_modes() -> Result<()> {
     create_pub_slot(&client, "pub_ri", "slot_ri", &["ri_default", "ri_full"])
         .await?;
 
-    // Verify schema loader captures replica identity
     let registry = Arc::new(InMemoryRegistry::new());
     let loader = PostgresSchemaLoader::new(
         &format!(
@@ -1166,7 +1264,6 @@ async fn postgres_cdc_replica_identity_modes() -> Result<()> {
     );
     info!("✓ FULL replica identity captured");
 
-    // Test CDC behavior
     let src = PostgresSource {
         id: "ri".into(),
         checkpoint_key: "pg-ri".into(),
@@ -1185,7 +1282,6 @@ async fn postgres_cdc_replica_identity_modes() -> Result<()> {
     wait_ready(&handle, Duration::from_secs(10)).await?;
     sleep(Duration::from_secs(2)).await;
 
-    // Insert then update both tables
     client
         .execute(
             "INSERT INTO ri_default (id, data) VALUES (1, 'original')",
@@ -1202,14 +1298,18 @@ async fn postgres_cdc_replica_identity_modes() -> Result<()> {
         .execute("UPDATE ri_full SET data = 'modified' WHERE id = 1", &[])
         .await?;
 
-    // Collect events
     let events =
         collect_until(&mut rx, Duration::from_secs(10), |e| e.len() >= 4).await;
 
-    // Find FULL table UPDATE - should have complete before image
+    // Verify envelope on all events
+    for e in &events {
+        verify_event_envelope(e, "postgresql");
+    }
+    info!("✓ envelope verified for all replica identity events");
+
     let full_update = events
         .iter()
-        .find(|e| e.op == Op::Update && e.table.contains("ri_full"));
+        .find(|e| e.op == Op::Update && e.source.table.contains("ri_full"));
     if let Some(upd) = full_update {
         let before = upd.before.as_ref().expect("FULL should have before");
         assert_eq!(before["id"], 1);
@@ -1217,14 +1317,12 @@ async fn postgres_cdc_replica_identity_modes() -> Result<()> {
         info!("✓ ri_full UPDATE has full before image");
     }
 
-    // DEFAULT table UPDATE may only have key columns in before
     let default_update = events
         .iter()
-        .find(|e| e.op == Op::Update && e.table.contains("ri_default"));
+        .find(|e| e.op == Op::Update && e.source.table.contains("ri_default"));
     if let Some(upd) = default_update {
         let before = upd.before.as_ref();
         info!("ri_default UPDATE before: {:?}", before);
-        // With DEFAULT, before may only have key or be minimal
     }
 
     handle.stop();
@@ -1275,7 +1373,6 @@ async fn postgres_cdc_graceful_shutdown() -> Result<()> {
     wait_ready(&handle, Duration::from_secs(10)).await?;
     sleep(Duration::from_secs(2)).await;
 
-    // Insert some data
     client
         .execute("INSERT INTO orders VALUES (1, 'test')", &[])
         .await?;
@@ -1285,11 +1382,9 @@ async fn postgres_cdc_graceful_shutdown() -> Result<()> {
     .await;
     assert!(events.iter().any(|e| has_id(e, 1)));
 
-    // Graceful stop
     let start = Instant::now();
     handle.stop();
 
-    // Should complete within reasonable time (source may have cleanup)
     let join_result = timeout(Duration::from_secs(15), handle.join()).await;
     let elapsed = start.elapsed();
 
@@ -1372,7 +1467,6 @@ async fn postgres_cdc_multi_table() -> Result<()> {
     wait_ready(&handle, Duration::from_secs(10)).await?;
     sleep(Duration::from_secs(2)).await;
 
-    // Insert into all tables
     client
         .execute("INSERT INTO orders VALUES (1, 'SKU-001')", &[])
         .await?;
@@ -1383,28 +1477,35 @@ async fn postgres_cdc_multi_table() -> Result<()> {
         .execute("INSERT INTO products VALUES (1, 'Widget')", &[])
         .await?;
 
-    // Collect events from all tables
     let events = collect_until(&mut rx, Duration::from_secs(15), |e| {
-        let has_orders = e.iter().any(|x| x.table.contains("orders"));
-        let has_customers = e.iter().any(|x| x.table.contains("customers"));
-        let has_products = e.iter().any(|x| x.table.contains("products"));
+        let has_orders = e.iter().any(|x| x.source.table.contains("orders"));
+        let has_customers =
+            e.iter().any(|x| x.source.table.contains("customers"));
+        let has_products =
+            e.iter().any(|x| x.source.table.contains("products"));
         has_orders && has_customers && has_products
     })
     .await;
 
     assert!(
-        events.iter().any(|e| e.table.contains("orders")),
+        events.iter().any(|e| e.source.table.contains("orders")),
         "missing orders event"
     );
     assert!(
-        events.iter().any(|e| e.table.contains("customers")),
+        events.iter().any(|e| e.source.table.contains("customers")),
         "missing customers event"
     );
     assert!(
-        events.iter().any(|e| e.table.contains("products")),
+        events.iter().any(|e| e.source.table.contains("products")),
         "missing products event"
     );
     info!("✓ multi-table CDC works");
+
+    // Verify envelope on all events from different tables
+    for e in &events {
+        verify_event_envelope(e, "postgresql");
+    }
+    info!("✓ envelope verified for multi-table events");
 
     handle.stop();
     handle.join().await.ok();
@@ -1460,18 +1561,15 @@ async fn postgres_cdc_null_handling() -> Result<()> {
     wait_ready(&handle, Duration::from_secs(10)).await?;
     sleep(Duration::from_secs(2)).await;
 
-    // Insert row with all NULLs except PK
     client
         .execute("INSERT INTO nullable_test (id) VALUES (1)", &[])
         .await?;
 
-    // Insert row with all values
     client.execute(
         "INSERT INTO nullable_test VALUES (2, 'text', 42, '{\"k\":1}', ARRAY['a','b'])",
         &[]
     ).await?;
 
-    // Update to set NULLs
     client
         .execute("UPDATE nullable_test SET text_col = NULL WHERE id = 2", &[])
         .await?;
@@ -1479,23 +1577,25 @@ async fn postgres_cdc_null_handling() -> Result<()> {
     let events =
         collect_until(&mut rx, Duration::from_secs(10), |e| e.len() >= 3).await;
 
-    // Verify NULL handling in INSERT
-    let null_insert =
-        events.iter().find(|e| e.op == Op::Insert && has_id(e, 1));
+    // Verify NULL handling in INSERT (using is_create_op for Debezium compatibility)
+    let null_insert = events.iter().find(|e| is_create_op(e) && has_id(e, 1));
     if let Some(ins) = null_insert {
         let after = ins.after.as_ref().unwrap();
         assert!(after["text_col"].is_null());
         assert!(after["int_col"].is_null());
-        info!("✓ NULL values in INSERT handled correctly");
+        info!("✓ NULL values in CREATE handled correctly");
+
+        verify_event_envelope(ins, "postgresql");
     }
 
-    // Verify UPDATE that sets NULL
     let null_update =
         events.iter().find(|e| e.op == Op::Update && has_id(e, 2));
     if let Some(upd) = null_update {
         let after = upd.after.as_ref().unwrap();
         assert!(after["text_col"].is_null());
         info!("✓ NULL values in UPDATE handled correctly");
+
+        verify_event_envelope(upd, "postgresql");
     }
 
     handle.stop();

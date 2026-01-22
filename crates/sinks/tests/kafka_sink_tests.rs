@@ -9,8 +9,8 @@
 
 use anyhow::Result;
 use ctor::dtor;
-use deltaforge_config::KafkaSinkCfg;
-use deltaforge_core::{Event, Op, Sink, SourceMeta};
+use deltaforge_config::{EncodingCfg, EnvelopeCfg, KafkaSinkCfg};
+use deltaforge_core::{Event, Op, Sink, SourceInfo, SourcePosition};
 use rdkafka::Message;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
@@ -199,14 +199,18 @@ async fn delete_topic(brokers: &str, topic: &str) -> Result<()> {
 /// Create a test event with a specific ID.
 fn make_test_event(id: i64) -> Event {
     Event::new_row(
-        "tenant".into(),
-        SourceMeta {
-            kind: "test".into(),
-            host: "localhost".into(),
+        SourceInfo {
+            version: "deltaforge-test".into(),
+            connector: "test".into(),
+            name: "test-db".into(),
+            ts_ms: 1_700_000_000_000 + id,
             db: "testdb".into(),
+            schema: None,
+            table: "table".into(),
+            snapshot: None,
+            position: SourcePosition::default(),
         },
-        "test.table".into(),
-        Op::Insert,
+        Op::Create,
         None,
         Some(json!({"id": id, "name": format!("item-{}", id)})),
         1_700_000_000_000 + id,
@@ -218,14 +222,18 @@ fn make_test_event(id: i64) -> Event {
 fn make_large_event(id: i64, size_bytes: usize) -> Event {
     let padding = "x".repeat(size_bytes);
     Event::new_row(
-        "tenant".into(),
-        SourceMeta {
-            kind: "test".into(),
-            host: "localhost".into(),
+        SourceInfo {
+            version: "deltaforge-test".into(),
+            connector: "test".into(),
+            name: "test-db".into(),
+            ts_ms: 1_700_000_000_000 + id,
             db: "testdb".into(),
+            schema: None,
+            table: "table".into(),
+            snapshot: None,
+            position: SourcePosition::default(),
         },
-        "test.table".into(),
-        Op::Insert,
+        Op::Create,
         None,
         Some(json!({"id": id, "payload": padding})),
         1_700_000_000_000 + id,
@@ -304,6 +312,8 @@ async fn kafka_sink_sends_single_event() -> Result<()> {
         id: "test-kafka".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         exactly_once: None,
         send_timeout_secs: Some(30),
@@ -348,6 +358,8 @@ async fn kafka_sink_sends_batch() -> Result<()> {
         id: "test-kafka-batch".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         exactly_once: None,
         send_timeout_secs: Some(30),
@@ -390,6 +402,8 @@ async fn kafka_sink_empty_batch_is_noop() -> Result<()> {
         id: "test-kafka-empty".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         exactly_once: None,
         send_timeout_secs: Some(30),
@@ -403,6 +417,563 @@ async fn kafka_sink_empty_batch_is_noop() -> Result<()> {
     sink.send_batch(&[]).await?;
 
     info!("✓ empty batch is a no-op");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
+// =============================================================================
+// Envelope Format Tests
+// =============================================================================
+
+/// Test Native envelope format (direct Event serialization).
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_native_envelope() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let topic = test_topic("native-envelope");
+    let brokers = brokers();
+    create_topic(&brokers, &topic, 1).await?;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-native".into(),
+        brokers: brokers.clone(),
+        topic: topic.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    let event = make_test_event(1);
+    sink.send(&event).await?;
+
+    let consumer = create_consumer(&brokers, &topic, "test-native-consumer")?;
+    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
+        !msgs.is_empty()
+    })
+    .await;
+
+    assert!(!messages.is_empty(), "should receive message");
+
+    // Native envelope serializes Event directly (Debezium payload structure)
+    let parsed: serde_json::Value = serde_json::from_slice(&messages[0])?;
+
+    // Verify native format has top-level Debezium-compatible fields
+    assert!(
+        parsed.get("op").is_some(),
+        "native format should have 'op' field at top level"
+    );
+    assert!(
+        parsed.get("source").is_some(),
+        "native format should have 'source' field at top level"
+    );
+
+    // Verify it's NOT wrapped in a payload (that's what Debezium envelope does)
+    assert!(
+        parsed.get("payload").is_none(),
+        "native format should NOT have 'payload' wrapper"
+    );
+
+    // Verify the op value is a valid Debezium code
+    let op = parsed.get("op").and_then(|v| v.as_str());
+    assert!(
+        matches!(
+            op,
+            Some("c") | Some("u") | Some("d") | Some("r") | Some("t")
+        ),
+        "op should be a valid Debezium operation code, got: {:?}",
+        op
+    );
+
+    info!("✓ native envelope format works correctly");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
+/// Test Debezium envelope format (payload wrapper).
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_debezium_envelope() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let topic = test_topic("debezium-envelope");
+    let brokers = brokers();
+    create_topic(&brokers, &topic, 1).await?;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-debezium".into(),
+        brokers: brokers.clone(),
+        topic: topic.clone(),
+        envelope: EnvelopeCfg::Debezium,
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    let event = make_test_event(1);
+    sink.send(&event).await?;
+
+    let consumer = create_consumer(&brokers, &topic, "test-debezium-consumer")?;
+    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
+        !msgs.is_empty()
+    })
+    .await;
+
+    assert!(!messages.is_empty(), "should receive message");
+
+    // Debezium envelope wraps event in {"payload": <event>}
+    let parsed: serde_json::Value = serde_json::from_slice(&messages[0])?;
+
+    // Verify Debezium format has payload wrapper
+    assert!(
+        parsed.get("schema").is_some(),
+        "debezium format must have 'schema' field"
+    );
+    assert!(
+        parsed.get("schema").unwrap().is_null(),
+        "debezium schema should be null (schemaless mode)"
+    );
+    assert!(
+        parsed.get("payload").is_some(),
+        "debezium format must have 'payload' wrapper"
+    );
+    assert!(
+        parsed.get("payload").unwrap().is_object(),
+        "payload must be an object"
+    );
+
+    // Verify payload contains the event fields (op, source, etc.)
+    let payload = parsed.get("payload").unwrap();
+    assert!(
+        payload.get("op").is_some(),
+        "payload should contain 'op' field"
+    );
+    assert!(
+        payload.get("source").is_some(),
+        "payload should contain 'source' field"
+    );
+
+    // Verify the op value is a valid Debezium code
+    let op = payload.get("op").and_then(|v| v.as_str());
+    assert!(
+        matches!(
+            op,
+            Some("c") | Some("u") | Some("d") | Some("r") | Some("t")
+        ),
+        "op should be a valid Debezium operation code, got: {:?}",
+        op
+    );
+
+    // Verify source block has connector info
+    let source = payload.get("source").unwrap();
+    assert!(
+        source.get("connector").is_some(),
+        "source should have 'connector' field"
+    );
+
+    info!("✓ debezium envelope format works correctly");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
+/// Verify exact wire format for Debezium envelope.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_debezium_wire_format() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let topic = test_topic("debezium-wire-format");
+    let brokers = brokers();
+    create_topic(&brokers, &topic, 1).await?;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-wire-format".into(),
+        brokers: brokers.clone(),
+        topic: topic.clone(),
+        envelope: EnvelopeCfg::Debezium,
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    let event = make_test_event(1);
+    sink.send(&event).await?;
+
+    let consumer =
+        create_consumer(&brokers, &topic, "test-wire-format-consumer")?;
+    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
+        !msgs.is_empty()
+    })
+    .await;
+
+    let raw = String::from_utf8_lossy(&messages[0]);
+
+    // Verify wire format starts with expected structure
+    // This catches field ordering changes and unexpected fields
+    assert!(
+        raw.starts_with(r#"{"schema":null,"payload":{"#),
+        "Debezium wire format should start with {{\"schema\":null,\"payload\":{{, got: {}",
+        &raw[..raw.len().min(100)]
+    );
+
+    info!("✓ debezium wire format matches spec");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
+/// Test CloudEvents envelope format.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_cloudevents_envelope() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let topic = test_topic("cloudevents-envelope");
+    let brokers = brokers();
+    create_topic(&brokers, &topic, 1).await?;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-cloudevents".into(),
+        brokers: brokers.clone(),
+        topic: topic.clone(),
+        envelope: EnvelopeCfg::CloudEvents {
+            type_prefix: "com.deltaforge.cdc".to_string(),
+        },
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    let event = make_test_event(1);
+    sink.send(&event).await?;
+
+    let consumer =
+        create_consumer(&brokers, &topic, "test-cloudevents-consumer")?;
+    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
+        !msgs.is_empty()
+    })
+    .await;
+
+    assert!(!messages.is_empty(), "should receive message");
+
+    // CloudEvents envelope restructures to CE 1.0 spec
+    let parsed: serde_json::Value = serde_json::from_slice(&messages[0])?;
+
+    // Verify CloudEvents 1.0 required attributes
+    assert_eq!(
+        parsed.get("specversion").and_then(|v| v.as_str()),
+        Some("1.0"),
+        "CloudEvents must have specversion 1.0"
+    );
+
+    assert!(
+        parsed.get("id").is_some(),
+        "CloudEvents must have 'id' attribute"
+    );
+
+    assert!(
+        parsed.get("source").is_some(),
+        "CloudEvents must have 'source' attribute"
+    );
+    // Source format: deltaforge/{name}/{full_table_name}
+    let source = parsed.get("source").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        source.starts_with("deltaforge/"),
+        "CloudEvents source should start with 'deltaforge/', got: {}",
+        source
+    );
+
+    assert!(
+        parsed.get("type").is_some(),
+        "CloudEvents must have 'type' attribute"
+    );
+    // Type format: {prefix}.{op_suffix} where op_suffix is created/updated/deleted/snapshot/truncated
+    let type_field = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        type_field.starts_with("com.deltaforge.cdc."),
+        "CloudEvents type should start with configured prefix, got: {}",
+        type_field
+    );
+    // Verify suffix is valid operation
+    let valid_suffixes =
+        ["created", "updated", "deleted", "snapshot", "truncated"];
+    let has_valid_suffix =
+        valid_suffixes.iter().any(|s| type_field.ends_with(s));
+    assert!(
+        has_valid_suffix,
+        "CloudEvents type should end with valid op suffix (created/updated/deleted/snapshot/truncated), got: {}",
+        type_field
+    );
+
+    // Verify optional but expected attributes
+    assert_eq!(
+        parsed.get("datacontenttype").and_then(|v| v.as_str()),
+        Some("application/json"),
+        "CloudEvents should have datacontenttype application/json"
+    );
+
+    assert!(
+        parsed.get("time").is_some(),
+        "CloudEvents should have 'time' attribute"
+    );
+
+    // Verify data payload contains before/after/op
+    assert!(
+        parsed.get("data").is_some(),
+        "CloudEvents must have 'data' attribute containing event data"
+    );
+    let data = parsed.get("data").unwrap();
+    assert!(
+        data.get("op").is_some(),
+        "CloudEvents data should contain 'op' field"
+    );
+    // Op in data uses Debezium codes (c/u/d/r/t)
+    let data_op = data.get("op").and_then(|v| v.as_str());
+    assert!(
+        matches!(
+            data_op,
+            Some("c") | Some("u") | Some("d") | Some("r") | Some("t")
+        ),
+        "data.op should be a valid Debezium operation code, got: {:?}",
+        data_op
+    );
+
+    info!("✓ cloudevents envelope format works correctly");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
+/// Test batch send with Debezium envelope.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_debezium_envelope_batch() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let topic = test_topic("debezium-batch");
+    let brokers = brokers();
+    create_topic(&brokers, &topic, 3).await?;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-debezium-batch".into(),
+        brokers: brokers.clone(),
+        topic: topic.clone(),
+        envelope: EnvelopeCfg::Debezium,
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    let events: Vec<Event> = (0..50).map(make_test_event).collect();
+    sink.send_batch(&events).await?;
+
+    let consumer =
+        create_consumer(&brokers, &topic, "test-debezium-batch-consumer")?;
+    let messages = consume_until(&consumer, Duration::from_secs(30), |msgs| {
+        msgs.len() >= 50
+    })
+    .await;
+
+    assert_eq!(messages.len(), 50, "should receive all 50 messages");
+
+    // Verify all messages have Debezium envelope
+    for msg in &messages {
+        let parsed: serde_json::Value = serde_json::from_slice(msg)?;
+        assert!(
+            parsed.get("payload").is_some(),
+            "all batch messages should have Debezium payload wrapper"
+        );
+    }
+
+    info!("✓ debezium envelope batch works correctly");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
+/// Test CloudEvents envelope with different operation types.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_cloudevents_operations() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let topic = test_topic("cloudevents-ops");
+    let brokers = brokers();
+    create_topic(&brokers, &topic, 1).await?;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-cloudevents-ops".into(),
+        brokers: brokers.clone(),
+        topic: topic.clone(),
+        envelope: EnvelopeCfg::CloudEvents {
+            type_prefix: "io.deltaforge.test".to_string(),
+        },
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    // Create events with different operations
+    let create_event = Event::new_row(
+        SourceInfo {
+            version: "deltaforge-test".into(),
+            connector: "test".into(),
+            name: "test-db".into(),
+            ts_ms: 1_700_000_000_000,
+            db: "testdb".into(),
+            schema: None,
+            table: "table".into(),
+            snapshot: None,
+            position: SourcePosition::default(),
+        },
+        Op::Create,
+        None,
+        Some(json!({"id": 1})),
+        1_700_000_000_000,
+        64,
+    );
+
+    let update_event = Event::new_row(
+        SourceInfo {
+            version: "deltaforge-test".into(),
+            connector: "test".into(),
+            name: "test-db".into(),
+            ts_ms: 1_700_000_000_001,
+            db: "testdb".into(),
+            schema: None,
+            table: "table".into(),
+            snapshot: None,
+            position: SourcePosition::default(),
+        },
+        Op::Update,
+        Some(json!({"id": 2, "name": "old"})),
+        Some(json!({"id": 2, "name": "new"})),
+        1_700_000_000_001,
+        64,
+    );
+
+    let delete_event = Event::new_row(
+        SourceInfo {
+            version: "deltaforge-test".into(),
+            connector: "test".into(),
+            name: "test-db".into(),
+            ts_ms: 1_700_000_000_002,
+            db: "testdb".into(),
+            schema: None,
+            table: "table".into(),
+            snapshot: None,
+            position: SourcePosition::default(),
+        },
+        Op::Delete,
+        Some(json!({"id": 3})),
+        None,
+        1_700_000_000_002,
+        64,
+    );
+
+    sink.send(&create_event).await?;
+    sink.send(&update_event).await?;
+    sink.send(&delete_event).await?;
+
+    let consumer =
+        create_consumer(&brokers, &topic, "test-cloudevents-ops-consumer")?;
+    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
+        msgs.len() >= 3
+    })
+    .await;
+
+    assert_eq!(messages.len(), 3, "should receive all 3 messages");
+
+    // Collect all type suffixes found
+    let mut type_suffixes: Vec<String> = Vec::new();
+    for msg in &messages {
+        let parsed: serde_json::Value = serde_json::from_slice(msg)?;
+
+        // Verify CloudEvents structure
+        assert_eq!(
+            parsed.get("specversion").and_then(|v| v.as_str()),
+            Some("1.0"),
+            "all messages should be CloudEvents 1.0"
+        );
+
+        let type_field =
+            parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            type_field.starts_with("io.deltaforge.test."),
+            "type should have configured prefix"
+        );
+
+        // Extract suffix (created/updated/deleted)
+        let suffix =
+            type_field.strip_prefix("io.deltaforge.test.").unwrap_or("");
+        type_suffixes.push(suffix.to_string());
+
+        // Verify data has op field with valid Debezium code
+        let data = parsed.get("data").expect("should have data");
+        let op = data.get("op").and_then(|v| v.as_str());
+        assert!(
+            matches!(
+                op,
+                Some("c") | Some("u") | Some("d") | Some("r") | Some("t")
+            ),
+            "data.op should be a valid Debezium code, got: {:?}",
+            op
+        );
+    }
+
+    // Verify we got all three operation type suffixes
+    // Op::Create -> "created", Op::Update -> "updated", Op::Delete -> "deleted"
+    assert!(
+        type_suffixes.contains(&"created".to_string()),
+        "should have 'created' type for Op::Create, found: {:?}",
+        type_suffixes
+    );
+    assert!(
+        type_suffixes.contains(&"updated".to_string()),
+        "should have 'updated' type for Op::Update, found: {:?}",
+        type_suffixes
+    );
+    assert!(
+        type_suffixes.contains(&"deleted".to_string()),
+        "should have 'deleted' type for Op::Delete, found: {:?}",
+        type_suffixes
+    );
+
+    info!("✓ cloudevents envelope handles all operation types correctly");
     delete_topic(&brokers, &topic).await?;
     Ok(())
 }
@@ -426,6 +997,8 @@ async fn kafka_sink_idempotent_mode() -> Result<()> {
         id: "test-idempotent".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         exactly_once: Some(false), // Idempotent, not exactly-once
         send_timeout_secs: Some(30),
@@ -470,6 +1043,8 @@ async fn kafka_sink_exactly_once_mode() -> Result<()> {
         id: "test-exactly-once".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         exactly_once: Some(true),
         send_timeout_secs: Some(30),
@@ -512,6 +1087,8 @@ async fn kafka_sink_invalid_brokers() -> Result<()> {
         id: "test-invalid".into(),
         brokers: "invalid-host:9999".into(),
         topic: "df-test-invalid".into(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         exactly_once: None,
         send_timeout_secs: Some(5),
@@ -549,6 +1126,8 @@ async fn kafka_sink_large_events() -> Result<()> {
         id: "test-large".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         exactly_once: None,
         send_timeout_secs: Some(30),
@@ -594,6 +1173,8 @@ async fn kafka_sink_concurrent_sends() -> Result<()> {
         id: "test-concurrent".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         exactly_once: None,
         send_timeout_secs: Some(30),
@@ -663,6 +1244,8 @@ async fn kafka_sink_custom_config() -> Result<()> {
         id: "test-custom".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         exactly_once: None,
         send_timeout_secs: Some(30),
@@ -706,6 +1289,8 @@ async fn kafka_sink_trait_implementation() -> Result<()> {
         id: "test-trait".into(),
         brokers: brokers(),
         topic: "df-test-trait".into(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         exactly_once: None,
         send_timeout_secs: Some(30),
@@ -736,6 +1321,8 @@ async fn kafka_sink_optional() -> Result<()> {
         id: "test-optional".into(),
         brokers: brokers(),
         topic: "df-test-optional".into(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(false),
         exactly_once: None,
         send_timeout_secs: None,
@@ -800,6 +1387,8 @@ async fn kafka_sink_recovers_after_restart() -> Result<()> {
         id: "test-restart".into(),
         brokers: brokers.clone(),
         topic: topic.into(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         exactly_once: None,
         send_timeout_secs: Some(30),
@@ -862,6 +1451,8 @@ async fn kafka_sink_handles_broker_hiccup() -> Result<()> {
         id: "test-hiccup".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         exactly_once: None,
         send_timeout_secs: Some(30),
@@ -921,6 +1512,8 @@ async fn kafka_sink_batch_resilience() -> Result<()> {
         id: "test-batch-resilience".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         exactly_once: None,
         send_timeout_secs: Some(30),
@@ -971,6 +1564,8 @@ async fn kafka_sink_respects_cancellation() -> Result<()> {
         id: "test-cancel".into(),
         brokers: "invalid-host:9999".into(),
         topic: "df-test-cancel".into(),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
         required: Some(true),
         exactly_once: None,
         send_timeout_secs: Some(2),
@@ -994,5 +1589,71 @@ async fn kafka_sink_respects_cancellation() -> Result<()> {
     assert!(result.is_err(), "cancelled operation should fail");
 
     info!("✓ cancellation respected");
+    Ok(())
+}
+
+// =============================================================================
+// Envelope Default Tests
+// =============================================================================
+
+/// Test that default envelope is Native.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_default_envelope_is_native() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let topic = test_topic("default-envelope");
+    let brokers = brokers();
+    create_topic(&brokers, &topic, 1).await?;
+
+    // Use Default::default() for envelope and encoding
+    let cfg = KafkaSinkCfg {
+        id: "test-default".into(),
+        brokers: brokers.clone(),
+        topic: topic.clone(),
+        envelope: EnvelopeCfg::default(),
+        encoding: EncodingCfg::default(),
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    // Verify defaults
+    assert_eq!(cfg.envelope, EnvelopeCfg::Native);
+    assert_eq!(cfg.encoding, EncodingCfg::Json);
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    let event = make_test_event(1);
+    sink.send(&event).await?;
+
+    let consumer = create_consumer(&brokers, &topic, "test-default-consumer")?;
+    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
+        !msgs.is_empty()
+    })
+    .await;
+
+    assert!(!messages.is_empty(), "should receive message with defaults");
+
+    // Verify native format (no payload wrapper, op at top level)
+    let parsed: serde_json::Value = serde_json::from_slice(&messages[0])?;
+    assert!(
+        parsed.get("payload").is_none(),
+        "default (native) envelope should NOT have payload wrapper"
+    );
+    assert!(
+        parsed.get("op").is_some(),
+        "default (native) envelope should have 'op' at top level"
+    );
+    assert!(
+        parsed.get("source").is_some(),
+        "default (native) envelope should have 'source' at top level"
+    );
+
+    info!("✓ default envelope is Native");
+    delete_topic(&brokers, &topic).await?;
     Ok(())
 }
