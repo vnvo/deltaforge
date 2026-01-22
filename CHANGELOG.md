@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Envelope formats** - Configurable output formats for sink messages ([71f4fdb](https://github.com/vnvo/deltaforge/commit/71f4fdb94e46a2dfa4cf56be43ea520246772126))
+  - **Native**: Direct Event serialization with minimal overhead
+  - **Debezium**: Wire-compatible with Debezium's schemaless mode (`{"schema":null,"payload":{...}}`)
+  - **CloudEvents**: CNCF CloudEvents 1.0 specification support
+  - Per-sink envelope configuration via `envelope.type` in YAML
+- **Encoding module** - Pluggable wire encoding for sink output ([316d763](https://github.com/vnvo/deltaforge/commit/316d76397479e00e07fef56f8568b90cf48ec4fc))
+  - JSON encoding (default)
+  - Extensible design for future Avro/Protobuf support
+
+### Changed
+
+- **Event structure** - Adopted Debezium-compatible envelope as base event structure ([57f2b9c](https://github.com/vnvo/deltaforge/commit/57f2b9c16c9998aebc9f297d8e374207b1b8b7d9))
+- **Sink configuration** - All sinks now support `envelope` and `encoding` options ([72a1898](https://github.com/vnvo/deltaforge/commit/72a1898dce913b8a6ff68ff0652224759d798854))
+  - Kafka, Redis, and NATS sinks updated to use envelope/encoding pipeline
+- **MySQL source** - Refactored to adopt envelope/encode model ([684b165](https://github.com/vnvo/deltaforge/commit/684b16575a9ae8f7958d0d1ffd70b8d0661aef1e))
+- **PostgreSQL source** - Refactored to adopt envelope/encode model ([a9ac527](https://github.com/vnvo/deltaforge/commit/a9ac527308306df5f3fc4e4c26643358e17416b2))
+- **Debezium envelope** - Uses `schema: null` for schemaless mode compatibility ([0e5cf38](https://github.com/vnvo/deltaforge/commit/0e5cf388b95ef02481f018af08d8f8cebd459c43))
+
+### Fixed
+
+- **MySQL DDL handling** - Fixed DDL event handling and required schema reload ([6dfe592](https://github.com/vnvo/deltaforge/commit/6dfe59204644e805167c7e474d5d11e052156386))
+
+### Documentation
+
+- Added envelope formats documentation with wire format examples ([538eee6](https://github.com/vnvo/deltaforge/commit/538eee60c356f116bfc6818148f4a6c00325085f))
+- Updated README with envelope configuration and quick start guide ([d39f455](https://github.com/vnvo/deltaforge/commit/d39f455aca56859651206985c75394efcd5d4522))
+- Updated example configurations with envelope options
+
+### Testing
+
+- Updated all sink integration tests for envelope and encoding support ([6938491](https://github.com/vnvo/deltaforge/commit/693849117d163c944749435f7bc2c0bdb2307b16))
+- Removed Turso integration tests temporarily ([17d933c](https://github.com/vnvo/deltaforge/commit/17d933c9869886f2f53d54de71423933d82db607))
+
 ---
 
 ## [0.1.0-beta.6] - 2025-01-11
