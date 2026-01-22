@@ -1,4 +1,3 @@
-version: "3.9"
 services:
   postgres:
     image: postgres:17
@@ -77,6 +76,16 @@ services:
       timeout: 5s
       retries: 5
 
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-sd", "/data"]
+    ports:
+      - "4222:4222"   # Client
+      - "8222:8222"   # HTTP monitoring
+    volumes:
+      - nats-data:/data
+
 volumes:
   postgres_data:
   mysql_data:
+  nats-data:

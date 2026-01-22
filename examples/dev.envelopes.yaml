@@ -1,0 +1,89 @@
+# Development config demonstrating all envelope formats.
+# Use this to test envelope serialization across sinks.
+
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: envelope-test
+  tenant: df
+
+spec:
+  source:
+    type: mysql
+    config:
+      id: mysql-shop
+      dsn: "mysql://df:dfpw@127.0.0.1:3306"
+      tables: ["orders.orders", "orders.order_items"]
+
+  processors: []
+
+  sinks:
+    # Native envelope - direct Event serialization
+    # Output: {"before":...,"after":...,"source":...,"op":"c","ts_ms":...}
+    - type: kafka
+      config:
+        id: kafka-native
+        brokers: "127.0.0.1:9092"
+        topic: orders.native
+        envelope:
+          type: native
+        encoding: json
+        required: false
+
+    # Debezium envelope - payload wrapper with null schema
+    # Output: {"schema":null,"payload":{"before":...,"after":...,...}}
+    - type: kafka
+      config:
+        id: kafka-debezium
+        brokers: "127.0.0.1:9092"
+        topic: orders.debezium
+        envelope:
+          type: debezium
+        encoding: json
+        required: false
+
+    # CloudEvents envelope - CNCF spec 1.0
+    # Output: {"specversion":"1.0","type":"com.acme.cdc.created",...,"data":{...}}
+    - type: kafka
+      config:
+        id: kafka-cloudevents
+        brokers: "127.0.0.1:9092"
+        topic: orders.cloudevents
+        envelope:
+          type: cloudevents
+          type_prefix: "com.df.cdc"
+        encoding: json
+        required: false
+
+    # Redis with native (most efficient for cache workers)
+    - type: redis
+      config:
+        id: redis-native
+        uri: "redis://127.0.0.1:6379"
+        stream: df.native
+        envelope:
+          type: native
+        encoding: json
+        required: false
+
+    # Redis with Debezium (for Debezium-aware consumers)
+    - type: redis
+      config:
+        id: redis-debezium
+        uri: "redis://127.0.0.1:6379"
+        stream: df.debezium
+        envelope:
+          type: debezium
+        encoding: json
+        required: false
+
+  batch:
+    max_events: 10
+    max_ms: 1000
+    respect_source_tx: true
+
+  commit_policy:
+    mode: all  # Wait for all sinks (testing mode)
+
+  schema_sensing:
+    enabled: false

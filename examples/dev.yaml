@@ -24,24 +24,33 @@ spec:
         }
 
   sinks:
+    # Redis: Native envelope for efficiency
     - type: redis
       config:
         id: r1
         uri: "redis://127.0.0.1:6379"
         stream: df.events
+        envelope:
+          type: native
+        encoding: json
         required: false
+
+    # Kafka: Debezium envelope for ecosystem compatibility
     - type: kafka
       config:
         id: kafka
         brokers: "127.0.0.1:9092"
         topic: orders
+        envelope:
+          type: debezium
+        encoding: json
         required: true
         exactly_once: false
 
   batch:
     max_events: 100
     max_bytes: 8388608
-    max_ms: 200
+    max_ms: 100
     respect_source_tx: true
     max_inflight: 1
 

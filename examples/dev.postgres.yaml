@@ -19,7 +19,7 @@ spec:
     config:
       id: orders-pg
       dsn: "${POSTGRES_DSN}"
-      slot: deltaforge_slot        # ← Missing!
+      slot: deltaforge_slot
       publication: deltaforge_pub
       tables:
         - public.orders
@@ -29,17 +29,27 @@ spec:
   processors: []
 
   sinks:
+    # Redis: Native for cache updates
     - type: redis
       config:
         id: r1
         uri: ${REDIS_URI}
         stream: df.pg.events
+        envelope:
+          type: native
+        encoding: json
         required: false
+
+    # Kafka: CloudEvents for event-driven consumers
     - type: kafka
       config:
         id: kafka
         brokers: ${KAFKA_BROKERS}
         topic: orders.cdc
+        envelope:
+          type: cloudevents
+          type_prefix: "io.deltaforge.orders"
+        encoding: json
         required: true
         exactly_once: false
 

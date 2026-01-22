@@ -8,6 +8,9 @@
   <a href="https://github.com/vnvo/deltaforge/releases">
     <img src="https://img.shields.io/github/v/release/vnvo/deltaforge" alt="Release">
   </a>
+  <a href="https://vnvo.github.io/deltaforge">
+    <img src="https://img.shields.io/badge/docs-online-blue.svg" alt="Docs">
+  </a>
   <a href="https://github.com/vnvo/deltaforge/pkgs/container/deltaforge">
     <img src="https://img.shields.io/badge/ghcr.io-deltaforge-blue?logo=docker" alt="GHCR">
   </a>
@@ -18,9 +21,6 @@
   <a href="https://coveralls.io/github/vnvo/deltaforge?branch=main">
     <img src="https://coveralls.io/repos/github/vnvo/deltaforge/badge.svg?branch=main" alt="Coverage Status">
   </a>
-  <a href="https://vnvo.github.io/deltaforge">
-    <img src="https://img.shields.io/badge/docs-online-blue.svg" alt="Docs">
-  </a>  
   <img src="https://img.shields.io/badge/rustc-1.89+-orange.svg" alt="MSRV">
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License">
 </p>
@@ -39,7 +39,77 @@ DeltaForge is a lightweight framework for building CDC pipelines that stream dat
 However, DeltaForge is NOT a DAG based stream processor.
 DeltaForge is meant to replace tools like Debezium and similar.
 
-## Supported Technologies
+## Quick Start
+
+Get DeltaForge running in under 5 minutes:
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### Pipeline Config
+```yaml
+# pipeline.yaml
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: my-first-pipeline
+  tenant: demo
+
+spec:
+  source:
+    type: mysql
+    config:
+      id: mysql-src
+      dsn: ${MYSQL_DSN}
+      tables: [mydb.users]
+
+  processors: []
+
+  sinks:
+    - type: kafka
+      config:
+        id: kafka-sink
+        brokers: ${KAFKA_BROKERS}
+        topic: users.cdc
+```
+
+</td>
+<td width="50%" valign="top">
+
+### Run with Docker
+```bash
+docker run --rm \
+  -e MYSQL_DSN="mysql://user:pass@host:3306/mydb" \
+  -e KAFKA_BROKERS="kafka:9092" \
+  -v $(pwd)/pipeline.yaml:/etc/deltaforge/pipeline.yaml:ro \
+  ghcr.io/vnvo/deltaforge:latest \
+  --config /etc/deltaforge/pipeline.yaml
+```
+
+That's it! DeltaForge streams changes from `mydb.users` to Kafka.
+
+**Want Debezium-compatible output?**
+```yaml
+sinks:
+  - type: kafka
+    config:
+      id: kafka-sink
+      brokers: ${KAFKA_BROKERS}
+      topic: users.cdc
+      envelope:
+        type: debezium
+```
+
+Output: `{"schema":null,"payload":{...}}`
+
+📘 [Full docs](https://vnvo.github.io/deltaforge) · [Configuration reference](#configuration-schema)
+
+</td>
+</tr>
+</table>
+
+## The Tech
 
 <table>
   <tr>
@@ -47,6 +117,7 @@ DeltaForge is meant to replace tools like Debezium and similar.
     <td align="center" width="140"><b>Sources</b></td>
     <td align="center" width="140"><b>Processors</b></td>
     <td align="center" width="140"><b>Sinks</b></td>
+    <td align="center" width="140"><b>Output Formats</b></td>
   </tr>
   <tr>
     <td align="center">
@@ -67,6 +138,11 @@ DeltaForge is meant to replace tools like Debezium and similar.
       <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/redis/redis-original.svg" width="40" height="40" alt="Redis">
       <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/nats/nats-original.svg" width="40" height="40" alt="NATS">
       <br><sub>Kafka · Redis · NATS</sub>
+    </td>
+    <td align="center">
+      <img src="https://img.shields.io/badge/Native-red?style=flat-square" alt="Native">
+      <img src="https://img.shields.io/badge/Debezium-green?style=flat-square" alt="Debezium">
+      <img src="https://img.shields.io/badge/CloudEvents-blue?style=flat-square" alt="CloudEvents">
     </td>
   </tr>
 </table>
@@ -105,6 +181,22 @@ DeltaForge is meant to replace tools like Debezium and similar.
   - NATS JetStream sink (via `async_nats`)
   - Configurable envelope formats: Native, Debezium, CloudEvents
   - JSON wire encoding (Avro planned and more to come)
+
+### Event Output Formats
+
+DeltaForge supports multiple envelope formats for ecosystem compatibility:
+
+| Format | Output | Use Case |
+|--------|--------|----------|
+| `native` | `{"op":"c","after":{...},"source":{...}}` | Lowest overhead, DeltaForge consumers |
+| `debezium` | `{"schema":null,"payload":{...}}` | Drop-in Debezium replacement |
+| `cloudevents` | `{"specversion":"1.0","type":"...","data":{...}}` | CNCF-standard, event-driven systems |
+
+🔄 **Debezium Compatibility**: DeltaForge uses Debezium's **schemaless mode** (`schema: null`), which matches Debezium's `JsonConverter` with `schemas.enable=false` - the recommended configuration for most Kafka deployments. This provides wire compatibility with existing Debezium consumers without the overhead of inline schemas (~500+ bytes per message).
+
+> 💡 **Migrating from Debezium?** If your consumers already use `schemas.enable=false`, configure `envelope: { type: debezium }` on your sinks for drop-in compatibility. For consumers expecting inline schemas, you'll need Schema Registry integration (Avro encoding - planned).
+
+See [Envelope Formats](docs/src/envelopes.md) for detailed examples and wire format specifications.
 
 ## Documentation
 
@@ -242,47 +334,6 @@ Environment variables are expanded before parsing, so secrets and URLs can be in
 <tr>
 <td width="50%" valign="top">
 
-### Key fields
-
-| Field | Description |
-|-------|-------------|
-| **`metadata`** | |
-| `name` | Pipeline identifier (used in API routes and metrics) |
-| `tenant` | Business-oriented tenant label |
-| **`spec.source`** | Database source - [MySQL](docs/src/sources/mysql.md), [PostgreSQL](docs/src/sources/postgres.md), etc. |
-| `type` | `mysql`, `postgres`, etc. |
-| `config.id` | Unique identifier for checkpoints |
-| `config.dsn` | Connection string (supports `${ENV_VAR}`) |
-| `config.tables` | Table patterns to capture |
-| **`spec.processors`** | Optional transforms - see [Processors](docs/src/configuration.md#processors) |
-| `type` | `javascript` |
-| `inline` | JavaScript code for batch processing |
-| `limits` | CPU, memory, and timeout limits |
-| **`spec.sinks`** | One or more sinks - see [Sinks](docs/src/sinks/README.md) |
-| `type` | `kafka`, `redis`, or `nats` |
-| `config.envelope` | Output format: `native`, `debezium`, or `cloudevents` - see [Envelopes](docs/src/envelopes.md) |
-| `config.encoding` | Wire encoding: `json` (default) |
-| `config.required` | Whether sink must ack for checkpoint (`true` default) |
-| **`spec.batch`** | Commit unit thresholds - see [Batching](docs/src/configuration.md#batching) |
-| `max_events` | Flush after N events (default: 500) |
-| `max_bytes` | Flush after size limit (default: 1MB) |
-| `max_ms` | Flush after time (default: 1000ms) |
-| `respect_source_tx` | Keep source transactions intact (`true` default) |
-| **`spec.commit_policy`** | Checkpoint gating - see [Commit policy](docs/src/configuration.md#commit-policy) |
-| `mode` | `all`, `required` (default), or `quorum` |
-| `quorum` | Number of sinks for quorum mode |
-| **`spec.schema_sensing`** | Runtime schema inference - see [Schema sensing](docs/src/schemasensing.md) |
-| `enabled` | Enable schema sensing (`false` default) |
-| `deep_inspect` | Nested JSON inspection settings |
-| `sampling` | Sampling rate and warmup config |
-
-📘 Full reference: [Configuration docs](docs/src/configuration.md)
-
-View some examples: [Example Configurations](docs/src/examples/README.md)
-
-</td>
-<td width="50%" valign="top">
-
 ### Full Example
 
 ```yaml
@@ -334,6 +385,7 @@ spec:
         stream: orders
         envelope:
           type: native
+        encoding: json
   
   batch:
     max_events: 500
@@ -356,12 +408,55 @@ spec:
 ```
 
 </td>
+<td width="50%" valign="top">
+
+### Key fields
+
+| Field | Description |
+|-------|-------------|
+| **`metadata`** | |
+| `name` | Pipeline identifier (used in API routes and metrics) |
+| `tenant` | Business-oriented tenant label |
+| **`spec.source`** | Database source - [MySQL](docs/src/sources/mysql.md), [PostgreSQL](docs/src/sources/postgres.md), etc. |
+| `type` | `mysql`, `postgres`, etc. |
+| `config.id` | Unique identifier for checkpoints |
+| `config.dsn` | Connection string (supports `${ENV_VAR}`) |
+| `config.tables` | Table patterns to capture |
+| **`spec.processors`** | Optional transforms - see [Processors](docs/src/configuration.md#processors) |
+| `type` | `javascript` |
+| `inline` | JavaScript code for batch processing |
+| `limits` | CPU, memory, and timeout limits |
+| **`spec.sinks`** | One or more sinks - see [Sinks](docs/src/sinks/README.md) |
+| `type` | `kafka`, `redis`, or `nats` |
+| `config.envelope` | Output format: `native`, `debezium`, or `cloudevents` - see [Envelopes](docs/src/envelopes.md) |
+| `config.encoding` | Wire encoding: `json` (default) |
+| `config.required` | Whether sink must ack for checkpoint (`true` default) |
+| **`spec.batch`** | Commit unit thresholds - see [Batching](docs/src/configuration.md#batching) |
+| `max_events` | Flush after N events (default: 500) |
+| `max_bytes` | Flush after size limit (default: 1MB) |
+| `max_ms` | Flush after time (default: 1000ms) |
+| `respect_source_tx` | Keep source transactions intact (`true` default) |
+| **`spec.commit_policy`** | Checkpoint gating - see [Commit policy](docs/src/configuration.md#commit-policy) |
+| `mode` | `all`, `required` (default), or `quorum` |
+| `quorum` | Number of sinks for quorum mode |
+| **`spec.schema_sensing`** | Runtime schema inference - see [Schema sensing](docs/src/schemasensing.md) |
+| `enabled` | Enable schema sensing (`false` default) |
+| `deep_inspect` | Nested JSON inspection settings |
+| `sampling` | Sampling rate and warmup config |
+
+📘 Full reference: [Configuration docs](docs/src/configuration.md)
+
+View actual examples: [Example Configurations](docs/src/examples/README.md)
+
+</td>
 </tr>
 </table>
 
 ## Roadmap
 
+- [ ] Outbox pattern support
 - [ ] Persistent schema registry (SQLite, then PostgreSQL)
+- [ ] Protobuf encoding
 - [ ] PostgreSQL/S3 checkpoint backends for HA
 - [ ] MongoDB source
 - [ ] ClickHouse sink  
