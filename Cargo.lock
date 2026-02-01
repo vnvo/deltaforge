@@ -1815,6 +1815,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "flowstats"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320ed5a38322ba3919497744d178c0742debbb5f753ae10f171f088b9dcd98de"
+dependencies = [
+ "libm",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4638,6 +4648,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "deltaforge-config",
+ "flowstats",
  "hex",
  "schema_analysis",
  "schemars 0.8.22",
@@ -6631,6 +6642,12 @@ dependencies = [
  "libc",
  "rustix 1.1.2",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
 
 [[package]]
 name = "yansi"

@@ -6,6 +6,7 @@ description = "Universal schema inference from JSON payloads for DeltaForge"
 license.workspace = true
 
 [dependencies]
+flowstats = { version = "0.1", features = ["cardinality", "frequency", "sampling"] }
 schema_analysis = "0.5"
 schemars = "0.8"
 sha2 = "0.10"

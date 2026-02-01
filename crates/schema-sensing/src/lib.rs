@@ -36,6 +36,11 @@ mod json_schema;
 mod schema_state;
 mod sensor;
 
+mod high_cardinality;
+pub use high_cardinality::{
+    HighCardinalityConfig, PathFieldStats, PathClassification, StableField
+};
+
 pub use errors::{SensorError, SensorResult};
 pub use fingerprint::compute_fingerprint;
 pub use json_schema::{JsonSchema, JsonSchemaType, to_json_schema};
