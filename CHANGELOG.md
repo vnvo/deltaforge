@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **High-cardinality key detection** - Automatic detection and normalization of dynamic map keys in schema sensing
+  - Probabilistic classification using HyperLogLog and SpaceSaving algorithms
+  - Stable vs dynamic field detection with configurable thresholds
+  - Adaptive structure hashing that ignores dynamic key names
+  - Reduces false schema evolutions from 100% to <1% for dynamic key payloads
+  - New configuration options: `high_cardinality.enabled`, `min_events`, `stable_threshold`, `min_dynamic_fields`
+  - REST API endpoint: `GET /pipelines/{name}/sensing/schemas/{table}/classifications`
+- **Schema sensing metrics** - Prometheus metrics for cache effectiveness and performance monitoring
+  - `deltaforge_schema_events_total` - Events observed per table
+  - `deltaforge_schema_cache_hits_total` / `cache_misses_total` - Cache effectiveness
+  - `deltaforge_schema_evolutions_total` - Schema changes detected
+  - `deltaforge_schema_tables_total` / `dynamic_maps_total` - Gauge metrics
+  - `deltaforge_schema_sensing_seconds` - Per-event latency histogram
 - **Envelope formats** - Configurable output formats for sink messages ([71f4fdb](https://github.com/vnvo/deltaforge/commit/71f4fdb94e46a2dfa4cf56be43ea520246772126))
   - **Native**: Direct Event serialization with minimal overhead
   - **Debezium**: Wire-compatible with Debezium's schemaless mode (`{"schema":null,"payload":{...}}`)
@@ -33,6 +46,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- Added high-cardinality key handling documentation with configuration examples
+- Updated schema sensing docs with side-by-side configuration reference
+- Added dynamic map classifications API documentation
+- Updated README with high-cardinality feature highlights
 - Added envelope formats documentation with wire format examples ([538eee6](https://github.com/vnvo/deltaforge/commit/538eee60c356f116bfc6818148f4a6c00325085f))
 - Updated README with envelope configuration and quick start guide ([d39f455](https://github.com/vnvo/deltaforge/commit/d39f455aca56859651206985c75394efcd5d4522))
 - Updated example configurations with envelope options
@@ -41,6 +58,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Updated all sink integration tests for envelope and encoding support ([6938491](https://github.com/vnvo/deltaforge/commit/693849117d163c944749435f7bc2c0bdb2307b16))
 - Removed Turso integration tests temporarily ([17d933c](https://github.com/vnvo/deltaforge/commit/17d933c9869886f2f53d54de71423933d82db607))
+- Added high-cardinality detection effectiveness tests
+- Added schema sensing benchmarks with Criterion
+
+### Performance
+
+- **Schema sensing optimizations** - Reduced overhead for high-cardinality detection
+  - Fast path for pure structs (no dynamic fields) - near-zero overhead after warmup
+  - Confidence scaling fix eliminates classification retry loop
+  - Pre-sorted stable fields with binary search (removes per-object HashSet allocation)
+  - Single-probe structure cache (removes double hash lookup)
+  - Lazy classifier updates with graduated sampling during warmup
 
 ---
 
