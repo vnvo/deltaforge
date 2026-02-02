@@ -140,8 +140,10 @@ impl PathFieldStats {
         for field in fields {
             self.total_field_observations += 1;
             self.cardinality.insert(field);
-            self.heavy_hitters.add(field.to_string());
-            self.samples.add(field.to_string());
+            // Allocate once, clone once (not two to_string() calls)
+            let s = field.to_string();
+            self.heavy_hitters.add(s.clone());
+            self.samples.add(s);
         }
     }
 
@@ -151,6 +153,7 @@ impl PathFieldStats {
         for field in fields {
             self.total_field_observations += 1;
             self.cardinality.insert(field);
+            // Allocate once, clone once (not two to_string() calls)
             self.heavy_hitters.add(field.clone());
             self.samples.add(field.clone());
         }
@@ -215,7 +218,7 @@ impl PathFieldStats {
             self.total_field_observations as f64 / self.total_events as f64;
         let top_fields = self.heavy_hitters.top_k(config.heavy_hitter_capacity);
 
-        let stable_fields: Vec<StableField> = top_fields
+        let mut stable_fields: Vec<StableField> = top_fields
             .into_iter()
             .map(|(name, count)| {
                 // Convert observation count to event frequency estimate
@@ -232,13 +235,18 @@ impl PathFieldStats {
             .filter(|f| f.frequency >= config.stable_threshold)
             .collect();
 
+        // Pre-sort by name for efficient binary_search lookup in adaptive_hash
+        stable_fields.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+
         let unique_count = self.cardinality.estimate() as usize;
         let stable_count = stable_fields.len();
         let dynamic_count = unique_count.saturating_sub(stable_count);
         let has_dynamic = dynamic_count >= config.min_dynamic_fields;
 
         // Confidence based on sample size and separation
-        let sample_factor = (self.total_events as f64 / 1000.0).min(1.0).sqrt();
+        // Scale by min_events (not hardcoded 1000) so classification succeeds near min_events
+        let denom = config.min_events.max(1) as f64;
+        let sample_factor = (self.total_events as f64 / denom).min(1.0).sqrt();
         let separation = if stable_fields.is_empty() {
             0.5
         } else {

@@ -21,6 +21,11 @@ deltaforge-config = { path = "../deltaforge-config" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "sensing_bench"
+harness = false
 
 [lints]
 workspace = true

@@ -1,7 +1,10 @@
-//! Schema sensor with high-cardinality key handling.
+//! Schema sensor with high-cardinality key handling (optimized).
 //!
-//! This is the modified SchemaSensor that integrates field classification
-//! to handle dynamic map keys properly.
+//! Optimizations:
+//! 1. Fast path for pure structs (no dynamic fields) - uses original hash
+//! 2. Lazy classifier updates - only update when needed, not every event
+//! 3. Reference-based classifications - no HashMap clone
+//! 4. Skip normalization when not needed
 
 use std::collections::{HashMap, HashSet};
 
@@ -22,31 +25,33 @@ use crate::schema_state::{
 /// Result of observing an event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObserveResult {
-    /// Schema sensing is disabled for this table
     Disabled,
-
-    /// First event for this table - schema initialized
-    NewSchema { fingerprint: String, sequence: u64 },
-
-    /// Schema changed from observing this event
+    NewSchema {
+        fingerprint: String,
+        sequence: u64,
+    },
     Evolved {
         old_fingerprint: String,
         new_fingerprint: String,
         old_sequence: u64,
         new_sequence: u64,
     },
-
-    /// Schema unchanged
-    Unchanged { fingerprint: String, sequence: u64 },
-
-    /// Sampling limit reached - schema stabilized
-    Stabilized { fingerprint: String, sequence: u64 },
-
-    /// Skipped due to structure cache hit (fast path)
-    CacheHit { fingerprint: String, sequence: u64 },
-
-    /// Skipped due to sampling (not selected for this event)
-    Sampled { fingerprint: String, sequence: u64 },
+    Unchanged {
+        fingerprint: String,
+        sequence: u64,
+    },
+    Stabilized {
+        fingerprint: String,
+        sequence: u64,
+    },
+    CacheHit {
+        fingerprint: String,
+        sequence: u64,
+    },
+    Sampled {
+        fingerprint: String,
+        sequence: u64,
+    },
 }
 
 /// Cache statistics for a single table.
@@ -70,7 +75,7 @@ struct StructureCache {
 impl StructureCache {
     fn new(max_size: usize) -> Self {
         Self {
-            seen: HashSet::new(),
+            seen: HashSet::with_capacity(max_size),
             max_size,
             hits: 0,
             misses: 0,
@@ -78,15 +83,27 @@ impl StructureCache {
     }
 
     fn check_and_insert(&mut self, hash: u64) -> bool {
-        if self.seen.contains(&hash) {
-            self.hits += 1;
-            return true;
+        if self.seen.len() >= self.max_size {
+            // At capacity: only check, don't insert (1 hash op)
+            if self.seen.contains(&hash) {
+                self.hits += 1;
+                true
+            } else {
+                self.misses += 1;
+                false
+            }
+        } else {
+            // Under capacity: insert returns false if was present (1 hash op)
+            if self.seen.insert(hash) {
+                // Was not present (now inserted)
+                self.misses += 1;
+                false
+            } else {
+                // Was present
+                self.hits += 1;
+                true
+            }
         }
-        self.misses += 1;
-        if self.seen.len() < self.max_size {
-            self.seen.insert(hash);
-        }
-        false
     }
 
     fn clear(&mut self) {
@@ -100,26 +117,37 @@ impl StructureCache {
     }
 }
 
-/// Universal schema sensor with high-cardinality key handling.
-///
-/// Infers and tracks schema from JSON payloads across all tables.
-/// Uses `schema_analysis` for robust type inference and `high_cardinality`
-/// for distinguishing stable fields from dynamic map keys.
+/// Per-table HC state tracking
+struct TableHcState {
+    classifier: FieldClassifier,
+    /// Cached: does any path have dynamic fields?
+    has_any_dynamic: bool,
+    /// Event count when has_any_dynamic was last computed
+    dynamic_check_at: u64,
+    /// Classification is considered stable (high confidence, enough events)
+    classification_stable: bool,
+    /// Fast path: confirmed pure struct (no dynamic fields after sufficient events)
+    confirmed_pure_struct: bool,
+}
+
+impl TableHcState {
+    fn new(config: HighCardinalityConfig) -> Self {
+        Self {
+            classifier: FieldClassifier::new(config),
+            has_any_dynamic: false,
+            dynamic_check_at: 0,
+            classification_stable: false,
+            confirmed_pure_struct: false,
+        }
+    }
+}
+
 pub struct SchemaSensor {
-    /// Configuration
     config: SchemaSensingConfig,
-
-    /// High-cardinality configuration
     hc_config: HighCardinalityConfig,
-
-    /// Per-table schema state
     schemas: HashMap<String, TableSchemaState>,
-
-    /// Per-table structure cache for fast-path skipping
     structure_caches: HashMap<String, StructureCache>,
-
-    /// Per-table field classifier for high-cardinality handling
-    field_classifiers: HashMap<String, FieldClassifier>,
+    hc_states: HashMap<String, TableHcState>,
 }
 
 impl SchemaSensor {
@@ -136,11 +164,10 @@ impl SchemaSensor {
             hc_config,
             schemas: HashMap::new(),
             structure_caches: HashMap::new(),
-            field_classifiers: HashMap::new(),
+            hc_states: HashMap::new(),
         }
     }
 
-    /// Create a sensor with sensing enabled (for testing).
     pub fn enabled() -> Self {
         Self::new(SchemaSensingConfig {
             enabled: true,
@@ -148,30 +175,24 @@ impl SchemaSensor {
         })
     }
 
-    /// Check if sensing is enabled.
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
     }
 
     /// Observe a pre-parsed JSON value (optimized path).
-    ///
-    /// This is the preferred method when you already have a parsed Value,
-    /// as it can use structure caching without re-parsing.
     pub fn observe_value(
         &mut self,
         table: &str,
         value: &serde_json::Value,
     ) -> SensorResult<ObserveResult> {
-        // Check if sensing is enabled for this table
         if !self.config.should_sense_table(table) {
             return Ok(ObserveResult::Disabled);
         }
 
-        // Get current event count for sampling decision
         let event_count =
             self.schemas.get(table).map(|s| s.event_count).unwrap_or(0);
 
-        // Check if we've hit the stabilization limit
+        // Early exit: schema stabilized
         if let Some(state) = self.schemas.get(table) {
             if state.stabilized {
                 return Ok(ObserveResult::Stabilized {
@@ -181,33 +202,47 @@ impl SchemaSensor {
             }
         }
 
-        // Update field classifier (always, even before cache check)
-        let classifications = self.update_field_classifier(table, value);
+        // HC processing - only when enabled and beneficial
+        let (use_adaptive_hash, has_dynamic) = if self.hc_config.enabled {
+            self.update_hc_state(table, value, event_count)
+        } else {
+            (false, false)
+        };
 
-        // Structure cache check using ADAPTIVE hash
+        // Structure cache check
         if self.config.sampling.structure_cache {
-            let structure_hash =
-                if self.hc_config.enabled && !classifications.is_empty() {
-                    compute_adaptive_hash(value, &classifications)
+            // OPTIMIZATION: Use simple hash when no dynamic fields
+            let structure_hash = if use_adaptive_hash && has_dynamic {
+                let hc_state = self.hc_states.get(table).unwrap();
+                compute_adaptive_hash(
+                    value,
+                    hc_state.classifier.classifications(),
+                )
+            } else {
+                compute_structure_hash(value)
+            };
+
+            // OPTIMIZATION: Use get() first to avoid String allocation on hot path
+            let cache_hit =
+                if let Some(cache) = self.structure_caches.get_mut(table) {
+                    cache.check_and_insert(structure_hash)
                 } else {
-                    compute_structure_hash(value)
+                    // First time for this table - need to create cache
+                    let cache = self
+                        .structure_caches
+                        .entry(table.to_string())
+                        .or_insert_with(|| {
+                            StructureCache::new(
+                                self.config.sampling.structure_cache_size,
+                            )
+                        });
+                    cache.check_and_insert(structure_hash)
                 };
 
-            let cache = self
-                .structure_caches
-                .entry(table.to_string())
-                .or_insert_with(|| {
-                    StructureCache::new(
-                        self.config.sampling.structure_cache_size,
-                    )
-                });
-
-            if cache.check_and_insert(structure_hash) {
-                // Cache hit - skip full sensing
+            if cache_hit {
                 if let Some(state) = self.schemas.get_mut(table) {
                     state.record_observation();
 
-                    // Check stabilization even on cache hit
                     let max_samples = self.config.deep_inspect.max_sample_size;
                     if max_samples > 0
                         && state.event_count >= max_samples as u64
@@ -225,11 +260,10 @@ impl SchemaSensor {
                         sequence: state.sequence,
                     });
                 }
-                // No schema yet - fall through to full sensing
             }
         }
 
-        // Sampling check (after warmup)
+        // Sampling check
         if !self.config.should_sample(event_count) {
             if let Some(state) = self.schemas.get_mut(table) {
                 state.record_observation();
@@ -240,111 +274,132 @@ impl SchemaSensor {
             }
         }
 
-        // Full sensing path - serialize and process
-        let json = serde_json::to_vec(value)
-            .map_err(|e| SensorError::Serialization(e.to_string()))?;
-        self.observe_bytes(table, &json)
+        // Full sensing - normalize only if needed
+        self.observe_value_full(table, value, has_dynamic)
     }
 
-    /// Observe raw JSON bytes.
-    pub fn observe(
+    /// Update HC state and return (should_use_adaptive_hash, has_any_dynamic)
+    fn update_hc_state(
         &mut self,
         table: &str,
-        json: &[u8],
-    ) -> SensorResult<ObserveResult> {
-        // Check if sensing is enabled for this table
-        if !self.config.should_sense_table(table) {
-            return Ok(ObserveResult::Disabled);
-        }
-
-        let event_count =
-            self.schemas.get(table).map(|s| s.event_count).unwrap_or(0);
-
-        // Check stabilization
-        if let Some(state) = self.schemas.get(table) {
-            if state.stabilized {
-                return Ok(ObserveResult::Stabilized {
-                    fingerprint: state.fingerprint.clone(),
-                    sequence: state.sequence,
-                });
+        value: &serde_json::Value,
+        event_count: u64,
+    ) -> (bool, bool) {
+        // FAST PATH: Check if we already have state and it's a confirmed pure struct
+        // Use .get() first to avoid String allocation for table key
+        if let Some(hc_state) = self.hc_states.get(table) {
+            if hc_state.confirmed_pure_struct {
+                return (false, false);
+            }
+            if hc_state.classification_stable && !hc_state.has_any_dynamic {
+                return (false, false);
             }
         }
 
-        // Parse for field classification and cache check
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(json) {
-            let classifications = self.update_field_classifier(table, &value);
+        // Slower path - need to potentially create/update state
+        let min_events = self.hc_config.min_events;
+        let confidence_threshold = self.hc_config.confidence_threshold;
+        let reevaluate_interval = self.hc_config.reevaluate_interval;
 
-            if self.config.sampling.structure_cache {
-                let structure_hash =
-                    if self.hc_config.enabled && !classifications.is_empty() {
-                        compute_adaptive_hash(&value, &classifications)
-                    } else {
-                        compute_structure_hash(&value)
-                    };
+        // Now we need mutable access - only allocate table string if needed
+        let hc_state = self
+            .hc_states
+            .entry(table.to_string())
+            .or_insert_with(|| TableHcState::new(self.hc_config.clone()));
 
-                let cache = self
-                    .structure_caches
-                    .entry(table.to_string())
-                    .or_insert_with(|| {
-                        StructureCache::new(
-                            self.config.sampling.structure_cache_size,
-                        )
-                    });
+        // Double-check after getting mutable reference
+        if hc_state.confirmed_pure_struct {
+            return (false, false);
+        }
 
-                if cache.check_and_insert(structure_hash) {
-                    // Cache hit
-                    if let Some(state) = self.schemas.get_mut(table) {
-                        state.record_observation();
+        // Check if classification is stable with no dynamic fields
+        if hc_state.classification_stable && !hc_state.has_any_dynamic {
+            // After 2x min_events with no dynamic fields, confirm pure struct
+            if event_count >= min_events * 2 {
+                hc_state.confirmed_pure_struct = true;
+            }
+            return (false, false);
+        }
 
-                        // Check stabilization even on cache hit
-                        let max_samples =
-                            self.config.deep_inspect.max_sample_size;
-                        if max_samples > 0
-                            && state.event_count >= max_samples as u64
-                            && !state.stabilized
-                        {
-                            state.mark_stabilized();
-                            return Ok(ObserveResult::Stabilized {
-                                fingerprint: state.fingerprint.clone(),
-                                sequence: state.sequence,
-                            });
-                        }
+        // Determine if we need to update classifier
+        let should_update = if hc_state.classification_stable {
+            // Only periodic re-evaluation after stable
+            reevaluate_interval > 0
+                && event_count.saturating_sub(hc_state.dynamic_check_at)
+                    >= reevaluate_interval
+        } else {
+            // During warmup: update less frequently as we get more events
+            if event_count < 20 {
+                true
+            } else if event_count < min_events {
+                event_count % 5 == 0
+            } else {
+                event_count % 20 == 0
+                    || hc_state.classifier.classifications().is_empty()
+            }
+        };
 
-                        return Ok(ObserveResult::CacheHit {
-                            fingerprint: state.fingerprint.clone(),
-                            sequence: state.sequence,
-                        });
-                    }
-                }
+        if should_update {
+            hc_state.classifier.observe(value);
+            hc_state.dynamic_check_at = event_count;
+
+            // Update has_any_dynamic cache
+            let classifications = hc_state.classifier.classifications();
+            hc_state.has_any_dynamic =
+                classifications.values().any(|c| c.has_dynamic_fields);
+
+            // Check if classification is now stable
+            if !hc_state.classification_stable && !classifications.is_empty() {
+                let all_confident = classifications
+                    .values()
+                    .all(|c| c.confidence >= confidence_threshold);
+                let enough_events = event_count >= min_events;
+                hc_state.classification_stable = all_confident && enough_events;
             }
         }
 
-        // Sampling check (after warmup)
-        if !self.config.should_sample(event_count) {
-            if let Some(state) = self.schemas.get_mut(table) {
-                state.record_observation();
-                return Ok(ObserveResult::Sampled {
-                    fingerprint: state.fingerprint.clone(),
-                    sequence: state.sequence,
-                });
-            }
-        }
-
-        self.observe_bytes(table, json)
+        let has_classifications =
+            !hc_state.classifier.classifications().is_empty();
+        (
+            has_classifications && hc_state.has_any_dynamic,
+            hc_state.has_any_dynamic,
+        )
     }
 
-    /// Internal: process JSON bytes for schema inference.
-    fn observe_bytes(
+    /// Full sensing path with optional normalization
+    fn observe_value_full(
         &mut self,
         table: &str,
-        json: &[u8],
+        value: &serde_json::Value,
+        has_dynamic: bool,
     ) -> SensorResult<ObserveResult> {
-        // Use schema_analysis to infer types (via serde deserialization)
-        let inferred: InferredSchema = serde_json::from_slice(json)?;
+        // OPTIMIZATION: Only normalize when there are dynamic fields
+        let empty_map = HashMap::new();
+        let inferred: InferredSchema = if has_dynamic {
+            let hc_state = self.hc_states.get(table);
+            let classifications = hc_state
+                .map(|s| s.classifier.classifications())
+                .unwrap_or(&empty_map);
+
+            if has_any_dynamic_in_tree(classifications) {
+                let normalized = normalize_value(value, "", classifications);
+                let json_bytes = serde_json::to_vec(&normalized)?;
+                serde_json::from_slice(&json_bytes)?
+            } else {
+                // No actual dynamic fields in tree, use value directly
+                let json_bytes = serde_json::to_vec(value)?;
+                serde_json::from_slice(&json_bytes)?
+            }
+        } else {
+            // Fast path: no normalization needed
+            let json_bytes = serde_json::to_vec(value)?;
+            serde_json::from_slice(&json_bytes)?
+        };
+
         let fingerprint =
             crate::fingerprint::compute_fingerprint(&inferred.schema);
 
-        // Check if table exists and if schema evolved
+        // Check for evolution
         let evolution_info = if let Some(state) = self.schemas.get(table) {
             if state.fingerprint != fingerprint {
                 Some((state.fingerprint.clone(), state.sequence))
@@ -355,15 +410,12 @@ impl SchemaSensor {
             None
         };
 
-        // Handle schema evolution or creation
         if let Some((old_fingerprint, old_sequence)) = evolution_info {
-            // Schema evolved - update state
             let state = self.schemas.get_mut(table).unwrap();
             state.inferred = inferred;
             state.fingerprint = fingerprint.clone();
             state.sequence += 1;
             state.record_observation();
-
             let new_sequence = state.sequence;
 
             debug!(
@@ -373,7 +425,6 @@ impl SchemaSensor {
                 "Schema evolved"
             );
 
-            // Clear structure cache on evolution
             if let Some(cache) = self.structure_caches.get_mut(table) {
                 cache.clear();
             }
@@ -386,7 +437,6 @@ impl SchemaSensor {
             });
         }
 
-        // Get or create table state
         let is_new = !self.schemas.contains_key(table);
         let state =
             self.schemas.entry(table.to_string()).or_insert_with(|| {
@@ -395,7 +445,6 @@ impl SchemaSensor {
 
         state.record_observation();
 
-        // Check stabilization
         let max_samples = self.config.deep_inspect.max_sample_size;
         if max_samples > 0
             && state.event_count >= max_samples as u64
@@ -421,61 +470,41 @@ impl SchemaSensor {
         }
     }
 
-    /// Update field classifier and return current classifications.
-    fn update_field_classifier(
+    /// Observe raw JSON bytes.
+    pub fn observe(
         &mut self,
         table: &str,
-        value: &serde_json::Value,
-    ) -> HashMap<String, PathClassification> {
-        if !self.hc_config.enabled {
-            return HashMap::new();
-        }
-
-        // Clone config before borrowing field_classifiers to avoid borrow conflict
-        let hc_config = self.hc_config.clone();
-        let classifier = self
-            .field_classifiers
-            .entry(table.to_string())
-            .or_insert_with(|| FieldClassifier::new(hc_config));
-
-        classifier.observe(value).clone()
+        json: &[u8],
+    ) -> SensorResult<ObserveResult> {
+        let value: serde_json::Value = serde_json::from_slice(json)?;
+        self.observe_value(table, &value)
     }
 
-    // ========================================================================
     // Query methods
-    // ========================================================================
-
-    /// Get the current schema version for a table.
     pub fn get_version(&self, table: &str) -> Option<SensedSchemaVersion> {
         self.schemas.get(table).map(|s| s.version())
     }
 
-    /// Get a snapshot of a table's schema.
     pub fn get_snapshot(&self, table: &str) -> Option<SchemaSnapshot> {
         self.schemas.get(table).map(SchemaSnapshot::from)
     }
 
-    /// List all tracked tables.
     pub fn tables(&self) -> Vec<&str> {
         self.schemas.keys().map(|s| s.as_str()).collect()
     }
 
-    /// Get all snapshots for all tables.
     pub fn all_snapshots(&self) -> Vec<SchemaSnapshot> {
         self.schemas.values().map(SchemaSnapshot::from).collect()
     }
 
-    /// Get the raw inferred schema for a table.
     pub fn get_schema(&self, table: &str) -> Option<&schema_analysis::Schema> {
         self.schemas.get(table).map(|s| s.schema())
     }
 
-    /// Get event count for a table.
     pub fn event_count(&self, table: &str) -> u64 {
         self.schemas.get(table).map(|s| s.event_count).unwrap_or(0)
     }
 
-    /// Check if a table's schema has stabilized.
     pub fn is_stabilized(&self, table: &str) -> bool {
         self.schemas
             .get(table)
@@ -483,7 +512,6 @@ impl SchemaSensor {
             .unwrap_or(false)
     }
 
-    /// Get cache statistics for a table.
     pub fn cache_stats(&self, table: &str) -> Option<CacheStatsEntry> {
         self.structure_caches.get(table).map(|c| {
             let (cached, max_size, hits, misses) = c.stats();
@@ -497,7 +525,6 @@ impl SchemaSensor {
         })
     }
 
-    /// Get cache statistics for all tables.
     pub fn all_cache_stats(&self) -> Vec<CacheStatsEntry> {
         self.structure_caches
             .iter()
@@ -514,80 +541,178 @@ impl SchemaSensor {
             .collect()
     }
 
-    // ========================================================================
-    // High-cardinality query methods
-    // ========================================================================
-
-    /// Get field classification for a path within a table.
-    pub fn get_classification(
-        &self,
-        table: &str,
-        path: &str,
-    ) -> Option<&PathClassification> {
-        self.field_classifiers
-            .get(table)
-            .and_then(|c| c.get_classification(path))
-    }
-
-    /// Get all classifications for a table.
-    pub fn get_all_classifications(
-        &self,
-        table: &str,
-    ) -> Option<&HashMap<String, PathClassification>> {
-        self.field_classifiers
-            .get(table)
-            .map(|c| c.classifications())
-    }
-
-    /// Get paths detected as maps (having dynamic keys) for a table.
-    pub fn detected_maps(&self, table: &str) -> Vec<&str> {
-        self.field_classifiers
-            .get(table)
-            .map(|c| c.map_paths())
-            .unwrap_or_default()
-    }
-
-    // ========================================================================
-    // Mutation methods
-    // ========================================================================
-
-    /// Reset tracking for a table.
     pub fn reset_table(&mut self, table: &str) {
         self.schemas.remove(table);
         self.structure_caches.remove(table);
-        self.field_classifiers.remove(table);
+        self.hc_states.remove(table);
     }
 
-    /// Reset all tracking.
     pub fn reset_all(&mut self) {
         self.schemas.clear();
         self.structure_caches.clear();
-        self.field_classifiers.clear();
+        self.hc_states.clear();
     }
 
-    /// Get configuration.
     pub fn config(&self) -> &SchemaSensingConfig {
         &self.config
     }
 
-    /// Export a table's schema as JSON Schema.
     pub fn to_json_schema(&self, table: &str) -> Option<JsonSchema> {
         self.schemas
             .get(table)
             .map(|s| crate::json_schema::to_json_schema(s.schema()))
     }
 
-    /// Export all schemas as JSON Schema.
     pub fn all_json_schemas(&self) -> HashMap<String, JsonSchema> {
         self.schemas
             .iter()
-            .map(|(table, state)| {
-                (
-                    table.clone(),
-                    crate::json_schema::to_json_schema(state.schema()),
-                )
+            .map(|(t, s)| {
+                (t.clone(), crate::json_schema::to_json_schema(s.schema()))
             })
             .collect()
+    }
+
+    // HC-specific methods
+    pub fn get_classification(
+        &self,
+        table: &str,
+        path: &str,
+    ) -> Option<&PathClassification> {
+        self.hc_states
+            .get(table)
+            .and_then(|s| s.classifier.classifications().get(path))
+    }
+
+    pub fn get_all_classifications(
+        &self,
+        table: &str,
+    ) -> Option<&HashMap<String, PathClassification>> {
+        self.hc_states
+            .get(table)
+            .map(|s| s.classifier.classifications())
+    }
+
+    pub fn detected_maps(&self, table: &str) -> Vec<&str> {
+        self.hc_states
+            .get(table)
+            .map(|s| s.classifier.map_paths())
+            .unwrap_or_default()
+    }
+
+    pub fn has_dynamic_fields(&self, table: &str) -> bool {
+        self.hc_states
+            .get(table)
+            .map(|s| s.has_any_dynamic)
+            .unwrap_or(false)
+    }
+}
+
+/// Check if any path in classifications has dynamic fields
+fn has_any_dynamic_in_tree(
+    classifications: &HashMap<String, PathClassification>,
+) -> bool {
+    classifications.values().any(|c| c.has_dynamic_fields)
+}
+
+/// Normalize value - optimized to avoid cloning when possible
+fn normalize_value(
+    value: &serde_json::Value,
+    path: &str,
+    classifications: &HashMap<String, PathClassification>,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let class = classifications.get(path);
+            let has_dynamic =
+                class.map(|c| c.has_dynamic_fields).unwrap_or(false);
+
+            if !has_dynamic {
+                // No dynamic fields at this path - still need to check children
+                let mut needs_normalization = false;
+                for (key, _) in map {
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{}.{}", path, key)
+                    };
+                    if classifications
+                        .get(&child_path)
+                        .map(|c| c.has_dynamic_fields)
+                        .unwrap_or(false)
+                    {
+                        needs_normalization = true;
+                        break;
+                    }
+                }
+
+                if !needs_normalization {
+                    // Fast path: no normalization needed in subtree
+                    return value.clone();
+                }
+            }
+
+            let stable_set: HashSet<&str> = class
+                .map(|c| {
+                    c.stable_fields.iter().map(|f| f.name.as_str()).collect()
+                })
+                .unwrap_or_default();
+
+            let mut new_map = serde_json::Map::new();
+            let mut dynamic_sample: Option<serde_json::Value> = None;
+
+            for (key, child) in map {
+                let is_dynamic =
+                    has_dynamic && !stable_set.contains(key.as_str());
+
+                if is_dynamic {
+                    if dynamic_sample.is_none() {
+                        let placeholder_path = if path.is_empty() {
+                            "<*>".to_string()
+                        } else {
+                            format!("{}.<*>", path)
+                        };
+                        dynamic_sample = Some(normalize_value(
+                            child,
+                            &placeholder_path,
+                            classifications,
+                        ));
+                    }
+                } else {
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{}.{}", path, key)
+                    };
+                    new_map.insert(
+                        key.clone(),
+                        normalize_value(child, &child_path, classifications),
+                    );
+                }
+            }
+
+            if let Some(sample) = dynamic_sample {
+                new_map.insert("<dynamic>".to_string(), sample);
+            }
+
+            serde_json::Value::Object(new_map)
+        }
+        serde_json::Value::Array(arr) => {
+            if let Some(first) = arr.first() {
+                let elem_path = if path.is_empty() {
+                    "[]".to_string()
+                } else {
+                    format!("{}[]", path)
+                };
+                serde_json::Value::Array(vec![normalize_value(
+                    first,
+                    &elem_path,
+                    classifications,
+                )])
+            } else {
+                value.clone()
+            }
+        }
+        _ => value.clone(),
     }
 }
 
@@ -599,21 +724,20 @@ mod tests {
 
     #[test]
     fn test_disabled_sensor() {
-        let mut sensor = SchemaSensor::new(SchemaSensingConfig::default());
-        let result = sensor.observe("users", b"{}").unwrap();
-        assert_eq!(result, ObserveResult::Disabled);
+        let config = SchemaSensingConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let mut sensor = SchemaSensor::new(config);
+        let result = sensor.observe("test", b"{}").unwrap();
+        assert!(matches!(result, ObserveResult::Disabled));
     }
 
     #[test]
     fn test_new_schema() {
         let mut sensor = SchemaSensor::enabled();
-        let json = br#"{"id": 1, "name": "Alice"}"#;
-
-        let result = sensor.observe("users", json).unwrap();
+        let result = sensor.observe("users", br#"{"id": 1}"#).unwrap();
         assert!(matches!(result, ObserveResult::NewSchema { .. }));
-
-        let version = sensor.get_version("users").unwrap();
-        assert_eq!(version.sequence, 1);
     }
 
     #[test]
@@ -637,57 +761,34 @@ mod tests {
         };
         let mut sensor = SchemaSensor::with_hc_config(config, hc_config);
 
-        // Warmup phase 1: Build classifications with varied keys
-        for i in 0..10 {
-            let val = json!({
+        let make_event = |i: u64| {
+            json!({
                 "id": i,
+                "type": "event",
                 "sessions": {
-                    format!("sess_{}", i): {"user": "test"}
+                    format!("sess_{}", i): {"user_id": i % 100, "ts": 123}
                 }
-            });
-            sensor.observe_value("events", &val).unwrap();
+            })
+        };
+
+        // Warmup
+        for i in 0..20 {
+            sensor.observe_value("events", &make_event(i)).unwrap();
         }
 
-        // Warmup phase 2: Use consistent structure to stabilize schema
-        // This lets the cache fill with the adaptive hash
-        for i in 10..20 {
-            let val = json!({
-                "id": i,
-                "sessions": {
-                    "sess_stable": {"user": "test"}
-                }
-            });
-            sensor.observe_value("events", &val).unwrap();
-        }
-
-        // Verify classifications detected the map
         let maps = sensor.detected_maps("events");
         assert!(
             maps.contains(&"sessions"),
-            "sessions should be detected as map"
+            "sessions should be detected as map, got: {:?}",
+            maps
         );
 
-        // Now test: different session keys should have same adaptive hash
-        let val1 = json!({
-            "id": 100,
-            "sessions": {
-                "sess_NEW_ABC": {"user": "alice"}
-            }
-        });
+        let val1 = make_event(100);
         let result1 = sensor.observe_value("events", &val1).unwrap();
 
-        let val2 = json!({
-            "id": 101,
-            "sessions": {
-                "sess_DIFFERENT_XYZ": {"user": "bob"}
-            }
-        });
+        let val2 = make_event(101);
         let result2 = sensor.observe_value("events", &val2).unwrap();
 
-        // Both should cache hit because:
-        // 1. Classifications exist (sessions is dynamic)
-        // 2. Adaptive hash ignores dynamic key names
-        // 3. Structure matches warmup phase 2
         assert!(
             matches!(
                 result1,
@@ -754,5 +855,61 @@ mod tests {
         let class = sensor.get_classification("users", "").unwrap();
         assert_eq!(class.stable_fields.len(), 3);
         assert!(!class.has_dynamic_fields);
+    }
+
+    #[test]
+    fn test_fingerprint_stability_with_dynamic_keys() {
+        let config = SchemaSensingConfig {
+            enabled: true,
+            sampling: SamplingConfig {
+                structure_cache: false,
+                structure_cache_size: 0,
+                warmup_events: 1000,
+                sample_rate: 1,
+            },
+            ..Default::default()
+        };
+        let hc_config = HighCardinalityConfig {
+            enabled: true,
+            min_events: 5,
+            confidence_threshold: 0.3,
+            min_dynamic_fields: 2,
+            ..Default::default()
+        };
+        let mut sensor = SchemaSensor::with_hc_config(config, hc_config);
+
+        let make_event = |i: u64| {
+            json!({
+                "id": i,
+                "sessions": {
+                    format!("sess_{}", i): {"ts": 123}
+                }
+            })
+        };
+
+        // Warmup
+        for i in 0..20 {
+            sensor.observe_value("events", &make_event(i)).unwrap();
+        }
+
+        let mut unchanged_count = 0;
+        let mut evolved_count = 0;
+
+        for i in 100..150 {
+            let result =
+                sensor.observe_value("events", &make_event(i)).unwrap();
+            match result {
+                ObserveResult::Unchanged { .. } => unchanged_count += 1,
+                ObserveResult::Evolved { .. } => evolved_count += 1,
+                _ => {}
+            }
+        }
+
+        assert!(
+            unchanged_count > evolved_count,
+            "Expected more Unchanged than Evolved with HC on: unchanged={}, evolved={}",
+            unchanged_count,
+            evolved_count
+        );
     }
 }

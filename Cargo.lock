@@ -4647,6 +4647,7 @@ name = "schema-sensing"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "criterion",
  "deltaforge-config",
  "flowstats",
  "hex",

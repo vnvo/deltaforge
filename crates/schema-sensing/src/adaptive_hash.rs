@@ -3,7 +3,7 @@
 //! Computes structure hashes that remain stable when dynamic keys change,
 //! enabling high cache hit rates for objects with map-like fields.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use crate::high_cardinality::PathClassification;
@@ -59,25 +59,17 @@ fn hash_value_adaptive<H: Hasher>(
 
             if let Some(class) = classifications.get(path) {
                 // We have classification - use it for stable hashing
-                let stable_set: HashSet<&str> = class
-                    .stable_fields
-                    .iter()
-                    .map(|f| f.name.as_str())
-                    .collect();
+                // stable_fields is pre-sorted by name, so we can use binary_search
 
-                // Hash stable fields (sorted for determinism)
-                let mut stable_names: Vec<&str> =
-                    stable_set.iter().copied().collect();
-                stable_names.sort_unstable();
-
-                stable_names.len().hash(hasher);
-                for name in &stable_names {
-                    name.hash(hasher);
-                    if let Some(child) = obj.get(*name) {
+                // Hash stable fields (already sorted in classification)
+                class.stable_fields.len().hash(hasher);
+                for sf in &class.stable_fields {
+                    sf.name.hash(hasher);
+                    if let Some(child) = obj.get(&sf.name) {
                         let child_path = if path.is_empty() {
-                            name.to_string()
+                            sf.name.clone()
                         } else {
-                            format!("{}.{}", path, name)
+                            format!("{}.{}", path, sf.name)
                         };
                         hash_value_adaptive(
                             child,
@@ -92,9 +84,16 @@ fn hash_value_adaptive<H: Hasher>(
                 if class.has_dynamic_fields {
                     "<MAP>".hash(hasher);
 
-                    // Find first dynamic key and hash its value structure
+                    // Find first dynamic key (not in stable_fields) and hash its value structure
                     for (key, val) in obj.iter() {
-                        if !stable_set.contains(key.as_str()) {
+                        // Use binary_search on pre-sorted stable_fields - no allocation
+                        let is_stable = class
+                            .stable_fields
+                            .binary_search_by(|f| {
+                                f.name.as_str().cmp(key.as_str())
+                            })
+                            .is_ok();
+                        if !is_stable {
                             let placeholder_path = if path.is_empty() {
                                 "<*>".to_string()
                             } else {
