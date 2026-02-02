@@ -47,7 +47,7 @@ Get DeltaForge running in under 5 minutes:
 <tr>
 <td width="50%" valign="top">
 
-### Pipeline Config
+### Minimal Pipeline Config
 ```yaml
 # pipeline.yaml
 apiVersion: deltaforge/v1
@@ -77,7 +77,7 @@ spec:
 </td>
 <td width="50%" valign="top">
 
-### Run with Docker
+### Run it with Docker
 ```bash
 docker run --rm \
   -e MYSQL_DSN="mysql://user:pass@host:3306/mydb" \
@@ -162,6 +162,7 @@ Output: `{"schema":null,"payload":{...}}`
 - **Schema Sensing**
   - Automatic schema inference from JSON event payloads
   - Deep inspection for nested JSON structures
+  - High-cardinality key detection (session IDs, trace IDs, dynamic maps)
   - Configurable sampling with warmup and cache optimization
   - Drift detection comparing DB schema vs observed data
   - JSON Schema export for downstream consumers
@@ -321,6 +322,7 @@ configuration.
 - `GET /pipelines/{name}/sensing/schemas` - list inferred schemas (from sensing).
 - `GET /pipelines/{name}/sensing/schemas/{table}` - get inferred schema details.
 - `GET /pipelines/{name}/sensing/schemas/{table}/json-schema` - export as JSON Schema.
+- `GET /pipelines/{name}/sensing/schemas/{table}/classifications` - get dynamic map classifications.
 - `GET /pipelines/{name}/drift` - get drift detection results.
 - `GET /pipelines/{name}/sensing/stats` - get schema sensing cache statistics.
 
@@ -405,6 +407,9 @@ spec:
     sampling:
       warmup_events: 50
       sample_rate: 5
+    high_cardinality:
+      enabled: true
+      min_events: 100
 ```
 
 </td>
@@ -443,6 +448,7 @@ spec:
 | `enabled` | Enable schema sensing (`false` default) |
 | `deep_inspect` | Nested JSON inspection settings |
 | `sampling` | Sampling rate and warmup config |
+| `high_cardinality` | Dynamic key detection settings |
 
 📘 Full reference: [Configuration docs](docs/src/configuration.md)
 

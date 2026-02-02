@@ -10,6 +10,7 @@ Schema sensing is useful when:
 - **JSON columns**: Database JSON/JSONB columns have dynamic structure
 - **Schema evolution tracking**: Detect when payload structure changes over time
 - **Downstream integration**: Generate JSON Schema for consumers
+- **Dynamic map keys**: Session IDs, trace IDs, or other high-cardinality keys in JSON
 
 ## How It Works
 
@@ -22,66 +23,119 @@ Schema sensing is useful when:
                               ▼
                      ┌─────────────────┐
                      │ Structure Cache │
+                     │ + HC Classifier │
                      └─────────────────┘
 ```
 
 1. **Observation**: Events flow through the sensor during batch processing
 2. **Sampling**: Not every event is fully analyzed (configurable rate)
 3. **Deep inspection**: Nested JSON structures are recursively analyzed
-4. **Fingerprinting**: Schema changes are detected via SHA-256 fingerprints
-5. **Caching**: Repeated structures skip full analysis for performance
+4. **High-cardinality detection**: Dynamic map keys are classified and normalized
+5. **Fingerprinting**: Schema changes are detected via SHA-256 fingerprints
+6. **Caching**: Repeated structures skip full analysis for performance
+
+## High-Cardinality Key Handling
+
+JSON payloads often contain dynamic keys like session IDs, trace IDs, or user-generated identifiers:
+
+```json
+{
+  "id": 1,
+  "sessions": {
+    "sess_abc123": {"user_id": 42, "started_at": 1700000000},
+    "sess_xyz789": {"user_id": 43, "started_at": 1700000001}
+  }
+}
+```
+
+Without special handling, each unique key (`sess_abc123`, `sess_xyz789`) triggers a "schema evolution" event, causing:
+- 0% cache hit rate
+- Constant false evolution alerts
+- Unbounded schema growth
+
+### How It Works
+
+DeltaForge uses probabilistic data structures (HyperLogLog, SpaceSaving) to classify fields:
+
+| Classification | Description | Example |
+|----------------|-------------|---------|
+| **Stable fields** | Appear in most events | `id`, `type`, `timestamp` |
+| **Dynamic fields** | Unique per event, high cardinality | `sess_*`, `trace_*`, `uuid_*` |
+
+When dynamic fields are detected, the schema sensor:
+1. **Normalizes keys**: Replaces `sess_abc123` with `<dynamic>` placeholder
+2. **Uses adaptive hashing**: Structure cache ignores dynamic key names
+3. **Produces stable fingerprints**: Same schema despite different keys
+
+### Results
+
+| Scenario | Without HC | With HC |
+|----------|------------|---------|
+| Nested dynamic keys | 100% evolution rate | <1% evolution rate |
+| Top-level dynamic keys | 0% cache hits | >99% cache hits |
+| Stable structs | Baseline | ~20% overhead during warmup, then ~0% |
 
 ## Configuration
 
-Enable schema sensing in your pipeline spec:
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### Example
 
 ```yaml
 spec:
   schema_sensing:
     enabled: true
     
-    # Deep inspection for nested JSON
     deep_inspect:
       enabled: true
       max_depth: 3
       max_sample_size: 500
     
-    # Sampling configuration
     sampling:
       warmup_events: 50
       sample_rate: 5
       structure_cache: true
       structure_cache_size: 50
     
-    # Output configuration
-    output:
-      include_stats: true
+    high_cardinality:
+      enabled: true
+      min_events: 100
+      stable_threshold: 0.5
+      min_dynamic_fields: 5
+      confidence_threshold: 0.7
+      reevaluate_interval: 10000
 ```
 
-### Configuration Options
+</td>
+<td width="50%" valign="top">
 
-#### Top Level
+### Options
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Enable schema sensing |
+| **deep_inspect** |
+| `enabled` | bool | `false` | Inspect nested JSON |
+| `max_depth` | int | `3` | Max nesting depth |
+| `max_sample_size` | int | `500` | Max events for deep analysis |
+| **sampling** |
+| `warmup_events` | int | `50` | Full analysis before sampling |
+| `sample_rate` | int | `5` | After warmup, analyze 1 in N |
+| `structure_cache` | bool | `true` | Cache structure hashes |
+| `structure_cache_size` | int | `50` | Max cached per table |
+| **high_cardinality** |
+| `enabled` | bool | `true` | Detect dynamic map keys |
+| `min_events` | int | `100` | Events before classification |
+| `stable_threshold` | float | `0.5` | Frequency for stable fields |
+| `min_dynamic_fields` | int | `5` | Min unique for map detection |
+| `confidence_threshold` | float | `0.7` | Required confidence |
+| `reevaluate_interval` | int | `10000` | Re-check interval (0=never) |
 
-#### Deep Inspection (`deep_inspect`)
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enabled` | bool | `false` | Enable deep inspection of nested objects |
-| `max_depth` | integer | `3` | Maximum nesting depth to analyze |
-| `max_sample_size` | integer | `500` | Max events to sample for deep analysis |
-
-#### Sampling (`sampling`)
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `warmup_events` | integer | `50` | Events to analyze before sampling kicks in |
-| `sample_rate` | integer | `5` | Analyze 1 in N events after warmup |
-| `structure_cache` | bool | `true` | Cache structure hashes for performance |
-| `structure_cache_size` | integer | `50` | Max cached structures per table |
+</td>
+</tr>
+</table>
 
 ## Inferred Types
 
@@ -147,6 +201,24 @@ curl http://localhost:8080/pipelines/my-pipeline/sensing/schemas/orders/json-sch
 curl http://localhost:8080/pipelines/my-pipeline/sensing/stats
 ```
 
+### Dynamic Map Classifications
+
+```bash
+curl http://localhost:8080/pipelines/my-pipeline/sensing/schemas/orders/classifications
+```
+
+Response:
+```json
+{
+  "table": "orders",
+  "paths": {
+    "": {"stable_fields": ["id", "type", "timestamp"], "has_dynamic_fields": false},
+    "sessions": {"stable_fields": [], "has_dynamic_fields": true, "unique_keys": 1523},
+    "metadata": {"stable_fields": ["version"], "has_dynamic_fields": true, "unique_keys": 42}
+  }
+}
+```
+
 ## Drift Detection
 
 Schema sensing integrates with drift detection to compare:
@@ -189,6 +261,9 @@ sampling:
   sample_rate: 10
   structure_cache: true
   structure_cache_size: 100
+high_cardinality:
+  enabled: true
+  min_events: 200
 ```
 
 **Schema evolution monitoring**:
@@ -197,6 +272,21 @@ sampling:
   warmup_events: 25
   sample_rate: 2
   structure_cache: true
+high_cardinality:
+  enabled: true
+  min_events: 50
+```
+
+**Payloads with dynamic keys** (session stores, feature flags):
+```yaml
+sampling:
+  structure_cache: true
+  structure_cache_size: 50
+high_cardinality:
+  enabled: true
+  min_events: 100
+  min_dynamic_fields: 3
+  stable_threshold: 0.5
 ```
 
 **Development/debugging**:
@@ -204,6 +294,9 @@ sampling:
 sampling:
   warmup_events: 10
   sample_rate: 1  # Analyze every event
+high_cardinality:
+  enabled: true
+  min_events: 20  # Faster classification
 ```
 
 ## Example: JSON Column Sensing
@@ -229,12 +322,29 @@ This enables downstream consumers to understand JSON column structure without ma
 
 ## Metrics
 
-Schema sensing emits these metrics:
+Schema sensing emits these Prometheus metrics:
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `deltaforge_schema_evolutions_total{pipeline}` | Counter | Schema evolution events detected |
-| `deltaforge_schema_drift_detected{pipeline}` | Counter | Incremented when drift is detected in a batch |
-| `deltaforge_stage_latency_seconds{pipeline,stage="schema_sensing"}` | Histogram | Time spent in schema sensing per batch |
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `deltaforge_schema_events_total` | Counter | `table` | Total events observed |
+| `deltaforge_schema_cache_hits_total` | Counter | `table` | Structure cache hits |
+| `deltaforge_schema_cache_misses_total` | Counter | `table` | Structure cache misses |
+| `deltaforge_schema_evolutions_total` | Counter | `table` | Schema evolutions detected |
+| `deltaforge_schema_tables_total` | Gauge | - | Tables with detected schemas |
+| `deltaforge_schema_dynamic_maps_total` | Gauge | - | Paths classified as dynamic maps |
+| `deltaforge_schema_sensing_seconds` | Histogram | `table` | Per-event sensing latency |
 
-Cache statistics (hits, misses, hit rate) are available via the REST API at `/pipelines/{name}/sensing/stats` but are not currently exposed as Prometheus metrics.
+### Example Queries
+
+```promql
+# Cache hit rate per table
+sum(rate(deltaforge_schema_cache_hits_total[5m])) by (table)
+/
+sum(rate(deltaforge_schema_events_total[5m])) by (table)
+
+# Schema evolution rate (should be near zero after warmup)
+sum(rate(deltaforge_schema_evolutions_total[5m])) by (table)
+
+# P99 sensing latency
+histogram_quantile(0.99, rate(deltaforge_schema_sensing_seconds_bucket[5m]))
+```

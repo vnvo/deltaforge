@@ -66,6 +66,7 @@ Pipelines are defined declaratively in YAML, making it straightforward to onboar
 ### Schema Intelligence
 
 - 🔍 **Schema sensing** : Automatically infer and track schema from event payloads, including deep inspection of nested JSON structures.
+- 🗺️ **High-cardinality handling** : Detect and normalize dynamic map keys (session IDs, trace IDs) to prevent false schema evolution events.
 - 🏷️ **Schema fingerprinting** : SHA-256 based change detection with schema-to-checkpoint correlation for reliable replay.
 - 🗃️ **Source-owned semantics** : Preserves native database types (PostgreSQL arrays, MySQL JSON, etc.) instead of normalizing to a universal type system.
 
