@@ -8,9 +8,9 @@ use deltaforge_config::{SamplingConfig, SchemaSensingConfig};
 use serde_json::json;
 
 /// Generate event with NESTED dynamic keys (realistic pattern)
-/// 
+///
 /// Real-world examples:
-/// - Session stores: `sessions.{session_id}` 
+/// - Session stores: `sessions.{session_id}`
 /// - Feature flags: `flags.{flag_name}`
 /// - User attributes: `attributes.{attr_key}`
 /// - Metrics: `metrics.{metric_name}`
@@ -113,9 +113,13 @@ fn compare_cache_hit_rates() {
     println!("Test events: {TEST_EVENTS}");
     println!();
     println!("Structure cache: DISABLED (forces full schema analysis)");
-    println!("Pattern: Nested dynamic keys (sessions.sess_*, metrics.metric_*)");
+    println!(
+        "Pattern: Nested dynamic keys (sessions.sess_*, metrics.metric_*)"
+    );
     println!();
-    println!("Key metric: Evolution rate (false schema changes from dynamic keys)");
+    println!(
+        "Key metric: Evolution rate (false schema changes from dynamic keys)"
+    );
     println!("  - HC OFF: Every unique dynamic key → schema 'evolves'");
     println!("  - HC ON:  Dynamic keys normalized → stable fingerprint");
     println!();
@@ -132,20 +136,27 @@ fn compare_cache_hit_rates() {
         // Warmup phase
         let mut warmup_stats = Stats::default();
         for i in 0..WARMUP {
-            let result = sensor.observe_value("events", &make_dynamic_event(i)).unwrap();
+            let result = sensor
+                .observe_value("events", &make_dynamic_event(i))
+                .unwrap();
             warmup_stats.record(&result);
         }
 
         // Test phase
         let mut test_stats = Stats::default();
         for i in WARMUP..(WARMUP + TEST_EVENTS) {
-            let result = sensor.observe_value("events", &make_dynamic_event(i)).unwrap();
+            let result = sensor
+                .observe_value("events", &make_dynamic_event(i))
+                .unwrap();
             test_stats.record(&result);
         }
 
         // Get cache stats
         let cache_stats = sensor.cache_stats("events");
-        let cached_structures = cache_stats.as_ref().map(|s| s.cached_structures).unwrap_or(0);
+        let cached_structures = cache_stats
+            .as_ref()
+            .map(|s| s.cached_structures)
+            .unwrap_or(0);
 
         println!("--- {label} ---");
         println!("Warmup phase:");
@@ -167,7 +178,7 @@ fn compare_cache_hit_rates() {
         if hc_enabled {
             let maps = sensor.detected_maps("events");
             println!("  Detected maps: {:?}", maps);
-            
+
             // Assertions for HC ON
             assert!(
                 test_stats.evolution_rate() < 10.0,
@@ -193,6 +204,6 @@ fn compare_cache_hit_rates() {
 
         println!();
     }
-    
+
     println!("✓ High-cardinality detection reduced false evolutions by >90%");
 }

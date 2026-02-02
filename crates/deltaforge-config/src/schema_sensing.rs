@@ -37,7 +37,7 @@ pub struct SchemaSensingConfig {
 
     /// High-cardinality field detection.
     #[serde(default)]
-    pub high_cardinality: HighCardinalityConfig,    
+    pub high_cardinality: HighCardinalityConfig,
 }
 
 /// Filter which tables to apply schema sensing to.
@@ -360,15 +360,33 @@ pub struct HighCardinalityConfig {
     pub sample_size: usize,
 }
 
-fn hc_default_true() -> bool { true }
-fn hc_default_min_events() -> u64 { 100 }
-fn hc_default_stable_threshold() -> f64 { 0.5 }
-fn hc_default_min_dynamic_fields() -> usize { 5 }
-fn hc_default_confidence_threshold() -> f64 { 0.7 }
-fn hc_default_reevaluate_interval() -> u64 { 10_000 }
-fn hc_default_hll_precision() -> u8 { 12 }
-fn hc_default_heavy_hitter_capacity() -> usize { 50 }
-fn hc_default_sample_size() -> usize { 50 }
+fn hc_default_true() -> bool {
+    true
+}
+fn hc_default_min_events() -> u64 {
+    100
+}
+fn hc_default_stable_threshold() -> f64 {
+    0.5
+}
+fn hc_default_min_dynamic_fields() -> usize {
+    5
+}
+fn hc_default_confidence_threshold() -> f64 {
+    0.7
+}
+fn hc_default_reevaluate_interval() -> u64 {
+    10_000
+}
+fn hc_default_hll_precision() -> u8 {
+    12
+}
+fn hc_default_heavy_hitter_capacity() -> usize {
+    50
+}
+fn hc_default_sample_size() -> usize {
+    50
+}
 
 impl Default for HighCardinalityConfig {
     fn default() -> Self {
