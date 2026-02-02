@@ -1,6 +1,6 @@
-//! Schema sensor with high-cardinality key handling (optimized).
+//! Schema sensor with high-cardinality key handling.
 //!
-//! Optimizations:
+//! It tries to be fast:
 //! 1. Fast path for pure structs (no dynamic fields) - uses original hash
 //! 2. Lazy classifier updates - only update when needed, not every event
 //! 3. Reference-based classifications - no HashMap clone
@@ -8,13 +8,14 @@
 
 use std::collections::{HashMap, HashSet};
 
+use metrics::{counter, gauge, histogram};
 use schema_analysis::InferredSchema;
 use tracing::debug;
 
 use deltaforge_config::SchemaSensingConfig;
 
 use crate::adaptive_hash::{compute_adaptive_hash, compute_structure_hash};
-use crate::errors::{SensorError, SensorResult};
+use crate::errors::SensorResult;
 use crate::field_classifier::FieldClassifier;
 use crate::high_cardinality::{HighCardinalityConfig, PathClassification};
 use crate::json_schema::JsonSchema;
@@ -181,6 +182,66 @@ impl SchemaSensor {
 
     /// Observe a pre-parsed JSON value (optimized path).
     pub fn observe_value(
+        &mut self,
+        table: &str,
+        value: &serde_json::Value,
+    ) -> SensorResult<ObserveResult> {
+        let start = std::time::Instant::now();
+        let result = self.observe_value_inner(table, value);
+
+        if let Ok(ref res) = result {
+            self.record_metrics(table, res, start.elapsed());
+        }
+
+        result
+    }
+
+    /// Record metrics for an observation result
+    fn record_metrics(
+        &self,
+        table: &str,
+        result: &ObserveResult,
+        elapsed: std::time::Duration,
+    ) {
+        counter!("deltaforge_schema_events_total", "table" => table.to_string()).increment(1);
+        histogram!("deltaforge_schema_sensing_seconds", "table" => table.to_string())
+            .record(elapsed.as_secs_f64());
+
+        match result {
+            ObserveResult::CacheHit { .. } => {
+                counter!("deltaforge_schema_cache_hits_total", "table" => table.to_string()).increment(1);
+            }
+            ObserveResult::Evolved { .. } => {
+                counter!("deltaforge_schema_cache_misses_total", "table" => table.to_string()).increment(1);
+                counter!("deltaforge_schema_evolutions_total", "table" => table.to_string()).increment(1);
+            }
+            ObserveResult::NewSchema { .. } => {
+                counter!("deltaforge_schema_cache_misses_total", "table" => table.to_string()).increment(1);
+            }
+            ObserveResult::Unchanged { .. } | ObserveResult::Sampled { .. } => {
+                // Not a cache hit but also not a miss - full sensing path
+            }
+            _ => {}
+        }
+
+        // Update gauges periodically (every 1000 events to avoid overhead)
+        if let Some(state) = self.schemas.get(table) {
+            if state.event_count % 1000 == 0 {
+                gauge!("deltaforge_schema_tables_total")
+                    .set(self.schemas.len() as f64);
+                let dynamic_maps: usize = self
+                    .hc_states
+                    .values()
+                    .map(|s| s.classifier.map_paths().len())
+                    .sum();
+                gauge!("deltaforge_schema_dynamic_maps_total")
+                    .set(dynamic_maps as f64);
+            }
+        }
+    }
+
+    /// Inner observe logic (no metrics)
+    fn observe_value_inner(
         &mut self,
         table: &str,
         value: &serde_json::Value,

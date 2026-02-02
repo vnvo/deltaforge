@@ -8,7 +8,8 @@
 //! - dynamic_toplevel: Top-level dynamic keys (worst case for original hash)
 
 use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
+    BenchmarkId, Criterion, Throughput, black_box, criterion_group,
+    criterion_main,
 };
 use schema_sensing::{HighCardinalityConfig, ObserveResult, SchemaSensor};
 
@@ -90,21 +91,59 @@ fn bench_stable_events(c: &mut Criterion) {
     for hc_enabled in [false, true] {
         let label = if hc_enabled { "hc_on" } else { "hc_off" };
 
-        group.bench_with_input(BenchmarkId::new("observe", label), &hc_enabled, |b, &hc| {
-            b.iter_batched(
-                || {
-                    let sensor = create_sensor(hc, true);
-                    let events: Vec<_> = (0..1000).map(make_stable_event).collect();
-                    (sensor, events)
-                },
-                |(mut sensor, events)| {
-                    for event in events {
-                        black_box(sensor.observe_value("events", &event).unwrap());
-                    }
-                },
-                criterion::BatchSize::SmallInput,
-            );
-        });
+        // Cold start (includes warmup overhead)
+        group.bench_with_input(
+            BenchmarkId::new("cold", label),
+            &hc_enabled,
+            |b, &hc| {
+                b.iter_batched(
+                    || {
+                        let sensor = create_sensor(hc, true);
+                        let events: Vec<_> =
+                            (0..1000).map(make_stable_event).collect();
+                        (sensor, events)
+                    },
+                    |(mut sensor, events)| {
+                        for event in events {
+                            black_box(
+                                sensor.observe_value("events", &event).unwrap(),
+                            );
+                        }
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
+
+        // Warmed up (measures steady-state overhead)
+        group.bench_with_input(
+            BenchmarkId::new("warm", label),
+            &hc_enabled,
+            |b, &hc| {
+                b.iter_batched(
+                    || {
+                        let mut sensor = create_sensor(hc, true);
+                        // Warmup to establish classifications
+                        for i in 0..100 {
+                            sensor
+                                .observe_value("events", &make_stable_event(i))
+                                .unwrap();
+                        }
+                        let events: Vec<_> =
+                            (1000..2000).map(make_stable_event).collect();
+                        (sensor, events)
+                    },
+                    |(mut sensor, events)| {
+                        for event in events {
+                            black_box(
+                                sensor.observe_value("events", &event).unwrap(),
+                            );
+                        }
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
     }
 
     group.finish();
@@ -118,44 +157,62 @@ fn bench_nested_dynamic(c: &mut Criterion) {
     for hc_enabled in [false, true] {
         let label = if hc_enabled { "hc_on" } else { "hc_off" };
 
-        group.bench_with_input(BenchmarkId::new("cold", label), &hc_enabled, |b, &hc| {
-            b.iter_batched(
-                || {
-                    let sensor = create_sensor(hc, true);
-                    let events: Vec<_> = (0..1000).map(make_nested_dynamic_event).collect();
-                    (sensor, events)
-                },
-                |(mut sensor, events)| {
-                    for event in events {
-                        black_box(sensor.observe_value("events", &event).unwrap());
-                    }
-                },
-                criterion::BatchSize::SmallInput,
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::new("cold", label),
+            &hc_enabled,
+            |b, &hc| {
+                b.iter_batched(
+                    || {
+                        let sensor = create_sensor(hc, true);
+                        let events: Vec<_> =
+                            (0..1000).map(make_nested_dynamic_event).collect();
+                        (sensor, events)
+                    },
+                    |(mut sensor, events)| {
+                        for event in events {
+                            black_box(
+                                sensor.observe_value("events", &event).unwrap(),
+                            );
+                        }
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
 
         // Warmed up - classifications established
-        group.bench_with_input(BenchmarkId::new("warm", label), &hc_enabled, |b, &hc| {
-            b.iter_batched(
-                || {
-                    let mut sensor = create_sensor(hc, true);
-                    // Warmup to establish classifications
-                    for i in 0..100 {
-                        sensor
-                            .observe_value("events", &make_nested_dynamic_event(i))
-                            .unwrap();
-                    }
-                    let events: Vec<_> = (1000..2000).map(make_nested_dynamic_event).collect();
-                    (sensor, events)
-                },
-                |(mut sensor, events)| {
-                    for event in events {
-                        black_box(sensor.observe_value("events", &event).unwrap());
-                    }
-                },
-                criterion::BatchSize::SmallInput,
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::new("warm", label),
+            &hc_enabled,
+            |b, &hc| {
+                b.iter_batched(
+                    || {
+                        let mut sensor = create_sensor(hc, true);
+                        // Warmup to establish classifications
+                        for i in 0..100 {
+                            sensor
+                                .observe_value(
+                                    "events",
+                                    &make_nested_dynamic_event(i),
+                                )
+                                .unwrap();
+                        }
+                        let events: Vec<_> = (1000..2000)
+                            .map(make_nested_dynamic_event)
+                            .collect();
+                        (sensor, events)
+                    },
+                    |(mut sensor, events)| {
+                        for event in events {
+                            black_box(
+                                sensor.observe_value("events", &event).unwrap(),
+                            );
+                        }
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
     }
 
     group.finish();
@@ -169,26 +226,37 @@ fn bench_toplevel_dynamic(c: &mut Criterion) {
     for hc_enabled in [false, true] {
         let label = if hc_enabled { "hc_on" } else { "hc_off" };
 
-        group.bench_with_input(BenchmarkId::new("warm", label), &hc_enabled, |b, &hc| {
-            b.iter_batched(
-                || {
-                    let mut sensor = create_sensor(hc, true);
-                    for i in 0..100 {
-                        sensor
-                            .observe_value("events", &make_toplevel_dynamic_event(i))
-                            .unwrap();
-                    }
-                    let events: Vec<_> = (1000..2000).map(make_toplevel_dynamic_event).collect();
-                    (sensor, events)
-                },
-                |(mut sensor, events)| {
-                    for event in events {
-                        black_box(sensor.observe_value("events", &event).unwrap());
-                    }
-                },
-                criterion::BatchSize::SmallInput,
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::new("warm", label),
+            &hc_enabled,
+            |b, &hc| {
+                b.iter_batched(
+                    || {
+                        let mut sensor = create_sensor(hc, true);
+                        for i in 0..100 {
+                            sensor
+                                .observe_value(
+                                    "events",
+                                    &make_toplevel_dynamic_event(i),
+                                )
+                                .unwrap();
+                        }
+                        let events: Vec<_> = (1000..2000)
+                            .map(make_toplevel_dynamic_event)
+                            .collect();
+                        (sensor, events)
+                    },
+                    |(mut sensor, events)| {
+                        for event in events {
+                            black_box(
+                                sensor.observe_value("events", &event).unwrap(),
+                            );
+                        }
+                    },
+                    criterion::BatchSize::SmallInput,
+                );
+            },
+        );
     }
 
     group.finish();
@@ -204,7 +272,11 @@ fn bench_cache_effectiveness(c: &mut Criterion) {
         ("toplevel_dyn", make_toplevel_dynamic_event),
     ] {
         for hc_enabled in [false, true] {
-            let label = format!("{}_{}", name, if hc_enabled { "hc_on" } else { "hc_off" });
+            let label = format!(
+                "{}_{}",
+                name,
+                if hc_enabled { "hc_on" } else { "hc_off" }
+            );
 
             group.bench_function(&label, |b| {
                 b.iter_batched(
@@ -212,7 +284,9 @@ fn bench_cache_effectiveness(c: &mut Criterion) {
                         let mut sensor = create_sensor(hc_enabled, true);
                         // Warmup
                         for i in 0..100 {
-                            sensor.observe_value("events", &make_event(i)).unwrap();
+                            sensor
+                                .observe_value("events", &make_event(i))
+                                .unwrap();
                         }
                         sensor
                     },
@@ -222,9 +296,16 @@ fn bench_cache_effectiveness(c: &mut Criterion) {
                         let mut other = 0u64;
 
                         for i in 1000..2000 {
-                            match sensor.observe_value("events", &make_event(i)).unwrap() {
-                                ObserveResult::CacheHit { .. } => cache_hits += 1,
-                                ObserveResult::Evolved { .. } => evolutions += 1,
+                            match sensor
+                                .observe_value("events", &make_event(i))
+                                .unwrap()
+                            {
+                                ObserveResult::CacheHit { .. } => {
+                                    cache_hits += 1
+                                }
+                                ObserveResult::Evolved { .. } => {
+                                    evolutions += 1
+                                }
                                 _ => other += 1,
                             }
                         }
@@ -257,15 +338,22 @@ fn bench_no_cache(c: &mut Criterion) {
                         let mut sensor = create_sensor(hc, false); // cache disabled
                         for i in 0..100 {
                             sensor
-                                .observe_value("events", &make_nested_dynamic_event(i))
+                                .observe_value(
+                                    "events",
+                                    &make_nested_dynamic_event(i),
+                                )
                                 .unwrap();
                         }
-                        let events: Vec<_> = (1000..1500).map(make_nested_dynamic_event).collect();
+                        let events: Vec<_> = (1000..1500)
+                            .map(make_nested_dynamic_event)
+                            .collect();
                         (sensor, events)
                     },
                     |(mut sensor, events)| {
                         for event in events {
-                            black_box(sensor.observe_value("events", &event).unwrap());
+                            black_box(
+                                sensor.observe_value("events", &event).unwrap(),
+                            );
                         }
                     },
                     criterion::BatchSize::SmallInput,

@@ -133,4 +133,41 @@ pub fn describe_metrics() {
         Unit::Bytes,
         "Distribution of serialized batch sizes"
     );
+
+    // Schema sensing metrics
+    describe_counter!(
+        "deltaforge_schema_events_total",
+        Unit::Count,
+        "Total events observed by schema sensor"
+    );
+    describe_counter!(
+        "deltaforge_schema_cache_hits_total",
+        Unit::Count,
+        "Schema structure cache hits"
+    );
+    describe_counter!(
+        "deltaforge_schema_cache_misses_total",
+        Unit::Count,
+        "Schema structure cache misses"
+    );
+    describe_counter!(
+        "deltaforge_schema_evolutions_total",
+        Unit::Count,
+        "Schema evolution events detected"
+    );
+    describe_gauge!(
+        "deltaforge_schema_tables_total",
+        Unit::Count,
+        "Number of tables with detected schemas"
+    );
+    describe_gauge!(
+        "deltaforge_schema_dynamic_maps_total",
+        Unit::Count,
+        "Number of paths classified as dynamic maps"
+    );
+    describe_histogram!(
+        "deltaforge_schema_sensing_seconds",
+        Unit::Seconds,
+        "Time spent in schema sensing per batch"
+    );
 }

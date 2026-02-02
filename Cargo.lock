@@ -4651,6 +4651,7 @@ dependencies = [
  "deltaforge-config",
  "flowstats",
  "hex",
+ "metrics",
  "schema_analysis",
  "schemars 0.8.22",
  "serde",
