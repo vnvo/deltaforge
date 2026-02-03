@@ -435,6 +435,11 @@ schema_sensing:
     sample_rate: 5
     structure_cache: true
     structure_cache_size: 50
+  high_cardinality:
+    enabled: true
+    min_events: 100
+    stable_threshold: 0.5
+    min_dynamic_fields: 5
 ```
 
 </td>
@@ -450,6 +455,10 @@ schema_sensing:
 | `sampling.sample_rate` | int | `10` | After warmup, analyze 1 in N |
 | `sampling.structure_cache` | bool | `true` | Cache structure fingerprints |
 | `sampling.structure_cache_size` | int | `100` | Max cached structures |
+| `high_cardinality.enabled` | bool | `true` | Detect dynamic map keys |
+| `high_cardinality.min_events` | int | `100` | Events before classification |
+| `high_cardinality.stable_threshold` | float | `0.5` | Frequency for stable fields |
+| `high_cardinality.min_dynamic_fields` | int | `5` | Min unique fields for map |
 
 </td>
 </tr>

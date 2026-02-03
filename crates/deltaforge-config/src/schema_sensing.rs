@@ -34,6 +34,10 @@ pub struct SchemaSensingConfig {
     /// Sampling configuration for performance optimization
     #[serde(default)]
     pub sampling: SamplingConfig,
+
+    /// High-cardinality field detection.
+    #[serde(default)]
+    pub high_cardinality: HighCardinalityConfig,
 }
 
 /// Filter which tables to apply schema sensing to.
@@ -310,6 +314,104 @@ fn matches_pattern(pattern: &str, value: &str) -> bool {
         return value.starts_with(prefix);
     }
     pattern == value
+}
+
+/// Configuration for high-cardinality field detection.
+///
+/// When enabled, schema sensing distinguishes between stable fields
+/// (schema properties) and dynamic fields (map keys like UUIDs).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HighCardinalityConfig {
+    /// Enable field classification for high-cardinality key detection.
+    #[serde(default = "hc_default_true")]
+    pub enabled: bool,
+
+    /// Minimum events before making classification decisions.
+    #[serde(default = "hc_default_min_events")]
+    pub min_events: u64,
+
+    /// Frequency threshold for stable fields (0.0 - 1.0).
+    /// Fields appearing in >= this fraction of events are stable.
+    #[serde(default = "hc_default_stable_threshold")]
+    pub stable_threshold: f64,
+
+    /// Minimum dynamic fields to classify object as having map component.
+    #[serde(default = "hc_default_min_dynamic_fields")]
+    pub min_dynamic_fields: usize,
+
+    /// Confidence threshold for classification decisions.
+    #[serde(default = "hc_default_confidence_threshold")]
+    pub confidence_threshold: f64,
+
+    /// Re-evaluate classification every N events (0 = never).
+    #[serde(default = "hc_default_reevaluate_interval")]
+    pub reevaluate_interval: u64,
+
+    /// HyperLogLog precision (10-16).
+    #[serde(default = "hc_default_hll_precision")]
+    pub hll_precision: u8,
+
+    /// Heavy hitter tracking capacity.
+    #[serde(default = "hc_default_heavy_hitter_capacity")]
+    pub heavy_hitter_capacity: usize,
+
+    /// Reservoir sample size for pattern extraction.
+    #[serde(default = "hc_default_sample_size")]
+    pub sample_size: usize,
+}
+
+fn hc_default_true() -> bool {
+    true
+}
+fn hc_default_min_events() -> u64 {
+    100
+}
+fn hc_default_stable_threshold() -> f64 {
+    0.5
+}
+fn hc_default_min_dynamic_fields() -> usize {
+    5
+}
+fn hc_default_confidence_threshold() -> f64 {
+    0.7
+}
+fn hc_default_reevaluate_interval() -> u64 {
+    10_000
+}
+fn hc_default_hll_precision() -> u8 {
+    12
+}
+fn hc_default_heavy_hitter_capacity() -> usize {
+    50
+}
+fn hc_default_sample_size() -> usize {
+    50
+}
+
+impl Default for HighCardinalityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_events: 100,
+            stable_threshold: 0.5,
+            min_dynamic_fields: 5,
+            confidence_threshold: 0.7,
+            reevaluate_interval: 10_000,
+            hll_precision: 12,
+            heavy_hitter_capacity: 50,
+            sample_size: 50,
+        }
+    }
+}
+
+impl HighCardinalityConfig {
+    /// Estimated memory usage per tracked path.
+    pub fn memory_per_path(&self) -> usize {
+        let hll = 1 << self.hll_precision;
+        let ss = self.heavy_hitter_capacity * 80;
+        let rs = self.sample_size * 40;
+        hll + ss + rs + 256
+    }
 }
 
 #[cfg(test)]
