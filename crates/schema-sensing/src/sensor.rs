@@ -393,9 +393,9 @@ impl SchemaSensor {
             if event_count < 20 {
                 true
             } else if event_count < min_events {
-                event_count % 5 == 0
+                event_count.is_multiple_of(5)
             } else {
-                event_count % 20 == 0
+                event_count.is_multiple_of(20)
                     || hc_state.classifier.classifications().is_empty()
             }
         };
