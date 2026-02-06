@@ -1816,9 +1816,9 @@ dependencies = [
 
 [[package]]
 name = "flowstats"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "320ed5a38322ba3919497744d178c0742debbb5f753ae10f171f088b9dcd98de"
+checksum = "845f55df6c60f3adf9a158a6daaaa1823cae51c408197c47b2866cf443a208f1"
 dependencies = [
  "libm",
  "xxhash-rust",
