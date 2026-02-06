@@ -15,28 +15,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo downloads + bins
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin
-          key: ${{ runner.os }}-cargo-docs-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-docs-
-            ${{ runner.os }}-cargo-
-
-      - name: Install cargo-binstall
+      - name: Install mdBook
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-binstall
-
-      - name: Install mdBook
-        run: cargo binstall -y mdbook --version 0.5.1
+          tool: mdbook@0.5.1
 
       - name: Build documentation
         working-directory: docs
