@@ -184,8 +184,13 @@ pub struct RedisSinkCfg {
     /// Example: "redis://:password@localhost:6379/0"
     pub uri: String,
 
-    /// Target Redis Stream name for CDC events.
+    /// Target Redis Stream name for CDC events. Supports `${path}` templates.
     pub stream: String,
+
+    /// Message key template for the "df-key" stream field.
+    /// When unset, uses event_id. Supports `${path}` templates.
+    #[serde(default)]
+    pub key: Option<String>,
 
     /// Envelope format for event serialization.
     /// Default: native (Debezium payload structure)
@@ -241,8 +246,13 @@ pub struct NatsSinkCfg {
     /// Supports comma-separated list for cluster connections.
     pub url: String,
 
-    /// Subject to publish events to.
+    /// Subject to publish events to. Supports `${path}` templates.
     pub subject: String,
+
+    /// Message key stored in NATS header "df-key".
+    /// Supports `${path}` templates. Optional, no header if unset.
+    #[serde(default)]
+    pub key: Option<String>,
 
     /// Envelope format for event serialization.
     /// Default: native (Debezium payload structure)
