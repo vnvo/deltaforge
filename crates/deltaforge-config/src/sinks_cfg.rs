@@ -109,8 +109,15 @@ pub struct KafkaSinkCfg {
     /// Example: "broker1:9092,broker2:9092"
     pub brokers: String,
 
-    /// Target Kafka topic for CDC events.
+    /// Target Kafka topic. Supports `${path}` templates for per-event routing.
+    /// Examples: `"cdc.${source.table}"`, `"static-topic"`
     pub topic: String,
+
+    /// Message key template for partition affinity.
+    /// Supports `${path}` templates. When unset, uses `event.idempotency_key()`.
+    /// Examples: `"${after.customer_id}"`, `"${source.table}"`
+    #[serde(default)]
+    pub key: Option<String>,
 
     /// Envelope format for event serialization.
     /// Default: native (Debezium payload structure)
