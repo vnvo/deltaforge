@@ -50,7 +50,13 @@ pub mod dsn;
 pub mod patterns;
 pub mod pause;
 pub mod retry;
+pub mod routing;
 pub mod time;
+
+// =============================================================================
+// Routing Tempaltes
+// =============================================================================
+pub use routing::{CompiledTemplate, TemplateError, UnresolvedVar};
 
 // =============================================================================
 // DSN Utilities
