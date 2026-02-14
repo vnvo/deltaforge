@@ -11,7 +11,9 @@
 //! Tests marked with `// Note: payload integers become floats` demonstrate
 //! this expected behavior.
 
-use deltaforge_core::{Event, Op, Processor, SourceInfo, SourcePosition};
+use deltaforge_core::{
+    Event, EventRouting, Op, Processor, SourceInfo, SourcePosition,
+};
 use pretty_assertions::assert_eq;
 use processors::JsProcessor;
 use serde_json::json;
@@ -505,4 +507,126 @@ fn js_missing_process_batch_fails_initialization() {
             "processor should have crashed from missing function"
         );
     }
+}
+
+// ============================================================================
+// Dynamic Routing
+// ============================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_sets_routing_topic() {
+    let js = r#"
+        function processBatch(events) {
+            for (const ev of events) {
+                ev.route({ topic: "cdc." + ev.source.table });
+            }
+            return null;
+        }
+    "#;
+
+    let proc = JsProcessor::new("route".into(), js.into()).expect("init ok");
+    let out = proc.process(vec![new_event()]).await.expect("ok");
+
+    let routing = out[0].routing.as_ref().expect("routing should be set");
+    assert_eq!(routing.topic.as_deref(), Some("cdc.orders"));
+    assert!(routing.key.is_none());
+    assert!(routing.headers.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_sets_routing_key_and_headers() {
+    let js = r#"
+        function processBatch(events) {
+            for (const ev of events) {
+                ev.route({
+                    key: "k1",
+                    headers: { "trace-id": "abc" }
+                });
+            }
+            return null;
+        }
+    "#;
+
+    let proc = JsProcessor::new("route_kh".into(), js.into()).expect("init ok");
+    let out = proc.process(vec![new_event()]).await.expect("ok");
+
+    let r = out[0].routing.as_ref().unwrap();
+    assert_eq!(r.key.as_deref(), Some("k1"));
+    assert_eq!(r.headers.as_ref().unwrap()["trace-id"], "abc");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_preserves_existing_routing() {
+    let js = "function processBatch(events) { return events; }";
+
+    let proc = JsProcessor::new("preserve".into(), js.into()).expect("init ok");
+    let mut ev = new_event();
+    ev.routing = Some(EventRouting {
+        topic: Some("pre-existing".into()),
+        ..Default::default()
+    });
+
+    let out = proc.process(vec![ev]).await.expect("ok");
+    assert_eq!(
+        out[0].routing.as_ref().unwrap().topic.as_deref(),
+        Some("pre-existing")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_clone_gets_separate_routing() {
+    let js = r#"
+        function processBatch(events) {
+            const out = [];
+            for (const ev of events) {
+                ev.route({ topic: "live" });
+                out.push(ev);
+
+                const clone = JSON.parse(JSON.stringify(ev));
+                route(clone, { topic: "audit" });
+                out.push(clone);
+            }
+            return out;
+        }
+    "#;
+
+    let proc =
+        JsProcessor::new("clone_route".into(), js.into()).expect("init ok");
+    let out = proc.process(vec![new_event()]).await.expect("ok");
+
+    assert_eq!(out.len(), 2);
+    assert_eq!(
+        out[0].routing.as_ref().unwrap().topic.as_deref(),
+        Some("live")
+    );
+    assert_eq!(
+        out[1].routing.as_ref().unwrap().topic.as_deref(),
+        Some("audit")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_no_route_call_means_no_routing() {
+    let js = "function processBatch(events) { return events; }";
+
+    let proc = JsProcessor::new("no_route".into(), js.into()).expect("init ok");
+    let out = proc.process(vec![new_event()]).await.expect("ok");
+    assert!(out[0].routing.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_filter_drops_routed_events() {
+    let js = r#"
+        function processBatch(events) {
+            for (const ev of events) {
+                ev.route({ topic: "will-be-dropped" });
+            }
+            return []; // drop all
+        }
+    "#;
+
+    let proc =
+        JsProcessor::new("filter_drop".into(), js.into()).expect("init ok");
+    let out = proc.process(vec![new_event()]).await.expect("ok");
+    assert_eq!(out.len(), 0);
 }
