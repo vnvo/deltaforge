@@ -630,3 +630,91 @@ async fn js_filter_drops_routed_events() {
     let out = proc.process(vec![new_event()]).await.expect("ok");
     assert_eq!(out.len(), 0);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_route_overwrites_existing_routing() {
+    let js = r#"
+        function processBatch(events) {
+            for (const ev of events) {
+                ev.route({ topic: "new-topic" });
+            }
+            return null;
+        }
+    "#;
+
+    let proc =
+        JsProcessor::new("overwrite".into(), js.into()).expect("init ok");
+    let mut ev = new_event();
+    ev.routing = Some(EventRouting {
+        topic: Some("old-topic".into()),
+        key: Some("old-key".into()),
+        ..Default::default()
+    });
+
+    let out = proc.process(vec![ev]).await.expect("ok");
+    let r = out[0].routing.as_ref().unwrap();
+    assert_eq!(r.topic.as_deref(), Some("new-topic"));
+    // ev.route() replaces the whole routing — key from old routing is gone
+    assert!(r.key.is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_conditional_routing_by_payload() {
+    let js = r#"
+        function processBatch(events) {
+            for (const ev of events) {
+                if (ev.after && ev.after.id > 5) {
+                    ev.route({ topic: "high-id" });
+                } else {
+                    ev.route({ topic: "low-id" });
+                }
+            }
+            return null;
+        }
+    "#;
+
+    let proc = JsProcessor::new("cond".into(), js.into()).expect("init ok");
+
+    let mut low = new_event();
+    low.after = Some(json!({"id": 2}));
+    let mut high = new_event();
+    high.after = Some(json!({"id": 10}));
+
+    let out = proc.process(vec![low, high]).await.expect("ok");
+
+    assert_eq!(
+        out[0].routing.as_ref().unwrap().topic.as_deref(),
+        Some("low-id")
+    );
+    assert_eq!(
+        out[1].routing.as_ref().unwrap().topic.as_deref(),
+        Some("high-id")
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_route_only_some_events() {
+    let js = r#"
+        function processBatch(events) {
+            for (const ev of events) {
+                if (ev.op === "d") {
+                    ev.route({ topic: "deletes" });
+                }
+                // creates get no routing — sinks use their default
+            }
+            return null;
+        }
+    "#;
+
+    let proc = JsProcessor::new("partial".into(), js.into()).expect("init ok");
+    let out = proc
+        .process(vec![new_event(), new_delete_event()])
+        .await
+        .expect("ok");
+
+    assert!(out[0].routing.is_none()); // create: no route() call
+    assert_eq!(
+        out[1].routing.as_ref().unwrap().topic.as_deref(),
+        Some("deletes")
+    );
+}
