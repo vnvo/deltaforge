@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
-use common::{CompiledTemplate, TemplateError};
+use common::CompiledTemplate;
 use common::{RetryOutcome, RetryPolicy, retry_async};
 use deltaforge_config::KafkaSinkCfg;
 use deltaforge_core::encoding::EncodingType;
@@ -281,11 +281,6 @@ impl KafkaSink {
         Some(headers)
     }
 
-    /// Check if this sink uses any dynamic routing (templates or routing field).
-    fn is_fully_static(&self) -> bool {
-        self.topic_template.is_static() && self.key_template.is_none()
-    }
-
     /// Serialize event using configured envelope.
     fn serialize_event(&self, event: &Event) -> SinkResult<Vec<u8>> {
         let envelope = self.envelope.wrap(event).map_err(|e| {
@@ -300,52 +295,6 @@ impl KafkaSink {
             .map_err(|e| SinkError::Serialization {
                 details: e.to_string().into(),
             })
-    }
-
-    /// Send a single message with retry logic.
-    async fn send_with_retry(
-        &self,
-        payload: Vec<u8>,
-        key: String,
-    ) -> SinkResult<()> {
-        let policy = RetryPolicy::new(
-            Duration::from_millis(100),
-            Duration::from_secs(10),
-            0.2,
-            Some(3),
-        );
-
-        let result = retry_async(
-            |attempt| {
-                let payload = payload.clone();
-                let key = key.clone();
-                async move {
-                    debug!(attempt, key = %key, "sending to kafka");
-
-                    self.producer
-                        .send(
-                            FutureRecord::to(&self.topic)
-                                .payload(&payload)
-                                .key(&key),
-                            Timeout::After(self.send_timeout),
-                        )
-                        .await
-                        .map(|_| ())
-                        .map_err(|(e, _msg)| KafkaRetryError::from(e))
-                }
-            },
-            |e| e.is_retryable(),
-            self.send_timeout,
-            policy,
-            &self.cancel,
-            "kafka_send",
-        )
-        .await;
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(outcome) => Err(outcome_to_sink_error(outcome)),
-        }
     }
 }
 

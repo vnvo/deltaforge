@@ -8,7 +8,6 @@
 //! ```
 
 use anyhow::Result;
-use async_nats::jetstream::stream::No;
 use ctor::dtor;
 use deltaforge_config::{EncodingCfg, EnvelopeCfg, KafkaSinkCfg};
 use deltaforge_core::{Event, Op, Sink, SourceInfo, SourcePosition};
