@@ -1,0 +1,90 @@
+# JavaScript-Driven Routing
+#
+# Uses a JavaScript processor to make per-event routing decisions.
+# The processor can override topic, key, and headers for each event
+# using ev.route({ topic, key, headers }).
+#
+# Common patterns:
+#   - Route high-value orders to a priority topic
+#   - Add trace/correlation headers for observability
+#   - Split events across topics by business logic, not just table name
+#   - Enrich routing metadata from event payload
+
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: js-routing-example
+  tenant: acme
+
+spec:
+  source:
+    type: postgres
+    config:
+      id: orders-pg
+      dsn: ${POSTGRES_DSN}
+      publication: orders_pub
+      slot: deltaforge_orders
+      tables:
+        - public.orders
+        - public.order_items
+
+  processors:
+    - type: javascript
+      id: route-by-value
+      inline: |
+        function processBatch(events) {
+          for (const ev of events) {
+            if (!ev.after) continue;
+
+            const table = ev.source.table;
+            const amount = ev.after.total_amount || 0;
+
+            if (table === "orders" && amount > 10000) {
+              // high-value orders -> priority topic with trace header
+              ev.route({
+                topic: "orders.priority",
+                key: String(ev.after.customer_id),
+                headers: {
+                  "x-order-tier": "high-value",
+                  "x-amount": String(amount)
+                }
+              });
+            } else if (table === "orders") {
+              // regular orders -> standard topic, keyed by customer
+              ev.route({
+                topic: "orders.standard",
+                key: String(ev.after.customer_id)
+              });
+            }
+            // order_items: no route() call -> uses sink's configured
+            // topic/template as default
+          }
+          return events;
+        }
+      limits:
+        cpu_ms: 50
+        mem_mb: 128
+        timeout_ms: 500
+
+  sinks:
+    # Default topic for events not routed by JS (e.g. order_items).
+    # JS-routed events override this with their ev.route() topic.
+    - type: kafka
+      config:
+        id: kafka-routed
+        brokers: ${KAFKA_BROKERS}
+        topic: "cdc.${source.table}"
+        envelope:
+          type: debezium
+        encoding: json
+        required: true
+        send_timeout_secs: 30
+
+  batch:
+    max_events: 500
+    max_bytes: 1048576
+    max_ms: 100
+    respect_source_tx: true
+
+  commit_policy:
+    mode: required

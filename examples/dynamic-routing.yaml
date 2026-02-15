@@ -1,0 +1,91 @@
+# Dynamic Routing
+#
+# Routes events to per-table destinations using template syntax.
+# Template variables are resolved at runtime from event fields:
+#
+#   ${source.table}     - table name (e.g. "orders")
+#   ${source.db}        - database name (e.g. "shop")
+#   ${source.schema}    - schema name, PG only (e.g. "public")
+#   ${source.connector} - source type (e.g. "mysql")
+#   ${op}               - operation code (c, u, d, r, t)
+#   ${after.<field>}    - field from the after image
+#   ${before.<field>}   - field from the before image
+#   ${tenant_id}        - pipeline tenant ID
+#
+# Missing/null fields resolve to empty string with a warning.
+#
+# Env vars like ${KAFKA_BROKERS} are expanded at config load time.
+# Template vars like ${source.table} pass through to runtime.
+
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: dynamic-routing-example
+  tenant: acme
+
+spec:
+  source:
+    type: mysql
+    config:
+      id: shop-mysql
+      dsn: ${MYSQL_DSN}
+      tables:
+        - shop.orders
+        - shop.customers
+        - shop.products
+
+  processors: []
+
+  sinks:
+    # Kafka: per-table topics with business key partitioning
+    #
+    # orders   -> cdc.shop.orders    (key: customer_id)
+    # customers-> cdc.shop.customers (key: customer_id)
+    # products -> cdc.shop.products  (key: product_id - but we use a
+    #             generic key template, so it falls back to empty for
+    #             rows without customer_id)
+    - type: kafka
+      config:
+        id: kafka-per-table
+        brokers: ${KAFKA_BROKERS}
+        topic: "cdc.${source.db}.${source.table}"
+        key: "${after.customer_id}"
+        envelope:
+          type: debezium
+        encoding: json
+        required: true
+        send_timeout_secs: 30
+
+    # Redis: per-table streams
+    - type: redis
+      config:
+        id: redis-per-table
+        uri: ${REDIS_URI}
+        stream: "cdc:${source.table}"
+        key: "${after.id}"
+        envelope:
+          type: native
+        encoding: json
+        required: false
+
+    # NATS: hierarchical subjects
+    - type: nats
+      config:
+        id: nats-per-table
+        url: ${NATS_URL}
+        subject: "cdc.${source.db}.${source.table}"
+        key: "${after.id}"
+        stream: CDC
+        envelope:
+          type: native
+        encoding: json
+        required: false
+
+  batch:
+    max_events: 500
+    max_bytes: 1048576
+    max_ms: 100
+    respect_source_tx: true
+
+  commit_policy:
+    mode: required
