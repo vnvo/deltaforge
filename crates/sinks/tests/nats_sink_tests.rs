@@ -11,9 +11,7 @@ use anyhow::Result;
 use async_nats::jetstream::{self, stream::Config as StreamConfig};
 use ctor::dtor;
 use deltaforge_config::{EncodingCfg, EnvelopeCfg, NatsSinkCfg};
-use deltaforge_core::{
-    Event, EventRouting, Sink,
-};
+use deltaforge_core::{Event, EventRouting, Sink};
 use sinks::nats::NatsSink;
 use std::collections::HashMap;
 use std::sync::Arc;
