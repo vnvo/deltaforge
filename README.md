@@ -174,6 +174,7 @@ Output: `{"schema":null,"payload":{...}}`
   - Kafka producer sink (via `rdkafka`)
   - Redis stream sink
   - NATS JetStream sink (via `async_nats`)
+  - Dynamic routing: per-event topic/stream/subject via templates or JavaScript
   - Configurable envelope formats: Native, Debezium, CloudEvents
   - JSON wire encoding (Avro planned and more to come)
 
