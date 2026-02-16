@@ -10,12 +10,15 @@
 use anyhow::Result;
 use ctor::dtor;
 use deltaforge_config::{EncodingCfg, EnvelopeCfg, KafkaSinkCfg};
-use deltaforge_core::{Event, Op, Sink, SourceInfo, SourcePosition};
+use deltaforge_core::{
+    Event, EventRouting, Op, Sink, SourceInfo, SourcePosition,
+};
 use rdkafka::Message;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::message::Headers;
 use serde_json::json;
 use sinks::kafka::KafkaSink;
 use std::collections::HashMap;
@@ -32,7 +35,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 mod sink_test_common;
-use sink_test_common::init_test_tracing;
+use sink_test_common::{
+    init_test_tracing, make_event_for_table, make_large_event, make_test_event,
+};
 
 // =============================================================================
 // Shared Test Infrastructure
@@ -196,51 +201,6 @@ async fn delete_topic(brokers: &str, topic: &str) -> Result<()> {
     Ok(())
 }
 
-/// Create a test event with a specific ID.
-fn make_test_event(id: i64) -> Event {
-    Event::new_row(
-        SourceInfo {
-            version: "deltaforge-test".into(),
-            connector: "test".into(),
-            name: "test-db".into(),
-            ts_ms: 1_700_000_000_000 + id,
-            db: "testdb".into(),
-            schema: None,
-            table: "table".into(),
-            snapshot: None,
-            position: SourcePosition::default(),
-        },
-        Op::Create,
-        None,
-        Some(json!({"id": id, "name": format!("item-{}", id)})),
-        1_700_000_000_000 + id,
-        64,
-    )
-}
-
-/// Create a test event with specific data size.
-fn make_large_event(id: i64, size_bytes: usize) -> Event {
-    let padding = "x".repeat(size_bytes);
-    Event::new_row(
-        SourceInfo {
-            version: "deltaforge-test".into(),
-            connector: "test".into(),
-            name: "test-db".into(),
-            ts_ms: 1_700_000_000_000 + id,
-            db: "testdb".into(),
-            schema: None,
-            table: "table".into(),
-            snapshot: None,
-            position: SourcePosition::default(),
-        },
-        Op::Create,
-        None,
-        Some(json!({"id": id, "payload": padding})),
-        1_700_000_000_000 + id,
-        64,
-    )
-}
-
 /// Create a consumer for reading messages from a topic.
 fn create_consumer(
     brokers: &str,
@@ -312,6 +272,7 @@ async fn kafka_sink_sends_single_event() -> Result<()> {
         id: "test-kafka".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -358,6 +319,7 @@ async fn kafka_sink_sends_batch() -> Result<()> {
         id: "test-kafka-batch".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -402,6 +364,7 @@ async fn kafka_sink_empty_batch_is_noop() -> Result<()> {
         id: "test-kafka-empty".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -440,6 +403,7 @@ async fn kafka_sink_native_envelope() -> Result<()> {
         id: "test-native".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -512,6 +476,7 @@ async fn kafka_sink_debezium_envelope() -> Result<()> {
         id: "test-debezium".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        key: None,
         envelope: EnvelopeCfg::Debezium,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -604,6 +569,7 @@ async fn kafka_sink_debezium_wire_format() -> Result<()> {
         id: "test-wire-format".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        key: None,
         envelope: EnvelopeCfg::Debezium,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -655,6 +621,7 @@ async fn kafka_sink_cloudevents_envelope() -> Result<()> {
         id: "test-cloudevents".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        key: None,
         envelope: EnvelopeCfg::CloudEvents {
             type_prefix: "com.deltaforge.cdc".to_string(),
         },
@@ -782,6 +749,7 @@ async fn kafka_sink_debezium_envelope_batch() -> Result<()> {
         id: "test-debezium-batch".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        key: None,
         envelope: EnvelopeCfg::Debezium,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -834,6 +802,7 @@ async fn kafka_sink_cloudevents_operations() -> Result<()> {
         id: "test-cloudevents-ops".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        key: None,
         envelope: EnvelopeCfg::CloudEvents {
             type_prefix: "io.deltaforge.test".to_string(),
         },
@@ -997,6 +966,7 @@ async fn kafka_sink_idempotent_mode() -> Result<()> {
         id: "test-idempotent".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -1043,6 +1013,7 @@ async fn kafka_sink_exactly_once_mode() -> Result<()> {
         id: "test-exactly-once".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -1087,6 +1058,7 @@ async fn kafka_sink_invalid_brokers() -> Result<()> {
         id: "test-invalid".into(),
         brokers: "invalid-host:9999".into(),
         topic: "df-test-invalid".into(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -1126,6 +1098,7 @@ async fn kafka_sink_large_events() -> Result<()> {
         id: "test-large".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -1173,6 +1146,7 @@ async fn kafka_sink_concurrent_sends() -> Result<()> {
         id: "test-concurrent".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -1244,6 +1218,7 @@ async fn kafka_sink_custom_config() -> Result<()> {
         id: "test-custom".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -1289,6 +1264,7 @@ async fn kafka_sink_trait_implementation() -> Result<()> {
         id: "test-trait".into(),
         brokers: brokers(),
         topic: "df-test-trait".into(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -1321,6 +1297,7 @@ async fn kafka_sink_optional() -> Result<()> {
         id: "test-optional".into(),
         brokers: brokers(),
         topic: "df-test-optional".into(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(false),
@@ -1387,6 +1364,7 @@ async fn kafka_sink_recovers_after_restart() -> Result<()> {
         id: "test-restart".into(),
         brokers: brokers.clone(),
         topic: topic.into(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -1451,6 +1429,7 @@ async fn kafka_sink_handles_broker_hiccup() -> Result<()> {
         id: "test-hiccup".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -1512,6 +1491,7 @@ async fn kafka_sink_batch_resilience() -> Result<()> {
         id: "test-batch-resilience".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -1564,6 +1544,7 @@ async fn kafka_sink_respects_cancellation() -> Result<()> {
         id: "test-cancel".into(),
         brokers: "invalid-host:9999".into(),
         topic: "df-test-cancel".into(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -1612,6 +1593,7 @@ async fn kafka_sink_default_envelope_is_native() -> Result<()> {
         id: "test-default".into(),
         brokers: brokers.clone(),
         topic: topic.clone(),
+        key: None,
         envelope: EnvelopeCfg::default(),
         encoding: EncodingCfg::default(),
         required: Some(true),
@@ -1654,6 +1636,252 @@ async fn kafka_sink_default_envelope_is_native() -> Result<()> {
     );
 
     info!("✓ default envelope is Native");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
+// =============================================================================
+// Dynamic Routing Tests
+// =============================================================================
+
+struct ConsumedMessage {
+    payload: Vec<u8>,
+    key: Option<String>,
+    headers: HashMap<String, String>,
+}
+
+/// Like `consume_until` but also captures message key and headers.
+async fn consume_messages_until<F>(
+    consumer: &StreamConsumer,
+    timeout_duration: Duration,
+    mut condition: F,
+) -> Vec<ConsumedMessage>
+where
+    F: FnMut(&[ConsumedMessage]) -> bool,
+{
+    let deadline = Instant::now() + timeout_duration;
+    let mut messages = Vec::new();
+
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match timeout(remaining, consumer.recv()).await {
+            Ok(Ok(msg)) => {
+                if let Some(payload) = msg.payload() {
+                    let key = msg
+                        .key()
+                        .map(|k| String::from_utf8_lossy(k).to_string());
+                    let mut headers = HashMap::new();
+                    if let Some(h) = msg.headers() {
+                        for header in h.iter() {
+                            if let Some(val) = header.value {
+                                headers.insert(
+                                    header.key.to_string(),
+                                    String::from_utf8_lossy(val).to_string(),
+                                );
+                            }
+                        }
+                    }
+                    messages.push(ConsumedMessage {
+                        payload: payload.to_vec(),
+                        key,
+                        headers,
+                    });
+                    if condition(&messages) {
+                        break;
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                warn!("consumer error: {}", e);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+
+    messages
+}
+
+/// Topic template routes events to per-table Kafka topics.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_topic_template_routes_by_table() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let brokers = brokers();
+    let topic_orders = test_topic("route-orders");
+    let topic_users = test_topic("route-users");
+    create_topic(&brokers, &topic_orders, 1).await?;
+    create_topic(&brokers, &topic_users, 1).await?;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-routing".into(),
+        brokers: brokers.clone(),
+        topic: "df-test-route-${source.table}".into(),
+        key: None,
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    sink.send_batch(&[
+        make_event_for_table(1, "orders"),
+        make_event_for_table(2, "users"),
+    ])
+    .await?;
+
+    let consumer =
+        create_consumer(&brokers, &topic_orders, "route-orders-consumer")?;
+    let msgs =
+        consume_messages_until(&consumer, Duration::from_secs(10), |m| {
+            !m.is_empty()
+        })
+        .await;
+    assert_eq!(msgs.len(), 1);
+    let parsed: serde_json::Value = serde_json::from_slice(&msgs[0].payload)?;
+    assert_eq!(parsed["source"]["table"], "orders");
+
+    let consumer =
+        create_consumer(&brokers, &topic_users, "route-users-consumer")?;
+    let msgs =
+        consume_messages_until(&consumer, Duration::from_secs(10), |m| {
+            !m.is_empty()
+        })
+        .await;
+    assert_eq!(msgs.len(), 1);
+    let parsed: serde_json::Value = serde_json::from_slice(&msgs[0].payload)?;
+    assert_eq!(parsed["source"]["table"], "users");
+
+    info!("✓ topic template routes events to correct topics");
+    delete_topic(&brokers, &topic_orders).await?;
+    delete_topic(&brokers, &topic_users).await?;
+    Ok(())
+}
+
+/// EventRouting.topic overrides the configured topic.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_event_routing_override() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let brokers = brokers();
+    let default_topic = test_topic("route-default");
+    let override_topic = test_topic("route-override");
+    create_topic(&brokers, &default_topic, 1).await?;
+    create_topic(&brokers, &override_topic, 1).await?;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-override".into(),
+        brokers: brokers.clone(),
+        topic: default_topic.clone(),
+        key: None,
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    let ev1 = make_test_event(1);
+    let mut ev2 = make_test_event(2);
+    ev2.routing = Some(EventRouting {
+        topic: Some(override_topic.clone()),
+        ..Default::default()
+    });
+
+    sink.send_batch(&[ev1, ev2]).await?;
+
+    let consumer =
+        create_consumer(&brokers, &default_topic, "default-consumer")?;
+    let msgs =
+        consume_until(&consumer, Duration::from_secs(10), |m| !m.is_empty())
+            .await;
+    assert_eq!(msgs.len(), 1);
+
+    let consumer =
+        create_consumer(&brokers, &override_topic, "override-consumer")?;
+    let msgs =
+        consume_until(&consumer, Duration::from_secs(10), |m| !m.is_empty())
+            .await;
+    assert_eq!(msgs.len(), 1);
+
+    info!("✓ EventRouting.topic overrides static config");
+    delete_topic(&brokers, &default_topic).await?;
+    delete_topic(&brokers, &override_topic).await?;
+    Ok(())
+}
+
+/// Key template resolves and routing headers land on the Kafka message.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_routing_key_and_headers() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let brokers = brokers();
+    let topic = test_topic("route-key-headers");
+    create_topic(&brokers, &topic, 1).await?;
+
+    let cfg = KafkaSinkCfg {
+        id: "test-kh".into(),
+        brokers: brokers.clone(),
+        topic: topic.clone(),
+        key: Some("${after.customer_id}".into()),
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    let mut event = make_event_for_table(1, "orders");
+    event.after = Some(json!({"id": 1, "customer_id": "cust-42"}));
+    event.routing = Some(EventRouting {
+        headers: Some(HashMap::from([
+            ("trace-id".into(), "abc-123".into()),
+            ("x-source".into(), "deltaforge".into()),
+        ])),
+        ..Default::default()
+    });
+
+    sink.send(&event).await?;
+
+    let consumer = create_consumer(&brokers, &topic, "kh-consumer")?;
+    let msgs =
+        consume_messages_until(&consumer, Duration::from_secs(10), |m| {
+            !m.is_empty()
+        })
+        .await;
+    assert_eq!(msgs.len(), 1);
+
+    let msg = &msgs[0];
+    assert_eq!(msg.key.as_deref(), Some("cust-42"), "key from template");
+    assert_eq!(
+        msg.headers.get("trace-id").map(|s| s.as_str()),
+        Some("abc-123")
+    );
+    assert_eq!(
+        msg.headers.get("x-source").map(|s| s.as_str()),
+        Some("deltaforge")
+    );
+
+    info!("✓ key template + routing headers delivered correctly");
     delete_topic(&brokers, &topic).await?;
     Ok(())
 }

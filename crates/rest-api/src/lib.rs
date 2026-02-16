@@ -209,6 +209,7 @@ mod tests {
                         id: "redis".to_string(),
                         uri: "redis://localhost".to_string(),
                         stream: "events".to_string(),
+                        key: None,
                         required: Some(true),
                         send_timeout_secs: Some(3),
                         batch_timeout_secs: Some(3),

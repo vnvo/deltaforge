@@ -1,0 +1,1062 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DeltaForge - High-Performance CDC Engine</title>
+<meta name="description" content="A versatile, high-performance Change Data Capture engine built in Rust. Stream database changes to Kafka, Redis, NATS and etc.">
+<meta name="keywords" content="CDC, change data capture, Rust, Kafka, Redis, NATS, MySQL, PostgreSQL, Debezium, real-time data, event streaming, database replication">
+<link rel="canonical" href="https://vnvo.github.io/deltaforge/">
+<!-- Open Graph -->
+<meta property="og:type" content="website">
+<meta property="og:title" content="DeltaForge - High-Performance CDC Engine">
+<meta property="og:description" content="Stream database changes from MySQL and PostgreSQL to Kafka, Redis, and NATS. Built in Rust for minimal overhead and maximum reliability.">
+<meta property="og:url" content="https://vnvo.github.io/deltaforge/">
+<meta property="og:site_name" content="DeltaForge">
+<!-- Twitter -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="DeltaForge - High-Performance CDC Engine">
+<meta name="twitter:description" content="Stream database changes from MySQL and PostgreSQL to Kafka, Redis, NATS and etc. Built in Rust.">
+<!-- Structured Data -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "DeltaForge",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "Linux",
+  "description": "A versatile, high-performance Change Data Capture engine built in Rust. Streams database changes to Kafka, Redis, NATS and etc.",
+  "url": "https://github.com/vnvo/deltaforge",
+  "license": "https://opensource.org/licenses/MIT",
+  "programmingLanguage": "Rust",
+  "offers": { "@type": "Offer", "price": "0" }
+}
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --bg-primary: #0a0a0b;
+  --bg-secondary: #111113;
+  --bg-card: #161618;
+  --bg-code: #0d0d0f;
+  --border: #222226;
+  --border-hover: #333338;
+  --text-primary: #e8e8ec;
+  --text-secondary: #8a8a96;
+  --text-dim: #555560;
+  --accent: #e8792b;
+  --accent-glow: #e8792b33;
+  --accent-subtle: #e8792b18;
+  --green: #34d399;
+  --blue: #60a5fa;
+  --purple: #a78bfa;
+  --red: #f87171;
+  --font-body: 'Plus Jakarta Sans', -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  font-family: var(--font-body);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--accent); text-decoration: none; transition: opacity 0.2s; }
+a:hover { opacity: 0.8; }
+
+.container { max-width: 980px; margin: 0 auto; padding: 0 24px; }
+
+/* ── HERO ── */
+.hero {
+  padding: 100px 0 80px;
+  text-align: center;
+  position: relative;
+  overflow: hidden;
+}
+
+.hero::before {
+  content: '';
+  position: absolute;
+  top: -200px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 800px;
+  height: 600px;
+  background: radial-gradient(ellipse, var(--accent-glow) 0%, transparent 70%);
+  pointer-events: none;
+}
+
+.hero-logo {
+  font-size: 3.2rem;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  margin-bottom: 8px;
+  position: relative;
+}
+
+.hero-logo .delta {
+  color: var(--accent);
+}
+
+.hero-tagline {
+  font-size: 1.25rem;
+  color: var(--text-secondary);
+  max-width: 600px;
+  margin: 0 auto 28px;
+  line-height: 1.5;
+}
+
+.hero-sub {
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  margin-bottom: 36px;
+}
+
+.hero-sub strong { color: var(--text-secondary); }
+
+.badges {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin-bottom: 40px;
+}
+
+.badges img { height: 22px; }
+
+.hero-buttons {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 22px;
+  border-radius: 8px;
+  font-family: var(--font-body);
+  font-size: 0.9rem;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  transition: all 0.2s;
+  cursor: pointer;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+.btn-primary:hover { opacity: 0.9; transform: translateY(-1px); }
+
+.btn-secondary {
+  background: var(--bg-card);
+  color: var(--text-primary);
+}
+.btn-secondary:hover { border-color: var(--border-hover); transform: translateY(-1px); }
+
+/* ── TECH STRIP ── */
+.tech-strip {
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding: 32px 0;
+  background: var(--bg-secondary);
+}
+
+.tech-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 0;
+  text-align: center;
+}
+
+.tech-cell { padding: 8px 12px; }
+.tech-cell:not(:last-child) { border-right: 1px solid var(--border); }
+
+.tech-label {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  margin-bottom: 10px;
+}
+
+.tech-icons {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.tech-icons img { width: 32px; height: 32px; }
+.tech-icons img.invert { filter: brightness(0) invert(1) opacity(0.85); }
+
+.tech-names {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin-top: 6px;
+}
+
+.format-badge {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 4px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  font-family: var(--font-mono);
+}
+
+.format-badge.native { background: #f8717122; color: var(--red); }
+.format-badge.debezium { background: #34d39922; color: var(--green); }
+.format-badge.cloudevents { background: #60a5fa22; color: var(--blue); }
+
+/* ── PIPELINE DEMO ── */
+.section {
+  padding: 80px 0;
+}
+
+.section-label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+
+.section-title {
+  font-size: 1.8rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin-bottom: 12px;
+}
+
+.section-desc {
+  color: var(--text-secondary);
+  max-width: 560px;
+  font-size: 0.95rem;
+  margin-bottom: 40px;
+}
+
+.pipeline-demo {
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border);
+}
+
+.demo-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 40px;
+  align-items: start;
+}
+
+.code-block {
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.code-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+}
+
+.code-dot {
+  width: 10px; height: 10px;
+  border-radius: 50%;
+  background: var(--border-hover);
+}
+.code-dot.r { background: #f87171; }
+.code-dot.y { background: #fbbf24; }
+.code-dot.g { background: #34d399; }
+
+.code-header span { margin-left: auto; }
+
+.code-body {
+  padding: 16px 20px;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.7;
+  overflow-x: auto;
+  color: var(--text-secondary);
+  white-space: pre;
+}
+
+.code-body .key { color: #60a5fa; }
+.code-body .str { color: #34d399; }
+.code-body .comment { color: #444450; font-style: italic; }
+.code-body .var { color: var(--accent); }
+.code-body .val { color: #fbbf24; }
+
+.demo-annotations {
+  padding-top: 12px;
+}
+
+.annotation {
+  display: flex;
+  gap: 16px;
+  padding: 18px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.annotation:last-child { border-bottom: none; }
+
+.annotation-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: var(--accent-subtle);
+  border: 1px solid #e8792b22;
+}
+
+.annotation-icon svg {
+  width: 20px;
+  height: 20px;
+  stroke: var(--accent);
+  stroke-width: 1.75;
+  fill: none;
+}
+
+.annotation-title {
+  font-weight: 600;
+  font-size: 0.9rem;
+  margin-bottom: 4px;
+}
+
+.annotation-desc {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+/* ── FEATURES ── */
+.features-section {
+  background: var(--bg-primary);
+}
+
+.features-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+}
+
+.feature-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 28px 24px;
+  transition: border-color 0.2s, transform 0.2s;
+}
+
+.feature-card:hover {
+  border-color: var(--border-hover);
+  transform: translateY(-2px);
+}
+
+.feature-icon {
+  width: 42px;
+  height: 42px;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 16px;
+}
+
+.feature-icon svg {
+  width: 22px;
+  height: 22px;
+  stroke-width: 1.75;
+  fill: none;
+}
+
+.feature-icon.amber { background: #e8792b14; border: 1px solid #e8792b22; }
+.feature-icon.amber svg { stroke: var(--accent); }
+.feature-icon.blue { background: #60a5fa14; border: 1px solid #60a5fa22; }
+.feature-icon.blue svg { stroke: var(--blue); }
+.feature-icon.green { background: #34d39914; border: 1px solid #34d39922; }
+.feature-icon.green svg { stroke: var(--green); }
+.feature-icon.purple { background: #a78bfa14; border: 1px solid #a78bfa22; }
+.feature-icon.purple svg { stroke: var(--purple); }
+
+.feature-name {
+  font-weight: 700;
+  font-size: 0.95rem;
+  margin-bottom: 8px;
+}
+
+.feature-desc {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  line-height: 1.55;
+}
+
+/* ── ENVELOPE FORMATS ── */
+.formats-section {
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.formats-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+}
+
+.format-card {
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;  
+}
+
+.format-card-header {
+  padding: 20px 20px 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.format-card-header h3 {
+  font-size: 0.95rem;
+  font-weight: 700;
+}
+
+.format-tag {
+  margin-left: auto;
+  font-size: 0.68rem;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-weight: 600;
+  background: var(--accent-subtle);
+  color: var(--accent);
+}
+
+.format-card-desc {
+  padding: 0 20px 14px;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+.format-card-code {
+  border-top: 1px solid var(--border);
+  padding: 14px 18px;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  line-height: 1.6;
+  color: var(--text-dim);
+  overflow-x: auto;
+  white-space: pre;
+  margin-top: auto;
+}
+
+.format-card-code .key { color: #60a5fa; }
+.format-card-code .str { color: #34d399; }
+.format-card-code .val { color: #fbbf24; }
+.format-card-code .punc { color: #555560; }
+
+/* ── ROUTING ── */
+.routing-section {
+  background: var(--bg-primary);
+}
+
+.routing-tabs {
+  display: flex;
+  gap: 0;
+  margin-bottom: 0;
+}
+
+.routing-tab {
+  padding: 10px 20px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  border: 1px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: all 0.2s;
+  font-family: var(--font-body);
+}
+
+.routing-tab:first-child { border-radius: 8px 0 0 0; }
+.routing-tab:last-child { border-radius: 0 8px 0 0; }
+
+.routing-tab.active {
+  background: var(--bg-code);
+  color: var(--accent);
+  border-bottom-color: var(--bg-code);
+}
+
+.routing-panel {
+  display: none;
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-top: none;
+  border-radius: 0 0 10px 10px;
+  padding: 20px 24px;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.7;
+  overflow-x: auto;
+  color: var(--text-secondary);
+  white-space: pre;
+}
+
+.routing-panel.active { display: block; }
+.routing-panel .key { color: #60a5fa; }
+.routing-panel .str { color: #34d399; }
+.routing-panel .comment { color: #444450; font-style: italic; }
+.routing-panel .var { color: var(--accent); }
+.routing-panel .val { color: #fbbf24; }
+.routing-panel .fn { color: #a78bfa; }
+.routing-panel .kw { color: #f472b6; }
+
+/* ── INSTALL ── */
+.install-section {
+  background: var(--bg-secondary);
+  border-top: 1px solid var(--border);
+}
+
+.install-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+}
+
+.install-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 24px;
+}
+
+.install-card h3 {
+  font-size: 0.9rem;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.install-card-sub {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  margin-bottom: 14px;
+}
+
+.install-cmd {
+  display: flex;
+  align-items: center;
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 14px;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  overflow-x: auto;
+  cursor: pointer;
+  transition: border-color 0.2s;
+  position: relative;
+}
+
+.install-cmd:hover { border-color: var(--border-hover); }
+
+.install-cmd .copy-indicator {
+  margin-left: auto;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  padding-left: 12px;
+  flex-shrink: 0;
+  transition: color 0.2s;
+}
+
+.install-cmd:hover .copy-indicator { color: var(--accent); }
+
+/* ── FOOTER ── */
+footer {
+  border-top: 1px solid var(--border);
+  padding: 32px 0;
+  text-align: center;
+}
+
+.footer-links {
+  display: flex;
+  gap: 24px;
+  justify-content: center;
+  margin-bottom: 16px;
+}
+
+.footer-links a {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+.footer-links a:hover { color: var(--text-primary); }
+
+.footer-meta {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
+/* ── RESPONSIVE ── */
+@media (max-width: 768px) {
+  .hero { padding: 60px 0 50px; }
+  .hero-logo { font-size: 2.2rem; }
+  .hero-tagline { font-size: 1.05rem; }
+  .tech-grid { grid-template-columns: repeat(3, 1fr); }
+  .tech-cell:nth-child(3) { border-right: none; }
+  .tech-cell:nth-child(4), .tech-cell:nth-child(5) { border-top: 1px solid var(--border); }
+  .demo-grid { grid-template-columns: 1fr; }
+  .features-grid { grid-template-columns: 1fr; }
+  .formats-grid { grid-template-columns: 1fr; }
+  .install-grid { grid-template-columns: 1fr; }
+  .section { padding: 50px 0; }
+}
+
+/* ── ANIMATIONS ── */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.hero-logo, .hero-tagline, .hero-sub, .badges, .hero-buttons {
+  animation: fadeUp 0.6s ease-out backwards;
+}
+.hero-tagline { animation-delay: 0.08s; }
+.hero-sub { animation-delay: 0.14s; }
+.badges { animation-delay: 0.2s; }
+.hero-buttons { animation-delay: 0.26s; }
+</style>
+</head>
+<body>
+
+<!-- ═══════════════ HERO ═══════════════ -->
+<section class="hero">
+  <div class="container">
+    <div class="hero-logo"><span class="delta">Delta</span>Forge</div>
+    <p class="hero-tagline">
+      A versatile, high-performance Change Data Capture engine built in Rust.
+      Stream database changes to Kafka, Redis, NATS and etc.
+    </p>
+    <p class="hero-sub">
+      ⚠️ <strong>Active development</strong>
+    </p>
+    <div class="badges">
+      <img src="https://img.shields.io/github/v/release/vnvo/deltaforge?color=e8792b&label=release" alt="Release">
+      <img src="https://img.shields.io/badge/ghcr.io-deltaforge-e8792b?logo=docker" alt="GHCR">
+      <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-e8792b" alt="Arch">
+      <img src="https://img.shields.io/badge/rustc-1.89+-e8792b" alt="MSRV">
+      <img src="https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-e8792b" alt="License">
+    </div>
+    <div class="hero-buttons">
+      <a href="https://github.com/vnvo/deltaforge" class="btn btn-primary">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        GitHub
+      </a>
+      <a href="https://vnvo.github.io/deltaforge/book/" class="btn btn-secondary">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/></svg>
+        Documentation
+      </a>
+      <a href="https://github.com/vnvo/deltaforge/releases" class="btn btn-secondary">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
+        Download
+      </a>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════ TECH STRIP ═══════════════ -->
+<section class="tech-strip">
+  <div class="container">
+    <div class="tech-grid">
+      <div class="tech-cell">
+        <div class="tech-label">Built with</div>
+        <div class="tech-icons">
+          <img class="invert" src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/rust/rust-original.svg" alt="Rust">
+        </div>
+        <div class="tech-names">Rust</div>
+      </div>
+      <div class="tech-cell">
+        <div class="tech-label">Sources</div>
+        <div class="tech-icons">
+          <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/mysql/mysql-original.svg" alt="MySQL">
+          <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/postgresql/postgresql-original.svg" alt="PostgreSQL">
+        </div>
+        <div class="tech-names">MySQL · PostgreSQL</div>
+      </div>
+      <div class="tech-cell">
+        <div class="tech-label">Processors</div>
+        <div class="tech-icons">
+          <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/javascript/javascript-original.svg" alt="JavaScript">
+        </div>
+        <div class="tech-names">JavaScript</div>
+      </div>
+      <div class="tech-cell">
+        <div class="tech-label">Sinks</div>
+        <div class="tech-icons">
+          <img class="invert" src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/apachekafka/apachekafka-original.svg" alt="Kafka">
+          <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/redis/redis-original.svg" alt="Redis">
+        </div>
+        <div class="tech-names">Kafka · Redis · NATS</div>
+      </div>
+      <div class="tech-cell">
+        <div class="tech-label">Formats</div>
+        <div class="tech-icons" style="gap: 5px;">
+          <span class="format-badge native">Native</span>
+          <span class="format-badge debezium">Debezium</span>
+          <span class="format-badge cloudevents">CloudEvents</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════ PIPELINE DEMO ═══════════════ -->
+<section class="section pipeline-demo">
+  <div class="container">
+    <div class="section-label">Quick Start</div>
+    <div class="section-title">Define a pipeline in YAML. Run it.</div>
+    <div class="section-desc">
+      No boilerplate code, no JVM, no Zookeeper. One config file, one binary.
+    </div>
+    <div class="demo-grid">
+      <div class="code-block">
+        <div class="code-header">
+          <span class="code-dot r"></span>
+          <span class="code-dot y"></span>
+          <span class="code-dot g"></span>
+          <span>pipeline.yaml</span>
+        </div>
+        <div class="code-body"><span class="key">metadata</span>:
+  <span class="key">name</span>: <span class="str">orders-to-kafka</span>
+  <span class="key">tenant</span>: <span class="str">acme</span>
+
+<span class="key">spec</span>:
+  <span class="key">source</span>:
+    <span class="key">type</span>: <span class="str">mysql</span>
+    <span class="key">config</span>:
+      <span class="key">dsn</span>: <span class="var">${MYSQL_DSN}</span>
+      <span class="key">tables</span>: [<span class="str">shop.orders</span>]
+
+  <span class="key">processors</span>:
+    - <span class="key">type</span>: <span class="str">javascript</span>
+      <span class="key">inline</span>: |
+        <span class="comment">// transform, filter, route</span>
+        <span class="str">function processBatch(events) {</span>
+        <span class="str">  return events;</span>
+        <span class="str">}</span>
+
+  <span class="key">sinks</span>:
+    - <span class="key">type</span>: <span class="str">kafka</span>
+      <span class="key">config</span>:
+        <span class="key">brokers</span>: <span class="var">${KAFKA_BROKERS}</span>
+        <span class="key">topic</span>: <span class="str">cdc.</span><span class="var">${source.table}</span>
+        <span class="key">envelope</span>:
+          <span class="key">type</span>: <span class="str">debezium</span></div>
+      </div>
+      <div class="demo-annotations">
+        <div class="annotation">
+          <div class="annotation-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/></svg></div>
+          <div>
+            <div class="annotation-title">Capture</div>
+            <div class="annotation-desc">Connect to MySQL binlog or PostgreSQL logical replication. Wildcard table patterns supported.</div>
+          </div>
+        </div>
+        <div class="annotation">
+          <div class="annotation-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m7 8-4 4 4 4"/><path d="m17 8 4 4-4 4"/><path d="m14 4-4 16"/></svg></div>
+          <div>
+            <div class="annotation-title">Transform</div>
+            <div class="annotation-desc">JavaScript processors for filtering, enrichment, PII redaction, and per-event routing decisions.</div>
+          </div>
+        </div>
+        <div class="annotation">
+          <div class="annotation-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></svg></div>
+          <div>
+            <div class="annotation-title">Route</div>
+            <div class="annotation-desc">Template strings resolve per-event: <code style="color:var(--accent);font-family:var(--font-mono);font-size:0.78rem;">cdc.${source.table}</code> routes each table to its own topic.</div>
+          </div>
+        </div>
+        <div class="annotation">
+          <div class="annotation-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg></div>
+          <div>
+            <div class="annotation-title">Deliver</div>
+            <div class="annotation-desc">Fan-out to Kafka, Redis, and NATS simultaneously. Debezium, CloudEvents, or Native wire formats.</div>
+          </div>
+        </div>
+        <div class="annotation">
+          <div class="annotation-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg></div>
+          <div>
+            <div class="annotation-title">Checkpoint</div>
+            <div class="annotation-desc">At-least-once delivery with configurable commit policies. Resume exactly where you left off after restarts.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════ FEATURES ═══════════════ -->
+<section class="section features-section">
+  <div class="container">
+    <div class="section-label">Why DeltaForge</div>
+    <div class="section-title">Built for production (CDC)</div>
+    <div class="section-desc">
+      Stream database changes reliably with minimal overhead.
+    </div>
+    <div class="features-grid">
+      <div class="feature-card">
+        <div class="feature-icon amber"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg></div>
+        <div class="feature-name">Powered by Rust</div>
+        <div class="feature-desc">Predictable latency, memory safety, and minimal resource footprint.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon amber"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></svg></div>
+        <div class="feature-name">Dynamic Routing</div>
+        <div class="feature-desc">Route events to per-table topics, streams, or subjects using template strings or JavaScript logic.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon blue"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/><path d="M11 8v6"/><path d="M8 11h6"/></svg></div>
+        <div class="feature-name">Schema Discovery</div>
+        <div class="feature-desc">Automatically infer and track schemas from event payloads with deep inspection of nested JSON structures.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon green"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg></div>
+        <div class="feature-name">Zero-Downtime DDL</div>
+        <div class="feature-desc">Detects schema changes and reloads automatically. No pipeline restart, no manual intervention.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon green"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></svg></div>
+        <div class="feature-name">Graceful Failover</div>
+        <div class="feature-desc">Handles source failover with automatic schema revalidation. Reconnects with exponential backoff and jitter.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon amber"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></svg></div>
+        <div class="feature-name">Reliable Checkpoints</div>
+        <div class="feature-desc">At-least-once delivery with pluggable backends. Configurable commit policies: all, required, or quorum.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon purple"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4"/><path d="M14 13.12c0 2.38 0 6.38-1 8.88"/><path d="M17.29 21.02c.12-.6.43-2.3.5-3.02"/><path d="M2 12a10 10 0 0 1 18-6"/><path d="M2 16h.01"/><path d="M21.8 16c.2-2 .131-5.354 0-6"/><path d="M5.71 17.11c.25.64.47 1.43.73 2.89"/><path d="M7.14 2.1c-2.42 1.4-4.14 3.56-4.88 6.14"/><path d="M20.97 5c-.67-.67-1.26-1.08-2.11-1.5"/></svg></div>
+        <div class="feature-name">High-Cardinality Keys</div>
+        <div class="feature-desc">Probabilistic detection of dynamic map keys prevents false schema evolution from session IDs and trace IDs.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon blue"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><line x1="4" x2="4" y1="21" y2="14"/><line x1="4" x2="4" y1="10" y2="3"/><line x1="12" x2="12" y1="21" y2="12"/><line x1="12" x2="12" y1="8" y2="3"/><line x1="20" x2="20" y1="21" y2="16"/><line x1="20" x2="20" y1="12" y2="3"/><line x1="2" x2="6" y1="14" y2="14"/><line x1="10" x2="14" y1="8" y2="8"/><line x1="18" x2="22" y1="16" y2="16"/></svg></div>
+        <div class="feature-name">Live Management</div>
+        <div class="feature-desc">Pause, resume, patch, and inspect running pipelines via REST API. Prometheus metrics and health probes built in.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon green"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/><path d="M12 17v5"/></svg></div>
+        <div class="feature-name">Debezium Compatible</div>
+        <div class="feature-desc">Drop-in wire format compatibility. Migrating from Debezium? Switch the envelope type and you're done.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════ ENVELOPE FORMATS ═══════════════ -->
+<section class="section formats-section">
+  <div class="container">
+    <div class="section-label">Output Formats</div>
+    <div class="section-title">Three envelope formats, one config field</div>
+    <div class="section-desc">
+      Match the wire format your consumers expect. Switch with a single line of YAML.
+    </div>
+    <div class="formats-grid">
+      <div class="format-card">
+        <div class="format-card-header">
+          <span class="format-badge native">Native</span>
+          <span class="format-tag">Lowest overhead</span>
+        </div>
+        <div class="format-card-desc">Minimal envelope for DeltaForge-native consumers. No wrapper overhead.</div>
+        <div class="format-card-code"><span class="punc">{</span>
+  <span class="key">"op"</span>: <span class="str">"c"</span>,
+  <span class="key">"after"</span>: <span class="punc">{</span> <span class="key">"id"</span>: <span class="val">1</span>, <span class="key">"status"</span>: <span class="str">"new"</span> <span class="punc">}</span>,
+  <span class="key">"source"</span>: <span class="punc">{</span> <span class="key">"table"</span>: <span class="str">"orders"</span> <span class="punc">}</span>
+<span class="punc">}</span>
+<span class="punc"> </span>
+<span class="punc"> </span></div>
+      </div>
+      <div class="format-card">
+        <div class="format-card-header">
+          <span class="format-badge debezium">Debezium</span>
+          <span class="format-tag">Drop-in compatible</span>
+        </div>
+        <div class="format-card-desc">Schemaless mode compatible with JsonConverter <code>schemas.enable=false</code>.</div>
+        <div class="format-card-code"><span class="punc">{</span>
+  <span class="key">"schema"</span>: <span class="val">null</span>,
+  <span class="key">"payload"</span>: <span class="punc">{</span>
+    <span class="key">"op"</span>: <span class="str">"c"</span>,
+    <span class="key">"after"</span>: <span class="punc">{</span> <span class="key">"id"</span>: <span class="val">1</span>, <span class="key">"status"</span>: <span class="str">"new"</span> <span class="punc">}</span>
+  <span class="punc">}</span>
+<span class="punc">}</span></div>
+      </div>
+      <div class="format-card">
+        <div class="format-card-header">
+          <span class="format-badge cloudevents">CloudEvents</span>
+          <span class="format-tag">CNCF standard</span>
+        </div>
+        <div class="format-card-desc">CNCF CloudEvents 1.0 spec for event-driven and serverless architectures.</div>
+        <div class="format-card-code"><span class="punc">{</span>
+  <span class="key">"specversion"</span>: <span class="str">"1.0"</span>,
+  <span class="key">"type"</span>: <span class="str">"com.acme.orders.create"</span>,
+  <span class="key">"data"</span>: <span class="punc">{</span>
+    <span class="key">"after"</span>: <span class="punc">{</span> <span class="key">"id"</span>: <span class="val">1</span>, <span class="key">"status"</span>: <span class="str">"new"</span> <span class="punc">}</span>
+  <span class="punc">}</span>
+<span class="punc">}</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════ ROUTING ═══════════════ -->
+<section class="section routing-section">
+  <div class="container">
+    <div class="section-label">Dynamic Routing</div>
+    <div class="section-title">Route every event to the right destination</div>
+    <div class="section-desc">
+      Template strings for simple per-table routing. JavaScript for conditional business logic.
+    </div>
+    <div>
+      <div class="routing-tabs">
+        <button class="routing-tab active" onclick="switchTab(0)">Template Routing</button>
+        <button class="routing-tab" onclick="switchTab(1)">JavaScript Routing</button>
+      </div>
+      <div class="routing-panel active" id="panel-0"><span class="comment"># Routes each table to its own topic automatically</span>
+<span class="key">sinks</span>:
+  - <span class="key">type</span>: <span class="str">kafka</span>
+    <span class="key">config</span>:
+      <span class="key">topic</span>: <span class="str">cdc.</span><span class="var">${source.db}</span><span class="str">.</span><span class="var">${source.table}</span>
+      <span class="key">key</span>:   <span class="var">${after.customer_id}</span>
+
+  - <span class="key">type</span>: <span class="str">redis</span>
+    <span class="key">config</span>:
+      <span class="key">stream</span>: <span class="str">events:</span><span class="var">${source.table}</span>
+      <span class="key">key</span>:    <span class="var">${after.id}</span>
+
+  - <span class="key">type</span>: <span class="str">nats</span>
+    <span class="key">config</span>:
+      <span class="key">subject</span>: <span class="str">cdc.</span><span class="var">${source.db}</span><span class="str">.</span><span class="var">${source.table}</span>
+
+<span class="comment"># Available: ${source.table}, ${source.db}, ${op},</span>
+<span class="comment">#   ${after.&lt;field&gt;}, ${before.&lt;field&gt;}, ${tenant_id}</span></div>
+      <div class="routing-panel" id="panel-1"><span class="kw">function</span> <span class="fn">processBatch</span>(events) {
+  <span class="kw">for</span> (<span class="kw">const</span> ev <span class="kw">of</span> events) {
+    <span class="kw">if</span> (!ev.after) <span class="kw">continue</span>;
+
+    <span class="kw">if</span> (ev.after.total_amount > <span class="val">10000</span>) {
+      <span class="comment">// High-value orders → priority topic</span>
+      ev.<span class="fn">route</span>({
+        <span class="key">topic</span>: <span class="str">"orders.priority"</span>,
+        <span class="key">key</span>: String(ev.after.customer_id),
+        <span class="key">headers</span>: {
+          <span class="str">"x-tier"</span>: <span class="str">"high-value"</span>,
+          <span class="str">"x-amount"</span>: String(ev.after.total_amount)
+        }
+      });
+    } <span class="kw">else</span> {
+      ev.<span class="fn">route</span>({
+        <span class="key">topic</span>: <span class="str">"orders.standard"</span>,
+        <span class="key">key</span>: String(ev.after.customer_id)
+      });
+    }
+  }
+  <span class="kw">return</span> events;
+}</div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════ INSTALL ═══════════════ -->
+<section class="section install-section">
+  <div class="container">
+    <div class="section-label">Install</div>
+    <div class="section-title">Up and running in seconds</div>
+    <div class="section-desc" style="margin-bottom: 28px;">
+      Single binary. ~60MB Docker image. No runtime dependencies.
+    </div>
+    <div class="install-grid">
+      <div class="install-card">
+        <h3>Docker</h3>
+        <div class="install-card-sub">Recommended</div>
+        <div class="install-cmd" onclick="copyCmd(this)">
+          docker pull ghcr.io/vnvo/deltaforge:latest
+          <span class="copy-indicator">copy</span>
+        </div>
+      </div>
+      <div class="install-card">
+        <h3>Docker Hub</h3>
+        <div class="install-card-sub">Alternative registry</div>
+        <div class="install-cmd" onclick="copyCmd(this)">
+          docker pull vnvohub/deltaforge:latest
+          <span class="copy-indicator">copy</span>
+        </div>
+      </div>
+      <div class="install-card">
+        <h3>From Source</h3>
+        <div class="install-card-sub">Requires Rust 1.89+</div>
+        <div class="install-cmd" onclick="copyCmd(this)">
+          cargo build --release -p runner
+          <span class="copy-indicator">copy</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════ FOOTER ═══════════════ -->
+<footer>
+  <div class="container">
+    <div class="footer-links">
+      <a href="https://github.com/vnvo/deltaforge">GitHub</a>
+      <a href="https://vnvo.github.io/deltaforge/book/">Documentation</a>
+      <a href="https://github.com/vnvo/deltaforge/releases">Releases</a>
+      <a href="https://github.com/vnvo/deltaforge/issues">Issues</a>
+    </div>
+    <div class="footer-meta">MIT | Apache-2.0 · Built with Rust</div>
+  </div>
+</footer>
+
+<script>
+function switchTab(idx) {
+  document.querySelectorAll('.routing-tab').forEach((t, i) => t.classList.toggle('active', i === idx));
+  document.querySelectorAll('.routing-panel').forEach((p, i) => p.classList.toggle('active', i === idx));
+}
+
+function copyCmd(el) {
+  const text = el.textContent.replace('copy', '').trim();
+  navigator.clipboard.writeText(text).then(() => {
+    const indicator = el.querySelector('.copy-indicator');
+    indicator.textContent = 'copied!';
+    indicator.style.color = 'var(--green)';
+    setTimeout(() => { indicator.textContent = 'copy'; indicator.style.color = ''; }, 1500);
+  });
+}
+</script>
+
+</body>
+</html>

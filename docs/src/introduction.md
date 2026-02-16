@@ -10,7 +10,7 @@
 
 # Introduction
 
-DeltaForge is a modular, config-driven [Change Data Capture](cdc.md) (CDC) micro-framework built in Rust. It streams database changes into downstream systems like Kafka, Redis, and NATS while giving you full control over how each event is processed.
+DeltaForge is a versatile, high-performance [Change Data Capture](cdc.md) (CDC) engine built in Rust. It streams database changes into downstream systems like Kafka, Redis, and NATS - giving you full control over how events are routed, transformed, and delivered. Built-in schema discovery automatically infers and tracks the shape of your data as it flows through, including deep inspection of nested JSON structures.
 
 Pipelines are defined declaratively in YAML, making it straightforward to onboard new use cases without custom code.
 
@@ -27,6 +27,9 @@ Pipelines are defined declaratively in YAML, making it straightforward to onboar
     </td>
     <td align="center" width="140">
       <b>Sinks</b>
+    </td>
+    <td align="center" width="140">
+      <b>Output Formats</b>
     </td>
   </tr>
   <tr>
@@ -49,6 +52,11 @@ Pipelines are defined declaratively in YAML, making it straightforward to onboar
       <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/nats/nats-original.svg" width="40" height="40" alt="NATS">
       <br><sub>Kafka · Redis · NATS</sub>
     </td>
+    <td align="center">
+      <img src="https://img.shields.io/badge/Native-red?style=flat-square" alt="Native">
+      <img src="https://img.shields.io/badge/Debezium-green?style=flat-square" alt="Debezium">
+      <img src="https://img.shields.io/badge/CloudEvents-blue?style=flat-square" alt="CloudEvents">
+    </td>
   </tr>
 </table>
 
@@ -60,6 +68,7 @@ Pipelines are defined declaratively in YAML, making it straightforward to onboar
 - 🔌 **Pluggable architecture** : Sources, processors, and sinks are modular and independently extensible.
 - 🧩 **Declarative pipelines** : Define sources, transforms, sinks, and commit policies in version-controlled YAML with environment variable expansion for secrets.
 - 📦 **Reliable checkpointing** : Resume safely after restarts with at-least-once delivery guarantees.
+- 🔀 **Dynamic routing** : Route events to per-table topics, streams, or subjects using templates or JavaScript logic.
 - 🛠️ **Cloud-native ready** : Single binary, Docker images, JSON logs, Prometheus metrics, and liveness/readiness probes for Kubernetes.
 
 
@@ -72,18 +81,22 @@ Pipelines are defined declaratively in YAML, making it straightforward to onboar
 
 ### Operational Features
 
-- 🔄 **Automatic reconnection** : Exponential backoff with jitter for resilient connections.
+- 🔄 **Graceful failover** : Handles source failover with automatic schema revalidation — no manual intervention needed.
+- 🧬 **Zero-downtime schema evolution** : Detects DDL changes and reloads schemas automatically, no pipeline restart needed.
 - 🎯 **Flexible table selection** : Wildcard patterns (`db.*`, `schema.prefix%`) for easy onboarding.
 - 📀 **Transaction boundaries** : Optionally keep source transactions intact across batches.
 - ⚙️ **Commit policies** : Control checkpoint behavior with `all`, `required`, or `quorum` modes across multiple sinks.
+- 🔧 **Live pipeline management** : Pause, resume, patch, and inspect running pipelines via the REST API.
 
 ## Use Cases
 
 DeltaForge is designed for:
 
-- **Real-time data synchronization** : Keep caches, search indexes, and analytics systems in sync.
-- **Event-driven architectures** : Stream database changes to Kafka or NATS for downstream consumers.
-- **Lightweight ETL** : Transform and route data without heavyweight infrastructure.
+- **Real-time data synchronization** : Keep caches, search indexes, and analytics systems in sync with your primary database.
+- **Event-driven architectures** : Stream database changes to Kafka or NATS for downstream microservices.
+- **Audit trails and compliance** : Capture every mutation with full before/after images for SOC2, HIPAA, or GDPR requirements.
+- **Lightweight ETL** : Transform, filter, and route data in-flight with JavaScript processors - no Spark or Flink cluster needed.
+
 
 > **DeltaForge is _not_ a DAG-based stream processor.** It is a focused CDC engine meant to replace tools like Debezium when you need a lighter, cloud-native, and more customizable runtime.
 

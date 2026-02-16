@@ -15,9 +15,10 @@ All contributions are welcome and highly appreciated.
 
 ## Workspace layout
 - `crates/deltaforge-core` : shared event model, pipeline engine, and checkpointing primitives.
+- `crates/deltaforge-config` : YAML config parsing, environment variable expansion, and pipeline spec types.
 - `crates/sources` : database CDC readers (MySQL binlog, Postgres logical replication) implemented as pluggable sources.
 - `crates/processors` : JavaScript-based processors and support code for transforming batches.
-- `crates/sinks` : sink implementations (Kafka producer, Redis streams) plus sink utilities.
+- `crates/sinks` : sink implementations (Kafka producer, Redis streams, NATS JetStream) plus sink utilities.
 - `crates/rest-api` : HTTP control plane with health/readiness and pipeline lifecycle endpoints.
 - `crates/runner` : CLI entrypoint that wires the runtime, metrics, and control plane together.
 

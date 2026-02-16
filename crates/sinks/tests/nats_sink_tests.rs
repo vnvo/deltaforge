@@ -11,9 +11,9 @@ use anyhow::Result;
 use async_nats::jetstream::{self, stream::Config as StreamConfig};
 use ctor::dtor;
 use deltaforge_config::{EncodingCfg, EnvelopeCfg, NatsSinkCfg};
-use deltaforge_core::{Event, Op, Sink, SourceInfo, SourcePosition};
-use serde_json::json;
+use deltaforge_core::{Event, EventRouting, Sink};
 use sinks::nats::NatsSink;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use testcontainers::{
@@ -27,7 +27,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 mod sink_test_common;
-use sink_test_common::init_test_tracing;
+use sink_test_common::{
+    init_test_tracing, make_event_for_table, make_large_event, make_test_event,
+};
 
 // =============================================================================
 // Shared Test Infrastructure
@@ -192,51 +194,6 @@ async fn read_stream_messages(
     Ok(messages)
 }
 
-/// Create a test event with a specific ID.
-fn make_test_event(id: i64) -> Event {
-    Event::new_row(
-        SourceInfo {
-            version: "deltaforge-test".into(),
-            connector: "test".into(),
-            name: "test-db".into(),
-            ts_ms: 1_700_000_000_000 + id,
-            db: "testdb".into(),
-            schema: None,
-            table: "table".into(),
-            snapshot: None,
-            position: SourcePosition::default(),
-        },
-        Op::Create,
-        None,
-        Some(json!({"id": id, "name": format!("item-{}", id)})),
-        1_700_000_000_000 + id,
-        64,
-    )
-}
-
-/// Create a test event with specific data size.
-fn make_large_event(id: i64, size_bytes: usize) -> Event {
-    let padding = "x".repeat(size_bytes);
-    Event::new_row(
-        SourceInfo {
-            version: "deltaforge-test".into(),
-            connector: "test".into(),
-            name: "test-db".into(),
-            ts_ms: 1_700_000_000_000 + id,
-            db: "testdb".into(),
-            schema: None,
-            table: "table".into(),
-            snapshot: None,
-            position: SourcePosition::default(),
-        },
-        Op::Create,
-        None,
-        Some(json!({"id": id, "payload": padding})),
-        1_700_000_000_000 + id,
-        64,
-    )
-}
-
 // =============================================================================
 // Basic Functionality Tests
 // =============================================================================
@@ -257,6 +214,7 @@ async fn nats_sink_sends_single_event() -> Result<()> {
         id: "test-nats".into(),
         url: url.clone(),
         subject: subject.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         stream: Some(stream.clone()),
@@ -308,6 +266,7 @@ async fn nats_sink_sends_batch() -> Result<()> {
         id: "test-nats-batch".into(),
         url: url.clone(),
         subject: subject.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         stream: Some(stream.clone()),
@@ -353,6 +312,7 @@ async fn nats_sink_empty_batch_is_noop() -> Result<()> {
         id: "test-nats-empty".into(),
         url: url.clone(),
         subject: subject.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         stream: Some(stream.clone()),
@@ -401,6 +361,7 @@ async fn nats_sink_native_envelope() -> Result<()> {
         id: "test-native".into(),
         url: url.clone(),
         subject: subject.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         stream: Some(stream.clone()),
@@ -474,6 +435,7 @@ async fn nats_sink_debezium_envelope() -> Result<()> {
         id: "test-debezium".into(),
         url: url.clone(),
         subject: subject.clone(),
+        key: None,
         envelope: EnvelopeCfg::Debezium,
         encoding: EncodingCfg::Json,
         stream: Some(stream.clone()),
@@ -551,6 +513,7 @@ async fn nats_sink_cloudevents_envelope() -> Result<()> {
         id: "test-cloudevents".into(),
         url: url.clone(),
         subject: subject.clone(),
+        key: None,
         envelope: EnvelopeCfg::CloudEvents {
             type_prefix: "com.deltaforge.cdc".to_string(),
         },
@@ -669,6 +632,7 @@ async fn nats_sink_debezium_envelope_batch() -> Result<()> {
         id: "test-debezium-batch".into(),
         url: url.clone(),
         subject: subject.clone(),
+        key: None,
         envelope: EnvelopeCfg::Debezium,
         encoding: EncodingCfg::Json,
         stream: Some(stream.clone()),
@@ -722,6 +686,7 @@ async fn nats_sink_cloudevents_envelope_batch() -> Result<()> {
         id: "test-cloudevents-batch".into(),
         url: url.clone(),
         subject: subject.clone(),
+        key: None,
         envelope: EnvelopeCfg::CloudEvents {
             type_prefix: "io.deltaforge.test".to_string(),
         },
@@ -786,6 +751,7 @@ async fn nats_sink_large_payload() -> Result<()> {
         id: "test-large".into(),
         url: url.clone(),
         subject: subject.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         stream: Some(stream.clone()),
@@ -838,6 +804,7 @@ async fn nats_sink_batch_large_payload() -> Result<()> {
         id: "test-batch-large".into(),
         url: url.clone(),
         subject: subject.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         stream: Some(stream.clone()),
@@ -888,6 +855,7 @@ async fn nats_sink_concurrent_sends() -> Result<()> {
         id: "test-concurrent".into(),
         url: url.clone(),
         subject: subject.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         stream: Some(stream.clone()),
@@ -952,6 +920,7 @@ async fn nats_sink_concurrent_batches() -> Result<()> {
         id: "test-concurrent-batch".into(),
         url: url.clone(),
         subject: subject.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         stream: Some(stream.clone()),
@@ -1030,6 +999,7 @@ async fn nats_sink_recovers_after_restart() -> Result<()> {
         id: "test-restart".into(),
         url: url.clone(),
         subject: subject.into(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         stream: Some(stream.into()),
@@ -1100,6 +1070,7 @@ async fn nats_sink_connection_reuse() -> Result<()> {
         id: "test-conn-reuse".into(),
         url: url.clone(),
         subject: subject.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         stream: Some(stream.clone()),
@@ -1140,6 +1111,7 @@ async fn nats_sink_connection_failure_invalid_url() -> Result<()> {
         id: "test-invalid".into(),
         url: "nats://127.0.0.1:59999".into(), // Invalid port, nothing listening
         subject: "df.test.invalid".into(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         stream: None,
@@ -1180,6 +1152,7 @@ async fn nats_sink_handles_rapid_sends() -> Result<()> {
         id: "test-rapid".into(),
         url: url.clone(),
         subject: subject.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         stream: Some(stream.clone()),
@@ -1241,6 +1214,7 @@ async fn nats_sink_batch_resilience() -> Result<()> {
         id: "test-batch-resilience".into(),
         url: url.clone(),
         subject: subject.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         stream: Some(stream.clone()),
@@ -1292,6 +1266,7 @@ async fn nats_sink_respects_cancellation() -> Result<()> {
         id: "test-cancel".into(),
         url: "nats://invalid-host:9999".into(),
         subject: "df.test.cancel".into(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         stream: None,
@@ -1346,6 +1321,7 @@ async fn nats_sink_default_envelope_is_native() -> Result<()> {
         id: "test-default".into(),
         url: url.clone(),
         subject: subject.clone(),
+        key: None,
         envelope: EnvelopeCfg::default(),
         encoding: EncodingCfg::default(),
         stream: Some(stream.clone()),
@@ -1407,6 +1383,7 @@ async fn nats_sink_trait_implementation() -> Result<()> {
         id: "test-trait".into(),
         url: nats_url(),
         subject: "df.test.trait".into(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         stream: None,
@@ -1444,6 +1421,7 @@ async fn nats_sink_optional() -> Result<()> {
         id: "test-optional".into(),
         url: nats_url(),
         subject: "df.test.optional".into(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         stream: None,
@@ -1488,6 +1466,7 @@ async fn nats_sink_without_stream_config() -> Result<()> {
         id: "test-no-stream".into(),
         url: url.clone(),
         subject: subject.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         stream: None, // No stream config
@@ -1543,6 +1522,7 @@ async fn nats_sink_wildcard_subject_stream() -> Result<()> {
         id: "test-wildcard".into(),
         url: url.clone(),
         subject: specific_subject.into(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         stream: Some(stream.clone()),
@@ -1566,6 +1546,199 @@ async fn nats_sink_wildcard_subject_stream() -> Result<()> {
     assert_eq!(count, 1, "event should match wildcard stream");
 
     info!("✓ wildcard subject stream works correctly");
+    cleanup_test_stream(&url, &stream).await?;
+    Ok(())
+}
+
+// =============================================================================
+// Dynamic Routing Tests
+// =============================================================================
+
+struct ConsumedNatsMessage {
+    subject: String,
+    #[allow(dead_code)]
+    payload: Vec<u8>,
+    headers: HashMap<String, String>,
+}
+
+/// Read messages from a NATS stream with subject and header metadata.
+async fn read_stream_messages_with_metadata(
+    url: &str,
+    stream_name: &str,
+    count: usize,
+) -> Result<Vec<ConsumedNatsMessage>> {
+    let client = async_nats::connect(url).await?;
+    let js = jetstream::new(client);
+    let stream = js.get_stream(stream_name).await?;
+
+    let consumer = stream
+        .create_consumer(async_nats::jetstream::consumer::pull::Config {
+            durable_name: Some(format!("test-meta-consumer-{}", stream_name)),
+            ..Default::default()
+        })
+        .await?;
+
+    let batch = consumer.fetch().max_messages(count).messages().await?;
+    use futures::StreamExt;
+    let mut batch = std::pin::pin!(batch);
+
+    let mut messages = Vec::new();
+    while let Some(msg) = batch.next().await {
+        if let Ok(msg) = msg {
+            let mut headers = HashMap::new();
+            if let Some(ref hdrs) = msg.headers {
+                for (key, values) in hdrs.iter() {
+                    if let Some(val) = values.first() {
+                        headers.insert(key.to_string(), val.to_string());
+                    }
+                }
+            }
+            messages.push(ConsumedNatsMessage {
+                subject: msg.subject.to_string(),
+                payload: msg.payload.to_vec(),
+                headers,
+            });
+            if messages.len() >= count {
+                break;
+            }
+        }
+    }
+
+    Ok(messages)
+}
+
+/// Subject template routes events to per-table NATS subjects.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn nats_sink_subject_template_routes_by_table() -> Result<()> {
+    init_test_tracing();
+    let _container = get_nats_container().await;
+
+    let url = nats_url();
+    let stream = test_stream("routing");
+
+    let client = async_nats::connect(&url).await?;
+    let js = jetstream::new(client);
+    let _ = js.delete_stream(&stream).await;
+    js.create_stream(StreamConfig {
+        name: stream.clone(),
+        subjects: vec!["df.test.routing.>".to_string()],
+        ..Default::default()
+    })
+    .await?;
+
+    let cfg = NatsSinkCfg {
+        id: "test-routing".into(),
+        url: url.clone(),
+        subject: "df.test.routing.${source.table}".into(),
+        key: None,
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
+        stream: Some(stream.clone()),
+        required: Some(true),
+        send_timeout_secs: Some(5),
+        batch_timeout_secs: Some(30),
+        connect_timeout_secs: Some(10),
+        credentials_file: None,
+        username: None,
+        password: None,
+        token: None,
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = NatsSink::new(&cfg, cancel)?;
+
+    sink.send_batch(&[
+        make_event_for_table(1, "orders"),
+        make_event_for_table(2, "users"),
+    ])
+    .await?;
+
+    let msgs = read_stream_messages_with_metadata(&url, &stream, 2).await?;
+    assert_eq!(msgs.len(), 2);
+
+    let subjects: Vec<&str> = msgs.iter().map(|m| m.subject.as_str()).collect();
+    assert!(
+        subjects.contains(&"df.test.routing.orders"),
+        "should have orders subject, got: {:?}",
+        subjects
+    );
+    assert!(
+        subjects.contains(&"df.test.routing.users"),
+        "should have users subject, got: {:?}",
+        subjects
+    );
+
+    info!("✓ subject template routes events to correct subjects");
+    cleanup_test_stream(&url, &stream).await?;
+    Ok(())
+}
+
+/// EventRouting overrides subject + headers delivered as NATS headers.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn nats_sink_routing_override_with_headers() -> Result<()> {
+    init_test_tracing();
+    let _container = get_nats_container().await;
+
+    let url = nats_url();
+    let stream = test_stream("route-override");
+
+    let client = async_nats::connect(&url).await?;
+    let js = jetstream::new(client);
+    let _ = js.delete_stream(&stream).await;
+    js.create_stream(StreamConfig {
+        name: stream.clone(),
+        subjects: vec!["df.test.route-override.>".to_string()],
+        ..Default::default()
+    })
+    .await?;
+
+    let cfg = NatsSinkCfg {
+        id: "test-override".into(),
+        url: url.clone(),
+        subject: "df.test.route-override.default".into(),
+        key: None,
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
+        stream: Some(stream.clone()),
+        required: Some(true),
+        send_timeout_secs: Some(5),
+        batch_timeout_secs: Some(30),
+        connect_timeout_secs: Some(10),
+        credentials_file: None,
+        username: None,
+        password: None,
+        token: None,
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = NatsSink::new(&cfg, cancel)?;
+
+    let mut event = make_test_event(1);
+    event.routing = Some(EventRouting {
+        topic: Some("df.test.route-override.priority".into()),
+        key: Some("order-99".into()),
+        headers: Some(HashMap::from([("trace-id".into(), "xyz-789".into())])),
+    });
+
+    sink.send(&event).await?;
+
+    let msgs = read_stream_messages_with_metadata(&url, &stream, 1).await?;
+    assert_eq!(msgs.len(), 1);
+
+    let msg = &msgs[0];
+    assert_eq!(msg.subject, "df.test.route-override.priority");
+    assert_eq!(
+        msg.headers.get("df-key").map(|s| s.as_str()),
+        Some("order-99"),
+    );
+    assert_eq!(
+        msg.headers.get("trace-id").map(|s| s.as_str()),
+        Some("xyz-789"),
+    );
+
+    info!("✓ EventRouting overrides subject + headers delivered");
     cleanup_test_stream(&url, &stream).await?;
     Ok(())
 }

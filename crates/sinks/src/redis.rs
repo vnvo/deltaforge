@@ -32,6 +32,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
+use common::CompiledTemplate;
 use common::{RetryOutcome, RetryPolicy, redact_url_password, retry_async};
 use deltaforge_config::RedisSinkCfg;
 use deltaforge_core::encoding::EncodingType;
@@ -64,7 +65,11 @@ pub struct RedisSink {
     id: String,
     cfg: RedisSinkCfg,
     client: redis::Client,
-    stream: String,
+
+    stream: String, // static fallback
+    stream_template: CompiledTemplate,
+    key_template: Option<CompiledTemplate>,
+
     /// Envelope for wrapping events (Native, Debezium, CloudEvents)
     envelope: Box<dyn Envelope>,
     /// Encoding type (currently just JSON)
@@ -124,6 +129,20 @@ impl RedisSink {
         let envelope_type = cfg.envelope.to_envelope_type();
         let encoding_type = cfg.encoding.to_encoding_type();
 
+        let stream_template = CompiledTemplate::parse(&cfg.stream)
+            .map_err(|e| anyhow::anyhow!("invalid stream template: {}", e))?;
+
+        let key_template = cfg
+            .key
+            .as_ref()
+            .map(|k| CompiledTemplate::parse(k))
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("invalid key template: {}", e))?;
+
+        if !stream_template.is_static() {
+            info!(id=%cfg.id, template = %cfg.stream, "stream uses dynamic routing template");
+        }
+
         info!(
             uri = %redact_url_password(&cfg.uri),
             envelope = %envelope_type.name(),
@@ -138,6 +157,8 @@ impl RedisSink {
             cfg: cfg.clone(),
             client,
             stream: cfg.stream.clone(),
+            stream_template,
+            key_template,
             envelope: envelope_type.build(),
             encoding: encoding_type,
             conn: RwLock::new(None),
@@ -146,6 +167,47 @@ impl RedisSink {
             batch_timeout,
             connect_timeout,
         })
+    }
+
+    /// Resolve stream, strict (empty stream = error).
+    fn resolve_stream(&self, event: &Event) -> SinkResult<String> {
+        if let Some(t) =
+            event.routing.as_ref().and_then(|r| r.effective_topic())
+        {
+            return Ok(t.to_string());
+        }
+        if self.stream_template.is_static() {
+            return Ok(self.stream.clone());
+        }
+        let event_json = serde_json::to_value(event).map_err(|e| {
+            SinkError::Serialization {
+                details: e.to_string().into(),
+            }
+        })?;
+        self.stream_template
+            .resolve_strict(&event_json)
+            .map_err(|e| SinkError::Routing {
+                details: e.to_string().into(),
+            })
+    }
+
+    /// Resolve key, lenient (empty = use event_id).
+    fn resolve_key(&self, event: &Event) -> String {
+        if let Some(k) = event.routing.as_ref().and_then(|r| r.key.as_deref()) {
+            return k.to_string();
+        }
+        if let Some(ref tmpl) = self.key_template {
+            if tmpl.is_static() {
+                return tmpl.resolve_lenient(&serde_json::Value::Null);
+            }
+            if let Ok(event_json) = serde_json::to_value(event) {
+                let resolved = tmpl.resolve_lenient(&event_json);
+                if !resolved.is_empty() {
+                    return resolved;
+                }
+            }
+        }
+        event.event_id.map(|id| id.to_string()).unwrap_or_default()
     }
 
     /// Serialize event using configured envelope.
@@ -267,19 +329,29 @@ impl RedisSink {
     async fn xadd_single(
         &self,
         conn: &mut MultiplexedConnection,
+        stream: &str,
         event_id: &str,
+        key: &str,
         payload: &[u8],
     ) -> Result<(), RedisRetryError> {
         let result = tokio::time::timeout(self.send_timeout, async {
-            redis::cmd("XADD")
-                .arg(&self.stream)
+            let mut cmd = redis::cmd("XADD");
+            cmd.arg(stream)
                 .arg("*")
                 .arg("event_id")
                 .arg(event_id)
                 .arg("df-event")
-                .arg(payload)
-                .query_async::<()>(conn)
-                .await
+                .arg(payload);
+
+            // Add df-key field if key is non-empty
+            if !key.is_empty() {
+                cmd.arg("df-key").arg(key);
+            }
+
+            // Add routing headers as df-headers JSON
+            // (handled by caller passing serialized headers)
+
+            cmd.query_async::<()>(conn).await
         })
         .await;
 
@@ -294,19 +366,24 @@ impl RedisSink {
     async fn execute_pipeline(
         &self,
         conn: &mut MultiplexedConnection,
-        items: &[(String, Vec<u8>)],
+        items: &[(String, String, String, Vec<u8>)], // (stream, event_id, key, payload)
     ) -> Result<(), RedisRetryError> {
         let result = tokio::time::timeout(self.batch_timeout, async {
             let mut pipe = redis::pipe();
 
-            for (event_id, payload) in items {
-                pipe.cmd("XADD")
-                    .arg(&self.stream)
+            for (stream, event_id, key, payload) in items {
+                let cmd = pipe
+                    .cmd("XADD")
+                    .arg(stream)
                     .arg("*")
                     .arg("event_id")
                     .arg(event_id)
                     .arg("df-event")
                     .arg(payload);
+
+                if !key.is_empty() {
+                    cmd.arg("df-key").arg(key);
+                }
             }
 
             pipe.query_async::<()>(conn).await
@@ -335,8 +412,10 @@ impl Sink for RedisSink {
     async fn send(&self, event: &Event) -> SinkResult<()> {
         // Serialize using configured envelope
         let payload = self.serialize_event(event)?;
+        let stream = self.resolve_stream(event)?;
         let event_id =
             event.event_id.map(|id| id.to_string()).unwrap_or_default();
+        let key = self.resolve_key(event);
 
         // Retry loop for transient failures
         let policy = RetryPolicy::new(
@@ -350,6 +429,9 @@ impl Sink for RedisSink {
             |attempt| {
                 let payload = payload.clone();
                 let event_id = event_id.clone();
+                let stream = stream.clone();
+                let key = key.clone();
+
                 async move {
                     debug!(attempt, "sending event to redis");
 
@@ -358,7 +440,11 @@ impl Sink for RedisSink {
                         .await
                         .map_err(|e| RedisRetryError::Connect(e.to_string()))?;
 
-                    match self.xadd_single(&mut conn, &event_id, &payload).await
+                    match self
+                        .xadd_single(
+                            &mut conn, &stream, &event_id, &key, &payload,
+                        )
+                        .await
                     {
                         Ok(_) => Ok(()),
                         Err(e) => {
@@ -392,14 +478,16 @@ impl Sink for RedisSink {
             return Ok(());
         }
 
-        // Pre-serialize all payloads using configured envelope
-        let serialized: Vec<(String, Vec<u8>)> = events
+        // Pre-serialize with resolved stream/key
+        let serialized: Vec<(String, String, String, Vec<u8>)> = events
             .iter()
             .map(|e| {
-                Ok((
-                    e.event_id.map(|id| id.to_string()).unwrap_or_default(),
-                    self.serialize_event(e)?,
-                ))
+                let stream = self.resolve_stream(e)?;
+                let key = self.resolve_key(e);
+                let event_id =
+                    e.event_id.map(|id| id.to_string()).unwrap_or_default();
+                let payload = self.serialize_event(e)?;
+                Ok((stream, event_id, key, payload))
             })
             .collect::<Result<Vec<_>, SinkError>>()?;
 

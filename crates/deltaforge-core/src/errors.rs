@@ -58,6 +58,9 @@ pub enum SinkError {
     #[error("backpressure: {details}")]
     Backpressure { details: Cow<'static, str> },
 
+    #[error("routing error: {details}")]
+    Routing { details: Cow<'static, str> },
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -70,6 +73,7 @@ impl SinkError {
             SinkError::Io(_) => "io error",
             SinkError::Serialization { .. } => "serialization error",
             SinkError::Backpressure { .. } => "backpressure",
+            SinkError::Routing { .. } => "routing error",
             SinkError::Other(_) => "other error",
         }
     }
@@ -79,6 +83,7 @@ impl SinkError {
             SinkError::Connect { details } => details.to_string(),
             SinkError::Auth { details } => details.to_string(),
             SinkError::Backpressure { details } => details.to_string(),
+            SinkError::Routing { details } => details.to_string(),
             SinkError::Serialization { details } => details.to_string(),
             SinkError::Io(e) => e.to_string(),
             SinkError::Other(e) => e.to_string(),

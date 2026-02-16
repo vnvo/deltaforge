@@ -24,9 +24,15 @@ jobs:
         working-directory: docs
         run: mdbook build
 
+      - name: Assemble site
+        run: |
+          mkdir -p docs/site
+          cp docs/index.html docs/site/
+          cp -r docs/book docs/site/book
+
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: docs/book
+          publish_dir: docs/site
           force_orphan: true

@@ -36,6 +36,7 @@ use anyhow::Context;
 use async_nats::Client;
 use async_nats::jetstream::{self, Context as JetStreamContext};
 use async_trait::async_trait;
+use common::CompiledTemplate;
 use common::{RetryOutcome, RetryPolicy, retry_async};
 use deltaforge_config::NatsSinkCfg;
 use deltaforge_core::encoding::EncodingType;
@@ -67,7 +68,11 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub struct NatsSink {
     id: String,
     cfg: NatsSinkCfg,
-    subject: String,
+
+    subject: String, // static fallback
+    subject_template: CompiledTemplate,
+    key_template: Option<CompiledTemplate>,
+
     /// Envelope for wrapping events (Native, Debezium, CloudEvents)
     envelope: Box<dyn Envelope>,
     /// Encoding type (currently just JSON)
@@ -128,10 +133,22 @@ impl NatsSink {
         let envelope_type = cfg.envelope.to_envelope_type();
         let encoding_type = cfg.encoding.to_encoding_type();
 
+        let subject_template = CompiledTemplate::parse(&cfg.subject)
+            .map_err(|e| anyhow::anyhow!("invalid subject template: {}", e))?;
+
+        let key_template = cfg
+            .key
+            .as_ref()
+            .map(|k| CompiledTemplate::parse(k))
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("invalid key template: {}", e))?;
+
         info!(
             url = %redact_nats_url(&cfg.url),
             subject = %cfg.subject,
             stream = ?cfg.stream,
+            subject_templ=?subject_template,
+            key_templ=?key_template,
             envelope = %envelope_type.name(),
             encoding = encoding_type.name(),
             send_timeout_ms = send_timeout.as_millis(),
@@ -143,6 +160,8 @@ impl NatsSink {
             id: cfg.id.clone(),
             cfg: cfg.clone(),
             subject: cfg.subject.clone(),
+            subject_template,
+            key_template,
             envelope: envelope_type.build(),
             encoding: encoding_type,
             client: RwLock::new(None),
@@ -151,6 +170,98 @@ impl NatsSink {
             batch_timeout,
             connect_timeout,
         })
+    }
+
+    /// Resolve NATS subject, strict with validation.
+    /// Invalid chars in NATS subjects: space, `.` is a token separator (valid in paths),
+    /// `*` and `>` are wildcards (not valid in published subjects).
+    fn resolve_subject(&self, event: &Event) -> SinkResult<String> {
+        if let Some(t) =
+            event.routing.as_ref().and_then(|r| r.effective_topic())
+        {
+            Self::validate_nats_subject(t)?;
+            return Ok(t.to_string());
+        }
+        if self.subject_template.is_static() {
+            return Ok(self.subject.clone());
+        }
+        let event_json = serde_json::to_value(event).map_err(|e| {
+            SinkError::Serialization {
+                details: e.to_string().into(),
+            }
+        })?;
+        let resolved = self
+            .subject_template
+            .resolve_strict(&event_json)
+            .map_err(|e| SinkError::Routing {
+                details: e.to_string().into(),
+            })?;
+
+        Self::validate_nats_subject(&resolved)?;
+        Ok(resolved)
+    }
+
+    /// Validate NATS subject - fail on wildcards or spaces.
+    fn validate_nats_subject(subject: &str) -> SinkResult<()> {
+        if subject.is_empty() {
+            return Err(SinkError::Routing {
+                details: "NATS subject cannot be empty".into(),
+            });
+        }
+        if subject.contains(' ')
+            || subject.contains('*')
+            || subject.contains('>')
+        {
+            return Err(SinkError::Routing {
+                details: format!(
+                    "NATS subject '{}' contains invalid chars (space, *, >)",
+                    subject
+                )
+                .into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Resolve key, stored in NATS header "df-key" if present.
+    fn resolve_key(&self, event: &Event) -> Option<String> {
+        if let Some(k) = event.routing.as_ref().and_then(|r| r.key.as_deref()) {
+            return Some(k.to_string());
+        }
+        if let Some(ref tmpl) = self.key_template {
+            if let Ok(event_json) = serde_json::to_value(event) {
+                let resolved = tmpl.resolve_lenient(&event_json);
+                if !resolved.is_empty() {
+                    return Some(resolved);
+                }
+            }
+        }
+        None // NATS has no native key concept - omit header if no key
+    }
+
+    /// Build NATS headers from routing key + routing headers.
+    fn build_nats_headers(
+        &self,
+        event: &Event,
+    ) -> Option<async_nats::HeaderMap> {
+        let key = self.resolve_key(event);
+        let routing_headers =
+            event.routing.as_ref().and_then(|r| r.headers.as_ref());
+
+        if key.is_none() && routing_headers.is_none() {
+            return None;
+        }
+
+        let mut headers = async_nats::HeaderMap::new();
+        if let Some(k) = key {
+            headers.insert("df-key", k.as_str());
+        }
+        if let Some(map) = routing_headers {
+            for (k, v) in map {
+                headers.insert(k.as_str(), v.as_str());
+            }
+        }
+        Some(headers)
     }
 
     /// Serialize event using configured envelope.
@@ -272,12 +383,19 @@ impl NatsSink {
     async fn publish_single(
         &self,
         jetstream: &JetStreamContext,
+        subject: String,
         payload: Vec<u8>,
+        headers: Option<async_nats::HeaderMap>,
     ) -> Result<(), NatsRetryError> {
         let result = tokio::time::timeout(self.send_timeout, async {
-            jetstream
-                .publish(self.subject.clone(), payload.into())
-                .await
+            let ack_fut = if let Some(hdrs) = headers {
+                jetstream
+                    .publish_with_headers(subject, hdrs, payload.into())
+                    .await
+            } else {
+                jetstream.publish(subject, payload.into()).await
+            };
+            ack_fut
                 .map_err(|e| NatsRetryError::Publish(e.to_string()))?
                 .await
                 .map_err(|e| NatsRetryError::Publish(e.to_string()))
@@ -341,8 +459,9 @@ impl Sink for NatsSink {
 
     #[instrument(skip_all, fields(sink_id = %self.id))]
     async fn send(&self, event: &Event) -> SinkResult<()> {
-        // Serialize using configured envelope
         let payload = self.serialize_event(event)?;
+        let subject = self.resolve_subject(event)?;
+        let headers = self.build_nats_headers(event);
 
         // Retry loop for transient failures
         let policy = RetryPolicy::new(
@@ -355,6 +474,9 @@ impl Sink for NatsSink {
         let result = retry_async(
             |attempt| {
                 let payload = payload.clone();
+                let subject = subject.clone();
+                let headers = headers.clone();
+
                 async move {
                     debug!(attempt, "sending event to nats");
 
@@ -363,7 +485,10 @@ impl Sink for NatsSink {
                         .await
                         .map_err(|e| NatsRetryError::Connect(e.to_string()))?;
 
-                    match self.publish_single(&jetstream, payload).await {
+                    match self
+                        .publish_single(&jetstream, subject, payload, headers)
+                        .await
+                    {
                         Ok(_) => Ok(()),
                         Err(e) => {
                             self.invalidate_connection().await;
@@ -395,11 +520,17 @@ impl Sink for NatsSink {
             return Ok(());
         }
 
-        // Pre-serialize all payloads using configured envelope
-        let serialized: Vec<Vec<u8>> = events
-            .iter()
-            .map(|e| self.serialize_event(e))
-            .collect::<Result<Vec<_>, _>>()?;
+        // Pre-serialize all payloads with resolved subjects and headers
+        let serialized: Vec<(String, Vec<u8>, Option<async_nats::HeaderMap>)> =
+            events
+                .iter()
+                .map(|e| {
+                    let subject = self.resolve_subject(e)?;
+                    let payload = self.serialize_event(e)?;
+                    let headers = self.build_nats_headers(e);
+                    Ok((subject, payload, headers))
+                })
+                .collect::<Result<Vec<_>, SinkError>>()?;
 
         // Retry loop for transient failures
         let policy = RetryPolicy::new(
@@ -427,14 +558,26 @@ impl Sink for NatsSink {
                     // Publish all messages concurrently
                     let futures: Vec<_> = serialized
                         .iter()
-                        .map(|payload| {
-                            let subject = self.subject.clone();
+                        .map(|(subject, payload, headers)| {
+                            let subject = subject.clone();
                             let jetstream = jetstream.clone();
                             let payload = payload.clone();
+                            let headers = headers.clone();
                             async move {
-                                jetstream
-                                    .publish(subject, payload.into())
-                                    .await
+                                let ack_fut = if let Some(hdrs) = headers {
+                                    jetstream
+                                        .publish_with_headers(
+                                            subject,
+                                            hdrs,
+                                            payload.into(),
+                                        )
+                                        .await
+                                } else {
+                                    jetstream
+                                        .publish(subject, payload.into())
+                                        .await
+                                };
+                                ack_fut
                                     .map_err(|e| {
                                         NatsRetryError::Publish(e.to_string())
                                     })?
@@ -475,7 +618,7 @@ impl Sink for NatsSink {
 
         match result {
             Ok(_) => {
-                debug!(subject = %self.subject, count = events.len(), "batch sent to nats");
+                debug!(count = events.len(), "batch sent to nats");
                 Ok(())
             }
             Err(outcome) => Err(outcome_to_sink_error(outcome)),

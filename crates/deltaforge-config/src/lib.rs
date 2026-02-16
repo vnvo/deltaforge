@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use thiserror::Error;
-use tracing::error;
+use tracing::{error, warn};
 use walkdir::WalkDir;
 
 #[cfg(feature = "turso")]
@@ -230,12 +230,29 @@ pub fn load_from_path(file_path: &str) -> ConfigResult<PipelineSpec> {
         source: e,
     })?;
 
-    let with_env = shellexpand::env(&raw)
-        .map_err(|e| ConfigError::Env {
-            path: file_path.to_owned(),
-            source: e,
-        })?
-        .to_string();
+    let with_env = shellexpand::env_with_context(&raw, |var_name: &str| {
+        match std::env::var(var_name) {
+            Ok(val) => Ok(Some(val)),
+            Err(_) => {
+                // Unknown variable — pass through as-is.
+                // This allows routing templates like ${source.table}
+                // to coexist with env vars like ${KAFKA_BROKERS}.
+                warn!(
+                    var = var_name,
+                    "unresolved variable, passing through as template"
+                );
+                Ok::<Option<String>, std::env::VarError>(Some(format!(
+                    "${{{}}}",
+                    var_name
+                )))
+            }
+        }
+    })
+    .map_err(|e| ConfigError::Env {
+        path: file_path.to_owned(),
+        source: e,
+    })?
+    .to_string();
     let spec: PipelineSpec =
         serde_yaml::from_str(&with_env).map_err(|e| ConfigError::Parse {
             path: file_path.to_owned(),

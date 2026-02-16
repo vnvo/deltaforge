@@ -10,7 +10,9 @@
 use anyhow::Result;
 use ctor::dtor;
 use deltaforge_config::{EncodingCfg, EnvelopeCfg, RedisSinkCfg};
-use deltaforge_core::{Event, Op, Sink, SourceInfo, SourcePosition};
+use deltaforge_core::{
+    Event, EventRouting, Op, Sink, SourceInfo, SourcePosition,
+};
 use redis::AsyncCommands;
 use serde_json::json;
 use sinks::redis::RedisSink;
@@ -27,7 +29,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 mod sink_test_common;
-use sink_test_common::init_test_tracing;
+use sink_test_common::{
+    init_test_tracing, make_event_for_table, make_large_event, make_test_event,
+};
 
 // =============================================================================
 // Shared Test Infrastructure
@@ -113,51 +117,6 @@ async fn cleanup_stream(uri: &str, stream: &str) -> Result<()> {
     Ok(())
 }
 
-/// Create a test event with a specific ID.
-fn make_test_event(id: i64) -> Event {
-    Event::new_row(
-        SourceInfo {
-            version: "deltaforge-test".into(),
-            connector: "test".into(),
-            name: "test-db".into(),
-            ts_ms: 1_700_000_000_000 + id,
-            db: "testdb".into(),
-            schema: None,
-            table: "table".into(),
-            snapshot: None,
-            position: SourcePosition::default(),
-        },
-        Op::Create,
-        None,
-        Some(json!({"id": id, "name": format!("item-{}", id)})),
-        1_700_000_000_000 + id,
-        64,
-    )
-}
-
-/// Create a test event with specific data size.
-fn make_large_event(id: i64, size_bytes: usize) -> Event {
-    let padding = "x".repeat(size_bytes);
-    Event::new_row(
-        SourceInfo {
-            version: "deltaforge-test".into(),
-            connector: "test".into(),
-            name: "test-db".into(),
-            ts_ms: 1_700_000_000_000 + id,
-            db: "testdb".into(),
-            schema: None,
-            table: "table".into(),
-            snapshot: None,
-            position: SourcePosition::default(),
-        },
-        Op::Create,
-        None,
-        Some(json!({"id": id, "payload": padding})),
-        1_700_000_000_000 + id,
-        64,
-    )
-}
-
 /// Read all entries from a Redis stream.
 async fn read_stream_entries(
     uri: &str,
@@ -206,6 +165,7 @@ async fn redis_sink_sends_single_event() -> Result<()> {
         id: "test-redis".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -268,6 +228,7 @@ async fn redis_sink_sends_batch() -> Result<()> {
         id: "test-redis-batch".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -307,6 +268,7 @@ async fn redis_sink_empty_batch_is_noop() -> Result<()> {
         id: "test-redis-empty".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -348,6 +310,7 @@ async fn redis_sink_native_envelope() -> Result<()> {
         id: "test-native".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -414,6 +377,7 @@ async fn redis_sink_debezium_envelope() -> Result<()> {
         id: "test-debezium".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        key: None,
         envelope: EnvelopeCfg::Debezium,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -487,6 +451,7 @@ async fn redis_sink_cloudevents_envelope() -> Result<()> {
         id: "test-cloudevents".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        key: None,
         envelope: EnvelopeCfg::CloudEvents {
             type_prefix: "com.deltaforge.cdc".to_string(),
         },
@@ -601,6 +566,7 @@ async fn redis_sink_debezium_envelope_batch() -> Result<()> {
         id: "test-debezium-batch".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        key: None,
         envelope: EnvelopeCfg::Debezium,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -648,6 +614,7 @@ async fn redis_sink_cloudevents_operations() -> Result<()> {
         id: "test-cloudevents-ops".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        key: None,
         envelope: EnvelopeCfg::CloudEvents {
             type_prefix: "io.deltaforge.test".to_string(),
         },
@@ -799,6 +766,7 @@ async fn redis_sink_default_envelope_is_native() -> Result<()> {
         id: "test-default".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        key: None,
         envelope: EnvelopeCfg::default(),
         encoding: EncodingCfg::default(),
         required: Some(true),
@@ -856,6 +824,7 @@ async fn redis_sink_connection_reuse() -> Result<()> {
         id: "test-conn-reuse".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -892,6 +861,7 @@ async fn redis_sink_invalid_uri() -> Result<()> {
         id: "test-invalid".into(),
         uri: "redis://invalid-host:9999/0".into(),
         stream: "df.test.invalid".into(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -928,6 +898,7 @@ async fn redis_sink_respects_cancellation() -> Result<()> {
         id: "test-cancel".into(),
         uri: "redis://invalid-host:9999/0".into(),
         stream: "df.test.cancel".into(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -975,6 +946,7 @@ async fn redis_sink_large_events() -> Result<()> {
         id: "test-large".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -1013,6 +985,7 @@ async fn redis_sink_large_batch() -> Result<()> {
         id: "test-large-batch".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -1056,6 +1029,7 @@ async fn redis_sink_concurrent_sends() -> Result<()> {
         id: "test-concurrent".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -1121,6 +1095,7 @@ async fn redis_sink_recovers_after_restart() -> Result<()> {
         id: "test-restart".into(),
         uri: uri.clone(),
         stream: stream.into(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -1185,6 +1160,7 @@ async fn redis_sink_handles_connection_drop() -> Result<()> {
         id: "test-conn-drop".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -1251,6 +1227,7 @@ async fn redis_sink_batch_retries_on_failure() -> Result<()> {
         id: "test-batch-retry".into(),
         uri: uri.clone(),
         stream: stream.clone(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -1306,6 +1283,7 @@ async fn redis_sink_trait_implementation() -> Result<()> {
         id: "test-trait".into(),
         uri: redis_uri(),
         stream: "df.test.trait".into(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(true),
@@ -1338,6 +1316,7 @@ async fn redis_sink_optional() -> Result<()> {
         id: "test-optional".into(),
         uri: redis_uri(),
         stream: "df.test.optional".into(),
+        key: None,
         envelope: EnvelopeCfg::Native,
         encoding: EncodingCfg::Json,
         required: Some(false),
@@ -1352,5 +1331,128 @@ async fn redis_sink_optional() -> Result<()> {
     assert!(!sink.required(), "sink should be optional");
 
     info!("✓ optional sink configuration works");
+    Ok(())
+}
+
+// =============================================================================
+// Dynamic Routing Tests
+// =============================================================================
+
+/// Find a field value in a Redis stream entry's field list.
+fn find_field<'a>(
+    fields: &'a [(String, String)],
+    name: &str,
+) -> Option<&'a str> {
+    fields
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
+}
+
+/// Stream template routes events to per-table Redis streams.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn redis_sink_stream_template_routes_by_table() -> Result<()> {
+    init_test_tracing();
+    let _container = get_redis_container().await;
+
+    let uri = redis_uri();
+    let stream_orders = test_stream("route-orders");
+    let stream_users = test_stream("route-users");
+    cleanup_stream(&uri, &stream_orders).await?;
+    cleanup_stream(&uri, &stream_users).await?;
+
+    let cfg = RedisSinkCfg {
+        id: "test-routing".into(),
+        uri: uri.clone(),
+        stream: "df.test.route_${source.table}".into(),
+        key: None,
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        send_timeout_secs: Some(5),
+        batch_timeout_secs: Some(30),
+        connect_timeout_secs: Some(10),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = RedisSink::new(&cfg, cancel)?;
+
+    sink.send_batch(&[
+        make_event_for_table(1, "orders"),
+        make_event_for_table(2, "users"),
+    ])
+    .await?;
+
+    let entries = read_stream_entries(&uri, &stream_orders).await?;
+    assert_eq!(entries.len(), 1, "orders stream should have 1 entry");
+    let payload =
+        find_field(&entries[0].1, "df-event").expect("df-event missing");
+    let parsed: serde_json::Value = serde_json::from_str(payload)?;
+    assert_eq!(parsed["source"]["table"], "orders");
+
+    let entries = read_stream_entries(&uri, &stream_users).await?;
+    assert_eq!(entries.len(), 1, "users stream should have 1 entry");
+    let payload =
+        find_field(&entries[0].1, "df-event").expect("df-event missing");
+    let parsed: serde_json::Value = serde_json::from_str(payload)?;
+    assert_eq!(parsed["source"]["table"], "users");
+
+    info!("✓ stream template routes events to correct streams");
+    cleanup_stream(&uri, &stream_orders).await?;
+    cleanup_stream(&uri, &stream_users).await?;
+    Ok(())
+}
+
+/// EventRouting overrides stream + key appears as df-key field.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn redis_sink_routing_override_with_key() -> Result<()> {
+    init_test_tracing();
+    let _container = get_redis_container().await;
+
+    let uri = redis_uri();
+    let default_stream = test_stream("route-default");
+    let override_stream = test_stream("route-override");
+    cleanup_stream(&uri, &default_stream).await?;
+    cleanup_stream(&uri, &override_stream).await?;
+
+    let cfg = RedisSinkCfg {
+        id: "test-override".into(),
+        uri: uri.clone(),
+        stream: default_stream.clone(),
+        key: None,
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        send_timeout_secs: Some(5),
+        batch_timeout_secs: Some(30),
+        connect_timeout_secs: Some(10),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = RedisSink::new(&cfg, cancel)?;
+
+    let mut event = make_test_event(1);
+    event.routing = Some(EventRouting {
+        topic: Some(override_stream.clone()),
+        key: Some("customer-42".into()),
+        ..Default::default()
+    });
+
+    sink.send(&event).await?;
+
+    let len = stream_length(&uri, &default_stream).await.unwrap_or(0);
+    assert_eq!(len, 0, "default stream should be empty");
+
+    let entries = read_stream_entries(&uri, &override_stream).await?;
+    assert_eq!(entries.len(), 1);
+
+    let df_key = find_field(&entries[0].1, "df-key");
+    assert_eq!(df_key, Some("customer-42"), "df-key field should match");
+
+    info!("✓ EventRouting overrides stream + key delivered as df-key");
+    cleanup_stream(&uri, &default_stream).await?;
+    cleanup_stream(&uri, &override_stream).await?;
     Ok(())
 }

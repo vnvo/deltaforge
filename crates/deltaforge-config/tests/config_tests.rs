@@ -514,3 +514,131 @@ spec:
         _ => panic!("expected nats"),
     }
 }
+
+// ============================================================================
+// Dynamic Routing Configuration (key + template topics)
+// ============================================================================
+
+/// Verifies `key` field and template strings parse for all sink types.
+/// Template vars like `${source.table}` pass through env expansion
+/// (they're compiled later by the sink at runtime).
+#[test]
+#[serial]
+fn sink_key_and_template_topic_parsing() {
+    let yaml = r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata: { name: routing_cfg, tenant: t }
+spec:
+  source:
+    type: mysql
+    config:
+      id: m
+      dsn: mysql://root:pw@localhost:3306/db
+      tables: [orders, users]
+  processors: []
+  sinks:
+    - type: kafka
+      config:
+        id: kafka-routed
+        brokers: localhost:9092
+        topic: "cdc.${source.table}"
+        key: "${after.customer_id}"
+        envelope:
+          type: debezium
+    - type: redis
+      config:
+        id: redis-routed
+        uri: redis://localhost:6379
+        stream: "events.${source.db}.${source.table}"
+        key: "${after.id}"
+    - type: nats
+      config:
+        id: nats-routed
+        url: nats://localhost:4222
+        subject: "cdc.${source.db}.${source.table}"
+        key: "${after.order_id}"
+        stream: CDC
+"#;
+
+    let path = write_temp(yaml);
+    let spec = load_from_path(path.to_str().unwrap()).expect("parse ok");
+
+    // Kafka: template topic + key preserved
+    match &spec.spec.sinks[0] {
+        SinkCfg::Kafka(kc) => {
+            assert_eq!(kc.topic, "cdc.${source.table}");
+            assert_eq!(kc.key.as_deref(), Some("${after.customer_id}"));
+        }
+        _ => panic!("expected kafka"),
+    }
+
+    // Redis: template stream + key preserved
+    match &spec.spec.sinks[1] {
+        SinkCfg::Redis(rc) => {
+            assert_eq!(rc.stream, "events.${source.db}.${source.table}");
+            assert_eq!(rc.key.as_deref(), Some("${after.id}"));
+        }
+        _ => panic!("expected redis"),
+    }
+
+    // NATS: template subject + key preserved
+    match &spec.spec.sinks[2] {
+        SinkCfg::Nats(nc) => {
+            assert_eq!(nc.subject, "cdc.${source.db}.${source.table}");
+            assert_eq!(nc.key.as_deref(), Some("${after.order_id}"));
+        }
+        _ => panic!("expected nats"),
+    }
+}
+
+/// key defaults to None when omitted (existing configs unaffected).
+#[test]
+#[serial]
+fn sink_key_defaults_to_none() {
+    let yaml = r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata: { name: no_key, tenant: t }
+spec:
+  source:
+    type: mysql
+    config:
+      id: m
+      dsn: mysql://root:pw@localhost:3306/db
+      tables: [orders]
+  processors: []
+  sinks:
+    - type: kafka
+      config:
+        id: k
+        brokers: localhost:9092
+        topic: orders
+    - type: redis
+      config:
+        id: r
+        uri: redis://localhost:6379
+        stream: orders
+    - type: nats
+      config:
+        id: n
+        url: nats://localhost:4222
+        subject: orders
+"#;
+
+    let path = write_temp(yaml);
+    let spec = load_from_path(path.to_str().unwrap()).expect("parse ok");
+
+    match &spec.spec.sinks[0] {
+        SinkCfg::Kafka(kc) => assert!(kc.key.is_none()),
+        _ => panic!("expected kafka"),
+    }
+    match &spec.spec.sinks[1] {
+        SinkCfg::Redis(rc) => assert!(rc.key.is_none()),
+        _ => panic!("expected redis"),
+    }
+    match &spec.spec.sinks[2] {
+        SinkCfg::Nats(nc) => assert!(nc.key.is_none()),
+        _ => panic!("expected nats"),
+    }
+}

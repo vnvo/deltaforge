@@ -1,6 +1,6 @@
 # Configuration
 
-Pipelines are defined as YAML documents that map directly to the `PipelineSpec` type. Environment variables are expanded before parsing using `${VAR}` syntax, so secrets and connection strings can be injected at runtime.
+Pipelines are defined as YAML documents that map directly to the `PipelineSpec` type. Environment variables are expanded before parsing using `${VAR}` syntax, so secrets and connection strings can be injected at runtime. Unknown variables (e.g. `${source.table}`) pass through for use as [routing templates](routing.md).
 
 ## Document structure
 
@@ -227,15 +227,16 @@ sinks:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `id` | string | — | Sink identifier |
-| `brokers` | string | — | Kafka broker addresses |
-| `topic` | string | — | Target topic |
+| `id` | string | - | Sink identifier |
+| `brokers` | string | - | Kafka broker addresses |
+| `topic` | string | - | Target topic or [template](routing.md) |
+| `key` | string | - | Message key [template](routing.md) |
 | `envelope` | object | `native` | Output format |
 | `encoding` | string | `json` | Wire encoding |
 | `required` | bool | `true` | Gates checkpoints |
 | `exactly_once` | bool | `false` | Transactional mode |
 | `send_timeout_secs` | int | `30` | Send timeout |
-| `client_conf` | map | — | librdkafka overrides |
+| `client_conf` | map | - | librdkafka overrides |
 
 </td>
 </tr>
@@ -282,9 +283,10 @@ sinks:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `id` | string | — | Sink identifier |
-| `uri` | string | — | Redis connection URI |
-| `stream` | string | — | Redis stream key |
+| `id` | string | - | Sink identifier |
+| `uri` | string | - | Redis connection URI |
+| `stream` | string | - | Redis stream key or [template](routing.md) |
+| `key` | string | - | Entry key [template](routing.md) |
 | `envelope` | object | `native` | Output format |
 | `encoding` | string | `json` | Wire encoding |
 | `required` | bool | `true` | Gates checkpoints |
@@ -325,20 +327,21 @@ sinks:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `id` | string | — | Sink identifier |
-| `url` | string | — | NATS server URL |
-| `subject` | string | — | Subject to publish to |
-| `stream` | string | — | JetStream stream name |
+| `id` | string | - | Sink identifier |
+| `url` | string | - | NATS server URL |
+| `subject` | string | - | Subject or [template](routing.md) |
+| `key` | string | - | Message key [template](routing.md) |
+| `stream` | string | - | JetStream stream name |
 | `envelope` | object | `native` | Output format |
 | `encoding` | string | `json` | Wire encoding |
 | `required` | bool | `true` | Gates checkpoints |
 | `send_timeout_secs` | int | `5` | Publish timeout |
 | `batch_timeout_secs` | int | `30` | Batch timeout |
 | `connect_timeout_secs` | int | `10` | Connection timeout |
-| `credentials_file` | string | — | NATS credentials file |
-| `username` | string | — | Auth username |
-| `password` | string | — | Auth password |
-| `token` | string | — | Auth token |
+| `credentials_file` | string | - | NATS credentials file |
+| `username` | string | - | Auth username |
+| `password` | string | - | Auth password |
+| `token` | string | - | Auth token |
 
 </td>
 </tr>

@@ -35,6 +35,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
+use common::CompiledTemplate;
 use common::{RetryOutcome, RetryPolicy, retry_async};
 use deltaforge_config::KafkaSinkCfg;
 use deltaforge_core::encoding::EncodingType;
@@ -43,6 +44,7 @@ use deltaforge_core::{Event, Sink, SinkError, SinkResult};
 use futures::future::try_join_all;
 use rdkafka::config::ClientConfig;
 use rdkafka::error::KafkaError;
+use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
 use tokio_util::sync::CancellationToken;
@@ -59,14 +61,23 @@ pub struct KafkaSink {
     id: String,
     cfg: KafkaSinkCfg,
     producer: FutureProducer,
+
+    /// static fallback (kept for fast path)
     topic: String,
+
+    topic_template: CompiledTemplate,
+    key_template: Option<CompiledTemplate>,
+
     /// Envelope for wrapping events (Native, Debezium, CloudEvents)
     envelope: Box<dyn Envelope>,
+
     /// Encoding type (currently just JSON, used for content-type headers)
     #[allow(dead_code)]
     encoding: EncodingType,
+
     /// Cancellation token for graceful shutdown.
     cancel: CancellationToken,
+
     /// Per-message send timeout.
     send_timeout: Duration,
 }
@@ -152,6 +163,24 @@ impl KafkaSink {
         let envelope_type = cfg.envelope.to_envelope_type();
         let encoding_type = cfg.encoding.to_encoding_type();
 
+        // routing templates
+        let topic_template = CompiledTemplate::parse(&cfg.topic)
+            .map_err(|e| anyhow::anyhow!("invalid topic template: {}", e))?;
+
+        let key_template = cfg
+            .key
+            .as_ref()
+            .map(|k| CompiledTemplate::parse(k))
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("invalid key template: {}", e))?;
+
+        if !topic_template.is_static() {
+            info!(
+                template = %cfg.topic,
+                "topic uses dynamic routing template"
+            );
+        }
+
         info!(
             brokers = %redact_brokers(&cfg.brokers),
             topic = %cfg.topic,
@@ -167,11 +196,89 @@ impl KafkaSink {
             cfg: cfg.clone(),
             producer,
             topic: cfg.topic.clone(),
+            topic_template,
+            key_template,
             envelope: envelope_type.build(),
             encoding: encoding_type,
             cancel,
             send_timeout,
         })
+    }
+
+    /// Resolve topic, strict. Returns Err if template produces empty/invalid topic.
+    fn resolve_topic(&self, event: &Event) -> SinkResult<String> {
+        // 1. Check explicit routing override (empty string = no override)
+        if let Some(t) =
+            event.routing.as_ref().and_then(|r| r.effective_topic())
+        {
+            return Ok(t.to_string());
+        }
+
+        // 2. Resolve template (or return static)
+        if self.topic_template.is_static() {
+            return Ok(self.topic.clone());
+        }
+
+        let event_json = serde_json::to_value(event).map_err(|e| {
+            SinkError::Serialization {
+                details: e.to_string().into(),
+            }
+        })?;
+
+        let resolved = self
+            .topic_template
+            .resolve_strict(&event_json)
+            .map_err(|e| SinkError::Routing {
+                details: e.to_string().into(),
+            })?;
+
+        if resolved.is_empty() {
+            return Err(SinkError::Routing {
+                details: format!(
+                    "topic template '{}' resolved to empty string",
+                    self.topic_template.raw()
+                )
+                .into(),
+            });
+        }
+        Ok(resolved)
+    }
+
+    /// Resolve key, lenient. Unresolvable = falls back to idempotency_key.
+    fn resolve_key(&self, event: &Event) -> String {
+        // 1. Check explicit routing override
+        if let Some(k) = event.routing.as_ref().and_then(|r| r.key.as_deref()) {
+            return k.to_string();
+        }
+
+        // 2. Resolve key template if configured
+        if let Some(ref tmpl) = self.key_template {
+            if tmpl.is_static() {
+                return tmpl.resolve_lenient(&serde_json::Value::Null);
+            }
+            if let Ok(event_json) = serde_json::to_value(event) {
+                return tmpl.resolve_lenient(&event_json);
+            }
+        }
+
+        // 3. Default to idempotency key
+        event.idempotency_key()
+    }
+
+    /// Build rdkafka OwnedHeaders from routing.headers.
+    fn build_headers(&self, event: &Event) -> Option<OwnedHeaders> {
+        let map = event.routing.as_ref()?.headers.as_ref()?;
+        if map.is_empty() {
+            return None;
+        }
+        let mut headers = OwnedHeaders::new();
+        for (k, v) in map {
+            headers = headers.insert(Header {
+                key: k,
+                value: Some(v.as_bytes()),
+            });
+        }
+        Some(headers)
     }
 
     /// Serialize event using configured envelope.
@@ -189,52 +296,6 @@ impl KafkaSink {
                 details: e.to_string().into(),
             })
     }
-
-    /// Send a single message with retry logic.
-    async fn send_with_retry(
-        &self,
-        payload: Vec<u8>,
-        key: String,
-    ) -> SinkResult<()> {
-        let policy = RetryPolicy::new(
-            Duration::from_millis(100),
-            Duration::from_secs(10),
-            0.2,
-            Some(3),
-        );
-
-        let result = retry_async(
-            |attempt| {
-                let payload = payload.clone();
-                let key = key.clone();
-                async move {
-                    debug!(attempt, key = %key, "sending to kafka");
-
-                    self.producer
-                        .send(
-                            FutureRecord::to(&self.topic)
-                                .payload(&payload)
-                                .key(&key),
-                            Timeout::After(self.send_timeout),
-                        )
-                        .await
-                        .map(|_| ())
-                        .map_err(|(e, _msg)| KafkaRetryError::from(e))
-                }
-            },
-            |e| e.is_retryable(),
-            self.send_timeout,
-            policy,
-            &self.cancel,
-            "kafka_send",
-        )
-        .await;
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(outcome) => Err(outcome_to_sink_error(outcome)),
-        }
-    }
 }
 
 #[async_trait]
@@ -249,14 +310,58 @@ impl Sink for KafkaSink {
 
     #[instrument(skip_all, fields(sink_id = %self.id))]
     async fn send(&self, event: &Event) -> SinkResult<()> {
-        // Serialize using configured envelope
         let payload = self.serialize_event(event)?;
-        let key = event.idempotency_key();
+        let topic = self.resolve_topic(event)?;
+        let key = self.resolve_key(event);
 
-        self.send_with_retry(payload, key).await?;
+        let policy = RetryPolicy::new(
+            Duration::from_millis(100),
+            Duration::from_secs(10),
+            0.2,
+            Some(3),
+        );
 
-        debug!(topic = %self.topic, "event sent to kafka");
-        Ok(())
+        let headers = self.build_headers(event);
+
+        let result = retry_async(
+            |attempt| {
+                let payload = payload.clone();
+                let key = key.clone();
+                let topic = topic.clone();
+                let headers = headers.clone();
+                async move {
+                    debug!(attempt, key = %key, topic = %topic, "sending to kafka");
+
+                    let mut record = FutureRecord::to(&topic)
+                        .payload(&payload)
+                        .key(&key);
+
+                    if let Some(ref h) = headers {
+                        record = record.headers(h.clone());
+                    }
+
+                    self.producer
+                        .send(record, Timeout::After(self.send_timeout))
+                        .await
+                        .map(|_| ())
+                        .map_err(|(e, _msg)| KafkaRetryError::from(e))
+                }
+            },
+            |e| e.is_retryable(),
+            self.send_timeout,
+            policy,
+            &self.cancel,
+            "kafka_send",
+        )
+        .await;
+
+        match result {
+            Ok(_) => {
+                debug!(topic = %topic, "event sent to kafka");
+                Ok(())
+            }
+            Err(outcome) => Err(outcome_to_sink_error(outcome)),
+        }
     }
 
     /// Batch send for Kafka: queue all messages, then await all deliveries.
@@ -274,25 +379,36 @@ impl Sink for KafkaSink {
             return Ok(());
         }
 
-        // Phase 1: Pre-serialize all payloads using configured envelope
-        let serialized: Vec<(Vec<u8>, String)> = events
-            .iter()
-            .map(|e| Ok((self.serialize_event(e)?, e.idempotency_key())))
-            .collect::<Result<Vec<_>, SinkError>>()?;
+        // Pre-serialize with resolved topic/key/headers
+        let serialized: Vec<(Vec<u8>, String, String, Option<OwnedHeaders>)> =
+            events
+                .iter()
+                .map(|e| {
+                    let payload = self.serialize_event(e)?;
+                    let topic = self.resolve_topic(e)?;
+                    let key = self.resolve_key(e);
+                    let headers = self.build_headers(e);
+                    Ok((payload, topic, key, headers))
+                })
+                .collect::<Result<Vec<_>, SinkError>>()?;
 
-        // Phase 2: Enqueue all messages to rdkafka's buffer
+        // Enqueue all messages
         let futures: Vec<_> = serialized
             .iter()
-            .map(|(payload, key)| {
-                self.producer.send(
-                    FutureRecord::to(&self.topic).payload(payload).key(key),
-                    Timeout::After(self.send_timeout),
-                )
+            .map(|(payload, topic, key, headers)| {
+                let mut record =
+                    FutureRecord::to(topic).payload(payload).key(key);
+
+                if let Some(h) = headers {
+                    record = record.headers(h.clone());
+                }
+
+                self.producer
+                    .send(record, Timeout::After(self.send_timeout))
             })
             .collect();
 
-        // Phase 3: Await all deliveries concurrently
-        // Fail fast on first error to avoid partial batch delivery
+        // await all deliveries
         let result = try_join_all(futures.into_iter().map(|f| async move {
             f.await.map_err(|(e, _)| KafkaRetryError::from(e))
         }))
@@ -300,11 +416,11 @@ impl Sink for KafkaSink {
 
         match result {
             Ok(_) => {
-                debug!(topic = %self.topic, count = events.len(), "batch sent to kafka");
+                debug!(count = events.len(), "batch sent to kafka");
                 Ok(())
             }
             Err(e) => {
-                warn!(topic = %self.topic, error = %e, "batch delivery failed");
+                warn!(error = %e, "batch delivery failed");
                 Err(SinkError::Backpressure {
                     details: format!("kafka batch error: {}", e).into(),
                 })

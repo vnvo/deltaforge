@@ -28,6 +28,9 @@ pub mod envelope;
 pub mod errors;
 pub use errors::{SinkError, SourceError};
 
+pub mod routing;
+pub use routing::EventRouting;
+
 // ============================================================================
 // Operation Type
 // ============================================================================
@@ -364,6 +367,11 @@ pub struct Event {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
 
+    /// Routing overrides for sinks (topic, key, headers).
+    /// Visible to processors but excluded from wire output by envelopes.
+    #[serde(skip)]
+    pub routing: Option<EventRouting>,
+
     /// Transaction boundary marker (true = last event in transaction)
     /// Useful for batching decisions in the coordinator.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -406,6 +414,7 @@ impl Event {
             ddl: None,
             trace_id: None,
             tags: None,
+            routing: None,
             tx_end: true,
             checkpoint: None,
             size_bytes,
@@ -433,6 +442,7 @@ impl Event {
             ddl: Some(ddl),
             trace_id: None,
             tags: None,
+            routing: None,
             tx_end: true,
             checkpoint: None,
             size_bytes,
@@ -460,6 +470,7 @@ impl Event {
             ddl: None,
             trace_id: None,
             tags: None,
+            routing: None,
             tx_end: true,
             checkpoint: None,
             size_bytes,
