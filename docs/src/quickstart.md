@@ -107,5 +107,7 @@ curl -X POST http://localhost:8080/pipelines/orders-mysql-to-kafka/stop
 - [CDC Overview](cdc.md) : Understand how Change Data Capture works
 - [Configuration](configuration.md) : Full pipeline spec reference
 - [Sources](sources/README.md) : MySQL and Postgres setup
-- [Sinks](sinks/README.md) : Kafka and Redis configuration
+- [Sinks](sinks/README.md) : Kafka, Redis, and NATS configuration
+- [Dynamic Routing](routing.md) : Route events to per-table destinations
+- [Envelopes](envelopes.md) : Native, Debezium, and CloudEvents output formats
 - [Development](development.md) : Build from source, run locally

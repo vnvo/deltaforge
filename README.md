@@ -25,23 +25,17 @@
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License">
 </p>
 
-> A modular, efficient and config-driven Change Data Capture (CDC) micro-framework.
+> A versatile, high-performance Change Data Capture (CDC) engine built in Rust.
 
 > ⚠️ **Status:** Active development. APIs, configuration, and semantics may change.
 
-DeltaForge is a lightweight framework for building CDC pipelines that stream database changes into downstream systems such as Kafka, Redis, and NATS. It focuses on:
+DeltaForge streams database changes into downstream systems like Kafka, Redis, and NATS - giving you full control over routing, transformation, and delivery. Built-in schema discovery automatically infers and tracks the shape of your data as it flows through, including deep inspection of nested JSON structures.
 
-- **User Control** : Using an embedded JS engine, users can fully control what happens to each event.
-- **Config-driven pipelines** : YAML-defined pipelines instead of bespoke code per use-case.
-- **Cloud-Native** : CN first design and operation.
-- **Extensibility** : add your own sources, processors, and sinks.
-
-However, DeltaForge is NOT a DAG based stream processor.
-DeltaForge is meant to replace tools like Debezium and similar.
+> DeltaForge is _not_ a DAG based stream processor. It is a focused CDC engine meant to replace tools like Debezium when you need a lighter, cloud-native, and more customizable runtime.
 
 ## Quick Start
 
-Get DeltaForge running in under 5 minutes:
+Get DeltaForge running in under 3 minutes:
 
 <table>
 <tr>

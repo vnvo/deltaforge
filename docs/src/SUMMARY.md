@@ -15,6 +15,7 @@
     - [Kafka](sinks/kafka.md)
     - [NATS](sinks/nats.md)
 - [Envelopes and Encodings](envelopes.md)
+- [Dynamic Routing](routing.md)
 - [Architecture](architecture.md)
     - [Checkpoints](checkpoints.md)
     - [Schema Registry](schemaregistry.md)
