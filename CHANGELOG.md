@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Dynamic event routing** - Route events to per-table destinations using template strings or JavaScript logic ([52a1d54](https://github.com/vnvo/deltaforge/commit/52a1d54acb0791202eda1d47b891c4727a566b15))
+  - `CompiledTemplate` with zero-overhead static detection and per-event resolution
+  - Template variables: `${source.table}`, `${source.db}`, `${op}`, `${after.<field>}`, `${before.<field>}`, `${tenant_id}`
+  - New `key` field on Kafka, Redis, and NATS sinks for partition/message key control
+  - Kafka: resolves topic and key per-event, passes headers to Kafka message headers
+  - Redis: resolves stream and key per-event, delivers key as `df-key` and headers as `df-headers` field
+  - NATS: resolves subject and key per-event, delivers key and headers as NATS headers
+- **JavaScript routing API** - `ev.route()` for programmatic per-event routing in JS processors ([0c6efdae](https://github.com/vnvo/deltaforge/commit/0c6efdae23ca7f84ec4b5f47c7587e02d10bfe5d))
+  - Override topic, key, and headers from JavaScript with `ev.route({ topic, key, headers })`
+  - Resolution priority: `ev.route()` override → config template → static config value
 - **High-cardinality key detection** - Automatic detection and normalization of dynamic map keys in schema sensing
   - Probabilistic classification using HyperLogLog and SpaceSaving algorithms
   - Stable vs dynamic field detection with configurable thresholds
@@ -33,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Config loader** - Lenient environment variable expansion; unknown `${...}` variables pass through as routing templates instead of erroring ([e2b185b](https://github.com/vnvo/deltaforge/commit/e2b185baf876fb0f6f8a98da6a710e0be7a1fbc7))
 - **Event structure** - Adopted Debezium-compatible envelope as base event structure ([57f2b9c](https://github.com/vnvo/deltaforge/commit/57f2b9c16c9998aebc9f297d8e374207b1b8b7d9))
 - **Sink configuration** - All sinks now support `envelope` and `encoding` options ([72a1898](https://github.com/vnvo/deltaforge/commit/72a1898dce913b8a6ff68ff0652224759d798854))
   - Kafka, Redis, and NATS sinks updated to use envelope/encoding pipeline
@@ -43,9 +54,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **MySQL DDL handling** - Fixed DDL event handling and required schema reload ([6dfe592](https://github.com/vnvo/deltaforge/commit/6dfe59204644e805167c7e474d5d11e052156386))
+- **Sink unit tests** - Fixed broken unit tests related to sink routing changes ([c8e23cd](https://github.com/vnvo/deltaforge/commit/c8e23cd594121fb6d321b3fc755aaac327535678))
 
 ### Documentation
 
+- Added dynamic routing documentation with template variable reference and resolution order ([cb6bafb](https://github.com/vnvo/deltaforge/commit/cb6bafb50c9cf2dd7c8c18d963209849ef83e358))
+- Added example configs: `dynamic-routing.yaml` and `js-routing.yaml` ([81cf409](https://github.com/vnvo/deltaforge/commit/81cf409f02ff863b45674597ca70867b3b41e951))
+- Added landing page for project documentation ([61f7c1b](https://github.com/vnvo/deltaforge/commit/61f7c1b23995ed2700096a6f35e05149bec074e1))
+- Updated configuration reference with `key` field and routing template links
+- Updated introduction, README, SUMMARY, and quickstart with routing feature
 - Added high-cardinality key handling documentation with configuration examples
 - Updated schema sensing docs with side-by-side configuration reference
 - Added dynamic map classifications API documentation
@@ -56,6 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing
 
+- Added integration tests for dynamic routing across Kafka, Redis, and NATS sinks ([75dae63](https://github.com/vnvo/deltaforge/commit/75dae637f289af40695b3791d9f0cb96437635ef))
+- Added JavaScript routing override tests ([aed8b59](https://github.com/vnvo/deltaforge/commit/aed8b59995a1396c8f3a1e3319f4d1e692d52496))
+- Added config parsing tests for `key` field and template topic preservation
+- Refactored sink integration tests with shared event factories
 - Updated all sink integration tests for envelope and encoding support ([6938491](https://github.com/vnvo/deltaforge/commit/693849117d163c944749435f7bc2c0bdb2307b16))
 - Removed Turso integration tests temporarily ([17d933c](https://github.com/vnvo/deltaforge/commit/17d933c9869886f2f53d54de71423933d82db607))
 - Added high-cardinality detection effectiveness tests
