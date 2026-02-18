@@ -1,14 +1,10 @@
 //! PostgreSQL CDC e2e tests. Run with:
 //! `cargo test -p sources --test postgres_cdc_e2e -- --include-ignored --nocapture --test-threads=1`
 //!
-//! Updated for Debezium-compatible Event structure with:
-//! - Op::Create instead of Op::Insert (Debezium uses 'c' for create)
-//! - SourceInfo envelope with connector, name, ts_ms, table, position fields
-//! - Transaction metadata support
-//! - SourcePosition with PostgreSQL-specific LSN tracking
 
 use anyhow::Result;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
+use common::AllowList;
 use ctor::dtor;
 use deltaforge_core::{Event, Op, Source, SourceHandle};
 use schema_registry::InMemoryRegistry;
@@ -364,6 +360,7 @@ async fn postgres_cdc_basic_events() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry: Arc::new(InMemoryRegistry::new()),
+        outbox_prefixes: AllowList::default(),
     };
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
@@ -474,6 +471,7 @@ async fn postgres_cdc_schema_evolution() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry: registry.clone(),
+        outbox_prefixes: AllowList::default(),
     };
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
@@ -559,6 +557,7 @@ async fn postgres_cdc_checkpoint_resume() -> Result<()> {
             tenant: "acme".into(),
             pipeline: "test".into(),
             registry: Arc::new(InMemoryRegistry::new()),
+            outbox_prefixes: AllowList::default(),
         };
         let handle = src.run(tx, ckpt.clone()).await;
         wait_ready(&handle, Duration::from_secs(10)).await?;
@@ -595,6 +594,7 @@ async fn postgres_cdc_checkpoint_resume() -> Result<()> {
             tenant: "acme".into(),
             pipeline: "test".into(),
             registry: Arc::new(InMemoryRegistry::new()),
+            outbox_prefixes: AllowList::default(),
         };
         let handle = src.run(tx, ckpt.clone()).await;
         wait_ready(&handle, Duration::from_secs(10)).await?;
@@ -661,6 +661,7 @@ async fn postgres_cdc_table_filtering() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry: Arc::new(InMemoryRegistry::new()),
+        outbox_prefixes: AllowList::default(),
     };
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
@@ -722,6 +723,7 @@ async fn postgres_cdc_reconnect() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry: Arc::new(InMemoryRegistry::new()),
+        outbox_prefixes: AllowList::default(),
     };
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
@@ -786,6 +788,7 @@ async fn postgres_cdc_extended_types() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry: Arc::new(InMemoryRegistry::new()),
+        outbox_prefixes: AllowList::default(),
     };
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
@@ -851,6 +854,7 @@ async fn postgres_cdc_pause_resume() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry: Arc::new(InMemoryRegistry::new()),
+        outbox_prefixes: AllowList::default(),
     };
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
@@ -930,6 +934,7 @@ async fn postgres_cdc_auth_failure() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry: Arc::new(InMemoryRegistry::new()),
+        outbox_prefixes: AllowList::default(),
     };
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
@@ -1001,6 +1006,7 @@ async fn postgres_cdc_slot_auto_created() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry: Arc::new(InMemoryRegistry::new()),
+        outbox_prefixes: AllowList::default(),
     };
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
@@ -1085,6 +1091,7 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry: Arc::new(InMemoryRegistry::new()),
+        outbox_prefixes: AllowList::default(),
     };
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
@@ -1152,6 +1159,7 @@ async fn postgres_cdc_invalid_dsn() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry: Arc::new(InMemoryRegistry::new()),
+        outbox_prefixes: AllowList::default(),
     };
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
@@ -1189,6 +1197,7 @@ async fn postgres_cdc_connection_refused() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry: Arc::new(InMemoryRegistry::new()),
+        outbox_prefixes: AllowList::default(),
     };
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
@@ -1274,6 +1283,7 @@ async fn postgres_cdc_replica_identity_modes() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry: Arc::new(InMemoryRegistry::new()),
+        outbox_prefixes: AllowList::default(),
     };
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
@@ -1365,6 +1375,7 @@ async fn postgres_cdc_graceful_shutdown() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry: Arc::new(InMemoryRegistry::new()),
+        outbox_prefixes: AllowList::default(),
     };
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
@@ -1459,6 +1470,7 @@ async fn postgres_cdc_multi_table() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry: Arc::new(InMemoryRegistry::new()),
+        outbox_prefixes: AllowList::default(),
     };
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
@@ -1553,6 +1565,7 @@ async fn postgres_cdc_null_handling() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry: Arc::new(InMemoryRegistry::new()),
+        outbox_prefixes: AllowList::default(),
     };
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
@@ -1601,6 +1614,352 @@ async fn postgres_cdc_null_handling() -> Result<()> {
     handle.stop();
     handle.join().await.ok();
     cleanup_repl(&client, "pub_null", "slot_null").await;
+    drop_db(&db).await;
+    Ok(())
+}
+
+// =============================================================================
+// OUTBOX PATTERN TESTS
+// =============================================================================
+
+/// Test outbox capture via pg_logical_emit_message().
+/// Verifies:
+/// - Matching prefix → source.schema = "__outbox"
+/// - Non-matching prefix → source.schema = "__wal_message"
+/// - JSON payload arrives in event.after
+/// - source.table set to the message prefix
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn postgres_cdc_outbox_capture() -> Result<()> {
+    init_test_tracing();
+    let _ = get_container().await;
+    let (db, client) = create_db("outbox").await?;
+
+    // Need a table + publication for the replication slot to work,
+    // but outbox events come from WAL messages, not table changes.
+    client
+        .execute(
+            "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64))",
+            &[],
+        )
+        .await?;
+    client
+        .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON orders TO {CDC_USER}"), &[])
+        .await?;
+    create_pub_slot(&client, "pub_outbox", "slot_outbox", &["orders"]).await?;
+
+    let src = PostgresSource {
+        id: "outbox".into(),
+        checkpoint_key: "pg-outbox".into(),
+        dsn: cdc_dsn(&db),
+        slot: "slot_outbox".into(),
+        publication: "pub_outbox".into(),
+        tables: vec!["public.orders".into()],
+        tenant: "acme".into(),
+        pipeline: "test".into(),
+        registry: Arc::new(InMemoryRegistry::new()),
+        outbox_prefixes: AllowList::new(&["outbox".to_string()]),
+    };
+
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = mpsc::channel(128);
+    let handle = src.run(tx, ckpt).await;
+    wait_ready(&handle, Duration::from_secs(10)).await?;
+    sleep(Duration::from_secs(2)).await;
+
+    // Emit outbox message (transactional = true)
+    client
+        .execute(
+            "SELECT pg_logical_emit_message(true, 'outbox', '{\"aggregate_type\":\"Order\",\"aggregate_id\":\"42\",\"event_type\":\"OrderCreated\",\"payload\":{\"total\":99.99}}')",
+            &[],
+        )
+        .await?;
+
+    // Emit non-outbox message
+    client
+        .execute(
+            "SELECT pg_logical_emit_message(true, 'audit', '{\"action\":\"login\"}')",
+            &[],
+        )
+        .await?;
+
+    // Also insert a normal table row to verify coexistence
+    client
+        .execute("INSERT INTO orders VALUES (1, 'sku-1')", &[])
+        .await?;
+
+    let events = collect_until(&mut rx, Duration::from_secs(15), |e| {
+        let has_outbox = e.iter().any(|x| x.source.table == "outbox");
+        let has_audit = e.iter().any(|x| x.source.table == "audit");
+        let has_order = e.iter().any(|x| x.source.table == "orders");
+        has_outbox && has_audit && has_order
+    })
+    .await;
+
+    // --- Outbox event ---
+    let outbox_ev = events
+        .iter()
+        .find(|e| e.source.table == "outbox")
+        .expect("should have outbox event");
+    assert_eq!(
+        outbox_ev.source.schema.as_deref(),
+        Some("__outbox"),
+        "matching prefix should be tagged __outbox"
+    );
+    assert_eq!(outbox_ev.op, Op::Create);
+    let after = outbox_ev.after.as_ref().expect("should have payload");
+    assert_eq!(after["aggregate_type"], "Order");
+    assert_eq!(after["aggregate_id"], "42");
+    assert_eq!(after["event_type"], "OrderCreated");
+    assert_eq!(after["payload"]["total"], 99.99);
+    info!("✓ outbox event captured with __outbox sentinel and full payload");
+
+    // --- Non-matching WAL message ---
+    let audit_ev = events
+        .iter()
+        .find(|e| e.source.table == "audit")
+        .expect("should have audit event");
+    assert_eq!(
+        audit_ev.source.schema.as_deref(),
+        Some("__wal_message"),
+        "non-matching prefix should be tagged __wal_message"
+    );
+    assert_eq!(audit_ev.after.as_ref().unwrap()["action"], "login");
+    info!("✓ non-matching WAL message tagged __wal_message");
+
+    // --- Normal table event coexists ---
+    let order_ev = events
+        .iter()
+        .find(|e| e.source.table == "orders")
+        .expect("should have table event");
+    assert_eq!(order_ev.source.schema.as_deref(), Some("public"));
+    assert!(is_create_op(order_ev));
+    info!("✓ normal table CDC coexists with outbox capture");
+
+    handle.stop();
+    handle.join().await.ok();
+    cleanup_repl(&client, "pub_outbox", "slot_outbox").await;
+    drop_db(&db).await;
+    Ok(())
+}
+
+/// Test outbox with glob prefix patterns (multi-outbox).
+/// Verifies that `outbox_%` matches `outbox_orders` and `outbox_payments`
+/// but not `audit`.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn postgres_cdc_outbox_glob_prefix() -> Result<()> {
+    init_test_tracing();
+    let _ = get_container().await;
+    let (db, client) = create_db("outbox_glob").await?;
+
+    client
+        .execute("CREATE TABLE stub (id INT PRIMARY KEY)", &[])
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON stub TO {CDC_USER}"), &[])
+        .await?;
+    create_pub_slot(&client, "pub_obglob", "slot_obglob", &["stub"]).await?;
+
+    let src = PostgresSource {
+        id: "obglob".into(),
+        checkpoint_key: "pg-obglob".into(),
+        dsn: cdc_dsn(&db),
+        slot: "slot_obglob".into(),
+        publication: "pub_obglob".into(),
+        tables: vec!["public.stub".into()],
+        tenant: "acme".into(),
+        pipeline: "test".into(),
+        registry: Arc::new(InMemoryRegistry::new()),
+        outbox_prefixes: AllowList::new(&["outbox_%".to_string()]),
+    };
+
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = mpsc::channel(128);
+    let handle = src.run(tx, ckpt).await;
+    wait_ready(&handle, Duration::from_secs(10)).await?;
+    sleep(Duration::from_secs(2)).await;
+
+    client
+        .execute(
+            "SELECT pg_logical_emit_message(true, 'outbox_orders', '{\"event_type\":\"OrderCreated\"}')",
+            &[],
+        )
+        .await?;
+    client
+        .execute(
+            "SELECT pg_logical_emit_message(true, 'outbox_payments', '{\"event_type\":\"PaymentReceived\"}')",
+            &[],
+        )
+        .await?;
+    client
+        .execute(
+            "SELECT pg_logical_emit_message(true, 'audit', '{\"action\":\"login\"}')",
+            &[],
+        )
+        .await?;
+
+    let events = collect_until(&mut rx, Duration::from_secs(15), |e| {
+        e.iter().filter(|x| x.source.schema.is_some()).count() >= 3
+    })
+    .await;
+
+    let outbox_orders =
+        events.iter().find(|e| e.source.table == "outbox_orders");
+    let outbox_payments =
+        events.iter().find(|e| e.source.table == "outbox_payments");
+    let audit = events.iter().find(|e| e.source.table == "audit");
+
+    assert_eq!(
+        outbox_orders.unwrap().source.schema.as_deref(),
+        Some("__outbox"),
+    );
+    assert_eq!(
+        outbox_payments.unwrap().source.schema.as_deref(),
+        Some("__outbox"),
+    );
+    assert_eq!(
+        audit.unwrap().source.schema.as_deref(),
+        Some("__wal_message"),
+    );
+    info!(
+        "✓ glob prefix outbox_%  matches outbox_orders and outbox_payments, not audit"
+    );
+
+    handle.stop();
+    handle.join().await.ok();
+    cleanup_repl(&client, "pub_obglob", "slot_obglob").await;
+    drop_db(&db).await;
+    Ok(())
+}
+
+/// Test full outbox pipeline: source capture -> OutboxProcessor -> transformed event.
+/// This wires the processor in-process to verify the complete data flow.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn postgres_cdc_outbox_full_pipeline() -> Result<()> {
+    use deltaforge_config::{
+        OUTBOX_SCHEMA_SENTINEL, OutboxColumns, OutboxProcessorCfg,
+    };
+    use deltaforge_core::Processor;
+    use processors::OutboxProcessor;
+
+    init_test_tracing();
+    let _ = get_container().await;
+    let (db, client) = create_db("outbox_pipe").await?;
+
+    client
+        .execute(
+            "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64))",
+            &[],
+        )
+        .await?;
+    client
+        .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON orders TO {CDC_USER}"), &[])
+        .await?;
+    create_pub_slot(&client, "pub_obpipe", "slot_obpipe", &["orders"]).await?;
+
+    let src = PostgresSource {
+        id: "obpipe".into(),
+        checkpoint_key: "pg-obpipe".into(),
+        dsn: cdc_dsn(&db),
+        slot: "slot_obpipe".into(),
+        publication: "pub_obpipe".into(),
+        tables: vec!["public.orders".into()],
+        tenant: "acme".into(),
+        pipeline: "test".into(),
+        registry: Arc::new(InMemoryRegistry::new()),
+        outbox_prefixes: AllowList::new(&["outbox".to_string()]),
+    };
+
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = mpsc::channel(128);
+    let handle = src.run(tx, ckpt).await;
+    wait_ready(&handle, Duration::from_secs(10)).await?;
+    sleep(Duration::from_secs(2)).await;
+
+    // Emit outbox message + normal insert
+    client
+        .execute(
+            "SELECT pg_logical_emit_message(true, 'outbox', '{\"aggregate_type\":\"Order\",\"aggregate_id\":\"42\",\"event_type\":\"OrderCreated\",\"payload\":{\"order_id\":42,\"total\":99.99}}')",
+            &[],
+        )
+        .await?;
+    client
+        .execute("INSERT INTO orders VALUES (1, 'sku-1')", &[])
+        .await?;
+
+    let raw_events = collect_until(&mut rx, Duration::from_secs(15), |e| {
+        let has_outbox = e.iter().any(|x| {
+            x.source.schema.as_deref() == Some(OUTBOX_SCHEMA_SENTINEL)
+        });
+        let has_table = e.iter().any(|x| x.source.table == "orders");
+        has_outbox && has_table
+    })
+    .await;
+    assert!(raw_events.len() >= 2, "should have outbox + table events");
+
+    // Run through processor
+    let proc = OutboxProcessor::new(OutboxProcessorCfg {
+        id: "outbox".into(),
+        tables: vec![],
+        columns: OutboxColumns::default(),
+        topic: Some("${aggregate_type}.${event_type}".into()),
+        default_topic: Some("events.unrouted".into()),
+    })?;
+
+    let processed = proc.process(raw_events).await?;
+
+    // Outbox event should be transformed
+    let outbox_ev = processed
+        .iter()
+        .find(|e| {
+            e.routing.as_ref().and_then(|r| r.topic.as_deref())
+                == Some("Order.OrderCreated")
+        })
+        .expect("should have routed outbox event");
+    assert!(
+        outbox_ev.source.schema.is_none(),
+        "sentinel should be cleared"
+    );
+    assert_eq!(outbox_ev.after.as_ref().unwrap()["order_id"], 42);
+    assert_eq!(outbox_ev.after.as_ref().unwrap()["total"], 99.99);
+    let headers = outbox_ev
+        .routing
+        .as_ref()
+        .unwrap()
+        .headers
+        .as_ref()
+        .unwrap();
+    assert_eq!(headers.get("df-aggregate-type").unwrap(), "Order");
+    assert_eq!(headers.get("df-aggregate-id").unwrap(), "42");
+    assert_eq!(headers.get("df-event-type").unwrap(), "OrderCreated");
+    info!("✓ outbox event transformed: topic, payload, headers");
+
+    // Normal table event should pass through unchanged
+    let table_ev = processed
+        .iter()
+        .find(|e| {
+            e.source.table == "orders"
+                && e.source.schema.as_deref() == Some("public")
+        })
+        .expect("table event should pass through");
+    assert!(
+        table_ev.routing.is_none(),
+        "table event should have no routing"
+    );
+    assert_eq!(table_ev.after.as_ref().unwrap()["sku"], "sku-1");
+    info!("✓ normal table event passes through processor unchanged");
+
+    handle.stop();
+    handle.join().await.ok();
+    cleanup_repl(&client, "pub_obpipe", "slot_obpipe").await;
     drop_db(&db).await;
     Ok(())
 }
