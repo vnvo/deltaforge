@@ -11,8 +11,9 @@ anyhow.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-deltaforge-core ={ path = "../deltaforge-core"}
-deltaforge-config ={ path = "../deltaforge-config" }
+deltaforge-core = { path = "../deltaforge-core" }
+deltaforge-config = { path = "../deltaforge-config" }
+common = { path = "../common" }
 uuid.workspace = true
 chrono.workspace = true
 tokio.workspace = true

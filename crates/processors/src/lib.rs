@@ -7,6 +7,9 @@ use deltaforge_core::ArcDynProcessor;
 mod js;
 pub use js::JsProcessor;
 
+mod outbox;
+pub use outbox::OutboxProcessor;
+
 pub fn build_processors(ps: &PipelineSpec) -> Result<Arc<[ArcDynProcessor]>> {
     let mut out: Vec<ArcDynProcessor> = Vec::new();
 
@@ -14,6 +17,10 @@ pub fn build_processors(ps: &PipelineSpec) -> Result<Arc<[ArcDynProcessor]>> {
         let proc: ArcDynProcessor = match p {
             ProcessorCfg::Javascript { id, inline, .. } => {
                 Arc::new(JsProcessor::new(id.clone(), inline.clone())?)
+                    as ArcDynProcessor
+            }
+            ProcessorCfg::Outbox { config } => {
+                Arc::new(OutboxProcessor::new(config.clone())?)
                     as ArcDynProcessor
             }
         };
