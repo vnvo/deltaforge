@@ -10,6 +10,8 @@
     - [MySQL](sources/mysql.md)
     - [Postgres](sources/postgres.md)
     - [Turso](sources/turso.md)
+- [Processors](processors.md)
+- [Outbox Pattern Support](outbox.md)
 - [Sinks](sinks/README.md)
     - [Redis](sinks/redis.md)
     - [Kafka](sinks/kafka.md)
