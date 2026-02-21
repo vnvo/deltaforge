@@ -1,4 +1,4 @@
-//! Outbox processor - transforms outbox-captured events and routes them.
+//! Outbox processor — transforms outbox-captured events and routes them.
 //!
 //! Explicit processor in the pipeline's `processors` list. Identifies events
 //! tagged by the source with `source.schema = "__outbox"`, extracts outbox
@@ -34,6 +34,7 @@ use tracing::debug;
 
 use deltaforge_core::{Event, Op, Processor};
 
+// Config types live in deltaforge-config to avoid circular deps
 use deltaforge_config::{
     OUTBOX_SCHEMA_SENTINEL, OutboxColumns, OutboxProcessorCfg,
 };
@@ -108,13 +109,12 @@ impl OutboxProcessor {
         let event_type =
             Self::extract_str(&after, &cols.event_type).map(String::from);
 
-        // Rewrite event
-        event.after = payload.or(Some(after));
-        event.before = None;
-
         let mut routing = event.routing.take().unwrap_or_default();
         if let Some(t) = topic {
             routing.topic = Some(t);
+        }
+        if self.cfg.raw_payload {
+            routing.raw_payload = true;
         }
         let headers = routing.headers.get_or_insert_with(HashMap::new);
         if let Some(ref v) = aggregate_type {
@@ -126,7 +126,17 @@ impl OutboxProcessor {
         if let Some(ref v) = event_type {
             headers.insert("df-event-type".into(), v.clone());
         }
+        // Forward additional payload fields as headers
+        for (header_name, col_name) in &self.cfg.additional_headers {
+            if let Some(v) = Self::extract_str(&after, col_name) {
+                headers.insert(header_name.clone(), v.to_string());
+            }
+        }
         event.routing = Some(routing);
+
+        // Rewrite payload (must happen after additional_headers extraction)
+        event.after = payload.or(Some(after));
+        event.before = None;
         event.source.schema = None;
 
         debug!(
@@ -138,7 +148,11 @@ impl OutboxProcessor {
         true
     }
 
-    /// Topic resolution cascade: template -> column -> default.
+    /// Topic resolution cascade: template → column → default.
+    ///
+    /// The template resolves against the raw `event.after` payload, so users
+    /// can reference their actual column names (e.g. `${domain}.${action}`)
+    /// without going through column mappings.
     fn resolve_topic(
         &self,
         after: &Value,
@@ -148,8 +162,8 @@ impl OutboxProcessor {
             if tpl.is_static() {
                 return Some(tpl.resolve_lenient(after));
             }
-            let ctx = self.build_template_context(after, cols);
-            let resolved = tpl.resolve_lenient(&ctx);
+            // Resolve directly against the raw payload — no remapping.
+            let resolved = tpl.resolve_lenient(after);
             if !resolved.is_empty() {
                 return Some(resolved);
             }
@@ -162,25 +176,6 @@ impl OutboxProcessor {
         }
 
         self.cfg.default_topic.clone()
-    }
-
-    fn build_template_context(
-        &self,
-        after: &Value,
-        cols: &OutboxColumns,
-    ) -> Value {
-        let mut map = serde_json::Map::new();
-        for (key, col_name) in [
-            ("aggregate_type", &cols.aggregate_type),
-            ("aggregate_id", &cols.aggregate_id),
-            ("event_type", &cols.event_type),
-            ("topic", &cols.topic),
-        ] {
-            if let Some(v) = after.get(col_name.as_str()) {
-                map.insert(key.to_string(), v.clone());
-            }
-        }
-        Value::Object(map)
     }
 }
 
@@ -265,6 +260,8 @@ mod tests {
             columns: OutboxColumns::default(),
             topic: None,
             default_topic: Some("events.default".into()),
+            additional_headers: HashMap::new(),
+            raw_payload: false,
         }
     }
 
@@ -321,6 +318,50 @@ mod tests {
             result[0].routing.as_ref().unwrap().topic.as_deref(),
             Some("Order.OrderCreated")
         );
+    }
+
+    #[tokio::test]
+    async fn custom_schema_topic_template() {
+        // User has non-standard column names and references them directly in the template
+        let cfg = OutboxProcessorCfg {
+            topic: Some("${domain}.${action}".into()),
+            columns: OutboxColumns {
+                aggregate_type: "domain".into(),
+                aggregate_id: "entity_id".into(),
+                event_type: "action".into(),
+                ..OutboxColumns::default()
+            },
+            ..default_cfg()
+        };
+        let proc = OutboxProcessor::new(cfg).unwrap();
+
+        let payload = json!({
+            "domain": "orders",
+            "entity_id": "42",
+            "action": "created",
+            "payload": {"total": 99.99}
+        });
+        let result = proc
+            .process(vec![outbox_event("outbox", payload)])
+            .await
+            .unwrap();
+
+        // Template resolves against raw payload columns
+        assert_eq!(
+            result[0].routing.as_ref().unwrap().topic.as_deref(),
+            Some("orders.created")
+        );
+        // Headers still use standard df- names, extracted via column mappings
+        let headers = result[0]
+            .routing
+            .as_ref()
+            .unwrap()
+            .headers
+            .as_ref()
+            .unwrap();
+        assert_eq!(headers.get("df-aggregate-type").unwrap(), "orders");
+        assert_eq!(headers.get("df-aggregate-id").unwrap(), "42");
+        assert_eq!(headers.get("df-event-type").unwrap(), "created");
     }
 
     #[tokio::test]
@@ -424,5 +465,105 @@ mod tests {
             result[0].routing.as_ref().unwrap().topic.as_deref(),
             Some("events.default")
         );
+    }
+
+    #[tokio::test]
+    async fn additional_headers_forwarded() {
+        let cfg = OutboxProcessorCfg {
+            additional_headers: HashMap::from([
+                ("x-trace-id".into(), "trace_id".into()),
+                ("x-tenant".into(), "tenant".into()),
+            ]),
+            ..default_cfg()
+        };
+        let proc = OutboxProcessor::new(cfg).unwrap();
+
+        let payload = json!({
+            "aggregate_type": "Order",
+            "aggregate_id": "42",
+            "event_type": "OrderCreated",
+            "trace_id": "abc-123",
+            "tenant": "acme",
+            "payload": {"total": 99.99}
+        });
+        let result = proc
+            .process(vec![outbox_event("outbox", payload)])
+            .await
+            .unwrap();
+
+        let headers = result[0]
+            .routing
+            .as_ref()
+            .unwrap()
+            .headers
+            .as_ref()
+            .unwrap();
+        assert_eq!(headers.get("x-trace-id").unwrap(), "abc-123");
+        assert_eq!(headers.get("x-tenant").unwrap(), "acme");
+        assert_eq!(headers.get("df-aggregate-type").unwrap(), "Order");
+    }
+
+    #[tokio::test]
+    async fn additional_headers_missing_column_skipped() {
+        let cfg = OutboxProcessorCfg {
+            additional_headers: HashMap::from([(
+                "x-trace-id".into(),
+                "trace_id".into(),
+            )]),
+            ..default_cfg()
+        };
+        let proc = OutboxProcessor::new(cfg).unwrap();
+
+        // payload has no trace_id field
+        let result = proc
+            .process(vec![outbox_event("outbox", outbox_payload())])
+            .await
+            .unwrap();
+
+        let headers = result[0]
+            .routing
+            .as_ref()
+            .unwrap()
+            .headers
+            .as_ref()
+            .unwrap();
+        assert!(
+            !headers.contains_key("x-trace-id"),
+            "missing column should be skipped"
+        );
+        assert!(
+            headers.contains_key("df-aggregate-type"),
+            "standard headers still set"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_payload_sets_routing_flag() {
+        let cfg = OutboxProcessorCfg {
+            raw_payload: true,
+            topic: Some("${aggregate_type}.${event_type}".into()),
+            ..default_cfg()
+        };
+        let proc = OutboxProcessor::new(cfg).unwrap();
+        let result = proc
+            .process(vec![outbox_event("outbox", outbox_payload())])
+            .await
+            .unwrap();
+
+        let routing = result[0].routing.as_ref().unwrap();
+        assert!(routing.raw_payload, "raw_payload flag should be set");
+        assert_eq!(routing.effective_topic(), Some("Order.OrderCreated"));
+    }
+
+    #[tokio::test]
+    async fn raw_payload_false_by_default() {
+        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+        let result = proc
+            .process(vec![outbox_event("outbox", outbox_payload())])
+            .await
+            .unwrap();
+
+        let routing = result[0].routing.as_ref().unwrap();
+        assert!(!routing.raw_payload, "raw_payload should default to false");
     }
 }

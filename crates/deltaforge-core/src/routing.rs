@@ -48,6 +48,12 @@ pub struct EventRouting {
     /// - Redis: serialized as JSON in "df-headers" field
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<HashMap<String, String>>,
+
+    /// When true, sinks serialize `event.after` directly as the wire payload,
+    /// bypassing envelope wrapping. Set by the outbox processor when
+    /// `raw_payload: true` is configured.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub raw_payload: bool,
 }
 
 impl EventRouting {
@@ -98,6 +104,7 @@ mod tests {
                 "trace-id".into(),
                 "abc-123".into(),
             )])),
+            raw_payload: false,
         };
         let json = serde_json::to_value(&r).unwrap();
         let r2: EventRouting = serde_json::from_value(json).unwrap();

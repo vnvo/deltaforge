@@ -972,10 +972,6 @@ async fn mysql_cdc_table_filtering() -> Result<()> {
 /// - Matching table -> source.schema = "__outbox"
 /// - Non-matching table -> normal CDC event (no sentinel)
 /// - Outbox JSON payload arrives in event.after
-///
-/// Note: production deployments should use ENGINE=BLACKHOLE to avoid
-/// storing outbox rows on disk. We use default InnoDB here since the
-/// storage engine has no effect on binlog CDC behavior.
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_cdc_outbox_capture() -> Result<()> {
@@ -1167,6 +1163,7 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
     };
     use deltaforge_core::Processor;
     use processors::OutboxProcessor;
+    use std::collections::HashMap;
 
     init_test_tracing();
     let _container = get_mysql_container().await;
@@ -1230,6 +1227,7 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
         })
         .await;
     assert!(raw_events.len() >= 2, "should have outbox + table events");
+    let raw_events_clone = raw_events.clone();
 
     // Run through processor
     let proc = OutboxProcessor::new(OutboxProcessorCfg {
@@ -1238,6 +1236,8 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
         columns: OutboxColumns::default(),
         topic: Some("${aggregate_type}.${event_type}".into()),
         default_topic: Some("events.unrouted".into()),
+        additional_headers: HashMap::new(),
+        raw_payload: false,
     })?;
 
     let processed = proc.process(raw_events).await?;
@@ -1280,6 +1280,49 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
     );
     assert_eq!(table_ev.after.as_ref().unwrap()["sku"], "sku-1");
     info!("✓ normal table event passes through processor unchanged");
+
+    // --- raw_payload mode: re-process cloned raw events ---
+    let raw_proc = OutboxProcessor::new(OutboxProcessorCfg {
+        id: "outbox-raw".into(),
+        tables: vec![],
+        columns: OutboxColumns::default(),
+        topic: Some("${aggregate_type}.${event_type}".into()),
+        default_topic: Some("events.unrouted".into()),
+        additional_headers: HashMap::new(),
+        raw_payload: true,
+    })?;
+
+    let raw_processed = raw_proc.process(raw_events_clone).await?;
+
+    let raw_outbox_ev = raw_processed
+        .iter()
+        .find(|e| {
+            e.routing.as_ref().and_then(|r| r.topic.as_deref())
+                == Some("Order.OrderCreated")
+        })
+        .expect("should have routed outbox event in raw mode");
+    assert!(
+        raw_outbox_ev.routing.as_ref().unwrap().raw_payload,
+        "raw_payload flag should be set on outbox event"
+    );
+    assert_eq!(
+        raw_outbox_ev.after.as_ref().unwrap()["order_id"],
+        42,
+        "payload should still be extracted"
+    );
+
+    let raw_table_ev = raw_processed
+        .iter()
+        .find(|e| e.source.table == "orders")
+        .expect("table event should pass through in raw mode");
+    assert!(
+        raw_table_ev
+            .routing
+            .as_ref()
+            .map_or(true, |r| !r.raw_payload),
+        "raw_payload flag should NOT be set on table event"
+    );
+    info!("✓ raw_payload flag set on outbox, not on table event");
 
     handle.stop();
     let _ = handle.join().await;

@@ -47,6 +47,7 @@ use rdkafka::error::KafkaError;
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
 
@@ -283,6 +284,13 @@ impl KafkaSink {
 
     /// Serialize event using configured envelope.
     fn serialize_event(&self, event: &Event) -> SinkResult<Vec<u8>> {
+        if event.routing.as_ref().map_or(false, |r| r.raw_payload) {
+            // Outbox raw mode: write event.after directly
+            return serde_json::to_vec(
+                event.after.as_ref().unwrap_or(&Value::Null),
+            )
+            .map_err(Into::into);
+        }
         let envelope = self.envelope.wrap(event).map_err(|e| {
             SinkError::Serialization {
                 details: e.to_string().into(),

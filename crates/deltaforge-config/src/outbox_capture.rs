@@ -13,6 +13,7 @@
 
 use common::AllowList;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Sentinel schema value set by the source on outbox-captured events.
 pub const OUTBOX_SCHEMA_SENTINEL: &str = "__outbox";
@@ -108,6 +109,19 @@ pub struct OutboxProcessorCfg {
     /// Fallback topic when template resolution fails or is not configured.
     #[serde(default)]
     pub default_topic: Option<String>,
+
+    /// Forward additional payload fields as routing headers.
+    /// Key = header name, value = column name in the outbox payload.
+    /// Example: `{"x-trace-id": "trace_id"}` extracts `trace_id` from
+    /// the payload and sets it as the `x-trace-id` header.
+    #[serde(default)]
+    pub additional_headers: HashMap<String, String>,
+
+    /// When true, the outbox payload is delivered as-is to sinks,
+    /// bypassing envelope wrapping (native/debezium/cloudevents).
+    /// Metadata is still available via routing headers.
+    #[serde(default)]
+    pub raw_payload: bool,
 }
 
 fn default_id() -> String {

@@ -1885,3 +1885,118 @@ async fn kafka_sink_routing_key_and_headers() -> Result<()> {
     delete_topic(&brokers, &topic).await?;
     Ok(())
 }
+
+// =============================================================================
+// Raw Payload Tests (Outbox)
+// =============================================================================
+
+/// When routing.raw_payload is true, the sink should serialize event.after
+/// directly to the wire, bypassing the configured envelope format.
+/// This test uses Debezium envelope to prove the bypass works.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_raw_payload_bypasses_envelope() -> Result<()> {
+    init_test_tracing();
+    let _container = get_kafka_container().await;
+
+    let topic = test_topic("raw-payload");
+    let brokers = brokers();
+    create_topic(&brokers, &topic, 1).await?;
+
+    // Deliberately use Debezium envelope - raw_payload should bypass it
+    let cfg = KafkaSinkCfg {
+        id: "test-raw".into(),
+        brokers: brokers.clone(),
+        topic: topic.clone(),
+        key: None,
+        envelope: EnvelopeCfg::Debezium,
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = KafkaSink::new(&cfg, cancel)?;
+
+    // Event with raw_payload flag (simulates outbox processor output)
+    let mut raw_event = make_test_event(1);
+    raw_event.after = Some(json!({"order_id": 42, "total": 99.99}));
+    raw_event.routing = Some(EventRouting {
+        raw_payload: true,
+        headers: Some(HashMap::from([(
+            "df-aggregate-type".into(),
+            "Order".into(),
+        )])),
+        ..Default::default()
+    });
+
+    // Normal event without raw_payload
+    let normal_event = make_test_event(2);
+
+    sink.send_batch(&[raw_event, normal_event]).await?;
+
+    let consumer = create_consumer(&brokers, &topic, "raw-payload-consumer")?;
+    let msgs =
+        consume_messages_until(&consumer, Duration::from_secs(10), |m| {
+            m.len() >= 2
+        })
+        .await;
+    assert_eq!(msgs.len(), 2, "should receive both messages");
+
+    // Find raw vs normal by checking structure
+    let parsed: Vec<serde_json::Value> = msgs
+        .iter()
+        .map(|m| serde_json::from_slice(&m.payload).unwrap())
+        .collect();
+
+    // One message should be raw (just {order_id, total}), the other wrapped
+    let raw_msg = parsed
+        .iter()
+        .find(|v| v.get("order_id").is_some())
+        .expect("should have a raw payload message");
+    let envelope_msg = parsed
+        .iter()
+        .find(|v| v.get("payload").is_some())
+        .expect("should have a Debezium-wrapped message");
+
+    // Raw: just the payload, no envelope wrapping
+    assert_eq!(raw_msg["order_id"], 42);
+    assert_eq!(raw_msg["total"], 99.99);
+    assert!(raw_msg.get("op").is_none(), "raw should have no 'op' field");
+    assert!(
+        raw_msg.get("source").is_none(),
+        "raw should have no 'source' field"
+    );
+    assert!(
+        raw_msg.get("schema").is_none(),
+        "raw should have no 'schema' field"
+    );
+
+    // Normal: full Debezium envelope
+    assert!(envelope_msg["payload"].get("op").is_some());
+    assert!(envelope_msg["payload"].get("source").is_some());
+
+    // Verify headers still delivered on raw message
+    let raw_kafka_msg = msgs
+        .iter()
+        .find(|m| {
+            let v: serde_json::Value =
+                serde_json::from_slice(&m.payload).unwrap();
+            v.get("order_id").is_some()
+        })
+        .unwrap();
+    assert_eq!(
+        raw_kafka_msg
+            .headers
+            .get("df-aggregate-type")
+            .map(|s| s.as_str()),
+        Some("Order"),
+        "routing headers should still be delivered"
+    );
+
+    info!("✓ raw_payload bypasses envelope, normal events still wrapped");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
