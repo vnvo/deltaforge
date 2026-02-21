@@ -5,7 +5,8 @@
 
 use bytes::Bytes;
 use deltaforge_core::{
-    Event, Op, SourceError, SourceInfo, SourcePosition, SourceResult, Transaction
+    Event, Op, SourceError, SourceInfo, SourcePosition, SourceResult,
+    Transaction,
 };
 use metrics::counter;
 use pgwire_replication::{Lsn, client::ReplicationEvent};

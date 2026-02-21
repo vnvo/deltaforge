@@ -20,8 +20,8 @@ pub use schema_sensing::{
 
 mod outbox_capture;
 pub use outbox_capture::{
-    OUTBOX_SCHEMA_SENTINEL, PgOutboxCapture, MysqlOutboxCapture,
-    OutboxProcessorCfg, OutboxColumns,
+    MysqlOutboxCapture, OUTBOX_SCHEMA_SENTINEL, OutboxColumns,
+    OutboxProcessorCfg, PgOutboxCapture,
 };
 
 #[derive(Debug, Error)]
@@ -133,7 +133,7 @@ pub struct MysqlSrcCfg {
     pub dsn: String,
     pub tables: Vec<String>,
     #[serde(default)]
-    pub outbox: Option<MysqlOutboxCapture>,    
+    pub outbox: Option<MysqlOutboxCapture>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,8 +157,8 @@ pub enum ProcessorCfg {
     #[serde(rename = "outbox")]
     Outbox {
         #[serde(flatten)]
-        config: OutboxProcessorCfg
-    }
+        config: OutboxProcessorCfg,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
