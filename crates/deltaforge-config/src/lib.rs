@@ -157,7 +157,7 @@ pub enum ProcessorCfg {
     #[serde(rename = "outbox")]
     Outbox {
         #[serde(flatten)]
-        config: OutboxProcessorCfg,
+        config: Box<OutboxProcessorCfg>,
     },
 }
 

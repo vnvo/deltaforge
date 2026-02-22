@@ -1916,6 +1916,7 @@ async fn postgres_cdc_outbox_full_pipeline() -> Result<()> {
         default_topic: Some("events.unrouted".into()),
         additional_headers: HashMap::new(),
         raw_payload: false,
+        key: None,
     })?;
 
     let processed = proc.process(raw_events).await?;
@@ -1970,6 +1971,7 @@ async fn postgres_cdc_outbox_full_pipeline() -> Result<()> {
         default_topic: Some("events.unrouted".into()),
         additional_headers: HashMap::new(),
         raw_payload: true,
+        key: None,
     })?;
 
     let raw_processed = raw_proc.process(raw_events_clone).await?;

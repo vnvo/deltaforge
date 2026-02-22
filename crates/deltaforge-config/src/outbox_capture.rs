@@ -1,13 +1,13 @@
 //! Source-level outbox capture configuration.
 //!
 //! Each source type uses native terminology:
-//! - PostgreSQL: `prefixes` — matched against pg_logical_emit_message prefix
-//! - MySQL: `tables` — matched against binlog table name using AllowList globs
+//! - PostgreSQL: `prefixes` - matched against pg_logical_emit_message prefix
+//! - MySQL: `tables` - matched against binlog table name using AllowList globs
 //!
 //! Pattern syntax reuses the existing AllowList from `common::patterns`:
-//! - `*.outbox` — outbox table in every database
-//! - `shop.order_outbox_%` — prefix match within a database
-//! - `outbox` — unqualified, matches any qualifier
+//! - `*.outbox` - outbox table in every database
+//! - `shop.order_outbox_%` - prefix match within a database
+//! - `outbox` - unqualified, matches any qualifier
 //!
 //! The source tags matching events with `source.schema = "__outbox"`.
 
@@ -63,9 +63,9 @@ impl PgOutboxCapture {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MysqlOutboxCapture {
     /// Table patterns to capture. Uses AllowList glob syntax:
-    /// - `*.outbox` — outbox table in every database
-    /// - `shop.outbox` — exact match
-    /// - `%.order_outbox_%` — prefix match across databases
+    /// - `*.outbox` - outbox table in every database
+    /// - `shop.outbox` - exact match
+    /// - `%.order_outbox_%` - prefix match across databases
     pub tables: Vec<String>,
 }
 
@@ -85,7 +85,7 @@ impl MysqlOutboxCapture {
 // Processor Config (lives here so ProcessorCfg can reference it)
 // =============================================================================
 
-/// Outbox processor config — referenced by `ProcessorCfg::Outbox`.
+/// Outbox processor config - referenced by `ProcessorCfg::Outbox`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboxProcessorCfg {
     /// Processor identifier.
@@ -109,6 +109,13 @@ pub struct OutboxProcessorCfg {
     /// Fallback topic when template resolution fails or is not configured.
     #[serde(default)]
     pub default_topic: Option<String>,
+
+    /// Key template resolved against the raw payload using `${...}`.
+    /// Sets `routing.key` for sink partitioning.
+    /// Example: `"${aggregate_id}"` routes by aggregate.
+    /// If omitted, falls back to `columns.aggregate_id` when present.
+    #[serde(default)]
+    pub key: Option<String>,
 
     /// Forward additional payload fields as routing headers.
     /// Key = header name, value = column name in the outbox payload.
@@ -141,6 +148,9 @@ pub struct OutboxColumns {
     pub event_type: String,
     #[serde(default = "default_topic_col")]
     pub topic: String,
+    /// Column for event identity (extracted as `df-event-id` header).
+    #[serde(default = "default_event_id")]
+    pub event_id: String,
 }
 
 impl Default for OutboxColumns {
@@ -151,6 +161,7 @@ impl Default for OutboxColumns {
             aggregate_id: default_aggregate_id(),
             event_type: default_event_type(),
             topic: default_topic_col(),
+            event_id: default_event_id(),
         }
     }
 }
@@ -169,6 +180,9 @@ fn default_event_type() -> String {
 }
 fn default_topic_col() -> String {
     "topic".into()
+}
+fn default_event_id() -> String {
+    "id".into()
 }
 
 #[cfg(test)]

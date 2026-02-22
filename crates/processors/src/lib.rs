@@ -20,7 +20,7 @@ pub fn build_processors(ps: &PipelineSpec) -> Result<Arc<[ArcDynProcessor]>> {
                     as ArcDynProcessor
             }
             ProcessorCfg::Outbox { config } => {
-                Arc::new(OutboxProcessor::new(config.clone())?)
+                Arc::new(OutboxProcessor::new(config.as_ref().clone())?)
                     as ArcDynProcessor
             }
         };

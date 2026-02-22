@@ -125,6 +125,7 @@ processors:
 | `columns` | object | *(see below)* | Column name mappings for extracting outbox fields |
 | `additional_headers` | map | `{}` | Forward extra payload fields as routing headers. Key = header name, value = column name. |
 | `raw_payload` | bool | `false` | When true, deliver the extracted payload as-is to sinks, bypassing envelope wrapping (native/debezium/cloudevents). Metadata is still available via routing headers. |
+| `key` | string | - | Key template resolved against raw payload. Sets `routing.key` for sink partitioning. Default: aggregate_id value. |
 
 ### Column Mappings
 
@@ -142,6 +143,7 @@ processors:
       aggregate_id: key       # default: "aggregate_id"
       event_type: action      # default: "event_type"
       topic: destination      # default: "topic"
+      event_id: uuid          # default: "id"
 ```
 
 ### Additional Headers
@@ -158,7 +160,20 @@ processors:
       x-source-region: region
 ```
 
-Each key becomes a header name, each value is the column name in the outbox payload. Missing columns are silently skipped — no error if a row doesn't contain the field.
+Each key becomes a header name, each value is the column name in the outbox payload. Missing columns are silently skipped - no error if a row doesn't contain the field.
+
+### Typed Extraction
+
+Header values are extracted as strings regardless of the source JSON type.
+Numeric IDs, booleans, and string values are all stringified automatically:
+
+| JSON value | Header value |
+|------------|-------------|
+| `"abc-123"` | `abc-123` |
+| `42` | `42` |
+| `true` | `true` |
+| `null` / missing | *(skipped)* |
+| `{}` / `[]` | *(skipped)* |
 
 ### What the Processor Does
 
@@ -169,11 +184,12 @@ Each key becomes a header name, each value is the column name in the outbox payl
    - Column value (a `topic` field in the payload, configurable via `columns.topic`)
    - `default_topic` fallback
 4. **Rewrites** `event.after` to just the `payload` content.
-5. **Sets routing headers**: `df-aggregate-type`, `df-aggregate-id`, `df-event-type`, plus any `additional_headers` mappings.
-6. **Marks raw delivery** if `raw_payload: true` — sinks serialize `event.after` directly, skipping envelope wrapping.
-7. **Clears** the `__outbox` sentinel so the event looks like a normal CDC event to sinks.
-8. **Drops** non-INSERT outbox events (UPDATE/DELETE on the outbox table are meaningless).
-9. **Passes through** all non-outbox events unchanged.
+5. **Sets routing headers**: `df-event-id`, `df-aggregate-type`, `df-aggregate-id`, `df-event-type`, plus any `additional_headers` mappings.
+6. **Sets routing key** using the key template (or falls back to `aggregate_id`).
+7. **Marks raw delivery** if `raw_payload: true` — sinks serialize `event.after` directly, skipping envelope wrapping.
+8. **Clears** the `__outbox` sentinel so the event looks like a normal CDC event to sinks.
+9. **Drops** non-INSERT outbox events (UPDATE/DELETE on the outbox table are meaningless).
+10. **Passes through** all non-outbox events unchanged.
 
 ### Multi-Outbox Routing
 
@@ -300,8 +316,10 @@ DeltaForge equivalent:
 processors:
   - type: outbox
     topic: "${aggregatetype}.${type}"
+    key: "${aggregateid}"
     raw_payload: true
     columns:
+      event_id: id
       aggregate_type: aggregatetype
       aggregate_id: aggregateid
       event_type: type
@@ -324,4 +342,5 @@ Key differences from Debezium:
 - **MySQL BLACKHOLE engine** avoids storing outbox rows on disk. The row is written to the binlog and immediately discarded. Use it in production to avoid unbounded table growth.
 - **Outbox events coexist with normal CDC.** The processor passes through all non-outbox events untouched, so you can mix regular table capture and outbox in the same pipeline.
 - **Topic templates use `${field}` syntax**, same as [dynamic routing](routing.md). The template resolves directly against the raw outbox payload columns — use your actual column names like `${domain}.${action}`, no remapping needed.
-- **At-least-once delivery** applies to outbox events just like regular CDC events. Downstream consumers should be idempotent — use `aggregate_id` + `event_type` as a deduplication key.
+- **At-least-once delivery** applies to outbox events just like regular CDC events. Downstream consumers should be idempotent - use the `df-event-id` header for idempotency, or `aggregate_id` + `event_type` as a composite dedup key.
+- **Malformed events are logged and dropped**. Non-INSERT operations, null payloads, and non-object payloads produce a WARN-level log with the table name and reason. They do not propagate to sinks.

@@ -1,4 +1,4 @@
-//! Outbox processor — transforms outbox-captured events and routes them.
+//! Outbox processor - transforms outbox-captured events and routes them.
 //!
 //! Explicit processor in the pipeline's `processors` list. Identifies events
 //! tagged by the source with `source.schema = "__outbox"`, extracts outbox
@@ -30,7 +30,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use common::{AllowList, routing::CompiledTemplate};
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use deltaforge_core::{Event, Op, Processor};
 
@@ -48,6 +48,7 @@ pub struct OutboxProcessor {
     cfg: OutboxProcessorCfg,
     table_filter: AllowList,
     topic_template: Option<CompiledTemplate>,
+    key_template: Option<CompiledTemplate>,
 }
 
 impl OutboxProcessor {
@@ -61,6 +62,13 @@ impl OutboxProcessor {
                 anyhow::anyhow!("invalid outbox topic template: {e}")
             })?;
 
+        let key_template = cfg
+            .key
+            .as_ref()
+            .map(|k| CompiledTemplate::parse(k))
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("invalid outbox key template: {e}"))?;
+
         let table_filter = AllowList::new(&cfg.tables);
         let id = cfg.id.clone();
 
@@ -69,6 +77,7 @@ impl OutboxProcessor {
             cfg,
             table_filter,
             topic_template,
+            key_template,
         })
     }
 
@@ -83,43 +92,68 @@ impl OutboxProcessor {
         self.table_filter.matches_name(&event.source.table)
     }
 
-    fn extract_str<'a>(obj: &'a Value, field: &str) -> Option<&'a str> {
-        obj.get(field).and_then(|v| v.as_str())
+    /// Extract a scalar value as a string. Handles string, number, bool.
+    fn extract_scalar(obj: &Value, field: &str) -> Option<String> {
+        match obj.get(field)? {
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            Value::Bool(b) => Some(b.to_string()),
+            _ => None,
+        }
     }
 
     /// Transform an outbox event in place. Returns false to drop.
     fn transform(&self, event: &mut Event) -> bool {
         if !matches!(event.op, Op::Create) {
+            warn!(
+                table = %event.source.table,
+                op = ?event.op,
+                "outbox: dropping non-INSERT event"
+            );
             return false;
         }
 
         let mut after = match event.after.take() {
             Some(v) if v.is_object() => v,
-            other => {
-                event.after = other;
+            Some(v) => {
+                warn!(
+                    table = %event.source.table,
+                    value_type = %value_type_name(&v),
+                    "outbox: dropping event with non-object payload"
+                );
+                event.after = Some(v);
+                return false;
+            }
+            None => {
+                warn!(
+                    table = %event.source.table,
+                    "outbox: dropping event with null payload"
+                );
                 return false;
             }
         };
 
         let cols = &self.cfg.columns;
 
+        // All immutable borrows of `after` in this block
         let topic = self.resolve_topic(&after, cols);
-        let aggregate_type =
-            Self::extract_str(&after, &cols.aggregate_type).map(String::from);
-        let aggregate_id =
-            Self::extract_str(&after, &cols.aggregate_id).map(String::from);
-        let event_type =
-            Self::extract_str(&after, &cols.event_type).map(String::from);
+        let key = self.resolve_key(&after, cols);
+        let event_id = Self::extract_scalar(&after, &cols.event_id);
+        let aggregate_type = Self::extract_scalar(&after, &cols.aggregate_type);
+        let aggregate_id = Self::extract_scalar(&after, &cols.aggregate_id);
+        let event_type = Self::extract_scalar(&after, &cols.event_type);
         let additional: Vec<(String, String)> = self
             .cfg
             .additional_headers
             .iter()
             .filter_map(|(header_name, col_name)| {
-                Self::extract_str(&after, col_name)
-                    .map(|v| (header_name.clone(), v.to_string()))
+                Self::extract_scalar(&after, col_name)
+                    .map(|v| (header_name.clone(), v))
             })
             .collect();
+        // — all immutable borrows released —
 
+        // Mutable: move payload out instead of cloning
         let payload = after
             .as_object_mut()
             .and_then(|obj| obj.remove(cols.payload.as_str()));
@@ -128,20 +162,28 @@ impl OutboxProcessor {
         if let Some(t) = topic {
             routing.topic = Some(t);
         }
+        if let Some(k) = key {
+            routing.key = Some(k);
+        }
         if self.cfg.raw_payload {
             routing.raw_payload = true;
         }
 
         let headers = routing.headers.get_or_insert_with(|| {
-            HashMap::with_capacity(3 + additional.len())
+            HashMap::with_capacity(4 + additional.len())
         });
 
+        // Debug first (borrows), then move into headers
         debug!(
             aggregate_type = ?aggregate_type,
             aggregate_id = ?aggregate_id,
             event_type = ?event_type,
+            event_id = ?event_id,
             "outbox event transformed"
         );
+        if let Some(v) = event_id {
+            headers.insert("df-event-id".into(), v);
+        }
         if let Some(v) = aggregate_type {
             headers.insert("df-aggregate-type".into(), v);
         }
@@ -161,6 +203,22 @@ impl OutboxProcessor {
         event.source.schema = None;
 
         true
+    }
+
+    /// Key resolution: template → aggregate_id fallback.
+    fn resolve_key(
+        &self,
+        after: &Value,
+        cols: &OutboxColumns,
+    ) -> Option<String> {
+        if let Some(ref tpl) = self.key_template {
+            let resolved = tpl.resolve_lenient(after);
+            if !resolved.is_empty() {
+                return Some(resolved);
+            }
+        }
+        // Default: use aggregate_id as key when no template configured
+        Self::extract_scalar(after, &cols.aggregate_id)
     }
 
     /// Topic resolution cascade: template → column → default.
@@ -184,13 +242,25 @@ impl OutboxProcessor {
             }
         }
 
-        if let Some(t) = Self::extract_str(after, &cols.topic) {
+        if let Some(t) = Self::extract_scalar(after, &cols.topic) {
             if !t.is_empty() {
-                return Some(t.to_string());
+                return Some(t);
             }
         }
 
         self.cfg.default_topic.clone()
+    }
+}
+
+/// Returns a human-readable JSON type name for diagnostics.
+fn value_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -275,6 +345,7 @@ mod tests {
             columns: OutboxColumns::default(),
             topic: None,
             default_topic: Some("events.default".into()),
+            key: None,
             additional_headers: HashMap::new(),
             raw_payload: false,
         }
@@ -580,5 +651,175 @@ mod tests {
 
         let routing = result[0].routing.as_ref().unwrap();
         assert!(!routing.raw_payload, "raw_payload should default to false");
+    }
+
+    // =========================================================================
+    // P0: key routing, event-id, typed extraction, drop diagnostics
+    // =========================================================================
+
+    #[tokio::test]
+    async fn key_template_sets_routing_key() {
+        let cfg = OutboxProcessorCfg {
+            key: Some("${aggregate_id}".into()),
+            ..default_cfg()
+        };
+        let proc = OutboxProcessor::new(cfg).unwrap();
+
+        let ev = outbox_event("outbox", outbox_payload());
+        let out = proc.process(vec![ev]).await.unwrap();
+        assert_eq!(out[0].routing.as_ref().unwrap().key.as_deref(), Some("42"));
+    }
+
+    #[tokio::test]
+    async fn key_defaults_to_aggregate_id_when_no_template() {
+        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+
+        let ev = outbox_event("outbox", outbox_payload());
+        let out = proc.process(vec![ev]).await.unwrap();
+        assert_eq!(out[0].routing.as_ref().unwrap().key.as_deref(), Some("42"));
+    }
+
+    #[tokio::test]
+    async fn composite_key_template() {
+        let cfg = OutboxProcessorCfg {
+            key: Some("${aggregate_type}:${aggregate_id}".into()),
+            ..default_cfg()
+        };
+        let proc = OutboxProcessor::new(cfg).unwrap();
+
+        let ev = outbox_event("outbox", outbox_payload());
+        let out = proc.process(vec![ev]).await.unwrap();
+        assert_eq!(
+            out[0].routing.as_ref().unwrap().key.as_deref(),
+            Some("Order:42")
+        );
+    }
+
+    #[tokio::test]
+    async fn event_id_extracted_as_header() {
+        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+
+        let ev = outbox_event(
+            "outbox",
+            json!({
+                "id": "evt-abc-123",
+                "aggregate_type": "Order",
+                "aggregate_id": "1",
+                "event_type": "Created",
+                "payload": {}
+            }),
+        );
+        let out = proc.process(vec![ev]).await.unwrap();
+        let headers =
+            out[0].routing.as_ref().unwrap().headers.as_ref().unwrap();
+        assert_eq!(headers.get("df-event-id").unwrap(), "evt-abc-123");
+    }
+
+    #[tokio::test]
+    async fn event_id_custom_column() {
+        let cfg = OutboxProcessorCfg {
+            columns: OutboxColumns {
+                event_id: "uuid".into(),
+                ..Default::default()
+            },
+            ..default_cfg()
+        };
+        let proc = OutboxProcessor::new(cfg).unwrap();
+
+        let ev = outbox_event(
+            "outbox",
+            json!({
+                "uuid": "550e8400-e29b-41d4",
+                "aggregate_type": "Order",
+                "aggregate_id": "1",
+                "event_type": "Created",
+                "payload": {}
+            }),
+        );
+        let out = proc.process(vec![ev]).await.unwrap();
+        let headers =
+            out[0].routing.as_ref().unwrap().headers.as_ref().unwrap();
+        assert_eq!(headers.get("df-event-id").unwrap(), "550e8400-e29b-41d4");
+    }
+
+    #[tokio::test]
+    async fn numeric_ids_stringified_in_headers() {
+        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+
+        let ev = outbox_event(
+            "outbox",
+            json!({
+                "id": 12345,
+                "aggregate_type": "Order",
+                "aggregate_id": 42,
+                "event_type": "Created",
+                "payload": {}
+            }),
+        );
+        let out = proc.process(vec![ev]).await.unwrap();
+        let headers =
+            out[0].routing.as_ref().unwrap().headers.as_ref().unwrap();
+        assert_eq!(headers.get("df-event-id").unwrap(), "12345");
+        assert_eq!(headers.get("df-aggregate-id").unwrap(), "42");
+        // key also falls back to aggregate_id
+        assert_eq!(out[0].routing.as_ref().unwrap().key.as_deref(), Some("42"));
+    }
+
+    #[tokio::test]
+    async fn boolean_additional_header_stringified() {
+        let cfg = OutboxProcessorCfg {
+            additional_headers: HashMap::from([(
+                "x-priority".into(),
+                "is_priority".into(),
+            )]),
+            ..default_cfg()
+        };
+        let proc = OutboxProcessor::new(cfg).unwrap();
+
+        let ev = outbox_event(
+            "outbox",
+            json!({
+                "aggregate_type": "Order",
+                "aggregate_id": "1",
+                "event_type": "Created",
+                "is_priority": true,
+                "payload": {}
+            }),
+        );
+        let out = proc.process(vec![ev]).await.unwrap();
+        let headers =
+            out[0].routing.as_ref().unwrap().headers.as_ref().unwrap();
+        assert_eq!(headers.get("x-priority").unwrap(), "true");
+    }
+
+    #[tokio::test]
+    async fn non_insert_outbox_event_dropped() {
+        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+
+        let mut ev = outbox_event("outbox", outbox_payload());
+        ev.op = Op::Update;
+
+        let out = proc.process(vec![ev]).await.unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn null_payload_event_dropped() {
+        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+
+        let mut ev = outbox_event("outbox", outbox_payload());
+        ev.after = None;
+
+        let out = proc.process(vec![ev]).await.unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_object_payload_dropped() {
+        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+
+        let ev = outbox_event("outbox", json!("just a string"));
+        let out = proc.process(vec![ev]).await.unwrap();
+        assert!(out.is_empty());
     }
 }
