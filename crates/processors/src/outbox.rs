@@ -93,21 +93,36 @@ impl OutboxProcessor {
             return false;
         }
 
-        let after = match event.after.as_ref() {
-            Some(v) if v.is_object() => v.clone(),
-            _ => return false,
+        let mut after = match event.after.take() {
+            Some(v) if v.is_object() => v,
+            other => {
+                event.after = other;
+                return false;
+            }
         };
 
         let cols = &self.cfg.columns;
 
         let topic = self.resolve_topic(&after, cols);
-        let payload = after.get(&cols.payload).cloned();
         let aggregate_type =
             Self::extract_str(&after, &cols.aggregate_type).map(String::from);
         let aggregate_id =
             Self::extract_str(&after, &cols.aggregate_id).map(String::from);
         let event_type =
             Self::extract_str(&after, &cols.event_type).map(String::from);
+        let additional: Vec<(String, String)> = self
+            .cfg
+            .additional_headers
+            .iter()
+            .filter_map(|(header_name, col_name)| {
+                Self::extract_str(&after, col_name)
+                    .map(|v| (header_name.clone(), v.to_string()))
+            })
+            .collect();
+
+        let payload = after
+            .as_object_mut()
+            .and_then(|obj| obj.remove(cols.payload.as_str()));
 
         let mut routing = event.routing.take().unwrap_or_default();
         if let Some(t) = topic {
@@ -116,28 +131,10 @@ impl OutboxProcessor {
         if self.cfg.raw_payload {
             routing.raw_payload = true;
         }
-        let headers = routing.headers.get_or_insert_with(HashMap::new);
-        if let Some(ref v) = aggregate_type {
-            headers.insert("df-aggregate-type".into(), v.clone());
-        }
-        if let Some(ref v) = aggregate_id {
-            headers.insert("df-aggregate-id".into(), v.clone());
-        }
-        if let Some(ref v) = event_type {
-            headers.insert("df-event-type".into(), v.clone());
-        }
-        // Forward additional payload fields as headers
-        for (header_name, col_name) in &self.cfg.additional_headers {
-            if let Some(v) = Self::extract_str(&after, col_name) {
-                headers.insert(header_name.clone(), v.to_string());
-            }
-        }
-        event.routing = Some(routing);
 
-        // Rewrite payload (must happen after additional_headers extraction)
-        event.after = payload.or(Some(after));
-        event.before = None;
-        event.source.schema = None;
+        let headers = routing.headers.get_or_insert_with(|| {
+            HashMap::with_capacity(3 + additional.len())
+        });
 
         debug!(
             aggregate_type = ?aggregate_type,
@@ -145,6 +142,24 @@ impl OutboxProcessor {
             event_type = ?event_type,
             "outbox event transformed"
         );
+        if let Some(v) = aggregate_type {
+            headers.insert("df-aggregate-type".into(), v);
+        }
+        if let Some(v) = aggregate_id {
+            headers.insert("df-aggregate-id".into(), v);
+        }
+        if let Some(v) = event_type {
+            headers.insert("df-event-type".into(), v);
+        }
+        for (name, val) in additional {
+            headers.insert(name, val);
+        }
+        event.routing = Some(routing);
+
+        event.after = Some(payload.unwrap_or(after));
+        event.before = None;
+        event.source.schema = None;
+
         true
     }
 
