@@ -31,5 +31,9 @@ once_cell = "1"
 name = "js_processor_bench"
 harness = false
 
+[[bench]]
+name = "outbox_processor_bench"
+harness = false
+
 [lints]
 workspace = true
