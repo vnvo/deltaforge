@@ -44,7 +44,7 @@ Pipelines are defined declaratively in YAML, making it straightforward to onboar
     </td>
     <td align="center">
       <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/javascript/javascript-original.svg" width="40" height="40" alt="JavaScript">
-      <br><sub>JavaScript</sub>
+      <br><sub>JavaScript · Outbox</sub>
     </td>
     <td align="center">
       <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/apachekafka/apachekafka-original.svg" width="40" height="40" alt="Kafka">
@@ -62,13 +62,14 @@ Pipelines are defined declaratively in YAML, making it straightforward to onboar
 
 ## Why DeltaForge?
 
-### Core Strengths
+### Core Capabilities
 
 - ⚡ **Powered by Rust** : Predictable performance, memory safety, and minimal resource footprint.
 - 🔌 **Pluggable architecture** : Sources, processors, and sinks are modular and independently extensible.
 - 🧩 **Declarative pipelines** : Define sources, transforms, sinks, and commit policies in version-controlled YAML with environment variable expansion for secrets.
 - 📦 **Reliable checkpointing** : Resume safely after restarts with at-least-once delivery guarantees.
 - 🔀 **Dynamic routing** : Route events to per-table topics, streams, or subjects using templates or JavaScript logic.
+- 📤 **Transactional outbox** : Publish domain events atomically with database writes. Per-aggregate routing, raw payload delivery, zero polling.
 - 🛠️ **Cloud-native ready** : Single binary, Docker images, JSON logs, Prometheus metrics, and liveness/readiness probes for Kubernetes.
 
 
@@ -81,7 +82,7 @@ Pipelines are defined declaratively in YAML, making it straightforward to onboar
 
 ### Operational Features
 
-- 🔄 **Graceful failover** : Handles source failover with automatic schema revalidation — no manual intervention needed.
+- 🔄 **Graceful failover** : Handles source failover with automatic schema revalidation - no manual intervention needed.
 - 🧬 **Zero-downtime schema evolution** : Detects DDL changes and reloads schemas automatically, no pipeline restart needed.
 - 🎯 **Flexible table selection** : Wildcard patterns (`db.*`, `schema.prefix%`) for easy onboarding.
 - 📀 **Transaction boundaries** : Optionally keep source transactions intact across batches.
@@ -94,6 +95,7 @@ DeltaForge is designed for:
 
 - **Real-time data synchronization** : Keep caches, search indexes, and analytics systems in sync with your primary database.
 - **Event-driven architectures** : Stream database changes to Kafka or NATS for downstream microservices.
+- **Transactional messaging** : Use the [outbox pattern](outbox.md) to publish domain events atomically with database writes - no distributed transactions needed.
 - **Audit trails and compliance** : Capture every mutation with full before/after images for SOC2, HIPAA, or GDPR requirements.
 - **Lightweight ETL** : Transform, filter, and route data in-flight with JavaScript processors - no Spark or Flink cluster needed.
 
