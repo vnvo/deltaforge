@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Outbox pattern support** - Zero-footprint transactional outbox for MySQL and PostgreSQL
+  - PostgreSQL: pg_logical_emit_message() captured via ReplicationEvent::Message
+  - MySQL: BLACKHOLE engine tables captured from binlog
+  - Source-level outbox config with AllowList glob patterns for multi-table/prefix matching
+  - Explicit OutboxProcessor with ${...} template-based topic routing
+  - Per-channel routing via tables filter on processor (multi-outbox support)
+  - Topic resolution cascade: template -> column -> default_topic
+  - Outbox metadata forwarded as routing headers (df-aggregate-type, df-aggregate-id, df-event-type)
+
+### Changed
+
+- Bumped pgwire-replication to 0.2 - logical decoding messages arrive as typed ReplicationEvent::Message
+
 ---
 
 ## [0.1.0-beta.7] - 2025-02-16
