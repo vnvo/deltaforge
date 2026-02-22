@@ -24,6 +24,7 @@ pub const WAL_MESSAGE_SCHEMA: &str = "__wal_message";
 /// the event is tagged with `__outbox` sentinel.
 ///
 /// Returns `None` if content is not valid JSON.
+#[allow(clippy::too_many_arguments)]
 pub fn to_event(
     prefix: &str,
     content: &Bytes,

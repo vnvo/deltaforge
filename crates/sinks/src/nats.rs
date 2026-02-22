@@ -267,7 +267,7 @@ impl NatsSink {
 
     /// Serialize event using configured envelope.
     fn serialize_event(&self, event: &Event) -> SinkResult<Vec<u8>> {
-        if event.routing.as_ref().map_or(false, |r| r.raw_payload) {
+        if event.routing.as_ref().is_some_and(|r| r.raw_payload) {
             // Outbox raw mode: write event.after directly
             return serde_json::to_vec(
                 event.after.as_ref().unwrap_or(&Value::Null),

@@ -1316,10 +1316,7 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
         .find(|e| e.source.table == "orders")
         .expect("table event should pass through in raw mode");
     assert!(
-        raw_table_ev
-            .routing
-            .as_ref()
-            .map_or(true, |r| !r.raw_payload),
+        raw_table_ev.routing.as_ref().is_none_or(|r| !r.raw_payload),
         "raw_payload flag should NOT be set on table event"
     );
     info!("✓ raw_payload flag set on outbox, not on table event");
