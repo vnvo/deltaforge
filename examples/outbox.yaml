@@ -1,0 +1,69 @@
+# Transactional Outbox Pattern
+#
+# Captures outbox events from MySQL and routes them to per-aggregate Kafka
+# topics with raw payload delivery. Regular CDC events flow through the
+# same pipeline with Debezium envelope wrapping.
+#
+# What lands on Kafka:
+#   Outbox events  -> topic "Order.OrderCreated"  -> raw JSON payload
+#   CDC events     -> topic "cdc.shop.orders"     -> Debezium envelope
+#
+# Setup:
+#   1. Create tables:
+#      CREATE TABLE orders (...);
+#      CREATE TABLE outbox (...) ENGINE=BLACKHOLE;
+#
+#   2. Create Kafka topics:
+#      ./dev.sh k-create Order.OrderCreated 3
+#      ./dev.sh k-create cdc.shop.orders 3
+#
+#   3. Run:
+#      cargo run -p runner -- --config examples/outbox.yaml
+
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: orders-outbox
+  tenant: acme
+
+spec:
+  source:
+    type: mysql
+    config:
+      id: orders-mysql
+      dsn: ${MYSQL_DSN}
+      tables:
+        - shop.orders
+        - shop.outbox
+      outbox:
+        tables: ["shop.outbox"]
+
+  processors:
+    # Extract outbox fields, resolve topic, deliver raw payload.
+    # Non-outbox events (shop.orders CDC) pass through unchanged.
+    - type: outbox
+      topic: "${aggregate_type}.${event_type}"
+      default_topic: events.unrouted
+      raw_payload: true
+
+  sinks:
+    # Outbox events: routed to per-aggregate topic by the processor.
+    # CDC events: routed by the sink's topic template.
+    - type: kafka
+      config:
+        id: events-kafka
+        brokers: ${KAFKA_BROKERS}
+        topic: "cdc.${source.db}.${source.table}"
+        envelope:
+          type: debezium
+        encoding: json
+        required: true
+        send_timeout_secs: 30
+
+  batch:
+    max_events: 500
+    max_ms: 500
+    respect_source_tx: true
+
+  commit_policy:
+    mode: required
