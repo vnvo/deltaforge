@@ -3938,6 +3938,7 @@ dependencies = [
  "deltaforge-config",
  "deltaforge-core",
  "deno_core",
+ "metrics",
  "once_cell",
  "pretty_assertions",
  "serde_json",

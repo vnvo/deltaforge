@@ -5,6 +5,7 @@ edition.workspace = true
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+metrics.workspace = true
 deno_core.workspace = true
 serde_v8.workspace = true
 anyhow.workspace = true

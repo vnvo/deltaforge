@@ -22,13 +22,15 @@
 //!       topic: "payments.${event_type}"
 //! ```
 //!
-//! Without `tables`, the processor handles all `__outbox` events.
+//! Without `tables`, the processor handles all `__outbox` events,
+//! essentially relying on the source semantics for identifying the outbox messages.
 
 use std::collections::HashMap;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use common::{AllowList, routing::CompiledTemplate};
+use metrics::counter;
 use serde_json::Value;
 use tracing::{debug, warn};
 
@@ -110,6 +112,7 @@ impl OutboxProcessor {
                 op = ?event.op,
                 "outbox: dropping non-INSERT event"
             );
+            counter!("deltaforge_outbox_dropped_total", "reason" => "non_insert").increment(1);
             return false;
         }
 
@@ -121,6 +124,7 @@ impl OutboxProcessor {
                     value_type = %value_type_name(&v),
                     "outbox: dropping event with non-object payload"
                 );
+                counter!("deltaforge_outbox_dropped_total", "reason" => "non_object").increment(1);
                 event.after = Some(v);
                 return false;
             }
@@ -129,6 +133,7 @@ impl OutboxProcessor {
                     table = %event.source.table,
                     "outbox: dropping event with null payload"
                 );
+                counter!("deltaforge_outbox_dropped_total", "reason" => "null_payload").increment(1);
                 return false;
             }
         };
@@ -170,7 +175,7 @@ impl OutboxProcessor {
         }
 
         let headers = routing.headers.get_or_insert_with(|| {
-            HashMap::with_capacity(4 + additional.len())
+            HashMap::with_capacity(5 + additional.len())
         });
 
         // Debug first (borrows), then move into headers
@@ -196,12 +201,14 @@ impl OutboxProcessor {
         for (name, val) in additional {
             headers.insert(name, val);
         }
+        headers.insert("df-source-kind".into(), "outbox".into());
         event.routing = Some(routing);
 
         event.after = Some(payload.unwrap_or(after));
         event.before = None;
         event.source.schema = None;
 
+        counter!("deltaforge_outbox_transformed_total").increment(1);
         true
     }
 
@@ -821,5 +828,16 @@ mod tests {
         let ev = outbox_event("outbox", json!("just a string"));
         let out = proc.process(vec![ev]).await.unwrap();
         assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provenance_header_set_on_transformed_events() {
+        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+
+        let ev = outbox_event("outbox", outbox_payload());
+        let out = proc.process(vec![ev]).await.unwrap();
+        let headers =
+            out[0].routing.as_ref().unwrap().headers.as_ref().unwrap();
+        assert_eq!(headers.get("df-source-kind").unwrap(), "outbox");
     }
 }
