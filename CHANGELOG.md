@@ -9,18 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Outbox pattern support** - Zero-footprint transactional outbox for MySQL and PostgreSQL
-  - PostgreSQL: pg_logical_emit_message() captured via ReplicationEvent::Message
-  - MySQL: BLACKHOLE engine tables captured from binlog
+- **Outbox pattern support** - Zero-footprint transactional outbox for MySQL and PostgreSQL ([9df087d](https://github.com/vnvo/deltaforge/commit/9df087d196cd3a5c199bb58d37e643915b0a5324))
+  - PostgreSQL: pg_logical_emit_message() captured via ReplicationEvent::Message ([346272c](https://github.com/vnvo/deltaforge/commit/346272c3b8e4be01745b59a6ec413c9b19d6243f))
+  - MySQL: BLACKHOLE engine tables captured from binlog ([0ede50c](https://github.com/vnvo/deltaforge/commit/0ede50c24406916a87407cea92944f435a7b84aa))
   - Source-level outbox config with AllowList glob patterns for multi-table/prefix matching
   - Explicit OutboxProcessor with ${...} template-based topic routing
   - Per-channel routing via tables filter on processor (multi-outbox support)
-  - Topic resolution cascade: template -> column -> default_topic
-  - Outbox metadata forwarded as routing headers (df-aggregate-type, df-aggregate-id, df-event-type)
+  - Topic resolution cascade: template → column → default_topic
+  - Additional headers and raw payload delivery mode ([3bb998e](https://github.com/vnvo/deltaforge/commit/3bb998e4b24b0d4e46c44d5e5ad98e6e85aabd4f))
+  - Key routing with template support (`key: "${aggregate_id}"`), defaults to aggregate_id ([84d621d](https://github.com/vnvo/deltaforge/commit/84d621d27ddc303a0ef24bf2ffc03619335643bf))
+  - Event ID extraction (`df-event-id` header) from configurable column (default: `id`) ([84d621d](https://github.com/vnvo/deltaforge/commit/84d621d27ddc303a0ef24bf2ffc03619335643bf))
+  - Typed extraction for headers — strings, numbers, booleans stringified automatically ([84d621d](https://github.com/vnvo/deltaforge/commit/84d621d27ddc303a0ef24bf2ffc03619335643bf))
+  - Drop diagnostics: WARN logs with table name and reason for every drop path ([84d621d](https://github.com/vnvo/deltaforge/commit/84d621d27ddc303a0ef24bf2ffc03619335643bf))
+  - Provenance header (`df-source-kind: outbox`) preserved after sentinel clearing ([558a269](https://github.com/vnvo/deltaforge/commit/558a26954a30a2247d7b218ca0005f8795cf9b08))
+  - Outbox metrics: `deltaforge_outbox_transformed_total`, `deltaforge_outbox_dropped_total{reason}` ([558a269](https://github.com/vnvo/deltaforge/commit/558a26954a30a2247d7b218ca0005f8795cf9b08))
+  - Strict mode (`strict: true`) fails the batch on missing required fields instead of silent drops ([09f04b8](https://github.com/vnvo/deltaforge/commit/09f04b85aa94b602ebaabca9b16d13f5f06ecfa6))
 
 ### Changed
 
 - Bumped pgwire-replication to 0.2 - logical decoding messages arrive as typed ReplicationEvent::Message
+
+### Documentation
+
+- Added outbox pattern documentation with full config reference, column mappings table, and Debezium migration guide ([cf501c8](https://github.com/vnvo/deltaforge/commit/cf501c871fa349acde83e301479cb40427fd9e14))
+- Updated docs to cover outbox processor configuration ([5a5a75b](https://github.com/vnvo/deltaforge/commit/5a5a75b6128ae0295d97627f59c73405ff16e0f4))
+- Updated landing page with outbox processor icon and feature card ([7431118](https://github.com/vnvo/deltaforge/commit/7431118ef0502ff9962912093a33927621cb0a99))
+- Updated README and introduction with outbox in processors tech table, features list, and roadmap ([6522c33](https://github.com/vnvo/deltaforge/commit/6522c333e8a220f08eae632b9153bde4314907ae))
+- Added observability section with metrics reference and drop reason table
+
+### Testing
+
+- Added OutboxProcessor unit tests (transform, topic/key resolution, headers, strict mode, drop paths)
+- Added outbox criterion benchmark (~650K events/sec single transform, linear batch scaling) ([6d2b772](https://github.com/vnvo/deltaforge/commit/6d2b772e6671145f91016e2b09c4f370f7ed8c35))
+- Added PostgreSQL outbox e2e integration test (WAL message capture -> processor -> transformed event)
+- Added MySQL outbox e2e integration test (BLACKHOLE table -> processor -> transformed event)
+
+### Performance
+
+- No deep JSON clones in outbox processor - uses take/remove instead of clone ([dc8fa68](https://github.com/vnvo/deltaforge/commit/dc8fa683bd4a8559ad13e141df8a8b7eb9d841d5))
+- Outbox processor benchmarked at ~650K events/sec per transform, 1.48M elem/sec for mixed CDC+outbox pipelines
+- Key template resolution adds zero measurable overhead
+- Additional headers (3 extra) add ~30% overhead
 
 ---
 
