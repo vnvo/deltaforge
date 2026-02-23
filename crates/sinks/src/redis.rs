@@ -39,6 +39,7 @@ use deltaforge_core::encoding::EncodingType;
 use deltaforge_core::envelope::Envelope;
 use deltaforge_core::{Event, Sink, SinkError, SinkResult};
 use redis::aio::MultiplexedConnection;
+use serde_json::Value;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
@@ -212,6 +213,13 @@ impl RedisSink {
 
     /// Serialize event using configured envelope.
     fn serialize_event(&self, event: &Event) -> SinkResult<Vec<u8>> {
+        if event.routing.as_ref().is_some_and(|r| r.raw_payload) {
+            // Outbox raw mode: write event.after directly
+            return serde_json::to_vec(
+                event.after.as_ref().unwrap_or(&Value::Null),
+            )
+            .map_err(Into::into);
+        }
         let envelope = self.envelope.wrap(event).map_err(|e| {
             SinkError::Serialization {
                 details: e.to_string().into(),

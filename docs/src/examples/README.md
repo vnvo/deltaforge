@@ -16,6 +16,7 @@ Complete pipeline configurations demonstrating common DeltaForge use cases. Each
 | [Cache Invalidation](cache_invalidation.md) | MySQL | Redis | CDC stream for cache invalidation workers |
 | [Audit Trail](audit_trail.md) | PostgreSQL | Kafka | Compliance logging, PII redaction |
 | [Analytics Preprocessing](analytics_preprocessing.md) | MySQL | Kafka + Redis | Metrics enrichment, analytics stream |
+| [Outbox Pattern](outbox_mysql_kafka.md) | MySQL | Kafka | Transactional outbox, raw payload, per-aggregate routing |
 
 ## Quick Start
 
@@ -41,6 +42,7 @@ Complete pipeline configurations demonstrating common DeltaForge use cases. Each
 | [Production Kafka](kafka_production.md) | Authentication, exactly-once, performance tuning |
 | [Multi-Sink Fan-Out](multi_sink_fanout.md) | Multiple sinks with different formats |
 | [Cache Invalidation](cache_invalidation.md) | CDC stream for cache invalidation |
+| [Outbox Pattern](outbox_mysql_kafka.md) | Transactional outbox with raw payload delivery |
 
 ### Data Processing
 | Example | Description |

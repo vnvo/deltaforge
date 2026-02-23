@@ -47,6 +47,11 @@ pub fn build_source(
             pipeline: pipeline.metadata.name.clone(),
             tenant: pipeline.metadata.tenant.clone(),
             registry,
+            outbox_prefixes: c
+                .outbox
+                .as_ref()
+                .map(|o| o.allow_list())
+                .unwrap_or_default(),
         })),
 
         SourceCfg::Mysql(c) => Ok(Arc::new(mysql::MySqlSource {
@@ -57,6 +62,11 @@ pub fn build_source(
             tenant: pipeline.metadata.tenant.clone(),
             pipeline: pipeline.metadata.name.clone(),
             registry,
+            outbox_tables: c
+                .outbox
+                .as_ref()
+                .map(|o| o.allow_list())
+                .unwrap_or_default(),
         })),
         #[cfg(feature = "turso")]
         SourceCfg::Turso(c) => Ok(Arc::new(turso::TursoSource::new(

@@ -9,6 +9,7 @@
 
 use anyhow::Result;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
+use common::AllowList;
 use ctor::dtor;
 use deltaforge_core::{Event, Op, Source, SourceHandle};
 use mysql_async::Opts;
@@ -454,6 +455,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".to_string(),
         registry: registry.clone(),
+        outbox_tables: AllowList::default(),
     };
 
     let ckpt_store: Arc<dyn CheckpointStore> =
@@ -582,6 +584,7 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".to_string(),
         registry: registry.clone(),
+        outbox_tables: AllowList::default(),
     };
 
     let ckpt_store: Arc<dyn CheckpointStore> =
@@ -698,6 +701,7 @@ async fn mysql_cdc_checkpoint_resume() -> Result<()> {
             tenant: "acme".into(),
             pipeline: "test".to_string(),
             registry: Arc::new(InMemoryRegistry::new()),
+            outbox_tables: AllowList::default(),
         };
 
         let handle = src.run(tx, ckpt_store.clone()).await;
@@ -742,6 +746,7 @@ async fn mysql_cdc_checkpoint_resume() -> Result<()> {
             tenant: "acme".into(),
             pipeline: "test".to_string(),
             registry: Arc::new(InMemoryRegistry::new()),
+            outbox_tables: AllowList::default(),
         };
 
         let handle = src.run(tx, ckpt_store.clone()).await;
@@ -799,6 +804,7 @@ async fn mysql_cdc_reconnect_after_disconnect() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".to_string(),
         registry: Arc::new(InMemoryRegistry::new()),
+        outbox_tables: AllowList::default(),
     };
 
     let ckpt_store: Arc<dyn CheckpointStore> =
@@ -899,6 +905,7 @@ async fn mysql_cdc_table_filtering() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".to_string(),
         registry: Arc::new(InMemoryRegistry::new()),
+        outbox_tables: AllowList::default(),
     };
 
     let ckpt_store: Arc<dyn CheckpointStore> =
@@ -952,6 +959,382 @@ async fn mysql_cdc_table_filtering() -> Result<()> {
     handle.stop();
     let _ = handle.join().await;
 
+    drop_test_database(&pool, &db_name).await;
+    Ok(())
+}
+
+// =============================================================================
+// OUTBOX PATTERN TESTS
+// =============================================================================
+
+/// Test outbox capture via MySQL table matching.
+/// Verifies:
+/// - Matching table -> source.schema = "__outbox"
+/// - Non-matching table -> normal CDC event (no sentinel)
+/// - Outbox JSON payload arrives in event.after
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_cdc_outbox_capture() -> Result<()> {
+    init_test_tracing();
+    let _container = get_mysql_container().await;
+
+    let (db_name, pool) = create_test_database("outbox").await?;
+    let mut conn = pool.get_conn().await?;
+    let dsn = cdc_dsn(&db_name);
+
+    conn.query_drop(format!("USE {}", db_name)).await?;
+    conn.query_drop(
+        r#"CREATE TABLE outbox (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            aggregate_type VARCHAR(64),
+            aggregate_id VARCHAR(64),
+            event_type VARCHAR(64),
+            payload JSON
+        )"#,
+    )
+    .await?;
+    conn.query_drop(
+        "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64))",
+    )
+    .await?;
+
+    let src = MySqlSource {
+        id: "outbox".into(),
+        checkpoint_key: "mysql-outbox".to_string(),
+        dsn: dsn.clone(),
+        tables: vec![
+            format!("{}.outbox", db_name),
+            format!("{}.orders", db_name),
+        ],
+        tenant: "acme".into(),
+        pipeline: "test".to_string(),
+        registry: Arc::new(InMemoryRegistry::new()),
+        outbox_tables: AllowList::new(&[format!("{}.outbox", db_name)]),
+    };
+
+    let ckpt_store: Arc<dyn CheckpointStore> =
+        Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = mpsc::channel::<Event>(128);
+    let handle = src.run(tx, ckpt_store).await;
+    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
+    sleep(Duration::from_secs(3)).await;
+
+    // Insert outbox event
+    conn.query_drop(
+        r#"INSERT INTO outbox (aggregate_type, aggregate_id, event_type, payload)
+           VALUES ('Order', '42', 'OrderCreated', '{"total": 99.99}')"#,
+    )
+    .await?;
+
+    // Insert normal table row
+    conn.query_drop("INSERT INTO orders (id, sku) VALUES (1, 'sku-1')")
+        .await?;
+
+    let events =
+        collect_events_until(&mut rx, Duration::from_secs(15), |evts| {
+            let has_outbox = evts.iter().any(|e| e.source.table == "outbox");
+            let has_order = evts.iter().any(|e| e.source.table == "orders");
+            has_outbox && has_order
+        })
+        .await;
+
+    // --- Outbox event ---
+    let outbox_ev = events
+        .iter()
+        .find(|e| e.source.table == "outbox")
+        .expect("should have outbox event");
+    assert_eq!(
+        outbox_ev.source.schema.as_deref(),
+        Some("__outbox"),
+        "matching table should be tagged __outbox"
+    );
+    assert_eq!(outbox_ev.op, Op::Create);
+    let after = outbox_ev.after.as_ref().expect("should have payload");
+    assert_eq!(after["aggregate_type"], "Order");
+    assert_eq!(after["aggregate_id"], "42");
+    assert_eq!(after["event_type"], "OrderCreated");
+    info!("✓ outbox event captured with __outbox sentinel");
+
+    // --- Normal table event ---
+    let order_ev = events
+        .iter()
+        .find(|e| e.source.table == "orders")
+        .expect("should have orders event");
+    assert_ne!(
+        order_ev.source.schema.as_deref(),
+        Some("__outbox"),
+        "non-outbox table should not be tagged"
+    );
+    assert_eq!(order_ev.after.as_ref().unwrap()["sku"], "sku-1");
+    info!("✓ normal table CDC coexists with outbox capture");
+
+    handle.stop();
+    let _ = handle.join().await;
+    drop_test_database(&pool, &db_name).await;
+    Ok(())
+}
+
+/// Test outbox with wildcard table patterns.
+/// `*.outbox` should match outbox tables across databases.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_cdc_outbox_wildcard_tables() -> Result<()> {
+    init_test_tracing();
+    let _container = get_mysql_container().await;
+
+    let (db_name, pool) = create_test_database("outbox_wild").await?;
+    let mut conn = pool.get_conn().await?;
+    let dsn = cdc_dsn(&db_name);
+
+    conn.query_drop(format!("USE {}", db_name)).await?;
+    conn.query_drop(
+        r#"CREATE TABLE outbox (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            aggregate_type VARCHAR(64),
+            event_type VARCHAR(64),
+            payload JSON
+        )"#,
+    )
+    .await?;
+    conn.query_drop(
+        "CREATE TABLE audit_log (id INT PRIMARY KEY, msg VARCHAR(256))",
+    )
+    .await?;
+
+    let src = MySqlSource {
+        id: "outbox_wild".into(),
+        checkpoint_key: "mysql-outbox-wild".to_string(),
+        dsn: dsn.clone(),
+        tables: vec![
+            format!("{}.outbox", db_name),
+            format!("{}.audit_log", db_name),
+        ],
+        tenant: "acme".into(),
+        pipeline: "test".to_string(),
+        registry: Arc::new(InMemoryRegistry::new()),
+        outbox_tables: AllowList::new(&["*.outbox".to_string()]),
+    };
+
+    let ckpt_store: Arc<dyn CheckpointStore> =
+        Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = mpsc::channel::<Event>(128);
+    let handle = src.run(tx, ckpt_store).await;
+    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
+    sleep(Duration::from_secs(3)).await;
+
+    conn.query_drop(
+        r#"INSERT INTO outbox (aggregate_type, event_type, payload)
+           VALUES ('Order', 'Created', '{"id": 1}')"#,
+    )
+    .await?;
+    conn.query_drop("INSERT INTO audit_log (id, msg) VALUES (1, 'login')")
+        .await?;
+
+    let events =
+        collect_events_until(&mut rx, Duration::from_secs(15), |evts| {
+            let has_outbox = evts.iter().any(|e| e.source.table == "outbox");
+            let has_audit = evts.iter().any(|e| e.source.table == "audit_log");
+            has_outbox && has_audit
+        })
+        .await;
+
+    let outbox_ev = events.iter().find(|e| e.source.table == "outbox").unwrap();
+    let audit_ev = events
+        .iter()
+        .find(|e| e.source.table == "audit_log")
+        .unwrap();
+
+    assert_eq!(outbox_ev.source.schema.as_deref(), Some("__outbox"));
+    assert_ne!(audit_ev.source.schema.as_deref(), Some("__outbox"));
+    info!("✓ wildcard *.outbox matches outbox but not audit_log");
+
+    handle.stop();
+    let _ = handle.join().await;
+    drop_test_database(&pool, &db_name).await;
+    Ok(())
+}
+
+/// Test full outbox pipeline: source capture → OutboxProcessor → transformed event.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
+    use deltaforge_config::{
+        OUTBOX_SCHEMA_SENTINEL, OutboxColumns, OutboxProcessorCfg,
+    };
+    use deltaforge_core::Processor;
+    use processors::OutboxProcessor;
+    use std::collections::HashMap;
+
+    init_test_tracing();
+    let _container = get_mysql_container().await;
+
+    let (db_name, pool) = create_test_database("outbox_pipe").await?;
+    let mut conn = pool.get_conn().await?;
+    let dsn = cdc_dsn(&db_name);
+
+    conn.query_drop(format!("USE {}", db_name)).await?;
+    conn.query_drop(
+        r#"CREATE TABLE outbox (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            aggregate_type VARCHAR(64),
+            aggregate_id VARCHAR(64),
+            event_type VARCHAR(64),
+            payload JSON
+        )"#,
+    )
+    .await?;
+    conn.query_drop(
+        "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64))",
+    )
+    .await?;
+
+    let src = MySqlSource {
+        id: "outbox_pipe".into(),
+        checkpoint_key: "mysql-outbox-pipe".to_string(),
+        dsn: dsn.clone(),
+        tables: vec![
+            format!("{}.outbox", db_name),
+            format!("{}.orders", db_name),
+        ],
+        tenant: "acme".into(),
+        pipeline: "test".to_string(),
+        registry: Arc::new(InMemoryRegistry::new()),
+        outbox_tables: AllowList::new(&[format!("{}.outbox", db_name)]),
+    };
+
+    let ckpt_store: Arc<dyn CheckpointStore> =
+        Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = mpsc::channel::<Event>(128);
+    let handle = src.run(tx, ckpt_store).await;
+    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
+    sleep(Duration::from_secs(3)).await;
+
+    conn.query_drop(
+        r#"INSERT INTO outbox (aggregate_type, aggregate_id, event_type, payload)
+           VALUES ('Order', '42', 'OrderCreated', '{"order_id": 42, "total": 99.99}')"#,
+    )
+    .await?;
+    conn.query_drop("INSERT INTO orders (id, sku) VALUES (1, 'sku-1')")
+        .await?;
+
+    let raw_events =
+        collect_events_until(&mut rx, Duration::from_secs(15), |evts| {
+            let has_outbox = evts.iter().any(|e| {
+                e.source.schema.as_deref() == Some(OUTBOX_SCHEMA_SENTINEL)
+            });
+            let has_table = evts.iter().any(|e| e.source.table == "orders");
+            has_outbox && has_table
+        })
+        .await;
+    assert!(raw_events.len() >= 2, "should have outbox + table events");
+    let raw_events_clone = raw_events.clone();
+
+    // Run through processor
+    let proc = OutboxProcessor::new(OutboxProcessorCfg {
+        id: "outbox".into(),
+        tables: vec![],
+        columns: OutboxColumns::default(),
+        topic: Some("${aggregate_type}.${event_type}".into()),
+        default_topic: Some("events.unrouted".into()),
+        key: None,
+        additional_headers: HashMap::new(),
+        raw_payload: false,
+        strict: false,
+    })?;
+
+    let processed = proc.process(raw_events).await?;
+
+    // Outbox event should be transformed
+    let outbox_ev = processed
+        .iter()
+        .find(|e| {
+            e.routing.as_ref().and_then(|r| r.topic.as_deref())
+                == Some("Order.OrderCreated")
+        })
+        .expect("should have routed outbox event");
+    assert!(
+        outbox_ev.source.schema.is_none(),
+        "sentinel should be cleared"
+    );
+    let after = outbox_ev.after.as_ref().unwrap();
+    assert_eq!(after["order_id"], 42);
+    assert_eq!(after["total"], 99.99);
+    let headers = outbox_ev
+        .routing
+        .as_ref()
+        .unwrap()
+        .headers
+        .as_ref()
+        .unwrap();
+    assert_eq!(headers.get("df-aggregate-type").unwrap(), "Order");
+    assert_eq!(headers.get("df-aggregate-id").unwrap(), "42");
+    assert_eq!(headers.get("df-event-type").unwrap(), "OrderCreated");
+    assert_eq!(headers.get("df-source-kind").unwrap(), "outbox");
+    assert_eq!(
+        outbox_ev.routing.as_ref().unwrap().key.as_deref(),
+        Some("42"),
+        "routing key should default to aggregate_id"
+    );
+    info!(
+        "✓ outbox event transformed: topic, payload, headers, key, provenance"
+    );
+
+    // Normal table event should pass through unchanged
+    let table_ev = processed
+        .iter()
+        .find(|e| e.source.table == "orders")
+        .expect("table event should pass through");
+    assert!(
+        table_ev.routing.is_none(),
+        "table event should have no routing"
+    );
+    assert_eq!(table_ev.after.as_ref().unwrap()["sku"], "sku-1");
+    info!("✓ normal table event passes through processor unchanged");
+
+    // --- raw_payload mode: re-process cloned raw events ---
+    let raw_proc = OutboxProcessor::new(OutboxProcessorCfg {
+        id: "outbox-raw".into(),
+        tables: vec![],
+        columns: OutboxColumns::default(),
+        topic: Some("${aggregate_type}.${event_type}".into()),
+        default_topic: Some("events.unrouted".into()),
+        key: None,
+        additional_headers: HashMap::new(),
+        raw_payload: true,
+        strict: false,
+    })?;
+
+    let raw_processed = raw_proc.process(raw_events_clone).await?;
+
+    let raw_outbox_ev = raw_processed
+        .iter()
+        .find(|e| {
+            e.routing.as_ref().and_then(|r| r.topic.as_deref())
+                == Some("Order.OrderCreated")
+        })
+        .expect("should have routed outbox event in raw mode");
+    assert!(
+        raw_outbox_ev.routing.as_ref().unwrap().raw_payload,
+        "raw_payload flag should be set on outbox event"
+    );
+    assert_eq!(
+        raw_outbox_ev.after.as_ref().unwrap()["order_id"],
+        42,
+        "payload should still be extracted"
+    );
+
+    let raw_table_ev = raw_processed
+        .iter()
+        .find(|e| e.source.table == "orders")
+        .expect("table event should pass through in raw mode");
+    assert!(
+        raw_table_ev.routing.as_ref().is_none_or(|r| !r.raw_payload),
+        "raw_payload flag should NOT be set on table event"
+    );
+    info!("✓ raw_payload flag set on outbox, not on table event");
+
+    handle.stop();
+    let _ = handle.join().await;
     drop_test_database(&pool, &db_name).await;
     Ok(())
 }

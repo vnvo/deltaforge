@@ -12,6 +12,7 @@ use async_nats::jetstream::{self, stream::Config as StreamConfig};
 use ctor::dtor;
 use deltaforge_config::{EncodingCfg, EnvelopeCfg, NatsSinkCfg};
 use deltaforge_core::{Event, EventRouting, Sink};
+use serde_json::json;
 use sinks::nats::NatsSink;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -1720,6 +1721,7 @@ async fn nats_sink_routing_override_with_headers() -> Result<()> {
         topic: Some("df.test.route-override.priority".into()),
         key: Some("order-99".into()),
         headers: Some(HashMap::from([("trace-id".into(), "xyz-789".into())])),
+        raw_payload: false,
     });
 
     sink.send(&event).await?;
@@ -1739,6 +1741,118 @@ async fn nats_sink_routing_override_with_headers() -> Result<()> {
     );
 
     info!("✓ EventRouting overrides subject + headers delivered");
+    cleanup_test_stream(&url, &stream).await?;
+    Ok(())
+}
+
+// =============================================================================
+// Raw Payload Tests (Outbox)
+// =============================================================================
+
+/// When routing.raw_payload is true, the sink should serialize event.after
+/// directly, bypassing the configured envelope format.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn nats_sink_raw_payload_bypasses_envelope() -> Result<()> {
+    init_test_tracing();
+    let _container = get_nats_container().await;
+
+    let subject = test_subject("raw-payload");
+    let stream = test_stream("raw-payload");
+    let url = nats_url();
+    setup_test_stream(&url, &stream, &subject).await?;
+
+    // Deliberately use Debezium envelope - raw_payload should bypass it
+    let cfg = NatsSinkCfg {
+        id: "test-raw".into(),
+        url: url.clone(),
+        subject: subject.clone(),
+        key: None,
+        envelope: EnvelopeCfg::Debezium,
+        encoding: EncodingCfg::Json,
+        stream: Some(stream.clone()),
+        required: Some(true),
+        send_timeout_secs: Some(5),
+        batch_timeout_secs: Some(30),
+        connect_timeout_secs: Some(10),
+        credentials_file: None,
+        username: None,
+        password: None,
+        token: None,
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = NatsSink::new(&cfg, cancel)?;
+
+    // Event with raw_payload flag (simulates outbox processor output)
+    let mut raw_event = make_test_event(1);
+    raw_event.after = Some(json!({"order_id": 42, "total": 99.99}));
+    raw_event.routing = Some(EventRouting {
+        raw_payload: true,
+        headers: Some(HashMap::from([(
+            "df-aggregate-type".into(),
+            "Order".into(),
+        )])),
+        ..Default::default()
+    });
+
+    // Normal event without raw_payload
+    let normal_event = make_test_event(2);
+
+    sink.send(&raw_event).await?;
+    sink.send(&normal_event).await?;
+
+    let messages = read_stream_messages(&url, &stream, 2).await?;
+    assert_eq!(messages.len(), 2, "should have 2 messages");
+
+    let payloads: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|m| serde_json::from_slice(m).unwrap())
+        .collect();
+
+    // One should be raw payload, other should be Debezium envelope
+    let raw_payload = payloads
+        .iter()
+        .find(|v| v.get("order_id").is_some())
+        .expect("should have raw payload message");
+    let envelope_payload = payloads
+        .iter()
+        .find(|v| v.get("payload").is_some())
+        .expect("should have Debezium-wrapped message");
+
+    // Raw: just the payload
+    assert_eq!(raw_payload["order_id"], 42);
+    assert_eq!(raw_payload["total"], 99.99);
+    assert!(raw_payload.get("op").is_none(), "raw should have no 'op'");
+    assert!(
+        raw_payload.get("schema").is_none(),
+        "raw should have no 'schema'"
+    );
+
+    // Normal: full Debezium envelope
+    assert!(envelope_payload["payload"].get("op").is_some());
+
+    // Verify headers still delivered on raw message via NATS headers
+    let msgs_meta =
+        read_stream_messages_with_metadata(&url, &stream, 2).await?;
+    let raw_meta = msgs_meta
+        .iter()
+        .find(|m| {
+            let v: serde_json::Value =
+                serde_json::from_slice(&m.payload).unwrap();
+            v.get("order_id").is_some()
+        })
+        .expect("should find raw message metadata");
+    assert_eq!(
+        raw_meta
+            .headers
+            .get("df-aggregate-type")
+            .map(|s| s.as_str()),
+        Some("Order"),
+        "routing headers should still be delivered as NATS headers"
+    );
+
+    info!("✓ raw_payload bypasses envelope on NATS");
     cleanup_test_stream(&url, &stream).await?;
     Ok(())
 }

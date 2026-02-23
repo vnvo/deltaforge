@@ -56,6 +56,7 @@ pub struct MySqlSource {
     pub tenant: String,
     pub pipeline: String,
     pub registry: Arc<InMemoryRegistry>,
+    pub outbox_tables: AllowList,
 }
 
 const HEARTBEAT_INTERVAL_SECS: u64 = 15;
@@ -83,6 +84,7 @@ struct RunCtx {
     last_file: String,
     last_pos: u64,
     last_gtid: Option<String>,
+    outbox_tables: AllowList,
 }
 
 impl MySqlSource {
@@ -133,6 +135,7 @@ impl MySqlSource {
             last_file: String::new(),
             last_pos: 0,
             last_gtid: None,
+            outbox_tables: self.outbox_tables.clone(),
         };
 
         info!(source_id=%self.id, "connecting for binlog stream ..");

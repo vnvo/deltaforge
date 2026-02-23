@@ -18,6 +18,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::mysql::mysql_helpers::{make_checkpoint_meta, short_sql};
 
+use deltaforge_config::OUTBOX_SCHEMA_SENTINEL;
+
 #[instrument(skip_all)]
 pub(super) async fn read_next_event(
     stream: &mut BinlogStream,
@@ -196,6 +198,13 @@ async fn handle_write_rows(
                     total_order: None,
                     data_collection_order: None,
                 });
+            }
+
+            // Check for outbox
+            if !ctx.outbox_tables.is_empty()
+                && ctx.outbox_tables.matches(&ev.source.db, &ev.source.table)
+            {
+                ev.source.schema = Some(OUTBOX_SCHEMA_SENTINEL.into());
             }
 
             ev.schema_version = Some(loaded.fingerprint.to_string());
@@ -669,6 +678,7 @@ mod tests {
             last_file: "mysql-bin.000001".to_string(),
             last_pos: 1234,
             last_gtid: Some("GTID-UNIT".to_string()),
+            outbox_tables: AllowList::default(),
         }
     }
 

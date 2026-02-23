@@ -408,6 +408,7 @@ mod tests {
                     id: "mysql".to_string(),
                     dsn: "mysql://root:root@localhost/db".to_string(),
                     tables: vec![],
+                    outbox: None,
                 }),
                 processors: vec![],
                 sinks: vec![SinkCfg::Redis(RedisSinkCfg {

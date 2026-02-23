@@ -5,7 +5,8 @@
 
 use bytes::Bytes;
 use deltaforge_core::{
-    Event, Op, SourceInfo, SourcePosition, SourceResult, Transaction,
+    Event, Op, SourceError, SourceInfo, SourcePosition, SourceResult,
+    Transaction,
 };
 use metrics::counter;
 use pgwire_replication::{Lsn, client::ReplicationEvent};
@@ -16,6 +17,7 @@ use common::watchdog;
 use super::RunCtx;
 use super::postgres_errors::LoopControl;
 use super::postgres_helpers::{make_checkpoint_meta, pg_timestamp_to_unix_ms};
+use super::postgres_logical_message;
 use super::postgres_object::{RelationColumn, build_object, parse_tuple_data};
 
 /// Relation metadata from pgoutput.
@@ -107,6 +109,36 @@ pub(super) async fn dispatch_event(
         }
         ReplicationEvent::StoppedAt { reached } => {
             info!(reached = %reached, "replication stopped at target LSN");
+        }
+        ReplicationEvent::Message {
+            transactional,
+            prefix,
+            content,
+            lsn,
+        } => {
+            debug!(
+                prefix = %prefix, lsn = %lsn,
+                transactional, bytes = content.len(),
+                "logical decoding message"
+            );
+
+            if let Some(event) = postgres_logical_message::to_event(
+                &prefix,
+                &content,
+                lsn,
+                &ctx.pipeline,       // pipeline name
+                &ctx.default_schema, // database name
+                ctx.current_tx_id,
+                ctx.current_tx_commit_time,
+                &ctx.outbox_prefixes,
+            ) {
+                ctx.tx.send(event).await.map_err(|e| {
+                    LoopControl::Fail(SourceError::Other(e.into()))
+                })?;
+            }
+
+            ctx.last_lsn = lsn;
+            ctx.repl_client.lock().await.update_applied_lsn(lsn);
         }
     }
     Ok(())

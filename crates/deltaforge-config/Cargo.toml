@@ -9,13 +9,14 @@ default = []
 turso = []
 
 [dependencies]
-walkdir ={ version = "2.5"}
+walkdir = { version = "2.5" }
 thiserror.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
 shellexpand.workspace = true
 tracing.workspace = true
-deltaforge-core = { path = "../deltaforge-core"}
+deltaforge-core = { path = "../deltaforge-core" }
+common = { path = "../common" }
 
 [dev-dependencies]
 tempfile = "3"

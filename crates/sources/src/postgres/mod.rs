@@ -40,6 +40,8 @@ use postgres_event::*;
 mod postgres_table_schema;
 pub use postgres_table_schema::{PostgresColumn, PostgresTableSchema};
 
+mod postgres_logical_message;
+
 // ============================================================================
 // Checkpoint
 // ============================================================================
@@ -67,6 +69,7 @@ pub struct PostgresSource {
     pub tenant: String,
     pub pipeline: String,
     pub registry: Arc<InMemoryRegistry>,
+    pub outbox_prefixes: AllowList,
 }
 
 // ============================================================================
@@ -96,6 +99,7 @@ pub(crate) struct RunCtx {
     pub current_tx_id: Option<u32>,
     pub current_tx_commit_time: Option<i64>,
     pub repl_client: Arc<Mutex<ReplicationClient>>,
+    pub outbox_prefixes: AllowList,
 }
 
 // ============================================================================
@@ -232,6 +236,7 @@ impl PostgresSource {
             current_tx_id: None,
             current_tx_commit_time: None,
             repl_client: Arc::new(Mutex::new(client)),
+            outbox_prefixes: self.outbox_prefixes.clone(),
         };
 
         info!("entering replication loop");

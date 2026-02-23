@@ -16,8 +16,8 @@ use deltaforge_core::{
 use redis::AsyncCommands;
 use serde_json::json;
 use sinks::redis::RedisSink;
-use std::sync::Arc;
 use std::time::Instant;
+use std::{collections::HashMap, sync::Arc};
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
@@ -1454,5 +1454,100 @@ async fn redis_sink_routing_override_with_key() -> Result<()> {
     info!("✓ EventRouting overrides stream + key delivered as df-key");
     cleanup_stream(&uri, &default_stream).await?;
     cleanup_stream(&uri, &override_stream).await?;
+    Ok(())
+}
+
+// =============================================================================
+// Raw Payload Tests (Outbox)
+// =============================================================================
+
+/// When routing.raw_payload is true, the sink should serialize event.after
+/// directly, bypassing the configured envelope format.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn redis_sink_raw_payload_bypasses_envelope() -> Result<()> {
+    init_test_tracing();
+    let _container = get_redis_container().await;
+
+    let stream = test_stream("raw_payload");
+    let uri = redis_uri();
+    cleanup_stream(&uri, &stream).await?;
+
+    // Deliberately use Debezium envelope — raw_payload should bypass it
+    let cfg = RedisSinkCfg {
+        id: "test-raw".into(),
+        uri: uri.clone(),
+        stream: stream.clone(),
+        key: None,
+        envelope: EnvelopeCfg::Debezium,
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        send_timeout_secs: Some(5),
+        batch_timeout_secs: Some(30),
+        connect_timeout_secs: Some(10),
+    };
+
+    let cancel = CancellationToken::new();
+    let sink = RedisSink::new(&cfg, cancel)?;
+
+    // Event with raw_payload flag (simulates outbox processor output)
+    let mut raw_event = make_test_event(1);
+    raw_event.after = Some(json!({"order_id": 42, "total": 99.99}));
+    raw_event.routing = Some(EventRouting {
+        raw_payload: true,
+        headers: Some(HashMap::from([(
+            "df-aggregate-type".into(),
+            "Order".into(),
+        )])),
+        ..Default::default()
+    });
+
+    // Normal event without raw_payload
+    let normal_event = make_test_event(2);
+
+    sink.send(&raw_event).await?;
+    sink.send(&normal_event).await?;
+
+    let entries = read_stream_entries(&uri, &stream).await?;
+    assert_eq!(entries.len(), 2, "should have 2 entries in stream");
+
+    // Redis stream entries are (id, [(field, value), ...])
+    // The sink writes the serialized payload in the "df-event" field
+    let payloads: Vec<serde_json::Value> = entries
+        .iter()
+        .filter_map(|(_id, fields)| {
+            fields
+                .iter()
+                .find(|(k, _)| k == "df-event")
+                .map(|(_, v)| serde_json::from_str(v).unwrap())
+        })
+        .collect();
+
+    assert_eq!(payloads.len(), 2, "both entries should have df-event field");
+
+    // One should be raw payload, other should be Debezium envelope
+    let raw_payload = payloads
+        .iter()
+        .find(|v| v.get("order_id").is_some())
+        .expect("should have raw payload entry");
+    let envelope_payload = payloads
+        .iter()
+        .find(|v| v.get("payload").is_some())
+        .expect("should have Debezium-wrapped entry");
+
+    // Raw: just the payload
+    assert_eq!(raw_payload["order_id"], 42);
+    assert_eq!(raw_payload["total"], 99.99);
+    assert!(raw_payload.get("op").is_none(), "raw should have no 'op'");
+    assert!(
+        raw_payload.get("schema").is_none(),
+        "raw should have no 'schema'"
+    );
+
+    // Normal: full Debezium envelope
+    assert!(envelope_payload["payload"].get("op").is_some());
+
+    info!("✓ raw_payload bypasses envelope on Redis stream");
+    cleanup_stream(&uri, &stream).await?;
     Ok(())
 }

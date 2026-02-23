@@ -125,7 +125,7 @@ Output: `{"schema":null,"payload":{...}}`
     </td>
     <td align="center">
       <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/javascript/javascript-original.svg" width="40" height="40" alt="JavaScript">
-      <br><sub>JavaScript</sub>
+      <br><sub>JavaScript · Outbox</sub>
     </td>
     <td align="center">
       <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/apachekafka/apachekafka-original.svg" width="40" height="40" alt="Kafka">
@@ -169,6 +169,8 @@ Output: `{"schema":null,"payload":{...}}`
 - **Processors**
   - JavaScript processors using `deno_core`:
     - Run user defined functions (UDFs) in JS to transform batches of events
+  - Outbox processor:
+    - Transactional outbox pattern with routing and raw payload delivery support
 
 - **Sinks**
   - Kafka producer sink (via `rdkafka`)
@@ -423,7 +425,7 @@ spec:
 | `config.dsn` | Connection string (supports `${ENV_VAR}`) |
 | `config.tables` | Table patterns to capture |
 | **`spec.processors`** | Optional transforms - see [Processors](docs/src/configuration.md#processors) |
-| `type` | `javascript` |
+| `type` | `javascript`, `outbox` |
 | `inline` | JavaScript code for batch processing |
 | `limits` | CPU, memory, and timeout limits |
 | **`spec.sinks`** | One or more sinks - see [Sinks](docs/src/sinks/README.md) |
@@ -455,7 +457,7 @@ View actual examples: [Example Configurations](docs/src/examples/README.md)
 
 ## Roadmap
 
-- [ ] Outbox pattern support
+- [x] Outbox pattern support
 - [ ] Persistent schema registry (SQLite, then PostgreSQL)
 - [ ] Protobuf encoding
 - [ ] PostgreSQL/S3 checkpoint backends for HA

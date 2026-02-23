@@ -18,6 +18,12 @@ pub use schema_sensing::{
     SensingOutputConfig, TableFilter, TrackingConfig,
 };
 
+mod outbox_capture;
+pub use outbox_capture::{
+    MysqlOutboxCapture, OUTBOX_SCHEMA_SENTINEL, OutboxColumns,
+    OutboxProcessorCfg, PgOutboxCapture,
+};
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config file {path}: {source}")]
@@ -107,6 +113,8 @@ pub struct PostgresSrcCfg {
     /// - {"lsn": "..."} starts from a specific LSN string (e.g., "0/16B6C50")
     #[serde(default)]
     pub start_position: PostgresStartPosition,
+    #[serde(default)]
+    pub outbox: Option<PgOutboxCapture>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -124,6 +132,8 @@ pub struct MysqlSrcCfg {
     pub id: String,
     pub dsn: String,
     pub tables: Vec<String>,
+    #[serde(default)]
+    pub outbox: Option<MysqlOutboxCapture>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +153,11 @@ pub enum ProcessorCfg {
         id: String,
         inline: String,
         limits: Option<Limits>,
+    },
+    #[serde(rename = "outbox")]
+    Outbox {
+        #[serde(flatten)]
+        config: Box<OutboxProcessorCfg>,
     },
 }
 
