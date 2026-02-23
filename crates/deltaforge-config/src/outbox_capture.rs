@@ -33,8 +33,8 @@ pub struct PgOutboxCapture {
     /// `pg_logical_emit_message(true, '<prefix>', ...)`.
     ///
     /// Supports AllowList glob patterns (flat, no qualifier):
-    /// - `outbox` — exact match
-    /// - `outbox_%` — prefix match
+    /// - `outbox` - exact match
+    /// - `outbox_%` - prefix match
     /// - `*` — capture all WAL messages as outbox events
     pub prefixes: Vec<String>,
 }
@@ -129,6 +129,13 @@ pub struct OutboxProcessorCfg {
     /// Metadata is still available via routing headers.
     #[serde(default)]
     pub raw_payload: bool,
+
+    /// When true, drop events that are missing required fields instead of
+    /// falling back silently. Checked fields: topic (after full resolution
+    /// cascade), payload column, aggregate_type, aggregate_id, event_type.
+    /// This is to make sure admins get a clear signal and intervene to fix the schema
+    #[serde(default)]
+    pub strict: bool,
 }
 
 fn default_id() -> String {

@@ -126,10 +126,20 @@ processors:
 | `additional_headers` | map | `{}` | Forward extra payload fields as routing headers. Key = header name, value = column name. |
 | `raw_payload` | bool | `false` | When true, deliver the extracted payload as-is to sinks, bypassing envelope wrapping (native/debezium/cloudevents). Metadata is still available via routing headers. |
 | `key` | string | - | Key template resolved against raw payload. Sets `routing.key` for sink partitioning. Default: aggregate_id value. |
+| `strict` | bool | `false` | When true, fail the batch if required fields are missing (topic, payload, aggregate_type, aggregate_id, event_type). When false, missing fields are silently skipped. |
 
 ### Column Mappings
 
 Column mappings control **header extraction and payload rewriting** - they tell the processor which fields correspond to `aggregate_type`, `aggregate_id`, etc. for setting `df-*` headers. The **topic template** resolves directly against the raw payload, so you reference your actual column names there.
+
+| Column | Default | Header | Description |
+|--------|---------|--------|-------------|
+| `payload` | `"payload"` | - | Event body. Extracted and promoted to `event.after`. |
+| `aggregate_type` | `"aggregate_type"` | `df-aggregate-type` | Aggregate root type (e.g. `Order`). |
+| `aggregate_id` | `"aggregate_id"` | `df-aggregate-id` | Aggregate root ID. Also used as default routing key. |
+| `event_type` | `"event_type"` | `df-event-type` | Domain event type (e.g. `OrderCreated`). |
+| `topic` | `"topic"` | - | Per-row topic override (used when template is absent). |
+| `event_id` | `"id"` | `df-event-id` | Event identity for idempotency/dedup. |
 
 If your outbox payload uses non-default field names, override them:
 
@@ -189,7 +199,8 @@ Numeric IDs, booleans, and string values are all stringified automatically:
 7. **Marks raw delivery** if `raw_payload: true` — sinks serialize `event.after` directly, skipping envelope wrapping.
 8. **Clears** the `__outbox` sentinel so the event looks like a normal CDC event to sinks.
 9. **Drops** non-INSERT outbox events (UPDATE/DELETE on the outbox table are meaningless).
-10. **Passes through** all non-outbox events unchanged.
+10. **Validates** in strict mode (`strict: true`): fails the batch with an error if any required field is missing (topic, payload, aggregate_type, aggregate_id, event_type). The error names the missing fields so operators can fix the schema. In lenient mode (default), missing fields are silently skipped.
+11. **Passes through** all non-outbox events unchanged.
 
 ### Multi-Outbox Routing
 
@@ -336,11 +347,33 @@ Key differences from Debezium:
 - `additional_headers` replaces `table.fields.additional.placement`
 - No SMT chain — everything is in one processor config
 
+
+## Observability
+
+The outbox processor emits Prometheus-compatible metrics:
+
+| Metric | Labels | Description |
+|--------|--------|-------------|
+| `deltaforge_outbox_transformed_total` | - | Events successfully transformed |
+| `deltaforge_outbox_dropped_total` | `reason` | Events dropped or rejected |
+
+Drop reasons:
+
+| Reason | Meaning |
+|--------|---------|
+| `non_insert` | UPDATE/DELETE on outbox table (expected, harmless) |
+| `non_object` | `event.after` is not a JSON object |
+| `null_payload` | `event.after` is null |
+| `strict_missing_fields` | Strict mode: required field missing (batch fails) |
+
+In strict mode, `strict_missing_fields` increments the counter *and* returns an error that halts the batch - the pipeline will not silently lose events.
+
+
 ## Tips
 
-- **PostgreSQL WAL messages are lightweight.** No table, no index, no vacuum — just a single WAL entry per message. Prefer this over table-based outbox when using PostgreSQL.
+- **PostgreSQL WAL messages are lightweight.** No table, no index, no vacuum - just a single WAL entry per message. Prefer this over table-based outbox when using PostgreSQL.
 - **MySQL BLACKHOLE engine** avoids storing outbox rows on disk. The row is written to the binlog and immediately discarded. Use it in production to avoid unbounded table growth.
 - **Outbox events coexist with normal CDC.** The processor passes through all non-outbox events untouched, so you can mix regular table capture and outbox in the same pipeline.
-- **Topic templates use `${field}` syntax**, same as [dynamic routing](routing.md). The template resolves directly against the raw outbox payload columns — use your actual column names like `${domain}.${action}`, no remapping needed.
+- **Topic templates use `${field}` syntax**, same as [dynamic routing](routing.md). The template resolves directly against the raw outbox payload columns - use your actual column names like `${domain}.${action}`, no remapping needed.
 - **At-least-once delivery** applies to outbox events just like regular CDC events. Downstream consumers should be idempotent - use the `df-event-id` header for idempotency, or `aggregate_id` + `event_type` as a composite dedup key.
-- **Malformed events are logged and dropped**. Non-INSERT operations, null payloads, and non-object payloads produce a WARN-level log with the table name and reason. They do not propagate to sinks.
+- **Malformed events are logged and dropped** by default. Non-INSERT operations, null payloads, and non-object payloads produce a WARN-level log with the table name and reason. They do not propagate to sinks. Enable `strict: true` to fail the batch instead of dropping - this ensures operators are alerted to schema issues before events are lost.

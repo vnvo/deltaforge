@@ -113,6 +113,7 @@ fn default_cfg() -> OutboxProcessorCfg {
         key: None,
         additional_headers: HashMap::new(),
         raw_payload: false,
+        strict: false,
     }
 }
 

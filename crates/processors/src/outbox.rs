@@ -104,8 +104,9 @@ impl OutboxProcessor {
         }
     }
 
-    /// Transform an outbox event in place. Returns false to drop.
-    fn transform(&self, event: &mut Event) -> bool {
+    /// Transform an outbox event in place.
+    /// Returns Ok(true) to keep, Ok(false) to drop, Err to fail the batch.
+    fn transform(&self, event: &mut Event) -> Result<bool> {
         if !matches!(event.op, Op::Create) {
             warn!(
                 table = %event.source.table,
@@ -113,7 +114,7 @@ impl OutboxProcessor {
                 "outbox: dropping non-INSERT event"
             );
             counter!("deltaforge_outbox_dropped_total", "reason" => "non_insert").increment(1);
-            return false;
+            return Ok(false);
         }
 
         let mut after = match event.after.take() {
@@ -126,7 +127,7 @@ impl OutboxProcessor {
                 );
                 counter!("deltaforge_outbox_dropped_total", "reason" => "non_object").increment(1);
                 event.after = Some(v);
-                return false;
+                return Ok(false);
             }
             None => {
                 warn!(
@@ -134,7 +135,7 @@ impl OutboxProcessor {
                     "outbox: dropping event with null payload"
                 );
                 counter!("deltaforge_outbox_dropped_total", "reason" => "null_payload").increment(1);
-                return false;
+                return Ok(false);
             }
         };
 
@@ -156,7 +157,35 @@ impl OutboxProcessor {
                     .map(|v| (header_name.clone(), v))
             })
             .collect();
-        // — all immutable borrows released —
+
+        // Strict mode: fail the batch so operators notice and fix the schema
+        if self.cfg.strict {
+            let has_payload = after.get(&cols.payload).is_some();
+            let mut missing = Vec::new();
+            if topic.is_none() {
+                missing.push("topic");
+            }
+            if !has_payload {
+                missing.push("payload");
+            }
+            if aggregate_type.is_none() {
+                missing.push("aggregate_type");
+            }
+            if aggregate_id.is_none() {
+                missing.push("aggregate_id");
+            }
+            if event_type.is_none() {
+                missing.push("event_type");
+            }
+            if !missing.is_empty() {
+                counter!("deltaforge_outbox_dropped_total", "reason" => "strict_missing_fields").increment(1);
+                anyhow::bail!(
+                    "outbox strict: event from table '{}' missing required fields: {:?}",
+                    event.source.table,
+                    missing
+                );
+            }
+        }
 
         // Mutable: move payload out instead of cloning
         let payload = after
@@ -209,10 +238,10 @@ impl OutboxProcessor {
         event.source.schema = None;
 
         counter!("deltaforge_outbox_transformed_total").increment(1);
-        true
+        Ok(true)
     }
 
-    /// Key resolution: template → aggregate_id fallback.
+    /// Key resolution: template -> aggregate_id fallback.
     fn resolve_key(
         &self,
         after: &Value,
@@ -228,7 +257,7 @@ impl OutboxProcessor {
         Self::extract_scalar(after, &cols.aggregate_id)
     }
 
-    /// Topic resolution cascade: template → column → default.
+    /// Topic resolution cascade: template -> column -> default.
     ///
     /// The template resolves against the raw `event.after` payload, so users
     /// can reference their actual column names (e.g. `${domain}.${action}`)
@@ -242,7 +271,7 @@ impl OutboxProcessor {
             if tpl.is_static() {
                 return Some(tpl.resolve_lenient(after));
             }
-            // Resolve directly against the raw payload — no remapping.
+            // Resolve directly against the raw payload - no remapping.
             let resolved = tpl.resolve_lenient(after);
             if !resolved.is_empty() {
                 return Some(resolved);
@@ -281,10 +310,10 @@ impl Processor for OutboxProcessor {
         let mut out = Vec::with_capacity(events.len());
         for mut event in events {
             if self.should_process(&event) {
-                if self.transform(&mut event) {
+                if self.transform(&mut event)? {
                     out.push(event);
                 }
-                // else: dropped (non-insert outbox event)
+                // else: dropped (non-insert / malformed outbox event)
             } else {
                 out.push(event); // pass through
             }
@@ -355,6 +384,7 @@ mod tests {
             key: None,
             additional_headers: HashMap::new(),
             raw_payload: false,
+            strict: false,
         }
     }
 
@@ -839,5 +869,117 @@ mod tests {
         let headers =
             out[0].routing.as_ref().unwrap().headers.as_ref().unwrap();
         assert_eq!(headers.get("df-source-kind").unwrap(), "outbox");
+    }
+
+    // =========================================================================
+    // Strict mode
+    // =========================================================================
+
+    fn strict_cfg() -> OutboxProcessorCfg {
+        OutboxProcessorCfg {
+            strict: true,
+            topic: Some("${aggregate_type}.${event_type}".into()),
+            default_topic: None,
+            ..default_cfg()
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_passes_complete_event() {
+        let proc = OutboxProcessor::new(strict_cfg()).unwrap();
+
+        let ev = outbox_event("outbox", outbox_payload());
+        let out = proc.process(vec![ev]).await.unwrap();
+        assert_eq!(out.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn strict_fails_batch_on_missing_aggregate_type() {
+        let proc = OutboxProcessor::new(strict_cfg()).unwrap();
+
+        let ev = outbox_event(
+            "outbox",
+            json!({
+                "aggregate_id": "42",
+                "event_type": "OrderCreated",
+                "payload": {"total": 99.99}
+            }),
+        );
+        let err = proc.process(vec![ev]).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("aggregate_type"),
+            "error should name missing field: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_fails_batch_on_missing_payload_column() {
+        let proc = OutboxProcessor::new(strict_cfg()).unwrap();
+
+        let ev = outbox_event(
+            "outbox",
+            json!({
+                "aggregate_type": "Order",
+                "aggregate_id": "42",
+                "event_type": "OrderCreated"
+                // no "payload" key
+            }),
+        );
+        let err = proc.process(vec![ev]).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("payload"),
+            "error should name missing field: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_fails_batch_when_topic_unresolvable() {
+        let cfg = OutboxProcessorCfg {
+            topic: Some("${nonexistent}".into()),
+            ..strict_cfg()
+        };
+        let proc = OutboxProcessor::new(cfg).unwrap();
+
+        let ev = outbox_event("outbox", outbox_payload());
+        let err = proc.process(vec![ev]).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("topic"),
+            "error should name missing field: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_reports_all_missing_fields() {
+        let cfg = OutboxProcessorCfg {
+            topic: Some("${nonexistent}".into()),
+            ..strict_cfg()
+        };
+        let proc = OutboxProcessor::new(cfg).unwrap();
+
+        let ev = outbox_event("outbox", json!({"unrelated": true}));
+        let err = proc.process(vec![ev]).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("topic"), "{msg}");
+        assert!(msg.contains("payload"), "{msg}");
+        assert!(msg.contains("aggregate_type"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn lenient_passes_missing_fields() {
+        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+
+        let ev = outbox_event(
+            "outbox",
+            json!({
+                "aggregate_id": "42",
+                "event_type": "OrderCreated",
+                "payload": {"total": 99.99}
+            }),
+        );
+        let out = proc.process(vec![ev]).await.unwrap();
+        assert_eq!(out.len(), 1);
     }
 }

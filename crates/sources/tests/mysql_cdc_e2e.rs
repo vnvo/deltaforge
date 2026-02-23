@@ -1154,7 +1154,7 @@ async fn mysql_cdc_outbox_wildcard_tables() -> Result<()> {
     Ok(())
 }
 
-/// Test full outbox pipeline: source capture -> OutboxProcessor -> transformed event.
+/// Test full outbox pipeline: source capture → OutboxProcessor → transformed event.
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
@@ -1236,9 +1236,10 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
         columns: OutboxColumns::default(),
         topic: Some("${aggregate_type}.${event_type}".into()),
         default_topic: Some("events.unrouted".into()),
+        key: None,
         additional_headers: HashMap::new(),
         raw_payload: false,
-        key: None,
+        strict: false,
     })?;
 
     let processed = proc.process(raw_events).await?;
@@ -1268,7 +1269,15 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
     assert_eq!(headers.get("df-aggregate-type").unwrap(), "Order");
     assert_eq!(headers.get("df-aggregate-id").unwrap(), "42");
     assert_eq!(headers.get("df-event-type").unwrap(), "OrderCreated");
-    info!("✓ outbox event transformed: topic, payload, headers");
+    assert_eq!(headers.get("df-source-kind").unwrap(), "outbox");
+    assert_eq!(
+        outbox_ev.routing.as_ref().unwrap().key.as_deref(),
+        Some("42"),
+        "routing key should default to aggregate_id"
+    );
+    info!(
+        "✓ outbox event transformed: topic, payload, headers, key, provenance"
+    );
 
     // Normal table event should pass through unchanged
     let table_ev = processed
@@ -1289,9 +1298,10 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
         columns: OutboxColumns::default(),
         topic: Some("${aggregate_type}.${event_type}".into()),
         default_topic: Some("events.unrouted".into()),
+        key: None,
         additional_headers: HashMap::new(),
         raw_payload: true,
-        key: None,
+        strict: false,
     })?;
 
     let raw_processed = raw_proc.process(raw_events_clone).await?;
@@ -1318,7 +1328,10 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
         .find(|e| e.source.table == "orders")
         .expect("table event should pass through in raw mode");
     assert!(
-        raw_table_ev.routing.as_ref().is_none_or(|r| !r.raw_payload),
+        raw_table_ev
+            .routing
+            .as_ref()
+            .is_none_or(|r| !r.raw_payload),
         "raw_payload flag should NOT be set on table event"
     );
     info!("✓ raw_payload flag set on outbox, not on table event");
