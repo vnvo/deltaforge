@@ -425,7 +425,7 @@ spec:
 | `config.dsn` | Connection string (supports `${ENV_VAR}`) |
 | `config.tables` | Table patterns to capture |
 | **`spec.processors`** | Optional transforms - see [Processors](docs/src/configuration.md#processors) |
-| `type` | `javascript`, `outbox` |
+| `type` | `javascript`, `outbox`, `flatten` |
 | `inline` | JavaScript code for batch processing |
 | `limits` | CPU, memory, and timeout limits |
 | **`spec.sinks`** | One or more sinks - see [Sinks](docs/src/sinks/README.md) |

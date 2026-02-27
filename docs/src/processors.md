@@ -7,7 +7,9 @@ Processors can transform, modify or take extra action per event batch between th
 | Processor | Description |
 |-----------|-------------|
 | [`javascript`](#javascript) | Custom transformations using V8-powered JavaScript |
-| [`outbox`](#outbox) | Transactional outbox pattern — extracts payload, resolves topic, sets routing headers |
+| [`outbox`](#outbox) | Transactional outbox pattern - extracts payload, resolves topic, sets routing headers |
+| [`flatten`](#flatten) | Flatten nested JSON objects into conmbined keys |
+
 
 ## JavaScript
 
@@ -80,6 +82,153 @@ processors:
 | `topic` | `"topic"` | Optional explicit topic override in payload |
 
 See the [Outbox Pattern](outbox.md) guide for source configuration, complete examples, and multi-outbox routing.
+
+
+## Flatten
+
+Flattens nested JSON objects in event payloads into top-level keys joined by a configurable separator. Works on every object-valued field present on the event without assuming any particular envelope structure - CDC `before`/`after`, outbox business payloads, or any custom fields introduced by upstream processors are all handled uniformly.
+
+```yaml
+processors:
+  - type: flatten
+    id: flat
+    separator: "__"
+    max_depth: 3
+    on_collision: last
+    empty_object: preserve
+    lists: preserve
+    empty_list: drop
+```
+
+**Input:**
+```json
+{
+  "after": {
+    "order_id": "abc",
+    "customer": {
+      "id": 1,
+      "address": { "city": "Berlin", "zip": "10115" }
+    },
+    "tags": ["vip"],
+    "meta": {}
+  }
+}
+```
+
+**Output** (with defaults — `separator: "__"`, `empty_object: preserve`, `lists: preserve`):
+```json
+{
+  "after": {
+    "order_id": "abc",
+    "customer__id": 1,
+    "customer__address__city": "Berlin",
+    "customer__address__zip": "10115",
+    "tags": ["vip"],
+    "meta": {}
+  }
+}
+```
+
+### Configuration
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `id` | string | `"flatten"` | Processor identifier |
+| `separator` | string | `"__"` | Separator inserted between path segments |
+| `max_depth` | int | unlimited | Stop recursing at this depth; objects at the boundary are kept as opaque leaves |
+| `on_collision` | string | `last` | What to do when two paths produce the same key. `last`, `first`, or `error` |
+| `empty_object` | string | `preserve` | How to handle `{}` values. `preserve`, `drop`, or `null` |
+| `lists` | string | `preserve` | How to handle array values. `preserve` (keep as-is) or `index` (expand to `field__0`, `field__1`, …) |
+| `empty_list` | string | `preserve` | How to handle `[]` values. `preserve`, `drop`, or `null` |
+
+### max_depth in practice
+
+`max_depth` counts nesting levels from the top of the payload object. Objects at the boundary are treated as opaque leaves rather than expanded further, still subject to `empty_object` policy.
+
+```
+# max_depth: 2
+
+depth 0: customer               -> object, recurse
+depth 1: customer__address      -> object, recurse
+depth 2: customer__address__geo -> STOP, kept as leaf {"lat": 52.5, "lng": 13.4}
+```
+
+Without `max_depth`, a deeply nested or recursive payload could produce a large number of keys. Setting a limit is recommended for payloads with variable or unknown nesting depth.
+
+### Collision policy
+
+A collision occurs when two input paths produce the same flattened key - typically when a payload already contains a pre-flattened key (e.g. `"a__b": 1`) alongside a nested object (`"a": {"b": 2}`).
+
+- `last` - the last path to write a key wins (default, never fails)
+- `first` - the first path to write a key wins, subsequent writes are ignored
+- `error` - the batch fails immediately, useful in strict pipelines where collisions indicate a schema problem
+
+### Working with outbox payloads
+
+After the [`outbox`](#outbox) processor runs, `event.after` holds the extracted business payload - there is no `before`. The flatten processor handles this naturally since it operates on whatever fields are present:
+
+```yaml
+processors:
+  - type: outbox
+    topic: "${aggregate_type}.${event_type}"
+  - type: flatten
+    id: flat
+    separator: "."
+    empty_list: drop
+```
+
+
+### Envelope interaction
+
+The flatten processor runs on the raw `Event` struct **before** sink delivery. Envelope wrapping happens inside the sink, after all processors have run. This means the envelope always wraps already-flattened data, no special configuration needed.
+
+```
+Source → [flatten processor] → Sink (envelope → bytes)
+```
+
+All envelope formats work as expected:
+
+```json
+// Native
+{ "before": null, "after": { "customer__id": 1, "customer__address__city": "Berlin" }, "op": "c" }
+
+// Debezium
+{ "payload": { "before": null, "after": { "customer__id": 1, "customer__address__city": "Berlin" }, "op": "c" } }
+
+// CloudEvents
+{ "specversion": "1.0", ..., "data": { "before": null, "after": { "customer__id": 1, "customer__address__city": "Berlin" } } }
+```
+
+**Outbox + `raw_payload: true`**
+
+When the outbox processor is configured with `raw_payload: true`, the sink delivers `event.after` directly, bypassing the envelope entirely. If the flatten processor runs after outbox, the raw payload delivered to the sink is the flattened object — which is the intended behavior for analytics sinks that can't handle nested JSON.
+
+```yaml
+processors:
+  - type: outbox
+    topic: "${aggregate_type}.${event_type}"
+    raw_payload: true       # sink delivers event.after directly, no envelope
+  - type: flatten
+    id: flat
+    separator: "__"
+    empty_list: drop
+```
+
+The flatten processor runs second, so by the time the sink delivers the raw payload it is already flat.
+
+### Analytics sink example
+
+When sending to column-oriented sinks (ClickHouse, BigQuery, S3 Parquet) that don't handle nested JSON:
+
+```yaml
+processors:
+  - type: flatten
+    id: flat
+    separator: "__"
+    lists: index          # expand arrays to indexed columns
+    empty_object: drop    # remove sparse marker objects
+    empty_list: drop      # remove empty arrays
+```
 
 ## Processor Chain
 
