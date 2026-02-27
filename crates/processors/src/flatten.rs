@@ -71,7 +71,7 @@ impl FlattenProcessor {
         depth: usize,
         out: &mut Map<String, Value>,
     ) -> Result<()> {
-        let at_max = self.cfg.max_depth.map_or(false, |max| depth >= max);
+        let at_max = self.cfg.max_depth.is_some_and(|max| depth >= max);
 
         match value {
             // ----------------------------------------------------------------
