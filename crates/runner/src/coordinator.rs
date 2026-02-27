@@ -671,27 +671,41 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
             events: Arc::<[Event]>::from(events),
         };
 
-        // 4) DELIVER to sinks
-        let mut required_total = 0usize;
-        let mut required_acks = 0usize;
-        let mut total_acks = 0usize;
+        // 4) DELIVER to all sinks concurrently
+        //
+        // Each sink gets the same Arc<[Event]> — no cloning of event data.
+        // We drive all futures simultaneously and collect per-sink outcomes,
+        // then fold the results into ack counters
+        let required_total =
+            self.sinks.iter().filter(|s| is_sink_required(s)).count();
 
         debug!(
             pipeline=%self.pipeline_name,
             sink_count=self.sinks.len(),
             event_count=frozen.events.len(),
-            "sending batch to sink(s)"
+            "sending batch to sink(s) concurrently"
         );
 
-        for sink in &self.sinks {
+        // Build one future per sink, tagged with its id and required flag.
+        let sink_futs = self.sinks.iter().map(|sink| {
+            let start = Instant::now();
+            let events = Arc::clone(&frozen.events);
             let required = is_sink_required(sink);
-            if required {
-                required_total += 1;
+            let sink_id = sink.id().to_string();
+
+            async move {
+                let result = sink.send_batch(&events).await;
+                (sink_id, required, start.elapsed(), result)
             }
+        });
 
-            let sink_start = Instant::now();
+        let outcomes = futures::future::join_all(sink_futs).await;
 
-            match sink.send_batch(&frozen.events).await {
+        let mut required_acks = 0usize;
+        let mut total_acks = 0usize;
+
+        for (sink_id, required, elapsed, result) in outcomes {
+            match result {
                 Ok(()) => {
                     total_acks += 1;
                     if required {
@@ -701,35 +715,34 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                     counter!(
                         "deltaforge_sink_events_total",
                         "pipeline" => self.pipeline_name.to_string(),
-                        "sink" => sink.id().to_string()
+                        "sink" => sink_id.clone()
                     )
                     .increment(frozen.events.len() as u64);
 
                     histogram!(
                         "deltaforge_sink_latency_seconds",
                         "pipeline" => self.pipeline_name.to_string(),
-                        "sink" => sink.id().to_string()
+                        "sink" => sink_id
                     )
-                    .record(sink_start.elapsed().as_secs_f64());
+                    .record(elapsed.as_secs_f64());
                 }
                 Err(e) => {
                     counter!(
                         "deltaforge_sink_errors_total",
                         "pipeline" => self.pipeline_name.to_string(),
-                        "sink" => sink.id().to_string()
+                        "sink" => sink_id.clone()
                     )
                     .increment(1);
 
                     warn!(
                         pipeline=%self.pipeline_name,
-                        sink=%sink.id(),
+                        sink=%sink_id,
                         error=%e,
                         "sink delivery failed"
                     );
                 }
             }
         }
-
         // 5) COMMIT checkpoint if policy satisfied
         if policy_satisfied(
             &self.commit_policy,
