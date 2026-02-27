@@ -44,12 +44,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added PostgreSQL outbox e2e integration test (WAL message capture -> processor -> transformed event)
 - Added MySQL outbox e2e integration test (BLACKHOLE table -> processor -> transformed event)
 
+### Fixed
+
+- **Batch byte cap default** - Corrected typo `3 * 1014 * 1024` → `3 * 1024 * 1024` (3MB) in `BatchConfig` default ([77b20bd](https://github.com/vnvo/deltaforge/commit/77b20bd56168afbbdde414a20c6640e9f7becc87))
+
 ### Performance
 
 - No deep JSON clones in outbox processor - uses take/remove instead of clone ([dc8fa68](https://github.com/vnvo/deltaforge/commit/dc8fa683bd4a8559ad13e141df8a8b7eb9d841d5))
 - Outbox processor benchmarked at ~650K events/sec per transform, 1.48M elem/sec for mixed CDC+outbox pipelines
 - Key template resolution adds zero measurable overhead
 - Additional headers (3 extra) add ~30% overhead
+- **Concurrent sink delivery** - Sinks now receive each batch in parallel instead of sequentially ([6a6a5fb](https://github.com/vnvo/deltaforge/commit/6a6a5fbeec3375d151e471930dcc66dfa935f98a))
+  - Latency scales with `max(sink_latencies)` instead of `sum(sink_latencies)`
+  - 2 sinks at 150ms each: ~300ms/batch → ~150ms/batch; 3 sinks: ~450ms → ~150ms
+  - Zero-copy delivery preserved — all sinks share the same `Arc<[Event]>` frozen batch
+  - Commit policy (all/required/quorum) and per-sink metrics fully preserved
+- **Non-blocking SQLite checkpoint store** - All SQLite operations dispatched via `tokio::task::spawn_blocking`, preventing Tokio worker thread stalls under load ([3af0d31](https://github.com/vnvo/deltaforge/commit/3af0d31e27fc6e9a69e8ca1715b535b989338e29))
+  - WAL journal mode, `synchronous=NORMAL`, `busy_timeout=5000`, and `foreign_keys=ON` enabled for improved write throughput
+  - `Arc<Mutex<Connection>>` replaces bare `Mutex<Connection>` to allow safe movement into blocking tasks
 
 ---
 
