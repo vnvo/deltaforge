@@ -79,8 +79,8 @@ spec:
             assert_eq!(id, "js");
             assert!(inline.contains("return [event];"));
         }
-        ProcessorCfg::Outbox { config: _ } => {
-            panic!("expected js processor, got outbox")
+        _ => {
+            panic!("expected js processor, got something else")
         }
     }
 
