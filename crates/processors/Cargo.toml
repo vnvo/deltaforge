@@ -35,5 +35,9 @@ harness = false
 name = "outbox_processor_bench"
 harness = false
 
+[[bench]]
+name = "flatten_processor_bench"
+harness = false
+
 [lints]
 workspace = true
