@@ -9,13 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+
+- **Flatten processor** - Native Rust processor that flattens nested JSON objects in event payloads into top-level keys joined by a configurable separator ([0f04b49](https://github.com/vnvo/deltaforge/commit/0f04b49e29df261756546d585b50ec560d1e49be))
+  - Works on any object-valued field present on the event (before, after, or custom fields from upstream processors) - no CDC structure assumptions
+  - `separator`: key path joiner (default: `"__"`)
+  - `max_depth`: stop recursing at this depth; objects at boundary kept as opaque leaves
+  - `on_collision`: `last` (default), `first`, or `error` when two paths produce the same key
+  - `empty_object`: `preserve` (default), `drop`, or `"null"`
+  - `lists`: `preserve` (default) or `index` (expand arrays to `field__0`, `field__1`, …)
+  - `empty_list`: `preserve` (default), `drop`, or `"null"`
+  - Envelope interaction: runs before sink serialization - all envelope formats (native, debezium, cloudevents) wrap already-flattened data
+  - Compatible with outbox + `raw_payload: true` - flatten runs on the extracted payload before raw delivery
+
 - **Outbox pattern support** - Zero-footprint transactional outbox for MySQL and PostgreSQL ([9df087d](https://github.com/vnvo/deltaforge/commit/9df087d196cd3a5c199bb58d37e643915b0a5324))
   - PostgreSQL: pg_logical_emit_message() captured via ReplicationEvent::Message ([346272c](https://github.com/vnvo/deltaforge/commit/346272c3b8e4be01745b59a6ec413c9b19d6243f))
   - MySQL: BLACKHOLE engine tables captured from binlog ([0ede50c](https://github.com/vnvo/deltaforge/commit/0ede50c24406916a87407cea92944f435a7b84aa))
   - Source-level outbox config with AllowList glob patterns for multi-table/prefix matching
   - Explicit OutboxProcessor with ${...} template-based topic routing
   - Per-channel routing via tables filter on processor (multi-outbox support)
-  - Topic resolution cascade: template → column → default_topic
+  - Topic resolution cascade: template -> column -> default_topic
   - Additional headers and raw payload delivery mode ([3bb998e](https://github.com/vnvo/deltaforge/commit/3bb998e4b24b0d4e46c44d5e5ad98e6e85aabd4f))
   - Key routing with template support (`key: "${aggregate_id}"`), defaults to aggregate_id ([84d621d](https://github.com/vnvo/deltaforge/commit/84d621d27ddc303a0ef24bf2ffc03619335643bf))
   - Event ID extraction (`df-event-id` header) from configurable column (default: `id`) ([84d621d](https://github.com/vnvo/deltaforge/commit/84d621d27ddc303a0ef24bf2ffc03619335643bf))
@@ -31,6 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+
+- Updated landing page: flatten processor icon in tech strip, flatten annotation in quickstart demo, production-focused features section overhaul ([487cde3](https://github.com/vnvo/deltaforge/commit/487cde33140db736159b72caee73c00de4727206))
+- Updated processors documentation with full flatten config reference, max_depth trace example, collision policy explanation, outbox chaining example, and envelope interaction section ([579cff6](https://github.com/vnvo/deltaforge/commit/579cff6c1a5b8eab8e705dd5ff96911723fb636a))
+- Updated configuration.md with flatten processor YAML snippet and config table
 - Added outbox pattern documentation with full config reference, column mappings table, and Debezium migration guide ([cf501c8](https://github.com/vnvo/deltaforge/commit/cf501c871fa349acde83e301479cb40427fd9e14))
 - Updated docs to cover outbox processor configuration ([5a5a75b](https://github.com/vnvo/deltaforge/commit/5a5a75b6128ae0295d97627f59c73405ff16e0f4))
 - Updated landing page with outbox processor icon and feature card ([7431118](https://github.com/vnvo/deltaforge/commit/7431118ef0502ff9962912093a33927621cb0a99))
@@ -39,6 +55,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing
 
+- Added FlattenProcessor unit tests (basic flattening, max_depth, all policy combinations, collision handling, outbox-style payloads, no-payload passthrough)
+- Added config parsing tests for flatten processor covering defaults, all explicit policy variants, default id, and outbox+flatten chain ([0379a15](https://github.com/vnvo/deltaforge/commit/0379a157bf6174c3772000dbc807cfa11c47c1f1))
+- Added flatten processor criterion benchmark ([6fe4e67](https://github.com/vnvo/deltaforge/commit/6fe4e676298d2ea49d52861ef1b011045e2fb4f2))
+  - ~900K events/sec for typical nested payloads; recursion depth has negligible impact
+  - 1.14M events/sec for already-flat payloads - fast path is effective
+  - ~1.8M fields/sec on wide payloads - linear scaling, no cliff
+  - Analytics config overhead negligible (~946K vs ~928K default)
+  - Batch throughput ~757K events/sec at batch_500
 - Added OutboxProcessor unit tests (transform, topic/key resolution, headers, strict mode, drop paths)
 - Added outbox criterion benchmark (~650K events/sec single transform, linear batch scaling) ([6d2b772](https://github.com/vnvo/deltaforge/commit/6d2b772e6671145f91016e2b09c4f370f7ed8c35))
 - Added PostgreSQL outbox e2e integration test (WAL message capture -> processor -> transformed event)
@@ -50,6 +74,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
+- **Flatten processor** benchmarked at ~900K events/sec for typical nested payloads, 1.14M events/sec for already-flat inputs; recursion depth adds negligible overhead
 - No deep JSON clones in outbox processor - uses take/remove instead of clone ([dc8fa68](https://github.com/vnvo/deltaforge/commit/dc8fa683bd4a8559ad13e141df8a8b7eb9d841d5))
 - Outbox processor benchmarked at ~650K events/sec per transform, 1.48M elem/sec for mixed CDC+outbox pipelines
 - Key template resolution adds zero measurable overhead
