@@ -819,7 +819,7 @@ footer {
       <span class="key">dsn</span>: <span class="var">${MYSQL_DSN}</span>
       <span class="key">tables</span>: [<span class="str">shop.orders</span>]</span>
 
-<span class="key">processors</span>:
+  <span class="key">processors</span>:
 <span class="hl-region" data-hl="processors">    - <span class="key">type</span>: <span class="str">javascript</span>
       <span class="key">inline</span>: |
         <span class="str">function processBatch(events) {</span>
@@ -856,7 +856,7 @@ footer {
           <div class="annotation-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg></div>
           <div>
             <div class="annotation-title">Deliver</div>
-            <div class="annotation-desc">Fan-out to Kafka, Redis, and NATS simultaneously. Each sink is independent - one failure won't block the others.</div>
+            <div class="annotation-desc">Fan-out to Kafka, Redis, and NATS simultaneously. Each sink is independent — one failure won't block the others.</div>
           </div>
         </div>
         <div class="annotation" data-hl="route">
@@ -897,12 +897,12 @@ footer {
       <div class="feature-card">
         <div class="feature-icon amber"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg></div>
         <div class="feature-name">High Performance</div>
-        <div class="feature-desc">Single binary, no JVM, no GC pauses. Predictable sub-millisecond latency with minimal memory footprint - handles high-throughput workloads without surprises.</div>
+        <div class="feature-desc">Single binary, no JVM, no GC pauses. Predictable sub-millisecond latency with minimal memory footprint — handles high-throughput workloads without surprises.</div>
       </div>
       <div class="feature-card">
         <div class="feature-icon amber"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></svg></div>
         <div class="feature-name">Reliable Checkpoints</div>
-        <div class="feature-desc">At-least-once delivery guaranteed. Checkpoints are saved only after sink acknowledgement - never before. Configurable commit policies: all, required, or quorum.</div>
+        <div class="feature-desc">At-least-once delivery guaranteed. Checkpoints are saved only after sink acknowledgement — never before. Configurable commit policies: all, required, or quorum.</div>
       </div>
       <div class="feature-card">
         <div class="feature-icon amber"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></svg></div>
@@ -912,7 +912,7 @@ footer {
       <div class="feature-card">
         <div class="feature-icon blue"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M2 9V5a2 2 0 0 1 2-2h4"/><path d="M22 9V5a2 2 0 0 0-2-2h-4"/><path d="M2 15v4a2 2 0 0 0 2 2h4"/><path d="M22 15v4a2 2 0 0 1-2 2h-4"/><circle cx="12" cy="12" r="3"/></svg></div>
         <div class="feature-name">Multi-Sink Fan-Out</div>
-        <div class="feature-desc">Deliver concurrently to Kafka, Redis, and NATS in a single pipeline. Each sink is independently required or best-effort - one failure won't block the others.</div>
+        <div class="feature-desc">Deliver concurrently to Kafka, Redis, and NATS in a single pipeline. Each sink is independently required or best-effort — one failure won't block the others.</div>
       </div>
       <div class="feature-card">
         <div class="feature-icon blue"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/><path d="M11 8v6"/><path d="M8 11h6"/></svg></div>
@@ -922,7 +922,7 @@ footer {
       <div class="feature-card">
         <div class="feature-icon blue"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><line x1="4" x2="4" y1="21" y2="14"/><line x1="4" x2="4" y1="10" y2="3"/><line x1="12" x2="12" y1="21" y2="12"/><line x1="12" x2="12" y1="8" y2="3"/><line x1="20" x2="20" y1="21" y2="16"/><line x1="20" x2="20" y1="12" y2="3"/><line x1="2" x2="6" y1="14" y2="14"/><line x1="10" x2="14" y1="8" y2="8"/><line x1="18" x2="22" y1="16" y2="16"/></svg></div>
         <div class="feature-name">Live Observability</div>
-        <div class="feature-desc">Prometheus metrics, structured logging, and health probes built in. Pause, resume, patch, and inspect running pipelines via REST API - no redeployment needed.</div>
+        <div class="feature-desc">Prometheus metrics, structured logging, and health probes built in. Pause, resume, patch, and inspect running pipelines via REST API — no redeployment needed.</div>
       </div>
       <div class="feature-card">
         <div class="feature-icon green"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg></div>
@@ -932,7 +932,7 @@ footer {
       <div class="feature-card">
         <div class="feature-icon green"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></svg></div>
         <div class="feature-name">Graceful Failover</div>
-        <div class="feature-desc">Handles source failover with automatic schema revalidation. Reconnects with exponential backoff and jitter - resumes exactly where it left off.</div>
+        <div class="feature-desc">Handles source failover with automatic schema revalidation. Reconnects with exponential backoff and jitter — resumes exactly where it left off.</div>
       </div>
     </div>
   </div>
