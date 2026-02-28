@@ -105,41 +105,9 @@ Output: `{"schema":null,"payload":{...}}`
 
 ## The Tech
 
-<table>
-  <tr>
-    <td align="center" width="140"><b>Built with</b></td>
-    <td align="center" width="140"><b>Sources</b></td>
-    <td align="center" width="140"><b>Processors</b></td>
-    <td align="center" width="140"><b>Sinks</b></td>
-    <td align="center" width="140"><b>Output Formats</b></td>
-  </tr>
-  <tr>
-    <td align="center">
-      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/rust/rust-original.svg" width="40" height="40" alt="Rust">
-      <br><sub>Rust</sub>
-    </td>
-    <td align="center">
-      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/mysql/mysql-original.svg" width="40" height="40" alt="MySQL">
-      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/postgresql/postgresql-original.svg" width="40" height="40" alt="PostgreSQL">
-      <br><sub>MySQL · PostgreSQL</sub>
-    </td>
-    <td align="center">
-      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/javascript/javascript-original.svg" width="40" height="40" alt="JavaScript">
-      <br><sub>JavaScript · Outbox</sub>
-    </td>
-    <td align="center">
-      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/apachekafka/apachekafka-original.svg" width="40" height="40" alt="Kafka">
-      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/redis/redis-original.svg" width="40" height="40" alt="Redis">
-      <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/nats/nats-original.svg" width="40" height="40" alt="NATS">
-      <br><sub>Kafka · Redis · NATS</sub>
-    </td>
-    <td align="center">
-      <img src="https://img.shields.io/badge/Native-red?style=flat-square" alt="Native">
-      <img src="https://img.shields.io/badge/Debezium-green?style=flat-square" alt="Debezium">
-      <img src="https://img.shields.io/badge/CloudEvents-blue?style=flat-square" alt="CloudEvents">
-    </td>
-  </tr>
-</table>
+| Built with | Sources | Processors | Sinks | Output Formats |
+|:---:|:---:|:---:|:---:|:---:|
+| Rust | MySQL · PostgreSQL | JavaScript · Outbox · Flatten | Kafka · Redis · NATS | Native · Debezium · CloudEvents |
 
 ## Features
 
@@ -167,10 +135,12 @@ Output: `{"schema":null,"payload":{...}}`
   - Transaction boundary preservation (best effort)
 
 - **Processors**
-  - JavaScript processors using `deno_core`:
+  - JavaScript processor using `deno_core`:
     - Run user defined functions (UDFs) in JS to transform batches of events
   - Outbox processor:
     - Transactional outbox pattern with routing and raw payload delivery support
+  - Flatten processor:
+    - Native Rust processor that collapses nested JSON into top-level `parent__child` keys
 
 - **Sinks**
   - Kafka producer sink (via `rdkafka`)
@@ -458,6 +428,7 @@ View actual examples: [Example Configurations](docs/src/examples/README.md)
 ## Roadmap
 
 - [x] Outbox pattern support
+- [x] Flatten processor
 - [ ] Persistent schema registry (SQLite, then PostgreSQL)
 - [ ] Protobuf encoding
 - [ ] PostgreSQL/S3 checkpoint backends for HA
