@@ -10,6 +10,9 @@ pub use js::JsProcessor;
 mod outbox;
 pub use outbox::OutboxProcessor;
 
+mod flatten;
+pub use flatten::FlattenProcessor;
+
 pub fn build_processors(ps: &PipelineSpec) -> Result<Arc<[ArcDynProcessor]>> {
     let mut out: Vec<ArcDynProcessor> = Vec::new();
 
@@ -21,6 +24,10 @@ pub fn build_processors(ps: &PipelineSpec) -> Result<Arc<[ArcDynProcessor]>> {
             }
             ProcessorCfg::Outbox { config } => {
                 Arc::new(OutboxProcessor::new(config.as_ref().clone())?)
+                    as ArcDynProcessor
+            }
+            ProcessorCfg::Flatten { config } => {
+                Arc::new(FlattenProcessor::new(config.as_ref().clone())?)
                     as ArcDynProcessor
             }
         };

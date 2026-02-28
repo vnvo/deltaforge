@@ -164,6 +164,33 @@ processors:
 
 ---
 
+### Flatten
+
+```yaml
+processors:
+  - type: flatten
+    id: flat
+    separator: "__"
+    max_depth: 3
+    on_collision: last
+    empty_object: preserve
+    lists: preserve
+    empty_list: drop
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `id` | string | `"flatten"` | Processor identifier |
+| `separator` | string | `"__"` | Separator between path segments |
+| `max_depth` | int | unlimited | Stop recursing at this depth; objects at the boundary kept as-is |
+| `on_collision` | string | `last` | Key collision policy: `last`, `first`, or `error` |
+| `empty_object` | string | `preserve` | Empty object policy: `preserve`, `drop`, or `null` |
+| `lists` | string | `preserve` | Array policy: `preserve` or `index` |
+| `empty_list` | string | `preserve` | Empty array policy: `preserve`, `drop`, or `null` |
+
+---
+
+
 ## Sinks
 
 Sinks deliver events to downstream systems. Each sink supports configurable [envelope formats and wire encodings](envelopes.md) to match consumer expectations. See the [Sinks documentation](sinks/README.md) for detailed information on multi-sink patterns, commit policies, and failure handling.

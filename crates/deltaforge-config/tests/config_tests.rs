@@ -1,6 +1,7 @@
 use deltaforge_config::{
-    CommitPolicy, ConfigError, EncodingCfg, EnvelopeCfg, ProcessorCfg, SinkCfg,
-    SourceCfg, load_from_path,
+    CollisionPolicy, CommitPolicy, ConfigError, EmptyListPolicy,
+    EmptyObjectPolicy, EncodingCfg, EnvelopeCfg, ListPolicy, ProcessorCfg,
+    SinkCfg, SourceCfg, load_from_path,
 };
 use pretty_assertions::assert_eq;
 use serial_test::serial;
@@ -79,8 +80,8 @@ spec:
             assert_eq!(id, "js");
             assert!(inline.contains("return [event];"));
         }
-        ProcessorCfg::Outbox { config: _ } => {
-            panic!("expected js processor, got outbox")
+        _ => {
+            panic!("expected js processor, got something else")
         }
     }
 
@@ -644,4 +645,162 @@ spec:
         SinkCfg::Nats(nc) => assert!(nc.key.is_none()),
         _ => panic!("expected nats"),
     }
+}
+
+// ============================================================================
+// Flatten Processor Config Parsing
+// ============================================================================
+
+#[test]
+#[serial]
+fn flatten_processor_defaults() {
+    // All policy fields omitted - verify serde defaults kick in correctly.
+    // This is the most important test: #[serde(flatten)] + #[serde(default)]
+    // on the config struct is the most likely place for a silent deserialization bug.
+    let yaml = r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata: { name: flatten_defaults, tenant: t }
+spec:
+  source:
+    type: mysql
+    config:
+      id: m
+      dsn: mysql://root:pw@localhost/db
+      tables: [orders]
+  processors:
+    - type: flatten
+      id: flat
+  sinks: []
+"#;
+
+    let path = write_temp(yaml);
+    let spec = load_from_path(path.to_str().unwrap()).expect("parse ok");
+
+    match &spec.spec.processors[0] {
+        ProcessorCfg::Flatten { config } => {
+            assert_eq!(config.id, "flat");
+            assert_eq!(config.separator, "__");
+            assert!(config.max_depth.is_none());
+            assert_eq!(config.on_collision, CollisionPolicy::Last);
+            assert_eq!(config.empty_object, EmptyObjectPolicy::Preserve);
+            assert_eq!(config.lists, ListPolicy::Preserve);
+            assert_eq!(config.empty_list, EmptyListPolicy::Preserve);
+        }
+        other => panic!("expected flatten processor, got {other:?}"),
+    }
+}
+
+#[test]
+#[serial]
+fn flatten_processor_all_policies_explicit() {
+    // Every policy field explicitly set - verifies rename_all = "lowercase"
+    // is applied correctly on all enum variants.
+    let yaml = r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata: { name: flatten_explicit, tenant: t }
+spec:
+  source:
+    type: mysql
+    config:
+      id: m
+      dsn: mysql://root:pw@localhost/db
+      tables: [orders]
+  processors:
+    - type: flatten
+      id: flat
+      separator: "."
+      max_depth: 3
+      on_collision: error
+      empty_object: "null"
+      lists: index
+      empty_list: drop
+  sinks: []
+"#;
+
+    let path = write_temp(yaml);
+    let spec = load_from_path(path.to_str().unwrap()).expect("parse ok");
+
+    match &spec.spec.processors[0] {
+        ProcessorCfg::Flatten { config } => {
+            assert_eq!(config.separator, ".");
+            assert_eq!(config.max_depth, Some(3));
+            assert_eq!(config.on_collision, CollisionPolicy::Error);
+            assert_eq!(config.empty_object, EmptyObjectPolicy::Null);
+            assert_eq!(config.lists, ListPolicy::Index);
+            assert_eq!(config.empty_list, EmptyListPolicy::Drop);
+        }
+        other => panic!("expected flatten processor, got {other:?}"),
+    }
+}
+
+#[test]
+#[serial]
+fn flatten_default_id_when_omitted() {
+    // id field omitted - should default to "flatten"
+    let yaml = r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata: { name: flatten_id, tenant: t }
+spec:
+  source:
+    type: mysql
+    config:
+      id: m
+      dsn: mysql://root:pw@localhost/db
+      tables: [orders]
+  processors:
+    - type: flatten
+  sinks: []
+"#;
+
+    let path = write_temp(yaml);
+    let spec = load_from_path(path.to_str().unwrap()).expect("parse ok");
+
+    match &spec.spec.processors[0] {
+        ProcessorCfg::Flatten { config } => {
+            assert_eq!(config.id, "flatten");
+        }
+        other => panic!("expected flatten processor, got {other:?}"),
+    }
+}
+
+#[test]
+#[serial]
+fn flatten_chained_after_outbox() {
+    // Common real-world pattern: outbox extracts payload, flatten normalizes it.
+    // Verifies both processors parse correctly in sequence.
+    let yaml = r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata: { name: outbox_then_flatten, tenant: t }
+spec:
+  source:
+    type: mysql
+    config:
+      id: m
+      dsn: mysql://root:pw@localhost/db
+      tables: [outbox]
+  processors:
+    - type: outbox
+      topic: "${aggregate_type}.${event_type}"
+    - type: flatten
+      id: flat
+      empty_list: drop
+  sinks: []
+"#;
+
+    let path = write_temp(yaml);
+    let spec = load_from_path(path.to_str().unwrap()).expect("parse ok");
+
+    assert_eq!(spec.spec.processors.len(), 2);
+    assert!(matches!(
+        &spec.spec.processors[0],
+        ProcessorCfg::Outbox { .. }
+    ));
+    assert!(matches!(
+        &spec.spec.processors[1],
+        ProcessorCfg::Flatten { .. }
+    ));
 }

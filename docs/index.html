@@ -385,7 +385,7 @@ a:hover { opacity: 0.8; }
 
 .features-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(4, 1fr);
   gap: 16px;
 }
 
@@ -694,9 +694,7 @@ footer {
     </p>
     <div class="badges">
       <img src="https://img.shields.io/github/v/release/vnvo/deltaforge?color=e8792b&label=release" alt="Release">
-      <img src="https://img.shields.io/badge/ghcr.io-deltaforge-e8792b?logo=docker" alt="GHCR">
       <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64-e8792b" alt="Arch">
-      <img src="https://img.shields.io/badge/rustc-1.89+-e8792b" alt="MSRV">
       <img src="https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-e8792b" alt="License">
     </div>
     <div class="hero-buttons">
@@ -722,42 +720,72 @@ footer {
     <div class="tech-grid">
       <div class="tech-cell">
         <div class="tech-label">Built with</div>
-        <div class="tech-icons">
-          <img class="invert" src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/rust/rust-original.svg" alt="Rust">
+        <div class="tech-icons" style="display:flex; gap:12px; justify-content:center; align-items:center;">
+          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
+            <img class="invert" src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/rust/rust-original.svg" alt="Rust" style="width:28px;height:28px;">
+            <span style="font-size:0.7rem;color:var(--text-secondary);">Rust</span>
+          </div>
         </div>
-        <div class="tech-names">Rust</div>
       </div>
       <div class="tech-cell">
         <div class="tech-label">Sources</div>
-        <div class="tech-icons">
-          <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/mysql/mysql-original.svg" alt="MySQL">
-          <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/postgresql/postgresql-original.svg" alt="PostgreSQL">
+        <div class="tech-icons" style="display:flex; gap:12px; justify-content:center; align-items:center;">
+          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
+            <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/mysql/mysql-original.svg" alt="MySQL" style="width:28px;height:28px;">
+            <span style="font-size:0.7rem;color:var(--text-secondary);">MySQL</span>
+          </div>
+          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
+            <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/postgresql/postgresql-original.svg" alt="PostgreSQL" style="width:28px;height:28px;">
+            <span style="font-size:0.7rem;color:var(--text-secondary);">PostgreSQL</span>
+          </div>
         </div>
-        <div class="tech-names">MySQL · PostgreSQL</div>
       </div>
       <div class="tech-cell">
         <div class="tech-label">Processors</div>
-        <div class="tech-icons">
-          <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/javascript/javascript-original.svg" alt="JavaScript">
-          &nbsp;<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="#e8e8ec" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="8" height="16" rx="1"/><path d="M2 8h8"/><path d="M2 12h8"/><path d="M2 16h8"/><path d="M13 12h6"/><path d="m17 9 3 3-3 3"/></svg>
+        <div class="tech-icons" style="display:flex; gap:12px; justify-content:center; align-items:center;">
+          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
+            <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/javascript/javascript-original.svg" alt="JavaScript" style="width:28px;height:28px;">
+            <span style="font-size:0.7rem;color:var(--text-secondary);">JavaScript</span>
+          </div>
+          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="#e8e8ec" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="11" height="18" rx="1"/><path d="M2 7h11"/><path d="M2 11h11"/><path d="M2 15h11"/><path d="M17 12h-3"/><path d="m19 9 3 3-3 3"/></svg>
+            <span style="font-size:0.7rem;color:var(--text-secondary);">Outbox</span>
+          </div>
+          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="#e8e8ec" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M2 5h7"/><path d="M5 10h7"/><path d="M8 15h7"/><path d="m18 8 3 3-3 3"/><path d="M21 5h1"/><path d="M21 11h1"/><path d="M21 17h1"/></svg>
+            <span style="font-size:0.7rem;color:var(--text-secondary);">Flatten</span>
+          </div>
         </div>
-        <div class="tech-names">JavaScript · Outbox</div>
       </div>
       <div class="tech-cell">
         <div class="tech-label">Sinks</div>
-        <div class="tech-icons">
-          <img class="invert" src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/apachekafka/apachekafka-original.svg" alt="Kafka">
-          <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/redis/redis-original.svg" alt="Redis">
-          <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/nats/nats-original.svg" alt="NATS">
+        <div class="tech-icons" style="display:flex; gap:12px; justify-content:center; align-items:center;">
+          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
+            <img class="invert" src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/apachekafka/apachekafka-original.svg" alt="Kafka" style="width:28px;height:28px;">
+            <span style="font-size:0.7rem;color:var(--text-secondary);">Kafka</span>
+          </div>
+          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
+            <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/redis/redis-original.svg" alt="Redis" style="width:28px;height:28px;">
+            <span style="font-size:0.7rem;color:var(--text-secondary);">Redis</span>
+          </div>
+          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
+            <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/nats/nats-original.svg" alt="NATS" style="width:28px;height:28px;">
+            <span style="font-size:0.7rem;color:var(--text-secondary);">NATS</span>
+          </div>
         </div>
-        <div class="tech-names">Kafka · Redis · NATS</div>
       </div>
       <div class="tech-cell">
         <div class="tech-label">Formats</div>
-        <div class="tech-icons" style="gap: 5px;">
-          <span class="format-badge native">Native</span>
-          <span class="format-badge debezium">Debezium</span>
-          <span class="format-badge cloudevents">CloudEvents</span>
+        <div class="tech-icons" style="display:flex; gap:8px; justify-content:center; align-items:center; flex-wrap:wrap;">
+          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
+            <span class="format-badge native" style="display:block;">Native</span>
+          </div>
+          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
+            <span class="format-badge debezium" style="display:block;">Debezium</span>
+          </div>
+          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
+            <span class="format-badge cloudevents" style="display:block;">CloudEvents</span>
+          </div>
         </div>
       </div>
     </div>
@@ -791,19 +819,22 @@ footer {
       <span class="key">dsn</span>: <span class="var">${MYSQL_DSN}</span>
       <span class="key">tables</span>: [<span class="str">shop.orders</span>]</span>
 
-<span class="hl-region" data-hl="transform">  <span class="key">processors</span>:
-    - <span class="key">type</span>: <span class="str">javascript</span>
+<span class="key">processors</span>:
+<span class="hl-region" data-hl="processors">    - <span class="key">type</span>: <span class="str">javascript</span>
       <span class="key">inline</span>: |
         <span class="str">function processBatch(events) {</span>
         <span class="str">  return events.filter(e =&gt; e.after?.status !== <span class="comment">'draft'</span>);</span>
         <span class="str">}</span></span>
+<span class="hl-region" data-hl="processors">    - <span class="key">type</span>: <span class="str">flatten</span>
+      <span class="key">separator</span>: <span class="str">"__"</span>
+      <span class="key">empty_list</span>: <span class="str">drop</span></span>
 
 <span class="hl-region" data-hl="deliver">  <span class="key">sinks</span>:
     - <span class="key">type</span>: <span class="str">kafka</span>
       <span class="key">config</span>:
         <span class="key">brokers</span>: <span class="var">${KAFKA_BROKERS}</span>
 </span><span class="hl-region" data-hl="route">        <span class="key">topic</span>: <span class="str">cdc.</span><span class="var">${source.table}</span>
-</span><span class="hl-region" data-hl="deliver">        <span class="key">envelope</span>:
+</span><span class="hl-region" data-hl="envelope">        <span class="key">envelope</span>:
           <span class="key">type</span>: <span class="str">debezium</span></span></div>
       </div>
       <div class="demo-annotations">
@@ -814,11 +845,18 @@ footer {
             <div class="annotation-desc">Connect to MySQL binlog or PostgreSQL logical replication. Wildcard table patterns supported.</div>
           </div>
         </div>
-        <div class="annotation" data-hl="transform">
+        <div class="annotation" data-hl="processors">
           <div class="annotation-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m7 8-4 4 4 4"/><path d="m17 8 4 4-4 4"/><path d="m14 4-4 16"/></svg></div>
           <div>
-            <div class="annotation-title">Transform</div>
-            <div class="annotation-desc">JavaScript processors for filtering, enrichment, and PII redaction. Here, draft orders are dropped before reaching the sink.</div>
+            <div class="annotation-title">Processors</div>
+            <div class="annotation-desc">Chain native and scripted processors in order. Here: JavaScript drops draft orders, then Flatten normalizes nested JSON to <code style="color:var(--accent);font-family:var(--font-mono);font-size:0.78rem;">parent__child</code> keys before delivery.</div>
+          </div>
+        </div>
+        <div class="annotation" data-hl="deliver">
+          <div class="annotation-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg></div>
+          <div>
+            <div class="annotation-title">Deliver</div>
+            <div class="annotation-desc">Fan-out to Kafka, Redis, and NATS simultaneously. Each sink is independent - one failure won't block the others.</div>
           </div>
         </div>
         <div class="annotation" data-hl="route">
@@ -828,11 +866,11 @@ footer {
             <div class="annotation-desc">Template strings resolve per-event: <code style="color:var(--accent);font-family:var(--font-mono);font-size:0.78rem;">cdc.${source.table}</code> routes each table to its own topic.</div>
           </div>
         </div>
-        <div class="annotation" data-hl="deliver">
-          <div class="annotation-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg></div>
+        <div class="annotation" data-hl="envelope">
+          <div class="annotation-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg></div>
           <div>
-            <div class="annotation-title">Deliver</div>
-            <div class="annotation-desc">Fan-out to Kafka, Redis, and NATS simultaneously. Debezium, CloudEvents, or Native wire formats.</div>
+            <div class="annotation-title">Envelope</div>
+            <div class="annotation-desc">Choose the wire format consumers expect: Native, Debezium-compatible, or CloudEvents 1.0. One config field, no consumer code changes.</div>
           </div>
         </div>
         <div class="annotation">
@@ -858,48 +896,43 @@ footer {
     <div class="features-grid">
       <div class="feature-card">
         <div class="feature-icon amber"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg></div>
-        <div class="feature-name">Powered by Rust</div>
-        <div class="feature-desc">Predictable latency, memory safety, and minimal resource footprint.</div>
-      </div>
-      <div class="feature-card">
-        <div class="feature-icon amber"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></svg></div>
-        <div class="feature-name">Dynamic Routing</div>
-        <div class="feature-desc">Route events to per-table topics, streams, or subjects using template strings or JavaScript logic.</div>
-      </div>
-      <div class="feature-card">
-        <div class="feature-icon blue"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/><path d="M11 8v6"/><path d="M8 11h6"/></svg></div>
-        <div class="feature-name">Schema Discovery</div>
-        <div class="feature-desc">Automatically infer and track schemas from event payloads with deep inspection of nested JSON structures.</div>
-      </div>
-      <div class="feature-card">
-        <div class="feature-icon purple"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg></div>
-        <div class="feature-name">Transactional Outbox</div>
-        <div class="feature-desc">Publish domain events atomically with database writes. Raw payload delivery, per-aggregate routing, zero polling.</div>
-      </div>
-      <div class="feature-card">
-        <div class="feature-icon blue"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><line x1="4" x2="4" y1="21" y2="14"/><line x1="4" x2="4" y1="10" y2="3"/><line x1="12" x2="12" y1="21" y2="12"/><line x1="12" x2="12" y1="8" y2="3"/><line x1="20" x2="20" y1="21" y2="16"/><line x1="20" x2="20" y1="12" y2="3"/><line x1="2" x2="6" y1="14" y2="14"/><line x1="10" x2="14" y1="8" y2="8"/><line x1="18" x2="22" y1="16" y2="16"/></svg></div>
-        <div class="feature-name">Live Management</div>
-        <div class="feature-desc">Pause, resume, patch, and inspect running pipelines via REST API. Prometheus metrics and health probes built in.</div>
-      </div>
-      <div class="feature-card">
-        <div class="feature-icon green"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/><path d="M12 17v5"/></svg></div>
-        <div class="feature-name">Debezium Compatible</div>
-        <div class="feature-desc">Drop-in wire format compatibility. Migrating from Debezium? Switch the envelope type and you're done.</div>
-      </div>
-      <div class="feature-card">
-        <div class="feature-icon green"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg></div>
-        <div class="feature-name">Zero-Downtime DDL</div>
-        <div class="feature-desc">Detects schema changes and reloads automatically. No pipeline restart, no manual intervention.</div>
-      </div>
-      <div class="feature-card">
-        <div class="feature-icon green"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></svg></div>
-        <div class="feature-name">Graceful Failover</div>
-        <div class="feature-desc">Handles source failover with automatic schema revalidation. Reconnects with exponential backoff and jitter.</div>
+        <div class="feature-name">High Performance</div>
+        <div class="feature-desc">Single binary, no JVM, no GC pauses. Predictable sub-millisecond latency with minimal memory footprint - handles high-throughput workloads without surprises.</div>
       </div>
       <div class="feature-card">
         <div class="feature-icon amber"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></svg></div>
         <div class="feature-name">Reliable Checkpoints</div>
-        <div class="feature-desc">At-least-once delivery with pluggable backends. Configurable commit policies: all, required, or quorum.</div>
+        <div class="feature-desc">At-least-once delivery guaranteed. Checkpoints are saved only after sink acknowledgement - never before. Configurable commit policies: all, required, or quorum.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon amber"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></svg></div>
+        <div class="feature-name">Dynamic Routing</div>
+        <div class="feature-desc">Route events to per-table topics, streams, or subjects using template strings or JavaScript logic. No pipeline restart required when routing rules change.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon blue"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M2 9V5a2 2 0 0 1 2-2h4"/><path d="M22 9V5a2 2 0 0 0-2-2h-4"/><path d="M2 15v4a2 2 0 0 0 2 2h4"/><path d="M22 15v4a2 2 0 0 1-2 2h-4"/><circle cx="12" cy="12" r="3"/></svg></div>
+        <div class="feature-name">Multi-Sink Fan-Out</div>
+        <div class="feature-desc">Deliver concurrently to Kafka, Redis, and NATS in a single pipeline. Each sink is independently required or best-effort - one failure won't block the others.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon blue"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/><path d="M11 8v6"/><path d="M8 11h6"/></svg></div>
+        <div class="feature-name">Schema Discovery</div>
+        <div class="feature-desc">Automatically infer and track schemas from live event payloads. Detects structural drift in nested JSON and alerts before it breaks downstream consumers.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon blue"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><line x1="4" x2="4" y1="21" y2="14"/><line x1="4" x2="4" y1="10" y2="3"/><line x1="12" x2="12" y1="21" y2="12"/><line x1="12" x2="12" y1="8" y2="3"/><line x1="20" x2="20" y1="21" y2="16"/><line x1="20" x2="20" y1="12" y2="3"/><line x1="2" x2="6" y1="14" y2="14"/><line x1="10" x2="14" y1="8" y2="8"/><line x1="18" x2="22" y1="16" y2="16"/></svg></div>
+        <div class="feature-name">Live Observability</div>
+        <div class="feature-desc">Prometheus metrics, structured logging, and health probes built in. Pause, resume, patch, and inspect running pipelines via REST API - no redeployment needed.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon green"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg></div>
+        <div class="feature-name">Zero-Downtime DDL</div>
+        <div class="feature-desc">Detects schema changes and reloads automatically. No pipeline restart, no manual intervention, no dropped events during table alterations.</div>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon green"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></svg></div>
+        <div class="feature-name">Graceful Failover</div>
+        <div class="feature-desc">Handles source failover with automatic schema revalidation. Reconnects with exponential backoff and jitter - resumes exactly where it left off.</div>
       </div>
     </div>
   </div>

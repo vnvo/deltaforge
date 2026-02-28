@@ -12,6 +12,9 @@ pub use turso_cfg::{NativeCdcLevel, TursoSrcCfg};
 mod sinks_cfg;
 pub use sinks_cfg::*;
 
+mod flatten_cfg;
+pub use flatten_cfg::*;
+
 mod schema_sensing;
 pub use schema_sensing::{
     ColumnFilter, DeepInspectConfig, SamplingConfig, SchemaSensingConfig,
@@ -158,6 +161,11 @@ pub enum ProcessorCfg {
     Outbox {
         #[serde(flatten)]
         config: Box<OutboxProcessorCfg>,
+    },
+    #[serde(rename = "flatten")]
+    Flatten {
+        #[serde(flatten)]
+        config: Box<FlattenProcessorCfg>,
     },
 }
 
