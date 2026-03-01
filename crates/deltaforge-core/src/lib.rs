@@ -367,6 +367,17 @@ pub struct Event {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
 
+    /// Processor ID that synthesized this event, or None if it originated from a source.
+    ///
+    /// Set by processors that *create* events from nothing (e.g. metrics windows,
+    /// JS fan-out). Processors that *transform* existing events leave this as None.
+    /// The underscore prefix convention (_metrics, _my-proc) is recommended but
+    /// not enforced - any non-None value marks the event as synthetic.
+    ///
+    /// Outbox events are NOT synthetic: they originate from a real database write.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub synthetic: Option<String>,
+
     /// Routing overrides for sinks (topic, key, headers).
     /// Visible to processors but excluded from wire output by envelopes.
     #[serde(skip)]
@@ -414,6 +425,7 @@ impl Event {
             ddl: None,
             trace_id: None,
             tags: None,
+            synthetic: None,
             routing: None,
             tx_end: true,
             checkpoint: None,
@@ -442,6 +454,7 @@ impl Event {
             ddl: Some(ddl),
             trace_id: None,
             tags: None,
+            synthetic: None,
             routing: None,
             tx_end: true,
             checkpoint: None,
@@ -470,6 +483,7 @@ impl Event {
             ddl: None,
             trace_id: None,
             tags: None,
+            synthetic: None,
             routing: None,
             tx_end: true,
             checkpoint: None,
@@ -521,6 +535,23 @@ impl Event {
     #[inline]
     pub fn full_table_name(&self) -> String {
         self.source.full_table_name()
+    }
+
+    /// Mark this event as synthesized by the given processor.
+    ///
+    /// Intended for processors that conjure events from nothing - metrics
+    /// windows, alert fan-outs, etc. Call on new events before returning
+    /// them from `process()`.
+    #[must_use]
+    pub fn mark_synthetic(mut self, processor_id: impl Into<String>) -> Self {
+        self.synthetic = Some(processor_id.into());
+        self
+    }
+
+    /// Returns true if this event was created by a processor rather than a source.
+    #[inline]
+    pub fn is_synthetic(&self) -> bool {
+        self.synthetic.is_some()
     }
 }
 

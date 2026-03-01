@@ -157,6 +157,11 @@ pub struct KafkaSinkCfg {
     /// - `compression.type`: none, gzip, snappy, lz4, zstd (default: lz4)
     #[serde(default)]
     pub client_conf: HashMap<String, String>,
+
+    /// Optional filter applied before delivery. Events not matching the filter
+    /// are silently ignored by this sink.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<SinkFilter>,
 }
 
 /// Redis Streams sink configuration.
@@ -221,6 +226,11 @@ pub struct RedisSinkCfg {
     /// Default: 10
     #[serde(default)]
     pub connect_timeout_secs: Option<u32>,
+
+    /// Optional filter applied before delivery. Events not matching the filter
+    /// are silently ignored by this sink.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<SinkFilter>,
 }
 
 /// NATS JetStream sink configuration.
@@ -304,6 +314,11 @@ pub struct NatsSinkCfg {
     /// Token for token-based authentication.
     #[serde(default)]
     pub token: Option<String>,
+
+    /// Optional filter applied before delivery. Events not matching the filter
+    /// are silently ignored by this sink.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<SinkFilter>,
 }
 
 // ============================================================================
@@ -335,6 +350,75 @@ impl EncodingCfg {
         match self {
             EncodingCfg::Json => deltaforge_core::encoding::EncodingType::Json,
         }
+    }
+}
+
+/// Filter applied before a sink receives events.
+///
+/// All configured conditions are AND-ed together. An event must satisfy
+/// every condition to be delivered. Omitting a field means "no restriction".
+///
+/// # Example
+///
+/// ```yaml
+/// sinks:
+///   - type: kafka
+///     config:
+///       id: kafka-business
+///       topic: "cdc.${source.table}"
+///       filter:
+///         exclude_synthetic: true    # drop processor-created events
+///
+///   - type: kafka
+///     config:
+///       id: kafka-metrics
+///       topic: "_deltaforge.metrics"
+///       filter:
+///         synthetic_only: true       # only processor-created events
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SinkFilter {
+    /// Drop all synthetic events (those created by processors, not sourced from a DB).
+    /// Mutually exclusive with `synthetic_only`.
+    #[serde(default)]
+    pub exclude_synthetic: bool,
+
+    /// Drop all non-synthetic events (only deliver processor-created events).
+    /// Mutually exclusive with `exclude_synthetic`.
+    #[serde(default)]
+    pub synthetic_only: bool,
+
+    /// Only deliver events produced by these processor IDs.
+    /// Empty = no restriction. Works alongside `synthetic_only`.
+    #[serde(default)]
+    pub producers: Vec<String>,
+}
+
+impl SinkFilter {
+    /// Returns true if any filter condition is configured.
+    /// Used to skip wrapping sinks when no filtering is needed.
+    pub fn is_active(&self) -> bool {
+        self.exclude_synthetic
+            || self.synthetic_only
+            || !self.producers.is_empty()
+    }
+
+    /// Returns true if the given event should be delivered to the sink.
+    pub fn allows(&self, event: &deltaforge_core::Event) -> bool {
+        if self.exclude_synthetic && event.is_synthetic() {
+            return false;
+        }
+        if self.synthetic_only && !event.is_synthetic() {
+            return false;
+        }
+        if !self.producers.is_empty() {
+            let producer = event.synthetic.as_deref().unwrap_or("");
+            if !self.producers.iter().any(|p| p == producer) {
+                return false;
+            }
+        }
+        true
     }
 }
 
