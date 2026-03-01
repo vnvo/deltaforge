@@ -8,7 +8,9 @@ use deltaforge_config::{
     CollisionPolicy, EmptyListPolicy, EmptyObjectPolicy, FlattenProcessorCfg,
     ListPolicy,
 };
-use deltaforge_core::{Event, Op, Processor, SourceInfo, SourcePosition};
+use deltaforge_core::{
+    BatchContext, Event, Op, Processor, SourceInfo, SourcePosition,
+};
 use processors::FlattenProcessor;
 use serde_json::json;
 
@@ -46,7 +48,9 @@ fn flatten(
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    let mut out = rt.block_on(proc.process(vec![ev])).expect("process ok");
+    let events = vec![ev];
+    let ctx = BatchContext::from_batch(&events);
+    let mut out = rt.block_on(proc.process(events, &ctx)).expect("process ok");
     out.remove(0).after.unwrap()
 }
 
@@ -221,7 +225,9 @@ fn collision_error_fails_batch() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    let result = rt.block_on(proc.process(vec![ev]));
+    let events = vec![ev];
+    let ctx = BatchContext::from_batch(&events);
+    let result = rt.block_on(proc.process(events, &ctx));
     assert!(result.is_err(), "expected collision error");
 }
 
@@ -238,7 +244,9 @@ fn flattens_both_before_and_after() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    let out = rt.block_on(proc.process(vec![ev])).unwrap();
+    let events = vec![ev];
+    let ctx = BatchContext::from_batch(&events);
+    let out = rt.block_on(proc.process(events, &ctx)).unwrap();
     assert_eq!(out[0].before.as_ref().unwrap()["addr__city"], "Old");
     assert_eq!(out[0].after.as_ref().unwrap()["addr__city"], "New");
 }
@@ -277,7 +285,9 @@ fn event_with_no_payload_passes_through_unchanged() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
-    let out = rt.block_on(proc.process(vec![ev])).unwrap();
+    let events = vec![ev];
+    let ctx = BatchContext::from_batch(&events);
+    let out = rt.block_on(proc.process(events, &ctx)).unwrap();
     assert!(out[0].before.is_none());
     assert!(out[0].after.is_none());
 }

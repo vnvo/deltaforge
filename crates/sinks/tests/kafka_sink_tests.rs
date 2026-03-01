@@ -254,6 +254,54 @@ where
 }
 
 // =============================================================================
+// Test Helpers
+// =============================================================================
+
+/// Standard per-test setup: tracing, shared container, brokers, topic creation.
+/// Returns (brokers, topic). Container is kept alive via the shared static.
+async fn setup(test_name: &str, partitions: i32) -> Result<(String, String)> {
+    init_test_tracing();
+    get_kafka_container().await;
+    let brokers = brokers();
+    let topic = test_topic(test_name);
+    create_topic(&brokers, &topic, partitions).await?;
+    Ok((brokers, topic))
+}
+
+/// Build a KafkaSink with standard defaults (Native envelope, Json, required,
+/// 30s timeout). Pass the varying fields; everything else is zero-config.
+fn make_sink(
+    id: &str,
+    brokers: &str,
+    topic: &str,
+    envelope: EnvelopeCfg,
+) -> Result<KafkaSink> {
+    let cfg = KafkaSinkCfg {
+        id: id.into(),
+        brokers: brokers.into(),
+        topic: topic.into(),
+        key: None,
+        envelope,
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        exactly_once: None,
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+        filter: None,
+    };
+    KafkaSink::new(&cfg, CancellationToken::new())
+}
+
+/// Consume up to `n` messages, waiting at most `secs` seconds.
+async fn consume_n(
+    consumer: &StreamConsumer,
+    n: usize,
+    secs: u64,
+) -> Vec<Vec<u8>> {
+    consume_until(consumer, Duration::from_secs(secs), |m| m.len() >= n).await
+}
+
+// =============================================================================
 // Basic Functionality Tests
 // =============================================================================
 
@@ -261,38 +309,16 @@ where
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn kafka_sink_sends_single_event() -> Result<()> {
-    init_test_tracing();
-    let _container = get_kafka_container().await;
+    let (brokers, topic) = setup("single", 1).await?;
 
-    let topic = test_topic("single");
-    let brokers = brokers();
-    create_topic(&brokers, &topic, 1).await?;
-
-    let cfg = KafkaSinkCfg {
-        id: "test-kafka".into(),
-        brokers: brokers.clone(),
-        topic: topic.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    let sink = make_sink("test-kafka", &brokers, &topic, EnvelopeCfg::Native)?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
 
     // Consume and verify
     let consumer = create_consumer(&brokers, &topic, "test-single-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
-        !msgs.is_empty()
-    })
-    .await;
+    let messages = consume_n(&consumer, 1, 10).await;
 
     assert!(!messages.is_empty(), "should receive at least one message");
 
@@ -308,28 +334,10 @@ async fn kafka_sink_sends_single_event() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn kafka_sink_sends_batch() -> Result<()> {
-    init_test_tracing();
-    let _container = get_kafka_container().await;
+    let (brokers, topic) = setup("batch", 3).await?;
 
-    let topic = test_topic("batch");
-    let brokers = brokers();
-    create_topic(&brokers, &topic, 3).await?;
-
-    let cfg = KafkaSinkCfg {
-        id: "test-kafka-batch".into(),
-        brokers: brokers.clone(),
-        topic: topic.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    let sink =
+        make_sink("test-kafka-batch", &brokers, &topic, EnvelopeCfg::Native)?;
 
     // Send a batch of 100 events
     let events: Vec<Event> = (0..100).map(make_test_event).collect();
@@ -337,10 +345,7 @@ async fn kafka_sink_sends_batch() -> Result<()> {
 
     // Consume all messages
     let consumer = create_consumer(&brokers, &topic, "test-batch-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(30), |msgs| {
-        msgs.len() >= 100
-    })
-    .await;
+    let messages = consume_n(&consumer, 100, 30).await;
 
     assert_eq!(messages.len(), 100, "should receive all 100 messages");
 
@@ -353,28 +358,10 @@ async fn kafka_sink_sends_batch() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn kafka_sink_empty_batch_is_noop() -> Result<()> {
-    init_test_tracing();
-    let _container = get_kafka_container().await;
+    let (brokers, topic) = setup("empty-batch", 1).await?;
 
-    let topic = test_topic("empty-batch");
-    let brokers = brokers();
-    create_topic(&brokers, &topic, 1).await?;
-
-    let cfg = KafkaSinkCfg {
-        id: "test-kafka-empty".into(),
-        brokers: brokers.clone(),
-        topic: topic.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    let sink =
+        make_sink("test-kafka-empty", &brokers, &topic, EnvelopeCfg::Native)?;
 
     // Send empty batch - should not produce any messages
     sink.send_batch(&[]).await?;
@@ -392,37 +379,15 @@ async fn kafka_sink_empty_batch_is_noop() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn kafka_sink_native_envelope() -> Result<()> {
-    init_test_tracing();
-    let _container = get_kafka_container().await;
+    let (brokers, topic) = setup("native-envelope", 1).await?;
 
-    let topic = test_topic("native-envelope");
-    let brokers = brokers();
-    create_topic(&brokers, &topic, 1).await?;
-
-    let cfg = KafkaSinkCfg {
-        id: "test-native".into(),
-        brokers: brokers.clone(),
-        topic: topic.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    let sink = make_sink("test-native", &brokers, &topic, EnvelopeCfg::Native)?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
 
     let consumer = create_consumer(&brokers, &topic, "test-native-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
-        !msgs.is_empty()
-    })
-    .await;
+    let messages = consume_n(&consumer, 1, 10).await;
 
     assert!(!messages.is_empty(), "should receive message");
 
@@ -465,37 +430,16 @@ async fn kafka_sink_native_envelope() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn kafka_sink_debezium_envelope() -> Result<()> {
-    init_test_tracing();
-    let _container = get_kafka_container().await;
+    let (brokers, topic) = setup("debezium-envelope", 1).await?;
 
-    let topic = test_topic("debezium-envelope");
-    let brokers = brokers();
-    create_topic(&brokers, &topic, 1).await?;
-
-    let cfg = KafkaSinkCfg {
-        id: "test-debezium".into(),
-        brokers: brokers.clone(),
-        topic: topic.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Debezium,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    let sink =
+        make_sink("test-debezium", &brokers, &topic, EnvelopeCfg::Debezium)?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
 
     let consumer = create_consumer(&brokers, &topic, "test-debezium-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
-        !msgs.is_empty()
-    })
-    .await;
+    let messages = consume_n(&consumer, 1, 10).await;
 
     assert!(!messages.is_empty(), "should receive message");
 
@@ -558,38 +502,17 @@ async fn kafka_sink_debezium_envelope() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn kafka_sink_debezium_wire_format() -> Result<()> {
-    init_test_tracing();
-    let _container = get_kafka_container().await;
+    let (brokers, topic) = setup("debezium-wire-format", 1).await?;
 
-    let topic = test_topic("debezium-wire-format");
-    let brokers = brokers();
-    create_topic(&brokers, &topic, 1).await?;
-
-    let cfg = KafkaSinkCfg {
-        id: "test-wire-format".into(),
-        brokers: brokers.clone(),
-        topic: topic.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Debezium,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    let sink =
+        make_sink("test-wire-format", &brokers, &topic, EnvelopeCfg::Debezium)?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
 
     let consumer =
         create_consumer(&brokers, &topic, "test-wire-format-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
-        !msgs.is_empty()
-    })
-    .await;
+    let messages = consume_n(&consumer, 1, 10).await;
 
     let raw = String::from_utf8_lossy(&messages[0]);
 
@@ -610,40 +533,23 @@ async fn kafka_sink_debezium_wire_format() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn kafka_sink_cloudevents_envelope() -> Result<()> {
-    init_test_tracing();
-    let _container = get_kafka_container().await;
+    let (brokers, topic) = setup("cloudevents-envelope", 1).await?;
 
-    let topic = test_topic("cloudevents-envelope");
-    let brokers = brokers();
-    create_topic(&brokers, &topic, 1).await?;
-
-    let cfg = KafkaSinkCfg {
-        id: "test-cloudevents".into(),
-        brokers: brokers.clone(),
-        topic: topic.clone(),
-        key: None,
-        envelope: EnvelopeCfg::CloudEvents {
-            type_prefix: "com.deltaforge.cdc".to_string(),
+    let sink = make_sink(
+        "test-cloudevents",
+        &brokers,
+        &topic,
+        EnvelopeCfg::CloudEvents {
+            type_prefix: "com.deltaforge.cdc".into(),
         },
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    )?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
 
     let consumer =
         create_consumer(&brokers, &topic, "test-cloudevents-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
-        !msgs.is_empty()
-    })
-    .await;
+    let messages = consume_n(&consumer, 1, 10).await;
 
     assert!(!messages.is_empty(), "should receive message");
 
@@ -738,38 +644,21 @@ async fn kafka_sink_cloudevents_envelope() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn kafka_sink_debezium_envelope_batch() -> Result<()> {
-    init_test_tracing();
-    let _container = get_kafka_container().await;
+    let (brokers, topic) = setup("debezium-batch", 3).await?;
 
-    let topic = test_topic("debezium-batch");
-    let brokers = brokers();
-    create_topic(&brokers, &topic, 3).await?;
-
-    let cfg = KafkaSinkCfg {
-        id: "test-debezium-batch".into(),
-        brokers: brokers.clone(),
-        topic: topic.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Debezium,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-debezium-batch",
+        &brokers,
+        &topic,
+        EnvelopeCfg::Debezium,
+    )?;
 
     let events: Vec<Event> = (0..50).map(make_test_event).collect();
     sink.send_batch(&events).await?;
 
     let consumer =
         create_consumer(&brokers, &topic, "test-debezium-batch-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(30), |msgs| {
-        msgs.len() >= 50
-    })
-    .await;
+    let messages = consume_n(&consumer, 50, 30).await;
 
     assert_eq!(messages.len(), 50, "should receive all 50 messages");
 
@@ -791,30 +680,16 @@ async fn kafka_sink_debezium_envelope_batch() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn kafka_sink_cloudevents_operations() -> Result<()> {
-    init_test_tracing();
-    let _container = get_kafka_container().await;
+    let (brokers, topic) = setup("cloudevents-ops", 1).await?;
 
-    let topic = test_topic("cloudevents-ops");
-    let brokers = brokers();
-    create_topic(&brokers, &topic, 1).await?;
-
-    let cfg = KafkaSinkCfg {
-        id: "test-cloudevents-ops".into(),
-        brokers: brokers.clone(),
-        topic: topic.clone(),
-        key: None,
-        envelope: EnvelopeCfg::CloudEvents {
-            type_prefix: "io.deltaforge.test".to_string(),
+    let sink = make_sink(
+        "test-cloudevents-ops",
+        &brokers,
+        &topic,
+        EnvelopeCfg::CloudEvents {
+            type_prefix: "io.deltaforge.test".into(),
         },
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    )?;
 
     // Create events with different operations
     let create_event = Event::new_row(
@@ -880,10 +755,7 @@ async fn kafka_sink_cloudevents_operations() -> Result<()> {
 
     let consumer =
         create_consumer(&brokers, &topic, "test-cloudevents-ops-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
-        msgs.len() >= 3
-    })
-    .await;
+    let messages = consume_n(&consumer, 3, 10).await;
 
     assert_eq!(messages.len(), 3, "should receive all 3 messages");
 
@@ -955,28 +827,24 @@ async fn kafka_sink_cloudevents_operations() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn kafka_sink_idempotent_mode() -> Result<()> {
-    init_test_tracing();
-    let _container = get_kafka_container().await;
+    let (brokers, topic) = setup("idempotent", 1).await?;
 
-    let topic = test_topic("idempotent");
-    let brokers = brokers();
-    create_topic(&brokers, &topic, 1).await?;
-
-    let cfg = KafkaSinkCfg {
-        id: "test-idempotent".into(),
-        brokers: brokers.clone(),
-        topic: topic.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: Some(false), // Idempotent, not exactly-once
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    let sink = KafkaSink::new(
+        &KafkaSinkCfg {
+            id: "test-idempotent".into(),
+            brokers: brokers.clone(),
+            topic: topic.clone(),
+            key: None,
+            envelope: EnvelopeCfg::Native,
+            encoding: EncodingCfg::Json,
+            required: Some(true),
+            exactly_once: Some(false),
+            send_timeout_secs: Some(30),
+            client_conf: HashMap::new(),
+            filter: None,
+        },
+        CancellationToken::new(),
+    )?;
 
     // Send multiple events
     for i in 0..10 {
@@ -986,10 +854,7 @@ async fn kafka_sink_idempotent_mode() -> Result<()> {
 
     let consumer =
         create_consumer(&brokers, &topic, "test-idempotent-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
-        msgs.len() >= 10
-    })
-    .await;
+    let messages = consume_n(&consumer, 10, 10).await;
 
     assert_eq!(messages.len(), 10, "should receive all 10 messages");
 
@@ -1002,28 +867,24 @@ async fn kafka_sink_idempotent_mode() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn kafka_sink_exactly_once_mode() -> Result<()> {
-    init_test_tracing();
-    let _container = get_kafka_container().await;
+    let (brokers, topic) = setup("exactly-once", 1).await?;
 
-    let topic = test_topic("exactly-once");
-    let brokers = brokers();
-    create_topic(&brokers, &topic, 1).await?;
-
-    let cfg = KafkaSinkCfg {
-        id: "test-exactly-once".into(),
-        brokers: brokers.clone(),
-        topic: topic.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: Some(true),
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    let sink = KafkaSink::new(
+        &KafkaSinkCfg {
+            id: "test-exactly-once".into(),
+            brokers: brokers.clone(),
+            topic: topic.clone(),
+            key: None,
+            envelope: EnvelopeCfg::Native,
+            encoding: EncodingCfg::Json,
+            required: Some(true),
+            exactly_once: Some(true),
+            send_timeout_secs: Some(30),
+            client_conf: HashMap::new(),
+            filter: None,
+        },
+        CancellationToken::new(),
+    )?;
 
     // Note: Full EOS testing requires transaction support; this just validates
     // that the producer can be created and send messages
@@ -1031,10 +892,7 @@ async fn kafka_sink_exactly_once_mode() -> Result<()> {
     sink.send(&event).await?;
 
     let consumer = create_consumer(&brokers, &topic, "test-eos-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
-        !msgs.is_empty()
-    })
-    .await;
+    let messages = consume_n(&consumer, 1, 10).await;
 
     assert!(!messages.is_empty(), "should receive message in EOS mode");
 
@@ -1052,23 +910,14 @@ async fn kafka_sink_exactly_once_mode() -> Result<()> {
 #[ignore = "requires docker"]
 async fn kafka_sink_invalid_brokers() -> Result<()> {
     init_test_tracing();
-    let _container = get_kafka_container().await;
+    get_kafka_container().await;
 
-    let cfg = KafkaSinkCfg {
-        id: "test-invalid".into(),
-        brokers: "invalid-host:9999".into(),
-        topic: "df-test-invalid".into(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(5),
-        client_conf: HashMap::new(),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-invalid",
+        "invalid-host:9999",
+        "df-test-invalid",
+        EnvelopeCfg::Native,
+    )?;
 
     // Send should fail (after retries/timeout)
     let event = make_test_event(1);
@@ -1087,38 +936,16 @@ async fn kafka_sink_invalid_brokers() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn kafka_sink_large_events() -> Result<()> {
-    init_test_tracing();
-    let _container = get_kafka_container().await;
+    let (brokers, topic) = setup("large", 1).await?;
 
-    let topic = test_topic("large");
-    let brokers = brokers();
-    create_topic(&brokers, &topic, 1).await?;
-
-    let cfg = KafkaSinkCfg {
-        id: "test-large".into(),
-        brokers: brokers.clone(),
-        topic: topic.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    let sink = make_sink("test-large", &brokers, &topic, EnvelopeCfg::Native)?;
 
     // Send a 500KB event (default max is 1MB)
     let large_event = make_large_event(1, 500 * 1024);
     sink.send(&large_event).await?;
 
     let consumer = create_consumer(&brokers, &topic, "test-large-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
-        !msgs.is_empty()
-    })
-    .await;
+    let messages = consume_n(&consumer, 1, 10).await;
 
     assert!(!messages.is_empty(), "large event should be delivered");
 
@@ -1135,28 +962,14 @@ async fn kafka_sink_large_events() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn kafka_sink_concurrent_sends() -> Result<()> {
-    init_test_tracing();
-    let _container = get_kafka_container().await;
+    let (brokers, topic) = setup("concurrent", 3).await?;
 
-    let topic = test_topic("concurrent");
-    let brokers = brokers();
-    create_topic(&brokers, &topic, 3).await?;
-
-    let cfg = KafkaSinkCfg {
-        id: "test-concurrent".into(),
-        brokers: brokers.clone(),
-        topic: topic.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = Arc::new(KafkaSink::new(&cfg, cancel)?);
+    let sink = Arc::new(make_sink(
+        "test-concurrent",
+        &brokers,
+        &topic,
+        EnvelopeCfg::Native,
+    )?);
 
     // Spawn 10 concurrent tasks, each sending 10 events
     let mut handles = Vec::new();
@@ -1179,10 +992,7 @@ async fn kafka_sink_concurrent_sends() -> Result<()> {
     // Consume and verify
     let consumer =
         create_consumer(&brokers, &topic, "test-concurrent-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(30), |msgs| {
-        msgs.len() >= 100
-    })
-    .await;
+    let messages = consume_n(&consumer, 100, 30).await;
 
     assert_eq!(
         messages.len(),
@@ -1203,12 +1013,7 @@ async fn kafka_sink_concurrent_sends() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn kafka_sink_custom_config() -> Result<()> {
-    init_test_tracing();
-    let _container = get_kafka_container().await;
-
-    let topic = test_topic("custom-config");
-    let brokers = brokers();
-    create_topic(&brokers, &topic, 1).await?;
+    let (brokers, topic) = setup("custom-config", 1).await?;
 
     let mut client_conf = HashMap::new();
     client_conf.insert("linger.ms".to_string(), "10".to_string());
@@ -1225,19 +1030,16 @@ async fn kafka_sink_custom_config() -> Result<()> {
         exactly_once: None,
         send_timeout_secs: Some(30),
         client_conf,
+        filter: None,
     };
 
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    let sink = KafkaSink::new(&cfg, CancellationToken::new())?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
 
     let consumer = create_consumer(&brokers, &topic, "test-custom-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
-        !msgs.is_empty()
-    })
-    .await;
+    let messages = consume_n(&consumer, 1, 10).await;
 
     assert!(
         !messages.is_empty(),
@@ -1258,23 +1060,14 @@ async fn kafka_sink_custom_config() -> Result<()> {
 #[ignore = "requires docker"]
 async fn kafka_sink_trait_implementation() -> Result<()> {
     init_test_tracing();
-    let _container = get_kafka_container().await;
+    get_kafka_container().await;
 
-    let cfg = KafkaSinkCfg {
-        id: "test-trait".into(),
-        brokers: brokers(),
-        topic: "df-test-trait".into(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-trait",
+        &brokers(),
+        "df-test-trait",
+        EnvelopeCfg::Native,
+    )?;
 
     // Test id()
     assert_eq!(sink.id(), "test-trait");
@@ -1291,7 +1084,7 @@ async fn kafka_sink_trait_implementation() -> Result<()> {
 #[ignore = "requires docker"]
 async fn kafka_sink_optional() -> Result<()> {
     init_test_tracing();
-    let _container = get_kafka_container().await;
+    get_kafka_container().await;
 
     let cfg = KafkaSinkCfg {
         id: "test-optional".into(),
@@ -1304,10 +1097,10 @@ async fn kafka_sink_optional() -> Result<()> {
         exactly_once: None,
         send_timeout_secs: None,
         client_conf: HashMap::new(),
+        filter: None,
     };
 
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    let sink = KafkaSink::new(&cfg, CancellationToken::new())?;
 
     assert!(!sink.required(), "sink should be optional");
 
@@ -1360,21 +1153,23 @@ async fn kafka_sink_recovers_after_restart() -> Result<()> {
     let topic = "df-test-restart";
     create_topic(&brokers, topic, 1).await?;
 
-    let cfg = KafkaSinkCfg {
-        id: "test-restart".into(),
-        brokers: brokers.clone(),
-        topic: topic.into(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
-
     let cancel = CancellationToken::new();
-    let sink = Arc::new(KafkaSink::new(&cfg, cancel.clone())?);
+    let sink = Arc::new(KafkaSink::new(
+        &KafkaSinkCfg {
+            id: "test-restart".into(),
+            brokers: brokers.clone(),
+            topic: topic.into(),
+            key: None,
+            envelope: EnvelopeCfg::Native,
+            encoding: EncodingCfg::Json,
+            required: Some(true),
+            exactly_once: None,
+            send_timeout_secs: Some(30),
+            client_conf: HashMap::new(),
+            filter: None,
+        },
+        cancel.clone(),
+    )?);
 
     // Send first event successfully
     let event1 = make_test_event(1);
@@ -1418,28 +1213,14 @@ async fn kafka_sink_recovers_after_restart() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn kafka_sink_handles_broker_hiccup() -> Result<()> {
-    init_test_tracing();
-    let _container = get_kafka_container().await;
+    let (brokers, topic) = setup("hiccup", 1).await?;
 
-    let topic = test_topic("hiccup");
-    let brokers = brokers();
-    create_topic(&brokers, &topic, 1).await?;
-
-    let cfg = KafkaSinkCfg {
-        id: "test-hiccup".into(),
-        brokers: brokers.clone(),
-        topic: topic.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = Arc::new(KafkaSink::new(&cfg, cancel)?);
+    let sink = Arc::new(make_sink(
+        "test-hiccup",
+        &brokers,
+        &topic,
+        EnvelopeCfg::Native,
+    )?);
 
     // Send multiple events rapidly
     // rdkafka's internal retry should handle any transient issues
@@ -1464,10 +1245,7 @@ async fn kafka_sink_handles_broker_hiccup() -> Result<()> {
 
     // Verify by consuming
     let consumer = create_consumer(&brokers, &topic, "test-hiccup-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(30), |msgs| {
-        msgs.len() >= 50
-    })
-    .await;
+    let messages = consume_n(&consumer, 50, 30).await;
 
     assert_eq!(messages.len(), 50, "all 50 messages should be consumable");
 
@@ -1480,28 +1258,14 @@ async fn kafka_sink_handles_broker_hiccup() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn kafka_sink_batch_resilience() -> Result<()> {
-    init_test_tracing();
-    let _container = get_kafka_container().await;
+    let (brokers, topic) = setup("batch-resilience", 3).await?;
 
-    let topic = test_topic("batch-resilience");
-    let brokers = brokers();
-    create_topic(&brokers, &topic, 3).await?;
-
-    let cfg = KafkaSinkCfg {
-        id: "test-batch-resilience".into(),
-        brokers: brokers.clone(),
-        topic: topic.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-batch-resilience",
+        &brokers,
+        &topic,
+        EnvelopeCfg::Native,
+    )?;
 
     // Send multiple batches in sequence
     for batch_num in 0..5 {
@@ -1516,10 +1280,7 @@ async fn kafka_sink_batch_resilience() -> Result<()> {
     // Verify all messages
     let consumer =
         create_consumer(&brokers, &topic, "test-batch-resilience-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(30), |msgs| {
-        msgs.len() >= 100
-    })
-    .await;
+    let messages = consume_n(&consumer, 100, 30).await;
 
     assert_eq!(messages.len(), 100, "all 100 messages should be delivered");
 
@@ -1537,24 +1298,26 @@ async fn kafka_sink_batch_resilience() -> Result<()> {
 #[ignore = "requires docker"]
 async fn kafka_sink_respects_cancellation() -> Result<()> {
     init_test_tracing();
-    let _container = get_kafka_container().await;
+    get_kafka_container().await;
 
     // Use an invalid broker so retry loop keeps trying
-    let cfg = KafkaSinkCfg {
-        id: "test-cancel".into(),
-        brokers: "invalid-host:9999".into(),
-        topic: "df-test-cancel".into(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(2),
-        client_conf: HashMap::new(),
-    };
-
     let cancel = CancellationToken::new();
-    let sink = Arc::new(KafkaSink::new(&cfg, cancel.clone())?);
+    let sink = Arc::new(KafkaSink::new(
+        &KafkaSinkCfg {
+            id: "test-cancel".into(),
+            brokers: "invalid-host:9999".into(),
+            topic: "df-test-cancel".into(),
+            key: None,
+            envelope: EnvelopeCfg::Native,
+            encoding: EncodingCfg::Json,
+            required: Some(true),
+            exactly_once: None,
+            send_timeout_secs: Some(2),
+            client_conf: HashMap::new(),
+            filter: None,
+        },
+        cancel.clone(),
+    )?);
 
     let sink_clone = sink.clone();
     let send_handle = tokio::spawn(async move {
@@ -1581,42 +1344,20 @@ async fn kafka_sink_respects_cancellation() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn kafka_sink_default_envelope_is_native() -> Result<()> {
-    init_test_tracing();
-    let _container = get_kafka_container().await;
-
-    let topic = test_topic("default-envelope");
-    let brokers = brokers();
-    create_topic(&brokers, &topic, 1).await?;
-
-    // Use Default::default() for envelope and encoding
-    let cfg = KafkaSinkCfg {
-        id: "test-default".into(),
-        brokers: brokers.clone(),
-        topic: topic.clone(),
-        key: None,
-        envelope: EnvelopeCfg::default(),
-        encoding: EncodingCfg::default(),
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
+    let (brokers, topic) = setup("default-envelope", 1).await?;
 
     // Verify defaults
-    assert_eq!(cfg.envelope, EnvelopeCfg::Native);
-    assert_eq!(cfg.encoding, EncodingCfg::Json);
+    assert_eq!(EnvelopeCfg::default(), EnvelopeCfg::Native);
+    assert_eq!(EncodingCfg::default(), EncodingCfg::Json);
 
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    let sink =
+        make_sink("test-default", &brokers, &topic, EnvelopeCfg::Native)?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
 
     let consumer = create_consumer(&brokers, &topic, "test-default-consumer")?;
-    let messages = consume_until(&consumer, Duration::from_secs(10), |msgs| {
-        !msgs.is_empty()
-    })
-    .await;
+    let messages = consume_n(&consumer, 1, 10).await;
 
     assert!(!messages.is_empty(), "should receive message with defaults");
 
@@ -1707,7 +1448,7 @@ where
 #[ignore = "requires docker"]
 async fn kafka_sink_topic_template_routes_by_table() -> Result<()> {
     init_test_tracing();
-    let _container = get_kafka_container().await;
+    get_kafka_container().await;
 
     let brokers = brokers();
     let topic_orders = test_topic("route-orders");
@@ -1715,21 +1456,12 @@ async fn kafka_sink_topic_template_routes_by_table() -> Result<()> {
     create_topic(&brokers, &topic_orders, 1).await?;
     create_topic(&brokers, &topic_users, 1).await?;
 
-    let cfg = KafkaSinkCfg {
-        id: "test-routing".into(),
-        brokers: brokers.clone(),
-        topic: "df-test-route-${source.table}".into(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-routing",
+        &brokers,
+        "df-test-route-${source.table}",
+        EnvelopeCfg::Native,
+    )?;
 
     sink.send_batch(&[
         make_event_for_table(1, "orders"),
@@ -1770,7 +1502,7 @@ async fn kafka_sink_topic_template_routes_by_table() -> Result<()> {
 #[ignore = "requires docker"]
 async fn kafka_sink_event_routing_override() -> Result<()> {
     init_test_tracing();
-    let _container = get_kafka_container().await;
+    get_kafka_container().await;
 
     let brokers = brokers();
     let default_topic = test_topic("route-default");
@@ -1778,21 +1510,12 @@ async fn kafka_sink_event_routing_override() -> Result<()> {
     create_topic(&brokers, &default_topic, 1).await?;
     create_topic(&brokers, &override_topic, 1).await?;
 
-    let cfg = KafkaSinkCfg {
-        id: "test-override".into(),
-        brokers: brokers.clone(),
-        topic: default_topic.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-override",
+        &brokers,
+        &default_topic,
+        EnvelopeCfg::Native,
+    )?;
 
     let ev1 = make_test_event(1);
     let mut ev2 = make_test_event(2);
@@ -1805,16 +1528,12 @@ async fn kafka_sink_event_routing_override() -> Result<()> {
 
     let consumer =
         create_consumer(&brokers, &default_topic, "default-consumer")?;
-    let msgs =
-        consume_until(&consumer, Duration::from_secs(10), |m| !m.is_empty())
-            .await;
+    let msgs = consume_n(&consumer, 1, 10).await;
     assert_eq!(msgs.len(), 1);
 
     let consumer =
         create_consumer(&brokers, &override_topic, "override-consumer")?;
-    let msgs =
-        consume_until(&consumer, Duration::from_secs(10), |m| !m.is_empty())
-            .await;
+    let msgs = consume_n(&consumer, 1, 10).await;
     assert_eq!(msgs.len(), 1);
 
     info!("✓ EventRouting.topic overrides static config");
@@ -1827,12 +1546,7 @@ async fn kafka_sink_event_routing_override() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn kafka_sink_routing_key_and_headers() -> Result<()> {
-    init_test_tracing();
-    let _container = get_kafka_container().await;
-
-    let brokers = brokers();
-    let topic = test_topic("route-key-headers");
-    create_topic(&brokers, &topic, 1).await?;
+    let (brokers, topic) = setup("route-key-headers", 1).await?;
 
     let cfg = KafkaSinkCfg {
         id: "test-kh".into(),
@@ -1845,10 +1559,10 @@ async fn kafka_sink_routing_key_and_headers() -> Result<()> {
         exactly_once: None,
         send_timeout_secs: Some(30),
         client_conf: HashMap::new(),
+        filter: None,
     };
 
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    let sink = KafkaSink::new(&cfg, CancellationToken::new())?;
 
     let mut event = make_event_for_table(1, "orders");
     event.after = Some(json!({"id": 1, "customer_id": "cust-42"}));
@@ -1896,29 +1610,10 @@ async fn kafka_sink_routing_key_and_headers() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn kafka_sink_raw_payload_bypasses_envelope() -> Result<()> {
-    init_test_tracing();
-    let _container = get_kafka_container().await;
-
-    let topic = test_topic("raw-payload");
-    let brokers = brokers();
-    create_topic(&brokers, &topic, 1).await?;
+    let (brokers, topic) = setup("raw-payload", 1).await?;
 
     // Deliberately use Debezium envelope - raw_payload should bypass it
-    let cfg = KafkaSinkCfg {
-        id: "test-raw".into(),
-        brokers: brokers.clone(),
-        topic: topic.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Debezium,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        exactly_once: None,
-        send_timeout_secs: Some(30),
-        client_conf: HashMap::new(),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = KafkaSink::new(&cfg, cancel)?;
+    let sink = make_sink("test-raw", &brokers, &topic, EnvelopeCfg::Debezium)?;
 
     // Event with raw_payload flag (simulates outbox processor output)
     let mut raw_event = make_test_event(1);

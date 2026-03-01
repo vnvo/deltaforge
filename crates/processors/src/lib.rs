@@ -4,6 +4,9 @@ use anyhow::Result;
 use deltaforge_config::{PipelineSpec, ProcessorCfg};
 use deltaforge_core::ArcDynProcessor;
 
+pub mod synthetic;
+pub use synthetic::SyntheticMarkingProcessor;
+
 mod js;
 pub use js::JsProcessor;
 
@@ -31,7 +34,7 @@ pub fn build_processors(ps: &PipelineSpec) -> Result<Arc<[ArcDynProcessor]>> {
                     as ArcDynProcessor
             }
         };
-        out.push(proc);
+        out.push(SyntheticMarkingProcessor::wrap(proc));
     }
 
     Ok(out.into())

@@ -36,7 +36,7 @@ use std::thread;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use deltaforge_core::{Event, EventRouting, Processor};
+use deltaforge_core::{BatchContext, Event, EventRouting, Processor};
 use deno_core::{JsRuntime, RuntimeOptions, extension};
 use deno_core::{serde_v8, v8};
 use serde_json::Value;
@@ -444,7 +444,11 @@ impl Processor for JsProcessor {
         &self.id
     }
 
-    async fn process(&self, events: Vec<Event>) -> Result<Vec<Event>> {
+    async fn process(
+        &self,
+        events: Vec<Event>,
+        _ctx: &BatchContext,
+    ) -> Result<Vec<Event>> {
         if !self.is_alive() {
             bail!("JS processor worker has crashed");
         }

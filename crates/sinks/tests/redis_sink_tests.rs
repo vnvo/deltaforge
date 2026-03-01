@@ -147,6 +147,46 @@ async fn stream_length(uri: &str, stream: &str) -> Result<i64> {
 }
 
 // =============================================================================
+// Test Helpers
+// =============================================================================
+
+/// Standard per-test setup: tracing, shared container, uri/stream, cleanup.
+/// Returns (uri, stream).
+async fn setup(name: &str) -> Result<(String, String)> {
+    init_test_tracing();
+    get_redis_container().await;
+    let uri = redis_uri();
+    let stream = test_stream(name);
+    cleanup_stream(&uri, &stream).await?;
+    Ok((uri, stream))
+}
+
+/// Build a RedisSink with standard defaults (5s send, 30s batch, 10s connect).
+fn make_sink(
+    id: &str,
+    uri: &str,
+    stream: &str,
+    envelope: EnvelopeCfg,
+) -> Result<RedisSink> {
+    RedisSink::new(
+        &RedisSinkCfg {
+            id: id.into(),
+            uri: uri.into(),
+            stream: stream.into(),
+            key: None,
+            envelope,
+            encoding: EncodingCfg::Json,
+            required: Some(true),
+            send_timeout_secs: Some(5),
+            batch_timeout_secs: Some(30),
+            connect_timeout_secs: Some(10),
+            filter: None,
+        },
+        CancellationToken::new(),
+    )
+}
+
+// =============================================================================
 // Basic Functionality Tests
 // =============================================================================
 
@@ -154,28 +194,9 @@ async fn stream_length(uri: &str, stream: &str) -> Result<i64> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn redis_sink_sends_single_event() -> Result<()> {
-    init_test_tracing();
-    let _container = get_redis_container().await;
+    let (uri, stream) = setup("single").await?;
 
-    let stream = test_stream("single");
-    let uri = redis_uri();
-    cleanup_stream(&uri, &stream).await?;
-
-    let cfg = RedisSinkCfg {
-        id: "test-redis".into(),
-        uri: uri.clone(),
-        stream: stream.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = RedisSink::new(&cfg, cancel)?;
+    let sink = make_sink("test-redis", &uri, &stream, EnvelopeCfg::Native)?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
@@ -217,28 +238,10 @@ async fn redis_sink_sends_single_event() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn redis_sink_sends_batch() -> Result<()> {
-    init_test_tracing();
-    let _container = get_redis_container().await;
+    let (uri, stream) = setup("batch").await?;
 
-    let stream = test_stream("batch");
-    let uri = redis_uri();
-    cleanup_stream(&uri, &stream).await?;
-
-    let cfg = RedisSinkCfg {
-        id: "test-redis-batch".into(),
-        uri: uri.clone(),
-        stream: stream.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = RedisSink::new(&cfg, cancel)?;
+    let sink =
+        make_sink("test-redis-batch", &uri, &stream, EnvelopeCfg::Native)?;
 
     // Send a batch of 100 events
     let events: Vec<Event> = (0..100).map(make_test_event).collect();
@@ -257,28 +260,10 @@ async fn redis_sink_sends_batch() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn redis_sink_empty_batch_is_noop() -> Result<()> {
-    init_test_tracing();
-    let _container = get_redis_container().await;
+    let (uri, stream) = setup("empty_batch").await?;
 
-    let stream = test_stream("empty_batch");
-    let uri = redis_uri();
-    cleanup_stream(&uri, &stream).await?;
-
-    let cfg = RedisSinkCfg {
-        id: "test-redis-empty".into(),
-        uri: uri.clone(),
-        stream: stream.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = RedisSink::new(&cfg, cancel)?;
+    let sink =
+        make_sink("test-redis-empty", &uri, &stream, EnvelopeCfg::Native)?;
 
     // Send empty batch
     sink.send_batch(&[]).await?;
@@ -299,28 +284,9 @@ async fn redis_sink_empty_batch_is_noop() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn redis_sink_native_envelope() -> Result<()> {
-    init_test_tracing();
-    let _container = get_redis_container().await;
+    let (uri, stream) = setup("native_envelope").await?;
 
-    let stream = test_stream("native_envelope");
-    let uri = redis_uri();
-    cleanup_stream(&uri, &stream).await?;
-
-    let cfg = RedisSinkCfg {
-        id: "test-native".into(),
-        uri: uri.clone(),
-        stream: stream.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = RedisSink::new(&cfg, cancel)?;
+    let sink = make_sink("test-native", &uri, &stream, EnvelopeCfg::Native)?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
@@ -366,28 +332,10 @@ async fn redis_sink_native_envelope() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn redis_sink_debezium_envelope() -> Result<()> {
-    init_test_tracing();
-    let _container = get_redis_container().await;
+    let (uri, stream) = setup("debezium_envelope").await?;
 
-    let stream = test_stream("debezium_envelope");
-    let uri = redis_uri();
-    cleanup_stream(&uri, &stream).await?;
-
-    let cfg = RedisSinkCfg {
-        id: "test-debezium".into(),
-        uri: uri.clone(),
-        stream: stream.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Debezium,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = RedisSink::new(&cfg, cancel)?;
+    let sink =
+        make_sink("test-debezium", &uri, &stream, EnvelopeCfg::Debezium)?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
@@ -440,30 +388,16 @@ async fn redis_sink_debezium_envelope() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn redis_sink_cloudevents_envelope() -> Result<()> {
-    init_test_tracing();
-    let _container = get_redis_container().await;
+    let (uri, stream) = setup("cloudevents_envelope").await?;
 
-    let stream = test_stream("cloudevents_envelope");
-    let uri = redis_uri();
-    cleanup_stream(&uri, &stream).await?;
-
-    let cfg = RedisSinkCfg {
-        id: "test-cloudevents".into(),
-        uri: uri.clone(),
-        stream: stream.clone(),
-        key: None,
-        envelope: EnvelopeCfg::CloudEvents {
-            type_prefix: "com.deltaforge.cdc".to_string(),
+    let sink = make_sink(
+        "test-cloudevents",
+        &uri,
+        &stream,
+        EnvelopeCfg::CloudEvents {
+            type_prefix: "com.deltaforge.cdc".into(),
         },
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = RedisSink::new(&cfg, cancel)?;
+    )?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
@@ -555,28 +489,10 @@ async fn redis_sink_cloudevents_envelope() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn redis_sink_debezium_envelope_batch() -> Result<()> {
-    init_test_tracing();
-    let _container = get_redis_container().await;
+    let (uri, stream) = setup("debezium_batch").await?;
 
-    let stream = test_stream("debezium_batch");
-    let uri = redis_uri();
-    cleanup_stream(&uri, &stream).await?;
-
-    let cfg = RedisSinkCfg {
-        id: "test-debezium-batch".into(),
-        uri: uri.clone(),
-        stream: stream.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Debezium,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = RedisSink::new(&cfg, cancel)?;
+    let sink =
+        make_sink("test-debezium-batch", &uri, &stream, EnvelopeCfg::Debezium)?;
 
     let events: Vec<Event> = (0..50).map(make_test_event).collect();
     sink.send_batch(&events).await?;
@@ -603,30 +519,16 @@ async fn redis_sink_debezium_envelope_batch() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn redis_sink_cloudevents_operations() -> Result<()> {
-    init_test_tracing();
-    let _container = get_redis_container().await;
+    let (uri, stream) = setup("cloudevents_ops").await?;
 
-    let stream = test_stream("cloudevents_ops");
-    let uri = redis_uri();
-    cleanup_stream(&uri, &stream).await?;
-
-    let cfg = RedisSinkCfg {
-        id: "test-cloudevents-ops".into(),
-        uri: uri.clone(),
-        stream: stream.clone(),
-        key: None,
-        envelope: EnvelopeCfg::CloudEvents {
-            type_prefix: "io.deltaforge.test".to_string(),
+    let sink = make_sink(
+        "test-cloudevents-ops",
+        &uri,
+        &stream,
+        EnvelopeCfg::CloudEvents {
+            type_prefix: "io.deltaforge.test".into(),
         },
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = RedisSink::new(&cfg, cancel)?;
+    )?;
 
     // Create events with different operations
     let create_event = Event::new_row(
@@ -755,32 +657,13 @@ async fn redis_sink_cloudevents_operations() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn redis_sink_default_envelope_is_native() -> Result<()> {
-    init_test_tracing();
-    let _container = get_redis_container().await;
-
-    let stream = test_stream("default_envelope");
-    let uri = redis_uri();
-    cleanup_stream(&uri, &stream).await?;
-
-    let cfg = RedisSinkCfg {
-        id: "test-default".into(),
-        uri: uri.clone(),
-        stream: stream.clone(),
-        key: None,
-        envelope: EnvelopeCfg::default(),
-        encoding: EncodingCfg::default(),
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-    };
+    let (uri, stream) = setup("default_envelope").await?;
 
     // Verify defaults
-    assert_eq!(cfg.envelope, EnvelopeCfg::Native);
-    assert_eq!(cfg.encoding, EncodingCfg::Json);
+    assert_eq!(EnvelopeCfg::default(), EnvelopeCfg::Native);
+    assert_eq!(EncodingCfg::default(), EncodingCfg::Json);
 
-    let cancel = CancellationToken::new();
-    let sink = RedisSink::new(&cfg, cancel)?;
+    let sink = make_sink("test-default", &uri, &stream, EnvelopeCfg::Native)?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
@@ -813,28 +696,10 @@ async fn redis_sink_default_envelope_is_native() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn redis_sink_connection_reuse() -> Result<()> {
-    init_test_tracing();
-    let _container = get_redis_container().await;
+    let (uri, stream) = setup("conn_reuse").await?;
 
-    let stream = test_stream("conn_reuse");
-    let uri = redis_uri();
-    cleanup_stream(&uri, &stream).await?;
-
-    let cfg = RedisSinkCfg {
-        id: "test-conn-reuse".into(),
-        uri: uri.clone(),
-        stream: stream.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = RedisSink::new(&cfg, cancel)?;
+    let sink =
+        make_sink("test-conn-reuse", &uri, &stream, EnvelopeCfg::Native)?;
 
     // Send multiple events - should reuse connection
     for i in 0..10 {
@@ -857,21 +722,12 @@ async fn redis_sink_invalid_uri() -> Result<()> {
     init_test_tracing();
     let _container = get_redis_container().await;
 
-    let cfg = RedisSinkCfg {
-        id: "test-invalid".into(),
-        uri: "redis://invalid-host:9999/0".into(),
-        stream: "df.test.invalid".into(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(2),
-        batch_timeout_secs: Some(5),
-        connect_timeout_secs: Some(2),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = RedisSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-invalid",
+        "redis://invalid-host:9999/0",
+        "df.test.invalid",
+        EnvelopeCfg::Native,
+    )?;
 
     // Send should fail after retries
     let event = make_test_event(1);
@@ -894,21 +750,23 @@ async fn redis_sink_respects_cancellation() -> Result<()> {
     let _container = get_redis_container().await;
 
     // Use an invalid URI so retry loop keeps trying
-    let cfg = RedisSinkCfg {
-        id: "test-cancel".into(),
-        uri: "redis://invalid-host:9999/0".into(),
-        stream: "df.test.cancel".into(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(1),
-        batch_timeout_secs: Some(5),
-        connect_timeout_secs: Some(1),
-    };
-
     let cancel = CancellationToken::new();
-    let sink = Arc::new(RedisSink::new(&cfg, cancel.clone())?);
+    let sink = Arc::new(RedisSink::new(
+        &RedisSinkCfg {
+            id: "test-cancel".into(),
+            uri: "redis://invalid-host:9999/0".into(),
+            stream: "df.test.cancel".into(),
+            key: None,
+            envelope: EnvelopeCfg::Native,
+            encoding: EncodingCfg::Json,
+            required: Some(true),
+            send_timeout_secs: Some(1),
+            batch_timeout_secs: Some(5),
+            connect_timeout_secs: Some(1),
+            filter: None,
+        },
+        cancel.clone(),
+    )?);
 
     let sink_clone = sink.clone();
     let send_handle = tokio::spawn(async move {
@@ -935,28 +793,24 @@ async fn redis_sink_respects_cancellation() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn redis_sink_large_events() -> Result<()> {
-    init_test_tracing();
-    let _container = get_redis_container().await;
+    let (uri, stream) = setup("large").await?;
 
-    let stream = test_stream("large");
-    let uri = redis_uri();
-    cleanup_stream(&uri, &stream).await?;
-
-    let cfg = RedisSinkCfg {
-        id: "test-large".into(),
-        uri: uri.clone(),
-        stream: stream.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(10),
-        batch_timeout_secs: Some(60),
-        connect_timeout_secs: Some(10),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = RedisSink::new(&cfg, cancel)?;
+    let sink = RedisSink::new(
+        &RedisSinkCfg {
+            id: "test-large".into(),
+            uri: uri.clone(),
+            stream: stream.clone(),
+            key: None,
+            envelope: EnvelopeCfg::Native,
+            encoding: EncodingCfg::Json,
+            required: Some(true),
+            send_timeout_secs: Some(10),
+            batch_timeout_secs: Some(60),
+            connect_timeout_secs: Some(10),
+            filter: None,
+        },
+        CancellationToken::new(),
+    )?;
 
     // Send a 1MB event
     let large_event = make_large_event(1, 1024 * 1024);
@@ -974,28 +828,24 @@ async fn redis_sink_large_events() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn redis_sink_large_batch() -> Result<()> {
-    init_test_tracing();
-    let _container = get_redis_container().await;
+    let (uri, stream) = setup("large_batch").await?;
 
-    let stream = test_stream("large_batch");
-    let uri = redis_uri();
-    cleanup_stream(&uri, &stream).await?;
-
-    let cfg = RedisSinkCfg {
-        id: "test-large-batch".into(),
-        uri: uri.clone(),
-        stream: stream.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(10),
-        batch_timeout_secs: Some(60),
-        connect_timeout_secs: Some(10),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = RedisSink::new(&cfg, cancel)?;
+    let sink = RedisSink::new(
+        &RedisSinkCfg {
+            id: "test-large-batch".into(),
+            uri: uri.clone(),
+            stream: stream.clone(),
+            key: None,
+            envelope: EnvelopeCfg::Native,
+            encoding: EncodingCfg::Json,
+            required: Some(true),
+            send_timeout_secs: Some(10),
+            batch_timeout_secs: Some(60),
+            connect_timeout_secs: Some(10),
+            filter: None,
+        },
+        CancellationToken::new(),
+    )?;
 
     // Send 10 events of 100KB each
     let events: Vec<Event> =
@@ -1018,28 +868,24 @@ async fn redis_sink_large_batch() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn redis_sink_concurrent_sends() -> Result<()> {
-    init_test_tracing();
-    let _container = get_redis_container().await;
+    let (uri, stream) = setup("concurrent").await?;
 
-    let stream = test_stream("concurrent");
-    let uri = redis_uri();
-    cleanup_stream(&uri, &stream).await?;
-
-    let cfg = RedisSinkCfg {
-        id: "test-concurrent".into(),
-        uri: uri.clone(),
-        stream: stream.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(10),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = Arc::new(RedisSink::new(&cfg, cancel)?);
+    let sink = Arc::new(RedisSink::new(
+        &RedisSinkCfg {
+            id: "test-concurrent".into(),
+            uri: uri.clone(),
+            stream: stream.clone(),
+            key: None,
+            envelope: EnvelopeCfg::Native,
+            encoding: EncodingCfg::Json,
+            required: Some(true),
+            send_timeout_secs: Some(10),
+            batch_timeout_secs: Some(30),
+            connect_timeout_secs: Some(10),
+            filter: None,
+        },
+        CancellationToken::new(),
+    )?);
 
     // Spawn 10 concurrent tasks, each sending 10 events
     let mut handles = Vec::new();
@@ -1091,21 +937,12 @@ async fn redis_sink_recovers_after_restart() -> Result<()> {
     wait_for_redis(&uri, Duration::from_secs(30)).await?;
 
     let stream = "df.test.restart";
-    let cfg = RedisSinkCfg {
-        id: "test-restart".into(),
-        uri: uri.clone(),
-        stream: stream.into(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = Arc::new(RedisSink::new(&cfg, cancel.clone())?);
+    let sink = Arc::new(make_sink(
+        "test-restart",
+        &uri,
+        stream,
+        EnvelopeCfg::Native,
+    )?);
 
     // Send first event successfully
     let event1 = make_test_event(1);
@@ -1149,28 +986,9 @@ async fn redis_sink_recovers_after_restart() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn redis_sink_handles_connection_drop() -> Result<()> {
-    init_test_tracing();
-    let _container = get_redis_container().await;
+    let (uri, stream) = setup("conn_drop").await?;
 
-    let stream = test_stream("conn_drop");
-    let uri = redis_uri();
-    cleanup_stream(&uri, &stream).await?;
-
-    let cfg = RedisSinkCfg {
-        id: "test-conn-drop".into(),
-        uri: uri.clone(),
-        stream: stream.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = RedisSink::new(&cfg, cancel)?;
+    let sink = make_sink("test-conn-drop", &uri, &stream, EnvelopeCfg::Native)?;
 
     // Send first event to establish connection
     let event1 = make_test_event(1);
@@ -1216,28 +1034,10 @@ async fn redis_sink_handles_connection_drop() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn redis_sink_batch_retries_on_failure() -> Result<()> {
-    init_test_tracing();
-    let _container = get_redis_container().await;
+    let (uri, stream) = setup("batch_retry").await?;
 
-    let stream = test_stream("batch_retry");
-    let uri = redis_uri();
-    cleanup_stream(&uri, &stream).await?;
-
-    let cfg = RedisSinkCfg {
-        id: "test-batch-retry".into(),
-        uri: uri.clone(),
-        stream: stream.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = RedisSink::new(&cfg, cancel)?;
+    let sink =
+        make_sink("test-batch-retry", &uri, &stream, EnvelopeCfg::Native)?;
 
     // Send first batch to warm up connection
     let events1: Vec<Event> = (0..10).map(make_test_event).collect();
@@ -1279,21 +1079,9 @@ async fn redis_sink_trait_implementation() -> Result<()> {
     init_test_tracing();
     let _container = get_redis_container().await;
 
-    let cfg = RedisSinkCfg {
-        id: "test-trait".into(),
-        uri: redis_uri(),
-        stream: "df.test.trait".into(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = RedisSink::new(&cfg, cancel)?;
+    let uri = redis_uri();
+    let sink =
+        make_sink("test-trait", &uri, "df.test.trait", EnvelopeCfg::Native)?;
 
     // Test id()
     assert_eq!(sink.id(), "test-trait");
@@ -1312,21 +1100,22 @@ async fn redis_sink_optional() -> Result<()> {
     init_test_tracing();
     let _container = get_redis_container().await;
 
-    let cfg = RedisSinkCfg {
-        id: "test-optional".into(),
-        uri: redis_uri(),
-        stream: "df.test.optional".into(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(false),
-        send_timeout_secs: None,
-        batch_timeout_secs: None,
-        connect_timeout_secs: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = RedisSink::new(&cfg, cancel)?;
+    let sink = RedisSink::new(
+        &RedisSinkCfg {
+            id: "test-optional".into(),
+            uri: redis_uri(),
+            stream: "df.test.optional".into(),
+            key: None,
+            envelope: EnvelopeCfg::Native,
+            encoding: EncodingCfg::Json,
+            required: Some(false),
+            send_timeout_secs: None,
+            batch_timeout_secs: None,
+            connect_timeout_secs: None,
+            filter: None,
+        },
+        CancellationToken::new(),
+    )?;
 
     assert!(!sink.required(), "sink should be optional");
 
@@ -1362,21 +1151,12 @@ async fn redis_sink_stream_template_routes_by_table() -> Result<()> {
     cleanup_stream(&uri, &stream_orders).await?;
     cleanup_stream(&uri, &stream_users).await?;
 
-    let cfg = RedisSinkCfg {
-        id: "test-routing".into(),
-        uri: uri.clone(),
-        stream: "df.test.route_${source.table}".into(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = RedisSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-routing",
+        &uri,
+        "df.test.route_${source.table}",
+        EnvelopeCfg::Native,
+    )?;
 
     sink.send_batch(&[
         make_event_for_table(1, "orders"),
@@ -1417,21 +1197,8 @@ async fn redis_sink_routing_override_with_key() -> Result<()> {
     cleanup_stream(&uri, &default_stream).await?;
     cleanup_stream(&uri, &override_stream).await?;
 
-    let cfg = RedisSinkCfg {
-        id: "test-override".into(),
-        uri: uri.clone(),
-        stream: default_stream.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = RedisSink::new(&cfg, cancel)?;
+    let sink =
+        make_sink("test-override", &uri, &default_stream, EnvelopeCfg::Native)?;
 
     let mut event = make_test_event(1);
     event.routing = Some(EventRouting {
@@ -1466,29 +1233,10 @@ async fn redis_sink_routing_override_with_key() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn redis_sink_raw_payload_bypasses_envelope() -> Result<()> {
-    init_test_tracing();
-    let _container = get_redis_container().await;
-
-    let stream = test_stream("raw_payload");
-    let uri = redis_uri();
-    cleanup_stream(&uri, &stream).await?;
+    let (uri, stream) = setup("raw_payload").await?;
 
     // Deliberately use Debezium envelope — raw_payload should bypass it
-    let cfg = RedisSinkCfg {
-        id: "test-raw".into(),
-        uri: uri.clone(),
-        stream: stream.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Debezium,
-        encoding: EncodingCfg::Json,
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = RedisSink::new(&cfg, cancel)?;
+    let sink = make_sink("test-raw", &uri, &stream, EnvelopeCfg::Debezium)?;
 
     // Event with raw_payload flag (simulates outbox processor output)
     let mut raw_event = make_test_event(1);

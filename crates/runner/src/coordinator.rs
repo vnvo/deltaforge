@@ -16,7 +16,9 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use deltaforge_config::{BatchConfig, CommitPolicy, SchemaSensingConfig};
-use deltaforge_core::{ArcDynProcessor, ArcDynSink, CheckpointMeta, Event};
+use deltaforge_core::{
+    ArcDynProcessor, ArcDynSink, BatchContext, CheckpointMeta, Event,
+};
 use schema_sensing::{ObserveResult, SchemaSensor};
 
 use crate::drift_detector::{DriftDetector, DriftSummary};
@@ -828,13 +830,15 @@ pub fn build_batch_processor(
                 });
             }
 
-            let mut batch = events;
+            // snapshot IDs once before any processor runs
+            let ctx = BatchContext::from_batch(&events);
 
+            let mut batch = events;
             for p in procs.iter() {
                 let pid = p.id();
                 let start = Instant::now();
                 batch = p
-                    .process(batch)
+                    .process(batch, &ctx)
                     .await
                     .with_context(|| format!("processor {pid} failed"))?;
 
@@ -845,12 +849,6 @@ pub fn build_batch_processor(
                 )
                 .record(start.elapsed().as_secs_f64());
             }
-
-            // let last_cp = batch
-            //     .iter()
-            //     .rev()
-            //     .find_map(|e| e.checkpoint.as_ref())
-            //     .cloned();
 
             Ok(ProcessedBatch {
                 events: batch,

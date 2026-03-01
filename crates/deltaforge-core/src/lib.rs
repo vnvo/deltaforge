@@ -31,6 +31,9 @@ pub use errors::{SinkError, SourceError};
 pub mod routing;
 pub use routing::EventRouting;
 
+pub mod batch_context;
+pub use batch_context::BatchContext;
+
 // ============================================================================
 // Operation Type
 // ============================================================================
@@ -367,14 +370,14 @@ pub struct Event {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
 
-    /// Processor ID that synthesized this event, or None if it originated from a source.
+    /// Processor ID that synthesized this event (`Some`), or `None` if it
+    /// came directly from a database source.
     ///
-    /// Set by processors that *create* events from nothing (e.g. metrics windows,
-    /// JS fan-out). Processors that *transform* existing events leave this as None.
-    /// The underscore prefix convention (_metrics, _my-proc) is recommended but
-    /// not enforced - any non-None value marks the event as synthetic.
+    /// Set automatically by `SyntheticMarkingProcessor` - processors that
+    /// create new events (metrics, js fan-out) do not need to set this
+    /// themselves; the framework detects new event IDs and fills it in.
     ///
-    /// Outbox events are NOT synthetic: they originate from a real database write.
+    /// The value is the `id()` of the processor that first produced the event.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub synthetic: Option<String>,
 
@@ -684,7 +687,7 @@ pub trait Source: Send + Sync {
 #[async_trait]
 pub trait Processor: Send + Sync {
     fn id(&self) -> &str;
-    async fn process(&self, events: Vec<Event>) -> Result<Vec<Event>>;
+    async fn process(&self, events: Vec<Event>, ctx: &BatchContext) -> Result<Vec<Event>>;
 }
 
 #[async_trait]

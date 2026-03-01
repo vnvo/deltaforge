@@ -6,7 +6,7 @@ use anyhow::Result;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
 use common::AllowList;
 use ctor::dtor;
-use deltaforge_core::{Event, Op, Source, SourceHandle};
+use deltaforge_core::{BatchContext, Event, Op, Source, SourceHandle};
 use schema_registry::InMemoryRegistry;
 
 use sources::postgres::{PostgresSchemaLoader, PostgresSource};
@@ -287,15 +287,62 @@ fn verify_event_envelope(e: &Event, expected_connector: &str) {
 }
 
 // =============================================================================
+// TEST HELPERS
+// =============================================================================
+
+/// Standard per-test setup: tracing, shared container, fresh database.
+/// Returns (db_name, client).
+async fn setup(prefix: &str) -> Result<(String, tokio_postgres::Client)> {
+    init_test_tracing();
+    get_container().await;
+    create_db(prefix).await
+}
+
+/// Build a PostgresSource with constant defaults (tenant=acme, pipeline=test,
+/// fresh InMemoryRegistry). `checkpoint_key` is derived as `pg-{id}`.
+fn make_source(
+    id: &str,
+    db: &str,
+    slot: &str,
+    publication: &str,
+    tables: Vec<String>,
+    outbox_prefixes: AllowList,
+) -> PostgresSource {
+    PostgresSource {
+        id: id.into(),
+        checkpoint_key: format!("pg-{id}"),
+        dsn: cdc_dsn(db),
+        slot: slot.into(),
+        publication: publication.into(),
+        tables,
+        tenant: "acme".into(),
+        pipeline: "test".into(),
+        registry: Arc::new(InMemoryRegistry::new()),
+        outbox_prefixes,
+    }
+}
+
+/// Start a source with a fresh checkpoint store, wait for ready, warm up 2s.
+/// Returns (rx, handle).
+async fn start_source(
+    src: PostgresSource,
+) -> Result<(mpsc::Receiver<Event>, SourceHandle)> {
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let (tx, rx) = mpsc::channel(128);
+    let handle = src.run(tx, ckpt).await;
+    wait_ready(&handle, Duration::from_secs(10)).await?;
+    sleep(Duration::from_secs(2)).await;
+    Ok((rx, handle))
+}
+
+// =============================================================================
 // TESTS
 // =============================================================================
 
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_schema_loader() -> Result<()> {
-    init_test_tracing();
-    let _ = get_container().await;
-    let (db, client) = create_db("schema").await?;
+    let (db, client) = setup("schema").await?;
 
     client.execute("CREATE TABLE orders (id SERIAL PRIMARY KEY, sku VARCHAR(64) NOT NULL, price NUMERIC(10,2))", &[]).await?;
     client.execute("CREATE TABLE order_items (id SERIAL PRIMARY KEY, order_id INT, product VARCHAR(128))", &[]).await?;
@@ -337,9 +384,7 @@ async fn postgres_schema_loader() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_basic_events() -> Result<()> {
-    init_test_tracing();
-    let _ = get_container().await;
-    let (db, client) = create_db("basic").await?;
+    let (db, client) = setup("basic").await?;
 
     client.execute("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64), payload JSONB)", &[]).await?;
     client
@@ -350,24 +395,15 @@ async fn postgres_cdc_basic_events() -> Result<()> {
         .await?;
     create_pub_slot(&client, "pub_basic", "slot_basic", &["orders"]).await?;
 
-    let src = PostgresSource {
-        id: "basic".into(),
-        checkpoint_key: "pg-basic".into(),
-        dsn: cdc_dsn(&db),
-        slot: "slot_basic".into(),
-        publication: "pub_basic".into(),
-        tables: vec!["public.orders".into()],
-        tenant: "acme".into(),
-        pipeline: "test".into(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_prefixes: AllowList::default(),
-    };
-
-    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel(128);
-    let handle = src.run(tx, ckpt).await;
-    wait_ready(&handle, Duration::from_secs(10)).await?;
-    sleep(Duration::from_secs(2)).await;
+    let src = make_source(
+        "basic",
+        &db,
+        "slot_basic",
+        "pub_basic",
+        vec!["public.orders".into()],
+        AllowList::default(),
+    );
+    let (mut rx, handle) = start_source(src).await?;
 
     client
         .execute("INSERT INTO orders VALUES (1, 'sku-1', '{\"a\":1}')", &[])
@@ -442,9 +478,7 @@ async fn postgres_cdc_basic_events() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_schema_evolution() -> Result<()> {
-    init_test_tracing();
-    let _ = get_container().await;
-    let (db, client) = create_db("evo").await?;
+    let (db, client) = setup("evo").await?;
 
     client
         .execute(
@@ -460,25 +494,15 @@ async fn postgres_cdc_schema_evolution() -> Result<()> {
         .await?;
     create_pub_slot(&client, "pub_evo", "slot_evo", &["orders"]).await?;
 
-    let registry = Arc::new(InMemoryRegistry::new());
-    let src = PostgresSource {
-        id: "evo".into(),
-        checkpoint_key: "pg-evo".into(),
-        dsn: cdc_dsn(&db),
-        slot: "slot_evo".into(),
-        publication: "pub_evo".into(),
-        tables: vec!["public.orders".into()],
-        tenant: "acme".into(),
-        pipeline: "test".into(),
-        registry: registry.clone(),
-        outbox_prefixes: AllowList::default(),
-    };
-
-    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel(128);
-    let handle = src.run(tx, ckpt).await;
-    wait_ready(&handle, Duration::from_secs(10)).await?;
-    sleep(Duration::from_secs(2)).await;
+    let src = make_source(
+        "evo",
+        &db,
+        "slot_evo",
+        "pub_evo",
+        vec!["public.orders".into()],
+        AllowList::default(),
+    );
+    let (mut rx, handle) = start_source(src).await?;
 
     client
         .execute("INSERT INTO orders VALUES (100, 'pre-ddl')", &[])
@@ -524,9 +548,7 @@ async fn postgres_cdc_schema_evolution() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_checkpoint_resume() -> Result<()> {
-    init_test_tracing();
-    let _ = get_container().await;
-    let (db, client) = create_db("ckpt").await?;
+    let (db, client) = setup("ckpt").await?;
 
     client
         .execute(
@@ -547,18 +569,14 @@ async fn postgres_cdc_checkpoint_resume() -> Result<()> {
     // First run
     {
         let (tx, mut rx) = mpsc::channel(128);
-        let src = PostgresSource {
-            id: "ckpt".into(),
-            checkpoint_key: "pg-ckpt".into(),
-            dsn: cdc_dsn(&db),
-            slot: "slot_ckpt".into(),
-            publication: "pub_ckpt".into(),
-            tables: vec!["public.orders".into()],
-            tenant: "acme".into(),
-            pipeline: "test".into(),
-            registry: Arc::new(InMemoryRegistry::new()),
-            outbox_prefixes: AllowList::default(),
-        };
+        let src = make_source(
+            "ckpt",
+            &db,
+            "slot_ckpt",
+            "pub_ckpt",
+            vec!["public.orders".into()],
+            AllowList::default(),
+        );
         let handle = src.run(tx, ckpt.clone()).await;
         wait_ready(&handle, Duration::from_secs(10)).await?;
         sleep(Duration::from_secs(2)).await;
@@ -584,18 +602,14 @@ async fn postgres_cdc_checkpoint_resume() -> Result<()> {
     // Second run
     {
         let (tx, mut rx) = mpsc::channel(128);
-        let src = PostgresSource {
-            id: "ckpt".into(),
-            checkpoint_key: "pg-ckpt".into(),
-            dsn: cdc_dsn(&db),
-            slot: "slot_ckpt".into(),
-            publication: "pub_ckpt".into(),
-            tables: vec!["public.orders".into()],
-            tenant: "acme".into(),
-            pipeline: "test".into(),
-            registry: Arc::new(InMemoryRegistry::new()),
-            outbox_prefixes: AllowList::default(),
-        };
+        let src = make_source(
+            "ckpt",
+            &db,
+            "slot_ckpt",
+            "pub_ckpt",
+            vec!["public.orders".into()],
+            AllowList::default(),
+        );
         let handle = src.run(tx, ckpt.clone()).await;
         wait_ready(&handle, Duration::from_secs(10)).await?;
 
@@ -618,9 +632,7 @@ async fn postgres_cdc_checkpoint_resume() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_table_filtering() -> Result<()> {
-    init_test_tracing();
-    let _ = get_container().await;
-    let (db, client) = create_db("filter").await?;
+    let (db, client) = setup("filter").await?;
 
     client
         .execute(
@@ -651,24 +663,15 @@ async fn postgres_cdc_table_filtering() -> Result<()> {
     )
     .await?;
 
-    let src = PostgresSource {
-        id: "filter".into(),
-        checkpoint_key: "pg-filter".into(),
-        dsn: cdc_dsn(&db),
-        slot: "slot_filter".into(),
-        publication: "pub_filter".into(),
-        tables: vec!["public.orders".into()], // Only orders
-        tenant: "acme".into(),
-        pipeline: "test".into(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_prefixes: AllowList::default(),
-    };
-
-    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel(128);
-    let handle = src.run(tx, ckpt).await;
-    wait_ready(&handle, Duration::from_secs(10)).await?;
-    sleep(Duration::from_secs(2)).await;
+    let src = make_source(
+        "filter",
+        &db,
+        "slot_filter",
+        "pub_filter",
+        vec!["public.orders".into()],
+        AllowList::default(),
+    ); // Only orders
+    let (mut rx, handle) = start_source(src).await?;
 
     client
         .execute("INSERT INTO audit_log VALUES (1, 'filtered')", &[])
@@ -695,9 +698,7 @@ async fn postgres_cdc_table_filtering() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_reconnect() -> Result<()> {
-    init_test_tracing();
-    let _ = get_container().await;
-    let (db, client) = create_db("reconn").await?;
+    let (db, client) = setup("reconn").await?;
 
     client
         .execute(
@@ -713,24 +714,15 @@ async fn postgres_cdc_reconnect() -> Result<()> {
         .await?;
     create_pub_slot(&client, "pub_reconn", "slot_reconn", &["orders"]).await?;
 
-    let src = PostgresSource {
-        id: "reconn".into(),
-        checkpoint_key: "pg-reconn".into(),
-        dsn: cdc_dsn(&db),
-        slot: "slot_reconn".into(),
-        publication: "pub_reconn".into(),
-        tables: vec!["public.orders".into()],
-        tenant: "acme".into(),
-        pipeline: "test".into(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_prefixes: AllowList::default(),
-    };
-
-    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel(128);
-    let handle = src.run(tx, ckpt).await;
-    wait_ready(&handle, Duration::from_secs(10)).await?;
-    sleep(Duration::from_secs(2)).await;
+    let src = make_source(
+        "reconn",
+        &db,
+        "slot_reconn",
+        "pub_reconn",
+        vec!["public.orders".into()],
+        AllowList::default(),
+    );
+    let (mut rx, handle) = start_source(src).await?;
 
     client
         .execute("INSERT INTO orders VALUES (200, 'before')", &[])
@@ -765,9 +757,7 @@ async fn postgres_cdc_reconnect() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_extended_types() -> Result<()> {
-    init_test_tracing();
-    let _ = get_container().await;
-    let (db, client) = create_db("types").await?;
+    let (db, client) = setup("types").await?;
 
     client.execute("CREATE TABLE complex (id SERIAL PRIMARY KEY, uuid_col UUID, tags TEXT[], metadata JSONB, amount NUMERIC(15,4))", &[]).await?;
     client
@@ -778,24 +768,15 @@ async fn postgres_cdc_extended_types() -> Result<()> {
         .await?;
     create_pub_slot(&client, "pub_types", "slot_types", &["complex"]).await?;
 
-    let src = PostgresSource {
-        id: "types".into(),
-        checkpoint_key: "pg-types".into(),
-        dsn: cdc_dsn(&db),
-        slot: "slot_types".into(),
-        publication: "pub_types".into(),
-        tables: vec!["public.complex".into()],
-        tenant: "acme".into(),
-        pipeline: "test".into(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_prefixes: AllowList::default(),
-    };
-
-    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel(128);
-    let handle = src.run(tx, ckpt).await;
-    wait_ready(&handle, Duration::from_secs(10)).await?;
-    sleep(Duration::from_secs(2)).await;
+    let src = make_source(
+        "types",
+        &db,
+        "slot_types",
+        "pub_types",
+        vec!["public.complex".into()],
+        AllowList::default(),
+    );
+    let (mut rx, handle) = start_source(src).await?;
 
     client.execute("INSERT INTO complex (uuid_col, tags, metadata, amount) VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', ARRAY['a','b'], '{\"k\":1}', 123.4567)", &[]).await?;
 
@@ -826,9 +807,7 @@ async fn postgres_cdc_extended_types() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_pause_resume() -> Result<()> {
-    init_test_tracing();
-    let _ = get_container().await;
-    let (db, client) = create_db("pause").await?;
+    let (db, client) = setup("pause").await?;
 
     client
         .execute(
@@ -844,24 +823,15 @@ async fn postgres_cdc_pause_resume() -> Result<()> {
         .await?;
     create_pub_slot(&client, "pub_pause", "slot_pause", &["orders"]).await?;
 
-    let src = PostgresSource {
-        id: "pause".into(),
-        checkpoint_key: "pg-pause".into(),
-        dsn: cdc_dsn(&db),
-        slot: "slot_pause".into(),
-        publication: "pub_pause".into(),
-        tables: vec!["public.orders".into()],
-        tenant: "acme".into(),
-        pipeline: "test".into(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_prefixes: AllowList::default(),
-    };
-
-    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel(128);
-    let handle = src.run(tx, ckpt).await;
-    wait_ready(&handle, Duration::from_secs(10)).await?;
-    sleep(Duration::from_secs(2)).await;
+    let src = make_source(
+        "pause",
+        &db,
+        "slot_pause",
+        "pub_pause",
+        vec!["public.orders".into()],
+        AllowList::default(),
+    );
+    let (mut rx, handle) = start_source(src).await?;
 
     client
         .execute("INSERT INTO orders VALUES (1, 'before')", &[])
@@ -907,9 +877,7 @@ async fn postgres_cdc_pause_resume() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_auth_failure() -> Result<()> {
-    init_test_tracing();
-    let _ = get_container().await;
-    let (db, client) = create_db("auth_fail").await?;
+    let (db, client) = setup("auth_fail").await?;
 
     client
         .execute("CREATE TABLE orders (id INT PRIMARY KEY)", &[])
@@ -924,19 +892,15 @@ async fn postgres_cdc_auth_failure() -> Result<()> {
         "postgres://{CDC_USER}:WRONG_PASSWORD@127.0.0.1:{PG_PORT}/{db}"
     );
 
-    let src = PostgresSource {
-        id: "auth-fail".into(),
-        checkpoint_key: "pg-auth-fail".into(),
-        dsn: bad_dsn,
-        slot: "slot_auth".into(),
-        publication: "pub_auth".into(),
-        tables: vec!["public.orders".into()],
-        tenant: "acme".into(),
-        pipeline: "test".into(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_prefixes: AllowList::default(),
-    };
-
+    let mut src = make_source(
+        "auth-fail",
+        &db,
+        "slot_auth",
+        "pub_auth",
+        vec!["public.orders".into()],
+        AllowList::default(),
+    );
+    src.dsn = bad_dsn;
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     let (tx, _rx) = mpsc::channel(128);
     let handle = src.run(tx, ckpt).await;
@@ -967,9 +931,7 @@ async fn postgres_cdc_auth_failure() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_slot_auto_created() -> Result<()> {
-    init_test_tracing();
-    let _ = get_container().await;
-    let (db, client) = create_db("slot_auto").await?;
+    let (db, client) = setup("slot_auto").await?;
 
     client
         .execute("CREATE TABLE orders (id INT PRIMARY KEY, name TEXT)", &[])
@@ -996,19 +958,14 @@ async fn postgres_cdc_slot_auto_created() -> Result<()> {
         .get(0);
     assert!(!slot_exists, "slot should not exist before source starts");
 
-    let src = PostgresSource {
-        id: "slot-auto".into(),
-        checkpoint_key: "pg-slot-auto".into(),
-        dsn: cdc_dsn(&db),
-        slot: "auto_slot".into(),
-        publication: "pub_auto".into(),
-        tables: vec!["public.orders".into()],
-        tenant: "acme".into(),
-        pipeline: "test".into(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_prefixes: AllowList::default(),
-    };
-
+    let src = make_source(
+        "slot-auto",
+        &db,
+        "auto_slot",
+        "pub_auto",
+        vec!["public.orders".into()],
+        AllowList::default(),
+    );
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     let (tx, mut rx) = mpsc::channel(128);
     let handle = src.run(tx, ckpt).await;
@@ -1055,9 +1012,7 @@ async fn postgres_cdc_slot_auto_created() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
-    init_test_tracing();
-    let _ = get_container().await;
-    let (db, client) = create_db("pub_missing").await?;
+    let (db, client) = setup("pub_missing").await?;
 
     client
         .execute("CREATE TABLE orders (id INT PRIMARY KEY, name TEXT)", &[])
@@ -1081,19 +1036,14 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
         .get(0);
     assert!(!pub_exists, "publication should not exist before test");
 
-    let src = PostgresSource {
-        id: "pub-missing".into(),
-        checkpoint_key: "pg-pub-missing".into(),
-        dsn: cdc_dsn(&db),
-        slot: "slot_missing_pub".into(),
-        publication: "missing_pub".into(),
-        tables: vec!["public.orders".into()],
-        tenant: "acme".into(),
-        pipeline: "test".into(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_prefixes: AllowList::default(),
-    };
-
+    let src = make_source(
+        "pub-missing",
+        &db,
+        "slot_missing_pub",
+        "missing_pub",
+        vec!["public.orders".into()],
+        AllowList::default(),
+    );
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     let (tx, mut rx) = mpsc::channel(128);
     let handle = src.run(tx, ckpt).await;
@@ -1149,19 +1099,15 @@ async fn postgres_cdc_invalid_dsn() -> Result<()> {
     init_test_tracing();
     let _ = get_container().await;
 
-    let src = PostgresSource {
-        id: "bad-dsn".into(),
-        checkpoint_key: "pg-bad-dsn".into(),
-        dsn: "not-a-valid-dsn-at-all".into(),
-        slot: "any_slot".into(),
-        publication: "any_pub".into(),
-        tables: vec!["public.orders".into()],
-        tenant: "acme".into(),
-        pipeline: "test".into(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_prefixes: AllowList::default(),
-    };
-
+    let mut src = make_source(
+        "bad-dsn",
+        "invalid",
+        "any_slot",
+        "any_pub",
+        vec!["public.orders".into()],
+        AllowList::default(),
+    );
+    src.dsn = "not-a-valid-dsn-at-all".into();
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     let (tx, _rx) = mpsc::channel(128);
     let handle = src.run(tx, ckpt).await;
@@ -1187,19 +1133,15 @@ async fn postgres_cdc_connection_refused() -> Result<()> {
     let bad_dsn =
         format!("postgres://{CDC_USER}:{CDC_PASS}@127.0.0.1:59999/testdb");
 
-    let src = PostgresSource {
-        id: "conn-refused".into(),
-        checkpoint_key: "pg-conn-refused".into(),
-        dsn: bad_dsn,
-        slot: "any_slot".into(),
-        publication: "any_pub".into(),
-        tables: vec!["public.orders".into()],
-        tenant: "acme".into(),
-        pipeline: "test".into(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_prefixes: AllowList::default(),
-    };
-
+    let mut src = make_source(
+        "conn-refused",
+        "invalid",
+        "any_slot",
+        "any_pub",
+        vec!["public.orders".into()],
+        AllowList::default(),
+    );
+    src.dsn = bad_dsn;
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     let (tx, _rx) = mpsc::channel(128);
     let handle = src.run(tx, ckpt).await;
@@ -1223,9 +1165,7 @@ async fn postgres_cdc_connection_refused() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_replica_identity_modes() -> Result<()> {
-    init_test_tracing();
-    let _ = get_container().await;
-    let (db, client) = create_db("replica_id").await?;
+    let (db, client) = setup("replica_id").await?;
 
     client
         .execute(
@@ -1273,24 +1213,15 @@ async fn postgres_cdc_replica_identity_modes() -> Result<()> {
     );
     info!("✓ FULL replica identity captured");
 
-    let src = PostgresSource {
-        id: "ri".into(),
-        checkpoint_key: "pg-ri".into(),
-        dsn: cdc_dsn(&db),
-        slot: "slot_ri".into(),
-        publication: "pub_ri".into(),
-        tables: vec!["public.ri_default".into(), "public.ri_full".into()],
-        tenant: "acme".into(),
-        pipeline: "test".into(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_prefixes: AllowList::default(),
-    };
-
-    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel(128);
-    let handle = src.run(tx, ckpt).await;
-    wait_ready(&handle, Duration::from_secs(10)).await?;
-    sleep(Duration::from_secs(2)).await;
+    let src = make_source(
+        "ri",
+        &db,
+        "slot_ri",
+        "pub_ri",
+        vec!["public.ri_default".into(), "public.ri_full".into()],
+        AllowList::default(),
+    );
+    let (mut rx, handle) = start_source(src).await?;
 
     client
         .execute(
@@ -1346,9 +1277,7 @@ async fn postgres_cdc_replica_identity_modes() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_graceful_shutdown() -> Result<()> {
-    init_test_tracing();
-    let _ = get_container().await;
-    let (db, client) = create_db("shutdown").await?;
+    let (db, client) = setup("shutdown").await?;
 
     client
         .execute(
@@ -1365,24 +1294,15 @@ async fn postgres_cdc_graceful_shutdown() -> Result<()> {
     create_pub_slot(&client, "pub_shutdown", "slot_shutdown", &["orders"])
         .await?;
 
-    let src = PostgresSource {
-        id: "shutdown".into(),
-        checkpoint_key: "pg-shutdown".into(),
-        dsn: cdc_dsn(&db),
-        slot: "slot_shutdown".into(),
-        publication: "pub_shutdown".into(),
-        tables: vec!["public.orders".into()],
-        tenant: "acme".into(),
-        pipeline: "test".into(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_prefixes: AllowList::default(),
-    };
-
-    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel(128);
-    let handle = src.run(tx, ckpt).await;
-    wait_ready(&handle, Duration::from_secs(10)).await?;
-    sleep(Duration::from_secs(2)).await;
+    let src = make_source(
+        "shutdown",
+        &db,
+        "slot_shutdown",
+        "pub_shutdown",
+        vec!["public.orders".into()],
+        AllowList::default(),
+    );
+    let (mut rx, handle) = start_source(src).await?;
 
     client
         .execute("INSERT INTO orders VALUES (1, 'test')", &[])
@@ -1416,9 +1336,7 @@ async fn postgres_cdc_graceful_shutdown() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_multi_table() -> Result<()> {
-    init_test_tracing();
-    let _ = get_container().await;
-    let (db, client) = create_db("multi").await?;
+    let (db, client) = setup("multi").await?;
 
     client
         .execute(
@@ -1456,28 +1374,19 @@ async fn postgres_cdc_multi_table() -> Result<()> {
     )
     .await?;
 
-    let src = PostgresSource {
-        id: "multi".into(),
-        checkpoint_key: "pg-multi".into(),
-        dsn: cdc_dsn(&db),
-        slot: "slot_multi".into(),
-        publication: "pub_multi".into(),
-        tables: vec![
+    let src = make_source(
+        "multi",
+        &db,
+        "slot_multi",
+        "pub_multi",
+        vec![
             "public.orders".into(),
             "public.customers".into(),
             "public.products".into(),
         ],
-        tenant: "acme".into(),
-        pipeline: "test".into(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_prefixes: AllowList::default(),
-    };
-
-    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel(128);
-    let handle = src.run(tx, ckpt).await;
-    wait_ready(&handle, Duration::from_secs(10)).await?;
-    sleep(Duration::from_secs(2)).await;
+        AllowList::default(),
+    );
+    let (mut rx, handle) = start_source(src).await?;
 
     client
         .execute("INSERT INTO orders VALUES (1, 'SKU-001')", &[])
@@ -1530,9 +1439,7 @@ async fn postgres_cdc_multi_table() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_null_handling() -> Result<()> {
-    init_test_tracing();
-    let _ = get_container().await;
-    let (db, client) = create_db("nulls").await?;
+    let (db, client) = setup("nulls").await?;
 
     client
         .execute(
@@ -1555,24 +1462,15 @@ async fn postgres_cdc_null_handling() -> Result<()> {
     create_pub_slot(&client, "pub_null", "slot_null", &["nullable_test"])
         .await?;
 
-    let src = PostgresSource {
-        id: "nulls".into(),
-        checkpoint_key: "pg-nulls".into(),
-        dsn: cdc_dsn(&db),
-        slot: "slot_null".into(),
-        publication: "pub_null".into(),
-        tables: vec!["public.nullable_test".into()],
-        tenant: "acme".into(),
-        pipeline: "test".into(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_prefixes: AllowList::default(),
-    };
-
-    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel(128);
-    let handle = src.run(tx, ckpt).await;
-    wait_ready(&handle, Duration::from_secs(10)).await?;
-    sleep(Duration::from_secs(2)).await;
+    let src = make_source(
+        "nulls",
+        &db,
+        "slot_null",
+        "pub_null",
+        vec!["public.nullable_test".into()],
+        AllowList::default(),
+    );
+    let (mut rx, handle) = start_source(src).await?;
 
     client
         .execute("INSERT INTO nullable_test (id) VALUES (1)", &[])
@@ -1631,9 +1529,7 @@ async fn postgres_cdc_null_handling() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_outbox_capture() -> Result<()> {
-    init_test_tracing();
-    let _ = get_container().await;
-    let (db, client) = create_db("outbox").await?;
+    let (db, client) = setup("outbox").await?;
 
     // Need a table + publication for the replication slot to work,
     // but outbox events come from WAL messages, not table changes.
@@ -1651,24 +1547,15 @@ async fn postgres_cdc_outbox_capture() -> Result<()> {
         .await?;
     create_pub_slot(&client, "pub_outbox", "slot_outbox", &["orders"]).await?;
 
-    let src = PostgresSource {
-        id: "outbox".into(),
-        checkpoint_key: "pg-outbox".into(),
-        dsn: cdc_dsn(&db),
-        slot: "slot_outbox".into(),
-        publication: "pub_outbox".into(),
-        tables: vec!["public.orders".into()],
-        tenant: "acme".into(),
-        pipeline: "test".into(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_prefixes: AllowList::new(&["outbox".to_string()]),
-    };
-
-    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel(128);
-    let handle = src.run(tx, ckpt).await;
-    wait_ready(&handle, Duration::from_secs(10)).await?;
-    sleep(Duration::from_secs(2)).await;
+    let src = make_source(
+        "outbox",
+        &db,
+        "slot_outbox",
+        "pub_outbox",
+        vec!["public.orders".into()],
+        AllowList::new(&["outbox".to_string()]),
+    );
+    let (mut rx, handle) = start_source(src).await?;
 
     // Emit outbox message (transactional = true)
     client
@@ -1752,9 +1639,7 @@ async fn postgres_cdc_outbox_capture() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_outbox_glob_prefix() -> Result<()> {
-    init_test_tracing();
-    let _ = get_container().await;
-    let (db, client) = create_db("outbox_glob").await?;
+    let (db, client) = setup("outbox_glob").await?;
 
     client
         .execute("CREATE TABLE stub (id INT PRIMARY KEY)", &[])
@@ -1764,24 +1649,15 @@ async fn postgres_cdc_outbox_glob_prefix() -> Result<()> {
         .await?;
     create_pub_slot(&client, "pub_obglob", "slot_obglob", &["stub"]).await?;
 
-    let src = PostgresSource {
-        id: "obglob".into(),
-        checkpoint_key: "pg-obglob".into(),
-        dsn: cdc_dsn(&db),
-        slot: "slot_obglob".into(),
-        publication: "pub_obglob".into(),
-        tables: vec!["public.stub".into()],
-        tenant: "acme".into(),
-        pipeline: "test".into(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_prefixes: AllowList::new(&["outbox_%".to_string()]),
-    };
-
-    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel(128);
-    let handle = src.run(tx, ckpt).await;
-    wait_ready(&handle, Duration::from_secs(10)).await?;
-    sleep(Duration::from_secs(2)).await;
+    let src = make_source(
+        "obglob",
+        &db,
+        "slot_obglob",
+        "pub_obglob",
+        vec!["public.stub".into()],
+        AllowList::new(&["outbox_%".to_string()]),
+    );
+    let (mut rx, handle) = start_source(src).await?;
 
     client
         .execute(
@@ -1848,9 +1724,7 @@ async fn postgres_cdc_outbox_full_pipeline() -> Result<()> {
     use processors::OutboxProcessor;
     use std::collections::HashMap;
 
-    init_test_tracing();
-    let _ = get_container().await;
-    let (db, client) = create_db("outbox_pipe").await?;
+    let (db, client) = setup("outbox_pipe").await?;
 
     client
         .execute(
@@ -1866,24 +1740,15 @@ async fn postgres_cdc_outbox_full_pipeline() -> Result<()> {
         .await?;
     create_pub_slot(&client, "pub_obpipe", "slot_obpipe", &["orders"]).await?;
 
-    let src = PostgresSource {
-        id: "obpipe".into(),
-        checkpoint_key: "pg-obpipe".into(),
-        dsn: cdc_dsn(&db),
-        slot: "slot_obpipe".into(),
-        publication: "pub_obpipe".into(),
-        tables: vec!["public.orders".into()],
-        tenant: "acme".into(),
-        pipeline: "test".into(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_prefixes: AllowList::new(&["outbox".to_string()]),
-    };
-
-    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel(128);
-    let handle = src.run(tx, ckpt).await;
-    wait_ready(&handle, Duration::from_secs(10)).await?;
-    sleep(Duration::from_secs(2)).await;
+    let src = make_source(
+        "obpipe",
+        &db,
+        "slot_obpipe",
+        "pub_obpipe",
+        vec!["public.orders".into()],
+        AllowList::new(&["outbox".to_string()]),
+    );
+    let (mut rx, handle) = start_source(src).await?;
 
     // Emit outbox message + normal insert
     client
@@ -1920,7 +1785,8 @@ async fn postgres_cdc_outbox_full_pipeline() -> Result<()> {
         strict: false,
     })?;
 
-    let processed = proc.process(raw_events).await?;
+    let ctx = BatchContext::from_batch(&raw_events);
+    let processed = proc.process(raw_events, &ctx).await?;
 
     // Outbox event should be transformed
     let outbox_ev = processed
@@ -1985,7 +1851,8 @@ async fn postgres_cdc_outbox_full_pipeline() -> Result<()> {
         strict: false,
     })?;
 
-    let raw_processed = raw_proc.process(raw_events_clone).await?;
+    let ctx = BatchContext::from_batch(&raw_events_clone);
+    let raw_processed = raw_proc.process(raw_events_clone, &ctx).await?;
 
     let raw_outbox_ev = raw_processed
         .iter()

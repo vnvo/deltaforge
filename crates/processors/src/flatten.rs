@@ -22,7 +22,7 @@ use deltaforge_config::{
     CollisionPolicy, EmptyListPolicy, EmptyObjectPolicy, FlattenProcessorCfg,
     ListPolicy,
 };
-use deltaforge_core::{Event, Processor};
+use deltaforge_core::{BatchContext, Event, Processor};
 use serde_json::{Map, Value};
 use tracing::debug;
 
@@ -189,7 +189,11 @@ impl Processor for FlattenProcessor {
         &self.id
     }
 
-    async fn process(&self, mut events: Vec<Event>) -> Result<Vec<Event>> {
+    async fn process(
+        &self,
+        mut events: Vec<Event>,
+        _ctx: &BatchContext,
+    ) -> Result<Vec<Event>> {
         for event in &mut events {
             self.flatten_event(event)?;
         }
