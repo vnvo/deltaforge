@@ -38,10 +38,10 @@ use deltaforge_config::{PipelineSpec, SinkCfg, SinkFilter};
 use deltaforge_core::ArcDynSink;
 use tokio_util::sync::CancellationToken;
 
+pub mod filter;
 pub mod kafka;
 pub mod nats;
 pub mod redis;
-pub mod filter;
 pub use filter::FilteredSink;
 pub use kafka::KafkaSink;
 pub use nats::NatsSink;
@@ -99,11 +99,13 @@ pub fn build_sinks(
         .map(|s| {
             let (sink, filter): (ArcDynSink, Option<SinkFilter>) = match s {
                 SinkCfg::Kafka(cfg) => (
-                    Arc::new(KafkaSink::new(cfg, cancel.clone())?) as ArcDynSink,
+                    Arc::new(KafkaSink::new(cfg, cancel.clone())?)
+                        as ArcDynSink,
                     cfg.filter.clone(),
                 ),
                 SinkCfg::Redis(cfg) => (
-                    Arc::new(RedisSink::new(cfg, cancel.clone())?) as ArcDynSink,
+                    Arc::new(RedisSink::new(cfg, cancel.clone())?)
+                        as ArcDynSink,
                     cfg.filter.clone(),
                 ),
                 SinkCfg::Nats(cfg) => (

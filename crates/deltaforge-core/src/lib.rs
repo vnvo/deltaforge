@@ -687,7 +687,11 @@ pub trait Source: Send + Sync {
 #[async_trait]
 pub trait Processor: Send + Sync {
     fn id(&self) -> &str;
-    async fn process(&self, events: Vec<Event>, ctx: &BatchContext) -> Result<Vec<Event>>;
+    async fn process(
+        &self,
+        events: Vec<Event>,
+        ctx: &BatchContext,
+    ) -> Result<Vec<Event>>;
 }
 
 #[async_trait]

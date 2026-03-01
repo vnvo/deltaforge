@@ -82,15 +82,22 @@ mod tests {
     impl CountingSink {
         fn new(id: &str) -> (ArcDynSink, Arc<AtomicUsize>) {
             let count = Arc::new(AtomicUsize::new(0));
-            let sink = Arc::new(Self { id: id.into(), count: count.clone() });
+            let sink = Arc::new(Self {
+                id: id.into(),
+                count: count.clone(),
+            });
             (sink, count)
         }
     }
 
     #[async_trait]
     impl Sink for CountingSink {
-        fn id(&self) -> &str { &self.id }
-        fn required(&self) -> bool { true }
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn required(&self) -> bool {
+            true
+        }
         async fn send(&self, _: &Event) -> SinkResult<()> {
             self.count.fetch_add(1, Ordering::Relaxed);
             Ok(())
@@ -104,12 +111,21 @@ mod tests {
     fn source_event() -> Event {
         Event::new_row(
             SourceInfo {
-                version: "1".into(), connector: "mysql".into(),
-                name: "db".into(), ts_ms: 0, db: "shop".into(),
-                schema: None, table: "orders".into(),
-                snapshot: None, position: SourcePosition::default(),
+                version: "1".into(),
+                connector: "mysql".into(),
+                name: "db".into(),
+                ts_ms: 0,
+                db: "shop".into(),
+                schema: None,
+                table: "orders".into(),
+                snapshot: None,
+                position: SourcePosition::default(),
             },
-            Op::Create, None, Some(json!({"id": 1})), 0, 64,
+            Op::Create,
+            None,
+            Some(json!({"id": 1})),
+            0,
+            64,
         )
         // synthetic is None — source event
     }
@@ -125,10 +141,13 @@ mod tests {
     #[tokio::test]
     async fn exclude_synthetic_drops_synthetic_passes_source() {
         let (inner, count) = CountingSink::new("sink");
-        let filter = SinkFilter { exclude_synthetic: true, ..Default::default() };
+        let filter = SinkFilter {
+            exclude_synthetic: true,
+            ..Default::default()
+        };
         let sink = FilteredSink::wrap(inner, filter);
 
-        sink.send(&source_event()).await.unwrap();         // passes
+        sink.send(&source_event()).await.unwrap(); // passes
         sink.send(&synthetic_event("analytics")).await.unwrap(); // dropped
 
         assert_eq!(count.load(Ordering::Relaxed), 1);
@@ -137,10 +156,13 @@ mod tests {
     #[tokio::test]
     async fn synthetic_only_passes_synthetic_drops_source() {
         let (inner, count) = CountingSink::new("sink");
-        let filter = SinkFilter { synthetic_only: true, ..Default::default() };
+        let filter = SinkFilter {
+            synthetic_only: true,
+            ..Default::default()
+        };
         let sink = FilteredSink::wrap(inner, filter);
 
-        sink.send(&source_event()).await.unwrap();              // dropped
+        sink.send(&source_event()).await.unwrap(); // dropped
         sink.send(&synthetic_event("metrics")).await.unwrap(); // passes
 
         assert_eq!(count.load(Ordering::Relaxed), 1);
@@ -157,7 +179,7 @@ mod tests {
 
         sink.send(&synthetic_event("analytics")).await.unwrap(); // passes
         sink.send(&synthetic_event("other-proc")).await.unwrap(); // dropped
-        sink.send(&source_event()).await.unwrap();                // dropped (no producer)
+        sink.send(&source_event()).await.unwrap(); // dropped (no producer)
 
         assert_eq!(count.load(Ordering::Relaxed), 1);
     }
@@ -165,7 +187,10 @@ mod tests {
     #[tokio::test]
     async fn send_batch_fast_path_when_nothing_filtered() {
         let (inner, count) = CountingSink::new("sink");
-        let filter = SinkFilter { exclude_synthetic: true, ..Default::default() };
+        let filter = SinkFilter {
+            exclude_synthetic: true,
+            ..Default::default()
+        };
         let sink = FilteredSink::wrap(inner, filter);
 
         // All source events → fast path, no clone
@@ -178,14 +203,14 @@ mod tests {
     #[tokio::test]
     async fn send_batch_partial_filter() {
         let (inner, count) = CountingSink::new("sink");
-        let filter = SinkFilter { exclude_synthetic: true, ..Default::default() };
+        let filter = SinkFilter {
+            exclude_synthetic: true,
+            ..Default::default()
+        };
         let sink = FilteredSink::wrap(inner, filter);
 
-        let events = vec![
-            source_event(),
-            synthetic_event("metrics"),
-            source_event(),
-        ];
+        let events =
+            vec![source_event(), synthetic_event("metrics"), source_event()];
         sink.send_batch(&events).await.unwrap();
 
         assert_eq!(count.load(Ordering::Relaxed), 2); // only the 2 source events
