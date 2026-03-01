@@ -804,3 +804,72 @@ spec:
         ProcessorCfg::Flatten { .. }
     ));
 }
+
+#[test]
+#[serial]
+fn sink_filter_exclude_synthetic_parses() {
+    let yaml = r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata: { name: filter_test, tenant: t }
+spec:
+  source:
+    type: mysql
+    config:
+      id: m
+      dsn: mysql://root:pw@localhost:3306/db
+      tables: [orders]
+  processors: []
+  sinks:
+    - type: kafka
+      config:
+        id: business
+        brokers: localhost:9092
+        topic: cdc.orders
+        filter:
+          exclude_synthetic: true
+    - type: kafka
+      config:
+        id: metrics
+        brokers: localhost:9092
+        topic: _deltaforge.metrics
+        filter:
+          synthetic_only: true
+          producers: ["analytics"]
+    - type: redis
+      config:
+        id: all-events
+        uri: redis://localhost:6379
+        stream: events
+        # no filter - gets everything
+"#;
+
+    let path = write_temp(yaml);
+    let spec = load_from_path(path.to_str().unwrap()).expect("parse ok");
+
+    match &spec.spec.sinks[0] {
+        SinkCfg::Kafka(kc) => {
+            let f = kc.filter.as_ref().expect("filter present");
+            assert!(f.exclude_synthetic);
+            assert!(!f.synthetic_only);
+            assert!(f.producers.is_empty());
+        }
+        _ => panic!("expected kafka"),
+    }
+
+    match &spec.spec.sinks[1] {
+        SinkCfg::Kafka(kc) => {
+            let f = kc.filter.as_ref().expect("filter present");
+            assert!(f.synthetic_only);
+            assert_eq!(f.producers, vec!["analytics"]);
+        }
+        _ => panic!("expected kafka"),
+    }
+
+    match &spec.spec.sinks[2] {
+        SinkCfg::Redis(rc) => {
+            assert!(rc.filter.is_none(), "no filter on all-events sink");
+        }
+        _ => panic!("expected redis"),
+    }
+}

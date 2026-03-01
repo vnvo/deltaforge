@@ -34,7 +34,7 @@ use metrics::counter;
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use deltaforge_core::{Event, Op, Processor};
+use deltaforge_core::{BatchContext, Event, Op, Processor};
 
 // Config types live in deltaforge-config to avoid circular deps
 use deltaforge_config::{
@@ -306,7 +306,11 @@ impl Processor for OutboxProcessor {
         &self.id
     }
 
-    async fn process(&self, events: Vec<Event>) -> Result<Vec<Event>> {
+    async fn process(
+        &self,
+        events: Vec<Event>,
+        _ctx: &BatchContext,
+    ) -> Result<Vec<Event>> {
         let mut out = Vec::with_capacity(events.len());
         for mut event in events {
             if self.should_process(&event) {
@@ -400,10 +404,9 @@ mod tests {
     #[tokio::test]
     async fn transforms_outbox_event() {
         let proc = OutboxProcessor::new(default_cfg()).unwrap();
-        let result = proc
-            .process(vec![outbox_event("outbox", outbox_payload())])
-            .await
-            .unwrap();
+        let events = vec![outbox_event("outbox", outbox_payload())];
+        let ctx = BatchContext::from_batch(&events);
+        let result = proc.process(events, &ctx).await.unwrap();
 
         assert_eq!(result.len(), 1);
         let ev = &result[0];
@@ -433,10 +436,9 @@ mod tests {
             ..default_cfg()
         };
         let proc = OutboxProcessor::new(cfg).unwrap();
-        let result = proc
-            .process(vec![outbox_event("outbox", outbox_payload())])
-            .await
-            .unwrap();
+        let events = vec![outbox_event("outbox", outbox_payload())];
+        let ctx = BatchContext::from_batch(&events);
+        let result = proc.process(events, &ctx).await.unwrap();
         assert_eq!(
             result[0].routing.as_ref().unwrap().topic.as_deref(),
             Some("Order.OrderCreated")
@@ -464,10 +466,9 @@ mod tests {
             "action": "created",
             "payload": {"total": 99.99}
         });
-        let result = proc
-            .process(vec![outbox_event("outbox", payload)])
-            .await
-            .unwrap();
+        let events = vec![outbox_event("outbox", payload)];
+        let ctx = BatchContext::from_batch(&events);
+        let result = proc.process(events, &ctx).await.unwrap();
 
         // Template resolves against raw payload columns
         assert_eq!(
@@ -495,13 +496,14 @@ mod tests {
         };
         let proc = OutboxProcessor::new(cfg).unwrap();
 
-        let result = proc
-            .process(vec![
-                outbox_event("orders_outbox", outbox_payload()),
-                outbox_event("payments_outbox", outbox_payload()),
-            ])
-            .await
-            .unwrap();
+        let events = vec![
+            outbox_event("orders_outbox", outbox_payload()),
+            outbox_event("payments_outbox", outbox_payload()),
+        ];
+
+        let ctx = BatchContext::from_batch(&events);
+
+        let result = proc.process(events, &ctx).await.unwrap();
 
         assert_eq!(result.len(), 2);
         assert!(result[0].source.schema.is_none()); // transformed
@@ -519,13 +521,14 @@ mod tests {
         };
         let proc = OutboxProcessor::new(cfg).unwrap();
 
-        let result = proc
-            .process(vec![
-                outbox_event("order_outbox", outbox_payload()),
-                outbox_event("payment_outbox", outbox_payload()),
-            ])
-            .await
-            .unwrap();
+        let events = vec![
+            outbox_event("order_outbox", outbox_payload()),
+            outbox_event("payment_outbox", outbox_payload()),
+        ];
+
+        let ctx = BatchContext::from_batch(&events);
+
+        let result = proc.process(events, &ctx).await.unwrap();
 
         assert!(result[0].source.schema.is_none());
         assert_eq!(
@@ -537,14 +540,13 @@ mod tests {
     #[tokio::test]
     async fn non_outbox_pass_through() {
         let proc = OutboxProcessor::new(default_cfg()).unwrap();
-        let result = proc
-            .process(vec![
-                table_event("orders"),
-                outbox_event("outbox", outbox_payload()),
-                table_event("customers"),
-            ])
-            .await
-            .unwrap();
+        let events = vec![
+            table_event("orders"),
+            outbox_event("outbox", outbox_payload()),
+            table_event("customers"),
+        ];
+        let ctx = BatchContext::from_batch(&events);
+        let result = proc.process(events, &ctx).await.unwrap();
 
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].source.table, "orders");
@@ -557,7 +559,11 @@ mod tests {
         let mut ev = outbox_event("outbox", outbox_payload());
         ev.op = Op::Delete;
 
-        let result = proc.process(vec![ev]).await.unwrap();
+        let events = vec![ev];
+
+        let ctx = BatchContext::from_batch(&events);
+
+        let result = proc.process(events, &ctx).await.unwrap();
         assert!(result.is_empty());
     }
 
@@ -570,20 +576,30 @@ mod tests {
         let proc = OutboxProcessor::new(cfg).unwrap();
 
         // Has explicit topic column → uses it
-        let result = proc.process(vec![outbox_event("outbox", json!({
-            "aggregate_type": "X", "aggregate_id": "1", "event_type": "Y",
-            "topic": "explicit", "payload": {}
-        }))]).await.unwrap();
+        let events = vec![outbox_event(
+            "outbox",
+            json!({
+                "aggregate_type": "X", "aggregate_id": "1", "event_type": "Y",
+                "topic": "explicit", "payload": {}
+            }),
+        )];
+        let ctx = BatchContext::from_batch(&events);
+        let result = proc.process(events, &ctx).await.unwrap();
         assert_eq!(
             result[0].routing.as_ref().unwrap().topic.as_deref(),
             Some("explicit")
         );
 
         // No topic column → falls to default
-        let result = proc.process(vec![outbox_event("outbox", json!({
-            "aggregate_type": "X", "aggregate_id": "1", "event_type": "Y",
-            "payload": {}
-        }))]).await.unwrap();
+        let events = vec![outbox_event(
+            "outbox",
+            json!({
+                "aggregate_type": "X", "aggregate_id": "1", "event_type": "Y",
+                "payload": {}
+            }),
+        )];
+        let ctx = BatchContext::from_batch(&events);
+        let result = proc.process(events, &ctx).await.unwrap();
         assert_eq!(
             result[0].routing.as_ref().unwrap().topic.as_deref(),
             Some("events.default")
@@ -609,10 +625,9 @@ mod tests {
             "tenant": "acme",
             "payload": {"total": 99.99}
         });
-        let result = proc
-            .process(vec![outbox_event("outbox", payload)])
-            .await
-            .unwrap();
+        let events = vec![outbox_event("outbox", payload)];
+        let ctx = BatchContext::from_batch(&events);
+        let result = proc.process(events, &ctx).await.unwrap();
 
         let headers = result[0]
             .routing
@@ -638,10 +653,9 @@ mod tests {
         let proc = OutboxProcessor::new(cfg).unwrap();
 
         // payload has no trace_id field
-        let result = proc
-            .process(vec![outbox_event("outbox", outbox_payload())])
-            .await
-            .unwrap();
+        let events = vec![outbox_event("outbox", outbox_payload())];
+        let ctx = BatchContext::from_batch(&events);
+        let result = proc.process(events, &ctx).await.unwrap();
 
         let headers = result[0]
             .routing
@@ -668,10 +682,9 @@ mod tests {
             ..default_cfg()
         };
         let proc = OutboxProcessor::new(cfg).unwrap();
-        let result = proc
-            .process(vec![outbox_event("outbox", outbox_payload())])
-            .await
-            .unwrap();
+        let events = vec![outbox_event("outbox", outbox_payload())];
+        let ctx = BatchContext::from_batch(&events);
+        let result = proc.process(events, &ctx).await.unwrap();
 
         let routing = result[0].routing.as_ref().unwrap();
         assert!(routing.raw_payload, "raw_payload flag should be set");
@@ -681,10 +694,9 @@ mod tests {
     #[tokio::test]
     async fn raw_payload_false_by_default() {
         let proc = OutboxProcessor::new(default_cfg()).unwrap();
-        let result = proc
-            .process(vec![outbox_event("outbox", outbox_payload())])
-            .await
-            .unwrap();
+        let events = vec![outbox_event("outbox", outbox_payload())];
+        let ctx = BatchContext::from_batch(&events);
+        let result = proc.process(events, &ctx).await.unwrap();
 
         let routing = result[0].routing.as_ref().unwrap();
         assert!(!routing.raw_payload, "raw_payload should default to false");
@@ -703,7 +715,9 @@ mod tests {
         let proc = OutboxProcessor::new(cfg).unwrap();
 
         let ev = outbox_event("outbox", outbox_payload());
-        let out = proc.process(vec![ev]).await.unwrap();
+        let events = vec![ev];
+        let ctx = BatchContext::from_batch(&events);
+        let out = proc.process(events, &ctx).await.unwrap();
         assert_eq!(out[0].routing.as_ref().unwrap().key.as_deref(), Some("42"));
     }
 
@@ -712,7 +726,9 @@ mod tests {
         let proc = OutboxProcessor::new(default_cfg()).unwrap();
 
         let ev = outbox_event("outbox", outbox_payload());
-        let out = proc.process(vec![ev]).await.unwrap();
+        let events = vec![ev];
+        let ctx = BatchContext::from_batch(&events);
+        let out = proc.process(events, &ctx).await.unwrap();
         assert_eq!(out[0].routing.as_ref().unwrap().key.as_deref(), Some("42"));
     }
 
@@ -725,7 +741,9 @@ mod tests {
         let proc = OutboxProcessor::new(cfg).unwrap();
 
         let ev = outbox_event("outbox", outbox_payload());
-        let out = proc.process(vec![ev]).await.unwrap();
+        let events = vec![ev];
+        let ctx = BatchContext::from_batch(&events);
+        let out = proc.process(events, &ctx).await.unwrap();
         assert_eq!(
             out[0].routing.as_ref().unwrap().key.as_deref(),
             Some("Order:42")
@@ -746,7 +764,9 @@ mod tests {
                 "payload": {}
             }),
         );
-        let out = proc.process(vec![ev]).await.unwrap();
+        let events = vec![ev];
+        let ctx = BatchContext::from_batch(&events);
+        let out = proc.process(events, &ctx).await.unwrap();
         let headers =
             out[0].routing.as_ref().unwrap().headers.as_ref().unwrap();
         assert_eq!(headers.get("df-event-id").unwrap(), "evt-abc-123");
@@ -773,7 +793,9 @@ mod tests {
                 "payload": {}
             }),
         );
-        let out = proc.process(vec![ev]).await.unwrap();
+        let events = vec![ev];
+        let ctx = BatchContext::from_batch(&events);
+        let out = proc.process(events, &ctx).await.unwrap();
         let headers =
             out[0].routing.as_ref().unwrap().headers.as_ref().unwrap();
         assert_eq!(headers.get("df-event-id").unwrap(), "550e8400-e29b-41d4");
@@ -793,7 +815,9 @@ mod tests {
                 "payload": {}
             }),
         );
-        let out = proc.process(vec![ev]).await.unwrap();
+        let events = vec![ev];
+        let ctx = BatchContext::from_batch(&events);
+        let out = proc.process(events, &ctx).await.unwrap();
         let headers =
             out[0].routing.as_ref().unwrap().headers.as_ref().unwrap();
         assert_eq!(headers.get("df-event-id").unwrap(), "12345");
@@ -823,7 +847,9 @@ mod tests {
                 "payload": {}
             }),
         );
-        let out = proc.process(vec![ev]).await.unwrap();
+        let events = vec![ev];
+        let ctx = BatchContext::from_batch(&events);
+        let out = proc.process(events, &ctx).await.unwrap();
         let headers =
             out[0].routing.as_ref().unwrap().headers.as_ref().unwrap();
         assert_eq!(headers.get("x-priority").unwrap(), "true");
@@ -836,7 +862,11 @@ mod tests {
         let mut ev = outbox_event("outbox", outbox_payload());
         ev.op = Op::Update;
 
-        let out = proc.process(vec![ev]).await.unwrap();
+        let events = vec![ev];
+
+        let ctx = BatchContext::from_batch(&events);
+
+        let out = proc.process(events, &ctx).await.unwrap();
         assert!(out.is_empty());
     }
 
@@ -847,7 +877,11 @@ mod tests {
         let mut ev = outbox_event("outbox", outbox_payload());
         ev.after = None;
 
-        let out = proc.process(vec![ev]).await.unwrap();
+        let events = vec![ev];
+
+        let ctx = BatchContext::from_batch(&events);
+
+        let out = proc.process(events, &ctx).await.unwrap();
         assert!(out.is_empty());
     }
 
@@ -856,7 +890,9 @@ mod tests {
         let proc = OutboxProcessor::new(default_cfg()).unwrap();
 
         let ev = outbox_event("outbox", json!("just a string"));
-        let out = proc.process(vec![ev]).await.unwrap();
+        let events = vec![ev];
+        let ctx = BatchContext::from_batch(&events);
+        let out = proc.process(events, &ctx).await.unwrap();
         assert!(out.is_empty());
     }
 
@@ -865,7 +901,9 @@ mod tests {
         let proc = OutboxProcessor::new(default_cfg()).unwrap();
 
         let ev = outbox_event("outbox", outbox_payload());
-        let out = proc.process(vec![ev]).await.unwrap();
+        let events = vec![ev];
+        let ctx = BatchContext::from_batch(&events);
+        let out = proc.process(events, &ctx).await.unwrap();
         let headers =
             out[0].routing.as_ref().unwrap().headers.as_ref().unwrap();
         assert_eq!(headers.get("df-source-kind").unwrap(), "outbox");
@@ -889,7 +927,9 @@ mod tests {
         let proc = OutboxProcessor::new(strict_cfg()).unwrap();
 
         let ev = outbox_event("outbox", outbox_payload());
-        let out = proc.process(vec![ev]).await.unwrap();
+        let events = vec![ev];
+        let ctx = BatchContext::from_batch(&events);
+        let out = proc.process(events, &ctx).await.unwrap();
         assert_eq!(out.len(), 1);
     }
 
@@ -905,7 +945,9 @@ mod tests {
                 "payload": {"total": 99.99}
             }),
         );
-        let err = proc.process(vec![ev]).await.unwrap_err();
+        let events = vec![ev];
+        let ctx = BatchContext::from_batch(&events);
+        let err = proc.process(events, &ctx).await.unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("aggregate_type"),
@@ -926,7 +968,9 @@ mod tests {
                 // no "payload" key
             }),
         );
-        let err = proc.process(vec![ev]).await.unwrap_err();
+        let events = vec![ev];
+        let ctx = BatchContext::from_batch(&events);
+        let err = proc.process(events, &ctx).await.unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("payload"),
@@ -943,7 +987,9 @@ mod tests {
         let proc = OutboxProcessor::new(cfg).unwrap();
 
         let ev = outbox_event("outbox", outbox_payload());
-        let err = proc.process(vec![ev]).await.unwrap_err();
+        let events = vec![ev];
+        let ctx = BatchContext::from_batch(&events);
+        let err = proc.process(events, &ctx).await.unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("topic"),
@@ -960,7 +1006,9 @@ mod tests {
         let proc = OutboxProcessor::new(cfg).unwrap();
 
         let ev = outbox_event("outbox", json!({"unrelated": true}));
-        let err = proc.process(vec![ev]).await.unwrap_err();
+        let events = vec![ev];
+        let ctx = BatchContext::from_batch(&events);
+        let err = proc.process(events, &ctx).await.unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("topic"), "{msg}");
         assert!(msg.contains("payload"), "{msg}");
@@ -979,7 +1027,9 @@ mod tests {
                 "payload": {"total": 99.99}
             }),
         );
-        let out = proc.process(vec![ev]).await.unwrap();
+        let events = vec![ev];
+        let ctx = BatchContext::from_batch(&events);
+        let out = proc.process(events, &ctx).await.unwrap();
         assert_eq!(out.len(), 1);
     }
 }

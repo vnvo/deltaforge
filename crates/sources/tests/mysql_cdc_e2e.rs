@@ -11,7 +11,7 @@ use anyhow::Result;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
 use common::AllowList;
 use ctor::dtor;
-use deltaforge_core::{Event, Op, Source, SourceHandle};
+use deltaforge_core::{BatchContext, Event, Op, Source, SourceHandle};
 use mysql_async::Opts;
 use mysql_async::{Pool as MySQLPool, prelude::Queryable};
 use schema_registry::{InMemoryRegistry, SourceSchema};
@@ -283,6 +283,54 @@ async fn wait_for_source_ready(
 }
 
 // =============================================================================
+// Test Helpers
+// =============================================================================
+
+/// Standard per-test setup: tracing, shared container, fresh database + DSN.
+/// Returns (db_name, pool, dsn). Caller does get_conn() + USE as needed.
+async fn setup(name: &str) -> Result<(String, MySQLPool, String)> {
+    init_test_tracing();
+    get_mysql_container().await;
+    let (db_name, pool) = create_test_database(name).await?;
+    let dsn = cdc_dsn(&db_name);
+    Ok((db_name, pool, dsn))
+}
+
+/// Build a MySqlSource with constant defaults (tenant=acme, pipeline=test,
+/// fresh InMemoryRegistry). `id` is also used as the checkpoint key suffix.
+fn make_source(
+    id: &str,
+    dsn: &str,
+    tables: Vec<String>,
+    outbox_tables: AllowList,
+) -> MySqlSource {
+    MySqlSource {
+        id: id.into(),
+        checkpoint_key: format!("mysql-{}", id),
+        dsn: dsn.to_string(),
+        tables,
+        tenant: "acme".into(),
+        pipeline: "test".to_string(),
+        registry: Arc::new(InMemoryRegistry::new()),
+        outbox_tables,
+    }
+}
+
+/// Start a source with a fresh checkpoint store, wait for ready, then warm up
+/// for 3 seconds. Returns (rx, handle).
+async fn start_source(
+    src: MySqlSource,
+) -> Result<(mpsc::Receiver<Event>, SourceHandle)> {
+    let ckpt_store: Arc<dyn CheckpointStore> =
+        Arc::new(MemCheckpointStore::new()?);
+    let (tx, rx) = mpsc::channel::<Event>(128);
+    let handle = src.run(tx, ckpt_store).await;
+    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
+    sleep(Duration::from_secs(3)).await;
+    Ok((rx, handle))
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -290,13 +338,8 @@ async fn wait_for_source_ready(
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_schema_loader() -> Result<()> {
-    init_test_tracing();
-    let _container = get_mysql_container().await;
-
-    let (db_name, pool) = create_test_database("schema_loader").await?;
+    let (db_name, pool, dsn) = setup("schema_loader").await?;
     let mut conn = pool.get_conn().await?;
-    let dsn = cdc_dsn(&db_name);
-
     conn.query_drop(format!("USE {}", db_name)).await?;
     conn.query_drop(
         r#"CREATE TABLE orders (
@@ -428,13 +471,8 @@ async fn mysql_schema_loader() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_cdc_basic_events() -> Result<()> {
-    init_test_tracing();
-    let _container = get_mysql_container().await;
-
-    let (db_name, pool) = create_test_database("cdc_basic").await?;
+    let (db_name, pool, dsn) = setup("cdc_basic").await?;
     let mut conn = pool.get_conn().await?;
-    let dsn = cdc_dsn(&db_name);
-
     conn.query_drop(format!("USE {}", db_name)).await?;
     conn.query_drop(
         r#"CREATE TABLE orders (
@@ -457,14 +495,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
         registry: registry.clone(),
         outbox_tables: AllowList::default(),
     };
-
-    let ckpt_store: Arc<dyn CheckpointStore> =
-        Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel::<Event>(128);
-    let handle = src.run(tx, ckpt_store).await;
-    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
-
-    sleep(Duration::from_secs(3)).await;
+    let (mut rx, handle) = start_source(src).await?;
 
     // Perform DML
     conn.query_drop(
@@ -559,13 +590,8 @@ async fn mysql_cdc_basic_events() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
-    init_test_tracing();
-    let _container = get_mysql_container().await;
-
-    let (db_name, pool) = create_test_database("schema_ddl").await?;
+    let (db_name, pool, dsn) = setup("schema_ddl").await?;
     let mut conn = pool.get_conn().await?;
-    let dsn = cdc_dsn(&db_name);
-
     conn.query_drop(format!("USE {}", db_name)).await?;
     conn.query_drop(
         r#"CREATE TABLE orders (
@@ -586,14 +612,7 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
         registry: registry.clone(),
         outbox_tables: AllowList::default(),
     };
-
-    let ckpt_store: Arc<dyn CheckpointStore> =
-        Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel::<Event>(128);
-    let handle = src.run(tx, ckpt_store).await;
-    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
-
-    sleep(Duration::from_secs(3)).await;
+    let (mut rx, handle) = start_source(src).await?;
 
     // Insert with original schema (2 columns)
     conn.query_drop("INSERT INTO orders (id, sku) VALUES (100, 'pre-ddl')")
@@ -669,13 +688,8 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_cdc_checkpoint_resume() -> Result<()> {
-    init_test_tracing();
-    let _container = get_mysql_container().await;
-
-    let (db_name, pool) = create_test_database("checkpoint").await?;
+    let (db_name, pool, dsn) = setup("checkpoint").await?;
     let mut conn = pool.get_conn().await?;
-    let dsn = cdc_dsn(&db_name);
-
     conn.query_drop(format!("USE {}", db_name)).await?;
     conn.query_drop(
         r#"CREATE TABLE orders (
@@ -693,16 +707,12 @@ async fn mysql_cdc_checkpoint_resume() -> Result<()> {
     info!("--- First run ---");
     {
         let (tx, mut rx) = mpsc::channel::<Event>(128);
-        let src = MySqlSource {
-            id: "ckpt-test".into(),
-            checkpoint_key: "mysql-ckpt".to_string(),
-            dsn: dsn.clone(),
-            tables: vec![format!("{}.orders", db_name)],
-            tenant: "acme".into(),
-            pipeline: "test".to_string(),
-            registry: Arc::new(InMemoryRegistry::new()),
-            outbox_tables: AllowList::default(),
-        };
+        let src = make_source(
+            "ckpt-test",
+            &dsn,
+            vec![format!("{}.orders", db_name)],
+            AllowList::default(),
+        );
 
         let handle = src.run(tx, ckpt_store.clone()).await;
         sleep(Duration::from_secs(3)).await;
@@ -738,16 +748,12 @@ async fn mysql_cdc_checkpoint_resume() -> Result<()> {
     info!("--- Second run ---");
     {
         let (tx, mut rx) = mpsc::channel::<Event>(128);
-        let src = MySqlSource {
-            id: "ckpt-test".into(),
-            checkpoint_key: "mysql-ckpt".to_string(),
-            dsn: dsn.clone(),
-            tables: vec![format!("{}.orders", db_name)],
-            tenant: "acme".into(),
-            pipeline: "test".to_string(),
-            registry: Arc::new(InMemoryRegistry::new()),
-            outbox_tables: AllowList::default(),
-        };
+        let src = make_source(
+            "ckpt-test",
+            &dsn,
+            vec![format!("{}.orders", db_name)],
+            AllowList::default(),
+        );
 
         let handle = src.run(tx, ckpt_store.clone()).await;
 
@@ -780,13 +786,8 @@ async fn mysql_cdc_checkpoint_resume() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_cdc_reconnect_after_disconnect() -> Result<()> {
-    init_test_tracing();
-    let _container = get_mysql_container().await;
-
-    let (db_name, pool) = create_test_database("reconnect").await?;
+    let (db_name, pool, dsn) = setup("reconnect").await?;
     let mut conn = pool.get_conn().await?;
-    let dsn = cdc_dsn(&db_name);
-
     conn.query_drop(format!("USE {}", db_name)).await?;
     conn.query_drop(
         r#"CREATE TABLE orders (
@@ -796,24 +797,13 @@ async fn mysql_cdc_reconnect_after_disconnect() -> Result<()> {
     )
     .await?;
 
-    let src = MySqlSource {
-        id: "reconnect".into(),
-        checkpoint_key: "mysql-reconnect".to_string(),
-        dsn: dsn.clone(),
-        tables: vec![format!("{}.orders", db_name)],
-        tenant: "acme".into(),
-        pipeline: "test".to_string(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_tables: AllowList::default(),
-    };
-
-    let ckpt_store: Arc<dyn CheckpointStore> =
-        Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel::<Event>(128);
-    let handle = src.run(tx, ckpt_store).await;
-    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
-
-    sleep(Duration::from_secs(3)).await;
+    let src = make_source(
+        "reconnect",
+        &dsn,
+        vec![format!("{}.orders", db_name)],
+        AllowList::default(),
+    );
+    let (mut rx, handle) = start_source(src).await?;
 
     // Insert before disconnect
     conn.query_drop(
@@ -879,13 +869,8 @@ async fn mysql_cdc_reconnect_after_disconnect() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_cdc_table_filtering() -> Result<()> {
-    init_test_tracing();
-    let _container = get_mysql_container().await;
-
-    let (db_name, pool) = create_test_database("filtering").await?;
+    let (db_name, pool, dsn) = setup("filtering").await?;
     let mut conn = pool.get_conn().await?;
-    let dsn = cdc_dsn(&db_name);
-
     conn.query_drop(format!("USE {}", db_name)).await?;
     conn.query_drop(
         "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64))",
@@ -897,24 +882,13 @@ async fn mysql_cdc_table_filtering() -> Result<()> {
     .await?;
 
     // Only subscribe to orders, not audit_log
-    let src = MySqlSource {
-        id: "filtering".into(),
-        checkpoint_key: "mysql-filtering".to_string(),
-        dsn: dsn.clone(),
-        tables: vec![format!("{}.orders", db_name)],
-        tenant: "acme".into(),
-        pipeline: "test".to_string(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_tables: AllowList::default(),
-    };
-
-    let ckpt_store: Arc<dyn CheckpointStore> =
-        Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel::<Event>(128);
-    let handle = src.run(tx, ckpt_store).await;
-    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
-
-    sleep(Duration::from_secs(3)).await;
+    let src = make_source(
+        "filtering",
+        &dsn,
+        vec![format!("{}.orders", db_name)],
+        AllowList::default(),
+    );
+    let (mut rx, handle) = start_source(src).await?;
 
     // Insert into both tables
     conn.query_drop(
@@ -975,13 +949,8 @@ async fn mysql_cdc_table_filtering() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_cdc_outbox_capture() -> Result<()> {
-    init_test_tracing();
-    let _container = get_mysql_container().await;
-
-    let (db_name, pool) = create_test_database("outbox").await?;
+    let (db_name, pool, dsn) = setup("outbox").await?;
     let mut conn = pool.get_conn().await?;
-    let dsn = cdc_dsn(&db_name);
-
     conn.query_drop(format!("USE {}", db_name)).await?;
     conn.query_drop(
         r#"CREATE TABLE outbox (
@@ -998,26 +967,13 @@ async fn mysql_cdc_outbox_capture() -> Result<()> {
     )
     .await?;
 
-    let src = MySqlSource {
-        id: "outbox".into(),
-        checkpoint_key: "mysql-outbox".to_string(),
-        dsn: dsn.clone(),
-        tables: vec![
-            format!("{}.outbox", db_name),
-            format!("{}.orders", db_name),
-        ],
-        tenant: "acme".into(),
-        pipeline: "test".to_string(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_tables: AllowList::new(&[format!("{}.outbox", db_name)]),
-    };
-
-    let ckpt_store: Arc<dyn CheckpointStore> =
-        Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel::<Event>(128);
-    let handle = src.run(tx, ckpt_store).await;
-    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
-    sleep(Duration::from_secs(3)).await;
+    let src = make_source(
+        "outbox",
+        &dsn,
+        vec![format!("{}.outbox", db_name), format!("{}.orders", db_name)],
+        AllowList::new(&[format!("{}.outbox", db_name)]),
+    );
+    let (mut rx, handle) = start_source(src).await?;
 
     // Insert outbox event
     conn.query_drop(
@@ -1079,13 +1035,8 @@ async fn mysql_cdc_outbox_capture() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_cdc_outbox_wildcard_tables() -> Result<()> {
-    init_test_tracing();
-    let _container = get_mysql_container().await;
-
-    let (db_name, pool) = create_test_database("outbox_wild").await?;
+    let (db_name, pool, dsn) = setup("outbox_wild").await?;
     let mut conn = pool.get_conn().await?;
-    let dsn = cdc_dsn(&db_name);
-
     conn.query_drop(format!("USE {}", db_name)).await?;
     conn.query_drop(
         r#"CREATE TABLE outbox (
@@ -1101,26 +1052,16 @@ async fn mysql_cdc_outbox_wildcard_tables() -> Result<()> {
     )
     .await?;
 
-    let src = MySqlSource {
-        id: "outbox_wild".into(),
-        checkpoint_key: "mysql-outbox-wild".to_string(),
-        dsn: dsn.clone(),
-        tables: vec![
+    let src = make_source(
+        "outbox_wild",
+        &dsn,
+        vec![
             format!("{}.outbox", db_name),
             format!("{}.audit_log", db_name),
         ],
-        tenant: "acme".into(),
-        pipeline: "test".to_string(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_tables: AllowList::new(&["*.outbox".to_string()]),
-    };
-
-    let ckpt_store: Arc<dyn CheckpointStore> =
-        Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel::<Event>(128);
-    let handle = src.run(tx, ckpt_store).await;
-    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
-    sleep(Duration::from_secs(3)).await;
+        AllowList::new(&["*.outbox".to_string()]),
+    );
+    let (mut rx, handle) = start_source(src).await?;
 
     conn.query_drop(
         r#"INSERT INTO outbox (aggregate_type, event_type, payload)
@@ -1165,13 +1106,8 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
     use processors::OutboxProcessor;
     use std::collections::HashMap;
 
-    init_test_tracing();
-    let _container = get_mysql_container().await;
-
-    let (db_name, pool) = create_test_database("outbox_pipe").await?;
+    let (db_name, pool, dsn) = setup("outbox_pipe").await?;
     let mut conn = pool.get_conn().await?;
-    let dsn = cdc_dsn(&db_name);
-
     conn.query_drop(format!("USE {}", db_name)).await?;
     conn.query_drop(
         r#"CREATE TABLE outbox (
@@ -1188,26 +1124,13 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
     )
     .await?;
 
-    let src = MySqlSource {
-        id: "outbox_pipe".into(),
-        checkpoint_key: "mysql-outbox-pipe".to_string(),
-        dsn: dsn.clone(),
-        tables: vec![
-            format!("{}.outbox", db_name),
-            format!("{}.orders", db_name),
-        ],
-        tenant: "acme".into(),
-        pipeline: "test".to_string(),
-        registry: Arc::new(InMemoryRegistry::new()),
-        outbox_tables: AllowList::new(&[format!("{}.outbox", db_name)]),
-    };
-
-    let ckpt_store: Arc<dyn CheckpointStore> =
-        Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel::<Event>(128);
-    let handle = src.run(tx, ckpt_store).await;
-    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
-    sleep(Duration::from_secs(3)).await;
+    let src = make_source(
+        "outbox_pipe",
+        &dsn,
+        vec![format!("{}.outbox", db_name), format!("{}.orders", db_name)],
+        AllowList::new(&[format!("{}.outbox", db_name)]),
+    );
+    let (mut rx, handle) = start_source(src).await?;
 
     conn.query_drop(
         r#"INSERT INTO outbox (aggregate_type, aggregate_id, event_type, payload)
@@ -1242,7 +1165,8 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
         strict: false,
     })?;
 
-    let processed = proc.process(raw_events).await?;
+    let ctx = BatchContext::from_batch(&raw_events);
+    let processed = proc.process(raw_events, &ctx).await?;
 
     // Outbox event should be transformed
     let outbox_ev = processed
@@ -1304,7 +1228,8 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
         strict: false,
     })?;
 
-    let raw_processed = raw_proc.process(raw_events_clone).await?;
+    let ctx = BatchContext::from_batch(&raw_events_clone);
+    let raw_processed = raw_proc.process(raw_events_clone, &ctx).await?;
 
     let raw_outbox_ev = raw_processed
         .iter()

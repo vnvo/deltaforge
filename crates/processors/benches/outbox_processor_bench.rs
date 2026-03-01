@@ -11,7 +11,9 @@ use criterion::{
 use deltaforge_config::{
     OUTBOX_SCHEMA_SENTINEL, OutboxColumns, OutboxProcessorCfg,
 };
-use deltaforge_core::{Event, Op, Processor, SourceInfo, SourcePosition};
+use deltaforge_core::{
+    BatchContext, Event, Op, Processor, SourceInfo, SourcePosition,
+};
 use once_cell::sync::Lazy;
 use serde_json::json;
 use std::collections::HashMap;
@@ -171,8 +173,10 @@ fn bench_outbox_single_event(c: &mut Criterion) {
             RT.block_on(async {
                 let start = Instant::now();
                 for _ in 0..iters {
-                    let _ = black_box(proc.process(vec![ev.clone()]).await)
-                        .unwrap();
+                    let events = vec![ev.clone()];
+                    let ctx = BatchContext::from_batch(&events);
+                    let _ =
+                        black_box(proc.process(events, &ctx).await).unwrap();
                 }
                 start.elapsed()
             })
@@ -194,8 +198,10 @@ fn bench_outbox_with_key_template(c: &mut Criterion) {
             RT.block_on(async {
                 let start = Instant::now();
                 for _ in 0..iters {
-                    let _ = black_box(proc.process(vec![ev.clone()]).await)
-                        .unwrap();
+                    let events = vec![ev.clone()];
+                    let ctx = BatchContext::from_batch(&events);
+                    let _ =
+                        black_box(proc.process(events, &ctx).await).unwrap();
                 }
                 start.elapsed()
             })
@@ -217,8 +223,10 @@ fn bench_outbox_additional_headers(c: &mut Criterion) {
             RT.block_on(async {
                 let start = Instant::now();
                 for _ in 0..iters {
-                    let _ = black_box(proc.process(vec![ev.clone()]).await)
-                        .unwrap();
+                    let events = vec![ev.clone()];
+                    let ctx = BatchContext::from_batch(&events);
+                    let _ =
+                        black_box(proc.process(events, &ctx).await).unwrap();
                 }
                 start.elapsed()
             })
@@ -242,7 +250,9 @@ fn bench_outbox_batch_sizes(c: &mut Criterion) {
                 RT.block_on(async {
                     let start = Instant::now();
                     for _ in 0..iters {
-                        let _ = black_box(proc.process(batch.clone()).await)
+                        let events = batch.clone();
+                        let ctx = BatchContext::from_batch(&events);
+                        let _ = black_box(proc.process(events, &ctx).await)
                             .unwrap();
                     }
                     start.elapsed()
@@ -268,7 +278,9 @@ fn bench_outbox_large_payload(c: &mut Criterion) {
                 RT.block_on(async {
                     let start = Instant::now();
                     for _ in 0..iters {
-                        let _ = black_box(proc.process(vec![ev.clone()]).await)
+                        let events = vec![ev.clone()];
+                        let ctx = BatchContext::from_batch(&events);
+                        let _ = black_box(proc.process(events, &ctx).await)
                             .unwrap();
                     }
                     start.elapsed()
@@ -302,8 +314,10 @@ fn bench_outbox_mixed_pipeline(c: &mut Criterion) {
             RT.block_on(async {
                 let start = Instant::now();
                 for _ in 0..iters {
+                    let events = batch.clone();
+                    let ctx = BatchContext::from_batch(&events);
                     let _ =
-                        black_box(proc.process(batch.clone()).await).unwrap();
+                        black_box(proc.process(events, &ctx).await).unwrap();
                 }
                 start.elapsed()
             })

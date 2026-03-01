@@ -9,7 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-
+- **Synthetic event support** - Framework-level detection and marking of processor-generated events ([c0b229c](https://github.com/vnvo/deltaforge/commit/c0b229c815b4068e1b8a97c97c6c88c3162df9ea))
+  - `BatchContext` captures original event IDs before the processor chain runs
+  - `SyntheticMarkingProcessor` wrapper automatically marks any event with a new ID as synthetic, setting `event.synthetic = Some(processor_id)` — no processor code changes required
+  - Processors that explicitly set `synthetic` are respected (no overwrite)
+  - `Processor` trait signature updated to `process(&self, events, ctx: &BatchContext)`
+  - `Event::is_synthetic()` convenience method
+  - `build_processors()` wraps every processor with `SyntheticMarkingProcessor` transparently
+- **Sink event filtering** - Per-sink filtering to route real vs. synthetic events to different destinations ([784223d](https://github.com/vnvo/deltaforge/commit/784223de64114fffc0439f820119cbe1deadc1a2))
+  - `filter.exclude_synthetic: true` — drop synthetic events (e.g. send only real CDC events to Kafka)
+  - `filter.synthetic_only: true` — drop real events (e.g. send only metric events to a dedicated stream)
+  - Available on all sink types: Kafka, Redis, NATS
+  - Zero overhead when no filter is configured
 - **Flatten processor** - Native Rust processor that flattens nested JSON objects in event payloads into top-level keys joined by a configurable separator ([0f04b49](https://github.com/vnvo/deltaforge/commit/0f04b49e29df261756546d585b50ec560d1e49be))
   - Works on any object-valued field present on the event (before, after, or custom fields from upstream processors) - no CDC structure assumptions
   - `separator`: key path joiner (default: `"__"`)

@@ -34,15 +34,15 @@
 
 use std::sync::Arc;
 
-use deltaforge_config::{PipelineSpec, SinkCfg};
+use deltaforge_config::{PipelineSpec, SinkCfg, SinkFilter};
 use deltaforge_core::ArcDynSink;
 use tokio_util::sync::CancellationToken;
 
+pub mod filter;
 pub mod kafka;
 pub mod nats;
 pub mod redis;
-
-// Re-export sink types for direct usage
+pub use filter::FilteredSink;
 pub use kafka::KafkaSink;
 pub use nats::NatsSink;
 pub use redis::RedisSink;
@@ -97,19 +97,26 @@ pub fn build_sinks(
         .sinks
         .iter()
         .map(|s| {
-            let sink: ArcDynSink = match s {
-                SinkCfg::Kafka(kafka_cfg) => {
-                    let sink = KafkaSink::new(kafka_cfg, cancel.clone())?;
-                    Arc::new(sink) as ArcDynSink
-                }
-                SinkCfg::Redis(redis_cfg) => {
-                    let sink = RedisSink::new(redis_cfg, cancel.clone())?;
-                    Arc::new(sink) as ArcDynSink
-                }
-                SinkCfg::Nats(nats_sink_cfg) => {
-                    let sink = NatsSink::new(nats_sink_cfg, cancel.clone())?;
-                    Arc::new(sink) as ArcDynSink
-                }
+            let (sink, filter): (ArcDynSink, Option<SinkFilter>) = match s {
+                SinkCfg::Kafka(cfg) => (
+                    Arc::new(KafkaSink::new(cfg, cancel.clone())?)
+                        as ArcDynSink,
+                    cfg.filter.clone(),
+                ),
+                SinkCfg::Redis(cfg) => (
+                    Arc::new(RedisSink::new(cfg, cancel.clone())?)
+                        as ArcDynSink,
+                    cfg.filter.clone(),
+                ),
+                SinkCfg::Nats(cfg) => (
+                    Arc::new(NatsSink::new(cfg, cancel.clone())?) as ArcDynSink,
+                    cfg.filter.clone(),
+                ),
+            };
+            // Only wrap when filter has actual conditions — zero overhead otherwise
+            let sink = match filter {
+                Some(f) if f.is_active() => FilteredSink::wrap(sink, f),
+                _ => sink,
             };
             Ok(sink)
         })

@@ -196,6 +196,53 @@ async fn read_stream_messages(
 }
 
 // =============================================================================
+// Test Helpers
+// =============================================================================
+
+/// Standard per-test setup: tracing, shared container, url/subject/stream creation.
+/// Returns (url, subject, stream).
+async fn setup(name: &str) -> Result<(String, String, String)> {
+    init_test_tracing();
+    get_nats_container().await;
+    let url = nats_url();
+    let subject = test_subject(name);
+    let stream = test_stream(name);
+    setup_test_stream(&url, &stream, &subject).await?;
+    Ok((url, subject, stream))
+}
+
+/// Build a NatsSink with standard defaults (5s send, 30s batch, 10s connect).
+fn make_sink(
+    id: &str,
+    url: &str,
+    subject: &str,
+    stream: Option<&str>,
+    envelope: EnvelopeCfg,
+) -> Result<NatsSink> {
+    NatsSink::new(
+        &NatsSinkCfg {
+            id: id.into(),
+            url: url.into(),
+            subject: subject.into(),
+            key: None,
+            envelope,
+            encoding: EncodingCfg::Json,
+            stream: stream.map(Into::into),
+            required: Some(true),
+            send_timeout_secs: Some(5),
+            batch_timeout_secs: Some(30),
+            connect_timeout_secs: Some(10),
+            credentials_file: None,
+            username: None,
+            password: None,
+            token: None,
+            filter: None,
+        },
+        CancellationToken::new(),
+    )
+}
+
+// =============================================================================
 // Basic Functionality Tests
 // =============================================================================
 
@@ -203,34 +250,15 @@ async fn read_stream_messages(
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn nats_sink_sends_single_event() -> Result<()> {
-    init_test_tracing();
-    let _container = get_nats_container().await;
+    let (url, subject, stream) = setup("single").await?;
 
-    let subject = test_subject("single");
-    let stream = test_stream("single");
-    let url = nats_url();
-    setup_test_stream(&url, &stream, &subject).await?;
-
-    let cfg = NatsSinkCfg {
-        id: "test-nats".into(),
-        url: url.clone(),
-        subject: subject.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        stream: Some(stream.clone()),
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-nats",
+        &url,
+        &subject,
+        Some(&stream),
+        EnvelopeCfg::Native,
+    )?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
@@ -255,34 +283,15 @@ async fn nats_sink_sends_single_event() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn nats_sink_sends_batch() -> Result<()> {
-    init_test_tracing();
-    let _container = get_nats_container().await;
+    let (url, subject, stream) = setup("batch").await?;
 
-    let subject = test_subject("batch");
-    let stream = test_stream("batch");
-    let url = nats_url();
-    setup_test_stream(&url, &stream, &subject).await?;
-
-    let cfg = NatsSinkCfg {
-        id: "test-nats-batch".into(),
-        url: url.clone(),
-        subject: subject.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        stream: Some(stream.clone()),
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-nats-batch",
+        &url,
+        &subject,
+        Some(&stream),
+        EnvelopeCfg::Native,
+    )?;
 
     // Send a batch of 100 events
     let events: Vec<Event> = (0..100).map(make_test_event).collect();
@@ -301,34 +310,15 @@ async fn nats_sink_sends_batch() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn nats_sink_empty_batch_is_noop() -> Result<()> {
-    init_test_tracing();
-    let _container = get_nats_container().await;
+    let (url, subject, stream) = setup("empty-batch").await?;
 
-    let subject = test_subject("empty-batch");
-    let stream = test_stream("empty-batch");
-    let url = nats_url();
-    setup_test_stream(&url, &stream, &subject).await?;
-
-    let cfg = NatsSinkCfg {
-        id: "test-nats-empty".into(),
-        url: url.clone(),
-        subject: subject.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        stream: Some(stream.clone()),
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-nats-empty",
+        &url,
+        &subject,
+        Some(&stream),
+        EnvelopeCfg::Native,
+    )?;
 
     // Send empty batch - should not produce any messages
     sink.send_batch(&[]).await?;
@@ -350,34 +340,15 @@ async fn nats_sink_empty_batch_is_noop() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn nats_sink_native_envelope() -> Result<()> {
-    init_test_tracing();
-    let _container = get_nats_container().await;
+    let (url, subject, stream) = setup("native-envelope").await?;
 
-    let subject = test_subject("native-envelope");
-    let stream = test_stream("native-envelope");
-    let url = nats_url();
-    setup_test_stream(&url, &stream, &subject).await?;
-
-    let cfg = NatsSinkCfg {
-        id: "test-native".into(),
-        url: url.clone(),
-        subject: subject.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        stream: Some(stream.clone()),
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-native",
+        &url,
+        &subject,
+        Some(&stream),
+        EnvelopeCfg::Native,
+    )?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
@@ -424,34 +395,15 @@ async fn nats_sink_native_envelope() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn nats_sink_debezium_envelope() -> Result<()> {
-    init_test_tracing();
-    let _container = get_nats_container().await;
+    let (url, subject, stream) = setup("debezium-envelope").await?;
 
-    let subject = test_subject("debezium-envelope");
-    let stream = test_stream("debezium-envelope");
-    let url = nats_url();
-    setup_test_stream(&url, &stream, &subject).await?;
-
-    let cfg = NatsSinkCfg {
-        id: "test-debezium".into(),
-        url: url.clone(),
-        subject: subject.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Debezium,
-        encoding: EncodingCfg::Json,
-        stream: Some(stream.clone()),
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-debezium",
+        &url,
+        &subject,
+        Some(&stream),
+        EnvelopeCfg::Debezium,
+    )?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
@@ -502,36 +454,17 @@ async fn nats_sink_debezium_envelope() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn nats_sink_cloudevents_envelope() -> Result<()> {
-    init_test_tracing();
-    let _container = get_nats_container().await;
+    let (url, subject, stream) = setup("cloudevents-envelope").await?;
 
-    let subject = test_subject("cloudevents-envelope");
-    let stream = test_stream("cloudevents-envelope");
-    let url = nats_url();
-    setup_test_stream(&url, &stream, &subject).await?;
-
-    let cfg = NatsSinkCfg {
-        id: "test-cloudevents".into(),
-        url: url.clone(),
-        subject: subject.clone(),
-        key: None,
-        envelope: EnvelopeCfg::CloudEvents {
-            type_prefix: "com.deltaforge.cdc".to_string(),
+    let sink = make_sink(
+        "test-cloudevents",
+        &url,
+        &subject,
+        Some(&stream),
+        EnvelopeCfg::CloudEvents {
+            type_prefix: "com.deltaforge.cdc".into(),
         },
-        encoding: EncodingCfg::Json,
-        stream: Some(stream.clone()),
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    )?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
@@ -621,34 +554,15 @@ async fn nats_sink_cloudevents_envelope() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn nats_sink_debezium_envelope_batch() -> Result<()> {
-    init_test_tracing();
-    let _container = get_nats_container().await;
+    let (url, subject, stream) = setup("debezium-batch").await?;
 
-    let subject = test_subject("debezium-batch");
-    let stream = test_stream("debezium-batch");
-    let url = nats_url();
-    setup_test_stream(&url, &stream, &subject).await?;
-
-    let cfg = NatsSinkCfg {
-        id: "test-debezium-batch".into(),
-        url: url.clone(),
-        subject: subject.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Debezium,
-        encoding: EncodingCfg::Json,
-        stream: Some(stream.clone()),
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-debezium-batch",
+        &url,
+        &subject,
+        Some(&stream),
+        EnvelopeCfg::Debezium,
+    )?;
 
     let events: Vec<Event> = (0..50).map(make_test_event).collect();
     sink.send_batch(&events).await?;
@@ -675,36 +589,17 @@ async fn nats_sink_debezium_envelope_batch() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn nats_sink_cloudevents_envelope_batch() -> Result<()> {
-    init_test_tracing();
-    let _container = get_nats_container().await;
+    let (url, subject, stream) = setup("cloudevents-batch").await?;
 
-    let subject = test_subject("cloudevents-batch");
-    let stream = test_stream("cloudevents-batch");
-    let url = nats_url();
-    setup_test_stream(&url, &stream, &subject).await?;
-
-    let cfg = NatsSinkCfg {
-        id: "test-cloudevents-batch".into(),
-        url: url.clone(),
-        subject: subject.clone(),
-        key: None,
-        envelope: EnvelopeCfg::CloudEvents {
-            type_prefix: "io.deltaforge.test".to_string(),
+    let sink = make_sink(
+        "test-cloudevents-batch",
+        &url,
+        &subject,
+        Some(&stream),
+        EnvelopeCfg::CloudEvents {
+            type_prefix: "io.deltaforge.test".into(),
         },
-        encoding: EncodingCfg::Json,
-        stream: Some(stream.clone()),
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    )?;
 
     let events: Vec<Event> = (0..50).map(make_test_event).collect();
     sink.send_batch(&events).await?;
@@ -740,34 +635,29 @@ async fn nats_sink_cloudevents_envelope_batch() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn nats_sink_large_payload() -> Result<()> {
-    init_test_tracing();
-    let _container = get_nats_container().await;
+    let (url, subject, stream) = setup("large-payload").await?;
 
-    let subject = test_subject("large-payload");
-    let stream = test_stream("large-payload");
-    let url = nats_url();
-    setup_test_stream(&url, &stream, &subject).await?;
-
-    let cfg = NatsSinkCfg {
-        id: "test-large".into(),
-        url: url.clone(),
-        subject: subject.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        stream: Some(stream.clone()),
-        required: Some(true),
-        send_timeout_secs: Some(30),
-        batch_timeout_secs: Some(60),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    let sink = NatsSink::new(
+        &NatsSinkCfg {
+            id: "test-large".into(),
+            url: url.clone(),
+            subject: subject.clone(),
+            key: None,
+            envelope: EnvelopeCfg::Native,
+            encoding: EncodingCfg::Json,
+            stream: Some(stream.clone()),
+            required: Some(true),
+            send_timeout_secs: Some(30),
+            batch_timeout_secs: Some(60),
+            connect_timeout_secs: Some(10),
+            credentials_file: None,
+            username: None,
+            password: None,
+            token: None,
+            filter: None,
+        },
+        CancellationToken::new(),
+    )?;
 
     // Test various payload sizes
     let sizes = [1_000, 10_000, 100_000, 500_000];
@@ -793,34 +683,29 @@ async fn nats_sink_large_payload() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn nats_sink_batch_large_payload() -> Result<()> {
-    init_test_tracing();
-    let _container = get_nats_container().await;
+    let (url, subject, stream) = setup("batch-large").await?;
 
-    let subject = test_subject("batch-large");
-    let stream = test_stream("batch-large");
-    let url = nats_url();
-    setup_test_stream(&url, &stream, &subject).await?;
-
-    let cfg = NatsSinkCfg {
-        id: "test-batch-large".into(),
-        url: url.clone(),
-        subject: subject.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        stream: Some(stream.clone()),
-        required: Some(true),
-        send_timeout_secs: Some(30),
-        batch_timeout_secs: Some(120),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    let sink = NatsSink::new(
+        &NatsSinkCfg {
+            id: "test-batch-large".into(),
+            url: url.clone(),
+            subject: subject.clone(),
+            key: None,
+            envelope: EnvelopeCfg::Native,
+            encoding: EncodingCfg::Json,
+            stream: Some(stream.clone()),
+            required: Some(true),
+            send_timeout_secs: Some(30),
+            batch_timeout_secs: Some(120),
+            connect_timeout_secs: Some(10),
+            credentials_file: None,
+            username: None,
+            password: None,
+            token: None,
+            filter: None,
+        },
+        CancellationToken::new(),
+    )?;
 
     // 20 events at 50KB each = ~1MB total
     let events: Vec<Event> =
@@ -844,34 +729,29 @@ async fn nats_sink_batch_large_payload() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn nats_sink_concurrent_sends() -> Result<()> {
-    init_test_tracing();
-    let _container = get_nats_container().await;
+    let (url, subject, stream) = setup("concurrent").await?;
 
-    let subject = test_subject("concurrent");
-    let stream = test_stream("concurrent");
-    let url = nats_url();
-    setup_test_stream(&url, &stream, &subject).await?;
-
-    let cfg = NatsSinkCfg {
-        id: "test-concurrent".into(),
-        url: url.clone(),
-        subject: subject.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        stream: Some(stream.clone()),
-        required: Some(true),
-        send_timeout_secs: Some(10),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = Arc::new(NatsSink::new(&cfg, cancel)?);
+    let sink = Arc::new(NatsSink::new(
+        &NatsSinkCfg {
+            id: "test-concurrent".into(),
+            url: url.clone(),
+            subject: subject.clone(),
+            key: None,
+            envelope: EnvelopeCfg::Native,
+            encoding: EncodingCfg::Json,
+            stream: Some(stream.clone()),
+            required: Some(true),
+            send_timeout_secs: Some(10),
+            batch_timeout_secs: Some(30),
+            connect_timeout_secs: Some(10),
+            credentials_file: None,
+            username: None,
+            password: None,
+            token: None,
+            filter: None,
+        },
+        CancellationToken::new(),
+    )?);
 
     // Spawn multiple concurrent send tasks
     let mut handles = Vec::new();
@@ -909,34 +789,29 @@ async fn nats_sink_concurrent_sends() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn nats_sink_concurrent_batches() -> Result<()> {
-    init_test_tracing();
-    let _container = get_nats_container().await;
+    let (url, subject, stream) = setup("concurrent-batch").await?;
 
-    let subject = test_subject("concurrent-batch");
-    let stream = test_stream("concurrent-batch");
-    let url = nats_url();
-    setup_test_stream(&url, &stream, &subject).await?;
-
-    let cfg = NatsSinkCfg {
-        id: "test-concurrent-batch".into(),
-        url: url.clone(),
-        subject: subject.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        stream: Some(stream.clone()),
-        required: Some(true),
-        send_timeout_secs: Some(10),
-        batch_timeout_secs: Some(60),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = Arc::new(NatsSink::new(&cfg, cancel)?);
+    let sink = Arc::new(NatsSink::new(
+        &NatsSinkCfg {
+            id: "test-concurrent-batch".into(),
+            url: url.clone(),
+            subject: subject.clone(),
+            key: None,
+            envelope: EnvelopeCfg::Native,
+            encoding: EncodingCfg::Json,
+            stream: Some(stream.clone()),
+            required: Some(true),
+            send_timeout_secs: Some(10),
+            batch_timeout_secs: Some(60),
+            connect_timeout_secs: Some(10),
+            credentials_file: None,
+            username: None,
+            password: None,
+            token: None,
+            filter: None,
+        },
+        CancellationToken::new(),
+    )?);
 
     // Spawn multiple concurrent batch send tasks
     let mut handles = Vec::new();
@@ -996,26 +871,13 @@ async fn nats_sink_recovers_after_restart() -> Result<()> {
     let stream = "DF_TEST_RESTART";
     setup_test_stream(&url, stream, subject).await?;
 
-    let cfg = NatsSinkCfg {
-        id: "test-restart".into(),
-        url: url.clone(),
-        subject: subject.into(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        stream: Some(stream.into()),
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = Arc::new(NatsSink::new(&cfg, cancel.clone())?);
+    let sink = Arc::new(make_sink(
+        "test-restart",
+        &url,
+        subject,
+        Some(stream),
+        EnvelopeCfg::Native,
+    )?);
 
     // Send first event successfully
     let event1 = make_test_event(1);
@@ -1059,34 +921,15 @@ async fn nats_sink_recovers_after_restart() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn nats_sink_connection_reuse() -> Result<()> {
-    init_test_tracing();
-    let _container = get_nats_container().await;
+    let (url, subject, stream) = setup("conn-reuse").await?;
 
-    let subject = test_subject("conn-reuse");
-    let stream = test_stream("conn-reuse");
-    let url = nats_url();
-    setup_test_stream(&url, &stream, &subject).await?;
-
-    let cfg = NatsSinkCfg {
-        id: "test-conn-reuse".into(),
-        url: url.clone(),
-        subject: subject.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        stream: Some(stream.clone()),
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-conn-reuse",
+        &url,
+        &subject,
+        Some(&stream),
+        EnvelopeCfg::Native,
+    )?;
 
     // Send multiple events - should reuse connection
     for i in 0..10 {
@@ -1108,26 +951,13 @@ async fn nats_sink_connection_reuse() -> Result<()> {
 async fn nats_sink_connection_failure_invalid_url() -> Result<()> {
     init_test_tracing();
 
-    let cfg = NatsSinkCfg {
-        id: "test-invalid".into(),
-        url: "nats://127.0.0.1:59999".into(), // Invalid port, nothing listening
-        subject: "df.test.invalid".into(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        stream: None,
-        required: Some(true),
-        send_timeout_secs: Some(2),
-        batch_timeout_secs: Some(5),
-        connect_timeout_secs: Some(2), // Short timeout to fail fast
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-invalid",
+        "nats://127.0.0.1:59999",
+        "df.test.invalid",
+        None,
+        EnvelopeCfg::Native,
+    )?;
 
     let event = make_test_event(1);
     let result = sink.send(&event).await;
@@ -1141,34 +971,29 @@ async fn nats_sink_connection_failure_invalid_url() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn nats_sink_handles_rapid_sends() -> Result<()> {
-    init_test_tracing();
-    let _container = get_nats_container().await;
+    let (url, subject, stream) = setup("rapid").await?;
 
-    let subject = test_subject("rapid");
-    let stream = test_stream("rapid");
-    let url = nats_url();
-    setup_test_stream(&url, &stream, &subject).await?;
-
-    let cfg = NatsSinkCfg {
-        id: "test-rapid".into(),
-        url: url.clone(),
-        subject: subject.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        stream: Some(stream.clone()),
-        required: Some(true),
-        send_timeout_secs: Some(30),
-        batch_timeout_secs: Some(60),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = Arc::new(NatsSink::new(&cfg, cancel)?);
+    let sink = Arc::new(NatsSink::new(
+        &NatsSinkCfg {
+            id: "test-rapid".into(),
+            url: url.clone(),
+            subject: subject.clone(),
+            key: None,
+            envelope: EnvelopeCfg::Native,
+            encoding: EncodingCfg::Json,
+            stream: Some(stream.clone()),
+            required: Some(true),
+            send_timeout_secs: Some(30),
+            batch_timeout_secs: Some(60),
+            connect_timeout_secs: Some(10),
+            credentials_file: None,
+            username: None,
+            password: None,
+            token: None,
+            filter: None,
+        },
+        CancellationToken::new(),
+    )?);
 
     // Send multiple events rapidly
     let mut handles = Vec::new();
@@ -1203,34 +1028,29 @@ async fn nats_sink_handles_rapid_sends() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn nats_sink_batch_resilience() -> Result<()> {
-    init_test_tracing();
-    let _container = get_nats_container().await;
+    let (url, subject, stream) = setup("batch-resilience").await?;
 
-    let subject = test_subject("batch-resilience");
-    let stream = test_stream("batch-resilience");
-    let url = nats_url();
-    setup_test_stream(&url, &stream, &subject).await?;
-
-    let cfg = NatsSinkCfg {
-        id: "test-batch-resilience".into(),
-        url: url.clone(),
-        subject: subject.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        stream: Some(stream.clone()),
-        required: Some(true),
-        send_timeout_secs: Some(30),
-        batch_timeout_secs: Some(60),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    let sink = NatsSink::new(
+        &NatsSinkCfg {
+            id: "test-batch-resilience".into(),
+            url: url.clone(),
+            subject: subject.clone(),
+            key: None,
+            envelope: EnvelopeCfg::Native,
+            encoding: EncodingCfg::Json,
+            stream: Some(stream.clone()),
+            required: Some(true),
+            send_timeout_secs: Some(30),
+            batch_timeout_secs: Some(60),
+            connect_timeout_secs: Some(10),
+            credentials_file: None,
+            username: None,
+            password: None,
+            token: None,
+            filter: None,
+        },
+        CancellationToken::new(),
+    )?;
 
     // Send multiple batches in sequence
     for batch_num in 0..5 {
@@ -1260,29 +1080,31 @@ async fn nats_sink_batch_resilience() -> Result<()> {
 #[ignore = "requires docker"]
 async fn nats_sink_respects_cancellation() -> Result<()> {
     init_test_tracing();
-    let _container = get_nats_container().await;
+    get_nats_container().await;
 
     // Use an invalid URL so retry loop keeps trying
-    let cfg = NatsSinkCfg {
-        id: "test-cancel".into(),
-        url: "nats://invalid-host:9999".into(),
-        subject: "df.test.cancel".into(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        stream: None,
-        required: Some(true),
-        send_timeout_secs: Some(2),
-        batch_timeout_secs: Some(5),
-        connect_timeout_secs: Some(2),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
     let cancel = CancellationToken::new();
-    let sink = Arc::new(NatsSink::new(&cfg, cancel.clone())?);
+    let sink = Arc::new(NatsSink::new(
+        &NatsSinkCfg {
+            id: "test-cancel".into(),
+            url: "nats://invalid-host:9999".into(),
+            subject: "df.test.cancel".into(),
+            key: None,
+            envelope: EnvelopeCfg::Native,
+            encoding: EncodingCfg::Json,
+            stream: None,
+            required: Some(true),
+            send_timeout_secs: Some(2),
+            batch_timeout_secs: Some(5),
+            connect_timeout_secs: Some(2),
+            credentials_file: None,
+            username: None,
+            password: None,
+            token: None,
+            filter: None,
+        },
+        cancel.clone(),
+    )?);
 
     let sink_clone = sink.clone();
     let send_handle = tokio::spawn(async move {
@@ -1309,39 +1131,19 @@ async fn nats_sink_respects_cancellation() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn nats_sink_default_envelope_is_native() -> Result<()> {
-    init_test_tracing();
-    let _container = get_nats_container().await;
-
-    let subject = test_subject("default-envelope");
-    let stream = test_stream("default-envelope");
-    let url = nats_url();
-    setup_test_stream(&url, &stream, &subject).await?;
-
-    // Use Default::default() for envelope and encoding
-    let cfg = NatsSinkCfg {
-        id: "test-default".into(),
-        url: url.clone(),
-        subject: subject.clone(),
-        key: None,
-        envelope: EnvelopeCfg::default(),
-        encoding: EncodingCfg::default(),
-        stream: Some(stream.clone()),
-        required: Some(true),
-        send_timeout_secs: Some(30),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
+    let (url, subject, stream) = setup("default-envelope").await?;
 
     // Verify defaults
-    assert_eq!(cfg.envelope, EnvelopeCfg::Native);
-    assert_eq!(cfg.encoding, EncodingCfg::Json);
+    assert_eq!(EnvelopeCfg::default(), EnvelopeCfg::Native);
+    assert_eq!(EncodingCfg::default(), EncodingCfg::Json);
 
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-default",
+        &url,
+        &subject,
+        Some(&stream),
+        EnvelopeCfg::Native,
+    )?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
@@ -1378,28 +1180,16 @@ async fn nats_sink_default_envelope_is_native() -> Result<()> {
 #[ignore = "requires docker"]
 async fn nats_sink_trait_implementation() -> Result<()> {
     init_test_tracing();
-    let _container = get_nats_container().await;
+    get_nats_container().await;
 
-    let cfg = NatsSinkCfg {
-        id: "test-trait".into(),
-        url: nats_url(),
-        subject: "df.test.trait".into(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        stream: None,
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    let url = nats_url();
+    let sink = make_sink(
+        "test-trait",
+        &url,
+        "df.test.trait",
+        None,
+        EnvelopeCfg::Native,
+    )?;
 
     // Test id()
     assert_eq!(sink.id(), "test-trait");
@@ -1416,28 +1206,29 @@ async fn nats_sink_trait_implementation() -> Result<()> {
 #[ignore = "requires docker"]
 async fn nats_sink_optional() -> Result<()> {
     init_test_tracing();
-    let _container = get_nats_container().await;
+    get_nats_container().await;
 
-    let cfg = NatsSinkCfg {
-        id: "test-optional".into(),
-        url: nats_url(),
-        subject: "df.test.optional".into(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        stream: None,
-        required: Some(false),
-        send_timeout_secs: None,
-        batch_timeout_secs: None,
-        connect_timeout_secs: None,
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    let sink = NatsSink::new(
+        &NatsSinkCfg {
+            id: "test-optional".into(),
+            url: nats_url(),
+            subject: "df.test.optional".into(),
+            key: None,
+            envelope: EnvelopeCfg::Native,
+            encoding: EncodingCfg::Json,
+            stream: None,
+            required: Some(false),
+            send_timeout_secs: None,
+            batch_timeout_secs: None,
+            connect_timeout_secs: None,
+            credentials_file: None,
+            username: None,
+            password: None,
+            token: None,
+            filter: None,
+        },
+        CancellationToken::new(),
+    )?;
 
     assert!(!sink.required(), "sink should be optional");
 
@@ -1453,36 +1244,11 @@ async fn nats_sink_optional() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn nats_sink_without_stream_config() -> Result<()> {
-    init_test_tracing();
-    let _container = get_nats_container().await;
+    let (url, subject, stream) = setup("no-stream-cfg").await?;
+    // Stream created by setup(); sink intentionally unaware of stream name
 
-    let subject = test_subject("no-stream-cfg");
-    let stream = test_stream("no-stream-cfg");
-    let url = nats_url();
-
-    // Create stream manually but don't tell the sink about it
-    setup_test_stream(&url, &stream, &subject).await?;
-
-    let cfg = NatsSinkCfg {
-        id: "test-no-stream".into(),
-        url: url.clone(),
-        subject: subject.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        stream: None, // No stream config
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    let sink =
+        make_sink("test-no-stream", &url, &subject, None, EnvelopeCfg::Native)?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
@@ -1501,7 +1267,7 @@ async fn nats_sink_without_stream_config() -> Result<()> {
 #[ignore = "requires docker"]
 async fn nats_sink_wildcard_subject_stream() -> Result<()> {
     init_test_tracing();
-    let _container = get_nats_container().await;
+    get_nats_container().await;
 
     let url = nats_url();
     let stream = test_stream("wildcard");
@@ -1519,26 +1285,13 @@ async fn nats_sink_wildcard_subject_stream() -> Result<()> {
 
     // Send to specific subject under wildcard
     let specific_subject = "df.test.wildcard.events";
-    let cfg = NatsSinkCfg {
-        id: "test-wildcard".into(),
-        url: url.clone(),
-        subject: specific_subject.into(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        stream: Some(stream.clone()),
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-wildcard",
+        &url,
+        specific_subject,
+        Some(&stream),
+        EnvelopeCfg::Native,
+    )?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
@@ -1613,7 +1366,7 @@ async fn read_stream_messages_with_metadata(
 #[ignore = "requires docker"]
 async fn nats_sink_subject_template_routes_by_table() -> Result<()> {
     init_test_tracing();
-    let _container = get_nats_container().await;
+    get_nats_container().await;
 
     let url = nats_url();
     let stream = test_stream("routing");
@@ -1628,26 +1381,13 @@ async fn nats_sink_subject_template_routes_by_table() -> Result<()> {
     })
     .await?;
 
-    let cfg = NatsSinkCfg {
-        id: "test-routing".into(),
-        url: url.clone(),
-        subject: "df.test.routing.${source.table}".into(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        stream: Some(stream.clone()),
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-routing",
+        &url,
+        "df.test.routing.${source.table}",
+        Some(&stream),
+        EnvelopeCfg::Native,
+    )?;
 
     sink.send_batch(&[
         make_event_for_table(1, "orders"),
@@ -1680,7 +1420,7 @@ async fn nats_sink_subject_template_routes_by_table() -> Result<()> {
 #[ignore = "requires docker"]
 async fn nats_sink_routing_override_with_headers() -> Result<()> {
     init_test_tracing();
-    let _container = get_nats_container().await;
+    get_nats_container().await;
 
     let url = nats_url();
     let stream = test_stream("route-override");
@@ -1695,26 +1435,13 @@ async fn nats_sink_routing_override_with_headers() -> Result<()> {
     })
     .await?;
 
-    let cfg = NatsSinkCfg {
-        id: "test-override".into(),
-        url: url.clone(),
-        subject: "df.test.route-override.default".into(),
-        key: None,
-        envelope: EnvelopeCfg::Native,
-        encoding: EncodingCfg::Json,
-        stream: Some(stream.clone()),
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-override",
+        &url,
+        "df.test.route-override.default",
+        Some(&stream),
+        EnvelopeCfg::Native,
+    )?;
 
     let mut event = make_test_event(1);
     event.routing = Some(EventRouting {
@@ -1754,35 +1481,16 @@ async fn nats_sink_routing_override_with_headers() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn nats_sink_raw_payload_bypasses_envelope() -> Result<()> {
-    init_test_tracing();
-    let _container = get_nats_container().await;
-
-    let subject = test_subject("raw-payload");
-    let stream = test_stream("raw-payload");
-    let url = nats_url();
-    setup_test_stream(&url, &stream, &subject).await?;
+    let (url, subject, stream) = setup("raw-payload").await?;
 
     // Deliberately use Debezium envelope - raw_payload should bypass it
-    let cfg = NatsSinkCfg {
-        id: "test-raw".into(),
-        url: url.clone(),
-        subject: subject.clone(),
-        key: None,
-        envelope: EnvelopeCfg::Debezium,
-        encoding: EncodingCfg::Json,
-        stream: Some(stream.clone()),
-        required: Some(true),
-        send_timeout_secs: Some(5),
-        batch_timeout_secs: Some(30),
-        connect_timeout_secs: Some(10),
-        credentials_file: None,
-        username: None,
-        password: None,
-        token: None,
-    };
-
-    let cancel = CancellationToken::new();
-    let sink = NatsSink::new(&cfg, cancel)?;
+    let sink = make_sink(
+        "test-raw",
+        &url,
+        &subject,
+        Some(&stream),
+        EnvelopeCfg::Debezium,
+    )?;
 
     // Event with raw_payload flag (simulates outbox processor output)
     let mut raw_event = make_test_event(1);

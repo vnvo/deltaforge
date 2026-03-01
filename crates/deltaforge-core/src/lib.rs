@@ -31,6 +31,9 @@ pub use errors::{SinkError, SourceError};
 pub mod routing;
 pub use routing::EventRouting;
 
+pub mod batch_context;
+pub use batch_context::BatchContext;
+
 // ============================================================================
 // Operation Type
 // ============================================================================
@@ -367,6 +370,17 @@ pub struct Event {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
 
+    /// Processor ID that synthesized this event (`Some`), or `None` if it
+    /// came directly from a database source.
+    ///
+    /// Set automatically by `SyntheticMarkingProcessor` - processors that
+    /// create new events (metrics, js fan-out) do not need to set this
+    /// themselves; the framework detects new event IDs and fills it in.
+    ///
+    /// The value is the `id()` of the processor that first produced the event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub synthetic: Option<String>,
+
     /// Routing overrides for sinks (topic, key, headers).
     /// Visible to processors but excluded from wire output by envelopes.
     #[serde(skip)]
@@ -414,6 +428,7 @@ impl Event {
             ddl: None,
             trace_id: None,
             tags: None,
+            synthetic: None,
             routing: None,
             tx_end: true,
             checkpoint: None,
@@ -442,6 +457,7 @@ impl Event {
             ddl: Some(ddl),
             trace_id: None,
             tags: None,
+            synthetic: None,
             routing: None,
             tx_end: true,
             checkpoint: None,
@@ -470,6 +486,7 @@ impl Event {
             ddl: None,
             trace_id: None,
             tags: None,
+            synthetic: None,
             routing: None,
             tx_end: true,
             checkpoint: None,
@@ -521,6 +538,23 @@ impl Event {
     #[inline]
     pub fn full_table_name(&self) -> String {
         self.source.full_table_name()
+    }
+
+    /// Mark this event as synthesized by the given processor.
+    ///
+    /// Intended for processors that conjure events from nothing - metrics
+    /// windows, alert fan-outs, etc. Call on new events before returning
+    /// them from `process()`.
+    #[must_use]
+    pub fn mark_synthetic(mut self, processor_id: impl Into<String>) -> Self {
+        self.synthetic = Some(processor_id.into());
+        self
+    }
+
+    /// Returns true if this event was created by a processor rather than a source.
+    #[inline]
+    pub fn is_synthetic(&self) -> bool {
+        self.synthetic.is_some()
     }
 }
 
@@ -653,7 +687,11 @@ pub trait Source: Send + Sync {
 #[async_trait]
 pub trait Processor: Send + Sync {
     fn id(&self) -> &str;
-    async fn process(&self, events: Vec<Event>) -> Result<Vec<Event>>;
+    async fn process(
+        &self,
+        events: Vec<Event>,
+        ctx: &BatchContext,
+    ) -> Result<Vec<Event>>;
 }
 
 #[async_trait]
