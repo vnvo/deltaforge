@@ -1,0 +1,626 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Change Data Capture - DeltaForge CDC Framework - User Guide</title>
+
+
+        <!-- Custom HTML head -->
+        <!-- SEO Meta Tags -->
+        <meta name="author" content="Vahid Negahdari">
+        <meta name="keywords" content="CDC, Change Data Capture, Rust, Kafka, Redis, MySQL, Postgres, streaming, data pipeline, real-time, Debezium alternative, ETL">
+        <meta name="robots" content="index, follow">
+        <link rel="canonical" href="https://vnvo.github.io/deltaforge/">
+        
+        <!-- Open Graph / Facebook -->
+        <meta property="og:type" content="website">
+        <meta property="og:url" content="https://vnvo.github.io/deltaforge/">
+        <meta property="og:title" content="DeltaForge - CDC Framework">
+        <meta property="og:description" content="A modular, config-driven Change Data Capture (CDC) micro-framework built in Rust. Stream database changes to Kafka and Redis.">
+        <meta property="og:image" content="https://vnvo.github.io/deltaforge/assets/deltaforge-blc.png">
+        <meta property="og:site_name" content="DeltaForge Documentation">
+        
+        <!-- Twitter Card -->
+        <meta name="twitter:card" content="summary_large_image">
+        <meta name="twitter:url" content="https://vnvo.github.io/deltaforge/">
+        <meta name="twitter:title" content="DeltaForge - CDC Framework">
+        <meta name="twitter:description" content="A modular, config-driven Change Data Capture (CDC) micro-framework built in Rust. Stream database changes to Kafka and Redis.">
+        <meta name="twitter:image" content="https://vnvo.github.io/deltaforge/assets/deltaforge-blc.png">
+        
+        <!-- Structured Data (JSON-LD) -->
+        <script type="application/ld+json">
+        {
+          "@context": "https://schema.org",
+          "@type": "SoftwareSourceCode",
+          "name": "DeltaForge",
+          "description": "A modular, config-driven Change Data Capture (CDC) micro-framework built in Rust",
+          "url": "https://github.com/vnvo/deltaforge",
+          "codeRepository": "https://github.com/vnvo/deltaforge",
+          "programmingLanguage": "Rust",
+          "license": "https://opensource.org/licenses/MIT",
+          "author": {
+            "@type": "Person",
+            "name": "Vahid Negahdari",
+            "url": "https://github.com/vnvo"
+          },
+          "keywords": ["CDC", "Change Data Capture", "Rust", "Kafka", "Redis", "MySQL", "Postgres", "streaming"]
+        }
+        </script>
+        <meta name="description" content="A modular, config-driven Change Data Capture (CDC) micro-framework built in Rust. Stream database changes to Kafka, Redis and etc.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="css/custom-55d982ab.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-46e7f876.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-d434cb00.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div class="sidebar-footer">
+                <a href="https://github.com/vnvo/deltaforge/releases">
+                    <img src="https://img.shields.io/github/v/release/vnvo/deltaforge?label=version" alt="Version">
+                </a>
+                <a href="https://github.com/vnvo/deltaforge/blob/main/LICENSE-MIT">
+                    <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License">
+                </a>
+                <img src="https://img.shields.io/badge/arch-amd64|arm64-blue" alt="Arch">
+                <img src="https://img.shields.io/badge/rustc-1.89+-blue.svg" alt="MSRV">
+            </div>            
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">DeltaForge CDC Framework - User Guide</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/vnvo/deltaforge" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/vnvo/deltaforge/edit/main/docs/src/src/cdc.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="change-data-capture-cdc"><a class="header" href="#change-data-capture-cdc">Change Data Capture (CDC)</a></h1>
+<p>Change Data Capture (CDC) is the practice of streaming database mutations as ordered events so downstream systems can stay in sync without periodic full loads. Rather than asking “what does my data look like now?”, CDC answers “what changed, and when?”</p>
+<p>DeltaForge is a CDC engine built to make log-based change streams reliable, observable, and operationally simple in modern, containerized environments. It focuses on <strong>row-level CDC</strong> from MySQL binlog and Postgres logical replication to keep consumers accurate and latency-aware while minimizing impact on source databases.</p>
+<blockquote>
+<p><strong>In short</strong>: DeltaForge tails committed transactions from MySQL and Postgres logs, preserves ordering and transaction boundaries, and delivers events to Kafka and Redis with checkpointed delivery, configurable batching, and Prometheus metrics - without requiring a JVM or distributed coordinator.</p>
+</blockquote>
+<hr>
+<h2 id="why-cdc-matters"><a class="header" href="#why-cdc-matters">Why CDC matters</a></h2>
+<p>Traditional data integration relies on periodic batch jobs that query source systems, compare snapshots, and push differences downstream. This approach worked for decades, but modern architectures demand something better.</p>
+<p><strong>The batch ETL problem</strong>: A nightly sync means your analytics are always a day stale. An hourly sync still leaves gaps and hammers your production database with expensive <code>SELECT *</code> queries during business hours. As data volumes grow, these jobs take longer, fail more often, and compete for the same resources your customers need.</p>
+<p>CDC flips the model. Instead of pulling data on a schedule, you subscribe to changes as they happen.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Aspect</th><th>Batch ETL</th><th>CDC</th></tr>
+</thead>
+<tbody>
+<tr><td>Latency</td><td>Minutes to hours</td><td>Seconds to milliseconds</td></tr>
+<tr><td>Source load</td><td>High (repeated scans)</td><td>Minimal (log tailing)</td></tr>
+<tr><td>Data freshness</td><td>Stale between runs</td><td>Near real-time</td></tr>
+<tr><td>Failure recovery</td><td>Re-run entire job</td><td>Resume from checkpoint</td></tr>
+<tr><td>Change detection</td><td>Diff comparison</td><td>Native from source</td></tr>
+</tbody>
+</table>
+</div>
+<p>These benefits compound as systems scale and teams decentralize:</p>
+<ul>
+<li><strong>Deterministic replay</strong>: Ordered events allow consumers to reconstruct state or power exactly-once delivery with checkpointing.</li>
+<li><strong>Polyglot delivery</strong>: The same change feed can serve caches, queues, warehouses, and search indexes simultaneously without additional source queries.</li>
+</ul>
+<hr>
+<h2 id="how-cdc-works"><a class="header" href="#how-cdc-works">How CDC works</a></h2>
+<p>All CDC implementations share a common goal: detect changes and emit them as events. The approaches differ in how they detect those changes.</p>
+<h3 id="log-based-cdc"><a class="header" href="#log-based-cdc">Log-based CDC</a></h3>
+<p>Databases maintain transaction logs (MySQL binlog, Postgres WAL) that record every committed change for durability and replication. Log-based CDC reads these logs directly, capturing changes without touching application tables.</p>
+<pre><code>┌─────────────┐    commits    ┌─────────────┐    tails     ┌─────────────┐
+│ Application │──────────────▶│  Database   │─────────────▶│ CDC Engine  │
+└─────────────┘               │   + WAL     │              └──────┬──────┘
+                              └─────────────┘                     │
+                                                                  ▼
+                                                           ┌─────────────┐
+                                                           │   Kafka /   │
+                                                           │   Redis     │
+                                                           └─────────────┘
+</code></pre>
+<p><strong>Advantages</strong>:</p>
+<ul>
+<li>Zero impact on source table performance</li>
+<li>Captures all changes including those from triggers and stored procedures</li>
+<li>Preserves transaction boundaries and ordering</li>
+<li>Can capture deletes without soft-delete columns</li>
+</ul>
+<p><strong>Trade-offs</strong>:</p>
+<ul>
+<li>Requires database configuration (replication slots, binlog retention)</li>
+<li>Schema changes need careful handling</li>
+<li>Log retention limits how far back you can replay</li>
+</ul>
+<p><strong>DeltaForge uses log-based CDC exclusively.</strong> This allows DeltaForge to provide stronger ordering guarantees, lower source impact, and simpler operational semantics than hybrid approaches that mix log tailing with polling or triggers.</p>
+<h3 id="trigger-based-cdc"><a class="header" href="#trigger-based-cdc">Trigger-based CDC</a></h3>
+<p>Database triggers fire on INSERT, UPDATE, and DELETE operations, writing change records to a shadow table that a separate process polls.</p>
+<p><strong>Advantages</strong>:</p>
+<ul>
+<li>Works on databases without accessible transaction logs</li>
+<li>Can capture application-level context unavailable in logs</li>
+</ul>
+<p><strong>Trade-offs</strong>:</p>
+<ul>
+<li>Adds write overhead to every transaction</li>
+<li>Triggers can be disabled or forgotten during schema migrations</li>
+<li>Shadow tables require maintenance and can grow unbounded</li>
+</ul>
+<h3 id="polling-based-cdc"><a class="header" href="#polling-based-cdc">Polling-based CDC</a></h3>
+<p>A process periodically queries tables for rows modified since the last check, typically using an <code>updated_at</code> timestamp or incrementing ID.</p>
+<p><strong>Advantages</strong>:</p>
+<ul>
+<li>Simple to implement</li>
+<li>No special database configuration required</li>
+</ul>
+<p><strong>Trade-offs</strong>:</p>
+<ul>
+<li>Cannot reliably detect deletes</li>
+<li>Requires <code>updated_at</code> columns on every table</li>
+<li>Polling frequency trades off latency against database load</li>
+<li>Clock skew and transaction visibility can cause missed or duplicate events</li>
+</ul>
+<hr>
+<h2 id="anatomy-of-a-cdc-event"><a class="header" href="#anatomy-of-a-cdc-event">Anatomy of a CDC event</a></h2>
+<p>A well-designed CDC event contains everything downstream consumers need to process the change correctly.</p>
+<pre><code class="language-json">{
+  "id": "evt_01J7K9X2M3N4P5Q6R7S8T9U0V1",
+  "source": {
+    "database": "shop",
+    "table": "orders",
+    "server_id": "mysql-prod-1"
+  },
+  "operation": "update",
+  "timestamp": "2025-01-15T14:32:01.847Z",
+  "transaction": {
+    "id": "gtid:3E11FA47-71CA-11E1-9E33-C80AA9429562:42",
+    "position": 15847293
+  },
+  "before": {
+    "id": 12345,
+    "status": "pending",
+    "total": 99.99,
+    "updated_at": "2025-01-15T14:30:00.000Z"
+  },
+  "after": {
+    "id": 12345,
+    "status": "shipped",
+    "total": 99.99,
+    "updated_at": "2025-01-15T14:32:01.000Z"
+  },
+  "schema_version": "v3"
+}
+</code></pre>
+<p>Key components:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><code>operation</code></td><td>INSERT, UPDATE, DELETE, or DDL</td></tr>
+<tr><td><code>before</code> / <code>after</code></td><td>Row state before and after the change (enables diff logic)</td></tr>
+<tr><td><code>transaction</code></td><td>Groups changes from the same database transaction</td></tr>
+<tr><td><code>timestamp</code></td><td>When the change was committed at the source</td></tr>
+<tr><td><code>schema_version</code></td><td>Helps consumers handle schema evolution</td></tr>
+</tbody>
+</table>
+</div>
+<p>Not all fields are present for every operation-<code>before</code> is omitted for INSERTs, <code>after</code> is omitted for DELETEs - but the event envelope and metadata fields are consistent across MySQL and Postgres sources.</p>
+<hr>
+<h2 id="real-world-use-cases"><a class="header" href="#real-world-use-cases">Real-world use cases</a></h2>
+<h3 id="cache-invalidation-and-population"><a class="header" href="#cache-invalidation-and-population">Cache invalidation and population</a></h3>
+<p><strong>Problem</strong>: Your Redis cache serves product catalog data, but cache invalidation logic is scattered across dozens of services. Some forget to invalidate, others invalidate too aggressively, and debugging staleness issues takes hours.</p>
+<p><strong>CDC solution</strong>: Stream changes from the <code>products</code> table to a message queue. A dedicated consumer reads the stream and updates or deletes cache keys based on the operation type. This centralizes invalidation logic, provides replay capability for cache rebuilds, and removes cache concerns from application code entirely.</p>
+<pre><code>┌──────────┐     CDC      ┌─────────────┐   consumer   ┌─────────────┐
+│  MySQL   │─────────────▶│   Stream    │─────────────▶│ Cache Keys  │
+│ products │              │  (Kafka/    │              │ product:123 │
+└──────────┘              │   Redis)    │              └─────────────┘
+                          └─────────────┘
+</code></pre>
+<h3 id="event-driven-microservices"><a class="header" href="#event-driven-microservices">Event-driven microservices</a></h3>
+<p><strong>Problem</strong>: Your order service needs to notify inventory, shipping, billing, and analytics whenever an order changes state. Direct service-to-service calls create tight coupling and cascade failures.</p>
+<p><strong>CDC solution</strong>: Publish order changes to a durable message queue. Each downstream service subscribes independently, processes at its own pace, and can replay events after failures or during onboarding. The order service doesn’t need to know about its consumers.</p>
+<pre><code>┌─────────────┐     CDC      ┌─────────────┐
+│   Orders    │─────────────▶│   Message   │
+│   Database  │              │   Queue     │
+└─────────────┘              └──────┬──────┘
+                    ┌───────────────┼───────────────┐
+                    ▼               ▼               ▼
+             ┌───────────┐   ┌───────────┐   ┌───────────┐
+             │ Inventory │   │ Shipping  │   │ Analytics │
+             └───────────┘   └───────────┘   └───────────┘
+</code></pre>
+<h3 id="search-index-synchronization"><a class="header" href="#search-index-synchronization">Search index synchronization</a></h3>
+<p><strong>Problem</strong>: Your Elasticsearch index drifts from the source of truth. Full reindexing takes hours and blocks search updates during the process.</p>
+<p><strong>CDC solution</strong>: Stream changes continuously to keep the index synchronized. Use the <code>before</code> image to remove old documents and the <code>after</code> image to index new content.</p>
+<h3 id="data-warehouse-incremental-loads"><a class="header" href="#data-warehouse-incremental-loads">Data warehouse incremental loads</a></h3>
+<p><strong>Problem</strong>: Nightly full loads into your warehouse take 6 hours and block analysts until noon. Business users complain that dashboards show yesterday’s numbers.</p>
+<p><strong>CDC solution</strong>: Stream changes to a staging topic, then micro-batch into your warehouse every few minutes. Analysts get near real-time data without impacting source systems.</p>
+<h3 id="audit-logging-and-compliance"><a class="header" href="#audit-logging-and-compliance">Audit logging and compliance</a></h3>
+<p><strong>Problem</strong>: Regulations require you to maintain a complete history of changes to sensitive data. Application-level audit logging is inconsistent and can be bypassed.</p>
+<p><strong>CDC solution</strong>: The transaction log captures every committed change regardless of how it was made - application code, admin scripts, or direct SQL. Stream these events to immutable storage for compliance.</p>
+<h3 id="cross-region-replication"><a class="header" href="#cross-region-replication">Cross-region replication</a></h3>
+<p><strong>Problem</strong>: You need to replicate data to a secondary region for disaster recovery, but built-in replication doesn’t support the transformations you need.</p>
+<p><strong>CDC solution</strong>: Stream changes through a CDC pipeline that filters, transforms, and routes events to the target region’s databases or message queues.</p>
+<hr>
+<h2 id="architecture-patterns"><a class="header" href="#architecture-patterns">Architecture patterns</a></h2>
+<h3 id="the-outbox-pattern"><a class="header" href="#the-outbox-pattern">The outbox pattern</a></h3>
+<p>When you need to update a database and publish an event atomically, the outbox pattern provides exactly-once semantics without distributed transactions.</p>
+<pre><code>┌─────────────────────────────────────────┐
+│              Single Transaction         │
+│  ┌─────────────┐    ┌─────────────────┐ │
+│  │ UPDATE      │    │ INSERT INTO     │ │
+│  │ orders SET  │ +  │ outbox (event)  │ │
+│  │ status=...  │    │                 │ │
+│  └─────────────┘    └─────────────────┘ │
+└─────────────────────────────────────────┘
+                      │
+                      ▼ CDC
+               ┌─────────────┐
+               │   Kafka     │
+               └─────────────┘
+</code></pre>
+<ol>
+<li>The application writes business data and an event record in the same transaction.</li>
+<li>CDC tails the outbox table and publishes events to Kafka.</li>
+<li>A cleanup process (or CDC itself) removes processed outbox rows.</li>
+</ol>
+<p>This guarantees that events are published if and only if the transaction commits.</p>
+<p><strong>When to skip the outbox</strong>: If your only requirement is to react to committed database state (not application intent), direct CDC from business tables is often simpler than introducing an outbox. The outbox pattern adds value when you need custom event payloads, explicit event versioning, or when the event schema differs significantly from table structure.</p>
+<h3 id="event-sourcing-integration"><a class="header" href="#event-sourcing-integration">Event sourcing integration</a></h3>
+<p>CDC complements event sourcing by bridging legacy systems that weren’t built event-first. Stream changes from existing tables into event stores, then gradually migrate to native event sourcing.</p>
+<h3 id="cqrs-command-query-responsibility-segregation"><a class="header" href="#cqrs-command-query-responsibility-segregation">CQRS (Command Query Responsibility Segregation)</a></h3>
+<p>CDC naturally supports CQRS by populating read-optimized projections from the write model. Changes flow through the CDC pipeline to update denormalized views, search indexes, or cache layers.</p>
+<hr>
+<h2 id="challenges-and-solutions"><a class="header" href="#challenges-and-solutions">Challenges and solutions</a></h2>
+<h3 id="schema-evolution"><a class="header" href="#schema-evolution">Schema evolution</a></h3>
+<p>Databases change. Columns get added, renamed, or removed. Types change. CDC pipelines need to handle this gracefully.</p>
+<p><strong>Strategies</strong>:</p>
+<ul>
+<li><strong>Schema registry</strong>: Store and version schemas centrally (e.g., Confluent Schema Registry with Avro/Protobuf).</li>
+<li><strong>Forward compatibility</strong>: Add columns as nullable; avoid removing columns that consumers depend on.</li>
+<li><strong>Consumer tolerance</strong>: Design consumers to ignore unknown fields and handle missing optional fields.</li>
+<li><strong>Processor transforms</strong>: Use DeltaForge’s JavaScript processors to normalize schemas before sinks.</li>
+</ul>
+<h3 id="ordering-guarantees"><a class="header" href="#ordering-guarantees">Ordering guarantees</a></h3>
+<p>Events must arrive in the correct order for consumers to reconstruct state accurately. A DELETE arriving before its corresponding INSERT would be catastrophic.</p>
+<p><strong>DeltaForge guarantees</strong>:</p>
+<ul>
+<li>Source-order preservation per table partition (always enabled)</li>
+<li>Transaction boundary preservation when <code>respect_source_tx: true</code> is configured in batch settings</li>
+</ul>
+<p>Kafka sink uses consistent partitioning by primary key to maintain ordering within a partition at the consumer.</p>
+<h3 id="exactly-once-delivery"><a class="header" href="#exactly-once-delivery">Exactly-once delivery</a></h3>
+<p>Network failures, process crashes, and consumer restarts can cause duplicates or gaps. True exactly-once semantics require coordination between source, pipeline, and sink.</p>
+<p><strong>DeltaForge approach</strong>:</p>
+<ul>
+<li>Checkpoints track the last committed position in the source log.</li>
+<li>Configurable commit policies (<code>all</code>, <code>required</code>, <code>quorum</code>) control when checkpoints advance.</li>
+<li>Kafka sink supports idempotent producers; transactional writes available via <code>exactly_once: true</code>.</li>
+</ul>
+<p><strong>Default behavior</strong>: DeltaForge provides at-least-once delivery out of the box. Exactly-once semantics require sink support and explicit configuration.</p>
+<h3 id="high-availability"><a class="header" href="#high-availability">High availability</a></h3>
+<p>Production CDC pipelines need to handle failures without data loss or extended downtime.</p>
+<p><strong>Best practices</strong>:</p>
+<ul>
+<li>Run multiple pipeline instances with leader election.</li>
+<li>Store checkpoints in durable storage (DeltaForge persists to local files, mountable volumes in containers).</li>
+<li>Monitor lag between source position and checkpoint position.</li>
+<li>Set up alerts for pipeline failures and excessive lag.</li>
+</ul>
+<p><strong>Expectations</strong>: DeltaForge checkpoints ensure no data loss on restart, but does not currently include built-in leader election. For HA deployments, use external coordination (Kubernetes leader election, etcd locks) or run active-passive with health-check-based failover.</p>
+<h3 id="backpressure"><a class="header" href="#backpressure">Backpressure</a></h3>
+<p>When sinks can’t keep up with the change rate, pipelines need to slow down gracefully rather than dropping events or exhausting memory.</p>
+<p><strong>DeltaForge handles backpressure through</strong>:</p>
+<ul>
+<li>Configurable batch sizes (<code>max_events</code>, <code>max_bytes</code>, <code>max_ms</code>).</li>
+<li>In-flight limits (<code>max_inflight</code>) that bound concurrent sink writes.</li>
+<li>Blocking reads from source when batches queue up.</li>
+</ul>
+<hr>
+<h2 id="performance-considerations"><a class="header" href="#performance-considerations">Performance considerations</a></h2>
+<h3 id="batching-trade-offs"><a class="header" href="#batching-trade-offs">Batching trade-offs</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Setting</th><th>Low value</th><th>High value</th></tr>
+</thead>
+<tbody>
+<tr><td><code>max_events</code></td><td>Lower latency, more overhead</td><td>Higher throughput, more latency</td></tr>
+<tr><td><code>max_ms</code></td><td>Faster flush, smaller batches</td><td>Larger batches, delayed flush</td></tr>
+<tr><td><code>max_bytes</code></td><td>Memory-safe, frequent commits</td><td>Efficient for large rows</td></tr>
+</tbody>
+</table>
+</div>
+<p>Start with DeltaForge defaults and tune based on observed latency and throughput.</p>
+<h3 id="source-database-impact"><a class="header" href="#source-database-impact">Source database impact</a></h3>
+<p>Log-based CDC has minimal impact, but consider:</p>
+<ul>
+<li><strong>Replication slot retention</strong>: Paused pipelines cause WAL/binlog accumulation.</li>
+<li><strong>Connection limits</strong>: Each pipeline holds a replication connection.</li>
+<li><strong>Network bandwidth</strong>: High-volume tables generate significant log traffic.</li>
+</ul>
+<h3 id="sink-throughput"><a class="header" href="#sink-throughput">Sink throughput</a></h3>
+<ul>
+<li><strong>Kafka</strong>: Tune <code>batch.size</code>, <code>linger.ms</code>, and compression in <code>client_conf</code>.</li>
+<li><strong>Redis</strong>: Use pipelining and connection pooling for high-volume streams.</li>
+</ul>
+<hr>
+<h2 id="monitoring-and-observability"><a class="header" href="#monitoring-and-observability">Monitoring and observability</a></h2>
+<p>CDC pipelines are long-running, stateful processes; without metrics and alerts, failures are silent by default. A healthy pipeline requires visibility into lag, throughput, and errors.</p>
+<h3 id="key-metrics-to-track"><a class="header" href="#key-metrics-to-track">Key metrics to track</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Metric</th><th>Description</th><th>Alert threshold</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cdc_lag_seconds</code></td><td>Time between event timestamp and processing</td><td>&gt; 60s</td></tr>
+<tr><td><code>events_processed_total</code></td><td>Throughput counter</td><td>Sudden drops</td></tr>
+<tr><td><code>checkpoint_lag_events</code></td><td>Events since last checkpoint</td><td>&gt; 10,000</td></tr>
+<tr><td><code>sink_errors_total</code></td><td>Failed sink writes</td><td>Any sustained errors</td></tr>
+<tr><td><code>batch_size_avg</code></td><td>Events per batch</td><td>Outside expected range</td></tr>
+</tbody>
+</table>
+</div>
+<p>DeltaForge exposes Prometheus metrics on the configurable metrics endpoint (default <code>:9000</code>).</p>
+<h3 id="health-checks"><a class="header" href="#health-checks">Health checks</a></h3>
+<ul>
+<li><code>GET /healthz</code>: Liveness probe - is the process running?</li>
+<li><code>GET /readyz</code>: Readiness probe - are pipelines connected and processing?</li>
+<li><code>GET /pipelines</code>: Detailed status of each pipeline including configuration.</li>
+</ul>
+<hr>
+<h2 id="choosing-a-cdc-solution"><a class="header" href="#choosing-a-cdc-solution">Choosing a CDC solution</a></h2>
+<p>When evaluating CDC tools, consider:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Factor</th><th>Questions to ask</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Source support</strong></td><td>Does it support your databases? MySQL binlog? Postgres logical replication?</td></tr>
+<tr><td><strong>Sink flexibility</strong></td><td>Can it write to your target systems? Kafka, Redis, HTTP, custom?</td></tr>
+<tr><td><strong>Transformation</strong></td><td>Can you filter, enrich, or reshape events in-flight?</td></tr>
+<tr><td><strong>Operational overhead</strong></td><td>How much infrastructure does it require? JVM? Distributed coordinator?</td></tr>
+<tr><td><strong>Resource efficiency</strong></td><td>What’s the memory/CPU footprint per pipeline?</td></tr>
+<tr><td><strong>Cloud-native</strong></td><td>Does it containerize cleanly? Support health checks? Emit metrics?</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="where-deltaforge-fits"><a class="header" href="#where-deltaforge-fits">Where DeltaForge fits</a></h3>
+<p>DeltaForge intentionally avoids the operational complexity of JVM-based CDC stacks (Kafka Connect-style deployments with Zookeeper, Connect workers, and converter configurations) while remaining compatible with Kafka-centric architectures.</p>
+<p><strong>DeltaForge is designed for teams that want</strong>:</p>
+<ul>
+<li><strong>Lightweight runtime</strong>: Single binary, minimal memory footprint, no JVM warmup.</li>
+<li><strong>Config-driven pipelines</strong>: YAML specs instead of code for common patterns.</li>
+<li><strong>Inline transformation</strong>: JavaScript processors for custom logic without recompilation.</li>
+<li><strong>Container-native operations</strong>: Built for Kubernetes with health endpoints and Prometheus metrics.</li>
+</ul>
+<p><strong>DeltaForge is not designed for</strong>:</p>
+<ul>
+<li>Complex DAG-based stream processing with windowed aggregations</li>
+<li>Stateful joins across multiple streams</li>
+<li>Sources beyond MySQL and Postgres (currently)</li>
+<li>Built-in schema registry integration (use external registries)</li>
+</ul>
+<p>If you need those capabilities, consider dedicated stream processors or the broader Kafka ecosystem. DeltaForge excels at getting data out of databases and into your event infrastructure reliably and efficiently.</p>
+<hr>
+<h2 id="getting-started"><a class="header" href="#getting-started">Getting started</a></h2>
+<p>Ready to try CDC with DeltaForge? Head to the <a href="quickstart.html">Quickstart guide</a> to run your first pipeline in minutes.</p>
+<p>For production deployments, review the <a href="development.html">Development guide</a> for container builds and operational best practices.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="introduction.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="quickstart.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="introduction.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="quickstart.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

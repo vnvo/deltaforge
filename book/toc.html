@@ -1,0 +1,71 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy" dir="ltr">
+    <head>
+        <!-- sidebar iframe generated using mdBook
+
+        This is a frame, and not included directly in the page, to control the total size of the
+        book. The TOC contains an entry for each page, so if each page includes a copy of the TOC,
+        the total size of the page becomes O(n**2).
+
+        The frame is only used as a fallback when JS is turned off. When it's on, the sidebar is
+        instead added to the main page by `toc.js` instead. The JavaScript mode is better
+        because, when running in a `file:///` URL, the iframed page would not be Same-Origin as
+        the rest of the page, so the sidebar and the main page theme would fall out of sync.
+        -->
+        <meta charset="UTF-8">
+        <meta name="robots" content="noindex">
+        <!-- Custom HTML head -->
+        <!-- SEO Meta Tags -->
+        <meta name="author" content="Vahid Negahdari">
+        <meta name="keywords" content="CDC, Change Data Capture, Rust, Kafka, Redis, MySQL, Postgres, streaming, data pipeline, real-time, Debezium alternative, ETL">
+        <meta name="robots" content="index, follow">
+        <link rel="canonical" href="https://vnvo.github.io/deltaforge/">
+        
+        <!-- Open Graph / Facebook -->
+        <meta property="og:type" content="website">
+        <meta property="og:url" content="https://vnvo.github.io/deltaforge/">
+        <meta property="og:title" content="DeltaForge - CDC Framework">
+        <meta property="og:description" content="A modular, config-driven Change Data Capture (CDC) micro-framework built in Rust. Stream database changes to Kafka and Redis.">
+        <meta property="og:image" content="https://vnvo.github.io/deltaforge/assets/deltaforge-blc.png">
+        <meta property="og:site_name" content="DeltaForge Documentation">
+        
+        <!-- Twitter Card -->
+        <meta name="twitter:card" content="summary_large_image">
+        <meta name="twitter:url" content="https://vnvo.github.io/deltaforge/">
+        <meta name="twitter:title" content="DeltaForge - CDC Framework">
+        <meta name="twitter:description" content="A modular, config-driven Change Data Capture (CDC) micro-framework built in Rust. Stream database changes to Kafka and Redis.">
+        <meta name="twitter:image" content="https://vnvo.github.io/deltaforge/assets/deltaforge-blc.png">
+        
+        <!-- Structured Data (JSON-LD) -->
+        <script type="application/ld+json">
+        {
+          "@context": "https://schema.org",
+          "@type": "SoftwareSourceCode",
+          "name": "DeltaForge",
+          "description": "A modular, config-driven Change Data Capture (CDC) micro-framework built in Rust",
+          "url": "https://github.com/vnvo/deltaforge",
+          "codeRepository": "https://github.com/vnvo/deltaforge",
+          "programmingLanguage": "Rust",
+          "license": "https://opensource.org/licenses/MIT",
+          "author": {
+            "@type": "Person",
+            "name": "Vahid Negahdari",
+            "url": "https://github.com/vnvo"
+          },
+          "keywords": ["CDC", "Change Data Capture", "Rust", "Kafka", "Redis", "MySQL", "Postgres", "streaming"]
+        }
+        </script>        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="css/custom-55d982ab.css">
+    </head>
+    <body class="sidebar-iframe-inner">
+        <ol class="chapter"><li class="chapter-item expanded "><span class="chapter-link-wrapper"><a href="introduction.html" target="_parent">Introduction</a></span></li><li class="chapter-item expanded "><span class="chapter-link-wrapper"><a href="cdc.html" target="_parent">Change Data Capture</a></span></li><li class="chapter-item expanded "><span class="chapter-link-wrapper"><a href="quickstart.html" target="_parent">Quickstart</a></span></li><li class="chapter-item expanded "><span class="chapter-link-wrapper"><a href="configuration.html" target="_parent">Configuration</a></span></li><li class="chapter-item expanded "><span class="chapter-link-wrapper"><a href="apireference.html" target="_parent">API Reference</a></span></li><li class="chapter-item expanded "><span class="chapter-link-wrapper"><a href="pipelines.html" target="_parent">Pipelines</a></span></li><li class="chapter-item expanded "><span class="chapter-link-wrapper"><a href="sources/index.html" target="_parent">Sources</a><a class="chapter-fold-toggle"><div>❱</div></a></span><ol class="section"><li class="chapter-item "><span class="chapter-link-wrapper"><a href="sources/mysql.html" target="_parent">MySQL</a></span></li><li class="chapter-item "><span class="chapter-link-wrapper"><a href="sources/postgres.html" target="_parent">Postgres</a></span></li><li class="chapter-item "><span class="chapter-link-wrapper"><a href="sources/turso.html" target="_parent">Turso</a></span></li></ol><li class="chapter-item expanded "><span class="chapter-link-wrapper"><a href="processors.html" target="_parent">Processors</a></span></li><li class="chapter-item expanded "><span class="chapter-link-wrapper"><a href="sinks/index.html" target="_parent">Sinks</a><a class="chapter-fold-toggle"><div>❱</div></a></span><ol class="section"><li class="chapter-item "><span class="chapter-link-wrapper"><a href="sinks/redis.html" target="_parent">Redis</a></span></li><li class="chapter-item "><span class="chapter-link-wrapper"><a href="sinks/kafka.html" target="_parent">Kafka</a></span></li><li class="chapter-item "><span class="chapter-link-wrapper"><a href="sinks/nats.html" target="_parent">NATS</a></span></li></ol><li class="chapter-item expanded "><span class="chapter-link-wrapper"><a href="envelopes.html" target="_parent">Envelopes and Encodings</a></span></li><li class="chapter-item expanded "><span class="chapter-link-wrapper"><a href="routing.html" target="_parent">Dynamic Routing</a></span></li><li class="chapter-item expanded "><span class="chapter-link-wrapper"><a href="outbox.html" target="_parent">Outbox Pattern Support</a></span></li><li class="chapter-item expanded "><span class="chapter-link-wrapper"><a href="architecture.html" target="_parent">Architecture</a><a class="chapter-fold-toggle"><div>❱</div></a></span><ol class="section"><li class="chapter-item "><span class="chapter-link-wrapper"><a href="checkpoints.html" target="_parent">Checkpoints</a></span></li><li class="chapter-item "><span class="chapter-link-wrapper"><a href="schemaregistry.html" target="_parent">Schema Registry</a></span></li><li class="chapter-item "><span class="chapter-link-wrapper"><a href="schemasensing.html" target="_parent">Schema Sensing</a></span></li></ol><li class="chapter-item expanded "><span class="chapter-link-wrapper"><a href="observability.html" target="_parent">Observability</a></span></li><li class="chapter-item expanded "><span class="chapter-link-wrapper"><a href="examples/index.html" target="_parent">Examples</a><a class="chapter-fold-toggle"><div>❱</div></a></span><ol class="section"><li class="chapter-item "><span class="chapter-link-wrapper"><a href="examples/mysql_to_redis.html" target="_parent">MySQL to Redis</a></span></li><li class="chapter-item "><span class="chapter-link-wrapper"><a href="examples/turso_to_kafka.html" target="_parent">Turso to Kafka</a></span></li><li class="chapter-item "><span class="chapter-link-wrapper"><a href="examples/postgres_to_nats.html" target="_parent">PostgreSQL to NATS</a></span></li><li class="chapter-item "><span class="chapter-link-wrapper"><a href="examples/multi_sink_fanout.html" target="_parent">Multi-Sink Fan-Out</a></span></li><li class="chapter-item "><span class="chapter-link-wrapper"><a href="examples/event_filtering.html" target="_parent">Event Filtering</a></span></li><li class="chapter-item "><span class="chapter-link-wrapper"><a href="examples/schema_sensing.html" target="_parent">Schema Sensing</a></span></li><li class="chapter-item "><span class="chapter-link-wrapper"><a href="examples/kafka_production.html" target="_parent">Production Kafka</a></span></li><li class="chapter-item "><span class="chapter-link-wrapper"><a href="examples/cache_invalidation.html" target="_parent">Cache Invalidation</a></span></li><li class="chapter-item "><span class="chapter-link-wrapper"><a href="examples/audit_trail.html" target="_parent">Audit Trail</a></span></li><li class="chapter-item "><span class="chapter-link-wrapper"><a href="examples/analytics_preprocessing.html" target="_parent">Analytics Preprocessing</a></span></li><li class="chapter-item "><span class="chapter-link-wrapper"><a href="examples/outbox_mysql_kafka.html" target="_parent">Outbox Pattern</a></span></li></ol><li class="chapter-item expanded "><span class="chapter-link-wrapper"><a href="troubleshooting.html" target="_parent">Troubleshooting</a></span></li><li class="chapter-item expanded "><span class="chapter-link-wrapper"><a href="development.html" target="_parent">Development</a></span></li><li class="chapter-item expanded "><span class="chapter-link-wrapper"><a href="roadmap.html" target="_parent">Roadmap</a></span></li></ol>
+    </body>
+</html>
