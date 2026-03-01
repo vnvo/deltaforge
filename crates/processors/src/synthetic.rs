@@ -71,7 +71,6 @@ mod tests {
         BatchContext, Event, Op, SourceInfo, SourcePosition,
     };
     use serde_json::json;
-    use uuid::Uuid;
 
     fn make_event() -> Event {
         Event::new_row(
@@ -171,7 +170,7 @@ mod tests {
     #[tokio::test]
     async fn passthrough_events_not_marked() {
         let e = make_event();
-        let ctx = BatchContext::from_batch(&[e.clone()]);
+        let ctx = BatchContext::from_batch(std::slice::from_ref(&e));
         let proc =
             SyntheticMarkingProcessor::wrap(Arc::new(Passthrough("p".into())));
 
@@ -188,7 +187,7 @@ mod tests {
     async fn fan_out_new_events_marked_original_not() {
         let e = make_event();
         let orig_id = e.event_id.unwrap();
-        let ctx = BatchContext::from_batch(&[e.clone()]);
+        let ctx = BatchContext::from_batch(std::slice::from_ref(&e));
         let proc =
             SyntheticMarkingProcessor::wrap(Arc::new(FanOut("fan-out".into())));
 
@@ -209,7 +208,7 @@ mod tests {
     #[tokio::test]
     async fn explicit_synthetic_not_overwritten() {
         let e = make_event();
-        let ctx = BatchContext::from_batch(&[e.clone()]);
+        let ctx = BatchContext::from_batch(std::slice::from_ref(&e));
         let proc = SyntheticMarkingProcessor::wrap(Arc::new(
             ExplicitSynthetic("wrapper-id".into()),
         ));
@@ -243,7 +242,7 @@ mod tests {
         let orig_id = e.event_id.unwrap();
 
         // ctx built once before any processor runs
-        let ctx = BatchContext::from_batch(&[e.clone()]);
+        let ctx = BatchContext::from_batch(std::slice::from_ref(&e));
 
         let proc_a =
             SyntheticMarkingProcessor::wrap(Arc::new(FanOut("proc-a".into())));

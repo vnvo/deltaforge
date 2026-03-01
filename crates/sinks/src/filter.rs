@@ -80,6 +80,7 @@ mod tests {
     }
 
     impl CountingSink {
+        #[allow(clippy::new_ret_no_self)]
         fn new(id: &str) -> (ArcDynSink, Arc<AtomicUsize>) {
             let count = Arc::new(AtomicUsize::new(0));
             let sink = Arc::new(Self {
