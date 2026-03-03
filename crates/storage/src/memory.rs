@@ -1,4 +1,4 @@
-//! In-memory `StorageBackend` - for testing and development only.
+//! In-memory `StorageBackend` — for testing and development only.
 //!
 //! State is lost on drop. Not suitable for production.
 

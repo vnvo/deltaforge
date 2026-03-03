@@ -7,10 +7,11 @@
 //! - On-demand reload capability
 
 use mysql_async::{Pool, Row, prelude::Queryable};
-use schema_registry::{InMemoryRegistry, SourceSchema};
+use schema_registry::SourceSchema;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
+use storage::DurableSchemaRegistry;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -39,7 +40,7 @@ pub struct MySqlSchemaLoader {
     /// Cache: (db, table) -> LoadedSchema
     cache: Arc<RwLock<HashMap<(String, String), LoadedSchema>>>,
     /// Schema registry for versioning
-    registry: Arc<InMemoryRegistry>,
+    registry: Arc<DurableSchemaRegistry>,
     tenant: String,
 }
 
@@ -47,7 +48,7 @@ impl MySqlSchemaLoader {
     /// Create a new schema loader.
     pub fn new(
         dsn: &str,
-        registry: Arc<InMemoryRegistry>,
+        registry: Arc<DurableSchemaRegistry>,
         tenant: &str,
     ) -> Self {
         info!("creating mysql schema loader for {}", redact_password(dsn));
@@ -436,8 +437,6 @@ impl MySqlSchemaLoader {
     pub(crate) fn from_static(
         cols: HashMap<(String, String), Arc<Vec<String>>>,
     ) -> Self {
-        use schema_registry::InMemoryRegistry;
-
         // Convert column-only map to LoadedSchema map
         let cache: HashMap<(String, String), LoadedSchema> = cols
             .into_iter()
@@ -472,7 +471,7 @@ impl MySqlSchemaLoader {
             pool: Pool::new("mysql://localhost/ignored"),
             dsn: "mysql://localhost/ignored".to_string(),
             cache: Arc::new(RwLock::new(cache)),
-            registry: Arc::new(InMemoryRegistry::new()),
+            registry: storage::DurableSchemaRegistry::for_testing(),
             tenant: "test".to_string(),
         }
     }

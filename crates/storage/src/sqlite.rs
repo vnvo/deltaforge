@@ -1,6 +1,6 @@
 //! SQLite `StorageBackend` for single-node production deployments.
 //!
-//! Uses WAL mode with a single `Arc<Mutex<Connection>>` — all reads and writes
+//! Uses WAL mode with a single `Arc<Mutex<Connection>>` - all reads and writes
 //! are serialized through it via `spawn_blocking`, matching the pattern used by
 //! `checkpoints/src/sqlite_store.rs`. This avoids a second `rusqlite`/
 //! `libsqlite3-sys` dependency version in the workspace.
@@ -26,11 +26,16 @@ fn now_secs() -> i64 {
         .as_secs() as i64
 }
 
-// ── Backend ───────────────────────────────────────────────────────────────────
-
 pub struct SqliteStorageBackend {
     conn: Arc<Mutex<Connection>>,
     _sweep_handle: JoinHandle<()>,
+}
+
+impl std::fmt::Debug for SqliteStorageBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqliteStorageBackend")
+            .finish_non_exhaustive()
+    }
 }
 
 const SCHEMA: &str = r#"
@@ -84,7 +89,7 @@ impl SqliteStorageBackend {
         Self::init(conn)
     }
 
-    /// In-memory database — for testing only.
+    /// In-memory database - for testing only.
     pub fn in_memory() -> Result<Arc<Self>> {
         let conn = Connection::open_in_memory()?;
         Self::init(conn)
@@ -140,8 +145,6 @@ macro_rules! db {
 
 #[async_trait]
 impl StorageBackend for SqliteStorageBackend {
-    // ── KV ──────────────────────────────────────────────────────────────────
-
     async fn kv_get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {
         let ns = ns.to_string();
         let key = key.to_string();
@@ -248,8 +251,6 @@ impl StorageBackend for SqliteStorageBackend {
         })
     }
 
-    // ── Log ─────────────────────────────────────────────────────────────────
-
     async fn log_append(
         &self,
         ns: &str,
@@ -310,8 +311,6 @@ impl StorageBackend for SqliteStorageBackend {
             .map_err(Into::into)
         })
     }
-
-    // ── Slot ────────────────────────────────────────────────────────────────
 
     async fn slot_upsert(
         &self,
@@ -387,8 +386,6 @@ impl StorageBackend for SqliteStorageBackend {
             )? > 0)
         })
     }
-
-    // ── Queue ────────────────────────────────────────────────────────────────
 
     async fn queue_push(
         &self,

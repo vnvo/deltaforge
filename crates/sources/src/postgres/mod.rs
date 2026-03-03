@@ -8,8 +8,8 @@ use std::{
 
 use async_trait::async_trait;
 use pgwire_replication::{Lsn, ReplicationClient};
-use schema_registry::InMemoryRegistry;
 use serde::{Deserialize, Serialize};
+use storage::DurableSchemaRegistry;
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -68,7 +68,7 @@ pub struct PostgresSource {
     pub tables: Vec<String>,
     pub tenant: String,
     pub pipeline: String,
-    pub registry: Arc<InMemoryRegistry>,
+    pub registry: Arc<DurableSchemaRegistry>,
     pub outbox_prefixes: AllowList,
 }
 

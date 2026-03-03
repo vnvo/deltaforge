@@ -3,10 +3,10 @@
 //! # Architecture
 //!
 //! [`StorageBackend`] exposes four primitives:
-//! - **KV** — mutable point-in-time state with optional TTL (checkpoints, FSM, leases, dedup)
-//! - **Log** — append-only monotonic history with global sequence (schema registry)
-//! - **Slot** — mutable record with compare-and-swap (snapshot cursors, leader election)
-//! - **Queue** — ordered bounded FIFO (quarantine buffer, DLQ)
+//! - **KV** - mutable point-in-time state with optional TTL (checkpoints, FSM, leases, dedup)
+//! - **Log** - append-only monotonic history with global sequence (schema registry)
+//! - **Slot** - mutable record with compare-and-swap (snapshot cursors, leader election)
+//! - **Queue** - ordered bounded FIFO (quarantine buffer, DLQ)
 //!
 //! Two implementations are provided: [`MemoryStorageBackend`] (testing) and
 //! [`SqliteStorageBackend`] (single-node production). A PostgreSQL backend
@@ -25,14 +25,16 @@ pub use memory::MemoryStorageBackend;
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteStorageBackend;
 
+// Adapter re-exports for ergonomic top-level imports
+pub use adapters::BackendCheckpointStore;
+pub use adapters::DurableSchemaRegistry;
+
 /// Unified storage backend trait.
 ///
 /// All four primitives operate within a `(ns, key)` address space.
 /// Namespaces are enforced by convention — see the namespace table in the spec.
 #[async_trait]
-pub trait StorageBackend: Send + Sync {
-    // ── KV ──────────────────────────────────────────────────────────────────
-
+pub trait StorageBackend: Send + Sync + std::fmt::Debug {
     async fn kv_get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>>;
     async fn kv_put(&self, ns: &str, key: &str, value: &[u8]) -> Result<()>;
     /// Store with TTL. Lazy expiry on read + periodic sweep.
@@ -51,8 +53,6 @@ pub trait StorageBackend: Send + Sync {
         ns: &str,
         prefix: Option<&str>,
     ) -> Result<Vec<String>>;
-
-    // ── Log ─────────────────────────────────────────────────────────────────
 
     /// Append a value; returns the **global** monotonic sequence number.
     async fn log_append(
@@ -79,8 +79,6 @@ pub trait StorageBackend: Send + Sync {
         key: &str,
     ) -> Result<Option<(u64, Vec<u8>)>>;
 
-    // ── Slot ────────────────────────────────────────────────────────────────
-
     /// Upsert a slot; returns the new version number.
     async fn slot_upsert(
         &self,
@@ -103,8 +101,6 @@ pub trait StorageBackend: Send + Sync {
     ) -> Result<bool>;
     /// Returns `true` if the slot existed.
     async fn slot_delete(&self, ns: &str, key: &str) -> Result<bool>;
-
-    // ── Queue ────────────────────────────────────────────────────────────────
 
     /// Push a value; returns the entry id.
     async fn queue_push(

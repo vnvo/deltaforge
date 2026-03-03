@@ -38,6 +38,7 @@ type Cache = HashMap<(String, String, String), Vec<SchemaVersion>>;
 /// Durable schema registry that survives process restarts.
 ///
 /// Identical API to `InMemoryRegistry` but persisted via [`StorageBackend`].
+#[derive(Debug)]
 pub struct DurableSchemaRegistry {
     backend: ArcStorageBackend,
     cache: RwLock<Cache>,
@@ -55,6 +56,20 @@ impl DurableSchemaRegistry {
         });
         registry.load_from_backend().await?;
         Ok(registry)
+    }
+
+    /// Sync constructor for unit tests — skips log replay.
+    ///
+    /// Safe to call from inside a tokio runtime. Uses a `MemoryStorageBackend`
+    /// so writes are accepted but not persisted. Only use this in `#[cfg(test)]`
+    /// `from_static`-style helpers where the cache is pre-populated and the
+    /// registry's `register()` path is never reached.
+    pub fn for_testing() -> Arc<Self> {
+        Arc::new(Self {
+            backend: std::sync::Arc::new(crate::MemoryStorageBackend::new()),
+            cache: RwLock::new(HashMap::new()),
+            sequence: AtomicU64::new(0),
+        })
     }
 
     /// Replay the full log into the in-memory cache.

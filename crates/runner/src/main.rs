@@ -1,13 +1,13 @@
 use anyhow::{Context, Result};
 use axum::Router;
-use checkpoints::{CheckpointStore, FileCheckpointStore};
 use clap::Parser;
-use deltaforge_config::{PipelineSpec, load_cfg};
+use deltaforge_config::{StorageBackendKind, StorageConfig, load_cfg};
 use rest_api::{
     AppState, PipelineController, SchemaState, SensingState, router_full,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
+use storage::SqliteStorageBackend;
 use tokio::net::TcpListener;
 use tracing::{debug, info};
 
@@ -26,6 +26,12 @@ struct Args {
     api_addr: String,
     #[arg(long, default_value = "0.0.0.0:9095")]
     metrics_addr: String,
+    /// Storage backend: sqlite (default) or memory
+    #[arg(long, default_value = "sqlite")]
+    storage_backend: String,
+    /// SQLite database path (only used with --storage-backend sqlite)
+    #[arg(long, default_value = "./data/deltaforge.db")]
+    storage_path: String,
 }
 
 #[tokio::main]
@@ -45,16 +51,33 @@ async fn main() -> Result<()> {
         },
         install_panic_hook: true,
     };
-
     let _ = o11y::init_all(&cfg);
 
     let pipeline_specs =
         load_pipeline_cfgs(&args.config).context("load pipeline specs")?;
-    let ckpt_store: Arc<dyn CheckpointStore> =
-        Arc::new(FileCheckpointStore::new("./data/df_checkpoints.json")?);
 
-    // Create manager and API wrappers
-    let manager = Arc::new(PipelineManager::new(ckpt_store.clone()));
+    let storage_cfg = StorageConfig {
+        backend: match args.storage_backend.as_str() {
+            "memory" => StorageBackendKind::Memory,
+            _ => StorageBackendKind::Sqlite,
+        },
+        path: args.storage_path.clone(),
+    };
+
+    let backend = build_storage_backend(&storage_cfg)
+        .context("initialise storage backend")?;
+
+    info!(
+        backend = %args.storage_backend,
+        path = %args.storage_path,
+        "storage backend ready"
+    );
+
+    let manager = Arc::new(
+        PipelineManager::with_backend(backend)
+            .await
+            .context("build pipeline manager")?,
+    );
     let schema_api = Arc::new(SchemaApi::new(manager.clone()));
     let sensing_api = Arc::new(SensingApi::new(manager.clone()));
 
@@ -62,7 +85,6 @@ async fn main() -> Result<()> {
         manager.create(ps).await?;
     }
 
-    // Build router with all routes
     let app: Router = router_full(
         AppState {
             controller: manager,
@@ -81,13 +103,36 @@ async fn main() -> Result<()> {
     info!(%addr, "api listening");
 
     let listener = TcpListener::bind(addr).await?;
-    let api_task = tokio::spawn(axum::serve(listener, app).into_future());
-    api_task.await??;
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
 
-fn load_pipeline_cfgs(path: &str) -> Result<Vec<PipelineSpec>> {
+fn build_storage_backend(
+    cfg: &StorageConfig,
+) -> Result<storage::ArcStorageBackend> {
+    match cfg.backend {
+        StorageBackendKind::Memory => {
+            info!("using in-memory storage backend (ephemeral)");
+            Ok(Arc::new(storage::MemoryStorageBackend::new()))
+        }
+        StorageBackendKind::Sqlite => {
+            // Ensure parent directory exists.
+            if let Some(parent) = std::path::Path::new(&cfg.path).parent() {
+                std::fs::create_dir_all(parent)
+                    .context("create storage directory")?;
+            }
+            info!(path = %cfg.path, "using SQLite storage backend");
+            SqliteStorageBackend::open(&cfg.path)
+                .map(|b| b as storage::ArcStorageBackend)
+                .context("open SQLite storage backend")
+        }
+    }
+}
+
+fn load_pipeline_cfgs(
+    path: &str,
+) -> Result<Vec<deltaforge_config::PipelineSpec>> {
     let specs = load_cfg(path)?;
     info!(specs_found = specs.len(), "pipeline specs loaded");
     debug!(pipeline_specs = ?specs, "pipeline spec");

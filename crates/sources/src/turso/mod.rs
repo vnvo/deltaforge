@@ -77,8 +77,8 @@ use deltaforge_core::{
 };
 use libsql::Connection;
 use metrics::counter;
-use schema_registry::InMemoryRegistry;
 use serde::{Deserialize, Serialize};
+use storage::DurableSchemaRegistry;
 use tokio::{
     sync::{Notify, mpsc},
     time::sleep,
@@ -131,7 +131,7 @@ pub struct TursoSource {
     pub cfg: TursoSrcCfg,
     pub tenant: String,
     pub pipeline: String,
-    pub registry: Arc<InMemoryRegistry>,
+    pub registry: Arc<DurableSchemaRegistry>,
 }
 
 impl TursoSource {
@@ -140,7 +140,7 @@ impl TursoSource {
         cfg: TursoSrcCfg,
         tenant: String,
         pipeline: String,
-        registry: Arc<InMemoryRegistry>,
+        registry: Arc<DurableSchemaRegistry>,
     ) -> Self {
         let id = cfg.id.clone();
         Self {

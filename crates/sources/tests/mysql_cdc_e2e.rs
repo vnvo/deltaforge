@@ -14,11 +14,12 @@ use ctor::dtor;
 use deltaforge_core::{BatchContext, Event, Op, Source, SourceHandle};
 use mysql_async::Opts;
 use mysql_async::{Pool as MySQLPool, prelude::Queryable};
-use schema_registry::{InMemoryRegistry, SourceSchema};
+use schema_registry::SourceSchema;
 use sources::SourceSchemaLoader;
 use sources::mysql::{MySqlSchemaLoader, MySqlSource};
 use std::sync::Arc;
 use std::time::Instant;
+use storage::{DurableSchemaRegistry, MemoryStorageBackend};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt, core::IntoContainerPort,
@@ -296,9 +297,14 @@ async fn setup(name: &str) -> Result<(String, MySQLPool, String)> {
     Ok((db_name, pool, dsn))
 }
 
+async fn make_registry() -> Arc<DurableSchemaRegistry> {
+    let backend = Arc::new(MemoryStorageBackend::new());
+    DurableSchemaRegistry::new(backend).await.expect("registry")
+}
+
 /// Build a MySqlSource with constant defaults (tenant=acme, pipeline=test,
 /// fresh InMemoryRegistry). `id` is also used as the checkpoint key suffix.
-fn make_source(
+async fn make_source(
     id: &str,
     dsn: &str,
     tables: Vec<String>,
@@ -311,7 +317,7 @@ fn make_source(
         tables,
         tenant: "acme".into(),
         pipeline: "test".to_string(),
-        registry: Arc::new(InMemoryRegistry::new()),
+        registry: make_registry().await,
         outbox_tables,
     }
 }
@@ -351,7 +357,7 @@ async fn mysql_schema_loader() -> Result<()> {
     )
     .await?;
 
-    let registry = Arc::new(InMemoryRegistry::new());
+    let registry = make_registry().await;
     let schema_loader = MySqlSchemaLoader::new(&dsn, registry.clone(), "acme");
 
     // Test: expand exact pattern
@@ -484,7 +490,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
     )
     .await?;
 
-    let registry = Arc::new(InMemoryRegistry::new());
+    let registry = make_registry().await;
     let src = MySqlSource {
         id: "cdc-basic".into(),
         checkpoint_key: "mysql-cdc-basic".to_string(),
@@ -601,7 +607,7 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
     )
     .await?;
 
-    let registry = Arc::new(InMemoryRegistry::new());
+    let registry = make_registry().await;
     let src = MySqlSource {
         id: "schema-ddl".into(),
         checkpoint_key: "mysql-schema-ddl".to_string(),
@@ -712,7 +718,8 @@ async fn mysql_cdc_checkpoint_resume() -> Result<()> {
             &dsn,
             vec![format!("{}.orders", db_name)],
             AllowList::default(),
-        );
+        )
+        .await;
 
         let handle = src.run(tx, ckpt_store.clone()).await;
         sleep(Duration::from_secs(3)).await;
@@ -753,7 +760,8 @@ async fn mysql_cdc_checkpoint_resume() -> Result<()> {
             &dsn,
             vec![format!("{}.orders", db_name)],
             AllowList::default(),
-        );
+        )
+        .await;
 
         let handle = src.run(tx, ckpt_store.clone()).await;
 
@@ -802,7 +810,8 @@ async fn mysql_cdc_reconnect_after_disconnect() -> Result<()> {
         &dsn,
         vec![format!("{}.orders", db_name)],
         AllowList::default(),
-    );
+    )
+    .await;
     let (mut rx, handle) = start_source(src).await?;
 
     // Insert before disconnect
@@ -887,7 +896,8 @@ async fn mysql_cdc_table_filtering() -> Result<()> {
         &dsn,
         vec![format!("{}.orders", db_name)],
         AllowList::default(),
-    );
+    )
+    .await;
     let (mut rx, handle) = start_source(src).await?;
 
     // Insert into both tables
@@ -972,7 +982,8 @@ async fn mysql_cdc_outbox_capture() -> Result<()> {
         &dsn,
         vec![format!("{}.outbox", db_name), format!("{}.orders", db_name)],
         AllowList::new(&[format!("{}.outbox", db_name)]),
-    );
+    )
+    .await;
     let (mut rx, handle) = start_source(src).await?;
 
     // Insert outbox event
@@ -1060,7 +1071,8 @@ async fn mysql_cdc_outbox_wildcard_tables() -> Result<()> {
             format!("{}.audit_log", db_name),
         ],
         AllowList::new(&["*.outbox".to_string()]),
-    );
+    )
+    .await;
     let (mut rx, handle) = start_source(src).await?;
 
     conn.query_drop(
@@ -1129,7 +1141,8 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
         &dsn,
         vec![format!("{}.outbox", db_name), format!("{}.orders", db_name)],
         AllowList::new(&[format!("{}.outbox", db_name)]),
-    );
+    )
+    .await;
     let (mut rx, handle) = start_source(src).await?;
 
     conn.query_drop(

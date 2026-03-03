@@ -9,8 +9,8 @@ use mysql_binlog_connector_rust::{
     binlog_client::BinlogClient, binlog_stream::BinlogStream,
     event::table_map_event::TableMapEvent,
 };
-use schema_registry::InMemoryRegistry;
 use serde::{Deserialize, Serialize};
+use storage::DurableSchemaRegistry;
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
@@ -55,7 +55,7 @@ pub struct MySqlSource {
     pub tables: Vec<String>, // ["db.table"]; empty = all
     pub tenant: String,
     pub pipeline: String,
-    pub registry: Arc<InMemoryRegistry>,
+    pub registry: Arc<DurableSchemaRegistry>,
     pub outbox_tables: AllowList,
 }
 
