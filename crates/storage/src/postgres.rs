@@ -80,7 +80,8 @@ pub struct PostgresStorageBackend {
 
 impl std::fmt::Debug for PostgresStorageBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PostgresStorageBackend").finish_non_exhaustive()
+        f.debug_struct("PostgresStorageBackend")
+            .finish_non_exhaustive()
     }
 }
 
@@ -108,7 +109,8 @@ impl PostgresStorageBackend {
         // TTL sweep every 60s
         let sweep_pool = pool.clone();
         let sweep_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
                 match sweep_pool.get().await {
@@ -127,7 +129,10 @@ impl PostgresStorageBackend {
         });
 
         info!("PostgreSQL storage backend initialized");
-        Ok(Arc::new(Self { pool, _sweep_handle: sweep_handle }))
+        Ok(Arc::new(Self {
+            pool,
+            _sweep_handle: sweep_handle,
+        }))
     }
 }
 
@@ -161,7 +166,11 @@ impl StorageBackend for PostgresStorageBackend {
         Ok(row.and_then(|r| {
             let val: Vec<u8> = r.get(0);
             let exp: Option<i64> = r.get(1);
-            if exp.is_some_and(|e| e <= now) { None } else { Some(val) }
+            if exp.is_some_and(|e| e <= now) {
+                None
+            } else {
+                Some(val)
+            }
         }))
     }
 
@@ -206,7 +215,11 @@ impl StorageBackend for PostgresStorageBackend {
         Ok(n > 0)
     }
 
-    async fn kv_list(&self, ns: &str, prefix: Option<&str>) -> Result<Vec<String>> {
+    async fn kv_list(
+        &self,
+        ns: &str,
+        prefix: Option<&str>,
+    ) -> Result<Vec<String>> {
         let c = client!(self);
         let now = now_secs();
         let rows = if let Some(p) = prefix {
@@ -230,7 +243,12 @@ impl StorageBackend for PostgresStorageBackend {
 
     // ── Log ─────────────────────────────────────────────────────────────────
 
-    async fn log_append(&self, ns: &str, key: &str, value: &[u8]) -> Result<u64> {
+    async fn log_append(
+        &self,
+        ns: &str,
+        key: &str,
+        value: &[u8],
+    ) -> Result<u64> {
         let c = client!(self);
         let row = c
             .query_one(
@@ -241,7 +259,11 @@ impl StorageBackend for PostgresStorageBackend {
         Ok(row.get::<_, i64>(0) as u64)
     }
 
-    async fn log_list(&self, ns: &str, key: &str) -> Result<Vec<(u64, Vec<u8>)>> {
+    async fn log_list(
+        &self,
+        ns: &str,
+        key: &str,
+    ) -> Result<Vec<(u64, Vec<u8>)>> {
         let c = client!(self);
         let rows = c
             .query(
@@ -255,7 +277,12 @@ impl StorageBackend for PostgresStorageBackend {
             .collect())
     }
 
-    async fn log_since(&self, ns: &str, key: &str, since_seq: u64) -> Result<Vec<(u64, Vec<u8>)>> {
+    async fn log_since(
+        &self,
+        ns: &str,
+        key: &str,
+        since_seq: u64,
+    ) -> Result<Vec<(u64, Vec<u8>)>> {
         let c = client!(self);
         let rows = c
             .query(
@@ -269,7 +296,11 @@ impl StorageBackend for PostgresStorageBackend {
             .collect())
     }
 
-    async fn log_latest(&self, ns: &str, key: &str) -> Result<Option<(u64, Vec<u8>)>> {
+    async fn log_latest(
+        &self,
+        ns: &str,
+        key: &str,
+    ) -> Result<Option<(u64, Vec<u8>)>> {
         let c = client!(self);
         let row = c
             .query_opt(
@@ -282,7 +313,12 @@ impl StorageBackend for PostgresStorageBackend {
 
     // ── Slot ────────────────────────────────────────────────────────────────
 
-    async fn slot_upsert(&self, ns: &str, key: &str, state: &[u8]) -> Result<u64> {
+    async fn slot_upsert(
+        &self,
+        ns: &str,
+        key: &str,
+        state: &[u8],
+    ) -> Result<u64> {
         let c = client!(self);
         let row = c
             .query_one(
@@ -299,7 +335,11 @@ impl StorageBackend for PostgresStorageBackend {
         Ok(row.get::<_, i64>(0) as u64)
     }
 
-    async fn slot_get(&self, ns: &str, key: &str) -> Result<Option<(u64, Vec<u8>)>> {
+    async fn slot_get(
+        &self,
+        ns: &str,
+        key: &str,
+    ) -> Result<Option<(u64, Vec<u8>)>> {
         let c = client!(self);
         let row = c
             .query_opt(
@@ -338,7 +378,12 @@ impl StorageBackend for PostgresStorageBackend {
 
     // ── Queue ────────────────────────────────────────────────────────────────
 
-    async fn queue_push(&self, ns: &str, key: &str, value: &[u8]) -> Result<u64> {
+    async fn queue_push(
+        &self,
+        ns: &str,
+        key: &str,
+        value: &[u8],
+    ) -> Result<u64> {
         let c = client!(self);
         let row = c
             .query_one(
@@ -349,7 +394,12 @@ impl StorageBackend for PostgresStorageBackend {
         Ok(row.get::<_, i64>(0) as u64)
     }
 
-    async fn queue_peek(&self, ns: &str, key: &str, limit: usize) -> Result<Vec<(u64, Vec<u8>)>> {
+    async fn queue_peek(
+        &self,
+        ns: &str,
+        key: &str,
+        limit: usize,
+    ) -> Result<Vec<(u64, Vec<u8>)>> {
         let c = client!(self);
         let rows = c
             .query(
@@ -363,7 +413,12 @@ impl StorageBackend for PostgresStorageBackend {
             .collect())
     }
 
-    async fn queue_ack(&self, ns: &str, key: &str, up_to_id: u64) -> Result<usize> {
+    async fn queue_ack(
+        &self,
+        ns: &str,
+        key: &str,
+        up_to_id: u64,
+    ) -> Result<usize> {
         let c = client!(self);
         let n = c
             .execute(
@@ -385,7 +440,12 @@ impl StorageBackend for PostgresStorageBackend {
         Ok(row.get::<_, i64>(0) as u64)
     }
 
-    async fn queue_drop_oldest(&self, ns: &str, key: &str, count: usize) -> Result<usize> {
+    async fn queue_drop_oldest(
+        &self,
+        ns: &str,
+        key: &str,
+        count: usize,
+    ) -> Result<usize> {
         let c = client!(self);
         let n = c
             .execute(

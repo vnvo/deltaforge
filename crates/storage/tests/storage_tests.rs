@@ -100,7 +100,6 @@ async fn log_since_returns_only_newer_entries() {
     });
 }
 
-
 #[tokio::test]
 async fn slot_cas_exactly_one_winner_under_contention() {
     for_each_backend!(|b: ArcStorageBackend| async move {
@@ -140,7 +139,6 @@ async fn slot_cas_wrong_version_returns_false() {
         assert_eq!(val, b"v0");
     });
 }
-
 
 #[tokio::test]
 async fn queue_ack_removes_up_to_id_inclusive() {
@@ -182,7 +180,6 @@ async fn queue_drop_oldest_removes_from_front() {
         assert_eq!(remaining[0].0, ids[2]); // ids[0] and ids[1] dropped
     });
 }
-
 
 #[tokio::test]
 async fn checkpoint_adapter_round_trip() {
@@ -294,7 +291,6 @@ async fn schema_registry_get_at_sequence() {
     });
 }
 
-
 #[tokio::test]
 async fn kv_namespaces_are_isolated() {
     for_each_backend!(|b: ArcStorageBackend| async move {
@@ -318,7 +314,6 @@ async fn kv_namespaces_are_isolated() {
         );
     });
 }
-
 
 #[tokio::test]
 async fn checkpoint_multiple_pipelines_isolated() {
@@ -381,7 +376,6 @@ async fn checkpoint_concurrent_writes_no_error() {
         );
     });
 }
-
 
 #[tokio::test]
 async fn schema_registry_multi_tenant_isolation() {

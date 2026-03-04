@@ -19,14 +19,14 @@ use async_trait::async_trait;
 
 pub mod adapters;
 pub mod memory;
-pub mod sqlite;
 pub mod postgres;
+pub mod sqlite;
 
 pub use memory::MemoryStorageBackend;
-#[cfg(feature = "sqlite")]
-pub use sqlite::SqliteStorageBackend;
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresStorageBackend;
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteStorageBackend;
 
 // Adapter re-exports for ergonomic top-level imports
 pub use adapters::BackendCheckpointStore;

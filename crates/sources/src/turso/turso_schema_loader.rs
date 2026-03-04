@@ -24,7 +24,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use deltaforge_core::{SourceError, SourceResult};
 use libsql::Connection;
-use schema_registry::{InMemoryRegistry, SourceSchema};
+use schema_registry::SourceSchema;
+use storage::DurableSchemaRegistry;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -71,7 +72,7 @@ pub struct LoadedSchema {
 pub struct TursoSchemaLoader {
     conn: Arc<Connection>,
     cache: Arc<RwLock<HashMap<String, LoadedSchema>>>,
-    registry: Arc<InMemoryRegistry>,
+    registry: Arc<DurableSchemaRegistry>,
     tenant: String,
     db_name: String,
 }
@@ -86,7 +87,7 @@ impl TursoSchemaLoader {
     /// * `db_name` - Database name for registry (defaults to "main")
     pub fn new(
         conn: Arc<Connection>,
-        registry: Arc<InMemoryRegistry>,
+        registry: Arc<DurableSchemaRegistry>,
         tenant: &str,
         db_name: Option<&str>,
     ) -> Self {
