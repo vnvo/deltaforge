@@ -46,7 +46,8 @@ Pipelines are defined declaratively in YAML. This enables:
                      │
           ┌──────────┴──────────┐
           │   Storage Backend   │
-          │  (SQLite / Memory)  │
+          │  (SQLite / PG /     │
+          │   Memory)           │
           ├─────────────────────┤
           │ KV · Log · Slot     │
           │ Queue               │
@@ -130,7 +131,7 @@ At startup, the schema loader auto-discovers tables via pattern expansion and lo
 | `db.prefix%` | Tables matching prefix |
 | `%.table` | Table in any database |
 
-**DDL detection** works through cache invalidation. When the binlog delivers a `QueryEvent` (DDL), the affected database's cache is cleared. On the next row event for that table, the schema is re-fetched from `INFORMATION_SCHEMA`, fingerprinted, and registered as a new version. No separate DDL history log is maintained - the live catalog is always the source of truth.
+**DDL detection** works through cache invalidation. When the binlog delivers a `QueryEvent` (DDL), the affected database's cache is cleared. On the next row event for that table, the schema is re-fetched from `INFORMATION_SCHEMA`, fingerprinted, and registered as a new version. No separate DDL history log is maintained — the live catalog is always the source of truth.
 
 **Failover reconciliation** (verifying schemas against a new primary after server identity change) is planned but not yet implemented.
 
@@ -184,7 +185,7 @@ The checkpoint is saved only after sinks acknowledge delivery:
                                           └────────────┘
 ```
 
-If the process crashes after sending to sink but before checkpoint, events will be replayed. This is the "at-least-once" guarantee - duplicates are possible, but loss is not.
+If the process crashes after sending to sink but before checkpoint, events will be replayed. This is the "at-least-once" guarantee — duplicates are possible, but loss is not.
 
 ### Storage Backends
 
@@ -194,7 +195,7 @@ Checkpoints are stored via `BackendCheckpointStore`, a thin adapter over the `St
 |---------|-------------|----------|
 | `SqliteStorageBackend` | SQLite file | Single-instance production |
 | `MemoryStorageBackend` | None | Testing, ephemeral deployments |
-| PostgreSQL *(planned)* | External DB | HA, multi-instance |
+| `PostgresStorageBackend` | External DB | HA, multi-instance |
 
 ### Checkpoint-Schema Correlation
 
@@ -267,8 +268,8 @@ Performance is tracked via:
 
 Planned enhancements:
 
-- **PostgreSQL storage backend** for HA deployments with shared state across instances
 - **Initial snapshot/backfill** using the Slot primitive for cursor tracking
 - **Event store**: time-based replay and schema evolution using the Log primitive
 - **Distributed coordination**: leader election via the Slot primitive with TTL-based leases
 - **Additional sources**: MongoDB, SQL Server, TiDB
+- **PostgreSQL storage validation**: chaos/recovery testing to bring it to production parity with SQLite

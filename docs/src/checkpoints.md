@@ -25,7 +25,7 @@ Checkpoints are stored via the unified `StorageBackend` - see [Storage](storage.
 |---------|-------------|----------|
 | `SqliteStorageBackend` | SQLite file on disk | Single-instance production |
 | `MemoryStorageBackend` | None (lost on restart) | Testing |
-| PostgreSQL *(planned)* | External database | HA, multi-instance |
+| `PostgresStorageBackend` | External database | HA, multi-instance |
 
 ## Checkpoint Contents
 

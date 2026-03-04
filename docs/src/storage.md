@@ -8,21 +8,36 @@ DeltaForge uses a unified storage layer that backs all runtime state: checkpoint
 |---------|-------------|----------|
 | `MemoryStorageBackend` | None (lost on restart) | Testing, ephemeral deployments |
 | `SqliteStorageBackend` | SQLite file on disk | Single-instance production |
-| PostgreSQL *(planned)* | External database | HA, multi-instance deployments |
+| `PostgresStorageBackend` | External database | HA, multi-instance deployments |
 
 ### Configuration
 
 The backend is selected via CLI flags:
 
 ```bash
-# SQLite (default)
-deltaforge --config pipeline.yaml --storage-path ./data/deltaforge.db
+# SQLite (default for production)
+deltaforge --config pipeline.yaml --storage-backend sqlite --storage-path ./data/deltaforge.db
 
-# Ephemeral in-memory (testing)
+# In-memory (testing only — all state lost on restart)
 deltaforge --config pipeline.yaml --storage-backend memory
 ```
 
-The SQLite backend creates the database file and parent directories automatically on first start.
+Or via the config file:
+
+```yaml
+storage:
+  backend: sqlite
+  path: ./data/deltaforge.db
+
+# or:
+storage:
+  backend: postgres
+  dsn: "host=localhost dbname=deltaforge_storage user=df password=secret"
+```
+
+The SQLite backend creates the database file and parent directories automatically on first start. The PostgreSQL backend runs schema migrations on first connect - no manual table creation is needed.
+
+> **PostgreSQL backend** is implemented and available under the `postgres` feature flag, but has not yet received the same chaos/recovery validation as the SQLite backend. Treat it as beta for production use.
 
 ## Primitives
 

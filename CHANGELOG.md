@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Unified storage backend** - New `storage` crate providing a single pluggable state layer for all runtime state ([e5a0c66](https://github.com/vnvo/deltaforge/commit/e5a0c665184598f6a82384e9242a7b6965f5c0ca), [b357fe2](https://github.com/vnvo/deltaforge/commit/b357fe2c0b9f671d817007cdab3b8176cc9c3ca6))
+  - `StorageBackend` trait with four primitives: **KV** (key-value with optional TTL), **Log** (append-only, globally sequenced), **Slot** (versioned CAS), **Queue** (ordered, ack-based)
+  - `MemoryStorageBackend` — ephemeral in-process backend for testing
+  - `SqliteStorageBackend` — durable single-file backend for production; uses `Arc<Mutex<Connection>>` + `spawn_blocking` to avoid blocking Tokio workers; WAL mode, `synchronous=NORMAL`, TTL sweep background task
+  - `BackendCheckpointStore` adapter — implements `CheckpointStore` on top of the KV primitive; replaces `FileCheckpointStore` and `SqliteCheckpointStore`
+  - `DurableSchemaRegistry` adapter — implements the schema registry on top of the Log primitive; replays log on startup to populate in-memory cache; `for_testing()` sync constructor for cross-crate test usage
+  - All sources (MySQL, PostgreSQL, Turso) and `PipelineManager` migrated to `DurableSchemaRegistry`
+  - `PipelineManager::with_backend()` wires both subsystems from a single backend instance
+- **PostgreSQL storage backend** — `PostgresStorageBackend` using `deadpool-postgres` connection pool; native async, no `spawn_blocking`; schema migrations run on first connect ([137b4e9](https://github.com/vnvo/deltaforge/commit/137b4e994bfacf31ab464946a3ab8e8d1e4f3c9e))
+  - Enabled via `--storage-backend postgres --storage-dsn <dsn>` or `storage.backend: postgres` in config
+  - `postgres` feature flag in the `storage` crate
+  - Note: implemented and functional; chaos/recovery validation pending
+
 - **Synthetic event support** - Framework-level detection and marking of processor-generated events ([c0b229c](https://github.com/vnvo/deltaforge/commit/c0b229c815b4068e1b8a97c97c6c88c3162df9ea))
   - `BatchContext` captures original event IDs before the processor chain runs
   - `SyntheticMarkingProcessor` wrapper automatically marks any event with a new ID as synthetic, setting `event.synthetic = Some(processor_id)` — no processor code changes required
@@ -16,11 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `Processor` trait signature updated to `process(&self, events, ctx: &BatchContext)`
   - `Event::is_synthetic()` convenience method
   - `build_processors()` wraps every processor with `SyntheticMarkingProcessor` transparently
+
 - **Sink event filtering** - Per-sink filtering to route real vs. synthetic events to different destinations ([784223d](https://github.com/vnvo/deltaforge/commit/784223de64114fffc0439f820119cbe1deadc1a2))
   - `filter.exclude_synthetic: true` — drop synthetic events (e.g. send only real CDC events to Kafka)
   - `filter.synthetic_only: true` — drop real events (e.g. send only metric events to a dedicated stream)
   - Available on all sink types: Kafka, Redis, NATS
   - Zero overhead when no filter is configured
+
 - **Flatten processor** - Native Rust processor that flattens nested JSON objects in event payloads into top-level keys joined by a configurable separator ([0f04b49](https://github.com/vnvo/deltaforge/commit/0f04b49e29df261756546d585b50ec560d1e49be))
   - Works on any object-valued field present on the event (before, after, or custom fields from upstream processors) - no CDC structure assumptions
   - `separator`: key path joiner (default: `"__"`)
@@ -50,12 +65,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+
+- **Runner** — `--storage-backend` flag selects backend (`sqlite` default, `memory`, `postgres`); `--storage-dsn` for PostgreSQL connection string ([137b4e9](https://github.com/vnvo/deltaforge/commit/137b4e994bfacf31ab464946a3ab8e8d1e4f3c9e))
+
+- **`dev.sh`** — added storage inspection commands (`storage-status`, `storage-checkpoints`, `storage-schemas`, `storage-reset`, `storage-wipe`, `storage-sh`), PostgreSQL storage setup commands (`storage-pg-setup`, `storage-pg-status`, `storage-pg-sh`), and `run-pg-storage` shorthand ([8384a87](https://github.com/vnvo/deltaforge/commit/8384a8783ef6e51239ad45847490f703c4eae1c2))
+
 - Bumped pgwire-replication to 0.2 - logical decoding messages arrive as typed ReplicationEvent::Message
 
 ### Documentation
 
-
-- Updated landing page: flatten processor icon in tech strip, flatten annotation in quickstart demo, production-focused features section overhaul ([487cde3](https://github.com/vnvo/deltaforge/commit/487cde33140db736159b72caee73c00de4727206))
+- Added `storage.md` — unified storage layer reference covering backends, primitives, namespace map, and adapter wiring ([676d541](https://github.com/vnvo/deltaforge/commit/676d541ba02f2d56a6736c72772e4923e6dea274))
+- Updated `architecture.md` — component diagram, storage backends table, schema sensing subsection, future architecture ([676d541](https://github.com/vnvo/deltaforge/commit/676d541ba02f2d56a6736c72772e4923e6dea274))
+- Updated `checkpoints.md` — rewritten as operator-facing reference; updated backends table to reflect unified storage layer ([676d541](https://github.com/vnvo/deltaforge/commit/676d541ba02f2d56a6736c72772e4923e6dea274))
+- Updated `SUMMARY.md` — added `storage.md` under Architecture; removed Turso source entry
+- Updated `README.md` roadmap — marked persistent schema registry and SQLite checkpoint backend as complete
+- Updated `landing page`: flatten processor icon in tech strip, flatten annotation in quickstart demo, production-focused features section overhaul ([487cde3](https://github.com/vnvo/deltaforge/commit/487cde33140db736159b72caee73c00de4727206))
 - Updated processors documentation with full flatten config reference, max_depth trace example, collision policy explanation, outbox chaining example, and envelope interaction section ([579cff6](https://github.com/vnvo/deltaforge/commit/579cff6c1a5b8eab8e705dd5ff96911723fb636a))
 - Updated configuration.md with flatten processor YAML snippet and config table
 - Added outbox pattern documentation with full config reference, column mappings table, and Debezium migration guide ([cf501c8](https://github.com/vnvo/deltaforge/commit/cf501c871fa349acde83e301479cb40427fd9e14))
@@ -66,6 +90,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing
 
+- Added parameterized storage backend tests covering all four primitives across `MemoryStorageBackend` and `SqliteStorageBackend` ([0a76f73](https://github.com/vnvo/deltaforge/commit/0a76f7304cf2b87f785d72be2855838b7994d939))
+- Added adapter tests: namespace isolation, multi-tenant isolation, concurrent writes, cold-start sequence continuity, schema replay after restart
 - Added FlattenProcessor unit tests (basic flattening, max_depth, all policy combinations, collision handling, outbox-style payloads, no-payload passthrough)
 - Added config parsing tests for flatten processor covering defaults, all explicit policy variants, default id, and outbox+flatten chain ([0379a15](https://github.com/vnvo/deltaforge/commit/0379a157bf6174c3772000dbc807cfa11c47c1f1))
 - Added flatten processor criterion benchmark ([6fe4e67](https://github.com/vnvo/deltaforge/commit/6fe4e676298d2ea49d52861ef1b011045e2fb4f2))

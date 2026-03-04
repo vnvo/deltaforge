@@ -20,6 +20,7 @@
 - [Outbox Pattern Support](outbox.md)
 - [Architecture](architecture.md)
     - [Checkpoints](checkpoints.md)
+    - [Storage](storage.md)
     - [Schema Registry](schemaregistry.md)
     - [Schema Sensing](schemasensing.md)
 - [Observability](observability.md)
