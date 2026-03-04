@@ -429,7 +429,8 @@ View actual examples: [Example Configurations](docs/src/examples/README.md)
 
 - [x] Outbox pattern support
 - [x] Flatten processor
-- [ ] Persistent schema registry (SQLite, then PostgreSQL)
+- [x] Persistent schema registry (SQLite, then PostgreSQL)
+- [ ] Snapshot/backfill (initial load for existing tables)
 - [ ] Protobuf encoding
 - [ ] PostgreSQL/S3 checkpoint backends for HA
 - [ ] MongoDB source

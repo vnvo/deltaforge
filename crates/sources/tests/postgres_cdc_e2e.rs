@@ -7,7 +7,7 @@ use checkpoints::{CheckpointStore, MemCheckpointStore};
 use common::AllowList;
 use ctor::dtor;
 use deltaforge_core::{BatchContext, Event, Op, Source, SourceHandle};
-use schema_registry::InMemoryRegistry;
+use storage::{DurableSchemaRegistry, MemoryStorageBackend};
 
 use sources::postgres::{PostgresSchemaLoader, PostgresSource};
 use std::sync::Arc;
@@ -298,9 +298,14 @@ async fn setup(prefix: &str) -> Result<(String, tokio_postgres::Client)> {
     create_db(prefix).await
 }
 
+async fn make_registry() -> Arc<DurableSchemaRegistry> {
+    let backend = Arc::new(MemoryStorageBackend::new());
+    DurableSchemaRegistry::new(backend).await.expect("registry")
+}
+
 /// Build a PostgresSource with constant defaults (tenant=acme, pipeline=test,
 /// fresh InMemoryRegistry). `checkpoint_key` is derived as `pg-{id}`.
-fn make_source(
+async fn make_source(
     id: &str,
     db: &str,
     slot: &str,
@@ -317,7 +322,7 @@ fn make_source(
         tables,
         tenant: "acme".into(),
         pipeline: "test".into(),
-        registry: Arc::new(InMemoryRegistry::new()),
+        registry: make_registry().await,
         outbox_prefixes,
     }
 }
@@ -347,7 +352,7 @@ async fn postgres_schema_loader() -> Result<()> {
     client.execute("CREATE TABLE orders (id SERIAL PRIMARY KEY, sku VARCHAR(64) NOT NULL, price NUMERIC(10,2))", &[]).await?;
     client.execute("CREATE TABLE order_items (id SERIAL PRIMARY KEY, order_id INT, product VARCHAR(128))", &[]).await?;
 
-    let registry = Arc::new(InMemoryRegistry::new());
+    let registry = make_registry().await;
     let loader = PostgresSchemaLoader::new(
         &format!(
             "host=127.0.0.1 port={PG_PORT} user={PG_USER} password={PG_PASS} dbname={db}"
@@ -402,7 +407,8 @@ async fn postgres_cdc_basic_events() -> Result<()> {
         "pub_basic",
         vec!["public.orders".into()],
         AllowList::default(),
-    );
+    )
+    .await;
     let (mut rx, handle) = start_source(src).await?;
 
     client
@@ -501,7 +507,8 @@ async fn postgres_cdc_schema_evolution() -> Result<()> {
         "pub_evo",
         vec!["public.orders".into()],
         AllowList::default(),
-    );
+    )
+    .await;
     let (mut rx, handle) = start_source(src).await?;
 
     client
@@ -576,7 +583,8 @@ async fn postgres_cdc_checkpoint_resume() -> Result<()> {
             "pub_ckpt",
             vec!["public.orders".into()],
             AllowList::default(),
-        );
+        )
+        .await;
         let handle = src.run(tx, ckpt.clone()).await;
         wait_ready(&handle, Duration::from_secs(10)).await?;
         sleep(Duration::from_secs(2)).await;
@@ -609,7 +617,8 @@ async fn postgres_cdc_checkpoint_resume() -> Result<()> {
             "pub_ckpt",
             vec!["public.orders".into()],
             AllowList::default(),
-        );
+        )
+        .await;
         let handle = src.run(tx, ckpt.clone()).await;
         wait_ready(&handle, Duration::from_secs(10)).await?;
 
@@ -670,7 +679,8 @@ async fn postgres_cdc_table_filtering() -> Result<()> {
         "pub_filter",
         vec!["public.orders".into()],
         AllowList::default(),
-    ); // Only orders
+    )
+    .await; // Only orders
     let (mut rx, handle) = start_source(src).await?;
 
     client
@@ -721,7 +731,8 @@ async fn postgres_cdc_reconnect() -> Result<()> {
         "pub_reconn",
         vec!["public.orders".into()],
         AllowList::default(),
-    );
+    )
+    .await;
     let (mut rx, handle) = start_source(src).await?;
 
     client
@@ -775,7 +786,8 @@ async fn postgres_cdc_extended_types() -> Result<()> {
         "pub_types",
         vec!["public.complex".into()],
         AllowList::default(),
-    );
+    )
+    .await;
     let (mut rx, handle) = start_source(src).await?;
 
     client.execute("INSERT INTO complex (uuid_col, tags, metadata, amount) VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', ARRAY['a','b'], '{\"k\":1}', 123.4567)", &[]).await?;
@@ -830,7 +842,8 @@ async fn postgres_cdc_pause_resume() -> Result<()> {
         "pub_pause",
         vec!["public.orders".into()],
         AllowList::default(),
-    );
+    )
+    .await;
     let (mut rx, handle) = start_source(src).await?;
 
     client
@@ -899,7 +912,8 @@ async fn postgres_cdc_auth_failure() -> Result<()> {
         "pub_auth",
         vec!["public.orders".into()],
         AllowList::default(),
-    );
+    )
+    .await;
     src.dsn = bad_dsn;
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     let (tx, _rx) = mpsc::channel(128);
@@ -965,7 +979,8 @@ async fn postgres_cdc_slot_auto_created() -> Result<()> {
         "pub_auto",
         vec!["public.orders".into()],
         AllowList::default(),
-    );
+    )
+    .await;
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     let (tx, mut rx) = mpsc::channel(128);
     let handle = src.run(tx, ckpt).await;
@@ -1043,7 +1058,8 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
         "missing_pub",
         vec!["public.orders".into()],
         AllowList::default(),
-    );
+    )
+    .await;
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     let (tx, mut rx) = mpsc::channel(128);
     let handle = src.run(tx, ckpt).await;
@@ -1106,7 +1122,8 @@ async fn postgres_cdc_invalid_dsn() -> Result<()> {
         "any_pub",
         vec!["public.orders".into()],
         AllowList::default(),
-    );
+    )
+    .await;
     src.dsn = "not-a-valid-dsn-at-all".into();
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     let (tx, _rx) = mpsc::channel(128);
@@ -1140,7 +1157,8 @@ async fn postgres_cdc_connection_refused() -> Result<()> {
         "any_pub",
         vec!["public.orders".into()],
         AllowList::default(),
-    );
+    )
+    .await;
     src.dsn = bad_dsn;
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     let (tx, _rx) = mpsc::channel(128);
@@ -1190,7 +1208,7 @@ async fn postgres_cdc_replica_identity_modes() -> Result<()> {
     create_pub_slot(&client, "pub_ri", "slot_ri", &["ri_default", "ri_full"])
         .await?;
 
-    let registry = Arc::new(InMemoryRegistry::new());
+    let registry = make_registry().await;
     let loader = PostgresSchemaLoader::new(
         &format!(
             "host=127.0.0.1 port={PG_PORT} user={PG_USER} password={PG_PASS} dbname={db}"
@@ -1220,7 +1238,8 @@ async fn postgres_cdc_replica_identity_modes() -> Result<()> {
         "pub_ri",
         vec!["public.ri_default".into(), "public.ri_full".into()],
         AllowList::default(),
-    );
+    )
+    .await;
     let (mut rx, handle) = start_source(src).await?;
 
     client
@@ -1301,7 +1320,8 @@ async fn postgres_cdc_graceful_shutdown() -> Result<()> {
         "pub_shutdown",
         vec!["public.orders".into()],
         AllowList::default(),
-    );
+    )
+    .await;
     let (mut rx, handle) = start_source(src).await?;
 
     client
@@ -1385,7 +1405,8 @@ async fn postgres_cdc_multi_table() -> Result<()> {
             "public.products".into(),
         ],
         AllowList::default(),
-    );
+    )
+    .await;
     let (mut rx, handle) = start_source(src).await?;
 
     client
@@ -1469,7 +1490,8 @@ async fn postgres_cdc_null_handling() -> Result<()> {
         "pub_null",
         vec!["public.nullable_test".into()],
         AllowList::default(),
-    );
+    )
+    .await;
     let (mut rx, handle) = start_source(src).await?;
 
     client
@@ -1554,7 +1576,8 @@ async fn postgres_cdc_outbox_capture() -> Result<()> {
         "pub_outbox",
         vec!["public.orders".into()],
         AllowList::new(&["outbox".to_string()]),
-    );
+    )
+    .await;
     let (mut rx, handle) = start_source(src).await?;
 
     // Emit outbox message (transactional = true)
@@ -1656,7 +1679,8 @@ async fn postgres_cdc_outbox_glob_prefix() -> Result<()> {
         "pub_obglob",
         vec!["public.stub".into()],
         AllowList::new(&["outbox_%".to_string()]),
-    );
+    )
+    .await;
     let (mut rx, handle) = start_source(src).await?;
 
     client
@@ -1747,7 +1771,8 @@ async fn postgres_cdc_outbox_full_pipeline() -> Result<()> {
         "pub_obpipe",
         vec!["public.orders".into()],
         AllowList::new(&["outbox".to_string()]),
-    );
+    )
+    .await;
     let (mut rx, handle) = start_source(src).await?;
 
     // Emit outbox message + normal insert

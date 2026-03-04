@@ -13,10 +13,13 @@ use metrics::{counter, gauge};
 use parking_lot::RwLock;
 use processors::build_processors;
 use rest_api::{PipeInfo, PipelineAPIError, PipelineController};
-use schema_registry::InMemoryRegistry;
 use serde_json::Value;
 use sinks::build_sinks;
 use sources::{ArcSchemaLoader, build_schema_loader, build_source};
+use storage::{
+    ArcStorageBackend, BackendCheckpointStore, DurableSchemaRegistry,
+    MemoryStorageBackend,
+};
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
@@ -88,20 +91,43 @@ impl PipelineRuntime {
 pub struct PipelineManager {
     pub(crate) pipelines: Arc<RwLock<HashMap<String, PipelineRuntime>>>,
     pub(crate) ckpt_store: Arc<dyn CheckpointStore>,
-    pub(crate) registry: Arc<InMemoryRegistry>,
+    pub(crate) registry: Arc<DurableSchemaRegistry>,
 }
 
 impl PipelineManager {
-    pub fn new(ckpt_store: Arc<dyn CheckpointStore>) -> Self {
+    /// Production constructor - wires a `StorageBackend` into both
+    /// checkpoint and schema registry subsystems. Replays the schema log
+    /// on startup so the cache is warm before any pipeline starts.
+    pub async fn with_backend(backend: ArcStorageBackend) -> Result<Self> {
+        let ckpt_store: Arc<dyn CheckpointStore> =
+            Arc::new(BackendCheckpointStore::new(Arc::clone(&backend)));
+        let registry = DurableSchemaRegistry::new(backend).await?;
+        Ok(Self {
+            pipelines: Arc::new(RwLock::new(HashMap::new())),
+            ckpt_store,
+            registry,
+        })
+    }
+
+    /// In-memory constructor for tests - no persistence.
+    pub fn for_testing() -> Self {
+        let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        let ckpt_store: Arc<dyn CheckpointStore> =
+            Arc::new(BackendCheckpointStore::new(Arc::clone(&backend)));
+        let registry = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(DurableSchemaRegistry::new(backend))
+                .expect("memory DurableSchemaRegistry never fails")
+        });
         Self {
             pipelines: Arc::new(RwLock::new(HashMap::new())),
             ckpt_store,
-            registry: Arc::new(InMemoryRegistry::new()),
+            registry,
         }
     }
 
     /// Access the schema registry (for version lookups).
-    pub fn registry(&self) -> &Arc<InMemoryRegistry> {
+    pub fn registry(&self) -> &Arc<DurableSchemaRegistry> {
         &self.registry
     }
 

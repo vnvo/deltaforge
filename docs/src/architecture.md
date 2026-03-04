@@ -9,7 +9,8 @@ This document describes DeltaForge's internal architecture, design decisions, an
 DeltaForge avoids imposing a universal data model on all sources. Instead, each database source defines and owns its schema semantics:
 
 - **MySQL** captures MySQL-specific types, collations, and engine information
-- **Future sources** (PostgreSQL, MongoDB, ClickHouse, Turso) will capture their native semantics
+- **PostgreSQL** captures PostgreSQL-specific types, OIDs, and replica identity
+- **Future sources** (MongoDB, ClickHouse, TiDB) will capture their native semantics
 
 This approach means downstream consumers receive schemas that accurately reflect the source database rather than a lowest-common-denominator normalization.
 
@@ -38,15 +39,19 @@ Pipelines are defined declaratively in YAML. This enables:
 │   Sources   │   Schema    │ Coordinator │    Sinks    │ Control │
 │             │  Registry   │  + Batch    │             │  Plane  │
 ├─────────────┼─────────────┼─────────────┼─────────────┼─────────┤
-│ MySQL       │ InMemory    │ Batching    │ Kafka       │ REST API│
-│ PostgreSQL  │ Registry    │ Commit      │ Redis       │ Metrics │
-│ (future)    │             │ Policy      │ (future)    │ Health  │
-└─────────────┴─────────────┴─────────────┴─────────────┴─────────┘
-                               │
-                    ┌──────────┴──────────┐
-                    │  Checkpoint Store   │
-                    │  (File/SQLite/Mem)  │
-                    └─────────────────────┘
+│ MySQL       │ Durable     │ Batching    │ Kafka       │ REST API│
+│ PostgreSQL  │ Schema      │ Commit      │ Redis       │ Metrics │
+│             │ Registry    │ Policy      │ NATS        │ Health  │
+└─────────────┴──────┬──────┴─────────────┴─────────────┴─────────┘
+                     │
+          ┌──────────┴──────────┐
+          │   Storage Backend   │
+          │  (SQLite / PG /     │
+          │   Memory)           │
+          ├─────────────────────┤
+          │ KV · Log · Slot     │
+          │ Queue               │
+          └─────────────────────┘
 ```
 
 ## Data Flow
@@ -113,6 +118,25 @@ The schema registry serves three purposes:
 2. **Detect schema changes**: Fingerprint comparison identifies when DDL has modified a table
 3. **Enable replay**: Sequence numbers correlate events with the schema active when they were produced
 
+### Schema Sensing
+
+At startup, the schema loader auto-discovers tables via pattern expansion and loads their schemas from the live database catalog before any CDC events arrive.
+
+**Pattern expansion** supports wildcards:
+
+| Pattern | Matches |
+|---------|---------|
+| `db.table` | Exact table |
+| `db.*` | All tables in database |
+| `db.prefix%` | Tables matching prefix |
+| `%.table` | Table in any database |
+
+**DDL detection** works through cache invalidation. When the binlog delivers a `QueryEvent` (DDL), the affected database's cache is cleared. On the next row event for that table, the schema is re-fetched from `INFORMATION_SCHEMA`, fingerprinted, and registered as a new version. No separate DDL history log is maintained — the live catalog is always the source of truth.
+
+**Failover reconciliation** (verifying schemas against a new primary after server identity change) is planned but not yet implemented.
+
+Schema versions are persisted via `DurableSchemaRegistry`, which uses the `StorageBackend` Log primitive. On startup the log is replayed to populate an in-memory cache, so hot-path reads have the same performance as the previous in-memory implementation. Cold-start reconstruction is always possible from the log alone.
+
 ### Schema Registration Flow
 
 ```
@@ -161,15 +185,17 @@ The checkpoint is saved only after sinks acknowledge delivery:
                                           └────────────┘
 ```
 
-If the process crashes after sending to sink but before checkpoint, events will be replayed. This is the "at-least-once" guarantee - duplicates are possible, but loss is not.
+If the process crashes after sending to sink but before checkpoint, events will be replayed. This is the "at-least-once" guarantee — duplicates are possible, but loss is not.
 
 ### Storage Backends
 
-| Backend | Versioning | Persistence | Use Case |
-|---------|------------|-------------|----------|
-| `FileCheckpointStore` | No | Yes | Production (simple) |
-| `SqliteCheckpointStore` | Yes | Yes | Development, debugging |
-| `MemCheckpointStore` | No | No | Testing |
+Checkpoints are stored via `BackendCheckpointStore`, a thin adapter over the `StorageBackend` KV primitive. See [Storage](storage.md) for backend configuration and the full namespace map.
+
+| Backend | Persistence | Use Case |
+|---------|-------------|----------|
+| `SqliteStorageBackend` | SQLite file | Single-instance production |
+| `MemoryStorageBackend` | None | Testing, ephemeral deployments |
+| `PostgresStorageBackend` | External DB | HA, multi-instance |
 
 ### Checkpoint-Schema Correlation
 
@@ -184,7 +210,7 @@ registry.register_with_checkpoint(
 ).await?;
 ```
 
-This creates a link between schema versions and source positions, enabling coordinated rollback and point-in-time schema queries.
+This creates a link between schema versions and source positions, enabling accurate schema lookup during replay.
 
 ## Coordinator
 
@@ -242,8 +268,8 @@ Performance is tracked via:
 
 Planned enhancements:
 
-- **Persistent schema registry**: SQLite backend initially, mirroring the checkpoint storage pattern
-- **Production storage backends**: PostgreSQL, S3/GCS for cloud-native and HA deployments
-- **Event store**: Time-based replay and schema evolution
-- **Distributed coordination**: Leader election for HA deployments
-- **Additional sources**: Turso/SQLite, ClickHouse, MongoDB
+- **Initial snapshot/backfill** using the Slot primitive for cursor tracking
+- **Event store**: time-based replay and schema evolution using the Log primitive
+- **Distributed coordination**: leader election via the Slot primitive with TTL-based leases
+- **Additional sources**: MongoDB, SQL Server, TiDB
+- **PostgreSQL storage validation**: chaos/recovery testing to bring it to production parity with SQLite

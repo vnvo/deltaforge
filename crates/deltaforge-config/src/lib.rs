@@ -9,6 +9,9 @@ mod turso_cfg;
 #[cfg(feature = "turso")]
 pub use turso_cfg::{NativeCdcLevel, TursoSrcCfg};
 
+mod storage;
+pub use storage::*;
+
 mod sinks_cfg;
 pub use sinks_cfg::*;
 

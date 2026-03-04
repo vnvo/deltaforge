@@ -17,6 +17,7 @@ deltaforge-config = { path = "../deltaforge-config" }
 deltaforge-core = { path = "../deltaforge-core" }
 checkpoints = { path = "../checkpoints" }
 schema-registry = { path = "../schema-registry" }
+storage ={ path = "../storage"}
 common = { path = "../common" }
 anyhow.workspace = true
 thiserror.workspace = true

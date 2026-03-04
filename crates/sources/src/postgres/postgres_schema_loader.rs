@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use schema_registry::{InMemoryRegistry, SourceSchema};
+use schema_registry::SourceSchema;
+use storage::DurableSchemaRegistry;
 use tokio::sync::RwLock;
 use tokio_postgres::NoTls;
 use tracing::{debug, info, warn};
@@ -38,7 +39,7 @@ pub struct LoadedSchema {
 pub struct PostgresSchemaLoader {
     dsn: String,
     cache: Arc<RwLock<HashMap<(String, String), LoadedSchema>>>,
-    registry: Arc<InMemoryRegistry>,
+    registry: Arc<DurableSchemaRegistry>,
     tenant: String,
 }
 
@@ -46,7 +47,7 @@ impl PostgresSchemaLoader {
     /// Create a new schema loader.
     pub fn new(
         dsn: &str,
-        registry: Arc<InMemoryRegistry>,
+        registry: Arc<DurableSchemaRegistry>,
         tenant: &str,
     ) -> Self {
         info!(
@@ -388,7 +389,13 @@ impl PostgresSchemaLoader {
         Self {
             dsn: "host=localhost".to_string(),
             cache: Arc::new(RwLock::new(cache)),
-            registry: Arc::new(InMemoryRegistry::new()),
+            registry: tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(storage::DurableSchemaRegistry::new(Arc::new(
+                    storage::MemoryStorageBackend::new(),
+                )))
+                .expect("test registry"),
             tenant: "test".to_string(),
         }
     }

@@ -18,8 +18,8 @@ pub mod turso;
 use anyhow::Result;
 use deltaforge_config::{PipelineSpec, SourceCfg};
 use deltaforge_core::ArcDynSource;
-use schema_registry::InMemoryRegistry;
 use std::sync::Arc;
+use storage::DurableSchemaRegistry;
 
 // Re-export loader types
 pub use schema_loader::{
@@ -34,7 +34,7 @@ pub use turso::{TursoCheckpoint, TursoSource};
 /// Build a CDC source from pipeline configuration.
 pub fn build_source(
     pipeline: &PipelineSpec,
-    registry: Arc<InMemoryRegistry>,
+    registry: Arc<DurableSchemaRegistry>,
 ) -> Result<ArcDynSource> {
     match &pipeline.spec.source {
         SourceCfg::Postgres(c) => Ok(Arc::new(postgres::PostgresSource {
@@ -68,6 +68,7 @@ pub fn build_source(
                 .map(|o| o.allow_list())
                 .unwrap_or_default(),
         })),
+
         #[cfg(feature = "turso")]
         SourceCfg::Turso(c) => Ok(Arc::new(turso::TursoSource::new(
             c.clone(),
@@ -83,7 +84,7 @@ pub fn build_source(
 /// Returns None for sources that handle schemas internally.
 pub fn build_schema_loader(
     pipeline: &PipelineSpec,
-    registry: Arc<InMemoryRegistry>,
+    registry: Arc<DurableSchemaRegistry>,
 ) -> Option<ArcSchemaLoader> {
     match &pipeline.spec.source {
         SourceCfg::Postgres(c) => {
@@ -101,6 +102,6 @@ pub fn build_schema_loader(
         ))),
 
         #[cfg(feature = "turso")]
-        SourceCfg::Turso(_) => None, // Turso handles schemas internally
+        SourceCfg::Turso(_) => None,
     }
 }
