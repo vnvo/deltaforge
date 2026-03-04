@@ -4,6 +4,7 @@
 
 use crate::StorageBackend;
 use anyhow::Result;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,17 +31,21 @@ impl KvEntry {
     }
 }
 
-#[derive(Debug, Default)]
-struct KvStore(HashMap<(String, String), KvEntry>);
+type NsKey = (String, String);
+type LogEntry = (u64, Vec<u8>);
+type QueueEntry = (u64, Vec<u8>);
 
 #[derive(Debug, Default)]
-struct LogStore(BTreeMap<(String, String), Vec<(u64, Vec<u8>)>>);
+struct KvStore(HashMap<NsKey, KvEntry>);
 
 #[derive(Debug, Default)]
-struct SlotStore(HashMap<(String, String), (u64, Vec<u8>)>);
+struct LogStore(BTreeMap<NsKey, Vec<LogEntry>>);
 
 #[derive(Debug, Default)]
-struct QueueStore(HashMap<(String, String), VecDeque<(u64, Vec<u8>)>>);
+struct SlotStore(HashMap<NsKey, (u64, Vec<u8>)>);
+
+#[derive(Debug, Default)]
+struct QueueStore(HashMap<NsKey, VecDeque<QueueEntry>>);
 
 /// In-memory storage backend. All state is lost on drop.
 #[derive(Debug, Default)]

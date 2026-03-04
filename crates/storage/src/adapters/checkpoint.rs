@@ -8,7 +8,6 @@ use async_trait::async_trait;
 use checkpoints::{CheckpointError, CheckpointResult, CheckpointStore};
 
 use crate::ArcStorageBackend;
-use anyhow::Result;
 
 /// Implements [`CheckpointStore`] on top of any [`StorageBackend`].
 pub struct BackendCheckpointStore {
