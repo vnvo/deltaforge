@@ -2,13 +2,15 @@ use serde::{Deserialize, Serialize};
 
 /// Top-level storage configuration.
 ///
-/// Controls where all operational runtime state is persisted:
-/// checkpoints, schema registry, FSM state, leases, dedup, quarantine, DLQ.
-///
 /// ```yaml
 /// storage:
 ///   backend: sqlite
 ///   path: ./data/deltaforge.db
+///
+/// # or for PostgreSQL:
+/// storage:
+///   backend: postgres
+///   dsn: "host=localhost dbname=deltaforge user=df password=secret"
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -16,9 +18,12 @@ pub struct StorageConfig {
     #[serde(default)]
     pub backend: StorageBackendKind,
 
-    /// Path for SQLite database file (only used when backend = sqlite).
+    /// Path for SQLite database file (sqlite backend only).
     #[serde(default = "default_sqlite_path")]
     pub path: String,
+
+    /// PostgreSQL connection string (postgres backend only).
+    pub dsn: Option<String>,
 }
 
 impl Default for StorageConfig {
@@ -26,6 +31,7 @@ impl Default for StorageConfig {
         Self {
             backend: StorageBackendKind::Sqlite,
             path: default_sqlite_path(),
+            dsn: None,
         }
     }
 }
@@ -35,7 +41,8 @@ impl Default for StorageConfig {
 pub enum StorageBackendKind {
     #[default]
     Sqlite,
-    Memory, // for testing / ephemeral deployments
+    Memory,
+    Postgres,
 }
 
 fn default_sqlite_path() -> String {

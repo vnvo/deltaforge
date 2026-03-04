@@ -6,8 +6,9 @@ license = "MIT OR Apache-2.0"
 description = "Unified durable storage abstraction for DeltaForge runtime state"
 
 [features]
-default = ["sqlite"]
+default = ["sqlite", "postgres"]
 sqlite = ["rusqlite"]
+postgres = ["deadpool-postgres"]
 
 [dependencies]
 anyhow.workspace = true
@@ -18,8 +19,8 @@ tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 chrono.workspace = true
 
-# SQLite — same version as checkpoints crate to avoid libsqlite3-sys conflict
 rusqlite = { version = "0.38", features = ["bundled"], optional = true }
+deadpool-postgres = { version = "0.14", optional = true }
 
 # Adapters
 checkpoints = { path = "../checkpoints" }

@@ -1,3 +1,5 @@
+// crates/runner/src/main.rs — full replacement
+
 use anyhow::{Context, Result};
 use axum::Router;
 use clap::Parser;
@@ -7,7 +9,6 @@ use rest_api::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
-use storage::SqliteStorageBackend;
 use tokio::net::TcpListener;
 use tracing::{debug, info};
 
@@ -26,12 +27,15 @@ struct Args {
     api_addr: String,
     #[arg(long, default_value = "0.0.0.0:9095")]
     metrics_addr: String,
-    /// Storage backend: sqlite (default) or memory
+    /// Storage backend: sqlite (default), memory, or postgres
     #[arg(long, default_value = "sqlite")]
     storage_backend: String,
-    /// SQLite database path (only used with --storage-backend sqlite)
+    /// SQLite database path (sqlite backend only)
     #[arg(long, default_value = "./data/deltaforge.db")]
     storage_path: String,
+    /// PostgreSQL DSN (postgres backend only)
+    #[arg(long)]
+    storage_dsn: Option<String>,
 }
 
 #[tokio::main]
@@ -56,23 +60,24 @@ async fn main() -> Result<()> {
     let pipeline_specs =
         load_pipeline_cfgs(&args.config).context("load pipeline specs")?;
 
+    // ── Build storage backend ─────────────────────────────────────────────────
     let storage_cfg = StorageConfig {
         backend: match args.storage_backend.as_str() {
             "memory" => StorageBackendKind::Memory,
+            "postgres" => StorageBackendKind::Postgres,
             _ => StorageBackendKind::Sqlite,
         },
         path: args.storage_path.clone(),
+        dsn: args.storage_dsn.clone(),
     };
 
     let backend = build_storage_backend(&storage_cfg)
+        .await
         .context("initialise storage backend")?;
 
-    info!(
-        backend = %args.storage_backend,
-        path = %args.storage_path,
-        "storage backend ready"
-    );
+    info!(backend = %args.storage_backend, "storage backend ready");
 
+    // ── Build pipeline manager ────────────────────────────────────────────────
     let manager = Arc::new(
         PipelineManager::with_backend(backend)
             .await
@@ -85,6 +90,7 @@ async fn main() -> Result<()> {
         manager.create(ps).await?;
     }
 
+    // ── HTTP server ───────────────────────────────────────────────────────────
     let app: Router = router_full(
         AppState {
             controller: manager,
@@ -108,24 +114,34 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_storage_backend(
+async fn build_storage_backend(
     cfg: &StorageConfig,
 ) -> Result<storage::ArcStorageBackend> {
     match cfg.backend {
         StorageBackendKind::Memory => {
             info!("using in-memory storage backend (ephemeral)");
-            Ok(Arc::new(storage::MemoryStorageBackend::new()))
+            Ok(Arc::new(storage::MemoryStorageBackend::new())
+                as storage::ArcStorageBackend)
         }
         StorageBackendKind::Sqlite => {
-            // Ensure parent directory exists.
             if let Some(parent) = std::path::Path::new(&cfg.path).parent() {
                 std::fs::create_dir_all(parent)
                     .context("create storage directory")?;
             }
             info!(path = %cfg.path, "using SQLite storage backend");
-            SqliteStorageBackend::open(&cfg.path)
+            storage::SqliteStorageBackend::open(&cfg.path)
                 .map(|b| b as storage::ArcStorageBackend)
                 .context("open SQLite storage backend")
+        }
+        StorageBackendKind::Postgres => {
+            let dsn = cfg.dsn.as_deref().context(
+                "--storage-dsn is required when using --storage-backend postgres"
+            )?;
+            info!("using PostgreSQL storage backend");
+            storage::PostgresStorageBackend::connect(dsn)
+                .await
+                .map(|b| b as storage::ArcStorageBackend)
+                .context("connect PostgreSQL storage backend")
         }
     }
 }
