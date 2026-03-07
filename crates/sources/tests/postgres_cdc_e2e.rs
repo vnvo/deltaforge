@@ -324,6 +324,7 @@ async fn make_source(
         pipeline: "test".into(),
         registry: make_registry().await,
         outbox_prefixes,
+        snapshot_cfg: deltaforge_config::SnapshotCfg::default(),
     }
 }
 
