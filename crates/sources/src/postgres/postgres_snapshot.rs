@@ -18,6 +18,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use checkpoints::CheckpointStore;
+use common::redact_url_password;
 use deltaforge_config::SnapshotCfg;
 use deltaforge_core::{Event, Op, SourceInfo, SourcePosition};
 use pgwire_replication::Lsn;
@@ -250,12 +251,14 @@ struct TableWorker {
     cfg: SnapshotCfg,
     tx: mpsc::Sender<Event>,
     schema_loader: PostgresSchemaLoader,
+    #[allow(unused)]
     chkpt_store: Arc<dyn CheckpointStore>,
     cancel: CancellationToken,
 }
 
 impl TableWorker {
     async fn run(self) -> Result<u64> {
+        info!(pipeline=%self.pipeline, source_id=%self.source_id, schema=%self.schema, table=%self.table, "snapshot worker starting");
         let fqn = fqn(&self.schema, &self.table);
         let t0 = Instant::now();
 
@@ -655,6 +658,14 @@ impl ChunkWorkerCtx {
         to: i64,
         fqn: &str,
     ) -> Result<u64> {
+        debug!(
+            pipeline=%self.pipeline, 
+            dsn=%redact_url_password(&self.dsn), 
+            snapshot_id=%self.snapshot_id, 
+            chunk_size=%self.chunk_size, 
+            "reading PK range"
+        );
+
         let sql = format!(
             r#"SELECT row_to_json(t)::text
                FROM (SELECT * FROM "{}"."{}"

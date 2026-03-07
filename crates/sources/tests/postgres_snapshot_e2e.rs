@@ -51,10 +51,6 @@ async fn collect_reads(
     events
 }
 
-fn default_cfg() -> SnapshotCfg {
-    SnapshotCfg::default() // mode = Never by default; tests override explicitly
-}
-
 fn initial_cfg() -> SnapshotCfg {
     SnapshotCfg {
         mode: SnapshotMode::Initial,
