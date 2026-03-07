@@ -125,7 +125,7 @@ pub struct PostgresSrcCfg {
     #[serde(default)]
     pub outbox: Option<PgOutboxCapture>,
     #[serde(default)]
-    pub snapshot: SnapshotCfg,    
+    pub snapshot: SnapshotCfg,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -146,7 +146,7 @@ pub struct MysqlSrcCfg {
     #[serde(default)]
     pub outbox: Option<MysqlOutboxCapture>,
     #[serde(default)]
-    pub snapshot: SnapshotCfg,    
+    pub snapshot: SnapshotCfg,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

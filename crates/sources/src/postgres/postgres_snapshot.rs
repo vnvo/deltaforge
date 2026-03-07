@@ -659,10 +659,10 @@ impl ChunkWorkerCtx {
         fqn: &str,
     ) -> Result<u64> {
         debug!(
-            pipeline=%self.pipeline, 
-            dsn=%redact_url_password(&self.dsn), 
-            snapshot_id=%self.snapshot_id, 
-            chunk_size=%self.chunk_size, 
+            pipeline=%self.pipeline,
+            dsn=%redact_url_password(&self.dsn),
+            snapshot_id=%self.snapshot_id,
+            chunk_size=%self.chunk_size,
             "reading PK range"
         );
 
