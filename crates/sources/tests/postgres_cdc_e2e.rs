@@ -7,142 +7,30 @@ use checkpoints::{CheckpointStore, MemCheckpointStore};
 use common::AllowList;
 use ctor::dtor;
 use deltaforge_core::{BatchContext, Event, Op, Source, SourceHandle};
-use storage::{DurableSchemaRegistry, MemoryStorageBackend};
 
 use sources::postgres::{PostgresSchemaLoader, PostgresSource};
 use std::sync::Arc;
 use std::time::Instant;
-use testcontainers::{
-    ContainerAsync, GenericImage, ImageExt,
-    core::{IntoContainerPort, WaitFor},
-    runners::AsyncRunner,
-};
 use tokio::{
-    sync::{OnceCell, mpsc},
+    sync::mpsc,
     time::{Duration, sleep, timeout},
 };
-use tokio_postgres::NoTls;
-use tracing::{debug, info};
+use tracing::info;
 
 mod test_common;
-use test_common::init_test_tracing;
-
-const PG_PORT: u16 = 5433;
-const PG_USER: &str = "postgres";
-const PG_PASS: &str = "password";
-const CDC_USER: &str = "df";
-const CDC_PASS: &str = "dfpw";
-
-static CONTAINER: OnceCell<ContainerAsync<GenericImage>> =
-    OnceCell::const_new();
+use test_common::{
+    PG_CDC_USER, PG_CONTAINER, init_test_tracing, make_registry, pg_admin_dsn,
+    pg_cdc_dsn, pg_drop_db, pg_get_container, pg_port, pg_setup,
+};
 
 #[dtor]
 fn cleanup() {
-    if let Some(c) = CONTAINER.get() {
+    if let Some(c) = PG_CONTAINER.get() {
         std::process::Command::new("docker")
-            .args(["rm", "-f", c.id()])
+            .args(["rm", "-f", c.0.id()])
             .output()
             .ok();
     }
-}
-
-async fn get_container() -> &'static ContainerAsync<GenericImage> {
-    debug!("get_container called ..");
-    CONTAINER
-        .get_or_init(|| async {
-            let img = GenericImage::new("postgres", "17")
-                .with_wait_for(WaitFor::message_on_stderr(
-                    "database system is ready",
-                ))
-                .with_env_var("POSTGRES_USER", PG_USER)
-                .with_env_var("POSTGRES_PASSWORD", PG_PASS)
-                .with_cmd(vec![
-                    "postgres",
-                    "-c",
-                    "wal_level=logical",
-                    "-c",
-                    "max_replication_slots=10",
-                    "-c",
-                    "max_wal_senders=10",
-                ])
-                .with_mapped_port(PG_PORT, 5432.tcp());
-            let c = img.start().await.expect("start postgres");
-            sleep(Duration::from_secs(5)).await;
-            setup_cdc_user().await.expect("setup cdc user");
-            c
-        })
-        .await
-}
-
-async fn setup_cdc_user() -> Result<()> {
-    let (client, conn) = tokio_postgres::connect(
-        &format!(
-            "host=127.0.0.1 port={PG_PORT} user={PG_USER} password={PG_PASS}"
-        ),
-        NoTls,
-    )
-    .await?;
-    tokio::spawn(async move {
-        conn.await.ok();
-    });
-    client
-        .execute(
-            &format!(
-                "CREATE USER {CDC_USER} WITH REPLICATION PASSWORD '{CDC_PASS}'"
-            ),
-            &[],
-        )
-        .await
-        .ok();
-    Ok(())
-}
-
-async fn create_db(prefix: &str) -> Result<(String, tokio_postgres::Client)> {
-    let db = format!("test_{}_{}", prefix, std::process::id());
-    let (c, conn) = tokio_postgres::connect(
-        &format!(
-            "host=127.0.0.1 port={PG_PORT} user={PG_USER} password={PG_PASS}"
-        ),
-        NoTls,
-    )
-    .await?;
-    tokio::spawn(async move {
-        conn.await.ok();
-    });
-    c.execute(&format!("DROP DATABASE IF EXISTS {db}"), &[])
-        .await?;
-    c.execute(&format!("CREATE DATABASE {db}"), &[]).await?;
-    let (client, conn) = tokio_postgres::connect(&format!("host=127.0.0.1 port={PG_PORT} user={PG_USER} password={PG_PASS} dbname={db}"), NoTls).await?;
-    tokio::spawn(async move {
-        conn.await.ok();
-    });
-    client
-        .execute(&format!("GRANT ALL ON SCHEMA public TO {CDC_USER}"), &[])
-        .await?;
-    Ok((db, client))
-}
-
-async fn drop_db(db: &str) {
-    if let Ok((c, conn)) = tokio_postgres::connect(
-        &format!(
-            "host=127.0.0.1 port={PG_PORT} user={PG_USER} password={PG_PASS}"
-        ),
-        NoTls,
-    )
-    .await
-    {
-        tokio::spawn(async move {
-            conn.await.ok();
-        });
-        c.execute(&format!("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='{db}'"), &[]).await.ok();
-        c.execute(&format!("DROP DATABASE IF EXISTS {db}"), &[])
-            .await
-            .ok();
-    }
-}
-
-fn cdc_dsn(db: &str) -> String {
-    format!("postgres://{CDC_USER}:{CDC_PASS}@127.0.0.1:{PG_PORT}/{db}")
 }
 
 async fn create_pub_slot(
@@ -290,19 +178,6 @@ fn verify_event_envelope(e: &Event, expected_connector: &str) {
 // TEST HELPERS
 // =============================================================================
 
-/// Standard per-test setup: tracing, shared container, fresh database.
-/// Returns (db_name, client).
-async fn setup(prefix: &str) -> Result<(String, tokio_postgres::Client)> {
-    init_test_tracing();
-    get_container().await;
-    create_db(prefix).await
-}
-
-async fn make_registry() -> Arc<DurableSchemaRegistry> {
-    let backend = Arc::new(MemoryStorageBackend::new());
-    DurableSchemaRegistry::new(backend).await.expect("registry")
-}
-
 /// Build a PostgresSource with constant defaults (tenant=acme, pipeline=test,
 /// fresh InMemoryRegistry). `checkpoint_key` is derived as `pg-{id}`.
 async fn make_source(
@@ -316,7 +191,7 @@ async fn make_source(
     PostgresSource {
         id: id.into(),
         checkpoint_key: format!("pg-{id}"),
-        dsn: cdc_dsn(db),
+        dsn: pg_cdc_dsn(db).await,
         slot: slot.into(),
         publication: publication.into(),
         tables,
@@ -348,16 +223,14 @@ async fn start_source(
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_schema_loader() -> Result<()> {
-    let (db, client) = setup("schema").await?;
+    let (db, client) = pg_setup("schema").await?;
 
     client.execute("CREATE TABLE orders (id SERIAL PRIMARY KEY, sku VARCHAR(64) NOT NULL, price NUMERIC(10,2))", &[]).await?;
     client.execute("CREATE TABLE order_items (id SERIAL PRIMARY KEY, order_id INT, product VARCHAR(128))", &[]).await?;
 
     let registry = make_registry().await;
     let loader = PostgresSchemaLoader::new(
-        &format!(
-            "host=127.0.0.1 port={PG_PORT} user={PG_USER} password={PG_PASS} dbname={db}"
-        ),
+        &pg_admin_dsn(&db).await,
         registry.clone(),
         "acme",
     );
@@ -383,21 +256,21 @@ async fn postgres_schema_loader() -> Result<()> {
     assert_ne!(fp1, fp2);
     info!("✓ DDL detection");
 
-    drop_db(&db).await;
+    pg_drop_db(&db).await;
     Ok(())
 }
 
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_basic_events() -> Result<()> {
-    let (db, client) = setup("basic").await?;
+    let (db, client) = pg_setup("basic").await?;
 
     client.execute("CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64), payload JSONB)", &[]).await?;
     client
         .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
         .await?;
     client
-        .execute(&format!("GRANT SELECT ON orders TO {CDC_USER}"), &[])
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
         .await?;
     create_pub_slot(&client, "pub_basic", "slot_basic", &["orders"]).await?;
 
@@ -478,14 +351,14 @@ async fn postgres_cdc_basic_events() -> Result<()> {
     handle.stop();
     handle.join().await.ok();
     cleanup_repl(&client, "pub_basic", "slot_basic").await;
-    drop_db(&db).await;
+    pg_drop_db(&db).await;
     Ok(())
 }
 
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_schema_evolution() -> Result<()> {
-    let (db, client) = setup("evo").await?;
+    let (db, client) = pg_setup("evo").await?;
 
     client
         .execute(
@@ -497,7 +370,7 @@ async fn postgres_cdc_schema_evolution() -> Result<()> {
         .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
         .await?;
     client
-        .execute(&format!("GRANT SELECT ON orders TO {CDC_USER}"), &[])
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
         .await?;
     create_pub_slot(&client, "pub_evo", "slot_evo", &["orders"]).await?;
 
@@ -549,14 +422,14 @@ async fn postgres_cdc_schema_evolution() -> Result<()> {
     handle.stop();
     handle.join().await.ok();
     cleanup_repl(&client, "pub_evo", "slot_evo").await;
-    drop_db(&db).await;
+    pg_drop_db(&db).await;
     Ok(())
 }
 
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_checkpoint_resume() -> Result<()> {
-    let (db, client) = setup("ckpt").await?;
+    let (db, client) = pg_setup("ckpt").await?;
 
     client
         .execute(
@@ -568,7 +441,7 @@ async fn postgres_cdc_checkpoint_resume() -> Result<()> {
         .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
         .await?;
     client
-        .execute(&format!("GRANT SELECT ON orders TO {CDC_USER}"), &[])
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
         .await?;
     create_pub_slot(&client, "pub_ckpt", "slot_ckpt", &["orders"]).await?;
 
@@ -635,14 +508,14 @@ async fn postgres_cdc_checkpoint_resume() -> Result<()> {
     }
 
     cleanup_repl(&client, "pub_ckpt", "slot_ckpt").await;
-    drop_db(&db).await;
+    pg_drop_db(&db).await;
     Ok(())
 }
 
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_table_filtering() -> Result<()> {
-    let (db, client) = setup("filter").await?;
+    let (db, client) = pg_setup("filter").await?;
 
     client
         .execute(
@@ -661,7 +534,7 @@ async fn postgres_cdc_table_filtering() -> Result<()> {
         .await?;
     client
         .execute(
-            &format!("GRANT SELECT ON orders, audit_log TO {CDC_USER}"),
+            &format!("GRANT SELECT ON orders, audit_log TO {PG_CDC_USER}"),
             &[],
         )
         .await?;
@@ -702,14 +575,14 @@ async fn postgres_cdc_table_filtering() -> Result<()> {
     handle.stop();
     handle.join().await.ok();
     cleanup_repl(&client, "pub_filter", "slot_filter").await;
-    drop_db(&db).await;
+    pg_drop_db(&db).await;
     Ok(())
 }
 
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_reconnect() -> Result<()> {
-    let (db, client) = setup("reconn").await?;
+    let (db, client) = pg_setup("reconn").await?;
 
     client
         .execute(
@@ -721,7 +594,7 @@ async fn postgres_cdc_reconnect() -> Result<()> {
         .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
         .await?;
     client
-        .execute(&format!("GRANT SELECT ON orders TO {CDC_USER}"), &[])
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
         .await?;
     create_pub_slot(&client, "pub_reconn", "slot_reconn", &["orders"]).await?;
 
@@ -746,7 +619,7 @@ async fn postgres_cdc_reconnect() -> Result<()> {
     assert!(events.iter().any(|e| has_id(e, 200)));
 
     // Kill connection
-    client.execute(&format!("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename='{CDC_USER}' LIMIT 1"), &[]).await.ok();
+    client.execute(&format!("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename='{PG_CDC_USER}' LIMIT 1"), &[]).await.ok();
     sleep(Duration::from_secs(5)).await;
 
     client
@@ -762,21 +635,21 @@ async fn postgres_cdc_reconnect() -> Result<()> {
     handle.stop();
     handle.join().await.ok();
     cleanup_repl(&client, "pub_reconn", "slot_reconn").await;
-    drop_db(&db).await;
+    pg_drop_db(&db).await;
     Ok(())
 }
 
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_extended_types() -> Result<()> {
-    let (db, client) = setup("types").await?;
+    let (db, client) = pg_setup("types").await?;
 
     client.execute("CREATE TABLE complex (id SERIAL PRIMARY KEY, uuid_col UUID, tags TEXT[], metadata JSONB, amount NUMERIC(15,4))", &[]).await?;
     client
         .execute("ALTER TABLE complex REPLICA IDENTITY FULL", &[])
         .await?;
     client
-        .execute(&format!("GRANT SELECT ON complex TO {CDC_USER}"), &[])
+        .execute(&format!("GRANT SELECT ON complex TO {PG_CDC_USER}"), &[])
         .await?;
     create_pub_slot(&client, "pub_types", "slot_types", &["complex"]).await?;
 
@@ -813,14 +686,14 @@ async fn postgres_cdc_extended_types() -> Result<()> {
     handle.stop();
     handle.join().await.ok();
     cleanup_repl(&client, "pub_types", "slot_types").await;
-    drop_db(&db).await;
+    pg_drop_db(&db).await;
     Ok(())
 }
 
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_pause_resume() -> Result<()> {
-    let (db, client) = setup("pause").await?;
+    let (db, client) = pg_setup("pause").await?;
 
     client
         .execute(
@@ -832,7 +705,7 @@ async fn postgres_cdc_pause_resume() -> Result<()> {
         .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
         .await?;
     client
-        .execute(&format!("GRANT SELECT ON orders TO {CDC_USER}"), &[])
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
         .await?;
     create_pub_slot(&client, "pub_pause", "slot_pause", &["orders"]).await?;
 
@@ -879,7 +752,7 @@ async fn postgres_cdc_pause_resume() -> Result<()> {
     handle.stop();
     handle.join().await.ok();
     cleanup_repl(&client, "pub_pause", "slot_pause").await;
-    drop_db(&db).await;
+    pg_drop_db(&db).await;
     Ok(())
 }
 
@@ -891,19 +764,21 @@ async fn postgres_cdc_pause_resume() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_auth_failure() -> Result<()> {
-    let (db, client) = setup("auth_fail").await?;
+    let (db, client) = pg_setup("auth_fail").await?;
 
     client
         .execute("CREATE TABLE orders (id INT PRIMARY KEY)", &[])
         .await?;
     client
-        .execute(&format!("GRANT SELECT ON orders TO {CDC_USER}"), &[])
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
         .await?;
     create_pub_slot(&client, "pub_auth", "slot_auth", &["orders"]).await?;
 
     // Use wrong password
     let bad_dsn = format!(
-        "postgres://{CDC_USER}:WRONG_PASSWORD@127.0.0.1:{PG_PORT}/{db}"
+        "postgres://{}:WRONG_PASSWORD@127.0.0.1:{}/{db}",
+        PG_CDC_USER,
+        pg_port().await
     );
 
     let mut src = make_source(
@@ -938,7 +813,7 @@ async fn postgres_cdc_auth_failure() -> Result<()> {
     }
 
     cleanup_repl(&client, "pub_auth", "slot_auth").await;
-    drop_db(&db).await;
+    pg_drop_db(&db).await;
     Ok(())
 }
 
@@ -946,7 +821,7 @@ async fn postgres_cdc_auth_failure() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_slot_auto_created() -> Result<()> {
-    let (db, client) = setup("slot_auto").await?;
+    let (db, client) = pg_setup("slot_auto").await?;
 
     client
         .execute("CREATE TABLE orders (id INT PRIMARY KEY, name TEXT)", &[])
@@ -955,7 +830,7 @@ async fn postgres_cdc_slot_auto_created() -> Result<()> {
         .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
         .await?;
     client
-        .execute(&format!("GRANT SELECT ON orders TO {CDC_USER}"), &[])
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
         .await?;
 
     // Create publication but NO slot - slot should be auto-created
@@ -1020,7 +895,7 @@ async fn postgres_cdc_slot_auto_created() -> Result<()> {
     client
         .execute("DROP PUBLICATION IF EXISTS pub_auto", &[])
         .await?;
-    drop_db(&db).await;
+    pg_drop_db(&db).await;
     Ok(())
 }
 
@@ -1028,7 +903,7 @@ async fn postgres_cdc_slot_auto_created() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
-    let (db, client) = setup("pub_missing").await?;
+    let (db, client) = pg_setup("pub_missing").await?;
 
     client
         .execute("CREATE TABLE orders (id INT PRIMARY KEY, name TEXT)", &[])
@@ -1037,7 +912,7 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
         .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
         .await?;
     client
-        .execute(&format!("GRANT SELECT ON orders TO {CDC_USER}"), &[])
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
         .await?;
 
     client
@@ -1105,7 +980,7 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
     client
         .execute("DROP PUBLICATION IF EXISTS missing_pub", &[])
         .await?;
-    drop_db(&db).await;
+    pg_drop_db(&db).await;
     Ok(())
 }
 
@@ -1114,7 +989,7 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
 #[ignore = "requires docker"]
 async fn postgres_cdc_invalid_dsn() -> Result<()> {
     init_test_tracing();
-    let _ = get_container().await;
+    let _ = pg_get_container().await;
 
     let mut src = make_source(
         "bad-dsn",
@@ -1146,10 +1021,13 @@ async fn postgres_cdc_invalid_dsn() -> Result<()> {
 #[ignore = "requires docker"]
 async fn postgres_cdc_connection_refused() -> Result<()> {
     init_test_tracing();
-    let _ = get_container().await;
+    let _ = pg_get_container().await;
 
-    let bad_dsn =
-        format!("postgres://{CDC_USER}:{CDC_PASS}@127.0.0.1:59999/testdb");
+    let bad_dsn = format!(
+        "postgres://{}:{}@127.0.0.1:59999/testdb",
+        PG_CDC_USER,
+        test_common::PG_CDC_PASS
+    );
 
     let mut src = make_source(
         "conn-refused",
@@ -1184,7 +1062,7 @@ async fn postgres_cdc_connection_refused() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_replica_identity_modes() -> Result<()> {
-    let (db, client) = setup("replica_id").await?;
+    let (db, client) = pg_setup("replica_id").await?;
 
     client
         .execute(
@@ -1202,7 +1080,7 @@ async fn postgres_cdc_replica_identity_modes() -> Result<()> {
 
     client
         .execute(
-            &format!("GRANT SELECT ON ri_default, ri_full TO {CDC_USER}"),
+            &format!("GRANT SELECT ON ri_default, ri_full TO {PG_CDC_USER}"),
             &[],
         )
         .await?;
@@ -1211,9 +1089,7 @@ async fn postgres_cdc_replica_identity_modes() -> Result<()> {
 
     let registry = make_registry().await;
     let loader = PostgresSchemaLoader::new(
-        &format!(
-            "host=127.0.0.1 port={PG_PORT} user={PG_USER} password={PG_PASS} dbname={db}"
-        ),
+        &pg_admin_dsn(&db).await,
         registry.clone(),
         "acme",
     );
@@ -1289,7 +1165,7 @@ async fn postgres_cdc_replica_identity_modes() -> Result<()> {
     handle.stop();
     handle.join().await.ok();
     cleanup_repl(&client, "pub_ri", "slot_ri").await;
-    drop_db(&db).await;
+    pg_drop_db(&db).await;
     Ok(())
 }
 
@@ -1297,7 +1173,7 @@ async fn postgres_cdc_replica_identity_modes() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_graceful_shutdown() -> Result<()> {
-    let (db, client) = setup("shutdown").await?;
+    let (db, client) = pg_setup("shutdown").await?;
 
     client
         .execute(
@@ -1309,7 +1185,7 @@ async fn postgres_cdc_graceful_shutdown() -> Result<()> {
         .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
         .await?;
     client
-        .execute(&format!("GRANT SELECT ON orders TO {CDC_USER}"), &[])
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
         .await?;
     create_pub_slot(&client, "pub_shutdown", "slot_shutdown", &["orders"])
         .await?;
@@ -1349,7 +1225,7 @@ async fn postgres_cdc_graceful_shutdown() -> Result<()> {
     }
 
     cleanup_repl(&client, "pub_shutdown", "slot_shutdown").await;
-    drop_db(&db).await;
+    pg_drop_db(&db).await;
     Ok(())
 }
 
@@ -1357,7 +1233,7 @@ async fn postgres_cdc_graceful_shutdown() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_multi_table() -> Result<()> {
-    let (db, client) = setup("multi").await?;
+    let (db, client) = pg_setup("multi").await?;
 
     client
         .execute(
@@ -1383,7 +1259,10 @@ async fn postgres_cdc_multi_table() -> Result<()> {
             .execute(&format!("ALTER TABLE {} REPLICA IDENTITY FULL", tbl), &[])
             .await?;
         client
-            .execute(&format!("GRANT SELECT ON {} TO {}", tbl, CDC_USER), &[])
+            .execute(
+                &format!("GRANT SELECT ON {} TO {}", tbl, PG_CDC_USER),
+                &[],
+            )
             .await?;
     }
 
@@ -1453,7 +1332,7 @@ async fn postgres_cdc_multi_table() -> Result<()> {
     handle.stop();
     handle.join().await.ok();
     cleanup_repl(&client, "pub_multi", "slot_multi").await;
-    drop_db(&db).await;
+    pg_drop_db(&db).await;
     Ok(())
 }
 
@@ -1461,7 +1340,7 @@ async fn postgres_cdc_multi_table() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_null_handling() -> Result<()> {
-    let (db, client) = setup("nulls").await?;
+    let (db, client) = pg_setup("nulls").await?;
 
     client
         .execute(
@@ -1479,7 +1358,10 @@ async fn postgres_cdc_null_handling() -> Result<()> {
         .execute("ALTER TABLE nullable_test REPLICA IDENTITY FULL", &[])
         .await?;
     client
-        .execute(&format!("GRANT SELECT ON nullable_test TO {CDC_USER}"), &[])
+        .execute(
+            &format!("GRANT SELECT ON nullable_test TO {PG_CDC_USER}"),
+            &[],
+        )
         .await?;
     create_pub_slot(&client, "pub_null", "slot_null", &["nullable_test"])
         .await?;
@@ -1535,7 +1417,7 @@ async fn postgres_cdc_null_handling() -> Result<()> {
     handle.stop();
     handle.join().await.ok();
     cleanup_repl(&client, "pub_null", "slot_null").await;
-    drop_db(&db).await;
+    pg_drop_db(&db).await;
     Ok(())
 }
 
@@ -1552,7 +1434,7 @@ async fn postgres_cdc_null_handling() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_outbox_capture() -> Result<()> {
-    let (db, client) = setup("outbox").await?;
+    let (db, client) = pg_setup("outbox").await?;
 
     // Need a table + publication for the replication slot to work,
     // but outbox events come from WAL messages, not table changes.
@@ -1566,7 +1448,7 @@ async fn postgres_cdc_outbox_capture() -> Result<()> {
         .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
         .await?;
     client
-        .execute(&format!("GRANT SELECT ON orders TO {CDC_USER}"), &[])
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
         .await?;
     create_pub_slot(&client, "pub_outbox", "slot_outbox", &["orders"]).await?;
 
@@ -1653,7 +1535,7 @@ async fn postgres_cdc_outbox_capture() -> Result<()> {
     handle.stop();
     handle.join().await.ok();
     cleanup_repl(&client, "pub_outbox", "slot_outbox").await;
-    drop_db(&db).await;
+    pg_drop_db(&db).await;
     Ok(())
 }
 
@@ -1663,13 +1545,13 @@ async fn postgres_cdc_outbox_capture() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_outbox_glob_prefix() -> Result<()> {
-    let (db, client) = setup("outbox_glob").await?;
+    let (db, client) = pg_setup("outbox_glob").await?;
 
     client
         .execute("CREATE TABLE stub (id INT PRIMARY KEY)", &[])
         .await?;
     client
-        .execute(&format!("GRANT SELECT ON stub TO {CDC_USER}"), &[])
+        .execute(&format!("GRANT SELECT ON stub TO {PG_CDC_USER}"), &[])
         .await?;
     create_pub_slot(&client, "pub_obglob", "slot_obglob", &["stub"]).await?;
 
@@ -1733,7 +1615,7 @@ async fn postgres_cdc_outbox_glob_prefix() -> Result<()> {
     handle.stop();
     handle.join().await.ok();
     cleanup_repl(&client, "pub_obglob", "slot_obglob").await;
-    drop_db(&db).await;
+    pg_drop_db(&db).await;
     Ok(())
 }
 
@@ -1749,7 +1631,7 @@ async fn postgres_cdc_outbox_full_pipeline() -> Result<()> {
     use processors::OutboxProcessor;
     use std::collections::HashMap;
 
-    let (db, client) = setup("outbox_pipe").await?;
+    let (db, client) = pg_setup("outbox_pipe").await?;
 
     client
         .execute(
@@ -1761,7 +1643,7 @@ async fn postgres_cdc_outbox_full_pipeline() -> Result<()> {
         .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
         .await?;
     client
-        .execute(&format!("GRANT SELECT ON orders TO {CDC_USER}"), &[])
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
         .await?;
     create_pub_slot(&client, "pub_obpipe", "slot_obpipe", &["orders"]).await?;
 
@@ -1913,6 +1795,6 @@ async fn postgres_cdc_outbox_full_pipeline() -> Result<()> {
     handle.stop();
     handle.join().await.ok();
     cleanup_repl(&client, "pub_obpipe", "slot_obpipe").await;
-    drop_db(&db).await;
+    pg_drop_db(&db).await;
     Ok(())
 }
