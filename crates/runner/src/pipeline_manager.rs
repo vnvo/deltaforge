@@ -418,8 +418,8 @@ fn merge_values(base: &mut Value, patch: Value) {
 mod tests {
     use super::*;
     use deltaforge_config::{
-        BatchConfig, Metadata, MysqlSrcCfg, RedisSinkCfg, SinkCfg, SourceCfg,
-        Spec,
+        BatchConfig, Metadata, MysqlSrcCfg, RedisSinkCfg, SinkCfg, SnapshotCfg,
+        SourceCfg, Spec,
     };
 
     fn sample_spec(name: &str) -> PipelineSpec {
@@ -435,6 +435,7 @@ mod tests {
                     dsn: "mysql://root:root@localhost/db".to_string(),
                     tables: vec![],
                     outbox: None,
+                    snapshot: SnapshotCfg::default(),
                 }),
                 processors: vec![],
                 sinks: vec![SinkCfg::Redis(RedisSinkCfg {

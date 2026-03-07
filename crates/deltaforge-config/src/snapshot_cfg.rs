@@ -42,7 +42,7 @@ pub struct SnapshotCfg {
 impl Default for SnapshotCfg {
     fn default() -> Self {
         Self {
-            mode: SnapshotMode::Initial,
+            mode: SnapshotMode::Never,
             max_parallel_tables: default_parallel_tables(),
             chunk_size: default_chunk_size(),
             intra_table_parallel: false,

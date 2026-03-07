@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Shared test infrastructure for sources integration tests.
 //!
 //! Generic utilities (tracing, random suffixes) are unprefixed.
@@ -20,7 +22,7 @@ use mysql_async::{Opts, Pool as MySQLPool, prelude::Queryable};
 use sources::postgres::PostgresSchemaLoader;
 
 // ============================================================================
-// Tracing — shared
+// Tracing - shared
 // ============================================================================
 
 static INIT: Once = Once::new();

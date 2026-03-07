@@ -5,6 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use deltaforge_config::SnapshotMode;
 use mysql_binlog_connector_rust::{
     binlog_client::BinlogClient, binlog_stream::BinlogStream,
     event::table_map_event::TableMapEvent,
@@ -17,7 +18,7 @@ use tracing::{debug, error, info};
 
 use checkpoints::{CheckpointStore, CheckpointStoreExt};
 use common::{AllowList, RetryPolicy, pause_until_resumed};
-use deltaforge_core::{Event, Source, SourceHandle, SourceResult};
+use deltaforge_core::{Event, Source, SourceError, SourceHandle, SourceResult};
 mod mysql_errors;
 pub use mysql_errors::{LoopControl, MySqlSourceError, MySqlSourceResult};
 
@@ -38,6 +39,9 @@ use crate::mysql::mysql_helpers::{
 };
 pub use mysql_table_schema::{MySqlColumn, MySqlTableSchema};
 
+pub mod mysql_snapshot;
+pub use mysql_snapshot::{MysqlSnapshotProgress, progress_key};
+
 //pub type MySqlSourceResult<T> = Result<T, MySqlSourceError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +61,7 @@ pub struct MySqlSource {
     pub pipeline: String,
     pub registry: Arc<DurableSchemaRegistry>,
     pub outbox_tables: AllowList,
+    pub snapshot_cfg: deltaforge_config::SnapshotCfg,
 }
 
 const HEARTBEAT_INTERVAL_SECS: u64 = 15;
@@ -96,6 +101,73 @@ impl MySqlSource {
         paused: Arc<AtomicBool>,
         pause_notify: Arc<Notify>,
     ) -> SourceResult<()> {
+        // snapshot (if configured)
+        let snapshot_progress: Option<MysqlSnapshotProgress> = chkpt_store
+            .get_raw(&mysql_snapshot::progress_key(&self.id))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+
+        let needs_snapshot = match self.snapshot_cfg.mode {
+            SnapshotMode::Initial => !snapshot_progress
+                .as_ref()
+                .map(|p| p.finished)
+                .unwrap_or(false),
+            SnapshotMode::Always => true,
+            SnapshotMode::Never => false,
+        };
+
+        if needs_snapshot {
+            // For Always mode, reset saved progress so run_snapshot starts fresh
+            // rather than returning early on the finished check inside it.
+            if self.snapshot_cfg.mode == SnapshotMode::Always {
+                if let Ok(bytes) =
+                    serde_json::to_vec(&MysqlSnapshotProgress::default())
+                {
+                    let _ = chkpt_store
+                        .put_raw(
+                            &mysql_snapshot::progress_key(&self.id),
+                            &bytes,
+                        )
+                        .await;
+                }
+            }
+            info!(source_id = %self.id, "starting mysql snapshot");
+
+            let snap_schema_loader = MySqlSchemaLoader::new(
+                &self.dsn,
+                self.registry.clone(),
+                &self.tenant,
+            );
+            let tracked = snap_schema_loader.preload(&self.tables).await?;
+
+            let snapshot_position = mysql_snapshot::run_snapshot(
+                &self.dsn,
+                &self.id,
+                &self.pipeline,
+                &self.tenant,
+                &tracked,
+                &self.snapshot_cfg,
+                &snap_schema_loader,
+                chkpt_store.clone(),
+                tx.clone(),
+                cancel.clone(),
+            )
+            .await
+            .map_err(SourceError::Other)?;
+
+            // Persist snapshot's binlog position as the CDC checkpoint so
+            // prepare_client resumes from here, not from the binlog tail.
+            chkpt_store
+                .put(&self.id, snapshot_position)
+                .await
+                .map_err(|e| SourceError::Other(e.into()))?;
+
+            info!(source_id = %self.id, "snapshot complete, starting binlog streaming");
+        }
+
+        // binlog streaming
         let (host, default_db, server_id, client) =
             prepare_client(&self.dsn, &self.id, &chkpt_store).await?;
 

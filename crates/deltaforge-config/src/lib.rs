@@ -145,6 +145,8 @@ pub struct MysqlSrcCfg {
     pub tables: Vec<String>,
     #[serde(default)]
     pub outbox: Option<MysqlOutboxCapture>,
+    #[serde(default)]
+    pub snapshot: SnapshotCfg,    
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

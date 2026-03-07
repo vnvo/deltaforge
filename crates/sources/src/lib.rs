@@ -68,6 +68,7 @@ pub fn build_source(
                 .as_ref()
                 .map(|o| o.allow_list())
                 .unwrap_or_default(),
+            snapshot_cfg: c.snapshot.clone(),
         })),
 
         #[cfg(feature = "turso")]

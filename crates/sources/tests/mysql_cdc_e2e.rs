@@ -11,6 +11,7 @@ use anyhow::Result;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
 use common::AllowList;
 use ctor::dtor;
+use deltaforge_config::SnapshotCfg;
 use deltaforge_core::{BatchContext, Event, Op, Source, SourceHandle};
 use mysql_async::prelude::Queryable;
 use schema_registry::SourceSchema;
@@ -124,6 +125,7 @@ async fn make_source(
         pipeline: "test".to_string(),
         registry: make_registry().await,
         outbox_tables,
+        snapshot_cfg: SnapshotCfg::default(),
     }
 }
 
@@ -305,6 +307,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
         pipeline: "test".to_string(),
         registry: registry.clone(),
         outbox_tables: AllowList::default(),
+        snapshot_cfg: SnapshotCfg::default(),
     };
     let (mut rx, handle) = start_source(src).await?;
 
@@ -422,6 +425,7 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
         pipeline: "test".to_string(),
         registry: registry.clone(),
         outbox_tables: AllowList::default(),
+        snapshot_cfg: SnapshotCfg::default(),
     };
     let (mut rx, handle) = start_source(src).await?;
 
