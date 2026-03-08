@@ -8,7 +8,7 @@ use ctor::dtor;
 use deltaforge_config::{SnapshotCfg, SnapshotMode};
 use deltaforge_core::{Event, Op, Source};
 use mysql_async::prelude::Queryable;
-use sources::mysql::{MySqlSource, progress_key};
+use sources::mysql::MySqlSource;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::{

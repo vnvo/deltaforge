@@ -42,12 +42,12 @@ impl PreflightReport {
 
         let duration_str = self
             .estimated_duration_secs
-            .map(|s| format_duration(s))
+            .map(format_duration)
             .unwrap_or_else(|| "unknown".into());
 
         let retention_str = self
             .retention_secs
-            .map(|s| format_duration(s))
+            .map(format_duration)
             .unwrap_or_else(|| "unknown".into());
 
         info!(

@@ -52,7 +52,7 @@ impl PreflightReport {
 
         let duration_str = self
             .estimated_duration_secs
-            .map(|s| format_duration(s))
+            .map(format_duration)
             .unwrap_or_else(|| "unknown".into());
 
         let wal_keep_str = match self.wal_keep_bytes {
