@@ -69,28 +69,33 @@ pub fn progress_key(source_id: &str) -> String {
 // Entry point
 // ============================================================================
 
+pub struct PgSnapshotCtx<'a> {
+    pub dsn: &'a str,
+    pub source_id: &'a str,
+    pub pipeline: &'a str,
+    pub tenant: &'a str,
+    pub cfg: &'a SnapshotCfg,
+    pub schema_loader: &'a PostgresSchemaLoader,
+    pub chkpt_store: Arc<dyn CheckpointStore>,
+    pub tx: mpsc::Sender<Event>,
+    pub cancel: CancellationToken,
+}
+
 /// Run a consistent snapshot of `tables`.
 ///
 /// Returns the WAL LSN captured before any rows were read — pass this to the
 /// replication client as `start_lsn` so streaming picks up exactly where the
 /// snapshot left off with no gaps and no duplicate events.
 pub async fn run_snapshot(
-    dsn: &str,
-    source_id: &str,
-    pipeline: &str,
-    tenant: &str,
+    ctx: &PgSnapshotCtx<'_>,
     tables: &[(String, String)],
-    cfg: &SnapshotCfg,
-    schema_loader: &PostgresSchemaLoader,
-    chkpt_store: Arc<dyn CheckpointStore>,
-    tx: mpsc::Sender<Event>,
-    cancel: CancellationToken,
 ) -> Result<Lsn> {
     let t0 = Instant::now();
 
     // Load any previous progress so we can skip already-completed tables.
-    let mut progress: SnapshotProgress = chkpt_store
-        .get_raw(&progress_key(source_id))
+    let mut progress: SnapshotProgress = ctx
+        .chkpt_store
+        .get_raw(&progress_key(ctx.source_id))
         .await
         .ok()
         .flatten()
@@ -98,13 +103,16 @@ pub async fn run_snapshot(
         .unwrap_or_default();
 
     if progress.finished {
-        info!(source_id, "snapshot already complete, returning saved LSN");
+        info!(
+            ctx.source_id,
+            "snapshot already complete, returning saved LSN"
+        );
         return Lsn::parse(&progress.start_lsn)
             .context("parse saved snapshot LSN");
     }
 
-    // ── Step 1: coordinator connection — export snapshot + capture LSN ──────
-    let (coord, coord_conn) = tokio_postgres::connect(dsn, NoTls)
+    // step 1: coordinator connection - export snapshot + capture LSN
+    let (coord, coord_conn) = tokio_postgres::connect(ctx.dsn, NoTls)
         .await
         .context("snapshot coordinator connect")?;
 
@@ -134,18 +142,18 @@ pub async fn run_snapshot(
     // Save start_lsn immediately — if we crash before finishing, we know
     // where to resume streaming from.
     progress.start_lsn = lsn_str.clone();
-    save_progress(&chkpt_store, source_id, &progress).await;
+    save_progress(&ctx.chkpt_store, ctx.source_id, &progress).await;
 
     info!(
-        source_id,
+        source_id = %ctx.source_id,
         snapshot_id = %snapshot_id,
         lsn = %start_lsn,
         tables = tables.len(),
         "snapshot started"
     );
 
-    // Step 2: fan out parallel table workers
-    let max_parallel = cfg.max_parallel_tables.min(tables.len()).max(1);
+    // step 2: fan out parallel table workers
+    let max_parallel = ctx.cfg.max_parallel_tables.min(tables.len()).max(1);
     let semaphore = Arc::new(Semaphore::new(max_parallel));
     let mut handles = Vec::new();
 
@@ -158,18 +166,18 @@ pub async fn run_snapshot(
         let permit = semaphore.clone().acquire_owned().await?;
 
         let worker = TableWorker {
-            dsn: dsn.to_string(),
+            dsn: ctx.dsn.to_string(),
             schema: schema.clone(),
             table: table.clone(),
             snapshot_id: snapshot_id.clone(),
-            source_id: source_id.to_string(),
-            pipeline: pipeline.to_string(),
-            tenant: tenant.to_string(),
-            cfg: cfg.clone(),
-            tx: tx.clone(),
-            schema_loader: schema_loader.clone(),
-            chkpt_store: chkpt_store.clone(),
-            cancel: cancel.clone(),
+            source_id: ctx.source_id.to_string(),
+            pipeline: ctx.pipeline.to_string(),
+            tenant: ctx.tenant.to_string(),
+            cfg: ctx.cfg.clone(),
+            tx: ctx.tx.clone(),
+            schema_loader: ctx.schema_loader.clone(),
+            chkpt_store: ctx.chkpt_store.clone(),
+            cancel: ctx.cancel.clone(),
         };
 
         let handle = tokio::spawn(async move {
@@ -181,7 +189,7 @@ pub async fn run_snapshot(
         handles.push((fqn(schema, table), handle));
     }
 
-    // Step 3: collect results
+    // step 3: collect results
     let mut failed = Vec::new();
 
     for (name, handle) in handles {
@@ -190,7 +198,8 @@ pub async fn run_snapshot(
                 let parts: Vec<&str> = name.splitn(2, '.').collect();
                 if parts.len() == 2 {
                     progress.mark_done(parts[0], parts[1]);
-                    save_progress(&chkpt_store, source_id, &progress).await;
+                    save_progress(&ctx.chkpt_store, ctx.source_id, &progress)
+                        .await;
                 }
                 info!(table = %name, "snapshot complete");
             }
@@ -214,10 +223,10 @@ pub async fn run_snapshot(
 
     // Mark fully done.
     progress.finished = true;
-    save_progress(&chkpt_store, source_id, &progress).await;
+    save_progress(&ctx.chkpt_store, ctx.source_id, &progress).await;
 
     info!(
-        source_id,
+        source_id = %ctx.source_id,
         elapsed_secs = t0.elapsed().as_secs(),
         start_lsn = %start_lsn,
         "snapshot finished — streaming will start from this LSN"

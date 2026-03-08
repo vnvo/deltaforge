@@ -19,7 +19,7 @@ use test_common::{pg_admin_dsn, pg_drop_db, pg_make_schema_loader, pg_setup};
 use ctor::dtor;
 
 use sources::postgres::postgres_snapshot::{
-    SnapshotProgress, progress_key, run_snapshot,
+    self, SnapshotProgress, progress_key, run_snapshot,
 };
 
 #[dtor]
@@ -87,20 +87,19 @@ async fn snapshot_captures_all_rows_integer_pk() -> Result<()> {
     let (tx, mut rx) = mpsc::channel(1024);
     let schema_loader = pg_make_schema_loader(&pg_admin_dsn(&db).await).await?;
     let chkpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let snapshot_ctx = postgres_snapshot::PgSnapshotCtx {
+        dsn: &pg_admin_dsn(&db).await,
+        source_id: "snap-basic",
+        pipeline: "test-pipeline",
+        tenant: "acme",
+        cfg: &initial_cfg(),
+        schema_loader: &schema_loader,
+        chkpt_store: chkpt.clone(),
+        tx: tx.clone(),
+        cancel: CancellationToken::new(),
+    };
 
-    run_snapshot(
-        &pg_admin_dsn(&db).await,
-        "snap-basic",
-        "test-pipeline",
-        "acme",
-        &[("public".into(), "orders".into())],
-        &initial_cfg(),
-        &schema_loader,
-        chkpt,
-        tx,
-        CancellationToken::new(),
-    )
-    .await?;
+    run_snapshot(&snapshot_ctx, &[("public".into(), "orders".into())]).await?;
 
     let events = collect_reads(&mut rx, Duration::from_secs(10)).await;
     assert_eq!(events.len(), 500);
@@ -151,21 +150,25 @@ async fn snapshot_parallel_tables() -> Result<()> {
         ..Default::default()
     };
 
+    let snapshot_ctx = postgres_snapshot::PgSnapshotCtx {
+        dsn: &pg_admin_dsn(&db).await,
+        source_id: "snap-parallel",
+        pipeline: "test",
+        tenant: "acme",
+        cfg: &cfg,
+        schema_loader: &schema_loader,
+        chkpt_store: chkpt.clone(),
+        tx: tx.clone(),
+        cancel: CancellationToken::new(),
+    };
+
     run_snapshot(
-        &pg_admin_dsn(&db).await,
-        "snap-parallel",
-        "test",
-        "acme",
+        &snapshot_ctx,
         &[
             ("public".into(), "users".into()),
             ("public".into(), "products".into()),
             ("public".into(), "orders".into()),
         ],
-        &cfg,
-        &schema_loader,
-        chkpt,
-        tx,
-        CancellationToken::new(),
     )
     .await?;
 
@@ -228,20 +231,24 @@ async fn snapshot_resumes_after_partial_completion() -> Result<()> {
         .await?;
 
     let (tx, mut rx) = mpsc::channel(256);
+    let snapshot_ctx = postgres_snapshot::PgSnapshotCtx {
+        dsn: &pg_admin_dsn(&db).await,
+        source_id: "snap-resume",
+        pipeline: "test",
+        tenant: "acme",
+        cfg: &initial_cfg(),
+        schema_loader: &schema_loader,
+        chkpt_store: chkpt.clone(),
+        tx: tx.clone(),
+        cancel: CancellationToken::new(),
+    };
+
     run_snapshot(
-        &pg_admin_dsn(&db).await,
-        "snap-resume",
-        "test",
-        "acme",
+        &snapshot_ctx,
         &[
             ("public".into(), "t1".into()),
             ("public".into(), "t2".into()),
         ],
-        &initial_cfg(),
-        &schema_loader,
-        chkpt,
-        tx,
-        CancellationToken::new(),
     )
     .await?;
 
@@ -277,20 +284,19 @@ async fn snapshot_ctid_fallback_for_uuid_pk() -> Result<()> {
     let (tx, mut rx) = mpsc::channel(512);
     let schema_loader = pg_make_schema_loader(&pg_admin_dsn(&db).await).await?;
     let chkpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let snapshot_ctx = postgres_snapshot::PgSnapshotCtx {
+        dsn: &pg_admin_dsn(&db).await,
+        source_id: "snap-ctid",
+        pipeline: "test",
+        tenant: "acme",
+        cfg: &initial_cfg(),
+        schema_loader: &schema_loader,
+        chkpt_store: chkpt.clone(),
+        tx: tx.clone(),
+        cancel: CancellationToken::new(),
+    };
 
-    run_snapshot(
-        &pg_admin_dsn(&db).await,
-        "snap-ctid",
-        "test",
-        "acme",
-        &[("public".into(), "events".into())],
-        &initial_cfg(),
-        &schema_loader,
-        chkpt,
-        tx,
-        CancellationToken::new(),
-    )
-    .await?;
+    run_snapshot(&snapshot_ctx, &[("public".into(), "events".into())]).await?;
 
     let events = collect_reads(&mut rx, Duration::from_secs(10)).await;
     assert_eq!(events.len(), 200);
@@ -317,20 +323,21 @@ async fn snapshot_persists_lsn_and_marks_finished() -> Result<()> {
     let chkpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     let schema_loader = pg_make_schema_loader(&pg_admin_dsn(&db).await).await?;
     let (tx, mut rx) = mpsc::channel(256);
+    let snapshot_ctx = postgres_snapshot::PgSnapshotCtx {
+        dsn: &pg_admin_dsn(&db).await,
+        source_id: "snap-lsn",
+        pipeline: "test",
+        tenant: "acme",
+        cfg: &initial_cfg(),
+        schema_loader: &schema_loader,
+        chkpt_store: chkpt.clone(),
+        tx: tx.clone(),
+        cancel: CancellationToken::new(),
+    };
 
-    let returned_lsn = run_snapshot(
-        &pg_admin_dsn(&db).await,
-        "snap-lsn",
-        "test",
-        "acme",
-        &[("public".into(), "items".into())],
-        &initial_cfg(),
-        &schema_loader,
-        chkpt.clone(),
-        tx,
-        CancellationToken::new(),
-    )
-    .await?;
+    let returned_lsn =
+        run_snapshot(&snapshot_ctx, &[("public".into(), "items".into())])
+            .await?;
 
     // Progress must be saved and marked finished.
     let saved = chkpt.get_raw(&progress_key("snap-lsn")).await?.unwrap();

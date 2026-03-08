@@ -34,7 +34,6 @@ use super::{MySqlCheckpoint, MySqlSchemaLoader};
 // ============================================================================
 // Snapshot progress (persisted for crash resume)
 // ============================================================================
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MysqlSnapshotProgress {
     /// Serialized `MySqlCheckpoint` captured before any rows were read.
@@ -70,28 +69,33 @@ pub fn progress_key(source_id: &str) -> String {
 // Entry point
 // ============================================================================
 
+pub struct SnapshotCtx<'a> {
+    pub dsn: &'a str,
+    pub source_id: &'a str,
+    pub pipeline: &'a str,
+    pub tenant: &'a str,
+    pub cfg: &'a SnapshotCfg,
+    pub schema_loader: &'a MySqlSchemaLoader,
+    pub chkpt_store: Arc<dyn CheckpointStore>,
+    pub tx: mpsc::Sender<Event>,
+    pub cancel: CancellationToken,
+}
+
 /// Run a consistent snapshot of `tables`.
 ///
 /// Returns a `MySqlCheckpoint` captured at the `FLUSH TABLES WITH READ LOCK`
 /// point. The caller must persist this as the binlog checkpoint so streaming
 /// resumes with no gaps.
 pub async fn run_snapshot(
-    dsn: &str,
-    source_id: &str,
-    pipeline: &str,
-    tenant: &str,
+    ctx: &SnapshotCtx<'_>,
     tables: &[(String, String)], // (db, table)
-    cfg: &SnapshotCfg,
-    schema_loader: &MySqlSchemaLoader,
-    chkpt_store: Arc<dyn CheckpointStore>,
-    tx: mpsc::Sender<Event>,
-    cancel: CancellationToken,
 ) -> Result<MySqlCheckpoint> {
     let t0 = Instant::now();
 
     // load previous progress for crash resume.
-    let mut progress: MysqlSnapshotProgress = chkpt_store
-        .get_raw(&progress_key(source_id))
+    let mut progress: MysqlSnapshotProgress = ctx
+        .chkpt_store
+        .get_raw(&progress_key(ctx.source_id))
         .await
         .ok()
         .flatten()
@@ -100,7 +104,7 @@ pub async fn run_snapshot(
 
     if progress.finished {
         info!(
-            source_id,
+            ctx.source_id,
             "mysql snapshot already complete, returning saved position"
         );
         return serde_json::from_str(&progress.start_position)
@@ -111,7 +115,7 @@ pub async fn run_snapshot(
     let mut worker_conns: Vec<mysql_async::Conn> =
         Vec::with_capacity(tables.len());
     for _ in 0..tables.len() {
-        let mut conn = Pool::new(dsn)
+        let mut conn = Pool::new(ctx.dsn)
             .get_conn()
             .await
             .context("snapshot worker connect")?;
@@ -124,7 +128,7 @@ pub async fn run_snapshot(
     // Capture position AFTER all workers have started their consistent snapshots.
     // InnoDB guarantees every row visible to a worker was committed at a binlog
     // position ≤ this captured position, so CDC streaming from here has no gaps.
-    let mut pos_conn = Pool::new(dsn)
+    let mut pos_conn = Pool::new(ctx.dsn)
         .get_conn()
         .await
         .context("snapshot position connect")?;
@@ -134,10 +138,10 @@ pub async fn run_snapshot(
     // persist position immediately for crash safety.
     progress.start_position = serde_json::to_string(&position)
         .context("serialize binlog position")?;
-    save_progress(&chkpt_store, source_id, &progress).await;
+    save_progress(&ctx.chkpt_store, ctx.source_id, &progress).await;
 
     info!(
-        source_id,
+        source_id = %ctx.source_id,
         file = %position.file,
         pos = position.pos,
         gtid = ?position.gtid_set,
@@ -146,7 +150,7 @@ pub async fn run_snapshot(
     );
 
     // step 2: fan out parallel table workers
-    let max_parallel = cfg.max_parallel_tables.min(tables.len()).max(1);
+    let max_parallel = ctx.cfg.max_parallel_tables.min(tables.len()).max(1);
     let semaphore = Arc::new(Semaphore::new(max_parallel));
     let mut handles = Vec::new();
 
@@ -164,13 +168,13 @@ pub async fn run_snapshot(
             db: db.clone(),
             table: table.clone(),
             conn,
-            source_id: source_id.to_string(),
-            pipeline: pipeline.to_string(),
-            tenant: tenant.to_string(),
-            cfg: cfg.clone(),
-            tx: tx.clone(),
-            schema_loader: schema_loader.clone(),
-            cancel: cancel.clone(),
+            source_id: ctx.source_id.to_string(),
+            pipeline: ctx.pipeline.to_string(),
+            tenant: ctx.tenant.to_string(),
+            cfg: ctx.cfg.clone(),
+            tx: ctx.tx.clone(),
+            schema_loader: ctx.schema_loader.clone(),
+            cancel: ctx.cancel.clone(),
         };
 
         let handle = tokio::spawn(async move {
@@ -191,7 +195,8 @@ pub async fn run_snapshot(
                 let parts: Vec<&str> = name.splitn(2, '.').collect();
                 if parts.len() == 2 {
                     progress.mark_done(parts[0], parts[1]);
-                    save_progress(&chkpt_store, source_id, &progress).await;
+                    save_progress(&ctx.chkpt_store, ctx.source_id, &progress)
+                        .await;
                 }
                 info!(table = %name, rows, "table snapshot complete");
             }
@@ -211,10 +216,10 @@ pub async fn run_snapshot(
     }
 
     progress.finished = true;
-    save_progress(&chkpt_store, source_id, &progress).await;
+    save_progress(&ctx.chkpt_store, ctx.source_id, &progress).await;
 
     info!(
-        source_id,
+        source_id= %ctx.source_id,
         elapsed_secs = t0.elapsed().as_secs(),
         file = %position.file,
         pos = position.pos,
@@ -511,7 +516,7 @@ fn value_to_json(val: Value) -> serde_json::Value {
 fn base64_encode(bytes: &[u8]) -> String {
     const ALPHA: &[u8] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = chunk.get(1).copied().unwrap_or(0) as u32;

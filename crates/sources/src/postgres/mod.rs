@@ -215,20 +215,20 @@ impl PostgresSource {
         // gaps once the snapshot finishes.
         let start_lsn = if needs_snapshot {
             info!(source_id = %self.id, "starting initial snapshot");
-            postgres_snapshot::run_snapshot(
-                &self.dsn,
-                &self.id,
-                &self.pipeline,
-                &self.tenant,
-                &tracked,
-                &self.snapshot_cfg,
-                &schema_loader,
-                chkpt_store.clone(),
-                tx.clone(),
-                cancel.clone(),
-            )
-            .await
-            .map_err(SourceError::Other)?
+            let snapshot_ctx = postgres_snapshot::PgSnapshotCtx {
+                dsn: &self.dsn,
+                source_id: &self.id,
+                pipeline: &self.pipeline,
+                tenant: &self.tenant,
+                cfg: &self.snapshot_cfg,
+                schema_loader: &schema_loader,
+                chkpt_store: chkpt_store.clone(),
+                tx: tx.clone(),
+                cancel: cancel.clone(),
+            };
+            postgres_snapshot::run_snapshot(&snapshot_ctx, &tracked)
+                .await
+                .map_err(SourceError::Other)?
         } else {
             start_lsn
         };

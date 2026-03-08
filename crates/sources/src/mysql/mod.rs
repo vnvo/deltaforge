@@ -141,21 +141,21 @@ impl MySqlSource {
                 &self.tenant,
             );
             let tracked = snap_schema_loader.preload(&self.tables).await?;
-
-            let snapshot_position = mysql_snapshot::run_snapshot(
-                &self.dsn,
-                &self.id,
-                &self.pipeline,
-                &self.tenant,
-                &tracked,
-                &self.snapshot_cfg,
-                &snap_schema_loader,
-                chkpt_store.clone(),
-                tx.clone(),
-                cancel.clone(),
-            )
-            .await
-            .map_err(SourceError::Other)?;
+            let snapshot_ctx = mysql_snapshot::SnapshotCtx {
+                dsn: &self.dsn,
+                source_id: &self.id,
+                pipeline: &self.pipeline,
+                tenant: &self.tenant,
+                cfg: &self.snapshot_cfg,
+                schema_loader: &snap_schema_loader,
+                chkpt_store: chkpt_store.clone(),
+                tx: tx.clone(),
+                cancel: cancel.clone(),
+            };
+            let snapshot_position =
+                mysql_snapshot::run_snapshot(&snapshot_ctx, &tracked)
+                    .await
+                    .map_err(SourceError::Other)?;
 
             // Persist snapshot's binlog position as the CDC checkpoint so
             // prepare_client resumes from here, not from the binlog tail.
