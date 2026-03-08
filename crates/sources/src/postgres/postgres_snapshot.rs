@@ -16,13 +16,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use scopeguard;
 use anyhow::{Context, Result};
 use checkpoints::CheckpointStore;
 use common::redact_url_password;
 use deltaforge_config::SnapshotCfg;
 use deltaforge_core::{Event, Op, SourceInfo, SourcePosition};
 use pgwire_replication::Lsn;
+use scopeguard;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, mpsc};
 use tokio_postgres::NoTls;

@@ -208,7 +208,7 @@ pub async fn run_preflight(
             .collect();
 
         let query = format!(
-            "SELECT COALESCE(SUM(pg_total_relation_size(t)), 0) \
+            "SELECT COALESCE(SUM(pg_total_relation_size(t)), 0)::bigint \
              FROM unnest(ARRAY[{}]) AS t",
             table_exprs.join(", ")
         );
