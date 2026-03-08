@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+
+- **Snapshot/backfill** — Initial load of existing table data before binlog/WAL streaming begins ([429918b](https://github.com/vnvo/deltaforge/commit/429918be840dda2bc04edfd5d2ad3cbf3f77d347), [aeadb9f](https://github.com/vnvo/deltaforge/commit/aeadb9fa743689c4399bab086af2e684d1fe0723))
+  - `SnapshotCfg` added to both MySQL and PostgreSQL source configs: `mode` (`never` / `initial` / `always`), `max_parallel_tables` (default 8), `chunk_size` (default 10,000), `intra_table_parallel`, `max_parallel_chunks`
+  - **MySQL**: lock-free InnoDB approach — all worker connections opened with `START TRANSACTION WITH CONSISTENT SNAPSHOT`, binlog position captured after all workers start; no `FLUSH TABLES WITH READ LOCK` or `RELOAD` privilege required
+  - **PostgreSQL**: consistent repeatable-read transaction against publication tables; LSN captured at snapshot start becomes the CDC resume point
+  - Integer single-column PKs use chunked range reads (`chunk_size` rows per query); all other tables fall back to a buffered full scan
+  - Tables run in parallel up to `max_parallel_tables`; snapshot rows emitted as `Op::Read` (`op: "r"`)
+  - Resume is table-granular: `MysqlSnapshotProgress` / `PostgresSnapshotProgress` persisted to the storage backend; interrupted snapshots re-run only incomplete tables on restart
+  - `SnapshotMode::Always` resets progress on each run; `SnapshotMode::Initial` skips if a completed snapshot record exists
+  - Binlog/LSN position captured at snapshot time written as CDC checkpoint so streaming resumes without gaps or duplicate detection needed
+  - E2E test suites: `mysql_snapshot_e2e.rs`, `postgres_snapshot_e2e.rs` (5 tests each: initial load, never mode, resume after interruption, parallel tables, always re-run) ([00b7921](https://github.com/vnvo/deltaforge/commit/00b7921bc10178142d62eb31c5a710edac755e9e))
+  - Documentation updated: `docs/src/sources/mysql.md`, `docs/src/sources/postgres.md`, `docs/src/configuration.md`, `README.md`, `docs/index.html` ([1f82c0a](https://github.com/vnvo/deltaforge/commit/1f82c0a97767f15b9a1e991b9f030fd3a3699301))
+
 - **Unified storage backend** - New `storage` crate providing a single pluggable state layer for all runtime state ([e5a0c66](https://github.com/vnvo/deltaforge/commit/e5a0c665184598f6a82384e9242a7b6965f5c0ca), [b357fe2](https://github.com/vnvo/deltaforge/commit/b357fe2c0b9f671d817007cdab3b8176cc9c3ca6))
   - `StorageBackend` trait with four primitives: **KV** (key-value with optional TTL), **Log** (append-only, globally sequenced), **Slot** (versioned CAS), **Queue** (ordered, ack-based)
   - `MemoryStorageBackend` — ephemeral in-process backend for testing
@@ -17,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `DurableSchemaRegistry` adapter — implements the schema registry on top of the Log primitive; replays log on startup to populate in-memory cache; `for_testing()` sync constructor for cross-crate test usage
   - All sources (MySQL, PostgreSQL, Turso) and `PipelineManager` migrated to `DurableSchemaRegistry`
   - `PipelineManager::with_backend()` wires both subsystems from a single backend instance
+
 - **PostgreSQL storage backend** — `PostgresStorageBackend` using `deadpool-postgres` connection pool; native async, no `spawn_blocking`; schema migrations run on first connect ([137b4e9](https://github.com/vnvo/deltaforge/commit/137b4e994bfacf31ab464946a3ab8e8d1e4f3c9e))
   - Enabled via `--storage-backend postgres --storage-dsn <dsn>` or `storage.backend: postgres` in config
   - `postgres` feature flag in the `storage` crate

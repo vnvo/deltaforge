@@ -60,6 +60,10 @@ source:
     tables:
       - shop.orders
       - shop.order_items
+    outbox:
+      tables: ["shop.outbox"]
+    snapshot:
+      mode: initial
 ```
 
 </td>
@@ -70,6 +74,10 @@ source:
 | `id` | string | Unique identifier for checkpoints and metrics |
 | `dsn` | string | MySQL connection string with replication privileges |
 | `tables` | array | Table patterns to capture; omit for all tables |
+| `outbox.tables` | array | Table patterns to tag as outbox events. Must also appear in `tables`. Supports globs: `shop.outbox`, `*.outbox`, `shop.outbox_%`. |
+| `snapshot.mode` | string | `never` (default), `initial` - run once if no checkpoint exists, `always` - re-snapshot on every restart |
+| `snapshot.max_parallel_tables` | int | Tables snapshotted concurrently (default: `8`) |
+| `snapshot.chunk_size` | int | Rows per range chunk for integer-PK tables (default: `10000`) |
 
 </td>
 </tr>
@@ -100,6 +108,10 @@ source:
       - public.users
       - public.sessions
     start_position: earliest
+    outbox:
+      prefixes: ["outbox", "order_outbox_%"]
+    snapshot:
+      mode: initial
 ```
 
 </td>
@@ -113,10 +125,16 @@ source:
 | `publication` | string | Publication name |
 | `tables` | array | Table patterns to capture |
 | `start_position` | string | `earliest`, `latest`, or `lsn` |
+| `outbox.prefixes` | array | `pg_logical_emit_message` prefixes to tag as outbox events. Supports globs: `outbox`, `outbox_%`, `*`. |
+| `snapshot.mode` | string | `never` (default), `initial` - run once if no checkpoint exists, `always` - re-snapshot on every restart |
+| `snapshot.max_parallel_tables` | int | Tables snapshotted concurrently (default: `8`) |
+| `snapshot.chunk_size` | int | Rows per range chunk (default: `10000`) |
 
 </td>
 </tr>
 </table>
+
+> **Note:** The source-level `outbox` field only tags matching events with the `__outbox` sentinel. Routing and transformation are handled by the [`outbox` processor](#outbox).
 
 ---
 
@@ -187,6 +205,42 @@ processors:
 | `empty_object` | string | `preserve` | Empty object policy: `preserve`, `drop`, or `null` |
 | `lists` | string | `preserve` | Array policy: `preserve` or `index` |
 | `empty_list` | string | `preserve` | Empty array policy: `preserve`, `drop`, or `null` |
+
+---
+
+### Outbox
+
+Transforms raw outbox events into routed, sink-ready events. Requires the source to have `outbox` configured so events are tagged before reaching this processor. See [Outbox pattern documentation](outbox.md) for full details.
+
+```yaml
+processors:
+  - type: outbox
+    id: outbox
+    topic: "${aggregate_type}.${event_type}"
+    default_topic: "events.unrouted"
+    raw_payload: true
+    columns:
+      payload: data
+    additional_headers:
+      x-trace-id: trace_id
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `id` | string | `"outbox"` | Processor identifier |
+| `tables` | array | `[]` | Filter: only process outbox events matching these patterns. Empty = all outbox events. |
+| `topic` | string | — | Topic template resolved against the raw payload using `${field}` placeholders |
+| `default_topic` | string | — | Fallback topic when template resolution fails and no `topic` column exists |
+| `key` | string | — | Key template resolved against raw payload. Default: `aggregate_id` value. |
+| `raw_payload` | bool | `false` | Deliver the extracted payload as-is to sinks, bypassing envelope wrapping |
+| `strict` | bool | `false` | Fail the batch if required fields are missing rather than silently falling back |
+| `columns.payload` | string | `payload` | Column containing the event payload |
+| `columns.aggregate_type` | string | `aggregate_type` | Column for aggregate type |
+| `columns.aggregate_id` | string | `aggregate_id` | Column for aggregate ID |
+| `columns.event_type` | string | `event_type` | Column for event type |
+| `columns.topic` | string | `topic` | Column for pre-computed topic override |
+| `columns.event_id` | string | `id` | Column extracted as `df-event-id` header |
+| `additional_headers` | map | `{}` | Forward extra payload fields as routing headers: `header-name: column-name` |
 
 ---
 

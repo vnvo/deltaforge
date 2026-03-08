@@ -7,6 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use deltaforge_config::SnapshotMode;
 use pgwire_replication::{Lsn, ReplicationClient};
 use serde::{Deserialize, Serialize};
 use storage::DurableSchemaRegistry;
@@ -42,6 +43,9 @@ pub use postgres_table_schema::{PostgresColumn, PostgresTableSchema};
 
 mod postgres_logical_message;
 
+pub mod postgres_snapshot;
+pub use postgres_snapshot::SnapshotProgress;
+
 // ============================================================================
 // Checkpoint
 // ============================================================================
@@ -70,6 +74,7 @@ pub struct PostgresSource {
     pub pipeline: String,
     pub registry: Arc<DurableSchemaRegistry>,
     pub outbox_prefixes: AllowList,
+    pub snapshot_cfg: deltaforge_config::SnapshotCfg,
 }
 
 // ============================================================================
@@ -130,6 +135,14 @@ impl PostgresSource {
         // Verify publication exists and ensure slot exists.
         // Retries with backoff if publication missing (admin can create it).
         let mut startup_retry = RetryPolicy::default();
+
+        // Determine whether a snapshot should run.
+        let needs_snapshot = match self.snapshot_cfg.mode {
+            SnapshotMode::Initial => last_checkpoint.is_none(),
+            SnapshotMode::Always => true,
+            SnapshotMode::Never => false,
+        };
+
         let start_lsn = if last_checkpoint.is_none() {
             loop {
                 match ensure_slot_and_publication(
@@ -176,11 +189,6 @@ impl PostgresSource {
             config.start_lsn
         };
 
-        let config = pgwire_replication::ReplicationConfig {
-            start_lsn,
-            ..config
-        };
-
         let schema_loader = PostgresSchemaLoader::new(
             &self.dsn,
             self.registry.clone(),
@@ -202,11 +210,39 @@ impl PostgresSource {
             }
         }
 
+        // Run snapshot if requested. The snapshot captures the WAL LSN before
+        // reading any rows, so streaming resumes from that position with no
+        // gaps once the snapshot finishes.
+        let start_lsn = if needs_snapshot {
+            info!(source_id = %self.id, "starting initial snapshot");
+            let snapshot_ctx = postgres_snapshot::PgSnapshotCtx {
+                dsn: &self.dsn,
+                source_id: &self.id,
+                pipeline: &self.pipeline,
+                tenant: &self.tenant,
+                cfg: &self.snapshot_cfg,
+                schema_loader: &schema_loader,
+                chkpt_store: chkpt_store.clone(),
+                tx: tx.clone(),
+                cancel: cancel.clone(),
+            };
+            postgres_snapshot::run_snapshot(&snapshot_ctx, &tracked)
+                .await
+                .map_err(SourceError::Other)?
+        } else {
+            start_lsn
+        };
+
         info!(
             source_id = %self.id, host = %components.host, slot = %self.slot,
             publication = %self.publication, start_lsn = %start_lsn,
             "postgres source starting"
         );
+
+        let config = pgwire_replication::ReplicationConfig {
+            start_lsn,
+            ..config
+        };
 
         let client = connect_replication_with_retries(
             &self.id,

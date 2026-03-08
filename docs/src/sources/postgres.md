@@ -164,6 +164,31 @@ DeltaForge checkpoints progress using PostgreSQL's LSN (Log Sequence Number):
 
 Checkpoints are stored using the `id` field as the key.
 
+## Snapshot (Initial Load)
+
+DeltaForge can perform a consistent initial snapshot using a repeatable-read transaction
+against the publication tables, capturing the current WAL LSN as the CDC resume point.
+
+### Configuration
+```yaml
+source:
+  type: postgres
+  config:
+    id: orders-postgres
+    dsn: ${POSTGRES_DSN}
+    slot: deltaforge_orders
+    publication: orders_pub
+    tables:
+      - public.orders
+    snapshot:
+      mode: initial
+      max_parallel_tables: 8
+      chunk_size: 10000
+```
+
+Fields are identical to the MySQL source. Snapshot events are emitted as `Op::Read`;
+the LSN captured at snapshot time is the CDC resume point.
+
 ## Type Handling
 
 DeltaForge preserves PostgreSQL's native type semantics:

@@ -113,8 +113,9 @@ Output: `{"schema":null,"payload":{...}}`
 
 - **Sources**
   - MySQL binlog CDC with GTID support
+  - Initial snapshot/backfill for existing tables — lock-free InnoDB approach, resumes at table granularity after interruption
   - PostgreSQL logical replication via pgoutput
-  - Turso/libSQL CDC (experimental, behind `turso` feature flag)
+  - Initial snapshot/backfill via consistent repeatable-read transaction
 
 - **Schema Registry**
   - Source-owned schema types (source native semantics)
@@ -323,6 +324,11 @@ spec:
       dsn: ${MYSQL_DSN}
       tables:
         - shop.orders
+        - shop.outbox
+      outbox:
+        tables: ["shop.outbox"]
+      snapshot:
+        mode: initial
 
   processors:
     - type: javascript
@@ -394,6 +400,8 @@ spec:
 | `config.id` | Unique identifier for checkpoints |
 | `config.dsn` | Connection string (supports `${ENV_VAR}`) |
 | `config.tables` | Table patterns to capture |
+| `config.outbox` | Tag outbox tables/prefixes with `__outbox` sentinel for the outbox processor |
+| `config.snapshot` | Initial load: `mode` (`never`/`initial`/`always`), `chunk_size`, `max_parallel_tables` |
 | **`spec.processors`** | Optional transforms - see [Processors](docs/src/configuration.md#processors) |
 | `type` | `javascript`, `outbox`, `flatten` |
 | `inline` | JavaScript code for batch processing |
@@ -430,7 +438,7 @@ View actual examples: [Example Configurations](docs/src/examples/README.md)
 - [x] Outbox pattern support
 - [x] Flatten processor
 - [x] Persistent schema registry (SQLite, then PostgreSQL)
-- [ ] Snapshot/backfill (initial load for existing tables)
+- [x] Snapshot/backfill (initial load for existing tables)
 - [ ] Protobuf encoding
 - [ ] PostgreSQL/S3 checkpoint backends for HA
 - [ ] MongoDB source

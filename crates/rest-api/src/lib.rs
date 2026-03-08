@@ -60,8 +60,8 @@ mod tests {
         http::{Method, Request, StatusCode},
     };
     use deltaforge_config::{
-        BatchConfig, Metadata, MysqlSrcCfg, RedisSinkCfg, SinkCfg, SourceCfg,
-        Spec,
+        BatchConfig, Metadata, MysqlSrcCfg, RedisSinkCfg, SinkCfg, SnapshotCfg,
+        SourceCfg, Spec,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -204,6 +204,7 @@ mod tests {
                         dsn: "mysql://root:root@localhost/db".to_string(),
                         tables: vec![],
                         outbox: None,
+                        snapshot: SnapshotCfg::default(),
                     }),
                     processors: vec![],
                     sinks: vec![SinkCfg::Redis(RedisSinkCfg {

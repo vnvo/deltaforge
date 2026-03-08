@@ -385,7 +385,7 @@ a:hover { opacity: 0.8; }
 
 .features-grid {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(3, 1fr);
   gap: 16px;
 }
 
@@ -905,6 +905,11 @@ footer {
         <div class="feature-desc">At-least-once delivery guaranteed. Checkpoints are saved only after sink acknowledgement — never before. Configurable commit policies: all, required, or quorum.</div>
       </div>
       <div class="feature-card">
+        <div class="feature-icon green"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg></div>
+        <div class="feature-name">Initial Load &amp; Snapshot</div>
+        <div class="feature-desc">Consistent snapshot of existing table data before streaming begins. Tables run in parallel with chunked range reads for large datasets. Lock-free InnoDB approach — no RELOAD privilege required. Resumes at table granularity after interruption.</div>
+      </div>
+            <div class="feature-card">
         <div class="feature-icon amber"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></svg></div>
         <div class="feature-name">Dynamic Routing</div>
         <div class="feature-desc">Route events to per-table topics, streams, or subjects using template strings or JavaScript logic. No pipeline restart required when routing rules change.</div>
@@ -1057,7 +1062,7 @@ footer {
     <div class="section-label">Install</div>
     <div class="section-title">Up and running in seconds</div>
     <div class="section-desc" style="margin-bottom: 28px;">
-      Single binary. ~60MB Docker image. No runtime dependencies.
+      Single binary. No runtime dependencies.
     </div>
     <div class="install-grid">
       <div class="install-card">

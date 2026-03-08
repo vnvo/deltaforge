@@ -12,6 +12,9 @@ pub use turso_cfg::{NativeCdcLevel, TursoSrcCfg};
 mod storage;
 pub use storage::*;
 
+mod snapshot_cfg;
+pub use snapshot_cfg::*;
+
 mod sinks_cfg;
 pub use sinks_cfg::*;
 
@@ -121,6 +124,8 @@ pub struct PostgresSrcCfg {
     pub start_position: PostgresStartPosition,
     #[serde(default)]
     pub outbox: Option<PgOutboxCapture>,
+    #[serde(default)]
+    pub snapshot: SnapshotCfg,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -140,6 +145,8 @@ pub struct MysqlSrcCfg {
     pub tables: Vec<String>,
     #[serde(default)]
     pub outbox: Option<MysqlOutboxCapture>,
+    #[serde(default)]
+    pub snapshot: SnapshotCfg,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -11,211 +11,32 @@ use anyhow::Result;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
 use common::AllowList;
 use ctor::dtor;
+use deltaforge_config::SnapshotCfg;
 use deltaforge_core::{BatchContext, Event, Op, Source, SourceHandle};
-use mysql_async::Opts;
-use mysql_async::{Pool as MySQLPool, prelude::Queryable};
+use mysql_async::prelude::Queryable;
 use schema_registry::SourceSchema;
 use sources::SourceSchemaLoader;
 use sources::mysql::{MySqlSchemaLoader, MySqlSource};
 use std::sync::Arc;
 use std::time::Instant;
-use storage::{DurableSchemaRegistry, MemoryStorageBackend};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{
-    ContainerAsync, GenericImage, ImageExt, core::IntoContainerPort,
-    core::WaitFor,
-};
-use tokio::sync::OnceCell;
 use tokio::{
-    io::AsyncBufReadExt,
     sync::mpsc,
     time::{Duration, sleep, timeout},
 };
 use tracing::{debug, info, warn};
 
 mod test_common;
-use test_common::init_test_tracing;
-
-// =============================================================================
-// Shared Test Infrastructure
-// =============================================================================
-
-const MYSQL_PORT: u16 = 3308;
-const ROOT_PASSWORD: &str = "rootpw";
-const CDC_USER: &str = "df";
-const CDC_PASSWORD: &str = "dfpw";
-
-/// Shared container - initialized once, reused by all tests.
-static MYSQL_CONTAINER: OnceCell<ContainerAsync<GenericImage>> =
-    OnceCell::const_new();
+use test_common::{MYSQL_CDC_USER, make_registry, mysql_drop_db, mysql_setup};
 
 #[dtor]
 fn cleanup() {
     // Force container cleanup on process exit
-    if let Some(container) = MYSQL_CONTAINER.get() {
+    if let Some(container) = test_common::MYSQL_CONTAINER.get() {
         std::process::Command::new("docker")
-            .args(["rm", "-f", container.id()])
+            .args(["rm", "-f", container.0.id()])
             .output()
             .ok();
     }
-}
-
-/// Get or start the shared MySQL container.
-async fn get_mysql_container() -> &'static ContainerAsync<GenericImage> {
-    MYSQL_CONTAINER
-        .get_or_init(|| async {
-            info!("starting MySQL container...");
-
-            let image = GenericImage::new("mysql", "8.4")
-                .with_wait_for(WaitFor::message_on_stderr(
-                    "ready for connections",
-                ))
-                .with_env_var("MYSQL_ROOT_PASSWORD", ROOT_PASSWORD)
-                .with_cmd(vec![
-                    "--server-id=999",
-                    "--log-bin=/var/lib/mysql/mysql-bin.log",
-                    "--binlog-format=ROW",
-                    "--binlog-row-image=FULL",
-                    "--gtid-mode=ON",
-                    "--enforce-gtid-consistency=ON",
-                    "--binlog-checksum=NONE",
-                ])
-                .with_mapped_port(MYSQL_PORT, 3306.tcp());
-
-            let container = image.start().await.expect("start mysql container");
-            info!("MySQL container started: {}", container.id());
-
-            // Spawn log follower for debugging
-            let mut stderr = container.stderr(true);
-            tokio::spawn(async move {
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match stderr.read_line(&mut line).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {
-                            if line.contains("ERROR")
-                                || line.contains("Warning")
-                                || line.contains("ready for connections")
-                            {
-                                print!("[mysql] {}", line);
-                            }
-                        }
-                    }
-                }
-            });
-
-            // Wait for MySQL to be fully ready
-            wait_for_mysql(&root_dsn(), Duration::from_secs(60))
-                .await
-                .expect("MySQL should be ready");
-
-            // Create CDC user with replication privileges
-            provision_cdc_user(&root_dsn())
-                .await
-                .expect("provision CDC user");
-
-            container
-        })
-        .await
-}
-
-/// Poll MySQL until it's ready to accept connections.
-async fn wait_for_mysql(dsn: &str, timeout_duration: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout_duration;
-    let opts = Opts::from_url(dsn)?;
-    let pool = MySQLPool::new(opts);
-
-    while Instant::now() < deadline {
-        if let Ok(mut conn) = pool.get_conn().await {
-            if conn.query_drop("SELECT 1").await.is_ok() {
-                let log_bin: Option<(String, String)> = conn
-                    .query_first("SHOW VARIABLES LIKE 'log_bin'")
-                    .await
-                    .ok()
-                    .flatten();
-
-                if let Some((_, value)) = log_bin {
-                    if value.eq_ignore_ascii_case("ON") {
-                        info!("MySQL is ready (binlog enabled)");
-                        return Ok(());
-                    }
-                }
-            }
-        }
-        sleep(Duration::from_millis(500)).await;
-    }
-
-    anyhow::bail!("MySQL not ready after {:?}", timeout_duration)
-}
-
-/// Create CDC user with replication privileges (runs once per container).
-async fn provision_cdc_user(root_dsn: &str) -> Result<()> {
-    let opts = Opts::from_url(root_dsn)?;
-    let pool = MySQLPool::new(opts);
-    let mut conn = pool.get_conn().await?;
-
-    conn.query_drop(format!(
-        "CREATE USER IF NOT EXISTS '{}'@'%' IDENTIFIED BY '{}'",
-        CDC_USER, CDC_PASSWORD
-    ))
-    .await?;
-
-    conn.query_drop(format!(
-        "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '{}'@'%'",
-        CDC_USER
-    ))
-    .await?;
-
-    conn.query_drop("FLUSH PRIVILEGES").await?;
-
-    info!(
-        "CDC user '{}' created with replication privileges",
-        CDC_USER
-    );
-    Ok(())
-}
-
-/// Create a fresh test database with a unique name.
-async fn create_test_database(test_name: &str) -> Result<(String, MySQLPool)> {
-    let db_name = format!("test_{}", test_name.replace('-', "_"));
-    let opts = Opts::from_url(&root_dsn())?;
-    let pool = MySQLPool::new(opts);
-    let mut conn = pool.get_conn().await?;
-
-    conn.query_drop(format!("DROP DATABASE IF EXISTS {}", db_name))
-        .await?;
-    conn.query_drop(format!("CREATE DATABASE {}", db_name))
-        .await?;
-    conn.query_drop(format!(
-        "GRANT SELECT, SHOW VIEW ON {}.* TO '{}'@'%'",
-        db_name, CDC_USER
-    ))
-    .await?;
-
-    debug!("created test database: {}", db_name);
-    Ok((db_name, pool))
-}
-
-/// Drop test database (cleanup).
-async fn drop_test_database(pool: &MySQLPool, db_name: &str) {
-    if let Ok(mut conn) = pool.get_conn().await {
-        let _ = conn
-            .query_drop(format!("DROP DATABASE IF EXISTS {}", db_name))
-            .await;
-        debug!("dropped test database: {}", db_name);
-    }
-}
-
-fn root_dsn() -> String {
-    format!("mysql://root:{}@127.0.0.1:{}/", ROOT_PASSWORD, MYSQL_PORT)
-}
-
-fn cdc_dsn(db: &str) -> String {
-    format!(
-        "mysql://{}:{}@127.0.0.1:{}/{}",
-        CDC_USER, CDC_PASSWORD, MYSQL_PORT, db
-    )
 }
 
 /// Collect events until condition is met or timeout.
@@ -287,21 +108,6 @@ async fn wait_for_source_ready(
 // Test Helpers
 // =============================================================================
 
-/// Standard per-test setup: tracing, shared container, fresh database + DSN.
-/// Returns (db_name, pool, dsn). Caller does get_conn() + USE as needed.
-async fn setup(name: &str) -> Result<(String, MySQLPool, String)> {
-    init_test_tracing();
-    get_mysql_container().await;
-    let (db_name, pool) = create_test_database(name).await?;
-    let dsn = cdc_dsn(&db_name);
-    Ok((db_name, pool, dsn))
-}
-
-async fn make_registry() -> Arc<DurableSchemaRegistry> {
-    let backend = Arc::new(MemoryStorageBackend::new());
-    DurableSchemaRegistry::new(backend).await.expect("registry")
-}
-
 /// Build a MySqlSource with constant defaults (tenant=acme, pipeline=test,
 /// fresh InMemoryRegistry). `id` is also used as the checkpoint key suffix.
 async fn make_source(
@@ -319,6 +125,7 @@ async fn make_source(
         pipeline: "test".to_string(),
         registry: make_registry().await,
         outbox_tables,
+        snapshot_cfg: SnapshotCfg::default(),
     }
 }
 
@@ -344,7 +151,7 @@ async fn start_source(
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_schema_loader() -> Result<()> {
-    let (db_name, pool, dsn) = setup("schema_loader").await?;
+    let (db_name, pool, dsn) = mysql_setup("schema_loader").await?;
     let mut conn = pool.get_conn().await?;
     conn.query_drop(format!("USE {}", db_name)).await?;
     conn.query_drop(
@@ -469,7 +276,7 @@ async fn mysql_schema_loader() -> Result<()> {
         info!("✓ schema caching works");
     }
 
-    drop_test_database(&pool, &db_name).await;
+    mysql_drop_db(&pool, &db_name).await;
     Ok(())
 }
 
@@ -477,7 +284,7 @@ async fn mysql_schema_loader() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_cdc_basic_events() -> Result<()> {
-    let (db_name, pool, dsn) = setup("cdc_basic").await?;
+    let (db_name, pool, dsn) = mysql_setup("cdc_basic").await?;
     let mut conn = pool.get_conn().await?;
     conn.query_drop(format!("USE {}", db_name)).await?;
     conn.query_drop(
@@ -500,6 +307,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
         pipeline: "test".to_string(),
         registry: registry.clone(),
         outbox_tables: AllowList::default(),
+        snapshot_cfg: SnapshotCfg::default(),
     };
     let (mut rx, handle) = start_source(src).await?;
 
@@ -588,7 +396,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
     handle.stop();
     let _ = handle.join().await;
 
-    drop_test_database(&pool, &db_name).await;
+    mysql_drop_db(&pool, &db_name).await;
     Ok(())
 }
 
@@ -596,7 +404,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
-    let (db_name, pool, dsn) = setup("schema_ddl").await?;
+    let (db_name, pool, dsn) = mysql_setup("schema_ddl").await?;
     let mut conn = pool.get_conn().await?;
     conn.query_drop(format!("USE {}", db_name)).await?;
     conn.query_drop(
@@ -617,6 +425,7 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
         pipeline: "test".to_string(),
         registry: registry.clone(),
         outbox_tables: AllowList::default(),
+        snapshot_cfg: SnapshotCfg::default(),
     };
     let (mut rx, handle) = start_source(src).await?;
 
@@ -686,7 +495,7 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
     handle.stop();
     let _ = handle.join().await;
 
-    drop_test_database(&pool, &db_name).await;
+    mysql_drop_db(&pool, &db_name).await;
     Ok(())
 }
 
@@ -694,7 +503,7 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_cdc_checkpoint_resume() -> Result<()> {
-    let (db_name, pool, dsn) = setup("checkpoint").await?;
+    let (db_name, pool, dsn) = mysql_setup("checkpoint").await?;
     let mut conn = pool.get_conn().await?;
     conn.query_drop(format!("USE {}", db_name)).await?;
     conn.query_drop(
@@ -786,7 +595,7 @@ async fn mysql_cdc_checkpoint_resume() -> Result<()> {
         let _ = handle.join().await;
     }
 
-    drop_test_database(&pool, &db_name).await;
+    mysql_drop_db(&pool, &db_name).await;
     Ok(())
 }
 
@@ -794,7 +603,7 @@ async fn mysql_cdc_checkpoint_resume() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_cdc_reconnect_after_disconnect() -> Result<()> {
-    let (db_name, pool, dsn) = setup("reconnect").await?;
+    let (db_name, pool, dsn) = mysql_setup("reconnect").await?;
     let mut conn = pool.get_conn().await?;
     conn.query_drop(format!("USE {}", db_name)).await?;
     conn.query_drop(
@@ -836,7 +645,7 @@ async fn mysql_cdc_reconnect_after_disconnect() -> Result<()> {
     let kill_result: Option<(u64,)> = conn
         .query_first(format!(
             "SELECT id FROM information_schema.processlist WHERE user = '{}' LIMIT 1",
-            CDC_USER
+            MYSQL_CDC_USER
         ))
         .await?;
 
@@ -870,7 +679,7 @@ async fn mysql_cdc_reconnect_after_disconnect() -> Result<()> {
     handle.stop();
     let _ = handle.join().await;
 
-    drop_test_database(&pool, &db_name).await;
+    mysql_drop_db(&pool, &db_name).await;
     Ok(())
 }
 
@@ -878,7 +687,7 @@ async fn mysql_cdc_reconnect_after_disconnect() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_cdc_table_filtering() -> Result<()> {
-    let (db_name, pool, dsn) = setup("filtering").await?;
+    let (db_name, pool, dsn) = mysql_setup("filtering").await?;
     let mut conn = pool.get_conn().await?;
     conn.query_drop(format!("USE {}", db_name)).await?;
     conn.query_drop(
@@ -943,7 +752,7 @@ async fn mysql_cdc_table_filtering() -> Result<()> {
     handle.stop();
     let _ = handle.join().await;
 
-    drop_test_database(&pool, &db_name).await;
+    mysql_drop_db(&pool, &db_name).await;
     Ok(())
 }
 
@@ -959,7 +768,7 @@ async fn mysql_cdc_table_filtering() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_cdc_outbox_capture() -> Result<()> {
-    let (db_name, pool, dsn) = setup("outbox").await?;
+    let (db_name, pool, dsn) = mysql_setup("outbox").await?;
     let mut conn = pool.get_conn().await?;
     conn.query_drop(format!("USE {}", db_name)).await?;
     conn.query_drop(
@@ -1037,7 +846,7 @@ async fn mysql_cdc_outbox_capture() -> Result<()> {
 
     handle.stop();
     let _ = handle.join().await;
-    drop_test_database(&pool, &db_name).await;
+    mysql_drop_db(&pool, &db_name).await;
     Ok(())
 }
 
@@ -1046,7 +855,7 @@ async fn mysql_cdc_outbox_capture() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_cdc_outbox_wildcard_tables() -> Result<()> {
-    let (db_name, pool, dsn) = setup("outbox_wild").await?;
+    let (db_name, pool, dsn) = mysql_setup("outbox_wild").await?;
     let mut conn = pool.get_conn().await?;
     conn.query_drop(format!("USE {}", db_name)).await?;
     conn.query_drop(
@@ -1103,7 +912,7 @@ async fn mysql_cdc_outbox_wildcard_tables() -> Result<()> {
 
     handle.stop();
     let _ = handle.join().await;
-    drop_test_database(&pool, &db_name).await;
+    mysql_drop_db(&pool, &db_name).await;
     Ok(())
 }
 
@@ -1118,7 +927,7 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
     use processors::OutboxProcessor;
     use std::collections::HashMap;
 
-    let (db_name, pool, dsn) = setup("outbox_pipe").await?;
+    let (db_name, pool, dsn) = mysql_setup("outbox_pipe").await?;
     let mut conn = pool.get_conn().await?;
     conn.query_drop(format!("USE {}", db_name)).await?;
     conn.query_drop(
@@ -1273,6 +1082,6 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
 
     handle.stop();
     let _ = handle.join().await;
-    drop_test_database(&pool, &db_name).await;
+    mysql_drop_db(&pool, &db_name).await;
     Ok(())
 }
