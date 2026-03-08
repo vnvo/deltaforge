@@ -166,8 +166,18 @@ Checkpoints are stored using the `id` field as the key.
 
 ## Snapshot (Initial Load)
 
-DeltaForge can perform a consistent initial snapshot using a repeatable-read transaction
-against the publication tables, capturing the current WAL LSN as the CDC resume point.
+DeltaForge performs a consistent initial snapshot using PostgreSQL's exported
+snapshot mechanism before starting logical replication.
+
+### How it works
+
+A coordinator connection exports a snapshot and captures the current WAL LSN
+in a single round trip. Worker connections each import the shared snapshot into
+their own `REPEATABLE READ` transaction - all workers see the same consistent
+DB state with no locks held on the source.
+
+Tables with a single integer primary key use PK-range chunking. All others
+fall back to ctid page-range chunking.
 
 ### Configuration
 ```yaml
@@ -181,13 +191,56 @@ source:
     tables:
       - public.orders
     snapshot:
-      mode: initial
-      max_parallel_tables: 8
-      chunk_size: 10000
+      mode: initial           # initial | always | never (default: never)
+      max_parallel_tables: 8  # tables snapshotted concurrently
+      chunk_size: 10000       # rows per chunk for integer-PK tables
 ```
 
-Fields are identical to the MySQL source. Snapshot events are emitted as `Op::Read`;
-the LSN captured at snapshot time is the CDC resume point.
+| Field | Default | Description |
+|-------|---------|-------------|
+| `mode` | `never` | `initial`: run once if no checkpoint exists; `always`: re-snapshot on every restart; `never`: skip |
+| `max_parallel_tables` | `8` | Tables snapshotted concurrently |
+| `chunk_size` | `10000` | Rows per range chunk (integer PK tables only; others use ctid chunking) |
+
+### Snapshot events
+
+Snapshot rows are emitted as `Op::Read` events (Debezium `op: "r"`),
+distinguishable from live CDC `Op::Create` events. The WAL LSN captured at
+snapshot time becomes the CDC resume point - no rows are missed or duplicated.
+
+### Resume after interruption
+
+If the snapshot is interrupted, DeltaForge resumes at table granularity on
+the next restart - already-completed tables are skipped.
+
+### WAL slot retention safety
+
+DeltaForge validates replication slot health before starting a snapshot and
+monitors it throughout. This prevents the slot from being invalidated during
+a long snapshot, which would make the captured LSN unreachable for CDC resume.
+
+**Preflight checks (before any rows are read):**
+- Fails hard if the slot does not exist or is already invalidated
+- Fails hard if `wal_status=lost`
+- Warns if `wal_status=unreserved` (WAL retention no longer guaranteed)
+- Estimates WAL generated during snapshot (~2× data size) against
+  `max_slot_wal_keep_size`; warns at ≥50%, HIGH RISK at ≥80%
+
+**During snapshot:**
+- Background task polls `pg_replication_slots` every 30s
+- Cancels immediately on slot invalidation or disappearance
+- Warns but continues on `wal_status=unreserved`
+
+**After all tables complete:**
+- Synchronous final check before writing `finished=true`
+- `finished=true` means the position is confirmed valid for CDC resume,
+  not just that rows were emitted
+
+If you see WAL retention risk warnings:
+```sql
+ALTER SYSTEM SET max_slot_wal_keep_size = '10GB';
+SELECT pg_reload_conf();
+```
 
 ## Type Handling
 

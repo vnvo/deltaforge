@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Snapshot health guards** — three-layer defence against binlog/WAL position being purged during a long snapshot ([06b56bb](https://github.com/vnvo/deltaforge/commit/06b56bbf8e030634a94f2f3fb334ab322f4f9f4b), [90f8937](https://github.com/vnvo/deltaforge/commit/90f893708b5181e1bc18d5dd7df746016ffc3d74), [f02ba53](https://github.com/vnvo/deltaforge/commit/f02ba537338cb222459393a361b0ce26624a2135))
+  - **Preflight** (`mysql_health::run_preflight`, `postgres_health::run_preflight`): runs before any workers spawn; hard errors on missing binlog/slot or `wal_status=lost`; estimates snapshot duration from table sizes vs retention config; warns at ≥50% usage, HIGH RISK at ≥80%
+  - **Background guard** (`spawn_binlog_position_guard`, `spawn_wal_slot_guard`): polls every 30s during snapshot via a child `CancellationToken`; cancels immediately on confirmed purge or slot invalidation; transient errors (connect failures, empty results) are retried and never abort; guard is scoped to the snapshot and stopped on all exit paths
+  - **Final synchronous check** (`verify_binlog_position`, `verify_slot_still_healthy`): called after all workers complete, before writing `finished=true`; closes the 30s polling race window
+  - `finished=true` now means "position confirmed valid for CDC resume", not just "rows emitted"
+  - PostgreSQL preflight also validates slot existence, `invalidation_reason`, `wal_status`, and publication (when provided)
+  - MySQL preflight validates `log_bin=ON` and `binlog_format=ROW` as hard blockers
+  - E2E test suites updated: `postgres_snapshot_e2e.rs` gains idempotency test (`snapshot_already_finished_returns_saved_lsn`); `mysql_snapshot_e2e.rs` resume test simplified to direct progress seeding
+  - Documentation updated: `docs/src/sources/mysql.md`, `docs/src/sources/postgres.md`, `README.md`
 
 - **Snapshot/backfill** — Initial load of existing table data before binlog/WAL streaming begins ([429918b](https://github.com/vnvo/deltaforge/commit/429918be840dda2bc04edfd5d2ad3cbf3f77d347), [aeadb9f](https://github.com/vnvo/deltaforge/commit/aeadb9fa743689c4399bab086af2e684d1fe0723))
   - `SnapshotCfg` added to both MySQL and PostgreSQL source configs: `mode` (`never` / `initial` / `always`), `max_parallel_tables` (default 8), `chunk_size` (default 10,000), `intra_table_parallel`, `max_parallel_chunks`
