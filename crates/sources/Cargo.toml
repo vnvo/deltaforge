@@ -9,6 +9,7 @@ default = []
 turso = ["dep:libsql"]
 
 [dependencies]
+scopeguard = "1"
 metrics.workspace = true
 async-trait.workspace = true
 tokio.workspace = true

@@ -1,22 +1,22 @@
 //! MySQL consistent snapshot engine.
 //!
-//! Low-impact initial load using InnoDB's consistent read mechanism:
+//! Lock-free initial load using InnoDB's consistent read mechanism:
 //!
-//! 1. Open a coordinator connection. Issue `FLUSH TABLES WITH READ LOCK` to
-//!    freeze writes just long enough to capture the current binlog position
-//!    and open all table worker connections with
-//!    `START TRANSACTION WITH CONSISTENT SNAPSHOT`.
-//! 2. Release the lock immediately — writes resume. Workers continue reading
-//!    their consistent snapshots in parallel; all see the same DB state.
+//! 1. Open all table worker connections and start each with
+//!    `START TRANSACTION WITH CONSISTENT SNAPSHOT`. All workers see the
+//!    same consistent DB state without any global lock.
+//! 2. Capture the current binlog position *after* all workers have started -
+//!    InnoDB guarantees every visible row was committed at or before this
+//!    position, so CDC streaming from here has no gaps.
 //! 3. Tables with a single integer PK use PK-range chunking. All others fall
-//!    back to a streaming full scan.
+//!    back to a full scan.
 //! 4. Completed tables are recorded in the checkpoint store so a crash resumes
 //!    at the table level rather than restarting from scratch.
-//! 5. Returns a `MySqlCheckpoint` captured at the lock point — pass this to
+//! 5. Returns a `MySqlCheckpoint` captured in step 2 - pass this to
 //!    `prepare_client` as the replication start position so streaming picks up
 //!    exactly where the snapshot left off.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -24,12 +24,17 @@ use checkpoints::CheckpointStore;
 use deltaforge_config::SnapshotCfg;
 use deltaforge_core::{Event, Op, SourceInfo, SourcePosition};
 use mysql_async::{Pool, Row, Value, prelude::Queryable};
+use scopeguard;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
+use super::mysql_health as health;
 use super::{MySqlCheckpoint, MySqlSchemaLoader};
+
+const POSITION_GUARD_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 // ============================================================================
 // Snapshot progress (persisted for crash resume)
@@ -81,18 +86,79 @@ pub struct SnapshotCtx<'a> {
     pub cancel: CancellationToken,
 }
 
+/// Spawns a background task that polls SHOW BINARY LOGS every POSITION_GUARD_INTERVAL seconds.
+/// On confirmed purge: sets abort_reason and fires the CancellationToken.
+/// Transient errors (connect failures, empty results) are retried - never abort.
+fn spawn_binlog_position_guard(
+    dsn: String,
+    captured_file: String,
+    cancel: CancellationToken,
+    abort_reason: Arc<Mutex<Option<String>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(POSITION_GUARD_INTERVAL);
+        interval.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = interval.tick() => {}
+            }
+
+            let mut conn = match Pool::new(dsn.as_str()).get_conn().await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(error = %e, "binlog guard: connect error, retrying");
+                    continue;
+                }
+            };
+
+            let rows: Vec<Row> = match conn.query("SHOW BINARY LOGS").await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(error = %e, "binlog guard: SHOW BINARY LOGS failed, retrying");
+                    continue;
+                }
+            };
+
+            let available: Vec<String> = rows
+                .into_iter()
+                .filter_map(|mut r: Row| r.take::<String, usize>(0))
+                .collect();
+
+            if !health::binlog_file_still_present(&available, &captured_file) {
+                let msg = format!(
+                    "binlog file '{}' purged during snapshot \
+                     (available: [{}]). \
+                     Increase binlog_expire_logs_seconds or reduce \
+                     max_parallel_tables and restart.",
+                    captured_file,
+                    available.join(", ")
+                );
+                warn!("{}", msg);
+                *abort_reason.lock().unwrap() = Some(msg);
+                cancel.cancel();
+                return;
+            }
+
+            debug!(file = %captured_file, "binlog guard: ok");
+        }
+    })
+}
+
 /// Run a consistent snapshot of `tables`.
 ///
-/// Returns a `MySqlCheckpoint` captured at the `FLUSH TABLES WITH READ LOCK`
-/// point. The caller must persist this as the binlog checkpoint so streaming
-/// resumes with no gaps.
+/// Returns a `MySqlCheckpoint` captured after all worker transactions open -
+/// InnoDB guarantees every visible row was committed at or before this position.
+/// The caller must persist this as the binlog checkpoint so streaming resumes
+/// with no gaps.
 pub async fn run_snapshot(
     ctx: &SnapshotCtx<'_>,
-    tables: &[(String, String)], // (db, table)
+    tables: &[(String, String)],
 ) -> Result<MySqlCheckpoint> {
     let t0 = Instant::now();
 
-    // load previous progress for crash resume.
+    // load previous progress for crash resume
     let mut progress: MysqlSnapshotProgress = ctx
         .chkpt_store
         .get_raw(&progress_key(ctx.source_id))
@@ -111,7 +177,14 @@ pub async fn run_snapshot(
             .context("parse saved snapshot position");
     }
 
-    // step 1: lock, capture position, start worker transactions
+    // preflight validation and risk estimation/guessing
+    let preflight =
+        health::run_preflight(ctx.dsn, tables, ctx.cfg.max_parallel_tables)
+            .await
+            .context("snapshot preflight")?;
+    preflight.emit_and_check(ctx.source_id, tables.len())?;
+
+    // step 1: start worker transactions
     let mut worker_conns: Vec<mysql_async::Conn> =
         Vec::with_capacity(tables.len());
     for _ in 0..tables.len() {
@@ -125,9 +198,6 @@ pub async fn run_snapshot(
         worker_conns.push(conn);
     }
 
-    // Capture position AFTER all workers have started their consistent snapshots.
-    // InnoDB guarantees every row visible to a worker was committed at a binlog
-    // position ≤ this captured position, so CDC streaming from here has no gaps.
     let mut pos_conn = Pool::new(ctx.dsn)
         .get_conn()
         .await
@@ -135,21 +205,30 @@ pub async fn run_snapshot(
     let position = capture_binlog_position(&mut pos_conn).await?;
     drop(pos_conn);
 
-    // persist position immediately for crash safety.
     progress.start_position = serde_json::to_string(&position)
         .context("serialize binlog position")?;
     save_progress(&ctx.chkpt_store, ctx.source_id, &progress).await;
+
+    // spawn background position guard
+    let abort_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let guard_cancel = ctx.cancel.child_token();
+    let _guard_stop = scopeguard::guard((), |_| guard_cancel.cancel());
+    let _position_guard = spawn_binlog_position_guard(
+        ctx.dsn.to_string(),
+        position.file.clone(),
+        guard_cancel.clone(),
+        abort_reason.clone(),
+    );
 
     info!(
         source_id = %ctx.source_id,
         file = %position.file,
         pos = position.pos,
-        gtid = ?position.gtid_set,
         tables = tables.len(),
         "mysql snapshot started"
     );
 
-    // step 2: fan out parallel table workers
+    // step 2: fan out parallel table workers (unchanged)
     let max_parallel = ctx.cfg.max_parallel_tables.min(tables.len()).max(1);
     let semaphore = Arc::new(Semaphore::new(max_parallel));
     let mut handles = Vec::new();
@@ -163,7 +242,6 @@ pub async fn run_snapshot(
         }
 
         let permit = semaphore.clone().acquire_owned().await?;
-
         let worker = TableWorker {
             db: db.clone(),
             table: table.clone(),
@@ -176,13 +254,11 @@ pub async fn run_snapshot(
             schema_loader: ctx.schema_loader.clone(),
             cancel: ctx.cancel.clone(),
         };
-
         let handle = tokio::spawn(async move {
             let result = worker.run().await;
             drop(permit);
             result
         });
-
         handles.push((fqn(db, table), handle));
     }
 
@@ -211,21 +287,38 @@ pub async fn run_snapshot(
         }
     }
 
-    if !failed.is_empty() {
-        anyhow::bail!("mysql snapshot failed for: {}", failed.join(", "));
+    // guard error takes priority over generic worker failures
+    if let Some(reason) = abort_reason.lock().unwrap().take() {
+        anyhow::bail!("snapshot aborted: {}", reason);
     }
 
+    if !failed.is_empty() {
+        anyhow::bail!(
+            "mysql snapshot failed for tables: {}",
+            failed.join(", ")
+        );
+    }
+
+    // final synchronous position check before marking complete
+    // this closes the 30s polling race window.
+    health::verify_binlog_position(ctx.dsn, &position.file)
+        .await
+        .context("post-snapshot binlog position verification")?;
+
+    // only write finished=true after the position is confirmed still valid.
+    // "finished" means "safe to hand off to CDC", not just "rows emitted".
     progress.finished = true;
     save_progress(&ctx.chkpt_store, ctx.source_id, &progress).await;
 
     info!(
-        source_id= %ctx.source_id,
+        source_id = %ctx.source_id,
         elapsed_secs = t0.elapsed().as_secs(),
         file = %position.file,
         pos = position.pos,
         "mysql snapshot finished"
     );
 
+    guard_cancel.cancel();
     Ok(position)
 }
 

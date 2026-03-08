@@ -97,6 +97,7 @@ async fn snapshot_captures_all_rows_integer_pk() -> Result<()> {
         chkpt_store: chkpt.clone(),
         tx: tx.clone(),
         cancel: CancellationToken::new(),
+        slot_name: None,
     };
 
     run_snapshot(&snapshot_ctx, &[("public".into(), "orders".into())]).await?;
@@ -160,6 +161,7 @@ async fn snapshot_parallel_tables() -> Result<()> {
         chkpt_store: chkpt.clone(),
         tx: tx.clone(),
         cancel: CancellationToken::new(),
+        slot_name: None,
     };
 
     run_snapshot(
@@ -241,6 +243,7 @@ async fn snapshot_resumes_after_partial_completion() -> Result<()> {
         chkpt_store: chkpt.clone(),
         tx: tx.clone(),
         cancel: CancellationToken::new(),
+        slot_name: None,
     };
 
     run_snapshot(
@@ -294,6 +297,7 @@ async fn snapshot_ctid_fallback_for_uuid_pk() -> Result<()> {
         chkpt_store: chkpt.clone(),
         tx: tx.clone(),
         cancel: CancellationToken::new(),
+        slot_name: None,
     };
 
     run_snapshot(&snapshot_ctx, &[("public".into(), "events".into())]).await?;
@@ -333,6 +337,7 @@ async fn snapshot_persists_lsn_and_marks_finished() -> Result<()> {
         chkpt_store: chkpt.clone(),
         tx: tx.clone(),
         cancel: CancellationToken::new(),
+        slot_name: None,
     };
 
     let returned_lsn =

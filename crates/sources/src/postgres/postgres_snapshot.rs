@@ -13,9 +13,10 @@
 //! 5. When all tables finish the coordinator commits, releasing the exported snapshot,
 //!    and the captured WAL LSN is returned to the caller as the replication start point.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use scopeguard;
 use anyhow::{Context, Result};
 use checkpoints::CheckpointStore;
 use common::redact_url_password;
@@ -28,6 +29,7 @@ use tokio_postgres::NoTls;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use super::postgres_health as health;
 use super::postgres_schema_loader::PostgresSchemaLoader;
 
 // ============================================================================
@@ -79,6 +81,7 @@ pub struct PgSnapshotCtx<'a> {
     pub chkpt_store: Arc<dyn CheckpointStore>,
     pub tx: mpsc::Sender<Event>,
     pub cancel: CancellationToken,
+    pub slot_name: Option<&'a str>,
 }
 
 /// Run a consistent snapshot of `tables`.
@@ -92,7 +95,7 @@ pub async fn run_snapshot(
 ) -> Result<Lsn> {
     let t0 = Instant::now();
 
-    // Load any previous progress so we can skip already-completed tables.
+    // load any previous progress so we can skip already-completed tables.
     let mut progress: SnapshotProgress = ctx
         .chkpt_store
         .get_raw(&progress_key(ctx.source_id))
@@ -110,6 +113,21 @@ pub async fn run_snapshot(
         return Lsn::parse(&progress.start_lsn)
             .context("parse saved snapshot LSN");
     }
+
+    // preflight
+    let preflight = health::run_preflight(
+        ctx.dsn,
+        ctx.slot_name,
+        // publication name not on ctx — pass empty string; publication check
+        // is already done in ensure_slot_and_publication before we get here.
+        // Pass slot_name here only for slot health checks.
+        "",
+        tables,
+        ctx.cfg.max_parallel_tables,
+    )
+    .await
+    .context("postgres snapshot preflight")?;
+    preflight.emit_and_check(ctx.source_id, tables.len())?;
 
     // step 1: coordinator connection - export snapshot + capture LSN
     let (coord, coord_conn) = tokio_postgres::connect(ctx.dsn, NoTls)
@@ -139,10 +157,22 @@ pub async fn run_snapshot(
     let lsn_str: String = row.get(1);
     let start_lsn = Lsn::parse(&lsn_str).context("parse snapshot LSN")?;
 
-    // Save start_lsn immediately — if we crash before finishing, we know
+    // Save start_lsn immediately - if we crash before finishing, we know
     // where to resume streaming from.
     progress.start_lsn = lsn_str.clone();
     save_progress(&ctx.chkpt_store, ctx.source_id, &progress).await;
+
+    let abort_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let guard_cancel = ctx.cancel.child_token();
+    let _guard_stop = scopeguard::guard((), |_| guard_cancel.cancel());
+    let _slot_guard = ctx.slot_name.map(|slot| {
+        health::spawn_wal_slot_guard(
+            ctx.dsn.to_string(),
+            slot.to_string(),
+            guard_cancel.clone(),
+            abort_reason.clone(),
+        )
+    });
 
     info!(
         source_id = %ctx.source_id,
@@ -214,14 +244,26 @@ pub async fn run_snapshot(
         }
     }
 
-    // Release the exported snapshot.
-    let _ = coord.batch_execute("COMMIT").await;
+    // guard check takes priority
+    if let Some(reason) = abort_reason.lock().unwrap().take() {
+        anyhow::bail!("snapshot aborted: {}", reason);
+    }
 
     if !failed.is_empty() {
         anyhow::bail!("snapshot failed for: {}", failed.join(", "));
     }
 
-    // Mark fully done.
+    // final slot health check before marking complete
+    if let Some(slot) = ctx.slot_name {
+        health::verify_slot_still_healthy(ctx.dsn, slot)
+            .await
+            .context("post-snapshot slot verification")?;
+    }
+
+    // release the exported snapshot.
+    coord.batch_execute("COMMIT").await.ok();
+
+    // mark fully done.
     progress.finished = true;
     save_progress(&ctx.chkpt_store, ctx.source_id, &progress).await;
 
@@ -232,6 +274,7 @@ pub async fn run_snapshot(
         "snapshot finished — streaming will start from this LSN"
     );
 
+    guard_cancel.cancel();
     Ok(start_lsn)
 }
 
