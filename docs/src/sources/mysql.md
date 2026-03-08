@@ -82,11 +82,64 @@ source:
 
 DeltaForge automatically checkpoints progress and resumes from the last position on restart. The resume strategy follows this priority:
 
-1. **GTID** - Preferred if the MySQL server has GTID enabled. Provides the most reliable resume across binlog rotations and failovers.
-2. **File:position** - Used when GTID is not available. Resumes from the exact binlog file and byte offset.
-3. **Binlog tail** - On first run with no checkpoint, starts from the current end of the binlog (no historical replay).
+1. **GTID**: Preferred if the MySQL server has GTID enabled. Provides the most reliable resume across binlog rotations and failovers.
+2. **File:position**: Used when GTID is not available. Resumes from the exact binlog file and byte offset.
+3. **Binlog tail**: On first run with no checkpoint, starts from the current end of the binlog (no historical replay).
 
 Checkpoints are stored using the `id` field as the key.
+
+## Snapshot (Initial Load)
+
+DeltaForge can perform a consistent initial snapshot of existing table data before
+starting binlog streaming. This is the recommended approach for migrating existing
+tables without manual backfills.
+
+### How it works
+
+DeltaForge opens all worker connections simultaneously, each with
+`START TRANSACTION WITH CONSISTENT SNAPSHOT`. The binlog position is captured
+*after* all workers have started - InnoDB guarantees every visible row was committed
+at or before that position, so CDC streaming from there has no gaps.
+
+No `FLUSH TABLES WITH READ LOCK` or `RELOAD` privilege is required.
+
+### Additional privileges
+```sql
+-- Required for snapshot (SELECT is already needed for introspection)
+GRANT SELECT ON your_database.* TO 'deltaforge'@'%';
+```
+
+### Configuration
+```yaml
+source:
+  type: mysql
+  config:
+    id: orders-mysql
+    dsn: ${MYSQL_DSN}
+    tables:
+      - shop.orders
+    snapshot:
+      mode: initial           # initial | always | never (default: never)
+      max_parallel_tables: 8  # tables snapshotted concurrently
+      chunk_size: 10000       # rows per chunk for integer-PK tables
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `mode` | `never` | `initial`: run once if no checkpoint exists; `always`: re-snapshot on every restart; `never`: skip |
+| `max_parallel_tables` | `8` | Tables snapshotted concurrently |
+| `chunk_size` | `10000` | Rows per range chunk (integer single-column PK tables only; others do a full scan) |
+
+### Snapshot events
+
+Snapshot rows are emitted as `Op::Read` events (Debezium `op: "r"`), distinguishable
+from live CDC `Op::Create` events. The binlog position captured at snapshot time becomes
+the CDC resume point, so no rows are missed or duplicated.
+
+### Resume after interruption
+
+If the snapshot is interrupted, DeltaForge resumes at table granularity on the next
+restart - already-completed tables are skipped.
 
 ## Server ID Handling
 
