@@ -88,6 +88,7 @@ Pipelines are defined declaratively in YAML, making it straightforward to onboar
 - 📀 **Transaction boundaries** : Optionally keep source transactions intact across batches.
 - ⚙️ **Commit policies** : Control checkpoint behavior with `all`, `required`, or `quorum` modes across multiple sinks.
 - 🔧 **Live pipeline management** : Pause, resume, patch, and inspect running pipelines via the REST API.
+- 🗄️ **Safe initial snapshot** : Consistent parallel backfill of existing tables before streaming begins, with binlog/WAL retention validation, background guards, and crash-resume at table granularity.
 
 ## Use Cases
 

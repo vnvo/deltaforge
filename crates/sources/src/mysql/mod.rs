@@ -42,7 +42,7 @@ pub use mysql_table_schema::{MySqlColumn, MySqlTableSchema};
 pub mod mysql_snapshot;
 pub use mysql_snapshot::{MysqlSnapshotProgress, progress_key};
 
-//pub type MySqlSourceResult<T> = Result<T, MySqlSourceError>;
+pub mod mysql_health;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MySqlCheckpoint {

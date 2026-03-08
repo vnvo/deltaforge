@@ -113,10 +113,9 @@ Output: `{"schema":null,"payload":{...}}`
 
 - **Sources**
   - MySQL binlog CDC with GTID support
-  - Initial snapshot/backfill for existing tables — lock-free InnoDB approach, resumes at table granularity after interruption
   - PostgreSQL logical replication via pgoutput
-  - Initial snapshot/backfill via consistent repeatable-read transaction
-
+  - Initial snapshot/backfill for existing tables (MySQL and PostgreSQL)
+    - resumes at table granularity after interruption, with binlog/WAL retention validation and background guards
 - **Schema Registry**
   - Source-owned schema types (source native semantics)
   - Schema change detection and versioning

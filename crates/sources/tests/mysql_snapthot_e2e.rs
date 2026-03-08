@@ -259,48 +259,28 @@ async fn mysql_snapshot_resumes_after_partial_completion() -> Result<()> {
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
 
-    // Simulate a previous run that completed table_a but not table_b.
-    // We need a real binlog position - run a quick snapshot to grab one then
-    // artificially mark only table_a as done.
-    {
-        let src = make_source(
-            "snap-resume",
-            &db,
-            vec![format!("{db}.table_a"), format!("{db}.table_b")],
-            SnapshotCfg {
-                mode: SnapshotMode::Initial,
-                ..Default::default()
-            },
-        )
-        .await;
-        let (tx, mut rx) = mpsc::channel(256);
-        let handle = src.run(tx, ckpt.clone()).await;
-        // Drain enough to let the snapshot run and finish.
-        collect_until(&mut rx, Duration::from_secs(30), |e| {
-            e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 6
-        })
-        .await;
-        handle.stop();
-        handle.join().await.ok();
-    }
+    // Seed progress directly - table_a done, table_b pending.
+    let mut pos_conn = pool.get_conn().await?;
+    let row: mysql_async::Row = pos_conn
+        .query_first("SHOW BINARY LOG STATUS")
+        .await?
+        .unwrap();
+    let file: String = row.get(0).unwrap();
+    let pos: u32 = row.get(1).unwrap();
 
-    // Reset progress: mark table_b incomplete to force a re-run.
-    let progress_raw = ckpt
-        .get_raw(&progress_key("snap-resume"))
-        .await
-        .ok()
-        .flatten();
-    if let Some(bytes) = progress_raw {
-        let mut progress: MysqlSnapshotProgress =
-            serde_json::from_slice(&bytes)?;
-        progress.done_tables.retain(|t| t.contains("table_a"));
-        progress.finished = false;
-        ckpt.put_raw(
-            &progress_key("snap-resume"),
-            &serde_json::to_vec(&progress)?,
-        )
+    let fake = MysqlSnapshotProgress {
+        start_position: serde_json::to_string(
+            &sources::mysql::MySqlCheckpoint {
+                file,
+                pos: pos as u64,
+                gtid_set: None,
+            },
+        )?,
+        done_tables: vec![format!("{db}.table_a")],
+        finished: false,
+    };
+    ckpt.put_raw(&progress_key("snap-resume"), &serde_json::to_vec(&fake)?)
         .await?;
-    }
 
     // Second run — should only snapshot table_b.
     let src = make_source(

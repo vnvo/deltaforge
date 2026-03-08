@@ -141,6 +141,31 @@ the CDC resume point, so no rows are missed or duplicated.
 If the snapshot is interrupted, DeltaForge resumes at table granularity on the next
 restart - already-completed tables are skipped.
 
+### Binlog retention safety
+
+DeltaForge validates binlog retention before starting a snapshot and monitors
+it throughout. This prevents the silent failure mode where a long snapshot
+completes successfully but CDC startup then fails because the captured binlog
+position was purged.
+
+**Preflight checks (before any rows are read):**
+- Fails hard if `log_bin=0` or `binlog_format != ROW`
+- Estimates snapshot duration from table sizes and `max_parallel_tables`
+- Warns at ≥50% of `binlog_expire_logs_seconds` usage; HIGH RISK at ≥80%
+
+**During snapshot:**
+- Background task polls `SHOW BINARY LOGS` every 30s
+- Cancels the snapshot immediately if the captured file is purged
+
+**After all tables complete:**
+- Synchronous final check before writing `finished=true`
+- `finished=true` means the position is confirmed valid for CDC resume,
+  not just that rows were emitted
+
+If you see retention risk warnings, the recommended actions are:
+1. Increase `binlog_expire_logs_seconds` to cover the estimated snapshot duration
+2. Use a read replica as the snapshot source to avoid load on the primary
+
 ## Server ID Handling
 
 MySQL replication requires each replica to have a unique `server_id`. DeltaForge derives this automatically from the source `id` using a CRC32 hash:

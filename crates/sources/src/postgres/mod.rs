@@ -46,6 +46,8 @@ mod postgres_logical_message;
 pub mod postgres_snapshot;
 pub use postgres_snapshot::SnapshotProgress;
 
+pub mod postgres_health;
+
 // ============================================================================
 // Checkpoint
 // ============================================================================
@@ -225,6 +227,7 @@ impl PostgresSource {
                 chkpt_store: chkpt_store.clone(),
                 tx: tx.clone(),
                 cancel: cancel.clone(),
+                slot_name: Some(&self.slot),
             };
             postgres_snapshot::run_snapshot(&snapshot_ctx, &tracked)
                 .await

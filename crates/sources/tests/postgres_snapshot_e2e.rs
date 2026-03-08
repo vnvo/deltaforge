@@ -65,7 +65,7 @@ fn initial_cfg() -> SnapshotCfg {
 /// Basic integer PK table — all rows arrive as Op::Read with correct payloads.
 #[tokio::test]
 #[ignore = "requires docker"]
-async fn snapshot_captures_all_rows_integer_pk() -> Result<()> {
+async fn pg_snapshot_captures_all_rows_integer_pk() -> Result<()> {
     let (db, client) = pg_setup("snap_basic").await?;
 
     client
@@ -97,6 +97,7 @@ async fn snapshot_captures_all_rows_integer_pk() -> Result<()> {
         chkpt_store: chkpt.clone(),
         tx: tx.clone(),
         cancel: CancellationToken::new(),
+        slot_name: None,
     };
 
     run_snapshot(&snapshot_ctx, &[("public".into(), "orders".into())]).await?;
@@ -118,7 +119,7 @@ async fn snapshot_captures_all_rows_integer_pk() -> Result<()> {
 /// Multiple tables snapshotted concurrently — all rows from all tables received.
 #[tokio::test]
 #[ignore = "requires docker"]
-async fn snapshot_parallel_tables() -> Result<()> {
+async fn pg_snapshot_parallel_tables() -> Result<()> {
     let (db, client) = pg_setup("snap_parallel").await?;
 
     for table in ["users", "products", "orders"] {
@@ -160,6 +161,7 @@ async fn snapshot_parallel_tables() -> Result<()> {
         chkpt_store: chkpt.clone(),
         tx: tx.clone(),
         cancel: CancellationToken::new(),
+        slot_name: None,
     };
 
     run_snapshot(
@@ -182,7 +184,7 @@ async fn snapshot_parallel_tables() -> Result<()> {
 /// Crash resume: pre-seed progress with t1 done, verify only t2 rows arrive.
 #[tokio::test]
 #[ignore = "requires docker"]
-async fn snapshot_resumes_after_partial_completion() -> Result<()> {
+async fn pg_snapshot_resumes_after_partial_completion() -> Result<()> {
     let (db, client) = pg_setup("snap_resume").await?;
 
     for table in ["t1", "t2"] {
@@ -231,8 +233,9 @@ async fn snapshot_resumes_after_partial_completion() -> Result<()> {
         .await?;
 
     let (tx, mut rx) = mpsc::channel(256);
+    let dsn = pg_admin_dsn(&db).await;
     let snapshot_ctx = postgres_snapshot::PgSnapshotCtx {
-        dsn: &pg_admin_dsn(&db).await,
+        dsn: &dsn,
         source_id: "snap-resume",
         pipeline: "test",
         tenant: "acme",
@@ -241,6 +244,7 @@ async fn snapshot_resumes_after_partial_completion() -> Result<()> {
         chkpt_store: chkpt.clone(),
         tx: tx.clone(),
         cancel: CancellationToken::new(),
+        slot_name: None,
     };
 
     run_snapshot(
@@ -263,7 +267,7 @@ async fn snapshot_resumes_after_partial_completion() -> Result<()> {
 /// ctid fallback: UUID PK - all rows still captured.
 #[tokio::test]
 #[ignore = "requires docker"]
-async fn snapshot_ctid_fallback_for_uuid_pk() -> Result<()> {
+async fn pg_snapshot_ctid_fallback_for_uuid_pk() -> Result<()> {
     let (db, client) = pg_setup("snap_ctid").await?;
 
     client
@@ -284,8 +288,9 @@ async fn snapshot_ctid_fallback_for_uuid_pk() -> Result<()> {
     let (tx, mut rx) = mpsc::channel(512);
     let schema_loader = pg_make_schema_loader(&pg_admin_dsn(&db).await).await?;
     let chkpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let dsn = pg_admin_dsn(&db).await;
     let snapshot_ctx = postgres_snapshot::PgSnapshotCtx {
-        dsn: &pg_admin_dsn(&db).await,
+        dsn: &dsn,
         source_id: "snap-ctid",
         pipeline: "test",
         tenant: "acme",
@@ -294,6 +299,7 @@ async fn snapshot_ctid_fallback_for_uuid_pk() -> Result<()> {
         chkpt_store: chkpt.clone(),
         tx: tx.clone(),
         cancel: CancellationToken::new(),
+        slot_name: None,
     };
 
     run_snapshot(&snapshot_ctx, &[("public".into(), "events".into())]).await?;
@@ -308,7 +314,7 @@ async fn snapshot_ctid_fallback_for_uuid_pk() -> Result<()> {
 /// LSN is captured before rows are read; progress is persisted with finished=true.
 #[tokio::test]
 #[ignore = "requires docker"]
-async fn snapshot_persists_lsn_and_marks_finished() -> Result<()> {
+async fn pg_snapshot_persists_lsn_and_marks_finished() -> Result<()> {
     let (db, client) = pg_setup("snap_lsn").await?;
 
     client
@@ -333,6 +339,7 @@ async fn snapshot_persists_lsn_and_marks_finished() -> Result<()> {
         chkpt_store: chkpt.clone(),
         tx: tx.clone(),
         cancel: CancellationToken::new(),
+        slot_name: None,
     };
 
     let returned_lsn =
@@ -347,6 +354,53 @@ async fn snapshot_persists_lsn_and_marks_finished() -> Result<()> {
 
     let events = collect_reads(&mut rx, Duration::from_secs(5)).await;
     assert_eq!(events.len(), 50);
+
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_snapshot_already_finished_returns_saved_lsn() -> Result<()> {
+    let (db, client) = pg_setup("snap_idempotent").await?;
+    client
+        .execute("CREATE TABLE t (id BIGSERIAL PRIMARY KEY)", &[])
+        .await?;
+    for _i in 1..=10i64 {
+        client.execute("INSERT INTO t DEFAULT VALUES", &[]).await?;
+    }
+
+    let chkpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let schema_loader = pg_make_schema_loader(&pg_admin_dsn(&db).await).await?;
+    let dsn = pg_admin_dsn(&db).await;
+    let cfg = initial_cfg();
+    let make_ctx = |tx: mpsc::Sender<Event>| postgres_snapshot::PgSnapshotCtx {
+        dsn: &dsn,
+        source_id: "snap-idempotent",
+        pipeline: "test",
+        tenant: "acme",
+        cfg: &cfg,
+        schema_loader: &schema_loader,
+        chkpt_store: chkpt.clone(),
+        tx,
+        cancel: CancellationToken::new(),
+        slot_name: None,
+    };
+
+    let (tx1, mut rx1) = mpsc::channel(64);
+    let lsn1 =
+        run_snapshot(&make_ctx(tx1), &[("public".into(), "t".into())]).await?;
+    let events1 = collect_reads(&mut rx1, Duration::from_secs(5)).await;
+    assert_eq!(events1.len(), 10);
+
+    // Second call — must return the same LSN, emit zero rows.
+    let (tx2, mut rx2) = mpsc::channel(64);
+    let lsn2 =
+        run_snapshot(&make_ctx(tx2), &[("public".into(), "t".into())]).await?;
+    let events2 = collect_reads(&mut rx2, Duration::from_secs(2)).await;
+
+    assert_eq!(lsn1, lsn2, "second run must return the same saved LSN");
+    assert!(events2.is_empty(), "second run must emit no rows");
 
     pg_drop_db(&db).await;
     Ok(())
