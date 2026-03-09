@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use deltaforge_config::SnapshotMode;
 use pgwire_replication::{Lsn, ReplicationClient};
 use serde::{Deserialize, Serialize};
-use storage::DurableSchemaRegistry;
+use storage::{ArcStorageBackend, DurableSchemaRegistry};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -48,11 +48,18 @@ pub use postgres_snapshot::SnapshotProgress;
 
 pub mod postgres_health;
 
+use crate::failover::identity::{
+    IdentityComparison, IdentityStore, ServerIdentity,
+};
+use crate::failover::reconciler::{ReconcileInput, SchemaReconciler};
+use crate::postgres::postgres_health::{
+    PositionReachability, check_position_reachability, fetch_server_identity,
+};
+
 // ============================================================================
 // Checkpoint
 // ============================================================================
 
-/// PostgreSQL checkpoint structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostgresCheckpoint {
     pub lsn: String,
@@ -63,7 +70,6 @@ pub struct PostgresCheckpoint {
 // Source Configuration
 // ============================================================================
 
-/// PostgreSQL CDC source.
 #[derive(Debug, Clone)]
 pub struct PostgresSource {
     pub id: String,
@@ -75,6 +81,7 @@ pub struct PostgresSource {
     pub tenant: String,
     pub pipeline: String,
     pub registry: Arc<DurableSchemaRegistry>,
+    pub backend: ArcStorageBackend,
     pub outbox_prefixes: AllowList,
     pub snapshot_cfg: deltaforge_config::SnapshotCfg,
 }
@@ -83,7 +90,6 @@ pub struct PostgresSource {
 // Runtime Context
 // ============================================================================
 
-/// Shared state for the PostgreSQL source run loop.
 pub(crate) struct RunCtx {
     pub source_id: String,
     pub pipeline: String,
@@ -91,6 +97,8 @@ pub(crate) struct RunCtx {
     #[allow(dead_code)]
     pub host: String,
     pub default_schema: String,
+    pub dsn: String,
+    pub slot: String,
     pub tx: mpsc::Sender<Event>,
     #[allow(dead_code)]
     pub chkpt: Arc<dyn CheckpointStore>,
@@ -107,13 +115,14 @@ pub(crate) struct RunCtx {
     pub current_tx_commit_time: Option<i64>,
     pub repl_client: Arc<Mutex<ReplicationClient>>,
     pub outbox_prefixes: AllowList,
+    pub identity_store: IdentityStore,
+    pub reconciler: SchemaReconciler,
 }
 
 // ============================================================================
 // Source Implementation
 // ============================================================================
 
-/// Maximum backoff for startup retries (publication/slot verification).
 const MAX_STARTUP_BACKOFF_SECS: u64 = 60;
 
 impl PostgresSource {
@@ -134,11 +143,8 @@ impl PostgresSource {
         )
         .await?;
 
-        // Verify publication exists and ensure slot exists.
-        // Retries with backoff if publication missing (admin can create it).
         let mut startup_retry = RetryPolicy::default();
 
-        // Determine whether a snapshot should run.
         let needs_snapshot = match self.snapshot_cfg.mode {
             SnapshotMode::Initial => last_checkpoint.is_none(),
             SnapshotMode::Always => true,
@@ -181,10 +187,7 @@ impl PostgresSource {
                         error!(source_id = %self.id, error = %e, "fatal error during startup");
                         return Err(e);
                     }
-                    Err(LoopControl::ReloadSchema { .. }) => {
-                        // Shouldn't happen during startup, treat as retry
-                        continue;
-                    }
+                    Err(LoopControl::ReloadSchema { .. }) => continue,
                 }
             }
         } else {
@@ -204,7 +207,8 @@ impl PostgresSource {
                 if let Some(ref identity) = loaded.schema.replica_identity {
                     if identity != "full" {
                         warn!(
-                            schema = %schema, table = %table, replica_identity = %identity,
+                            schema = %schema, table = %table,
+                            replica_identity = %identity,
                             "table does not have REPLICA IDENTITY FULL - before images will be incomplete"
                         );
                     }
@@ -212,9 +216,6 @@ impl PostgresSource {
             }
         }
 
-        // Run snapshot if requested. The snapshot captures the WAL LSN before
-        // reading any rows, so streaming resumes from that position with no
-        // gaps once the snapshot finishes.
         let start_lsn = if needs_snapshot {
             info!(source_id = %self.id, "starting initial snapshot");
             let snapshot_ctx = postgres_snapshot::PgSnapshotCtx {
@@ -255,12 +256,16 @@ impl PostgresSource {
         )
         .await?;
 
+        let backend = Arc::clone(&self.backend);
+
         let mut ctx = RunCtx {
             source_id: self.id.clone(),
             pipeline: self.pipeline.clone(),
             tenant: self.tenant.clone(),
             host: components.host.clone(),
             default_schema: "public".to_string(),
+            dsn: self.dsn.clone(),
+            slot: self.slot.clone(),
             tx,
             chkpt: chkpt_store.clone(),
             cancel,
@@ -276,7 +281,16 @@ impl PostgresSource {
             current_tx_commit_time: None,
             repl_client: Arc::new(Mutex::new(client)),
             outbox_prefixes: self.outbox_prefixes.clone(),
+            identity_store: IdentityStore::new(Arc::clone(&backend)),
+            reconciler: SchemaReconciler::new(
+                Arc::clone(&self.registry),
+                Arc::clone(&backend),
+                self.tenant.clone(),
+            ),
         };
+
+        // Store initial server identity (FirstSeen path).
+        check_identity_post_reconnect(&mut ctx).await?;
 
         info!("entering replication loop");
         loop {
@@ -288,12 +302,8 @@ impl PostgresSource {
 
             debug!(source_id = %self.id, "reading next event");
 
-            // Read next event, may return LoopControl on error
             let event_result = match read_next_event(&ctx).await {
-                Ok(Some(event)) => {
-                    // Dispatch event, may return LoopControl for schema reload
-                    dispatch_event(&mut ctx, event).await
-                }
+                Ok(Some(event)) => dispatch_event(&mut ctx, event).await,
                 Ok(None) => {
                     info!(source_id = %self.id, "replication stream ended");
                     break;
@@ -301,7 +311,6 @@ impl PostgresSource {
                 Err(ctrl) => Err(ctrl),
             };
 
-            // Handle LoopControl from either read or dispatch
             match event_result {
                 Ok(()) => {}
                 Err(LoopControl::ReloadSchema { schema, table }) => {
@@ -312,12 +321,14 @@ impl PostgresSource {
                         info!("reloading all schemas");
                         let _ = ctx.schema.reload_all(&self.tables).await;
                     }
-                    // Continue without reconnect for schema changes detected in-stream
-                    // (the relation message already updated our relation_map)
                 }
                 Err(LoopControl::Reconnect) => {
                     let delay = ctx.retry.next_backoff();
-                    warn!(source_id = %self.id, delay_ms = delay.as_millis(), "scheduling reconnect after backoff");
+                    warn!(
+                        source_id = %self.id,
+                        delay_ms = delay.as_millis(),
+                        "scheduling reconnect after backoff"
+                    );
 
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
@@ -345,9 +356,13 @@ impl PostgresSource {
                             *ctx.repl_client.lock().await = new_client;
                             ctx.retry.reset();
                             info!(source_id = %self.id, "reconnected successfully");
+                            check_identity_post_reconnect(&mut ctx).await?;
                         }
                         Err(e) => {
-                            error!(source_id = %self.id, error = %e, "reconnect failed after retries");
+                            error!(
+                                source_id = %self.id, error = %e,
+                                "reconnect failed after retries"
+                            );
                             return Err(e);
                         }
                     }
@@ -363,7 +378,6 @@ impl PostgresSource {
             }
         }
 
-        // Best-effort final checkpoint
         let _ = chkpt_store
             .put(
                 &self.id,
@@ -374,7 +388,6 @@ impl PostgresSource {
             )
             .await;
 
-        // Shutdown replication client
         if let Err(e) = ctx.repl_client.lock().await.shutdown().await {
             warn!(error = %e, "error during replication client shutdown");
         }
@@ -426,4 +439,117 @@ impl Source for PostgresSource {
             join,
         }
     }
+}
+
+// ============================================================================
+// Failover detection + reconciliation
+// ============================================================================
+
+async fn check_identity_post_reconnect(ctx: &mut RunCtx) -> SourceResult<()> {
+    let live_pg = match fetch_server_identity(&ctx.dsn).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            warn!(
+                source_id = %ctx.source_id, error = %e,
+                "could not fetch server identity, skipping check"
+            );
+            return Ok(());
+        }
+    };
+    let live = ServerIdentity::from(live_pg);
+
+    match ctx
+        .identity_store
+        .compare(&ctx.source_id, &live)
+        .await
+        .unwrap_or(IdentityComparison::Same)
+    {
+        IdentityComparison::FirstSeen => {
+            let _ = ctx.identity_store.store(&ctx.source_id, &live).await;
+        }
+        IdentityComparison::Same => {}
+        IdentityComparison::Changed { previous, current } => {
+            warn!(
+                source_id = %ctx.source_id,
+                prev = ?previous,
+                new = ?current,
+                "server identity changed — failover detected, reconciling"
+            );
+            run_failover_reconciliation(ctx, previous, current).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_failover_reconciliation(
+    ctx: &mut RunCtx,
+    previous: ServerIdentity,
+    current: ServerIdentity,
+) -> SourceResult<()> {
+    let existing = ctx
+        .reconciler
+        .already_completed(&ctx.source_id, &previous, &current)
+        .await
+        .unwrap_or(None);
+
+    if existing.is_none() {
+        // Position reachability via slot state.
+        match check_position_reachability(&ctx.dsn, &ctx.slot)
+            .await
+            .unwrap_or(PositionReachability::Unknown {
+                reason: "reachability check failed".into(),
+            }) {
+            PositionReachability::Reachable => {}
+            PositionReachability::Unknown { reason } => {
+                warn!(
+                    source_id = %ctx.source_id,
+                    %reason,
+                    "could not verify position reachability after failover — resuming anyway"
+                );
+            }
+            PositionReachability::Lost { reason } => {
+                return Err(SourceError::Other(anyhow::anyhow!(
+                    "position lost after failover: {reason}. Re-snapshot required."
+                )));
+            }
+        }
+
+        // Schema diff against live catalog.
+        let tracked = ctx.schema.cached_tables();
+        let mut inputs = Vec::with_capacity(tracked.len());
+        for (schema, table) in &tracked {
+            let live_cols: Option<
+                Vec<crate::failover::reconciler::ColumnSnapshot>,
+            > = postgres_health::fetch_live_columns(&ctx.dsn, schema, table)
+                .await
+                .ok()
+                .flatten()
+                .map(|cols| cols.into_iter().map(Into::into).collect());
+            inputs.push(ReconcileInput {
+                db: schema.clone(),
+                table: table.clone(),
+                live_columns: live_cols,
+            });
+        }
+
+        let record = ctx
+            .reconciler
+            .run(&ctx.source_id, &previous, &current, &inputs)
+            .await
+            .map_err(SourceError::Other)?;
+
+        for result in &record.table_results {
+            if !result.deltas.is_empty() {
+                let _ =
+                    ctx.schema.reload_schema(&result.db, &result.table).await;
+            }
+        }
+    }
+
+    let _ = ctx.identity_store.store(&ctx.source_id, &current).await;
+
+    info!(source_id = %ctx.source_id, "failover reconciliation complete");
+    Ok(())
 }

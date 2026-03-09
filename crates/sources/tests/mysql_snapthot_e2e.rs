@@ -23,6 +23,8 @@ use test_common::{
     mysql_drop_db, mysql_setup,
 };
 
+use crate::test_common::make_storage_backend;
+
 #[dtor]
 fn cleanup() {
     if let Some((c, _)) = MYSQL_CONTAINER.get() {
@@ -54,6 +56,7 @@ async fn make_source(
         registry: make_registry().await,
         outbox_tables: AllowList::default(),
         snapshot_cfg,
+        backend: make_storage_backend().await,
     }
 }
 

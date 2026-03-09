@@ -92,6 +92,7 @@ pub struct PipelineManager {
     pub(crate) pipelines: Arc<RwLock<HashMap<String, PipelineRuntime>>>,
     pub(crate) ckpt_store: Arc<dyn CheckpointStore>,
     pub(crate) registry: Arc<DurableSchemaRegistry>,
+    pub(crate) backend: ArcStorageBackend,
 }
 
 impl PipelineManager {
@@ -101,11 +102,13 @@ impl PipelineManager {
     pub async fn with_backend(backend: ArcStorageBackend) -> Result<Self> {
         let ckpt_store: Arc<dyn CheckpointStore> =
             Arc::new(BackendCheckpointStore::new(Arc::clone(&backend)));
-        let registry = DurableSchemaRegistry::new(backend).await?;
+        let registry = DurableSchemaRegistry::new(Arc::clone(&backend)).await?;
+
         Ok(Self {
             pipelines: Arc::new(RwLock::new(HashMap::new())),
             ckpt_store,
             registry,
+            backend,
         })
     }
 
@@ -116,13 +119,14 @@ impl PipelineManager {
             Arc::new(BackendCheckpointStore::new(Arc::clone(&backend)));
         let registry = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(DurableSchemaRegistry::new(backend))
+                .block_on(DurableSchemaRegistry::new(Arc::clone(&backend)))
                 .expect("memory DurableSchemaRegistry never fails")
         });
         Self {
             pipelines: Arc::new(RwLock::new(HashMap::new())),
             ckpt_store,
             registry,
+            backend,
         }
     }
 
@@ -175,8 +179,12 @@ impl PipelineManager {
         // Create cancellation token early so it can be shared with sinks
         let cancel = CancellationToken::new();
 
-        let source = build_source(&spec, self.registry.clone())
-            .context("build source")?;
+        let source = build_source(
+            &spec,
+            self.registry.clone(),
+            Arc::clone(&self.backend),
+        )
+        .context("build source")?;
         let processors = build_processors(&spec).context("build processors")?;
         let sinks =
             build_sinks(&spec, cancel.clone()).context("build sinks")?;

@@ -11,10 +11,10 @@ use mysql_binlog_connector_rust::{
     event::table_map_event::TableMapEvent,
 };
 use serde::{Deserialize, Serialize};
-use storage::DurableSchemaRegistry;
+use storage::{ArcStorageBackend, DurableSchemaRegistry};
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use checkpoints::{CheckpointStore, CheckpointStoreExt};
 use common::{AllowList, RetryPolicy, pause_until_resumed};
@@ -44,6 +44,14 @@ pub use mysql_snapshot::{MysqlSnapshotProgress, progress_key};
 
 pub mod mysql_health;
 
+use crate::failover::identity::{
+    IdentityComparison, IdentityStore, ServerIdentity,
+};
+use crate::failover::reconciler::{ReconcileInput, SchemaReconciler};
+use crate::mysql::mysql_health::{
+    PositionReachability, check_position_reachability, fetch_server_identity,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MySqlCheckpoint {
     pub file: String,
@@ -53,20 +61,21 @@ pub struct MySqlCheckpoint {
 
 #[derive(Debug, Clone)]
 pub struct MySqlSource {
-    pub id: String, // checkpoint key + server_id seed
+    pub id: String,
     pub checkpoint_key: String,
-    pub dsn: String,         // mysql://user:pass@host:3306/db
-    pub tables: Vec<String>, // ["db.table"]; empty = all
+    pub dsn: String,
+    pub tables: Vec<String>,
     pub tenant: String,
     pub pipeline: String,
     pub registry: Arc<DurableSchemaRegistry>,
+    pub backend: ArcStorageBackend,
     pub outbox_tables: AllowList,
     pub snapshot_cfg: deltaforge_config::SnapshotCfg,
 }
 
 const HEARTBEAT_INTERVAL_SECS: u64 = 15;
 const READ_TIMEOUT: u64 = 90;
-// shared state for mysql source
+
 struct RunCtx {
     source_id: String,
     pipeline: String,
@@ -90,6 +99,8 @@ struct RunCtx {
     last_pos: u64,
     last_gtid: Option<String>,
     outbox_tables: AllowList,
+    identity_store: IdentityStore,
+    reconciler: SchemaReconciler,
 }
 
 impl MySqlSource {
@@ -119,8 +130,6 @@ impl MySqlSource {
         };
 
         if needs_snapshot {
-            // For Always mode, reset saved progress so run_snapshot starts fresh
-            // rather than returning early on the finished check inside it.
             if self.snapshot_cfg.mode == SnapshotMode::Always {
                 if let Ok(bytes) =
                     serde_json::to_vec(&MysqlSnapshotProgress::default())
@@ -157,8 +166,6 @@ impl MySqlSource {
                     .await
                     .map_err(SourceError::Other)?;
 
-            // Persist snapshot's binlog position as the CDC checkpoint so
-            // prepare_client resumes from here, not from the binlog tail.
             chkpt_store
                 .put(&self.id, snapshot_position)
                 .await
@@ -186,6 +193,8 @@ impl MySqlSource {
             db=%default_db,
             "mysql source starting ...");
 
+        let backend = Arc::clone(&self.backend);
+
         let mut ctx = RunCtx {
             source_id: self.id.clone(),
             pipeline: self.pipeline.clone(),
@@ -202,6 +211,12 @@ impl MySqlSource {
             schema: schema_loader,
             allow: AllowList::new(&self.tables),
             retry: RetryPolicy::default(),
+            identity_store: IdentityStore::new(Arc::clone(&backend)),
+            reconciler: SchemaReconciler::new(
+                Arc::clone(&self.registry),
+                Arc::clone(&backend),
+                self.tenant.clone(),
+            ),
             inactivity: Duration::from_secs(60),
             table_map: HashMap::new(),
             last_file: String::new(),
@@ -213,16 +228,19 @@ impl MySqlSource {
         info!(source_id=%self.id, "connecting for binlog stream ..");
         let mut stream = connect_first_stream(&ctx, client).await?;
 
+        // Store initial server identity (FirstSeen path).
+        check_identity_post_reconnect(&mut ctx).await?;
+
         info!("entering binlog read loop");
         loop {
             if !pause_until_resumed(&ctx.cancel, &ctx.paused, &ctx.pause_notify)
                 .await
             {
-                info!(source_id=%self.id, "resuming ..");
+                info!(source_id=%ctx.source_id, "resuming ..");
                 break;
             }
 
-            debug!(source_id=%self.id, "reading the next event ..");
+            debug!(source_id=%ctx.source_id, "reading the next event ..");
             match read_next_event(&mut stream, &ctx).await {
                 Ok((header, data)) => {
                     ctx.last_pos = header.next_event_position as u64;
@@ -238,7 +256,7 @@ impl MySqlSource {
                 }
                 Err(LoopControl::Reconnect) => {
                     let delay = ctx.retry.next_backoff();
-                    tracing::warn!(
+                    warn!(
                         source_id = %ctx.source_id,
                         delay_ms = delay.as_millis(),
                         "scheduling reconnect after backoff"
@@ -279,9 +297,6 @@ impl Source for MySqlSource {
         &self.checkpoint_key
     }
 
-    /// start the source in a background task and return a control handle.
-    /// outside callers have to use this to start a CDC source.
-    /// see `SourceHandler` for available controls returned by run.
     async fn run(
         &self,
         tx: mpsc::Sender<Event>,
@@ -321,7 +336,10 @@ impl Source for MySqlSource {
     }
 }
 
-/// build a factory from the inital client's resume point
+// ============================================================================
+// Stream helpers
+// ============================================================================
+
 async fn connect_first_stream(
     ctx: &RunCtx,
     client: BinlogClient,
@@ -360,20 +378,20 @@ async fn connect_first_stream(
         c
     };
 
-    let stream = connect_binlog_with_retries(
+    connect_binlog_with_retries(
         &ctx.source_id,
         make_client,
         &ctx.cancel,
         &ctx.default_db,
         ctx.retry.clone(),
     )
-    .await?;
-
-    Ok(stream)
+    .await
 }
 
+/// Reconnect using the best available resume position, then run the identity
+/// check. If a failover is detected, reconciliation runs before returning the
+/// stream — callers see a ready stream regardless.
 async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
-    // Choose best resume: GTID > file:pos > tail
     let (gtid_to_use, file_to_use, pos_to_use) = if let Some(g) = &ctx.last_gtid
     {
         (Some(g.clone()), None, None)
@@ -419,5 +437,130 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
 
     ctx.retry.reset();
 
+    check_identity_post_reconnect(ctx).await?;
+
     Ok(stream)
+}
+
+// ============================================================================
+// Failover detection + reconciliation
+// ============================================================================
+
+/// Compare the live server identity against the stored one.
+///
+/// - `FirstSeen`: store and continue (clean start or wiped state).
+/// - `Same`: normal reconnect, nothing to do.
+/// - `Changed`: run full failover reconciliation before returning.
+async fn check_identity_post_reconnect(ctx: &mut RunCtx) -> SourceResult<()> {
+    let live_mysql = match fetch_server_identity(&ctx.dsn).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return Ok(()), // MySQL < 5.6 or unavailable — skip silently
+        Err(e) => {
+            warn!(source_id = %ctx.source_id, error = %e, "could not fetch server identity, skipping check");
+            return Ok(());
+        }
+    };
+    let live = ServerIdentity::from(live_mysql);
+
+    match ctx
+        .identity_store
+        .compare(&ctx.source_id, &live)
+        .await
+        .unwrap_or(IdentityComparison::Same) // transient storage error → treat as same
+    {
+        IdentityComparison::FirstSeen => {
+            let _ = ctx.identity_store.store(&ctx.source_id, &live).await;
+        }
+        IdentityComparison::Same => {}
+        IdentityComparison::Changed { previous, current } => {
+            warn!(
+                source_id = %ctx.source_id,
+                prev = ?previous,
+                new = ?current,
+                "server identity changed — failover detected, reconciling"
+            );
+            run_failover_reconciliation(ctx, previous, current).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_failover_reconciliation(
+    ctx: &mut RunCtx,
+    previous: ServerIdentity,
+    current: ServerIdentity,
+) -> SourceResult<()> {
+    // Idempotency: skip catalog queries if this transition already reconciled.
+    let existing = ctx
+        .reconciler
+        .already_completed(&ctx.source_id, &previous, &current)
+        .await
+        .unwrap_or(None);
+
+    if existing.is_none() {
+        // Position reachability — hard stop if confirmed lost.
+        match check_position_reachability(
+            &ctx.dsn,
+            &ctx.last_file,
+            ctx.last_gtid.as_deref(),
+        )
+        .await
+        .unwrap_or(PositionReachability::Unknown {
+            reason: "reachability check failed".into(),
+        }) {
+            PositionReachability::Reachable => {}
+            PositionReachability::Unknown { reason } => {
+                warn!(
+                    source_id = %ctx.source_id,
+                    %reason,
+                    "could not verify position reachability after failover — resuming anyway"
+                );
+            }
+            PositionReachability::Lost { reason } => {
+                return Err(SourceError::Other(anyhow::anyhow!(
+                    "position lost after failover: {reason}. Re-snapshot required."
+                )));
+            }
+        }
+
+        // Schema diff against live catalog.
+        let tracked = ctx.schema.cached_tables();
+        let mut inputs = Vec::with_capacity(tracked.len());
+        for (db, table) in &tracked {
+            let live_cols: Option<
+                Vec<crate::failover::reconciler::ColumnSnapshot>,
+            > = mysql_health::fetch_live_columns(&ctx.dsn, db, table)
+                .await
+                .ok()
+                .flatten()
+                .map(|cols| cols.into_iter().map(Into::into).collect());
+            inputs.push(ReconcileInput {
+                db: db.clone().to_owned(),
+                table: table.clone().to_owned(),
+                live_columns: live_cols,
+            });
+        }
+
+        let record = ctx
+            .reconciler
+            .run(&ctx.source_id, &previous, &current, &inputs)
+            .await
+            .map_err(SourceError::Other)?;
+
+        // Invalidate schema loader cache for changed tables so the next row
+        // event triggers a fresh load and registry registration.
+        for result in &record.table_results {
+            if !result.deltas.is_empty() {
+                let _ =
+                    ctx.schema.reload_schema(&result.db, &result.table).await;
+            }
+        }
+    }
+
+    // Persist new identity only after reconciliation completes.
+    let _ = ctx.identity_store.store(&ctx.source_id, &current).await;
+
+    info!(source_id = %ctx.source_id, "failover reconciliation complete");
+    Ok(())
 }

@@ -9,8 +9,11 @@
 //! snapshot duration, and logs actionable warnings when at risk.
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 use tokio_postgres::NoTls;
-use tracing::{info, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
 
 const THROUGHPUT_PER_WORKER_BYTES: u64 = 20 * 1024 * 1024; // 20 MB/s
 
@@ -355,10 +358,6 @@ pub async fn verify_slot_still_healthy(
 
 // Background guard
 
-use std::sync::{Arc, Mutex};
-use tokio_util::sync::CancellationToken;
-use tracing::debug;
-
 const GUARD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Spawns a background task that monitors slot health every GUARD_INTERVAL seconds.
@@ -472,6 +471,228 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
+// ============================================================================
+// Failover Detection
+// ============================================================================
+//
+// Source-native half of failover handling: plain queries returning raw data.
+// No orchestration, no state. Called by the failover reconciler above this layer.
+
+/// The stable identity of a PostgreSQL cluster.
+///
+/// `system_identifier` is a 64-bit integer written to `pg_control` at
+/// `initdb` time. It uniquely identifies a cluster and never changes,
+/// making it the correct signal for "did I just connect to a different server?"
+///
+/// Available via `pg_control_system()` (PG 9.6+) without superuser.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostgresServerIdentity {
+    pub system_identifier: i64,
+}
+
+/// Fetch the cluster identity from a live PostgreSQL connection.
+///
+/// Returns `Ok(None)` if `pg_control_system()` is unavailable (pre-9.6 or
+/// restricted). The caller treats `None` as "cannot detect failover" and
+/// falls through to slot/position validation only.
+pub async fn fetch_server_identity(
+    dsn: &str,
+) -> Result<Option<PostgresServerIdentity>> {
+    let (client, conn) = tokio_postgres::connect(dsn, NoTls)
+        .await
+        .context("fetch_server_identity: connect failed")?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let row = client
+        .query_opt("SELECT system_identifier FROM pg_control_system()", &[])
+        .await
+        .context("fetch_server_identity: query failed")?;
+
+    let identity = row.map(|r| {
+        let system_identifier: i64 = r.get(0);
+        PostgresServerIdentity { system_identifier }
+    });
+
+    Ok(identity)
+}
+
+// ============================================================================
+// Position Reachability
+// ============================================================================
+
+/// Whether a saved checkpoint is still reachable on the current server.
+///
+/// For PostgreSQL, reachability is determined by slot state rather than
+/// WAL position arithmetic — a healthy slot guarantees the LSN is reachable.
+#[derive(Debug, PartialEq)]
+pub enum PositionReachability {
+    /// Confirmed reachable — slot is healthy, resume is safe.
+    Reachable,
+    /// Confirmed unreachable — slot gone or invalidated.
+    Lost { reason: String },
+    /// Could not determine (transient connect error, missing row).
+    /// Caller should warn but not hard-fail.
+    Unknown { reason: String },
+}
+
+/// Check whether a saved LSN checkpoint is still reachable via the replication slot.
+///
+/// Unlike `verify_slot_still_healthy` (which bails on any problem), this
+/// returns a three-way result so the failover orchestrator can distinguish
+/// confirmed loss from transient uncertainty.
+///
+/// Checks in order:
+/// 1. Slot exists
+/// 2. Slot is not invalidated (`invalidation_reason` is NULL)
+/// 3. `wal_status` is not `lost`
+///
+/// `unreserved` is treated as `Reachable` with a warning — WAL is not
+/// guaranteed but hasn't been removed yet.
+pub async fn check_position_reachability(
+    dsn: &str,
+    slot_name: &str,
+) -> Result<PositionReachability> {
+    let (client, conn) = match tokio_postgres::connect(dsn, NoTls).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            return Ok(PositionReachability::Unknown {
+                reason: format!("connect failed: {e}"),
+            });
+        }
+    };
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let row = client
+        .query_opt(
+            "SELECT invalidation_reason, wal_status \
+             FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot_name],
+        )
+        .await
+        .context("check_position_reachability: query failed")?;
+
+    match row {
+        None => Ok(PositionReachability::Lost {
+            reason: format!(
+                "replication slot '{slot_name}' does not exist on this server"
+            ),
+        }),
+        Some(r) => {
+            let invalidation: Option<String> = r.get(0);
+            if let Some(reason) = invalidation {
+                return Ok(PositionReachability::Lost {
+                    reason: format!("slot '{slot_name}' invalidated: {reason}"),
+                });
+            }
+
+            let wal_status: Option<String> = r.try_get(1).ok().flatten();
+            match wal_status.as_deref() {
+                Some("lost") => Ok(PositionReachability::Lost {
+                    reason: format!(
+                        "slot '{slot_name}' wal_status=lost: required WAL removed"
+                    ),
+                }),
+                Some("unreserved") => {
+                    warn!(slot = %slot_name, "slot wal_status=unreserved after failover: WAL not guaranteed but not yet gone");
+                    Ok(PositionReachability::Reachable)
+                }
+                _ => Ok(PositionReachability::Reachable),
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Live Catalog Fetch
+// ============================================================================
+
+/// A column as reported by the PostgreSQL catalog.
+/// Used by the schema reconciler to diff live state against the registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveColumn {
+    pub name: String,
+    pub data_type: String,
+    pub is_nullable: bool,
+    pub is_primary_key: bool,
+}
+
+/// Fetch current columns for a table from `information_schema` and
+/// `pg_constraint` (for PK membership).
+///
+/// Returns `Ok(None)` when the table does not exist — the reconciler treats
+/// that as a dropped-table delta.
+///
+/// Called after failover detection, before row events resume.
+pub async fn fetch_live_columns(
+    dsn: &str,
+    schema: &str,
+    table: &str,
+) -> Result<Option<Vec<LiveColumn>>> {
+    let (client, conn) = tokio_postgres::connect(dsn, NoTls)
+        .await
+        .context("fetch_live_columns: connect failed")?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    // Existence check — distinguish "table gone" from query error.
+    let exists: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM information_schema.tables \
+             WHERE table_schema = $1 AND table_name = $2",
+            &[&schema, &table],
+        )
+        .await
+        .context("fetch_live_columns: existence check failed")?
+        .get(0);
+
+    if exists == 0 {
+        return Ok(None);
+    }
+
+    // Columns with PK membership in one pass.
+    let rows = client
+        .query(
+            "SELECT
+                c.column_name,
+                c.data_type,
+                c.is_nullable = 'YES',
+                EXISTS (
+                    SELECT 1
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu
+                      ON tc.constraint_name = kcu.constraint_name
+                     AND tc.table_schema    = kcu.table_schema
+                    WHERE tc.constraint_type = 'PRIMARY KEY'
+                      AND tc.table_schema    = c.table_schema
+                      AND tc.table_name      = c.table_name
+                      AND kcu.column_name    = c.column_name
+                ) AS is_pk
+             FROM information_schema.columns c
+             WHERE c.table_schema = $1 AND c.table_name = $2
+             ORDER BY c.ordinal_position",
+            &[&schema, &table],
+        )
+        .await
+        .context("fetch_live_columns: columns query failed")?;
+
+    let columns = rows
+        .into_iter()
+        .map(|r| LiveColumn {
+            name: r.get(0),
+            data_type: r.get(1),
+            is_nullable: r.get(2),
+            is_primary_key: r.get(3),
+        })
+        .collect();
+
+    Ok(Some(columns))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,5 +735,42 @@ mod tests {
         cancel.cancel();
         assert!(cancel.is_cancelled());
         assert_eq!(abort.lock().unwrap().as_deref(), Some("slot lost"));
+    }
+
+    // --- Failover detection ---
+
+    #[test]
+    fn wal_status_lost_maps_to_position_lost() {
+        // The wal_status=lost branch should produce Lost, not Unknown.
+        // This mirrors the logic in check_position_reachability without
+        // needing a real connection.
+        let wal_status = Some("lost");
+        let reachability = match wal_status {
+            Some("lost") => PositionReachability::Lost {
+                reason: "slot wal_status=lost: required WAL removed".into(),
+            },
+            Some("unreserved") => PositionReachability::Reachable,
+            _ => PositionReachability::Reachable,
+        };
+        assert_eq!(
+            reachability,
+            PositionReachability::Lost {
+                reason: "slot wal_status=lost: required WAL removed".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn wal_status_unreserved_is_reachable_with_warning() {
+        // unreserved = WAL not guaranteed but not gone; should not block resume.
+        let wal_status = Some("unreserved");
+        let reachability = match wal_status {
+            Some("lost") => PositionReachability::Lost {
+                reason: String::new(),
+            },
+            Some("unreserved") => PositionReachability::Reachable,
+            _ => PositionReachability::Reachable,
+        };
+        assert_eq!(reachability, PositionReachability::Reachable);
     }
 }

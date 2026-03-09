@@ -617,8 +617,9 @@ async fn handle_query(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mysql::MySqlCheckpoint;
+    use crate::failover::reconciler::SchemaReconciler;
     use crate::mysql::mysql_schema_loader::MySqlSchemaLoader;
+    use crate::{failover::identity::IdentityStore, mysql::MySqlCheckpoint};
     use common::AllowList;
     use mysql_binlog_connector_rust::column::column_value::ColumnValue;
     use mysql_binlog_connector_rust::event::delete_rows_event::DeleteRowsEvent;
@@ -679,6 +680,14 @@ mod tests {
             last_pos: 1234,
             last_gtid: Some("GTID-UNIT".to_string()),
             outbox_tables: AllowList::default(),
+            identity_store: IdentityStore::new(Arc::new(
+                storage::MemoryStorageBackend::new(),
+            )),
+            reconciler: SchemaReconciler::new(
+                storage::DurableSchemaRegistry::for_testing(),
+                Arc::new(storage::MemoryStorageBackend::new()),
+                "test-tenant",
+            ),
         }
     }
 

@@ -271,6 +271,15 @@ impl MySqlSchemaLoader {
         })
     }
 
+    /// Returns all (db, table) pairs currently in cache.
+    /// Sync, for failover reconciliation - avoids async where not needed.
+    pub fn cached_tables(&self) -> Vec<(String, String)> {
+        self.cache
+            .try_read()
+            .map(|c| c.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Check if schema has changed and update if needed.
     pub async fn check_and_update(
         &self,

@@ -28,6 +28,8 @@ use tracing::{debug, info, warn};
 mod test_common;
 use test_common::{MYSQL_CDC_USER, make_registry, mysql_drop_db, mysql_setup};
 
+use crate::test_common::make_storage_backend;
+
 #[dtor]
 fn cleanup() {
     // Force container cleanup on process exit
@@ -126,6 +128,7 @@ async fn make_source(
         registry: make_registry().await,
         outbox_tables,
         snapshot_cfg: SnapshotCfg::default(),
+        backend: make_storage_backend().await,
     }
 }
 
@@ -298,6 +301,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
     .await?;
 
     let registry = make_registry().await;
+    let backend = make_storage_backend().await;
     let src = MySqlSource {
         id: "cdc-basic".into(),
         checkpoint_key: "mysql-cdc-basic".to_string(),
@@ -308,6 +312,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
         registry: registry.clone(),
         outbox_tables: AllowList::default(),
         snapshot_cfg: SnapshotCfg::default(),
+        backend,
     };
     let (mut rx, handle) = start_source(src).await?;
 
@@ -426,6 +431,7 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
         registry: registry.clone(),
         outbox_tables: AllowList::default(),
         snapshot_cfg: SnapshotCfg::default(),
+        backend: make_storage_backend().await,
     };
     let (mut rx, handle) = start_source(src).await?;
 

@@ -9,7 +9,7 @@
 use std::sync::{Arc, Once};
 
 use anyhow::Result;
-use storage::{DurableSchemaRegistry, MemoryStorageBackend};
+use storage::{ArcStorageBackend, DurableSchemaRegistry, MemoryStorageBackend};
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt, core::WaitFor, runners::AsyncRunner,
 };
@@ -228,6 +228,10 @@ pub async fn make_registry() -> Arc<DurableSchemaRegistry> {
     DurableSchemaRegistry::new(Arc::new(MemoryStorageBackend::new()))
         .await
         .expect("registry")
+}
+
+pub async fn make_storage_backend() -> ArcStorageBackend {
+    Arc::new(storage::MemoryStorageBackend::new()) as storage::ArcStorageBackend
 }
 
 pub async fn pg_make_schema_loader(dsn: &str) -> Result<PostgresSchemaLoader> {
