@@ -98,6 +98,12 @@ struct RunCtx {
     last_file: String,
     last_pos: u64,
     last_gtid: Option<String>,
+    /// Original checkpoint position, preserved even after a pre-connect failover
+    /// adjustment clears last_gtid/last_file. Used by check_position_reachability
+    /// to verify whether A's position actually exists on B.
+    checkpoint_gtid: Option<String>,
+    checkpoint_file: String,
+    tables: Vec<String>,
     outbox_tables: AllowList,
     identity_store: IdentityStore,
     reconciler: SchemaReconciler,
@@ -175,8 +181,54 @@ impl MySqlSource {
         }
 
         // binlog streaming
-        let (host, default_db, server_id, client) =
+        let (host, default_db, server_id, mut client) =
             prepare_client(&self.dsn, &self.id, &chkpt_store).await?;
+
+        // Capture the original checkpoint position BEFORE any adjustment.
+        // This is used later by check_position_reachability to determine whether
+        // A's position actually exists on B - even if we've already switched the
+        // connection to B's tail.
+        let checkpoint_gtid =
+            client.gtid_enabled.then(|| client.gtid_set.clone());
+        let checkpoint_file = client.binlog_filename.clone();
+
+        // Pre-connect failover adjustment: if A's GTID checkpoint would be rejected
+        // by B ("purged required binary logs"), switch to B's tail before capturing
+        // init_gtid so the first stream opens cleanly. Without this, the "purged"
+        // error fires on the first stream read and the reconnect loop re-sends the
+        // stale GTID forever (identity_store already stores B after reconciliation,
+        // so the in-loop pre-connect check always sees Same).
+        if client.gtid_enabled {
+            let id_store = IdentityStore::new(Arc::clone(&self.backend));
+            if let Ok(Some(live_id)) = fetch_server_identity(&self.dsn).await {
+                let live = ServerIdentity::from(live_id);
+                if matches!(
+                    id_store.compare(&self.id, &live).await,
+                    Ok(IdentityComparison::Changed { .. })
+                ) {
+                    match resolve_binlog_tail(&self.dsn).await {
+                        Ok((fname, fpos)) => {
+                            warn!(
+                                source_id = %self.id,
+                                "pre-connect failover: switching from A's GTID to B's binlog tail"
+                            );
+                            client.gtid_enabled = false;
+                            client.gtid_set = String::new();
+                            client.binlog_filename = fname;
+                            client.binlog_position = fpos as u32;
+                        }
+                        Err(e) => {
+                            warn!(source_id = %self.id, error = %e,
+                                "pre-connect: could not resolve B's tail, will attempt with stale GTID");
+                        }
+                    }
+                }
+            }
+        }
+
+        let init_gtid = client.gtid_enabled.then(|| client.gtid_set.clone());
+        let init_file = client.binlog_filename.clone();
+        let init_pos = client.binlog_position as u64;
 
         info!(source_id=%self.id, "prepare_client finished, loading schemas");
         let schema_loader = MySqlSchemaLoader::new(
@@ -185,8 +237,9 @@ impl MySqlSource {
             &self.tenant,
         );
 
-        let tracked = schema_loader.preload(&self.tables).await?;
-        info!(source_id=%self.id, tables = tracked.len(), "schemas preloaded");
+        // NOTE: preload deferred until after check_identity_post_reconnect so the
+        // registry still holds A's schema when the reconciler computes the drift diff.
+
         info!(
             source_id=%self.id,
             host=%host,
@@ -219,17 +272,24 @@ impl MySqlSource {
             ),
             inactivity: Duration::from_secs(60),
             table_map: HashMap::new(),
-            last_file: String::new(),
-            last_pos: 0,
-            last_gtid: None,
+            last_file: init_file,
+            last_pos: init_pos,
+            last_gtid: init_gtid,
+            checkpoint_gtid,
+            checkpoint_file,
+            tables: self.tables.clone(),
             outbox_tables: self.outbox_tables.clone(),
         };
 
         info!(source_id=%self.id, "connecting for binlog stream ..");
         let mut stream = connect_first_stream(&ctx, client).await?;
 
-        // Store initial server identity (FirstSeen path).
+        // Identity check before preload: registry still holds A's schema here.
         check_identity_post_reconnect(&mut ctx).await?;
+
+        // Safe to preload now: reconciliation has run, registry reflects post-reconcile state.
+        let tracked = ctx.schema.preload(&self.tables).await?;
+        info!(source_id=%self.id, tables = tracked.len(), "schemas preloaded");
 
         info!("entering binlog read loop");
         loop {
@@ -390,7 +450,7 @@ async fn connect_first_stream(
 
 /// Reconnect using the best available resume position, then run the identity
 /// check. If a failover is detected, reconciliation runs before returning the
-/// stream — callers see a ready stream regardless.
+/// stream - callers see a ready stream regardless.
 async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     let (gtid_to_use, file_to_use, pos_to_use) = if let Some(g) = &ctx.last_gtid
     {
@@ -454,7 +514,7 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
 async fn check_identity_post_reconnect(ctx: &mut RunCtx) -> SourceResult<()> {
     let live_mysql = match fetch_server_identity(&ctx.dsn).await {
         Ok(Some(id)) => id,
-        Ok(None) => return Ok(()), // MySQL < 5.6 or unavailable — skip silently
+        Ok(None) => return Ok(()), // MySQL < 5.6 or unavailable - skip silently
         Err(e) => {
             warn!(source_id = %ctx.source_id, error = %e, "could not fetch server identity, skipping check");
             return Ok(());
@@ -466,7 +526,7 @@ async fn check_identity_post_reconnect(ctx: &mut RunCtx) -> SourceResult<()> {
         .identity_store
         .compare(&ctx.source_id, &live)
         .await
-        .unwrap_or(IdentityComparison::Same) // transient storage error → treat as same
+        .unwrap_or(IdentityComparison::Same) // transient storage error -> treat as same
     {
         IdentityComparison::FirstSeen => {
             let _ = ctx.identity_store.store(&ctx.source_id, &live).await;
@@ -499,11 +559,12 @@ async fn run_failover_reconciliation(
         .unwrap_or(None);
 
     if existing.is_none() {
-        // Position reachability — hard stop if confirmed lost.
+        // Position reachability — use the original checkpoint position, not the
+        // (potentially adjusted) streaming position in last_gtid/last_file.
         match check_position_reachability(
             &ctx.dsn,
-            &ctx.last_file,
-            ctx.last_gtid.as_deref(),
+            &ctx.checkpoint_file,
+            ctx.checkpoint_gtid.as_deref(),
         )
         .await
         .unwrap_or(PositionReachability::Unknown {
@@ -524,20 +585,25 @@ async fn run_failover_reconciliation(
             }
         }
 
-        // Schema diff against live catalog.
-        let tracked = ctx.schema.cached_tables();
-        let mut inputs = Vec::with_capacity(tracked.len());
-        for (db, table) in &tracked {
+        // Schema diff - use ctx.tables (configured patterns) since the schema cache
+        // may be empty (preload is intentionally deferred until after reconciliation).
+        let mut inputs = Vec::new();
+        for pattern in &ctx.tables {
+            let parts: Vec<&str> = pattern.splitn(2, '.').collect();
+            if parts.len() != 2 || parts[1].contains('*') {
+                continue;
+            }
+            let (db, table) = (parts[0].to_owned(), parts[1].to_owned());
             let live_cols: Option<
                 Vec<crate::failover::reconciler::ColumnSnapshot>,
-            > = mysql_health::fetch_live_columns(&ctx.dsn, db, table)
+            > = mysql_health::fetch_live_columns(&ctx.dsn, &db, &table)
                 .await
                 .ok()
                 .flatten()
                 .map(|cols| cols.into_iter().map(Into::into).collect());
             inputs.push(ReconcileInput {
-                db: db.clone().to_owned(),
-                table: table.clone().to_owned(),
+                db,
+                table,
                 live_columns: live_cols,
             });
         }
@@ -560,6 +626,13 @@ async fn run_failover_reconciliation(
 
     // Persist new identity only after reconciliation completes.
     let _ = ctx.identity_store.store(&ctx.source_id, &current).await;
+
+    // Clear streaming position so subsequent reconnects resolve B's binlog tail
+    // rather than re-sending A's GTID. Covers mid-run failovers where the stream
+    // was already open when the switch happened.
+    ctx.last_gtid = None;
+    ctx.last_file = String::new();
+    ctx.last_pos = 0;
 
     info!(source_id = %ctx.source_id, "failover reconciliation complete");
     Ok(())

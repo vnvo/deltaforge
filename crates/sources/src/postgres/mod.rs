@@ -237,6 +237,18 @@ impl PostgresSource {
             start_lsn
         };
 
+        // Adjust start_lsn BEFORE opening the replication stream.
+        // If a failover has occurred, START_REPLICATION with A's stale LSN would
+        // advance B's slot.confirmed_flush_lsn past B's uncommitted changes, making
+        // them permanently invisible even if we reconnect from the correct LSN later.
+        let start_lsn = {
+            let id_store = IdentityStore::new(Arc::clone(&self.backend));
+            pre_connect_lsn_adjust(
+                &self.dsn, &self.slot, start_lsn, &id_store, &self.id,
+            )
+            .await
+        };
+
         info!(
             source_id = %self.id, host = %components.host, slot = %self.slot,
             publication = %self.publication, start_lsn = %start_lsn,
@@ -257,7 +269,7 @@ impl PostgresSource {
         .await?;
 
         let backend = Arc::clone(&self.backend);
-
+        let cancel_ref = cancel.clone();
         let mut ctx = RunCtx {
             source_id: self.id.clone(),
             pipeline: self.pipeline.clone(),
@@ -291,6 +303,23 @@ impl PostgresSource {
 
         // Store initial server identity (FirstSeen path).
         check_identity_post_reconnect(&mut ctx).await?;
+
+        // If failover was detected, ctx.last_lsn was reset to B's slot position.
+        // The existing stream was opened from A's stale LSN — reconnect from the correct point.
+        if ctx.last_lsn != start_lsn {
+            let reconnect_config = pgwire_replication::ReplicationConfig {
+                start_lsn: ctx.last_lsn,
+                ..config.clone()
+            };
+            let new_client = connect_replication_with_retries(
+                &self.id,
+                reconnect_config,
+                &cancel_ref,
+                RetryPolicy::default(),
+            )
+            .await?;
+            *ctx.repl_client.lock().await = new_client;
+        }
 
         info!("entering replication loop");
         loop {
@@ -445,6 +474,59 @@ impl Source for PostgresSource {
 // Failover detection + reconciliation
 // ============================================================================
 
+/// Adjusts `start_lsn` for a possible failover **before** opening the replication stream.
+///
+/// `START_REPLICATION` immediately advances the slot's `confirmed_flush_lsn` to
+/// `max(start_lsn, slot.confirmed_flush_lsn)`.  If we start with A's stale checkpoint
+/// LSN on a fresh B whose slot is behind that checkpoint, PostgreSQL will skip any
+/// changes B committed between its slot creation LSN and A's checkpoint — even if we
+/// reconnect from the correct LSN afterwards.
+///
+/// By fetching the correct start LSN before the first replication connection, we avoid
+/// permanently advancing the slot past unread data.
+async fn pre_connect_lsn_adjust(
+    dsn: &str,
+    slot: &str,
+    start_lsn: Lsn,
+    id_store: &IdentityStore,
+    source_id: &str,
+) -> Lsn {
+    let live_pg = match fetch_server_identity(dsn).await {
+        Ok(Some(id)) => id,
+        _ => return start_lsn,
+    };
+    let live = ServerIdentity::from(live_pg);
+
+    match id_store
+        .compare(source_id, &live)
+        .await
+        .unwrap_or(IdentityComparison::Same)
+    {
+        IdentityComparison::Changed { .. } => {
+            // Failover detected: use the slot's actual confirmed_flush_lsn on B.
+            match fetch_slot_confirmed_lsn(dsn, slot).await {
+                Ok(slot_lsn) => {
+                    debug!(
+                        source_id = %source_id,
+                        original_lsn = %start_lsn,
+                        slot_lsn = %slot_lsn,
+                        "pre-connect failover adjustment: using slot LSN"
+                    );
+                    slot_lsn
+                }
+                Err(e) => {
+                    warn!(
+                        source_id = %source_id, error = %e,
+                        "could not fetch slot LSN for pre-connect adjustment, using checkpoint LSN"
+                    );
+                    start_lsn
+                }
+            }
+        }
+        _ => start_lsn,
+    }
+}
+
 async fn check_identity_post_reconnect(ctx: &mut RunCtx) -> SourceResult<()> {
     let live_pg = match fetch_server_identity(&ctx.dsn).await {
         Ok(Some(id)) => id,
@@ -516,6 +598,12 @@ async fn run_failover_reconciliation(
             }
         }
 
+        if let Ok(slot_lsn) =
+            fetch_slot_confirmed_lsn(&ctx.dsn, &ctx.slot).await
+        {
+            ctx.last_lsn = slot_lsn;
+        }
+
         // Schema diff against live catalog.
         let tracked = ctx.schema.cached_tables();
         let mut inputs = Vec::with_capacity(tracked.len());
@@ -552,4 +640,24 @@ async fn run_failover_reconciliation(
 
     info!(source_id = %ctx.source_id, "failover reconciliation complete");
     Ok(())
+}
+
+async fn fetch_slot_confirmed_lsn(
+    dsn: &str,
+    slot: &str,
+) -> anyhow::Result<Lsn> {
+    let (client, conn) =
+        tokio_postgres::connect(dsn, tokio_postgres::NoTls).await?;
+    tokio::spawn(async move {
+        conn.await.ok();
+    });
+    let row = client
+        .query_one(
+            "SELECT confirmed_flush_lsn::text \
+             FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .await?;
+    let s: &str = row.get(0);
+    s.parse::<Lsn>().map_err(|e| anyhow::anyhow!("{e}"))
 }

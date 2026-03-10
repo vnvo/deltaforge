@@ -679,6 +679,9 @@ mod tests {
             last_file: "mysql-bin.000001".to_string(),
             last_pos: 1234,
             last_gtid: Some("GTID-UNIT".to_string()),
+            checkpoint_gtid: Some("GTID-UNIT".to_string()),
+            checkpoint_file: "mysql-bin.000001".to_string(),
+            tables: vec!["shop.orders".to_string()],
             outbox_tables: AllowList::default(),
             identity_store: IdentityStore::new(Arc::new(
                 storage::MemoryStorageBackend::new(),
