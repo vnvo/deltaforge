@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: deltaforge
+    static_configs:
+      - targets: ["deltaforge:9000"]
+    metrics_path: /metrics

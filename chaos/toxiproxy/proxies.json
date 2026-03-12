@@ -1,0 +1,20 @@
+[
+  {
+    "name": "mysql",
+    "listen": "0.0.0.0:5100",
+    "upstream": "mysql:3306",
+    "enabled": true
+  },
+  {
+    "name": "postgres",
+    "listen": "0.0.0.0:5101",
+    "upstream": "postgres:5432",
+    "enabled": true
+  },
+  {
+    "name": "kafka",
+    "listen": "0.0.0.0:5102",
+    "upstream": "kafka:9093",
+    "enabled": true
+  }
+]

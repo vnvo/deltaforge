@@ -1,0 +1,41 @@
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: chaos-postgres
+  tenant: chaos
+
+spec:
+  source:
+    type: postgres
+    config:
+      id: chaos-postgres
+      host: toxiproxy
+      port: 5101
+      username: postgres
+      password: postgres
+      database: orders
+      publication: deltaforge_pub
+      slot_name: chaos_slot
+      tables: ["public.*"]
+      on_schema_drift: adapt
+
+  sinks:
+    - type: kafka
+      config:
+        id: chaos-kafka
+        brokers: "toxiproxy:5102"
+        topic: chaos.cdc
+        required: true
+        send_timeout_secs: 10
+
+  batch:
+    max_events: 50
+    max_ms: 500
+    respect_source_tx: true
+
+  commit_policy:
+    mode: required
+
+  storage:
+    backend: sqlite
+    path: /data/chaos.db
