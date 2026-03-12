@@ -71,7 +71,7 @@ pub use dsn::{
 // Pattern Matching
 // =============================================================================
 
-pub use patterns::AllowList;
+pub use patterns::{AllowList, TableFilter};
 
 // =============================================================================
 // Pause Gates
