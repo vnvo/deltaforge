@@ -9,7 +9,7 @@
 use std::sync::{Arc, Once};
 
 use anyhow::Result;
-use storage::{DurableSchemaRegistry, MemoryStorageBackend};
+use storage::{ArcStorageBackend, DurableSchemaRegistry, MemoryStorageBackend};
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt, core::WaitFor, runners::AsyncRunner,
 };
@@ -30,7 +30,7 @@ static INIT: Once = Once::new();
 pub fn init_test_tracing() {
     INIT.call_once(|| {
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("debug,serial_test=off,hyper=warn,rustls=warn")
+            EnvFilter::new("debug,serial_test=off,hyper=warn,rustls=warn,bollard=off,testcontainers=off")
         });
         let _ = fmt()
             .with_env_filter(filter)
@@ -228,6 +228,10 @@ pub async fn make_registry() -> Arc<DurableSchemaRegistry> {
     DurableSchemaRegistry::new(Arc::new(MemoryStorageBackend::new()))
         .await
         .expect("registry")
+}
+
+pub async fn make_storage_backend() -> ArcStorageBackend {
+    Arc::new(storage::MemoryStorageBackend::new()) as storage::ArcStorageBackend
 }
 
 pub async fn pg_make_schema_loader(dsn: &str) -> Result<PostgresSchemaLoader> {

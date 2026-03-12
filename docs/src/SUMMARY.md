@@ -23,6 +23,7 @@
     - [Storage](storage.md)
     - [Schema Registry](schemaregistry.md)
     - [Schema Sensing](schemasensing.md)
+    - [Failover Handling](failover.md)
 - [Observability](observability.md)
 - [Examples](examples/README.md)
     - [MySQL to Redis](examples/mysql_to_redis.md)

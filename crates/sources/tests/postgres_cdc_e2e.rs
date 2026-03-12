@@ -23,6 +23,8 @@ use test_common::{
     pg_cdc_dsn, pg_drop_db, pg_get_container, pg_port, pg_setup,
 };
 
+use crate::test_common::make_storage_backend;
+
 #[dtor]
 fn cleanup() {
     if let Some(c) = PG_CONTAINER.get() {
@@ -200,6 +202,8 @@ async fn make_source(
         registry: make_registry().await,
         outbox_prefixes,
         snapshot_cfg: deltaforge_config::SnapshotCfg::default(),
+        backend: make_storage_backend().await,
+        on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
     }
 }
 

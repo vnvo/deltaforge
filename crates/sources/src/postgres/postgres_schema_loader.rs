@@ -359,6 +359,15 @@ impl PostgresSchemaLoader {
         ))
     }
 
+    /// Returns all (db, table) pairs currently in cache.
+    /// Sync, for failover reconciliation — avoids async where not needed.
+    pub fn cached_tables(&self) -> Vec<(String, String)> {
+        self.cache
+            .try_read()
+            .map(|c| c.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     #[allow(dead_code)]
     pub(crate) fn from_static(
         cols: HashMap<(String, String), Arc<Vec<String>>>,

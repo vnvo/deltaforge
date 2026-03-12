@@ -64,6 +64,7 @@ source:
       tables: ["shop.outbox"]
     snapshot:
       mode: initial
+    on_schema_drift: adapt
 ```
 
 </td>
@@ -78,6 +79,7 @@ source:
 | `snapshot.mode` | string | `never` (default), `initial` - run once if no checkpoint exists, `always` - re-snapshot on every restart |
 | `snapshot.max_parallel_tables` | int | Tables snapshotted concurrently (default: `8`) |
 | `snapshot.chunk_size` | int | Rows per range chunk for integer-PK tables (default: `10000`) |
+| `on_schema_drift` | string | `adapt` (default) - reload schema and continue after failover drift; `halt` — stop and require operator intervention. See [Failover Handling](failover.md). |
 
 </td>
 </tr>
@@ -112,6 +114,7 @@ source:
       prefixes: ["outbox", "order_outbox_%"]
     snapshot:
       mode: initial
+    on_schema_drift: adapt
 ```
 
 </td>
@@ -129,6 +132,7 @@ source:
 | `snapshot.mode` | string | `never` (default), `initial` - run once if no checkpoint exists, `always` - re-snapshot on every restart |
 | `snapshot.max_parallel_tables` | int | Tables snapshotted concurrently (default: `8`) |
 | `snapshot.chunk_size` | int | Rows per range chunk (default: `10000`) |
+| `on_schema_drift` | string | `adapt` (default) — reload schema and continue after failover drift; `halt` — stop and require operator intervention. See [Failover Handling](failover.md). |
 
 </td>
 </tr>

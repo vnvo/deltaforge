@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Failover handling** — automatic detection and recovery when the source database primary changes ([9f5bcb7](https://github.com/vnvo/deltaforge/commit/9f5bcb7a538f0d4e18423ecb8c83dd1709e6d910), [daf630b](https://github.com/vnvo/deltaforge/commit/daf630b9775141fa314795c380f7b528663430ad), [29652a3](https://github.com/vnvo/deltaforge/commit/29652a36dcbb248faf15bacfc319e9b5a3819c3d), [784295c](https://github.com/vnvo/deltaforge/commit/784295cd81ca8167a373d6e153ede7b819197397), [e761267](https://github.com/vnvo/deltaforge/commit/e761267a70d41df76139df24e2310e7c0778e822))
+  - **Identity detection**: every reconnect queries `@@server_uuid` (MySQL) or `system_identifier` (PostgreSQL) and compares against the value stored in the durable backend; `FirstSeen` / `Same` / `Changed` outcomes gate reconciliation
+  - **Checkpoint reachability**: on identity change, verifies that the prior checkpoint is covered by the new primary's transaction history — MySQL checks GTID executed set coverage; PostgreSQL checks slot `confirmed_flush_lsn`; confirmed-lost position stops the source immediately with a re-snapshot error rather than silently skipping data
+  - **Position adjustment**: pre-connect correction prevents data loss caused by the connection protocol itself — MySQL switches from A's GTID to B's binlog tail before opening the stream (avoids "purged required binary logs" rejection loop); PostgreSQL fetches the slot's actual `confirmed_flush_lsn` before `START_REPLICATION` (prevents irreversible slot advancement past un-replicated LSNs); original checkpoint preserved separately for the reachability check
+  - **Schema drift reconciliation**: compares the registry (A's last known schema) against B's live catalog; column additions, removals, and renames recorded as `ReconcileRecord` in the storage backend; schema cache invalidated so the first post-failover row event reloads the correct column mapping
+  - **`on_schema_drift` policy**: `adapt` (default) — reload schema and continue; `halt` — stop the source and require operator intervention; `ReconcileRecord` persisted before halt so operators can inspect what changed; available on both `MysqlSrcCfg` and `PostgresSrcCfg`
+  - Reconciliation is idempotent via `already_completed` — safe to restart mid-reconciliation; identity stored only after both reachability and drift checks pass
+  - **Failover module**: `crates/sources/src/failover/` — `identity.rs` (server identity store and comparison), `reconciler.rs` (schema diff engine and record persistence), `mod.rs`
+  - E2E test suite: `crates/sources/tests/failover_e2e.rs` — 7 tests covering: streaming resumes after identity change (MySQL + PostgreSQL), position lost stops source (MySQL + PostgreSQL), schema drift detected and recorded, schema drift halts source, halt policy passes when schema is unchanged
+  - Documentation: `docs/src/failover.md` (new), `docs/src/SUMMARY.md`, `docs/src/configuration.md`, `README.md`, `docs/index.html`
+
 - **Snapshot health guards** — three-layer defence against binlog/WAL position being purged during a long snapshot ([06b56bb](https://github.com/vnvo/deltaforge/commit/06b56bbf8e030634a94f2f3fb334ab322f4f9f4b), [90f8937](https://github.com/vnvo/deltaforge/commit/90f893708b5181e1bc18d5dd7df746016ffc3d74), [f02ba53](https://github.com/vnvo/deltaforge/commit/f02ba537338cb222459393a361b0ce26624a2135))
   - **Preflight** (`mysql_health::run_preflight`, `postgres_health::run_preflight`): runs before any workers spawn; hard errors on missing binlog/slot or `wal_status=lost`; estimates snapshot duration from table sizes vs retention config; warns at ≥50% usage, HIGH RISK at ≥80%
   - **Background guard** (`spawn_binlog_position_guard`, `spawn_wal_slot_guard`): polls every 30s during snapshot via a child `CancellationToken`; cancels immediately on confirmed purge or slot invalidation; transient errors (connect failures, empty results) are retried and never abort; guard is scoped to the snapshot and stopped on all exit paths
@@ -87,7 +98,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Strict mode (`strict: true`) fails the batch on missing required fields instead of silent drops ([09f04b8](https://github.com/vnvo/deltaforge/commit/09f04b85aa94b602ebaabca9b16d13f5f06ecfa6))
 
 ### Changed
-
 
 - **Runner** — `--storage-backend` flag selects backend (`sqlite` default, `memory`, `postgres`); `--storage-dsn` for PostgreSQL connection string ([137b4e9](https://github.com/vnvo/deltaforge/commit/137b4e994bfacf31ab464946a3ab8e8d1e4f3c9e))
 
