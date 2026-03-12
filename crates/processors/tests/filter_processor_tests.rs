@@ -70,10 +70,12 @@ async fn run(cfg: FilterProcessorCfg, events: Vec<Event>) -> Vec<Event> {
 
 #[tokio::test]
 async fn all_gates_must_pass() {
-    let mut cfg = FilterProcessorCfg::default();
-    cfg.ops = vec![OpFilter::Create];
-    cfg.tables = TableFilter::new(vec!["shop.orders".into()], vec![]);
-    cfg.fields = vec![pred("status", FieldOp::Eq, json!("active"))];
+    let cfg = FilterProcessorCfg {
+        ops: vec![OpFilter::Create],
+        tables: TableFilter::new(vec!["shop.orders".into()], vec![]),
+        fields: vec![pred("status", FieldOp::Eq, json!("active"))],
+        ..Default::default()
+    };
 
     let events = vec![
         make_event("shop", "orders", Op::Create, json!({"status": "active"})), // pass
@@ -91,9 +93,13 @@ async fn all_gates_must_pass() {
 
 #[tokio::test]
 async fn table_exclude_takes_priority_over_include() {
-    let mut cfg = FilterProcessorCfg::default();
-    cfg.tables =
-        TableFilter::new(vec!["shop.*".into()], vec!["shop.tmp".into()]);
+    let cfg = FilterProcessorCfg {
+        tables: TableFilter::new(
+            vec!["shop.*".into()],
+            vec!["shop.tmp".into()],
+        ),
+        ..Default::default()
+    };
 
     let events = vec![
         make_event("shop", "orders", Op::Create, json!({})),
@@ -111,8 +117,10 @@ async fn table_exclude_takes_priority_over_include() {
 #[tokio::test]
 async fn field_eq_int_vs_float_normalised() {
     // 42 == 42.0 - critical when a JS processor upstream converts integers to floats.
-    let mut cfg = FilterProcessorCfg::default();
-    cfg.fields = vec![pred("score", FieldOp::Eq, json!(42))];
+    let cfg = FilterProcessorCfg {
+        fields: vec![pred("score", FieldOp::Eq, json!(42))],
+        ..Default::default()
+    };
 
     let events = vec![
         make_event("db", "t", Op::Create, json!({"score": 42.0})),
@@ -124,8 +132,10 @@ async fn field_eq_int_vs_float_normalised() {
 
 #[tokio::test]
 async fn field_dotted_path_traversal() {
-    let mut cfg = FilterProcessorCfg::default();
-    cfg.fields = vec![pred("order.status", FieldOp::Eq, json!("paid"))];
+    let cfg = FilterProcessorCfg {
+        fields: vec![pred("order.status", FieldOp::Eq, json!("paid"))],
+        ..Default::default()
+    };
 
     let events = vec![
         make_event("db", "t", Op::Create, json!({"order": {"status": "paid"}})),
@@ -135,7 +145,7 @@ async fn field_dotted_path_traversal() {
             Op::Create,
             json!({"order": {"status": "pending"}}),
         ),
-        make_event("db", "t", Op::Create, json!({"order": {}})), // missing path → drop
+        make_event("db", "t", Op::Create, json!({"order": {}})), // missing path -> drop
     ];
     let out = run(cfg, events).await;
     assert_eq!(out.len(), 1);
@@ -144,8 +154,10 @@ async fn field_dotted_path_traversal() {
 #[tokio::test]
 async fn field_predicate_with_no_after_drops_event() {
     // Delete events have no after - field predicates must not panic.
-    let mut cfg = FilterProcessorCfg::default();
-    cfg.fields = vec![pred("status", FieldOp::Eq, json!("active"))];
+    let cfg = FilterProcessorCfg {
+        fields: vec![pred("status", FieldOp::Eq, json!("active"))],
+        ..Default::default()
+    };
 
     let mut ev = make_event("db", "t", Op::Delete, json!({}));
     ev.after = None;
@@ -160,12 +172,14 @@ async fn field_predicate_with_no_after_drops_event() {
 
 #[tokio::test]
 async fn match_any_passes_if_one_predicate_matches() {
-    let mut cfg = FilterProcessorCfg::default();
-    cfg.match_mode = MatchMode::Any;
-    cfg.fields = vec![
-        pred("status", FieldOp::Eq, json!("active")),
-        pred("priority", FieldOp::Eq, json!("high")),
-    ];
+    let cfg = FilterProcessorCfg {
+        match_mode: MatchMode::Any,
+        fields: vec![
+            pred("status", FieldOp::Eq, json!("active")),
+            pred("priority", FieldOp::Eq, json!("high")),
+        ],
+        ..Default::default()
+    };
 
     let events = vec![
         make_event(
@@ -197,12 +211,14 @@ async fn match_any_passes_if_one_predicate_matches() {
 
 #[tokio::test]
 async fn field_in_array() {
-    let mut cfg = FilterProcessorCfg::default();
-    cfg.fields = vec![FieldPredicate {
-        path: "status".into(),
-        op: FieldOp::In,
-        value: Some(json!(["pending", "processing", "retry"])),
-    }];
+    let cfg = FilterProcessorCfg {
+        fields: vec![FieldPredicate {
+            path: "status".into(),
+            op: FieldOp::In,
+            value: Some(json!(["pending", "processing", "retry"])),
+        }],
+        ..Default::default()
+    };
 
     let events = vec![
         make_event("db", "t", Op::Create, json!({"status": "pending"})),
@@ -215,12 +231,14 @@ async fn field_in_array() {
 #[tokio::test]
 async fn field_not_in_missing_field_passes() {
     // A field absent from the event is not in any exclusion set - must pass.
-    let mut cfg = FilterProcessorCfg::default();
-    cfg.fields = vec![FieldPredicate {
-        path: "region".into(),
-        op: FieldOp::NotIn,
-        value: Some(json!(["eu-west-1"])),
-    }];
+    let cfg = FilterProcessorCfg {
+        fields: vec![FieldPredicate {
+            path: "region".into(),
+            op: FieldOp::NotIn,
+            value: Some(json!(["eu-west-1"])),
+        }],
+        ..Default::default()
+    };
 
     let out = run(
         cfg,
@@ -236,20 +254,22 @@ async fn field_not_in_missing_field_passes() {
 
 #[tokio::test]
 async fn contains_works_on_strings_and_arrays() {
-    let mut cfg = FilterProcessorCfg::default();
-    cfg.match_mode = MatchMode::Any;
-    cfg.fields = vec![
-        FieldPredicate {
-            path: "desc".into(),
-            op: FieldOp::Contains,
-            value: Some(json!("urgent")),
-        },
-        FieldPredicate {
-            path: "tags".into(),
-            op: FieldOp::Contains,
-            value: Some(json!("vip")),
-        },
-    ];
+    let cfg = FilterProcessorCfg {
+        match_mode: MatchMode::Any,
+        fields: vec![
+            FieldPredicate {
+                path: "desc".into(),
+                op: FieldOp::Contains,
+                value: Some(json!("urgent")),
+            },
+            FieldPredicate {
+                path: "tags".into(),
+                op: FieldOp::Contains,
+                value: Some(json!("vip")),
+            },
+        ],
+        ..Default::default()
+    };
 
     let events = vec![
         make_event(
@@ -262,13 +282,13 @@ async fn contains_works_on_strings_and_arrays() {
             "db",
             "t",
             Op::Create,
-            json!({"desc": "routine",         "tags": ["vip"]}),
+            json!({"desc": "routine", "tags": ["vip"]}),
         ),
         make_event(
             "db",
             "t",
             Op::Create,
-            json!({"desc": "routine",         "tags": ["retail"]}),
+            json!({"desc": "routine", "tags": ["retail"]}),
         ),
     ];
     let out = run(cfg, events).await;
@@ -281,8 +301,10 @@ async fn contains_works_on_strings_and_arrays() {
 
 #[tokio::test]
 async fn changed_only_passes_when_field_actually_differs() {
-    let mut cfg = FilterProcessorCfg::default();
-    cfg.fields = vec![pred_no_value("status", FieldOp::Changed)];
+    let cfg = FilterProcessorCfg {
+        fields: vec![pred_no_value("status", FieldOp::Changed)],
+        ..Default::default()
+    };
 
     let mut ev_changed =
         make_event("db", "t", Op::Update, json!({"status": "active"}));
@@ -304,8 +326,10 @@ async fn changed_only_passes_when_field_actually_differs() {
 #[tokio::test]
 async fn changed_passes_creates_unconditionally() {
     // No before image on creates - always passes regardless of after content.
-    let mut cfg = FilterProcessorCfg::default();
-    cfg.fields = vec![pred_no_value("status", FieldOp::Changed)];
+    let cfg = FilterProcessorCfg {
+        fields: vec![pred_no_value("status", FieldOp::Changed)],
+        ..Default::default()
+    };
 
     let out = run(
         cfg,
@@ -321,12 +345,14 @@ async fn changed_passes_creates_unconditionally() {
 
 #[tokio::test]
 async fn regex_matches_string_field() {
-    let mut cfg = FilterProcessorCfg::default();
-    cfg.fields = vec![FieldPredicate {
-        path: "email".into(),
-        op: FieldOp::Regex,
-        value: Some(json!(r"@internal\.company\.com$")),
-    }];
+    let cfg = FilterProcessorCfg {
+        fields: vec![FieldPredicate {
+            path: "email".into(),
+            op: FieldOp::Regex,
+            value: Some(json!(r"@internal\.company\.com$")),
+        }],
+        ..Default::default()
+    };
 
     let events = vec![
         make_event(
@@ -343,11 +369,13 @@ async fn regex_matches_string_field() {
 
 #[tokio::test]
 async fn regex_invalid_pattern_fails_construction() {
-    let mut cfg = FilterProcessorCfg::default();
-    cfg.fields = vec![FieldPredicate {
-        path: "x".into(),
-        op: FieldOp::Regex,
-        value: Some(json!(r"[invalid")),
-    }];
+    let cfg = FilterProcessorCfg {
+        fields: vec![FieldPredicate {
+            path: "x".into(),
+            op: FieldOp::Regex,
+            value: Some(json!(r"[invalid")),
+        }],
+        ..Default::default()
+    };
     assert!(FilterProcessor::new(cfg).is_err());
 }
