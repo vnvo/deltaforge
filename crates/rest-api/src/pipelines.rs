@@ -187,7 +187,8 @@ mod tests {
                         tables: vec![],
                         outbox: None,
                         snapshot: SnapshotCfg::default(),
-                        on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
+                        on_schema_drift:
+                            deltaforge_config::OnSchemaDrift::Adapt,
                     }),
                     processors: vec![],
                     sinks: vec![SinkCfg::Redis(RedisSinkCfg {

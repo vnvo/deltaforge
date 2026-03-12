@@ -5,7 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use deltaforge_config::{MysqlSrcCfg, SnapshotMode};
+use deltaforge_config::SnapshotMode;
 use mysql_binlog_connector_rust::{
     binlog_client::BinlogClient, binlog_stream::BinlogStream,
     event::table_map_event::TableMapEvent,
