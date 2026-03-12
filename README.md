@@ -116,6 +116,7 @@ Output: `{"schema":null,"payload":{...}}`
   - PostgreSQL logical replication via pgoutput
   - Initial snapshot/backfill for existing tables (MySQL and PostgreSQL)
     - resumes at table granularity after interruption, with binlog/WAL retention validation and background guards
+  - Automatic failover handling: server identity detection, checkpoint reachability verification, schema drift reconciliation, and configurable halt-on-drift policy
 - **Schema Registry**
   - Source-owned schema types (source native semantics)
   - Schema change detection and versioning
@@ -401,6 +402,7 @@ spec:
 | `config.tables` | Table patterns to capture |
 | `config.outbox` | Tag outbox tables/prefixes with `__outbox` sentinel for the outbox processor |
 | `config.snapshot` | Initial load: `mode` (`never`/`initial`/`always`), `chunk_size`, `max_parallel_tables` |
+| `config.on_schema_drift` | `adapt` (default) — continue after failover schema drift; `halt` — stop for operator intervention |
 | **`spec.processors`** | Optional transforms - see [Processors](docs/src/configuration.md#processors) |
 | `type` | `javascript`, `outbox`, `flatten` |
 | `inline` | JavaScript code for batch processing |
