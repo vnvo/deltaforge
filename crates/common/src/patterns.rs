@@ -186,6 +186,75 @@ impl std::fmt::Display for AllowList {
 }
 
 // =============================================================================
+// TableFilter
+// =============================================================================
+
+/// Include/exclude filter for tables, backed by `AllowList`.
+///
+/// Used wherever pipeline config needs to scope to a subset of tables.
+/// Supports the same glob patterns as `AllowList`:
+/// `db.table`, `*.orders`, `shop.*`, `shop.order_%`.
+///
+/// Two matching modes:
+/// - `matches(qualifier, name)` - for qualified contexts (MySQL db.table, PG schema.table)
+/// - `matches_name(name)` - for unqualified contexts (schema sensing, topic names)
+///
+/// Both modes treat an empty `include` list as "include all", and apply
+/// `exclude` after `include`.
+///
+/// ```yaml
+/// tables:
+///   include: ["shop.orders", "shop.items"]
+///   exclude: ["*.tmp"]
+/// ```
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct TableFilter {
+    /// Patterns to include. Empty = include all.
+    #[serde(default)]
+    pub include: Vec<String>,
+    /// Patterns to exclude. Evaluated after include; takes priority.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+impl TableFilter {
+    pub fn new(include: Vec<String>, exclude: Vec<String>) -> Self {
+        Self { include, exclude }
+    }
+
+    /// Qualified match: `db.table` / `schema.table`.
+    ///
+    /// An empty `include` list passes all tables; `exclude` is applied after.
+    pub fn matches(&self, qualifier: &str, name: &str) -> bool {
+        let include = AllowList::new(&self.include);
+        let exclude = AllowList::new(&self.exclude);
+
+        if !exclude.is_empty() && exclude.matches(qualifier, name) {
+            return false;
+        }
+        include.is_empty() || include.matches(qualifier, name)
+    }
+
+    /// Unqualified match: table name only, no qualifier.
+    ///
+    /// Useful for schema sensing and other single-name contexts.
+    pub fn matches_name(&self, name: &str) -> bool {
+        let include = AllowList::new(&self.include);
+        let exclude = AllowList::new(&self.exclude);
+
+        if !exclude.is_empty() && exclude.matches_name(name) {
+            return false;
+        }
+        include.is_empty() || include.matches_name(name)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.include.is_empty() && self.exclude.is_empty()
+    }
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -294,5 +363,43 @@ mod tests {
         assert_eq!(patterns.len(), 2);
         assert_eq!(patterns[0], (Some("public"), "users"));
         assert_eq!(patterns[1], (None, "orders"));
+    }
+
+    #[test]
+    fn empty_filter_passes_all() {
+        let f = TableFilter::default();
+        assert!(f.matches("db", "orders"));
+        assert!(f.matches_name("orders"));
+    }
+
+    #[test]
+    fn include_scopes_qualified() {
+        let f = TableFilter::new(vec!["shop.orders".into()], vec![]);
+        assert!(f.matches("shop", "orders"));
+        assert!(!f.matches("shop", "users"));
+    }
+
+    #[test]
+    fn exclude_priority_over_include() {
+        let f =
+            TableFilter::new(vec!["shop.*".into()], vec!["shop.tmp".into()]);
+        assert!(f.matches("shop", "orders"));
+        assert!(!f.matches("shop", "tmp"));
+    }
+
+    #[test]
+    fn matches_name_unqualified() {
+        let f =
+            TableFilter::new(vec!["orders".into(), "audit_%".into()], vec![]);
+        assert!(f.matches_name("orders"));
+        assert!(f.matches_name("audit_log"));
+        assert!(!f.matches_name("customers"));
+    }
+
+    #[test]
+    fn exclude_name_unqualified() {
+        let f = TableFilter::new(vec![], vec!["_df_%".into()]);
+        assert!(f.matches_name("orders"));
+        assert!(!f.matches_name("_df_cdc_changes"));
     }
 }

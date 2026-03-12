@@ -9,6 +9,7 @@ Processors can transform, modify or take extra action per event batch between th
 | [`javascript`](#javascript) | Custom transformations using V8-powered JavaScript |
 | [`outbox`](#outbox) | Transactional outbox pattern - extracts payload, resolves topic, sets routing headers |
 | [`flatten`](#flatten) | Flatten nested JSON objects into conmbined keys |
+| [`filter`](#filter) | Drop events by op type, table pattern, or field value |
 
 
 ## JavaScript
@@ -177,7 +178,6 @@ processors:
     empty_list: drop
 ```
 
-
 ### Envelope interaction
 
 The flatten processor runs on the raw `Event` struct **before** sink delivery. Envelope wrapping happens inside the sink, after all processors have run. This means the envelope always wraps already-flattened data, no special configuration needed.
@@ -229,6 +229,126 @@ processors:
     empty_object: drop    # remove sparse marker objects
     empty_list: drop      # remove empty arrays
 ```
+
+## Filter
+ 
+Drops events that do not pass configured criteria. Each criterion is independent — omit any of them to skip that check entirely. An event must pass all configured checks to be forwarded.
+ 
+```yaml
+processors:
+  - type: filter
+    id: only-active-orders
+    ops: [create, update]
+    tables:
+      include: ["shop.orders"]
+      exclude: ["*.tmp"]
+    fields:
+      - path: status
+        op: eq
+        value: "active"
+      - path: total
+        op: gte
+        value: 100
+    match: all
+```
+ 
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `id` | string | `"filter"` | Processor identifier |
+| `ops` | list | `[]` (all) | Operation types to keep: `create`, `update`, `delete`, `read`, `truncate` |
+| `tables.include` | list | `[]` (all) | Table patterns to include. Uses AllowList glob syntax: `db.table`, `shop.*`, `*.orders` |
+| `tables.exclude` | list | `[]` (none) | Table patterns to exclude. Applied after include; takes priority |
+| `fields` | list | `[]` (skip) | Predicates evaluated against `event.after` |
+| `match` | string | `all` | How to combine multiple field predicates: `all` (every predicate must pass) or `any` (at least one must pass) |
+ 
+### Field operators
+ 
+The `path` field is a dot-separated path into `event.after`, e.g. `"status"` or `"order.total"`.
+ 
+| Op | `value` | Description |
+|----|---------|-------------|
+| `eq` | scalar | Field equals value |
+| `ne` | scalar | Field does not equal value |
+| `exists` | — | Field is present and non-null |
+| `not_exists` | — | Field is absent or null |
+| `gt` / `gte` | number or string | Greater than / greater than or equal |
+| `lt` / `lte` | number or string | Less than / less than or equal |
+| `in` | array | Field value is one of the items in the array |
+| `not_in` | array | Field value is not in the array |
+| `contains` | scalar | String field contains the substring, or array field contains the element |
+| `changed` | — | Field value differs between `event.before` and `event.after`. Creates and Deletes always pass (no pair to compare) |
+| `regex` | string | String field matches the regex pattern. Compiled once at startup; invalid patterns fail pipeline initialization |
+ 
+### Notes
+ 
+**Numeric equality** — `eq` and `in` compare integers and floats by value, so `42` and `42.0` are considered equal. This matters when events have passed through the JavaScript processor, which converts all numbers to `f64`.
+ 
+**`not_in` with a missing field** — if the field is absent from the event, the event passes. Absence is not membership in any set.
+ 
+**`regex` on non-string fields** — silently does not match. Use `exists` first if the field may be absent or non-string.
+ 
+**`changed` and the before image** — the predicate reads `event.before`, which is only populated for `update` operations from sources configured with full row images. Verify your source has `REPLICA IDENTITY FULL` (PostgreSQL) or `binlog_row_image = FULL` (MySQL) before using `changed` in production.
+ 
+### Performance
+ 
+The filter processor is pure Rust with no serialization overhead. Op and table checks are O(1) to O(patterns). Field predicate evaluation reads `event.after` directly. Regex patterns are compiled once at construction time. Put a filter early in the processor chain to reduce the batch size before heavier processors (JavaScript, flatten) run.
+ 
+### Examples
+ 
+Drop deletes and snapshot reads:
+```yaml
+- type: filter
+  id: no-deletes
+  ops: [create, update]
+```
+ 
+Alert stream - pass if status is failed OR retry count exhausted:
+```yaml
+- type: filter
+  id: alert-worthy
+  match: any
+  fields:
+    - path: status
+      op: eq
+      value: "failed"
+    - path: retry_count
+      op: gte
+      value: 3
+```
+ 
+Filter before enrichment to avoid paying JavaScript overhead on the full stream:
+```yaml
+processors:
+  - type: filter
+    id: low-stock
+    ops: [create, update]
+    tables:
+      include: ["inventory.products"]
+    fields:
+      - path: stock_qty
+        op: lt
+        value: 10
+  - type: javascript
+    id: enrich
+    inline: |
+      function processBatch(events) {
+        return events.map(e => {
+          e.after.alert_level = e.after.stock_qty === 0 ? "critical" : "warning";
+          return e;
+        });
+      }
+```
+ 
+Only forward rows where a status column actually changed value (suppresses no-op updates):
+```yaml
+- type: filter
+  id: real-status-changes
+  ops: [update]
+  fields:
+    - path: status
+      op: changed
+```
+
 
 ## Processor Chain
 

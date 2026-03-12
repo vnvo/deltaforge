@@ -16,6 +16,9 @@ pub use outbox::OutboxProcessor;
 mod flatten;
 pub use flatten::FlattenProcessor;
 
+mod filter;
+pub use filter::FilterProcessor;
+
 pub fn build_processors(ps: &PipelineSpec) -> Result<Arc<[ArcDynProcessor]>> {
     let mut out: Vec<ArcDynProcessor> = Vec::new();
 

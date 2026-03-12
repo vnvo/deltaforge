@@ -33,6 +33,11 @@ pub use outbox_capture::{
     OutboxProcessorCfg, PgOutboxCapture,
 };
 
+mod filter_cfg;
+pub use filter_cfg::{
+    FieldOp, FieldPredicate, FilterProcessorCfg, MatchMode, OpFilter,
+};
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config file {path}: {source}")]
