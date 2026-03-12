@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+ 
+- **Filter processor** — native Rust processor that drops events not matching configured criteria ([543e632](https://github.com/vnvo/deltaforge/commit/543e632eca6b159eddbfd9d7e93b4dce056c4610), [52b3fb7](https://github.com/vnvo/deltaforge/commit/52b3fb753b153f3d030ef31ff10d45038c7b63b8), [0b847a5](https://github.com/vnvo/deltaforge/commit/0b847a59dbb382734b16abf37c9b478521d3063c))
+  - Three independent gates evaluated in order — all must pass: **op** (create/update/delete/read/truncate), **table** (AllowList glob patterns with include/exclude), **fields** (predicates against `event.after`)
+  - Numeric equality normalises int/float — `42` matches `42.0` for JS processor interop
+ 
 ---
 
 ## [0.1.0-beta.8] - 2026-03-12
