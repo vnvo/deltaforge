@@ -755,6 +755,10 @@ footer {
             <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="#e8e8ec" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M2 5h7"/><path d="M5 10h7"/><path d="M8 15h7"/><path d="m18 8 3 3-3 3"/><path d="M21 5h1"/><path d="M21 11h1"/><path d="M21 17h1"/></svg>
             <span style="font-size:0.7rem;color:var(--text-secondary);">Flatten</span>
           </div>
+          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="#e8e8ec" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+            <span style="font-size:0.7rem;color:var(--text-secondary);">Filter</span>
+          </div>
         </div>
       </div>
       <div class="tech-cell">
@@ -820,11 +824,12 @@ footer {
       <span class="key">tables</span>: [<span class="str">shop.orders</span>]</span>
 
   <span class="key">processors</span>:
-<span class="hl-region" data-hl="processors">    - <span class="key">type</span>: <span class="str">javascript</span>
-      <span class="key">inline</span>: |
-        <span class="str">function processBatch(events) {</span>
-        <span class="str">  return events.filter(e =&gt; e.after?.status !== <span class="comment">'draft'</span>);</span>
-        <span class="str">}</span></span>
+<span class="hl-region" data-hl="processors">    - <span class="key">type</span>: <span class="str">filter</span>
+      <span class="key">ops</span>: [<span class="str">create</span>, <span class="str">update</span>]
+      <span class="key">fields</span>:
+        - <span class="key">path</span>: <span class="str">status</span>
+          <span class="key">op</span>: <span class="str">ne</span>
+          <span class="key">value</span>: <span class="str">"draft"</span></span>
 <span class="hl-region" data-hl="processors">    - <span class="key">type</span>: <span class="str">flatten</span>
       <span class="key">separator</span>: <span class="str">"__"</span>
       <span class="key">empty_list</span>: <span class="str">drop</span></span>
@@ -849,7 +854,7 @@ footer {
           <div class="annotation-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m7 8-4 4 4 4"/><path d="m17 8 4 4-4 4"/><path d="m14 4-4 16"/></svg></div>
           <div>
             <div class="annotation-title">Processors</div>
-            <div class="annotation-desc">Chain native and scripted processors in order. Here: JavaScript drops draft orders, then Flatten normalizes nested JSON to <code style="color:var(--accent);font-family:var(--font-mono);font-size:0.78rem;">parent__child</code> keys before delivery.</div>
+            <div class="annotation-desc">Chain native and scripted processors in order. Here: Filter drops draft orders in native Rust, then Flatten normalizes nested JSON to <code style="color:var(--accent);font-family:var(--font-mono);font-size:0.78rem;">parent__child</code> keys before delivery.</div>
           </div>
         </div>
         <div class="annotation" data-hl="deliver">

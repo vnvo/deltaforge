@@ -212,6 +212,37 @@ processors:
 
 ---
 
+### Filter
+ 
+```yaml
+processors:
+  - type: filter
+    id: only-active-orders
+    ops: [create, update]
+    tables:
+      include: ["shop.orders"]
+      exclude: ["*.tmp"]
+    fields:
+      - path: status
+        op: eq
+        value: "active"
+      - path: total
+        op: gte
+        value: 100
+    match: all
+```
+ 
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `id` | string | `"filter"` | Processor identifier |
+| `ops` | list | `[]` | Op types to keep. Empty = all. `create`, `update`, `delete`, `read`, `truncate` |
+| `tables.include` | list | `[]` | Table glob patterns to include. Empty = all |
+| `tables.exclude` | list | `[]` | Table glob patterns to exclude. Takes priority over include |
+| `fields` | list | `[]` | Field predicates against `event.after`. See [Filter operators](processors.md#field-operators) |
+| `match` | string | `all` | `all` - every predicate must match; `any` - at least one |
+ 
+---
+
 ### Outbox
 
 Transforms raw outbox events into routed, sink-ready events. Requires the source to have `outbox` configured so events are tagged before reaching this processor. See [Outbox pattern documentation](outbox.md) for full details.

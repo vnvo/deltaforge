@@ -107,7 +107,7 @@ Output: `{"schema":null,"payload":{...}}`
 
 | Built with | Sources | Processors | Sinks | Output Formats |
 |:---:|:---:|:---:|:---:|:---:|
-| Rust | MySQL · PostgreSQL | JavaScript · Outbox · Flatten | Kafka · Redis · NATS | Native · Debezium · CloudEvents |
+| Rust | MySQL · PostgreSQL | JavaScript · Outbox · Flatten · Filter | Kafka · Redis · NATS | Native · Debezium · CloudEvents |
 
 ## Features
 
@@ -142,6 +142,8 @@ Output: `{"schema":null,"payload":{...}}`
     - Transactional outbox pattern with routing and raw payload delivery support
   - Flatten processor:
     - Native Rust processor that collapses nested JSON into top-level `parent__child` keys
+  - Filter processor:
+    - Native Rust processor for dropping events by op type, table pattern, or field predicates (eq, ne, gt, in, regex, changed, and more)
 
 - **Sinks**
   - Kafka producer sink (via `rdkafka`)
@@ -404,7 +406,7 @@ spec:
 | `config.snapshot` | Initial load: `mode` (`never`/`initial`/`always`), `chunk_size`, `max_parallel_tables` |
 | `config.on_schema_drift` | `adapt` (default) — continue after failover schema drift; `halt` — stop for operator intervention |
 | **`spec.processors`** | Optional transforms - see [Processors](docs/src/configuration.md#processors) |
-| `type` | `javascript`, `outbox`, `flatten` |
+| `type` | `javascript`, `outbox`, `flatten`, `filter` |
 | `inline` | JavaScript code for batch processing |
 | `limits` | CPU, memory, and timeout limits |
 | **`spec.sinks`** | One or more sinks - see [Sinks](docs/src/sinks/README.md) |
@@ -438,6 +440,7 @@ View actual examples: [Example Configurations](docs/src/examples/README.md)
 
 - [x] Outbox pattern support
 - [x] Flatten processor
+- [x] Filter processor
 - [x] Persistent schema registry (SQLite, then PostgreSQL)
 - [x] Snapshot/backfill (initial load for existing tables)
 - [ ] Protobuf encoding
