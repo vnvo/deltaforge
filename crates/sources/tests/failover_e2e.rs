@@ -223,6 +223,7 @@ async fn make_mysql_source(
         backend,
         outbox_tables: AllowList::default(),
         snapshot_cfg: SnapshotCfg::default(),
+        on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
     }
 }
 
@@ -246,6 +247,7 @@ async fn make_pg_source(
         backend,
         outbox_prefixes: AllowList::default(),
         snapshot_cfg: SnapshotCfg::default(),
+        on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
     }
 }
 
@@ -504,6 +506,7 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
             backend: Arc::clone(&backend),
             outbox_tables: AllowList::default(),
             snapshot_cfg: SnapshotCfg::default(),
+            on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         };
         let (tx, mut rx) = mpsc::channel(64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -552,6 +555,7 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
             backend: Arc::clone(&backend),
             outbox_tables: AllowList::default(),
             snapshot_cfg: SnapshotCfg::default(),
+            on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         };
         let (tx, mut rx) = mpsc::channel(64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -615,8 +619,202 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
 }
 
 // ============================================================================
-// PostgreSQL: identity change → reconciliation → streaming resumes
+// MySQL: on_schema_drift=halt + drift detected → source stops
 // ============================================================================
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
+    init_test_tracing();
+    const DB: &str = "shop";
+
+    let (_c_a, port_a) = start_mysql().await;
+    mysql_create_schema(port_a, DB).await;
+
+    let registry = make_registry().await;
+    let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+
+    // run 1: register A's schema (id, sku)
+    {
+        let src = MySqlSource {
+            id: "fo_halt".into(),
+            checkpoint_key: "mysql-fo_halt".into(),
+            dsn: mysql_cdc_dsn(port_a, DB),
+            tables: vec![format!("{DB}.orders")],
+            tenant: "acme".into(),
+            pipeline: "test".into(),
+            registry: Arc::clone(&registry),
+            backend: Arc::clone(&backend),
+            outbox_tables: AllowList::default(),
+            snapshot_cfg: SnapshotCfg::default(),
+            on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
+        };
+        let (tx, mut rx) = mpsc::channel(64);
+        let handle = src.run(tx, Arc::clone(&ckpt)).await;
+        sleep(Duration::from_secs(4)).await;
+
+        let pool = mysql_root_pool(port_a).await;
+        let mut conn = pool.get_conn().await?;
+        conn.query_drop(format!("USE {DB}")).await?;
+        conn.query_drop("INSERT INTO orders VALUES (1, 'before')")
+            .await?;
+        collect_until(&mut rx, Duration::from_secs(10), |e| {
+            e.iter().any(|x| has_id(x, 1))
+        })
+        .await;
+
+        handle.stop();
+        handle.join().await.ok();
+    }
+
+    let uuid_a = mysql_fetch_uuid(port_a).await;
+
+    // B: extra column added, simulating an un-synced replica schema
+    let (_c_b, port_b) = start_mysql().await;
+    mysql_create_schema(port_b, DB).await;
+    {
+        let pool = mysql_root_pool(port_b).await;
+        let mut conn = pool.get_conn().await?;
+        conn.query_drop(format!("USE {DB}")).await?;
+        conn.query_drop("ALTER TABLE orders ADD COLUMN status VARCHAR(32)")
+            .await?;
+        conn.query_drop(format!("SET GLOBAL gtid_purged='{uuid_a}:1-100'"))
+            .await?;
+    }
+
+    // run 2: on_schema_drift=halt → source must stop with drift error
+    {
+        let src = MySqlSource {
+            id: "fo_halt".into(),
+            checkpoint_key: "mysql-fo_halt".into(),
+            dsn: mysql_cdc_dsn(port_b, DB),
+            tables: vec![format!("{DB}.orders")],
+            tenant: "acme".into(),
+            pipeline: "test".into(),
+            registry: Arc::clone(&registry),
+            backend: Arc::clone(&backend),
+            outbox_tables: AllowList::default(),
+            snapshot_cfg: SnapshotCfg::default(),
+            on_schema_drift: deltaforge_config::OnSchemaDrift::Halt,
+        };
+        let (tx, _rx) = mpsc::channel(64);
+        let handle = src.run(tx, Arc::clone(&ckpt)).await;
+
+        match timeout(Duration::from_secs(20), handle.join()).await {
+            Ok(Err(e)) => {
+                assert!(
+                    e.to_string().contains("schema drift"),
+                    "unexpected error: {e}"
+                );
+                info!("✓ source stopped with schema drift error");
+            }
+            Ok(Ok(())) => panic!(
+                "source must not succeed when schema drift detected with halt policy"
+            ),
+            Err(_) => panic!("source did not stop within timeout"),
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// MySQL: on_schema_drift=halt + no drift → source continues normally
+// ============================================================================
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_failover_schema_drift_halt_no_drift_continues() -> Result<()> {
+    init_test_tracing();
+    const DB: &str = "shop";
+
+    let (_c_a, port_a) = start_mysql().await;
+    mysql_create_schema(port_a, DB).await;
+
+    let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+
+    // run 1: register A's schema
+    {
+        let src = make_mysql_source(
+            "fo_halt_nodrift",
+            &mysql_cdc_dsn(port_a, DB),
+            DB,
+            Arc::clone(&backend),
+        )
+        .await;
+        let (tx, mut rx) = mpsc::channel(64);
+        let handle = src.run(tx, Arc::clone(&ckpt)).await;
+        sleep(Duration::from_secs(4)).await;
+
+        let pool = mysql_root_pool(port_a).await;
+        let mut conn = pool.get_conn().await?;
+        conn.query_drop(format!("USE {DB}")).await?;
+        conn.query_drop("INSERT INTO orders VALUES (1, 'on-a')")
+            .await?;
+        collect_until(&mut rx, Duration::from_secs(10), |e| {
+            e.iter().any(|x| has_id(x, 1))
+        })
+        .await;
+
+        handle.stop();
+        handle.join().await.ok();
+    }
+
+    let uuid_a = mysql_fetch_uuid(port_a).await;
+
+    // B: identical schema, GTID purged to simulate promoted replica
+    let (_c_b, port_b) = start_mysql().await;
+    mysql_create_schema(port_b, DB).await;
+    {
+        let pool = mysql_root_pool(port_b).await;
+        let mut conn = pool.get_conn().await?;
+        conn.query_drop(format!("SET GLOBAL gtid_purged='{uuid_a}:1-100'"))
+            .await?;
+    }
+
+    // run 2: on_schema_drift=halt, but B has no drift → must stream normally
+    {
+        let src = MySqlSource {
+            id: "fo_halt_nodrift".into(),
+            checkpoint_key: "mysql-fo_halt_nodrift".into(),
+            dsn: mysql_cdc_dsn(port_b, DB),
+            tables: vec![format!("{DB}.orders")],
+            tenant: "acme".into(),
+            pipeline: "test".into(),
+            registry: make_registry().await,
+            backend: Arc::clone(&backend),
+            outbox_tables: AllowList::default(),
+            snapshot_cfg: SnapshotCfg::default(),
+            on_schema_drift: deltaforge_config::OnSchemaDrift::Halt,
+        };
+        let (tx, mut rx) = mpsc::channel(64);
+        let handle = src.run(tx, Arc::clone(&ckpt)).await;
+        sleep(Duration::from_secs(5)).await;
+
+        let pool = mysql_root_pool(port_b).await;
+        let mut conn = pool.get_conn().await?;
+        conn.query_drop(format!("USE {DB}")).await?;
+        conn.query_drop("INSERT INTO orders VALUES (2, 'on-b')")
+            .await?;
+
+        let evts = collect_until(&mut rx, Duration::from_secs(15), |e| {
+            e.iter().any(|x| has_id(x, 2))
+        })
+        .await;
+        assert!(
+            evts.iter().any(|e| has_id(e, 2)),
+            "halt policy must not block streaming when schema is unchanged"
+        );
+        info!("✓ streaming continued with halt policy and no schema drift");
+
+        handle.stop();
+        handle.join().await.ok();
+    }
+
+    Ok(())
+}
 
 #[tokio::test]
 #[ignore = "requires docker"]

@@ -57,6 +57,7 @@ async fn make_source(
         outbox_tables: AllowList::default(),
         snapshot_cfg,
         backend: make_storage_backend().await,
+        on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
     }
 }
 

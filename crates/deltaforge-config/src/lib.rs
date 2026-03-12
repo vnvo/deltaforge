@@ -109,6 +109,20 @@ pub struct Spec {
     pub schema_sensing: SchemaSensingConfig,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum OnSchemaDrift {
+    /// Detect drift, record it, reload the schema cache, and continue streaming.
+    /// Safe for additive drift (new columns on B). Risky if B is missing columns
+    /// that A had - row events may decode incorrectly against the wrong schema.
+    #[default]
+    Adapt,
+    /// Stop the source when any schema drift is detected after failover.
+    /// Requires operator intervention: verify B's schema, apply missing migrations,
+    /// then restart. Use this when DDL sync to replicas is not guaranteed.
+    Halt,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostgresSrcCfg {
     pub id: String,
@@ -126,6 +140,9 @@ pub struct PostgresSrcCfg {
     pub outbox: Option<PgOutboxCapture>,
     #[serde(default)]
     pub snapshot: SnapshotCfg,
+    /// What to do when schema drift is detected after failover.
+    #[serde(default)]
+    pub on_schema_drift: OnSchemaDrift,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -147,6 +164,9 @@ pub struct MysqlSrcCfg {
     pub outbox: Option<MysqlOutboxCapture>,
     #[serde(default)]
     pub snapshot: SnapshotCfg,
+    /// What to do when schema drift is detected after failover.
+    #[serde(default)]
+    pub on_schema_drift: OnSchemaDrift,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

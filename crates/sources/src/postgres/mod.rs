@@ -7,7 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use deltaforge_config::SnapshotMode;
+use deltaforge_config::{OnSchemaDrift, SnapshotMode};
 use pgwire_replication::{Lsn, ReplicationClient};
 use serde::{Deserialize, Serialize};
 use storage::{ArcStorageBackend, DurableSchemaRegistry};
@@ -84,6 +84,7 @@ pub struct PostgresSource {
     pub backend: ArcStorageBackend,
     pub outbox_prefixes: AllowList,
     pub snapshot_cfg: deltaforge_config::SnapshotCfg,
+    pub on_schema_drift: OnSchemaDrift,
 }
 
 // ============================================================================
@@ -117,6 +118,7 @@ pub(crate) struct RunCtx {
     pub outbox_prefixes: AllowList,
     pub identity_store: IdentityStore,
     pub reconciler: SchemaReconciler,
+    pub on_schema_drift: OnSchemaDrift,
 }
 
 // ============================================================================
@@ -299,6 +301,7 @@ impl PostgresSource {
                 Arc::clone(&backend),
                 self.tenant.clone(),
             ),
+            on_schema_drift: self.on_schema_drift.clone(),
         };
 
         // Store initial server identity (FirstSeen path).
@@ -632,6 +635,18 @@ async fn run_failover_reconciliation(
             if !result.deltas.is_empty() {
                 let _ =
                     ctx.schema.reload_schema(&result.db, &result.table).await;
+            }
+        }
+
+        let has_drift =
+            record.table_results.iter().any(|r| !r.deltas.is_empty());
+        if has_drift {
+            warn!(pipeline=%ctx.pipeline, source_id=%ctx.source_id, "schema drift detected after failover");
+            if ctx.on_schema_drift == deltaforge_config::OnSchemaDrift::Halt {
+                return Err(SourceError::Other(anyhow::anyhow!(
+                    "schema drift detected after failover and on_schema_drift=halt. \
+                Verify B's schema and apply any missing migrations before restarting."
+                )));
             }
         }
     }

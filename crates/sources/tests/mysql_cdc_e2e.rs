@@ -129,6 +129,7 @@ async fn make_source(
         outbox_tables,
         snapshot_cfg: SnapshotCfg::default(),
         backend: make_storage_backend().await,
+        on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
     }
 }
 
@@ -313,6 +314,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
         outbox_tables: AllowList::default(),
         snapshot_cfg: SnapshotCfg::default(),
         backend,
+        on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
     };
     let (mut rx, handle) = start_source(src).await?;
 
@@ -432,6 +434,7 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
         outbox_tables: AllowList::default(),
         snapshot_cfg: SnapshotCfg::default(),
         backend: make_storage_backend().await,
+        on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
     };
     let (mut rx, handle) = start_source(src).await?;
 

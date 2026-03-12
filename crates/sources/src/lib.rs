@@ -56,6 +56,7 @@ pub fn build_source(
                 .map(|o| o.allow_list())
                 .unwrap_or_default(),
             snapshot_cfg: c.snapshot.clone(),
+            on_schema_drift: c.on_schema_drift.clone(),
         })),
 
         SourceCfg::Mysql(c) => Ok(Arc::new(mysql::MySqlSource {
@@ -73,6 +74,7 @@ pub fn build_source(
                 .map(|o| o.allow_list())
                 .unwrap_or_default(),
             snapshot_cfg: c.snapshot.clone(),
+            on_schema_drift: c.on_schema_drift.clone(),
         })),
 
         #[cfg(feature = "turso")]

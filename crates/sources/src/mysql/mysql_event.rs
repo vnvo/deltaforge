@@ -691,6 +691,7 @@ mod tests {
                 Arc::new(storage::MemoryStorageBackend::new()),
                 "test-tenant",
             ),
+            on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         }
     }
 

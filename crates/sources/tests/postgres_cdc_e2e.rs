@@ -203,6 +203,7 @@ async fn make_source(
         outbox_prefixes,
         snapshot_cfg: deltaforge_config::SnapshotCfg::default(),
         backend: make_storage_backend().await,
+        on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
     }
 }
 
