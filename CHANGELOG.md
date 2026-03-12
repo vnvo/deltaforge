@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.1.0-beta.8] - 2026-03-12
+
 ### Added
 
 - **Failover handling** — automatic detection and recovery when the source database primary changes ([9f5bcb7](https://github.com/vnvo/deltaforge/commit/9f5bcb7a538f0d4e18423ecb8c83dd1709e6d910), [daf630b](https://github.com/vnvo/deltaforge/commit/daf630b9775141fa314795c380f7b528663430ad), [29652a3](https://github.com/vnvo/deltaforge/commit/29652a36dcbb248faf15bacfc319e9b5a3819c3d), [784295c](https://github.com/vnvo/deltaforge/commit/784295cd81ca8167a373d6e153ede7b819197397), [e761267](https://github.com/vnvo/deltaforge/commit/e761267a70d41df76139df24e2310e7c0778e822))
@@ -429,7 +433,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Links
 
-- [Unreleased]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.7...HEAD
+- [Unreleased]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.8...HEAD
+- [0.1.0-beta.8]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.7...v0.1.0-beta.8
 - [0.1.0-beta.7]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.6...v0.1.0-beta.7
 - [0.1.0-beta.6]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.5...v0.1.0-beta.6
 - [0.1.0-beta.5]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.4...v0.1.0-beta.5
