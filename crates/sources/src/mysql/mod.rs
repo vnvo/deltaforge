@@ -330,7 +330,16 @@ impl MySqlSource {
                         _ = ctx.cancel.cancelled() => break,
                     }
 
-                    stream = reconnect_stream(&mut ctx).await?;
+                    //stream = reconnect_stream(&mut ctx).await?;
+                    match reconnect_stream(&mut ctx).await {
+                        Ok(s) => stream = s,
+                        Err(SourceError::Connect { .. })
+                        | Err(SourceError::Io(_)) => {
+                            // still can't connect, loop back, next backoff will fire
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 Err(LoopControl::Stop) => break,
                 Err(LoopControl::Fail(e)) => return Err(e),
@@ -463,7 +472,12 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     } else {
         match resolve_binlog_tail(&ctx.dsn).await {
             Ok((f, p)) => (None, Some(f), Some(p as u32)),
-            Err(err) => return Err(err.into()),
+            Err(_) => {
+                return Err(SourceError::Connect {
+                    details: "could not resolve binlog tail during reconnect"
+                        .into(),
+                });
+            }
         }
     };
 

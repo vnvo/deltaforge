@@ -66,8 +66,19 @@ pub(super) async fn prepare_client(
 
         if let Some(gtid) = &p.gtid_set {
             client.gtid_enabled = true;
-            client.gtid_set = gtid.clone();
-            info!(source_id = %source_id, %gtid, "resuming via GTID");
+            // Fetch the full executed set — the checkpoint stores only the last
+            // transaction GTID, but MySQL needs the full set to resume correctly.
+            // Fall back to the checkpoint value if the fetch fails.
+            match fetch_executed_gtid_set(dsn).await {
+                Ok(Some(full_set)) => {
+                    info!(source_id = %source_id, %full_set, "resuming via full GTID set");
+                    client.gtid_set = full_set;
+                }
+                _ => {
+                    info!(source_id = %source_id, %gtid, "resuming via checkpoint GTID (fallback)");
+                    client.gtid_set = gtid.clone();
+                }
+            }
         } else {
             client.gtid_enabled = false;
             client.binlog_filename = p.file.clone();
@@ -86,6 +97,12 @@ pub(super) async fn prepare_client(
                 info!(source_id = %source_id, %file, %pos, "start from end (first run)");
                 client.binlog_filename = file;
                 client.binlog_position = pos as u32;
+                // Also fetch the full executed GTID set so reconnects resume
+                // from here rather than replaying the full binlog history.
+                if let Ok(Some(gtid_set)) = fetch_executed_gtid_set(dsn).await {
+                    client.gtid_enabled = true;
+                    client.gtid_set = gtid_set;
+                }
             }
             Err(e) => {
                 error!(source_id = %source_id, error = %e, "failed to resolve binlog tail");
@@ -468,7 +485,6 @@ pub(crate) fn short_sql(s: &str, max: usize) -> String {
     }
 }
 
-#[allow(dead_code)]
 pub(super) async fn fetch_executed_gtid_set(
     dsn: &str,
 ) -> SourceResult<Option<String>> {

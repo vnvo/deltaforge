@@ -397,7 +397,41 @@ fn handle_gtid(
 ) {
     let gtid_str = gt.gtid.clone();
     debug!(source_id=%ctx.source_id, gtid=%gtid_str, "gtid");
-    ctx.last_gtid = Some(gtid_str);
+
+    // Accumulate the full executed GTID set rather than storing just the last
+    // transaction. MySQL needs the full set to resume correctly on reconnect.
+    // Format: "uuid:1-N" built by extending the existing range.
+    ctx.last_gtid = Some(match &ctx.last_gtid {
+        None => gtid_str,
+        Some(existing) => merge_gtid(existing, &gtid_str),
+    });
+}
+
+/// Merge a single GTID (e.g. "uuid:21") into an existing set (e.g. "uuid:1-20").
+/// Handles the common case of a single server UUID with a contiguous range.
+/// Falls back to appending with a comma for multi-source replication.
+fn merge_gtid(existing: &str, new_gtid: &str) -> String {
+    // Parse "uuid:N" or "uuid:M-N"
+    if let (Some(e_colon), Some(n_colon)) =
+        (existing.rfind(':'), new_gtid.rfind(':'))
+    {
+        let e_uuid = &existing[..e_colon];
+        let n_uuid = &new_gtid[..n_colon];
+        let n_seq: u64 = new_gtid[n_colon + 1..].parse().unwrap_or(0);
+
+        if e_uuid == n_uuid && n_seq > 0 {
+            // Same server — extend the range
+            let range = &existing[e_colon + 1..];
+            let start: u64 = if let Some(dash) = range.find('-') {
+                range[..dash].parse().unwrap_or(1)
+            } else {
+                range.parse().unwrap_or(1)
+            };
+            return format!("{}:{}-{}", e_uuid, start, n_seq);
+        }
+    }
+    // Multi-source or parse failure — append
+    format!("{},{}", existing, new_gtid)
 }
 
 fn handle_rotate(
