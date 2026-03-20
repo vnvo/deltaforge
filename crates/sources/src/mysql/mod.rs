@@ -315,30 +315,15 @@ impl MySqlSource {
                     } else {
                         let _ = ctx.schema.reload_all(&self.tables).await?;
                     }
-                    stream = reconnect_stream(&mut ctx).await?;
+                    match do_reconnect(&mut ctx).await? {
+                        Some(s) => stream = s,
+                        None => continue,
+                    }
                 }
                 Err(LoopControl::Reconnect) => {
-                    let delay = ctx.retry.next_backoff();
-                    warn!(
-                        source_id = %ctx.source_id,
-                        delay_ms = delay.as_millis(),
-                        "scheduling reconnect after backoff"
-                    );
-
-                    tokio::select! {
-                        _ = tokio::time::sleep(delay) => {}
-                        _ = ctx.cancel.cancelled() => break,
-                    }
-
-                    //stream = reconnect_stream(&mut ctx).await?;
-                    match reconnect_stream(&mut ctx).await {
-                        Ok(s) => stream = s,
-                        Err(SourceError::Connect { .. })
-                        | Err(SourceError::Io(_)) => {
-                            // still can't connect, loop back, next backoff will fire
-                            continue;
-                        }
-                        Err(e) => return Err(e),
+                    match do_reconnect(&mut ctx).await? {
+                        Some(s) => stream = s,
+                        None => continue,
                     }
                 }
                 Err(LoopControl::Stop) => break,
@@ -366,7 +351,7 @@ impl MySqlSource {
 #[async_trait]
 impl Source for MySqlSource {
     fn checkpoint_key(&self) -> &str {
-        &self.checkpoint_key
+        &self.id
     }
 
     async fn run(
@@ -517,6 +502,34 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     check_identity_post_reconnect(ctx).await?;
 
     Ok(stream)
+}
+
+/// Apply backoff, sleep (cancel-aware), reconnect, and absorb transient errors.
+///
+/// Returns:
+/// - `Ok(Some(stream))` - reconnected, caller assigns the new stream.
+/// - `Ok(None)`         - cancelled during sleep or transient connect error;
+///                        caller should `continue` the loop (next iteration
+///                        will either break on cancel or retry with fresh backoff).
+/// - `Err(e)`           - fatal error, caller propagates.
+async fn do_reconnect(ctx: &mut RunCtx) -> SourceResult<Option<BinlogStream>> {
+    let delay = ctx.retry.next_backoff();
+    warn!(
+        source_id = %ctx.source_id,
+        delay_ms = delay.as_millis(),
+        "scheduling reconnect after backoff"
+    );
+
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => {}
+        _ = ctx.cancel.cancelled() => return Ok(None),
+    }
+
+    match reconnect_stream(ctx).await {
+        Ok(s) => Ok(Some(s)),
+        Err(SourceError::Connect { .. }) | Err(SourceError::Io(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 // ============================================================================

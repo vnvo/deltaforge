@@ -408,30 +408,49 @@ fn handle_gtid(
 }
 
 /// Merge a single GTID (e.g. "uuid:21") into an existing set (e.g. "uuid:1-20").
-/// Handles the common case of a single server UUID with a contiguous range.
-/// Falls back to appending with a comma for multi-source replication.
+///
+/// Handles both single-source ("uuid:1-N") and multi-source sets
+/// ("uuid1:1-N,uuid2:1-M") by splitting on commas and updating the matching
+/// UUID entry in-place. Appends a new entry if the UUID is not yet present.
 fn merge_gtid(existing: &str, new_gtid: &str) -> String {
-    // Parse "uuid:N" or "uuid:M-N"
-    if let (Some(e_colon), Some(n_colon)) =
-        (existing.rfind(':'), new_gtid.rfind(':'))
-    {
-        let e_uuid = &existing[..e_colon];
-        let n_uuid = &new_gtid[..n_colon];
-        let n_seq: u64 = new_gtid[n_colon + 1..].parse().unwrap_or(0);
+    // Parse the incoming single GTID: "uuid:N"
+    let n_colon = match new_gtid.rfind(':') {
+        Some(p) => p,
+        None => return format!("{},{}", existing, new_gtid),
+    };
+    let n_uuid = &new_gtid[..n_colon];
+    let n_seq: u64 = match new_gtid[n_colon + 1..].parse() {
+        Ok(n) if n > 0 => n,
+        _ => return format!("{},{}", existing, new_gtid),
+    };
 
-        if e_uuid == n_uuid && n_seq > 0 {
-            // Same server — extend the range
-            let range = &existing[e_colon + 1..];
-            let start: u64 = if let Some(dash) = range.find('-') {
-                range[..dash].parse().unwrap_or(1)
-            } else {
-                range.parse().unwrap_or(1)
-            };
-            return format!("{}:{}-{}", e_uuid, start, n_seq);
+    // Walk each "uuid:range" entry and update the one that matches.
+    let mut entries: Vec<String> =
+        existing.split(',').map(str::to_owned).collect();
+    let mut found = false;
+    for entry in &mut entries {
+        // find(':') is correct here — individual entries never contain commas,
+        // so find and rfind are equivalent, but find is explicit about intent.
+        if let Some(colon) = entry.find(':') {
+            if &entry[..colon] == n_uuid {
+                let range = &entry[colon + 1..];
+                let start: u64 = if let Some(dash) = range.find('-') {
+                    range[..dash].parse().unwrap_or(1)
+                } else {
+                    range.parse().unwrap_or(1)
+                };
+                *entry = format!("{}:{}-{}", n_uuid, start, n_seq);
+                found = true;
+                break;
+            }
         }
     }
-    // Multi-source or parse failure — append
-    format!("{},{}", existing, new_gtid)
+
+    if !found {
+        entries.push(format!("{}:{}", n_uuid, n_seq));
+    }
+
+    entries.join(",")
 }
 
 fn handle_rotate(
@@ -1122,5 +1141,52 @@ mod tests {
             None
         );
         assert_eq!(extract_table_from_ddl("BEGIN"), None);
+    }
+
+    // =========================================================================
+    // merge_gtid tests
+    // =========================================================================
+
+    #[test]
+    fn merge_gtid_single_source_extends_range() {
+        // Normal case: sequential GTIDs from one server
+        let result = merge_gtid("uuid-a:1-10", "uuid-a:11");
+        assert_eq!(result, "uuid-a:1-11");
+    }
+
+    #[test]
+    fn merge_gtid_single_source_first_event() {
+        // Existing set has a single point, not yet a range
+        let result = merge_gtid("uuid-a:1", "uuid-a:2");
+        assert_eq!(result, "uuid-a:1-2");
+    }
+
+    #[test]
+    fn merge_gtid_multi_source_extends_correct_entry() {
+        // The bug: rfind(':') on the existing set would find the colon in
+        // "uuid-b:1-50" and compute e_uuid = "uuid-a:1-100,uuid-b", failing
+        // the equality check and appending instead of extending.
+        let result = merge_gtid("uuid-a:1-100,uuid-b:1-50", "uuid-a:101");
+        assert_eq!(result, "uuid-a:1-101,uuid-b:1-50");
+    }
+
+    #[test]
+    fn merge_gtid_multi_source_extends_second_entry() {
+        let result = merge_gtid("uuid-a:1-100,uuid-b:1-50", "uuid-b:51");
+        assert_eq!(result, "uuid-a:1-100,uuid-b:1-51");
+    }
+
+    #[test]
+    fn merge_gtid_multi_source_appends_new_uuid() {
+        // A GTID from a third source not yet in the set
+        let result = merge_gtid("uuid-a:1-100,uuid-b:1-50", "uuid-c:1");
+        assert_eq!(result, "uuid-a:1-100,uuid-b:1-50,uuid-c:1");
+    }
+
+    #[test]
+    fn merge_gtid_three_sources_middle_entry() {
+        let result =
+            merge_gtid("uuid-a:1-10,uuid-b:1-20,uuid-c:1-30", "uuid-b:21");
+        assert_eq!(result, "uuid-a:1-10,uuid-b:1-21,uuid-c:1-30");
     }
 }

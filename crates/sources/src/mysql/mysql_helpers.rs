@@ -66,19 +66,12 @@ pub(super) async fn prepare_client(
 
         if let Some(gtid) = &p.gtid_set {
             client.gtid_enabled = true;
-            // Fetch the full executed set — the checkpoint stores only the last
-            // transaction GTID, but MySQL needs the full set to resume correctly.
-            // Fall back to the checkpoint value if the fetch fails.
-            match fetch_executed_gtid_set(dsn).await {
-                Ok(Some(full_set)) => {
-                    info!(source_id = %source_id, %full_set, "resuming via full GTID set");
-                    client.gtid_set = full_set;
-                }
-                _ => {
-                    info!(source_id = %source_id, %gtid, "resuming via checkpoint GTID (fallback)");
-                    client.gtid_set = gtid.clone();
-                }
-            }
+            // The checkpoint holds the full accumulated GTID set (built by
+            // merge_gtid as events flow in). Use it directly so MySQL replays
+            // exactly what we haven't seen yet. Fetching @@gtid_executed here
+            // would advance past transactions inserted while the source was down.
+            info!(source_id = %source_id, %gtid, "resuming via checkpoint GTID set");
+            client.gtid_set = gtid.clone();
         } else {
             client.gtid_enabled = false;
             client.binlog_filename = p.file.clone();
@@ -502,7 +495,7 @@ pub(super) async fn fetch_executed_gtid_set(
     conn.disconnect()
         .await
         .map_err(|e| SourceError::Other(e.into()))?;
-
+    
     Ok(row.and_then(|(s,)| s))
 }
 
