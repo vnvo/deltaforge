@@ -55,8 +55,9 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
     // Insert rows and wait for them to be checkpointed before killing.
     // This ensures the crash happens after a valid checkpoint exists.
     info!("step 2/5: inserting 5 rows and waiting for checkpoint ...");
+    let pre_crash_baseline = harness.kafka_offset().await?;
     insert_rows("pre-crash", 5).await?;
-    let target_pre = harness.kafka_offset().await? + 5;
+    let target_pre = pre_crash_baseline + 5;
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if harness.kafka_offset().await? >= target_pre {

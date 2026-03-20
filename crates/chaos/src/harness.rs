@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, bail};
 use rdkafka::ClientConfig;
-use rdkafka::consumer::{BaseConsumer, Consumer, StreamConsumer};
-use rdkafka::message::Message;
+use rdkafka::consumer::{BaseConsumer, Consumer};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::info;
@@ -77,14 +76,6 @@ impl Harness {
         Ok(result.1 as u64) // (low, high) — high is the next offset to be written
     }
 
-    /// Kept for compatibility but now delegates to kafka_offset.
-    pub async fn count_delivered_events(
-        &self,
-        _idle_timeout: Duration,
-    ) -> Result<u64> {
-        self.kafka_offset().await
-    }
-
     /// Fetch current source event counter from DeltaForge Prometheus metrics.
     pub async fn source_event_count(&self) -> Result<f64> {
         let body = reqwest::get("http://localhost:9000/metrics")
@@ -118,15 +109,6 @@ fn parse_counter(body: &str, name: &str) -> Result<f64> {
         }
     }
     Ok(0.0)
-}
-
-fn uuid() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos()
-        .to_string()
 }
 
 /// Scenario outcome — printed at the end of every run.

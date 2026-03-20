@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::info;
 
-use crate::harness::{CHAOS_TOPIC, Harness, MYSQL_DSN, ScenarioResult};
+use crate::harness::{Harness, MYSQL_DSN, ScenarioResult};
 
 const PARTITION_HOLD: Duration = Duration::from_secs(10);
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
