@@ -140,6 +140,12 @@ impl LoopControl {
                     details: msg.clone().into(),
                 })
             }
+            ConnectError(ref msg) if is_purged_error(msg) => {
+                error!(error = %msg, "binlog position purged - re-snapshot required");
+                Self::Fail(SourceError::Checkpoint {
+                    details: msg.clone().into(),
+                })
+            }
             ConnectError(msg) => {
                 warn!(error = %msg, "connect error, will reconnect");
                 Self::Reconnect
@@ -207,6 +213,13 @@ fn is_auth_error(msg: &str) -> bool {
     lower.contains("access denied")
         || lower.contains("authentication")
         || lower.contains("unauthorized")
+}
+
+/// Check if an error message indicates the binlog position has been purged.
+/// This is unrecoverable - reconnecting will hit the same error forever.
+fn is_purged_error(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("purged") || lower.contains("gtid_purged")
 }
 
 #[cfg(test)]
@@ -294,6 +307,31 @@ mod tests {
         assert!(matches!(
             control,
             LoopControl::Fail(SourceError::Auth { .. })
+        ));
+    }
+
+    #[test]
+    fn connect_error_purged_binlog_triggers_checkpoint_fail() {
+        let err = BinlogError::ConnectError(
+            "The replica requires binary logs containing GTIDs that the source has purged"
+                .to_string(),
+        );
+        let control = LoopControl::from_binlog_error(err);
+        assert!(matches!(
+            control,
+            LoopControl::Fail(SourceError::Checkpoint { .. })
+        ));
+    }
+
+    #[test]
+    fn connect_error_gtid_purged_triggers_checkpoint_fail() {
+        let err = BinlogError::ConnectError(
+            "requested GTIDs are in gtid_purged".to_string(),
+        );
+        let control = LoopControl::from_binlog_error(err);
+        assert!(matches!(
+            control,
+            LoopControl::Fail(SourceError::Checkpoint { .. })
         ));
     }
 

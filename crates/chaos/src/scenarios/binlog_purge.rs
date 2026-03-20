@@ -57,12 +57,10 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
     // ── Stop and purge ────────────────────────────────────────────────────────
     info!("step 2/4: stopping DeltaForge cleanly to preserve checkpoint ...");
     stop_deltaforge().await?;
+    // Clean stop (SIGTERM) flushes the checkpoint to SQLite before exit.
+    // SQLite WAL is on the Docker volume and replays automatically on restart —
+    // no manual WAL checkpoint needed.
     info!("DeltaForge stopped");
-
-    // Force SQLite WAL checkpoint so the checkpoint survives container restart.
-    // Without this the WAL may not be flushed to the main db file.
-    force_wal_checkpoint().await?;
-    info!("SQLite WAL checkpoint forced");
 
     insert_rows(3).await?;
     purge_binlogs().await?;
@@ -156,48 +154,6 @@ async fn start_deltaforge() -> Result<()> {
     if !status.success() {
         anyhow::bail!("docker start failed");
     }
-    Ok(())
-}
-
-async fn force_wal_checkpoint() -> Result<()> {
-    // Copy the db files to host and force WAL checkpoint via host sqlite3,
-    // then copy back so the main db file is fully up to date.
-    for cmd in [
-        vec![
-            "cp",
-            "deltaforge-deltaforge-1:/data/deltaforge.db",
-            "/tmp/df_wal_check.db",
-        ],
-        vec![
-            "cp",
-            "deltaforge-deltaforge-1:/data/deltaforge.db-shm",
-            "/tmp/df_wal_check.db-shm",
-        ],
-        vec![
-            "cp",
-            "deltaforge-deltaforge-1:/data/deltaforge.db-wal",
-            "/tmp/df_wal_check.db-wal",
-        ],
-    ] {
-        let _ = tokio::process::Command::new("docker")
-            .args(cmd)
-            .status()
-            .await;
-    }
-    // Force checkpoint on host
-    let _ = tokio::process::Command::new("sqlite3")
-        .args(["/tmp/df_wal_check.db", "PRAGMA wal_checkpoint(TRUNCATE);"])
-        .status()
-        .await;
-    // Copy checkpointed db back
-    let _ = tokio::process::Command::new("docker")
-        .args([
-            "cp",
-            "/tmp/df_wal_check.db",
-            "deltaforge-deltaforge-1:/data/deltaforge.db",
-        ])
-        .status()
-        .await;
     Ok(())
 }
 
