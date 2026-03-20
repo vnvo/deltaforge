@@ -37,6 +37,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 15
+    ports:
+      - "3306:3306"
     networks: [chaos_net]
 
   postgres:
@@ -80,10 +82,10 @@ services:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       # Two listeners: INTERNAL for container-to-container, EXTERNAL for host
-      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9093,EXTERNAL://0.0.0.0:9092
-      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9093,EXTERNAL://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_LISTENERS: BROKER://0.0.0.0:9093,CLIENT://0.0.0.0:9094,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: BROKER://kafka:9093,CLIENT://toxiproxy:5102,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: BROKER:PLAINTEXT,CLIENT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: BROKER
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
     healthcheck:
@@ -91,6 +93,8 @@ services:
       interval: 10s
       timeout: 10s
       retries: 10
+    ports:
+      - "9092:9092"
     networks: [chaos_net]
 
   # Toxiproxy
@@ -117,13 +121,16 @@ services:
   # Build first: docker build -t deltaforge:local-debug -f Dockerfile.debug .
 
   deltaforge:
-    image: ghcr.io/vnvo/deltaforge:0.1.0-beta.8-debug
-    command: ["--config", "/etc/deltaforge/mysql-to-kafka.yaml"]
+    #image: ghcr.io/vnvo/deltaforge:0.1.0-beta.8-debug
+    image: deltaforge:dev-debug
+    command: ["--config", "/etc/deltaforge/mysql-to-kafka.yaml", "--storage-path", "/data/deltaforge.db"]
+    profiles: [app]
+    user: root
     volumes:
       - ./chaos/config:/etc/deltaforge:ro
       - deltaforge_data:/data
     environment:
-      RUST_LOG: "deltaforge=info,sources=info,sinks=info,warn"
+      RUST_LOG: "deltaforge=debug,sources=debug,sinks=info,warn"
     ports:
       - "8080:8080"   # REST API / health
       - "9000:9000"   # Prometheus /metrics

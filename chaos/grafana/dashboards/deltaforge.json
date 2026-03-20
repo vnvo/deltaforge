@@ -3,13 +3,21 @@
   "uid": "deltaforge-chaos",
   "schemaVersion": 38,
   "refresh": "5s",
-  "time": { "from": "now-15m", "to": "now" },
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
   "panels": [
     {
       "id": 1,
       "title": "Event Throughput (events/s)",
       "type": "timeseries",
-      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
       "targets": [
         {
           "datasource": "Prometheus",
@@ -23,14 +31,24 @@
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "ops", "custom": { "lineWidth": 2 } }
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
       }
     },
     {
       "id": 2,
       "title": "Reconnects (cumulative)",
       "type": "timeseries",
-      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
       "targets": [
         {
           "datasource": "Prometheus",
@@ -39,77 +57,116 @@
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short", "color": { "fixedColor": "orange", "mode": "fixed" }, "custom": { "lineWidth": 2 } }
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "fixedColor": "orange",
+            "mode": "fixed"
+          },
+          "custom": {
+            "lineWidth": 2
+          }
+        }
       }
     },
     {
       "id": 3,
-      "title": "Sink Latency p50 / p99 (ms)",
+      "title": "Avg Sink Latency (ms)",
       "type": "timeseries",
-      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
       "targets": [
         {
           "datasource": "Prometheus",
-          "expr": "histogram_quantile(0.50, rate(deltaforge_sink_latency_seconds_bucket[30s])) * 1000",
-          "legendFormat": "p50"
-        },
-        {
-          "datasource": "Prometheus",
-          "expr": "histogram_quantile(0.99, rate(deltaforge_sink_latency_seconds_bucket[30s])) * 1000",
-          "legendFormat": "p99"
+          "expr": "rate(deltaforge_sink_latency_seconds_sum[30s]) / rate(deltaforge_sink_latency_seconds_count[30s]) * 1000",
+          "legendFormat": "avg sink latency"
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "ms", "custom": { "lineWidth": 2 } }
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
       }
     },
     {
       "id": 4,
-      "title": "Pipeline Stage Latency p99 (ms)",
+      "title": "Avg Pipeline Stage Latency (ms)",
       "type": "timeseries",
-      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "gridPos": {
+        "x": 12,
+        "y": 16,
+        "w": 12,
+        "h": 8
+      },
       "targets": [
         {
           "datasource": "Prometheus",
-          "expr": "histogram_quantile(0.99, rate(deltaforge_stage_latency_seconds_bucket[30s])) * 1000",
+          "expr": "rate(deltaforge_stage_latency_seconds_sum[30s]) / rate(deltaforge_stage_latency_seconds_count[30s]) * 1000",
           "legendFormat": "{{stage}}"
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "ms", "custom": { "lineWidth": 2 } }
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
       }
     },
     {
       "id": 5,
-      "title": "Batch Size Distribution (events/batch)",
+      "title": "Avg Batch Size (events/batch)",
       "type": "timeseries",
-      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "gridPos": {
+        "x": 0,
+        "y": 24,
+        "w": 12,
+        "h": 8
+      },
       "targets": [
         {
           "datasource": "Prometheus",
-          "expr": "histogram_quantile(0.50, rate(deltaforge_batch_events_bucket[30s]))",
-          "legendFormat": "p50"
-        },
-        {
-          "datasource": "Prometheus",
-          "expr": "histogram_quantile(0.99, rate(deltaforge_batch_events_bucket[30s]))",
-          "legendFormat": "p99"
+          "expr": "rate(deltaforge_batch_events_sum[30s]) / rate(deltaforge_batch_events_count[30s])",
+          "legendFormat": "avg events/batch"
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short", "custom": { "lineWidth": 2 } }
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
       }
     },
     {
       "id": 6,
-      "title": "Running Pipelines",
-      "type": "stat",
-      "gridPos": { "x": 12, "y": 16, "w": 6, "h": 4 },
+      "title": "Pipeline Status",
+      "type": "bargauge",
+      "gridPos": {
+        "x": 12,
+        "y": 24,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
         {
           "datasource": "Prometheus",
-          "expr": "deltaforge_running_pipeline",
-          "legendFormat": ""
+          "expr": "sum(deltaforge_pipeline_status == 1)",
+          "legendFormat": "UP"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "sum(deltaforge_pipeline_status == 0)",
+          "legendFormat": "DOWN"
         }
       ],
       "fieldConfig": {
@@ -118,18 +175,51 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "red", "value": 0 },
-              { "color": "green", "value": 1 }
+              {
+                "color": "green",
+                "value": 0
+              }
             ]
           }
-        }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "DOWN"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "displayMode": "basic"
       }
     },
     {
       "id": 7,
       "title": "Total Events Delivered",
       "type": "stat",
-      "gridPos": { "x": 18, "y": 16, "w": 6, "h": 4 },
+      "gridPos": {
+        "x": 18,
+        "y": 24,
+        "w": 6,
+        "h": 4
+      },
       "targets": [
         {
           "datasource": "Prometheus",
@@ -138,7 +228,65 @@
         }
       ],
       "fieldConfig": {
-        "defaults": { "unit": "short" }
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Checkpoints (cumulative)",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "deltaforge_checkpoints_total",
+          "legendFormat": "{{pipeline}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "fixedColor": "blue",
+            "mode": "fixed"
+          },
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      }
+    },
+    {
+      "id": 9,
+      "title": "Checkpoint Rate (per second)",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "rate(deltaforge_checkpoints_total[30s])",
+          "legendFormat": "{{pipeline}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "lineWidth": 2
+          }
+        }
       }
     }
   ]

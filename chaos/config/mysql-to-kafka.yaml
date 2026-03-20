@@ -9,14 +9,12 @@ spec:
     type: mysql
     config:
       id: chaos-mysql
-      host: toxiproxy
-      port: 5100
-      username: cdc_user
-      password: cdc_password
-      database: orders
-      tables: ["orders.*"]
-      server_id: 201
+      dsn: "mysql://cdc_user:cdc_password@toxiproxy:5100/orders"
+      tables:
+        - "orders.*"
       on_schema_drift: adapt
+
+  processors: []
 
   sinks:
     - type: kafka
@@ -25,7 +23,7 @@ spec:
         brokers: "toxiproxy:5102"
         topic: chaos.cdc
         required: true
-        send_timeout_secs: 10
+        send_timeout_secs: 3
 
   batch:
     max_events: 50
@@ -34,7 +32,3 @@ spec:
 
   commit_policy:
     mode: required
-
-  storage:
-    backend: sqlite
-    path: /data/chaos.db

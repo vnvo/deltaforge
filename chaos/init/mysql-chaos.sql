@@ -25,6 +25,6 @@ INSERT INTO customers (name, email, balance) VALUES
   ('Charlie', 'charlie@example.com', 250.00);
 
 -- CDC replication user
-CREATE USER IF NOT EXISTS 'cdc_user'@'%' IDENTIFIED WITH mysql_native_password BY 'cdc_password';
+CREATE USER IF NOT EXISTS 'cdc_user'@'%' IDENTIFIED BY 'cdc_password';
 GRANT SELECT, REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'cdc_user'@'%';
 FLUSH PRIVILEGES;

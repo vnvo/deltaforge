@@ -14,7 +14,7 @@
   {
     "name": "kafka",
     "listen": "0.0.0.0:5102",
-    "upstream": "kafka:9093",
+    "upstream": "kafka:9094",
     "enabled": true
   }
 ]

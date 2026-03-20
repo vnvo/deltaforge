@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
 
     let cfg = o11y::O11yConfig {
         logging: o11y::logging::Config {
-            level: None,
+            level: std::env::var("RUST_LOG").ok(),
             json: false,
             with_targets: false,
         },
