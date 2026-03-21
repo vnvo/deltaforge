@@ -61,10 +61,18 @@ pub trait SourceBackend: Send + Sync {
 pub struct MysqlBackend;
 
 impl SourceBackend for MysqlBackend {
-    fn name(&self) -> &str { "mysql" }
-    fn proxy(&self) -> &str { "mysql" }
-    fn compose_profile(&self) -> &str { "app" }
-    fn compose_service(&self) -> &str { "deltaforge" }
+    fn name(&self) -> &str {
+        "mysql"
+    }
+    fn proxy(&self) -> &str {
+        "mysql"
+    }
+    fn compose_profile(&self) -> &str {
+        "app"
+    }
+    fn compose_service(&self) -> &str {
+        "deltaforge"
+    }
 
     async fn insert_rows(&self, tag: &str, n: i64) -> Result<i64> {
         use mysql_async::prelude::Queryable;
@@ -88,7 +96,8 @@ impl SourceBackend for MysqlBackend {
     }
 
     async fn schema_drift_add(&self) -> Result<()> {
-        mysql_exec("ALTER TABLE customers ADD COLUMN notes TEXT DEFAULT NULL").await
+        mysql_exec("ALTER TABLE customers ADD COLUMN notes TEXT DEFAULT NULL")
+            .await
     }
 
     async fn schema_drift_drop(&self) -> Result<()> {
@@ -127,14 +136,25 @@ impl SourceBackend for MysqlBackend {
 pub struct PgBackend;
 
 impl SourceBackend for PgBackend {
-    fn name(&self) -> &str { "postgres" }
-    fn proxy(&self) -> &str { "postgres" }
-    fn compose_profile(&self) -> &str { "pg-app" }
-    fn compose_service(&self) -> &str { "deltaforge-pg" }
+    fn name(&self) -> &str {
+        "postgres"
+    }
+    fn proxy(&self) -> &str {
+        "postgres"
+    }
+    fn compose_profile(&self) -> &str {
+        "pg-app"
+    }
+    fn compose_service(&self) -> &str {
+        "deltaforge-pg"
+    }
 
     async fn insert_rows(&self, tag: &str, n: i64) -> Result<i64> {
-        let (client, conn) = tokio_postgres::connect(PG_DSN, tokio_postgres::NoTls).await?;
-        tokio::spawn(async move { let _ = conn.await; });
+        let (client, conn) =
+            tokio_postgres::connect(PG_DSN, tokio_postgres::NoTls).await?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
         let ts = now_ms();
         for i in 0..n {
             let name = format!("{tag}-{ts}-{i}");
@@ -151,7 +171,8 @@ impl SourceBackend for PgBackend {
     }
 
     async fn schema_drift_add(&self) -> Result<()> {
-        pg_exec("ALTER TABLE customers ADD COLUMN notes TEXT DEFAULT NULL").await
+        pg_exec("ALTER TABLE customers ADD COLUMN notes TEXT DEFAULT NULL")
+            .await
     }
 
     async fn schema_drift_drop(&self) -> Result<()> {
@@ -159,8 +180,11 @@ impl SourceBackend for PgBackend {
     }
 
     async fn schema_drift_insert(&self, notes: Option<String>) -> Result<()> {
-        let (client, conn) = tokio_postgres::connect(PG_DSN, tokio_postgres::NoTls).await?;
-        tokio::spawn(async move { let _ = conn.await; });
+        let (client, conn) =
+            tokio_postgres::connect(PG_DSN, tokio_postgres::NoTls).await?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
         let ts = now_ms();
         let name = format!("drift-{ts}");
         let email = format!("drift-{ts}@test.com");
@@ -210,8 +234,11 @@ async fn mysql_exec(sql: &str) -> Result<()> {
 
 /// Run a single DDL/DML statement against Postgres (no parameters).
 async fn pg_exec(sql: &str) -> Result<()> {
-    let (client, conn) = tokio_postgres::connect(PG_DSN, tokio_postgres::NoTls).await?;
-    tokio::spawn(async move { let _ = conn.await; });
+    let (client, conn) =
+        tokio_postgres::connect(PG_DSN, tokio_postgres::NoTls).await?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
     client.execute(sql, &[]).await?;
     Ok(())
 }

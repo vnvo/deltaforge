@@ -82,7 +82,11 @@ async fn main() -> Result<()> {
     }
 
     let failures = results.iter().filter(|r| !r.passed).count();
-    println!("\n{}/{} scenarios passed", results.len() - failures, results.len());
+    println!(
+        "\n{}/{} scenarios passed",
+        results.len() - failures,
+        results.len()
+    );
 
     if failures > 0 {
         std::process::exit(1);
@@ -90,22 +94,29 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_mysql(harness: &Harness, scenario: &Scenario) -> Result<Vec<harness::ScenarioResult>> {
+async fn run_mysql(
+    harness: &Harness,
+    scenario: &Scenario,
+) -> Result<Vec<harness::ScenarioResult>> {
     let backend = MysqlBackend;
     let mut results = vec![];
 
     match scenario {
         Scenario::NetworkPartition => {
-            results.push(scenarios::network_partition::run(harness, &backend).await?);
+            results.push(
+                scenarios::network_partition::run(harness, &backend).await?,
+            );
         }
         Scenario::SinkOutage => {
             results.push(scenarios::sink_outage::run(harness, &backend).await?);
         }
         Scenario::CrashRecovery => {
-            results.push(scenarios::crash_recovery::run(harness, &backend).await?);
+            results
+                .push(scenarios::crash_recovery::run(harness, &backend).await?);
         }
         Scenario::SchemaDrift => {
-            results.push(scenarios::schema_drift::run(harness, &backend).await?);
+            results
+                .push(scenarios::schema_drift::run(harness, &backend).await?);
         }
         Scenario::Failover => {
             results.push(scenarios::failover::run(harness).await?);
@@ -114,17 +125,24 @@ async fn run_mysql(harness: &Harness, scenario: &Scenario) -> Result<Vec<harness
             results.push(scenarios::binlog_purge::run(harness).await?);
         }
         Scenario::PgFailover | Scenario::SlotDropped => {
-            eprintln!("error: {:?} is a PostgreSQL-specific scenario — use --source postgres", scenario.to_possible_value().unwrap().get_name());
+            eprintln!(
+                "error: {:?} is a PostgreSQL-specific scenario — use --source postgres",
+                scenario.to_possible_value().unwrap().get_name()
+            );
             std::process::exit(2);
         }
         Scenario::All => {
             // Run in order of increasing destructiveness.
             // binlog_purge wipes MySQL GTID state and must always run last.
-            results.push(scenarios::network_partition::run(harness, &backend).await?);
+            results.push(
+                scenarios::network_partition::run(harness, &backend).await?,
+            );
             results.push(scenarios::sink_outage::run(harness, &backend).await?);
-            results.push(scenarios::crash_recovery::run(harness, &backend).await?);
+            results
+                .push(scenarios::crash_recovery::run(harness, &backend).await?);
             results.push(scenarios::failover::run(harness).await?);
-            results.push(scenarios::schema_drift::run(harness, &backend).await?);
+            results
+                .push(scenarios::schema_drift::run(harness, &backend).await?);
             results.push(scenarios::binlog_purge::run(harness).await?);
         }
     }
@@ -141,16 +159,20 @@ async fn run_postgres(
 
     match scenario {
         Scenario::NetworkPartition => {
-            results.push(scenarios::network_partition::run(harness, &backend).await?);
+            results.push(
+                scenarios::network_partition::run(harness, &backend).await?,
+            );
         }
         Scenario::SinkOutage => {
             results.push(scenarios::sink_outage::run(harness, &backend).await?);
         }
         Scenario::CrashRecovery => {
-            results.push(scenarios::crash_recovery::run(harness, &backend).await?);
+            results
+                .push(scenarios::crash_recovery::run(harness, &backend).await?);
         }
         Scenario::SchemaDrift => {
-            results.push(scenarios::schema_drift::run(harness, &backend).await?);
+            results
+                .push(scenarios::schema_drift::run(harness, &backend).await?);
         }
         Scenario::PgFailover => {
             results.push(scenarios::pg_failover::run(harness).await?);
@@ -159,16 +181,23 @@ async fn run_postgres(
             results.push(scenarios::slot_dropped::run(harness).await?);
         }
         Scenario::Failover | Scenario::BinlogPurge => {
-            eprintln!("error: {:?} is a MySQL-specific scenario — use --source mysql", scenario.to_possible_value().unwrap().get_name());
+            eprintln!(
+                "error: {:?} is a MySQL-specific scenario — use --source mysql",
+                scenario.to_possible_value().unwrap().get_name()
+            );
             std::process::exit(2);
         }
         Scenario::All => {
             // slot_dropped must run last — it clears the checkpoint DB.
-            results.push(scenarios::network_partition::run(harness, &backend).await?);
+            results.push(
+                scenarios::network_partition::run(harness, &backend).await?,
+            );
             results.push(scenarios::sink_outage::run(harness, &backend).await?);
-            results.push(scenarios::crash_recovery::run(harness, &backend).await?);
+            results
+                .push(scenarios::crash_recovery::run(harness, &backend).await?);
             results.push(scenarios::pg_failover::run(harness).await?);
-            results.push(scenarios::schema_drift::run(harness, &backend).await?);
+            results
+                .push(scenarios::schema_drift::run(harness, &backend).await?);
             results.push(scenarios::slot_dropped::run(harness).await?);
         }
     }

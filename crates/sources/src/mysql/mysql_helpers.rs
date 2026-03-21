@@ -495,7 +495,7 @@ pub(super) async fn fetch_executed_gtid_set(
     conn.disconnect()
         .await
         .map_err(|e| SourceError::Other(e.into()))?;
-    
+
     Ok(row.and_then(|(s,)| s))
 }
 

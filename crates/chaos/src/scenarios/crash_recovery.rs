@@ -27,11 +27,16 @@ const RESTART_TIMEOUT: Duration = Duration::from_secs(60);
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-pub async fn run<B: SourceBackend>(harness: &Harness, backend: &B) -> Result<ScenarioResult> {
+pub async fn run<B: SourceBackend>(
+    harness: &Harness,
+    backend: &B,
+) -> Result<ScenarioResult> {
     let name = format!("{}/crash_recovery", backend.name());
     harness.setup().await?;
 
-    info!("step 1/5: warming up - waiting for DeltaForge to stream a sentinel event ...");
+    info!(
+        "step 1/5: warming up - waiting for DeltaForge to stream a sentinel event ..."
+    );
     let warm_offset = harness.kafka_offset().await?;
     let deadline = Instant::now() + WARMUP_TIMEOUT;
     loop {
@@ -72,9 +77,13 @@ pub async fn run<B: SourceBackend>(harness: &Harness, backend: &B) -> Result<Sce
     info!(%events_before_crash, "pre-crash inserts confirmed and checkpointed");
 
     info!("step 3/5: sending SIGKILL to DeltaForge container ...");
-    docker::kill_service(backend.compose_profile(), backend.compose_service()).await?;
-    docker::start_service(backend.compose_profile(), backend.compose_service()).await?;
-    info!("DeltaForge killed and restart initiated - inserting rows while down");
+    docker::kill_service(backend.compose_profile(), backend.compose_service())
+        .await?;
+    docker::start_service(backend.compose_profile(), backend.compose_service())
+        .await?;
+    info!(
+        "DeltaForge killed and restart initiated - inserting rows while down"
+    );
 
     let post_inserts = backend.insert_rows("post-crash", 5).await?;
     info!(%post_inserts, "rows inserted while DeltaForge is down");

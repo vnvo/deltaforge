@@ -36,7 +36,9 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
     harness.setup().await?;
 
     // ── Warmup ────────────────────────────────────────────────────────────────
-    info!("step 1/5: warming up — confirming DeltaForge is streaming on postgres-a ...");
+    info!(
+        "step 1/5: warming up — confirming DeltaForge is streaming on postgres-a ..."
+    );
     let warm_offset = harness.kafka_offset().await?;
     let deadline = Instant::now() + WARMUP_TIMEOUT;
     loop {
@@ -55,14 +57,23 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
     }
 
     // ── Switch ────────────────────────────────────────────────────────────────
-    info!("step 2/5: cutting postgres proxy to tear down active connection ...");
+    info!(
+        "step 2/5: cutting postgres proxy to tear down active connection ..."
+    );
     harness.toxi.disable("postgres").await?;
     sleep(Duration::from_secs(2)).await;
 
-    info!("step 3/5: switching proxy upstream from postgres-a to postgres-b ...");
-    harness.toxi.update_upstream("postgres", "postgres-b:5432").await?;
+    info!(
+        "step 3/5: switching proxy upstream from postgres-a to postgres-b ..."
+    );
+    harness
+        .toxi
+        .update_upstream("postgres", "postgres-b:5432")
+        .await?;
 
-    info!("step 4/5: re-enabling proxy — DeltaForge will reconnect to postgres-b ...");
+    info!(
+        "step 4/5: re-enabling proxy — DeltaForge will reconnect to postgres-b ..."
+    );
     harness.toxi.enable("postgres").await?;
 
     // ── Verify ────────────────────────────────────────────────────────────────
@@ -82,7 +93,9 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
             .unwrap_or(false);
 
         if !healthy {
-            info!("DeltaForge is unhealthy — pg failover guard fired correctly");
+            info!(
+                "DeltaForge is unhealthy — pg failover guard fired correctly"
+            );
             went_unhealthy = true;
             break;
         }
@@ -96,8 +109,13 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
     // Restore the proxy to postgres-a, clear the stale checkpoint (it references
     // a slot on postgres-a that DeltaForge may have already invalidated), then
     // restart so subsequent scenarios start fresh.
-    info!("restoring postgres proxy upstream to postgres-a and restarting DeltaForge ...");
-    let _ = harness.toxi.update_upstream("postgres", "postgres:5432").await;
+    info!(
+        "restoring postgres proxy upstream to postgres-a and restarting DeltaForge ..."
+    );
+    let _ = harness
+        .toxi
+        .update_upstream("postgres", "postgres:5432")
+        .await;
     let _ = harness.toxi.enable("postgres").await;
     let _ = docker::stop_service("pg-app", "deltaforge-pg").await;
     let _ = docker::clear_checkpoint("pg-app", "deltaforge-pg").await;
@@ -123,8 +141,11 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
 }
 
 async fn insert_row() -> Result<()> {
-    let (client, conn) = tokio_postgres::connect(PG_DSN, tokio_postgres::NoTls).await?;
-    tokio::spawn(async move { let _ = conn.await; });
+    let (client, conn) =
+        tokio_postgres::connect(PG_DSN, tokio_postgres::NoTls).await?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

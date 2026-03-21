@@ -24,7 +24,10 @@ const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const WARMUP_TIMEOUT: Duration = Duration::from_secs(60);
 
-pub async fn run<B: SourceBackend>(harness: &Harness, backend: &B) -> Result<ScenarioResult> {
+pub async fn run<B: SourceBackend>(
+    harness: &Harness,
+    backend: &B,
+) -> Result<ScenarioResult> {
     let name = format!("{}/network_partition", backend.name());
     const ROUNDS: u32 = 2;
 
@@ -99,12 +102,22 @@ async fn run_once<B: SourceBackend>(
     info!(%events_before_partition, "pre-partition inserts confirmed in Kafka");
 
     let proxy = backend.proxy();
-    info!(round, proxy, "step 3/6: cutting proxy - DeltaForge should begin reconnect backoff");
+    info!(
+        round,
+        proxy,
+        "step 3/6: cutting proxy - DeltaForge should begin reconnect backoff"
+    );
     harness.toxi.disable(proxy).await?;
 
-    info!(round, "step 4/6: inserting 5 rows during partition (direct to DB, bypassing proxy)");
+    info!(
+        round,
+        "step 4/6: inserting 5 rows during partition (direct to DB, bypassing proxy)"
+    );
     let inserts = backend.insert_rows("partition", 5).await?;
-    info!(inserts, "rows committed to DB - DeltaForge cannot see them yet");
+    info!(
+        inserts,
+        "rows committed to DB - DeltaForge cannot see them yet"
+    );
 
     info!(
         round,

@@ -25,7 +25,10 @@ const DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const POST_DDL_INSERTS: u64 = 5;
 
-pub async fn run<B: SourceBackend>(harness: &Harness, backend: &B) -> Result<ScenarioResult> {
+pub async fn run<B: SourceBackend>(
+    harness: &Harness,
+    backend: &B,
+) -> Result<ScenarioResult> {
     let name = format!("{}/schema_drift", backend.name());
     harness.setup().await?;
 
@@ -51,7 +54,9 @@ pub async fn run<B: SourceBackend>(harness: &Harness, backend: &B) -> Result<Sce
     let pre_ddl_offset = harness.kafka_offset().await?;
 
     // ── DDL ───────────────────────────────────────────────────────────────────
-    info!("step 2/5: ALTER TABLE customers ADD COLUMN notes TEXT — DDL mid-stream ...");
+    info!(
+        "step 2/5: ALTER TABLE customers ADD COLUMN notes TEXT — DDL mid-stream ..."
+    );
     backend.schema_drift_add().await?;
 
     // ── Post-DDL inserts ──────────────────────────────────────────────────────

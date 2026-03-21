@@ -66,7 +66,10 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
     sleep(Duration::from_secs(2)).await;
 
     info!("step 3/5: switching proxy upstream from mysql-a to mysql-b ...");
-    harness.toxi.update_upstream("mysql", "mysql-b:3306").await?;
+    harness
+        .toxi
+        .update_upstream("mysql", "mysql-b:3306")
+        .await?;
 
     info!(
         "step 4/5: re-enabling proxy — DeltaForge will reconnect to mysql-b ..."
@@ -103,13 +106,13 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
     // ── Restore ───────────────────────────────────────────────────────────────
     // Always restore mysql proxy and restart DeltaForge so subsequent scenarios
     // start from a clean state.
-    info!("restoring mysql proxy upstream to mysql-a and restarting DeltaForge ...");
+    info!(
+        "restoring mysql proxy upstream to mysql-a and restarting DeltaForge ..."
+    );
     let _ = harness.toxi.update_upstream("mysql", "mysql:3306").await;
     let _ = harness.toxi.enable("mysql").await;
     let _ = docker::restart_service("app", "deltaforge").await;
-    let _ = harness
-        .wait_for_deltaforge(Duration::from_secs(30))
-        .await;
+    let _ = harness.wait_for_deltaforge(Duration::from_secs(30)).await;
     info!("DeltaForge restored");
 
     if !went_unhealthy {

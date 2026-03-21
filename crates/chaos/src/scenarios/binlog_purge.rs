@@ -132,7 +132,11 @@ async fn purge_binlogs() -> Result<()> {
     let mut conn = pool.get_conn().await?;
     // MySQL 8.0+: RESET BINARY LOGS AND GTIDS purges all binlogs and GTID state
     // Falls back to RESET MASTER for older versions
-    if conn.query_drop("RESET BINARY LOGS AND GTIDS").await.is_err() {
+    if conn
+        .query_drop("RESET BINARY LOGS AND GTIDS")
+        .await
+        .is_err()
+    {
         conn.query_drop("RESET MASTER").await?;
     }
     conn.disconnect().await?;

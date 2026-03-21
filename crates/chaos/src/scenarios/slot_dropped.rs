@@ -62,10 +62,14 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
 
     insert_row().await?;
     drop_replication_slot().await?;
-    info!("replication slot '{SLOT_NAME}' dropped — checkpoint position is now lost");
+    info!(
+        "replication slot '{SLOT_NAME}' dropped — checkpoint position is now lost"
+    );
 
     // ── Restart ───────────────────────────────────────────────────────────────
-    info!("step 3/4: restarting DeltaForge — expecting it to detect lost slot and halt ...");
+    info!(
+        "step 3/4: restarting DeltaForge — expecting it to detect lost slot and halt ..."
+    );
     docker::start_service("pg-app", "deltaforge-pg").await?;
 
     // ── Verify unhealthy ──────────────────────────────────────────────────────
@@ -82,7 +86,9 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
             .unwrap_or(false);
 
         if !healthy {
-            info!("DeltaForge is unhealthy — slot-dropped guard fired correctly");
+            info!(
+                "DeltaForge is unhealthy — slot-dropped guard fired correctly"
+            );
             went_unhealthy = true;
             break;
         }
@@ -116,8 +122,11 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
 }
 
 async fn drop_replication_slot() -> Result<()> {
-    let (client, conn) = tokio_postgres::connect(PG_DSN, tokio_postgres::NoTls).await?;
-    tokio::spawn(async move { let _ = conn.await; });
+    let (client, conn) =
+        tokio_postgres::connect(PG_DSN, tokio_postgres::NoTls).await?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
     // SELECT (not DO) so errors surface immediately rather than being swallowed.
     client
         .execute(
@@ -131,8 +140,11 @@ async fn drop_replication_slot() -> Result<()> {
 }
 
 async fn insert_row() -> Result<()> {
-    let (client, conn) = tokio_postgres::connect(PG_DSN, tokio_postgres::NoTls).await?;
-    tokio::spawn(async move { let _ = conn.await; });
+    let (client, conn) =
+        tokio_postgres::connect(PG_DSN, tokio_postgres::NoTls).await?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

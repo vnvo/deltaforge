@@ -10,14 +10,19 @@ use tokio::time::{Duration, sleep};
 const COMPOSE_FILE: &str = "docker-compose.chaos.yml";
 
 async fn compose(profile: &str, args: &[&str]) -> Result<()> {
-    let mut full: Vec<&str> = vec!["compose", "-f", COMPOSE_FILE, "--profile", profile];
+    let mut full: Vec<&str> =
+        vec!["compose", "-f", COMPOSE_FILE, "--profile", profile];
     full.extend_from_slice(args);
     let status = tokio::process::Command::new("docker")
         .args(&full)
         .status()
         .await?;
     if !status.success() {
-        bail!("docker compose {} failed (exit {:?})", args.join(" "), status.code());
+        bail!(
+            "docker compose {} failed (exit {:?})",
+            args.join(" "),
+            status.code()
+        );
     }
     Ok(())
 }

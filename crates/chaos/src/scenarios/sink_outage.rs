@@ -26,7 +26,10 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const WARMUP_TIMEOUT: Duration = Duration::from_secs(60);
 const ROUNDS: u32 = 2;
 
-pub async fn run<B: SourceBackend>(harness: &Harness, backend: &B) -> Result<ScenarioResult> {
+pub async fn run<B: SourceBackend>(
+    harness: &Harness,
+    backend: &B,
+) -> Result<ScenarioResult> {
     let name = format!("{}/sink_outage", backend.name());
     harness.setup().await?;
 
@@ -51,7 +54,10 @@ async fn run_once<B: SourceBackend>(
     name: &str,
     round: u32,
 ) -> Result<ScenarioResult> {
-    info!(round, "step 1/5: warming up - waiting for DeltaForge to stream a sentinel event ...");
+    info!(
+        round,
+        "step 1/5: warming up - waiting for DeltaForge to stream a sentinel event ..."
+    );
     let warm_offset = harness.kafka_offset().await?;
     let deadline = Instant::now() + WARMUP_TIMEOUT;
     loop {
@@ -72,14 +78,24 @@ async fn run_once<B: SourceBackend>(
     let events_before = harness.kafka_offset().await?;
     info!(round, %events_before, "baseline captured");
 
-    info!(round, "step 2/5: cutting Kafka proxy - DeltaForge should buffer and retry");
+    info!(
+        round,
+        "step 2/5: cutting Kafka proxy - DeltaForge should buffer and retry"
+    );
     harness.toxi.disable("kafka").await?;
 
     info!(round, "step 3/5: inserting 10 rows while Kafka is down");
     let inserts = backend.insert_rows("outage", 10).await?;
-    info!(round, inserts, "rows committed to DB - DeltaForge cannot deliver them yet");
+    info!(
+        round,
+        inserts, "rows committed to DB - DeltaForge cannot deliver them yet"
+    );
 
-    info!(round, hold_secs = OUTAGE_HOLD.as_secs(), "step 4/5: holding outage ...");
+    info!(
+        round,
+        hold_secs = OUTAGE_HOLD.as_secs(),
+        "step 4/5: holding outage ..."
+    );
     sleep(OUTAGE_HOLD).await;
 
     info!(
@@ -128,7 +144,9 @@ async fn run_once<B: SourceBackend>(
     }
 
     Ok(ScenarioResult::pass(name)
-        .note(format!("round {round}: events delivered: {delivered}/{inserts}"))
+        .note(format!(
+            "round {round}: events delivered: {delivered}/{inserts}"
+        ))
         .note(if delivered > inserts as u64 {
             format!(
                 "{} duplicate(s) - expected with at-least-once",

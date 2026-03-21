@@ -1,8 +1,5 @@
 use axum::{
-    Json, Router,
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
+    Json, Router, extract::State, http::StatusCode, response::IntoResponse,
     routing::get,
 };
 use serde::Serialize;
