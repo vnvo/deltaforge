@@ -44,6 +44,7 @@ impl Harness {
     }
 
     /// Always called in scenario cleanup — ensures faults don't leak between runs.
+    #[allow(dead_code)]
     pub async fn teardown(&self) {
         let _ = self.toxi.reset_all().await;
         info!("harness: teardown complete");
@@ -81,6 +82,7 @@ impl Harness {
     }
 
     /// Fetch current source event counter from DeltaForge Prometheus metrics.
+    #[allow(dead_code)]
     pub async fn source_event_count(&self) -> Result<f64> {
         let body = reqwest::get("http://localhost:9000/metrics")
             .await?

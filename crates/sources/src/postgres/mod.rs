@@ -468,6 +468,7 @@ impl PostgresSource {
 
 #[async_trait]
 impl Source for PostgresSource {
+    #[allow(clippy::misnamed_getters)] // intentionally returns id; checkpoint_key field is the storage namespace prefix
     fn checkpoint_key(&self) -> &str {
         &self.id
     }

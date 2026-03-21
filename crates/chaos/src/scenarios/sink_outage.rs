@@ -91,7 +91,7 @@ async fn run_once<B: SourceBackend>(
 
     let target = events_before + inserts as u64;
     let deadline = Instant::now() + RECOVERY_TIMEOUT;
-    let mut events_after = events_before;
+    let mut events_after;
     let mut last_logged = events_before;
     loop {
         events_after = harness.kafka_offset().await?;

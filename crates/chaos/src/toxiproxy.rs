@@ -53,6 +53,7 @@ impl ToxiproxyClient {
     }
 
     /// Add a toxic. `attributes` is toxic-specific (latency, rate, etc).
+    #[allow(dead_code)]
     pub async fn add_toxic(
         &self,
         proxy: &str,
@@ -83,12 +84,14 @@ impl ToxiproxyClient {
     }
 
     /// Convenience: add a bandwidth toxic that throttles to ~0 (simulates packet loss).
+    #[allow(dead_code)]
     pub async fn throttle(&self, proxy: &str) -> Result<()> {
         self.add_toxic(proxy, "throttle", "bandwidth", json!({"rate": 0}))
             .await
     }
 
     /// Convenience: add a latency toxic.
+    #[allow(dead_code)]
     pub async fn add_latency(
         &self,
         proxy: &str,

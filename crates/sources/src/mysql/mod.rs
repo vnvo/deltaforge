@@ -350,6 +350,7 @@ impl MySqlSource {
 
 #[async_trait]
 impl Source for MySqlSource {
+    #[allow(clippy::misnamed_getters)] // intentionally returns id; checkpoint_key field is the storage namespace prefix
     fn checkpoint_key(&self) -> &str {
         &self.id
     }
@@ -508,9 +509,9 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
 ///
 /// Returns:
 /// - `Ok(Some(stream))` - reconnected, caller assigns the new stream.
-/// - `Ok(None)`         - cancelled during sleep or transient connect error;
-///                        caller should `continue` the loop (next iteration
-///                        will either break on cancel or retry with fresh backoff).
+/// - `Ok(None)` — cancelled during sleep or transient connect error;
+///   caller should `continue` the loop (next iteration will either break
+///   on cancel or retry with fresh backoff).
 /// - `Err(e)`           - fatal error, caller propagates.
 async fn do_reconnect(ctx: &mut RunCtx) -> SourceResult<Option<BinlogStream>> {
     let delay = ctx.retry.next_backoff();

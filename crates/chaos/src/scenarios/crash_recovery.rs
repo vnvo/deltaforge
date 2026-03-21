@@ -89,7 +89,7 @@ pub async fn run<B: SourceBackend>(harness: &Harness, backend: &B) -> Result<Sce
     );
     let target = events_before_crash + post_inserts as u64;
     let deadline = Instant::now() + RECOVERY_TIMEOUT;
-    let mut events_after = events_before_crash;
+    let mut events_after;
     let mut last_logged = events_before_crash;
     loop {
         events_after = harness.kafka_offset().await?;
