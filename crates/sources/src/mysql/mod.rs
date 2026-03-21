@@ -561,7 +561,34 @@ async fn check_identity_post_reconnect(ctx: &mut RunCtx) -> SourceResult<()> {
         IdentityComparison::FirstSeen => {
             let _ = ctx.identity_store.store(&ctx.source_id, &live).await;
         }
-        IdentityComparison::Same => {}
+        IdentityComparison::Same => {
+            // A RESET BINARY LOGS AND GTIDS wipes the GTID history without
+            // changing the server UUID.  Run the position check here too so
+            // we catch that case on the first reconnect after a purge.
+            // Skip when there is no GTID checkpoint (file/pos mode or fresh
+            // start) to avoid false positives from the file-presence fallback.
+            if ctx.checkpoint_gtid.is_some() {
+                match check_position_reachability(
+                    &ctx.dsn,
+                    &ctx.checkpoint_file,
+                    ctx.checkpoint_gtid.as_deref(),
+                )
+                .await
+                .unwrap_or(PositionReachability::Unknown {
+                    reason: "reachability check failed".into(),
+                }) {
+                    PositionReachability::Reachable
+                    | PositionReachability::Unknown { .. } => {}
+                    PositionReachability::Lost { reason } => {
+                        return Err(SourceError::Other(anyhow::anyhow!(
+                            "checkpoint GTID set no longer reachable on \
+                             this server (binlog purge?): {reason}. \
+                             Re-snapshot required."
+                        )));
+                    }
+                }
+            }
+        }
         IdentityComparison::Changed { previous, current } => {
             warn!(
                 source_id = %ctx.source_id,
