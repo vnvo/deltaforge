@@ -62,7 +62,6 @@ pub struct MySqlCheckpoint {
 #[derive(Debug, Clone)]
 pub struct MySqlSource {
     pub id: String,
-    pub checkpoint_key: String,
     pub dsn: String,
     pub tables: Vec<String>,
     pub tenant: String,
@@ -350,11 +349,6 @@ impl MySqlSource {
 
 #[async_trait]
 impl Source for MySqlSource {
-    #[allow(clippy::misnamed_getters)] // intentionally returns id; checkpoint_key field is the storage namespace prefix
-    fn checkpoint_key(&self) -> &str {
-        &self.id
-    }
-
     async fn run(
         &self,
         tx: mpsc::Sender<Event>,

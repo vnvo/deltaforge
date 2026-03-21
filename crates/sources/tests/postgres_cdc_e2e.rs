@@ -192,7 +192,6 @@ async fn make_source(
 ) -> PostgresSource {
     PostgresSource {
         id: id.into(),
-        checkpoint_key: format!("pg-{id}"),
         dsn: pg_cdc_dsn(db).await,
         slot: slot.into(),
         publication: publication.into(),

@@ -214,7 +214,6 @@ async fn make_mysql_source(
 ) -> MySqlSource {
     MySqlSource {
         id: id.into(),
-        checkpoint_key: format!("mysql-{id}"),
         dsn: dsn.into(),
         tables: vec![format!("{db}.orders")],
         tenant: "acme".into(),
@@ -236,7 +235,6 @@ async fn make_pg_source(
 ) -> PostgresSource {
     PostgresSource {
         id: id.into(),
-        checkpoint_key: format!("pg-{id}"),
         dsn: dsn.into(),
         slot: slot.into(),
         publication: pub_name.into(),
@@ -497,7 +495,6 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
     {
         let src = MySqlSource {
             id: "fo_drift".into(),
-            checkpoint_key: "mysql-fo_drift".into(),
             dsn: mysql_cdc_dsn(port_a, DB),
             tables: vec![format!("{DB}.orders")],
             tenant: "acme".into(),
@@ -546,7 +543,6 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
     {
         let src = MySqlSource {
             id: "fo_drift".into(),
-            checkpoint_key: "mysql-fo_drift".into(),
             dsn: mysql_cdc_dsn(port_b, DB),
             tables: vec![format!("{DB}.orders")],
             tenant: "acme".into(),
@@ -639,7 +635,6 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
     {
         let src = MySqlSource {
             id: "fo_halt".into(),
-            checkpoint_key: "mysql-fo_halt".into(),
             dsn: mysql_cdc_dsn(port_a, DB),
             tables: vec![format!("{DB}.orders")],
             tenant: "acme".into(),
@@ -687,7 +682,6 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
     {
         let src = MySqlSource {
             id: "fo_halt".into(),
-            checkpoint_key: "mysql-fo_halt".into(),
             dsn: mysql_cdc_dsn(port_b, DB),
             tables: vec![format!("{DB}.orders")],
             tenant: "acme".into(),
@@ -778,7 +772,6 @@ async fn mysql_failover_schema_drift_halt_no_drift_continues() -> Result<()> {
     {
         let src = MySqlSource {
             id: "fo_halt_nodrift".into(),
-            checkpoint_key: "mysql-fo_halt_nodrift".into(),
             dsn: mysql_cdc_dsn(port_b, DB),
             tables: vec![format!("{DB}.orders")],
             tenant: "acme".into(),

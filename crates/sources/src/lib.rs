@@ -41,7 +41,6 @@ pub fn build_source(
     match &pipeline.spec.source {
         SourceCfg::Postgres(c) => Ok(Arc::new(postgres::PostgresSource {
             id: c.id.clone(),
-            checkpoint_key: format!("pg-{}", c.id),
             dsn: c.dsn.clone(),
             slot: c.slot.clone(),
             publication: c.publication.clone(),
@@ -61,7 +60,6 @@ pub fn build_source(
 
         SourceCfg::Mysql(c) => Ok(Arc::new(mysql::MySqlSource {
             id: c.id.clone(),
-            checkpoint_key: format!("mysql-{}", c.id),
             dsn: c.dsn.clone(),
             tables: c.tables.clone(),
             tenant: pipeline.metadata.tenant.clone(),

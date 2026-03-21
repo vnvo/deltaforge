@@ -73,7 +73,6 @@ pub struct PostgresCheckpoint {
 #[derive(Debug, Clone)]
 pub struct PostgresSource {
     pub id: String,
-    pub checkpoint_key: String,
     pub dsn: String,
     pub slot: String,
     pub publication: String,
@@ -468,11 +467,6 @@ impl PostgresSource {
 
 #[async_trait]
 impl Source for PostgresSource {
-    #[allow(clippy::misnamed_getters)] // intentionally returns id; checkpoint_key field is the storage namespace prefix
-    fn checkpoint_key(&self) -> &str {
-        &self.id
-    }
-
     async fn run(
         &self,
         tx: mpsc::Sender<Event>,

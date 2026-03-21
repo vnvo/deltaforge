@@ -120,7 +120,6 @@ async fn make_source(
 ) -> MySqlSource {
     MySqlSource {
         id: id.into(),
-        checkpoint_key: format!("mysql-{}", id),
         dsn: dsn.to_string(),
         tables,
         tenant: "acme".into(),
@@ -305,7 +304,6 @@ async fn mysql_cdc_basic_events() -> Result<()> {
     let backend = make_storage_backend().await;
     let src = MySqlSource {
         id: "cdc-basic".into(),
-        checkpoint_key: "mysql-cdc-basic".to_string(),
         dsn: dsn.clone(),
         tables: vec![format!("{}.orders", db_name)],
         tenant: "acme".into(),
@@ -425,7 +423,6 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
     let registry = make_registry().await;
     let src = MySqlSource {
         id: "schema-ddl".into(),
-        checkpoint_key: "mysql-schema-ddl".to_string(),
         dsn: dsn.clone(),
         tables: vec![format!("{}.orders", db_name)],
         tenant: "acme".into(),

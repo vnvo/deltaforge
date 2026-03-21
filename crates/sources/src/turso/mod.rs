@@ -127,7 +127,6 @@ impl TursoCheckpoint {
 #[derive(Clone)]
 pub struct TursoSource {
     pub id: String,
-    pub checkpoint_key: String,
     pub cfg: TursoSrcCfg,
     pub tenant: String,
     pub pipeline: String,
@@ -144,7 +143,6 @@ impl TursoSource {
     ) -> Self {
         let id = cfg.id.clone();
         Self {
-            checkpoint_key: format!("turso-{}", id),
             id,
             cfg,
             tenant,
@@ -343,7 +341,7 @@ impl TursoSource {
 
         // Load checkpoint
         let mut checkpoint: TursoCheckpoint = chkpt_store
-            .get(&self.checkpoint_key)
+            .get(&self.id)
             .await
             .map_err(|e| SourceError::Other(e.into()))?
             .unwrap_or_default();
@@ -675,10 +673,6 @@ impl TursoSource {
 
 #[async_trait]
 impl Source for TursoSource {
-    fn checkpoint_key(&self) -> &str {
-        &self.checkpoint_key
-    }
-
     async fn run(
         &self,
         tx: mpsc::Sender<Event>,
