@@ -1,5 +1,5 @@
 use axum::{Router, routing::get};
-use metrics::{Unit, describe_counter, describe_gauge, describe_histogram};
+use metrics::{Unit, describe_counter, describe_gauge, describe_histogram, gauge};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use once_cell::sync::OnceCell;
 use std::{net::SocketAddr, time::Duration};
@@ -83,11 +83,6 @@ pub fn describe_metrics() {
         Unit::Count,
         "Total number of pipelines"
     );
-    describe_gauge!(
-        "deltaforge_running_pipeline",
-        Unit::Count,
-        "Pipelines in the running state"
-    );
     describe_counter!(
         "deltaforge_source_events_total",
         Unit::Count,
@@ -101,7 +96,7 @@ pub fn describe_metrics() {
     describe_counter!(
         "deltaforge_sink_batch_total",
         Unit::Count,
-        "Total number of individual batches sent to sink"
+        "Total number of batches successfully delivered to a sink"
     );
     describe_counter!(
         "deltaforge_sink_events_total",
@@ -148,6 +143,26 @@ pub fn describe_metrics() {
         Unit::Count,
         "Number of batches where schema drift was detected"
     );
+    describe_counter!(
+        "deltaforge_pipeline_evolutions_total",
+        Unit::Count,
+        "Schema evolution events detected per pipeline (pipeline-level aggregate)"
+    );
+    describe_gauge!(
+        "deltaforge_source_lag_seconds",
+        Unit::Seconds,
+        "Lag between the latest source event timestamp and wall clock time"
+    );
+    describe_gauge!(
+        "deltaforge_build_info",
+        Unit::Count,
+        "Build metadata (version, commit, build_date labels); always 1"
+    );
+    describe_counter!(
+        "deltaforge_snapshot_rows_total",
+        Unit::Count,
+        "Total rows emitted during initial snapshot, per pipeline and table"
+    );
 
     // Schema sensing metrics
     describe_counter!(
@@ -185,4 +200,23 @@ pub fn describe_metrics() {
         Unit::Seconds,
         "Time spent in schema sensing per batch"
     );
+}
+
+/// Set the `deltaforge_build_info` gauge with version metadata.
+///
+/// Call once at startup after [`init`]. The gauge is always 1.0; the
+/// information is carried in the labels so it can be joined with other
+/// metrics in Prometheus/Grafana.
+pub fn set_build_info(
+    version: &'static str,
+    commit: &'static str,
+    build_date: &'static str,
+) {
+    gauge!(
+        "deltaforge_build_info",
+        "version" => version,
+        "commit" => commit,
+        "build_date" => build_date,
+    )
+    .set(1.0);
 }

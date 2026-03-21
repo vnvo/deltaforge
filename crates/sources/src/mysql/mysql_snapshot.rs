@@ -28,6 +28,7 @@ use scopeguard;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
+use metrics::counter;
 use tracing::{debug, error, info, warn};
 
 use super::mysql_health as health;
@@ -417,6 +418,13 @@ impl TableWorker {
         };
 
         self.conn.query_drop("COMMIT").await.ok();
+
+        counter!(
+            "deltaforge_snapshot_rows_total",
+            "pipeline" => self.pipeline.clone(),
+            "table" => table_fqn.clone()
+        )
+        .increment(rows_sent);
 
         info!(
             table = %table_fqn,

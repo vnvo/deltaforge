@@ -26,6 +26,7 @@ use scopeguard;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, mpsc};
 use tokio_postgres::NoTls;
+use metrics::counter;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -361,6 +362,13 @@ impl TableWorker {
         };
 
         client.batch_execute("COMMIT").await.ok();
+
+        counter!(
+            "deltaforge_snapshot_rows_total",
+            "pipeline" => self.pipeline.clone(),
+            "table" => fqn.clone()
+        )
+        .increment(rows_sent);
 
         info!(
             table = %fqn,

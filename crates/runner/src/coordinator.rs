@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use checkpoints::CheckpointStore;
 use futures::future::BoxFuture;
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
 use parking_lot::Mutex;
 use tokio::sync::watch;
 use tokio::time::{Instant, interval};
@@ -635,7 +635,7 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
 
             if evolutions > 0 {
                 counter!(
-                    "deltaforge_schema_evolutions_total",
+                    "deltaforge_pipeline_evolutions_total",
                     "pipeline" => self.pipeline_name.to_string()
                 )
                 .increment(evolutions as u64);
@@ -653,6 +653,20 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
 
         // Recompute size after processing
         let bytes: usize = events.iter().map(event_size_hint).sum();
+
+        // Replication lag: how far behind wall-clock is the latest source event.
+        if let Some(last_ts_ms) = events.last().map(|e| e.ts_ms) {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let lag_secs = ((now_ms - last_ts_ms).max(0) as f64) / 1000.0;
+            gauge!(
+                "deltaforge_source_lag_seconds",
+                "pipeline" => self.pipeline_name.to_string()
+            )
+            .set(lag_secs);
+        }
 
         histogram!(
             "deltaforge_batch_events",
@@ -713,6 +727,13 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                     if required {
                         required_acks += 1;
                     }
+
+                    counter!(
+                        "deltaforge_sink_batch_total",
+                        "pipeline" => self.pipeline_name.to_string(),
+                        "sink" => sink_id.clone()
+                    )
+                    .increment(1);
 
                     counter!(
                         "deltaforge_sink_events_total",
