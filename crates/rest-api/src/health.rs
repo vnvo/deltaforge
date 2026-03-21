@@ -11,8 +11,8 @@ use crate::pipelines::{AppState, PipeInfo};
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
+        .route("/health", get(healthz))
+        .route("/ready", get(readyz))
         .with_state(state)
 }
 

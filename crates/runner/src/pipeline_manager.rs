@@ -54,7 +54,7 @@ pub(crate) struct PipelineRuntime {
     pub(crate) spec: PipelineSpec,
     pub(crate) status: PipelineStatus,
     /// Set to false by the coordinator task when it exits without cancellation
-    /// (i.e. the source died unexpectedly). Used to drive /healthz.
+    /// (i.e. the source died unexpectedly). Used to drive /health.
     pub(crate) alive: Arc<AtomicBool>,
     pub(crate) cancel: CancellationToken,
     pub(crate) pause: watch::Sender<bool>,
@@ -215,7 +215,7 @@ impl PipelineManager {
         // the source task dies without an explicit cancellation.  The
         // coordinator may be blocked in a long I/O operation (Kafka flush,
         // SQLite commit) and never return, so we cannot rely solely on the
-        // coordinator wrapper below to drive /healthz.
+        // coordinator wrapper below to drive /health.
         let alive_for_src = Arc::clone(&alive);
         let cancel_for_src = cancel.clone();
         let SourceHandle {
