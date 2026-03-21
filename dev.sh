@@ -9,6 +9,9 @@ STORAGE_DB="${STORAGE_DB:-./data/deltaforge.db}"
 IMAGE_NAME="deltaforge"
 IMAGE_TAG="dev"
 
+CHAOS_DC=(docker compose -f docker-compose.chaos.yml)
+CHAOS_IMAGE="deltaforge:dev-debug"
+
 usage() {
   cat <<'EOF'
 DeltaForge dev helper
@@ -97,12 +100,27 @@ Docs:
 Release:
   ./dev.sh release-check
 
+Chaos (resilience scenarios against a live Docker Compose stack):
+  ./dev.sh chaos-build                    # build deltaforge:dev-debug image
+  ./dev.sh chaos-up [mysql|postgres]      # start chaos stack (default: mysql)
+  ./dev.sh chaos-down [mysql|postgres]    # stop & remove (default: mysql)
+  ./dev.sh chaos-ps                       # list chaos services
+  ./dev.sh chaos-logs [service]           # tail logs (all services or one)
+  ./dev.sh chaos-health                   # curl DeltaForge /health
+  ./dev.sh chaos-run [args...]            # cargo run -p chaos -- <args>
+  ./dev.sh chaos-mysql-sh                 # mysql shell into chaos orders DB
+  ./dev.sh chaos-pg-sh                    # psql shell into chaos orders DB
+  ./dev.sh chaos-mysql-status             # binlog / GTID status
+  ./dev.sh chaos-pg-status                # replication slots + publications
+  ./dev.sh chaos-reset [mysql|postgres]   # full teardown with volume wipe
+
 Notes:
 - Kafka: localhost:9092, NATS: localhost:4222 (JetStream enabled)
 - API: http://localhost:8080 (override with API_BASE)
 - PostgreSQL: wal_level=logical; MySQL: GTID + ROW binlog
 - Storage db: ./data/deltaforge.db (override with STORAGE_DB)
 - Storage commands are SQLite-only; for Postgres use psql directly.
+- Chaos stack: build debug image first, then chaos-up [mysql|postgres].
 EOF
 }
 
@@ -521,8 +539,8 @@ cmd_storage_sh() {
 
 # ── API ───────────────────────────────────────────────────────────────────────
 
-cmd_api_health()  { echo "GET $API_BASE/healthz"; curl -s "$API_BASE/healthz"; echo; }
-cmd_api_ready()   { echo "GET $API_BASE/readyz"; api_curl "$API_BASE/readyz"; }
+cmd_api_health()  { echo "GET $API_BASE/health"; curl -s "$API_BASE/health"; echo; }
+cmd_api_ready()   { echo "GET $API_BASE/ready"; api_curl "$API_BASE/ready"; }
 cmd_api_list()    { echo "GET $API_BASE/pipelines"; api_curl "$API_BASE/pipelines"; }
 
 cmd_api_get()     { api_pipeline "GET"    ""            "${1:-}"; }
@@ -568,6 +586,96 @@ cmd_docker_multi() {
 cmd_docker_all() {
   cmd_docker; cmd_docker_test; cmd_docker_debug; cmd_docker_test_debug
   echo "✅ All Docker builds successful!"
+}
+
+# ── Chaos ─────────────────────────────────────────────────────────────────────
+
+_chaos_profile() {
+  local src="${1:-mysql}"
+  case "$src" in
+    mysql)    echo "app" ;;
+    postgres) echo "pg-app" ;;
+    *) echo "Unknown source: $src (use mysql or postgres)" >&2; exit 1 ;;
+  esac
+}
+
+cmd_chaos_build() {
+  docker build -t "$CHAOS_IMAGE" -f Dockerfile.debug .
+  docker image ls | grep deltaforge
+  echo "✅ Built $CHAOS_IMAGE"
+}
+
+cmd_chaos_up() {
+  local src="${1:-mysql}"
+  local profile; profile=$(_chaos_profile "$src")
+  "${CHAOS_DC[@]}" up -d
+  "${CHAOS_DC[@]}" --profile "$profile" up -d
+  echo "✅ Chaos stack up ($src / profile=$profile)"
+  echo "   Grafana:    http://localhost:3000"
+  echo "   Prometheus: http://localhost:9090"
+  echo "   DeltaForge: http://localhost:8080/health"
+}
+
+cmd_chaos_down() {
+  local src="${1:-mysql}"
+  local profile; profile=$(_chaos_profile "$src")
+  "${CHAOS_DC[@]}" --profile "$profile" down
+  "${CHAOS_DC[@]}" down
+}
+
+cmd_chaos_ps() {
+  "${CHAOS_DC[@]}" --profile app --profile pg-app ps
+}
+
+cmd_chaos_logs() {
+  local svc="${1:-}"
+  if [[ -n "$svc" ]]; then
+    "${CHAOS_DC[@]}" --profile app --profile pg-app logs -f "$svc"
+  else
+    "${CHAOS_DC[@]}" --profile app --profile pg-app logs -f
+  fi
+}
+
+cmd_chaos_health() {
+  echo "GET http://localhost:8080/health"
+  curl -s http://localhost:8080/health; echo
+}
+
+cmd_chaos_run() {
+  cargo run -p chaos -- "$@"
+}
+
+cmd_chaos_mysql_sh() {
+  docker compose -f docker-compose.chaos.yml exec -ti mysql mysql -uroot -ppassword orders
+}
+
+cmd_chaos_pg_sh() {
+  docker compose -f docker-compose.chaos.yml --profile pg-app exec -ti postgres psql -U postgres -d orders
+}
+
+cmd_chaos_mysql_status() {
+  echo "=== Chaos MySQL CDC Status ==="
+  docker compose -f docker-compose.chaos.yml exec -T mysql mysql -uroot -ppassword \
+    -e "SHOW MASTER STATUS\G" \
+    -e "SELECT @@gtid_mode, @@enforce_gtid_consistency, @@binlog_format, @@server_uuid\G"
+}
+
+cmd_chaos_pg_status() {
+  echo "=== Chaos PostgreSQL CDC Status ==="
+  docker compose -f docker-compose.chaos.yml --profile pg-app exec -T postgres \
+    psql -U postgres -d orders \
+    -c "SELECT slot_name, plugin, active, restart_lsn, confirmed_flush_lsn FROM pg_replication_slots;" \
+    -c "SELECT pubname, puballtables FROM pg_publication;" \
+    -c "SELECT system_identifier FROM pg_control_system();"
+}
+
+cmd_chaos_reset() {
+  local src="${1:-mysql}"
+  local profile; profile=$(_chaos_profile "$src")
+  echo "⚠️  Tearing down chaos stack ($src) with volume wipe..."
+  "${CHAOS_DC[@]}" --profile "$profile" down -v
+  "${CHAOS_DC[@]}" down -v
+  echo "✅ Chaos stack reset"
 }
 
 # ── Docs / Release ────────────────────────────────────────────────────────────
@@ -672,6 +780,19 @@ case "${1:-}" in
   docs) shift; cmd_docs "$@";;
   docs-build) shift; cmd_docs_build "$@";;
   release-check) shift; cmd_release_check "$@";;
+
+  chaos-build) shift; cmd_chaos_build "$@";;
+  chaos-up) shift; cmd_chaos_up "$@";;
+  chaos-down) shift; cmd_chaos_down "$@";;
+  chaos-ps) shift; cmd_chaos_ps "$@";;
+  chaos-logs) shift; cmd_chaos_logs "$@";;
+  chaos-health) shift; cmd_chaos_health "$@";;
+  chaos-run) shift; cmd_chaos_run "$@";;
+  chaos-mysql-sh) shift; cmd_chaos_mysql_sh "$@";;
+  chaos-pg-sh) shift; cmd_chaos_pg_sh "$@";;
+  chaos-mysql-status) shift; cmd_chaos_mysql_status "$@";;
+  chaos-pg-status) shift; cmd_chaos_pg_status "$@";;
+  chaos-reset) shift; cmd_chaos_reset "$@";;
 
   -h|--help|help|"") usage;;
   *) echo "Unknown command: $1"; echo; usage; exit 1;;
