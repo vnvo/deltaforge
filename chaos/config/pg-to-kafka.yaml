@@ -9,15 +9,13 @@ spec:
     type: postgres
     config:
       id: chaos-postgres
-      host: toxiproxy
-      port: 5101
-      username: postgres
-      password: postgres
-      database: orders
+      dsn: "postgresql://postgres:postgres@toxiproxy:5101/orders"
       publication: deltaforge_pub
-      slot_name: chaos_slot
+      slot: chaos_slot
       tables: ["public.*"]
       on_schema_drift: adapt
+
+  processors: []
 
   sinks:
     - type: kafka
