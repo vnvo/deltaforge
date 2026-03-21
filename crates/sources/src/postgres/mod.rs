@@ -193,6 +193,44 @@ impl PostgresSource {
                 }
             }
         } else {
+            // Resuming from a checkpoint: verify the replication slot still exists
+            // before trusting the saved LSN. A dropped slot means the WAL position
+            // is permanently lost — halt rather than silently reconnecting.
+            match check_position_reachability(&self.dsn, &self.slot).await {
+                Ok(PositionReachability::Lost { reason }) => {
+                    error!(
+                        source_id = %self.id,
+                        slot = %self.slot,
+                        %reason,
+                        "replication slot lost — checkpoint position is unreachable, halting"
+                    );
+                    return Err(SourceError::Checkpoint {
+                        details: format!(
+                            "replication slot '{}' is gone: {reason}. \
+                             Re-snapshot required.",
+                            self.slot
+                        )
+                        .into(),
+                    });
+                }
+                Ok(PositionReachability::Unknown { reason }) => {
+                    warn!(
+                        source_id = %self.id,
+                        slot = %self.slot,
+                        %reason,
+                        "could not verify slot reachability, resuming anyway"
+                    );
+                }
+                Ok(PositionReachability::Reachable) => {}
+                Err(e) => {
+                    warn!(
+                        source_id = %self.id,
+                        slot = %self.slot,
+                        error = %e,
+                        "slot reachability check failed, resuming anyway"
+                    );
+                }
+            }
             config.start_lsn
         };
 
@@ -431,7 +469,7 @@ impl PostgresSource {
 #[async_trait]
 impl Source for PostgresSource {
     fn checkpoint_key(&self) -> &str {
-        &self.checkpoint_key
+        &self.id
     }
 
     async fn run(

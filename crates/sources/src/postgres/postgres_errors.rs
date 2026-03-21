@@ -311,6 +311,13 @@ fn is_connection_error(s: &str) -> bool {
         || s.contains("connection closed")
         || s.contains("timed out")
         || s.contains("unexpected eof")
+        // tokio::io::AsyncReadExt::read_exact returns "early eof" on EOF
+        // (io::ErrorKind::UnexpectedEof). Happens when the remote side closes
+        // the TCP connection gracefully (FIN) mid-message — e.g. Toxiproxy
+        // closing a proxied connection. std::io::Read::read_exact uses
+        // "failed to fill whole buffer" instead, so cover both.
+        || s.contains("early eof")
+        || s.contains("failed to fill whole buffer")
         || s.contains("terminating connection")
         || s.contains("administrator command")
         || s.contains("57p01")
