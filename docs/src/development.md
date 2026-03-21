@@ -196,6 +196,51 @@ The `dev.sh` script provides shortcuts for common tasks:
 ./dev.sh release-check  # run all checks + build all Docker variants
 ```
 
+## Chaos testing
+
+End-to-end resilience tests run against a live Docker Compose stack with fault injection via [Toxiproxy](https://github.com/Shopify/toxiproxy). They cover network partitions, sink outages, crash recovery, server failover, schema drift, and binlog purge.
+
+### Prerequisites
+
+Build the debug image first (includes a shell, needed for some scenarios):
+
+```bash
+docker build -t deltaforge:dev-debug -f Dockerfile.debug .
+```
+
+### Start the chaos stack
+
+```bash
+docker compose -f docker-compose.chaos.yml up -d
+docker compose -f docker-compose.chaos.yml --profile app up -d
+```
+
+### Run scenarios
+
+```bash
+# All scenarios in sequence
+cargo run -p chaos -- --scenario all
+
+# Single scenario
+cargo run -p chaos -- --scenario network-partition
+cargo run -p chaos -- --scenario sink-outage
+cargo run -p chaos -- --scenario crash-recovery
+cargo run -p chaos -- --scenario failover
+cargo run -p chaos -- --scenario schema-drift
+cargo run -p chaos -- --scenario binlog-purge
+```
+
+Exit code is `0` on full pass, `1` on any failure — suitable for CI.
+
+### Teardown
+
+```bash
+docker compose -f docker-compose.chaos.yml --profile app down -v
+docker compose -f docker-compose.chaos.yml down -v
+```
+
+See [`crates/chaos/README.md`](../../crates/chaos/README.md) for the full scenario catalogue, network topology, and instructions for adding new scenarios.
+
 ## Contributing
 
 1. Fork the repository

@@ -9,8 +9,8 @@ Each pipeline is created from a single `PipelineSpec`. The runtime spawns the so
 
 The REST API addresses pipelines by `metadata.name` and returns `PipeInfo` records containing the live spec and status.
 
-- `GET /healthz` - liveness probe.
-- `GET /readyz` - readiness with pipeline states.
+- `GET /health` - liveness probe.
+- `GET /ready` - readiness with pipeline states.
 - `GET /pipelines` - list pipelines.
 - `POST /pipelines` - create from a full spec.
 - `PATCH /pipelines/{name}` - merge a partial spec (for example, adjust batch thresholds) and restart the pipeline.

@@ -19,20 +19,27 @@ deltaforge --config pipelines.yaml --api-addr 0.0.0.0:9090
 ### Liveness Probe
 
 ```http
-GET /healthz
+GET /health
 ```
 
-Returns `ok` if the process is running. Use for Kubernetes liveness probes.
+Returns `ok` when the process is running and all pipelines are healthy. Returns `503` if any pipeline has entered a failed state (e.g. position lost after failover, binlog purged, unrecoverable source error). Use for Kubernetes liveness probes — a `503` indicates the process should be restarted.
 
-**Response:** `200 OK`
+**Response:** `200 OK` — all pipelines healthy
 ```
 ok
 ```
 
+**Response:** `503 Service Unavailable` — one or more pipelines failed
+```
+pipeline failed
+```
+
+Pipeline status can be inspected via `/ready` or `GET /pipelines` to identify which pipeline failed and why.
+
 ### Readiness Probe
 
 ```http
-GET /readyz
+GET /ready
 ```
 
 Returns pipeline states. Use for Kubernetes readiness probes.

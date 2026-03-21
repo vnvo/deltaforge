@@ -270,8 +270,8 @@ configuration.
 
 ### Health
 
-- `GET /healthz` - lightweight liveness probe returning `ok`.
-- `GET /readyz` - readiness view returning `{"status":"ready","pipelines":[...]}`
+- `GET /health` - lightweight liveness probe returning `ok`.
+- `GET /ready` - readiness view returning `{"status":"ready","pipelines":[...]}`
   with the current pipeline states.
 
 ### Pipeline management
