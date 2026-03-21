@@ -12,27 +12,27 @@
 //!   6. Verify reconnect counter incremented and all inserts arrived in Kafka.
 
 use anyhow::Result;
-use mysql_async::prelude::Queryable;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::info;
 
-use crate::harness::{Harness, MYSQL_DSN, ScenarioResult};
+use crate::backend::SourceBackend;
+use crate::harness::{Harness, ScenarioResult};
 
 const PARTITION_HOLD: Duration = Duration::from_secs(10);
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const WARMUP_TIMEOUT: Duration = Duration::from_secs(60);
 
-pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
-    const NAME: &str = "network_partition";
+pub async fn run<B: SourceBackend>(harness: &Harness, backend: &B) -> Result<ScenarioResult> {
+    let name = format!("{}/network_partition", backend.name());
     const ROUNDS: u32 = 2;
 
     harness.setup().await?;
 
     for round in 1..=ROUNDS {
         info!(round, total = ROUNDS, "-- starting round");
-        let result = run_once(harness, NAME, round).await?;
+        let result = run_once(harness, backend, &name, round).await?;
         if !result.passed {
             return Ok(result);
         }
@@ -42,18 +42,15 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
         }
     }
 
-    Ok(ScenarioResult::pass(NAME).note(format!("all {ROUNDS} rounds passed")))
+    Ok(ScenarioResult::pass(&name).note(format!("all {ROUNDS} rounds passed")))
 }
 
-async fn run_once(
+async fn run_once<B: SourceBackend>(
     harness: &Harness,
+    backend: &B,
     name: &str,
     round: u32,
 ) -> Result<ScenarioResult> {
-    // Warmup
-    // Insert a sentinel row and wait for it to appear in Kafka.
-    // This confirms DeltaForge is actively streaming before we cut the proxy.
-    // Expected: < 5s on a healthy pipeline.
     info!(
         round,
         "step 1/6: warming up - waiting for DeltaForge to stream a sentinel event ..."
@@ -61,10 +58,7 @@ async fn run_once(
     let warm_offset = harness.kafka_offset().await?;
     let deadline = Instant::now() + WARMUP_TIMEOUT;
     loop {
-        // Keep inserting rows so that at least one lands while DeltaForge is
-        // actively streaming — avoids a race where the single pre-loop insert
-        // is committed before DeltaForge resolves its start binlog position.
-        insert_rows(1).await?;
+        backend.insert_rows("warmup", 1).await?;
         sleep(Duration::from_secs(3)).await;
         if harness.kafka_offset().await? > warm_offset {
             info!("sentinel arrived in Kafka - DeltaForge is streaming");
@@ -82,19 +76,15 @@ async fn run_once(
     let events_before = harness.kafka_offset().await?;
     info!(%reconnects_before, %events_before, "baseline captured");
 
-    // Pre-partition inserts
-    // Insert rows while streaming is healthy. These should arrive in Kafka
-    // before the partition is cut, establishing a clean pre-partition baseline.
     info!(
         round,
         "step 2/6: inserting 3 rows before partition - these should arrive immediately"
     );
-    insert_rows(3).await?;
+    backend.insert_rows("pre-partition", 3).await?;
     let target_pre = events_before + 3;
     let deadline_pre = Instant::now() + Duration::from_secs(15);
     loop {
-        let offset = harness.kafka_offset().await?;
-        if offset >= target_pre {
+        if harness.kafka_offset().await? >= target_pre {
             break;
         }
         if Instant::now() > deadline_pre {
@@ -108,48 +98,31 @@ async fn run_once(
     let events_before_partition = harness.kafka_offset().await?;
     info!(%events_before_partition, "pre-partition inserts confirmed in Kafka");
 
-    // Partition
-    // Cut the MySQL proxy. DeltaForge will detect the broken connection and
-    // begin exponential backoff reconnects (~1s, 2s, 4s, 8s ...).
-    info!(
-        round,
-        "step 3/6: cutting MySQL proxy - DeltaForge should begin reconnect backoff"
-    );
-    harness.toxi.disable("mysql").await?;
+    let proxy = backend.proxy();
+    info!(round, proxy, "step 3/6: cutting proxy - DeltaForge should begin reconnect backoff");
+    harness.toxi.disable(proxy).await?;
 
-    // Insert rows directly to MySQL (bypasses toxiproxy).
-    // These must survive the partition and be delivered after recovery.
-    info!(
-        round,
-        "step 4/6: inserting 5 rows during partition (direct to MySQL, bypassing proxy)"
-    );
-    let inserts = insert_rows(5).await?;
-    info!(
-        inserts,
-        "rows committed to MySQL - DeltaForge cannot see them yet"
-    );
+    info!(round, "step 4/6: inserting 5 rows during partition (direct to DB, bypassing proxy)");
+    let inserts = backend.insert_rows("partition", 5).await?;
+    info!(inserts, "rows committed to DB - DeltaForge cannot see them yet");
 
-    // Hold the partition to accumulate backoff — ensures we test recovery
-    // from deep backoff sleep, not just a brief hiccup.
     info!(
         round,
-        "step 5/6: holding partition for {}s (backoff accumulation) ...",
-        PARTITION_HOLD.as_secs()
+        hold_secs = PARTITION_HOLD.as_secs(),
+        "step 5/6: holding partition (backoff accumulation) ..."
     );
     sleep(PARTITION_HOLD).await;
 
     let reconnects_during = harness.reconnect_count().await?;
-    info!(%reconnects_during, "successful reconnects during partition (expect 0)");
+    info!(%reconnects_during, "reconnects during partition (expect 0)");
 
-    // Recovery
-    // Restore the proxy. DeltaForge will reconnect on its next backoff wake-up
-    // (up to ~60s), then replay the binlog from its last checkpoint.
     info!(
         round,
-        "step 6/6: restoring MySQL proxy - waiting up to {}s for DeltaForge to recover ...",
-        RECOVERY_TIMEOUT.as_secs()
+        proxy,
+        recovery_secs = RECOVERY_TIMEOUT.as_secs(),
+        "step 6/6: restoring proxy - waiting for DeltaForge to recover ..."
     );
-    harness.toxi.enable("mysql").await?;
+    harness.toxi.enable(backend.proxy()).await?;
 
     let target = events_before_partition + inserts as u64;
     let deadline = Instant::now() + RECOVERY_TIMEOUT;
@@ -207,27 +180,4 @@ async fn run_once(
         .note(format!(
             "events delivered to Kafka: {events_recovered}/{inserts}"
         )))
-}
-
-async fn insert_rows(n: i64) -> Result<i64> {
-    let pool = mysql_async::Pool::new(MYSQL_DSN);
-    let mut conn = pool.get_conn().await?;
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    for i in 0..n {
-        conn.exec_drop(
-            "INSERT INTO customers (name, email, balance) VALUES (?, ?, ?)",
-            (
-                format!("chaos-{ts}-{i}"),
-                format!("chaos-{ts}-{i}@test.com"),
-                0.0_f64,
-            ),
-        )
-        .await?;
-    }
-    conn.disconnect().await?;
-    let _ = pool.disconnect().await;
-    Ok(n)
 }

@@ -13,12 +13,12 @@
 //!   6. Verify all inserted rows eventually appear in the topic.
 
 use anyhow::Result;
-use mysql_async::prelude::Queryable;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::info;
 
-use crate::harness::{Harness, MYSQL_DSN, ScenarioResult};
+use crate::backend::SourceBackend;
+use crate::harness::{Harness, ScenarioResult};
 
 const OUTAGE_HOLD: Duration = Duration::from_secs(21);
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -26,13 +26,13 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const WARMUP_TIMEOUT: Duration = Duration::from_secs(60);
 const ROUNDS: u32 = 2;
 
-pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
-    const NAME: &str = "sink_outage";
+pub async fn run<B: SourceBackend>(harness: &Harness, backend: &B) -> Result<ScenarioResult> {
+    let name = format!("{}/sink_outage", backend.name());
     harness.setup().await?;
 
     for round in 1..=ROUNDS {
         info!(round, total = ROUNDS, "── starting round");
-        let result = run_once(harness, NAME, round).await?;
+        let result = run_once(harness, backend, &name, round).await?;
         if !result.passed {
             return Ok(result);
         }
@@ -42,23 +42,20 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
         }
     }
 
-    Ok(ScenarioResult::pass(NAME).note(format!("all {ROUNDS} rounds passed")))
+    Ok(ScenarioResult::pass(&name).note(format!("all {ROUNDS} rounds passed")))
 }
 
-async fn run_once(
+async fn run_once<B: SourceBackend>(
     harness: &Harness,
+    backend: &B,
     name: &str,
     round: u32,
 ) -> Result<ScenarioResult> {
-    // Warmup
-    info!(
-        round,
-        "step 1/5: warming up - waiting for DeltaForge to stream a sentinel event ..."
-    );
+    info!(round, "step 1/5: warming up - waiting for DeltaForge to stream a sentinel event ...");
     let warm_offset = harness.kafka_offset().await?;
     let deadline = Instant::now() + WARMUP_TIMEOUT;
     loop {
-        insert_rows(1).await?;
+        backend.insert_rows("warmup", 1).await?;
         sleep(Duration::from_secs(3)).await;
         if harness.kafka_offset().await? > warm_offset {
             info!(round, "sentinel arrived in Kafka - DeltaForge is streaming");
@@ -75,34 +72,20 @@ async fn run_once(
     let events_before = harness.kafka_offset().await?;
     info!(round, %events_before, "baseline captured");
 
-    // Outage
-    // Cut Kafka. DeltaForge will buffer events and retry delivery.
-    // The checkpoint must NOT advance while the sink is down.
-    info!(
-        round,
-        "step 2/5: cutting Kafka proxy - DeltaForge should buffer and retry"
-    );
+    info!(round, "step 2/5: cutting Kafka proxy - DeltaForge should buffer and retry");
     harness.toxi.disable("kafka").await?;
 
     info!(round, "step 3/5: inserting 10 rows while Kafka is down");
-    let inserts = insert_rows(10).await?;
-    info!(
-        round,
-        inserts, "rows committed to MySQL - DeltaForge cannot deliver them yet"
-    );
+    let inserts = backend.insert_rows("outage", 10).await?;
+    info!(round, inserts, "rows committed to DB - DeltaForge cannot deliver them yet");
 
-    info!(
-        round,
-        "step 4/5: holding outage for {}s ...",
-        OUTAGE_HOLD.as_secs()
-    );
+    info!(round, hold_secs = OUTAGE_HOLD.as_secs(), "step 4/5: holding outage ...");
     sleep(OUTAGE_HOLD).await;
 
-    // Recovery
     info!(
         round,
-        "step 5/5: restoring Kafka proxy - waiting up to {}s for flush ...",
-        RECOVERY_TIMEOUT.as_secs()
+        recovery_secs = RECOVERY_TIMEOUT.as_secs(),
+        "step 5/5: restoring Kafka proxy - waiting for flush ..."
     );
     harness.toxi.enable("kafka").await?;
 
@@ -145,9 +128,7 @@ async fn run_once(
     }
 
     Ok(ScenarioResult::pass(name)
-        .note(format!(
-            "round {round}: events delivered: {delivered}/{inserts}"
-        ))
+        .note(format!("round {round}: events delivered: {delivered}/{inserts}"))
         .note(if delivered > inserts as u64 {
             format!(
                 "{} duplicate(s) - expected with at-least-once",
@@ -156,23 +137,4 @@ async fn run_once(
         } else {
             "no duplicates observed".into()
         }))
-}
-
-async fn insert_rows(n: i64) -> Result<i64> {
-    let pool = mysql_async::Pool::new(MYSQL_DSN);
-    let mut conn = pool.get_conn().await?;
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    for i in 0..n {
-        conn.exec_drop(
-            "INSERT INTO order_events (customer_id, amount, status) VALUES (?, ?, ?)",
-            (1i64, (i as f64 + 1.0) * 9.99, "pending"),
-        )
-        .await?;
-    }
-    conn.disconnect().await?;
-    let _ = pool.disconnect().await;
-    Ok(n)
 }

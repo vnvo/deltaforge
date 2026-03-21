@@ -23,11 +23,13 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::info;
 
-use crate::harness::{Harness, MYSQL_DSN, ScenarioResult};
+use crate::backend::MYSQL_DSN;
+use crate::docker;
+use crate::harness::{Harness, ScenarioResult};
 
 const WARMUP_TIMEOUT: Duration = Duration::from_secs(60);
 // DeltaForge must lose the connection, hit backoff, reconnect to mysql-b,
-// run identity check, discover position lost — then /healthz returns 503.
+// run identity check, discover position lost — then /health returns 503.
 const UNHEALTHY_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
@@ -82,7 +84,7 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
     let deadline = Instant::now() + UNHEALTHY_TIMEOUT;
     let mut went_unhealthy = false;
     loop {
-        let healthy = reqwest::get("http://localhost:8080/healthz")
+        let healthy = reqwest::get("http://localhost:8080/health")
             .await
             .map(|r| r.status().is_success())
             .unwrap_or(false);
@@ -104,7 +106,7 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
     info!("restoring mysql proxy upstream to mysql-a and restarting DeltaForge ...");
     let _ = harness.toxi.update_upstream("mysql", "mysql:3306").await;
     let _ = harness.toxi.enable("mysql").await;
-    let _ = restart_deltaforge().await;
+    let _ = docker::restart_service("app", "deltaforge").await;
     let _ = harness
         .wait_for_deltaforge(Duration::from_secs(30))
         .await;
@@ -125,35 +127,6 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
         "DeltaForge correctly halted after detecting server identity change \
          (position lost on new server)",
     ))
-}
-
-async fn restart_deltaforge() -> Result<()> {
-    for args in [
-        vec![
-            "compose",
-            "-f",
-            "docker-compose.chaos.yml",
-            "--profile",
-            "app",
-            "stop",
-            "deltaforge",
-        ],
-        vec![
-            "compose",
-            "-f",
-            "docker-compose.chaos.yml",
-            "--profile",
-            "app",
-            "start",
-            "deltaforge",
-        ],
-    ] {
-        tokio::process::Command::new("docker")
-            .args(&args)
-            .status()
-            .await?;
-    }
-    Ok(())
 }
 
 async fn insert_row() -> Result<()> {

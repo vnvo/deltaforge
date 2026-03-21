@@ -9,10 +9,6 @@ use crate::toxiproxy::ToxiproxyClient;
 
 pub const KAFKA_BROKERS: &str = "localhost:9092";
 pub const CHAOS_TOPIC: &str = "chaos.cdc";
-pub const MYSQL_DSN: &str = "mysql://root:password@127.0.0.1:3306/orders";
-// Connect via host port, not toxiproxy — load generation bypasses the fault proxy
-pub const PG_DSN: &str =
-    "host=localhost port=5432 user=postgres password=postgres dbname=orders";
 
 pub struct Harness {
     pub toxi: ToxiproxyClient,
@@ -29,7 +25,7 @@ impl Harness {
     pub async fn wait_for_deltaforge(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
-            match reqwest::get("http://localhost:8080/healthz").await {
+            match reqwest::get("http://localhost:8080/health").await {
                 Ok(r) if r.status().is_success() => return Ok(()),
                 _ => {}
             }

@@ -20,7 +20,9 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::info;
 
-use crate::harness::{Harness, MYSQL_DSN, ScenarioResult};
+use crate::backend::MYSQL_DSN;
+use crate::docker;
+use crate::harness::{Harness, ScenarioResult};
 
 const WARMUP_TIMEOUT: Duration = Duration::from_secs(60);
 const UNHEALTHY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -56,7 +58,7 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
 
     // ── Stop and purge ────────────────────────────────────────────────────────
     info!("step 2/4: stopping DeltaForge cleanly to preserve checkpoint ...");
-    stop_deltaforge().await?;
+    docker::stop_service("app", "deltaforge").await?;
     // Clean stop (SIGTERM) flushes the checkpoint to SQLite before exit.
     // SQLite WAL is on the Docker volume and replays automatically on restart —
     // no manual WAL checkpoint needed.
@@ -70,7 +72,7 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
     info!(
         "step 3/4: restarting DeltaForge - expecting it to detect purge and halt ..."
     );
-    start_deltaforge().await?;
+    docker::start_service("app", "deltaforge").await?;
 
     // ── Verify unhealthy ──────────────────────────────────────────────────────
     // Poll the health endpoint — DeltaForge should go down, not stay up.
@@ -82,7 +84,7 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
     let deadline = Instant::now() + UNHEALTHY_TIMEOUT;
     let mut went_unhealthy = false;
     loop {
-        let healthy = reqwest::get("http://localhost:8080/healthz")
+        let healthy = reqwest::get("http://localhost:8080/health")
             .await
             .map(|r| r.status().is_success())
             .unwrap_or(false);
@@ -106,9 +108,9 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
     // GTIDs that no longer exist on mysql-a).  Clear the SQLite file while the
     // container is stopped so the next suite run starts from a fresh position
     // rather than looping on "Replica has more GTIDs than the source has".
-    let _ = stop_deltaforge().await;
-    let _ = clear_deltaforge_checkpoint().await;
-    let _ = start_deltaforge().await;
+    let _ = docker::stop_service("app", "deltaforge").await;
+    let _ = docker::clear_checkpoint("app", "deltaforge").await;
+    let _ = docker::start_service("app", "deltaforge").await;
 
     if !went_unhealthy {
         return Ok(ScenarioResult::fail(
@@ -123,69 +125,6 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
     Ok(ScenarioResult::pass(NAME).note(
         "DeltaForge correctly halted after detecting purged binlog position",
     ))
-}
-
-async fn stop_deltaforge() -> Result<()> {
-    let status = tokio::process::Command::new("docker")
-        .args([
-            "compose",
-            "-f",
-            "docker-compose.chaos.yml",
-            "--profile",
-            "app",
-            "stop",
-            "deltaforge",
-        ])
-        .status()
-        .await?;
-    if !status.success() {
-        anyhow::bail!("docker stop failed");
-    }
-    Ok(())
-}
-
-async fn start_deltaforge() -> Result<()> {
-    let status = tokio::process::Command::new("docker")
-        .args([
-            "compose",
-            "-f",
-            "docker-compose.chaos.yml",
-            "--profile",
-            "app",
-            "start",
-            "deltaforge",
-        ])
-        .status()
-        .await?;
-    if !status.success() {
-        anyhow::bail!("docker start failed");
-    }
-    Ok(())
-}
-
-/// Delete the SQLite checkpoint DB from the deltaforge_data volume while the
-/// container is stopped.  Uses `docker compose run` so we inherit the correct
-/// volume mount from the service definition without hard-coding the volume name.
-async fn clear_deltaforge_checkpoint() -> Result<()> {
-    tokio::process::Command::new("docker")
-        .args([
-            "compose",
-            "-f",
-            "docker-compose.chaos.yml",
-            "--profile",
-            "app",
-            "run",
-            "--rm",
-            "--no-deps",
-            "--entrypoint",
-            "sh",
-            "deltaforge",
-            "-c",
-            "rm -f /data/deltaforge.db /data/deltaforge.db-shm /data/deltaforge.db-wal",
-        ])
-        .status()
-        .await?;
-    Ok(())
 }
 
 async fn purge_binlogs() -> Result<()> {

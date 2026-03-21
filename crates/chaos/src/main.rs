@@ -1,8 +1,11 @@
+mod backend;
+mod docker;
 mod harness;
 mod scenarios;
 mod toxiproxy;
 
 use anyhow::Result;
+use backend::{MysqlBackend, PgBackend};
 use clap::{Parser, ValueEnum};
 use harness::Harness;
 use tracing::info;
@@ -10,9 +13,15 @@ use tracing::info;
 #[derive(Parser)]
 #[command(name = "chaos", about = "DeltaForge chaos scenario runner")]
 struct Cli {
-    /// Scenario to run, or 'all' to run every scenario in sequence.
+    /// Scenario to run, or 'all' to run every scenario for the selected source.
     #[arg(short, long, default_value = "all")]
     scenario: Scenario,
+
+    /// CDC source to test. Determines which DeltaForge instance and scenario
+    /// set to use. `mysql` requires the `app` profile; `postgres` requires
+    /// the `pg-app` profile.
+    #[arg(long, default_value = "mysql")]
+    source: Source,
 
     /// Seconds to wait for DeltaForge to become healthy before starting.
     #[arg(long, default_value_t = 30)]
@@ -20,13 +29,26 @@ struct Cli {
 }
 
 #[derive(Clone, ValueEnum)]
+enum Source {
+    Mysql,
+    Postgres,
+}
+
+#[derive(Clone, ValueEnum)]
 enum Scenario {
+    /// Run all scenarios for the selected source in sequence.
     All,
+    // Generic (run for any source via --source)
     NetworkPartition,
     SinkOutage,
     CrashRecovery,
+    SchemaDrift,
+    // MySQL-specific
     Failover,
     BinlogPurge,
+    // PostgreSQL-specific
+    PgFailover,
+    SlotDropped,
 }
 
 #[tokio::main]
@@ -47,34 +69,9 @@ async fn main() -> Result<()> {
         .await?;
     info!("DeltaForge is healthy — starting chaos");
 
-    let results = match cli.scenario {
-        Scenario::NetworkPartition => {
-            vec![scenarios::network_partition::run(&harness).await?]
-        }
-        Scenario::SinkOutage => {
-            vec![scenarios::sink_outage::run(&harness).await?]
-        }
-        Scenario::CrashRecovery => {
-            vec![scenarios::crash_recovery::run(&harness).await?]
-        }
-        Scenario::BinlogPurge => {
-            vec![scenarios::binlog_purge::run(&harness).await?]
-        }
-        Scenario::Failover => {
-            vec![scenarios::failover::run(&harness).await?]
-        }
-        Scenario::All => {
-            let mut results = vec![];
-            // Run in order of increasing destructiveness.
-            // Failover restarts DeltaForge mid-run; binlog_purge wipes MySQL
-            // GTID state and must always run last.
-            results.push(scenarios::network_partition::run(&harness).await?);
-            results.push(scenarios::sink_outage::run(&harness).await?);
-            results.push(scenarios::crash_recovery::run(&harness).await?);
-            results.push(scenarios::failover::run(&harness).await?);
-            results.push(scenarios::binlog_purge::run(&harness).await?);
-            results
-        }
+    let results = match cli.source {
+        Source::Mysql => run_mysql(&harness, &cli.scenario).await?,
+        Source::Postgres => run_postgres(&harness, &cli.scenario).await?,
     };
 
     println!("\n═══════════════════════════════════");
@@ -91,4 +88,90 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+async fn run_mysql(harness: &Harness, scenario: &Scenario) -> Result<Vec<harness::ScenarioResult>> {
+    let backend = MysqlBackend;
+    let mut results = vec![];
+
+    match scenario {
+        Scenario::NetworkPartition => {
+            results.push(scenarios::network_partition::run(harness, &backend).await?);
+        }
+        Scenario::SinkOutage => {
+            results.push(scenarios::sink_outage::run(harness, &backend).await?);
+        }
+        Scenario::CrashRecovery => {
+            results.push(scenarios::crash_recovery::run(harness, &backend).await?);
+        }
+        Scenario::SchemaDrift => {
+            results.push(scenarios::schema_drift::run(harness, &backend).await?);
+        }
+        Scenario::Failover => {
+            results.push(scenarios::failover::run(harness).await?);
+        }
+        Scenario::BinlogPurge => {
+            results.push(scenarios::binlog_purge::run(harness).await?);
+        }
+        Scenario::PgFailover | Scenario::SlotDropped => {
+            eprintln!("error: {:?} is a PostgreSQL-specific scenario — use --source postgres", scenario.to_possible_value().unwrap().get_name());
+            std::process::exit(2);
+        }
+        Scenario::All => {
+            // Run in order of increasing destructiveness.
+            // binlog_purge wipes MySQL GTID state and must always run last.
+            results.push(scenarios::network_partition::run(harness, &backend).await?);
+            results.push(scenarios::sink_outage::run(harness, &backend).await?);
+            results.push(scenarios::crash_recovery::run(harness, &backend).await?);
+            results.push(scenarios::failover::run(harness).await?);
+            results.push(scenarios::schema_drift::run(harness, &backend).await?);
+            results.push(scenarios::binlog_purge::run(harness).await?);
+        }
+    }
+
+    Ok(results)
+}
+
+async fn run_postgres(
+    harness: &Harness,
+    scenario: &Scenario,
+) -> Result<Vec<harness::ScenarioResult>> {
+    let backend = PgBackend;
+    let mut results = vec![];
+
+    match scenario {
+        Scenario::NetworkPartition => {
+            results.push(scenarios::network_partition::run(harness, &backend).await?);
+        }
+        Scenario::SinkOutage => {
+            results.push(scenarios::sink_outage::run(harness, &backend).await?);
+        }
+        Scenario::CrashRecovery => {
+            results.push(scenarios::crash_recovery::run(harness, &backend).await?);
+        }
+        Scenario::SchemaDrift => {
+            results.push(scenarios::schema_drift::run(harness, &backend).await?);
+        }
+        Scenario::PgFailover => {
+            results.push(scenarios::pg_failover::run(harness).await?);
+        }
+        Scenario::SlotDropped => {
+            results.push(scenarios::slot_dropped::run(harness).await?);
+        }
+        Scenario::Failover | Scenario::BinlogPurge => {
+            eprintln!("error: {:?} is a MySQL-specific scenario — use --source mysql", scenario.to_possible_value().unwrap().get_name());
+            std::process::exit(2);
+        }
+        Scenario::All => {
+            // slot_dropped must run last — it clears the checkpoint DB.
+            results.push(scenarios::network_partition::run(harness, &backend).await?);
+            results.push(scenarios::sink_outage::run(harness, &backend).await?);
+            results.push(scenarios::crash_recovery::run(harness, &backend).await?);
+            results.push(scenarios::pg_failover::run(harness).await?);
+            results.push(scenarios::schema_drift::run(harness, &backend).await?);
+            results.push(scenarios::slot_dropped::run(harness).await?);
+        }
+    }
+
+    Ok(results)
 }
