@@ -101,8 +101,14 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
         sleep(POLL_INTERVAL).await;
     }
 
-    // Always stop deltaforge after this scenario — binlog state is corrupted
+    // Always restore a clean DeltaForge after this scenario.
+    // RESET BINARY LOGS AND GTIDS leaves the checkpoint DB stale (references
+    // GTIDs that no longer exist on mysql-a).  Clear the SQLite file while the
+    // container is stopped so the next suite run starts from a fresh position
+    // rather than looping on "Replica has more GTIDs than the source has".
     let _ = stop_deltaforge().await;
+    let _ = clear_deltaforge_checkpoint().await;
+    let _ = start_deltaforge().await;
 
     if !went_unhealthy {
         return Ok(ScenarioResult::fail(
@@ -154,6 +160,31 @@ async fn start_deltaforge() -> Result<()> {
     if !status.success() {
         anyhow::bail!("docker start failed");
     }
+    Ok(())
+}
+
+/// Delete the SQLite checkpoint DB from the deltaforge_data volume while the
+/// container is stopped.  Uses `docker compose run` so we inherit the correct
+/// volume mount from the service definition without hard-coding the volume name.
+async fn clear_deltaforge_checkpoint() -> Result<()> {
+    tokio::process::Command::new("docker")
+        .args([
+            "compose",
+            "-f",
+            "docker-compose.chaos.yml",
+            "--profile",
+            "app",
+            "run",
+            "--rm",
+            "--no-deps",
+            "--entrypoint",
+            "sh",
+            "deltaforge",
+            "-c",
+            "rm -f /data/deltaforge.db /data/deltaforge.db-shm /data/deltaforge.db-wal",
+        ])
+        .status()
+        .await?;
     Ok(())
 }
 
