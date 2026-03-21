@@ -133,6 +133,21 @@ pub fn describe_metrics() {
         Unit::Bytes,
         "Distribution of serialized batch sizes"
     );
+    describe_counter!(
+        "deltaforge_checkpoints_total",
+        Unit::Count,
+        "Total number of checkpoints committed"
+    );
+    describe_counter!(
+        "deltaforge_sink_errors_total",
+        Unit::Count,
+        "Total number of sink delivery errors"
+    );
+    describe_counter!(
+        "deltaforge_schema_drift_detected",
+        Unit::Count,
+        "Number of batches where schema drift was detected"
+    );
 
     // Schema sensing metrics
     describe_counter!(

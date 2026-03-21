@@ -264,6 +264,66 @@
       }
     },
     {
+      "id": 10,
+      "title": "Sink Errors (cumulative)",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 0,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "deltaforge_sink_errors_total",
+          "legendFormat": "{{pipeline}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "fixedColor": "red",
+            "mode": "fixed"
+          },
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      }
+    },
+    {
+      "id": 11,
+      "title": "Schema Drift Detected (cumulative)",
+      "type": "timeseries",
+      "gridPos": {
+        "x": 12,
+        "y": 32,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "deltaforge_schema_drift_detected",
+          "legendFormat": "{{pipeline}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "fixedColor": "purple",
+            "mode": "fixed"
+          },
+          "custom": {
+            "lineWidth": 2
+          }
+        }
+      }
+    },
+    {
       "id": 9,
       "title": "Checkpoint Rate (per second)",
       "type": "timeseries",
