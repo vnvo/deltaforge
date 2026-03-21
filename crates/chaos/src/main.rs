@@ -25,6 +25,7 @@ enum Scenario {
     NetworkPartition,
     SinkOutage,
     CrashRecovery,
+    Failover,
     BinlogPurge,
 }
 
@@ -59,12 +60,18 @@ async fn main() -> Result<()> {
         Scenario::BinlogPurge => {
             vec![scenarios::binlog_purge::run(&harness).await?]
         }
+        Scenario::Failover => {
+            vec![scenarios::failover::run(&harness).await?]
+        }
         Scenario::All => {
             let mut results = vec![];
-            // Run in order of increasing destructiveness
+            // Run in order of increasing destructiveness.
+            // Failover restarts DeltaForge mid-run; binlog_purge wipes MySQL
+            // GTID state and must always run last.
             results.push(scenarios::network_partition::run(&harness).await?);
             results.push(scenarios::sink_outage::run(&harness).await?);
             results.push(scenarios::crash_recovery::run(&harness).await?);
+            results.push(scenarios::failover::run(&harness).await?);
             results.push(scenarios::binlog_purge::run(&harness).await?);
             results
         }

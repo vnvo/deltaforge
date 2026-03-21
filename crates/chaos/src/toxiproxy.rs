@@ -26,6 +26,21 @@ impl ToxiproxyClient {
         Ok(())
     }
 
+    /// Change the upstream a proxy points at without touching enabled state.
+    pub async fn update_upstream(
+        &self,
+        proxy: &str,
+        upstream: &str,
+    ) -> Result<()> {
+        self.http
+            .post(format!("{TOXIPROXY_API}/proxies/{proxy}"))
+            .json(&json!({"upstream": upstream}))
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
     /// Restore a previously disabled proxy.
     pub async fn enable(&self, proxy: &str) -> Result<()> {
         self.http

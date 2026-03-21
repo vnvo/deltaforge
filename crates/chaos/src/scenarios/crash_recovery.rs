@@ -21,7 +21,7 @@ use tracing::info;
 
 use crate::harness::{Harness, MYSQL_DSN, ScenarioResult};
 
-const WARMUP_TIMEOUT: Duration = Duration::from_secs(15);
+const WARMUP_TIMEOUT: Duration = Duration::from_secs(60);
 const RESTART_TIMEOUT: Duration = Duration::from_secs(60);
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -35,9 +35,10 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
         "step 1/5: warming up - waiting for DeltaForge to stream a sentinel event ..."
     );
     let warm_offset = harness.kafka_offset().await?;
-    insert_rows("warmup", 1).await?;
     let deadline = Instant::now() + WARMUP_TIMEOUT;
     loop {
+        insert_rows("warmup", 1).await?;
+        sleep(Duration::from_secs(3)).await;
         if harness.kafka_offset().await? > warm_offset {
             info!("sentinel arrived in Kafka - DeltaForge is streaming");
             break;
@@ -48,7 +49,6 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
                 "DeltaForge not streaming before crash (warmup timed out)",
             ));
         }
-        sleep(Duration::from_secs(1)).await;
     }
 
     // Pre-crash inserts

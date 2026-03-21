@@ -22,6 +22,7 @@ services:
       MYSQL_ROOT_PASSWORD: password
     volumes:
       - ./chaos/init/mysql-chaos.sql:/docker-entrypoint-initdb.d/01_init.sql
+      - mysql_data:/var/lib/mysql
     command:
       - --server-id=101
       - --log-bin=mysql-bin
@@ -39,6 +40,29 @@ services:
       retries: 15
     ports:
       - "3306:3306"
+    networks: [chaos_net]
+
+  mysql-b:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+    volumes:
+      - ./chaos/init/mysql-chaos.sql:/docker-entrypoint-initdb.d/01_init.sql
+      - mysql_b_data:/var/lib/mysql
+    command:
+      - --server-id=102
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --binlog-checksum=NONE
+      - --binlog-expire-logs-seconds=120
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-ppassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
     networks: [chaos_net]
 
   postgres:
@@ -169,3 +193,5 @@ networks:
 volumes:
   deltaforge_data:
   grafana_data:
+  mysql_data:
+  mysql_b_data:

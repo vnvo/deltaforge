@@ -23,7 +23,7 @@ use crate::harness::{Harness, MYSQL_DSN, ScenarioResult};
 const OUTAGE_HOLD: Duration = Duration::from_secs(21);
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
-const WARMUP_TIMEOUT: Duration = Duration::from_secs(15);
+const WARMUP_TIMEOUT: Duration = Duration::from_secs(60);
 const ROUNDS: u32 = 2;
 
 pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
@@ -56,9 +56,10 @@ async fn run_once(
         "step 1/5: warming up - waiting for DeltaForge to stream a sentinel event ..."
     );
     let warm_offset = harness.kafka_offset().await?;
-    insert_rows(1).await?;
     let deadline = Instant::now() + WARMUP_TIMEOUT;
     loop {
+        insert_rows(1).await?;
+        sleep(Duration::from_secs(3)).await;
         if harness.kafka_offset().await? > warm_offset {
             info!(round, "sentinel arrived in Kafka - DeltaForge is streaming");
             break;
@@ -69,7 +70,6 @@ async fn run_once(
                 "DeltaForge not streaming before outage (warmup timed out)",
             ));
         }
-        sleep(Duration::from_secs(1)).await;
     }
 
     let events_before = harness.kafka_offset().await?;

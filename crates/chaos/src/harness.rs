@@ -71,9 +71,17 @@ impl Harness {
                 std::time::Duration::from_secs(5),
             )
         })
-        .await??;
+        .await?;
 
-        Ok(result.1 as u64) // (low, high) — high is the next offset to be written
+        match result {
+            Ok((_, high)) => Ok(high as u64),
+            // Topic doesn't exist yet (no events produced) — treat as offset 0.
+            Err(rdkafka::error::KafkaError::MetadataFetch(
+                rdkafka::types::RDKafkaErrorCode::UnknownPartition
+                | rdkafka::types::RDKafkaErrorCode::UnknownTopicOrPartition,
+            )) => Ok(0),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Fetch current source event counter from DeltaForge Prometheus metrics.

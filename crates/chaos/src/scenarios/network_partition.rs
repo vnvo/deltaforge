@@ -22,7 +22,7 @@ use crate::harness::{Harness, MYSQL_DSN, ScenarioResult};
 const PARTITION_HOLD: Duration = Duration::from_secs(10);
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
-const WARMUP_TIMEOUT: Duration = Duration::from_secs(15);
+const WARMUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
     const NAME: &str = "network_partition";
@@ -59,9 +59,13 @@ async fn run_once(
         "step 1/6: warming up - waiting for DeltaForge to stream a sentinel event ..."
     );
     let warm_offset = harness.kafka_offset().await?;
-    insert_rows(1).await?;
     let deadline = Instant::now() + WARMUP_TIMEOUT;
     loop {
+        // Keep inserting rows so that at least one lands while DeltaForge is
+        // actively streaming — avoids a race where the single pre-loop insert
+        // is committed before DeltaForge resolves its start binlog position.
+        insert_rows(1).await?;
+        sleep(Duration::from_secs(3)).await;
         if harness.kafka_offset().await? > warm_offset {
             info!("sentinel arrived in Kafka - DeltaForge is streaming");
             break;
@@ -72,7 +76,6 @@ async fn run_once(
                 "DeltaForge not streaming before partition (warmup timed out)",
             ));
         }
-        sleep(Duration::from_secs(1)).await;
     }
 
     let reconnects_before = harness.reconnect_count().await?;
