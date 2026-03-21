@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::coordinator::{
     Coordinator, SchemaSensorState, build_batch_processor, build_commit_fn,
@@ -8,7 +9,7 @@ use crate::schema_provider::SchemaLoaderAdapter;
 use anyhow::{Context, Result};
 use checkpoints::CheckpointStore;
 use deltaforge_config::{PipelineSpec, SourceCfg};
-use deltaforge_core::{Event, SourceHandle};
+use deltaforge_core::{Event, SourceError, SourceHandle};
 use metrics::{counter, gauge};
 use parking_lot::RwLock;
 use processors::build_processors;
@@ -52,6 +53,9 @@ impl PipelineStatus {
 pub(crate) struct PipelineRuntime {
     pub(crate) spec: PipelineSpec,
     pub(crate) status: PipelineStatus,
+    /// Set to false by the coordinator task when it exits without cancellation
+    /// (i.e. the source died unexpectedly). Used to drive /healthz.
+    pub(crate) alive: Arc<AtomicBool>,
     pub(crate) cancel: CancellationToken,
     pub(crate) pause: watch::Sender<bool>,
     pub(crate) sources: Vec<SourceHandle>,
@@ -75,9 +79,14 @@ impl PipelineRuntime {
     }
 
     pub(crate) fn info(&self) -> PipeInfo {
+        let status = if !self.alive.load(Ordering::Acquire) {
+            "failed"
+        } else {
+            self.status.as_str()
+        };
         PipeInfo {
             name: self.spec.metadata.name.clone(),
-            status: self.status.as_str().to_string(),
+            status: status.to_string(),
             spec: self.spec.clone(),
         }
     }
@@ -197,8 +206,42 @@ impl PipelineManager {
             SourceCfg::Turso(c) => c.tables.clone(),
         };
 
+        let alive = Arc::new(AtomicBool::new(true));
+
         let (event_tx, event_rx) = mpsc::channel::<Event>(4096);
         let src_handle = source.run(event_tx, self.ckpt_store.clone()).await;
+
+        // Wrap the source JoinHandle so alive=false is set immediately when
+        // the source task dies without an explicit cancellation.  The
+        // coordinator may be blocked in a long I/O operation (Kafka flush,
+        // SQLite commit) and never return, so we cannot rely solely on the
+        // coordinator wrapper below to drive /healthz.
+        let alive_for_src = Arc::clone(&alive);
+        let cancel_for_src = cancel.clone();
+        let SourceHandle {
+            cancel: src_cancel,
+            paused: src_paused,
+            pause_notify: src_pause_notify,
+            join: raw_join,
+        } = src_handle;
+        let monitored_join = tokio::spawn(async move {
+            let res = raw_join.await;
+            if !cancel_for_src.is_cancelled() {
+                alive_for_src.store(false, Ordering::Release);
+            }
+            match res {
+                Ok(r) => r,
+                Err(e) => Err(SourceError::Other(anyhow::anyhow!(
+                    "source task panicked: {e}"
+                ))),
+            }
+        });
+        let src_handle = SourceHandle {
+            cancel: src_cancel,
+            paused: src_paused,
+            pause_notify: src_pause_notify,
+            join: monitored_join,
+        };
 
         let batch_processor =
             build_batch_processor(processors, pipeline_name.clone());
@@ -234,12 +277,23 @@ impl PipelineManager {
 
         let coord = builder.build();
         let cancel_for_task = cancel.clone();
+        let cancel_check = cancel.clone();
         let pname = pipeline_name.clone();
 
+        let alive_for_task = Arc::clone(&alive);
+
         let join = tokio::spawn(async move {
-            coord.run(event_rx, cancel_for_task, pause_rx).await?;
+            let result = coord.run(event_rx, cancel_for_task, pause_rx).await;
+            if !cancel_check.is_cancelled() {
+                // Coordinator exited without an explicit stop — also mark
+                // failed (covers errors that originate inside the coordinator
+                // itself rather than in the source task).
+                alive_for_task.store(false, Ordering::Release);
+                gauge!("deltaforge_pipeline_status", "pipeline" => pname.clone())
+                    .set(-1.0);
+            }
             info!(pipeline = %pname, "pipeline coordinator exited");
-            Ok(())
+            result
         });
 
         gauge!("deltaforge_pipeline_status", "pipeline" => pipeline_name)
@@ -248,6 +302,7 @@ impl PipelineManager {
         Ok(PipelineRuntime {
             spec,
             status: PipelineStatus::Running,
+            alive,
             cancel,
             pause: pause_tx,
             sources: vec![src_handle],

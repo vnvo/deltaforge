@@ -26,9 +26,9 @@ use tracing::info;
 use crate::harness::{Harness, MYSQL_DSN, ScenarioResult};
 
 const WARMUP_TIMEOUT: Duration = Duration::from_secs(60);
-// Generous: DeltaForge must lose the connection, hit backoff, reconnect to
-// mysql-b, run identity check, discover position lost, and exit.
-const UNHEALTHY_TIMEOUT: Duration = Duration::from_secs(90);
+// DeltaForge must lose the connection, hit backoff, reconnect to mysql-b,
+// run identity check, discover position lost — then /healthz returns 503.
+const UNHEALTHY_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 pub async fn run(harness: &Harness) -> Result<ScenarioResult> {

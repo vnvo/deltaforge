@@ -1,4 +1,10 @@
-use axum::{Json, Router, extract::State, routing::get};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::get,
+};
 use serde::Serialize;
 
 use crate::pipelines::{AppState, PipeInfo};
@@ -10,8 +16,13 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn healthz() -> &'static str {
-    "ok"
+async fn healthz(State(st): State<AppState>) -> impl IntoResponse {
+    let pipelines = st.controller.list().await;
+    if pipelines.iter().any(|p| p.status == "failed") {
+        return (StatusCode::SERVICE_UNAVAILABLE, "pipeline failed\n")
+            .into_response();
+    }
+    (StatusCode::OK, "ok\n").into_response()
 }
 
 #[derive(Serialize)]
