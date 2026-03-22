@@ -165,7 +165,7 @@ fn bench_outbox_single_event(c: &mut Criterion) {
     let mut group = c.benchmark_group("outbox_single");
     group.throughput(Throughput::Elements(1));
 
-    let proc = OutboxProcessor::new(default_cfg()).unwrap();
+    let proc = OutboxProcessor::new(default_cfg(), String::new()).unwrap();
     let ev = make_outbox_event(1);
 
     group.bench_function("transform", |b| {
@@ -190,7 +190,7 @@ fn bench_outbox_with_key_template(c: &mut Criterion) {
     let mut group = c.benchmark_group("outbox_key_template");
     group.throughput(Throughput::Elements(1));
 
-    let proc = OutboxProcessor::new(cfg_with_key()).unwrap();
+    let proc = OutboxProcessor::new(cfg_with_key(), String::new()).unwrap();
     let ev = make_outbox_event(1);
 
     group.bench_function("topic_and_key", |b| {
@@ -215,7 +215,7 @@ fn bench_outbox_additional_headers(c: &mut Criterion) {
     let mut group = c.benchmark_group("outbox_additional_headers");
     group.throughput(Throughput::Elements(1));
 
-    let proc = OutboxProcessor::new(cfg_with_headers()).unwrap();
+    let proc = OutboxProcessor::new(cfg_with_headers(), String::new()).unwrap();
     let ev = make_outbox_event_with_extra_headers(1);
 
     group.bench_function("3_extra_headers", |b| {
@@ -239,7 +239,7 @@ fn bench_outbox_additional_headers(c: &mut Criterion) {
 fn bench_outbox_batch_sizes(c: &mut Criterion) {
     let mut group = c.benchmark_group("outbox_batch_sizes");
 
-    let proc = OutboxProcessor::new(default_cfg()).unwrap();
+    let proc = OutboxProcessor::new(default_cfg(), String::new()).unwrap();
 
     for size in [1, 10, 50, 100, 500] {
         let batch: Vec<Event> = (0..size).map(make_outbox_event).collect();
@@ -267,7 +267,7 @@ fn bench_outbox_batch_sizes(c: &mut Criterion) {
 fn bench_outbox_large_payload(c: &mut Criterion) {
     let mut group = c.benchmark_group("outbox_large_payload");
 
-    let proc = OutboxProcessor::new(default_cfg()).unwrap();
+    let proc = OutboxProcessor::new(default_cfg(), String::new()).unwrap();
 
     for keys in [10, 50, 200] {
         let ev = make_large_outbox_event(keys);
@@ -295,7 +295,7 @@ fn bench_outbox_large_payload(c: &mut Criterion) {
 fn bench_outbox_mixed_pipeline(c: &mut Criterion) {
     let mut group = c.benchmark_group("outbox_mixed_pipeline");
 
-    let proc = OutboxProcessor::new(default_cfg()).unwrap();
+    let proc = OutboxProcessor::new(default_cfg(), String::new()).unwrap();
 
     // 20% outbox, 80% CDC passthrough — realistic mixed pipeline
     let batch: Vec<Event> = (0..100)

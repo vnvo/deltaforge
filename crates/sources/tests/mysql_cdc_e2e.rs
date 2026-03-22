@@ -991,7 +991,7 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
         additional_headers: HashMap::new(),
         raw_payload: false,
         strict: false,
-    })?;
+    }, String::new())?;
 
     let ctx = BatchContext::from_batch(&raw_events);
     let processed = proc.process(raw_events, &ctx).await?;
@@ -1054,7 +1054,7 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
         additional_headers: HashMap::new(),
         raw_payload: true,
         strict: false,
-    })?;
+    }, String::new())?;
 
     let ctx = BatchContext::from_batch(&raw_events_clone);
     let raw_processed = raw_proc.process(raw_events_clone, &ctx).await?;

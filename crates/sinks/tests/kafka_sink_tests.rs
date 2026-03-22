@@ -289,7 +289,7 @@ fn make_sink(
         client_conf: HashMap::new(),
         filter: None,
     };
-    KafkaSink::new(&cfg, CancellationToken::new())
+    KafkaSink::new(&cfg, CancellationToken::new(), "")
 }
 
 /// Consume up to `n` messages, waiting at most `secs` seconds.
@@ -844,6 +844,7 @@ async fn kafka_sink_idempotent_mode() -> Result<()> {
             filter: None,
         },
         CancellationToken::new(),
+        "",
     )?;
 
     // Send multiple events
@@ -884,6 +885,7 @@ async fn kafka_sink_exactly_once_mode() -> Result<()> {
             filter: None,
         },
         CancellationToken::new(),
+        "",
     )?;
 
     // Note: Full EOS testing requires transaction support; this just validates
@@ -1033,7 +1035,7 @@ async fn kafka_sink_custom_config() -> Result<()> {
         filter: None,
     };
 
-    let sink = KafkaSink::new(&cfg, CancellationToken::new())?;
+    let sink = KafkaSink::new(&cfg, CancellationToken::new(), "")?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
@@ -1100,7 +1102,7 @@ async fn kafka_sink_optional() -> Result<()> {
         filter: None,
     };
 
-    let sink = KafkaSink::new(&cfg, CancellationToken::new())?;
+    let sink = KafkaSink::new(&cfg, CancellationToken::new(), "")?;
 
     assert!(!sink.required(), "sink should be optional");
 
@@ -1169,6 +1171,7 @@ async fn kafka_sink_recovers_after_restart() -> Result<()> {
             filter: None,
         },
         cancel.clone(),
+        "",
     )?);
 
     // Send first event successfully
@@ -1317,6 +1320,7 @@ async fn kafka_sink_respects_cancellation() -> Result<()> {
             filter: None,
         },
         cancel.clone(),
+        "",
     )?);
 
     let sink_clone = sink.clone();
@@ -1562,7 +1566,7 @@ async fn kafka_sink_routing_key_and_headers() -> Result<()> {
         filter: None,
     };
 
-    let sink = KafkaSink::new(&cfg, CancellationToken::new())?;
+    let sink = KafkaSink::new(&cfg, CancellationToken::new(), "")?;
 
     let mut event = make_event_for_table(1, "orders");
     event.after = Some(json!({"id": 1, "customer_id": "cust-42"}));
