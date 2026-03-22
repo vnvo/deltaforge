@@ -276,6 +276,9 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
               <option value="soak-stable">Soak Stable (no faults, baseline)</option>
               <option value="tpcc">TPC-C (OLTP benchmark)</option>
             </optgroup>
+            <optgroup label="Benchmarks">
+              <option value="backlog-drain">Backlog Drain (1 M row catch-up throughput)</option>
+            </optgroup>
             <optgroup label="Suite">
               <option value="all">All (runs every scenario in order)</option>
             </optgroup>
@@ -314,6 +317,38 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
             <input type="range" id="delay-slider" min="0" max="100" step="5" value="30"
                    oninput="document.getElementById('delay-val').textContent=this.value;updateRateEst()">
             <div class="duration-row"><span id="delay-val">30</span> ms per task between writes</div>
+          </div>
+        </div>
+
+        <!-- Drain settings — only shown for backlog-drain -->
+        <div id="drain-settings" style="display:none;border:1px solid var(--border);border-radius:6px;padding:10px;display:none;flex-direction:column;gap:8px;background:var(--surface2)">
+          <div style="font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);margin-bottom:2px">Drain Throughput Settings</div>
+
+          <div class="form-row">
+            <label>Batch size</label>
+            <div style="display:flex;gap:6px;align-items:center;flex:1">
+              <input type="number" id="drain-max-events" value="200" min="1" max="10000" style="width:80px">
+              <span class="muted">events &nbsp;·&nbsp; max age</span>
+              <input type="number" id="drain-max-ms" value="100" min="10" max="5000" style="width:70px">
+              <span class="muted">ms</span>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <label>Acks</label>
+            <div class="source-toggle">
+              <button id="drain-commit-required" class="active" onclick="setDrainCommit('required')">required</button>
+              <button id="drain-commit-all" onclick="setDrainCommit('all')">all</button>
+              <button id="drain-commit-quorum" onclick="setDrainCommit('quorum')">quorum</button>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <label>Sensing</label>
+            <div class="source-toggle">
+              <button id="drain-sensing-off" class="active" onclick="setDrainSensing(false)">Off (faster)</button>
+              <button id="drain-sensing-on" onclick="setDrainSensing(true)">On</button>
+            </div>
           </div>
         </div>
 
@@ -451,6 +486,8 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
 // ── State ──────────────────────────────────────────────────────────────────
 let source = 'mysql';
 let logLength = 0;
+let drainCommitMode = 'required';
+let drainSensing = false;
 
 // ── Toast ──────────────────────────────────────────────────────────────────
 function toast(msg, type = 'ok') {
@@ -490,9 +527,25 @@ function onScenarioChange() {
   const sc = document.getElementById('scenario-select').value;
   const needsDuration = sc === 'soak' || sc === 'soak-stable' || sc === 'tpcc';
   const isSoak = sc === 'soak' || sc === 'soak-stable';
+  const isDrain = sc === 'backlog-drain';
   document.getElementById('duration-row').style.display = needsDuration ? '' : 'none';
   document.getElementById('writers-row').style.display = isSoak ? '' : 'none';
   document.getElementById('delay-row').style.display = isSoak ? '' : 'none';
+  const ds = document.getElementById('drain-settings');
+  ds.style.display = isDrain ? 'flex' : 'none';
+  ds.style.flexDirection = isDrain ? 'column' : '';
+}
+
+function setDrainCommit(mode) {
+  drainCommitMode = mode;
+  ['required', 'all', 'quorum'].forEach(m =>
+    document.getElementById('drain-commit-' + m).classList.toggle('active', m === mode));
+}
+
+function setDrainSensing(on) {
+  drainSensing = on;
+  document.getElementById('drain-sensing-off').classList.toggle('active', !on);
+  document.getElementById('drain-sensing-on').classList.toggle('active', on);
 }
 onScenarioChange();
 updateRateEst();
@@ -541,7 +594,17 @@ async function startScenario() {
   const duration_mins = parseInt(document.getElementById('duration-slider').value, 10);
   const writer_tasks = parseInt(document.getElementById('writers-slider').value, 10);
   const write_delay_ms = parseInt(document.getElementById('delay-slider').value, 10);
-  const r = await api('POST', '/api/scenario/start', { scenario, source, duration_mins, writer_tasks, write_delay_ms });
+
+  const body = { scenario, source, duration_mins, writer_tasks, write_delay_ms };
+
+  if (scenario === 'backlog-drain') {
+    body.drain_max_events = parseInt(document.getElementById('drain-max-events').value, 10);
+    body.drain_max_ms = parseInt(document.getElementById('drain-max-ms').value, 10);
+    body.drain_commit_mode = drainCommitMode;
+    body.drain_schema_sensing = drainSensing;
+  }
+
+  const r = await api('POST', '/api/scenario/start', body);
   if (r.status === 409) { toast('A scenario is already running', 'err'); return; }
   if (!r.ok) { toast('Failed to start scenario', 'err'); return; }
   toast(`▶ ${scenario} started`, 'ok');

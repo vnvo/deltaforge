@@ -41,6 +41,31 @@ struct Cli {
     /// Lower values increase write throughput. Default: 30.
     #[arg(long, default_value_t = 30)]
     write_delay_ms: u64,
+
+    // ── Backlog-drain throughput knobs ────────────────────────────────────────
+
+    /// Max events per Kafka batch during the backlog-drain (pipeline spec batch.max_events).
+    /// Higher values reduce produce calls per second. Default: 200.
+    #[arg(long, default_value_t = 200)]
+    drain_max_events: u64,
+
+    /// Max batch age in ms during the backlog-drain (pipeline spec batch.max_ms).
+    /// Lower values reduce latency at the cost of smaller batches. Default: 100.
+    #[arg(long, default_value_t = 100)]
+    drain_max_ms: u64,
+
+    /// Commit mode during the backlog-drain: "required" (safe) or "periodic" (faster).
+    #[arg(long, default_value = "required")]
+    drain_commit_mode: String,
+
+    /// Checkpoint interval in ms — only used when --drain-commit-mode=periodic. Default: 500.
+    #[arg(long, default_value_t = 500)]
+    drain_commit_interval_ms: u64,
+
+    /// Enable schema sensing during the backlog-drain.
+    /// Disabling sensing (the default) greatly improves replay throughput.
+    #[arg(long, default_value_t = false)]
+    drain_schema_sensing: bool,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -79,6 +104,10 @@ enum Scenario {
     /// mix against a 9-table wholesale-supplier schema. Requires the `tpcc`
     /// compose profile. Use --duration-mins to control length.
     Tpcc,
+    /// Binlog backlog drain benchmark: writes 1 M rows to MySQL while DeltaForge
+    /// is stopped, then resumes and measures catch-up throughput. Requires the
+    /// `soak` compose profile.
+    BacklogDrain,
     /// TPC-DI data integration benchmark — prints requirements and exits.
     /// Not yet implemented.
     TpcDi,
@@ -106,7 +135,7 @@ async fn main() -> Result<()> {
 
     // Soak/Tpcc/TpcDi/TpcE target separate instances or print-and-exit;
     // skip the default port-8080 health check for all of them.
-    if !matches!(cli.scenario, Scenario::Soak | Scenario::SoakStable | Scenario::Tpcc | Scenario::TpcDi | Scenario::TpcE) {
+    if !matches!(cli.scenario, Scenario::Soak | Scenario::SoakStable | Scenario::BacklogDrain | Scenario::Tpcc | Scenario::TpcDi | Scenario::TpcE) {
         info!("waiting for DeltaForge to be healthy...");
         harness
             .wait_for_deltaforge(std::time::Duration::from_secs(cli.wait_secs))
@@ -114,8 +143,16 @@ async fn main() -> Result<()> {
         info!("DeltaForge is healthy — starting chaos");
     }
 
+    let drain_cfg = scenarios::backlog_drain::DrainConfig {
+        max_events: cli.drain_max_events,
+        max_ms: cli.drain_max_ms,
+        commit_mode: cli.drain_commit_mode.clone(),
+        commit_interval_ms: cli.drain_commit_interval_ms,
+        schema_sensing: cli.drain_schema_sensing,
+    };
+
     let results = match cli.source {
-        Source::Mysql => run_mysql(&harness, &cli.scenario, cli.duration_mins, cli.writer_tasks, cli.write_delay_ms).await?,
+        Source::Mysql => run_mysql(&harness, &cli.scenario, cli.duration_mins, cli.writer_tasks, cli.write_delay_ms, drain_cfg).await?,
         Source::Postgres => run_postgres(&harness, &cli.scenario, cli.duration_mins).await?,
     };
 
@@ -145,6 +182,7 @@ async fn run_mysql(
     duration_mins: u64,
     writer_tasks: usize,
     write_delay_ms: u64,
+    drain_cfg: scenarios::backlog_drain::DrainConfig,
 ) -> Result<Vec<harness::ScenarioResult>> {
     let backend = MysqlBackend;
     let mut results = vec![];
@@ -180,6 +218,9 @@ async fn run_mysql(
         }
         Scenario::Tpcc => {
             results.push(scenarios::tpcc::run(harness, duration_mins).await?);
+        }
+        Scenario::BacklogDrain => {
+            results.push(scenarios::backlog_drain::run(harness, drain_cfg).await?);
         }
         Scenario::TpcDi => {
             results.push(scenarios::tpc_di::run().await?);
@@ -246,7 +287,7 @@ async fn run_postgres(
             results.push(scenarios::slot_dropped::run(harness).await?);
         }
         Scenario::Ui => unreachable!("ui is handled before source dispatch"),
-        Scenario::Soak | Scenario::SoakStable | Scenario::Tpcc | Scenario::Failover | Scenario::BinlogPurge => {
+        Scenario::Soak | Scenario::SoakStable | Scenario::BacklogDrain | Scenario::Tpcc | Scenario::Failover | Scenario::BinlogPurge => {
             eprintln!(
                 "error: {:?} is a MySQL-specific scenario — use --source mysql",
                 scenario.to_possible_value().unwrap().get_name()

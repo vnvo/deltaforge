@@ -12,6 +12,7 @@ pub mod soak;
 // Heavy endurance / benchmark scenarios — not included in `--scenario all`.
 // Each prints a requirements preamble before running (or before failing if
 // the scenario is not yet implemented).
+pub mod backlog_drain;
 pub mod tpcc;
 pub mod tpc_di;
 pub mod tpc_e;

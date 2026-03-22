@@ -189,6 +189,17 @@ struct RunRequest {
     writer_tasks: usize,
     #[serde(default)]
     write_delay_ms: u64,
+    // Backlog-drain throughput settings
+    #[serde(default)]
+    drain_max_events: Option<u64>,
+    #[serde(default)]
+    drain_max_ms: Option<u64>,
+    #[serde(default)]
+    drain_commit_mode: Option<String>,
+    #[serde(default)]
+    drain_commit_interval_ms: Option<u64>,
+    #[serde(default)]
+    drain_schema_sensing: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -221,6 +232,21 @@ async fn api_scenario_start(
     }
     if req.write_delay_ms > 0 {
         cmd.arg("--write-delay-ms").arg(req.write_delay_ms.to_string());
+    }
+    if let Some(v) = req.drain_max_events {
+        cmd.arg("--drain-max-events").arg(v.to_string());
+    }
+    if let Some(v) = req.drain_max_ms {
+        cmd.arg("--drain-max-ms").arg(v.to_string());
+    }
+    if let Some(v) = &req.drain_commit_mode {
+        cmd.arg("--drain-commit-mode").arg(v);
+    }
+    if let Some(v) = req.drain_commit_interval_ms {
+        cmd.arg("--drain-commit-interval-ms").arg(v.to_string());
+    }
+    if req.drain_schema_sensing == Some(true) {
+        cmd.arg("--drain-schema-sensing");
     }
     cmd.current_dir(workspace_root());
     cmd.stdout(std::process::Stdio::piped());
