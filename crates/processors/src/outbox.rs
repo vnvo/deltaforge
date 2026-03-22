@@ -47,6 +47,7 @@ use deltaforge_config::{
 
 pub struct OutboxProcessor {
     id: String,
+    pipeline: String,
     cfg: OutboxProcessorCfg,
     table_filter: AllowList,
     topic_template: Option<CompiledTemplate>,
@@ -54,7 +55,7 @@ pub struct OutboxProcessor {
 }
 
 impl OutboxProcessor {
-    pub fn new(cfg: OutboxProcessorCfg) -> Result<Self> {
+    pub fn new(cfg: OutboxProcessorCfg, pipeline: String) -> Result<Self> {
         let topic_template = cfg
             .topic
             .as_ref()
@@ -76,6 +77,7 @@ impl OutboxProcessor {
 
         Ok(Self {
             id,
+            pipeline,
             cfg,
             table_filter,
             topic_template,
@@ -113,7 +115,7 @@ impl OutboxProcessor {
                 op = ?event.op,
                 "outbox: dropping non-INSERT event"
             );
-            counter!("deltaforge_outbox_dropped_total", "reason" => "non_insert").increment(1);
+            counter!("deltaforge_outbox_dropped_total", "pipeline" => self.pipeline.clone(), "processor" => self.id.clone(), "reason" => "non_insert").increment(1);
             return Ok(false);
         }
 
@@ -125,7 +127,7 @@ impl OutboxProcessor {
                     value_type = %value_type_name(&v),
                     "outbox: dropping event with non-object payload"
                 );
-                counter!("deltaforge_outbox_dropped_total", "reason" => "non_object").increment(1);
+                counter!("deltaforge_outbox_dropped_total", "pipeline" => self.pipeline.clone(), "processor" => self.id.clone(), "reason" => "non_object").increment(1);
                 event.after = Some(v);
                 return Ok(false);
             }
@@ -134,7 +136,7 @@ impl OutboxProcessor {
                     table = %event.source.table,
                     "outbox: dropping event with null payload"
                 );
-                counter!("deltaforge_outbox_dropped_total", "reason" => "null_payload").increment(1);
+                counter!("deltaforge_outbox_dropped_total", "pipeline" => self.pipeline.clone(), "processor" => self.id.clone(), "reason" => "null_payload").increment(1);
                 return Ok(false);
             }
         };
@@ -178,7 +180,7 @@ impl OutboxProcessor {
                 missing.push("event_type");
             }
             if !missing.is_empty() {
-                counter!("deltaforge_outbox_dropped_total", "reason" => "strict_missing_fields").increment(1);
+                counter!("deltaforge_outbox_dropped_total", "pipeline" => self.pipeline.clone(), "processor" => self.id.clone(), "reason" => "strict_missing_fields").increment(1);
                 anyhow::bail!(
                     "outbox strict: event from table '{}' missing required fields: {:?}",
                     event.source.table,
@@ -237,7 +239,7 @@ impl OutboxProcessor {
         event.before = None;
         event.source.schema = None;
 
-        counter!("deltaforge_outbox_transformed_total").increment(1);
+        counter!("deltaforge_outbox_transformed_total", "pipeline" => self.pipeline.clone(), "processor" => self.id.clone()).increment(1);
         Ok(true)
     }
 
@@ -311,6 +313,14 @@ impl Processor for OutboxProcessor {
         events: Vec<Event>,
         _ctx: &BatchContext,
     ) -> Result<Vec<Event>> {
+        let events_in = events.len() as u64;
+        counter!(
+            "deltaforge_processor_events_in_total",
+            "pipeline" => self.pipeline.clone(),
+            "processor" => self.id.clone(),
+        )
+        .increment(events_in);
+
         let mut out = Vec::with_capacity(events.len());
         for mut event in events {
             if self.should_process(&event) {
@@ -322,6 +332,14 @@ impl Processor for OutboxProcessor {
                 out.push(event); // pass through
             }
         }
+
+        counter!(
+            "deltaforge_processor_events_out_total",
+            "pipeline" => self.pipeline.clone(),
+            "processor" => self.id.clone(),
+        )
+        .increment(out.len() as u64);
+
         Ok(out)
     }
 }
@@ -403,7 +421,7 @@ mod tests {
 
     #[tokio::test]
     async fn transforms_outbox_event() {
-        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+        let proc = OutboxProcessor::new(default_cfg(), String::new()).unwrap();
         let events = vec![outbox_event("outbox", outbox_payload())];
         let ctx = BatchContext::from_batch(&events);
         let result = proc.process(events, &ctx).await.unwrap();
@@ -435,7 +453,7 @@ mod tests {
             topic: Some("${aggregate_type}.${event_type}".into()),
             ..default_cfg()
         };
-        let proc = OutboxProcessor::new(cfg).unwrap();
+        let proc = OutboxProcessor::new(cfg, String::new()).unwrap();
         let events = vec![outbox_event("outbox", outbox_payload())];
         let ctx = BatchContext::from_batch(&events);
         let result = proc.process(events, &ctx).await.unwrap();
@@ -458,7 +476,7 @@ mod tests {
             },
             ..default_cfg()
         };
-        let proc = OutboxProcessor::new(cfg).unwrap();
+        let proc = OutboxProcessor::new(cfg, String::new()).unwrap();
 
         let payload = json!({
             "domain": "orders",
@@ -494,7 +512,7 @@ mod tests {
             tables: vec!["orders_outbox".into()],
             ..default_cfg()
         };
-        let proc = OutboxProcessor::new(cfg).unwrap();
+        let proc = OutboxProcessor::new(cfg, String::new()).unwrap();
 
         let events = vec![
             outbox_event("orders_outbox", outbox_payload()),
@@ -519,7 +537,7 @@ mod tests {
             tables: vec!["order_%".into()],
             ..default_cfg()
         };
-        let proc = OutboxProcessor::new(cfg).unwrap();
+        let proc = OutboxProcessor::new(cfg, String::new()).unwrap();
 
         let events = vec![
             outbox_event("order_outbox", outbox_payload()),
@@ -539,7 +557,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_outbox_pass_through() {
-        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+        let proc = OutboxProcessor::new(default_cfg(), String::new()).unwrap();
         let events = vec![
             table_event("orders"),
             outbox_event("outbox", outbox_payload()),
@@ -555,7 +573,7 @@ mod tests {
 
     #[tokio::test]
     async fn drops_non_insert_outbox() {
-        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+        let proc = OutboxProcessor::new(default_cfg(), String::new()).unwrap();
         let mut ev = outbox_event("outbox", outbox_payload());
         ev.op = Op::Delete;
 
@@ -573,7 +591,7 @@ mod tests {
             topic: Some("${nonexistent}".into()),
             ..default_cfg()
         };
-        let proc = OutboxProcessor::new(cfg).unwrap();
+        let proc = OutboxProcessor::new(cfg, String::new()).unwrap();
 
         // Has explicit topic column → uses it
         let events = vec![outbox_event(
@@ -615,7 +633,7 @@ mod tests {
             ]),
             ..default_cfg()
         };
-        let proc = OutboxProcessor::new(cfg).unwrap();
+        let proc = OutboxProcessor::new(cfg, String::new()).unwrap();
 
         let payload = json!({
             "aggregate_type": "Order",
@@ -650,7 +668,7 @@ mod tests {
             )]),
             ..default_cfg()
         };
-        let proc = OutboxProcessor::new(cfg).unwrap();
+        let proc = OutboxProcessor::new(cfg, String::new()).unwrap();
 
         // payload has no trace_id field
         let events = vec![outbox_event("outbox", outbox_payload())];
@@ -681,7 +699,7 @@ mod tests {
             topic: Some("${aggregate_type}.${event_type}".into()),
             ..default_cfg()
         };
-        let proc = OutboxProcessor::new(cfg).unwrap();
+        let proc = OutboxProcessor::new(cfg, String::new()).unwrap();
         let events = vec![outbox_event("outbox", outbox_payload())];
         let ctx = BatchContext::from_batch(&events);
         let result = proc.process(events, &ctx).await.unwrap();
@@ -693,7 +711,7 @@ mod tests {
 
     #[tokio::test]
     async fn raw_payload_false_by_default() {
-        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+        let proc = OutboxProcessor::new(default_cfg(), String::new()).unwrap();
         let events = vec![outbox_event("outbox", outbox_payload())];
         let ctx = BatchContext::from_batch(&events);
         let result = proc.process(events, &ctx).await.unwrap();
@@ -712,7 +730,7 @@ mod tests {
             key: Some("${aggregate_id}".into()),
             ..default_cfg()
         };
-        let proc = OutboxProcessor::new(cfg).unwrap();
+        let proc = OutboxProcessor::new(cfg, String::new()).unwrap();
 
         let ev = outbox_event("outbox", outbox_payload());
         let events = vec![ev];
@@ -723,7 +741,7 @@ mod tests {
 
     #[tokio::test]
     async fn key_defaults_to_aggregate_id_when_no_template() {
-        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+        let proc = OutboxProcessor::new(default_cfg(), String::new()).unwrap();
 
         let ev = outbox_event("outbox", outbox_payload());
         let events = vec![ev];
@@ -738,7 +756,7 @@ mod tests {
             key: Some("${aggregate_type}:${aggregate_id}".into()),
             ..default_cfg()
         };
-        let proc = OutboxProcessor::new(cfg).unwrap();
+        let proc = OutboxProcessor::new(cfg, String::new()).unwrap();
 
         let ev = outbox_event("outbox", outbox_payload());
         let events = vec![ev];
@@ -752,7 +770,7 @@ mod tests {
 
     #[tokio::test]
     async fn event_id_extracted_as_header() {
-        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+        let proc = OutboxProcessor::new(default_cfg(), String::new()).unwrap();
 
         let ev = outbox_event(
             "outbox",
@@ -781,7 +799,7 @@ mod tests {
             },
             ..default_cfg()
         };
-        let proc = OutboxProcessor::new(cfg).unwrap();
+        let proc = OutboxProcessor::new(cfg, String::new()).unwrap();
 
         let ev = outbox_event(
             "outbox",
@@ -803,7 +821,7 @@ mod tests {
 
     #[tokio::test]
     async fn numeric_ids_stringified_in_headers() {
-        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+        let proc = OutboxProcessor::new(default_cfg(), String::new()).unwrap();
 
         let ev = outbox_event(
             "outbox",
@@ -835,7 +853,7 @@ mod tests {
             )]),
             ..default_cfg()
         };
-        let proc = OutboxProcessor::new(cfg).unwrap();
+        let proc = OutboxProcessor::new(cfg, String::new()).unwrap();
 
         let ev = outbox_event(
             "outbox",
@@ -857,7 +875,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_insert_outbox_event_dropped() {
-        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+        let proc = OutboxProcessor::new(default_cfg(), String::new()).unwrap();
 
         let mut ev = outbox_event("outbox", outbox_payload());
         ev.op = Op::Update;
@@ -872,7 +890,7 @@ mod tests {
 
     #[tokio::test]
     async fn null_payload_event_dropped() {
-        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+        let proc = OutboxProcessor::new(default_cfg(), String::new()).unwrap();
 
         let mut ev = outbox_event("outbox", outbox_payload());
         ev.after = None;
@@ -887,7 +905,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_object_payload_dropped() {
-        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+        let proc = OutboxProcessor::new(default_cfg(), String::new()).unwrap();
 
         let ev = outbox_event("outbox", json!("just a string"));
         let events = vec![ev];
@@ -898,7 +916,7 @@ mod tests {
 
     #[tokio::test]
     async fn provenance_header_set_on_transformed_events() {
-        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+        let proc = OutboxProcessor::new(default_cfg(), String::new()).unwrap();
 
         let ev = outbox_event("outbox", outbox_payload());
         let events = vec![ev];
@@ -924,7 +942,7 @@ mod tests {
 
     #[tokio::test]
     async fn strict_passes_complete_event() {
-        let proc = OutboxProcessor::new(strict_cfg()).unwrap();
+        let proc = OutboxProcessor::new(strict_cfg(), String::new()).unwrap();
 
         let ev = outbox_event("outbox", outbox_payload());
         let events = vec![ev];
@@ -935,7 +953,7 @@ mod tests {
 
     #[tokio::test]
     async fn strict_fails_batch_on_missing_aggregate_type() {
-        let proc = OutboxProcessor::new(strict_cfg()).unwrap();
+        let proc = OutboxProcessor::new(strict_cfg(), String::new()).unwrap();
 
         let ev = outbox_event(
             "outbox",
@@ -957,7 +975,7 @@ mod tests {
 
     #[tokio::test]
     async fn strict_fails_batch_on_missing_payload_column() {
-        let proc = OutboxProcessor::new(strict_cfg()).unwrap();
+        let proc = OutboxProcessor::new(strict_cfg(), String::new()).unwrap();
 
         let ev = outbox_event(
             "outbox",
@@ -984,7 +1002,7 @@ mod tests {
             topic: Some("${nonexistent}".into()),
             ..strict_cfg()
         };
-        let proc = OutboxProcessor::new(cfg).unwrap();
+        let proc = OutboxProcessor::new(cfg, String::new()).unwrap();
 
         let ev = outbox_event("outbox", outbox_payload());
         let events = vec![ev];
@@ -1003,7 +1021,7 @@ mod tests {
             topic: Some("${nonexistent}".into()),
             ..strict_cfg()
         };
-        let proc = OutboxProcessor::new(cfg).unwrap();
+        let proc = OutboxProcessor::new(cfg, String::new()).unwrap();
 
         let ev = outbox_event("outbox", json!({"unrelated": true}));
         let events = vec![ev];
@@ -1017,7 +1035,7 @@ mod tests {
 
     #[tokio::test]
     async fn lenient_passes_missing_fields() {
-        let proc = OutboxProcessor::new(default_cfg()).unwrap();
+        let proc = OutboxProcessor::new(default_cfg(), String::new()).unwrap();
 
         let ev = outbox_event(
             "outbox",
