@@ -14,6 +14,21 @@ spec:
         - "orders.*"
       on_schema_drift: adapt
 
+  schema_sensing:
+    enabled: true
+    sampling:
+      warmup_events: 100    # default 1000 — reach steady state faster across 120 tables
+      sample_rate: 50       # default 10 — sense 2% of events post-warmup
+      structure_cache: true
+    deep_inspect:
+      enabled: true
+      max_depth: 3          # default 10 — soak tables have no deeply nested JSON
+      max_sample_size: 100  # default 1000
+    tracking:
+      field_statistics: false
+      null_rates: false     # skip per-field null tracking
+      enum_detection: false # soak tables use simple scalar values
+
   processors: []
 
   sinks:
@@ -27,7 +42,7 @@ spec:
 
   batch:
     max_events: 200
-    max_ms: 200
+    max_ms: 100
     respect_source_tx: false
 
   commit_policy:
