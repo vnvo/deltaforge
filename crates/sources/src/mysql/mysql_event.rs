@@ -3,7 +3,7 @@ use crate::mysql::LoopControl;
 use crate::mysql::RunCtx;
 use common::{ts_sec_to_ms, watchdog};
 use deltaforge_core::{
-    Event, Op, SourceInfo, SourcePosition, SourceResult, Transaction,
+    Event, Op, SourceError, SourceInfo, SourcePosition, SourceResult, Transaction,
 };
 use metrics::counter;
 use mysql_binlog_connector_rust::{
@@ -37,6 +37,14 @@ pub(super) async fn read_next_event(
                     "deltaforge_source_reconnects_total",
                     "pipeline" => ctx.pipeline.clone(),
                     "source" => ctx.source_id.clone(),
+                )
+                .increment(1);
+            } else if let LoopControl::Fail(ref e) = control {
+                counter!(
+                    "deltaforge_source_errors_total",
+                    "pipeline" => ctx.pipeline.clone(),
+                    "source" => ctx.source_id.clone(),
+                    "kind" => source_error_kind(e),
                 )
                 .increment(1);
             }
@@ -218,6 +226,7 @@ async fn handle_write_rows(
                         "pipeline" => ctx.pipeline.clone(),
                         "source" => ctx.source_id.clone(),
                         "table" => table,
+                        "op" => "c",
                     )
                     .increment(1);
                 }
@@ -300,6 +309,7 @@ async fn handle_update_rows(
                         "pipeline" => ctx.pipeline.clone(),
                         "source" => ctx.source_id.clone(),
                         "table" => table,
+                        "op" => "u",
                     )
                     .increment(1);
                 }
@@ -377,6 +387,7 @@ async fn handle_delete_rows(
                         "pipeline" => ctx.pipeline.clone(),
                         "source" => ctx.source_id.clone(),
                         "table" => table,
+                        "op" => "d",
                     )
                     .increment(1);
                 }
@@ -389,6 +400,23 @@ async fn handle_delete_rows(
         warn!(source_id=%ctx.source_id, table_id=dr.table_id, "delete_rows for unknown table_id");
     }
     Ok(())
+}
+
+fn source_error_kind(e: &SourceError) -> &'static str {
+    match e {
+        SourceError::Auth { .. } => "auth",
+        SourceError::Connect { .. } => "connect",
+        SourceError::Checkpoint { .. } => "checkpoint",
+        SourceError::Schema { .. } => "schema",
+        SourceError::Incompatible { .. } => "incompatible",
+        SourceError::Permission { .. } => "permission",
+        SourceError::NotFound { .. } => "not_found",
+        SourceError::Io(_) => "io",
+        SourceError::Timeout { .. } => "timeout",
+        SourceError::Backpressure => "backpressure",
+        SourceError::Cancelled => "cancelled",
+        SourceError::Other(_) => "other",
+    }
 }
 
 fn handle_gtid(
