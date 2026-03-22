@@ -209,14 +209,14 @@ impl SchemaSensor {
 
         match result {
             ObserveResult::CacheHit { .. } => {
-                counter!("deltaforge_schema_cache_hits_total", "table" => table.to_string()).increment(1);
+                counter!("deltaforge_schema_sensing_cache_hits_total", "table" => table.to_string()).increment(1);
             }
             ObserveResult::Evolved { .. } => {
-                counter!("deltaforge_schema_cache_misses_total", "table" => table.to_string()).increment(1);
+                counter!("deltaforge_schema_sensing_cache_misses_total", "table" => table.to_string()).increment(1);
                 counter!("deltaforge_schema_evolutions_total", "table" => table.to_string()).increment(1);
             }
             ObserveResult::NewSchema { .. } => {
-                counter!("deltaforge_schema_cache_misses_total", "table" => table.to_string()).increment(1);
+                counter!("deltaforge_schema_sensing_cache_misses_total", "table" => table.to_string()).increment(1);
             }
             ObserveResult::Unchanged { .. } | ObserveResult::Sampled { .. } => {
                 // Not a cache hit but also not a miss - full sensing path
