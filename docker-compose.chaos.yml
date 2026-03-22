@@ -22,6 +22,8 @@ services:
       MYSQL_ROOT_PASSWORD: password
     volumes:
       - ./chaos/init/mysql-chaos.sql:/docker-entrypoint-initdb.d/01_init.sql
+      - ./chaos/init/mysql-soak.sql:/docker-entrypoint-initdb.d/02_soak.sql
+      - ./chaos/init/mysql-tpcc.sql:/docker-entrypoint-initdb.d/03_tpcc.sql
       - mysql_data:/var/lib/mysql
     command:
       - --server-id=101
@@ -210,6 +212,63 @@ services:
     restart: on-failure
     networks: [chaos_net]
 
+  # DeltaForge — TPC-C soak (MySQL source, 9-table wholesale-supplier workload)
+  # Profile: tpcc. Ports 8082 (health) and 9002 (metrics) so it can run
+  # alongside the regular and soak instances.
+
+  deltaforge-tpcc:
+    image: deltaforge:dev-debug
+    command: ["--config", "/etc/deltaforge/mysql-tpcc.yaml", "--storage-path", "/data/deltaforge-tpcc.db"]
+    profiles: [tpcc]
+    user: root
+    volumes:
+      - ./chaos/config:/etc/deltaforge:ro
+      - deltaforge_tpcc_data:/data
+    environment:
+      RUST_LOG: "deltaforge=info,sources=info,sinks=info,warn"
+    ports:
+      - "8082:8080"   # REST API / health
+      - "9002:9000"   # Prometheus /metrics
+    depends_on: [toxiproxy]
+    restart: on-failure
+    networks: [chaos_net]
+
+  # DeltaForge — Soak test (MySQL source, high-throughput, 120-table workload)
+  # Profile: soak. Exposes on ports 8081 (health) and 9001 (metrics) so it can
+  # run alongside the regular deltaforge instance.
+
+  deltaforge-soak:
+    image: deltaforge:dev-debug
+    command: ["--config", "/etc/deltaforge/mysql-soak.yaml", "--storage-path", "/data/deltaforge-soak.db"]
+    profiles: [soak]
+    user: root
+    volumes:
+      - ./chaos/config:/etc/deltaforge:ro
+      - deltaforge_soak_data:/data
+    environment:
+      RUST_LOG: "deltaforge=info,sources=info,sinks=info,warn"
+    ports:
+      - "8081:8080"   # REST API / health
+      - "9001:9000"   # Prometheus /metrics
+    depends_on: [toxiproxy]
+    restart: on-failure
+    networks: [chaos_net]
+
+  # cAdvisor — container-level CPU, memory, network, and disk I/O metrics
+  # Scrapes Docker runtime stats and exposes them to Prometheus.
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.2
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    ports: ["8888:8080"]
+    networks: [chaos_net]
+
   # Observability
 
   prometheus:
@@ -240,6 +299,8 @@ networks:
 volumes:
   deltaforge_data:
   deltaforge_pg_data:
+  deltaforge_tpcc_data:
+  deltaforge_soak_data:
   grafana_data:
   mysql_data:
   mysql_b_data:

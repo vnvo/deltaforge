@@ -101,6 +101,47 @@ impl Harness {
     }
 }
 
+/// Wait until any health endpoint returns 200 (URL configurable).
+pub async fn wait_for_url(url: &str, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match reqwest::get(url).await {
+            Ok(r) if r.status().is_success() => return Ok(()),
+            _ => {}
+        }
+        if Instant::now() > deadline {
+            bail!("timed out waiting for health at {url}");
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Return the high-watermark offset for any topic (partition 0).
+pub async fn kafka_offset_for_topic(topic: &str) -> Result<u64> {
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", KAFKA_BROKERS)
+        .set("group.id", "chaos-watermark")
+        .create()
+        .context("kafka consumer")?;
+    let topic_owned = topic.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        consumer.fetch_watermarks(
+            &topic_owned,
+            0,
+            std::time::Duration::from_secs(5),
+        )
+    })
+    .await?;
+    match result {
+        Ok((_, high)) => Ok(high as u64),
+        Err(rdkafka::error::KafkaError::MetadataFetch(
+            rdkafka::types::RDKafkaErrorCode::UnknownPartition
+            | rdkafka::types::RDKafkaErrorCode::UnknownTopicOrPartition,
+        )) => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Parse a simple counter value from a Prometheus text exposition.
 fn parse_counter(body: &str, name: &str) -> Result<f64> {
     for line in body.lines() {

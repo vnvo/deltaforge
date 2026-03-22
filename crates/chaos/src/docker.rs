@@ -52,6 +52,68 @@ pub async fn kill_service(profile: &str, service: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resource usage snapshot for a running compose service.
+#[derive(Debug, Default, Clone)]
+pub struct ResourceStats {
+    /// CPU utilisation percent (e.g. 2.5 means 2.5 %).
+    pub cpu_percent: f64,
+    /// Resident memory in bytes.
+    pub mem_bytes: u64,
+}
+
+/// Sample CPU% and memory for a compose service via `docker compose stats`.
+///
+/// Returns `Ok(ResourceStats::default())` if the container is not running or
+/// the output cannot be parsed — the caller should treat this as a gap sample.
+pub async fn sample_stats(profile: &str, service: &str) -> Result<ResourceStats> {
+    let output = tokio::process::Command::new("docker")
+        .args([
+            "compose",
+            "-f",
+            COMPOSE_FILE,
+            "--profile",
+            profile,
+            "stats",
+            "--no-stream",
+            "--format",
+            "{{.CPUPerc}}\t{{.MemUsage}}",
+            service,
+        ])
+        .output()
+        .await?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().next().unwrap_or("").trim();
+    let parts: Vec<&str> = line.splitn(2, '\t').collect();
+    if parts.len() < 2 {
+        return Ok(ResourceStats::default());
+    }
+
+    let cpu = parts[0]
+        .trim()
+        .trim_end_matches('%')
+        .parse::<f64>()
+        .unwrap_or(0.0);
+    let mem_str = parts[1].split('/').next().unwrap_or("").trim();
+    let mem_bytes = parse_mem(mem_str);
+
+    Ok(ResourceStats { cpu_percent: cpu, mem_bytes })
+}
+
+fn parse_mem(s: &str) -> u64 {
+    let s = s.trim();
+    if let Some(n) = s.strip_suffix("GiB") {
+        return (n.trim().parse::<f64>().unwrap_or(0.0) * 1024.0 * 1024.0 * 1024.0) as u64;
+    }
+    if let Some(n) = s.strip_suffix("MiB") {
+        return (n.trim().parse::<f64>().unwrap_or(0.0) * 1024.0 * 1024.0) as u64;
+    }
+    if let Some(n) = s.strip_suffix("kB") {
+        return (n.trim().parse::<f64>().unwrap_or(0.0) * 1024.0) as u64;
+    }
+    0
+}
+
 /// Delete the DeltaForge SQLite checkpoint DB from the service's data volume
 /// while the container is stopped.
 ///
