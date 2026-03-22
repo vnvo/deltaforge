@@ -94,6 +94,11 @@ pub fn describe_metrics() {
         "Reconnects performed by a source reader"
     );
     describe_counter!(
+        "deltaforge_source_errors_total",
+        Unit::Count,
+        "Fatal (non-retryable) source errors, labelled by kind"
+    );
+    describe_counter!(
         "deltaforge_sink_batch_total",
         Unit::Count,
         "Total number of batches successfully delivered to a sink"
@@ -137,6 +142,46 @@ pub fn describe_metrics() {
         "deltaforge_sink_errors_total",
         Unit::Count,
         "Total number of sink delivery errors"
+    );
+    describe_counter!(
+        "deltaforge_sink_routing_errors_total",
+        Unit::Count,
+        "Serialization or routing errors during sink send, labelled by kind"
+    );
+    describe_counter!(
+        "deltaforge_sink_reconnects_total",
+        Unit::Count,
+        "Sink connections (re)established"
+    );
+    describe_counter!(
+        "deltaforge_sink_bytes_total",
+        Unit::Bytes,
+        "Total bytes delivered to a sink (batch path)"
+    );
+    describe_counter!(
+        "deltaforge_processor_events_in_total",
+        Unit::Count,
+        "Events entering a processor"
+    );
+    describe_counter!(
+        "deltaforge_processor_events_out_total",
+        Unit::Count,
+        "Events leaving a processor after processing (drops reduce this vs in)"
+    );
+    describe_counter!(
+        "deltaforge_kafka_produce_retries_total",
+        Unit::Count,
+        "Cumulative producer-level retries reported by rdkafka (absolute counter)"
+    );
+    describe_gauge!(
+        "deltaforge_kafka_producer_queue_messages",
+        Unit::Count,
+        "Current number of messages in all rdkafka internal queues"
+    );
+    describe_gauge!(
+        "deltaforge_kafka_producer_queue_bytes",
+        Unit::Bytes,
+        "Current bytes in all rdkafka internal queues"
     );
     describe_counter!(
         "deltaforge_schema_drift_detected",
