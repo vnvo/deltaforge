@@ -910,6 +910,7 @@ name = "chaos"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum 0.8.4",
  "chrono",
  "clap",
  "mysql_async 0.35.1",

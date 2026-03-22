@@ -33,8 +33,8 @@ services:
       - --gtid-mode=ON
       - --enforce-gtid-consistency=ON
       - --binlog-checksum=NONE
-      # Short retention: lets us test the binlog-purge scenario quickly
-      - --binlog-expire-logs-seconds=120
+      # 5 min retention: short enough to test binlog-purge, long enough for soak/tpcc
+      - --binlog-expire-logs-seconds=300
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-ppassword"]
       interval: 5s
@@ -59,7 +59,7 @@ services:
       - --gtid-mode=ON
       - --enforce-gtid-consistency=ON
       - --binlog-checksum=NONE
-      - --binlog-expire-logs-seconds=120
+      - --binlog-expire-logs-seconds=300
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-ppassword"]
       interval: 5s
@@ -141,6 +141,10 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: BROKER
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Keep topics lean: 5 min retention, 1 min segments so cleanup fires quickly
+      KAFKA_LOG_RETENTION_MS: "300000"
+      KAFKA_LOG_SEGMENT_MS: "60000"
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: "30000"
     healthcheck:
       test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
       interval: 10s
