@@ -33,8 +33,8 @@ services:
       - --gtid-mode=ON
       - --enforce-gtid-consistency=ON
       - --binlog-checksum=NONE
-      # 5 min retention: short enough to test binlog-purge, long enough for soak/tpcc
-      - --binlog-expire-logs-seconds=300
+      # 10 min retention: binlog-purge uses RESET BINARY LOGS (manual), not expiry
+      - --binlog-expire-logs-seconds=600
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-ppassword"]
       interval: 5s
@@ -59,7 +59,7 @@ services:
       - --gtid-mode=ON
       - --enforce-gtid-consistency=ON
       - --binlog-checksum=NONE
-      - --binlog-expire-logs-seconds=300
+      - --binlog-expire-logs-seconds=600
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-ppassword"]
       interval: 5s
