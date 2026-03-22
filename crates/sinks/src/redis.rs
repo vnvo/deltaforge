@@ -42,6 +42,7 @@ use redis::aio::MultiplexedConnection;
 use serde_json::Value;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
+use metrics::counter;
 use tracing::{debug, info, instrument, warn};
 
 // =============================================================================
@@ -64,6 +65,7 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Redis Streams sink with connection pooling and retry logic.
 pub struct RedisSink {
     id: String,
+    pipeline: String,
     cfg: RedisSinkCfg,
     client: redis::Client,
 
@@ -104,6 +106,7 @@ impl RedisSink {
     pub fn new(
         cfg: &RedisSinkCfg,
         cancel: CancellationToken,
+        pipeline: &str,
     ) -> anyhow::Result<Self> {
         let client =
             redis::Client::open(cfg.uri.clone()).with_context(|| {
@@ -155,6 +158,7 @@ impl RedisSink {
 
         Ok(Self {
             id: cfg.id.clone(),
+            pipeline: pipeline.to_string(),
             cfg: cfg.clone(),
             client,
             stream: cfg.stream.clone(),
@@ -296,6 +300,12 @@ impl RedisSink {
         match result {
             Ok(conn) => {
                 info!(uri = %uri_redacted, "redis connection established");
+                counter!(
+                    "deltaforge_sink_reconnects_total",
+                    "pipeline" => self.pipeline.clone(),
+                    "sink" => self.id.clone(),
+                )
+                .increment(1);
                 Ok(conn)
             }
             Err(outcome) => {
@@ -487,7 +497,7 @@ impl Sink for RedisSink {
         }
 
         // Pre-serialize with resolved stream/key
-        let serialized: Vec<(String, String, String, Vec<u8>)> = events
+        let serialized: Result<Vec<(String, String, String, Vec<u8>)>, SinkError> = events
             .iter()
             .map(|e| {
                 let stream = self.resolve_stream(e)?;
@@ -497,7 +507,25 @@ impl Sink for RedisSink {
                 let payload = self.serialize_event(e)?;
                 Ok((stream, event_id, key, payload))
             })
-            .collect::<Result<Vec<_>, SinkError>>()?;
+            .collect();
+        let serialized = match serialized {
+            Ok(s) => s,
+            Err(e) => {
+                let kind = match &e {
+                    SinkError::Serialization { .. } => "serialization",
+                    SinkError::Routing { .. } => "routing",
+                    _ => "other",
+                };
+                counter!(
+                    "deltaforge_sink_routing_errors_total",
+                    "pipeline" => self.pipeline.clone(),
+                    "sink" => self.id.clone(),
+                    "kind" => kind,
+                )
+                .increment(1);
+                return Err(e);
+            }
+        };
 
         // Retry loop for transient failures
         let policy = RetryPolicy::new(
@@ -541,6 +569,14 @@ impl Sink for RedisSink {
 
         match result {
             Ok(_) => {
+                let total_bytes: u64 =
+                    serialized.iter().map(|(_, _, _, p)| p.len() as u64).sum();
+                counter!(
+                    "deltaforge_sink_bytes_total",
+                    "pipeline" => self.pipeline.clone(),
+                    "sink" => self.id.clone(),
+                )
+                .increment(total_bytes);
                 debug!(stream = %self.stream, count = events.len(), "batch sent to redis");
                 Ok(())
             }

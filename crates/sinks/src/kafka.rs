@@ -42,11 +42,13 @@ use deltaforge_core::encoding::EncodingType;
 use deltaforge_core::envelope::Envelope;
 use deltaforge_core::{Event, Sink, SinkError, SinkResult};
 use futures::future::try_join_all;
+use metrics::{counter, gauge};
 use rdkafka::config::ClientConfig;
 use rdkafka::error::KafkaError;
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
+use rdkafka::{ClientContext, Statistics};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
@@ -54,14 +56,68 @@ use tracing::{debug, info, instrument, warn};
 /// Default timeout for individual send operations.
 const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Statistics interval for rdkafka broker metrics.
+const STATS_INTERVAL_MS: &str = "5000";
+
+// =============================================================================
+// rdkafka metrics context
+// =============================================================================
+
+/// Custom rdkafka ClientContext that emits broker-level stats as Prometheus metrics.
+struct KafkaMetricsContext {
+    pipeline: String,
+    sink_id: String,
+}
+
+impl ClientContext for KafkaMetricsContext {
+    fn stats(&self, statistics: Statistics) {
+        let (total_retries, total_connects) =
+            statistics.brokers.values().fold((0u64, 0u64), |acc, b| {
+                (
+                    acc.0 + b.txretries,
+                    acc.1 + b.connects.unwrap_or(0) as u64,
+                )
+            });
+
+        counter!(
+            "deltaforge_kafka_produce_retries_total",
+            "pipeline" => self.pipeline.clone(),
+            "sink" => self.sink_id.clone(),
+        )
+        .absolute(total_retries);
+
+        counter!(
+            "deltaforge_sink_reconnects_total",
+            "pipeline" => self.pipeline.clone(),
+            "sink" => self.sink_id.clone(),
+        )
+        .absolute(total_connects);
+
+        gauge!(
+            "deltaforge_kafka_producer_queue_messages",
+            "pipeline" => self.pipeline.clone(),
+            "sink" => self.sink_id.clone(),
+        )
+        .set(statistics.msg_cnt as f64);
+
+        gauge!(
+            "deltaforge_kafka_producer_queue_bytes",
+            "pipeline" => self.pipeline.clone(),
+            "sink" => self.sink_id.clone(),
+        )
+        .set(statistics.msg_size as f64);
+    }
+}
+
 /// Default linger time for batching (ms).
 const DEFAULT_LINGER_MS: &str = "5";
 
 /// Kafka sink with idempotent production and optional exactly-once semantics.
 pub struct KafkaSink {
     id: String,
+    pipeline: String,
     cfg: KafkaSinkCfg,
-    producer: FutureProducer,
+    producer: FutureProducer<KafkaMetricsContext>,
 
     /// static fallback (kept for fast path)
     topic: String,
@@ -104,6 +160,7 @@ impl KafkaSink {
     pub fn new(
         cfg: &KafkaSinkCfg,
         cancel: CancellationToken,
+        pipeline: &str,
     ) -> anyhow::Result<Self> {
         let mut client_cfg = ClientConfig::new();
 
@@ -142,13 +199,20 @@ impl KafkaSink {
                 .set("max.in.flight.requests.per.connection", "5");
         }
 
+        // Enable rdkafka statistics for broker-level metrics
+        client_cfg.set("statistics.interval.ms", STATS_INTERVAL_MS);
+
         // Apply user overrides last
         for (k, v) in &cfg.client_conf {
             client_cfg.set(k, v);
         }
 
-        let producer: FutureProducer =
-            client_cfg.create().with_context(|| {
+        let context = KafkaMetricsContext {
+            pipeline: pipeline.to_string(),
+            sink_id: cfg.id.clone(),
+        };
+        let producer: FutureProducer<KafkaMetricsContext> =
+            client_cfg.create_with_context(context).with_context(|| {
                 format!(
                     "creating kafka producer for {}",
                     redact_brokers(&cfg.brokers)
@@ -194,6 +258,7 @@ impl KafkaSink {
 
         Ok(Self {
             id: cfg.id.clone(),
+            pipeline: pipeline.to_string(),
             cfg: cfg.clone(),
             producer,
             topic: cfg.topic.clone(),
@@ -388,7 +453,7 @@ impl Sink for KafkaSink {
         }
 
         // Pre-serialize with resolved topic/key/headers
-        let serialized: Vec<(Vec<u8>, String, String, Option<OwnedHeaders>)> =
+        let serialized: Result<Vec<(Vec<u8>, String, String, Option<OwnedHeaders>)>, SinkError> =
             events
                 .iter()
                 .map(|e| {
@@ -398,7 +463,25 @@ impl Sink for KafkaSink {
                     let headers = self.build_headers(e);
                     Ok((payload, topic, key, headers))
                 })
-                .collect::<Result<Vec<_>, SinkError>>()?;
+                .collect();
+        let serialized = match serialized {
+            Ok(s) => s,
+            Err(e) => {
+                let kind = match &e {
+                    SinkError::Serialization { .. } => "serialization",
+                    SinkError::Routing { .. } => "routing",
+                    _ => "other",
+                };
+                counter!(
+                    "deltaforge_sink_routing_errors_total",
+                    "pipeline" => self.pipeline.clone(),
+                    "sink" => self.id.clone(),
+                    "kind" => kind,
+                )
+                .increment(1);
+                return Err(e);
+            }
+        };
 
         // Enqueue all messages
         let futures: Vec<_> = serialized
@@ -424,6 +507,14 @@ impl Sink for KafkaSink {
 
         match result {
             Ok(_) => {
+                let total_bytes: u64 =
+                    serialized.iter().map(|(p, ..)| p.len() as u64).sum();
+                counter!(
+                    "deltaforge_sink_bytes_total",
+                    "pipeline" => self.pipeline.clone(),
+                    "sink" => self.id.clone(),
+                )
+                .increment(total_bytes);
                 debug!(count = events.len(), "batch sent to kafka");
                 Ok(())
             }

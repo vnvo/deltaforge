@@ -92,6 +92,7 @@ pub use redis::RedisSink;
 pub fn build_sinks(
     ps: &PipelineSpec,
     cancel: CancellationToken,
+    pipeline: &str,
 ) -> anyhow::Result<Vec<ArcDynSink>> {
     ps.spec
         .sinks
@@ -99,17 +100,17 @@ pub fn build_sinks(
         .map(|s| {
             let (sink, filter): (ArcDynSink, Option<SinkFilter>) = match s {
                 SinkCfg::Kafka(cfg) => (
-                    Arc::new(KafkaSink::new(cfg, cancel.clone())?)
+                    Arc::new(KafkaSink::new(cfg, cancel.clone(), pipeline)?)
                         as ArcDynSink,
                     cfg.filter.clone(),
                 ),
                 SinkCfg::Redis(cfg) => (
-                    Arc::new(RedisSink::new(cfg, cancel.clone())?)
+                    Arc::new(RedisSink::new(cfg, cancel.clone(), pipeline)?)
                         as ArcDynSink,
                     cfg.filter.clone(),
                 ),
                 SinkCfg::Nats(cfg) => (
-                    Arc::new(NatsSink::new(cfg, cancel.clone())?) as ArcDynSink,
+                    Arc::new(NatsSink::new(cfg, cancel.clone(), pipeline)?) as ArcDynSink,
                     cfg.filter.clone(),
                 ),
             };
@@ -136,16 +137,17 @@ pub fn build_sinks(
 pub fn build_sink(
     cfg: &SinkCfg,
     cancel: CancellationToken,
+    pipeline: &str,
 ) -> anyhow::Result<ArcDynSink> {
     let sink: ArcDynSink = match cfg {
         SinkCfg::Kafka(kafka_cfg) => {
-            Arc::new(KafkaSink::new(kafka_cfg, cancel)?) as ArcDynSink
+            Arc::new(KafkaSink::new(kafka_cfg, cancel, pipeline)?) as ArcDynSink
         }
         SinkCfg::Redis(redis_cfg) => {
-            Arc::new(RedisSink::new(redis_cfg, cancel)?) as ArcDynSink
+            Arc::new(RedisSink::new(redis_cfg, cancel, pipeline)?) as ArcDynSink
         }
         SinkCfg::Nats(nats_sink_cfg) => {
-            Arc::new(NatsSink::new(nats_sink_cfg, cancel)?) as ArcDynSink
+            Arc::new(NatsSink::new(nats_sink_cfg, cancel, pipeline)?) as ArcDynSink
         }
     };
     Ok(sink)
@@ -165,10 +167,12 @@ mod tests {
         let _: fn(
             &KafkaSinkCfg,
             CancellationToken,
+            &str,
         ) -> anyhow::Result<KafkaSink> = KafkaSink::new;
         let _: fn(
             &RedisSinkCfg,
             CancellationToken,
+            &str,
         ) -> anyhow::Result<RedisSink> = RedisSink::new;
     }
 }
