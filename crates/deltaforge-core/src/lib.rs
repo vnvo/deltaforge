@@ -401,6 +401,19 @@ pub struct Event {
     /// Estimated event size in bytes for batching
     #[serde(skip)]
     pub size_bytes: usize,
+
+    /// Wall-clock time (ms since epoch) when this event was first parsed by
+    /// the pipeline. Used for pipeline-internal latency tracking; always
+    /// millisecond-precise regardless of source timestamp granularity.
+    #[serde(skip)]
+    pub received_at_ms: i64,
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 impl Event {
@@ -433,6 +446,7 @@ impl Event {
             tx_end: true,
             checkpoint: None,
             size_bytes,
+            received_at_ms: now_ms(),
         }
     }
 
@@ -462,6 +476,7 @@ impl Event {
             tx_end: true,
             checkpoint: None,
             size_bytes,
+            received_at_ms: now_ms(),
         }
     }
 
@@ -491,6 +506,7 @@ impl Event {
             tx_end: true,
             checkpoint: None,
             size_bytes,
+            received_at_ms: now_ms(),
         }
     }
 

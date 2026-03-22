@@ -667,14 +667,20 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
             )
             .set(lag_secs);
 
-            // E2E latency: first event's source timestamp → now (before sink delivery).
-            let first_ts_ms =
-                events.first().map(|e| e.ts_ms).unwrap_or(last_ts_ms);
+            // E2E latency: first event's pipeline-receive time → now (before sink
+            // delivery). Uses received_at_ms (wall-clock at parse time) rather than
+            // ts_ms (binlog header timestamp, second-precision) so the metric reflects
+            // actual pipeline processing time, not source clock granularity.
+            let first_received_ms = events
+                .first()
+                .map(|e| e.received_at_ms)
+                .filter(|&t| t > 0)
+                .unwrap_or(last_ts_ms);
             histogram!(
                 "deltaforge_e2e_latency_seconds",
                 "pipeline" => self.pipeline_name.to_string(),
             )
-            .record(((now_ms - first_ts_ms).max(0) as f64) / 1000.0);
+            .record(((now_ms - first_received_ms).max(0) as f64) / 1000.0);
         }
 
         histogram!(
