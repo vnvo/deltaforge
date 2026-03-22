@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use metrics::counter;
 use schema_registry::SourceSchema;
 use storage::DurableSchemaRegistry;
 use tokio::sync::RwLock;
@@ -84,6 +85,11 @@ impl PostgresSchemaLoader {
     }
 
     /// Expand wildcard patterns and preload all matching schemas.
+    ///
+    /// Warm-start path: schemas already known to the durable registry are
+    /// deserialized directly into the in-memory cache, avoiding a
+    /// information_schema query per table on restart. Tables missing from the
+    /// registry (first-ever run, or new tables) are fetched from the source.
     pub async fn preload(
         &self,
         patterns: &[String],
@@ -98,7 +104,46 @@ impl PostgresSchemaLoader {
             "expanded table patterns"
         );
 
-        for (schema, table) in &tables {
+        // Warm cache from the durable registry first.
+        let mut from_registry = 0usize;
+        let mut needs_fetch: Vec<&(String, String)> = Vec::new();
+        {
+            let mut cache = self.cache.write().await;
+            for pair in &tables {
+                let (schema, table) = pair;
+                match self.registry.get_latest(&self.tenant, schema, table) {
+                    Some(sv) => {
+                        match serde_json::from_value::<PostgresTableSchema>(sv.schema_json) {
+                            Ok(pg_schema) => {
+                                let fingerprint = pg_schema.fingerprint();
+                                let column_names = Arc::new(
+                                    pg_schema.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                                );
+                                cache.insert(
+                                    (schema.clone(), table.clone()),
+                                    LoadedSchema {
+                                        schema: pg_schema,
+                                        registry_version: sv.version,
+                                        fingerprint: fingerprint.into(),
+                                        sequence: sv.sequence,
+                                        column_names,
+                                    },
+                                );
+                                from_registry += 1;
+                            }
+                            Err(e) => {
+                                warn!(schema=%schema, table=%table, error=%e,
+                                    "failed to deserialize registry schema; fetching from source");
+                                needs_fetch.push(pair);
+                            }
+                        }
+                    }
+                    None => needs_fetch.push(pair),
+                }
+            }
+        }
+
+        for (schema, table) in &needs_fetch {
             if let Err(e) = self.load_schema(schema, table).await {
                 warn!(schema = %schema, table = %table, error = %e, "failed to preload schema");
             }
@@ -106,6 +151,8 @@ impl PostgresSchemaLoader {
 
         info!(
             tables_loaded = tables.len(),
+            from_registry,
+            from_source = needs_fetch.len(),
             elapsed_ms = t0.elapsed().as_millis(),
             "schema preload complete"
         );
@@ -173,8 +220,14 @@ impl PostgresSchemaLoader {
 
         if let Some(cached) = self.cache.read().await.get(&key) {
             debug!(schema = %schema, table = %table, "schema cache hit");
+            counter!("deltaforge_source_schema_cache_hits_total",
+                "pipeline" => self.tenant.clone(), "source" => "postgres")
+                .increment(1);
             return Ok(cached.clone());
         }
+        counter!("deltaforge_source_schema_cache_misses_total",
+            "pipeline" => self.tenant.clone(), "source" => "postgres")
+            .increment(1);
 
         let t0 = Instant::now();
         let pg_schema = self.fetch_schema(schema, table).await?;
