@@ -431,25 +431,97 @@ impl PipelineController for PipelineManager {
     }
 
     async fn resume(&self, name: &str) -> Result<PipeInfo, PipelineAPIError> {
-        let mut guard = self.pipelines.write();
-        let runtime = guard
-            .get_mut(name)
-            .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?;
-        runtime.resume();
-        gauge!("deltaforge_pipeline_status", "pipeline" => name.to_string())
-            .set(1.0);
-        Ok(runtime.info())
-    }
-
-    async fn stop(&self, name: &str) -> Result<PipeInfo, PipelineAPIError> {
-        let info = self
+        let status = self
             .pipelines
             .read()
             .get(name)
             .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?
-            .info();
-        self.stop_pipeline(name).await?;
-        Ok(info)
+            .status;
+
+        match status {
+            PipelineStatus::Paused => {
+                let mut guard = self.pipelines.write();
+                let runtime = guard
+                    .get_mut(name)
+                    .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?;
+                runtime.resume();
+                gauge!("deltaforge_pipeline_status", "pipeline" => name.to_string())
+                    .set(1.0);
+                Ok(runtime.info())
+            }
+            PipelineStatus::Stopped => {
+                // Re-spawn from the stored spec and replace the stopped runtime.
+                let spec = self
+                    .pipelines
+                    .read()
+                    .get(name)
+                    .expect("runtime was not removed")
+                    .spec
+                    .clone();
+                let new_runtime = self
+                    .spawn_pipeline(spec)
+                    .await
+                    .map_err(PipelineAPIError::Failed)?;
+                let info = new_runtime.info();
+                self.pipelines.write().insert(name.to_string(), new_runtime);
+                Ok(info)
+            }
+            PipelineStatus::Running => {
+                Ok(self
+                    .pipelines
+                    .read()
+                    .get(name)
+                    .expect("runtime was not removed")
+                    .info())
+            }
+        }
+    }
+
+    async fn stop(&self, name: &str) -> Result<PipeInfo, PipelineAPIError> {
+        // Cancel tasks and clear handles, but keep the runtime in the registry
+        // so the pipeline can be resumed later.
+        let (cancel, sources, join) = {
+            let mut guard = self.pipelines.write();
+            let runtime = guard
+                .get_mut(name)
+                .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?;
+
+            if runtime.status == PipelineStatus::Stopped {
+                return Ok(runtime.info());
+            }
+
+            runtime.status = PipelineStatus::Stopped;
+            let cancel = runtime.cancel.clone();
+            let sources = std::mem::take(&mut runtime.sources);
+            let join = runtime.join.take();
+            (cancel, sources, join)
+        };
+
+        cancel.cancel();
+        for src in &sources {
+            src.cancel.cancel();
+        }
+        // Update the gauge immediately — the status is already Stopped in the
+        // registry. Don't wait for the join handles; the source task may be
+        // stuck in a TCP read that is slow to notice cancellation.
+        gauge!("deltaforge_pipeline_status", "pipeline" => name.to_string())
+            .set(0.0);
+        // Await cleanup in the background so the HTTP handler returns promptly.
+        tokio::spawn(async move {
+            if let Some(j) = join {
+                let _ = j.await;
+            }
+            for src in sources {
+                let _ = src.join.await;
+            }
+        });
+
+        Ok(self
+            .pipelines
+            .read()
+            .get(name)
+            .expect("runtime was not removed")
+            .info())
     }
 
     async fn delete(&self, name: &str) -> Result<(), PipelineAPIError> {
