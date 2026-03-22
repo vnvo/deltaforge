@@ -654,7 +654,7 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
         // Recompute size after processing
         let bytes: usize = events.iter().map(event_size_hint).sum();
 
-        // Replication lag: how far behind wall-clock is the latest source event.
+        // Replication lag and e2e latency relative to wall-clock.
         if let Some(last_ts_ms) = events.last().map(|e| e.ts_ms) {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -666,6 +666,15 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                 "pipeline" => self.pipeline_name.to_string()
             )
             .set(lag_secs);
+
+            // E2E latency: first event's source timestamp → now (before sink delivery).
+            let first_ts_ms =
+                events.first().map(|e| e.ts_ms).unwrap_or(last_ts_ms);
+            histogram!(
+                "deltaforge_e2e_latency_seconds",
+                "pipeline" => self.pipeline_name.to_string(),
+            )
+            .record(((now_ms - first_ts_ms).max(0) as f64) / 1000.0);
         }
 
         histogram!(
@@ -790,6 +799,17 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                     "pipeline" => self.pipeline_name.to_string()
                 )
                 .increment(1);
+
+                gauge!(
+                    "deltaforge_last_checkpoint_ts",
+                    "pipeline" => self.pipeline_name.to_string()
+                )
+                .set(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs_f64())
+                        .unwrap_or(0.0),
+                );
             }
         } else {
             warn!(
@@ -858,10 +878,19 @@ pub fn build_batch_processor(
             for p in procs.iter() {
                 let pid = p.id();
                 let start = Instant::now();
-                batch = p
-                    .process(batch, &ctx)
-                    .await
-                    .with_context(|| format!("processor {pid} failed"))?;
+                batch = match p.process(batch, &ctx).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        counter!(
+                            "deltaforge_processor_errors_total",
+                            "pipeline" => pipeline.to_string(),
+                            "processor" => pid.to_string(),
+                        )
+                        .increment(1);
+                        return Err(e)
+                            .with_context(|| format!("processor {pid} failed"));
+                    }
+                };
 
                 histogram!(
                     "deltaforge_processor_latency_seconds",

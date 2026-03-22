@@ -211,6 +211,32 @@ pub fn describe_metrics() {
         "Total rows emitted during initial snapshot, per pipeline and table"
     );
 
+    describe_histogram!(
+        "deltaforge_e2e_latency_seconds",
+        Unit::Seconds,
+        "End-to-end latency from first event's source timestamp to sink delivery"
+    );
+    describe_gauge!(
+        "deltaforge_last_checkpoint_ts",
+        Unit::Seconds,
+        "Unix epoch seconds when the last checkpoint was committed; use time()-this for age"
+    );
+    describe_counter!(
+        "deltaforge_processor_errors_total",
+        Unit::Count,
+        "Processor failures per pipeline and processor"
+    );
+    describe_counter!(
+        "deltaforge_pipeline_pauses_total",
+        Unit::Count,
+        "Number of times a pipeline was paused"
+    );
+    describe_counter!(
+        "deltaforge_pipeline_resumes_total",
+        Unit::Count,
+        "Number of times a pipeline was resumed"
+    );
+
     // Schema sensing metrics
     describe_counter!(
         "deltaforge_schema_events_total",

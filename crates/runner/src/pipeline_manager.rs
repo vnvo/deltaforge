@@ -70,12 +70,22 @@ impl PipelineRuntime {
         self.sources.iter().for_each(|s| s.pause());
         let _ = self.pause.send(true);
         self.status = PipelineStatus::Paused;
+        counter!(
+            "deltaforge_pipeline_pauses_total",
+            "pipeline" => self.spec.metadata.name.clone()
+        )
+        .increment(1);
     }
 
     pub(crate) fn resume(&mut self) {
         self.sources.iter().for_each(|s| s.resume());
         let _ = self.pause.send(false);
         self.status = PipelineStatus::Running;
+        counter!(
+            "deltaforge_pipeline_resumes_total",
+            "pipeline" => self.spec.metadata.name.clone()
+        )
+        .increment(1);
     }
 
     pub(crate) fn info(&self) -> PipeInfo {
