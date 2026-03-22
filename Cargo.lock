@@ -913,6 +913,7 @@ dependencies = [
  "chrono",
  "clap",
  "mysql_async 0.35.1",
+ "rand 0.8.5",
  "rdkafka",
  "reqwest",
  "serde",
