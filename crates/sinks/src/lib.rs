@@ -110,7 +110,8 @@ pub fn build_sinks(
                     cfg.filter.clone(),
                 ),
                 SinkCfg::Nats(cfg) => (
-                    Arc::new(NatsSink::new(cfg, cancel.clone(), pipeline)?) as ArcDynSink,
+                    Arc::new(NatsSink::new(cfg, cancel.clone(), pipeline)?)
+                        as ArcDynSink,
                     cfg.filter.clone(),
                 ),
             };
@@ -147,7 +148,8 @@ pub fn build_sink(
             Arc::new(RedisSink::new(redis_cfg, cancel, pipeline)?) as ArcDynSink
         }
         SinkCfg::Nats(nats_sink_cfg) => {
-            Arc::new(NatsSink::new(nats_sink_cfg, cancel, pipeline)?) as ArcDynSink
+            Arc::new(NatsSink::new(nats_sink_cfg, cancel, pipeline)?)
+                as ArcDynSink
         }
     };
     Ok(sink)

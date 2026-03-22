@@ -38,11 +38,11 @@ use deltaforge_config::RedisSinkCfg;
 use deltaforge_core::encoding::EncodingType;
 use deltaforge_core::envelope::Envelope;
 use deltaforge_core::{Event, Sink, SinkError, SinkResult};
+use metrics::counter;
 use redis::aio::MultiplexedConnection;
 use serde_json::Value;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use metrics::counter;
 use tracing::{debug, info, instrument, warn};
 
 // =============================================================================
@@ -497,7 +497,10 @@ impl Sink for RedisSink {
         }
 
         // Pre-serialize with resolved stream/key
-        let serialized: Result<Vec<(String, String, String, Vec<u8>)>, SinkError> = events
+        let serialized: Result<
+            Vec<(String, String, String, Vec<u8>)>,
+            SinkError,
+        > = events
             .iter()
             .map(|e| {
                 let stream = self.resolve_stream(e)?;

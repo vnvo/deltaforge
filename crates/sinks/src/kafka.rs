@@ -73,10 +73,7 @@ impl ClientContext for KafkaMetricsContext {
     fn stats(&self, statistics: Statistics) {
         let (total_retries, total_connects) =
             statistics.brokers.values().fold((0u64, 0u64), |acc, b| {
-                (
-                    acc.0 + b.txretries,
-                    acc.1 + b.connects.unwrap_or(0) as u64,
-                )
+                (acc.0 + b.txretries, acc.1 + b.connects.unwrap_or(0) as u64)
             });
 
         counter!(
@@ -453,17 +450,19 @@ impl Sink for KafkaSink {
         }
 
         // Pre-serialize with resolved topic/key/headers
-        let serialized: Result<Vec<(Vec<u8>, String, String, Option<OwnedHeaders>)>, SinkError> =
-            events
-                .iter()
-                .map(|e| {
-                    let payload = self.serialize_event(e)?;
-                    let topic = self.resolve_topic(e)?;
-                    let key = self.resolve_key(e);
-                    let headers = self.build_headers(e);
-                    Ok((payload, topic, key, headers))
-                })
-                .collect();
+        let serialized: Result<
+            Vec<(Vec<u8>, String, String, Option<OwnedHeaders>)>,
+            SinkError,
+        > = events
+            .iter()
+            .map(|e| {
+                let payload = self.serialize_event(e)?;
+                let topic = self.resolve_topic(e)?;
+                let key = self.resolve_key(e);
+                let headers = self.build_headers(e);
+                Ok((payload, topic, key, headers))
+            })
+            .collect();
         let serialized = match serialized {
             Ok(s) => s,
             Err(e) => {

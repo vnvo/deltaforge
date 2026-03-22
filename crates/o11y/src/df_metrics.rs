@@ -1,5 +1,7 @@
 use axum::{Router, routing::get};
-use metrics::{Unit, describe_counter, describe_gauge, describe_histogram, gauge};
+use metrics::{
+    Unit, describe_counter, describe_gauge, describe_histogram, gauge,
+};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use once_cell::sync::OnceCell;
 use std::{net::SocketAddr, time::Duration};

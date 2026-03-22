@@ -194,9 +194,10 @@ impl PipelineManager {
             Arc::clone(&self.backend),
         )
         .context("build source")?;
-        let processors = build_processors(&spec, &pipeline_name).context("build processors")?;
-        let sinks =
-            build_sinks(&spec, cancel.clone(), &pipeline_name).context("build sinks")?;
+        let processors = build_processors(&spec, &pipeline_name)
+            .context("build processors")?;
+        let sinks = build_sinks(&spec, cancel.clone(), &pipeline_name)
+            .context("build sinks")?;
         let schema_loader = build_schema_loader(&spec, self.registry.clone());
 
         let table_patterns = match &spec.spec.source {

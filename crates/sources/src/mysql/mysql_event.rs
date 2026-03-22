@@ -3,7 +3,8 @@ use crate::mysql::LoopControl;
 use crate::mysql::RunCtx;
 use common::{ts_sec_to_ms, watchdog};
 use deltaforge_core::{
-    Event, Op, SourceError, SourceInfo, SourcePosition, SourceResult, Transaction,
+    Event, Op, SourceError, SourceInfo, SourcePosition, SourceResult,
+    Transaction,
 };
 use metrics::counter;
 use mysql_binlog_connector_rust::{

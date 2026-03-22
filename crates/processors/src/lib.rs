@@ -19,7 +19,10 @@ pub use flatten::FlattenProcessor;
 mod filter;
 pub use filter::FilterProcessor;
 
-pub fn build_processors(ps: &PipelineSpec, pipeline: &str) -> Result<Arc<[ArcDynProcessor]>> {
+pub fn build_processors(
+    ps: &PipelineSpec,
+    pipeline: &str,
+) -> Result<Arc<[ArcDynProcessor]>> {
     let mut out: Vec<ArcDynProcessor> = Vec::new();
 
     for p in &ps.spec.processors {
@@ -28,13 +31,11 @@ pub fn build_processors(ps: &PipelineSpec, pipeline: &str) -> Result<Arc<[ArcDyn
                 Arc::new(JsProcessor::new(id.clone(), inline.clone())?)
                     as ArcDynProcessor
             }
-            ProcessorCfg::Outbox { config } => {
-                Arc::new(OutboxProcessor::new(
-                    config.as_ref().clone(),
-                    pipeline.to_string(),
-                )?)
-                    as ArcDynProcessor
-            }
+            ProcessorCfg::Outbox { config } => Arc::new(OutboxProcessor::new(
+                config.as_ref().clone(),
+                pipeline.to_string(),
+            )?)
+                as ArcDynProcessor,
             ProcessorCfg::Flatten { config } => {
                 Arc::new(FlattenProcessor::new(config.as_ref().clone())?)
                     as ArcDynProcessor

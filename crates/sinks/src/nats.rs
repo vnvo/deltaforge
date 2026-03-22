@@ -43,10 +43,10 @@ use deltaforge_core::encoding::EncodingType;
 use deltaforge_core::envelope::Envelope;
 use deltaforge_core::{Event, Sink, SinkError, SinkResult};
 use futures::future::try_join_all;
+use metrics::counter;
 use serde_json::Value;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use metrics::counter;
 use tracing::{debug, info, instrument, warn};
 
 // =============================================================================
@@ -539,16 +539,18 @@ impl Sink for NatsSink {
         }
 
         // Pre-serialize all payloads with resolved subjects and headers
-        let serialized: Result<Vec<(String, Vec<u8>, Option<async_nats::HeaderMap>)>, SinkError> =
-            events
-                .iter()
-                .map(|e| {
-                    let subject = self.resolve_subject(e)?;
-                    let payload = self.serialize_event(e)?;
-                    let headers = self.build_nats_headers(e);
-                    Ok((subject, payload, headers))
-                })
-                .collect();
+        let serialized: Result<
+            Vec<(String, Vec<u8>, Option<async_nats::HeaderMap>)>,
+            SinkError,
+        > = events
+            .iter()
+            .map(|e| {
+                let subject = self.resolve_subject(e)?;
+                let payload = self.serialize_event(e)?;
+                let headers = self.build_nats_headers(e);
+                Ok((subject, payload, headers))
+            })
+            .collect();
         let serialized = match serialized {
             Ok(s) => s,
             Err(e) => {

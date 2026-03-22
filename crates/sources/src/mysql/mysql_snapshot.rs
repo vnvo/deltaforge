@@ -23,12 +23,12 @@ use anyhow::{Context, Result};
 use checkpoints::CheckpointStore;
 use deltaforge_config::SnapshotCfg;
 use deltaforge_core::{Event, Op, SourceInfo, SourcePosition};
+use metrics::counter;
 use mysql_async::{Pool, Row, Value, prelude::Queryable};
 use scopeguard;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
-use metrics::counter;
 use tracing::{debug, error, info, warn};
 
 use super::mysql_health as health;

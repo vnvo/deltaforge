@@ -21,12 +21,12 @@ use checkpoints::CheckpointStore;
 use common::redact_url_password;
 use deltaforge_config::SnapshotCfg;
 use deltaforge_core::{Event, Op, SourceInfo, SourcePosition};
+use metrics::counter;
 use pgwire_replication::Lsn;
 use scopeguard;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, mpsc};
 use tokio_postgres::NoTls;
-use metrics::counter;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
