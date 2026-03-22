@@ -16,7 +16,7 @@
 //! ```
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -38,12 +38,12 @@ const DOMAINS: &[&str] =
     &["customer", "order", "product", "inventory", "payment", "event"];
 const TABLES_PER_DOMAIN: usize = 20;
 
-/// Number of concurrent writer goroutines driving DML.
-const WRITER_TASKS: usize = 16;
+/// Default number of concurrent writer goroutines driving DML.
+const DEFAULT_WRITER_TASKS: usize = 16;
 
 /// Minimum and maximum seconds between injected faults.
-const FAULT_MIN_SECS: u64 = 120;
-const FAULT_MAX_SECS: u64 = 300;
+const FAULT_MIN_SECS: u64 = 300;
+const FAULT_MAX_SECS: u64 = 600;
 
 /// How long to hold each fault type before restoring.
 const PARTITION_HOLD_SECS: u64 = 15;
@@ -68,7 +68,7 @@ pub const SOAK_TOPIC: &str = "chaos.soak";
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-pub async fn run(harness: &Harness, duration_mins: u64) -> Result<ScenarioResult> {
+pub async fn run(harness: &Harness, duration_mins: u64, writer_tasks: usize, write_delay_ms: u64) -> Result<ScenarioResult> {
     let name = "soak";
     harness.setup().await?;
 
@@ -86,20 +86,27 @@ pub async fn run(harness: &Harness, duration_mins: u64) -> Result<ScenarioResult
 
     // Step 3: launch writer tasks + schema alter task.
     let total_written = Arc::new(AtomicU64::new(0));
-    let stop = Arc::new(tokio::sync::Notify::new());
+    // `stop_flag` is the reliable termination signal — checked at the top of
+    // every loop iteration so no task can miss it regardless of timing.
+    // `wake` is a best-effort nudge that interrupts the alter loop's long sleep
+    // early; it is NOT used as the authoritative stop check.
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let wake = Arc::new(tokio::sync::Notify::new());
 
-    info!(writer_tasks = WRITER_TASKS, "step 3/4: starting writer tasks ...");
-    let writer_handles: Vec<_> = (0..WRITER_TASKS)
+    let writer_tasks = if writer_tasks == 0 { DEFAULT_WRITER_TASKS } else { writer_tasks };
+    info!(writer_tasks, write_delay_ms, "step 3/4: starting writer tasks ...");
+    let writer_handles: Vec<_> = (0..writer_tasks)
         .map(|id| {
             let written = Arc::clone(&total_written);
-            let s = Arc::clone(&stop);
-            tokio::spawn(async move { writer_loop(id, written, s).await })
+            let flag = Arc::clone(&stop_flag);
+            tokio::spawn(async move { writer_loop(id, written, flag, write_delay_ms).await })
         })
         .collect();
 
     let alter_handle = {
-        let s = Arc::clone(&stop);
-        tokio::spawn(async move { alter_loop(s).await })
+        let flag = Arc::clone(&stop_flag);
+        let w = Arc::clone(&wake);
+        tokio::spawn(async move { alter_loop(flag, w).await })
     };
 
     // Step 4: endurance loop with random faults.
@@ -127,6 +134,12 @@ pub async fn run(harness: &Harness, duration_mins: u64) -> Result<ScenarioResult
         sample_and_log(&mut stats_samples, &total_written).await;
 
         sleep(actual_wait).await;
+
+        // Re-check deadline after sleeping — the sleep may have consumed all
+        // remaining time, in which case skip the fault + recovery to exit cleanly.
+        if Instant::now() >= deadline {
+            break;
+        }
 
         // Pick and inject a random fault.
         let fault_idx = rng.gen_range(0usize..3);
@@ -168,7 +181,8 @@ pub async fn run(harness: &Harness, duration_mins: u64) -> Result<ScenarioResult
     sample_and_log(&mut stats_samples, &total_written).await;
 
     // Stop writers and alter task.
-    stop.notify_waiters();
+    stop_flag.store(true, Ordering::Relaxed);
+    wake.notify_waiters(); // wake alter loop from its long inter-fault sleep
     for h in writer_handles {
         let _ = h.await;
     }
@@ -211,7 +225,8 @@ pub async fn run(harness: &Harness, duration_mins: u64) -> Result<ScenarioResult
             DOMAINS.len(),
             TABLES_PER_DOMAIN
         ))
-        .note(format!("writer tasks: {WRITER_TASKS}"))
+        .note(format!("writer tasks: {writer_tasks}"))
+        .note(format!("write delay max: {write_delay_ms} ms"))
         .note(format!("rows written to DB: {written}"))
         .note(format!("events delivered to Kafka: {delivered}"))
         .note(format!("faults injected: {}", faults.len()))
@@ -231,6 +246,86 @@ pub async fn run(harness: &Harness, duration_mins: u64) -> Result<ScenarioResult
             if fault.recovered { "OK" } else { "TIMEOUT" }
         ));
     }
+
+    Ok(result)
+}
+
+// ── Stable (no-fault) variant ─────────────────────────────────────────────────
+
+/// Same as [`run`] but with **no fault injection** — only writers and ALTER TABLE
+/// run for the full duration. Use this to establish a steady-state baseline
+/// for metrics like cache hit ratio, E2E latency, and resource usage.
+pub async fn run_stable(harness: &Harness, duration_mins: u64, writer_tasks: usize, write_delay_ms: u64) -> Result<ScenarioResult> {
+    let name = "soak-stable";
+    harness.setup().await?;
+
+    info!("step 1/3: waiting for soak DeltaForge at {SOAK_HEALTH_URL} ...");
+    harness::wait_for_url(SOAK_HEALTH_URL, Duration::from_secs(60)).await?;
+    info!("soak DeltaForge is healthy");
+
+    info!(tables = DOMAINS.len() * TABLES_PER_DOMAIN, "step 2/3: verifying soak tables exist ...");
+    seed_tables().await?;
+
+    let total_written = Arc::new(AtomicU64::new(0));
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let wake = Arc::new(tokio::sync::Notify::new());
+
+    let writer_tasks = if writer_tasks == 0 { DEFAULT_WRITER_TASKS } else { writer_tasks };
+    info!(writer_tasks, write_delay_ms, "step 3/3: starting writer tasks (no faults) ...");
+    let writer_handles: Vec<_> = (0..writer_tasks)
+        .map(|id| {
+            let written = Arc::clone(&total_written);
+            let flag = Arc::clone(&stop_flag);
+            tokio::spawn(async move { writer_loop(id, written, flag, write_delay_ms).await })
+        })
+        .collect();
+
+    let alter_handle = {
+        let flag = Arc::clone(&stop_flag);
+        let w = Arc::clone(&wake);
+        tokio::spawn(async move { alter_loop(flag, w).await })
+    };
+
+    let kafka_start = harness::kafka_offset_for_topic(SOAK_TOPIC).await.unwrap_or(0);
+    let deadline = Instant::now() + Duration::from_secs(duration_mins * 60);
+    let mut stats_samples: Vec<ResourceSample> = Vec::new();
+
+    // Just wait — sample resource usage every 60 s.
+    while Instant::now() < deadline {
+        sample_and_log(&mut stats_samples, &total_written).await;
+        let remaining = deadline.duration_since(Instant::now());
+        sleep(remaining.min(Duration::from_secs(60))).await;
+    }
+
+    sample_and_log(&mut stats_samples, &total_written).await;
+
+    stop_flag.store(true, Ordering::Relaxed);
+    wake.notify_waiters();
+    for h in writer_handles {
+        let _ = h.await;
+    }
+    let alters = alter_handle.await.unwrap_or_default();
+
+    let kafka_end = harness::kafka_offset_for_topic(SOAK_TOPIC).await.unwrap_or(0);
+    let delivered = kafka_end.saturating_sub(kafka_start);
+    let written = total_written.load(Ordering::Relaxed);
+    let alters_ok = alters.iter().filter(|a| a.ok).count();
+    let alters_failed = alters.iter().filter(|a| !a.ok).count();
+    let peak_mem = stats_samples.iter().map(|s| s.mem_bytes).max().unwrap_or(0);
+    let max_cpu = stats_samples.iter().map(|s| (s.cpu_percent * 10.0) as u64).max().unwrap_or(0);
+
+    let result = ScenarioResult::pass(name)
+        .note(format!("duration: {duration_mins} min"))
+        .note(format!("tables: {} ({} domains × {} each)", DOMAINS.len() * TABLES_PER_DOMAIN, DOMAINS.len(), TABLES_PER_DOMAIN))
+        .note(format!("writer tasks: {writer_tasks}"))
+        .note(format!("write delay max: {write_delay_ms} ms"))
+        .note(format!("rows written to DB: {written}"))
+        .note(format!("events delivered to Kafka: {delivered}"))
+        .note("faults injected: 0 (stable baseline run)")
+        .note(format!("peak memory: {} MiB", peak_mem / 1024 / 1024))
+        .note(format!("max CPU: {:.1}%", max_cpu as f64 / 10.0))
+        .note(format!("schema alters applied: {alters_ok}"))
+        .note(format!("schema alters failed: {alters_failed}"));
 
     Ok(result)
 }
@@ -265,7 +360,8 @@ async fn seed_tables() -> Result<()> {
 async fn writer_loop(
     id: usize,
     written: Arc<AtomicU64>,
-    stop: Arc<tokio::sync::Notify>,
+    stop: Arc<AtomicBool>,
+    write_delay_ms: u64,
 ) {
     let tables = all_tables();
     let pool = match mysql_async::Pool::new(MYSQL_DSN).get_conn().await {
@@ -281,13 +377,11 @@ async fn writer_loop(
     loop {
         // Compute the sleep duration before the select so rng is not held
         // across the await point (required for Send).
-        let delay_ms = rng.gen_range(5u64..=30);
+        if stop.load(Ordering::Relaxed) { break; }
 
-        if tokio::select! {
-            _ = stop.notified() => true,
-            _ = sleep(Duration::from_millis(delay_ms)) => false,
-        } {
-            break;
+        let delay_ms = if write_delay_ms == 0 { 0 } else { rng.gen_range(1u64..=write_delay_ms) };
+        if delay_ms > 0 {
+            sleep(Duration::from_millis(delay_ms)).await;
         }
 
         let table = &tables[rng.gen_range(0..tables.len())];
@@ -429,20 +523,23 @@ struct AlterRecord {
 /// while the endurance loop is running. Uses unique random column names so
 /// multiple runs against the same volumes don't collide. Errors are logged
 /// and swallowed — a failed alter is interesting but not a test failure.
-async fn alter_loop(stop: Arc<tokio::sync::Notify>) -> Vec<AlterRecord> {
+async fn alter_loop(stop: Arc<AtomicBool>, wake: Arc<tokio::sync::Notify>) -> Vec<AlterRecord> {
     let tables = all_tables();
     let mut rng = SmallRng::from_entropy();
     let mut records: Vec<AlterRecord> = Vec::new();
     let pool = mysql_async::Pool::new(MYSQL_DSN);
 
     loop {
+        if stop.load(Ordering::Relaxed) { break; }
+
+        // Wait for the inter-alter interval, but wake early if stop fires.
         let wait_secs = rng.gen_range(ALTER_MIN_SECS..=ALTER_MAX_SECS);
-        if tokio::select! {
-            _ = stop.notified() => true,
-            _ = sleep(Duration::from_secs(wait_secs)) => false,
-        } {
-            break;
+        tokio::select! {
+            _ = wake.notified() => {}
+            _ = sleep(Duration::from_secs(wait_secs)) => {}
         }
+
+        if stop.load(Ordering::Relaxed) { break; }
 
         let table = tables[rng.gen_range(0..tables.len())].clone();
         // Random suffix makes the column name unique across restarts.
@@ -457,17 +554,22 @@ async fn alter_loop(stop: Arc<tokio::sync::Notify>) -> Vec<AlterRecord> {
             _ => format!("ALTER TABLE {table} ADD COLUMN {col_name} FLOAT DEFAULT NULL"),
         };
 
-        let ok = match pool.get_conn().await {
-            Ok(mut conn) => conn.exec_drop(&sql, ()).await.is_ok(),
-            Err(_) => false,
-        };
-
-        if ok {
-            info!(%table, %col_name, "mid-stream schema alter applied");
-        } else {
-            info!(%table, %col_name, "mid-stream schema alter failed (ignored)");
+        match pool.get_conn().await {
+            Ok(mut conn) => match conn.exec_drop(&sql, ()).await {
+                Ok(_) => {
+                    info!(%table, %col_name, "mid-stream schema alter applied");
+                    records.push(AlterRecord { ok: true });
+                }
+                Err(e) => {
+                    info!(%table, %col_name, error = %e, "mid-stream schema alter failed (ignored)");
+                    records.push(AlterRecord { ok: false });
+                }
+            },
+            Err(e) => {
+                tracing::warn!(%table, error = %e, "alter loop failed to get connection");
+                records.push(AlterRecord { ok: false });
+            }
         }
-        records.push(AlterRecord { ok });
     }
 
     let _ = pool.disconnect().await;

@@ -20,7 +20,7 @@
 //! ```
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -143,22 +143,24 @@ pub async fn run(harness: &Harness, duration_mins: u64) -> Result<ScenarioResult
     // Step 3: launch terminal tasks + schema alter task.
     let counters = Arc::new(Counters::default());
     let next_o_id = Arc::new(AtomicU64::new((CUSTOMERS_PER_DISTRICT as u64) + 1));
-    let stop = Arc::new(tokio::sync::Notify::new());
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let wake = Arc::new(tokio::sync::Notify::new());
 
     info!(terminals = TERMINALS, "step 3/4: starting terminal tasks ...");
     let terminal_handles: Vec<_> = (0..TERMINALS)
         .map(|id| {
             let c = Arc::clone(&counters);
             let oid = Arc::clone(&next_o_id);
-            let s = Arc::clone(&stop);
+            let flag = Arc::clone(&stop_flag);
             let w_id = (id as u32 % WAREHOUSES) + 1;
-            tokio::spawn(async move { terminal_loop(id, w_id, c, oid, s).await })
+            tokio::spawn(async move { terminal_loop(id, w_id, c, oid, flag).await })
         })
         .collect();
 
     let alter_handle = {
-        let s = Arc::clone(&stop);
-        tokio::spawn(async move { alter_loop(s).await })
+        let flag = Arc::clone(&stop_flag);
+        let w = Arc::clone(&wake);
+        tokio::spawn(async move { alter_loop(flag, w).await })
     };
 
     // Step 4: endurance loop with fault injection.
@@ -208,7 +210,8 @@ pub async fn run(harness: &Harness, duration_mins: u64) -> Result<ScenarioResult
     sample_and_log(&mut stats_samples, &counters).await;
 
     // Shutdown.
-    stop.notify_waiters();
+    stop_flag.store(true, Ordering::Relaxed);
+    wake.notify_waiters();
     for h in terminal_handles {
         let _ = h.await;
     }
@@ -459,12 +462,14 @@ async fn terminal_loop(
     w_id: u32,
     counters: Arc<Counters>,
     next_o_id: Arc<AtomicU64>,
-    stop: Arc<tokio::sync::Notify>,
+    stop: Arc<AtomicBool>,
 ) {
     let pool = mysql_async::Pool::new(MYSQL_DSN);
     let mut rng = SmallRng::from_entropy();
 
     loop {
+        if stop.load(Ordering::Relaxed) { break; }
+
         let think_ms = rng.gen_range(THINK_MIN_MS..=THINK_MAX_MS);
         let roll: u8 = rng.gen_range(1..=100);
         let d_id: u32 = rng.gen_range(1..=DISTRICTS);
@@ -473,12 +478,7 @@ async fn terminal_loop(
         let ol_cnt: u32 = rng.gen_range(5..=15);
         let carrier: u8 = rng.gen_range(1..=10);
 
-        if tokio::select! {
-            _ = stop.notified() => true,
-            _ = sleep(Duration::from_millis(think_ms)) => false,
-        } {
-            break;
-        }
+        sleep(Duration::from_millis(think_ms)).await;
 
         let mut conn = match pool.get_conn().await {
             Ok(c) => c,
@@ -743,17 +743,21 @@ const TPCC_TABLES: &[&str] = &[
 
 struct AlterRecord { ok: bool }
 
-async fn alter_loop(stop: Arc<tokio::sync::Notify>) -> Vec<AlterRecord> {
+async fn alter_loop(stop: Arc<AtomicBool>, wake: Arc<tokio::sync::Notify>) -> Vec<AlterRecord> {
     let mut rng = SmallRng::from_entropy();
     let mut records = Vec::new();
     let pool = mysql_async::Pool::new(MYSQL_DSN);
 
     loop {
+        if stop.load(Ordering::Relaxed) { break; }
+
         let wait_secs = rng.gen_range(ALTER_MIN_SECS..=ALTER_MAX_SECS);
-        if tokio::select! {
-            _ = stop.notified() => true,
-            _ = sleep(Duration::from_secs(wait_secs)) => false,
-        } { break; }
+        tokio::select! {
+            _ = wake.notified() => {}
+            _ = sleep(Duration::from_secs(wait_secs)) => {}
+        }
+
+        if stop.load(Ordering::Relaxed) { break; }
 
         let table = TPCC_TABLES[rng.gen_range(0..TPCC_TABLES.len())];
         let col_suffix: u32 = rng.r#gen();
@@ -766,13 +770,22 @@ async fn alter_loop(stop: Arc<tokio::sync::Notify>) -> Vec<AlterRecord> {
             _ => format!("ALTER TABLE {table} ADD COLUMN {col_name} FLOAT DEFAULT NULL"),
         };
 
-        let ok = match pool.get_conn().await {
-            Ok(mut conn) => conn.exec_drop(&sql, ()).await.is_ok(),
-            Err(_) => false,
-        };
-        if ok { info!(%table, %col_name, "mid-stream schema alter applied"); }
-        else  { info!(%table, %col_name, "mid-stream schema alter failed (ignored)"); }
-        records.push(AlterRecord { ok });
+        match pool.get_conn().await {
+            Ok(mut conn) => match conn.exec_drop(&sql, ()).await {
+                Ok(_) => {
+                    info!(%table, %col_name, "mid-stream schema alter applied");
+                    records.push(AlterRecord { ok: true });
+                }
+                Err(e) => {
+                    info!(%table, %col_name, error = %e, "mid-stream schema alter failed (ignored)");
+                    records.push(AlterRecord { ok: false });
+                }
+            },
+            Err(e) => {
+                tracing::warn!(%table, error = %e, "alter loop failed to get connection");
+                records.push(AlterRecord { ok: false });
+            }
+        }
     }
 
     let _ = pool.disconnect().await;

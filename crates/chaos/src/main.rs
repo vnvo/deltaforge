@@ -3,6 +3,7 @@ mod docker;
 mod harness;
 mod scenarios;
 mod toxiproxy;
+mod ui;
 
 use anyhow::Result;
 use backend::{MysqlBackend, PgBackend};
@@ -30,6 +31,16 @@ struct Cli {
     /// Duration for the soak scenario in minutes (ignored for other scenarios).
     #[arg(long, default_value_t = 120)]
     duration_mins: u64,
+
+    /// Number of concurrent writer tasks for the soak scenario (ignored for other scenarios).
+    /// Higher values increase write throughput. Default: 16.
+    #[arg(long, default_value_t = 16)]
+    writer_tasks: usize,
+
+    /// Maximum per-task sleep between writes in milliseconds for the soak scenario.
+    /// Lower values increase write throughput. Default: 30.
+    #[arg(long, default_value_t = 30)]
+    write_delay_ms: u64,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -40,6 +51,8 @@ enum Source {
 
 #[derive(Clone, ValueEnum)]
 enum Scenario {
+    /// Launch the web UI playground on localhost:7474.
+    Ui,
     /// Run all scenarios for the selected source in sequence.
     All,
     // Generic (run for any source via --source)
@@ -56,6 +69,10 @@ enum Scenario {
     /// Long-running endurance test with random fault injection (MySQL only).
     /// Requires the `soak` compose profile. Use --duration-mins to control length.
     Soak,
+    /// Steady-state baseline: same as Soak but with no fault injection.
+    /// Writers and ALTER TABLE operations run for the full duration.
+    /// Use to measure cache hit ratio, latency, and resource usage without chaos.
+    SoakStable,
     // Heavy benchmark scenarios — not included in `all`.
     // Each prints a preamble explaining what it proves before running.
     /// TPC-C inspired endurance test: New-Order / Payment / Delivery transaction
@@ -82,9 +99,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let harness = Harness::new();
 
+    // UI mode: start the web playground and exit.
+    if matches!(cli.scenario, Scenario::Ui) {
+        return ui::run(7474).await;
+    }
+
     // Soak/Tpcc/TpcDi/TpcE target separate instances or print-and-exit;
     // skip the default port-8080 health check for all of them.
-    if !matches!(cli.scenario, Scenario::Soak | Scenario::Tpcc | Scenario::TpcDi | Scenario::TpcE) {
+    if !matches!(cli.scenario, Scenario::Soak | Scenario::SoakStable | Scenario::Tpcc | Scenario::TpcDi | Scenario::TpcE) {
         info!("waiting for DeltaForge to be healthy...");
         harness
             .wait_for_deltaforge(std::time::Duration::from_secs(cli.wait_secs))
@@ -93,7 +115,7 @@ async fn main() -> Result<()> {
     }
 
     let results = match cli.source {
-        Source::Mysql => run_mysql(&harness, &cli.scenario, cli.duration_mins).await?,
+        Source::Mysql => run_mysql(&harness, &cli.scenario, cli.duration_mins, cli.writer_tasks, cli.write_delay_ms).await?,
         Source::Postgres => run_postgres(&harness, &cli.scenario, cli.duration_mins).await?,
     };
 
@@ -121,6 +143,8 @@ async fn run_mysql(
     harness: &Harness,
     scenario: &Scenario,
     duration_mins: u64,
+    writer_tasks: usize,
+    write_delay_ms: u64,
 ) -> Result<Vec<harness::ScenarioResult>> {
     let backend = MysqlBackend;
     let mut results = vec![];
@@ -149,7 +173,10 @@ async fn run_mysql(
             results.push(scenarios::binlog_purge::run(harness).await?);
         }
         Scenario::Soak => {
-            results.push(scenarios::soak::run(harness, duration_mins).await?);
+            results.push(scenarios::soak::run(harness, duration_mins, writer_tasks, write_delay_ms).await?);
+        }
+        Scenario::SoakStable => {
+            results.push(scenarios::soak::run_stable(harness, duration_mins, writer_tasks, write_delay_ms).await?);
         }
         Scenario::Tpcc => {
             results.push(scenarios::tpcc::run(harness, duration_mins).await?);
@@ -160,6 +187,7 @@ async fn run_mysql(
         Scenario::TpcE => {
             results.push(scenarios::tpc_e::run().await?);
         }
+        Scenario::Ui => unreachable!("ui is handled before source dispatch"),
         Scenario::PgFailover | Scenario::SlotDropped => {
             eprintln!(
                 "error: {:?} is a PostgreSQL-specific scenario — use --source postgres",
@@ -217,7 +245,8 @@ async fn run_postgres(
         Scenario::SlotDropped => {
             results.push(scenarios::slot_dropped::run(harness).await?);
         }
-        Scenario::Soak | Scenario::Tpcc | Scenario::Failover | Scenario::BinlogPurge => {
+        Scenario::Ui => unreachable!("ui is handled before source dispatch"),
+        Scenario::Soak | Scenario::SoakStable | Scenario::Tpcc | Scenario::Failover | Scenario::BinlogPurge => {
             eprintln!(
                 "error: {:?} is a MySQL-specific scenario — use --source mysql",
                 scenario.to_possible_value().unwrap().get_name()
