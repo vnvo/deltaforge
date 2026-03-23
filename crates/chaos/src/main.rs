@@ -43,7 +43,6 @@ struct Cli {
     write_delay_ms: u64,
 
     // ── Backlog-drain throughput knobs ────────────────────────────────────────
-
     /// Max events per Kafka batch during the backlog-drain (pipeline spec batch.max_events).
     /// Higher values reduce produce calls per second. Default: 200.
     #[arg(long, default_value_t = 200)]
@@ -135,7 +134,15 @@ async fn main() -> Result<()> {
 
     // Soak/Tpcc/TpcDi/TpcE target separate instances or print-and-exit;
     // skip the default port-8080 health check for all of them.
-    if !matches!(cli.scenario, Scenario::Soak | Scenario::SoakStable | Scenario::BacklogDrain | Scenario::Tpcc | Scenario::TpcDi | Scenario::TpcE) {
+    if !matches!(
+        cli.scenario,
+        Scenario::Soak
+            | Scenario::SoakStable
+            | Scenario::BacklogDrain
+            | Scenario::Tpcc
+            | Scenario::TpcDi
+            | Scenario::TpcE
+    ) {
         info!("waiting for DeltaForge to be healthy...");
         harness
             .wait_for_deltaforge(std::time::Duration::from_secs(cli.wait_secs))
@@ -152,8 +159,20 @@ async fn main() -> Result<()> {
     };
 
     let results = match cli.source {
-        Source::Mysql => run_mysql(&harness, &cli.scenario, cli.duration_mins, cli.writer_tasks, cli.write_delay_ms, drain_cfg).await?,
-        Source::Postgres => run_postgres(&harness, &cli.scenario, cli.duration_mins).await?,
+        Source::Mysql => {
+            run_mysql(
+                &harness,
+                &cli.scenario,
+                cli.duration_mins,
+                cli.writer_tasks,
+                cli.write_delay_ms,
+                drain_cfg,
+            )
+            .await?
+        }
+        Source::Postgres => {
+            run_postgres(&harness, &cli.scenario, cli.duration_mins).await?
+        }
     };
 
     println!("\n═══════════════════════════════════");
@@ -211,16 +230,33 @@ async fn run_mysql(
             results.push(scenarios::binlog_purge::run(harness).await?);
         }
         Scenario::Soak => {
-            results.push(scenarios::soak::run(harness, duration_mins, writer_tasks, write_delay_ms).await?);
+            results.push(
+                scenarios::soak::run(
+                    harness,
+                    duration_mins,
+                    writer_tasks,
+                    write_delay_ms,
+                )
+                .await?,
+            );
         }
         Scenario::SoakStable => {
-            results.push(scenarios::soak::run_stable(harness, duration_mins, writer_tasks, write_delay_ms).await?);
+            results.push(
+                scenarios::soak::run_stable(
+                    harness,
+                    duration_mins,
+                    writer_tasks,
+                    write_delay_ms,
+                )
+                .await?,
+            );
         }
         Scenario::Tpcc => {
             results.push(scenarios::tpcc::run(harness, duration_mins).await?);
         }
         Scenario::BacklogDrain => {
-            results.push(scenarios::backlog_drain::run(harness, drain_cfg).await?);
+            results
+                .push(scenarios::backlog_drain::run(harness, drain_cfg).await?);
         }
         Scenario::TpcDi => {
             results.push(scenarios::tpc_di::run().await?);
@@ -287,7 +323,12 @@ async fn run_postgres(
             results.push(scenarios::slot_dropped::run(harness).await?);
         }
         Scenario::Ui => unreachable!("ui is handled before source dispatch"),
-        Scenario::Soak | Scenario::SoakStable | Scenario::BacklogDrain | Scenario::Tpcc | Scenario::Failover | Scenario::BinlogPurge => {
+        Scenario::Soak
+        | Scenario::SoakStable
+        | Scenario::BacklogDrain
+        | Scenario::Tpcc
+        | Scenario::Failover
+        | Scenario::BinlogPurge => {
             eprintln!(
                 "error: {:?} is a MySQL-specific scenario — use --source mysql",
                 scenario.to_possible_value().unwrap().get_name()

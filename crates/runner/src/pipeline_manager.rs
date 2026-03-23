@@ -441,9 +441,9 @@ impl PipelineController for PipelineManager {
         match status {
             PipelineStatus::Paused => {
                 let mut guard = self.pipelines.write();
-                let runtime = guard
-                    .get_mut(name)
-                    .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?;
+                let runtime = guard.get_mut(name).ok_or_else(|| {
+                    PipelineAPIError::NotFound(name.to_string())
+                })?;
                 runtime.resume();
                 gauge!("deltaforge_pipeline_status", "pipeline" => name.to_string())
                     .set(1.0);
@@ -466,14 +466,12 @@ impl PipelineController for PipelineManager {
                 self.pipelines.write().insert(name.to_string(), new_runtime);
                 Ok(info)
             }
-            PipelineStatus::Running => {
-                Ok(self
-                    .pipelines
-                    .read()
-                    .get(name)
-                    .expect("runtime was not removed")
-                    .info())
-            }
+            PipelineStatus::Running => Ok(self
+                .pipelines
+                .read()
+                .get(name)
+                .expect("runtime was not removed")
+                .info()),
         }
     }
 

@@ -108,31 +108,72 @@ struct ServiceInfo {
 
 async fn api_status() -> Json<Vec<ServiceInfo>> {
     let defs: &[(&str, &str, Option<&str>)] = &[
-        ("mysql",           "deltaforge-mysql-1",             None),
-        ("mysql-b",         "deltaforge-mysql-b-1",           None),
-        ("kafka",           "deltaforge-kafka-1",             None),
-        ("zookeeper",       "deltaforge-zookeeper-1",         None),
-        ("toxiproxy",       "deltaforge-toxiproxy-1",         Some("http://localhost:8474/proxies")),
-        ("prometheus",      "deltaforge-prometheus-1",        Some("http://localhost:9090/-/ready")),
-        ("grafana",         "deltaforge-grafana-1",           Some("http://localhost:3000/api/health")),
-        ("cadvisor",        "deltaforge-cadvisor-1",          Some("http://localhost:8888/healthz")),
-        ("deltaforge",      "deltaforge-deltaforge-1",        Some("http://localhost:8080/health")),
-        ("deltaforge-pg",   "deltaforge-deltaforge-pg-1",     Some("http://localhost:8080/health")),
-        ("deltaforge-soak", "deltaforge-deltaforge-soak-1",   Some("http://localhost:8081/health")),
-        ("deltaforge-tpcc", "deltaforge-deltaforge-tpcc-1",   Some("http://localhost:8082/health")),
-        ("postgres",        "deltaforge-postgres-1",          None),
-        ("postgres-b",      "deltaforge-postgres-b-1",        None),
+        ("mysql", "deltaforge-mysql-1", None),
+        ("mysql-b", "deltaforge-mysql-b-1", None),
+        ("kafka", "deltaforge-kafka-1", None),
+        ("zookeeper", "deltaforge-zookeeper-1", None),
+        (
+            "toxiproxy",
+            "deltaforge-toxiproxy-1",
+            Some("http://localhost:8474/proxies"),
+        ),
+        (
+            "prometheus",
+            "deltaforge-prometheus-1",
+            Some("http://localhost:9090/-/ready"),
+        ),
+        (
+            "grafana",
+            "deltaforge-grafana-1",
+            Some("http://localhost:3000/api/health"),
+        ),
+        (
+            "cadvisor",
+            "deltaforge-cadvisor-1",
+            Some("http://localhost:8888/healthz"),
+        ),
+        (
+            "deltaforge",
+            "deltaforge-deltaforge-1",
+            Some("http://localhost:8080/health"),
+        ),
+        (
+            "deltaforge-pg",
+            "deltaforge-deltaforge-pg-1",
+            Some("http://localhost:8080/health"),
+        ),
+        (
+            "deltaforge-soak",
+            "deltaforge-deltaforge-soak-1",
+            Some("http://localhost:8081/health"),
+        ),
+        (
+            "deltaforge-tpcc",
+            "deltaforge-deltaforge-tpcc-1",
+            Some("http://localhost:8082/health"),
+        ),
+        ("postgres", "deltaforge-postgres-1", None),
+        ("postgres-b", "deltaforge-postgres-b-1", None),
     ];
 
     let mut out = Vec::new();
     for (label, container, url) in defs {
         let (state, health) = inspect_container(container).await;
         let http_ok = if state == "running" {
-            if let Some(u) = url { check_http(u).await } else { None }
+            if let Some(u) = url {
+                check_http(u).await
+            } else {
+                None
+            }
         } else {
             None
         };
-        out.push(ServiceInfo { label: label.to_string(), state, health, http_ok });
+        out.push(ServiceInfo {
+            label: label.to_string(),
+            state,
+            health,
+            http_ok,
+        });
     }
     Json(out)
 }
@@ -162,22 +203,35 @@ async fn api_inject_fault(
 ) -> StatusCode {
     let r: anyhow::Result<()> = match req.preset.as_str() {
         "mysql-partition" => st.toxi.disable("mysql").await,
-        "kafka-outage"    => st.toxi.disable("kafka").await,
-        "pg-partition"    => st.toxi.disable("postgres").await,
-        "mysql-latency"   => st.toxi.add_latency("mysql", 2000, 500).await,
-        "kafka-latency"   => st.toxi.add_latency("kafka", 1000, 200).await,
+        "kafka-outage" => st.toxi.disable("kafka").await,
+        "pg-partition" => st.toxi.disable("postgres").await,
+        "mysql-latency" => st.toxi.add_latency("mysql", 2000, 500).await,
+        "kafka-latency" => st.toxi.add_latency("kafka", 1000, 200).await,
         "mysql-bandwidth" => {
             st.toxi
-                .add_toxic("mysql", "ui-bw", "bandwidth", serde_json::json!({"rate": 100}))
+                .add_toxic(
+                    "mysql",
+                    "ui-bw",
+                    "bandwidth",
+                    serde_json::json!({"rate": 100}),
+                )
                 .await
         }
         _ => Err(anyhow::anyhow!("unknown preset")),
     };
-    if r.is_ok() { StatusCode::OK } else { StatusCode::BAD_GATEWAY }
+    if r.is_ok() {
+        StatusCode::OK
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
 }
 
 async fn api_clear_faults(State(st): State<Arc<UiState>>) -> StatusCode {
-    if st.toxi.reset_all().await.is_ok() { StatusCode::OK } else { StatusCode::BAD_GATEWAY }
+    if st.toxi.reset_all().await.is_ok() {
+        StatusCode::OK
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
 }
 
 #[derive(Deserialize)]
@@ -225,13 +279,15 @@ async fn api_scenario_start(
     cmd.arg("--scenario").arg(&req.scenario);
     cmd.arg("--source").arg(&req.source);
     if req.duration_mins > 0 {
-        cmd.arg("--duration-mins").arg(req.duration_mins.to_string());
+        cmd.arg("--duration-mins")
+            .arg(req.duration_mins.to_string());
     }
     if req.writer_tasks > 0 {
         cmd.arg("--writer-tasks").arg(req.writer_tasks.to_string());
     }
     if req.write_delay_ms > 0 {
-        cmd.arg("--write-delay-ms").arg(req.write_delay_ms.to_string());
+        cmd.arg("--write-delay-ms")
+            .arg(req.write_delay_ms.to_string());
     }
     if let Some(v) = req.drain_max_events {
         cmd.arg("--drain-max-events").arg(v.to_string());
@@ -272,7 +328,9 @@ async fn api_scenario_start(
         while let Ok(Some(line)) = lines.next_line().await {
             let mut log = st2.log.lock().await;
             log.push_back(line);
-            if log.len() > 500 { log.pop_front(); }
+            if log.len() > 500 {
+                log.pop_front();
+            }
         }
     });
 
@@ -283,7 +341,9 @@ async fn api_scenario_start(
         while let Ok(Some(line)) = lines.next_line().await {
             let mut log = st3.log.lock().await;
             log.push_back(line);
-            if log.len() > 500 { log.pop_front(); }
+            if log.len() > 500 {
+                log.pop_front();
+            }
         }
     });
 
@@ -298,7 +358,10 @@ async fn api_scenario_start(
                     *lock = None;
                     drop(lock);
                     st4.running.store(false, Ordering::Relaxed);
-                    st4.log.lock().await.push_back("▶ scenario finished".to_string());
+                    st4.log
+                        .lock()
+                        .await
+                        .push_back("▶ scenario finished".to_string());
                     break;
                 }
                 Some(Err(_)) => {
@@ -321,11 +384,16 @@ async fn api_scenario_stop(State(st): State<Arc<UiState>>) -> StatusCode {
     }
     *lock = None;
     st.running.store(false, Ordering::Relaxed);
-    st.log.lock().await.push_back("▶ stopped by user".to_string());
+    st.log
+        .lock()
+        .await
+        .push_back("▶ stopped by user".to_string());
     StatusCode::OK
 }
 
-async fn api_scenario_status(State(st): State<Arc<UiState>>) -> Json<ScenarioStatus> {
+async fn api_scenario_status(
+    State(st): State<Arc<UiState>>,
+) -> Json<ScenarioStatus> {
     Json(ScenarioStatus {
         running: st.running.load(Ordering::Relaxed),
         lines: st.log.lock().await.iter().cloned().collect(),
@@ -362,7 +430,11 @@ async fn api_infra(Json(req): Json<InfraRequest>) -> StatusCode {
         .map(|s| s.success())
         .unwrap_or(false);
 
-    if ok { StatusCode::OK } else { StatusCode::INTERNAL_SERVER_ERROR }
+    if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
 }
 
 // ── DeltaForge API proxy ──────────────────────────────────────────────────────
@@ -379,11 +451,16 @@ async fn api_df_get(Query(p): Query<DfGetParams>) -> impl IntoResponse {
     let url = format!("http://localhost:{}{}", p.port, p.path);
     match reqwest::Client::new().get(&url).send().await {
         Ok(r) => {
-            let status = StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let status = StatusCode::from_u16(r.status().as_u16())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
             let body = r.text().await.unwrap_or_default();
             (status, [(header::CONTENT_TYPE, "application/json")], body)
         }
-        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, [(header::CONTENT_TYPE, "application/json")], "{}".to_string()),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "application/json")],
+            "{}".to_string(),
+        ),
     }
 }
 
@@ -407,11 +484,16 @@ async fn api_df_post(Json(req): Json<DfPostReq>) -> impl IntoResponse {
     };
     match r {
         Ok(r) => {
-            let status = StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let status = StatusCode::from_u16(r.status().as_u16())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
             let body = r.text().await.unwrap_or_default();
             (status, [(header::CONTENT_TYPE, "application/json")], body)
         }
-        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, [(header::CONTENT_TYPE, "application/json")], "{}".to_string()),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "application/json")],
+            "{}".to_string(),
+        ),
     }
 }
 
@@ -421,11 +503,16 @@ async fn api_df_delete(Json(req): Json<DfPostReq>) -> impl IntoResponse {
     let url = format!("http://localhost:{}{}", req.port, req.path);
     match reqwest::Client::new().delete(&url).send().await {
         Ok(r) => {
-            let status = StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let status = StatusCode::from_u16(r.status().as_u16())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
             let body = r.text().await.unwrap_or_default();
             (status, [(header::CONTENT_TYPE, "application/json")], body)
         }
-        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, [(header::CONTENT_TYPE, "application/json")], "{}".to_string()),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "application/json")],
+            "{}".to_string(),
+        ),
     }
 }
 

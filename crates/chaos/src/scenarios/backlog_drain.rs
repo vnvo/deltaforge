@@ -91,7 +91,10 @@ impl Default for DrainConfig {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-pub async fn run(harness: &Harness, cfg: DrainConfig) -> Result<ScenarioResult> {
+pub async fn run(
+    harness: &Harness,
+    cfg: DrainConfig,
+) -> Result<ScenarioResult> {
     let name = "backlog-drain";
     info!(
         max_events = cfg.max_events,
@@ -124,7 +127,10 @@ pub async fn run(harness: &Harness, cfg: DrainConfig) -> Result<ScenarioResult> 
 
     // Step 4: populate the backlog — write TARGET_EVENTS rows as fast as
     // possible. Writers stop themselves once the shared counter hits the target.
-    info!(TARGET_EVENTS, WRITER_TASKS, "step 3/6: populating MySQL backlog ...");
+    info!(
+        TARGET_EVENTS,
+        WRITER_TASKS, "step 3/6: populating MySQL backlog ..."
+    );
     let counter = Arc::new(AtomicU64::new(0));
     let write_start = Instant::now();
 
@@ -136,7 +142,9 @@ pub async fn run(harness: &Harness, cfg: DrainConfig) -> Result<ScenarioResult> 
         loop {
             sleep(Duration::from_secs(10)).await;
             let current = progress_ctr.load(Ordering::Relaxed);
-            if current >= TARGET_EVENTS { break; }
+            if current >= TARGET_EVENTS {
+                break;
+            }
             let delta = current.saturating_sub(last);
             let tps = delta as f64 / last_t.elapsed().as_secs_f64();
             info!(
@@ -292,12 +300,12 @@ pub async fn run(harness: &Harness, cfg: DrainConfig) -> Result<ScenarioResult> 
         .note(format!(
             "write duration: {write_secs:.1}s ({write_tps:.0} rows/s)"
         ))
-        .note(format!(
-            "drain duration: {drain_secs:.1}s"
-        ))
+        .note(format!("drain duration: {drain_secs:.1}s"))
         .note(format!("drain avg throughput: {avg_drain_tps:.0} events/s"))
         .note(format!("drain p50 throughput: {p50_drain_tps:.0} events/s"))
-        .note(format!("drain peak throughput: {peak_drain_tps:.0} events/s")))
+        .note(format!(
+            "drain peak throughput: {peak_drain_tps:.0} events/s"
+        )))
 }
 
 // ── Writer ────────────────────────────────────────────────────────────────────
@@ -305,7 +313,8 @@ pub async fn run(harness: &Harness, cfg: DrainConfig) -> Result<ScenarioResult> 
 async fn writer(id: usize, counter: Arc<AtomicU64>) {
     let tables = soak_tables();
     let pool = mysql_async::Pool::new(MYSQL_DSN);
-    let mut rng = <rand::rngs::SmallRng as rand::SeedableRng>::seed_from_u64(id as u64);
+    let mut rng =
+        <rand::rngs::SmallRng as rand::SeedableRng>::seed_from_u64(id as u64);
 
     loop {
         // Atomically claim a slot; stop if target reached.
@@ -351,8 +360,14 @@ async fn writer(id: usize, counter: Arc<AtomicU64>) {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn soak_tables() -> Vec<String> {
-    const DOMAINS: &[&str] =
-        &["customer", "order", "product", "inventory", "payment", "event"];
+    const DOMAINS: &[&str] = &[
+        "customer",
+        "order",
+        "product",
+        "inventory",
+        "payment",
+        "event",
+    ];
     let mut tables = Vec::with_capacity(DOMAINS.len() * 20);
     for domain in DOMAINS {
         for i in 1..=20usize {
@@ -409,4 +424,3 @@ fn now_ms() -> u128 {
         .unwrap()
         .as_millis()
 }
-

@@ -6,8 +6,8 @@
 //!
 //! This module prints requirements and exits. Implement when ready.
 
-use anyhow::Result;
 use crate::harness::ScenarioResult;
+use anyhow::Result;
 
 pub fn print_requirements() {
     println!();

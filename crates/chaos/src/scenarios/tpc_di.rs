@@ -7,8 +7,8 @@
 //!
 //! This module prints requirements and exits. Implement when ready.
 
-use anyhow::Result;
 use crate::harness::ScenarioResult;
+use anyhow::Result;
 
 pub fn print_requirements() {
     println!();
@@ -47,7 +47,9 @@ pub fn print_requirements() {
     println!("      or a downstream OLAP store (e.g. DuckDB) so correctness");
     println!("      can be asserted, not just event counts.");
     println!();
-    println!("    • A secondary pipeline sourcing from both MySQL and Postgres");
+    println!(
+        "    • A secondary pipeline sourcing from both MySQL and Postgres"
+    );
     println!("      simultaneously to test cross-source fan-in ordering.");
     println!();
     println!("    • At least two full schema migration cycles injected while");

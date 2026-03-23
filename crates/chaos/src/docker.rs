@@ -65,7 +65,10 @@ pub struct ResourceStats {
 ///
 /// Returns `Ok(ResourceStats::default())` if the container is not running or
 /// the output cannot be parsed — the caller should treat this as a gap sample.
-pub async fn sample_stats(profile: &str, service: &str) -> Result<ResourceStats> {
+pub async fn sample_stats(
+    profile: &str,
+    service: &str,
+) -> Result<ResourceStats> {
     let output = tokio::process::Command::new("docker")
         .args([
             "compose",
@@ -97,16 +100,23 @@ pub async fn sample_stats(profile: &str, service: &str) -> Result<ResourceStats>
     let mem_str = parts[1].split('/').next().unwrap_or("").trim();
     let mem_bytes = parse_mem(mem_str);
 
-    Ok(ResourceStats { cpu_percent: cpu, mem_bytes })
+    Ok(ResourceStats {
+        cpu_percent: cpu,
+        mem_bytes,
+    })
 }
 
 fn parse_mem(s: &str) -> u64 {
     let s = s.trim();
     if let Some(n) = s.strip_suffix("GiB") {
-        return (n.trim().parse::<f64>().unwrap_or(0.0) * 1024.0 * 1024.0 * 1024.0) as u64;
+        return (n.trim().parse::<f64>().unwrap_or(0.0)
+            * 1024.0
+            * 1024.0
+            * 1024.0) as u64;
     }
     if let Some(n) = s.strip_suffix("MiB") {
-        return (n.trim().parse::<f64>().unwrap_or(0.0) * 1024.0 * 1024.0) as u64;
+        return (n.trim().parse::<f64>().unwrap_or(0.0) * 1024.0 * 1024.0)
+            as u64;
     }
     if let Some(n) = s.strip_suffix("kB") {
         return (n.trim().parse::<f64>().unwrap_or(0.0) * 1024.0) as u64;

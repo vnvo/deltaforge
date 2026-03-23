@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use mysql_async::{TxOpts, Value};
 use mysql_async::prelude::Queryable;
+use mysql_async::{TxOpts, Value};
 use rand::Rng;
 use rand::SeedableRng as _;
 use rand::rngs::SmallRng;
@@ -82,15 +82,25 @@ pub fn print_preamble() {
     println!("  TPC-C Soak — what this test proves for DeltaForge");
     println!("═══════════════════════════════════════════════════════════════");
     println!();
-    println!("  Transaction mix ({TERMINALS} terminals, think-time {THINK_MIN_MS}-{THINK_MAX_MS} ms):");
-    println!("    New-Order  45%  INSERT order + order_line×5-15 + UPDATE stock×5-15");
-    println!("    Payment    43%  UPDATE warehouse / district / customer + INSERT history");
-    println!("    Delivery   12%  DELETE new_order + UPDATE order + order_line + customer");
+    println!(
+        "  Transaction mix ({TERMINALS} terminals, think-time {THINK_MIN_MS}-{THINK_MAX_MS} ms):"
+    );
+    println!(
+        "    New-Order  45%  INSERT order + order_line×5-15 + UPDATE stock×5-15"
+    );
+    println!(
+        "    Payment    43%  UPDATE warehouse / district / customer + INSERT history"
+    );
+    println!(
+        "    Delivery   12%  DELETE new_order + UPDATE order + order_line + customer"
+    );
     println!();
     println!("  What a PASS proves:");
     println!("    ✓ Multi-table transaction atomicity");
     println!("      New-Order spans 3 tables in one MySQL COMMIT.");
-    println!("      Every order_line must be delivered before its parent order");
+    println!(
+        "      Every order_line must be delivered before its parent order"
+    );
     println!("      becomes visible, and all-or-nothing on fault/recovery.");
     println!();
     println!("    ✓ Mixed INSERT / UPDATE / DELETE at realistic proportions");
@@ -113,7 +123,9 @@ pub fn print_preamble() {
     println!("      table. DeltaForge must adapt without losing events.");
     println!();
     println!("  Requirements:");
-    println!("    • tpcc compose profile running (deltaforge-tpcc on 8082/9002)");
+    println!(
+        "    • tpcc compose profile running (deltaforge-tpcc on 8082/9002)"
+    );
     println!("    • ~300 MB RAM headroom for seed data (W={WAREHOUSES})");
     println!("    • Seed phase ≈ 60-90 s before writes begin");
     println!("    • Storage: see README — ~4 GB per 2-hour run");
@@ -124,7 +136,10 @@ pub fn print_preamble() {
     println!();
 }
 
-pub async fn run(harness: &Harness, duration_mins: u64) -> Result<ScenarioResult> {
+pub async fn run(
+    harness: &Harness,
+    duration_mins: u64,
+) -> Result<ScenarioResult> {
     let name = "tpcc";
     print_preamble();
     harness.setup().await?;
@@ -142,18 +157,24 @@ pub async fn run(harness: &Harness, duration_mins: u64) -> Result<ScenarioResult
 
     // Step 3: launch terminal tasks + schema alter task.
     let counters = Arc::new(Counters::default());
-    let next_o_id = Arc::new(AtomicU64::new((CUSTOMERS_PER_DISTRICT as u64) + 1));
+    let next_o_id =
+        Arc::new(AtomicU64::new((CUSTOMERS_PER_DISTRICT as u64) + 1));
     let stop_flag = Arc::new(AtomicBool::new(false));
     let wake = Arc::new(tokio::sync::Notify::new());
 
-    info!(terminals = TERMINALS, "step 3/4: starting terminal tasks ...");
+    info!(
+        terminals = TERMINALS,
+        "step 3/4: starting terminal tasks ..."
+    );
     let terminal_handles: Vec<_> = (0..TERMINALS)
         .map(|id| {
             let c = Arc::clone(&counters);
             let oid = Arc::clone(&next_o_id);
             let flag = Arc::clone(&stop_flag);
             let w_id = (id as u32 % WAREHOUSES) + 1;
-            tokio::spawn(async move { terminal_loop(id, w_id, c, oid, flag).await })
+            tokio::spawn(
+                async move { terminal_loop(id, w_id, c, oid, flag).await },
+            )
         })
         .collect();
 
@@ -170,7 +191,9 @@ pub async fn run(harness: &Harness, duration_mins: u64) -> Result<ScenarioResult
     let mut faults: Vec<FaultRecord> = Vec::new();
     let mut stats_samples: Vec<ResourceSample> = Vec::new();
 
-    let kafka_start = harness::kafka_offset_for_topic(TPCC_TOPIC).await.unwrap_or(0);
+    let kafka_start = harness::kafka_offset_for_topic(TPCC_TOPIC)
+        .await
+        .unwrap_or(0);
 
     while Instant::now() < deadline {
         let remaining = deadline.duration_since(Instant::now());
@@ -185,7 +208,8 @@ pub async fn run(harness: &Harness, duration_mins: u64) -> Result<ScenarioResult
         sleep(actual_wait).await;
 
         let fault_idx = rng.gen_range(0usize..3);
-        let fault_name = ["network_partition", "sink_outage", "crash"][fault_idx];
+        let fault_name =
+            ["network_partition", "sink_outage", "crash"][fault_idx];
         info!(%fault_name, "injecting fault");
 
         let fault_start = Instant::now();
@@ -198,11 +222,19 @@ pub async fn run(harness: &Harness, duration_mins: u64) -> Result<ScenarioResult
         match inject_result {
             Ok(recovery) => {
                 info!(%fault_name, recovery_secs = recovery.as_secs_f64(), "fault recovered");
-                faults.push(FaultRecord { kind: fault_name, recovery_secs: recovery.as_secs_f64(), recovered: true });
+                faults.push(FaultRecord {
+                    kind: fault_name,
+                    recovery_secs: recovery.as_secs_f64(),
+                    recovered: true,
+                });
             }
             Err(e) => {
                 info!(%fault_name, error = %e, "fault recovery timed out");
-                faults.push(FaultRecord { kind: fault_name, recovery_secs: fault_start.elapsed().as_secs_f64(), recovered: false });
+                faults.push(FaultRecord {
+                    kind: fault_name,
+                    recovery_secs: fault_start.elapsed().as_secs_f64(),
+                    recovered: false,
+                });
             }
         }
     }
@@ -219,24 +251,42 @@ pub async fn run(harness: &Harness, duration_mins: u64) -> Result<ScenarioResult
     let _ = pool.disconnect().await;
 
     // Gather totals.
-    let kafka_end = harness::kafka_offset_for_topic(TPCC_TOPIC).await.unwrap_or(0);
+    let kafka_end = harness::kafka_offset_for_topic(TPCC_TOPIC)
+        .await
+        .unwrap_or(0);
     let delivered = kafka_end.saturating_sub(kafka_start);
     let new_orders = counters.new_orders.load(Ordering::Relaxed);
     let payments = counters.payments.load(Ordering::Relaxed);
     let deliveries = counters.deliveries.load(Ordering::Relaxed);
     let errors = counters.errors.load(Ordering::Relaxed);
     let failed_faults = faults.iter().filter(|f| !f.recovered).count();
-    let avg_recovery = if faults.is_empty() { 0.0 }
-        else { faults.iter().map(|f| f.recovery_secs).sum::<f64>() / faults.len() as f64 };
-    let max_recovery = faults.iter().map(|f| f.recovery_secs).fold(0.0_f64, f64::max);
+    let avg_recovery = if faults.is_empty() {
+        0.0
+    } else {
+        faults.iter().map(|f| f.recovery_secs).sum::<f64>()
+            / faults.len() as f64
+    };
+    let max_recovery = faults
+        .iter()
+        .map(|f| f.recovery_secs)
+        .fold(0.0_f64, f64::max);
     let peak_mem = stats_samples.iter().map(|s| s.mem_bytes).max().unwrap_or(0);
-    let max_cpu = stats_samples.iter().map(|s| (s.cpu_percent * 10.0) as u64).max().unwrap_or(0);
+    let max_cpu = stats_samples
+        .iter()
+        .map(|s| (s.cpu_percent * 10.0) as u64)
+        .max()
+        .unwrap_or(0);
     let alters_ok = alters.iter().filter(|a| a.ok).count();
 
     let mut result = if failed_faults == 0 && errors == 0 {
         ScenarioResult::pass(name)
     } else {
-        ScenarioResult::fail(name, format!("{failed_faults} unrecovered fault(s), {errors} txn error(s)"))
+        ScenarioResult::fail(
+            name,
+            format!(
+                "{failed_faults} unrecovered fault(s), {errors} txn error(s)"
+            ),
+        )
     };
 
     result = result
@@ -252,7 +302,9 @@ pub async fn run(harness: &Harness, duration_mins: u64) -> Result<ScenarioResult
 
     for f in &faults {
         result = result.note(format!(
-            "  {} → {:.1}s ({})", f.kind, f.recovery_secs,
+            "  {} → {:.1}s ({})",
+            f.kind,
+            f.recovery_secs,
             if f.recovered { "OK" } else { "TIMEOUT" }
         ));
     }
@@ -330,11 +382,21 @@ async fn seed_items(pool: &mysql_async::Pool) -> Result<()> {
     for i in 1..=ITEMS {
         let price: f64 = rng.gen_range(1.0..100.0);
         let data = if rng.gen_bool(0.1) {
-            format!("{}ORIGINAL{}", rand_str(&mut rng, 0, 10), rand_str(&mut rng, 0, 10))
+            format!(
+                "{}ORIGINAL{}",
+                rand_str(&mut rng, 0, 10),
+                rand_str(&mut rng, 0, 10)
+            )
         } else {
             rand_str(&mut rng, 26, 50)
         };
-        batch.push((i, i % 10_000 + 1, rand_str(&mut rng, 14, 24), price, data));
+        batch.push((
+            i,
+            i % 10_000 + 1,
+            rand_str(&mut rng, 14, 24),
+            price,
+            data,
+        ));
 
         if batch.len() == 100 {
             conn.exec_batch(
@@ -366,12 +428,19 @@ async fn seed_stock(pool: &mysql_async::Pool) -> Result<()> {
         for i in 1..=ITEMS {
             let qty: i16 = rng.gen_range(10..100);
             batch.push(vec![
-                i.into(), w.into(), qty.into(),
-                rand_fixed24(&mut rng).into(), rand_fixed24(&mut rng).into(),
-                rand_fixed24(&mut rng).into(), rand_fixed24(&mut rng).into(),
-                rand_fixed24(&mut rng).into(), rand_fixed24(&mut rng).into(),
-                rand_fixed24(&mut rng).into(), rand_fixed24(&mut rng).into(),
-                rand_fixed24(&mut rng).into(), rand_fixed24(&mut rng).into(),
+                i.into(),
+                w.into(),
+                qty.into(),
+                rand_fixed24(&mut rng).into(),
+                rand_fixed24(&mut rng).into(),
+                rand_fixed24(&mut rng).into(),
+                rand_fixed24(&mut rng).into(),
+                rand_fixed24(&mut rng).into(),
+                rand_fixed24(&mut rng).into(),
+                rand_fixed24(&mut rng).into(),
+                rand_fixed24(&mut rng).into(),
+                rand_fixed24(&mut rng).into(),
+                rand_fixed24(&mut rng).into(),
                 rand_str(&mut rng, 26, 50).into(),
             ]);
 
@@ -395,7 +464,8 @@ async fn seed_stock(pool: &mysql_async::Pool) -> Result<()> {
               s_dist_06, s_dist_07, s_dist_08, s_dist_09, s_dist_10, s_data) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             batch.drain(..),
-        ).await?;
+        )
+        .await?;
     }
     conn.disconnect().await?;
     info!(rows = WAREHOUSES * ITEMS, "stock seeded");
@@ -414,13 +484,24 @@ async fn seed_customers(pool: &mysql_async::Pool) -> Result<()> {
                 let credit: &str = if rng.gen_bool(0.1) { "BC" } else { "GC" };
                 let discount: f64 = rng.gen_range(0.0..0.5);
                 batch.push(vec![
-                    c.into(), d.into(), w.into(),
-                    rand_str(&mut rng, 8, 16).into(), "OE".into(), last_name(&mut rng, c).into(),
-                    rand_str(&mut rng, 10, 20).into(), rand_str(&mut rng, 10, 20).into(),
-                    rand_str(&mut rng, 10, 20).into(), rand_state(&mut rng).into(),
-                    rand_zip(&mut rng).into(), rand_phone(&mut rng).into(),
-                    credit.into(), 50_000.0_f64.into(), discount.into(),
-                    (-10.0_f64).into(), 1i16.into(), 0i16.into(),
+                    c.into(),
+                    d.into(),
+                    w.into(),
+                    rand_str(&mut rng, 8, 16).into(),
+                    "OE".into(),
+                    last_name(&mut rng, c).into(),
+                    rand_str(&mut rng, 10, 20).into(),
+                    rand_str(&mut rng, 10, 20).into(),
+                    rand_str(&mut rng, 10, 20).into(),
+                    rand_state(&mut rng).into(),
+                    rand_zip(&mut rng).into(),
+                    rand_phone(&mut rng).into(),
+                    credit.into(),
+                    50_000.0_f64.into(),
+                    discount.into(),
+                    (-10.0_f64).into(),
+                    1i16.into(),
+                    0i16.into(),
                     rand_str(&mut rng, 300, 500).into(),
                 ]);
 
@@ -447,7 +528,8 @@ async fn seed_customers(pool: &mysql_async::Pool) -> Result<()> {
               c_payment_cnt, c_delivery_cnt, c_data) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             batch.drain(..),
-        ).await?;
+        )
+        .await?;
     }
     conn.disconnect().await?;
     let total = WAREHOUSES * DISTRICTS * CUSTOMERS_PER_DISTRICT;
@@ -468,7 +550,9 @@ async fn terminal_loop(
     let mut rng = SmallRng::from_entropy();
 
     loop {
-        if stop.load(Ordering::Relaxed) { break; }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
 
         let think_ms = rng.gen_range(THINK_MIN_MS..=THINK_MAX_MS);
         let roll: u8 = rng.gen_range(1..=100);
@@ -491,7 +575,8 @@ async fn terminal_loop(
 
         let result = if roll <= 45 {
             let o_id = next_o_id.fetch_add(1, Ordering::Relaxed);
-            txn_new_order(&mut conn, w_id, d_id, c_id, o_id, ol_cnt, &mut rng).await
+            txn_new_order(&mut conn, w_id, d_id, c_id, o_id, ol_cnt, &mut rng)
+                .await
         } else if roll <= 88 {
             txn_payment(&mut conn, w_id, d_id, c_id, amount, &mut rng).await
         } else {
@@ -501,9 +586,15 @@ async fn terminal_loop(
         match result {
             Ok(kind) => {
                 match kind {
-                    TxnKind::NewOrder   => counters.new_orders.fetch_add(1, Ordering::Relaxed),
-                    TxnKind::Payment    => counters.payments.fetch_add(1, Ordering::Relaxed),
-                    TxnKind::Delivery   => counters.deliveries.fetch_add(1, Ordering::Relaxed),
+                    TxnKind::NewOrder => {
+                        counters.new_orders.fetch_add(1, Ordering::Relaxed)
+                    }
+                    TxnKind::Payment => {
+                        counters.payments.fetch_add(1, Ordering::Relaxed)
+                    }
+                    TxnKind::Delivery => {
+                        counters.deliveries.fetch_add(1, Ordering::Relaxed)
+                    }
                 };
             }
             Err(e) => {
@@ -518,7 +609,11 @@ async fn terminal_loop(
     let _ = pool.disconnect().await;
 }
 
-enum TxnKind { NewOrder, Payment, Delivery }
+enum TxnKind {
+    NewOrder,
+    Payment,
+    Delivery,
+}
 
 // ── New-Order transaction ──────────────────────────────────────────────────────
 // Inserts order + new_order + ol_cnt order_lines, updates ol_cnt stock rows.
@@ -526,7 +621,11 @@ enum TxnKind { NewOrder, Payment, Delivery }
 
 async fn txn_new_order(
     conn: &mut mysql_async::Conn,
-    w_id: u32, d_id: u32, c_id: u32, o_id: u64, ol_cnt: u32,
+    w_id: u32,
+    d_id: u32,
+    c_id: u32,
+    o_id: u64,
+    ol_cnt: u32,
     rng: &mut SmallRng,
 ) -> Result<TxnKind> {
     // Generate all random inputs before touching the DB.
@@ -535,12 +634,18 @@ async fn txn_new_order(
             let i_id = rng.gen_range(1..=ITEMS);
             let supply_w = if WAREHOUSES > 1 && rng.gen_bool(0.15) {
                 (rng.gen_range(1..WAREHOUSES) % WAREHOUSES) + 1
-            } else { w_id };
+            } else {
+                w_id
+            };
             let qty: u16 = rng.gen_range(1..=10);
             (i_id, supply_w, qty)
         })
         .collect();
-    let all_local: u8 = if items.iter().all(|(_, sw, _)| *sw == w_id) { 1 } else { 0 };
+    let all_local: u8 = if items.iter().all(|(_, sw, _)| *sw == w_id) {
+        1
+    } else {
+        0
+    };
 
     let mut tx = conn.start_transaction(TxOpts::default()).await?;
 
@@ -590,8 +695,19 @@ async fn txn_new_order(
              (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, ol_supply_w_id, \
               ol_quantity, ol_amount, ol_dist_info) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (o_id, d_id, w_id, (num + 1) as u8, i_id, supply_w, *qty as i16, amount, dist_info),
-        ).await?;
+            (
+                o_id,
+                d_id,
+                w_id,
+                (num + 1) as u8,
+                i_id,
+                supply_w,
+                *qty as i16,
+                amount,
+                dist_info,
+            ),
+        )
+        .await?;
     }
 
     tx.commit().await?;
@@ -603,17 +719,22 @@ async fn txn_new_order(
 
 async fn txn_payment(
     conn: &mut mysql_async::Conn,
-    w_id: u32, d_id: u32, c_id: u32, amount: f64,
+    w_id: u32,
+    d_id: u32,
+    c_id: u32,
+    amount: f64,
     rng: &mut SmallRng,
 ) -> Result<TxnKind> {
-    let h_data: String = format!("{}    {}", rand_str(rng, 6, 10), rand_str(rng, 6, 10));
+    let h_data: String =
+        format!("{}    {}", rand_str(rng, 6, 10), rand_str(rng, 6, 10));
 
     let mut tx = conn.start_transaction(TxOpts::default()).await?;
 
     tx.exec_drop(
         "UPDATE tpcc_warehouse SET w_ytd = w_ytd + ? WHERE w_id = ?",
         (amount, w_id),
-    ).await?;
+    )
+    .await?;
 
     tx.exec_drop(
         "UPDATE tpcc_district SET d_ytd = d_ytd + ? WHERE d_w_id = ? AND d_id = ?",
@@ -626,7 +747,8 @@ async fn txn_payment(
              c_payment_cnt = c_payment_cnt + 1 \
          WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",
         (amount, amount, w_id, d_id, c_id),
-    ).await?;
+    )
+    .await?;
 
     tx.exec_drop(
         "INSERT INTO tpcc_history \
@@ -644,7 +766,9 @@ async fn txn_payment(
 
 async fn txn_delivery(
     conn: &mut mysql_async::Conn,
-    w_id: u32, d_id: u32, carrier_id: u8,
+    w_id: u32,
+    d_id: u32,
+    carrier_id: u8,
 ) -> Result<TxnKind> {
     let mut tx = conn.start_transaction(TxOpts::default()).await?;
 
@@ -684,7 +808,8 @@ async fn txn_delivery(
         "UPDATE tpcc_order_line SET ol_delivery_d = NOW() \
          WHERE ol_w_id = ? AND ol_d_id = ? AND ol_o_id = ?",
         (w_id, d_id, o_id),
-    ).await?;
+    )
+    .await?;
 
     let ol_total: f64 = tx
         .exec_first(
@@ -700,7 +825,8 @@ async fn txn_delivery(
          SET c_balance = c_balance + ?, c_delivery_cnt = c_delivery_cnt + 1 \
          WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?",
         (ol_total, w_id, d_id, c_id),
-    ).await?;
+    )
+    .await?;
 
     tx.commit().await?;
     Ok(TxnKind::Delivery)
@@ -737,19 +863,33 @@ async fn inject_crash() -> Result<Duration> {
 // ── Schema alter loop ─────────────────────────────────────────────────────────
 
 const TPCC_TABLES: &[&str] = &[
-    "tpcc_warehouse", "tpcc_district", "tpcc_customer", "tpcc_history",
-    "tpcc_item", "tpcc_stock", "tpcc_order", "tpcc_new_order", "tpcc_order_line",
+    "tpcc_warehouse",
+    "tpcc_district",
+    "tpcc_customer",
+    "tpcc_history",
+    "tpcc_item",
+    "tpcc_stock",
+    "tpcc_order",
+    "tpcc_new_order",
+    "tpcc_order_line",
 ];
 
-struct AlterRecord { ok: bool }
+struct AlterRecord {
+    ok: bool,
+}
 
-async fn alter_loop(stop: Arc<AtomicBool>, wake: Arc<tokio::sync::Notify>) -> Vec<AlterRecord> {
+async fn alter_loop(
+    stop: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
+) -> Vec<AlterRecord> {
     let mut rng = SmallRng::from_entropy();
     let mut records = Vec::new();
     let pool = mysql_async::Pool::new(MYSQL_DSN);
 
     loop {
-        if stop.load(Ordering::Relaxed) { break; }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
 
         let wait_secs = rng.gen_range(ALTER_MIN_SECS..=ALTER_MAX_SECS);
         tokio::select! {
@@ -757,17 +897,29 @@ async fn alter_loop(stop: Arc<AtomicBool>, wake: Arc<tokio::sync::Notify>) -> Ve
             _ = sleep(Duration::from_secs(wait_secs)) => {}
         }
 
-        if stop.load(Ordering::Relaxed) { break; }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
 
         let table = TPCC_TABLES[rng.gen_range(0..TPCC_TABLES.len())];
         let col_suffix: u32 = rng.r#gen();
         let col_name = format!("ext_{col_suffix:08x}");
         let sql = match rng.gen_range(0u8..5) {
-            0 => format!("ALTER TABLE {table} ADD COLUMN {col_name} BIGINT DEFAULT NULL"),
-            1 => format!("ALTER TABLE {table} ADD COLUMN {col_name} VARCHAR(128) DEFAULT NULL"),
-            2 => format!("ALTER TABLE {table} ADD COLUMN {col_name} BOOLEAN DEFAULT FALSE"),
-            3 => format!("ALTER TABLE {table} ADD COLUMN {col_name} JSON DEFAULT NULL"),
-            _ => format!("ALTER TABLE {table} ADD COLUMN {col_name} FLOAT DEFAULT NULL"),
+            0 => format!(
+                "ALTER TABLE {table} ADD COLUMN {col_name} BIGINT DEFAULT NULL"
+            ),
+            1 => format!(
+                "ALTER TABLE {table} ADD COLUMN {col_name} VARCHAR(128) DEFAULT NULL"
+            ),
+            2 => format!(
+                "ALTER TABLE {table} ADD COLUMN {col_name} BOOLEAN DEFAULT FALSE"
+            ),
+            3 => format!(
+                "ALTER TABLE {table} ADD COLUMN {col_name} JSON DEFAULT NULL"
+            ),
+            _ => format!(
+                "ALTER TABLE {table} ADD COLUMN {col_name} FLOAT DEFAULT NULL"
+            ),
         };
 
         match pool.get_conn().await {
@@ -794,20 +946,29 @@ async fn alter_loop(stop: Arc<AtomicBool>, wake: Arc<tokio::sync::Notify>) -> Ve
 
 // ── Resource sampling ─────────────────────────────────────────────────────────
 
-struct ResourceSample { mem_bytes: u64, cpu_percent: f64 }
+struct ResourceSample {
+    mem_bytes: u64,
+    cpu_percent: f64,
+}
 
-async fn sample_and_log(samples: &mut Vec<ResourceSample>, counters: &Arc<Counters>) {
+async fn sample_and_log(
+    samples: &mut Vec<ResourceSample>,
+    counters: &Arc<Counters>,
+) {
     if let Ok(s) = docker::sample_stats(TPCC_PROFILE, TPCC_SERVICE).await {
         if s.mem_bytes > 0 {
             info!(
                 cpu = s.cpu_percent,
                 mem_mib = s.mem_bytes / 1024 / 1024,
                 new_orders = counters.new_orders.load(Ordering::Relaxed),
-                payments   = counters.payments.load(Ordering::Relaxed),
+                payments = counters.payments.load(Ordering::Relaxed),
                 deliveries = counters.deliveries.load(Ordering::Relaxed),
                 "resource snapshot",
             );
-            samples.push(ResourceSample { mem_bytes: s.mem_bytes, cpu_percent: s.cpu_percent });
+            samples.push(ResourceSample {
+                mem_bytes: s.mem_bytes,
+                cpu_percent: s.cpu_percent,
+            });
         }
     }
 }
@@ -817,27 +978,48 @@ async fn sample_and_log(samples: &mut Vec<ResourceSample>, counters: &Arc<Counte
 #[derive(Default)]
 struct Counters {
     new_orders: AtomicU64,
-    payments:   AtomicU64,
+    payments: AtomicU64,
     deliveries: AtomicU64,
-    errors:     AtomicU64,
+    errors: AtomicU64,
 }
 
-struct FaultRecord { kind: &'static str, recovery_secs: f64, recovered: bool }
+struct FaultRecord {
+    kind: &'static str,
+    recovery_secs: f64,
+    recovered: bool,
+}
 
 const SYLLABLES: &[&str] = &[
-    "BAR", "OUGHT", "ABLE", "PRI", "PRES", "ESE", "ANTI", "CALLY", "ATION", "EING",
+    "BAR", "OUGHT", "ABLE", "PRI", "PRES", "ESE", "ANTI", "CALLY", "ATION",
+    "EING",
 ];
 
 /// TPC-C last name: concatenate three syllables based on n % 1000.
 fn last_name(rng: &mut SmallRng, c_id: u32) -> String {
-    let n = if c_id <= 1000 { c_id - 1 } else { rng.gen_range(0..1000) };
-    format!("{}{}{}", SYLLABLES[(n / 100) as usize], SYLLABLES[((n / 10) % 10) as usize], SYLLABLES[(n % 10) as usize])
+    let n = if c_id <= 1000 {
+        c_id - 1
+    } else {
+        rng.gen_range(0..1000)
+    };
+    format!(
+        "{}{}{}",
+        SYLLABLES[(n / 100) as usize],
+        SYLLABLES[((n / 10) % 10) as usize],
+        SYLLABLES[(n % 10) as usize]
+    )
 }
 
 fn rand_str(rng: &mut SmallRng, min: usize, max: usize) -> String {
-    const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let len = if min == max { min } else { rng.gen_range(min..=max) };
-    (0..len).map(|_| ALPHA[rng.gen_range(0..ALPHA.len())] as char).collect()
+    const ALPHA: &[u8] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let len = if min == max {
+        min
+    } else {
+        rng.gen_range(min..=max)
+    };
+    (0..len)
+        .map(|_| ALPHA[rng.gen_range(0..ALPHA.len())] as char)
+        .collect()
 }
 
 fn rand_fixed24(rng: &mut SmallRng) -> String {
@@ -846,14 +1028,23 @@ fn rand_fixed24(rng: &mut SmallRng) -> String {
 }
 
 fn rand_state(rng: &mut SmallRng) -> &'static str {
-    const STATES: &[&str] = &["CA", "TX", "NY", "FL", "WA", "OR", "IL", "OH", "GA", "NC"];
+    const STATES: &[&str] =
+        &["CA", "TX", "NY", "FL", "WA", "OR", "IL", "OH", "GA", "NC"];
     STATES[rng.gen_range(0..STATES.len())]
 }
 
-fn rand_zip(rng: &mut SmallRng) -> String { format!("{:05}1111", rng.gen_range(0..100_000u32)) }
-fn rand_tax(rng: &mut SmallRng) -> f64    { rng.gen_range(0.0..0.2) }
+fn rand_zip(rng: &mut SmallRng) -> String {
+    format!("{:05}1111", rng.gen_range(0..100_000u32))
+}
+fn rand_tax(rng: &mut SmallRng) -> f64 {
+    rng.gen_range(0.0..0.2)
+}
 fn rand_phone(rng: &mut SmallRng) -> String {
-    format!("{:04}-{:03}-{:04}-{:04}",
-        rng.gen_range(0..10000u32), rng.gen_range(0..1000u32),
-        rng.gen_range(0..10000u32), rng.gen_range(0..10000u32))
+    format!(
+        "{:04}-{:03}-{:04}-{:04}",
+        rng.gen_range(0..10000u32),
+        rng.gen_range(0..1000u32),
+        rng.gen_range(0..10000u32),
+        rng.gen_range(0..10000u32)
+    )
 }

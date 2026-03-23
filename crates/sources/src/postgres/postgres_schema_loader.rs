@@ -113,11 +113,17 @@ impl PostgresSchemaLoader {
                 let (schema, table) = pair;
                 match self.registry.get_latest(&self.tenant, schema, table) {
                     Some(sv) => {
-                        match serde_json::from_value::<PostgresTableSchema>(sv.schema_json) {
+                        match serde_json::from_value::<PostgresTableSchema>(
+                            sv.schema_json,
+                        ) {
                             Ok(pg_schema) => {
                                 let fingerprint = pg_schema.fingerprint();
                                 let column_names = Arc::new(
-                                    pg_schema.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                                    pg_schema
+                                        .columns
+                                        .iter()
+                                        .map(|c| c.name.clone())
+                                        .collect::<Vec<_>>(),
                                 );
                                 cache.insert(
                                     (schema.clone(), table.clone()),
@@ -222,12 +228,12 @@ impl PostgresSchemaLoader {
             debug!(schema = %schema, table = %table, "schema cache hit");
             counter!("deltaforge_source_schema_cache_hits_total",
                 "pipeline" => self.tenant.clone(), "source" => "postgres")
-                .increment(1);
+            .increment(1);
             return Ok(cached.clone());
         }
         counter!("deltaforge_source_schema_cache_misses_total",
             "pipeline" => self.tenant.clone(), "source" => "postgres")
-            .increment(1);
+        .increment(1);
 
         let t0 = Instant::now();
         let pg_schema = self.fetch_schema(schema, table).await?;

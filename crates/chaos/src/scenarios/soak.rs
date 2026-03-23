@@ -34,8 +34,14 @@ use crate::harness::{self, Harness, ScenarioResult};
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// 6 domains × 20 tables = 120 total.
-const DOMAINS: &[&str] =
-    &["customer", "order", "product", "inventory", "payment", "event"];
+const DOMAINS: &[&str] = &[
+    "customer",
+    "order",
+    "product",
+    "inventory",
+    "payment",
+    "event",
+];
 const TABLES_PER_DOMAIN: usize = 20;
 
 /// Default number of concurrent writer goroutines driving DML.
@@ -53,7 +59,7 @@ const OUTAGE_HOLD_SECS: u64 = 20;
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Interval between mid-stream ALTER TABLE operations (schema drift injection).
-const ALTER_MIN_SECS: u64 = 600;  // 10 min
+const ALTER_MIN_SECS: u64 = 600; // 10 min
 const ALTER_MAX_SECS: u64 = 1800; // 30 min
 
 /// Compose profile and service for the soak DeltaForge instance.
@@ -68,7 +74,12 @@ pub const SOAK_TOPIC: &str = "chaos.soak";
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-pub async fn run(harness: &Harness, duration_mins: u64, writer_tasks: usize, write_delay_ms: u64) -> Result<ScenarioResult> {
+pub async fn run(
+    harness: &Harness,
+    duration_mins: u64,
+    writer_tasks: usize,
+    write_delay_ms: u64,
+) -> Result<ScenarioResult> {
     let name = "soak";
     harness.setup().await?;
 
@@ -93,13 +104,22 @@ pub async fn run(harness: &Harness, duration_mins: u64, writer_tasks: usize, wri
     let stop_flag = Arc::new(AtomicBool::new(false));
     let wake = Arc::new(tokio::sync::Notify::new());
 
-    let writer_tasks = if writer_tasks == 0 { DEFAULT_WRITER_TASKS } else { writer_tasks };
-    info!(writer_tasks, write_delay_ms, "step 3/4: starting writer tasks ...");
+    let writer_tasks = if writer_tasks == 0 {
+        DEFAULT_WRITER_TASKS
+    } else {
+        writer_tasks
+    };
+    info!(
+        writer_tasks,
+        write_delay_ms, "step 3/4: starting writer tasks ..."
+    );
     let writer_handles: Vec<_> = (0..writer_tasks)
         .map(|id| {
             let written = Arc::clone(&total_written);
             let flag = Arc::clone(&stop_flag);
-            tokio::spawn(async move { writer_loop(id, written, flag, write_delay_ms).await })
+            tokio::spawn(async move {
+                writer_loop(id, written, flag, write_delay_ms).await
+            })
         })
         .collect();
 
@@ -117,8 +137,9 @@ pub async fn run(harness: &Harness, duration_mins: u64, writer_tasks: usize, wri
     let mut stats_samples: Vec<ResourceSample> = Vec::new();
 
     // Kafka baseline so we can count delivered events over the run.
-    let kafka_start =
-        harness::kafka_offset_for_topic(SOAK_TOPIC).await.unwrap_or(0);
+    let kafka_start = harness::kafka_offset_for_topic(SOAK_TOPIC)
+        .await
+        .unwrap_or(0);
 
     while Instant::now() < deadline {
         let remaining = deadline.duration_since(Instant::now());
@@ -143,7 +164,8 @@ pub async fn run(harness: &Harness, duration_mins: u64, writer_tasks: usize, wri
 
         // Pick and inject a random fault.
         let fault_idx = rng.gen_range(0usize..3);
-        let fault_name = ["network_partition", "sink_outage", "crash"][fault_idx];
+        let fault_name =
+            ["network_partition", "sink_outage", "crash"][fault_idx];
         info!(%fault_name, "injecting fault");
 
         let fault_start = Instant::now();
@@ -189,8 +211,9 @@ pub async fn run(harness: &Harness, duration_mins: u64, writer_tasks: usize, wri
     let alters = alter_handle.await.unwrap_or_default();
 
     // Gather totals.
-    let kafka_end =
-        harness::kafka_offset_for_topic(SOAK_TOPIC).await.unwrap_or(0);
+    let kafka_end = harness::kafka_offset_for_topic(SOAK_TOPIC)
+        .await
+        .unwrap_or(0);
     let delivered = kafka_end.saturating_sub(kafka_start);
     let written = total_written.load(Ordering::Relaxed);
     let failed = faults.iter().filter(|f| !f.recovered).count();
@@ -199,12 +222,14 @@ pub async fn run(harness: &Harness, duration_mins: u64, writer_tasks: usize, wri
     let avg_recovery = if faults.is_empty() {
         0.0
     } else {
-        faults.iter().map(|f| f.recovery_secs).sum::<f64>() / faults.len() as f64
+        faults.iter().map(|f| f.recovery_secs).sum::<f64>()
+            / faults.len() as f64
     };
-    let max_recovery =
-        faults.iter().map(|f| f.recovery_secs).fold(0.0_f64, f64::max);
-    let peak_mem =
-        stats_samples.iter().map(|s| s.mem_bytes).max().unwrap_or(0);
+    let max_recovery = faults
+        .iter()
+        .map(|f| f.recovery_secs)
+        .fold(0.0_f64, f64::max);
+    let peak_mem = stats_samples.iter().map(|s| s.mem_bytes).max().unwrap_or(0);
     let max_cpu = stats_samples
         .iter()
         .map(|s| (s.cpu_percent * 10.0) as u64)
@@ -214,7 +239,10 @@ pub async fn run(harness: &Harness, duration_mins: u64, writer_tasks: usize, wri
     let mut result = if failed == 0 {
         ScenarioResult::pass(name)
     } else {
-        ScenarioResult::fail(name, format!("{failed} fault(s) did not recover within timeout"))
+        ScenarioResult::fail(
+            name,
+            format!("{failed} fault(s) did not recover within timeout"),
+        )
     };
 
     result = result
@@ -255,7 +283,12 @@ pub async fn run(harness: &Harness, duration_mins: u64, writer_tasks: usize, wri
 /// Same as [`run`] but with **no fault injection** — only writers and ALTER TABLE
 /// run for the full duration. Use this to establish a steady-state baseline
 /// for metrics like cache hit ratio, E2E latency, and resource usage.
-pub async fn run_stable(harness: &Harness, duration_mins: u64, writer_tasks: usize, write_delay_ms: u64) -> Result<ScenarioResult> {
+pub async fn run_stable(
+    harness: &Harness,
+    duration_mins: u64,
+    writer_tasks: usize,
+    write_delay_ms: u64,
+) -> Result<ScenarioResult> {
     let name = "soak-stable";
     harness.setup().await?;
 
@@ -263,20 +296,32 @@ pub async fn run_stable(harness: &Harness, duration_mins: u64, writer_tasks: usi
     harness::wait_for_url(SOAK_HEALTH_URL, Duration::from_secs(60)).await?;
     info!("soak DeltaForge is healthy");
 
-    info!(tables = DOMAINS.len() * TABLES_PER_DOMAIN, "step 2/3: verifying soak tables exist ...");
+    info!(
+        tables = DOMAINS.len() * TABLES_PER_DOMAIN,
+        "step 2/3: verifying soak tables exist ..."
+    );
     seed_tables().await?;
 
     let total_written = Arc::new(AtomicU64::new(0));
     let stop_flag = Arc::new(AtomicBool::new(false));
     let wake = Arc::new(tokio::sync::Notify::new());
 
-    let writer_tasks = if writer_tasks == 0 { DEFAULT_WRITER_TASKS } else { writer_tasks };
-    info!(writer_tasks, write_delay_ms, "step 3/3: starting writer tasks (no faults) ...");
+    let writer_tasks = if writer_tasks == 0 {
+        DEFAULT_WRITER_TASKS
+    } else {
+        writer_tasks
+    };
+    info!(
+        writer_tasks,
+        write_delay_ms, "step 3/3: starting writer tasks (no faults) ..."
+    );
     let writer_handles: Vec<_> = (0..writer_tasks)
         .map(|id| {
             let written = Arc::clone(&total_written);
             let flag = Arc::clone(&stop_flag);
-            tokio::spawn(async move { writer_loop(id, written, flag, write_delay_ms).await })
+            tokio::spawn(async move {
+                writer_loop(id, written, flag, write_delay_ms).await
+            })
         })
         .collect();
 
@@ -286,7 +331,9 @@ pub async fn run_stable(harness: &Harness, duration_mins: u64, writer_tasks: usi
         tokio::spawn(async move { alter_loop(flag, w).await })
     };
 
-    let kafka_start = harness::kafka_offset_for_topic(SOAK_TOPIC).await.unwrap_or(0);
+    let kafka_start = harness::kafka_offset_for_topic(SOAK_TOPIC)
+        .await
+        .unwrap_or(0);
     let deadline = Instant::now() + Duration::from_secs(duration_mins * 60);
     let mut stats_samples: Vec<ResourceSample> = Vec::new();
 
@@ -306,17 +353,28 @@ pub async fn run_stable(harness: &Harness, duration_mins: u64, writer_tasks: usi
     }
     let alters = alter_handle.await.unwrap_or_default();
 
-    let kafka_end = harness::kafka_offset_for_topic(SOAK_TOPIC).await.unwrap_or(0);
+    let kafka_end = harness::kafka_offset_for_topic(SOAK_TOPIC)
+        .await
+        .unwrap_or(0);
     let delivered = kafka_end.saturating_sub(kafka_start);
     let written = total_written.load(Ordering::Relaxed);
     let alters_ok = alters.iter().filter(|a| a.ok).count();
     let alters_failed = alters.iter().filter(|a| !a.ok).count();
     let peak_mem = stats_samples.iter().map(|s| s.mem_bytes).max().unwrap_or(0);
-    let max_cpu = stats_samples.iter().map(|s| (s.cpu_percent * 10.0) as u64).max().unwrap_or(0);
+    let max_cpu = stats_samples
+        .iter()
+        .map(|s| (s.cpu_percent * 10.0) as u64)
+        .max()
+        .unwrap_or(0);
 
     let result = ScenarioResult::pass(name)
         .note(format!("duration: {duration_mins} min"))
-        .note(format!("tables: {} ({} domains × {} each)", DOMAINS.len() * TABLES_PER_DOMAIN, DOMAINS.len(), TABLES_PER_DOMAIN))
+        .note(format!(
+            "tables: {} ({} domains × {} each)",
+            DOMAINS.len() * TABLES_PER_DOMAIN,
+            DOMAINS.len(),
+            TABLES_PER_DOMAIN
+        ))
         .note(format!("writer tasks: {writer_tasks}"))
         .note(format!("write delay max: {write_delay_ms} ms"))
         .note(format!("rows written to DB: {written}"))
@@ -377,9 +435,15 @@ async fn writer_loop(
     loop {
         // Compute the sleep duration before the select so rng is not held
         // across the await point (required for Send).
-        if stop.load(Ordering::Relaxed) { break; }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
 
-        let delay_ms = if write_delay_ms == 0 { 0 } else { rng.gen_range(1u64..=write_delay_ms) };
+        let delay_ms = if write_delay_ms == 0 {
+            0
+        } else {
+            rng.gen_range(1u64..=write_delay_ms)
+        };
         if delay_ms > 0 {
             sleep(Duration::from_millis(delay_ms)).await;
         }
@@ -523,14 +587,19 @@ struct AlterRecord {
 /// while the endurance loop is running. Uses unique random column names so
 /// multiple runs against the same volumes don't collide. Errors are logged
 /// and swallowed — a failed alter is interesting but not a test failure.
-async fn alter_loop(stop: Arc<AtomicBool>, wake: Arc<tokio::sync::Notify>) -> Vec<AlterRecord> {
+async fn alter_loop(
+    stop: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
+) -> Vec<AlterRecord> {
     let tables = all_tables();
     let mut rng = SmallRng::from_entropy();
     let mut records: Vec<AlterRecord> = Vec::new();
     let pool = mysql_async::Pool::new(MYSQL_DSN);
 
     loop {
-        if stop.load(Ordering::Relaxed) { break; }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
 
         // Wait for the inter-alter interval, but wake early if stop fires.
         let wait_secs = rng.gen_range(ALTER_MIN_SECS..=ALTER_MAX_SECS);
@@ -539,7 +608,9 @@ async fn alter_loop(stop: Arc<AtomicBool>, wake: Arc<tokio::sync::Notify>) -> Ve
             _ = sleep(Duration::from_secs(wait_secs)) => {}
         }
 
-        if stop.load(Ordering::Relaxed) { break; }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
 
         let table = tables[rng.gen_range(0..tables.len())].clone();
         // Random suffix makes the column name unique across restarts.
@@ -547,11 +618,21 @@ async fn alter_loop(stop: Arc<AtomicBool>, wake: Arc<tokio::sync::Notify>) -> Ve
         let col_name = format!("ext_{col_suffix:08x}");
 
         let sql = match rng.gen_range(0u8..5) {
-            0 => format!("ALTER TABLE {table} ADD COLUMN {col_name} BIGINT DEFAULT NULL"),
-            1 => format!("ALTER TABLE {table} ADD COLUMN {col_name} VARCHAR(128) DEFAULT NULL"),
-            2 => format!("ALTER TABLE {table} ADD COLUMN {col_name} BOOLEAN DEFAULT FALSE"),
-            3 => format!("ALTER TABLE {table} ADD COLUMN {col_name} JSON DEFAULT NULL"),
-            _ => format!("ALTER TABLE {table} ADD COLUMN {col_name} FLOAT DEFAULT NULL"),
+            0 => format!(
+                "ALTER TABLE {table} ADD COLUMN {col_name} BIGINT DEFAULT NULL"
+            ),
+            1 => format!(
+                "ALTER TABLE {table} ADD COLUMN {col_name} VARCHAR(128) DEFAULT NULL"
+            ),
+            2 => format!(
+                "ALTER TABLE {table} ADD COLUMN {col_name} BOOLEAN DEFAULT FALSE"
+            ),
+            3 => format!(
+                "ALTER TABLE {table} ADD COLUMN {col_name} JSON DEFAULT NULL"
+            ),
+            _ => format!(
+                "ALTER TABLE {table} ADD COLUMN {col_name} FLOAT DEFAULT NULL"
+            ),
         };
 
         match pool.get_conn().await {

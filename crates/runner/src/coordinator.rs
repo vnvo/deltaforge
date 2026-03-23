@@ -893,8 +893,9 @@ pub fn build_batch_processor(
                             "processor" => pid.to_string(),
                         )
                         .increment(1);
-                        return Err(e)
-                            .with_context(|| format!("processor {pid} failed"));
+                        return Err(e).with_context(|| {
+                            format!("processor {pid} failed")
+                        });
                     }
                 };
 

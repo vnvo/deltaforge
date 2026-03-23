@@ -106,11 +106,17 @@ impl MySqlSchemaLoader {
                 let (db, table) = pair;
                 match self.registry.get_latest(&self.tenant, db, table) {
                     Some(sv) => {
-                        match serde_json::from_value::<MySqlTableSchema>(sv.schema_json) {
+                        match serde_json::from_value::<MySqlTableSchema>(
+                            sv.schema_json,
+                        ) {
                             Ok(schema) => {
                                 let fingerprint = schema.fingerprint();
                                 let column_names = Arc::new(
-                                    schema.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                                    schema
+                                        .columns
+                                        .iter()
+                                        .map(|c| c.name.clone())
+                                        .collect::<Vec<_>>(),
                                 );
                                 cache.insert(
                                     (db.clone(), table.clone()),
@@ -241,12 +247,12 @@ impl MySqlSchemaLoader {
             debug!(db = %db, table = %table, "schema cache hit");
             counter!("deltaforge_source_schema_cache_hits_total",
                 "pipeline" => self.tenant.clone(), "source" => "mysql")
-                .increment(1);
+            .increment(1);
             return Ok(cached.clone());
         }
         counter!("deltaforge_source_schema_cache_misses_total",
             "pipeline" => self.tenant.clone(), "source" => "mysql")
-            .increment(1);
+        .increment(1);
 
         let t0 = Instant::now();
         let schema = self.fetch_schema(db, table).await?;

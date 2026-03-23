@@ -2,7 +2,9 @@ use axum::{Router, routing::get};
 use metrics::{
     Unit, describe_counter, describe_gauge, describe_histogram, gauge,
 };
-use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use metrics_exporter_prometheus::{
+    Matcher, PrometheusBuilder, PrometheusHandle,
+};
 use once_cell::sync::OnceCell;
 use std::{net::SocketAddr, time::Duration};
 use tokio::net::TcpListener;
@@ -32,10 +34,12 @@ pub fn init(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     if HANDLE.get().is_none() {
         // Latency buckets: 1 ms → 30 s, covering CDC e2e and sink/stage latency.
         let latency_buckets: &[f64] = &[
-            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            10.0, 30.0,
         ];
         // Batch-size buckets: 1 event up to max configured batch.
-        let batch_buckets: &[f64] = &[1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0];
+        let batch_buckets: &[f64] =
+            &[1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0];
 
         let builder = PrometheusBuilder::new()
             .set_buckets_for_metric(
