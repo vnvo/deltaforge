@@ -1,0 +1,29 @@
+[package]
+name = "chaos"
+version = "0.1.0"
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+description = "Chaos scenario runner for DeltaForge reliability testing"
+
+[[bin]]
+name = "chaos"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+axum.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+clap = { version = "4", features = ["derive"] }
+rand = { version = "0.8", features = ["small_rng"] }
+reqwest = { version = "0.12", features = ["json"] }
+rdkafka.workspace = true
+mysql_async = "0.35"
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+chrono.workspace = true
+
+[lints]
+workspace = true

@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use checkpoints::CheckpointStore;
 use futures::future::BoxFuture;
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
 use parking_lot::Mutex;
 use tokio::sync::watch;
 use tokio::time::{Instant, interval};
@@ -635,7 +635,7 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
 
             if evolutions > 0 {
                 counter!(
-                    "deltaforge_schema_evolutions_total",
+                    "deltaforge_pipeline_evolutions_total",
                     "pipeline" => self.pipeline_name.to_string()
                 )
                 .increment(evolutions as u64);
@@ -653,6 +653,35 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
 
         // Recompute size after processing
         let bytes: usize = events.iter().map(event_size_hint).sum();
+
+        // Replication lag and e2e latency relative to wall-clock.
+        if let Some(last_ts_ms) = events.last().map(|e| e.ts_ms) {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let lag_secs = ((now_ms - last_ts_ms).max(0) as f64) / 1000.0;
+            gauge!(
+                "deltaforge_source_lag_seconds",
+                "pipeline" => self.pipeline_name.to_string()
+            )
+            .set(lag_secs);
+
+            // E2E latency: first event's pipeline-receive time → now (before sink
+            // delivery). Uses received_at_ms (wall-clock at parse time) rather than
+            // ts_ms (binlog header timestamp, second-precision) so the metric reflects
+            // actual pipeline processing time, not source clock granularity.
+            let first_received_ms = events
+                .first()
+                .map(|e| e.received_at_ms)
+                .filter(|&t| t > 0)
+                .unwrap_or(last_ts_ms);
+            histogram!(
+                "deltaforge_e2e_latency_seconds",
+                "pipeline" => self.pipeline_name.to_string(),
+            )
+            .record(((now_ms - first_received_ms).max(0) as f64) / 1000.0);
+        }
 
         histogram!(
             "deltaforge_batch_events",
@@ -715,6 +744,13 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                     }
 
                     counter!(
+                        "deltaforge_sink_batch_total",
+                        "pipeline" => self.pipeline_name.to_string(),
+                        "sink" => sink_id.clone()
+                    )
+                    .increment(1);
+
+                    counter!(
                         "deltaforge_sink_events_total",
                         "pipeline" => self.pipeline_name.to_string(),
                         "sink" => sink_id.clone()
@@ -769,6 +805,17 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                     "pipeline" => self.pipeline_name.to_string()
                 )
                 .increment(1);
+
+                gauge!(
+                    "deltaforge_last_checkpoint_ts",
+                    "pipeline" => self.pipeline_name.to_string()
+                )
+                .set(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs_f64())
+                        .unwrap_or(0.0),
+                );
             }
         } else {
             warn!(
@@ -837,10 +884,20 @@ pub fn build_batch_processor(
             for p in procs.iter() {
                 let pid = p.id();
                 let start = Instant::now();
-                batch = p
-                    .process(batch, &ctx)
-                    .await
-                    .with_context(|| format!("processor {pid} failed"))?;
+                batch = match p.process(batch, &ctx).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        counter!(
+                            "deltaforge_processor_errors_total",
+                            "pipeline" => pipeline.to_string(),
+                            "processor" => pid.to_string(),
+                        )
+                        .increment(1);
+                        return Err(e).with_context(|| {
+                            format!("processor {pid} failed")
+                        });
+                    }
+                };
 
                 histogram!(
                     "deltaforge_processor_latency_seconds",

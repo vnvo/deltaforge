@@ -43,6 +43,7 @@ use deltaforge_core::encoding::EncodingType;
 use deltaforge_core::envelope::Envelope;
 use deltaforge_core::{Event, Sink, SinkError, SinkResult};
 use futures::future::try_join_all;
+use metrics::counter;
 use serde_json::Value;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -68,6 +69,7 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// NATS JetStream sink with connection management and retry logic.
 pub struct NatsSink {
     id: String,
+    pipeline: String,
     cfg: NatsSinkCfg,
 
     subject: String, // static fallback
@@ -113,6 +115,7 @@ impl NatsSink {
     pub fn new(
         cfg: &NatsSinkCfg,
         cancel: CancellationToken,
+        pipeline: &str,
     ) -> anyhow::Result<Self> {
         // Extract timeouts from config or use defaults
         let send_timeout = cfg
@@ -159,6 +162,7 @@ impl NatsSink {
 
         Ok(Self {
             id: cfg.id.clone(),
+            pipeline: pipeline.to_string(),
             cfg: cfg.clone(),
             subject: cfg.subject.clone(),
             subject_template,
@@ -350,6 +354,12 @@ impl NatsSink {
         match result {
             Ok(state) => {
                 info!(url = %url_redacted, "nats connection established");
+                counter!(
+                    "deltaforge_sink_reconnects_total",
+                    "pipeline" => self.pipeline.clone(),
+                    "sink" => self.id.clone(),
+                )
+                .increment(1);
                 Ok(state)
             }
             Err(outcome) => {
@@ -529,16 +539,36 @@ impl Sink for NatsSink {
         }
 
         // Pre-serialize all payloads with resolved subjects and headers
-        let serialized: Vec<(String, Vec<u8>, Option<async_nats::HeaderMap>)> =
-            events
-                .iter()
-                .map(|e| {
-                    let subject = self.resolve_subject(e)?;
-                    let payload = self.serialize_event(e)?;
-                    let headers = self.build_nats_headers(e);
-                    Ok((subject, payload, headers))
-                })
-                .collect::<Result<Vec<_>, SinkError>>()?;
+        let serialized: Result<
+            Vec<(String, Vec<u8>, Option<async_nats::HeaderMap>)>,
+            SinkError,
+        > = events
+            .iter()
+            .map(|e| {
+                let subject = self.resolve_subject(e)?;
+                let payload = self.serialize_event(e)?;
+                let headers = self.build_nats_headers(e);
+                Ok((subject, payload, headers))
+            })
+            .collect();
+        let serialized = match serialized {
+            Ok(s) => s,
+            Err(e) => {
+                let kind = match &e {
+                    SinkError::Serialization { .. } => "serialization",
+                    SinkError::Routing { .. } => "routing",
+                    _ => "other",
+                };
+                counter!(
+                    "deltaforge_sink_routing_errors_total",
+                    "pipeline" => self.pipeline.clone(),
+                    "sink" => self.id.clone(),
+                    "kind" => kind,
+                )
+                .increment(1);
+                return Err(e);
+            }
+        };
 
         // Retry loop for transient failures
         let policy = RetryPolicy::new(
@@ -626,6 +656,14 @@ impl Sink for NatsSink {
 
         match result {
             Ok(_) => {
+                let total_bytes: u64 =
+                    serialized.iter().map(|(_, p, _)| p.len() as u64).sum();
+                counter!(
+                    "deltaforge_sink_bytes_total",
+                    "pipeline" => self.pipeline.clone(),
+                    "sink" => self.id.clone(),
+                )
+                .increment(total_bytes);
                 debug!(count = events.len(), "batch sent to nats");
                 Ok(())
             }

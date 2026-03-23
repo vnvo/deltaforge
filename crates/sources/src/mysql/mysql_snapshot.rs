@@ -23,6 +23,7 @@ use anyhow::{Context, Result};
 use checkpoints::CheckpointStore;
 use deltaforge_config::SnapshotCfg;
 use deltaforge_core::{Event, Op, SourceInfo, SourcePosition};
+use metrics::counter;
 use mysql_async::{Pool, Row, Value, prelude::Queryable};
 use scopeguard;
 use serde::{Deserialize, Serialize};
@@ -417,6 +418,13 @@ impl TableWorker {
         };
 
         self.conn.query_drop("COMMIT").await.ok();
+
+        counter!(
+            "deltaforge_snapshot_rows_total",
+            "pipeline" => self.pipeline.clone(),
+            "table" => table_fqn.clone()
+        )
+        .increment(rows_sent);
 
         info!(
             table = %table_fqn,

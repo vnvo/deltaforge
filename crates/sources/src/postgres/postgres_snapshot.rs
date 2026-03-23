@@ -21,6 +21,7 @@ use checkpoints::CheckpointStore;
 use common::redact_url_password;
 use deltaforge_config::SnapshotCfg;
 use deltaforge_core::{Event, Op, SourceInfo, SourcePosition};
+use metrics::counter;
 use pgwire_replication::Lsn;
 use scopeguard;
 use serde::{Deserialize, Serialize};
@@ -361,6 +362,13 @@ impl TableWorker {
         };
 
         client.batch_execute("COMMIT").await.ok();
+
+        counter!(
+            "deltaforge_snapshot_rows_total",
+            "pipeline" => self.pipeline.clone(),
+            "table" => fqn.clone()
+        )
+        .increment(rows_sent);
 
         info!(
             table = %fqn,

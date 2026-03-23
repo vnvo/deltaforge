@@ -1,0 +1,36 @@
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: chaos-tpcc
+  tenant: chaos
+
+spec:
+  source:
+    type: mysql
+    config:
+      id: chaos-tpcc-mysql
+      dsn: "mysql://cdc_user:cdc_password@toxiproxy:5100/orders"
+      tables:
+        - "orders.tpcc_*"
+      on_schema_drift: adapt
+
+  processors: []
+
+  sinks:
+    - type: kafka
+      config:
+        id: chaos-tpcc-kafka
+        brokers: "toxiproxy:5102"
+        topic: chaos.tpcc
+        required: true
+        send_timeout_secs: 5
+
+  batch:
+    max_events: 500
+    max_ms: 100
+    # Respect MySQL transaction boundaries so New-Order events (order +
+    # order_line × N + stock × N) are delivered atomically to the sink.
+    respect_source_tx: true
+
+  commit_policy:
+    mode: required

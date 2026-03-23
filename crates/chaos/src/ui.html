@@ -1,0 +1,1070 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DeltaForge Playground</title>
+<style>
+:root {
+  --bg:      #0d1117;
+  --surface: #161b22;
+  --surface2:#1c2128;
+  --border:  #30363d;
+  --text:    #e6edf3;
+  --muted:   #7d8590;
+  --green:   #3fb950;
+  --red:     #f85149;
+  --yellow:  #d29922;
+  --blue:    #58a6ff;
+  --orange:  #db6d28;
+  --purple:  #bc8cff;
+  --radius:  8px;
+  --mono: 'SF Mono','Fira Code','Cascadia Code','Consolas',monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;font-size:14px;line-height:1.5;min-height:100vh;display:flex;flex-direction:column}
+
+/* ── Header ── */
+header{display:flex;align-items:center;gap:16px;padding:12px 20px;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0}
+.logo{font-size:18px;font-weight:700;letter-spacing:-0.3px}
+.logo span{color:var(--blue)}
+.tagline{color:var(--muted);font-size:12px;flex:1}
+header nav{display:flex;gap:8px}
+header nav a{color:var(--blue);text-decoration:none;font-size:12px;padding:4px 10px;border:1px solid var(--border);border-radius:var(--radius);transition:background .15s}
+header nav a:hover{background:var(--surface2)}
+
+/* ── Layout ── */
+.main{display:grid;grid-template-columns:260px 280px 1fr;gap:16px;padding:16px;flex:1;min-height:0}
+.col{display:flex;flex-direction:column;gap:12px;min-height:0}
+
+/* ── Cards ── */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px;display:flex;flex-direction:column;gap:10px}
+.card h3{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);padding-bottom:6px;border-bottom:1px solid var(--border)}
+
+/* ── Service pills ── */
+.svc-grid{display:flex;flex-direction:column;gap:4px}
+.svc-row{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:5px;font-size:13px}
+.svc-row:hover{background:var(--surface2)}
+.dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.dot.running{background:var(--green)}
+.dot.exited{background:var(--red)}
+.dot.absent{background:var(--border)}
+.dot.starting{background:var(--yellow)}
+.svc-name{flex:1;font-family:var(--mono);font-size:12px}
+.svc-badge{font-size:10px;padding:1px 5px;border-radius:3px;font-family:var(--mono)}
+.badge-ok{background:#1a3a1a;color:var(--green)}
+.badge-err{background:#3a1a1a;color:var(--red)}
+.badge-warn{background:#3a2a0a;color:var(--yellow)}
+.badge-dim{background:var(--surface2);color:var(--muted)}
+.health-dot{width:6px;height:6px;border-radius:50%;margin-left:auto}
+.health-dot.healthy{background:var(--green)}
+.health-dot.unhealthy{background:var(--red)}
+.health-dot.starting{background:var(--yellow)}
+
+/* ── Buttons ── */
+btn,button,.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:6px 12px;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface2);color:var(--text);font-size:12px;font-family:inherit;cursor:pointer;transition:all .15s;white-space:nowrap}
+button:hover,.btn:hover{background:var(--border)}
+button:active{transform:scale(.97)}
+button:disabled{opacity:.4;cursor:not-allowed}
+.btn-green{background:#1a3a1a;border-color:var(--green);color:var(--green)}
+.btn-green:hover{background:#224022}
+.btn-red{background:#3a1a1a;border-color:var(--red);color:var(--red)}
+.btn-red:hover{background:#4a2020}
+.btn-yellow{background:#2a1f0a;border-color:var(--yellow);color:var(--yellow)}
+.btn-yellow:hover{background:#352808}
+.btn-blue{background:#0d2040;border-color:var(--blue);color:var(--blue)}
+.btn-blue:hover{background:#112850}
+
+/* ── Infra controls ── */
+.group-header{display:flex;align-items:center;gap:6px;padding:6px 8px 2px;font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted)}
+.group-header-label{flex:1}
+.btn-sm{padding:2px 7px;font-size:10px}
+
+/* ── Fault grid ── */
+.fault-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.fault-btn{flex-direction:column;gap:2px;padding:10px 8px;text-align:center;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface2);cursor:pointer;transition:all .15s}
+.fault-btn:hover{border-color:var(--orange);background:#1e1408}
+.fault-btn .f-icon{font-size:18px}
+.fault-btn .f-label{font-size:11px;font-weight:600}
+.fault-btn .f-desc{font-size:10px;color:var(--muted)}
+.fault-btn.danger:hover{border-color:var(--red);background:#1e0808}
+.fault-btn.clear-btn{grid-column:1/-1;border-color:var(--green);background:#0d1f0d}
+.fault-btn.clear-btn:hover{background:#122415}
+
+.toxics-section h4{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px}
+#toxics-list{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.toxic-item{padding:4px 8px;background:var(--surface2);border-radius:4px;margin-bottom:3px;border-left:2px solid var(--orange)}
+.toxic-none{color:var(--muted);font-style:italic}
+
+/* ── Scenario runner ── */
+.scenario-card{flex:1;min-height:0}
+.scenario-form{display:flex;flex-direction:column;gap:8px}
+.form-row{display:flex;align-items:center;gap:8px}
+.form-row label{font-size:11px;color:var(--muted);width:80px;flex-shrink:0}
+select,input[type=range],input[type=number]{background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:5px 8px;font-size:12px;font-family:inherit;width:100%}
+select:focus,input:focus{outline:none;border-color:var(--blue)}
+.source-toggle{display:flex;gap:4px}
+.source-toggle button{padding:4px 12px;font-size:11px;border-radius:4px}
+.source-toggle button.active{background:var(--blue);border-color:var(--blue);color:#fff}
+.scenario-actions{display:flex;gap:8px;margin-top:4px}
+.scenario-actions button{flex:1;padding:8px}
+.duration-row{font-size:11px;color:var(--muted)}
+#duration-val{color:var(--text);font-weight:600}
+
+.log-wrap{flex:1;min-height:0;display:flex;flex-direction:column;margin-top:4px}
+.log-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+.log-header span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+.running-indicator{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--green)}
+.running-dot{width:6px;height:6px;border-radius:50%;background:var(--green);animation:pulse 1.2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+#log-terminal{flex:1;background:#010409;border:1px solid var(--border);border-radius:5px;padding:10px;overflow-y:auto;font-family:var(--mono);font-size:11px;line-height:1.6;min-height:200px;max-height:600px;color:#c9d1d9;white-space:pre-wrap;word-break:break-all}
+.log-line-info{color:#c9d1d9}
+.log-line-warn{color:var(--yellow)}
+.log-line-error{color:var(--red)}
+.log-line-meta{color:var(--blue)}
+
+/* ── Toasts ── */
+#toast{position:fixed;bottom:20px;right:20px;padding:10px 16px;border-radius:var(--radius);font-size:13px;opacity:0;transition:opacity .3s;pointer-events:none;z-index:9999;max-width:320px}
+#toast.show{opacity:1}
+#toast.ok{background:#1a3a1a;border:1px solid var(--green);color:var(--green)}
+#toast.err{background:#3a1a1a;border:1px solid var(--red);color:var(--red)}
+
+/* ── Misc ── */
+.muted{color:var(--muted);font-size:11px}
+.divider{border:none;border-top:1px solid var(--border);margin:4px 0}
+
+/* ── Tabs ── */
+.tab-nav{display:flex;gap:3px}
+.tab-btn{padding:4px 14px;font-size:12px;border-radius:var(--radius);border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer;transition:all .15s;font-family:inherit}
+.tab-btn:hover{color:var(--text);background:var(--surface2)}
+.tab-btn.active{background:var(--surface2);color:var(--text);border-color:var(--blue)}
+.tab-panel{display:none;flex:1;flex-direction:column;min-height:0;overflow:hidden}
+.tab-panel.active{display:flex}
+
+/* ── API tab ── */
+.api-wrap{padding:16px;display:flex;flex-direction:column;gap:10px;overflow-y:auto;flex:1}
+.api-section{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:10px 14px;display:flex;flex-direction:column;gap:8px}
+.api-section-title{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.6px;color:var(--muted)}
+.api-btn-row{display:flex;flex-wrap:wrap;gap:5px}
+.api-params{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.api-params label{font-size:11px;color:var(--muted);white-space:nowrap}
+.api-params input{width:120px;padding:3px 7px;font-size:11px;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:5px;font-family:var(--mono)}
+.api-params input:focus{outline:none;border-color:var(--blue)}
+.api-result{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);display:flex;flex-direction:column;flex:1;min-height:220px}
+.api-result-bar{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border);font-size:11px;flex-shrink:0}
+.api-method{padding:2px 6px;border-radius:3px;font-family:var(--mono);font-size:10px;font-weight:700;flex-shrink:0}
+.api-method.get{background:#0d2040;color:var(--blue)}
+.api-method.post{background:#1a3a1a;color:var(--green)}
+.api-method.delete{background:#3a1a1a;color:var(--red)}
+.api-path{font-family:var(--mono);font-size:11px;color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.api-result-body{flex:1;background:#010409;padding:10px 12px;font-family:var(--mono);font-size:11px;line-height:1.6;color:#c9d1d9;overflow:auto;white-space:pre-wrap;word-break:break-all;border-radius:0 0 var(--radius) var(--radius)}
+.api-section-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">⚡ <span>DeltaForge</span></div>
+  <div class="tagline">CDC Playground · Chaos &amp; Fault Injection</div>
+  <div class="tab-nav">
+    <button id="tab-btn-chaos" class="tab-btn active" onclick="switchTab('chaos')">Chaos</button>
+    <button id="tab-btn-api" class="tab-btn" onclick="switchTab('api')">Pipeline API</button>
+  </div>
+  <nav>
+    <a href="http://localhost:3000" target="_blank">📊 Grafana</a>
+    <a href="http://localhost:9090" target="_blank">🔥 Prometheus</a>
+    <a href="http://localhost:8474/proxies" target="_blank">☠️ Toxiproxy</a>
+  </nav>
+</header>
+
+<div id="tab-chaos" class="tab-panel active">
+<div class="main">
+
+  <!-- ── Left: Services + Infra ── -->
+  <div class="col">
+
+    <div class="card">
+      <h3>Services <span class="muted" style="font-size:10px;font-weight:400;text-transform:none;letter-spacing:0">↻ 3 s</span></h3>
+      <div id="services-grid" class="svc-grid">
+        <div class="muted">Loading…</div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── Middle: Fault Injection ── -->
+  <div class="col">
+
+    <div class="card">
+      <h3>Fault Injection</h3>
+
+      <div class="fault-grid">
+        <button class="fault-btn danger" onclick="injectFault('mysql-partition')" title="Severs all MySQL connections through toxiproxy">
+          <span class="f-icon">🔌</span>
+          <span class="f-label">MySQL Partition</span>
+          <span class="f-desc">severs CDC source</span>
+        </button>
+        <button class="fault-btn danger" onclick="injectFault('kafka-outage')" title="Drops all Kafka connections through toxiproxy">
+          <span class="f-icon">📭</span>
+          <span class="f-label">Kafka Outage</span>
+          <span class="f-desc">blocks sink delivery</span>
+        </button>
+        <button class="fault-btn" onclick="injectFault('mysql-latency')" title="Adds 2 s ± 500 ms latency on MySQL proxy">
+          <span class="f-icon">⏱</span>
+          <span class="f-label">MySQL Latency</span>
+          <span class="f-desc">2 s ± 500 ms</span>
+        </button>
+        <button class="fault-btn" onclick="injectFault('kafka-latency')" title="Adds 1 s ± 200 ms latency on Kafka proxy">
+          <span class="f-icon">⏳</span>
+          <span class="f-label">Kafka Latency</span>
+          <span class="f-desc">1 s ± 200 ms</span>
+        </button>
+        <button class="fault-btn" onclick="injectFault('mysql-bandwidth')" title="Throttles MySQL proxy to 100 kbps">
+          <span class="f-icon">📉</span>
+          <span class="f-label">MySQL Throttle</span>
+          <span class="f-desc">100 kbps cap</span>
+        </button>
+        <button class="fault-btn danger" onclick="injectFault('pg-partition')" title="Severs all Postgres connections">
+          <span class="f-icon">🔌</span>
+          <span class="f-label">PG Partition</span>
+          <span class="f-desc">severs pg source</span>
+        </button>
+        <button class="fault-btn clear-btn" onclick="clearFaults()">
+          <span class="f-icon">✨</span>
+          <span class="f-label">Clear All Faults</span>
+          <span class="f-desc">restore all proxies</span>
+        </button>
+      </div>
+
+      <hr class="divider">
+
+      <div class="toxics-section">
+        <h4>Active Toxics</h4>
+        <div id="toxics-list"><span class="toxic-none">none</span></div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── Right: Scenario Runner ── -->
+  <div class="col">
+
+    <div class="card scenario-card">
+      <h3>Scenario Runner</h3>
+
+      <div class="scenario-form">
+
+        <div class="form-row">
+          <label>Scenario</label>
+          <select id="scenario-select" onchange="onScenarioChange()">
+            <optgroup label="Generic (any source)">
+              <option value="network-partition">Network Partition</option>
+              <option value="sink-outage">Sink Outage</option>
+              <option value="crash-recovery">Crash Recovery</option>
+              <option value="schema-drift">Schema Drift</option>
+            </optgroup>
+            <optgroup label="MySQL only">
+              <option value="failover">MySQL Failover</option>
+              <option value="binlog-purge">Binlog Purge</option>
+            </optgroup>
+            <optgroup label="PostgreSQL only">
+              <option value="pg-failover">PG Failover</option>
+              <option value="slot-dropped">Slot Dropped</option>
+            </optgroup>
+            <optgroup label="Endurance">
+              <option value="soak">Soak (random faults, long-running)</option>
+              <option value="soak-stable">Soak Stable (no faults, baseline)</option>
+              <option value="tpcc">TPC-C (OLTP benchmark)</option>
+            </optgroup>
+            <optgroup label="Benchmarks">
+              <option value="backlog-drain">Backlog Drain (1 M row catch-up throughput)</option>
+            </optgroup>
+            <optgroup label="Suite">
+              <option value="all">All (runs every scenario in order)</option>
+            </optgroup>
+          </select>
+        </div>
+
+        <div class="form-row">
+          <label>Source</label>
+          <div class="source-toggle">
+            <button id="src-mysql" class="active" onclick="setSource('mysql')">MySQL</button>
+            <button id="src-postgres" onclick="setSource('postgres')">Postgres</button>
+          </div>
+        </div>
+
+        <div class="form-row" id="duration-row">
+          <label>Duration</label>
+          <div style="flex:1">
+            <input type="range" id="duration-slider" min="5" max="300" value="120"
+                   oninput="document.getElementById('duration-val').textContent=this.value">
+            <div class="duration-row"><span id="duration-val">120</span> minutes</div>
+          </div>
+        </div>
+
+        <div class="form-row" id="writers-row">
+          <label>Writers</label>
+          <div style="flex:1">
+            <input type="range" id="writers-slider" min="4" max="128" step="4" value="16"
+                   oninput="document.getElementById('writers-val').textContent=this.value">
+            <div class="duration-row"><span id="writers-val">16</span> concurrent tasks &nbsp;·&nbsp; ~<span id="writers-rate">—</span> ops/s est.</div>
+          </div>
+        </div>
+
+        <div class="form-row" id="delay-row">
+          <label>Delay max</label>
+          <div style="flex:1">
+            <input type="range" id="delay-slider" min="0" max="100" step="5" value="30"
+                   oninput="document.getElementById('delay-val').textContent=this.value;updateRateEst()">
+            <div class="duration-row"><span id="delay-val">30</span> ms per task between writes</div>
+          </div>
+        </div>
+
+        <!-- Drain settings — only shown for backlog-drain -->
+        <div id="drain-settings" style="display:none;border:1px solid var(--border);border-radius:6px;padding:10px;display:none;flex-direction:column;gap:8px;background:var(--surface2)">
+          <div style="font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);margin-bottom:2px">Drain Throughput Settings</div>
+
+          <div class="form-row">
+            <label>Batch size</label>
+            <div style="display:flex;gap:6px;align-items:center;flex:1">
+              <input type="number" id="drain-max-events" value="200" min="1" max="10000" style="width:80px">
+              <span class="muted">events &nbsp;·&nbsp; max age</span>
+              <input type="number" id="drain-max-ms" value="100" min="10" max="5000" style="width:70px">
+              <span class="muted">ms</span>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <label>Acks</label>
+            <div class="source-toggle">
+              <button id="drain-commit-required" class="active" onclick="setDrainCommit('required')">required</button>
+              <button id="drain-commit-all" onclick="setDrainCommit('all')">all</button>
+              <button id="drain-commit-quorum" onclick="setDrainCommit('quorum')">quorum</button>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <label>Sensing</label>
+            <div class="source-toggle">
+              <button id="drain-sensing-off" class="active" onclick="setDrainSensing(false)">Off (faster)</button>
+              <button id="drain-sensing-on" onclick="setDrainSensing(true)">On</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="scenario-actions">
+          <button id="btn-start" class="btn btn-green" onclick="startScenario()">▶ Run</button>
+          <button id="btn-stop" class="btn btn-red" onclick="stopScenario()" disabled>■ Stop</button>
+        </div>
+
+      </div>
+
+      <div class="log-wrap">
+        <div class="log-header">
+          <span>Output</span>
+          <div style="display:flex;align-items:center;gap:8px">
+            <div id="running-badge" style="display:none" class="running-indicator">
+              <div class="running-dot"></div> running
+            </div>
+            <button class="btn" style="padding:2px 8px;font-size:10px" onclick="exportLog()" title="Download log as .txt">⬇ Export</button>
+          </div>
+        </div>
+        <div id="log-terminal"><span style="color:var(--muted)">No scenario running. Pick one above and click Run.</span></div>
+      </div>
+
+    </div>
+
+  </div>
+
+</div>
+</div><!-- /tab-chaos -->
+
+<!-- ── API Tab ── -->
+<div id="tab-api" class="tab-panel">
+  <div class="api-wrap">
+
+    <!-- Top bar: instance + pipeline -->
+    <div class="api-section">
+      <div class="api-section-row">
+        <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
+          <span style="font-size:11px;color:var(--muted)">Instance</span>
+          <div class="source-toggle">
+            <button id="api-8080" class="active" onclick="apiSetPort(8080)">:8080</button>
+            <button id="api-8081" onclick="apiSetPort(8081)">soak</button>
+            <button id="api-8082" onclick="apiSetPort(8082)">tpcc</button>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;flex:1;min-width:220px">
+          <span style="font-size:11px;color:var(--muted);flex-shrink:0">Pipeline</span>
+          <select id="api-pipeline" style="flex:1;font-size:11px;padding:3px 6px">
+            <option value="">— select pipeline —</option>
+          </select>
+          <button class="btn" style="font-size:11px;padding:4px 10px;flex-shrink:0" onclick="apiListPipelines()">↻ Refresh</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- System -->
+    <div class="api-section">
+      <div class="api-section-title">System</div>
+      <div class="api-btn-row">
+        <button class="btn" onclick="apiGet('/health')">GET /health</button>
+        <button class="btn" onclick="apiGet('/ready')">GET /ready</button>
+        <button class="btn" onclick="apiGet('/metrics')" title="Prometheus text exposition">GET /metrics</button>
+      </div>
+    </div>
+
+    <!-- Pipelines -->
+    <div class="api-section">
+      <div class="api-section-title">Pipelines</div>
+      <div class="api-btn-row">
+        <button class="btn" onclick="apiListPipelines()">List All</button>
+        <button class="btn" onclick="apiGetPipeline()">Get Pipeline</button>
+        <button class="btn btn-yellow" onclick="apiPostPipeline('pause')">⏸ Pause</button>
+        <button class="btn btn-green" onclick="apiPostPipeline('resume')">▶ Resume</button>
+        <button class="btn btn-red" onclick="apiPostPipeline('stop')">■ Stop</button>
+        <button class="btn" style="border-color:var(--orange);color:var(--orange);background:#1a1208" onclick="apiDeletePipeline()" title="DELETE /pipelines/{name}">🗑 Delete</button>
+      </div>
+    </div>
+
+    <!-- Schemas -->
+    <div class="api-section">
+      <div class="api-section-row">
+        <div class="api-section-title">Schemas</div>
+        <div class="api-params">
+          <label>db</label>
+          <input type="text" id="api-db" placeholder="orders">
+          <label>table</label>
+          <input type="text" id="api-table" placeholder="soak_order_01" style="width:150px">
+        </div>
+      </div>
+      <div class="api-btn-row">
+        <button class="btn" onclick="apiGetSchemas()">List Schemas</button>
+        <button class="btn" onclick="apiGetSchema()">Get Table</button>
+        <button class="btn" onclick="apiGetSchemaVersions()">Versions</button>
+        <button class="btn btn-yellow" onclick="apiReloadAllSchemas()">↺ Reload All</button>
+        <button class="btn btn-yellow" onclick="apiReloadTableSchema()">↺ Reload Table</button>
+      </div>
+    </div>
+
+    <!-- Sensing & Drift -->
+    <div class="api-section">
+      <div class="api-section-row">
+        <div class="api-section-title">Sensing &amp; Drift</div>
+        <div class="api-params">
+          <label>table</label>
+          <input type="text" id="api-sense-table" placeholder="soak_order_01" style="width:150px">
+        </div>
+      </div>
+      <div class="api-btn-row">
+        <button class="btn" onclick="apiSensing('sensing/stats')">Cache Stats</button>
+        <button class="btn" onclick="apiSensing('sensing/schemas')">All Inferred</button>
+        <button class="btn" onclick="apiGetSensingTable()">Table Schema</button>
+        <button class="btn" onclick="apiGetJsonSchema()">JSON Schema</button>
+        <button class="btn" onclick="apiSensing('drift')">All Drift</button>
+        <button class="btn" onclick="apiGetDriftTable()">Table Drift</button>
+      </div>
+    </div>
+
+    <!-- Result -->
+    <div class="api-result">
+      <div class="api-result-bar">
+        <span id="api-result-method" class="api-method get" style="visibility:hidden">GET</span>
+        <span id="api-result-path" class="api-path" style="font-style:italic">No request made yet · click any button above</span>
+        <button class="btn" style="padding:1px 6px;font-size:10px;margin-left:8px;flex-shrink:0" onclick="apiCopyResult()" title="Copy JSON">⎘ Copy</button>
+        <button class="btn" style="padding:1px 6px;font-size:10px;flex-shrink:0" onclick="apiClearResult()">✕</button>
+      </div>
+      <pre id="api-result-body" class="api-result-body" style="color:var(--muted)">—</pre>
+    </div>
+
+  </div>
+</div><!-- /tab-api -->
+
+<div id="toast"></div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+let source = 'mysql';
+let logLength = 0;
+let drainCommitMode = 'required';
+let drainSensing = false;
+
+// ── Toast ──────────────────────────────────────────────────────────────────
+function toast(msg, type = 'ok') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'show ' + type;
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.className = '', 2800);
+}
+
+// ── Source toggle ──────────────────────────────────────────────────────────
+function setSource(s) {
+  source = s;
+  document.getElementById('src-mysql').classList.toggle('active', s === 'mysql');
+  document.getElementById('src-postgres').classList.toggle('active', s === 'postgres');
+}
+
+// ── Scenario select ────────────────────────────────────────────────────────
+function updateRateEst() {
+  const tasks = parseInt(document.getElementById('writers-slider').value, 10);
+  const delayMax = parseInt(document.getElementById('delay-slider').value, 10);
+  // avg delay = (1 + delayMax) / 2 ms when delayMax > 0, else 0
+  const avgDelay = delayMax === 0 ? 0 : (1 + delayMax) / 2;
+  // rough estimate: tasks / (avgDelay ms + ~5ms MySQL RTT) * 1000
+  const est = avgDelay === 0
+    ? tasks * 200   // ~5ms RTT only
+    : Math.round(tasks / (avgDelay + 5) * 1000);
+  document.getElementById('writers-rate').textContent = est.toLocaleString();
+}
+
+document.getElementById('writers-slider').addEventListener('input', function() {
+  document.getElementById('writers-val').textContent = this.value;
+  updateRateEst();
+});
+
+function onScenarioChange() {
+  const sc = document.getElementById('scenario-select').value;
+  const needsDuration = sc === 'soak' || sc === 'soak-stable' || sc === 'tpcc';
+  const isSoak = sc === 'soak' || sc === 'soak-stable';
+  const isDrain = sc === 'backlog-drain';
+  document.getElementById('duration-row').style.display = needsDuration ? '' : 'none';
+  document.getElementById('writers-row').style.display = isSoak ? '' : 'none';
+  document.getElementById('delay-row').style.display = isSoak ? '' : 'none';
+  const ds = document.getElementById('drain-settings');
+  ds.style.display = isDrain ? 'flex' : 'none';
+  ds.style.flexDirection = isDrain ? 'column' : '';
+}
+
+function setDrainCommit(mode) {
+  drainCommitMode = mode;
+  ['required', 'all', 'quorum'].forEach(m =>
+    document.getElementById('drain-commit-' + m).classList.toggle('active', m === mode));
+}
+
+function setDrainSensing(on) {
+  drainSensing = on;
+  document.getElementById('drain-sensing-off').classList.toggle('active', !on);
+  document.getElementById('drain-sensing-on').classList.toggle('active', on);
+}
+onScenarioChange();
+updateRateEst();
+
+// ── API helpers ────────────────────────────────────────────────────────────
+async function api(method, path, body) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  const r = await fetch(path, opts);
+  return r;
+}
+
+// ── Infrastructure ─────────────────────────────────────────────────────────
+async function infraAction(action, profile) {
+  toast(`docker compose ${action} ${profile || '(base)'}…`, 'ok');
+  const r = await api('POST', '/api/infra', { action, profile });
+  toast(r.ok ? `✅ ${action} ${profile || 'base'} done` : `❌ ${action} failed`, r.ok ? 'ok' : 'err');
+}
+
+// ── Fault injection ────────────────────────────────────────────────────────
+async function injectFault(preset) {
+  const labels = {
+    'mysql-partition': 'MySQL partition',
+    'kafka-outage':    'Kafka outage',
+    'mysql-latency':   'MySQL latency 2 s',
+    'kafka-latency':   'Kafka latency 1 s',
+    'mysql-bandwidth': 'MySQL throttle 100 kbps',
+    'pg-partition':    'PG partition',
+  };
+  toast(`Injecting: ${labels[preset] || preset}…`);
+  const r = await api('POST', '/api/fault', { preset });
+  toast(r.ok ? `☠️ ${labels[preset]} injected` : `❌ injection failed`, r.ok ? 'ok' : 'err');
+  refreshProxies();
+}
+
+async function clearFaults() {
+  toast('Clearing all faults…');
+  const r = await api('POST', '/api/fault/clear');
+  toast(r.ok ? '✨ All faults cleared' : '❌ Clear failed', r.ok ? 'ok' : 'err');
+  refreshProxies();
+}
+
+// ── Scenario ──────────────────────────────────────────────────────────────
+async function startScenario() {
+  const scenario = document.getElementById('scenario-select').value;
+  const duration_mins = parseInt(document.getElementById('duration-slider').value, 10);
+  const writer_tasks = parseInt(document.getElementById('writers-slider').value, 10);
+  const write_delay_ms = parseInt(document.getElementById('delay-slider').value, 10);
+
+  const body = { scenario, source, duration_mins, writer_tasks, write_delay_ms };
+
+  if (scenario === 'backlog-drain') {
+    body.drain_max_events = parseInt(document.getElementById('drain-max-events').value, 10);
+    body.drain_max_ms = parseInt(document.getElementById('drain-max-ms').value, 10);
+    body.drain_commit_mode = drainCommitMode;
+    body.drain_schema_sensing = drainSensing;
+  }
+
+  const r = await api('POST', '/api/scenario/start', body);
+  if (r.status === 409) { toast('A scenario is already running', 'err'); return; }
+  if (!r.ok) { toast('Failed to start scenario', 'err'); return; }
+  toast(`▶ ${scenario} started`, 'ok');
+  logLength = 0;
+}
+
+async function stopScenario() {
+  await api('POST', '/api/scenario/stop');
+  toast('■ Scenario stopped', 'ok');
+}
+
+// ── Log rendering ──────────────────────────────────────────────────────────
+// Strip ANSI escape codes (colors, bold, dim, reset, etc.)
+const ANSI_RE = /\x1b\[[0-9;]*m/g;
+
+// Parse tracing's structured log format:
+//   <dim>TIMESTAMP<reset> <color>LEVEL<reset> <dim>target<reset><dim>:<reset> message <dim>key<reset><dim>=<reset>value ...
+// Returns { level, target, message, fields } or null if it doesn't match.
+function parseTracingLine(raw) {
+  const s = raw.replace(ANSI_RE, '').trim();
+  // tracing-subscriber compact/full format:
+  // 2026-03-22T13:21:51.792018Z  INFO chaos::harness: harness: toxiproxy reset ...
+  const m = s.match(/^(\d{4}-\d{2}-\d{2}T[\d:.]+Z)\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+([\w:]+):\s+(.*)$/);
+  if (!m) return null;
+  const [, ts, level, target, rest] = m;
+  // Split trailing structured fields (key=value pairs at the end)
+  const fieldRe = /\s+([\w.]+)=(\S+)$/g;
+  let message = rest;
+  const fields = [];
+  let fm;
+  // Greedily pull key=value off the end
+  const parts = rest.match(/^(.*?)\s+((?:[\w.]+=[^\s]+\s*)+)$/);
+  if (parts) {
+    message = parts[1];
+    const fieldStr = parts[2];
+    for (const [, k, v] of fieldStr.matchAll(/([\w.]+)=([^\s]+)/g)) {
+      fields.push([k, v]);
+    }
+  }
+  return { ts: ts.replace('T', ' ').replace('Z', ''), level, target: target.split('::').pop(), message, fields };
+}
+
+function renderParsedLine(raw) {
+  const parsed = parseTracingLine(raw);
+  const span = document.createElement('span');
+
+  if (!parsed) {
+    // Plain line — just strip ANSI and show
+    span.className = 'log-line-info';
+    const clean = raw.replace(ANSI_RE, '');
+    const l = clean.toLowerCase();
+    if (l.includes('error') || l.includes('fatal') || l.includes('failed')) span.className = 'log-line-error';
+    else if (l.includes('warn')) span.className = 'log-line-warn';
+    else if (raw.startsWith('▶') || raw.startsWith('═')) span.className = 'log-line-meta';
+    span.textContent = clean + '\n';
+    return span;
+  }
+
+  // Structured tracing line — render with coloured components
+  const levelColors = { INFO: '#3fb950', WARN: '#d29922', ERROR: '#f85149', DEBUG: '#7d8590', TRACE: '#444c56' };
+  const color = levelColors[parsed.level] || '#c9d1d9';
+
+  span.style.display = 'block';
+  span.style.lineHeight = '1.6';
+
+  // Timestamp (muted)
+  const tsEl = document.createElement('span');
+  tsEl.style.color = '#444c56';
+  tsEl.textContent = parsed.ts.slice(11, 23) + ' '; // just HH:MM:SS.mmm
+  span.appendChild(tsEl);
+
+  // Level badge
+  const lvlEl = document.createElement('span');
+  lvlEl.style.cssText = `color:${color};font-weight:600;min-width:5ch;display:inline-block`;
+  lvlEl.textContent = parsed.level + ' ';
+  span.appendChild(lvlEl);
+
+  // Target (muted)
+  const tgtEl = document.createElement('span');
+  tgtEl.style.color = '#58a6ff';
+  tgtEl.textContent = parsed.target + ' ';
+  span.appendChild(tgtEl);
+
+  // Message
+  const msgEl = document.createElement('span');
+  msgEl.style.color = '#e6edf3';
+  msgEl.textContent = parsed.message;
+  span.appendChild(msgEl);
+
+  // Structured fields
+  for (const [k, v] of parsed.fields) {
+    const sep = document.createElement('span');
+    sep.style.color = '#444c56';
+    sep.textContent = ' ';
+    span.appendChild(sep);
+
+    const kEl = document.createElement('span');
+    kEl.style.color = '#bc8cff';
+    kEl.textContent = k + '=';
+    span.appendChild(kEl);
+
+    const vEl = document.createElement('span');
+    vEl.style.color = '#d29922';
+    vEl.textContent = v;
+    span.appendChild(vEl);
+  }
+
+  const nl = document.createTextNode('\n');
+  span.appendChild(nl);
+  return span;
+}
+
+function renderLog(lines) {
+  const el = document.getElementById('log-terminal');
+  if (lines.length === 0) return;
+  if (lines.length < logLength) {
+    // New run — reset terminal
+    el.innerHTML = '';
+    logLength = 0;
+  }
+  const frag = document.createDocumentFragment();
+  for (let i = logLength; i < lines.length; i++) {
+    frag.appendChild(renderParsedLine(lines[i]));
+  }
+  logLength = lines.length;
+  el.appendChild(frag);
+  el.scrollTop = el.scrollHeight;
+}
+
+function exportLog() {
+  const scenario = document.getElementById('scenario-select').value;
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const filename = `deltaforge-${scenario}-${ts}.txt`;
+  // Pull raw lines from the last API response stored in logLines cache
+  const text = (window._logLines || []).join('\n');
+  if (!text) { toast('No log to export', 'err'); return; }
+  const blob = new Blob([text], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  toast(`Exported ${filename}`);
+}
+
+// ── Tab switching ──────────────────────────────────────────────────────────
+function switchTab(tab) {
+  ['chaos', 'api'].forEach(t => {
+    document.getElementById('tab-' + t).classList.toggle('active', t === tab);
+    document.getElementById('tab-btn-' + t).classList.toggle('active', t === tab);
+  });
+}
+
+// ── Pipeline API tab ───────────────────────────────────────────────────────
+let apiPort = 8080;
+
+function apiSetPort(p) {
+  apiPort = p;
+  [8080, 8081, 8082].forEach(x =>
+    document.getElementById('api-' + x).classList.toggle('active', x === p));
+}
+
+function apiPipeline() { return document.getElementById('api-pipeline').value; }
+
+function apiShowResult(method, path, data) {
+  const mEl = document.getElementById('api-result-method');
+  mEl.textContent = method;
+  mEl.className = 'api-method ' + method.toLowerCase();
+  mEl.style.visibility = '';
+  const pEl = document.getElementById('api-result-path');
+  pEl.textContent = `http://localhost:${apiPort}${path}`;
+  pEl.style.fontStyle = '';
+  const body = document.getElementById('api-result-body');
+  body.textContent = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+  body.style.color = '';
+}
+
+function apiClearResult() {
+  document.getElementById('api-result-method').style.visibility = 'hidden';
+  const p = document.getElementById('api-result-path');
+  p.textContent = 'No request made yet · click any button above';
+  p.style.fontStyle = 'italic';
+  const b = document.getElementById('api-result-body');
+  b.textContent = '—';
+  b.style.color = 'var(--muted)';
+}
+
+function apiCopyResult() {
+  const text = document.getElementById('api-result-body').textContent;
+  if (text === '—') { toast('Nothing to copy', 'err'); return; }
+  navigator.clipboard.writeText(text).then(() => toast('Copied to clipboard')).catch(() => toast('Copy failed', 'err'));
+}
+
+async function apiGet(path) {
+  if (!path) { toast('Select a pipeline first', 'err'); return; }
+  try {
+    const r = await fetch(`/api/df?port=${apiPort}&path=${encodeURIComponent(path)}`);
+    const text = await r.text();
+    let data; try { data = JSON.parse(text); } catch { data = text; }
+    apiShowResult('GET', path, data);
+  } catch (e) { apiShowResult('GET', path, { error: e.message }); }
+}
+
+async function apiPost(path, body) {
+  if (!path) { toast('Select a pipeline first', 'err'); return; }
+  try {
+    const r = await fetch('/api/df', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ port: apiPort, path, body: body ?? null }),
+    });
+    const text = await r.text();
+    let data; try { data = text ? JSON.parse(text) : { status: r.status }; } catch { data = text; }
+    toast(`${path.split('/').pop()} → ${r.ok ? 'ok' : 'failed ('+r.status+')'}`, r.ok ? 'ok' : 'err');
+    apiShowResult('POST', path, data);
+  } catch (e) { apiShowResult('POST', path, { error: e.message }); }
+}
+
+async function apiDelete(path) {
+  if (!path) { toast('Select a pipeline first', 'err'); return; }
+  try {
+    const r = await fetch('/api/df/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ port: apiPort, path }),
+    });
+    toast(`delete → ${r.ok ? 'ok (204)' : 'failed ('+r.status+')'}`, r.ok ? 'ok' : 'err');
+    apiShowResult('DELETE', path, r.ok ? '204 No Content' : `HTTP ${r.status}`);
+  } catch (e) { apiShowResult('DELETE', path, { error: e.message }); }
+}
+
+async function apiListPipelines() {
+  try {
+    const r = await fetch(`/api/df?port=${apiPort}&path=${encodeURIComponent('/pipelines')}`);
+    const data = await r.json();
+    const sel = document.getElementById('api-pipeline');
+    if (Array.isArray(data)) {
+      sel.innerHTML = '<option value="">— select pipeline —</option>' +
+        data.map(p => `<option value="${p.name}">${p.name}${p.status ? ' · ' + p.status : ''}</option>`).join('');
+    }
+    apiShowResult('GET', '/pipelines', data);
+  } catch (e) { apiShowResult('GET', '/pipelines', { error: e.message }); }
+}
+
+function apiGetPipeline() {
+  const p = apiPipeline(); if (!p) { toast('Select a pipeline first', 'err'); return; }
+  apiGet(`/pipelines/${p}`);
+}
+function apiPostPipeline(action) {
+  const p = apiPipeline(); if (!p) { toast('Select a pipeline first', 'err'); return; }
+  apiPost(`/pipelines/${p}/${action}`);
+}
+function apiDeletePipeline() {
+  const p = apiPipeline(); if (!p) { toast('Select a pipeline first', 'err'); return; }
+  if (!confirm(`Delete pipeline "${p}"? This cannot be undone.`)) return;
+  apiDelete(`/pipelines/${p}`);
+}
+
+function apiGetSchemas() {
+  const p = apiPipeline(); if (!p) { toast('Select a pipeline first', 'err'); return; }
+  apiGet(`/pipelines/${p}/schemas`);
+}
+function apiGetSchema() {
+  const p = apiPipeline(), db = document.getElementById('api-db').value, tbl = document.getElementById('api-table').value;
+  if (!p) { toast('Select a pipeline first', 'err'); return; }
+  if (!db || !tbl) { toast('Enter db and table', 'err'); return; }
+  apiGet(`/pipelines/${p}/schemas/${db}/${tbl}`);
+}
+function apiGetSchemaVersions() {
+  const p = apiPipeline(), db = document.getElementById('api-db').value, tbl = document.getElementById('api-table').value;
+  if (!p) { toast('Select a pipeline first', 'err'); return; }
+  if (!db || !tbl) { toast('Enter db and table', 'err'); return; }
+  apiGet(`/pipelines/${p}/schemas/${db}/${tbl}/versions`);
+}
+function apiReloadAllSchemas() {
+  const p = apiPipeline(); if (!p) { toast('Select a pipeline first', 'err'); return; }
+  apiPost(`/pipelines/${p}/schemas/reload`);
+}
+function apiReloadTableSchema() {
+  const p = apiPipeline(), db = document.getElementById('api-db').value, tbl = document.getElementById('api-table').value;
+  if (!p) { toast('Select a pipeline first', 'err'); return; }
+  if (!db || !tbl) { toast('Enter db and table', 'err'); return; }
+  apiPost(`/pipelines/${p}/schemas/${db}/${tbl}/reload`);
+}
+
+function apiSensing(suffix) {
+  const p = apiPipeline(); if (!p) { toast('Select a pipeline first', 'err'); return; }
+  apiGet(`/pipelines/${p}/${suffix}`);
+}
+function apiGetSensingTable() {
+  const p = apiPipeline(), tbl = document.getElementById('api-sense-table').value;
+  if (!p) { toast('Select a pipeline first', 'err'); return; }
+  if (!tbl) { toast('Enter table name', 'err'); return; }
+  apiGet(`/pipelines/${p}/sensing/schemas/${tbl}`);
+}
+function apiGetJsonSchema() {
+  const p = apiPipeline(), tbl = document.getElementById('api-sense-table').value;
+  if (!p) { toast('Select a pipeline first', 'err'); return; }
+  if (!tbl) { toast('Enter table name', 'err'); return; }
+  apiGet(`/pipelines/${p}/sensing/schemas/${tbl}/json-schema`);
+}
+function apiGetDriftTable() {
+  const p = apiPipeline(), tbl = document.getElementById('api-sense-table').value;
+  if (!p) { toast('Select a pipeline first', 'err'); return; }
+  if (!tbl) { toast('Enter table name', 'err'); return; }
+  apiGet(`/pipelines/${p}/drift/${tbl}`);
+}
+
+// ── Status refresh ─────────────────────────────────────────────────────────
+function stateIcon(state) {
+  return { running: '●', exited: '●', absent: '○', starting: '◑' }[state] || '○';
+}
+
+function renderServices(services) {
+  const grid = document.getElementById('services-grid');
+  grid.innerHTML = '';
+
+  const groups = [
+    { label: 'Base Infra',    profile: '',       names: ['mysql','mysql-b','kafka','zookeeper','toxiproxy'] },
+    { label: 'Observability', profile: null,     names: ['prometheus','grafana','cadvisor'] },
+    { label: 'MySQL app',     profile: 'app',    names: ['deltaforge'] },
+    { label: 'PG app',        profile: 'pg-app', names: ['deltaforge-pg'] },
+    { label: 'Soak',          profile: 'soak',   names: ['deltaforge-soak'] },
+    { label: 'TPC-C',         profile: 'tpcc',   names: ['deltaforge-tpcc'] },
+    { label: 'Postgres',      profile: null,     names: ['postgres','postgres-b'] },
+  ];
+
+  const byName = Object.fromEntries(services.map(s => [s.label, s]));
+
+  for (const group of groups) {
+    const header = document.createElement('div');
+    header.className = 'group-header';
+
+    const lbl = document.createElement('span');
+    lbl.className = 'group-header-label';
+    lbl.textContent = group.label;
+    header.appendChild(lbl);
+
+    if (group.profile !== null) {
+      const p = group.profile;
+      const up = document.createElement('button');
+      up.className = 'btn btn-green btn-sm';
+      up.textContent = '▲ Start';
+      up.title = `docker compose up ${p || '(base)'}`;
+      up.onclick = () => infraAction('up', p);
+      header.appendChild(up);
+
+      const dn = document.createElement('button');
+      dn.className = 'btn btn-red btn-sm';
+      dn.textContent = '▼ Stop';
+      dn.title = `docker compose stop ${p || '(base)'}`;
+      dn.onclick = () => infraAction('stop', p);
+      header.appendChild(dn);
+    }
+
+    grid.appendChild(header);
+
+    for (const name of group.names) {
+      const svc = byName[name];
+      if (!svc) continue;
+
+      const row = document.createElement('div');
+      row.className = 'svc-row';
+
+      const dot = document.createElement('div');
+      dot.className = `dot ${svc.state}`;
+      row.appendChild(dot);
+
+      const nm = document.createElement('span');
+      nm.className = 'svc-name';
+      nm.textContent = name;
+      row.appendChild(nm);
+
+      // HTTP badge
+      if (svc.http_ok !== null && svc.http_ok !== undefined) {
+        const badge = document.createElement('span');
+        badge.className = `svc-badge ${svc.http_ok ? 'badge-ok' : 'badge-err'}`;
+        badge.textContent = svc.http_ok ? 'ok' : 'down';
+        row.appendChild(badge);
+      } else if (svc.state === 'absent') {
+        const badge = document.createElement('span');
+        badge.className = 'svc-badge badge-dim';
+        badge.textContent = 'off';
+        row.appendChild(badge);
+      }
+
+      // Health dot
+      if (svc.health && svc.health !== '-') {
+        const hd = document.createElement('div');
+        hd.className = `health-dot ${svc.health}`;
+        hd.title = `health: ${svc.health}`;
+        row.appendChild(hd);
+      }
+
+      grid.appendChild(row);
+    }
+  }
+}
+
+function renderProxies(proxies) {
+  const el = document.getElementById('toxics-list');
+  const entries = Object.entries(proxies);
+  const active = [];
+  for (const [proxy, info] of entries) {
+    const toxics = info.toxics || [];
+    const enabled = info.enabled !== false;
+    if (!enabled) {
+      active.push({ proxy, kind: 'DISABLED', name: '(proxy disabled)' });
+    }
+    for (const t of toxics) {
+      active.push({ proxy, kind: t.type, name: t.name, attrs: t.attributes });
+    }
+  }
+  if (active.length === 0) {
+    el.innerHTML = '<span class="toxic-none">none — all proxies clean</span>';
+    return;
+  }
+  el.innerHTML = active.map(t => {
+    const attrs = t.attrs ? ` ${JSON.stringify(t.attrs)}` : '';
+    return `<div class="toxic-item">${t.proxy} / <strong>${t.kind}</strong> "${t.name}"${attrs}</div>`;
+  }).join('');
+}
+
+// ── Polling ────────────────────────────────────────────────────────────────
+async function refreshStatus() {
+  try {
+    const r = await fetch('/api/status');
+    if (r.ok) renderServices(await r.json());
+  } catch (_) {}
+}
+
+async function refreshProxies() {
+  try {
+    const r = await fetch('/api/proxies');
+    if (r.ok) renderProxies(await r.json());
+  } catch (_) {}
+}
+
+async function refreshScenario() {
+  try {
+    const r = await fetch('/api/scenario/status');
+    if (!r.ok) return;
+    const data = await r.json();
+
+    document.getElementById('btn-start').disabled = data.running;
+    document.getElementById('btn-stop').disabled = !data.running;
+    document.getElementById('running-badge').style.display = data.running ? '' : 'none';
+
+    window._logLines = data.lines.map(l => l.replace(ANSI_RE, ''));
+    renderLog(data.lines);
+  } catch (_) {}
+}
+
+// Initial + interval polls
+refreshStatus();
+refreshProxies();
+refreshScenario();
+setInterval(refreshStatus, 3000);
+setInterval(refreshProxies, 4000);
+setInterval(refreshScenario, 1500);
+</script>
+</body>
+</html>

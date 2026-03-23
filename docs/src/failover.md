@@ -14,7 +14,7 @@ The result is compared against the value stored in DeltaForge's storage backend.
 | Result | Meaning | Action |
 |--------|---------|--------|
 | `FirstSeen` | No identity stored yet | Store and continue |
-| `Same` | Same server as before | Normal reconnect |
+| `Same` | Same server as before | Verify checkpoint GTID is still reachable, then continue |
 | `Changed` | Server identity differs | Run failover reconciliation |
 
 Identity is written to the durable storage backend (SQLite or PostgreSQL), so it survives process restarts and is correctly preserved across pipeline reloads.
@@ -30,15 +30,20 @@ DeltaForge verifies that the checkpoint position from the old primary still exis
 - **MySQL**: checks whether the GTID set from the last checkpoint is present in B's executed GTID history or purged range
 - **PostgreSQL**: checks whether the replication slot's `confirmed_flush_lsn` is reachable
 
-If the position is confirmed **lost** (e.g. the replication slot was not preserved, or binlogs were purged without GTID overlap), the source stops immediately with an error:
+If the position is confirmed **lost**, the source stops immediately with an error and `/health` returns `503`. This covers two distinct cases:
+
+- **Server changed (`Changed`)**: B's GTID history does not contain A's checkpoint (e.g. B was a lagging replica).
+- **Same server, history wiped (`Same`)**: `RESET BINARY LOGS AND GTIDS` was run on the same server, clearing all GTID state without changing the server UUID. DeltaForge detects this on the first reconnect by checking `GTID_SUBSET(checkpoint, @@gtid_executed)`.
+
+In both cases the error message is:
 
 ```
-position lost after failover: <reason>. Re-snapshot required.
+position lost: <reason>. Re-snapshot required.
 ```
 
-This is intentional. Silently skipping data is worse than halting. Restart the pipeline with a fresh snapshot to recover.
+Silently skipping data is worse than halting. Restart the pipeline with a fresh snapshot to recover.
 
-If reachability cannot be determined (e.g. the health query fails), DeltaForge logs a warning and continues - it does not halt on uncertainty.
+If reachability cannot be determined (e.g. the health query fails transiently), DeltaForge logs a warning and continues — it does not halt on uncertainty.
 
 ### 2. Schema drift detection
 

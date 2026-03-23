@@ -1,6 +1,10 @@
 use axum::{Router, routing::get};
-use metrics::{Unit, describe_counter, describe_gauge, describe_histogram};
-use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use metrics::{
+    Unit, describe_counter, describe_gauge, describe_histogram, gauge,
+};
+use metrics_exporter_prometheus::{
+    Matcher, PrometheusBuilder, PrometheusHandle,
+};
 use once_cell::sync::OnceCell;
 use std::{net::SocketAddr, time::Duration};
 use tokio::net::TcpListener;
@@ -28,7 +32,31 @@ pub fn init(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if HANDLE.get().is_none() {
-        let builder = PrometheusBuilder::new();
+        // Latency buckets: 1 ms → 30 s, covering CDC e2e and sink/stage latency.
+        let latency_buckets: &[f64] = &[
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+            10.0, 30.0,
+        ];
+        // Batch-size buckets: 1 event up to max configured batch.
+        let batch_buckets: &[f64] =
+            &[1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0];
+
+        let builder = PrometheusBuilder::new()
+            .set_buckets_for_metric(
+                Matcher::Suffix("_latency_seconds".to_string()),
+                latency_buckets,
+            )
+            .expect("invalid latency buckets")
+            .set_buckets_for_metric(
+                Matcher::Full("deltaforge_e2e_latency_seconds".to_string()),
+                latency_buckets,
+            )
+            .expect("invalid e2e latency buckets")
+            .set_buckets_for_metric(
+                Matcher::Full("deltaforge_batch_events".to_string()),
+                batch_buckets,
+            )
+            .expect("invalid batch buckets");
         let handle = builder
             .install_recorder()
             .expect("failed to install recorder");
@@ -83,11 +111,6 @@ pub fn describe_metrics() {
         Unit::Count,
         "Total number of pipelines"
     );
-    describe_gauge!(
-        "deltaforge_running_pipeline",
-        Unit::Count,
-        "Pipelines in the running state"
-    );
     describe_counter!(
         "deltaforge_source_events_total",
         Unit::Count,
@@ -99,9 +122,14 @@ pub fn describe_metrics() {
         "Reconnects performed by a source reader"
     );
     describe_counter!(
+        "deltaforge_source_errors_total",
+        Unit::Count,
+        "Fatal (non-retryable) source errors, labelled by kind"
+    );
+    describe_counter!(
         "deltaforge_sink_batch_total",
         Unit::Count,
-        "Total number of individual batches sent to sink"
+        "Total number of batches successfully delivered to a sink"
     );
     describe_counter!(
         "deltaforge_sink_events_total",
@@ -133,6 +161,107 @@ pub fn describe_metrics() {
         Unit::Bytes,
         "Distribution of serialized batch sizes"
     );
+    describe_counter!(
+        "deltaforge_checkpoints_total",
+        Unit::Count,
+        "Total number of checkpoints committed"
+    );
+    describe_counter!(
+        "deltaforge_sink_errors_total",
+        Unit::Count,
+        "Total number of sink delivery errors"
+    );
+    describe_counter!(
+        "deltaforge_sink_routing_errors_total",
+        Unit::Count,
+        "Serialization or routing errors during sink send, labelled by kind"
+    );
+    describe_counter!(
+        "deltaforge_sink_reconnects_total",
+        Unit::Count,
+        "Sink connections (re)established"
+    );
+    describe_counter!(
+        "deltaforge_sink_bytes_total",
+        Unit::Bytes,
+        "Total bytes delivered to a sink (batch path)"
+    );
+    describe_counter!(
+        "deltaforge_processor_events_in_total",
+        Unit::Count,
+        "Events entering a processor"
+    );
+    describe_counter!(
+        "deltaforge_processor_events_out_total",
+        Unit::Count,
+        "Events leaving a processor after processing (drops reduce this vs in)"
+    );
+    describe_counter!(
+        "deltaforge_kafka_produce_retries_total",
+        Unit::Count,
+        "Cumulative producer-level retries reported by rdkafka (absolute counter)"
+    );
+    describe_gauge!(
+        "deltaforge_kafka_producer_queue_messages",
+        Unit::Count,
+        "Current number of messages in all rdkafka internal queues"
+    );
+    describe_gauge!(
+        "deltaforge_kafka_producer_queue_bytes",
+        Unit::Bytes,
+        "Current bytes in all rdkafka internal queues"
+    );
+    describe_counter!(
+        "deltaforge_schema_drift_detected",
+        Unit::Count,
+        "Number of batches where schema drift was detected"
+    );
+    describe_counter!(
+        "deltaforge_pipeline_evolutions_total",
+        Unit::Count,
+        "Schema evolution events detected per pipeline (pipeline-level aggregate)"
+    );
+    describe_gauge!(
+        "deltaforge_source_lag_seconds",
+        Unit::Seconds,
+        "Lag between the latest source event timestamp and wall clock time"
+    );
+    describe_gauge!(
+        "deltaforge_build_info",
+        Unit::Count,
+        "Build metadata (version, commit, build_date labels); always 1"
+    );
+    describe_counter!(
+        "deltaforge_snapshot_rows_total",
+        Unit::Count,
+        "Total rows emitted during initial snapshot, per pipeline and table"
+    );
+
+    describe_histogram!(
+        "deltaforge_e2e_latency_seconds",
+        Unit::Seconds,
+        "End-to-end latency from first event's source timestamp to sink delivery"
+    );
+    describe_gauge!(
+        "deltaforge_last_checkpoint_ts",
+        Unit::Seconds,
+        "Unix epoch seconds when the last checkpoint was committed; use time()-this for age"
+    );
+    describe_counter!(
+        "deltaforge_processor_errors_total",
+        Unit::Count,
+        "Processor failures per pipeline and processor"
+    );
+    describe_counter!(
+        "deltaforge_pipeline_pauses_total",
+        Unit::Count,
+        "Number of times a pipeline was paused"
+    );
+    describe_counter!(
+        "deltaforge_pipeline_resumes_total",
+        Unit::Count,
+        "Number of times a pipeline was resumed"
+    );
 
     // Schema sensing metrics
     describe_counter!(
@@ -141,14 +270,24 @@ pub fn describe_metrics() {
         "Total events observed by schema sensor"
     );
     describe_counter!(
-        "deltaforge_schema_cache_hits_total",
+        "deltaforge_schema_sensing_cache_hits_total",
         Unit::Count,
-        "Schema structure cache hits"
+        "Schema sensing structure fingerprint cache hits (requires schema_sensing.enabled)"
     );
     describe_counter!(
-        "deltaforge_schema_cache_misses_total",
+        "deltaforge_schema_sensing_cache_misses_total",
         Unit::Count,
-        "Schema structure cache misses"
+        "Schema sensing structure fingerprint cache misses (requires schema_sensing.enabled)"
+    );
+    describe_counter!(
+        "deltaforge_source_schema_cache_hits_total",
+        Unit::Count,
+        "Source schema loader cache hits — table column definitions served from memory (labels: pipeline, source)"
+    );
+    describe_counter!(
+        "deltaforge_source_schema_cache_misses_total",
+        Unit::Count,
+        "Source schema loader cache misses — triggered an information_schema fetch (labels: pipeline, source)"
     );
     describe_counter!(
         "deltaforge_schema_evolutions_total",
@@ -170,4 +309,23 @@ pub fn describe_metrics() {
         Unit::Seconds,
         "Time spent in schema sensing per batch"
     );
+}
+
+/// Set the `deltaforge_build_info` gauge with version metadata.
+///
+/// Call once at startup after [`init`]. The gauge is always 1.0; the
+/// information is carried in the labels so it can be joined with other
+/// metrics in Prometheus/Grafana.
+pub fn set_build_info(
+    version: &'static str,
+    commit: &'static str,
+    build_date: &'static str,
+) {
+    gauge!(
+        "deltaforge_build_info",
+        "version" => version,
+        "commit" => commit,
+        "build_date" => build_date,
+    )
+    .set(1.0);
 }

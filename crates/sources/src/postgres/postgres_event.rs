@@ -59,6 +59,14 @@ pub(super) async fn read_next_event(
                     "source" => ctx.source_id.clone(),
                 )
                 .increment(1);
+            } else if let LoopControl::Fail(ref e) = control {
+                counter!(
+                    "deltaforge_source_errors_total",
+                    "pipeline" => ctx.pipeline.clone(),
+                    "source" => ctx.source_id.clone(),
+                    "kind" => source_error_kind(e),
+                )
+                .increment(1);
             }
             Err(control)
         }
@@ -418,7 +426,7 @@ async fn handle_insert(
     ev.schema_version = Some(loaded.fingerprint.to_string());
     ev.schema_sequence = Some(loaded.sequence);
 
-    send_event(ctx, ev, &schema, &table, "insert").await;
+    send_event(ctx, ev, &schema, &table, "c").await;
     Ok(())
 }
 
@@ -514,7 +522,7 @@ async fn handle_update(
     ev.schema_version = Some(loaded.fingerprint.to_string());
     ev.schema_sequence = Some(loaded.sequence);
 
-    send_event(ctx, ev, &schema, &table, "update").await;
+    send_event(ctx, ev, &schema, &table, "u").await;
     Ok(())
 }
 
@@ -586,7 +594,7 @@ async fn handle_delete(
     ev.schema_version = Some(loaded.fingerprint.to_string());
     ev.schema_sequence = Some(loaded.sequence);
 
-    send_event(ctx, ev, &schema, &table, "delete").await;
+    send_event(ctx, ev, &schema, &table, "d").await;
     Ok(())
 }
 
@@ -678,7 +686,7 @@ async fn send_event(
     ev: Event,
     schema: &str,
     table: &str,
-    op: &str,
+    op: &'static str,
 ) {
     let table_name = format!("{}.{}", schema, table);
     match ctx.tx.send(ev).await {
@@ -688,12 +696,30 @@ async fn send_event(
                 "pipeline" => ctx.pipeline.clone(),
                 "source" => ctx.source_id.clone(),
                 "table" => table_name,
+                "op" => op,
             )
             .increment(1);
         }
         Err(_) => {
             error!(source_id = %ctx.source_id, op, "channel send failed");
         }
+    }
+}
+
+fn source_error_kind(e: &SourceError) -> &'static str {
+    match e {
+        SourceError::Auth { .. } => "auth",
+        SourceError::Connect { .. } => "connect",
+        SourceError::Checkpoint { .. } => "checkpoint",
+        SourceError::Schema { .. } => "schema",
+        SourceError::Incompatible { .. } => "incompatible",
+        SourceError::Permission { .. } => "permission",
+        SourceError::NotFound { .. } => "not_found",
+        SourceError::Io(_) => "io",
+        SourceError::Timeout { .. } => "timeout",
+        SourceError::Backpressure => "backpressure",
+        SourceError::Cancelled => "cancelled",
+        SourceError::Other(_) => "other",
     }
 }
 

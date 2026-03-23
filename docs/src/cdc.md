@@ -341,8 +341,8 @@ DeltaForge exposes Prometheus metrics on the configurable metrics endpoint (defa
 
 ### Health checks
 
-- `GET /healthz`: Liveness probe - is the process running?
-- `GET /readyz`: Readiness probe - are pipelines connected and processing?
+- `GET /health`: Liveness probe - is the process running?
+- `GET /ready`: Readiness probe - are pipelines connected and processing?
 - `GET /pipelines`: Detailed status of each pipeline including configuration.
 
 ---

@@ -120,7 +120,6 @@ async fn make_source(
 ) -> MySqlSource {
     MySqlSource {
         id: id.into(),
-        checkpoint_key: format!("mysql-{}", id),
         dsn: dsn.to_string(),
         tables,
         tenant: "acme".into(),
@@ -305,7 +304,6 @@ async fn mysql_cdc_basic_events() -> Result<()> {
     let backend = make_storage_backend().await;
     let src = MySqlSource {
         id: "cdc-basic".into(),
-        checkpoint_key: "mysql-cdc-basic".to_string(),
         dsn: dsn.clone(),
         tables: vec![format!("{}.orders", db_name)],
         tenant: "acme".into(),
@@ -425,7 +423,6 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
     let registry = make_registry().await;
     let src = MySqlSource {
         id: "schema-ddl".into(),
-        checkpoint_key: "mysql-schema-ddl".to_string(),
         dsn: dsn.clone(),
         tables: vec![format!("{}.orders", db_name)],
         tenant: "acme".into(),
@@ -984,17 +981,20 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
     let raw_events_clone = raw_events.clone();
 
     // Run through processor
-    let proc = OutboxProcessor::new(OutboxProcessorCfg {
-        id: "outbox".into(),
-        tables: vec![],
-        columns: OutboxColumns::default(),
-        topic: Some("${aggregate_type}.${event_type}".into()),
-        default_topic: Some("events.unrouted".into()),
-        key: None,
-        additional_headers: HashMap::new(),
-        raw_payload: false,
-        strict: false,
-    })?;
+    let proc = OutboxProcessor::new(
+        OutboxProcessorCfg {
+            id: "outbox".into(),
+            tables: vec![],
+            columns: OutboxColumns::default(),
+            topic: Some("${aggregate_type}.${event_type}".into()),
+            default_topic: Some("events.unrouted".into()),
+            key: None,
+            additional_headers: HashMap::new(),
+            raw_payload: false,
+            strict: false,
+        },
+        String::new(),
+    )?;
 
     let ctx = BatchContext::from_batch(&raw_events);
     let processed = proc.process(raw_events, &ctx).await?;
@@ -1047,17 +1047,20 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
     info!("✓ normal table event passes through processor unchanged");
 
     // --- raw_payload mode: re-process cloned raw events ---
-    let raw_proc = OutboxProcessor::new(OutboxProcessorCfg {
-        id: "outbox-raw".into(),
-        tables: vec![],
-        columns: OutboxColumns::default(),
-        topic: Some("${aggregate_type}.${event_type}".into()),
-        default_topic: Some("events.unrouted".into()),
-        key: None,
-        additional_headers: HashMap::new(),
-        raw_payload: true,
-        strict: false,
-    })?;
+    let raw_proc = OutboxProcessor::new(
+        OutboxProcessorCfg {
+            id: "outbox-raw".into(),
+            tables: vec![],
+            columns: OutboxColumns::default(),
+            topic: Some("${aggregate_type}.${event_type}".into()),
+            default_topic: Some("events.unrouted".into()),
+            key: None,
+            additional_headers: HashMap::new(),
+            raw_payload: true,
+            strict: false,
+        },
+        String::new(),
+    )?;
 
     let ctx = BatchContext::from_batch(&raw_events_clone);
     let raw_processed = raw_proc.process(raw_events_clone, &ctx).await?;

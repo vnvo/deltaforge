@@ -21,6 +21,7 @@ All contributions are welcome and highly appreciated.
 - `crates/sinks` : sink implementations (Kafka producer, Redis streams, NATS JetStream) plus sink utilities.
 - `crates/rest-api` : HTTP control plane with health/readiness and pipeline lifecycle endpoints.
 - `crates/runner` : CLI entrypoint that wires the runtime, metrics, and control plane together.
+- `crates/chaos` : end-to-end chaos scenario runner, benchmarks, and interactive playground UI.
 
 Use these crate boundaries as reference points when adding new sources, sinks, or pipeline behaviors.
 
@@ -195,6 +196,80 @@ The `dev.sh` script provides shortcuts for common tasks:
 ```bash
 ./dev.sh release-check  # run all checks + build all Docker variants
 ```
+
+## Chaos testing
+
+End-to-end resilience tests and benchmarks run against a live Docker Compose stack with fault injection via [Toxiproxy](https://github.com/Shopify/toxiproxy). Scenarios cover network partitions, sink outages, crash recovery, server failover, schema drift, binlog purge, long-running endurance runs, and binlog backlog drain benchmarks.
+
+### Prerequisites
+
+Build the debug image first (includes a shell, needed for some scenarios):
+
+```bash
+docker build -t deltaforge:dev-debug -f Dockerfile.debug .
+```
+
+### Stack profiles
+
+Different scenarios require different compose profiles:
+
+| Profile | Port | Use case |
+|---------|------|----------|
+| `app` | 8080 | MySQL resilience scenarios |
+| `pg` + `pg-app` | 8080 | PostgreSQL resilience scenarios |
+| `soak` | 8081 | Soak endurance test, backlog-drain benchmark |
+| `tpcc` | 8082 | TPC-C benchmark |
+
+### Run resilience scenarios
+
+```bash
+docker compose -f docker-compose.chaos.yml up -d
+docker compose -f docker-compose.chaos.yml --profile app up -d
+
+cargo run -p chaos -- --scenario all           # all MySQL scenarios
+cargo run -p chaos -- --scenario network-partition
+cargo run -p chaos -- --scenario all --source postgres
+```
+
+Exit code is `0` on full pass, `1` on any failure — suitable for CI.
+
+### Run endurance and benchmark scenarios
+
+```bash
+# Soak — long-running with random fault injection
+docker compose -f docker-compose.chaos.yml --profile soak up -d
+cargo run -p chaos -- --scenario soak --duration-mins 60
+
+# Soak-stable — same workload, no faults (baseline)
+cargo run -p chaos -- --scenario soak-stable --duration-mins 30
+
+# Backlog-drain — measures catch-up throughput after a planned stop
+cargo run -p chaos -- --scenario backlog-drain
+
+# TPC-C — OLTP transaction mix benchmark
+docker compose -f docker-compose.chaos.yml --profile tpcc up -d
+cargo run -p chaos -- --scenario tpcc --duration-mins 30
+```
+
+### Playground UI
+
+The chaos binary also ships an interactive web UI for manual exploration:
+
+```bash
+cargo run -p chaos -- --scenario ui
+# Open http://localhost:7474
+```
+
+The UI provides live service status, one-click fault injection, a scenario runner with live log output, and a full Pipeline API browser for any DeltaForge instance.
+
+### Teardown
+
+```bash
+docker compose -f docker-compose.chaos.yml --profile app down -v
+docker compose -f docker-compose.chaos.yml down -v
+```
+
+See [`crates/chaos/README.md`](../../crates/chaos/README.md) for the full scenario catalogue, network topology, all CLI flags, and instructions for adding new scenarios.
 
 ## Contributing
 

@@ -45,7 +45,7 @@ async fn main() -> Result<()> {
 
     let cfg = o11y::O11yConfig {
         logging: o11y::logging::Config {
-            level: None,
+            level: std::env::var("RUST_LOG").ok(),
             json: false,
             with_targets: false,
         },
@@ -56,6 +56,11 @@ async fn main() -> Result<()> {
         install_panic_hook: true,
     };
     let _ = o11y::init_all(&cfg);
+    o11y::df_metrics::set_build_info(
+        version::GIT_VERSION,
+        version::GIT_HASH,
+        version::BUILD_DATE,
+    );
 
     let pipeline_specs =
         load_pipeline_cfgs(&args.config).context("load pipeline specs")?;

@@ -62,7 +62,6 @@ pub struct MySqlCheckpoint {
 #[derive(Debug, Clone)]
 pub struct MySqlSource {
     pub id: String,
-    pub checkpoint_key: String,
     pub dsn: String,
     pub tables: Vec<String>,
     pub tenant: String,
@@ -315,22 +314,16 @@ impl MySqlSource {
                     } else {
                         let _ = ctx.schema.reload_all(&self.tables).await?;
                     }
-                    stream = reconnect_stream(&mut ctx).await?;
+                    match do_reconnect(&mut ctx).await? {
+                        Some(s) => stream = s,
+                        None => continue,
+                    }
                 }
                 Err(LoopControl::Reconnect) => {
-                    let delay = ctx.retry.next_backoff();
-                    warn!(
-                        source_id = %ctx.source_id,
-                        delay_ms = delay.as_millis(),
-                        "scheduling reconnect after backoff"
-                    );
-
-                    tokio::select! {
-                        _ = tokio::time::sleep(delay) => {}
-                        _ = ctx.cancel.cancelled() => break,
+                    match do_reconnect(&mut ctx).await? {
+                        Some(s) => stream = s,
+                        None => continue,
                     }
-
-                    stream = reconnect_stream(&mut ctx).await?;
                 }
                 Err(LoopControl::Stop) => break,
                 Err(LoopControl::Fail(e)) => return Err(e),
@@ -356,10 +349,6 @@ impl MySqlSource {
 
 #[async_trait]
 impl Source for MySqlSource {
-    fn checkpoint_key(&self) -> &str {
-        &self.checkpoint_key
-    }
-
     async fn run(
         &self,
         tx: mpsc::Sender<Event>,
@@ -463,7 +452,12 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     } else {
         match resolve_binlog_tail(&ctx.dsn).await {
             Ok((f, p)) => (None, Some(f), Some(p as u32)),
-            Err(err) => return Err(err.into()),
+            Err(_) => {
+                return Err(SourceError::Connect {
+                    details: "could not resolve binlog tail during reconnect"
+                        .into(),
+                });
+            }
         }
     };
 
@@ -505,6 +499,34 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     Ok(stream)
 }
 
+/// Apply backoff, sleep (cancel-aware), reconnect, and absorb transient errors.
+///
+/// Returns:
+/// - `Ok(Some(stream))` - reconnected, caller assigns the new stream.
+/// - `Ok(None)` — cancelled during sleep or transient connect error;
+///   caller should `continue` the loop (next iteration will either break
+///   on cancel or retry with fresh backoff).
+/// - `Err(e)`           - fatal error, caller propagates.
+async fn do_reconnect(ctx: &mut RunCtx) -> SourceResult<Option<BinlogStream>> {
+    let delay = ctx.retry.next_backoff();
+    warn!(
+        source_id = %ctx.source_id,
+        delay_ms = delay.as_millis(),
+        "scheduling reconnect after backoff"
+    );
+
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => {}
+        _ = ctx.cancel.cancelled() => return Ok(None),
+    }
+
+    match reconnect_stream(ctx).await {
+        Ok(s) => Ok(Some(s)),
+        Err(SourceError::Connect { .. }) | Err(SourceError::Io(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 // ============================================================================
 // Failover detection + reconciliation
 // ============================================================================
@@ -534,7 +556,34 @@ async fn check_identity_post_reconnect(ctx: &mut RunCtx) -> SourceResult<()> {
         IdentityComparison::FirstSeen => {
             let _ = ctx.identity_store.store(&ctx.source_id, &live).await;
         }
-        IdentityComparison::Same => {}
+        IdentityComparison::Same => {
+            // A RESET BINARY LOGS AND GTIDS wipes the GTID history without
+            // changing the server UUID.  Run the position check here too so
+            // we catch that case on the first reconnect after a purge.
+            // Skip when there is no GTID checkpoint (file/pos mode or fresh
+            // start) to avoid false positives from the file-presence fallback.
+            if ctx.checkpoint_gtid.is_some() {
+                match check_position_reachability(
+                    &ctx.dsn,
+                    &ctx.checkpoint_file,
+                    ctx.checkpoint_gtid.as_deref(),
+                )
+                .await
+                .unwrap_or(PositionReachability::Unknown {
+                    reason: "reachability check failed".into(),
+                }) {
+                    PositionReachability::Reachable
+                    | PositionReachability::Unknown { .. } => {}
+                    PositionReachability::Lost { reason } => {
+                        return Err(SourceError::Other(anyhow::anyhow!(
+                            "checkpoint GTID set no longer reachable on \
+                             this server (binlog purge?): {reason}. \
+                             Re-snapshot required."
+                        )));
+                    }
+                }
+            }
+        }
         IdentityComparison::Changed { previous, current } => {
             warn!(
                 source_id = %ctx.source_id,

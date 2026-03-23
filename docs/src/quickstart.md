@@ -78,10 +78,10 @@ Check health and pipeline status:
 
 ```bash
 # Liveness probe
-curl http://localhost:8080/healthz
+curl http://localhost:8080/health
 
 # Readiness with pipeline status
-curl http://localhost:8080/readyz
+curl http://localhost:8080/ready
 
 # List all pipelines
 curl http://localhost:8080/pipelines

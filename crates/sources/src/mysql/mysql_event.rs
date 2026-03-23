@@ -3,7 +3,8 @@ use crate::mysql::LoopControl;
 use crate::mysql::RunCtx;
 use common::{ts_sec_to_ms, watchdog};
 use deltaforge_core::{
-    Event, Op, SourceInfo, SourcePosition, SourceResult, Transaction,
+    Event, Op, SourceError, SourceInfo, SourcePosition, SourceResult,
+    Transaction,
 };
 use metrics::counter;
 use mysql_binlog_connector_rust::{
@@ -37,6 +38,14 @@ pub(super) async fn read_next_event(
                     "deltaforge_source_reconnects_total",
                     "pipeline" => ctx.pipeline.clone(),
                     "source" => ctx.source_id.clone(),
+                )
+                .increment(1);
+            } else if let LoopControl::Fail(ref e) = control {
+                counter!(
+                    "deltaforge_source_errors_total",
+                    "pipeline" => ctx.pipeline.clone(),
+                    "source" => ctx.source_id.clone(),
+                    "kind" => source_error_kind(e),
                 )
                 .increment(1);
             }
@@ -218,6 +227,7 @@ async fn handle_write_rows(
                         "pipeline" => ctx.pipeline.clone(),
                         "source" => ctx.source_id.clone(),
                         "table" => table,
+                        "op" => "c",
                     )
                     .increment(1);
                 }
@@ -300,6 +310,7 @@ async fn handle_update_rows(
                         "pipeline" => ctx.pipeline.clone(),
                         "source" => ctx.source_id.clone(),
                         "table" => table,
+                        "op" => "u",
                     )
                     .increment(1);
                 }
@@ -377,6 +388,7 @@ async fn handle_delete_rows(
                         "pipeline" => ctx.pipeline.clone(),
                         "source" => ctx.source_id.clone(),
                         "table" => table,
+                        "op" => "d",
                     )
                     .increment(1);
                 }
@@ -391,13 +403,83 @@ async fn handle_delete_rows(
     Ok(())
 }
 
+fn source_error_kind(e: &SourceError) -> &'static str {
+    match e {
+        SourceError::Auth { .. } => "auth",
+        SourceError::Connect { .. } => "connect",
+        SourceError::Checkpoint { .. } => "checkpoint",
+        SourceError::Schema { .. } => "schema",
+        SourceError::Incompatible { .. } => "incompatible",
+        SourceError::Permission { .. } => "permission",
+        SourceError::NotFound { .. } => "not_found",
+        SourceError::Io(_) => "io",
+        SourceError::Timeout { .. } => "timeout",
+        SourceError::Backpressure => "backpressure",
+        SourceError::Cancelled => "cancelled",
+        SourceError::Other(_) => "other",
+    }
+}
+
 fn handle_gtid(
     ctx: &mut RunCtx,
     gt: mysql_binlog_connector_rust::event::gtid_event::GtidEvent,
 ) {
     let gtid_str = gt.gtid.clone();
     debug!(source_id=%ctx.source_id, gtid=%gtid_str, "gtid");
-    ctx.last_gtid = Some(gtid_str);
+
+    // Accumulate the full executed GTID set rather than storing just the last
+    // transaction. MySQL needs the full set to resume correctly on reconnect.
+    // Format: "uuid:1-N" built by extending the existing range.
+    ctx.last_gtid = Some(match &ctx.last_gtid {
+        None => gtid_str,
+        Some(existing) => merge_gtid(existing, &gtid_str),
+    });
+}
+
+/// Merge a single GTID (e.g. "uuid:21") into an existing set (e.g. "uuid:1-20").
+///
+/// Handles both single-source ("uuid:1-N") and multi-source sets
+/// ("uuid1:1-N,uuid2:1-M") by splitting on commas and updating the matching
+/// UUID entry in-place. Appends a new entry if the UUID is not yet present.
+fn merge_gtid(existing: &str, new_gtid: &str) -> String {
+    // Parse the incoming single GTID: "uuid:N"
+    let n_colon = match new_gtid.rfind(':') {
+        Some(p) => p,
+        None => return format!("{},{}", existing, new_gtid),
+    };
+    let n_uuid = &new_gtid[..n_colon];
+    let n_seq: u64 = match new_gtid[n_colon + 1..].parse() {
+        Ok(n) if n > 0 => n,
+        _ => return format!("{},{}", existing, new_gtid),
+    };
+
+    // Walk each "uuid:range" entry and update the one that matches.
+    let mut entries: Vec<String> =
+        existing.split(',').map(str::to_owned).collect();
+    let mut found = false;
+    for entry in &mut entries {
+        // find(':') is correct here — individual entries never contain commas,
+        // so find and rfind are equivalent, but find is explicit about intent.
+        if let Some(colon) = entry.find(':') {
+            if &entry[..colon] == n_uuid {
+                let range = &entry[colon + 1..];
+                let start: u64 = if let Some(dash) = range.find('-') {
+                    range[..dash].parse().unwrap_or(1)
+                } else {
+                    range.parse().unwrap_or(1)
+                };
+                *entry = format!("{}:{}-{}", n_uuid, start, n_seq);
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if !found {
+        entries.push(format!("{}:{}", n_uuid, n_seq));
+    }
+
+    entries.join(",")
 }
 
 fn handle_rotate(
@@ -1088,5 +1170,52 @@ mod tests {
             None
         );
         assert_eq!(extract_table_from_ddl("BEGIN"), None);
+    }
+
+    // =========================================================================
+    // merge_gtid tests
+    // =========================================================================
+
+    #[test]
+    fn merge_gtid_single_source_extends_range() {
+        // Normal case: sequential GTIDs from one server
+        let result = merge_gtid("uuid-a:1-10", "uuid-a:11");
+        assert_eq!(result, "uuid-a:1-11");
+    }
+
+    #[test]
+    fn merge_gtid_single_source_first_event() {
+        // Existing set has a single point, not yet a range
+        let result = merge_gtid("uuid-a:1", "uuid-a:2");
+        assert_eq!(result, "uuid-a:1-2");
+    }
+
+    #[test]
+    fn merge_gtid_multi_source_extends_correct_entry() {
+        // The bug: rfind(':') on the existing set would find the colon in
+        // "uuid-b:1-50" and compute e_uuid = "uuid-a:1-100,uuid-b", failing
+        // the equality check and appending instead of extending.
+        let result = merge_gtid("uuid-a:1-100,uuid-b:1-50", "uuid-a:101");
+        assert_eq!(result, "uuid-a:1-101,uuid-b:1-50");
+    }
+
+    #[test]
+    fn merge_gtid_multi_source_extends_second_entry() {
+        let result = merge_gtid("uuid-a:1-100,uuid-b:1-50", "uuid-b:51");
+        assert_eq!(result, "uuid-a:1-100,uuid-b:1-51");
+    }
+
+    #[test]
+    fn merge_gtid_multi_source_appends_new_uuid() {
+        // A GTID from a third source not yet in the set
+        let result = merge_gtid("uuid-a:1-100,uuid-b:1-50", "uuid-c:1");
+        assert_eq!(result, "uuid-a:1-100,uuid-b:1-50,uuid-c:1");
+    }
+
+    #[test]
+    fn merge_gtid_three_sources_middle_entry() {
+        let result =
+            merge_gtid("uuid-a:1-10,uuid-b:1-20,uuid-c:1-30", "uuid-b:21");
+        assert_eq!(result, "uuid-a:1-10,uuid-b:1-21,uuid-c:1-30");
     }
 }

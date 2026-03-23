@@ -249,7 +249,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/healthz")
+                    .uri("/health")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -258,12 +258,12 @@ mod tests {
 
         assert_eq!(StatusCode::OK, resp.status());
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(&body[..], b"ok");
+        assert_eq!(&body[..], b"ok\n");
 
         let ready = app
             .oneshot(
                 Request::builder()
-                    .uri("/readyz")
+                    .uri("/ready")
                     .body(Body::empty())
                     .unwrap(),
             )

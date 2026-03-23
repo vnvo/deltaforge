@@ -48,7 +48,6 @@ async fn make_source(
     let dsn = mysql_cdc_dsn(db).await;
     MySqlSource {
         id: id.into(),
-        checkpoint_key: format!("mysql-{id}"),
         dsn,
         tables,
         tenant: "acme".into(),

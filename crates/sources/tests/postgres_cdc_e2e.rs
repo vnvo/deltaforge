@@ -192,7 +192,6 @@ async fn make_source(
 ) -> PostgresSource {
     PostgresSource {
         id: id.into(),
-        checkpoint_key: format!("pg-{id}"),
         dsn: pg_cdc_dsn(db).await,
         slot: slot.into(),
         publication: publication.into(),
@@ -1685,17 +1684,20 @@ async fn postgres_cdc_outbox_full_pipeline() -> Result<()> {
     let raw_events_clone = raw_events.clone();
 
     // Run through processor
-    let proc = OutboxProcessor::new(OutboxProcessorCfg {
-        id: "outbox".into(),
-        tables: vec![],
-        columns: OutboxColumns::default(),
-        topic: Some("${aggregate_type}.${event_type}".into()),
-        default_topic: Some("events.unrouted".into()),
-        key: None,
-        additional_headers: HashMap::new(),
-        raw_payload: false,
-        strict: false,
-    })?;
+    let proc = OutboxProcessor::new(
+        OutboxProcessorCfg {
+            id: "outbox".into(),
+            tables: vec![],
+            columns: OutboxColumns::default(),
+            topic: Some("${aggregate_type}.${event_type}".into()),
+            default_topic: Some("events.unrouted".into()),
+            key: None,
+            additional_headers: HashMap::new(),
+            raw_payload: false,
+            strict: false,
+        },
+        String::new(),
+    )?;
 
     let ctx = BatchContext::from_batch(&raw_events);
     let processed = proc.process(raw_events, &ctx).await?;
@@ -1751,17 +1753,20 @@ async fn postgres_cdc_outbox_full_pipeline() -> Result<()> {
     info!("✓ normal table event passes through processor unchanged");
 
     // --- raw_payload mode: re-process cloned raw events ---
-    let raw_proc = OutboxProcessor::new(OutboxProcessorCfg {
-        id: "outbox-raw".into(),
-        tables: vec![],
-        columns: OutboxColumns::default(),
-        topic: Some("${aggregate_type}.${event_type}".into()),
-        default_topic: Some("events.unrouted".into()),
-        key: None,
-        additional_headers: HashMap::new(),
-        raw_payload: true,
-        strict: false,
-    })?;
+    let raw_proc = OutboxProcessor::new(
+        OutboxProcessorCfg {
+            id: "outbox-raw".into(),
+            tables: vec![],
+            columns: OutboxColumns::default(),
+            topic: Some("${aggregate_type}.${event_type}".into()),
+            default_topic: Some("events.unrouted".into()),
+            key: None,
+            additional_headers: HashMap::new(),
+            raw_payload: true,
+            strict: false,
+        },
+        String::new(),
+    )?;
 
     let ctx = BatchContext::from_batch(&raw_events_clone);
     let raw_processed = raw_proc.process(raw_events_clone, &ctx).await?;

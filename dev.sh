@@ -9,6 +9,9 @@ STORAGE_DB="${STORAGE_DB:-./data/deltaforge.db}"
 IMAGE_NAME="deltaforge"
 IMAGE_TAG="dev"
 
+CHAOS_DC=(docker compose -f docker-compose.chaos.yml)
+CHAOS_IMAGE="deltaforge:dev-debug"
+
 usage() {
   cat <<'EOF'
 DeltaForge dev helper
@@ -97,12 +100,51 @@ Docs:
 Release:
   ./dev.sh release-check
 
+Chaos (resilience scenarios against a live Docker Compose stack):
+  ./dev.sh chaos-status                   # overview of all chaos services and Kafka topics
+  ./dev.sh chaos-ui                       # start the web playground UI at http://localhost:7474
+  ./dev.sh chaos-build                    # build deltaforge:dev-debug image
+  ./dev.sh chaos-up [mysql|postgres]      # start chaos stack (default: mysql)
+  ./dev.sh chaos-down [mysql|postgres]    # stop & remove (default: mysql)
+  ./dev.sh chaos-ps                       # list all running chaos services
+  ./dev.sh chaos-logs [service]           # tail logs (all services or one)
+  ./dev.sh chaos-health [port=8080]       # curl DeltaForge /health
+  ./dev.sh chaos-metrics [port=9000]      # curl /metrics from DeltaForge
+  ./dev.sh chaos-toxics                   # show active toxiproxy toxics
+  ./dev.sh chaos-run [args...]            # cargo run -p chaos -- <args>
+  ./dev.sh chaos-scenario <scenario> [--source mysql|postgres] [--duration-mins N]
+  ./dev.sh chaos-mysql-sh                 # mysql shell into chaos orders DB
+  ./dev.sh chaos-pg-sh                    # psql shell into chaos orders DB
+  ./dev.sh chaos-mysql-status             # binlog / GTID status
+  ./dev.sh chaos-pg-status                # replication slots + publications
+  ./dev.sh chaos-kafka-consume [topic=chaos.cdc]  # consume from chaos Kafka
+  ./dev.sh chaos-reset [mysql|postgres]   # full teardown with volume wipe
+
+Chaos — Soak (long-running, 120-table workload with random fault injection):
+  ./dev.sh chaos-soak-up                  # start infra + deltaforge-soak (port 8081/9001)
+  ./dev.sh chaos-soak-down                # stop soak stack (infra stays up)
+  ./dev.sh chaos-soak-run [mins=120]      # run soak scenario
+  ./dev.sh chaos-soak-reset               # stop + wipe soak storage (MySQL tables preserved)
+  ./dev.sh chaos-soak-reload-tables       # reload soak SQL into running MySQL
+
+Chaos — TPC-C (9-table OLTP benchmark, New-Order/Payment/Delivery mix):
+  ./dev.sh chaos-tpcc-up                  # start infra + deltaforge-tpcc (port 8082/9002)
+  ./dev.sh chaos-tpcc-down                # stop tpcc stack (infra stays up)
+  ./dev.sh chaos-tpcc-run [mins=120]      # run TPC-C scenario
+  ./dev.sh chaos-tpcc-reset               # stop + wipe tpcc storage (MySQL tables preserved)
+  ./dev.sh chaos-tpcc-reload-tables       # reload TPC-C SQL into running MySQL
+
 Notes:
 - Kafka: localhost:9092, NATS: localhost:4222 (JetStream enabled)
 - API: http://localhost:8080 (override with API_BASE)
 - PostgreSQL: wal_level=logical; MySQL: GTID + ROW binlog
 - Storage db: ./data/deltaforge.db (override with STORAGE_DB)
 - Storage commands are SQLite-only; for Postgres use psql directly.
+- Chaos stack: build debug image first, then chaos-up [mysql|postgres].
+- Soak/TPC-C: infra must be running first (chaos-up starts it).
+- Soak health: http://localhost:8081/health  metrics: http://localhost:9001/metrics
+- TPC-C health: http://localhost:8082/health  metrics: http://localhost:9002/metrics
+- Toxiproxy API: http://localhost:8474 (check active toxics with chaos-toxics).
 EOF
 }
 
@@ -521,8 +563,8 @@ cmd_storage_sh() {
 
 # ── API ───────────────────────────────────────────────────────────────────────
 
-cmd_api_health()  { echo "GET $API_BASE/healthz"; curl -s "$API_BASE/healthz"; echo; }
-cmd_api_ready()   { echo "GET $API_BASE/readyz"; api_curl "$API_BASE/readyz"; }
+cmd_api_health()  { echo "GET $API_BASE/health"; curl -s "$API_BASE/health"; echo; }
+cmd_api_ready()   { echo "GET $API_BASE/ready"; api_curl "$API_BASE/ready"; }
 cmd_api_list()    { echo "GET $API_BASE/pipelines"; api_curl "$API_BASE/pipelines"; }
 
 cmd_api_get()     { api_pipeline "GET"    ""            "${1:-}"; }
@@ -568,6 +610,297 @@ cmd_docker_multi() {
 cmd_docker_all() {
   cmd_docker; cmd_docker_test; cmd_docker_debug; cmd_docker_test_debug
   echo "✅ All Docker builds successful!"
+}
+
+# ── Chaos ─────────────────────────────────────────────────────────────────────
+
+_chaos_profile() {
+  local src="${1:-mysql}"
+  case "$src" in
+    mysql)    echo "app" ;;
+    postgres) echo "pg-app" ;;
+    *) echo "Unknown source: $src (use mysql or postgres)" >&2; exit 1 ;;
+  esac
+}
+
+cmd_chaos_build() {
+  docker build -t "$CHAOS_IMAGE" -f Dockerfile.debug .
+  docker image ls | grep deltaforge
+  echo "✅ Built $CHAOS_IMAGE"
+}
+
+cmd_chaos_up() {
+  local src="${1:-mysql}"
+  local profile; profile=$(_chaos_profile "$src")
+  "${CHAOS_DC[@]}" up -d
+  "${CHAOS_DC[@]}" --profile "$profile" up -d
+  echo "✅ Chaos stack up ($src / profile=$profile)"
+  echo "   Grafana:    http://localhost:3000"
+  echo "   Prometheus: http://localhost:9090"
+  echo "   DeltaForge: http://localhost:8080/health"
+}
+
+cmd_chaos_down() {
+  local src="${1:-mysql}"
+  local profile; profile=$(_chaos_profile "$src")
+  "${CHAOS_DC[@]}" --profile "$profile" down
+  "${CHAOS_DC[@]}" down
+}
+
+cmd_chaos_ps() {
+  "${CHAOS_DC[@]}" --profile app --profile pg-app ps
+}
+
+cmd_chaos_logs() {
+  local svc="${1:-}"
+  if [[ -n "$svc" ]]; then
+    "${CHAOS_DC[@]}" --profile app --profile pg-app logs -f "$svc"
+  else
+    "${CHAOS_DC[@]}" --profile app --profile pg-app logs -f
+  fi
+}
+
+cmd_chaos_run() {
+  cargo run -p chaos -- "$@"
+}
+
+cmd_chaos_mysql_sh() {
+  docker compose -f docker-compose.chaos.yml exec -ti mysql mysql -uroot -ppassword orders
+}
+
+cmd_chaos_pg_sh() {
+  docker compose -f docker-compose.chaos.yml --profile pg-app exec -ti postgres psql -U postgres -d orders
+}
+
+cmd_chaos_mysql_status() {
+  echo "=== Chaos MySQL CDC Status ==="
+  docker compose -f docker-compose.chaos.yml exec -T mysql mysql -uroot -ppassword \
+    -e "SHOW MASTER STATUS\G" \
+    -e "SELECT @@gtid_mode, @@enforce_gtid_consistency, @@binlog_format, @@server_uuid\G"
+}
+
+cmd_chaos_pg_status() {
+  echo "=== Chaos PostgreSQL CDC Status ==="
+  docker compose -f docker-compose.chaos.yml --profile pg-app exec -T postgres \
+    psql -U postgres -d orders \
+    -c "SELECT slot_name, plugin, active, restart_lsn, confirmed_flush_lsn FROM pg_replication_slots;" \
+    -c "SELECT pubname, puballtables FROM pg_publication;" \
+    -c "SELECT system_identifier FROM pg_control_system();"
+}
+
+cmd_chaos_reset() {
+  local src="${1:-mysql}"
+  local profile; profile=$(_chaos_profile "$src")
+  echo "⚠️  Tearing down chaos stack ($src) with volume wipe..."
+  "${CHAOS_DC[@]}" --profile "$profile" down -v
+  "${CHAOS_DC[@]}" down -v
+  echo "✅ Chaos stack reset"
+}
+
+cmd_chaos_status() {
+  # Helper: check if a container is running and print a status line
+  _svc_line() {
+    local label="$1" container="$2" url="${3:-}" extra="${4:-}"
+    local state; state=$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null || echo "absent")
+    local health; health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}}' "$container" 2>/dev/null || echo "-")
+    local icon
+    case "$state" in
+      running)
+        [[ "$health" == "healthy" || "$health" == "-" ]] && icon="✅" || icon="⚠️ "
+        ;;
+      exited) icon="💀" ;;
+      absent)  icon="⬜" ;;
+      *)       icon="❓" ;;
+    esac
+    local suffix=""
+    if [[ "$state" == "running" && -n "$url" ]]; then
+      local http_status; http_status=$(curl -s -o /dev/null -w "%{http_code}" --max-time 1 "$url" 2>/dev/null || echo "---")
+      suffix=" [HTTP ${http_status}]"
+    fi
+    [[ -n "$extra" ]] && suffix="${suffix}  ${extra}"
+    printf "  %-28s %s  %-10s  health:%-10s%s\n" "$label" "$icon" "$state" "$health" "$suffix"
+  }
+
+  # Helper: count active toxics across all proxies
+  _toxic_count() {
+    curl -s --max-time 1 http://localhost:8474/proxies 2>/dev/null \
+      | python3 -c "import sys,json; d=json.load(sys.stdin); print(sum(len(v.get('toxics',[])) for v in d.values()))" 2>/dev/null \
+      || echo "?"
+  }
+
+  echo ""
+  echo "══════════════════════════════════════════════════════"
+  echo "  DeltaForge Chaos Stack Status"
+  echo "══════════════════════════════════════════════════════"
+
+  echo ""
+  echo "── Infrastructure ────────────────────────────────────"
+  _svc_line "mysql"       "deltaforge-mysql-1"
+  _svc_line "mysql-b"     "deltaforge-mysql-b-1"
+  _svc_line "zookeeper"   "deltaforge-zookeeper-1"
+  _svc_line "kafka"       "deltaforge-kafka-1"
+  _svc_line "toxiproxy"   "deltaforge-toxiproxy-1"   "http://localhost:8474/proxies" \
+    "(active toxics: $(_toxic_count))"
+  _svc_line "prometheus"  "deltaforge-prometheus-1"   "http://localhost:9090/-/ready"
+  _svc_line "grafana"     "deltaforge-grafana-1"      "http://localhost:3000/api/health"
+  _svc_line "cadvisor"    "deltaforge-cadvisor-1"     "http://localhost:8888/healthz"
+
+  echo ""
+  echo "── DeltaForge Instances ──────────────────────────────"
+  _svc_line "deltaforge (mysql→kafka)"  "deltaforge-deltaforge-1"     "http://localhost:8080/health"
+  _svc_line "deltaforge-pg (pg→kafka)"  "deltaforge-deltaforge-pg-1"  "http://localhost:8080/health"
+  _svc_line "deltaforge-soak"           "deltaforge-deltaforge-soak-1" "http://localhost:8081/health"
+  _svc_line "deltaforge-tpcc"           "deltaforge-deltaforge-tpcc-1" "http://localhost:8082/health"
+
+  echo ""
+  echo "── Postgres (pg / pg-app profiles) ──────────────────"
+  _svc_line "postgres"    "deltaforge-postgres-1"
+  _svc_line "postgres-b"  "deltaforge-postgres-b-1"
+
+  # Kafka topic offsets if kafka is up
+  local kafka_running; kafka_running=$(docker inspect --format '{{.State.Status}}' "deltaforge-kafka-1" 2>/dev/null || echo "absent")
+  if [[ "$kafka_running" == "running" ]]; then
+    echo ""
+    echo "── Kafka Topics ──────────────────────────────────────"
+    docker compose -f docker-compose.chaos.yml exec -T kafka \
+      kafka-topics --list --bootstrap-server localhost:9092 2>/dev/null \
+      | grep -v '^__' \
+      | while read -r topic; do
+          local offset
+          offset=$(docker compose -f docker-compose.chaos.yml exec -T kafka \
+            kafka-run-class kafka.tools.GetOffsetShell \
+            --broker-list localhost:9092 --topic "$topic" --time -1 2>/dev/null \
+            | awk -F: '{sum+=$3} END{print sum+0}')
+          printf "  %-35s  %s msgs total\n" "$topic" "$offset"
+        done
+  fi
+
+  echo ""
+  echo "── Observability ─────────────────────────────────────"
+  echo "  Grafana:    http://localhost:3000"
+  echo "  Prometheus: http://localhost:9090"
+  echo "  Toxiproxy:  http://localhost:8474"
+  echo "══════════════════════════════════════════════════════"
+  echo ""
+}
+
+cmd_chaos_health() {
+  local port="${1:-8080}"
+  echo "GET http://localhost:${port}/health"
+  curl -s "http://localhost:${port}/health"; echo
+}
+
+cmd_chaos_metrics() {
+  local port="${1:-9000}"
+  curl -s "http://localhost:${port}/metrics"
+}
+
+cmd_chaos_toxics() {
+  echo "=== Toxiproxy active toxics ==="
+  curl -s http://localhost:8474/proxies | python3 -c "
+import sys, json
+proxies = json.load(sys.stdin)
+any_found = False
+for name, proxy in proxies.items():
+    toxics = proxy.get('toxics', [])
+    if toxics:
+        any_found = True
+        print(f'  {name}: {json.dumps(toxics, indent=4)}')
+if not any_found:
+    print('  (none — all proxies clean)')
+" 2>/dev/null || curl -s http://localhost:8474/proxies
+}
+
+cmd_chaos_scenario() {
+  local scenario="${1:-}"; shift || true
+  [[ -z "$scenario" ]] && { echo "Usage: ./dev.sh chaos-scenario <scenario> [--source mysql|postgres] [--duration-mins N]"; exit 1; }
+  cargo run -p chaos -- --scenario "$scenario" "$@"
+}
+
+cmd_chaos_kafka_consume() {
+  local topic="${1:-chaos.cdc}"
+  echo "Consuming from chaos Kafka topic: $topic (Ctrl+C to stop)"
+  docker compose -f docker-compose.chaos.yml exec -e KAFKA_OPTS="" kafka \
+    kafka-console-consumer --bootstrap-server localhost:9092 \
+    --topic "$topic" --from-beginning
+}
+
+# ── Chaos: Soak ───────────────────────────────────────────────────────────────
+
+cmd_chaos_soak_up() {
+  "${CHAOS_DC[@]}" up -d
+  "${CHAOS_DC[@]}" --profile soak up -d
+  echo "✅ Soak stack up"
+  echo "   DeltaForge: http://localhost:8081/health"
+  echo "   Metrics:    http://localhost:9001/metrics"
+  echo "   Grafana:    http://localhost:3000"
+  echo ""
+  echo "Run: ./dev.sh chaos-soak-run [mins=120]"
+}
+
+cmd_chaos_soak_down() {
+  "${CHAOS_DC[@]}" --profile soak stop deltaforge-soak
+  echo "✅ Soak deltaforge stopped (infra still up)"
+}
+
+cmd_chaos_soak_run() {
+  local mins="${1:-120}"
+  cargo run -p chaos -- --scenario soak --duration-mins "$mins"
+}
+
+cmd_chaos_soak_reset() {
+  local project; project=$(basename "$(pwd)")
+  echo "⚠️  Stopping soak deltaforge + wiping its storage volume..."
+  "${CHAOS_DC[@]}" --profile soak rm -sf deltaforge-soak 2>/dev/null || true
+  docker volume rm "${project}_deltaforge_soak_data" 2>/dev/null || true
+  echo "✅ Soak reset (MySQL soak tables preserved)"
+  echo "   To reload soak tables: ./dev.sh chaos-soak-reload-tables"
+}
+
+cmd_chaos_soak_reload_tables() {
+  echo "Reloading soak tables into running MySQL..."
+  docker compose -f docker-compose.chaos.yml exec -T mysql \
+    mysql -uroot -ppassword < chaos/init/mysql-soak.sql
+  echo "✅ Soak tables reloaded"
+}
+
+# ── Chaos: TPC-C ─────────────────────────────────────────────────────────────
+
+cmd_chaos_tpcc_up() {
+  "${CHAOS_DC[@]}" up -d
+  "${CHAOS_DC[@]}" --profile tpcc up -d
+  echo "✅ TPC-C stack up"
+  echo "   DeltaForge: http://localhost:8082/health"
+  echo "   Metrics:    http://localhost:9002/metrics"
+  echo "   Grafana:    http://localhost:3000"
+  echo ""
+  echo "Run: ./dev.sh chaos-tpcc-run [mins=120]"
+}
+
+cmd_chaos_tpcc_down() {
+  "${CHAOS_DC[@]}" --profile tpcc stop deltaforge-tpcc
+  echo "✅ TPC-C deltaforge stopped (infra still up)"
+}
+
+cmd_chaos_tpcc_run() {
+  local mins="${1:-120}"
+  cargo run -p chaos -- --scenario tpcc --duration-mins "$mins"
+}
+
+cmd_chaos_tpcc_reset() {
+  local project; project=$(basename "$(pwd)")
+  echo "⚠️  Stopping TPC-C deltaforge + wiping its storage volume..."
+  "${CHAOS_DC[@]}" --profile tpcc rm -sf deltaforge-tpcc 2>/dev/null || true
+  docker volume rm "${project}_deltaforge_tpcc_data" 2>/dev/null || true
+  echo "✅ TPC-C reset (MySQL TPC-C tables preserved)"
+  echo "   To reload TPC-C tables: ./dev.sh chaos-tpcc-reload-tables"
+}
+
+cmd_chaos_tpcc_reload_tables() {
+  echo "Reloading TPC-C tables into running MySQL..."
+  docker compose -f docker-compose.chaos.yml exec -T mysql \
+    mysql -uroot -ppassword < chaos/init/mysql-tpcc.sql
+  echo "✅ TPC-C tables reloaded"
 }
 
 # ── Docs / Release ────────────────────────────────────────────────────────────
@@ -672,6 +1005,35 @@ case "${1:-}" in
   docs) shift; cmd_docs "$@";;
   docs-build) shift; cmd_docs_build "$@";;
   release-check) shift; cmd_release_check "$@";;
+
+  chaos-status) shift; cmd_chaos_status "$@";;
+  chaos-ui) shift; cargo run -p chaos -- --scenario ui "$@";;
+  chaos-build) shift; cmd_chaos_build "$@";;
+  chaos-up) shift; cmd_chaos_up "$@";;
+  chaos-down) shift; cmd_chaos_down "$@";;
+  chaos-ps) shift; cmd_chaos_ps "$@";;
+  chaos-logs) shift; cmd_chaos_logs "$@";;
+  chaos-health) shift; cmd_chaos_health "$@";;
+  chaos-metrics) shift; cmd_chaos_metrics "$@";;
+  chaos-toxics) shift; cmd_chaos_toxics "$@";;
+  chaos-run) shift; cmd_chaos_run "$@";;
+  chaos-scenario) shift; cmd_chaos_scenario "$@";;
+  chaos-mysql-sh) shift; cmd_chaos_mysql_sh "$@";;
+  chaos-pg-sh) shift; cmd_chaos_pg_sh "$@";;
+  chaos-mysql-status) shift; cmd_chaos_mysql_status "$@";;
+  chaos-pg-status) shift; cmd_chaos_pg_status "$@";;
+  chaos-kafka-consume) shift; cmd_chaos_kafka_consume "$@";;
+  chaos-reset) shift; cmd_chaos_reset "$@";;
+  chaos-soak-up) shift; cmd_chaos_soak_up "$@";;
+  chaos-soak-down) shift; cmd_chaos_soak_down "$@";;
+  chaos-soak-run) shift; cmd_chaos_soak_run "$@";;
+  chaos-soak-reset) shift; cmd_chaos_soak_reset "$@";;
+  chaos-soak-reload-tables) shift; cmd_chaos_soak_reload_tables "$@";;
+  chaos-tpcc-up) shift; cmd_chaos_tpcc_up "$@";;
+  chaos-tpcc-down) shift; cmd_chaos_tpcc_down "$@";;
+  chaos-tpcc-run) shift; cmd_chaos_tpcc_run "$@";;
+  chaos-tpcc-reset) shift; cmd_chaos_tpcc_reset "$@";;
+  chaos-tpcc-reload-tables) shift; cmd_chaos_tpcc_reload_tables "$@";;
 
   -h|--help|help|"") usage;;
   *) echo "Unknown command: $1"; echo; usage; exit 1;;

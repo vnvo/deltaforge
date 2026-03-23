@@ -183,6 +183,17 @@ pub enum SourceCfg {
     Turso(turso_cfg::TursoSrcCfg),
 }
 
+impl SourceCfg {
+    pub fn source_id(&self) -> &str {
+        match self {
+            SourceCfg::Postgres(c) => &c.id,
+            SourceCfg::Mysql(c) => &c.id,
+            #[cfg(feature = "turso")]
+            SourceCfg::Turso(c) => &c.id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ProcessorCfg {
