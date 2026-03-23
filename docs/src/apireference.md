@@ -163,8 +163,14 @@ PATCH /pipelines/{name}
 Content-Type: application/json
 ```
 
-Applies a partial update to an existing pipeline. The pipeline is stopped,
-updated, and restarted.
+Applies a partial update to an existing pipeline. The spec is merged, the
+pipeline is restarted from its last saved checkpoint, and the new config takes
+effect immediately. Only the fields present in the request body are changed —
+omitted fields retain their current values.
+
+If the pipeline is currently **stopped**, PATCH applies the new config and
+restarts it from the saved checkpoint. This is the recommended way to tune
+throughput settings before resuming after a planned stop.
 
 **Request:**
 ```json
@@ -189,21 +195,7 @@ updated, and restarted.
 
 **Errors:**
 - `404 Not Found` - Pipeline doesn't exist
-- `400 Bad Request` - Name mismatch in patch
-
-### Delete Pipeline
-
-```http
-DELETE /pipelines/{name}
-```
-
-Permanently deletes a pipeline. This removes the pipeline from the runtime
-and cannot be undone.
-
-**Response:** `204 No Content`
-
-**Errors:**
-- `404 Not Found` - Pipeline doesn't exist
+- `400 Bad Request` - Invalid field value or name mismatch in patch
 
 ### Pause Pipeline
 
@@ -211,7 +203,9 @@ and cannot be undone.
 POST /pipelines/{name}/pause
 ```
 
-Pauses ingestion. Events in the buffer are not processed until resumed.
+Suspends event processing while keeping the source connection alive. No new
+events are consumed from the binlog/WAL. Resume restarts processing from
+exactly where it paused — no events are missed.
 
 **Response:** `200 OK`
 ```json
@@ -228,7 +222,10 @@ Pauses ingestion. Events in the buffer are not processed until resumed.
 POST /pipelines/{name}/resume
 ```
 
-Resumes a paused pipeline.
+Resumes a paused or stopped pipeline.
+
+- **From paused** — restarts event processing immediately; source connection was kept alive.
+- **From stopped** — reconnects to the source and replays from the last saved checkpoint; any events written to the binlog/WAL while stopped are replayed in order.
 
 **Response:** `200 OK`
 ```json
@@ -245,7 +242,14 @@ Resumes a paused pipeline.
 POST /pipelines/{name}/stop
 ```
 
-Stops a pipeline. Final checkpoint is saved.
+Gracefully stops a pipeline: flushes in-flight events, saves the binlog/WAL
+checkpoint, and disconnects from the source. The pipeline remains in the
+registry and can be resumed with `POST /pipelines/{name}/resume` or by
+issuing a `PATCH` with updated config.
+
+Use stop (rather than delete) when you intend to restart the pipeline later —
+for example, before a planned maintenance window or when tuning config for a
+backlog drain.
 
 **Response:** `200 OK`
 ```json
@@ -255,6 +259,20 @@ Stops a pipeline. Final checkpoint is saved.
   "spec": { ... }
 }
 ```
+
+### Delete Pipeline
+
+```http
+DELETE /pipelines/{name}
+```
+
+Permanently removes a pipeline from the runtime. The checkpoint is **not**
+preserved. Use `stop` first if you may want to restart the pipeline later.
+
+**Response:** `204 No Content`
+
+**Errors:**
+- `404 Not Found` - Pipeline doesn't exist
 
 ---
 
