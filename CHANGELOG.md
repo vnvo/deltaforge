@@ -8,11 +8,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
- 
+
 - **Filter processor** — native Rust processor that drops events not matching configured criteria ([543e632](https://github.com/vnvo/deltaforge/commit/543e632eca6b159eddbfd9d7e93b4dce056c4610), [52b3fb7](https://github.com/vnvo/deltaforge/commit/52b3fb753b153f3d030ef31ff10d45038c7b63b8), [0b847a5](https://github.com/vnvo/deltaforge/commit/0b847a59dbb382734b16abf37c9b478521d3063c))
   - Three independent gates evaluated in order — all must pass: **op** (create/update/delete/read/truncate), **table** (AllowList glob patterns with include/exclude), **fields** (predicates against `event.after`)
   - Numeric equality normalises int/float — `42` matches `42.0` for JS processor interop
- 
+
+- **Chaos UI playground** — interactive web UI at `http://localhost:7474` (`--scenario ui`) with live service status, one-click fault injection, scenario runner with live log output, and a full Pipeline API browser for any DeltaForge instance
+
+- **Backlog-drain benchmark** (`--scenario backlog-drain`) — measures binlog catch-up throughput; stops the pipeline, writes 1 M rows, resumes from checkpoint, and reports avg/p50/peak drain events/s; throughput knobs (batch size, acks, schema sensing) configurable per run from the CLI or UI
+
+- **Soak-stable scenario** (`--scenario soak-stable`) — same 120-table workload as `soak` but without fault injection; provides a steady-state baseline for throughput and cache hit ratio
+
+- **TPC-C endurance scenario** (`--scenario tpcc`) — New-Order / Payment / Delivery transaction mix against a 9-table wholesale-supplier schema; runs on a dedicated DeltaForge instance (port 8082)
+
+- **New metrics**: `deltaforge_e2e_latency_seconds`, `deltaforge_checkpoint_age_seconds`, `deltaforge_processor_latency_seconds`, pipeline pause/resume counters, per-source schema cache hit/miss counters
+
+- **Schema cache warm-start** — sources pre-populate the schema cache from the durable registry on startup, eliminating cold-start cache misses after a restart
+
+### Fixed
+
+- **Pipeline stop/resume semantics** — `stop` now saves the checkpoint and keeps the pipeline in the registry (resumable via `resume` or `PATCH`); `delete` is the only permanent removal; `resume` works from both paused and stopped states
+
+- **E2E latency accuracy** — `deltaforge_e2e_latency_seconds` now uses a wall-clock `received_at_ms` timestamp stamped at parse time instead of the binlog `header.timestamp`, which has one-second precision and caused up to ±500 ms of phantom jitter
+
+- **Pipeline stop blocking the API** — cancel tokens are now fired synchronously and join handles awaited in a background task; the REST handler returns immediately instead of hanging until the source TCP read times out
+
+- **MySQL GTID range in checkpoint reachability check** ([04550e0](https://github.com/vnvo/deltaforge/commit/04550e0))
+
+### Changed
+
+- **Grafana chaos dashboard** — redesigned with 22 panels covering pipeline state, throughput, E2E latency, schema cache, batch distribution, processor latency, and container-level resource usage via cAdvisor; `deltaforge_pipeline_status` gauge uses `1.0` running / `0.5` paused / `0.0` stopped / `< 0` failed
+
+- **Binlog retention** in the chaos stack raised from 300 s to 600 s to accommodate backlog-drain run durations
+
 ---
 
 ## [0.1.0-beta.8] - 2026-03-12
