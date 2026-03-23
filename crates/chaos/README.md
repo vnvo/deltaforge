@@ -1,8 +1,10 @@
 # DeltaForge Chaos Tests
 
-End-to-end resilience scenarios that run against a live Docker Compose stack. Each scenario injects a specific failure, asserts the expected outcome, and restores the stack to a clean state before the next scenario runs.
+End-to-end resilience scenarios and benchmarks that run against a live Docker Compose stack. Each scenario injects a specific failure, asserts the expected outcome, and restores the stack to a clean state before the next scenario runs.
 
 Two source backends are supported: **MySQL** and **PostgreSQL**. Generic scenarios (network partition, sink outage, crash recovery, schema drift) run against either source. Source-specific scenarios (failover, binlog purge for MySQL; pg_failover, slot_dropped for PostgreSQL) are wired to their respective source.
+
+A **web UI playground** is also included for interactive fault injection, scenario control, and live DeltaForge API access without touching the command line.
 
 ## Prerequisites
 
@@ -10,9 +12,24 @@ Two source backends are supported: **MySQL** and **PostgreSQL**. Generic scenari
 - The debug image built locally: `docker build -t deltaforge:dev-debug -f Dockerfile.debug .`
 - Rust toolchain (to compile and run the scenario runner)
 
+## Stack profiles
+
+The compose file uses profiles to bring up only what a given test needs.
+
+| Profile | Services added | Use case |
+|---------|---------------|----------|
+| *(base)* | MySQL, MySQL-B, Kafka, Zookeeper, Toxiproxy, Prometheus, Grafana, cAdvisor | Always required |
+| `app` | `deltaforge` (MySQL source, port 8080) | Resilience scenarios against MySQL |
+| `pg-app` | `deltaforge-pg` (PostgreSQL source, port 8080) | Resilience scenarios against PostgreSQL |
+| `pg` | `postgres`, `postgres-b` | Required alongside `pg-app` |
+| `soak` | `deltaforge-soak` (MySQL source, port 8081) | Soak test and backlog-drain benchmark |
+| `tpcc` | `deltaforge-tpcc` (MySQL source, port 8082) | TPC-C endurance benchmark |
+
+> **Note:** `app` and `pg-app` both bind to ports 8080 and 9000. Only one should be active at a time.
+
 ## Stack setup
 
-### MySQL
+### MySQL resilience scenarios
 
 ```bash
 docker compose -f docker-compose.chaos.yml up -d
@@ -20,19 +37,49 @@ docker compose -f docker-compose.chaos.yml --profile app up -d
 curl http://localhost:8080/health   # should return "ok"
 ```
 
-### PostgreSQL
+### PostgreSQL resilience scenarios
 
 ```bash
 docker compose -f docker-compose.chaos.yml up -d
-docker compose -f docker-compose.chaos.yml --profile pg-app up -d
+docker compose -f docker-compose.chaos.yml --profile pg --profile pg-app up -d
 curl http://localhost:8080/health   # should return "ok"
 ```
 
-> **Note:** `app` and `pg-app` both bind to ports 8080 and 9000. Bring up one at a time.
+### Soak test and backlog-drain benchmark
+
+```bash
+docker compose -f docker-compose.chaos.yml up -d
+docker compose -f docker-compose.chaos.yml --profile soak up -d
+curl http://localhost:8081/health   # should return "ok"
+```
+
+### TPC-C benchmark
+
+```bash
+docker compose -f docker-compose.chaos.yml up -d
+docker compose -f docker-compose.chaos.yml --profile tpcc up -d
+curl http://localhost:8082/health   # should return "ok"
+```
 
 Grafana is available at `http://localhost:3000` (anonymous admin). Prometheus at `http://localhost:9090`.
 
-## Running scenarios
+## Playground UI
+
+The chaos binary includes an interactive web UI that provides a live view of the Docker stack, one-click fault injection, scenario control, and a full DeltaForge REST API browser — all in the browser.
+
+```bash
+cargo run -p chaos -- --scenario ui
+# Open http://localhost:7474
+```
+
+The UI has three areas:
+
+- **Chaos tab** — service health grid with start/stop buttons per profile, fault injection (MySQL/PG/Kafka partition, latency, throttle), and the scenario runner with live log output.
+- **Pipeline API tab** — proxied access to any DeltaForge instance (port 8080, 8081, or 8082) for inspecting pipelines, schemas, sensing stats, and drift results.
+
+Fault injection and scenario settings (duration, writer count, drain throughput knobs) are configurable per run from the UI.
+
+## Running scenarios from the CLI
 
 ```bash
 # MySQL (default)
@@ -54,6 +101,16 @@ cargo run -p chaos -- --scenario all --source postgres
 cargo run -p chaos -- --scenario network-partition --source postgres
 cargo run -p chaos -- --scenario pg-failover --source postgres
 cargo run -p chaos -- --scenario slot-dropped --source postgres
+
+# Long-running endurance (requires soak profile)
+cargo run -p chaos -- --scenario soak --duration-mins 120 --writer-tasks 16
+cargo run -p chaos -- --scenario soak-stable --duration-mins 60
+
+# TPC-C benchmark (requires tpcc profile)
+cargo run -p chaos -- --scenario tpcc --duration-mins 60
+
+# Backlog-drain benchmark (requires soak profile)
+cargo run -p chaos -- --scenario backlog-drain
 ```
 
 The runner prints a summary at the end:
@@ -127,19 +184,91 @@ Stops DeltaForge cleanly (checkpoint saved), then drops the replication slot dir
 
 > **Note:** `slot_dropped` always runs last in `--scenario all --source postgres`. The scenario clears the checkpoint DB so the next run starts fresh.
 
+### Endurance scenarios
+
+#### `soak` (MySQL, requires `soak` profile)
+Long-running endurance test against a 120-table MySQL workload. Concurrent writer tasks insert rows at a configurable rate while random faults (network partition, Kafka outage, latency injection) are injected every few minutes. Verifies DeltaForge keeps up and delivers all events correctly over time.
+
+```bash
+cargo run -p chaos -- --scenario soak \
+  --duration-mins 120 \
+  --writer-tasks 16 \
+  --write-delay-ms 30
+```
+
+**What it proves:** sustained throughput, fault recovery under load, no silent data loss over hours.
+
+#### `soak-stable` (MySQL, requires `soak` profile)
+Same as `soak` but with no fault injection — writers and DDL operations run for the full duration against a stable stack. Use to establish baseline throughput, cache hit ratio, and resource usage numbers for comparison with the fault-injected run.
+
+```bash
+cargo run -p chaos -- --scenario soak-stable --duration-mins 60
+```
+
+**What it proves:** steady-state performance baseline (schema cache hit ratio, latency, CPU/memory).
+
+#### `tpcc` (MySQL, requires `tpcc` profile)
+TPC-C inspired endurance test using a 9-table wholesale-supplier schema (Warehouse, District, Customer, Order, Order-Line, Item, Stock, New-Order, History). Runs a New-Order / Payment / Delivery transaction mix for the configured duration. Measures CDC throughput against a realistic OLTP workload.
+
+```bash
+cargo run -p chaos -- --scenario tpcc --duration-mins 60
+```
+
+**What it proves:** CDC throughput and correctness under a realistic relational transaction mix.
+
+### Benchmarks
+
+#### `backlog-drain` (MySQL, requires `soak` profile)
+Measures how quickly DeltaForge can replay a pre-built binlog backlog — the catch-up path that runs on cold starts, long outages, or migrations.
+
+**Method:**
+1. Stop the `chaos-soak` pipeline via the REST API so DeltaForge disconnects and saves its binlog checkpoint.
+2. Write 1,000,000 rows to MySQL as fast as possible using 32 concurrent writers.
+3. PATCH the pipeline with throughput settings (batch size, Kafka acks, schema sensing on/off) and resume from the saved checkpoint.
+4. Poll the Kafka topic offset until all 1M events are delivered, then report drain throughput.
+
+```bash
+# Default settings (batch 200, sensing off, required acks)
+cargo run -p chaos -- --scenario backlog-drain
+
+# Tuned for higher throughput
+cargo run -p chaos -- --scenario backlog-drain \
+  --drain-max-events 1000 \
+  --drain-max-ms 50 \
+  --drain-commit-mode required \
+  --drain-schema-sensing false
+```
+
+**CLI flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--drain-max-events` | `200` | Max events per Kafka batch |
+| `--drain-max-ms` | `100` | Max batch age in ms |
+| `--drain-commit-mode` | `required` | Kafka ack mode: `required`, `all`, `quorum` |
+| `--drain-schema-sensing` | `false` | Enable schema sensing during drain (slower) |
+
+**Output includes:** write throughput, drain duration, avg/p50/peak drain events/s.
+
+**What it proves:** binlog catch-up throughput, checkpoint resume correctness, impact of batch size and schema sensing on replay performance.
+
+> Schema sensing processes every event to infer structure and is ~15x slower than disabled. Disable it (the default) for maximum drain throughput. The original pipeline config is restored on container restart.
+
 ## Network topology
 
 ```
-DeltaForge ──► Toxiproxy ──► mysql          (port 5100)
-                         ──► mysql-b         (MySQL failover target)
-                         ──► postgres        (port 5101)
-                         ──► kafka           (port 5102)
+DeltaForge (app)    ──► Toxiproxy ──► mysql          (port 5100)
+DeltaForge (soak)   ──►           ──► mysql-b         (MySQL failover target)
+DeltaForge (tpcc)   ──►           ──► postgres        (port 5101)
+DeltaForge (pg-app) ──►           ──► kafka           (port 5102)
 
-Toxiproxy API:   localhost:8474   (scenario runner injects faults here)
-DeltaForge API:  localhost:8080   (health checks)
-Kafka (direct):  localhost:9092   (scenario runner reads offsets here)
-MySQL (direct):  localhost:3306   (scenario runner inserts rows here)
-Postgres (direct): localhost:5432 (scenario runner inserts rows here)
+Toxiproxy API:        localhost:8474  (scenario runner injects faults here)
+DeltaForge (app):     localhost:8080  (health/REST API · metrics :9000)
+DeltaForge (soak):    localhost:8081  (health/REST API · metrics :9001)
+DeltaForge (tpcc):    localhost:8082  (health/REST API · metrics :9002)
+Kafka (direct):       localhost:9092  (scenario runner reads offsets here)
+MySQL (direct):       localhost:3306  (scenario runner inserts rows here)
+Postgres (direct):    localhost:5432  (scenario runner inserts rows here)
 ```
 
 `postgres-b` has no host port — it is only reachable via the Toxiproxy upstream switch.
@@ -154,7 +283,14 @@ docker compose -f docker-compose.chaos.yml down -v
 
 ### PostgreSQL stack
 ```bash
-docker compose -f docker-compose.chaos.yml --profile pg-app down -v
+docker compose -f docker-compose.chaos.yml --profile pg --profile pg-app down -v
+docker compose -f docker-compose.chaos.yml down -v
+```
+
+### Soak / TPC-C
+```bash
+docker compose -f docker-compose.chaos.yml --profile soak down -v
+docker compose -f docker-compose.chaos.yml --profile tpcc down -v
 docker compose -f docker-compose.chaos.yml down -v
 ```
 
