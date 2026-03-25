@@ -64,8 +64,8 @@ const OUTAGE_HOLD_SECS: u64 = 20;
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Mid-stream schema alter interval.
-const ALTER_MIN_SECS: u64 = 600;
-const ALTER_MAX_SECS: u64 = 1800;
+const ALTER_MIN_SECS: u64 = 60;
+const ALTER_MAX_SECS: u64 = 180;
 
 // ── Compose / health ──────────────────────────────────────────────────────────
 
@@ -119,7 +119,7 @@ pub fn print_preamble() {
     println!("      equal rows written — no gap, no double-delivery.");
     println!();
     println!("    ✓ Schema evolution under live load");
-    println!("      ALTER TABLE ADD COLUMN fires every 10-30 min on a random");
+    println!("      ALTER TABLE ADD COLUMN fires every 1-3 min on a random");
     println!("      table. DeltaForge must adapt without losing events.");
     println!();
     println!("  Requirements:");
@@ -278,7 +278,10 @@ pub async fn run(
         .unwrap_or(0);
     let alters_ok = alters.iter().filter(|a| a.ok).count();
 
-    let mut result = if failed_faults == 0 && errors == 0 {
+    // Transaction errors from writer tasks are expected during fault injection
+    // (network partitions kill connections, crashes drop in-flight queries).
+    // Only fail on unrecovered faults — those indicate DeltaForge didn't come back.
+    let mut result = if failed_faults == 0 {
         ScenarioResult::pass(name)
     } else {
         ScenarioResult::fail(
@@ -773,14 +776,16 @@ async fn txn_delivery(
     let mut tx = conn.start_transaction(TxOpts::default()).await?;
 
     // Find the oldest undelivered order for this district.
-    let no_o_id: Option<u64> = tx
+    // MIN() returns NULL when no rows match, so we need Option<Option<u64>>:
+    // the outer Option is "did we get a row", the inner is "was the value NULL".
+    let no_o_id: Option<Option<u64>> = tx
         .exec_first(
             "SELECT MIN(no_o_id) FROM tpcc_new_order WHERE no_w_id = ? AND no_d_id = ?",
             (w_id, d_id),
         )
         .await?;
 
-    let Some(o_id) = no_o_id else {
+    let Some(Some(o_id)) = no_o_id else {
         tx.rollback().await?;
         return Ok(TxnKind::Delivery); // Nothing pending for this district.
     };
