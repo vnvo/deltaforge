@@ -48,9 +48,9 @@ spec:
         exactly_once: false
 
   batch:
-    max_events: 100
+    max_events: 2000
     max_bytes: 8388608
-    max_ms: 100
+    max_ms: 50
     respect_source_tx: true
     max_inflight: 1
 

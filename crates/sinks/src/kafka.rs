@@ -107,7 +107,8 @@ impl ClientContext for KafkaMetricsContext {
 }
 
 /// Default linger time for batching (ms).
-const DEFAULT_LINGER_MS: &str = "5";
+const DEFAULT_LINGER_MS: &str = "20";
+const DEFAULT_BATCH_SIZE: &str = "1048576"; // 1 MB — rdkafka default (16 KB) is too small for high throughput
 
 /// Kafka sink with idempotent production and optional exactly-once semantics.
 pub struct KafkaSink {
@@ -170,7 +171,8 @@ impl KafkaSink {
         // Batching and compression
         client_cfg
             .set("compression.type", "lz4")
-            .set("linger.ms", DEFAULT_LINGER_MS);
+            .set("linger.ms", DEFAULT_LINGER_MS)
+            .set("batch.size", DEFAULT_BATCH_SIZE);
 
         // Timeout configuration
         client_cfg
