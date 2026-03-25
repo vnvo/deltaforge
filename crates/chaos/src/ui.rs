@@ -29,6 +29,10 @@ pub struct UiState {
     log: Mutex<VecDeque<String>>,
     running: AtomicBool,
     toxi: ToxiproxyClient,
+    /// Last generated flamegraph SVG (populated after profiling completes).
+    flamegraph: Mutex<Option<Vec<u8>>>,
+    /// Profiling state: "idle", "recording", "generating".
+    profile_status: Mutex<String>,
 }
 
 impl UiState {
@@ -38,6 +42,8 @@ impl UiState {
             log: Mutex::new(VecDeque::new()),
             running: AtomicBool::new(false),
             toxi: ToxiproxyClient::new(),
+            flamegraph: Mutex::new(None),
+            profile_status: Mutex::new("idle".to_string()),
         })
     }
 }
@@ -235,6 +241,95 @@ async fn api_clear_faults(State(st): State<Arc<UiState>>) -> StatusCode {
 }
 
 #[derive(Deserialize)]
+struct ResetRequest {
+    scope: String, // "checkpoints" or "all"
+}
+
+async fn api_reset_volumes(Json(req): Json<ResetRequest>) -> StatusCode {
+    let root = workspace_root();
+    match req.scope.as_str() {
+        "checkpoints" => {
+            // Remove DeltaForge SQLite checkpoint DBs from each app volume.
+            // Stop DeltaForge services first, then clear, then leave stopped.
+            let profiles = &[
+                ("app", "deltaforge"),
+                ("pg-app", "deltaforge-pg"),
+                ("soak", "deltaforge-soak"),
+                ("tpcc", "deltaforge-tpcc"),
+            ];
+            for (profile, service) in profiles {
+                // Best-effort stop — service may already be stopped.
+                let _ = Command::new("docker")
+                    .args([
+                        "compose",
+                        "-f",
+                        "docker-compose.chaos.yml",
+                        "--profile",
+                        profile,
+                        "stop",
+                        service,
+                    ])
+                    .current_dir(&root)
+                    .status()
+                    .await;
+
+                // Clear checkpoint files from the data volume.
+                let _ = Command::new("docker")
+                    .args([
+                        "compose",
+                        "-f",
+                        "docker-compose.chaos.yml",
+                        "--profile",
+                        profile,
+                        "run",
+                        "--rm",
+                        "--no-deps",
+                        "--entrypoint",
+                        "sh",
+                        service,
+                        "-c",
+                        "rm -f /data/*.db /data/*.db-shm /data/*.db-wal",
+                    ])
+                    .current_dir(&root)
+                    .status()
+                    .await;
+            }
+            StatusCode::OK
+        }
+        "all" => {
+            // Full teardown: stop everything and remove all named volumes.
+            let ok = Command::new("docker")
+                .args([
+                    "compose",
+                    "-f",
+                    "docker-compose.chaos.yml",
+                    "--profile",
+                    "app",
+                    "--profile",
+                    "pg-app",
+                    "--profile",
+                    "soak",
+                    "--profile",
+                    "tpcc",
+                    "down",
+                    "-v",
+                ])
+                .current_dir(&root)
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                StatusCode::OK
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+        }
+        _ => StatusCode::BAD_REQUEST,
+    }
+}
+
+#[derive(Deserialize)]
 struct RunRequest {
     scenario: String,
     source: String,
@@ -254,6 +349,9 @@ struct RunRequest {
     drain_commit_interval_ms: Option<u64>,
     #[serde(default)]
     drain_schema_sensing: Option<bool>,
+    /// rdkafka producer overrides as key=value strings.
+    #[serde(default)]
+    drain_kafka_conf: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -303,6 +401,9 @@ async fn api_scenario_start(
     }
     if req.drain_schema_sensing == Some(true) {
         cmd.arg("--drain-schema-sensing");
+    }
+    for kv in &req.drain_kafka_conf {
+        cmd.arg("--drain-kafka-conf").arg(kv);
     }
     cmd.current_dir(workspace_root());
     cmd.stdout(std::process::Stdio::piped());
@@ -516,6 +617,212 @@ async fn api_df_delete(Json(req): Json<DfPostReq>) -> impl IntoResponse {
     }
 }
 
+// ── Profiling ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ProfileRequest {
+    /// Docker container name (e.g. "deltaforge-deltaforge-soak-1").
+    container: String,
+    /// Recording duration in seconds (default 30).
+    #[serde(default = "default_profile_secs")]
+    duration_secs: u64,
+    /// Sampling frequency in Hz (default 99).
+    #[serde(default = "default_profile_freq")]
+    frequency: u32,
+}
+
+fn default_profile_secs() -> u64 {
+    30
+}
+fn default_profile_freq() -> u32 {
+    99
+}
+
+#[derive(Serialize)]
+struct ProfileStatus {
+    status: String, // "idle", "recording", "generating", "ready", "error"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+async fn api_profile_start(
+    State(st): State<Arc<UiState>>,
+    Json(req): Json<ProfileRequest>,
+) -> StatusCode {
+    {
+        let status = st.profile_status.lock().await;
+        if *status == "recording" || *status == "generating" {
+            return StatusCode::CONFLICT;
+        }
+    }
+
+    *st.profile_status.lock().await = "recording".to_string();
+    *st.flamegraph.lock().await = None;
+
+    let st2 = Arc::clone(&st);
+    tokio::spawn(async move {
+        match run_profile(&req.container, req.duration_secs, req.frequency).await
+        {
+            Ok(svg) => {
+                *st2.flamegraph.lock().await = Some(svg);
+                *st2.profile_status.lock().await = "ready".to_string();
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "profiling failed");
+                *st2.profile_status.lock().await =
+                    format!("error: {e}");
+            }
+        }
+    });
+
+    StatusCode::OK
+}
+
+async fn api_profile_status(
+    State(st): State<Arc<UiState>>,
+) -> Json<ProfileStatus> {
+    let status = st.profile_status.lock().await.clone();
+    let (status_str, error) = if status.starts_with("error:") {
+        (
+            "error".to_string(),
+            Some(status.strip_prefix("error: ").unwrap_or(&status).to_string()),
+        )
+    } else {
+        (status, None)
+    };
+    Json(ProfileStatus {
+        status: status_str,
+        error,
+    })
+}
+
+async fn api_profile_flamegraph(
+    State(st): State<Arc<UiState>>,
+) -> impl IntoResponse {
+    let svg = st.flamegraph.lock().await;
+    match svg.as_ref() {
+        Some(data) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "image/svg+xml"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "inline; filename=\"flamegraph.svg\"",
+                ),
+            ],
+            data.clone(),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            [
+                (header::CONTENT_TYPE, "text/plain"),
+                (header::CONTENT_DISPOSITION, ""),
+            ],
+            b"no flamegraph available".to_vec(),
+        ),
+    }
+}
+
+/// Record a CPU profile inside the container and generate a flamegraph SVG.
+///
+/// 1. `docker exec` to run `perf record` inside the container (symbols resolve correctly).
+/// 2. `docker exec` to run `perf script` and capture the output.
+/// 3. Collapse and render the flamegraph in-process via the `inferno` crate.
+async fn run_profile(
+    container: &str,
+    duration_secs: u64,
+    frequency: u32,
+) -> anyhow::Result<Vec<u8>> {
+    // Step 1: Record.
+    tracing::info!(container, duration_secs, frequency, "starting perf record");
+    let record_status = Command::new("docker")
+        .args([
+            "exec",
+            container,
+            "perf",
+            "record",
+            "-F",
+            &frequency.to_string(),
+            "-p",
+            "1",
+            "-g",
+            "--call-graph",
+            "dwarf",
+            "-o",
+            "/tmp/perf.data",
+            "--",
+            "sleep",
+            &duration_secs.to_string(),
+        ])
+        .status()
+        .await?;
+
+    if !record_status.success() {
+        anyhow::bail!(
+            "perf record failed (exit {}). Is the container running the profiling image?",
+            record_status.code().unwrap_or(-1)
+        );
+    }
+
+    // Step 2: Script — run inside container so symbols resolve.
+    // --no-inline avoids addr2line lookups that fail in the slim container
+    // (no separate debuginfo packages installed).
+    tracing::info!(container, "running perf script");
+    let script_output = Command::new("docker")
+        .args([
+            "exec",
+            container,
+            "perf",
+            "script",
+            "--no-inline",
+            "-i",
+            "/tmp/perf.data",
+        ])
+        .output()
+        .await?;
+
+    // perf script may print addr2line warnings to stderr even on success.
+    // Only fail if stdout is empty (no usable data).
+    if script_output.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&script_output.stderr);
+        anyhow::bail!("perf script produced no output: {stderr}");
+    }
+
+    // Step 3: Collapse via inferno.
+    tracing::info!("collapsing perf script output");
+    let mut collapsed = Vec::new();
+    {
+        let mut folder = inferno::collapse::perf::Folder::default();
+        inferno::collapse::Collapse::collapse(
+            &mut folder,
+            &script_output.stdout[..],
+            &mut collapsed,
+        )?;
+    }
+
+    // Step 4: Generate flamegraph SVG.
+    tracing::info!("generating flamegraph SVG");
+    let mut svg = Vec::new();
+    {
+        let mut opts = inferno::flamegraph::Options::default();
+        opts.title = format!("DeltaForge CPU Profile — {container}");
+        opts.subtitle = Some(format!(
+            "{duration_secs}s @ {frequency}Hz — {}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        ));
+        inferno::flamegraph::from_reader(&mut opts, &collapsed[..], &mut svg)?;
+    }
+
+    // Cleanup perf.data inside container (best-effort).
+    let _ = Command::new("docker")
+        .args(["exec", container, "rm", "-f", "/tmp/perf.data"])
+        .status()
+        .await;
+
+    tracing::info!(svg_bytes = svg.len(), "flamegraph generated");
+    Ok(svg)
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn run(port: u16) -> Result<()> {
@@ -531,6 +838,10 @@ pub async fn run(port: u16) -> Result<()> {
         .route("/api/scenario/stop", post(api_scenario_stop))
         .route("/api/scenario/status", get(api_scenario_status))
         .route("/api/infra", post(api_infra))
+        .route("/api/reset-volumes", post(api_reset_volumes))
+        .route("/api/profile/start", post(api_profile_start))
+        .route("/api/profile/status", get(api_profile_status))
+        .route("/api/profile/flamegraph", get(api_profile_flamegraph))
         .route("/api/df", get(api_df_get))
         .route("/api/df", post(api_df_post))
         .route("/api/df/delete", post(api_df_delete))

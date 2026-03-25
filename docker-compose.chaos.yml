@@ -242,10 +242,14 @@ services:
   # run alongside the regular deltaforge instance.
 
   deltaforge-soak:
-    image: deltaforge:dev-debug
+    image: deltaforge:dev-profile
     command: ["--config", "/etc/deltaforge/mysql-soak.yaml", "--storage-path", "/data/deltaforge-soak.db"]
     profiles: [soak]
     user: root
+    # SYS_ADMIN + perf_event_open access needed for CPU profiling via perf.
+    # Only effective when running the profiling image; harmless with dev-debug.
+    cap_add: [SYS_ADMIN]
+    security_opt: ["seccomp=unconfined"]
     volumes:
       - ./chaos/config:/etc/deltaforge:ro
       - deltaforge_soak_data:/data

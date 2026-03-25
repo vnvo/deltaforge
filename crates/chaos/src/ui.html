@@ -190,6 +190,24 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
       </div>
     </div>
 
+    <div class="card">
+      <h3>Data Management</h3>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <button class="btn btn-yellow" style="width:100%;justify-content:center" onclick="resetVolumes('checkpoints')"
+                title="Stops DeltaForge instances and deletes their SQLite checkpoint DBs (GTID positions, offsets). Source databases and Kafka are untouched.">
+          🗑 Reset Checkpoints
+        </button>
+        <button class="btn btn-red" style="width:100%;justify-content:center" onclick="resetVolumes('all')"
+                title="Tears down all containers and removes ALL named volumes — MySQL data, Kafka state, Postgres data, checkpoints, Grafana. Full clean slate.">
+          💣 Reset All Volumes
+        </button>
+        <div class="muted" style="font-size:10px;line-height:1.4;margin-top:2px">
+          <strong>Checkpoints</strong> — clears DeltaForge snapshot/GTID state only.<br>
+          <strong>All</strong> — <code>docker compose down -v</code>, wipes everything.
+        </div>
+      </div>
+    </div>
+
   </div>
 
   <!-- ── Middle: Fault Injection ── -->
@@ -241,6 +259,36 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
       <div class="toxics-section">
         <h4>Active Toxics</h4>
         <div id="toxics-list"><span class="toxic-none">none</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>CPU Profiling</h3>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <div class="form-row">
+          <label style="width:70px;font-size:11px;color:var(--muted)">Target</label>
+          <select id="profile-container" style="flex:1;font-size:11px;padding:3px 6px">
+            <option value="deltaforge-deltaforge-soak-1">soak (:8081)</option>
+            <option value="deltaforge-deltaforge-1">app (:8080)</option>
+            <option value="deltaforge-deltaforge-tpcc-1">tpcc (:8082)</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label style="width:70px;font-size:11px;color:var(--muted)">Duration</label>
+          <div style="flex:1;display:flex;align-items:center;gap:6px">
+            <input type="range" id="profile-duration" min="5" max="60" value="30" style="flex:1"
+                   oninput="document.getElementById('profile-dur-val').textContent=this.value">
+            <span id="profile-dur-val" style="font-size:11px;font-weight:600;min-width:20px">30</span>
+            <span class="muted" style="font-size:10px">sec</span>
+          </div>
+        </div>
+        <div style="display:flex;gap:6px">
+          <button id="btn-profile-start" class="btn btn-blue" style="flex:1" onclick="startProfile()">🔥 Record</button>
+          <button id="btn-profile-view" class="btn" style="flex:1" onclick="viewFlamegraph()" disabled>📊 View</button>
+        </div>
+        <div id="profile-status-text" class="muted" style="font-size:10px;line-height:1.4">
+          Requires the <code>profiling</code> image with perf installed.
+        </div>
       </div>
     </div>
 
@@ -348,6 +396,43 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
             <div class="source-toggle">
               <button id="drain-sensing-off" class="active" onclick="setDrainSensing(false)">Off (faster)</button>
               <button id="drain-sensing-on" onclick="setDrainSensing(true)">On</button>
+            </div>
+          </div>
+
+          <hr style="border:none;border-top:1px solid var(--border);margin:4px 0">
+          <div style="font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);margin-bottom:2px">Kafka Producer Tuning <span style="text-transform:none;letter-spacing:0">(rdkafka)</span></div>
+
+          <div class="form-row">
+            <label>batch.size</label>
+            <div style="display:flex;gap:6px;align-items:center;flex:1">
+              <input type="number" id="drain-kafka-batch-size" value="1048576" min="1024" max="16777216" style="width:100px">
+              <span class="muted">bytes (default 16384)</span>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <label>linger.ms</label>
+            <div style="display:flex;gap:6px;align-items:center;flex:1">
+              <input type="number" id="drain-kafka-linger" value="20" min="0" max="1000" style="width:70px">
+              <span class="muted">ms (default 5)</span>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <label style="width:100px">batch.num.messages</label>
+            <div style="display:flex;gap:6px;align-items:center;flex:1">
+              <input type="number" id="drain-kafka-batch-num" value="100000" min="1000" max="1000000" style="width:100px">
+              <span class="muted">(default 10000)</span>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <label>compression</label>
+            <div class="source-toggle">
+              <button id="drain-kafka-comp-lz4" class="active" onclick="setDrainCompression('lz4')">lz4</button>
+              <button id="drain-kafka-comp-snappy" onclick="setDrainCompression('snappy')">snappy</button>
+              <button id="drain-kafka-comp-zstd" onclick="setDrainCompression('zstd')">zstd</button>
+              <button id="drain-kafka-comp-none" onclick="setDrainCompression('none')">none</button>
             </div>
           </div>
         </div>
@@ -488,6 +573,7 @@ let source = 'mysql';
 let logLength = 0;
 let drainCommitMode = 'required';
 let drainSensing = false;
+let drainCompression = 'lz4';
 
 // ── Toast ──────────────────────────────────────────────────────────────────
 function toast(msg, type = 'ok') {
@@ -547,6 +633,12 @@ function setDrainSensing(on) {
   document.getElementById('drain-sensing-off').classList.toggle('active', !on);
   document.getElementById('drain-sensing-on').classList.toggle('active', on);
 }
+
+function setDrainCompression(c) {
+  drainCompression = c;
+  ['lz4', 'snappy', 'zstd', 'none'].forEach(x =>
+    document.getElementById('drain-kafka-comp-' + x).classList.toggle('active', x === c));
+}
 onScenarioChange();
 updateRateEst();
 
@@ -563,6 +655,88 @@ async function infraAction(action, profile) {
   toast(`docker compose ${action} ${profile || '(base)'}…`, 'ok');
   const r = await api('POST', '/api/infra', { action, profile });
   toast(r.ok ? `✅ ${action} ${profile || 'base'} done` : `❌ ${action} failed`, r.ok ? 'ok' : 'err');
+}
+
+// ── Volume reset ──────────────────────────────────────────────────────────
+async function resetVolumes(scope) {
+  const labels = { checkpoints: 'Reset Checkpoints', all: 'Reset All Volumes' };
+  const descriptions = {
+    checkpoints: 'This will stop DeltaForge instances and delete their checkpoint databases (GTID positions, offsets).',
+    all: 'This will tear down ALL containers and remove ALL volumes (MySQL data, Kafka, Postgres, checkpoints, Grafana). Everything will need to be re-initialized.',
+  };
+  if (!confirm(`${labels[scope]}\n\n${descriptions[scope]}\n\nContinue?`)) return;
+  toast(`${labels[scope]}… this may take a moment`, 'ok');
+  const r = await api('POST', '/api/reset-volumes', { scope });
+  toast(r.ok ? `✅ ${labels[scope]} complete` : `❌ Reset failed`, r.ok ? 'ok' : 'err');
+  refreshStatus();
+}
+
+// ── CPU Profiling ─────────────────────────────────────────────────────────
+let profilePollTimer = null;
+
+async function startProfile() {
+  const container = document.getElementById('profile-container').value;
+  const duration_secs = parseInt(document.getElementById('profile-duration').value, 10);
+  document.getElementById('btn-profile-start').disabled = true;
+  document.getElementById('btn-profile-view').disabled = true;
+  document.getElementById('profile-status-text').textContent = `Recording ${duration_secs}s on ${container}…`;
+  toast(`🔥 Recording CPU profile (${duration_secs}s)…`, 'ok');
+
+  const r = await api('POST', '/api/profile/start', { container, duration_secs, frequency: 99 });
+  if (r.status === 409) {
+    toast('Profile already in progress', 'err');
+    document.getElementById('btn-profile-start').disabled = false;
+    return;
+  }
+  if (!r.ok) {
+    toast('Failed to start profiling', 'err');
+    document.getElementById('btn-profile-start').disabled = false;
+    document.getElementById('profile-status-text').textContent = 'Failed to start. Is the profiling image running?';
+    return;
+  }
+  // Poll for completion.
+  if (profilePollTimer) clearInterval(profilePollTimer);
+  profilePollTimer = setInterval(pollProfileStatus, 2000);
+}
+
+async function pollProfileStatus() {
+  try {
+    const r = await fetch('/api/profile/status');
+    if (!r.ok) return;
+    const data = await r.json();
+    const statusEl = document.getElementById('profile-status-text');
+    const startBtn = document.getElementById('btn-profile-start');
+    const viewBtn = document.getElementById('btn-profile-view');
+
+    if (data.status === 'recording') {
+      statusEl.textContent = 'Recording… perf is sampling CPU stacks.';
+    } else if (data.status === 'generating') {
+      statusEl.textContent = 'Generating flamegraph SVG…';
+    } else if (data.status === 'ready') {
+      statusEl.textContent = 'Flamegraph ready.';
+      startBtn.disabled = false;
+      viewBtn.disabled = false;
+      clearInterval(profilePollTimer);
+      profilePollTimer = null;
+      toast('📊 Flamegraph ready — click View', 'ok');
+    } else if (data.status === 'error') {
+      statusEl.textContent = 'Error: ' + (data.error || 'unknown');
+      startBtn.disabled = false;
+      viewBtn.disabled = true;
+      clearInterval(profilePollTimer);
+      profilePollTimer = null;
+      toast('❌ Profiling failed: ' + (data.error || ''), 'err');
+    } else {
+      // idle
+      startBtn.disabled = false;
+      clearInterval(profilePollTimer);
+      profilePollTimer = null;
+    }
+  } catch (_) {}
+}
+
+function viewFlamegraph() {
+  window.open('/api/profile/flamegraph', '_blank');
 }
 
 // ── Fault injection ────────────────────────────────────────────────────────
@@ -602,6 +776,17 @@ async function startScenario() {
     body.drain_max_ms = parseInt(document.getElementById('drain-max-ms').value, 10);
     body.drain_commit_mode = drainCommitMode;
     body.drain_schema_sensing = drainSensing;
+
+    // rdkafka producer tuning overrides
+    const kafkaConf = [];
+    const batchSize = document.getElementById('drain-kafka-batch-size').value;
+    const linger = document.getElementById('drain-kafka-linger').value;
+    const batchNum = document.getElementById('drain-kafka-batch-num').value;
+    if (batchSize) kafkaConf.push('batch.size=' + batchSize);
+    if (linger) kafkaConf.push('linger.ms=' + linger);
+    if (batchNum) kafkaConf.push('batch.num.messages=' + batchNum);
+    if (drainCompression) kafkaConf.push('compression.type=' + drainCompression);
+    body.drain_kafka_conf = kafkaConf;
   }
 
   const r = await api('POST', '/api/scenario/start', body);
