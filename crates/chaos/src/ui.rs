@@ -64,12 +64,12 @@ fn workspace_root() -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
 }
 
-async fn inspect_container(name: &str) -> (String, String) {
+async fn inspect_container(name: &str) -> (String, String, String) {
     let out = Command::new("docker")
         .args([
             "inspect",
             "--format",
-            "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}}",
+            "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}} {{.Config.Image}}",
             name,
         ])
         .output()
@@ -78,12 +78,13 @@ async fn inspect_container(name: &str) -> (String, String) {
     match out {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            let mut it = s.splitn(2, ' ');
+            let mut it = s.splitn(3, ' ');
             let state = it.next().unwrap_or("absent").to_string();
             let health = it.next().unwrap_or("-").to_string();
-            (state, health)
+            let image = it.next().unwrap_or("").to_string();
+            (state, health, image)
         }
-        _ => ("absent".to_string(), "-".to_string()),
+        _ => ("absent".to_string(), "-".to_string(), String::new()),
     }
 }
 
@@ -110,6 +111,7 @@ struct ServiceInfo {
     state: String,
     health: String,
     http_ok: Option<bool>,
+    image: String,
 }
 
 async fn api_status() -> Json<Vec<ServiceInfo>> {
@@ -164,7 +166,7 @@ async fn api_status() -> Json<Vec<ServiceInfo>> {
 
     let mut out = Vec::new();
     for (label, container, url) in defs {
-        let (state, health) = inspect_container(container).await;
+        let (state, health, image) = inspect_container(container).await;
         let http_ok = if state == "running" {
             if let Some(u) = url {
                 check_http(u).await
@@ -179,6 +181,7 @@ async fn api_status() -> Json<Vec<ServiceInfo>> {
             state,
             health,
             http_ok,
+            image,
         });
     }
     Json(out)
@@ -538,6 +541,90 @@ async fn api_infra(Json(req): Json<InfraRequest>) -> StatusCode {
     }
 }
 
+#[derive(Deserialize)]
+struct ImageSwapRequest {
+    /// Compose service name (e.g. "deltaforge-soak").
+    service: String,
+    /// Compose profile (e.g. "soak").
+    profile: String,
+    /// Target image (e.g. "deltaforge:dev-profile").
+    image: String,
+}
+
+/// Swap the image for a DeltaForge service by stopping it, updating the
+/// compose file, and recreating. Uses awk to patch only the target service.
+async fn api_swap_image(Json(req): Json<ImageSwapRequest>) -> StatusCode {
+    let root = workspace_root();
+    let compose_file = root.join("docker-compose.chaos.yml");
+
+    // Stop the service first.
+    let _ = Command::new("docker")
+        .args([
+            "compose",
+            "-f",
+            "docker-compose.chaos.yml",
+            "--profile",
+            &req.profile,
+            "stop",
+            &req.service,
+        ])
+        .current_dir(&root)
+        .status()
+        .await;
+
+    // Patch the image line for the target service using awk.
+    let awk_prog = format!(
+        "/^  {}:/ {{ in_svc=1 }} in_svc && /image:/ {{ sub(/image:.*/, \"image: {}\"); in_svc=0 }} {{ print }}",
+        req.service, req.image
+    );
+    let tmp_file = compose_file.with_extension("yml.tmp");
+
+    let awk_ok = Command::new("awk")
+        .arg(&awk_prog)
+        .arg(&compose_file)
+        .stdout(std::process::Stdio::from(
+            std::fs::File::create(&tmp_file).unwrap_or_else(|_| {
+                std::fs::File::create("/dev/null").unwrap()
+            }),
+        ))
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if awk_ok {
+        let _ = std::fs::rename(&tmp_file, &compose_file);
+    } else {
+        let _ = std::fs::remove_file(&tmp_file);
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+
+    // Recreate the service with the new image.
+    let ok = Command::new("docker")
+        .args([
+            "compose",
+            "-f",
+            "docker-compose.chaos.yml",
+            "--profile",
+            &req.profile,
+            "up",
+            "-d",
+            "--force-recreate",
+            &req.service,
+        ])
+        .current_dir(&root)
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
 // ── DeltaForge API proxy ──────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -844,6 +931,7 @@ pub async fn run(port: u16) -> Result<()> {
         .route("/api/scenario/status", get(api_scenario_status))
         .route("/api/infra", post(api_infra))
         .route("/api/reset-volumes", post(api_reset_volumes))
+        .route("/api/swap-image", post(api_swap_image))
         .route("/api/profile/start", post(api_profile_start))
         .route("/api/profile/status", get(api_profile_status))
         .route("/api/profile/flamegraph", get(api_profile_flamegraph))

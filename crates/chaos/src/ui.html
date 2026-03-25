@@ -267,7 +267,7 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
       <div style="display:flex;flex-direction:column;gap:8px">
         <div class="form-row">
           <label style="width:70px;font-size:11px;color:var(--muted)">Target</label>
-          <select id="profile-container" style="flex:1;font-size:11px;padding:3px 6px">
+          <select id="profile-container" style="flex:1;font-size:11px;padding:3px 6px" onchange="updateProfileAvailability()">
             <option value="deltaforge-deltaforge-soak-1">soak (:8081)</option>
             <option value="deltaforge-deltaforge-1">app (:8080)</option>
             <option value="deltaforge-deltaforge-tpcc-1">tpcc (:8082)</option>
@@ -370,70 +370,62 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
 
         <!-- Drain settings — only shown for backlog-drain -->
         <div id="drain-settings" style="display:none;border:1px solid var(--border);border-radius:6px;padding:10px;display:none;flex-direction:column;gap:8px;background:var(--surface2)">
-          <div style="font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);margin-bottom:2px">Drain Throughput Settings</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
 
-          <div class="form-row">
-            <label>Batch size</label>
-            <div style="display:flex;gap:6px;align-items:center;flex:1">
-              <input type="number" id="drain-max-events" value="200" min="1" max="10000" style="width:80px">
-              <span class="muted">events &nbsp;·&nbsp; max age</span>
-              <input type="number" id="drain-max-ms" value="100" min="10" max="5000" style="width:70px">
-              <span class="muted">ms</span>
+            <!-- Left: Pipeline batch settings -->
+            <div style="display:flex;flex-direction:column;gap:6px">
+              <div style="font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted)">Pipeline</div>
+              <div style="display:flex;gap:4px;align-items:center">
+                <span class="muted" style="font-size:10px;width:55px">Batch</span>
+                <input type="number" id="drain-max-events" value="200" min="1" max="10000" style="width:60px;font-size:11px;padding:2px 4px" title="max_events">
+                <span class="muted" style="font-size:9px">ev</span>
+                <input type="number" id="drain-max-ms" value="100" min="10" max="5000" style="width:50px;font-size:11px;padding:2px 4px" title="max_ms">
+                <span class="muted" style="font-size:9px">ms</span>
+              </div>
+              <div style="display:flex;gap:4px;align-items:center">
+                <span class="muted" style="font-size:10px;width:55px">Acks</span>
+                <div class="source-toggle">
+                  <button id="drain-commit-required" class="active" onclick="setDrainCommit('required')">required</button>
+                  <button id="drain-commit-all" onclick="setDrainCommit('all')">all</button>
+                  <button id="drain-commit-quorum" onclick="setDrainCommit('quorum')">quorum</button>
+                </div>
+              </div>
+              <div style="display:flex;gap:4px;align-items:center">
+                <span class="muted" style="font-size:10px;width:55px">Sensing</span>
+                <div class="source-toggle">
+                  <button id="drain-sensing-off" class="active" onclick="setDrainSensing(false)">Off</button>
+                  <button id="drain-sensing-on" onclick="setDrainSensing(true)">On</button>
+                </div>
+              </div>
             </div>
-          </div>
 
-          <div class="form-row">
-            <label>Acks</label>
-            <div class="source-toggle">
-              <button id="drain-commit-required" class="active" onclick="setDrainCommit('required')">required</button>
-              <button id="drain-commit-all" onclick="setDrainCommit('all')">all</button>
-              <button id="drain-commit-quorum" onclick="setDrainCommit('quorum')">quorum</button>
+            <!-- Right: Kafka producer tuning -->
+            <div style="display:flex;flex-direction:column;gap:6px">
+              <div style="font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted)">Kafka <span style="text-transform:none;letter-spacing:0">(rdkafka)</span></div>
+              <div style="display:flex;gap:4px;align-items:center">
+                <span class="muted" style="font-size:10px;width:65px">batch.size</span>
+                <input type="number" id="drain-kafka-batch-size" value="1048576" min="1024" max="16777216" style="width:80px;font-size:11px;padding:2px 4px">
+                <span class="muted" style="font-size:9px">B</span>
+              </div>
+              <div style="display:flex;gap:4px;align-items:center">
+                <span class="muted" style="font-size:10px;width:65px">linger.ms</span>
+                <input type="number" id="drain-kafka-linger" value="20" min="0" max="1000" style="width:50px;font-size:11px;padding:2px 4px">
+              </div>
+              <div style="display:flex;gap:4px;align-items:center">
+                <span class="muted" style="font-size:10px;width:65px">batch.num</span>
+                <input type="number" id="drain-kafka-batch-num" value="100000" min="1000" max="1000000" style="width:80px;font-size:11px;padding:2px 4px">
+              </div>
+              <div style="display:flex;gap:4px;align-items:center">
+                <span class="muted" style="font-size:10px;width:65px">compress</span>
+                <div class="source-toggle">
+                  <button id="drain-kafka-comp-lz4" class="active" onclick="setDrainCompression('lz4')">lz4</button>
+                  <button id="drain-kafka-comp-snappy" onclick="setDrainCompression('snappy')">snappy</button>
+                  <button id="drain-kafka-comp-zstd" onclick="setDrainCompression('zstd')">zstd</button>
+                  <button id="drain-kafka-comp-none" onclick="setDrainCompression('none')">none</button>
+                </div>
+              </div>
             </div>
-          </div>
 
-          <div class="form-row">
-            <label>Sensing</label>
-            <div class="source-toggle">
-              <button id="drain-sensing-off" class="active" onclick="setDrainSensing(false)">Off (faster)</button>
-              <button id="drain-sensing-on" onclick="setDrainSensing(true)">On</button>
-            </div>
-          </div>
-
-          <hr style="border:none;border-top:1px solid var(--border);margin:4px 0">
-          <div style="font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);margin-bottom:2px">Kafka Producer Tuning <span style="text-transform:none;letter-spacing:0">(rdkafka)</span></div>
-
-          <div class="form-row">
-            <label>batch.size</label>
-            <div style="display:flex;gap:6px;align-items:center;flex:1">
-              <input type="number" id="drain-kafka-batch-size" value="1048576" min="1024" max="16777216" style="width:100px">
-              <span class="muted">bytes (default 16384)</span>
-            </div>
-          </div>
-
-          <div class="form-row">
-            <label>linger.ms</label>
-            <div style="display:flex;gap:6px;align-items:center;flex:1">
-              <input type="number" id="drain-kafka-linger" value="20" min="0" max="1000" style="width:70px">
-              <span class="muted">ms (default 5)</span>
-            </div>
-          </div>
-
-          <div class="form-row">
-            <label style="width:100px">batch.num.messages</label>
-            <div style="display:flex;gap:6px;align-items:center;flex:1">
-              <input type="number" id="drain-kafka-batch-num" value="100000" min="1000" max="1000000" style="width:100px">
-              <span class="muted">(default 10000)</span>
-            </div>
-          </div>
-
-          <div class="form-row">
-            <label>compression</label>
-            <div class="source-toggle">
-              <button id="drain-kafka-comp-lz4" class="active" onclick="setDrainCompression('lz4')">lz4</button>
-              <button id="drain-kafka-comp-snappy" onclick="setDrainCompression('snappy')">snappy</button>
-              <button id="drain-kafka-comp-zstd" onclick="setDrainCompression('zstd')">zstd</button>
-              <button id="drain-kafka-comp-none" onclick="setDrainCompression('none')">none</button>
-            </div>
           </div>
         </div>
 
@@ -671,7 +663,31 @@ async function resetVolumes(scope) {
   refreshStatus();
 }
 
+// ── Image swap ────────────────────────────────────────────────────────────
+async function swapImage(service, profile, image) {
+  if (!confirm(`Swap ${service} to ${image}?\n\nThis will stop the service, update docker-compose.chaos.yml, and recreate.`)) return;
+  toast(`Swapping ${service} → ${image}…`, 'ok');
+  const r = await api('POST', '/api/swap-image', { service, profile, image });
+  toast(r.ok ? `✅ ${service} now using ${image}` : `❌ Swap failed`, r.ok ? 'ok' : 'err');
+  refreshStatus();
+}
+
 // ── CPU Profiling ─────────────────────────────────────────────────────────
+function updateProfileAvailability() {
+  const container = document.getElementById('profile-container').value;
+  const isSoak = container === 'deltaforge-deltaforge-soak-1';
+  const available = isSoak ? window._soakIsProfile : true;
+  const btn = document.getElementById('btn-profile-start');
+  const status = document.getElementById('profile-status-text');
+  if (!available && !profilePollTimer) {
+    btn.disabled = true;
+    status.innerHTML = '⚠️ Soak is using <code>dev-debug</code> — click the image tag in Services to swap to <code>dev-profile</code>.';
+  } else if (!profilePollTimer) {
+    btn.disabled = false;
+    status.innerHTML = 'Ready to record. Requires the <code>profiling</code> image with perf installed.';
+  }
+}
+
 let profilePollTimer = null;
 
 async function startProfile() {
@@ -1162,6 +1178,27 @@ function renderServices(services) {
       nm.className = 'svc-name';
       nm.textContent = name;
       row.appendChild(nm);
+
+      // Image tag badge for DeltaForge services
+      if (svc.image && svc.image.startsWith('deltaforge:')) {
+        const tag = svc.image.split(':')[1] || '';
+        const imgBadge = document.createElement('span');
+        imgBadge.className = 'svc-badge ' + (tag.includes('profile') ? 'badge-ok' : 'badge-dim');
+        imgBadge.textContent = tag;
+        imgBadge.style.cursor = 'pointer';
+        imgBadge.title = 'Click to swap image';
+        imgBadge.onclick = () => {
+          const newImg = tag.includes('profile') ? 'deltaforge:dev-debug' : 'deltaforge:dev-profile';
+          swapImage(name, group.profile, newImg);
+        };
+        row.appendChild(imgBadge);
+
+        // Track soak profile image for CPU profiling card
+        if (name === 'deltaforge-soak') {
+          window._soakIsProfile = tag.includes('profile');
+          updateProfileAvailability();
+        }
+      }
 
       // HTTP badge
       if (svc.http_ok !== null && svc.http_ok !== undefined) {
