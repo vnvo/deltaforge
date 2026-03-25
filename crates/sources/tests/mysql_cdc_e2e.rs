@@ -251,7 +251,8 @@ async fn mysql_schema_loader() -> Result<()> {
         let fp_before = schema_loader
             .load_schema(&db_name, "orders")
             .await?
-            .fingerprint;
+            .fingerprint
+            .clone();
 
         conn.query_drop("ALTER TABLE orders ADD COLUMN notes TEXT")
             .await?;

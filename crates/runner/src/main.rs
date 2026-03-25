@@ -1,5 +1,9 @@
 // crates/runner/src/main.rs — full replacement
 
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use anyhow::{Context, Result};
 use axum::Router;
 use clap::Parser;

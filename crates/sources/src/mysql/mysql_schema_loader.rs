@@ -38,8 +38,8 @@ pub struct LoadedSchema {
 pub struct MySqlSchemaLoader {
     pool: Pool,
     dsn: String,
-    /// Cache: (db, table) -> LoadedSchema
-    cache: Arc<RwLock<HashMap<(String, String), LoadedSchema>>>,
+    /// Cache: (db, table) -> Arc<LoadedSchema>
+    cache: Arc<RwLock<HashMap<(String, String), Arc<LoadedSchema>>>>,
     /// Schema registry for versioning
     registry: Arc<DurableSchemaRegistry>,
     tenant: String,
@@ -120,13 +120,13 @@ impl MySqlSchemaLoader {
                                 );
                                 cache.insert(
                                     (db.clone(), table.clone()),
-                                    LoadedSchema {
+                                    Arc::new(LoadedSchema {
                                         schema,
                                         registry_version: sv.version,
                                         fingerprint: fingerprint.into(),
                                         sequence: sv.sequence,
                                         column_names,
-                                    },
+                                    }),
                                 );
                                 from_registry += 1;
                             }
@@ -228,7 +228,7 @@ impl MySqlSchemaLoader {
         &self,
         db: &str,
         table: &str,
-    ) -> SourceResult<LoadedSchema> {
+    ) -> SourceResult<Arc<LoadedSchema>> {
         self.load_schema_at_checkpoint(db, table, None).await
     }
 
@@ -237,7 +237,7 @@ impl MySqlSchemaLoader {
         db: &str,
         table: &str,
         checkpoint: Option<&[u8]>,
-    ) -> SourceResult<LoadedSchema> {
+    ) -> SourceResult<Arc<LoadedSchema>> {
         if let Some(cached) = self
             .cache
             .read()
@@ -248,7 +248,7 @@ impl MySqlSchemaLoader {
             counter!("deltaforge_source_schema_cache_hits_total",
                 "pipeline" => self.tenant.clone(), "source" => "mysql")
             .increment(1);
-            return Ok(cached.clone());
+            return Ok(Arc::clone(cached));
         }
         counter!("deltaforge_source_schema_cache_misses_total",
             "pipeline" => self.tenant.clone(), "source" => "mysql")
@@ -276,19 +276,19 @@ impl MySqlSchemaLoader {
             )
             .await
             .map_err(SourceError::Other)?;
-        let loaded = LoadedSchema {
+        let loaded = Arc::new(LoadedSchema {
             schema,
             registry_version: version,
             fingerprint: fingerprint.into(),
             sequence: self.registry.current_sequence(),
             column_names,
-        };
+        });
 
         // Cache it
         self.cache
             .write()
             .await
-            .insert((db.to_string(), table.to_string()), loaded.clone());
+            .insert((db.to_string(), table.to_string()), Arc::clone(&loaded));
 
         let elapsed = t0.elapsed();
         if elapsed.as_millis() > 200 {
@@ -304,7 +304,7 @@ impl MySqlSchemaLoader {
         &self,
         db: &str,
         table: &str,
-    ) -> SourceResult<LoadedSchema> {
+    ) -> SourceResult<Arc<LoadedSchema>> {
         // Remove from cache
         self.cache
             .write()
@@ -328,7 +328,7 @@ impl MySqlSchemaLoader {
     }
 
     /// Get cached schema (without loading from DB).
-    pub fn get_cached(&self, db: &str, table: &str) -> Option<LoadedSchema> {
+    pub fn get_cached(&self, db: &str, table: &str) -> Option<Arc<LoadedSchema>> {
         // Note: This is sync because we're using try_read to avoid blocking
         self.cache.try_read().ok().and_then(|guard| {
             guard.get(&(db.to_string(), table.to_string())).cloned()
@@ -510,8 +510,8 @@ impl MySqlSchemaLoader {
     pub(crate) fn from_static(
         cols: HashMap<(String, String), Arc<Vec<String>>>,
     ) -> Self {
-        // Convert column-only map to LoadedSchema map
-        let cache: HashMap<(String, String), LoadedSchema> = cols
+        // Convert column-only map to Arc<LoadedSchema> map
+        let cache: HashMap<(String, String), Arc<LoadedSchema>> = cols
             .into_iter()
             .map(|((db, table), col_names)| {
                 let columns: Vec<MySqlColumn> = col_names
@@ -529,13 +529,13 @@ impl MySqlSchemaLoader {
                     .collect();
                 let schema = MySqlTableSchema::new(columns);
                 let fingerprint = schema.fingerprint();
-                let loaded = LoadedSchema {
+                let loaded = Arc::new(LoadedSchema {
                     schema,
                     registry_version: 1,
                     fingerprint: fingerprint.into(),
                     sequence: 0,
                     column_names: col_names,
-                };
+                });
                 ((db, table), loaded)
             })
             .collect();
