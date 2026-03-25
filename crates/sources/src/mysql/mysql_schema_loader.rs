@@ -330,7 +330,11 @@ impl MySqlSchemaLoader {
     }
 
     /// Get cached schema (without loading from DB).
-    pub fn get_cached(&self, db: &str, table: &str) -> Option<Arc<LoadedSchema>> {
+    pub fn get_cached(
+        &self,
+        db: &str,
+        table: &str,
+    ) -> Option<Arc<LoadedSchema>> {
         // Note: This is sync because we're using try_read to avoid blocking
         self.cache.try_read().ok().and_then(|guard| {
             guard.get(&(db.to_string(), table.to_string())).cloned()

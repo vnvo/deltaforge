@@ -190,11 +190,8 @@ async fn handle_write_rows(
         // Pre-compute values shared across all rows in this event.
         let ts_ms = ts_sec_to_ms(header.timestamp);
         let event_len = header.event_length as usize;
-        let checkpoint = make_checkpoint_meta(
-            &ctx.last_file,
-            ctx.last_pos,
-            &ctx.last_gtid,
-        );
+        let checkpoint =
+            make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid);
         let transaction = ctx.last_gtid.as_ref().map(|gtid| Transaction {
             id: gtid.clone(),
             total_order: None,
@@ -277,11 +274,8 @@ async fn handle_update_rows(
 
         let ts_ms = ts_sec_to_ms(header.timestamp);
         let event_len = header.event_length as usize;
-        let checkpoint = make_checkpoint_meta(
-            &ctx.last_file,
-            ctx.last_pos,
-            &ctx.last_gtid,
-        );
+        let checkpoint =
+            make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid);
         let transaction = ctx.last_gtid.as_ref().map(|gtid| Transaction {
             id: gtid.clone(),
             total_order: None,
@@ -364,11 +358,8 @@ async fn handle_delete_rows(
 
         let ts_ms = ts_sec_to_ms(header.timestamp);
         let event_len = header.event_length as usize;
-        let checkpoint = make_checkpoint_meta(
-            &ctx.last_file,
-            ctx.last_pos,
-            &ctx.last_gtid,
-        );
+        let checkpoint =
+            make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid);
         let transaction = ctx.last_gtid.as_ref().map(|gtid| Transaction {
             id: gtid.clone(),
             total_order: None,

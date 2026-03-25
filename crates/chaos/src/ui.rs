@@ -661,7 +661,8 @@ async fn api_profile_start(
 
     let st2 = Arc::clone(&st);
     tokio::spawn(async move {
-        match run_profile(&req.container, req.duration_secs, req.frequency).await
+        match run_profile(&req.container, req.duration_secs, req.frequency)
+            .await
         {
             Ok(svg) => {
                 *st2.flamegraph.lock().await = Some(svg);
@@ -669,8 +670,7 @@ async fn api_profile_start(
             }
             Err(e) => {
                 tracing::error!(error = %e, "profiling failed");
-                *st2.profile_status.lock().await =
-                    format!("error: {e}");
+                *st2.profile_status.lock().await = format!("error: {e}");
             }
         }
     });
@@ -685,7 +685,12 @@ async fn api_profile_status(
     let (status_str, error) = if status.starts_with("error:") {
         (
             "error".to_string(),
-            Some(status.strip_prefix("error: ").unwrap_or(&status).to_string()),
+            Some(
+                status
+                    .strip_prefix("error: ")
+                    .unwrap_or(&status)
+                    .to_string(),
+            ),
         )
     } else {
         (status, None)
