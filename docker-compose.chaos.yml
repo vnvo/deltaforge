@@ -69,12 +69,13 @@ services:
 
   postgres:
     image: postgres:17
-    profiles: [pg, pg-app]
+    profiles: [pg, pg-app, pg-soak]
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: orders
     volumes:
       - ./chaos/init/postgres-chaos.sql:/docker-entrypoint-initdb.d/01_init.sql
+      - ./chaos/init/postgres-soak.sql:/docker-entrypoint-initdb.d/02_soak.sql
       - postgres_data:/var/lib/postgresql/data
     command:
       - postgres
@@ -262,6 +263,28 @@ services:
     restart: on-failure
     networks: [chaos_net]
 
+  # DeltaForge — PostgreSQL Soak test (Postgres source, 120-table workload)
+  # Profile: pg-soak. Exposes on ports 8083 (health) and 9003 (metrics).
+
+  deltaforge-pg-soak:
+    image: deltaforge:dev-debug
+    command: ["--config", "/etc/deltaforge/pg-soak.yaml", "--storage-path", "/data/deltaforge-pg-soak.db"]
+    profiles: [pg-soak]
+    user: root
+    cap_add: [SYS_ADMIN]
+    security_opt: ["seccomp=unconfined"]
+    volumes:
+      - ./chaos/config:/etc/deltaforge:ro
+      - deltaforge_pg_soak_data:/data
+    environment:
+      RUST_LOG: "deltaforge=info,sources=info,sinks=info,warn"
+    ports:
+      - "8083:8080"   # REST API / health
+      - "9003:9000"   # Prometheus /metrics
+    depends_on: [toxiproxy, postgres]
+    restart: on-failure
+    networks: [chaos_net]
+
   # cAdvisor — container-level CPU, memory, network, and disk I/O metrics
   # Scrapes Docker runtime stats and exposes them to Prometheus.
 
@@ -309,6 +332,7 @@ volumes:
   deltaforge_pg_data:
   deltaforge_tpcc_data:
   deltaforge_soak_data:
+  deltaforge_pg_soak_data:
   grafana_data:
   mysql_data:
   mysql_b_data:

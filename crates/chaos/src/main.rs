@@ -187,7 +187,7 @@ async fn main() -> Result<()> {
             .await?
         }
         Source::Postgres => {
-            run_postgres(&harness, &cli.scenario, cli.duration_mins).await?
+            run_postgres(&harness, &cli.scenario, cli.duration_mins, cli.writer_tasks, cli.write_delay_ms).await?
         }
     };
 
@@ -310,7 +310,9 @@ async fn run_mysql(
 async fn run_postgres(
     harness: &Harness,
     scenario: &Scenario,
-    _duration_mins: u64,
+    duration_mins: u64,
+    writer_tasks: usize,
+    write_delay_ms: u64,
 ) -> Result<Vec<harness::ScenarioResult>> {
     let backend = PgBackend;
     let mut results = vec![];
@@ -338,10 +340,30 @@ async fn run_postgres(
         Scenario::SlotDropped => {
             results.push(scenarios::slot_dropped::run(harness).await?);
         }
+        Scenario::Soak => {
+            results.push(
+                scenarios::soak::run_pg(
+                    harness,
+                    duration_mins,
+                    writer_tasks,
+                    write_delay_ms,
+                )
+                .await?,
+            );
+        }
+        Scenario::SoakStable => {
+            results.push(
+                scenarios::soak::run_stable_pg(
+                    harness,
+                    duration_mins,
+                    writer_tasks,
+                    write_delay_ms,
+                )
+                .await?,
+            );
+        }
         Scenario::Ui => unreachable!("ui is handled before source dispatch"),
-        Scenario::Soak
-        | Scenario::SoakStable
-        | Scenario::BacklogDrain
+        Scenario::BacklogDrain
         | Scenario::Tpcc
         | Scenario::Failover
         | Scenario::BinlogPurge => {
