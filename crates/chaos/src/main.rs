@@ -65,6 +65,12 @@ struct Cli {
     /// Disabling sensing (the default) greatly improves replay throughput.
     #[arg(long, default_value_t = false)]
     drain_schema_sensing: bool,
+
+    /// rdkafka producer config overrides for the backlog-drain, as key=value pairs.
+    /// Useful knobs: linger.ms, batch.size, batch.num.messages, compression.type.
+    /// Example: --drain-kafka-conf linger.ms=20 --drain-kafka-conf batch.size=1048576
+    #[arg(long = "drain-kafka-conf", value_name = "KEY=VALUE")]
+    drain_kafka_conf: Vec<String>,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -150,12 +156,22 @@ async fn main() -> Result<()> {
         info!("DeltaForge is healthy — starting chaos");
     }
 
+    let kafka_client_conf: std::collections::HashMap<String, String> = cli
+        .drain_kafka_conf
+        .iter()
+        .filter_map(|s| {
+            let (k, v) = s.split_once('=')?;
+            Some((k.trim().to_string(), v.trim().to_string()))
+        })
+        .collect();
+
     let drain_cfg = scenarios::backlog_drain::DrainConfig {
         max_events: cli.drain_max_events,
         max_ms: cli.drain_max_ms,
         commit_mode: cli.drain_commit_mode.clone(),
         commit_interval_ms: cli.drain_commit_interval_ms,
         schema_sensing: cli.drain_schema_sensing,
+        kafka_client_conf,
     };
 
     let results = match cli.source {

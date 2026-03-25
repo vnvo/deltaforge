@@ -11,6 +11,7 @@ IMAGE_TAG="dev"
 
 CHAOS_DC=(docker compose -f docker-compose.chaos.yml)
 CHAOS_IMAGE="deltaforge:dev-debug"
+CHAOS_PROFILE_IMAGE="deltaforge:dev-profile"
 
 usage() {
   cat <<'EOF'
@@ -103,7 +104,8 @@ Release:
 Chaos (resilience scenarios against a live Docker Compose stack):
   ./dev.sh chaos-status                   # overview of all chaos services and Kafka topics
   ./dev.sh chaos-ui                       # start the web playground UI at http://localhost:7474
-  ./dev.sh chaos-build                    # build deltaforge:dev-debug image
+  ./dev.sh chaos-build                    # build deltaforge:dev-debug (stripped release, for scenarios)
+  ./dev.sh chaos-build-profile            # build deltaforge:dev-profile (opt-level=2, DWARF symbols, linux-perf)
   ./dev.sh chaos-up [mysql|postgres]      # start chaos stack (default: mysql)
   ./dev.sh chaos-down [mysql|postgres]    # stop & remove (default: mysql)
   ./dev.sh chaos-ps                       # list all running chaos services
@@ -126,6 +128,8 @@ Chaos — Soak (long-running, 120-table workload with random fault injection):
   ./dev.sh chaos-soak-run [mins=120]      # run soak scenario
   ./dev.sh chaos-soak-reset               # stop + wipe soak storage (MySQL tables preserved)
   ./dev.sh chaos-soak-reload-tables       # reload soak SQL into running MySQL
+  ./dev.sh chaos-soak-profile             # swap soak container to profiling image (enables CPU flamegraphs)
+  ./dev.sh chaos-soak-unprofile           # swap soak container back to standard debug image
 
 Chaos — TPC-C (9-table OLTP benchmark, New-Order/Payment/Delivery mix):
   ./dev.sh chaos-tpcc-up                  # start infra + deltaforge-tpcc (port 8082/9002)
@@ -141,6 +145,8 @@ Notes:
 - Storage db: ./data/deltaforge.db (override with STORAGE_DB)
 - Storage commands are SQLite-only; for Postgres use psql directly.
 - Chaos stack: build debug image first, then chaos-up [mysql|postgres].
+- Profiling: chaos-build-profile builds the image, chaos-soak-profile swaps soak to it.
+  Then use the Playground UI's CPU Profiling card to record and view flamegraphs.
 - Soak/TPC-C: infra must be running first (chaos-up starts it).
 - Soak health: http://localhost:8081/health  metrics: http://localhost:9001/metrics
 - TPC-C health: http://localhost:8082/health  metrics: http://localhost:9002/metrics
@@ -629,6 +635,19 @@ cmd_chaos_build() {
   echo "✅ Built $CHAOS_IMAGE"
 }
 
+cmd_chaos_build_profile() {
+  echo "Building profiling image…"
+  echo "   Profile:  profiling (opt-level=2, DWARF debug symbols, no strip)"
+  echo "   Extras:   linux-perf installed in runtime image"
+  echo "   Use case: CPU flamegraphs via the Playground UI or manual perf record"
+  echo ""
+  docker build --build-arg CARGO_PROFILE=profiling -t "$CHAOS_PROFILE_IMAGE" -f Dockerfile.debug .
+  docker image ls | grep deltaforge
+  echo ""
+  echo "✅ Built $CHAOS_PROFILE_IMAGE"
+  echo "   Next: ./dev.sh chaos-soak-profile  (swap soak container to this image)"
+}
+
 cmd_chaos_up() {
   local src="${1:-mysql}"
   local profile; profile=$(_chaos_profile "$src")
@@ -864,6 +883,55 @@ cmd_chaos_soak_reload_tables() {
   echo "✅ Soak tables reloaded"
 }
 
+cmd_chaos_soak_profile() {
+  if ! docker image inspect "$CHAOS_PROFILE_IMAGE" &>/dev/null; then
+    echo "⚠️  Profile image ($CHAOS_PROFILE_IMAGE) not found."
+    echo "   Building it now (this compiles Rust with debug symbols — may take a few minutes)…"
+    echo ""
+    cmd_chaos_build_profile
+  fi
+  echo "Swapping soak container image: $CHAOS_IMAGE → $CHAOS_PROFILE_IMAGE"
+  echo "   This stops deltaforge-soak, updates docker-compose.chaos.yml, and recreates the container."
+  "${CHAOS_DC[@]}" --profile soak stop deltaforge-soak 2>/dev/null || true
+  # Patch the image line for the deltaforge-soak service in the compose file.
+  awk -v img="$CHAOS_PROFILE_IMAGE" '
+    /^  deltaforge-soak:/ { in_soak=1 }
+    in_soak && /image:/ { sub(/image:.*/, "image: " img); in_soak=0 }
+    { print }
+  ' docker-compose.chaos.yml > docker-compose.chaos.yml.tmp \
+    && mv docker-compose.chaos.yml.tmp docker-compose.chaos.yml
+  "${CHAOS_DC[@]}" --profile soak up -d --force-recreate deltaforge-soak
+  echo ""
+  echo "✅ Soak is now running with the profiling image"
+  echo ""
+  echo "   What changed:"
+  echo "     - Binary compiled with opt-level=2 + full DWARF debug symbols"
+  echo "     - linux-perf installed inside the container"
+  echo "     - docker-compose.chaos.yml updated (deltaforge-soak → $CHAOS_PROFILE_IMAGE)"
+  echo ""
+  echo "   Record a flamegraph:"
+  echo "     Option A: Use the Playground UI → CPU Profiling card (./dev.sh chaos-ui)"
+  echo "     Option B: docker exec deltaforge-deltaforge-soak-1 perf record -F 99 -p 1 -g --call-graph dwarf -o /tmp/perf.data -- sleep 30"
+  echo ""
+  echo "   To revert: ./dev.sh chaos-soak-unprofile"
+}
+
+cmd_chaos_soak_unprofile() {
+  echo "Swapping soak container image: $CHAOS_PROFILE_IMAGE → $CHAOS_IMAGE"
+  echo "   This stops deltaforge-soak, updates docker-compose.chaos.yml, and recreates the container."
+  "${CHAOS_DC[@]}" --profile soak stop deltaforge-soak 2>/dev/null || true
+  # Patch the image line for the deltaforge-soak service in the compose file.
+  awk -v img="$CHAOS_IMAGE" '
+    /^  deltaforge-soak:/ { in_soak=1 }
+    in_soak && /image:/ { sub(/image:.*/, "image: " img); in_soak=0 }
+    { print }
+  ' docker-compose.chaos.yml > docker-compose.chaos.yml.tmp \
+    && mv docker-compose.chaos.yml.tmp docker-compose.chaos.yml
+  "${CHAOS_DC[@]}" --profile soak up -d --force-recreate deltaforge-soak
+  echo ""
+  echo "✅ Soak reverted to standard debug image ($CHAOS_IMAGE)"
+}
+
 # ── Chaos: TPC-C ─────────────────────────────────────────────────────────────
 
 cmd_chaos_tpcc_up() {
@@ -1009,6 +1077,7 @@ case "${1:-}" in
   chaos-status) shift; cmd_chaos_status "$@";;
   chaos-ui) shift; cargo run -p chaos -- --scenario ui "$@";;
   chaos-build) shift; cmd_chaos_build "$@";;
+  chaos-build-profile) shift; cmd_chaos_build_profile "$@";;
   chaos-up) shift; cmd_chaos_up "$@";;
   chaos-down) shift; cmd_chaos_down "$@";;
   chaos-ps) shift; cmd_chaos_ps "$@";;
@@ -1029,6 +1098,8 @@ case "${1:-}" in
   chaos-soak-run) shift; cmd_chaos_soak_run "$@";;
   chaos-soak-reset) shift; cmd_chaos_soak_reset "$@";;
   chaos-soak-reload-tables) shift; cmd_chaos_soak_reload_tables "$@";;
+  chaos-soak-profile) shift; cmd_chaos_soak_profile "$@";;
+  chaos-soak-unprofile) shift; cmd_chaos_soak_unprofile "$@";;
   chaos-tpcc-up) shift; cmd_chaos_tpcc_up "$@";;
   chaos-tpcc-down) shift; cmd_chaos_tpcc_down "$@";;
   chaos-tpcc-run) shift; cmd_chaos_tpcc_run "$@";;

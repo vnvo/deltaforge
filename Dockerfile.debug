@@ -4,6 +4,10 @@
 
 FROM rust:1.91-bookworm AS builder
 
+# Build profile: "release" (default) or "profiling" (keeps debug symbols for perf/flamegraph).
+# Usage: docker build --build-arg CARGO_PROFILE=profiling -t deltaforge:dev-profile -f Dockerfile.debug .
+ARG CARGO_PROFILE=release
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -21,9 +25,12 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 COPY examples ./examples
 
-RUN cargo build --locked --release --bin runner
+RUN cargo build --locked --profile ${CARGO_PROFILE} --bin runner
 
+# Copy from the correct target directory (release or profiling).
 FROM debian:bookworm-slim
+
+ARG CARGO_PROFILE=release
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -34,10 +41,11 @@ RUN apt-get update \
     curl \
     procps \
     net-tools \
+    $(if [ "$CARGO_PROFILE" = "profiling" ]; then echo "linux-perf"; fi) \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -u 10001 deltaforge
 
-COPY --from=builder /app/target/release/runner /usr/local/bin/deltaforge
+COPY --from=builder /app/target/${CARGO_PROFILE}/runner /usr/local/bin/deltaforge
 
 USER deltaforge
 WORKDIR /app

@@ -246,6 +246,13 @@ cargo run -p chaos -- --scenario soak-stable --duration-mins 30
 # Backlog-drain — measures catch-up throughput after a planned stop
 cargo run -p chaos -- --scenario backlog-drain
 
+# Backlog-drain with rdkafka producer tuning
+cargo run -p chaos -- --scenario backlog-drain \
+  --drain-max-events 3500 --drain-max-ms 50 \
+  --drain-kafka-conf batch.size=1048576 \
+  --drain-kafka-conf linger.ms=20 \
+  --drain-kafka-conf batch.num.messages=100000
+
 # TPC-C — OLTP transaction mix benchmark
 docker compose -f docker-compose.chaos.yml --profile tpcc up -d
 cargo run -p chaos -- --scenario tpcc --duration-mins 30
@@ -261,6 +268,13 @@ cargo run -p chaos -- --scenario ui
 ```
 
 The UI provides live service status, one-click fault injection, a scenario runner with live log output, and a full Pipeline API browser for any DeltaForge instance.
+
+#### Data management
+
+The UI includes a **Data Management** card for resetting persistent state between test runs:
+
+- **Reset Checkpoints** — stops all DeltaForge instances and deletes their SQLite checkpoint databases (GTID positions, replication offsets). Source databases and Kafka are untouched. Use this when switching branches or after a binlog purge leaves stale checkpoint state.
+- **Reset All Volumes** — runs `docker compose down -v` across all profiles, removing every named volume (MySQL data, Kafka state, Postgres data, checkpoints, Grafana). Full clean slate that requires re-initialization of all services.
 
 ### Teardown
 

@@ -75,6 +75,10 @@ pub struct DrainConfig {
     /// Whether schema sensing is enabled during the drain.
     /// Disabling it improves throughput significantly.
     pub schema_sensing: bool,
+    /// rdkafka producer overrides applied to the sink's `client_conf`.
+    /// Common keys: `linger.ms`, `batch.size`, `batch.num.messages`,
+    /// `compression.type`, `queue.buffering.max.messages`.
+    pub kafka_client_conf: std::collections::HashMap<String, String>,
 }
 
 impl Default for DrainConfig {
@@ -85,6 +89,7 @@ impl Default for DrainConfig {
             commit_mode: "required".to_string(),
             commit_interval_ms: 500,
             schema_sensing: false,
+            kafka_client_conf: std::collections::HashMap::new(),
         }
     }
 }
@@ -102,6 +107,7 @@ pub async fn run(
         commit_mode = %cfg.commit_mode,
         commit_interval_ms = cfg.commit_interval_ms,
         schema_sensing = cfg.schema_sensing,
+        kafka_overrides = cfg.kafka_client_conf.len(),
         "drain config"
     );
     harness.setup().await?;
@@ -189,13 +195,27 @@ pub async fn run(
         "step 4/6: patching pipeline '{PIPELINE_NAME}' and restarting ..."
     );
     // Build the PATCH body from DrainConfig.
-    let patch_body = serde_json::json!({
-        "spec": {
-            "schema_sensing": {"enabled": cfg.schema_sensing},
-            "batch": {"max_events": cfg.max_events, "max_ms": cfg.max_ms},
-            "commit_policy": {"mode": cfg.commit_mode},
-        }
+    let mut patch_spec = serde_json::json!({
+        "schema_sensing": {"enabled": cfg.schema_sensing},
+        "batch": {"max_events": cfg.max_events, "max_ms": cfg.max_ms},
+        "commit_policy": {"mode": cfg.commit_mode},
     });
+
+    // If any rdkafka client_conf overrides were provided, patch the first sink.
+    if !cfg.kafka_client_conf.is_empty() {
+        let cc: serde_json::Value = cfg
+            .kafka_client_conf
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .collect::<serde_json::Map<String, serde_json::Value>>()
+            .into();
+        info!(?cc, "applying kafka client_conf overrides");
+        patch_spec["sinks"] = serde_json::json!([
+            {"config": {"client_conf": cc}}
+        ]);
+    }
+
+    let patch_body = serde_json::json!({ "spec": patch_spec });
     let patch_ok = df_patch(&format!("/pipelines/{PIPELINE_NAME}"), patch_body)
         .await
         .map(|_| true)
@@ -291,12 +311,23 @@ pub async fn run(
         "step 6/6: backlog drain benchmark complete"
     );
 
-    Ok(ScenarioResult::pass(name)
+    let mut result = ScenarioResult::pass(name)
         .note(format!("target events: {TARGET_EVENTS}"))
         .note(format!("rows written to MySQL: {rows_written}"))
         .note(format!("batch max_events: {}", cfg.max_events))
         .note(format!("commit mode: {}", cfg.commit_mode))
-        .note(format!("schema sensing: {}", cfg.schema_sensing))
+        .note(format!("schema sensing: {}", cfg.schema_sensing));
+
+    if !cfg.kafka_client_conf.is_empty() {
+        let pairs: Vec<String> = cfg
+            .kafka_client_conf
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        result = result.note(format!("kafka overrides: {}", pairs.join(", ")));
+    }
+
+    Ok(result
         .note(format!(
             "write duration: {write_secs:.1}s ({write_tps:.0} rows/s)"
         ))

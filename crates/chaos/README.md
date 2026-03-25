@@ -75,9 +75,10 @@ cargo run -p chaos -- --scenario ui
 The UI has three areas:
 
 - **Chaos tab** — service health grid with start/stop buttons per profile, fault injection (MySQL/PG/Kafka partition, latency, throttle), and the scenario runner with live log output.
+- **Data Management** — reset checkpoints (clears stale GTID/offset state) or reset all volumes (`docker compose down -v`). Useful when switching branches or after binlog purge errors.
 - **Pipeline API tab** — proxied access to any DeltaForge instance (port 8080, 8081, or 8082) for inspecting pipelines, schemas, sensing stats, and drift results.
 
-Fault injection and scenario settings (duration, writer count, drain throughput knobs) are configurable per run from the UI.
+Fault injection and scenario settings (duration, writer count, drain throughput knobs, rdkafka producer tuning) are configurable per run from the UI.
 
 ## Running scenarios from the CLI
 
@@ -233,24 +234,42 @@ cargo run -p chaos -- --scenario backlog-drain
 
 # Tuned for higher throughput
 cargo run -p chaos -- --scenario backlog-drain \
-  --drain-max-events 1000 \
+  --drain-max-events 3500 \
   --drain-max-ms 50 \
-  --drain-commit-mode required \
-  --drain-schema-sensing false
+  --drain-commit-mode required
+
+# With rdkafka producer tuning for maximum throughput
+cargo run -p chaos -- --scenario backlog-drain \
+  --drain-max-events 3500 --drain-max-ms 50 \
+  --drain-kafka-conf batch.size=1048576 \
+  --drain-kafka-conf linger.ms=20 \
+  --drain-kafka-conf batch.num.messages=100000
 ```
 
 **CLI flags:**
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--drain-max-events` | `200` | Max events per Kafka batch |
+| `--drain-max-events` | `200` | Max events per pipeline batch |
 | `--drain-max-ms` | `100` | Max batch age in ms |
-| `--drain-commit-mode` | `required` | Kafka ack mode: `required`, `all`, `quorum` |
+| `--drain-commit-mode` | `required` | Commit mode: `required` (safe) or `periodic` (faster) |
 | `--drain-schema-sensing` | `false` | Enable schema sensing during drain (slower) |
+| `--drain-kafka-conf KEY=VALUE` | *(none)* | rdkafka producer overrides (repeatable) |
 
-**Output includes:** write throughput, drain duration, avg/p50/peak drain events/s.
+**Useful `--drain-kafka-conf` keys:**
 
-**What it proves:** binlog catch-up throughput, checkpoint resume correctness, impact of batch size and schema sensing on replay performance.
+| Key | rdkafka default | Description |
+|-----|-----------------|-------------|
+| `batch.size` | `16384` (16 KB) | Max bytes per Kafka produce request. Raise to 1 MB+ for high-throughput drains. |
+| `linger.ms` | `5` | How long rdkafka waits to fill a batch before sending. Higher = more batching. |
+| `batch.num.messages` | `10000` | Max messages per Kafka produce request. |
+| `compression.type` | `lz4` | Compression codec: `lz4`, `snappy`, `zstd`, `none`. |
+
+These settings are also available in the **Playground UI** under the "Kafka Producer Tuning" panel when the backlog-drain scenario is selected.
+
+**Output includes:** write throughput, drain duration, avg/p50/peak drain events/s, and any kafka overrides applied.
+
+**What it proves:** binlog catch-up throughput, checkpoint resume correctness, impact of batch size, rdkafka producer tuning, and schema sensing on replay performance.
 
 > Schema sensing processes every event to infer structure and is ~15x slower than disabled. Disable it (the default) for maximum drain throughput. The original pipeline config is restored on container restart.
 
@@ -295,6 +314,13 @@ docker compose -f docker-compose.chaos.yml down -v
 ```
 
 The `-v` flag removes all volumes, giving the next run a completely clean slate.
+
+### Reset from the Playground UI
+
+The UI's **Data Management** card provides two reset options without touching the command line:
+
+- **Reset Checkpoints** — stops all DeltaForge instances and deletes their SQLite checkpoint databases (GTID positions, replication slot offsets). Source databases and Kafka data are preserved. This is the quickest fix for stale checkpoint errors (e.g. "binlog position purged" after switching branches).
+- **Reset All Volumes** — equivalent to `docker compose down -v` across all profiles. Wipes everything including MySQL data, Kafka state, and Grafana dashboards.
 
 ## Adding a scenario
 
