@@ -219,7 +219,7 @@ impl PipelineManager {
 
         let alive = Arc::new(AtomicBool::new(true));
 
-        let (event_tx, event_rx) = mpsc::channel::<Event>(4096);
+        let (event_tx, event_rx) = mpsc::channel::<Event>(32_768);
         let src_handle = source.run(event_tx, self.ckpt_store.clone()).await;
 
         // Wrap the source JoinHandle so alive=false is set immediately when
@@ -554,6 +554,19 @@ fn merge_values(base: &mut Value, patch: Value) {
                 }
             }
         }
+        // Deep-merge arrays element-wise by index. Patch elements that are
+        // objects are merged into the corresponding base element; non-object
+        // patch elements replace the base element. If the patch array is
+        // longer than the base, extra elements are appended.
+        (Value::Array(b), Value::Array(p)) => {
+            for (i, pv) in p.into_iter().enumerate() {
+                if i < b.len() {
+                    merge_values(&mut b[i], pv);
+                } else {
+                    b.push(pv);
+                }
+            }
+        }
         (b, p) => *b = p,
     }
 }
@@ -611,5 +624,28 @@ mod tests {
             serde_json::json!({"spec": {"batch": {"max_events": 2000}}});
         let merged = merge_spec(base, patch).unwrap();
         assert_eq!(merged.spec.batch.as_ref().unwrap().max_events, Some(2000));
+    }
+
+    #[test]
+    fn merge_values_deep_merges_arrays() {
+        let mut base = serde_json::json!({
+            "sinks": [
+                {"type": "kafka", "config": {"id": "k1", "brokers": "localhost:9092", "topic": "t1"}},
+                {"type": "redis", "config": {"id": "r1", "uri": "redis://localhost"}}
+            ]
+        });
+        let patch = serde_json::json!({
+            "sinks": [
+                {"config": {"client_conf": {"linger.ms": "20"}}}
+            ]
+        });
+        merge_values(&mut base, patch);
+        // First sink should have client_conf merged in, keeping type/id/brokers/topic.
+        let first = &base["sinks"][0];
+        assert_eq!(first["type"], "kafka");
+        assert_eq!(first["config"]["id"], "k1");
+        assert_eq!(first["config"]["client_conf"]["linger.ms"], "20");
+        // Second sink should be untouched.
+        assert_eq!(base["sinks"][1]["type"], "redis");
     }
 }

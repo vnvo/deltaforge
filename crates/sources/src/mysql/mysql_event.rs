@@ -21,7 +21,23 @@ use crate::mysql::mysql_helpers::{make_checkpoint_meta, short_sql};
 
 use deltaforge_config::OUTBOX_SCHEMA_SENTINEL;
 
-#[instrument(skip_all)]
+/// Send an event to the coordinator channel.
+///
+/// Uses `try_send` (non-blocking) when the channel has capacity to avoid
+/// the overhead of the async state machine on every single row. Falls back
+/// to the async `send` only when the channel is full (backpressure).
+#[inline]
+async fn send_event(tx: &tokio::sync::mpsc::Sender<Event>, ev: Event) -> bool {
+    match tx.try_send(ev) {
+        Ok(()) => true,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(ev)) => {
+            // Channel full — apply backpressure via async wait.
+            tx.send(ev).await.is_ok()
+        }
+        Err(_) => false, // channel closed
+    }
+}
+
 pub(super) async fn read_next_event(
     stream: &mut BinlogStream,
     ctx: &RunCtx,
@@ -55,7 +71,6 @@ pub(super) async fn read_next_event(
     }
 }
 
-#[instrument(skip_all)]
 pub(super) async fn dispatch_event(
     ctx: &mut RunCtx,
     header: &EventHeader,
@@ -156,7 +171,6 @@ fn build_source_info(
     }
 }
 
-#[instrument(skip_all)]
 async fn handle_write_rows(
     ctx: &mut RunCtx,
     header: &EventHeader,
@@ -170,8 +184,27 @@ async fn handle_write_rows(
             .schema
             .load_schema(&tm.database_name, &tm.table_name)
             .await?;
-        debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=wr.rows.len(), "write_rows");
+        let row_count = wr.rows.len();
+        debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=row_count, "write_rows");
 
+        // Pre-compute values shared across all rows in this event.
+        let ts_ms = ts_sec_to_ms(header.timestamp);
+        let event_len = header.event_length as usize;
+        let checkpoint = make_checkpoint_meta(
+            &ctx.last_file,
+            ctx.last_pos,
+            &ctx.last_gtid,
+        );
+        let transaction = ctx.last_gtid.as_ref().map(|gtid| Transaction {
+            id: gtid.clone(),
+            total_order: None,
+            data_collection_order: None,
+        });
+        let fingerprint_str = loaded.fingerprint.to_string();
+        let is_outbox = !ctx.outbox_tables.is_empty()
+            && ctx.outbox_tables.matches(&tm.database_name, &tm.table_name);
+
+        let mut sent = 0u64;
         for row in wr.rows {
             let after = build_object(
                 &loaded.column_names,
@@ -190,51 +223,36 @@ async fn handle_write_rows(
                 Op::Create,
                 None,
                 Some(after),
-                ts_sec_to_ms(header.timestamp),
-                header.event_length as usize,
+                ts_ms,
+                event_len,
             )
             .with_tenant(ctx.tenant.clone())
-            .with_checkpoint(make_checkpoint_meta(
-                &ctx.last_file,
-                ctx.last_pos,
-                &ctx.last_gtid,
-            ));
+            .with_checkpoint(checkpoint.clone());
 
-            // Set transaction info if GTID is available
-            if let Some(gtid) = &ctx.last_gtid {
-                ev.transaction = Some(Transaction {
-                    id: gtid.clone(),
-                    total_order: None,
-                    data_collection_order: None,
-                });
-            }
-
-            // Check for outbox
-            if !ctx.outbox_tables.is_empty()
-                && ctx.outbox_tables.matches(&ev.source.db, &ev.source.table)
-            {
+            ev.transaction = transaction.clone();
+            if is_outbox {
                 ev.source.schema = Some(OUTBOX_SCHEMA_SENTINEL.into());
             }
-
-            ev.schema_version = Some(loaded.fingerprint.to_string());
+            ev.schema_version = Some(fingerprint_str.clone());
             ev.schema_sequence = Some(loaded.sequence);
 
-            let table = format!("{}.{}", tm.database_name, tm.table_name);
-            match ctx.tx.send(ev).await {
-                Ok(_) => {
-                    counter!(
-                        "deltaforge_source_events_total",
-                        "pipeline" => ctx.pipeline.clone(),
-                        "source" => ctx.source_id.clone(),
-                        "table" => table,
-                        "op" => "c",
-                    )
-                    .increment(1);
-                }
-                Err(_) => {
-                    error!(source_id=%ctx.source_id, "channel send failed (op=insert)");
-                }
+            if send_event(&ctx.tx, ev).await {
+                sent += 1;
+            } else {
+                error!(source_id=%ctx.source_id, "channel send failed (op=insert)");
             }
+        }
+
+        // Batch metrics: one counter increment per binlog event instead of per row.
+        if sent > 0 {
+            counter!(
+                "deltaforge_source_events_total",
+                "pipeline" => ctx.pipeline.clone(),
+                "source" => ctx.source_id.clone(),
+                "table" => format!("{}.{}", tm.database_name, tm.table_name),
+                "op" => "c",
+            )
+            .increment(sent);
         }
     } else {
         warn!(source_id=%ctx.source_id, table_id=wr.table_id, "write_rows for unknown table_id");
@@ -242,7 +260,6 @@ async fn handle_write_rows(
     Ok(())
 }
 
-#[instrument(skip_all)]
 async fn handle_update_rows(
     ctx: &mut RunCtx,
     header: &EventHeader,
@@ -258,6 +275,22 @@ async fn handle_update_rows(
             .await?;
         debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=ur.rows.len(), "update_rows");
 
+        let ts_ms = ts_sec_to_ms(header.timestamp);
+        let event_len = header.event_length as usize;
+        let checkpoint = make_checkpoint_meta(
+            &ctx.last_file,
+            ctx.last_pos,
+            &ctx.last_gtid,
+        );
+        let transaction = ctx.last_gtid.as_ref().map(|gtid| Transaction {
+            id: gtid.clone(),
+            total_order: None,
+            data_collection_order: None,
+        });
+        let fingerprint_str = loaded.fingerprint.to_string();
+        let sequence = ctx.schema.current_sequence();
+
+        let mut sent = 0u64;
         for (before_row, after_row) in ur.rows {
             let before = build_object(
                 &loaded.column_names,
@@ -281,43 +314,32 @@ async fn handle_update_rows(
                 Op::Update,
                 Some(before),
                 Some(after),
-                ts_sec_to_ms(header.timestamp),
-                header.event_length as usize,
+                ts_ms,
+                event_len,
             )
             .with_tenant(ctx.tenant.clone())
-            .with_checkpoint(make_checkpoint_meta(
-                &ctx.last_file,
-                ctx.last_pos,
-                &ctx.last_gtid,
-            ));
+            .with_checkpoint(checkpoint.clone());
 
-            if let Some(gtid) = &ctx.last_gtid {
-                ev.transaction = Some(Transaction {
-                    id: gtid.clone(),
-                    total_order: None,
-                    data_collection_order: None,
-                });
+            ev.transaction = transaction.clone();
+            ev.schema_version = Some(fingerprint_str.clone());
+            ev.schema_sequence = Some(sequence);
+
+            if send_event(&ctx.tx, ev).await {
+                sent += 1;
+            } else {
+                error!(source_id=%ctx.source_id, "channel send failed (op=update)");
             }
+        }
 
-            ev.schema_version = Some(loaded.fingerprint.to_string());
-            ev.schema_sequence = Some(ctx.schema.current_sequence());
-
-            let table = format!("{}.{}", tm.database_name, tm.table_name);
-            match ctx.tx.send(ev).await {
-                Ok(_) => {
-                    counter!(
-                        "deltaforge_source_events_total",
-                        "pipeline" => ctx.pipeline.clone(),
-                        "source" => ctx.source_id.clone(),
-                        "table" => table,
-                        "op" => "u",
-                    )
-                    .increment(1);
-                }
-                Err(_) => {
-                    error!(source_id=%ctx.source_id, "channel send failed (op=update)");
-                }
-            }
+        if sent > 0 {
+            counter!(
+                "deltaforge_source_events_total",
+                "pipeline" => ctx.pipeline.clone(),
+                "source" => ctx.source_id.clone(),
+                "table" => format!("{}.{}", tm.database_name, tm.table_name),
+                "op" => "u",
+            )
+            .increment(sent);
         }
     } else {
         warn!(source_id=%ctx.source_id, table_id=ur.table_id, "update_rows for unknown table_id");
@@ -325,7 +347,6 @@ async fn handle_update_rows(
     Ok(())
 }
 
-#[instrument(skip_all)]
 async fn handle_delete_rows(
     ctx: &mut RunCtx,
     header: &EventHeader,
@@ -341,6 +362,22 @@ async fn handle_delete_rows(
             .await?;
         debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=dr.rows.len(), "delete_rows");
 
+        let ts_ms = ts_sec_to_ms(header.timestamp);
+        let event_len = header.event_length as usize;
+        let checkpoint = make_checkpoint_meta(
+            &ctx.last_file,
+            ctx.last_pos,
+            &ctx.last_gtid,
+        );
+        let transaction = ctx.last_gtid.as_ref().map(|gtid| Transaction {
+            id: gtid.clone(),
+            total_order: None,
+            data_collection_order: None,
+        });
+        let fingerprint_str = loaded.fingerprint.to_string();
+        let sequence = ctx.schema.current_sequence();
+
+        let mut sent = 0u64;
         for row in dr.rows {
             let before = build_object(
                 &loaded.column_names,
@@ -359,43 +396,32 @@ async fn handle_delete_rows(
                 Op::Delete,
                 Some(before),
                 None,
-                ts_sec_to_ms(header.timestamp),
-                header.event_length as usize,
+                ts_ms,
+                event_len,
             )
             .with_tenant(ctx.tenant.clone())
-            .with_checkpoint(make_checkpoint_meta(
-                &ctx.last_file,
-                ctx.last_pos,
-                &ctx.last_gtid,
-            ));
+            .with_checkpoint(checkpoint.clone());
 
-            if let Some(gtid) = &ctx.last_gtid {
-                ev.transaction = Some(Transaction {
-                    id: gtid.clone(),
-                    total_order: None,
-                    data_collection_order: None,
-                });
+            ev.transaction = transaction.clone();
+            ev.schema_version = Some(fingerprint_str.clone());
+            ev.schema_sequence = Some(sequence);
+
+            if send_event(&ctx.tx, ev).await {
+                sent += 1;
+            } else {
+                error!(source_id=%ctx.source_id, "channel send failed (op=delete)");
             }
+        }
 
-            ev.schema_version = Some(loaded.fingerprint.to_string());
-            ev.schema_sequence = Some(ctx.schema.current_sequence());
-
-            let table = format!("{}.{}", tm.database_name, tm.table_name);
-            match ctx.tx.send(ev).await {
-                Ok(_) => {
-                    counter!(
-                        "deltaforge_source_events_total",
-                        "pipeline" => ctx.pipeline.clone(),
-                        "source" => ctx.source_id.clone(),
-                        "table" => table,
-                        "op" => "d",
-                    )
-                    .increment(1);
-                }
-                Err(_) => {
-                    error!(source_id=%ctx.source_id, "channel send failed (op=delete)");
-                }
-            }
+        if sent > 0 {
+            counter!(
+                "deltaforge_source_events_total",
+                "pipeline" => ctx.pipeline.clone(),
+                "source" => ctx.source_id.clone(),
+                "table" => format!("{}.{}", tm.database_name, tm.table_name),
+                "op" => "d",
+            )
+            .increment(sent);
         }
     } else {
         warn!(source_id=%ctx.source_id, table_id=dr.table_id, "delete_rows for unknown table_id");

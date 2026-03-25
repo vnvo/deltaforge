@@ -477,6 +477,9 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
 
         let mut building: Option<BuildingBatch> = None;
 
+        // Reusable buffer for recv_many — avoids allocation per drain cycle.
+        let mut drain_buf: Vec<Event> = Vec::with_capacity(256);
+
         loop {
             if *pause_rx.borrow() {
                 tokio::select! {
@@ -518,7 +521,7 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                 }
 
                 maybe_ev = event_rx.recv() => {
-                    let Some(ev) = maybe_ev else {
+                    let Some(first_ev) = maybe_ev else {
                         // Channel closed - final flush
                         if let Some(b) = building.take() && !b.raw.is_empty() {
                                 self.process_deliver_and_maybe_commit(b, "shutdown").await?;
@@ -532,26 +535,60 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                     }
 
                     let cfg = &self.batch_cfg_eff;
+                    let max_events = cfg.max_events.unwrap_or(usize::MAX);
+                    let max_bytes = cfg.max_bytes.unwrap_or(usize::MAX);
                     let mut b = building.take().unwrap();
 
-                    let would_exceed_events = cfg.max_events.map(|m| b.raw.len() >= m).unwrap_or(false);
-                    let would_exceed_bytes = cfg.max_bytes.map(|m| b.bytes + event_size_hint(&ev) >= m).unwrap_or(false);
-                    let limit_hit = would_exceed_events || would_exceed_bytes;
+                    // Accumulate the first event we already received.
+                    Self::accumulate_event(&self, &mut b, first_ev, max_events, max_bytes).await?;
 
-                    let boundary = is_tx_boundary(&ev);
-
-                    if (!b.raw.is_empty() || !boundary) && limit_hit {
-                        self.process_deliver_and_maybe_commit(b, "limits").await?;
-                        b = BuildingBatch::new();
+                    // Drain as many additional events as are immediately
+                    // available, up to the remaining batch capacity. This
+                    // amortises the select! overhead across many events when
+                    // the source is producing faster than the coordinator
+                    // consumes.
+                    let remaining = max_events.saturating_sub(b.raw.len()).min(512);
+                    if remaining > 0 {
+                        drain_buf.clear();
+                        let n = event_rx.recv_many(&mut drain_buf, remaining).await;
+                        if n == 0 && b.raw.is_empty() {
+                            // Channel closed with nothing buffered.
+                            break;
+                        }
+                        for ev in drain_buf.drain(..) {
+                            Self::accumulate_event(&self, &mut b, ev, max_events, max_bytes).await?;
+                        }
                     }
 
-                    b.bytes += event_size_hint(&ev);
-                    b.raw.push(ev);
                     building = Some(b);
                 }
             }
         }
 
+        Ok(())
+    }
+
+    /// Push one event into the building batch, flushing first if limits are hit.
+    async fn accumulate_event(
+        &self,
+        b: &mut BuildingBatch,
+        ev: Event,
+        max_events: usize,
+        max_bytes: usize,
+    ) -> Result<()> {
+        let would_exceed_events = b.raw.len() >= max_events;
+        let would_exceed_bytes = b.bytes + event_size_hint(&ev) >= max_bytes;
+        let limit_hit = would_exceed_events || would_exceed_bytes;
+        let boundary = is_tx_boundary(&ev);
+
+        if (!b.raw.is_empty() || !boundary) && limit_hit {
+            let full = std::mem::replace(b, BuildingBatch::new());
+            self.process_deliver_and_maybe_commit(full, "limits")
+                .await?;
+        }
+
+        b.bytes += event_size_hint(&ev);
+        b.raw.push(ev);
         Ok(())
     }
 
