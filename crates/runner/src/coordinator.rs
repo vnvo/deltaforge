@@ -734,7 +734,7 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
 
         // 3) FREEZE for zero-copy sharing
         let frozen = FrozenBatch {
-            id: Uuid::new_v4(),
+            id: Uuid::now_v7(),
             bytes,
             events: Arc::<[Event]>::from(events),
         };

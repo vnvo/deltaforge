@@ -85,7 +85,7 @@ impl Envelope for CloudEvents {
             id: event
                 .event_id
                 .map(|u| u.to_string())
-                .unwrap_or_else(|| Uuid::new_v4().to_string()),
+                .unwrap_or_else(|| Uuid::now_v7().to_string()),
             source: format!(
                 "deltaforge/{}/{}",
                 event.source.name,

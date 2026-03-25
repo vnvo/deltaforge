@@ -33,13 +33,15 @@ pub struct LoadedSchema {
     pub column_names: Arc<Vec<String>>,
 }
 
+type ArcSchemaCache = Arc<RwLock<HashMap<(String, String), Arc<LoadedSchema>>>>;
+
 /// Schema loader with caching and registry integration.
 #[derive(Clone)]
 pub struct MySqlSchemaLoader {
     pool: Pool,
     dsn: String,
     /// Cache: (db, table) -> Arc<LoadedSchema>
-    cache: Arc<RwLock<HashMap<(String, String), Arc<LoadedSchema>>>>,
+    cache: ArcSchemaCache,
     /// Schema registry for versioning
     registry: Arc<DurableSchemaRegistry>,
     tenant: String,
