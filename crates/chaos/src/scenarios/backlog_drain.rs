@@ -1,15 +1,15 @@
-//! Scenario: binlog backlog drain benchmark.
+//! Scenario: backlog drain benchmark.
 //!
-//! Measures how quickly DeltaForge can replay a pre-built binlog backlog —
+//! Measures how quickly DeltaForge can replay a pre-built backlog —
 //! the catch-up path that runs on cold starts, long outages, or migrations.
 //!
 //! ## Method
 //!
-//! 1. Stop the `chaos-soak` pipeline via the REST API so DeltaForge
-//!    disconnects from MySQL and saves its binlog checkpoint.
+//! 1. Stop the pipeline via the REST API so DeltaForge disconnects and saves
+//!    its checkpoint (binlog position for MySQL, LSN for Postgres).
 //! 2. Record the current Kafka high-watermark offset as baseline.
-//! 3. Hammer MySQL with `TARGET_EVENTS` pure inserts using `WRITER_TASKS`
-//!    concurrent writers (no artificial delay).
+//! 3. Hammer the source DB with `TARGET_EVENTS` pure inserts using
+//!    `WRITER_TASKS` concurrent writers (no artificial delay).
 //! 4. Record write throughput and duration.
 //! 5. Resume the pipeline — it reconnects and starts replaying from the
 //!    saved checkpoint, processing the entire backlog.
@@ -19,10 +19,13 @@
 //! ## Usage
 //!
 //! ```bash
-//! # Requires the soak compose profile
+//! # MySQL — requires the soak compose profile
 //! docker compose -f docker-compose.chaos.yml --profile soak up -d
-//!
 //! cargo run -p chaos -- --scenario backlog-drain --source mysql
+//!
+//! # Postgres — requires the pg-soak compose profile
+//! docker compose -f docker-compose.chaos.yml --profile pg-soak up -d
+//! cargo run -p chaos -- --scenario backlog-drain --source postgres
 //! ```
 
 use std::sync::Arc;
@@ -30,17 +33,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
-use mysql_async::prelude::Queryable;
 use tokio::time::sleep;
 use tracing::info;
 
-use crate::backend::MYSQL_DSN;
 use crate::harness::{self, Harness, ScenarioResult};
-use crate::scenarios::soak::{SOAK_HEALTH_URL, SOAK_TOPIC};
+use crate::scenarios::soak::SoakSource;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Number of rows to insert into MySQL before starting DeltaForge.
+/// Number of rows to insert before starting DeltaForge.
 const TARGET_EVENTS: u64 = 1_000_000;
 
 /// Concurrent writer tasks during the population phase.
@@ -52,12 +53,6 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(600); // 10 min
 
 /// How often to sample the Kafka offset during drain.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
-
-/// DeltaForge soak instance base URL.
-const DF_BASE: &str = "http://localhost:8081";
-
-/// Name of the pipeline managed by the soak DeltaForge instance.
-const PIPELINE_NAME: &str = "chaos-soak";
 
 // ── Drain config ──────────────────────────────────────────────────────────────
 
@@ -94,14 +89,26 @@ impl Default for DrainConfig {
     }
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
+// ── Entry points ──────────────────────────────────────────────────────────────
 
-pub async fn run(
+pub async fn run(harness: &Harness, cfg: DrainConfig) -> Result<ScenarioResult> {
+    run_with_source(harness, &super::soak::MYSQL_SOAK, cfg).await
+}
+
+pub async fn run_pg(harness: &Harness, cfg: DrainConfig) -> Result<ScenarioResult> {
+    run_with_source(harness, &super::soak::PG_SOAK, cfg).await
+}
+
+async fn run_with_source(
     harness: &Harness,
+    src: &SoakSource,
     cfg: DrainConfig,
 ) -> Result<ScenarioResult> {
-    let name = "backlog-drain";
+    let name = format!("backlog-drain-{}", src.name);
+    let is_pg = src.name == "postgres";
+
     info!(
+        source = src.name,
         max_events = cfg.max_events,
         max_ms = cfg.max_ms,
         commit_mode = %cfg.commit_mode,
@@ -112,35 +119,35 @@ pub async fn run(
     );
     harness.setup().await?;
 
-    // Step 1: verify soak DeltaForge is healthy.
-    info!("step 1/6: waiting for soak DeltaForge at {SOAK_HEALTH_URL} ...");
-    harness::wait_for_url(SOAK_HEALTH_URL, Duration::from_secs(60)).await?;
-    info!("soak DeltaForge is healthy");
+    // Step 1: verify DeltaForge is healthy.
+    info!("step 1/6: waiting for DeltaForge at {} ...", src.health_url);
+    harness::wait_for_url(src.health_url, Duration::from_secs(60)).await?;
+    info!("DeltaForge is healthy");
 
-    // Step 2: stop the pipeline so DeltaForge disconnects and saves its
-    // binlog checkpoint. All writes from this point forward will queue up
-    // in MySQL's binlog.
-    info!("step 2/6: stopping pipeline '{PIPELINE_NAME}' ...");
-    df_post(&format!("/pipelines/{PIPELINE_NAME}/stop")).await?;
-    info!("pipeline stopped — binlog checkpoint saved");
+    // Step 2: stop the pipeline so DeltaForge disconnects and saves its checkpoint.
+    let pipeline = src.pipeline;
+    info!("step 2/6: stopping pipeline '{pipeline}' ...");
+    df_post(src.df_base, &format!("/pipelines/{pipeline}/stop")).await?;
+    info!("pipeline stopped — checkpoint saved");
 
-    // Step 3: baseline Kafka offset. We snapshot here (after the stop) so
-    // any in-flight events that flushed just before the stop are excluded.
-    let kafka_baseline = harness::kafka_offset_for_topic(SOAK_TOPIC)
+    // Step 3: baseline Kafka offset.
+    let kafka_baseline = harness::kafka_offset_for_topic(src.topic)
         .await
         .unwrap_or(0);
     info!(kafka_baseline, "kafka baseline offset recorded");
 
-    // Step 4: populate the backlog — write TARGET_EVENTS rows as fast as
-    // possible. Writers stop themselves once the shared counter hits the target.
+    // Step 4: populate the backlog.
     info!(
         TARGET_EVENTS,
-        WRITER_TASKS, "step 3/6: populating MySQL backlog ..."
+        WRITER_TASKS,
+        source = src.name,
+        "step 3/6: populating {} backlog ...",
+        src.name,
     );
     let counter = Arc::new(AtomicU64::new(0));
     let write_start = Instant::now();
 
-    // Progress monitor — logs every 10 s so the UI terminal shows activity.
+    // Progress monitor — logs every 10 s.
     let progress_ctr = Arc::clone(&counter);
     let progress_handle = tokio::spawn(async move {
         let mut last = 0u64;
@@ -167,7 +174,11 @@ pub async fn run(
     let handles: Vec<_> = (0..WRITER_TASKS)
         .map(|id| {
             let ctr = Arc::clone(&counter);
-            tokio::spawn(async move { writer(id, ctr).await })
+            if is_pg {
+                tokio::spawn(async move { pg_writer(id, ctr).await })
+            } else {
+                tokio::spawn(async move { mysql_writer(id, ctr).await })
+            }
         })
         .collect();
 
@@ -192,9 +203,8 @@ pub async fn run(
         max_ms = cfg.max_ms,
         commit_mode = %cfg.commit_mode,
         schema_sensing = cfg.schema_sensing,
-        "step 4/6: patching pipeline '{PIPELINE_NAME}' and restarting ..."
+        "step 4/6: patching pipeline '{pipeline}' and restarting ..."
     );
-    // Build the PATCH body from DrainConfig.
     let mut patch_spec = serde_json::json!({
         "schema_sensing": {"enabled": cfg.schema_sensing},
         "batch": {"max_events": cfg.max_events, "max_ms": cfg.max_ms},
@@ -216,7 +226,7 @@ pub async fn run(
     }
 
     let patch_body = serde_json::json!({ "spec": patch_spec });
-    let patch_ok = df_patch(&format!("/pipelines/{PIPELINE_NAME}"), patch_body)
+    let patch_ok = df_patch(src.df_base, &format!("/pipelines/{pipeline}"), patch_body)
         .await
         .map(|_| true)
         .unwrap_or_else(|e| {
@@ -228,7 +238,7 @@ pub async fn run(
     // checkpoint. If it failed, issue an explicit resume so the drain still runs.
     if !patch_ok {
         info!("issuing explicit resume after failed patch ...");
-        df_post(&format!("/pipelines/{PIPELINE_NAME}/resume")).await?;
+        df_post(src.df_base, &format!("/pipelines/{pipeline}/resume")).await?;
     }
 
     let drain_start = Instant::now();
@@ -247,7 +257,7 @@ pub async fn run(
     loop {
         sleep(POLL_INTERVAL).await;
 
-        let current_offset = harness::kafka_offset_for_topic(SOAK_TOPIC)
+        let current_offset = harness::kafka_offset_for_topic(src.topic)
             .await
             .unwrap_or(kafka_baseline);
         let delivered = current_offset.saturating_sub(kafka_baseline);
@@ -281,10 +291,11 @@ pub async fn run(
         if elapsed >= DRAIN_TIMEOUT {
             let shortfall = rows_written.saturating_sub(delivered);
             return Ok(ScenarioResult::fail(
-                name,
+                &name,
                 format!("drain timed out after {DRAIN_TIMEOUT:?}: {shortfall} events not yet delivered"),
             )
-            .note(format!("rows written to MySQL: {rows_written}"))
+            .note(format!("source: {}", src.name))
+            .note(format!("rows written: {rows_written}"))
             .note(format!("events delivered to Kafka: {delivered}"))
             .note(format!("write throughput: {write_tps:.0} rows/s"))
             .note(format!("write duration: {write_secs:.1}s")));
@@ -311,9 +322,10 @@ pub async fn run(
         "step 6/6: backlog drain benchmark complete"
     );
 
-    let mut result = ScenarioResult::pass(name)
+    let mut result = ScenarioResult::pass(&name)
+        .note(format!("source: {}", src.name))
         .note(format!("target events: {TARGET_EVENTS}"))
-        .note(format!("rows written to MySQL: {rows_written}"))
+        .note(format!("rows written: {rows_written}"))
         .note(format!("batch max_events: {}", cfg.max_events))
         .note(format!("commit mode: {}", cfg.commit_mode))
         .note(format!("schema sensing: {}", cfg.schema_sensing));
@@ -339,19 +351,19 @@ pub async fn run(
         )))
 }
 
-// ── Writer ────────────────────────────────────────────────────────────────────
+// ── MySQL writer ──────────────────────────────────────────────────────────────
 
-async fn writer(id: usize, counter: Arc<AtomicU64>) {
+async fn mysql_writer(id: usize, counter: Arc<AtomicU64>) {
+    use mysql_async::prelude::Queryable;
+
     let tables = soak_tables();
-    let pool = mysql_async::Pool::new(MYSQL_DSN);
+    let pool = mysql_async::Pool::new(crate::backend::MYSQL_DSN);
     let mut rng =
         <rand::rngs::SmallRng as rand::SeedableRng>::seed_from_u64(id as u64);
 
     loop {
-        // Atomically claim a slot; stop if target reached.
         let prev = counter.fetch_add(1, Ordering::Relaxed);
         if prev >= TARGET_EVENTS {
-            // Undo the over-increment so the final count stays accurate.
             counter.fetch_sub(1, Ordering::Relaxed);
             break;
         }
@@ -377,8 +389,7 @@ async fn writer(id: usize, counter: Arc<AtomicU64>) {
                     .await;
             }
             Err(e) => {
-                tracing::debug!(writer = id, error = %e, "connection error, retrying");
-                // Undo the claim so this slot can be retried.
+                tracing::warn!(writer = id, error = %e, "mysql writer connection error, retrying");
                 counter.fetch_sub(1, Ordering::Relaxed);
                 sleep(Duration::from_millis(50)).await;
             }
@@ -386,6 +397,71 @@ async fn writer(id: usize, counter: Arc<AtomicU64>) {
     }
 
     let _ = pool.disconnect().await;
+}
+
+// ── Postgres writer ───────────────────────────────────────────────────────────
+
+async fn pg_writer(id: usize, counter: Arc<AtomicU64>) {
+    let tables = soak_tables();
+    let mut rng =
+        <rand::rngs::SmallRng as rand::SeedableRng>::seed_from_u64(id as u64);
+
+    // Outer loop: reconnect on connection failure.
+    loop {
+        // Check if target reached before connecting.
+        if counter.load(Ordering::Relaxed) >= TARGET_EVENTS {
+            break;
+        }
+
+        let (client, conn) =
+            match tokio_postgres::connect(crate::backend::PG_DSN, tokio_postgres::NoTls).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(writer = id, error = %e, "pg writer connect failed, retrying");
+                    sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+            };
+        let conn_handle = tokio::spawn(async move { let _ = conn.await; });
+
+        // Inner loop: execute queries on active connection.
+        loop {
+            let prev = counter.fetch_add(1, Ordering::Relaxed);
+            if prev >= TARGET_EVENTS {
+                counter.fetch_sub(1, Ordering::Relaxed);
+                conn_handle.abort();
+                return;
+            }
+
+            let table = &tables[rand::Rng::gen_range(&mut rng, 0..tables.len())];
+            let ts = now_ms();
+            let tag = format!("drain-{id}-{ts}");
+            let data = format!("backlog-{ts}");
+            let value = format!("{:.4}", rand::Rng::gen_range(&mut rng, 0.0..10000.0_f64));
+            let status: i16 = rand::Rng::gen_range(&mut rng, 0i16..4);
+
+            match client
+                .execute(
+                    &format!(
+                        "INSERT INTO {table} (tag, data, value, status) \
+                         VALUES ($1, $2, {value}, $3)"
+                    ),
+                    &[&tag, &data, &status],
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(writer = id, error = %e, "pg writer query failed, reconnecting");
+                    counter.fetch_sub(1, Ordering::Relaxed);
+                    break; // Break to outer loop → reconnect.
+                }
+            }
+        }
+
+        conn_handle.abort();
+        sleep(Duration::from_millis(100)).await;
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -408,8 +484,8 @@ fn soak_tables() -> Vec<String> {
     tables
 }
 
-async fn df_patch(path: &str, body: serde_json::Value) -> Result<()> {
-    let url = format!("{DF_BASE}{path}");
+async fn df_patch(base: &str, path: &str, body: serde_json::Value) -> Result<()> {
+    let url = format!("{base}{path}");
     info!(%url, "df_patch");
     let resp = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
@@ -429,8 +505,8 @@ async fn df_patch(path: &str, body: serde_json::Value) -> Result<()> {
     }
 }
 
-async fn df_post(path: &str) -> Result<()> {
-    let url = format!("{DF_BASE}{path}");
+async fn df_post(base: &str, path: &str) -> Result<()> {
+    let url = format!("{base}{path}");
     info!(%url, "df_post");
     let resp = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))

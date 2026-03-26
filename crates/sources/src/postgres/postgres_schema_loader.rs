@@ -529,15 +529,18 @@ fn parse_pattern(pattern: &str) -> (String, String) {
 }
 
 fn build_pattern_query(schema_pattern: &str, table_pattern: &str) -> String {
+    // Use LIKE only when the pattern contains a glob wildcard (*).
+    // The `_` character is common in table names and should NOT trigger
+    // LIKE matching — it's a literal underscore, not a wildcard.
     let schema_clause = match schema_pattern {
         "*" | "%" => "table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')".to_string(),
-        s if s.contains('%') || s.contains('_') => format!("table_schema LIKE '{}'", escape_like(s)),
+        s if s.contains('*') => format!("table_schema LIKE '{}'", escape_like(s)),
         s => format!("table_schema = '{}'", escape_sql(s)),
     };
 
     let table_clause = match table_pattern {
         "*" | "%" => "1=1".to_string(),
-        t if t.contains('%') || t.contains('_') => {
+        t if t.contains('*') => {
             format!("table_name LIKE '{}'", escape_like(t))
         }
         t => format!("table_name = '{}'", escape_sql(t)),
@@ -554,8 +557,14 @@ fn escape_sql(s: &str) -> String {
     s.replace('\'', "''")
 }
 
+/// Convert a glob-style pattern (using `*` as wildcard) to a SQL LIKE pattern.
+/// Escapes SQL LIKE metacharacters (`%`, `_`) as literals, then replaces
+/// glob `*` with LIKE `%`.
 fn escape_like(s: &str) -> String {
     s.replace('\'', "''")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+        .replace('*', "%")
 }
 
 fn query_error(e: tokio_postgres::Error) -> SourceError {

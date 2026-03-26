@@ -187,7 +187,7 @@ async fn main() -> Result<()> {
             .await?
         }
         Source::Postgres => {
-            run_postgres(&harness, &cli.scenario, cli.duration_mins, cli.writer_tasks, cli.write_delay_ms).await?
+            run_postgres(&harness, &cli.scenario, cli.duration_mins, cli.writer_tasks, cli.write_delay_ms, drain_cfg).await?
         }
     };
 
@@ -313,6 +313,7 @@ async fn run_postgres(
     duration_mins: u64,
     writer_tasks: usize,
     write_delay_ms: u64,
+    drain_cfg: scenarios::backlog_drain::DrainConfig,
 ) -> Result<Vec<harness::ScenarioResult>> {
     let backend = PgBackend;
     let mut results = vec![];
@@ -362,9 +363,12 @@ async fn run_postgres(
                 .await?,
             );
         }
+        Scenario::BacklogDrain => {
+            results
+                .push(scenarios::backlog_drain::run_pg(harness, drain_cfg).await?);
+        }
         Scenario::Ui => unreachable!("ui is handled before source dispatch"),
-        Scenario::BacklogDrain
-        | Scenario::Tpcc
+        Scenario::Tpcc
         | Scenario::Failover
         | Scenario::BinlogPurge => {
             eprintln!(

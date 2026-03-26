@@ -63,11 +63,6 @@ const ALTER_MIN_SECS: u64 = 600; // 10 min
 const ALTER_MAX_SECS: u64 = 1800; // 30 min
 
 /// Health endpoint for the MySQL soak DeltaForge (used by backlog_drain).
-pub const SOAK_HEALTH_URL: &str = "http://localhost:8081/health";
-
-/// Kafka topic written by the soak DeltaForge pipeline.
-pub const SOAK_TOPIC: &str = "chaos.soak";
-
 // ── Source-specific config ────────────────────────────────────────────────────
 
 /// Encapsulates everything that differs between MySQL and Postgres soak runs.
@@ -80,6 +75,10 @@ pub struct SoakSource {
     pub topic: &'static str,
     /// Toxiproxy proxy name for the source DB.
     pub proxy: &'static str,
+    /// DeltaForge REST API base URL (e.g. "http://localhost:8081").
+    pub df_base: &'static str,
+    /// Pipeline name managed by this DeltaForge instance.
+    pub pipeline: &'static str,
 }
 
 pub const MYSQL_SOAK: SoakSource = SoakSource {
@@ -89,6 +88,8 @@ pub const MYSQL_SOAK: SoakSource = SoakSource {
     health_url: "http://localhost:8081/health",
     topic: "chaos.soak",
     proxy: "mysql",
+    df_base: "http://localhost:8081",
+    pipeline: "chaos-soak",
 };
 
 pub const PG_SOAK: SoakSource = SoakSource {
@@ -98,6 +99,8 @@ pub const PG_SOAK: SoakSource = SoakSource {
     health_url: "http://localhost:8083/health",
     topic: "chaos.pg.soak",
     proxy: "postgres",
+    df_base: "http://localhost:8083",
+    pipeline: "chaos-pg-soak",
 };
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -560,7 +563,7 @@ async fn writer_loop(
         let mut conn = match pool.get_conn().await {
             Ok(c) => c,
             Err(e) => {
-                tracing::debug!(writer = id, error = %e, "writer connection error, retrying");
+                tracing::warn!(writer = id, error = %e, "writer query failed, reconnecting");
                 sleep(Duration::from_millis(200)).await;
                 continue;
             }
@@ -773,75 +776,89 @@ async fn pg_writer_loop(
     write_delay_ms: u64,
 ) {
     let tables = all_tables();
-    let (client, conn) = match tokio_postgres::connect(PG_DSN, tokio_postgres::NoTls).await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(writer = id, error = %e, "pg writer failed to connect, exiting");
-            return;
-        }
-    };
-    tokio::spawn(async move { let _ = conn.await; });
-
     let mut rng = SmallRng::from_entropy();
 
+    // Outer loop: reconnect on connection failure.
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
 
-        let delay_ms = if write_delay_ms == 0 {
-            0
-        } else {
-            rng.gen_range(1u64..=write_delay_ms)
-        };
-        if delay_ms > 0 {
-            sleep(Duration::from_millis(delay_ms)).await;
-        }
-
-        let table = &tables[rng.gen_range(0..tables.len())];
-        let op = rng.gen_range(0u8..10); // 0-6 insert, 7-8 update, 9 delete
-
-        let ts = now_ms();
-        let tag = format!("w{id}-{ts}");
-        let data = format!("payload-{ts}");
-        let value: f64 = rng.gen_range(0.0..10000.0);
-        let status: i16 = rng.gen_range(0i16..4);
-
-        let result = if op < 7 {
-            client
-                .execute(
-                    &format!("INSERT INTO {table} (tag, data, value, status) VALUES ($1, $2, $3, $4)"),
-                    &[&tag, &data, &value, &status],
-                )
-                .await
-        } else if op < 9 {
-            let row_id: i32 = rng.gen_range(1..5000);
-            client
-                .execute(
-                    &format!("UPDATE {table} SET value = $1, status = $2, updated_at = NOW() WHERE id = $3"),
-                    &[&value, &status, &row_id],
-                )
-                .await
-        } else {
-            let row_id: i32 = rng.gen_range(1..5000);
-            client
-                .execute(
-                    &format!("DELETE FROM {table} WHERE id = $1"),
-                    &[&row_id],
-                )
-                .await
-        };
-
-        match result {
-            Ok(_) => { written.fetch_add(1, Ordering::Relaxed); }
+        let (client, conn) = match tokio_postgres::connect(PG_DSN, tokio_postgres::NoTls).await {
+            Ok(c) => c,
             Err(e) => {
-                tracing::debug!(writer = id, error = %e, "pg writer error, reconnecting");
-                sleep(Duration::from_millis(200)).await;
-                // Connection may be broken — exit and let the task be replaced.
-                // For simplicity we just continue; the next query will fail and
-                // retry via the same path.
+                tracing::warn!(writer = id, error = %e, "pg writer connect failed, retrying");
+                sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+        // Drive the connection in the background; it closes when client is dropped.
+        let conn_handle = tokio::spawn(async move { let _ = conn.await; });
+
+        // Inner loop: execute queries on the active connection.
+        loop {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let delay_ms = if write_delay_ms == 0 {
+                0
+            } else {
+                rng.gen_range(1u64..=write_delay_ms)
+            };
+            if delay_ms > 0 {
+                sleep(Duration::from_millis(delay_ms)).await;
+            }
+
+            let table = &tables[rng.gen_range(0..tables.len())];
+            let op = rng.gen_range(0u8..10); // 0-6 insert, 7-8 update, 9 delete
+
+            let ts = now_ms();
+            let tag = format!("w{id}-{ts}");
+            let data = format!("payload-{ts}");
+            let value = format!("{:.4}", rng.gen_range(0.0f64..10000.0));
+            let status: i16 = rng.gen_range(0i16..4);
+
+            let result = if op < 7 {
+                client
+                    .execute(
+                        &format!("INSERT INTO {table} (tag, data, value, status) VALUES ($1, $2, {value}, $3)"),
+                        &[&tag, &data, &status],
+                    )
+                    .await
+            } else if op < 9 {
+                let row_id: i32 = rng.gen_range(1..5000);
+                client
+                    .execute(
+                        &format!("UPDATE {table} SET value = {value}, status = $1, updated_at = NOW() WHERE id = $2"),
+                        &[&status, &row_id],
+                    )
+                    .await
+            } else {
+                let row_id: i32 = rng.gen_range(1..5000);
+                client
+                    .execute(
+                        &format!("DELETE FROM {table} WHERE id = $1"),
+                        &[&row_id],
+                    )
+                    .await
+            };
+
+            match result {
+                Ok(_) => { written.fetch_add(1, Ordering::Relaxed); }
+                Err(e) => {
+                    tracing::warn!(writer = id, error = %e, "pg writer query failed, reconnecting");
+                    break; // Break inner loop → reconnect in outer loop.
+                }
             }
         }
+
+        conn_handle.abort();
+
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        sleep(Duration::from_millis(200)).await;
     }
 }
 

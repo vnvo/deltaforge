@@ -159,6 +159,39 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
 .api-path{font-family:var(--mono);font-size:11px;color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .api-result-body{flex:1;background:#010409;padding:10px 12px;font-family:var(--mono);font-size:11px;line-height:1.6;color:#c9d1d9;overflow:auto;white-space:pre-wrap;word-break:break-all;border-radius:0 0 var(--radius) var(--radius)}
 .api-section-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+
+/* ── Config Lab tab ── */
+.lab-wrap{padding:16px;display:flex;flex-direction:column;gap:12px;overflow-y:auto;flex:1}
+.lab-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.lab-editors{display:grid;grid-template-columns:1fr 1fr;gap:12px;flex:1;min-height:0}
+.lab-editor{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);display:flex;flex-direction:column;min-height:350px}
+.lab-editor-header{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.lab-editor-label{font-size:13px;font-weight:700;flex-shrink:0}
+.lab-editor-label.a{color:var(--blue)}
+.lab-editor-label.b{color:var(--purple)}
+.lab-textarea{flex:1;background:#010409;color:#c9d1d9;font-family:var(--mono);font-size:11px;line-height:1.5;border:none;padding:10px 12px;resize:none;outline:none;border-radius:0 0 var(--radius) var(--radius);tab-size:2;white-space:pre;overflow:auto}
+.lab-results{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.lab-result-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:12px;display:flex;flex-direction:column;gap:6px}
+.lab-result-card.a{border-top:2px solid var(--blue)}
+.lab-result-card.b{border-top:2px solid var(--purple)}
+.lab-result-title{font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+.lab-metric{display:flex;justify-content:space-between;font-size:12px;padding:3px 0;border-bottom:1px solid var(--border)}
+.lab-metric:last-child{border-bottom:none}
+.lab-metric-name{color:var(--muted)}
+.lab-metric-val{font-family:var(--mono);font-weight:600}
+.lab-delta{font-size:11px;font-family:var(--mono);padding:1px 5px;border-radius:3px;margin-left:6px}
+.lab-delta.better{background:#0d2a0d;color:var(--green)}
+.lab-delta.worse{background:#2a0d0d;color:var(--red)}
+.lab-delta.same{background:var(--surface2);color:var(--muted)}
+.lab-phase{font-size:12px;color:var(--muted);font-style:italic}
+.lab-comparison{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:12px}
+.lab-comparison-title{font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px}
+.lab-comparison table{width:100%;font-size:12px;border-collapse:collapse}
+.lab-comparison th{text-align:left;color:var(--muted);font-weight:600;padding:4px 8px;border-bottom:1px solid var(--border)}
+.lab-comparison td{padding:4px 8px;border-bottom:1px solid var(--border);font-family:var(--mono)}
+.lab-comparison td:first-child{font-family:inherit;color:var(--muted)}
+.lab-comparison .col-a{color:var(--blue)}
+.lab-comparison .col-b{color:var(--purple)}
 </style>
 </head>
 <body>
@@ -169,6 +202,7 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
   <div class="tab-nav">
     <button id="tab-btn-chaos" class="tab-btn active" onclick="switchTab('chaos')">Chaos</button>
     <button id="tab-btn-api" class="tab-btn" onclick="switchTab('api')">Pipeline API</button>
+    <button id="tab-btn-lab" class="tab-btn" onclick="switchTab('lab')">Config Lab</button>
   </div>
   <nav>
     <a href="http://localhost:3000" target="_blank">📊 Grafana</a>
@@ -269,6 +303,7 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
           <label style="width:70px;font-size:11px;color:var(--muted)">Target</label>
           <select id="profile-container" style="flex:1;font-size:11px;padding:3px 6px" onchange="updateProfileAvailability()">
             <option value="deltaforge-deltaforge-soak-1">soak (:8081)</option>
+            <option value="deltaforge-deltaforge-pg-soak-1">pg-soak (:8083)</option>
             <option value="deltaforge-deltaforge-1">app (:8080)</option>
             <option value="deltaforge-deltaforge-tpcc-1">tpcc (:8082)</option>
           </select>
@@ -469,6 +504,7 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
             <button id="api-8080" class="active" onclick="apiSetPort(8080)">:8080</button>
             <button id="api-8081" onclick="apiSetPort(8081)">soak</button>
             <button id="api-8082" onclick="apiSetPort(8082)">tpcc</button>
+            <button id="api-8083" onclick="apiSetPort(8083)">pg-soak</button>
           </div>
         </div>
         <div style="display:flex;align-items:center;gap:6px;flex:1;min-width:220px">
@@ -556,6 +592,100 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
 
   </div>
 </div><!-- /tab-api -->
+
+<div id="tab-lab" class="tab-panel">
+  <div class="lab-wrap">
+
+    <!-- Toolbar -->
+    <div class="api-section">
+      <div class="lab-toolbar">
+        <span style="font-size:11px;color:var(--muted)">Instance</span>
+        <div class="source-toggle">
+          <button id="lab-8080" onclick="labSetPort(8080)">:8080</button>
+          <button id="lab-8081" class="active" onclick="labSetPort(8081)">soak</button>
+          <button id="lab-8082" onclick="labSetPort(8082)">tpcc</button>
+          <button id="lab-8083" onclick="labSetPort(8083)">pg-soak</button>
+        </div>
+        <span style="font-size:11px;color:var(--muted)">Pipeline</span>
+        <select id="lab-pipeline" style="font-size:11px;padding:3px 6px;min-width:160px">
+          <option value="">— select —</option>
+        </select>
+        <button class="btn" style="font-size:11px;padding:4px 10px" onclick="labRefreshPipelines()">↻</button>
+        <div style="flex:1"></div>
+        <span style="font-size:11px;color:var(--muted)">Scenario</span>
+        <select id="lab-scenario" style="font-size:11px;padding:3px 6px;min-width:120px">
+          <option value="soak-stable">soak-stable</option>
+          <option value="soak">soak</option>
+          <option value="backlog-drain">backlog-drain</option>
+        </select>
+        <span style="font-size:11px;color:var(--muted)">Duration</span>
+        <input type="number" id="lab-duration" value="2" min="1" max="60" style="width:48px;font-size:11px;padding:3px 6px;background:var(--surface2);border:1px solid var(--border);color:var(--text);border-radius:5px;font-family:var(--mono);text-align:center">
+        <span style="font-size:11px;color:var(--muted)">min</span>
+      </div>
+    </div>
+
+    <!-- Editors A + B -->
+    <div class="lab-editors">
+
+      <!-- Config A -->
+      <div class="lab-editor">
+        <div class="lab-editor-header">
+          <span class="lab-editor-label a">Config A</span>
+          <select id="lab-preset-a" style="font-size:11px;padding:2px 6px;flex:1;min-width:100px" onchange="labLoadPreset('a')">
+            <option value="">— preset —</option>
+          </select>
+          <button class="btn" style="font-size:10px;padding:2px 8px" onclick="labFetchConfig('a')" title="Load current config from running pipeline">⬇ Fetch</button>
+          <button class="btn" style="font-size:10px;padding:2px 8px" onclick="labSavePreset('a')" title="Save as named preset">💾 Save</button>
+          <button class="btn btn-green" style="font-size:10px;padding:2px 8px" onclick="labApplyConfig('a')" title="PATCH pipeline with this config">⬆ Apply</button>
+        </div>
+        <textarea id="lab-editor-a" class="lab-textarea" spellcheck="false" placeholder="Fetch config from a running pipeline or paste JSON here..."></textarea>
+      </div>
+
+      <!-- Config B -->
+      <div class="lab-editor">
+        <div class="lab-editor-header">
+          <span class="lab-editor-label b">Config B</span>
+          <select id="lab-preset-b" style="font-size:11px;padding:2px 6px;flex:1;min-width:100px" onchange="labLoadPreset('b')">
+            <option value="">— preset —</option>
+          </select>
+          <button class="btn" style="font-size:10px;padding:2px 8px" onclick="labFetchConfig('b')" title="Load current config from running pipeline">⬇ Fetch</button>
+          <button class="btn" style="font-size:10px;padding:2px 8px" onclick="labSavePreset('b')" title="Save as named preset">💾 Save</button>
+          <button class="btn btn-green" style="font-size:10px;padding:2px 8px" onclick="labApplyConfig('b')" title="PATCH pipeline with this config">⬆ Apply</button>
+        </div>
+        <textarea id="lab-editor-b" class="lab-textarea" spellcheck="false" placeholder="Fetch config from a running pipeline or paste JSON here..."></textarea>
+      </div>
+
+    </div>
+
+    <!-- A/B Runner -->
+    <div class="api-section">
+      <div class="lab-toolbar">
+        <button id="lab-run-btn" class="btn btn-green" style="font-weight:700;padding:6px 20px" onclick="labRunComparison()">▶ Run A/B Comparison</button>
+        <button id="lab-stop-btn" class="btn btn-red" style="padding:6px 14px" onclick="labStopComparison()" disabled>■ Stop</button>
+        <span id="lab-phase" class="lab-phase"></span>
+        <div style="flex:1"></div>
+        <button class="btn" style="font-size:10px;padding:2px 8px" onclick="labClearResults()">Clear Results</button>
+        <button class="btn" style="font-size:10px;padding:2px 8px" onclick="labDeletePreset()" title="Delete a saved preset">🗑 Delete Preset</button>
+      </div>
+    </div>
+
+    <!-- Results comparison -->
+    <div id="lab-results-wrap" style="display:none">
+      <div class="lab-comparison" id="lab-comparison-table"></div>
+      <div class="lab-results" style="margin-top:12px">
+        <div class="lab-result-card a">
+          <div class="lab-result-title">Config A — Raw Output</div>
+          <pre id="lab-result-a" style="font-family:var(--mono);font-size:11px;line-height:1.5;color:#c9d1d9;white-space:pre-wrap;max-height:300px;overflow:auto;background:#010409;padding:8px;border-radius:var(--radius)">—</pre>
+        </div>
+        <div class="lab-result-card b">
+          <div class="lab-result-title">Config B — Raw Output</div>
+          <pre id="lab-result-b" style="font-family:var(--mono);font-size:11px;line-height:1.5;color:#c9d1d9;white-space:pre-wrap;max-height:300px;overflow:auto;background:#010409;padding:8px;border-radius:var(--radius)">—</pre>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div><!-- /tab-lab -->
 
 <div id="toast"></div>
 
@@ -953,10 +1083,11 @@ function exportLog() {
 
 // ── Tab switching ──────────────────────────────────────────────────────────
 function switchTab(tab) {
-  ['chaos', 'api'].forEach(t => {
+  ['chaos', 'api', 'lab'].forEach(t => {
     document.getElementById('tab-' + t).classList.toggle('active', t === tab);
     document.getElementById('tab-btn-' + t).classList.toggle('active', t === tab);
   });
+  if (tab === 'lab') labRefreshPipelines();
 }
 
 // ── Pipeline API tab ───────────────────────────────────────────────────────
@@ -964,7 +1095,7 @@ let apiPort = 8080;
 
 function apiSetPort(p) {
   apiPort = p;
-  [8080, 8081, 8082].forEach(x =>
+  [8080, 8081, 8082, 8083].forEach(x =>
     document.getElementById('api-' + x).classList.toggle('active', x === p));
 }
 
@@ -1129,6 +1260,7 @@ function renderServices(services) {
     { label: 'MySQL app',     profile: 'app',    names: ['deltaforge'] },
     { label: 'PG app',        profile: 'pg-app', names: ['deltaforge-pg'] },
     { label: 'Soak',          profile: 'soak',   names: ['deltaforge-soak'] },
+    { label: 'PG Soak',       profile: 'pg-soak', names: ['deltaforge-pg-soak'] },
     { label: 'TPC-C',         profile: 'tpcc',   names: ['deltaforge-tpcc'] },
     { label: 'Postgres',      profile: null,     names: ['postgres','postgres-b'] },
   ];
@@ -1287,6 +1419,362 @@ refreshScenario();
 setInterval(refreshStatus, 3000);
 setInterval(refreshProxies, 4000);
 setInterval(refreshScenario, 1500);
+
+// ── Config Lab ──────────────────────────────────────────────────────────────
+let labPort = 8081;
+let labRunning = false;
+let labAbort = false;
+
+const LAB_PRESETS_KEY = 'deltaforge-lab-presets';
+
+function labSetPort(p) {
+  labPort = p;
+  [8080, 8081, 8082, 8083].forEach(x =>
+    document.getElementById('lab-' + x).classList.toggle('active', x === p));
+  labRefreshPipelines();
+}
+
+async function labRefreshPipelines() {
+  try {
+    const r = await fetch(`/api/df?port=${labPort}&path=/pipelines`);
+    if (!r.ok) return;
+    const data = await r.json();
+    const sel = document.getElementById('lab-pipeline');
+    const prev = sel.value;
+    sel.innerHTML = '';
+    const arr = Array.isArray(data) ? data : (data.pipelines || []);
+    arr.forEach(p => {
+      const name = typeof p === 'string' ? p : (p.name || '');
+      if (name) {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        sel.appendChild(opt);
+      }
+    });
+    if (prev && [...sel.options].some(o => o.value === prev)) sel.value = prev;
+  } catch (_) {}
+}
+
+async function labFetchConfig(slot) {
+  const pipeline = document.getElementById('lab-pipeline').value;
+  if (!pipeline) { toast('Select a pipeline first', 'err'); return; }
+  try {
+    const r = await fetch(`/api/df?port=${labPort}&path=/pipelines/${encodeURIComponent(pipeline)}`);
+    if (!r.ok) { toast('Failed to fetch pipeline config', 'err'); return; }
+    const data = await r.json();
+    const spec = data.spec || data;
+    document.getElementById('lab-editor-' + slot).value = JSON.stringify(spec, null, 2);
+    toast(`Config ${slot.toUpperCase()} loaded from ${pipeline}`);
+  } catch (e) { toast('Fetch error: ' + e.message, 'err'); }
+}
+
+async function labApplyConfig(slot) {
+  const pipeline = document.getElementById('lab-pipeline').value;
+  if (!pipeline) { toast('Select a pipeline first', 'err'); return; }
+  const raw = document.getElementById('lab-editor-' + slot).value.trim();
+  if (!raw) { toast('Config is empty', 'err'); return; }
+  let spec;
+  try { spec = JSON.parse(raw); } catch (e) { toast('Invalid JSON: ' + e.message, 'err'); return; }
+  try {
+    const r = await fetch('/api/df/patch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ port: labPort, path: `/pipelines/${pipeline}`, body: { spec } })
+    });
+    if (!r.ok) {
+      const txt = await r.text();
+      toast(`PATCH failed (${r.status}): ${txt}`, 'err');
+      return;
+    }
+    toast(`Config ${slot.toUpperCase()} applied to ${pipeline}`);
+  } catch (e) { toast('Apply error: ' + e.message, 'err'); }
+}
+
+// ── Presets ──────────────────────────────────────────────────────────────────
+
+function labGetPresets() {
+  try { return JSON.parse(localStorage.getItem(LAB_PRESETS_KEY) || '{}'); }
+  catch { return {}; }
+}
+
+function labSavePresetsToStorage(presets) {
+  localStorage.setItem(LAB_PRESETS_KEY, JSON.stringify(presets));
+}
+
+function labRefreshPresetDropdowns() {
+  const presets = labGetPresets();
+  const names = Object.keys(presets).sort();
+  ['a', 'b'].forEach(slot => {
+    const sel = document.getElementById('lab-preset-' + slot);
+    const prev = sel.value;
+    sel.innerHTML = '<option value="">— preset —</option>';
+    names.forEach(n => {
+      const opt = document.createElement('option');
+      opt.value = n;
+      opt.textContent = n;
+      sel.appendChild(opt);
+    });
+    if (prev && names.includes(prev)) sel.value = prev;
+  });
+}
+
+function labLoadPreset(slot) {
+  const name = document.getElementById('lab-preset-' + slot).value;
+  if (!name) return;
+  const presets = labGetPresets();
+  if (presets[name]) {
+    document.getElementById('lab-editor-' + slot).value =
+      typeof presets[name] === 'string' ? presets[name] : JSON.stringify(presets[name], null, 2);
+  }
+}
+
+function labSavePreset(slot) {
+  const raw = document.getElementById('lab-editor-' + slot).value.trim();
+  if (!raw) { toast('Editor is empty', 'err'); return; }
+  try { JSON.parse(raw); } catch { toast('Invalid JSON — fix before saving', 'err'); return; }
+  const name = prompt('Preset name:');
+  if (!name || !name.trim()) return;
+  const presets = labGetPresets();
+  presets[name.trim()] = raw;
+  labSavePresetsToStorage(presets);
+  labRefreshPresetDropdowns();
+  toast(`Preset "${name.trim()}" saved`);
+}
+
+function labDeletePreset() {
+  const presets = labGetPresets();
+  const names = Object.keys(presets).sort();
+  if (names.length === 0) { toast('No saved presets', 'err'); return; }
+  const name = prompt('Delete preset:\n\nAvailable: ' + names.join(', '));
+  if (!name || !presets[name]) { if (name) toast('Preset not found', 'err'); return; }
+  delete presets[name];
+  labSavePresetsToStorage(presets);
+  labRefreshPresetDropdowns();
+  toast(`Preset "${name}" deleted`);
+}
+
+// ── A/B Comparison Runner ────────────────────────────────────────────────────
+
+function labSetPhase(msg) {
+  document.getElementById('lab-phase').textContent = msg;
+}
+
+function labSetRunning(running) {
+  labRunning = running;
+  document.getElementById('lab-run-btn').disabled = running;
+  document.getElementById('lab-stop-btn').disabled = !running;
+}
+
+function labStopComparison() {
+  labAbort = true;
+  fetch('/api/scenario/stop', { method: 'POST' });
+  labSetPhase('Stopping...');
+}
+
+function labClearResults() {
+  document.getElementById('lab-results-wrap').style.display = 'none';
+  document.getElementById('lab-result-a').textContent = '—';
+  document.getElementById('lab-result-b').textContent = '—';
+  document.getElementById('lab-comparison-table').innerHTML = '';
+}
+
+async function labWaitForHealth(timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (labAbort) throw new Error('Aborted');
+    try {
+      const r = await fetch(`/api/df?port=${labPort}&path=/health`);
+      if (r.ok) return;
+    } catch (_) {}
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  throw new Error('Pipeline did not become healthy');
+}
+
+async function labWaitForScenarioDone(timeoutMs = 600000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (labAbort) throw new Error('Aborted');
+    try {
+      const r = await fetch('/api/scenario/status');
+      if (r.ok) {
+        const data = await r.json();
+        if (!data.running) return data.lines || [];
+      }
+    } catch (_) {}
+    await new Promise(r => setTimeout(r, 2000));
+  }
+  throw new Error('Scenario timed out');
+}
+
+function labParseMetrics(lines) {
+  const metrics = {};
+  const stripped = lines.map(l => l.replace(/\x1b\[[0-9;]*m/g, ''));
+  for (const line of stripped) {
+    const m = line.match(/^\s+([\w\s/():.]+?):\s+(.+)$/);
+    if (m) {
+      const key = m[1].trim();
+      const val = m[2].trim();
+      metrics[key] = val;
+    }
+  }
+  // Also capture pass/fail
+  const resultLine = stripped.find(l => /\[(PASS|FAIL)/.test(l));
+  if (resultLine) {
+    metrics['_result'] = resultLine.includes('PASS') ? 'PASS' : 'FAIL';
+    const nameMatch = resultLine.match(/[✓✗]\]\s+(.+)/);
+    if (nameMatch) metrics['_name'] = nameMatch[1].trim();
+  }
+  return metrics;
+}
+
+function labRenderComparison(metricsA, metricsB, linesA, linesB) {
+  document.getElementById('lab-results-wrap').style.display = '';
+
+  // Raw output
+  document.getElementById('lab-result-a').textContent = linesA.join('\n');
+  document.getElementById('lab-result-b').textContent = linesB.join('\n');
+
+  // Comparison table
+  const allKeys = new Set([...Object.keys(metricsA), ...Object.keys(metricsB)]);
+  const skipKeys = new Set(['_result', '_name']);
+  const keys = [...allKeys].filter(k => !skipKeys.has(k));
+
+  let html = '<div class="lab-comparison-title">A / B Comparison</div>';
+  html += '<table><tr><th>Metric</th><th class="col-a">Config A</th><th class="col-b">Config B</th><th>Delta</th></tr>';
+
+  for (const key of keys) {
+    const va = metricsA[key] || '—';
+    const vb = metricsB[key] || '—';
+    let delta = '';
+
+    // Try numeric comparison
+    const na = parseFloat(va.replace(/[^\d.-]/g, ''));
+    const nb = parseFloat(vb.replace(/[^\d.-]/g, ''));
+    if (!isNaN(na) && !isNaN(nb) && na !== 0) {
+      const pct = ((nb - na) / Math.abs(na) * 100).toFixed(1);
+      const sign = nb > na ? '+' : '';
+      // For most metrics, higher = better (events, rows). For some, lower = better (latency, memory).
+      const lowerBetter = /latency|memory|mem|cpu|error|fail/i.test(key);
+      const isBetter = lowerBetter ? nb < na : nb > na;
+      const cls = na === nb ? 'same' : (isBetter ? 'better' : 'worse');
+      delta = `<span class="lab-delta ${cls}">${sign}${pct}%</span>`;
+    }
+
+    html += `<tr><td>${key}</td><td class="col-a">${va}</td><td class="col-b">${vb}</td><td>${delta}</td></tr>`;
+  }
+
+  // Result row
+  const ra = metricsA['_result'] || '—';
+  const rb = metricsB['_result'] || '—';
+  html += `<tr><td><strong>Result</strong></td><td class="col-a" style="color:${ra==='PASS'?'var(--green)':'var(--red)'}">${ra}</td><td class="col-b" style="color:${rb==='PASS'?'var(--green)':'var(--red)'}">${rb}</td><td></td></tr>`;
+  html += '</table>';
+
+  document.getElementById('lab-comparison-table').innerHTML = html;
+}
+
+async function labRunComparison() {
+  const pipeline = document.getElementById('lab-pipeline').value;
+  if (!pipeline) { toast('Select a pipeline first', 'err'); return; }
+  const configA = document.getElementById('lab-editor-a').value.trim();
+  const configB = document.getElementById('lab-editor-b').value.trim();
+  if (!configA || !configB) { toast('Both Config A and Config B are required', 'err'); return; }
+  let specA, specB;
+  try { specA = JSON.parse(configA); } catch (e) { toast('Config A: invalid JSON', 'err'); return; }
+  try { specB = JSON.parse(configB); } catch (e) { toast('Config B: invalid JSON', 'err'); return; }
+
+  const scenario = document.getElementById('lab-scenario').value;
+  const duration = parseInt(document.getElementById('lab-duration').value, 10) || 2;
+
+  labAbort = false;
+  labSetRunning(true);
+  labClearResults();
+
+  const scenarioBody = {
+    scenario,
+    source: labPort === 8083 ? 'postgres' : 'mysql',
+    duration_mins: duration,
+    writer_tasks: 16,
+    write_delay_ms: 30,
+  };
+
+  let linesA = [], linesB = [];
+  try {
+    // ── Run A ──
+    labSetPhase('Applying Config A...');
+    const rA = await fetch('/api/df/patch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ port: labPort, path: `/pipelines/${pipeline}`, body: { spec: specA } })
+    });
+    if (!rA.ok) throw new Error('PATCH Config A failed: ' + await rA.text());
+    if (labAbort) throw new Error('Aborted');
+
+    labSetPhase('Waiting for pipeline health...');
+    await labWaitForHealth();
+
+    labSetPhase(`Running scenario with Config A (${duration} min)...`);
+    const startA = await fetch('/api/scenario/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(scenarioBody)
+    });
+    if (!startA.ok) throw new Error('Failed to start scenario for Config A: ' + await startA.text());
+
+    linesA = await labWaitForScenarioDone(duration * 60 * 1000 + 120000);
+    if (labAbort) throw new Error('Aborted');
+
+    // Brief pause between runs
+    labSetPhase('Cooldown between runs (5s)...');
+    await new Promise(r => setTimeout(r, 5000));
+
+    // ── Run B ──
+    labSetPhase('Applying Config B...');
+    const rB = await fetch('/api/df/patch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ port: labPort, path: `/pipelines/${pipeline}`, body: { spec: specB } })
+    });
+    if (!rB.ok) throw new Error('PATCH Config B failed: ' + await rB.text());
+    if (labAbort) throw new Error('Aborted');
+
+    labSetPhase('Waiting for pipeline health...');
+    await labWaitForHealth();
+
+    labSetPhase(`Running scenario with Config B (${duration} min)...`);
+    const startB = await fetch('/api/scenario/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(scenarioBody)
+    });
+    if (!startB.ok) throw new Error('Failed to start scenario for Config B: ' + await startB.text());
+
+    linesB = await labWaitForScenarioDone(duration * 60 * 1000 + 120000);
+
+    // ── Compare ──
+    labSetPhase('Done!');
+    const metricsA = labParseMetrics(linesA);
+    const metricsB = labParseMetrics(linesB);
+    labRenderComparison(metricsA, metricsB, linesA, linesB);
+    toast('A/B comparison complete');
+
+  } catch (e) {
+    labSetPhase(e.message);
+    toast(e.message, 'err');
+    // Show partial results if we have any
+    if (linesA.length > 0 || linesB.length > 0) {
+      document.getElementById('lab-results-wrap').style.display = '';
+      if (linesA.length) document.getElementById('lab-result-a').textContent = linesA.join('\n');
+      if (linesB.length) document.getElementById('lab-result-b').textContent = linesB.join('\n');
+    }
+  } finally {
+    labSetRunning(false);
+  }
+}
+
+// Init presets on load
+labRefreshPresetDropdowns();
 </script>
 </body>
 </html>

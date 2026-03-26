@@ -160,6 +160,11 @@ async fn api_status() -> Json<Vec<ServiceInfo>> {
             "deltaforge-deltaforge-tpcc-1",
             Some("http://localhost:8082/health"),
         ),
+        (
+            "deltaforge-pg-soak",
+            "deltaforge-deltaforge-pg-soak-1",
+            Some("http://localhost:8083/health"),
+        ),
         ("postgres", "deltaforge-postgres-1", None),
         ("postgres-b", "deltaforge-postgres-b-1", None),
     ];
@@ -258,6 +263,7 @@ async fn api_reset_volumes(Json(req): Json<ResetRequest>) -> StatusCode {
                 ("app", "deltaforge"),
                 ("pg-app", "deltaforge-pg"),
                 ("soak", "deltaforge-soak"),
+                ("pg-soak", "deltaforge-pg-soak"),
                 ("tpcc", "deltaforge-tpcc"),
             ];
             for (profile, service) in profiles {
@@ -685,6 +691,31 @@ async fn api_df_post(Json(req): Json<DfPostReq>) -> impl IntoResponse {
     }
 }
 
+/// Proxy a PATCH to any DeltaForge REST endpoint, e.g.
+/// POST /api/df/patch { port: 8081, path: "/pipelines/chaos-soak", body: {...} }
+async fn api_df_patch(Json(req): Json<DfPostReq>) -> impl IntoResponse {
+    let url = format!("http://localhost:{}{}", req.port, req.path);
+    let client = reqwest::Client::new();
+    let r = if let Some(b) = req.body {
+        client.patch(&url).json(&b).send().await
+    } else {
+        client.patch(&url).send().await
+    };
+    match r {
+        Ok(r) => {
+            let status = StatusCode::from_u16(r.status().as_u16())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let body = r.text().await.unwrap_or_default();
+            (status, [(header::CONTENT_TYPE, "application/json")], body)
+        }
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "application/json")],
+            "{}".to_string(),
+        ),
+    }
+}
+
 /// Proxy a DELETE to any DeltaForge REST endpoint, e.g.
 /// POST /api/df/delete { port: 8080, path: "/pipelines/my-pipeline" }
 async fn api_df_delete(Json(req): Json<DfPostReq>) -> impl IntoResponse {
@@ -937,6 +968,7 @@ pub async fn run(port: u16) -> Result<()> {
         .route("/api/profile/flamegraph", get(api_profile_flamegraph))
         .route("/api/df", get(api_df_get))
         .route("/api/df", post(api_df_post))
+        .route("/api/df/patch", post(api_df_patch))
         .route("/api/df/delete", post(api_df_delete))
         .with_state(state);
 
