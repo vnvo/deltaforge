@@ -187,7 +187,15 @@ async fn main() -> Result<()> {
             .await?
         }
         Source::Postgres => {
-            run_postgres(&harness, &cli.scenario, cli.duration_mins, cli.writer_tasks, cli.write_delay_ms, drain_cfg).await?
+            run_postgres(
+                &harness,
+                &cli.scenario,
+                cli.duration_mins,
+                cli.writer_tasks,
+                cli.write_delay_ms,
+                drain_cfg,
+            )
+            .await?
         }
     };
 
@@ -364,13 +372,12 @@ async fn run_postgres(
             );
         }
         Scenario::BacklogDrain => {
-            results
-                .push(scenarios::backlog_drain::run_pg(harness, drain_cfg).await?);
+            results.push(
+                scenarios::backlog_drain::run_pg(harness, drain_cfg).await?,
+            );
         }
         Scenario::Ui => unreachable!("ui is handled before source dispatch"),
-        Scenario::Tpcc
-        | Scenario::Failover
-        | Scenario::BinlogPurge => {
+        Scenario::Tpcc | Scenario::Failover | Scenario::BinlogPurge => {
             eprintln!(
                 "error: {:?} is a MySQL-specific scenario — use --source mysql",
                 scenario.to_possible_value().unwrap().get_name()

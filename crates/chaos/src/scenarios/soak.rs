@@ -64,7 +64,6 @@ const ALTER_MAX_SECS: u64 = 1800; // 30 min
 
 /// Health endpoint for the MySQL soak DeltaForge (used by backlog_drain).
 // ── Source-specific config ────────────────────────────────────────────────────
-
 /// Encapsulates everything that differs between MySQL and Postgres soak runs.
 #[derive(Clone)]
 pub struct SoakSource {
@@ -111,7 +110,14 @@ pub async fn run(
     writer_tasks: usize,
     write_delay_ms: u64,
 ) -> Result<ScenarioResult> {
-    run_with_source(harness, &MYSQL_SOAK, duration_mins, writer_tasks, write_delay_ms).await
+    run_with_source(
+        harness,
+        &MYSQL_SOAK,
+        duration_mins,
+        writer_tasks,
+        write_delay_ms,
+    )
+    .await
 }
 
 pub async fn run_pg(
@@ -120,7 +126,14 @@ pub async fn run_pg(
     writer_tasks: usize,
     write_delay_ms: u64,
 ) -> Result<ScenarioResult> {
-    run_with_source(harness, &PG_SOAK, duration_mins, writer_tasks, write_delay_ms).await
+    run_with_source(
+        harness,
+        &PG_SOAK,
+        duration_mins,
+        writer_tasks,
+        write_delay_ms,
+    )
+    .await
 }
 
 async fn run_with_source(
@@ -134,7 +147,10 @@ async fn run_with_source(
     harness.setup().await?;
 
     // Step 1: ensure soak DeltaForge is healthy.
-    info!("step 1/4: waiting for soak DeltaForge at {} ...", src.health_url);
+    info!(
+        "step 1/4: waiting for soak DeltaForge at {} ...",
+        src.health_url
+    );
     harness::wait_for_url(src.health_url, Duration::from_secs(60)).await?;
     info!("soak DeltaForge is healthy");
 
@@ -353,7 +369,14 @@ pub async fn run_stable(
     writer_tasks: usize,
     write_delay_ms: u64,
 ) -> Result<ScenarioResult> {
-    run_stable_with_source(harness, &MYSQL_SOAK, duration_mins, writer_tasks, write_delay_ms).await
+    run_stable_with_source(
+        harness,
+        &MYSQL_SOAK,
+        duration_mins,
+        writer_tasks,
+        write_delay_ms,
+    )
+    .await
 }
 
 pub async fn run_stable_pg(
@@ -362,7 +385,14 @@ pub async fn run_stable_pg(
     writer_tasks: usize,
     write_delay_ms: u64,
 ) -> Result<ScenarioResult> {
-    run_stable_with_source(harness, &PG_SOAK, duration_mins, writer_tasks, write_delay_ms).await
+    run_stable_with_source(
+        harness,
+        &PG_SOAK,
+        duration_mins,
+        writer_tasks,
+        write_delay_ms,
+    )
+    .await
 }
 
 async fn run_stable_with_source(
@@ -375,7 +405,10 @@ async fn run_stable_with_source(
     let name = &format!("soak-stable-{}", src.name);
     harness.setup().await?;
 
-    info!("step 1/3: waiting for soak DeltaForge at {} ...", src.health_url);
+    info!(
+        "step 1/3: waiting for soak DeltaForge at {} ...",
+        src.health_url
+    );
     harness::wait_for_url(src.health_url, Duration::from_secs(60)).await?;
     info!("soak DeltaForge is healthy");
 
@@ -501,7 +534,9 @@ async fn seed_tables(src: &SoakSource) -> Result<()> {
     if src.name == "postgres" {
         let (client, conn) =
             tokio_postgres::connect(PG_DSN, tokio_postgres::NoTls).await?;
-        tokio::spawn(async move { let _ = conn.await; });
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
         let row = client
             .query_one(
                 "SELECT COUNT(*)::BIGINT FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE 'soak_%'",
@@ -613,7 +648,10 @@ async fn writer_loop(
 
 /// Cut the MySQL Toxiproxy for PARTITION_HOLD_SECS, restore, then wait for
 /// DeltaForge to recover. Returns the total elapsed time (hold + recovery).
-async fn inject_network_partition(harness: &Harness, src: &SoakSource) -> Result<Duration> {
+async fn inject_network_partition(
+    harness: &Harness,
+    src: &SoakSource,
+) -> Result<Duration> {
     let start = Instant::now();
     harness.toxi.disable(src.proxy).await?;
     sleep(Duration::from_secs(PARTITION_HOLD_SECS)).await;
@@ -624,7 +662,10 @@ async fn inject_network_partition(harness: &Harness, src: &SoakSource) -> Result
 
 /// Cut the Kafka Toxiproxy for OUTAGE_HOLD_SECS, restore, then wait for
 /// DeltaForge to recover and flush pending events.
-async fn inject_sink_outage(harness: &Harness, src: &SoakSource) -> Result<Duration> {
+async fn inject_sink_outage(
+    harness: &Harness,
+    src: &SoakSource,
+) -> Result<Duration> {
     let start = Instant::now();
     harness.toxi.disable("kafka").await?;
     sleep(Duration::from_secs(OUTAGE_HOLD_SECS)).await;
@@ -784,7 +825,12 @@ async fn pg_writer_loop(
             break;
         }
 
-        let (client, conn) = match tokio_postgres::connect(PG_DSN, tokio_postgres::NoTls).await {
+        let (client, conn) = match tokio_postgres::connect(
+            PG_DSN,
+            tokio_postgres::NoTls,
+        )
+        .await
+        {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(writer = id, error = %e, "pg writer connect failed, retrying");
@@ -793,7 +839,9 @@ async fn pg_writer_loop(
             }
         };
         // Drive the connection in the background; it closes when client is dropped.
-        let conn_handle = tokio::spawn(async move { let _ = conn.await; });
+        let conn_handle = tokio::spawn(async move {
+            let _ = conn.await;
+        });
 
         // Inner loop: execute queries on the active connection.
         loop {
@@ -845,7 +893,9 @@ async fn pg_writer_loop(
             };
 
             match result {
-                Ok(_) => { written.fetch_add(1, Ordering::Relaxed); }
+                Ok(_) => {
+                    written.fetch_add(1, Ordering::Relaxed);
+                }
                 Err(e) => {
                     tracing::warn!(writer = id, error = %e, "pg writer query failed, reconnecting");
                     break; // Break inner loop → reconnect in outer loop.
@@ -893,16 +943,28 @@ async fn pg_alter_loop(
 
         // Postgres type equivalents (JSONB instead of JSON, REAL instead of FLOAT).
         let sql = match rng.gen_range(0u8..5) {
-            0 => format!("ALTER TABLE {table} ADD COLUMN {col_name} BIGINT DEFAULT NULL"),
-            1 => format!("ALTER TABLE {table} ADD COLUMN {col_name} VARCHAR(128) DEFAULT NULL"),
-            2 => format!("ALTER TABLE {table} ADD COLUMN {col_name} BOOLEAN DEFAULT FALSE"),
-            3 => format!("ALTER TABLE {table} ADD COLUMN {col_name} JSONB DEFAULT NULL"),
-            _ => format!("ALTER TABLE {table} ADD COLUMN {col_name} REAL DEFAULT NULL"),
+            0 => format!(
+                "ALTER TABLE {table} ADD COLUMN {col_name} BIGINT DEFAULT NULL"
+            ),
+            1 => format!(
+                "ALTER TABLE {table} ADD COLUMN {col_name} VARCHAR(128) DEFAULT NULL"
+            ),
+            2 => format!(
+                "ALTER TABLE {table} ADD COLUMN {col_name} BOOLEAN DEFAULT FALSE"
+            ),
+            3 => format!(
+                "ALTER TABLE {table} ADD COLUMN {col_name} JSONB DEFAULT NULL"
+            ),
+            _ => format!(
+                "ALTER TABLE {table} ADD COLUMN {col_name} REAL DEFAULT NULL"
+            ),
         };
 
         match tokio_postgres::connect(PG_DSN, tokio_postgres::NoTls).await {
             Ok((client, conn)) => {
-                tokio::spawn(async move { let _ = conn.await; });
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
                 match client.execute(&sql, &[]).await {
                     Ok(_) => {
                         info!(%table, %col_name, "mid-stream pg schema alter applied");

@@ -91,11 +91,17 @@ impl Default for DrainConfig {
 
 // ── Entry points ──────────────────────────────────────────────────────────────
 
-pub async fn run(harness: &Harness, cfg: DrainConfig) -> Result<ScenarioResult> {
+pub async fn run(
+    harness: &Harness,
+    cfg: DrainConfig,
+) -> Result<ScenarioResult> {
     run_with_source(harness, &super::soak::MYSQL_SOAK, cfg).await
 }
 
-pub async fn run_pg(harness: &Harness, cfg: DrainConfig) -> Result<ScenarioResult> {
+pub async fn run_pg(
+    harness: &Harness,
+    cfg: DrainConfig,
+) -> Result<ScenarioResult> {
     run_with_source(harness, &super::soak::PG_SOAK, cfg).await
 }
 
@@ -413,16 +419,22 @@ async fn pg_writer(id: usize, counter: Arc<AtomicU64>) {
             break;
         }
 
-        let (client, conn) =
-            match tokio_postgres::connect(crate::backend::PG_DSN, tokio_postgres::NoTls).await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(writer = id, error = %e, "pg writer connect failed, retrying");
-                    sleep(Duration::from_millis(200)).await;
-                    continue;
-                }
-            };
-        let conn_handle = tokio::spawn(async move { let _ = conn.await; });
+        let (client, conn) = match tokio_postgres::connect(
+            crate::backend::PG_DSN,
+            tokio_postgres::NoTls,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(writer = id, error = %e, "pg writer connect failed, retrying");
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        };
+        let conn_handle = tokio::spawn(async move {
+            let _ = conn.await;
+        });
 
         // Inner loop: execute queries on active connection.
         loop {
@@ -433,11 +445,15 @@ async fn pg_writer(id: usize, counter: Arc<AtomicU64>) {
                 return;
             }
 
-            let table = &tables[rand::Rng::gen_range(&mut rng, 0..tables.len())];
+            let table =
+                &tables[rand::Rng::gen_range(&mut rng, 0..tables.len())];
             let ts = now_ms();
             let tag = format!("drain-{id}-{ts}");
             let data = format!("backlog-{ts}");
-            let value = format!("{:.4}", rand::Rng::gen_range(&mut rng, 0.0..10000.0_f64));
+            let value = format!(
+                "{:.4}",
+                rand::Rng::gen_range(&mut rng, 0.0..10000.0_f64)
+            );
             let status: i16 = rand::Rng::gen_range(&mut rng, 0i16..4);
 
             match client
@@ -484,7 +500,11 @@ fn soak_tables() -> Vec<String> {
     tables
 }
 
-async fn df_patch(base: &str, path: &str, body: serde_json::Value) -> Result<()> {
+async fn df_patch(
+    base: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> Result<()> {
     let url = format!("{base}{path}");
     info!(%url, "df_patch");
     let resp = reqwest::Client::builder()
