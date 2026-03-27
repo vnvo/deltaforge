@@ -180,27 +180,16 @@ struct ServiceLink {
 /// If not listed here, falls back to showing the port number.
 fn port_label(host_port: u16) -> Option<(&'static str, String)> {
     match host_port {
-        // DeltaForge REST API
-        8080 | 8081 | 8082 | 8083 => Some(("API", format!("http://localhost:{host_port}"))),
-        // DeltaForge metrics (Prometheus exposition)
-        9000 | 9001 | 9002 | 9003 => Some(("metrics", format!("http://localhost:{host_port}/metrics"))),
-        // Grafana
-        3000 => Some(("UI", format!("http://localhost:3000"))),
-        // Prometheus
-        9090 => Some(("UI", format!("http://localhost:9090"))),
-        // cAdvisor
-        8888 => Some(("UI", format!("http://localhost:8888"))),
-        // Toxiproxy API
-        8474 => Some(("API", format!("http://localhost:8474"))),
-        // MySQL
+        8080..=8083 => Some(("API", format!("http://localhost:{host_port}"))),
+        9000..=9003 => Some(("metrics", format!("http://localhost:{host_port}/metrics"))),
+        3000 => Some(("UI", "http://localhost:3000".to_string())),
+        9090 => Some(("UI", "http://localhost:9090".to_string())),
+        8888 => Some(("UI", "http://localhost:8888".to_string())),
+        8474 => Some(("API", "http://localhost:8474".to_string())),
         3306 | 3307 => Some(("mysql", format!("localhost:{host_port}"))),
-        // PostgreSQL
         5432 | 5433 => Some(("psql", format!("localhost:{host_port}"))),
-        // Kafka
-        9092 => Some(("broker", format!("localhost:9092"))),
-        // Zookeeper
-        2181 => Some(("zk", format!("localhost:2181"))),
-        // Skip internal/proxy ports (toxiproxy proxied ports, etc.)
+        9092 => Some(("broker", "localhost:9092".to_string())),
+        2181 => Some(("zk", "localhost:2181".to_string())),
         _ => None,
     }
 }

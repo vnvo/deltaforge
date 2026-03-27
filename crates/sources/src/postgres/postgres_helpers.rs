@@ -191,7 +191,10 @@ fn pgwire_error_to_source_error(e: PgWireError) -> SourceError {
         Auth(msg) => SourceError::Auth {
             details: msg.into(),
         },
-        Io(msg) | Task(msg) => SourceError::Connect {
+        Io(err) => SourceError::Connect {
+            details: format!("{err} ({:?})", err.kind()).into(),
+        },
+        Task(msg) => SourceError::Connect {
             details: msg.into(),
         },
         Tls(msg) => SourceError::Incompatible {
@@ -415,7 +418,9 @@ pub(crate) fn make_checkpoint_meta(
     let mut buf = String::with_capacity(48);
     let _ = write!(buf, r#"{{"lsn":"{}","tx_id":"#, lsn);
     match tx_id {
-        Some(id) => { let _ = write!(buf, "{}}}", id); }
+        Some(id) => {
+            let _ = write!(buf, "{}}}", id);
+        }
         None => buf.push_str("null}"),
     }
     CheckpointMeta::from_vec(buf.into_bytes())
@@ -453,12 +458,15 @@ mod tests {
 
     #[test]
     fn test_pgwire_error_to_source_error() {
+        let io =
+            |s| PgWireError::Io(std::sync::Arc::new(std::io::Error::other(s)));
+
         assert!(matches!(
             pgwire_error_to_source_error(PgWireError::Auth("x".into())),
             SourceError::Auth { .. }
         ));
         assert!(matches!(
-            pgwire_error_to_source_error(PgWireError::Io("x".into())),
+            pgwire_error_to_source_error(io("x")),
             SourceError::Connect { .. }
         ));
         assert!(matches!(
