@@ -26,9 +26,11 @@ use crate::schema_loader::{
 };
 
 /// Loaded schema with metadata.
+///
+/// Wrapped fields use `Arc` to avoid deep-cloning per event on cache hits.
 #[derive(Debug, Clone)]
 pub struct LoadedSchema {
-    pub schema: PostgresTableSchema,
+    pub schema: Arc<PostgresTableSchema>,
     pub registry_version: i32,
     pub fingerprint: Arc<str>,
     pub sequence: u64,
@@ -128,7 +130,7 @@ impl PostgresSchemaLoader {
                                 cache.insert(
                                     (schema.clone(), table.clone()),
                                     LoadedSchema {
-                                        schema: pg_schema,
+                                        schema: Arc::new(pg_schema),
                                         registry_version: sv.version,
                                         fingerprint: fingerprint.into(),
                                         sequence: sv.sequence,
@@ -259,7 +261,7 @@ impl PostgresSchemaLoader {
             .map_err(SourceError::Other)?;
 
         let loaded = LoadedSchema {
-            schema: pg_schema,
+            schema: Arc::new(pg_schema),
             registry_version: version,
             fingerprint: fingerprint.into(),
             sequence: self.registry.current_sequence(),
@@ -444,7 +446,7 @@ impl PostgresSchemaLoader {
                 let pg_schema = PostgresTableSchema::new(columns);
                 let fingerprint = pg_schema.fingerprint();
                 let loaded = LoadedSchema {
-                    schema: pg_schema,
+                    schema: Arc::new(pg_schema),
                     registry_version: 1,
                     fingerprint: fingerprint.into(),
                     sequence: 0,
@@ -586,7 +588,7 @@ impl SourceSchemaLoader for PostgresSchemaLoader {
         Ok(ApiLoadedSchema {
             database: schema.to_string(),
             table: table.to_string(),
-            schema_json: serde_json::to_value(&loaded.schema)
+            schema_json: serde_json::to_value(&*loaded.schema)
                 .unwrap_or_default(),
             columns: loaded.column_names.iter().cloned().collect(),
             primary_key: loaded.schema.primary_key.clone(),
@@ -605,7 +607,7 @@ impl SourceSchemaLoader for PostgresSchemaLoader {
         Ok(ApiLoadedSchema {
             database: schema.to_string(),
             table: table.to_string(),
-            schema_json: serde_json::to_value(&loaded.schema)
+            schema_json: serde_json::to_value(&*loaded.schema)
                 .unwrap_or_default(),
             columns: loaded.column_names.iter().cloned().collect(),
             primary_key: loaded.schema.primary_key.clone(),

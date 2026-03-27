@@ -404,19 +404,21 @@ pub(crate) fn redact_password(dsn: &str) -> String {
 }
 
 /// Build checkpoint metadata from LSN.
+///
+/// Hand-writes the JSON to avoid serde_json overhead on every event.
+/// Format: `{"lsn":"X/Y","tx_id":N}` or `{"lsn":"X/Y","tx_id":null}`
 pub(crate) fn make_checkpoint_meta(
     lsn: &Lsn,
     tx_id: Option<u32>,
 ) -> CheckpointMeta {
-    let cp = PostgresCheckpoint {
-        lsn: lsn.to_string(),
-        tx_id,
-    };
-    let bytes = serde_json::to_vec(&cp).unwrap_or_else(|e| {
-        error!(error=%e, "failed to serialize checkpoint");
-        Vec::new()
-    });
-    CheckpointMeta::from_vec(bytes)
+    use std::fmt::Write;
+    let mut buf = String::with_capacity(48);
+    let _ = write!(buf, r#"{{"lsn":"{}","tx_id":"#, lsn);
+    match tx_id {
+        Some(id) => { let _ = write!(buf, "{}}}", id); }
+        None => buf.push_str("null}"),
+    }
+    CheckpointMeta::from_vec(buf.into_bytes())
 }
 
 /// Convert PostgreSQL epoch timestamp (microseconds since 2000-01-01) to Unix milliseconds.

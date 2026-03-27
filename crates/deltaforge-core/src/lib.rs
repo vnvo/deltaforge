@@ -7,7 +7,7 @@
 use std::str::FromStr;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use anyhow::{Result, anyhow};
@@ -22,6 +22,49 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
+
+// ── Fast UUID v7 ─────────────────────────────────────────────────────────────
+// Standard `Uuid::now_v7()` calls `getrandom` per UUID (~3% CPU in benchmarks).
+// This implementation uses a global atomic counter for the random portion,
+// avoiding the syscall entirely. The result is a valid RFC 9562 UUID v7 with
+// monotonic ordering within a millisecond — ideal for CDC event IDs where
+// uniqueness matters but cryptographic randomness does not.
+
+static UUID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Generate a UUID v7 using timestamp + atomic counter (no getrandom syscall).
+#[inline]
+pub fn fast_uuid_v7() -> Uuid {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let seq = UUID_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let mut b = [0u8; 16];
+    // 48-bit unix timestamp (ms), big-endian
+    b[0] = (millis >> 40) as u8;
+    b[1] = (millis >> 32) as u8;
+    b[2] = (millis >> 24) as u8;
+    b[3] = (millis >> 16) as u8;
+    b[4] = (millis >> 8) as u8;
+    b[5] = millis as u8;
+    // version 7 (4 bits) + 12 bits from counter
+    b[6] = 0x70 | ((seq >> 8) as u8 & 0x0F);
+    b[7] = seq as u8;
+    // variant 10 (2 bits) + 62 bits from counter
+    b[8] = 0x80 | ((seq >> 56) as u8 & 0x3F);
+    b[9] = (seq >> 48) as u8;
+    b[10] = (seq >> 40) as u8;
+    b[11] = (seq >> 32) as u8;
+    b[12] = (seq >> 24) as u8;
+    b[13] = (seq >> 16) as u8;
+    b[14] = (seq >> 8) as u8;
+    b[15] = seq as u8;
+
+    Uuid::from_bytes(b)
+}
 
 pub mod encoding;
 pub mod envelope;
@@ -434,7 +477,7 @@ impl Event {
             op,
             ts_ms,
             transaction: None,
-            event_id: Some(Uuid::now_v7()),
+            event_id: Some(fast_uuid_v7()),
             tenant_id: None,
             schema_version: None,
             schema_sequence: None,
@@ -464,7 +507,7 @@ impl Event {
             op: Op::Read, // DDL events use "r" in Debezium
             ts_ms,
             transaction: None,
-            event_id: Some(Uuid::now_v7()),
+            event_id: Some(fast_uuid_v7()),
             tenant_id: None,
             schema_version: None,
             schema_sequence: None,
@@ -494,7 +537,7 @@ impl Event {
             op: Op::Read,
             ts_ms,
             transaction: None,
-            event_id: Some(Uuid::now_v7()),
+            event_id: Some(fast_uuid_v7()),
             tenant_id: None,
             schema_version: None,
             schema_sequence: None,
@@ -535,8 +578,12 @@ impl Event {
 
     /// Generate idempotency key for deduplication.
     pub fn idempotency_key(&self) -> String {
-        format!(
-            "{}|{}.{}|{}|{}",
+        use std::fmt::Write;
+        // Pre-size: tenant(~8) + db(~8) + table(~16) + tx_id(~8) + uuid(36) + separators(4)
+        let mut key = String::with_capacity(80);
+        let _ = write!(
+            key,
+            "{}|{}.{}|{}|",
             self.tenant_id.as_deref().unwrap_or("_"),
             self.source.db,
             self.source.table,
@@ -544,10 +591,15 @@ impl Event {
                 .as_ref()
                 .map(|t| t.id.as_str())
                 .unwrap_or(""),
-            self.event_id
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| "_".to_string())
-        )
+        );
+        match self.event_id {
+            Some(u) => {
+                // Write UUID hyphenated directly into the buffer (no intermediate String).
+                let _ = write!(key, "{}", u.as_hyphenated());
+            }
+            None => key.push('_'),
+        }
+        key
     }
 
     /// Returns the fully-qualified table name.

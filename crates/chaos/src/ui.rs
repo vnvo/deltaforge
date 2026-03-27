@@ -64,7 +64,24 @@ fn workspace_root() -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
 }
 
-async fn inspect_container(name: &str) -> (String, String, String) {
+/// Container inspection result.
+struct ContainerInfo {
+    state: String,
+    health: String,
+    image: String,
+    /// Published ports: list of (host_port, container_port, protocol).
+    ports: Vec<(u16, u16, String)>,
+}
+
+async fn inspect_container(name: &str) -> ContainerInfo {
+    let absent = ContainerInfo {
+        state: "absent".into(),
+        health: "-".into(),
+        image: String::new(),
+        ports: vec![],
+    };
+
+    // Get state, health, image in one call.
     let out = Command::new("docker")
         .args([
             "inspect",
@@ -75,7 +92,7 @@ async fn inspect_container(name: &str) -> (String, String, String) {
         .output()
         .await;
 
-    match out {
+    let (state, health, image) = match out {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
             let mut it = s.splitn(3, ' ');
@@ -84,8 +101,43 @@ async fn inspect_container(name: &str) -> (String, String, String) {
             let image = it.next().unwrap_or("").to_string();
             (state, health, image)
         }
-        _ => ("absent".to_string(), "-".to_string(), String::new()),
+        _ => return absent,
+    };
+
+    // Get published port mappings via `docker port`.
+    let ports_out = Command::new("docker")
+        .args(["port", name])
+        .output()
+        .await;
+
+    let mut ports = vec![];
+    if let Ok(o) = ports_out {
+        if o.status.success() {
+            // Output format: "8080/tcp -> 0.0.0.0:8080\n9000/tcp -> 0.0.0.0:9000\n"
+            let s = String::from_utf8_lossy(&o.stdout);
+            for line in s.lines() {
+                // "3306/tcp -> 0.0.0.0:3306"
+                if let Some((left, right)) = line.split_once(" -> ") {
+                    let (cport_str, proto) = left.split_once('/').unwrap_or((left, "tcp"));
+                    let cport: u16 = cport_str.parse().unwrap_or(0);
+                    // right is "0.0.0.0:3306" or "[::]:3306"
+                    let hport: u16 = right
+                        .rsplit(':')
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    if cport > 0 && hport > 0 {
+                        ports.push((hport, cport, proto.to_string()));
+                    }
+                }
+            }
+        }
     }
+    // Deduplicate (docker port can show both IPv4 and IPv6).
+    ports.sort();
+    ports.dedup();
+
+    ContainerInfo { state, health, image, ports }
 }
 
 async fn check_http(url: &str) -> Option<bool> {
@@ -112,6 +164,56 @@ struct ServiceInfo {
     health: String,
     http_ok: Option<bool>,
     image: String,
+    /// Clickable links derived from published ports.
+    links: Vec<ServiceLink>,
+}
+
+#[derive(Serialize, Clone)]
+struct ServiceLink {
+    /// Short label (e.g. "API", "metrics", "UI", or port number).
+    label: String,
+    /// Full URL (e.g. "http://localhost:8080").
+    url: String,
+}
+
+/// Well-known container ports → human-readable link labels.
+/// If not listed here, falls back to showing the port number.
+fn port_label(host_port: u16) -> Option<(&'static str, String)> {
+    match host_port {
+        // DeltaForge REST API
+        8080 | 8081 | 8082 | 8083 => Some(("API", format!("http://localhost:{host_port}"))),
+        // DeltaForge metrics (Prometheus exposition)
+        9000 | 9001 | 9002 | 9003 => Some(("metrics", format!("http://localhost:{host_port}/metrics"))),
+        // Grafana
+        3000 => Some(("UI", format!("http://localhost:3000"))),
+        // Prometheus
+        9090 => Some(("UI", format!("http://localhost:9090"))),
+        // cAdvisor
+        8888 => Some(("UI", format!("http://localhost:8888"))),
+        // Toxiproxy API
+        8474 => Some(("API", format!("http://localhost:8474"))),
+        // MySQL
+        3306 | 3307 => Some(("mysql", format!("localhost:{host_port}"))),
+        // PostgreSQL
+        5432 | 5433 => Some(("psql", format!("localhost:{host_port}"))),
+        // Kafka
+        9092 => Some(("broker", format!("localhost:9092"))),
+        // Zookeeper
+        2181 => Some(("zk", format!("localhost:2181"))),
+        // Skip internal/proxy ports (toxiproxy proxied ports, etc.)
+        _ => None,
+    }
+}
+
+fn links_from_ports(ports: &[(u16, u16, String)]) -> Vec<ServiceLink> {
+    let mut links = Vec::new();
+    for &(host_port, _container_port, _) in ports {
+        // Only include ports with known labels — skip internal/proxy ports.
+        if let Some((lbl, url)) = port_label(host_port) {
+            links.push(ServiceLink { label: lbl.to_string(), url });
+        }
+    }
+    links
 }
 
 async fn api_status() -> Json<Vec<ServiceInfo>> {
@@ -171,8 +273,8 @@ async fn api_status() -> Json<Vec<ServiceInfo>> {
 
     let mut out = Vec::new();
     for (label, container, url) in defs {
-        let (state, health, image) = inspect_container(container).await;
-        let http_ok = if state == "running" {
+        let info = inspect_container(container).await;
+        let http_ok = if info.state == "running" {
             if let Some(u) = url {
                 check_http(u).await
             } else {
@@ -181,12 +283,14 @@ async fn api_status() -> Json<Vec<ServiceInfo>> {
         } else {
             None
         };
+        let links = links_from_ports(&info.ports);
         out.push(ServiceInfo {
             label: label.to_string(),
-            state,
-            health,
+            state: info.state,
+            health: info.health,
             http_ok,
-            image,
+            image: info.image,
+            links,
         });
     }
     Json(out)
@@ -532,6 +636,51 @@ async fn api_infra(Json(req): Json<InfraRequest>) -> StatusCode {
         args.push("-d".to_string());
     }
 
+    let ok = Command::new("docker")
+        .args(&args)
+        .current_dir(&root)
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+#[derive(Deserialize)]
+struct RefreshServiceRequest {
+    /// Compose service name (e.g. "deltaforge-pg-soak").
+    service: String,
+    /// Compose profile (e.g. "pg-soak").
+    profile: String,
+}
+
+/// Recreate a single service with the latest image, without affecting
+/// dependencies. Runs: docker compose up -d --no-deps --force-recreate <service>
+async fn api_refresh_service(Json(req): Json<RefreshServiceRequest>) -> StatusCode {
+    let root = workspace_root();
+    let mut args = vec![
+        "compose".to_string(),
+        "-f".to_string(),
+        "docker-compose.chaos.yml".to_string(),
+    ];
+    if !req.profile.is_empty() {
+        args.push("--profile".to_string());
+        args.push(req.profile.clone());
+    }
+    args.extend([
+        "up".to_string(),
+        "-d".to_string(),
+        "--no-deps".to_string(),
+        "--force-recreate".to_string(),
+        req.service.clone(),
+    ]);
+
+    tracing::info!(service = %req.service, profile = %req.profile, "refreshing service");
     let ok = Command::new("docker")
         .args(&args)
         .current_dir(&root)
@@ -961,6 +1110,7 @@ pub async fn run(port: u16) -> Result<()> {
         .route("/api/scenario/stop", post(api_scenario_stop))
         .route("/api/scenario/status", get(api_scenario_status))
         .route("/api/infra", post(api_infra))
+        .route("/api/refresh-service", post(api_refresh_service))
         .route("/api/reset-volumes", post(api_reset_volumes))
         .route("/api/swap-image", post(api_swap_image))
         .route("/api/profile/start", post(api_profile_start))

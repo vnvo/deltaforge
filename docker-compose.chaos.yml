@@ -267,7 +267,7 @@ services:
   # Profile: pg-soak. Exposes on ports 8083 (health) and 9003 (metrics).
 
   deltaforge-pg-soak:
-    image: deltaforge:dev-debug
+    image: deltaforge:dev-profile
     command: ["--config", "/etc/deltaforge/pg-soak.yaml", "--storage-path", "/data/deltaforge-pg-soak.db"]
     profiles: [pg-soak]
     user: root

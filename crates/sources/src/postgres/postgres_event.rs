@@ -3,6 +3,8 @@
 //! Processes pgoutput protocol messages from logical replication and
 //! converts them to DeltaForge events.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use deltaforge_core::{
     Event, Op, SourceError, SourceInfo, SourcePosition, SourceResult,
@@ -10,7 +12,7 @@ use deltaforge_core::{
 };
 use metrics::counter;
 use pgwire_replication::{Lsn, client::ReplicationEvent};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, info, warn};
 
 use common::watchdog;
 
@@ -26,13 +28,14 @@ pub struct RelationInfo {
     pub id: u32,
     pub schema: String,
     pub table: String,
-    pub columns: Vec<RelationColumn>,
+    /// Pre-formatted "schema.table" for metrics labels (avoids per-event allocation).
+    pub qualified_name: Arc<str>,
+    pub columns: Arc<Vec<RelationColumn>>,
     /// Replica identity: d=default, n=nothing, f=full, i=index
     pub replica_identity: char,
 }
 
 /// Read next replication event with watchdog timeout.
-#[instrument(skip_all)]
 pub(super) async fn read_next_event(
     ctx: &RunCtx,
 ) -> Result<Option<ReplicationEvent>, LoopControl> {
@@ -75,7 +78,6 @@ pub(super) async fn read_next_event(
 
 /// Dispatch a replication event to appropriate handler.
 /// Returns LoopControl to signal schema reload or fatal errors.
-#[instrument(skip_all)]
 pub(super) async fn dispatch_event(
     ctx: &mut RunCtx,
     event: ReplicationEvent,
@@ -286,13 +288,15 @@ fn handle_relation(
         .unwrap_or(false);
 
     // Update relation map with new column info
+    let qualified_name: Arc<str> = format!("{schema}.{table}").into();
     ctx.relation_map.insert(
         relation_id,
         RelationInfo {
             id: relation_id,
             schema: schema.clone(),
             table: table.clone(),
-            columns,
+            qualified_name,
+            columns: Arc::new(columns),
             replica_identity,
         },
     );
@@ -333,6 +337,12 @@ fn columns_differ(old: &[RelationColumn], new: &[RelationColumn]) -> bool {
     false
 }
 
+/// Static version string — allocated once, not per event.
+static PG_VERSION: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        concat!("deltaforge-", env!("CARGO_PKG_VERSION")).to_string()
+    });
+
 /// Build SourceInfo for PostgreSQL events
 fn build_source_info(
     ctx: &RunCtx,
@@ -342,18 +352,18 @@ fn build_source_info(
     timestamp_ms: i64,
 ) -> SourceInfo {
     SourceInfo {
-        version: concat!("deltaforge-", env!("CARGO_PKG_VERSION")).to_string(),
+        version: PG_VERSION.clone(),
         connector: "postgresql".to_string(),
         name: ctx.pipeline.clone(),
         ts_ms: timestamp_ms,
-        db: ctx.default_schema.clone(), // database name
+        db: ctx.default_schema.clone(),
         schema: Some(schema.to_string()),
         table: table.to_string(),
         snapshot: None,
         position: SourcePosition::postgres(
             wal_lsn.to_string(),
             ctx.current_tx_id.map(|id| id as i64),
-            None, // xmin not tracked currently
+            None,
         ),
     }
 }
@@ -386,12 +396,12 @@ async fn handle_insert(
         return Ok(());
     }
 
-    // Clone what we need
-    let schema = relation.schema.clone();
-    let table = relation.table.clone();
-    let columns = relation.columns.clone();
+    let columns = Arc::clone(&relation.columns);
+    let qualified_name = Arc::clone(&relation.qualified_name);
+    let schema = &relation.schema;
+    let table = &relation.table;
 
-    let loaded = ctx.schema.load_schema(&schema, &table).await?;
+    let loaded = ctx.schema.load_schema(schema, table).await?;
 
     let tuple_data = Bytes::copy_from_slice(&payload[5..]);
     let (values, _) = parse_tuple_data(&tuple_data, columns.len());
@@ -403,7 +413,7 @@ async fn handle_insert(
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
     let source_info =
-        build_source_info(ctx, &wal_lsn, &schema, &table, timestamp_ms);
+        build_source_info(ctx, &wal_lsn, schema, table, timestamp_ms);
     let mut ev = Event::new_row(
         source_info,
         Op::Create,
@@ -426,7 +436,7 @@ async fn handle_insert(
     ev.schema_version = Some(loaded.fingerprint.to_string());
     ev.schema_sequence = Some(loaded.sequence);
 
-    send_event(ctx, ev, &schema, &table, "c").await;
+    send_event(ctx, ev, &qualified_name, "c").await;
     Ok(())
 }
 
@@ -453,10 +463,10 @@ async fn handle_update(
         return Ok(());
     }
 
-    // Clone what we need before the mutable borrow ends
-    let schema = relation.schema.clone();
-    let table = relation.table.clone();
-    let columns = relation.columns.clone();
+    let columns = Arc::clone(&relation.columns);
+    let qualified_name = Arc::clone(&relation.qualified_name);
+    let schema = &relation.schema;
+    let table = &relation.table;
 
     let mut before_values = None;
     let mut after_values = None;
@@ -488,7 +498,7 @@ async fn handle_update(
         return Ok(());
     };
 
-    let loaded = ctx.schema.load_schema(&schema, &table).await?;
+    let loaded = ctx.schema.load_schema(schema, table).await?;
 
     let before = before_values.map(|v| build_object(&columns, &v));
     let after = build_object(&columns, &after_vals);
@@ -499,7 +509,7 @@ async fn handle_update(
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
     let source_info =
-        build_source_info(ctx, &wal_lsn, &schema, &table, timestamp_ms);
+        build_source_info(ctx, &wal_lsn, schema, table, timestamp_ms);
     let mut ev = Event::new_row(
         source_info,
         Op::Update,
@@ -522,7 +532,7 @@ async fn handle_update(
     ev.schema_version = Some(loaded.fingerprint.to_string());
     ev.schema_sequence = Some(loaded.sequence);
 
-    send_event(ctx, ev, &schema, &table, "u").await;
+    send_event(ctx, ev, &qualified_name, "u").await;
     Ok(())
 }
 
@@ -554,12 +564,12 @@ async fn handle_delete(
         return Ok(());
     }
 
-    // Clone what we need
-    let schema = relation.schema.clone();
-    let table = relation.table.clone();
-    let columns = relation.columns.clone();
+    let columns = Arc::clone(&relation.columns);
+    let qualified_name = Arc::clone(&relation.qualified_name);
+    let schema = &relation.schema;
+    let table = &relation.table;
 
-    let loaded = ctx.schema.load_schema(&schema, &table).await?;
+    let loaded = ctx.schema.load_schema(schema, table).await?;
 
     let tuple_data = Bytes::copy_from_slice(&payload[5..]);
     let (values, _) = parse_tuple_data(&tuple_data, columns.len());
@@ -571,7 +581,7 @@ async fn handle_delete(
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
     let source_info =
-        build_source_info(ctx, &wal_lsn, &schema, &table, timestamp_ms);
+        build_source_info(ctx, &wal_lsn, schema, table, timestamp_ms);
     let mut ev = Event::new_row(
         source_info,
         Op::Delete,
@@ -594,7 +604,7 @@ async fn handle_delete(
     ev.schema_version = Some(loaded.fingerprint.to_string());
     ev.schema_sequence = Some(loaded.sequence);
 
-    send_event(ctx, ev, &schema, &table, "d").await;
+    send_event(ctx, ev, &qualified_name, "d").await;
     Ok(())
 }
 
@@ -681,28 +691,35 @@ async fn handle_truncate(
 }
 
 /// Send event and update metrics.
+///
+/// Uses `try_send` (non-blocking) when the channel has capacity to avoid
+/// the overhead of the async state machine on every single row. Falls back
+/// to the async `send` only when the channel is full (backpressure).
+#[inline]
 async fn send_event(
     ctx: &RunCtx,
     ev: Event,
-    schema: &str,
-    table: &str,
+    table_name: &str,
     op: &'static str,
 ) {
-    let table_name = format!("{}.{}", schema, table);
-    match ctx.tx.send(ev).await {
-        Ok(_) => {
-            counter!(
-                "deltaforge_source_events_total",
-                "pipeline" => ctx.pipeline.clone(),
-                "source" => ctx.source_id.clone(),
-                "table" => table_name,
-                "op" => op,
-            )
-            .increment(1);
+    let ok = match ctx.tx.try_send(ev) {
+        Ok(()) => true,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(ev)) => {
+            ctx.tx.send(ev).await.is_ok()
         }
-        Err(_) => {
-            error!(source_id = %ctx.source_id, op, "channel send failed");
-        }
+        Err(_) => false,
+    };
+    if ok {
+        counter!(
+            "deltaforge_source_events_total",
+            "pipeline" => ctx.pipeline.clone(),
+            "source" => ctx.source_id.clone(),
+            "table" => table_name.to_string(),
+            "op" => op,
+        )
+        .increment(1);
+    } else {
+        error!(source_id = %ctx.source_id, op, "channel send failed");
     }
 }
 

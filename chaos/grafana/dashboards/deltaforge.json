@@ -119,8 +119,13 @@
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
-          "custom": { "lineWidth": 2 },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 500 }, { "color": "red", "value": 2000 }] }
+          "custom": { "lineWidth": 2, "fillOpacity": 15, "gradientMode": "scheme" },
+          "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "#73BF69", "value": null },
+            { "color": "#FF9830", "value": 0 },
+            { "color": "#F2495C", "value": 2000 }
+          ]}
         }
       },
       "options": { "tooltip": { "mode": "multi" } }

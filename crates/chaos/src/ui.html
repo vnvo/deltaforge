@@ -34,7 +34,7 @@ header nav a{color:var(--blue);text-decoration:none;font-size:12px;padding:4px 1
 header nav a:hover{background:var(--surface2)}
 
 /* ── Layout ── */
-.main{display:grid;grid-template-columns:260px 280px 1fr;gap:16px;padding:16px;flex:1;min-height:0}
+.main{display:grid;grid-template-columns:340px 240px 1fr;gap:16px;padding:16px;flex:1;min-height:0}
 .col{display:flex;flex-direction:column;gap:12px;min-height:0}
 
 /* ── Cards ── */
@@ -43,15 +43,17 @@ header nav a:hover{background:var(--surface2)}
 
 /* ── Service pills ── */
 .svc-grid{display:flex;flex-direction:column;gap:4px}
-.svc-row{display:flex;align-items:center;gap:8px;padding:5px 8px;border-radius:5px;font-size:13px}
+.svc-row{display:flex;align-items:center;gap:6px;padding:5px 8px;border-radius:5px;font-size:13px;flex-wrap:wrap}
 .svc-row:hover{background:var(--surface2)}
 .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
 .dot.running{background:var(--green)}
 .dot.exited{background:var(--red)}
 .dot.absent{background:var(--border)}
 .dot.starting{background:var(--yellow)}
-.svc-name{flex:1;font-family:var(--mono);font-size:12px}
+.svc-name{font-family:var(--mono);font-size:12px;min-width:110px}
 .svc-badge{font-size:10px;padding:1px 5px;border-radius:3px;font-family:var(--mono)}
+.badge-link{color:var(--blue);text-decoration:none;border:1px solid var(--border);cursor:pointer;transition:all .15s}
+.badge-link:hover{background:var(--surface2);border-color:var(--blue)}
 .badge-ok{background:#1a3a1a;color:var(--green)}
 .badge-err{background:#3a1a1a;color:var(--red)}
 .badge-warn{background:#3a2a0a;color:var(--yellow)}
@@ -779,6 +781,13 @@ async function infraAction(action, profile) {
   toast(r.ok ? `✅ ${action} ${profile || 'base'} done` : `❌ ${action} failed`, r.ok ? 'ok' : 'err');
 }
 
+// ── Service refresh ───────────────────────────────────────────────────────
+async function refreshService(service, profile) {
+  toast(`↻ Refreshing ${service}…`, 'ok');
+  const r = await api('POST', '/api/refresh-service', { service, profile });
+  toast(r.ok ? `✅ ${service} refreshed` : `❌ refresh failed`, r.ok ? 'ok' : 'err');
+}
+
 // ── Volume reset ──────────────────────────────────────────────────────────
 async function resetVolumes(scope) {
   const labels = { checkpoints: 'Reset Checkpoints', all: 'Reset All Volumes' };
@@ -1291,6 +1300,18 @@ function renderServices(services) {
       dn.title = `docker compose stop ${p || '(base)'}`;
       dn.onclick = () => infraAction('stop', p);
       header.appendChild(dn);
+
+      // Refresh button for DeltaForge app services (not base infra / observability)
+      if (p && group.names.some(n => n.startsWith('deltaforge'))) {
+        const rf = document.createElement('button');
+        rf.className = 'btn btn-sm';
+        rf.style.borderColor = 'var(--blue)';
+        rf.style.color = 'var(--blue)';
+        rf.textContent = '↻ Refresh';
+        rf.title = `Recreate ${group.names[0]} with latest image (no-deps)`;
+        rf.onclick = () => refreshService(group.names[0], p);
+        header.appendChild(rf);
+      }
     }
 
     grid.appendChild(header);
@@ -1310,6 +1331,19 @@ function renderServices(services) {
       nm.className = 'svc-name';
       nm.textContent = name;
       row.appendChild(nm);
+
+      // Port/URL link badges
+      if (svc.links && svc.links.length) {
+        for (const link of svc.links) {
+          const a = document.createElement('a');
+          a.className = 'svc-badge badge-link';
+          a.textContent = link.label;
+          a.href = link.url;
+          a.target = '_blank';
+          a.title = link.url;
+          row.appendChild(a);
+        }
+      }
 
       // Image tag badge for DeltaForge services
       if (svc.image && svc.image.startsWith('deltaforge:')) {
@@ -1332,25 +1366,28 @@ function renderServices(services) {
         }
       }
 
-      // HTTP badge
-      if (svc.http_ok !== null && svc.http_ok !== undefined) {
-        const badge = document.createElement('span');
-        badge.className = `svc-badge ${svc.http_ok ? 'badge-ok' : 'badge-err'}`;
-        badge.textContent = svc.http_ok ? 'ok' : 'down';
-        row.appendChild(badge);
-      } else if (svc.state === 'absent') {
-        const badge = document.createElement('span');
-        badge.className = 'svc-badge badge-dim';
-        badge.textContent = 'off';
-        row.appendChild(badge);
-      }
-
-      // Health dot
-      if (svc.health && svc.health !== '-') {
+      // Health dot (from Docker HEALTHCHECK)
+      const hasHealthDot = svc.health && svc.health !== '-';
+      if (hasHealthDot) {
         const hd = document.createElement('div');
         hd.className = `health-dot ${svc.health}`;
         hd.title = `health: ${svc.health}`;
         row.appendChild(hd);
+      }
+
+      // HTTP badge — only show when there's no health dot (avoid redundancy)
+      if (!hasHealthDot) {
+        if (svc.http_ok !== null && svc.http_ok !== undefined) {
+          const badge = document.createElement('span');
+          badge.className = `svc-badge ${svc.http_ok ? 'badge-ok' : 'badge-err'}`;
+          badge.textContent = svc.http_ok ? 'ok' : 'down';
+          row.appendChild(badge);
+        } else if (svc.state === 'absent') {
+          const badge = document.createElement('span');
+          badge.className = 'svc-badge badge-dim';
+          badge.textContent = 'off';
+          row.appendChild(badge);
+        }
       }
 
       grid.appendChild(row);

@@ -50,10 +50,10 @@ struct BuildingBatch {
 }
 
 impl BuildingBatch {
-    fn new() -> Self {
+    fn with_capacity(cap: usize) -> Self {
         Self {
             started_at: Instant::now(),
-            raw: Vec::new(),
+            raw: Vec::with_capacity(cap),
             bytes: 0,
         }
     }
@@ -529,13 +529,13 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                         break;
                     };
 
-                    if building.is_none() {
-                        building = Some(BuildingBatch::new());
-                        debug!(pipeline=%self.pipeline_name, "building new batch");
-                    }
-
                     let cfg = &self.batch_cfg_eff;
                     let max_events = cfg.max_events.unwrap_or(usize::MAX);
+
+                    if building.is_none() {
+                        building = Some(BuildingBatch::with_capacity(max_events));
+                        debug!(pipeline=%self.pipeline_name, "building new batch");
+                    }
                     let max_bytes = cfg.max_bytes.unwrap_or(usize::MAX);
                     let mut b = building.take().unwrap();
 
@@ -582,7 +582,7 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
         let boundary = is_tx_boundary(&ev);
 
         if (!b.raw.is_empty() || !boundary) && limit_hit {
-            let full = std::mem::replace(b, BuildingBatch::new());
+            let full = std::mem::replace(b, BuildingBatch::with_capacity(max_events));
             self.process_deliver_and_maybe_commit(full, "limits")
                 .await?;
         }
