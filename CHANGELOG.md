@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Postgres soak & backlog-drain** — 120-table soak test and 1M-row drain benchmark for `--source postgres` ([de9e8b2](https://github.com/vnvo/deltaforge/commit/de9e8b2), [9c8fba2](https://github.com/vnvo/deltaforge/commit/9c8fba2))
+- **Config Lab UI** — A/B config comparison with presets, side-by-side editors, and sequential scenario runner ([e611f93](https://github.com/vnvo/deltaforge/commit/e611f93))
+- **Chaos UI** — service refresh button (`--no-deps --force-recreate`), dynamic port/URL badges, PATCH proxy endpoint ([e611f93](https://github.com/vnvo/deltaforge/commit/e611f93))
+
+### Changed
+
+- **Postgres CDC at MySQL parity** — 29.4K → 48.5K events/s via fast_uuid_v7, zero-copy tuples, counter/LSN caches, Arc schemas, pre-alloc batches ([e611f93](https://github.com/vnvo/deltaforge/commit/e611f93), [0636159](https://github.com/vnvo/deltaforge/commit/0636159))
+- **pgwire-replication v0.3** — buffered WAL reads, `Io(Arc<io::Error>)` structured errors ([7bbaa82](https://github.com/vnvo/deltaforge/commit/7bbaa82))
+- **Grafana in-flight panel** — color thresholds: green=draining, orange=buffering, red=backlog ([e611f93](https://github.com/vnvo/deltaforge/commit/e611f93))
+
+### Fixed
+
+- **Postgres `escape_like`** — `_` escaped as literal, glob `*` converted to SQL `%` ([9c8fba2](https://github.com/vnvo/deltaforge/commit/9c8fba2))
+- **Postgres soak writer** — `f64`→`NUMERIC` type fix, reconnect loop, errors promoted to `warn` ([9c8fba2](https://github.com/vnvo/deltaforge/commit/9c8fba2))
+
 - **Filter processor** — native Rust processor that drops events not matching configured criteria ([543e632](https://github.com/vnvo/deltaforge/commit/543e632eca6b159eddbfd9d7e93b4dce056c4610), [52b3fb7](https://github.com/vnvo/deltaforge/commit/52b3fb753b153f3d030ef31ff10d45038c7b63b8), [0b847a5](https://github.com/vnvo/deltaforge/commit/0b847a59dbb382734b16abf37c9b478521d3063c))
   - Three independent gates evaluated in order — all must pass: **op** (create/update/delete/read/truncate), **table** (AllowList glob patterns with include/exclude), **fields** (predicates against `event.after`)
   - Numeric equality normalises int/float — `42` matches `42.0` for JS processor interop
