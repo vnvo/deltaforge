@@ -18,7 +18,7 @@ use common::watchdog;
 
 use super::RunCtx;
 use super::postgres_errors::LoopControl;
-use super::postgres_helpers::{make_checkpoint_meta, pg_timestamp_to_unix_ms};
+use super::postgres_helpers::{make_checkpoint_meta, make_checkpoint_meta_str, pg_timestamp_to_unix_ms};
 use super::postgres_logical_message;
 use super::postgres_object::{RelationColumn, build_object, parse_tuple_data};
 
@@ -165,17 +165,19 @@ async fn handle_pgoutput_message(
     }
 
     let msg_type = data[0];
-    let payload = &data[1..];
+    // Keep a Bytes handle for zero-copy slicing in DML handlers.
+    let payload_bytes = data.slice(1..);
+    let payload = payload_bytes.as_ref();
 
     match msg_type {
         b'R' => handle_relation(ctx, payload),
-        b'I' => handle_insert(ctx, payload, wal_lsn)
+        b'I' => handle_insert(ctx, &payload_bytes, wal_lsn)
             .await
             .map_err(LoopControl::Fail),
-        b'U' => handle_update(ctx, payload, wal_lsn)
+        b'U' => handle_update(ctx, &payload_bytes, wal_lsn)
             .await
             .map_err(LoopControl::Fail),
-        b'D' => handle_delete(ctx, payload, wal_lsn)
+        b'D' => handle_delete(ctx, &payload_bytes, wal_lsn)
             .await
             .map_err(LoopControl::Fail),
         b'T' => handle_truncate(ctx, payload, wal_lsn)
@@ -343,14 +345,27 @@ static PG_VERSION: std::sync::LazyLock<String> =
         concat!("deltaforge-", env!("CARGO_PKG_VERSION")).to_string()
     });
 
-/// Build SourceInfo for PostgreSQL events
+/// Build SourceInfo for PostgreSQL events.
+///
+/// Caches the formatted LSN string to avoid re-formatting when consecutive
+/// events share the same WAL position (common within a transaction).
 fn build_source_info(
-    ctx: &RunCtx,
+    ctx: &mut RunCtx,
     wal_lsn: &Lsn,
     schema: &str,
     table: &str,
     timestamp_ms: i64,
 ) -> SourceInfo {
+    // Cache the LSN string — only reformat when it changes.
+    let lsn_str = match &ctx.cached_lsn {
+        Some((cached, s)) if cached == wal_lsn => s.clone(),
+        _ => {
+            let s = wal_lsn.to_string();
+            ctx.cached_lsn = Some((*wal_lsn, s.clone()));
+            s
+        }
+    };
+
     SourceInfo {
         version: PG_VERSION.clone(),
         connector: "postgresql".to_string(),
@@ -361,7 +376,7 @@ fn build_source_info(
         table: table.to_string(),
         snapshot: None,
         position: SourcePosition::postgres(
-            wal_lsn.to_string(),
+            lsn_str,
             ctx.current_tx_id.map(|id| id as i64),
             None,
         ),
@@ -371,9 +386,10 @@ fn build_source_info(
 /// Handle INSERT message.
 async fn handle_insert(
     ctx: &mut RunCtx,
-    payload: &[u8],
+    payload_bytes: &Bytes,
     wal_lsn: Lsn,
 ) -> SourceResult<()> {
+    let payload = payload_bytes.as_ref();
     if payload.len() < 5 {
         return Ok(());
     }
@@ -396,14 +412,15 @@ async fn handle_insert(
         return Ok(());
     }
 
+    // Extract all needed data from relation upfront to release the borrow.
     let columns = Arc::clone(&relation.columns);
     let qualified_name = Arc::clone(&relation.qualified_name);
-    let schema = &relation.schema;
-    let table = &relation.table;
+    let schema = relation.schema.clone();
+    let table = relation.table.clone();
 
-    let loaded = ctx.schema.load_schema(schema, table).await?;
+    let loaded = ctx.schema.load_schema(&schema, &table).await?;
 
-    let tuple_data = Bytes::copy_from_slice(&payload[5..]);
+    let tuple_data = payload_bytes.slice(5..);
     let (values, _) = parse_tuple_data(&tuple_data, columns.len());
     let after = build_object(&columns, &values);
 
@@ -413,7 +430,9 @@ async fn handle_insert(
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
     let source_info =
-        build_source_info(ctx, &wal_lsn, schema, table, timestamp_ms);
+        build_source_info(ctx, &wal_lsn, &schema, &table, timestamp_ms);
+    let lsn_str = &ctx.cached_lsn.as_ref().unwrap().1;
+    let chkpt = make_checkpoint_meta_str(lsn_str, ctx.current_tx_id);
     let mut ev = Event::new_row(
         source_info,
         Op::Create,
@@ -423,7 +442,7 @@ async fn handle_insert(
         payload.len(),
     )
     .with_tenant(ctx.tenant.clone())
-    .with_checkpoint(make_checkpoint_meta(&wal_lsn, ctx.current_tx_id));
+    .with_checkpoint(chkpt);
 
     if let Some(tx_id) = ctx.current_tx_id {
         ev.transaction = Some(Transaction {
@@ -443,9 +462,10 @@ async fn handle_insert(
 /// Handle UPDATE message.
 async fn handle_update(
     ctx: &mut RunCtx,
-    payload: &[u8],
+    payload_bytes: &Bytes,
     wal_lsn: Lsn,
 ) -> SourceResult<()> {
+    let payload = payload_bytes.as_ref();
     if payload.len() < 5 {
         return Ok(());
     }
@@ -465,8 +485,8 @@ async fn handle_update(
 
     let columns = Arc::clone(&relation.columns);
     let qualified_name = Arc::clone(&relation.qualified_name);
-    let schema = &relation.schema;
-    let table = &relation.table;
+    let schema = relation.schema.clone();
+    let table = relation.table.clone();
 
     let mut before_values = None;
     let mut after_values = None;
@@ -477,14 +497,14 @@ async fn handle_update(
 
         match marker {
             b'K' | b'O' => {
-                let tuple_data = Bytes::copy_from_slice(&payload[offset..]);
+                let tuple_data = payload_bytes.slice(offset..);
                 let (values, consumed) =
                     parse_tuple_data(&tuple_data, columns.len());
                 before_values = Some(values);
                 offset += consumed;
             }
             b'N' => {
-                let tuple_data = Bytes::copy_from_slice(&payload[offset..]);
+                let tuple_data = payload_bytes.slice(offset..);
                 let (values, _) = parse_tuple_data(&tuple_data, columns.len());
                 after_values = Some(values);
                 break;
@@ -498,7 +518,7 @@ async fn handle_update(
         return Ok(());
     };
 
-    let loaded = ctx.schema.load_schema(schema, table).await?;
+    let loaded = ctx.schema.load_schema(&schema, &table).await?;
 
     let before = before_values.map(|v| build_object(&columns, &v));
     let after = build_object(&columns, &after_vals);
@@ -509,7 +529,9 @@ async fn handle_update(
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
     let source_info =
-        build_source_info(ctx, &wal_lsn, schema, table, timestamp_ms);
+        build_source_info(ctx, &wal_lsn, &schema, &table, timestamp_ms);
+    let lsn_str = &ctx.cached_lsn.as_ref().unwrap().1;
+    let chkpt = make_checkpoint_meta_str(lsn_str, ctx.current_tx_id);
     let mut ev = Event::new_row(
         source_info,
         Op::Update,
@@ -519,7 +541,7 @@ async fn handle_update(
         payload.len(),
     )
     .with_tenant(ctx.tenant.clone())
-    .with_checkpoint(make_checkpoint_meta(&wal_lsn, ctx.current_tx_id));
+    .with_checkpoint(chkpt);
 
     if let Some(tx_id) = ctx.current_tx_id {
         ev.transaction = Some(Transaction {
@@ -539,9 +561,10 @@ async fn handle_update(
 /// Handle DELETE message.
 async fn handle_delete(
     ctx: &mut RunCtx,
-    payload: &[u8],
+    payload_bytes: &Bytes,
     wal_lsn: Lsn,
 ) -> SourceResult<()> {
+    let payload = payload_bytes.as_ref();
     if payload.len() < 5 {
         return Ok(());
     }
@@ -566,12 +589,12 @@ async fn handle_delete(
 
     let columns = Arc::clone(&relation.columns);
     let qualified_name = Arc::clone(&relation.qualified_name);
-    let schema = &relation.schema;
-    let table = &relation.table;
+    let schema = relation.schema.clone();
+    let table = relation.table.clone();
 
-    let loaded = ctx.schema.load_schema(schema, table).await?;
+    let loaded = ctx.schema.load_schema(&schema, &table).await?;
 
-    let tuple_data = Bytes::copy_from_slice(&payload[5..]);
+    let tuple_data = payload_bytes.slice(5..);
     let (values, _) = parse_tuple_data(&tuple_data, columns.len());
     let before = build_object(&columns, &values);
 
@@ -581,7 +604,9 @@ async fn handle_delete(
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
     let source_info =
-        build_source_info(ctx, &wal_lsn, schema, table, timestamp_ms);
+        build_source_info(ctx, &wal_lsn, &schema, &table, timestamp_ms);
+    let lsn_str = &ctx.cached_lsn.as_ref().unwrap().1;
+    let chkpt = make_checkpoint_meta_str(lsn_str, ctx.current_tx_id);
     let mut ev = Event::new_row(
         source_info,
         Op::Delete,
@@ -591,7 +616,7 @@ async fn handle_delete(
         payload.len(),
     )
     .with_tenant(ctx.tenant.clone())
-    .with_checkpoint(make_checkpoint_meta(&wal_lsn, ctx.current_tx_id));
+    .with_checkpoint(chkpt);
 
     if let Some(tx_id) = ctx.current_tx_id {
         ev.transaction = Some(Transaction {
@@ -695,11 +720,12 @@ async fn handle_truncate(
 /// Uses `try_send` (non-blocking) when the channel has capacity to avoid
 /// the overhead of the async state machine on every single row. Falls back
 /// to the async `send` only when the channel is full (backpressure).
+/// Counter handles are cached per (table, op) to avoid hash lookups per event.
 #[inline]
 async fn send_event(
-    ctx: &RunCtx,
+    ctx: &mut RunCtx,
     ev: Event,
-    table_name: &str,
+    table_name: &Arc<str>,
     op: &'static str,
 ) {
     let ok = match ctx.tx.try_send(ev) {
@@ -710,14 +736,17 @@ async fn send_event(
         Err(_) => false,
     };
     if ok {
-        counter!(
-            "deltaforge_source_events_total",
-            "pipeline" => ctx.pipeline.clone(),
-            "source" => ctx.source_id.clone(),
-            "table" => table_name.to_string(),
-            "op" => op,
-        )
-        .increment(1);
+        let key = (Arc::clone(table_name), op);
+        let ctr = ctx.counter_cache.entry(key).or_insert_with_key(|k| {
+            counter!(
+                "deltaforge_source_events_total",
+                "pipeline" => ctx.pipeline.clone(),
+                "source" => ctx.source_id.clone(),
+                "table" => k.0.to_string(),
+                "op" => k.1,
+            )
+        });
+        ctr.increment(1);
     } else {
         error!(source_id = %ctx.source_id, op, "channel send failed");
     }

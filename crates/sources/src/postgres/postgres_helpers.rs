@@ -414,9 +414,18 @@ pub(crate) fn make_checkpoint_meta(
     lsn: &Lsn,
     tx_id: Option<u32>,
 ) -> CheckpointMeta {
+    make_checkpoint_meta_str(&lsn.to_string(), tx_id)
+}
+
+/// Build checkpoint metadata from a pre-formatted LSN string.
+/// Avoids reformatting the LSN when it's already cached.
+pub(crate) fn make_checkpoint_meta_str(
+    lsn_str: &str,
+    tx_id: Option<u32>,
+) -> CheckpointMeta {
     use std::fmt::Write;
     let mut buf = String::with_capacity(48);
-    let _ = write!(buf, r#"{{"lsn":"{}","tx_id":"#, lsn);
+    let _ = write!(buf, r#"{{"lsn":"{}","tx_id":"#, lsn_str);
     match tx_id {
         Some(id) => {
             let _ = write!(buf, "{}}}", id);

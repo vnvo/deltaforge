@@ -10,16 +10,18 @@ use serde_json::{Value, json};
 use tracing::debug;
 
 /// Column value from pgoutput tuple data.
+///
+/// Uses `Bytes` for zero-copy slicing from the WAL message buffer.
 #[derive(Debug, Clone)]
 pub enum PgColumnValue {
     /// NULL value (n)
     Null,
     /// TOAST unchanged value (u) - placeholder
     Unchanged,
-    /// Text value (t)
-    Text(String),
-    /// Binary value (b)
-    Binary(Vec<u8>),
+    /// Text value (t) — zero-copy slice from the WAL buffer.
+    Text(Bytes),
+    /// Binary value (b) — zero-copy slice from the WAL buffer.
+    Binary(Bytes),
 }
 
 /// Relation column metadata from pgoutput.
@@ -90,7 +92,16 @@ fn convert_value(value: &PgColumnValue, type_oid: u32) -> Value {
     match value {
         PgColumnValue::Null => Value::Null,
         PgColumnValue::Unchanged => json!({"_unchanged": true}),
-        PgColumnValue::Text(s) => convert_text_value(s, type_oid),
+        PgColumnValue::Text(bytes) => {
+            // Zero-copy: borrow the Bytes slice as &str.
+            // pgoutput text mode always sends valid UTF-8.
+            let s = std::str::from_utf8(bytes)
+                .unwrap_or_else(|_| {
+                    // Shouldn't happen with pgoutput, but be safe.
+                    ""
+                });
+            convert_text_value(s, type_oid)
+        }
         PgColumnValue::Binary(bytes) => convert_binary_value(bytes, type_oid),
     }
 }
@@ -256,71 +267,73 @@ fn parse_array_element(s: &str) -> Value {
 }
 
 /// Parse tuple data from pgoutput message.
-/// Returns (values, bytes_consumed).
+///
+/// Returns (values, bytes_consumed). Uses zero-copy `Bytes::slice()` to
+/// avoid allocating per column — the returned `PgColumnValue::Text` and
+/// `Binary` variants hold reference-counted slices of the input buffer.
 pub fn parse_tuple_data(
     data: &Bytes,
     column_count: usize,
 ) -> (Vec<PgColumnValue>, usize) {
     let mut values = Vec::with_capacity(column_count);
     let mut offset = 0;
-    let data = data.as_ref();
+    let raw = data.as_ref();
 
     // First 2 bytes are number of columns
-    if data.len() < 2 {
+    if raw.len() < 2 {
         return (values, 0);
     }
-    let col_count = u16::from_be_bytes([data[0], data[1]]) as usize;
+    let col_count = u16::from_be_bytes([raw[0], raw[1]]) as usize;
     offset += 2;
 
     for _ in 0..col_count {
-        if offset >= data.len() {
+        if offset >= raw.len() {
             break;
         }
 
-        let col_type = data[offset];
+        let col_type = raw[offset];
         offset += 1;
 
         let value = match col_type {
             b'n' => PgColumnValue::Null,
             b'u' => PgColumnValue::Unchanged,
             b't' => {
-                if offset + 4 > data.len() {
+                if offset + 4 > raw.len() {
                     break;
                 }
                 let len = u32::from_be_bytes([
-                    data[offset],
-                    data[offset + 1],
-                    data[offset + 2],
-                    data[offset + 3],
+                    raw[offset],
+                    raw[offset + 1],
+                    raw[offset + 2],
+                    raw[offset + 3],
                 ]) as usize;
                 offset += 4;
 
-                if offset + len > data.len() {
+                if offset + len > raw.len() {
                     break;
                 }
-                let text = String::from_utf8_lossy(&data[offset..offset + len])
-                    .to_string();
+                let slice = data.slice(offset..offset + len);
                 offset += len;
-                PgColumnValue::Text(text)
+                PgColumnValue::Text(slice)
             }
             b'b' => {
-                if offset + 4 > data.len() {
+                if offset + 4 > raw.len() {
                     break;
                 }
                 let len = u32::from_be_bytes([
-                    data[offset],
-                    data[offset + 1],
-                    data[offset + 2],
-                    data[offset + 3],
+                    raw[offset],
+                    raw[offset + 1],
+                    raw[offset + 2],
+                    raw[offset + 3],
                 ]) as usize;
                 offset += 4;
 
-                if offset + len > data.len() {
+                if offset + len > raw.len() {
                     break;
                 }
-                let bytes = data[offset..offset + len].to_vec();
+                let slice = data.slice(offset..offset + len);
                 offset += len;
-                PgColumnValue::Binary(bytes)
+                PgColumnValue::Binary(slice)
             }
             _ => PgColumnValue::Null,
         };
@@ -353,8 +366,8 @@ mod tests {
         ];
 
         let values = vec![
-            PgColumnValue::Text("42".to_string()),
-            PgColumnValue::Text("Alice".to_string()),
+            PgColumnValue::Text(Bytes::from_static(b"42")),
+            PgColumnValue::Text(Bytes::from_static(b"Alice")),
         ];
 
         let obj = build_object(&columns, &values);
@@ -380,8 +393,8 @@ mod tests {
         ];
 
         let values = vec![
-            PgColumnValue::Text("1".to_string()),
-            PgColumnValue::Text("Bob".to_string()),
+            PgColumnValue::Text(Bytes::from_static(b"1")),
+            PgColumnValue::Text(Bytes::from_static(b"Bob")),
         ];
 
         let obj = build_key_object(&columns, &values);
