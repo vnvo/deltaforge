@@ -95,11 +95,7 @@ fn convert_value(value: &PgColumnValue, type_oid: u32) -> Value {
         PgColumnValue::Text(bytes) => {
             // Zero-copy: borrow the Bytes slice as &str.
             // pgoutput text mode always sends valid UTF-8.
-            let s = std::str::from_utf8(bytes)
-                .unwrap_or_else(|_| {
-                    // Shouldn't happen with pgoutput, but be safe.
-                    ""
-                });
+            let s = std::str::from_utf8(bytes).unwrap_or("");
             convert_text_value(s, type_oid)
         }
         PgColumnValue::Binary(bytes) => convert_binary_value(bytes, type_oid),

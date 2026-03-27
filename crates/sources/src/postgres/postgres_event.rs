@@ -18,7 +18,9 @@ use common::watchdog;
 
 use super::RunCtx;
 use super::postgres_errors::LoopControl;
-use super::postgres_helpers::{make_checkpoint_meta, make_checkpoint_meta_str, pg_timestamp_to_unix_ms};
+use super::postgres_helpers::{
+    make_checkpoint_meta, make_checkpoint_meta_str, pg_timestamp_to_unix_ms,
+};
 use super::postgres_logical_message;
 use super::postgres_object::{RelationColumn, build_object, parse_tuple_data};
 
