@@ -105,10 +105,7 @@ async fn inspect_container(name: &str) -> ContainerInfo {
     };
 
     // Get published port mappings via `docker port`.
-    let ports_out = Command::new("docker")
-        .args(["port", name])
-        .output()
-        .await;
+    let ports_out = Command::new("docker").args(["port", name]).output().await;
 
     let mut ports = vec![];
     if let Ok(o) = ports_out {
@@ -118,7 +115,8 @@ async fn inspect_container(name: &str) -> ContainerInfo {
             for line in s.lines() {
                 // "3306/tcp -> 0.0.0.0:3306"
                 if let Some((left, right)) = line.split_once(" -> ") {
-                    let (cport_str, proto) = left.split_once('/').unwrap_or((left, "tcp"));
+                    let (cport_str, proto) =
+                        left.split_once('/').unwrap_or((left, "tcp"));
                     let cport: u16 = cport_str.parse().unwrap_or(0);
                     // right is "0.0.0.0:3306" or "[::]:3306"
                     let hport: u16 = right
@@ -137,7 +135,12 @@ async fn inspect_container(name: &str) -> ContainerInfo {
     ports.sort();
     ports.dedup();
 
-    ContainerInfo { state, health, image, ports }
+    ContainerInfo {
+        state,
+        health,
+        image,
+        ports,
+    }
 }
 
 async fn check_http(url: &str) -> Option<bool> {
@@ -181,7 +184,9 @@ struct ServiceLink {
 fn port_label(host_port: u16) -> Option<(&'static str, String)> {
     match host_port {
         8080..=8083 => Some(("API", format!("http://localhost:{host_port}"))),
-        9000..=9003 => Some(("metrics", format!("http://localhost:{host_port}/metrics"))),
+        9000..=9003 => {
+            Some(("metrics", format!("http://localhost:{host_port}/metrics")))
+        }
         3000 => Some(("UI", "http://localhost:3000".to_string())),
         9090 => Some(("UI", "http://localhost:9090".to_string())),
         8888 => Some(("UI", "http://localhost:8888".to_string())),
@@ -199,7 +204,10 @@ fn links_from_ports(ports: &[(u16, u16, String)]) -> Vec<ServiceLink> {
     for &(host_port, _container_port, _) in ports {
         // Only include ports with known labels — skip internal/proxy ports.
         if let Some((lbl, url)) = port_label(host_port) {
-            links.push(ServiceLink { label: lbl.to_string(), url });
+            links.push(ServiceLink {
+                label: lbl.to_string(),
+                url,
+            });
         }
     }
     links
@@ -650,7 +658,9 @@ struct RefreshServiceRequest {
 
 /// Recreate a single service with the latest image, without affecting
 /// dependencies. Runs: docker compose up -d --no-deps --force-recreate <service>
-async fn api_refresh_service(Json(req): Json<RefreshServiceRequest>) -> StatusCode {
+async fn api_refresh_service(
+    Json(req): Json<RefreshServiceRequest>,
+) -> StatusCode {
     let root = workspace_root();
     let mut args = vec![
         "compose".to_string(),

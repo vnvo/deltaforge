@@ -582,7 +582,8 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
         let boundary = is_tx_boundary(&ev);
 
         if (!b.raw.is_empty() || !boundary) && limit_hit {
-            let full = std::mem::replace(b, BuildingBatch::with_capacity(max_events));
+            let full =
+                std::mem::replace(b, BuildingBatch::with_capacity(max_events));
             self.process_deliver_and_maybe_commit(full, "limits")
                 .await?;
         }
