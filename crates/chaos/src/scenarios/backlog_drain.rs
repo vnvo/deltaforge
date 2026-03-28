@@ -248,7 +248,8 @@ async fn run_with_source(
     }
 
     let drain_start = Instant::now();
-    info!("pipeline restarted — backlog drain started");
+    let conn_mode = harness::connection_mode_summary(src.df_base, pipeline).await;
+    info!(connection = %conn_mode, "pipeline restarted — backlog drain started");
 
     // Step 6: poll Kafka until the offset advances by rows_written.
     info!(
@@ -330,6 +331,7 @@ async fn run_with_source(
 
     let mut result = ScenarioResult::pass(&name)
         .note(format!("source: {}", src.name))
+        .note(format!("connection: {conn_mode}"))
         .note(format!("target events: {TARGET_EVENTS}"))
         .note(format!("rows written: {rows_written}"))
         .note(format!("batch max_events: {}", cfg.max_events))
@@ -359,6 +361,9 @@ async fn run_with_source(
 
 // ── MySQL writer ──────────────────────────────────────────────────────────────
 
+/// Rows per multi-row INSERT statement in the MySQL writer.
+const MYSQL_BATCH_SIZE: usize = 64;
+
 async fn mysql_writer(id: usize, counter: Arc<AtomicU64>) {
     use mysql_async::prelude::Queryable;
 
@@ -367,39 +372,68 @@ async fn mysql_writer(id: usize, counter: Arc<AtomicU64>) {
     let mut rng =
         <rand::rngs::SmallRng as rand::SeedableRng>::seed_from_u64(id as u64);
 
+    // Outer loop: acquire a connection and reuse it for many inserts.
     loop {
-        let prev = counter.fetch_add(1, Ordering::Relaxed);
-        if prev >= TARGET_EVENTS {
-            counter.fetch_sub(1, Ordering::Relaxed);
+        if counter.load(Ordering::Relaxed) >= TARGET_EVENTS {
             break;
         }
 
-        let table = &tables[rand::Rng::gen_range(&mut rng, 0..tables.len())];
-        let ts = now_ms();
-
-        match pool.get_conn().await {
-            Ok(mut conn) => {
-                let _ = conn
-                    .exec_drop(
-                        format!(
-                            "INSERT INTO {table} (tag, data, value, status) \
-                             VALUES (?, ?, ?, ?)"
-                        ),
-                        (
-                            format!("drain-{id}-{ts}"),
-                            format!("backlog-{ts}"),
-                            rand::Rng::gen_range(&mut rng, 0.0..10000.0_f64),
-                            rand::Rng::gen_range(&mut rng, 0u8..4),
-                        ),
-                    )
-                    .await;
-            }
+        let mut conn = match pool.get_conn().await {
+            Ok(c) => c,
             Err(e) => {
-                tracing::warn!(writer = id, error = %e, "mysql writer connection error, retrying");
-                counter.fetch_sub(1, Ordering::Relaxed);
-                sleep(Duration::from_millis(50)).await;
+                tracing::warn!(writer = id, error = %e, "mysql writer connect failed, retrying");
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        };
+
+        // Inner loop: batch inserts on a live connection.
+        loop {
+            // Reserve a batch of rows.
+            let batch_start = counter.fetch_add(MYSQL_BATCH_SIZE as u64, Ordering::Relaxed);
+            if batch_start >= TARGET_EVENTS {
+                // Return the over-claimed amount.
+                counter.fetch_sub(MYSQL_BATCH_SIZE as u64, Ordering::Relaxed);
+                let _ = pool.disconnect().await;
+                return;
+            }
+            let actual_batch = ((TARGET_EVENTS - batch_start) as usize).min(MYSQL_BATCH_SIZE);
+            if actual_batch < MYSQL_BATCH_SIZE {
+                // Return the over-claimed remainder.
+                counter.fetch_sub((MYSQL_BATCH_SIZE - actual_batch) as u64, Ordering::Relaxed);
+            }
+
+            let table = &tables[rand::Rng::gen_range(&mut rng, 0..tables.len())];
+            let ts = now_ms();
+
+            // Build a multi-row INSERT: INSERT INTO t (cols) VALUES (...), (...), ...
+            let mut sql = format!(
+                "INSERT INTO {table} (tag, data, value, status) VALUES "
+            );
+            let mut params: Vec<mysql_async::Value> = Vec::with_capacity(actual_batch * 4);
+            for i in 0..actual_batch {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                sql.push_str("(?, ?, ?, ?)");
+                params.push(format!("drain-{id}-{ts}-{i}").into());
+                params.push(format!("backlog-{ts}").into());
+                params.push(rand::Rng::gen_range(&mut rng, 0.0..10000.0_f64).into());
+                params.push(rand::Rng::gen_range(&mut rng, 0u8..4).into());
+            }
+
+            match conn.exec_drop(&sql, mysql_async::Params::Positional(params)).await {
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(writer = id, error = %e, "mysql writer query failed, reconnecting");
+                    // Return the batch — they weren't committed.
+                    counter.fetch_sub(actual_batch as u64, Ordering::Relaxed);
+                    break; // Break to outer loop → reconnect.
+                }
             }
         }
+
+        sleep(Duration::from_millis(100)).await;
     }
 
     let _ = pool.disconnect().await;
