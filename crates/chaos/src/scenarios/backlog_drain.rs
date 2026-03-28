@@ -63,6 +63,9 @@ pub struct DrainConfig {
     pub max_events: u64,
     /// Max batch age in ms (pipeline spec `batch.max_ms`).
     pub max_ms: u64,
+    /// How many batches may be in-flight concurrently.
+    /// Higher values overlap accumulation with delivery for better throughput.
+    pub max_inflight: u64,
     /// Commit mode: "required" (safe) or "periodic" (faster, may lose events on crash).
     pub commit_mode: String,
     /// Checkpoint interval in ms — only used when `commit_mode` is "periodic".
@@ -78,13 +81,20 @@ pub struct DrainConfig {
 
 impl Default for DrainConfig {
     fn default() -> Self {
+        let mut kafka = std::collections::HashMap::new();
+        // Zero linger for drain benchmarks: the coordinator enqueues thousands
+        // of messages per batch in a tight loop, so rdkafka batches naturally.
+        // Any linger > 0 adds idle wait per produce and directly caps throughput.
+        kafka.insert("linger.ms".into(), "0".into());
+
         Self {
-            max_events: 200,
+            max_events: 4000,
             max_ms: 100,
+            max_inflight: 4,
             commit_mode: "required".to_string(),
             commit_interval_ms: 500,
             schema_sensing: false,
-            kafka_client_conf: std::collections::HashMap::new(),
+            kafka_client_conf: kafka,
         }
     }
 }
@@ -117,6 +127,7 @@ async fn run_with_source(
         source = src.name,
         max_events = cfg.max_events,
         max_ms = cfg.max_ms,
+        max_inflight = cfg.max_inflight,
         commit_mode = %cfg.commit_mode,
         commit_interval_ms = cfg.commit_interval_ms,
         schema_sensing = cfg.schema_sensing,
@@ -207,13 +218,18 @@ async fn run_with_source(
     info!(
         max_events = cfg.max_events,
         max_ms = cfg.max_ms,
+        max_inflight = cfg.max_inflight,
         commit_mode = %cfg.commit_mode,
         schema_sensing = cfg.schema_sensing,
         "step 4/6: patching pipeline '{pipeline}' and restarting ..."
     );
     let mut patch_spec = serde_json::json!({
         "schema_sensing": {"enabled": cfg.schema_sensing},
-        "batch": {"max_events": cfg.max_events, "max_ms": cfg.max_ms},
+        "batch": {
+            "max_events": cfg.max_events,
+            "max_ms": cfg.max_ms,
+            "max_inflight": cfg.max_inflight,
+        },
         "commit_policy": {"mode": cfg.commit_mode},
     });
 
@@ -336,6 +352,7 @@ async fn run_with_source(
         .note(format!("target events: {TARGET_EVENTS}"))
         .note(format!("rows written: {rows_written}"))
         .note(format!("batch max_events: {}", cfg.max_events))
+        .note(format!("batch max_inflight: {}", cfg.max_inflight))
         .note(format!("commit mode: {}", cfg.commit_mode))
         .note(format!("schema sensing: {}", cfg.schema_sensing));
 
@@ -376,7 +393,7 @@ async fn mysql_writer(id: usize, counter: Arc<AtomicU64>) {
     // Outer loop: acquire a connection and reuse it for many inserts.
     loop {
         if counter.load(Ordering::Relaxed) >= TARGET_EVENTS {
-            break;
+            return;
         }
 
         let mut conn = match pool.get_conn().await {
@@ -394,15 +411,12 @@ async fn mysql_writer(id: usize, counter: Arc<AtomicU64>) {
             let batch_start =
                 counter.fetch_add(MYSQL_BATCH_SIZE as u64, Ordering::Relaxed);
             if batch_start >= TARGET_EVENTS {
-                // Return the over-claimed amount.
                 counter.fetch_sub(MYSQL_BATCH_SIZE as u64, Ordering::Relaxed);
-                let _ = pool.disconnect().await;
-                return;
+                return; // pool + conn dropped automatically
             }
             let actual_batch =
                 ((TARGET_EVENTS - batch_start) as usize).min(MYSQL_BATCH_SIZE);
             if actual_batch < MYSQL_BATCH_SIZE {
-                // Return the over-claimed remainder.
                 counter.fetch_sub(
                     (MYSQL_BATCH_SIZE - actual_batch) as u64,
                     Ordering::Relaxed,
@@ -439,7 +453,6 @@ async fn mysql_writer(id: usize, counter: Arc<AtomicU64>) {
                 Ok(_) => {}
                 Err(e) => {
                     tracing::warn!(writer = id, error = %e, "mysql writer query failed, reconnecting");
-                    // Return the batch — they weren't committed.
                     counter.fetch_sub(actual_batch as u64, Ordering::Relaxed);
                     break; // Break to outer loop → reconnect.
                 }
@@ -448,8 +461,6 @@ async fn mysql_writer(id: usize, counter: Arc<AtomicU64>) {
 
         sleep(Duration::from_millis(100)).await;
     }
-
-    let _ = pool.disconnect().await;
 }
 
 // ── Postgres writer ───────────────────────────────────────────────────────────

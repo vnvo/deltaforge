@@ -44,14 +44,19 @@ struct Cli {
 
     // ── Backlog-drain throughput knobs ────────────────────────────────────────
     /// Max events per Kafka batch during the backlog-drain (pipeline spec batch.max_events).
-    /// Higher values reduce produce calls per second. Default: 200.
-    #[arg(long, default_value_t = 200)]
+    /// Higher values reduce produce calls per second.
+    #[arg(long, default_value_t = 4000)]
     drain_max_events: u64,
 
     /// Max batch age in ms during the backlog-drain (pipeline spec batch.max_ms).
-    /// Lower values reduce latency at the cost of smaller batches. Default: 100.
+    /// Lower values reduce latency at the cost of smaller batches.
     #[arg(long, default_value_t = 100)]
     drain_max_ms: u64,
+
+    /// How many batches may be in-flight concurrently during the drain.
+    /// Higher values overlap accumulation with delivery for better throughput.
+    #[arg(long, default_value_t = 4)]
+    drain_max_inflight: u64,
 
     /// Commit mode during the backlog-drain: "required" (safe) or "periodic" (faster).
     #[arg(long, default_value = "required")]
@@ -173,6 +178,7 @@ async fn main() -> Result<()> {
     let drain_cfg = scenarios::backlog_drain::DrainConfig {
         max_events: cli.drain_max_events,
         max_ms: cli.drain_max_ms,
+        max_inflight: cli.drain_max_inflight,
         commit_mode: cli.drain_commit_mode.clone(),
         commit_interval_ms: cli.drain_commit_interval_ms,
         schema_sensing: cli.drain_schema_sensing,
