@@ -248,7 +248,8 @@ async fn run_with_source(
     }
 
     let drain_start = Instant::now();
-    let conn_mode = harness::connection_mode_summary(src.df_base, pipeline).await;
+    let conn_mode =
+        harness::connection_mode_summary(src.df_base, pipeline).await;
     info!(connection = %conn_mode, "pipeline restarted — backlog drain started");
 
     // Step 6: poll Kafka until the offset advances by rows_written.
@@ -390,27 +391,34 @@ async fn mysql_writer(id: usize, counter: Arc<AtomicU64>) {
         // Inner loop: batch inserts on a live connection.
         loop {
             // Reserve a batch of rows.
-            let batch_start = counter.fetch_add(MYSQL_BATCH_SIZE as u64, Ordering::Relaxed);
+            let batch_start =
+                counter.fetch_add(MYSQL_BATCH_SIZE as u64, Ordering::Relaxed);
             if batch_start >= TARGET_EVENTS {
                 // Return the over-claimed amount.
                 counter.fetch_sub(MYSQL_BATCH_SIZE as u64, Ordering::Relaxed);
                 let _ = pool.disconnect().await;
                 return;
             }
-            let actual_batch = ((TARGET_EVENTS - batch_start) as usize).min(MYSQL_BATCH_SIZE);
+            let actual_batch =
+                ((TARGET_EVENTS - batch_start) as usize).min(MYSQL_BATCH_SIZE);
             if actual_batch < MYSQL_BATCH_SIZE {
                 // Return the over-claimed remainder.
-                counter.fetch_sub((MYSQL_BATCH_SIZE - actual_batch) as u64, Ordering::Relaxed);
+                counter.fetch_sub(
+                    (MYSQL_BATCH_SIZE - actual_batch) as u64,
+                    Ordering::Relaxed,
+                );
             }
 
-            let table = &tables[rand::Rng::gen_range(&mut rng, 0..tables.len())];
+            let table =
+                &tables[rand::Rng::gen_range(&mut rng, 0..tables.len())];
             let ts = now_ms();
 
             // Build a multi-row INSERT: INSERT INTO t (cols) VALUES (...), (...), ...
             let mut sql = format!(
                 "INSERT INTO {table} (tag, data, value, status) VALUES "
             );
-            let mut params: Vec<mysql_async::Value> = Vec::with_capacity(actual_batch * 4);
+            let mut params: Vec<mysql_async::Value> =
+                Vec::with_capacity(actual_batch * 4);
             for i in 0..actual_batch {
                 if i > 0 {
                     sql.push_str(", ");
@@ -418,11 +426,16 @@ async fn mysql_writer(id: usize, counter: Arc<AtomicU64>) {
                 sql.push_str("(?, ?, ?, ?)");
                 params.push(format!("drain-{id}-{ts}-{i}").into());
                 params.push(format!("backlog-{ts}").into());
-                params.push(rand::Rng::gen_range(&mut rng, 0.0..10000.0_f64).into());
+                params.push(
+                    rand::Rng::gen_range(&mut rng, 0.0..10000.0_f64).into(),
+                );
                 params.push(rand::Rng::gen_range(&mut rng, 0u8..4).into());
             }
 
-            match conn.exec_drop(&sql, mysql_async::Params::Positional(params)).await {
+            match conn
+                .exec_drop(&sql, mysql_async::Params::Positional(params))
+                .await
+            {
                 Ok(_) => {}
                 Err(e) => {
                     tracing::warn!(writer = id, error = %e, "mysql writer query failed, reconnecting");

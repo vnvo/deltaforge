@@ -201,9 +201,15 @@ pub async fn set_proxy_bypass(bypass: bool) -> u32 {
             let mut spec_patch = serde_json::Map::new();
 
             // Swap source DSN (spec is double-nested: p.spec.spec.source)
-            if let Some(dsn) = p["spec"]["spec"]["source"]["config"]["dsn"].as_str() {
+            if let Some(dsn) =
+                p["spec"]["spec"]["source"]["config"]["dsn"].as_str()
+            {
                 for &(_, proxied, direct) in PROXY_ADDRS {
-                    let (from, to) = if bypass { (proxied, direct) } else { (direct, proxied) };
+                    let (from, to) = if bypass {
+                        (proxied, direct)
+                    } else {
+                        (direct, proxied)
+                    };
                     if dsn.contains(from) {
                         let new_dsn = dsn.replace(from, to);
                         spec_patch.insert(
@@ -222,7 +228,11 @@ pub async fn set_proxy_bypass(bypass: bool) -> u32 {
                 for s in sinks {
                     if let Some(brokers) = s["config"]["brokers"].as_str() {
                         for &(_, proxied, direct) in PROXY_ADDRS {
-                            let (from, to) = if bypass { (proxied, direct) } else { (direct, proxied) };
+                            let (from, to) = if bypass {
+                                (proxied, direct)
+                            } else {
+                                (direct, proxied)
+                            };
                             if brokers.contains(from) {
                                 new_sinks.push(serde_json::json!({"config": {"brokers": brokers.replace(from, to)}}));
                                 sink_changed = true;
@@ -237,7 +247,8 @@ pub async fn set_proxy_bypass(bypass: bool) -> u32 {
                     }
                 }
                 if sink_changed {
-                    spec_patch.insert("sinks".into(), serde_json::json!(new_sinks));
+                    spec_patch
+                        .insert("sinks".into(), serde_json::json!(new_sinks));
                 }
             }
 

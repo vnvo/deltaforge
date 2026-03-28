@@ -496,7 +496,8 @@ async fn run_stable_with_source(
         .max()
         .unwrap_or(0);
 
-    let conn_mode = harness::connection_mode_summary(src.df_base, src.pipeline).await;
+    let conn_mode =
+        harness::connection_mode_summary(src.df_base, src.pipeline).await;
 
     let result = ScenarioResult::pass(name)
         .note(format!("duration: {duration_mins} min"))

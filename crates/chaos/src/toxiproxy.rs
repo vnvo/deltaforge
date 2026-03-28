@@ -45,7 +45,11 @@ impl ToxiproxyClient {
                 let parts: Vec<String> = states
                     .iter()
                     .map(|(name, enabled)| {
-                        format!("{}={}", name, if *enabled { "on" } else { "DISABLED" })
+                        format!(
+                            "{}={}",
+                            name,
+                            if *enabled { "on" } else { "DISABLED" }
+                        )
                     })
                     .collect();
                 parts.join(", ")
