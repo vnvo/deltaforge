@@ -671,8 +671,13 @@ mod tests {
         assert!(q.contains("table_schema = 'public'"));
         assert!(q.contains("1=1"));
 
-        let q = build_pattern_query("%", "audit%");
+        // Glob `*` triggers LIKE; literal `%` is treated as exact match.
+        let q = build_pattern_query("*", "audit*");
         assert!(q.contains("table_schema NOT IN"));
         assert!(q.contains("table_name LIKE 'audit%'"));
+
+        // Literal `%` in table name — exact match, not LIKE.
+        let q = build_pattern_query("public", "audit%");
+        assert!(q.contains("table_name = 'audit%'"));
     }
 }

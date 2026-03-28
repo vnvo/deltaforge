@@ -11,13 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Postgres soak & backlog-drain** — 120-table soak test and 1M-row drain benchmark for `--source postgres` ([de9e8b2](https://github.com/vnvo/deltaforge/commit/de9e8b2), [9c8fba2](https://github.com/vnvo/deltaforge/commit/9c8fba2))
 - **Config Lab UI** — A/B config comparison with presets, side-by-side editors, and sequential scenario runner ([e611f93](https://github.com/vnvo/deltaforge/commit/e611f93))
-- **Chaos UI** — service refresh button (`--no-deps --force-recreate`), dynamic port/URL badges, PATCH proxy endpoint ([e611f93](https://github.com/vnvo/deltaforge/commit/e611f93))
+- **Chaos UI** — service refresh button, dynamic port/URL badges, PATCH proxy endpoint, per-scenario proxy bypass toggle ([e611f93](https://github.com/vnvo/deltaforge/commit/e611f93))
+- **Bytes throughput metrics** — `deltaforge_source_bytes_total` and `deltaforge_bytes_total` counters for MB/s monitoring
+- **Proxy bypass** — `--no-proxy` CLI flag patches pipeline DSNs to bypass Toxiproxy for direct connections
 
 ### Changed
 
+- **Coordinator batch pipelining** — `max_inflight` decouples event accumulation from sink delivery; overlaps batch building with Kafka produce for higher throughput
+- **Drain benchmark tuning** — defaults raised to `max_events=5000`, `max_inflight=4`, aggressive Kafka producer settings (`linger.ms=50`, `batch.size=1MB`, `acks=1`, `lz4`)
+- **MySQL drain writer** — batched multi-row INSERTs (64 rows/statement) with connection reuse for faster backlog population
+- **Grafana dashboard redesign** — collapsible row sections, multi-pipeline stat panels, running-pipeline filtering for Checkpoint Age and Replication Lag
 - **Postgres CDC at MySQL parity** — 29.4K → 48.5K events/s via fast_uuid_v7, zero-copy tuples, counter/LSN caches, Arc schemas, pre-alloc batches ([e611f93](https://github.com/vnvo/deltaforge/commit/e611f93), [0636159](https://github.com/vnvo/deltaforge/commit/0636159))
 - **pgwire-replication v0.3** — buffered WAL reads, `Io(Arc<io::Error>)` structured errors ([7bbaa82](https://github.com/vnvo/deltaforge/commit/7bbaa82))
-- **Grafana in-flight panel** — color thresholds: green=draining, orange=buffering, red=backlog ([e611f93](https://github.com/vnvo/deltaforge/commit/e611f93))
 
 ### Fixed
 
