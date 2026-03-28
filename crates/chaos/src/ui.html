@@ -378,6 +378,14 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
           </div>
         </div>
 
+        <div class="form-row">
+          <label>Proxy</label>
+          <div class="source-toggle">
+            <button id="proxy-on" class="active" onclick="setProxy(true)">Through Proxy</button>
+            <button id="proxy-off" onclick="setProxy(false)">Direct (bypass)</button>
+          </div>
+        </div>
+
         <div class="form-row" id="duration-row">
           <label>Duration</label>
           <div style="flex:1">
@@ -694,6 +702,7 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
 <script>
 // ── State ──────────────────────────────────────────────────────────────────
 let source = 'mysql';
+let useProxy = true;
 let logLength = 0;
 let drainCommitMode = 'required';
 let drainSensing = false;
@@ -713,6 +722,12 @@ function setSource(s) {
   source = s;
   document.getElementById('src-mysql').classList.toggle('active', s === 'mysql');
   document.getElementById('src-postgres').classList.toggle('active', s === 'postgres');
+}
+
+function setProxy(on) {
+  useProxy = on;
+  document.getElementById('proxy-on').classList.toggle('active', on);
+  document.getElementById('proxy-off').classList.toggle('active', !on);
 }
 
 // ── Scenario select ────────────────────────────────────────────────────────
@@ -924,7 +939,7 @@ async function startScenario() {
   const writer_tasks = parseInt(document.getElementById('writers-slider').value, 10);
   const write_delay_ms = parseInt(document.getElementById('delay-slider').value, 10);
 
-  const body = { scenario, source, duration_mins, writer_tasks, write_delay_ms };
+  const body = { scenario, source, duration_mins, writer_tasks, write_delay_ms, use_proxy: useProxy };
 
   if (scenario === 'backlog-drain') {
     body.drain_max_events = parseInt(document.getElementById('drain-max-events').value, 10);

@@ -158,6 +158,167 @@ fn parse_counter(body: &str, name: &str) -> Result<f64> {
     Ok(0.0)
 }
 
+// ── Proxy bypass ─────────────────────────────────────────────────────────────
+
+/// Address mapping for proxy bypass: (proxy_name, proxied, direct).
+const PROXY_ADDRS: &[(&str, &str, &str)] = &[
+    ("mysql", "toxiproxy:5100", "mysql:3306"),
+    ("postgres", "toxiproxy:5101", "postgres:5432"),
+    ("kafka", "toxiproxy:5102", "kafka:9094"),
+];
+
+/// DeltaForge instance ports to scan for pipelines.
+const DF_PORTS: &[u16] = &[8080, 8081, 8082, 8083];
+
+/// PATCH all running pipelines to use direct connections (bypass proxy)
+/// or restore proxied connections. Returns the number of pipelines patched.
+pub async fn set_proxy_bypass(bypass: bool) -> u32 {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    let mut patched = 0u32;
+    for port in DF_PORTS {
+        let Ok(resp) = client
+            .get(format!("http://localhost:{port}/pipelines"))
+            .send()
+            .await
+        else {
+            continue;
+        };
+        let Ok(pipelines) = resp.json::<serde_json::Value>().await else {
+            continue;
+        };
+        let Some(arr) = pipelines.as_array() else {
+            continue;
+        };
+
+        for p in arr {
+            let Some(name) = p["name"].as_str() else {
+                continue;
+            };
+            let mut spec_patch = serde_json::Map::new();
+
+            // Swap source DSN (spec is double-nested: p.spec.spec.source)
+            if let Some(dsn) = p["spec"]["spec"]["source"]["config"]["dsn"].as_str() {
+                for &(_, proxied, direct) in PROXY_ADDRS {
+                    let (from, to) = if bypass { (proxied, direct) } else { (direct, proxied) };
+                    if dsn.contains(from) {
+                        let new_dsn = dsn.replace(from, to);
+                        spec_patch.insert(
+                            "source".into(),
+                            serde_json::json!({"config": {"dsn": new_dsn}}),
+                        );
+                        break;
+                    }
+                }
+            }
+
+            // Swap sink brokers
+            if let Some(sinks) = p["spec"]["spec"]["sinks"].as_array() {
+                let mut new_sinks = Vec::new();
+                let mut sink_changed = false;
+                for s in sinks {
+                    if let Some(brokers) = s["config"]["brokers"].as_str() {
+                        for &(_, proxied, direct) in PROXY_ADDRS {
+                            let (from, to) = if bypass { (proxied, direct) } else { (direct, proxied) };
+                            if brokers.contains(from) {
+                                new_sinks.push(serde_json::json!({"config": {"brokers": brokers.replace(from, to)}}));
+                                sink_changed = true;
+                                break;
+                            }
+                        }
+                        if !sink_changed {
+                            new_sinks.push(serde_json::json!({}));
+                        }
+                    } else {
+                        new_sinks.push(serde_json::json!({}));
+                    }
+                }
+                if sink_changed {
+                    spec_patch.insert("sinks".into(), serde_json::json!(new_sinks));
+                }
+            }
+
+            if spec_patch.is_empty() {
+                continue;
+            }
+
+            let body = serde_json::json!({"spec": spec_patch});
+            if client
+                .patch(format!("http://localhost:{port}/pipelines/{name}"))
+                .json(&body)
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+            {
+                patched += 1;
+            }
+        }
+    }
+
+    info!(
+        bypass,
+        patched,
+        "proxy bypass: {} pipelines switched to {}",
+        patched,
+        if bypass { "direct" } else { "proxied" }
+    );
+    patched
+}
+
+/// Check if a pipeline is using proxied or direct connections by inspecting its DSN.
+pub async fn connection_mode_summary(df_base: &str, pipeline: &str) -> String {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    let Ok(resp) = client
+        .get(format!("{df_base}/pipelines/{pipeline}"))
+        .send()
+        .await
+    else {
+        return "unknown".to_string();
+    };
+    let Ok(p) = resp.json::<serde_json::Value>().await else {
+        return "unknown".to_string();
+    };
+
+    let mut parts = Vec::new();
+
+    // Check source DSN (spec is double-nested: p.spec.spec.source)
+    if let Some(dsn) = p["spec"]["spec"]["source"]["config"]["dsn"].as_str() {
+        if dsn.contains("toxiproxy") {
+            parts.push("source=proxied");
+        } else {
+            parts.push("source=direct");
+        }
+    }
+
+    // Check sink brokers
+    if let Some(sinks) = p["spec"]["spec"]["sinks"].as_array() {
+        for s in sinks {
+            if let Some(brokers) = s["config"]["brokers"].as_str() {
+                if brokers.contains("toxiproxy") {
+                    parts.push("sink=proxied");
+                } else {
+                    parts.push("sink=direct");
+                }
+                break;
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        "unknown".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
 /// Scenario outcome — printed at the end of every run.
 #[derive(Debug)]
 pub struct ScenarioResult {

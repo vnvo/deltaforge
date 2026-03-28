@@ -733,6 +733,12 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
         )
         .record(bytes as f64);
 
+        counter!(
+            "deltaforge_bytes_total",
+            "pipeline" => self.pipeline_name.to_string(),
+        )
+        .increment(bytes as u64);
+
         // 3) FREEZE for zero-copy sharing
         let frozen = FrozenBatch {
             id: Uuid::now_v7(),

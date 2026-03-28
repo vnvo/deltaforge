@@ -15,6 +15,45 @@ impl ToxiproxyClient {
         }
     }
 
+    /// Get the enabled state of all known proxies (Toxiproxy-level, not pipeline DSN).
+    #[allow(dead_code)]
+    /// Returns a list of (name, enabled) pairs.
+    pub async fn proxy_states(&self) -> Result<Vec<(String, bool)>> {
+        let resp: Value = self
+            .http
+            .get(format!("{TOXIPROXY_API}/proxies"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let mut states = Vec::new();
+        if let Some(obj) = resp.as_object() {
+            for (name, info) in obj {
+                let enabled = info["enabled"].as_bool().unwrap_or(true);
+                states.push((name.clone(), enabled));
+            }
+        }
+        states.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(states)
+    }
+
+    /// Format proxy states as a human-readable summary for scenario logs.
+    #[allow(dead_code)]
+    pub async fn proxy_summary(&self) -> String {
+        match self.proxy_states().await {
+            Ok(states) => {
+                let parts: Vec<String> = states
+                    .iter()
+                    .map(|(name, enabled)| {
+                        format!("{}={}", name, if *enabled { "on" } else { "DISABLED" })
+                    })
+                    .collect();
+                parts.join(", ")
+            }
+            Err(_) => "unknown (toxiproxy unreachable)".to_string(),
+        }
+    }
+
     /// Cut all connections through a proxy.
     pub async fn disable(&self, proxy: &str) -> Result<()> {
         self.http

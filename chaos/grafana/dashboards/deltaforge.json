@@ -1,17 +1,16 @@
 {
-  "title": "DeltaForge Chaos",
+  "title": "DeltaForge CDC",
   "uid": "deltaforge-chaos",
   "schemaVersion": 38,
   "refresh": "5s",
-  "time": {
-    "from": "now-30m",
-    "to": "now"
-  },
+  "time": { "from": "now-30m", "to": "now" },
   "panels": [
 
-    { "id": 1,  "title": "Pipeline State Counts",
+    { "id": 100, "type": "row", "title": "Overview", "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 }, "collapsed": false, "panels": [] },
+
+    { "id": 1, "title": "Pipeline States",
       "type": "bargauge",
-      "gridPos": { "x": 0,  "y": 0, "w": 6, "h": 4 },
+      "gridPos": { "x": 0, "y": 1, "w": 5, "h": 4 },
       "targets": [
         { "datasource": "Prometheus", "expr": "count(deltaforge_pipeline_status == 1)   or vector(0)", "legendFormat": "RUNNING" },
         { "datasource": "Prometheus", "expr": "count(deltaforge_pipeline_status == 0.5) or vector(0)", "legendFormat": "PAUSED" },
@@ -20,9 +19,7 @@
       ],
       "options": { "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"] }, "displayMode": "basic" },
       "fieldConfig": {
-        "defaults": { "unit": "short", "min": 0,
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }] }
-        },
+        "defaults": { "unit": "short", "min": 0, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }] } },
         "overrides": [
           { "matcher": { "id": "byName", "options": "RUNNING" },  "properties": [{ "id": "color", "value": { "fixedColor": "green",  "mode": "fixed" } }] },
           { "matcher": { "id": "byName", "options": "PAUSED" },   "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
@@ -32,90 +29,77 @@
       }
     },
 
-    { "id": 30, "title": "Per-Pipeline State",
-      "type": "timeseries",
-      "gridPos": { "x": 0, "y": 76, "w": 24, "h": 8 },
-      "targets": [
-        { "datasource": "Prometheus",
-          "expr": "deltaforge_pipeline_status",
-          "legendFormat": "{{pipeline}}" }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": { "lineWidth": 2, "fillOpacity": 10 },
-          "thresholds": { "mode": "absolute", "steps": [
-            { "color": "red",    "value": -1 },
-            { "color": "gray",   "value": 0  },
-            { "color": "orange", "value": 0.5 },
-            { "color": "green",  "value": 1   }
-          ]}
-        }
-      },
-      "options": {
-        "tooltip": { "mode": "multi" },
-        "legend": { "displayMode": "list", "placement": "bottom" }
-      }
+    { "id": 2, "title": "Events Delivered",
+      "type": "stat",
+      "gridPos": { "x": 5, "y": 1, "w": 4, "h": 4 },
+      "targets": [{ "datasource": "Prometheus", "expr": "sum by(pipeline)(deltaforge_sink_events_total)", "legendFormat": "{{pipeline}}" }],
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "value_and_name" }
     },
 
-    { "id": 2, "title": "Total Events Delivered",
+    { "id": 32, "title": "Data Moved",
       "type": "stat",
-      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
-      "targets": [{ "datasource": "Prometheus", "expr": "sum(deltaforge_sink_events_total)", "legendFormat": "" }],
-      "fieldConfig": { "defaults": { "unit": "short" } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } }
+      "gridPos": { "x": 9, "y": 1, "w": 4, "h": 4 },
+      "targets": [{ "datasource": "Prometheus", "expr": "sum by(pipeline)(deltaforge_bytes_total)", "legendFormat": "{{pipeline}}" }],
+      "fieldConfig": { "defaults": { "unit": "bytes" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "value_and_name" }
     },
 
     { "id": 3, "title": "Checkpoint Age",
       "type": "stat",
-      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
-      "targets": [{ "datasource": "Prometheus", "expr": "max(time() - deltaforge_last_checkpoint_ts)", "legendFormat": "" }],
+      "gridPos": { "x": 13, "y": 1, "w": 4, "h": 4 },
+      "targets": [{ "datasource": "Prometheus", "expr": "(time() - deltaforge_last_checkpoint_ts) and on(pipeline) (deltaforge_pipeline_status == 1)", "legendFormat": "{{pipeline}}" }],
       "fieldConfig": {
         "defaults": {
           "unit": "s",
           "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 30 }, { "color": "red", "value": 120 }] }
         }
       },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } }
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "value_and_name", "colorMode": "background" }
     },
 
-    { "id": 4, "title": "Source Reconnects (total)",
+    { "id": 6, "title": "Replication Lag",
       "type": "stat",
-      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
-      "targets": [{ "datasource": "Prometheus", "expr": "sum(deltaforge_source_reconnects_total)", "legendFormat": "" }],
-      "fieldConfig": { "defaults": { "unit": "short" } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } }
+      "gridPos": { "x": 17, "y": 1, "w": 3, "h": 4 },
+      "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_source_lag_seconds and on(pipeline) (deltaforge_pipeline_status == 1)", "legendFormat": "{{pipeline}}" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s", "decimals": 1,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 5 }, { "color": "red", "value": 30 }] }
+        }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "value_and_name", "colorMode": "background" }
     },
+
+    { "id": 4, "title": "Reconnects",
+      "type": "stat",
+      "gridPos": { "x": 20, "y": 1, "w": 4, "h": 4 },
+      "targets": [
+        { "datasource": "Prometheus", "expr": "sum by(pipeline)(deltaforge_source_reconnects_total)", "legendFormat": "src · {{pipeline}}" },
+        { "datasource": "Prometheus", "expr": "sum by(pipeline)(deltaforge_sink_reconnects_total)", "legendFormat": "sink · {{pipeline}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "value_and_name" }
+    },
+
+    { "id": 101, "type": "row", "title": "Throughput", "gridPos": { "x": 0, "y": 5, "w": 24, "h": 1 }, "collapsed": false, "panels": [] },
 
     { "id": 5, "title": "Event Throughput by Op (events/s)",
       "type": "timeseries",
-      "gridPos": { "x": 0, "y": 4, "w": 8, "h": 8 },
+      "gridPos": { "x": 0, "y": 6, "w": 8, "h": 8 },
       "targets": [
         { "datasource": "Prometheus", "expr": "sum by(pipeline, op)(rate(deltaforge_source_events_total[30s]))", "legendFormat": "{{pipeline}} · {{op}}" }
       ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "custom": {
-            "lineWidth": 1,
-            "fillOpacity": 60,
-            "stacking": { "mode": "normal", "group": "A" }
-          }
-        }
-      },
-      "options": { "tooltip": { "mode": "multi" } }
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 1, "fillOpacity": 60, "stacking": { "mode": "normal", "group": "A" } } } },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
     },
 
-    { "id": 23, "title": "Source vs Sink In-Flight (events/s)",
+    { "id": 23, "title": "Source – Sink In-Flight (events/s)",
       "type": "timeseries",
-      "gridPos": { "x": 8, "y": 4, "w": 8, "h": 8 },
-      "targets": [
-        {
-          "datasource": "Prometheus",
-          "expr": "sum by(pipeline)(rate(deltaforge_source_events_total[30s])) - on(pipeline) group_left sum by(pipeline)(rate(deltaforge_sink_events_total[30s]))",
-          "legendFormat": "{{pipeline}}"
-        }
-      ],
+      "gridPos": { "x": 8, "y": 6, "w": 8, "h": 8 },
+      "targets": [{ "datasource": "Prometheus",
+        "expr": "sum by(pipeline)(rate(deltaforge_source_events_total[30s])) - on(pipeline) group_left sum by(pipeline)(rate(deltaforge_sink_events_total[30s]))",
+        "legendFormat": "{{pipeline}}" }],
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
@@ -128,176 +112,256 @@
           ]}
         }
       },
-      "options": { "tooltip": { "mode": "multi" } }
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
     },
 
-    { "id": 6, "title": "Replication Lag (seconds)",
+    { "id": 31, "title": "Data Throughput (bytes/s)",
       "type": "timeseries",
-      "gridPos": { "x": 16, "y": 4, "w": 8, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_source_lag_seconds", "legendFormat": "{{pipeline}}" }],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "custom": { "lineWidth": 2 },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 5 }, { "color": "red", "value": 30 }] }
-        }
-      }
+      "gridPos": { "x": 16, "y": 6, "w": 8, "h": 8 },
+      "targets": [
+        { "datasource": "Prometheus", "expr": "sum by(pipeline)(rate(deltaforge_source_bytes_total[30s]))", "legendFormat": "source · {{pipeline}}" },
+        { "datasource": "Prometheus", "expr": "sum by(pipeline)(rate(deltaforge_bytes_total[30s]))", "legendFormat": "pipeline · {{pipeline}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "lineWidth": 2, "fillOpacity": 15 } } },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
     },
 
-    { "id": 7, "title": "Sink Error Rate (errors/s)",
-      "type": "timeseries",
-      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_sink_errors_total[30s])", "legendFormat": "{{pipeline}} / {{sink}}" }],
-      "fieldConfig": { "defaults": { "unit": "ops", "color": { "fixedColor": "red", "mode": "fixed" }, "custom": { "lineWidth": 2 } } }
-    },
-
-    { "id": 8, "title": "Source Errors by Kind (errors/s)",
-      "type": "timeseries",
-      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_source_errors_total[30s])", "legendFormat": "{{pipeline}} / {{kind}}" }],
-      "fieldConfig": { "defaults": { "unit": "ops", "color": { "fixedColor": "dark-red", "mode": "fixed" }, "custom": { "lineWidth": 2 } } }
-    },
+    { "id": 102, "type": "row", "title": "Latency", "gridPos": { "x": 0, "y": 14, "w": 24, "h": 1 }, "collapsed": false, "panels": [] },
 
     { "id": 9, "title": "E2E Latency p50 / p95",
       "type": "timeseries",
-      "gridPos": { "x": 0, "y": 20, "w": 12, "h": 8 },
+      "gridPos": { "x": 0, "y": 15, "w": 8, "h": 8 },
       "targets": [
         { "datasource": "Prometheus", "expr": "histogram_quantile(0.50, rate(deltaforge_e2e_latency_seconds_bucket[60s]))", "legendFormat": "p50 {{pipeline}}" },
         { "datasource": "Prometheus", "expr": "histogram_quantile(0.95, rate(deltaforge_e2e_latency_seconds_bucket[60s]))", "legendFormat": "p95 {{pipeline}}" }
       ],
-      "fieldConfig": { "defaults": { "unit": "s", "custom": { "lineWidth": 2 } } }
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "lineWidth": 2 } } },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
     },
 
-    { "id": 10, "title": "Sink Latency by Pipeline / Sink",
+    { "id": 10, "title": "Sink Latency (avg ms)",
       "type": "timeseries",
-      "gridPos": { "x": 12, "y": 20, "w": 12, "h": 8 },
+      "gridPos": { "x": 8, "y": 15, "w": 8, "h": 8 },
       "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_sink_latency_seconds_sum[30s]) / rate(deltaforge_sink_latency_seconds_count[30s]) * 1000", "legendFormat": "{{pipeline}} / {{sink}}" }],
-      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "lineWidth": 2 } } }
+      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "lineWidth": 2 } } },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
     },
 
-    { "id": 11, "title": "Checkpoints (cumulative)",
+    { "id": 15, "title": "Stage Latency (avg ms)",
       "type": "timeseries",
-      "gridPos": { "x": 0, "y": 28, "w": 12, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_checkpoints_total", "legendFormat": "{{pipeline}}" }],
-      "fieldConfig": { "defaults": { "unit": "short", "color": { "fixedColor": "blue", "mode": "fixed" }, "custom": { "lineWidth": 2 } } }
+      "gridPos": { "x": 16, "y": 15, "w": 8, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "sum by(pipeline, stage)(rate(deltaforge_stage_latency_seconds_sum[30s])) / sum by(pipeline, stage)(rate(deltaforge_stage_latency_seconds_count[30s])) * 1000", "legendFormat": "{{pipeline}} · {{stage}}" }],
+      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "lineWidth": 2 } } },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    { "id": 40, "title": "Replication Lag (seconds)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 23, "w": 8, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_source_lag_seconds", "legendFormat": "{{pipeline}}" }],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2 },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 5 }, { "color": "red", "value": 30 }] }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    { "id": 3001, "title": "Checkpoint Age (seconds)",
+      "type": "timeseries",
+      "gridPos": { "x": 8, "y": 23, "w": 8, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "(time() - deltaforge_last_checkpoint_ts) and on(pipeline) (deltaforge_pipeline_status == 1)", "legendFormat": "{{pipeline}}" }],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2 },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 30 }, { "color": "red", "value": 120 }] }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
     },
 
     { "id": 12, "title": "Checkpoint Rate (commits/s)",
       "type": "timeseries",
-      "gridPos": { "x": 12, "y": 28, "w": 12, "h": 8 },
+      "gridPos": { "x": 16, "y": 23, "w": 8, "h": 8 },
       "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_checkpoints_total[30s])", "legendFormat": "{{pipeline}}" }],
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 } } }
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 } } },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
     },
 
-    { "id": 13, "title": "Reconnects (source + sink, cumulative)",
+    { "id": 103, "type": "row", "title": "Errors & Reliability", "gridPos": { "x": 0, "y": 31, "w": 24, "h": 1 }, "collapsed": false, "panels": [] },
+
+    { "id": 7, "title": "Sink Errors (errors/s)",
       "type": "timeseries",
-      "gridPos": { "x": 0, "y": 36, "w": 12, "h": 8 },
+      "gridPos": { "x": 0, "y": 32, "w": 8, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_sink_errors_total[30s])", "legendFormat": "{{pipeline}} / {{sink}}" }],
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "fixedColor": "red", "mode": "fixed" }, "custom": { "lineWidth": 2 } } },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    { "id": 8, "title": "Source Errors by Kind (errors/s)",
+      "type": "timeseries",
+      "gridPos": { "x": 8, "y": 32, "w": 8, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_source_errors_total[30s])", "legendFormat": "{{pipeline}} / {{kind}}" }],
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "fixedColor": "dark-red", "mode": "fixed" }, "custom": { "lineWidth": 2 } } },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    { "id": 13, "title": "Reconnects (cumulative)",
+      "type": "timeseries",
+      "gridPos": { "x": 16, "y": 32, "w": 8, "h": 8 },
       "targets": [
         { "datasource": "Prometheus", "expr": "deltaforge_source_reconnects_total", "legendFormat": "source · {{pipeline}}" },
         { "datasource": "Prometheus", "expr": "deltaforge_sink_reconnects_total",   "legendFormat": "sink · {{pipeline}} / {{sink}}" }
       ],
-      "fieldConfig": { "defaults": { "unit": "short", "color": { "fixedColor": "orange", "mode": "fixed" }, "custom": { "lineWidth": 2 } } }
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "fixedColor": "orange", "mode": "fixed" }, "custom": { "lineWidth": 2 } } },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
     },
 
-    { "id": 14, "title": "Kafka Producer Queue (messages)",
-      "type": "timeseries",
-      "gridPos": { "x": 12, "y": 36, "w": 12, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_kafka_producer_queue_messages", "legendFormat": "{{pipeline}} / {{sink}}" }],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": { "lineWidth": 2 },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 5000 }, { "color": "red", "value": 50000 }] }
-        }
+    { "id": 104, "type": "row", "title": "Batching & Kafka", "gridPos": { "x": 0, "y": 40, "w": 24, "h": 1 }, "collapsed": true, "panels": [
+
+      { "id": 16, "title": "Avg Batch Size (events/batch)",
+        "type": "timeseries",
+        "gridPos": { "x": 0, "y": 41, "w": 8, "h": 8 },
+        "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_batch_events_sum[30s]) / rate(deltaforge_batch_events_count[30s])", "legendFormat": "{{pipeline}}" }],
+        "fieldConfig": { "defaults": { "unit": "short", "custom": { "lineWidth": 2 } } },
+        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+      },
+
+      { "id": 33, "title": "Avg Batch Bytes",
+        "type": "timeseries",
+        "gridPos": { "x": 8, "y": 41, "w": 8, "h": 8 },
+        "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_batch_bytes_sum[30s]) / rate(deltaforge_batch_bytes_count[30s])", "legendFormat": "{{pipeline}}" }],
+        "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "lineWidth": 2 } } },
+        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+      },
+
+      { "id": 14, "title": "Kafka Producer Queue (messages)",
+        "type": "timeseries",
+        "gridPos": { "x": 16, "y": 41, "w": 8, "h": 8 },
+        "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_kafka_producer_queue_messages", "legendFormat": "{{pipeline}} / {{sink}}" }],
+        "fieldConfig": {
+          "defaults": { "unit": "short", "custom": { "lineWidth": 2 },
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 5000 }, { "color": "red", "value": 50000 }] }
+          }
+        },
+        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
       }
-    },
 
-    { "id": 15, "title": "Stage Latency by Pipeline (process / schema_sensing / commit)",
-      "type": "timeseries",
-      "gridPos": { "x": 0, "y": 44, "w": 8, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "sum by(pipeline, stage)(rate(deltaforge_stage_latency_seconds_sum[30s])) / sum by(pipeline, stage)(rate(deltaforge_stage_latency_seconds_count[30s])) * 1000", "legendFormat": "{{pipeline}} · {{stage}}" }],
-      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "lineWidth": 2 } } }
-    },
+    ]},
 
-    { "id": 24, "title": "Processor Latency by Pipeline / Processor",
-      "type": "timeseries",
-      "gridPos": { "x": 8, "y": 44, "w": 8, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_processor_latency_seconds_sum[30s]) / rate(deltaforge_processor_latency_seconds_count[30s]) * 1000", "legendFormat": "{{pipeline}} · {{processor}}" }],
-      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "lineWidth": 2 } } }
-    },
+    { "id": 105, "type": "row", "title": "Schema & Processors", "gridPos": { "x": 0, "y": 49, "w": 24, "h": 1 }, "collapsed": true, "panels": [
 
-    { "id": 16, "title": "Avg Batch Size (events/batch)",
-      "type": "timeseries",
-      "gridPos": { "x": 16, "y": 44, "w": 8, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_batch_events_sum[30s]) / rate(deltaforge_batch_events_count[30s])", "legendFormat": "{{pipeline}}" }],
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "lineWidth": 2 } } }
-    },
+      { "id": 17, "title": "Source Schema Cache Hit Ratio",
+        "type": "timeseries",
+        "gridPos": { "x": 0, "y": 50, "w": 8, "h": 8 },
+        "targets": [{ "datasource": "Prometheus", "expr": "sum by(pipeline)(rate(deltaforge_source_schema_cache_hits_total[60s])) / (sum by(pipeline)(rate(deltaforge_source_schema_cache_hits_total[60s])) + sum by(pipeline)(rate(deltaforge_source_schema_cache_misses_total[60s])))", "legendFormat": "{{pipeline}}" }],
+        "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "lineWidth": 2 } } },
+        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+      },
 
-    { "id": 17, "title": "Source Schema Cache Hit Ratio (table definitions)",
-      "type": "timeseries",
-      "gridPos": { "x": 0, "y": 52, "w": 8, "h": 8 },
-      "targets": [
-        { "datasource": "Prometheus", "expr": "sum by(pipeline)(rate(deltaforge_source_schema_cache_hits_total[60s])) / (sum by(pipeline)(rate(deltaforge_source_schema_cache_hits_total[60s])) + sum by(pipeline)(rate(deltaforge_source_schema_cache_misses_total[60s])))", "legendFormat": "{{pipeline}}" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "lineWidth": 2 } } }
-    },
+      { "id": 25, "title": "Schema Sensing Cache Hit Ratio",
+        "type": "timeseries",
+        "gridPos": { "x": 8, "y": 50, "w": 8, "h": 8 },
+        "targets": [{ "datasource": "Prometheus", "expr": "sum by(pipeline)(rate(deltaforge_schema_sensing_cache_hits_total[60s])) / (sum by(pipeline)(rate(deltaforge_schema_sensing_cache_hits_total[60s])) + sum by(pipeline)(rate(deltaforge_schema_sensing_cache_misses_total[60s])))", "legendFormat": "{{pipeline}}" }],
+        "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "lineWidth": 2 } } },
+        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+      },
 
-    { "id": 25, "title": "Schema Sensing Cache Hit Ratio (requires schema_sensing.enabled)",
-      "type": "timeseries",
-      "gridPos": { "x": 8, "y": 52, "w": 8, "h": 8 },
-      "targets": [
-        { "datasource": "Prometheus", "expr": "sum by(pipeline)(rate(deltaforge_schema_sensing_cache_hits_total[60s])) / (sum by(pipeline)(rate(deltaforge_schema_sensing_cache_hits_total[60s])) + sum by(pipeline)(rate(deltaforge_schema_sensing_cache_misses_total[60s])))", "legendFormat": "{{pipeline}}" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "lineWidth": 2 } } }
-    },
+      { "id": 18, "title": "Schema Drift Detected",
+        "type": "timeseries",
+        "gridPos": { "x": 16, "y": 50, "w": 8, "h": 8 },
+        "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_schema_drift_detected", "legendFormat": "{{pipeline}}" }],
+        "fieldConfig": { "defaults": { "unit": "short", "color": { "fixedColor": "purple", "mode": "fixed" }, "custom": { "lineWidth": 2 } } },
+        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+      },
 
-    { "id": 18, "title": "Schema Drift Detected (cumulative)",
-      "type": "timeseries",
-      "gridPos": { "x": 16, "y": 52, "w": 8, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_schema_drift_detected", "legendFormat": "{{pipeline}}" }],
-      "fieldConfig": { "defaults": { "unit": "short", "color": { "fixedColor": "purple", "mode": "fixed" }, "custom": { "lineWidth": 2 } } }
-    },
+      { "id": 24, "title": "Processor Latency (avg ms)",
+        "type": "timeseries",
+        "gridPos": { "x": 0, "y": 58, "w": 8, "h": 8 },
+        "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_processor_latency_seconds_sum[30s]) / rate(deltaforge_processor_latency_seconds_count[30s]) * 1000", "legendFormat": "{{pipeline}} · {{processor}}" }],
+        "fieldConfig": { "defaults": { "unit": "ms", "custom": { "lineWidth": 2 } } },
+        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+      },
 
-    { "id": 19, "title": "Processor Events Drop Rate (events/s)",
-      "type": "timeseries",
-      "gridPos": { "x": 0, "y": 60, "w": 12, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_processor_events_in_total[30s]) - rate(deltaforge_processor_events_out_total[30s])", "legendFormat": "{{pipeline}} / {{processor}}" }],
-      "fieldConfig": { "defaults": { "unit": "ops", "color": { "fixedColor": "orange", "mode": "fixed" }, "custom": { "lineWidth": 2 } } }
-    },
+      { "id": 19, "title": "Processor Drop Rate (events/s)",
+        "type": "timeseries",
+        "gridPos": { "x": 8, "y": 58, "w": 8, "h": 8 },
+        "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_processor_events_in_total[30s]) - rate(deltaforge_processor_events_out_total[30s])", "legendFormat": "{{pipeline}} / {{processor}}" }],
+        "fieldConfig": { "defaults": { "unit": "ops", "color": { "fixedColor": "orange", "mode": "fixed" }, "custom": { "lineWidth": 2 } } },
+        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+      },
 
-    { "id": 20, "title": "Processor Errors (errors/s)",
-      "type": "timeseries",
-      "gridPos": { "x": 12, "y": 60, "w": 12, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_processor_errors_total[30s])", "legendFormat": "{{pipeline}} / {{processor}}" }],
-      "fieldConfig": { "defaults": { "unit": "ops", "color": { "fixedColor": "dark-orange", "mode": "fixed" }, "custom": { "lineWidth": 2 } } }
-    },
-
-    { "id": 21, "title": "Container CPU Usage",
-      "type": "timeseries",
-      "gridPos": { "x": 0, "y": 68, "w": 12, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "rate(container_cpu_usage_seconds_total{container_label_com_docker_compose_service=~\"deltaforge.*\"}[30s]) * 100", "legendFormat": "{{container_label_com_docker_compose_service}}" }],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "percent",
-          "min": 0,
-          "custom": { "lineWidth": 2 },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 70 }, { "color": "red", "value": 90 }] }
-        }
+      { "id": 20, "title": "Processor Errors (errors/s)",
+        "type": "timeseries",
+        "gridPos": { "x": 16, "y": 58, "w": 8, "h": 8 },
+        "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_processor_errors_total[30s])", "legendFormat": "{{pipeline}} / {{processor}}" }],
+        "fieldConfig": { "defaults": { "unit": "ops", "color": { "fixedColor": "dark-orange", "mode": "fixed" }, "custom": { "lineWidth": 2 } } },
+        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
       }
-    },
 
-    { "id": 22, "title": "Container Memory (working set)",
-      "type": "timeseries",
-      "gridPos": { "x": 12, "y": 68, "w": 12, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "container_memory_working_set_bytes{container_label_com_docker_compose_service=~\"deltaforge.*\"}", "legendFormat": "{{container_label_com_docker_compose_service}}" }],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "bytes",
-          "custom": { "lineWidth": 2 },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 536870912 }, { "color": "red", "value": 1073741824 }] }
-        }
+    ]},
+
+    { "id": 106, "type": "row", "title": "Pipeline State", "gridPos": { "x": 0, "y": 66, "w": 24, "h": 1 }, "collapsed": true, "panels": [
+
+      { "id": 30, "title": "Per-Pipeline State Timeline",
+        "type": "timeseries",
+        "gridPos": { "x": 0, "y": 67, "w": 24, "h": 8 },
+        "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_pipeline_status", "legendFormat": "{{pipeline}}" }],
+        "fieldConfig": {
+          "defaults": { "unit": "short", "custom": { "lineWidth": 2, "fillOpacity": 10 },
+            "thresholds": { "mode": "absolute", "steps": [
+              { "color": "red", "value": -1 }, { "color": "gray", "value": 0 },
+              { "color": "orange", "value": 0.5 }, { "color": "green", "value": 1 }
+            ]}
+          }
+        },
+        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+      },
+
+      { "id": 11, "title": "Checkpoints (cumulative)",
+        "type": "timeseries",
+        "gridPos": { "x": 0, "y": 75, "w": 12, "h": 8 },
+        "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_checkpoints_total", "legendFormat": "{{pipeline}}" }],
+        "fieldConfig": { "defaults": { "unit": "short", "color": { "fixedColor": "blue", "mode": "fixed" }, "custom": { "lineWidth": 2 } } },
+        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+      },
+
+      { "id": 34, "title": "Source WAL/Binlog Bytes (bytes/s)",
+        "type": "timeseries",
+        "gridPos": { "x": 12, "y": 75, "w": 12, "h": 8 },
+        "targets": [{ "datasource": "Prometheus", "expr": "sum by(pipeline, source)(rate(deltaforge_source_bytes_total[30s]))", "legendFormat": "{{pipeline}} / {{source}}" }],
+        "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "lineWidth": 2 }, "color": { "fixedColor": "blue", "mode": "fixed" } } },
+        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
       }
-    }
+
+    ]},
+
+    { "id": 107, "type": "row", "title": "Infrastructure", "gridPos": { "x": 0, "y": 83, "w": 24, "h": 1 }, "collapsed": true, "panels": [
+
+      { "id": 21, "title": "Container CPU Usage",
+        "type": "timeseries",
+        "gridPos": { "x": 0, "y": 84, "w": 12, "h": 8 },
+        "targets": [{ "datasource": "Prometheus", "expr": "rate(container_cpu_usage_seconds_total{container_label_com_docker_compose_service=~\"deltaforge.*\"}[30s]) * 100", "legendFormat": "{{container_label_com_docker_compose_service}}" }],
+        "fieldConfig": {
+          "defaults": { "unit": "percent", "min": 0, "custom": { "lineWidth": 2 },
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 70 }, { "color": "red", "value": 90 }] }
+          }
+        },
+        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+      },
+
+      { "id": 22, "title": "Container Memory (working set)",
+        "type": "timeseries",
+        "gridPos": { "x": 12, "y": 84, "w": 12, "h": 8 },
+        "targets": [{ "datasource": "Prometheus", "expr": "container_memory_working_set_bytes{container_label_com_docker_compose_service=~\"deltaforge.*\"}", "legendFormat": "{{container_label_com_docker_compose_service}}" }],
+        "fieldConfig": {
+          "defaults": { "unit": "bytes", "custom": { "lineWidth": 2 },
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 536870912 }, { "color": "red", "value": 1073741824 }] }
+          }
+        },
+        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+      }
+
+    ]}
 
   ]
 }

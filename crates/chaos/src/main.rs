@@ -71,6 +71,11 @@ struct Cli {
     /// Example: --drain-kafka-conf linger.ms=20 --drain-kafka-conf batch.size=1048576
     #[arg(long = "drain-kafka-conf", value_name = "KEY=VALUE")]
     drain_kafka_conf: Vec<String>,
+
+    /// Bypass Toxiproxy: PATCH pipelines to connect directly to source/sink
+    /// before running the scenario. Restores proxied addresses after completion.
+    #[arg(long, default_value_t = false)]
+    no_proxy: bool,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -174,6 +179,11 @@ async fn main() -> Result<()> {
         kafka_client_conf,
     };
 
+    // Apply proxy bypass if requested.
+    if cli.no_proxy {
+        harness::set_proxy_bypass(true).await;
+    }
+
     let results = match cli.source {
         Source::Mysql => {
             run_mysql(
@@ -198,6 +208,11 @@ async fn main() -> Result<()> {
             .await?
         }
     };
+
+    // Restore proxied connections after scenario completes.
+    if cli.no_proxy {
+        harness::set_proxy_bypass(false).await;
+    }
 
     println!("\n═══════════════════════════════════");
     println!("  Chaos Run Results");

@@ -92,6 +92,12 @@ pub(super) async fn dispatch_event(
             ..
         } => {
             debug!(wal_start = %wal_start, wal_end = %wal_end, bytes = data.len(), "xlog data");
+            counter!(
+                "deltaforge_source_bytes_total",
+                "pipeline" => ctx.pipeline.clone(),
+                "source" => ctx.source_id.clone(),
+            )
+            .increment(data.len() as u64);
             ctx.last_lsn = wal_end;
             handle_pgoutput_message(ctx, &data, wal_end).await?;
             ctx.repl_client.lock().await.update_applied_lsn(wal_end);

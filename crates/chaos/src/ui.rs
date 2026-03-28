@@ -349,6 +349,9 @@ async fn api_clear_faults(State(st): State<Arc<UiState>>) -> StatusCode {
     }
 }
 
+// Proxy bypass is handled per-scenario via --no-proxy flag.
+// The UI sets `use_proxy` on the RunRequest.
+
 #[derive(Deserialize)]
 struct ResetRequest {
     scope: String, // "checkpoints" or "all"
@@ -448,6 +451,9 @@ struct RunRequest {
     writer_tasks: usize,
     #[serde(default)]
     write_delay_ms: u64,
+    /// Whether to route through Toxiproxy (true) or bypass to direct connections (false).
+    #[serde(default = "default_true")]
+    use_proxy: bool,
     // Backlog-drain throughput settings
     #[serde(default)]
     drain_max_events: Option<u64>,
@@ -462,6 +468,10 @@ struct RunRequest {
     /// rdkafka producer overrides as key=value strings.
     #[serde(default)]
     drain_kafka_conf: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Serialize)]
@@ -514,6 +524,9 @@ async fn api_scenario_start(
     }
     for kv in &req.drain_kafka_conf {
         cmd.arg("--drain-kafka-conf").arg(kv);
+    }
+    if !req.use_proxy {
+        cmd.arg("--no-proxy");
     }
     cmd.current_dir(workspace_root());
     cmd.stdout(std::process::Stdio::piped());

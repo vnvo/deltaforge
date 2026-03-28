@@ -85,6 +85,13 @@ pub(super) async fn dispatch_event(
         "event received"
     );
 
+    counter!(
+        "deltaforge_source_bytes_total",
+        "pipeline" => ctx.pipeline.clone(),
+        "source" => ctx.source_id.clone(),
+    )
+    .increment(header.event_length as u64);
+
     match data {
         EventData::TableMap(tm) => handle_table_map(ctx, tm).await,
         EventData::WriteRows(wr) => handle_write_rows(ctx, header, wr).await,
