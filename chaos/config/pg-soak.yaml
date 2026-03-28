@@ -1,0 +1,50 @@
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: chaos-pg-soak
+  tenant: chaos
+
+spec:
+  source:
+    type: postgres
+    config:
+      id: chaos-pg-soak
+      dsn: "postgresql://postgres:postgres@toxiproxy:5101/orders"
+      publication: deltaforge_soak_pub
+      slot: chaos_pg_soak_slot
+      tables: ["public.soak_*"]
+      on_schema_drift: adapt
+
+  schema_sensing:
+    enabled: true
+    sampling:
+      warmup_events: 100
+      sample_rate: 50
+      structure_cache: true
+    deep_inspect:
+      enabled: true
+      max_depth: 3
+      max_sample_size: 100
+    tracking:
+      field_statistics: false
+      null_rates: false
+      enum_detection: false
+
+  processors: []
+
+  sinks:
+    - type: kafka
+      config:
+        id: chaos-pg-soak-kafka
+        brokers: "toxiproxy:5102"
+        topic: chaos.pg.soak
+        required: true
+        send_timeout_secs: 5
+
+  batch:
+    max_events: 2000
+    max_ms: 50
+    respect_source_tx: false
+
+  commit_policy:
+    mode: required

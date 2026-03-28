@@ -119,14 +119,30 @@ impl LoopControl {
         use pgwire_replication::PgWireError::*;
 
         match err {
-            Io(ref msg) if msg.contains("permission denied") => {
-                error!(error = %msg, "permission denied");
+            Io(ref err)
+                if err.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                error!(error = %err, kind = ?err.kind(), "permission denied");
                 Self::Fail(SourceError::Auth {
-                    details: msg.clone().into(),
+                    details: format!("{err}").into(),
                 })
             }
-            Io(msg) => {
-                warn!(error = %msg, "IO error, will reconnect");
+            Io(ref err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                warn!(error = %err, kind = ?err.kind(), "IO error, will reconnect");
+                Self::Reconnect
+            }
+            Io(err) => {
+                warn!(error = %err, kind = ?err.kind(), "IO error, will reconnect");
                 Self::Reconnect
             }
 

@@ -64,27 +64,104 @@ fn workspace_root() -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
 }
 
-async fn inspect_container(name: &str) -> (String, String, String) {
+/// Container inspection result.
+struct ContainerInfo {
+    state: String,
+    health: String,
+    image: String,
+    /// True if the container's image ID differs from the local image ID
+    /// (i.e. image was rebuilt but container not recreated).
+    image_stale: bool,
+    /// Published ports: list of (host_port, container_port, protocol).
+    ports: Vec<(u16, u16, String)>,
+}
+
+async fn inspect_container(name: &str) -> ContainerInfo {
+    let absent = ContainerInfo {
+        state: "absent".into(),
+        health: "-".into(),
+        image: String::new(),
+        image_stale: false,
+        ports: vec![],
+    };
+
+    // Get state, health, image name, and image ID in one call.
     let out = Command::new("docker")
         .args([
             "inspect",
             "--format",
-            "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}} {{.Config.Image}}",
+            "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}} {{.Config.Image}} {{.Image}}",
             name,
         ])
         .output()
         .await;
 
-    match out {
+    let (state, health, image, container_image_id) = match out {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            let mut it = s.splitn(3, ' ');
+            let mut it = s.splitn(4, ' ');
             let state = it.next().unwrap_or("absent").to_string();
             let health = it.next().unwrap_or("-").to_string();
             let image = it.next().unwrap_or("").to_string();
-            (state, health, image)
+            let image_id = it.next().unwrap_or("").to_string();
+            (state, health, image, image_id)
         }
-        _ => ("absent".to_string(), "-".to_string(), String::new()),
+        _ => return absent,
+    };
+
+    // Check if the container's image ID matches the current local image ID.
+    // If they differ, the image was rebuilt but the container wasn't recreated.
+    let image_stale = if !image.is_empty() && !container_image_id.is_empty() {
+        let local_id = Command::new("docker")
+            .args(["inspect", "--format", "{{.Id}}", &image])
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        !local_id.is_empty() && local_id != container_image_id
+    } else {
+        false
+    };
+
+    // Get published port mappings via `docker port`.
+    let ports_out = Command::new("docker").args(["port", name]).output().await;
+
+    let mut ports = vec![];
+    if let Ok(o) = ports_out {
+        if o.status.success() {
+            // Output format: "8080/tcp -> 0.0.0.0:8080\n9000/tcp -> 0.0.0.0:9000\n"
+            let s = String::from_utf8_lossy(&o.stdout);
+            for line in s.lines() {
+                // "3306/tcp -> 0.0.0.0:3306"
+                if let Some((left, right)) = line.split_once(" -> ") {
+                    let (cport_str, proto) =
+                        left.split_once('/').unwrap_or((left, "tcp"));
+                    let cport: u16 = cport_str.parse().unwrap_or(0);
+                    // right is "0.0.0.0:3306" or "[::]:3306"
+                    let hport: u16 = right
+                        .rsplit(':')
+                        .next()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    if cport > 0 && hport > 0 {
+                        ports.push((hport, cport, proto.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    // Deduplicate (docker port can show both IPv4 and IPv6).
+    ports.sort();
+    ports.dedup();
+
+    ContainerInfo {
+        state,
+        health,
+        image,
+        image_stale,
+        ports,
     }
 }
 
@@ -112,6 +189,51 @@ struct ServiceInfo {
     health: String,
     http_ok: Option<bool>,
     image: String,
+    /// True if the image was rebuilt but the container not recreated.
+    image_stale: bool,
+    /// Clickable links derived from published ports.
+    links: Vec<ServiceLink>,
+}
+
+#[derive(Serialize, Clone)]
+struct ServiceLink {
+    /// Short label (e.g. "API", "metrics", "UI", or port number).
+    label: String,
+    /// Full URL (e.g. "http://localhost:8080").
+    url: String,
+}
+
+/// Well-known container ports → human-readable link labels.
+/// If not listed here, falls back to showing the port number.
+fn port_label(host_port: u16) -> Option<(&'static str, String)> {
+    match host_port {
+        8080..=8083 => Some(("API", format!("http://localhost:{host_port}"))),
+        9000..=9003 => {
+            Some(("metrics", format!("http://localhost:{host_port}/metrics")))
+        }
+        3000 => Some(("UI", "http://localhost:3000".to_string())),
+        9090 => Some(("UI", "http://localhost:9090".to_string())),
+        8888 => Some(("UI", "http://localhost:8888".to_string())),
+        8474 => Some(("API", "http://localhost:8474".to_string())),
+        3306 | 3307 => Some(("mysql", format!("localhost:{host_port}"))),
+        5432 | 5433 => Some(("psql", format!("localhost:{host_port}"))),
+        9092 => Some(("broker", "localhost:9092".to_string())),
+        _ => None,
+    }
+}
+
+fn links_from_ports(ports: &[(u16, u16, String)]) -> Vec<ServiceLink> {
+    let mut links = Vec::new();
+    for &(host_port, _container_port, _) in ports {
+        // Only include ports with known labels — skip internal/proxy ports.
+        if let Some((lbl, url)) = port_label(host_port) {
+            links.push(ServiceLink {
+                label: lbl.to_string(),
+                url,
+            });
+        }
+    }
+    links
 }
 
 async fn api_status() -> Json<Vec<ServiceInfo>> {
@@ -119,7 +241,6 @@ async fn api_status() -> Json<Vec<ServiceInfo>> {
         ("mysql", "deltaforge-mysql-1", None),
         ("mysql-b", "deltaforge-mysql-b-1", None),
         ("kafka", "deltaforge-kafka-1", None),
-        ("zookeeper", "deltaforge-zookeeper-1", None),
         (
             "toxiproxy",
             "deltaforge-toxiproxy-1",
@@ -160,14 +281,19 @@ async fn api_status() -> Json<Vec<ServiceInfo>> {
             "deltaforge-deltaforge-tpcc-1",
             Some("http://localhost:8082/health"),
         ),
+        (
+            "deltaforge-pg-soak",
+            "deltaforge-deltaforge-pg-soak-1",
+            Some("http://localhost:8083/health"),
+        ),
         ("postgres", "deltaforge-postgres-1", None),
         ("postgres-b", "deltaforge-postgres-b-1", None),
     ];
 
     let mut out = Vec::new();
     for (label, container, url) in defs {
-        let (state, health, image) = inspect_container(container).await;
-        let http_ok = if state == "running" {
+        let info = inspect_container(container).await;
+        let http_ok = if info.state == "running" {
             if let Some(u) = url {
                 check_http(u).await
             } else {
@@ -176,12 +302,15 @@ async fn api_status() -> Json<Vec<ServiceInfo>> {
         } else {
             None
         };
+        let links = links_from_ports(&info.ports);
         out.push(ServiceInfo {
             label: label.to_string(),
-            state,
-            health,
+            state: info.state,
+            health: info.health,
             http_ok,
-            image,
+            image: info.image,
+            image_stale: info.image_stale,
+            links,
         });
     }
     Json(out)
@@ -243,6 +372,9 @@ async fn api_clear_faults(State(st): State<Arc<UiState>>) -> StatusCode {
     }
 }
 
+// Proxy bypass is handled per-scenario via --no-proxy flag.
+// The UI sets `use_proxy` on the RunRequest.
+
 #[derive(Deserialize)]
 struct ResetRequest {
     scope: String, // "checkpoints" or "all"
@@ -258,6 +390,7 @@ async fn api_reset_volumes(Json(req): Json<ResetRequest>) -> StatusCode {
                 ("app", "deltaforge"),
                 ("pg-app", "deltaforge-pg"),
                 ("soak", "deltaforge-soak"),
+                ("pg-soak", "deltaforge-pg-soak"),
                 ("tpcc", "deltaforge-tpcc"),
             ];
             for (profile, service) in profiles {
@@ -341,6 +474,9 @@ struct RunRequest {
     writer_tasks: usize,
     #[serde(default)]
     write_delay_ms: u64,
+    /// Whether to route through Toxiproxy (true) or bypass to direct connections (false).
+    #[serde(default = "default_true")]
+    use_proxy: bool,
     // Backlog-drain throughput settings
     #[serde(default)]
     drain_max_events: Option<u64>,
@@ -355,6 +491,10 @@ struct RunRequest {
     /// rdkafka producer overrides as key=value strings.
     #[serde(default)]
     drain_kafka_conf: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Serialize)]
@@ -407,6 +547,9 @@ async fn api_scenario_start(
     }
     for kv in &req.drain_kafka_conf {
         cmd.arg("--drain-kafka-conf").arg(kv);
+    }
+    if !req.use_proxy {
+        cmd.arg("--no-proxy");
     }
     cmd.current_dir(workspace_root());
     cmd.stdout(std::process::Stdio::piped());
@@ -542,6 +685,53 @@ async fn api_infra(Json(req): Json<InfraRequest>) -> StatusCode {
 }
 
 #[derive(Deserialize)]
+struct RefreshServiceRequest {
+    /// Compose service name (e.g. "deltaforge-pg-soak").
+    service: String,
+    /// Compose profile (e.g. "pg-soak").
+    profile: String,
+}
+
+/// Recreate a single service with the latest image, without affecting
+/// dependencies. Runs: docker compose up -d --no-deps --force-recreate <service>
+async fn api_refresh_service(
+    Json(req): Json<RefreshServiceRequest>,
+) -> StatusCode {
+    let root = workspace_root();
+    let mut args = vec![
+        "compose".to_string(),
+        "-f".to_string(),
+        "docker-compose.chaos.yml".to_string(),
+    ];
+    if !req.profile.is_empty() {
+        args.push("--profile".to_string());
+        args.push(req.profile.clone());
+    }
+    args.extend([
+        "up".to_string(),
+        "-d".to_string(),
+        "--no-deps".to_string(),
+        "--force-recreate".to_string(),
+        req.service.clone(),
+    ]);
+
+    tracing::info!(service = %req.service, profile = %req.profile, "refreshing service");
+    let ok = Command::new("docker")
+        .args(&args)
+        .current_dir(&root)
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+#[derive(Deserialize)]
 struct ImageSwapRequest {
     /// Compose service name (e.g. "deltaforge-soak").
     service: String,
@@ -625,6 +815,60 @@ async fn api_swap_image(Json(req): Json<ImageSwapRequest>) -> StatusCode {
     }
 }
 
+// ── Docker images ────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ImageListParams {
+    /// Image repository filter (e.g. "deltaforge"). Passed to `docker images`.
+    repo: String,
+}
+
+#[derive(Serialize)]
+struct ImageInfo {
+    repository: String,
+    tag: String,
+    id: String,
+    created: String,
+    size: String,
+    /// Full image reference: "repository:tag".
+    full: String,
+}
+
+/// List local Docker images matching a repository name.
+/// GET /api/images?repo=deltaforge
+async fn api_images(Query(p): Query<ImageListParams>) -> Json<Vec<ImageInfo>> {
+    let out = Command::new("docker")
+        .args([
+            "images",
+            "--format",
+            "{{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.CreatedSince}}\t{{.Size}}",
+            &p.repo,
+        ])
+        .output()
+        .await;
+
+    let mut images = Vec::new();
+    if let Ok(o) = out {
+        if o.status.success() {
+            let s = String::from_utf8_lossy(&o.stdout);
+            for line in s.lines() {
+                let parts: Vec<&str> = line.split('\t').collect();
+                if parts.len() >= 5 {
+                    images.push(ImageInfo {
+                        repository: parts[0].to_string(),
+                        tag: parts[1].to_string(),
+                        id: parts[2].to_string(),
+                        created: parts[3].to_string(),
+                        size: parts[4].to_string(),
+                        full: format!("{}:{}", parts[0], parts[1]),
+                    });
+                }
+            }
+        }
+    }
+    Json(images)
+}
+
 // ── DeltaForge API proxy ──────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -685,6 +929,31 @@ async fn api_df_post(Json(req): Json<DfPostReq>) -> impl IntoResponse {
     }
 }
 
+/// Proxy a PATCH to any DeltaForge REST endpoint, e.g.
+/// POST /api/df/patch { port: 8081, path: "/pipelines/chaos-soak", body: {...} }
+async fn api_df_patch(Json(req): Json<DfPostReq>) -> impl IntoResponse {
+    let url = format!("http://localhost:{}{}", req.port, req.path);
+    let client = reqwest::Client::new();
+    let r = if let Some(b) = req.body {
+        client.patch(&url).json(&b).send().await
+    } else {
+        client.patch(&url).send().await
+    };
+    match r {
+        Ok(r) => {
+            let status = StatusCode::from_u16(r.status().as_u16())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            let body = r.text().await.unwrap_or_default();
+            (status, [(header::CONTENT_TYPE, "application/json")], body)
+        }
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::CONTENT_TYPE, "application/json")],
+            "{}".to_string(),
+        ),
+    }
+}
+
 /// Proxy a DELETE to any DeltaForge REST endpoint, e.g.
 /// POST /api/df/delete { port: 8080, path: "/pipelines/my-pipeline" }
 async fn api_df_delete(Json(req): Json<DfPostReq>) -> impl IntoResponse {
@@ -716,6 +985,9 @@ struct ProfileRequest {
     /// Sampling frequency in Hz (default 99).
     #[serde(default = "default_profile_freq")]
     frequency: u32,
+    /// Optional context notes to embed in the flamegraph subtitle.
+    #[serde(default)]
+    notes: Option<String>,
 }
 
 fn default_profile_secs() -> u64 {
@@ -746,10 +1018,19 @@ async fn api_profile_start(
     *st.profile_status.lock().await = "recording".to_string();
     *st.flamegraph.lock().await = None;
 
+    // Gather environment context for the flamegraph subtitle.
+    let env_notes =
+        gather_profile_context(&req.container, req.notes.as_deref()).await;
+
     let st2 = Arc::clone(&st);
     tokio::spawn(async move {
-        match run_profile(&req.container, req.duration_secs, req.frequency)
-            .await
+        match run_profile(
+            &req.container,
+            req.duration_secs,
+            req.frequency,
+            &env_notes,
+        )
+        .await
         {
             Ok(svg) => {
                 *st2.flamegraph.lock().await = Some(svg);
@@ -815,6 +1096,100 @@ async fn api_profile_flamegraph(
     }
 }
 
+/// Gather pipeline config and container info for the flamegraph subtitle.
+async fn gather_profile_context(
+    container: &str,
+    notes: Option<&str>,
+) -> String {
+    let mut parts = Vec::new();
+
+    // Try to detect which DeltaForge port this container maps to.
+    let port_map: &[(&str, u16)] = &[
+        ("deltaforge-deltaforge-soak-1", 8081),
+        ("deltaforge-deltaforge-pg-soak-1", 8083),
+        ("deltaforge-deltaforge-1", 8080),
+        ("deltaforge-deltaforge-pg-1", 8080),
+        ("deltaforge-deltaforge-tpcc-1", 8082),
+    ];
+    if let Some(&(_, port)) = port_map.iter().find(|&&(c, _)| c == container) {
+        // Fetch pipeline list to get config summary.
+        let url = format!("http://localhost:{port}/pipelines");
+        if let Ok(resp) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap_or_default()
+            .get(&url)
+            .send()
+            .await
+        {
+            if let Ok(pipelines) = resp.json::<serde_json::Value>().await {
+                if let Some(arr) = pipelines.as_array() {
+                    for p in arr {
+                        let name = p["name"].as_str().unwrap_or("?");
+                        let status = p["status"].as_str().unwrap_or("?");
+
+                        // Extract batch config from spec.spec.batch or spec.batch
+                        let batch = p["spec"]["spec"]["batch"]
+                            .as_object()
+                            .or_else(|| p["spec"]["batch"].as_object());
+                        let batch_str = if let Some(b) = batch {
+                            let me =
+                                b.get("max_events").and_then(|v| v.as_u64());
+                            let mm = b.get("max_ms").and_then(|v| v.as_u64());
+                            let mi =
+                                b.get("max_inflight").and_then(|v| v.as_u64());
+                            format!(
+                                "batch({}/{}ms/{}inf)",
+                                me.map(|v| v.to_string())
+                                    .unwrap_or_else(|| "?".into()),
+                                mm.map(|v| v.to_string())
+                                    .unwrap_or_else(|| "?".into()),
+                                mi.map(|v| v.to_string())
+                                    .unwrap_or_else(|| "?".into()),
+                            )
+                        } else {
+                            String::new()
+                        };
+
+                        // Check source DSN for proxy vs direct
+                        let conn = if let Some(dsn) =
+                            p["spec"]["spec"]["source"]["config"]["dsn"]
+                                .as_str()
+                        {
+                            if dsn.contains("toxiproxy") {
+                                "proxied"
+                            } else {
+                                "direct"
+                            }
+                        } else {
+                            "?"
+                        };
+
+                        parts.push(format!(
+                            "{name}({status}) {batch_str} conn={conn}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Get container image.
+    let info = inspect_container(container).await;
+    if !info.image.is_empty() {
+        parts.push(format!("image={}", info.image));
+    }
+
+    // Append user-provided notes.
+    if let Some(n) = notes {
+        if !n.is_empty() {
+            parts.push(n.to_string());
+        }
+    }
+
+    parts.join(" | ")
+}
+
 /// Record a CPU profile inside the container and generate a flamegraph SVG.
 ///
 /// 1. `docker exec` to run `perf record` inside the container (symbols resolve correctly).
@@ -824,6 +1199,7 @@ async fn run_profile(
     container: &str,
     duration_secs: u64,
     frequency: u32,
+    env_notes: &str,
 ) -> anyhow::Result<Vec<u8>> {
     // Step 1: Record.
     tracing::info!(container, duration_secs, frequency, "starting perf record");
@@ -898,10 +1274,14 @@ async fn run_profile(
     {
         let mut opts = inferno::flamegraph::Options::default();
         opts.title = format!("DeltaForge CPU Profile — {container}");
-        opts.subtitle = Some(format!(
-            "{duration_secs}s @ {frequency}Hz — {}",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-        ));
+        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        opts.subtitle = if env_notes.is_empty() {
+            Some(format!("{duration_secs}s @ {frequency}Hz — {ts}"))
+        } else {
+            Some(format!(
+                "{duration_secs}s @ {frequency}Hz — {ts}\n{env_notes}"
+            ))
+        };
         inferno::flamegraph::from_reader(&mut opts, &collapsed[..], &mut svg)?;
     }
 
@@ -930,13 +1310,16 @@ pub async fn run(port: u16) -> Result<()> {
         .route("/api/scenario/stop", post(api_scenario_stop))
         .route("/api/scenario/status", get(api_scenario_status))
         .route("/api/infra", post(api_infra))
+        .route("/api/refresh-service", post(api_refresh_service))
         .route("/api/reset-volumes", post(api_reset_volumes))
         .route("/api/swap-image", post(api_swap_image))
+        .route("/api/images", get(api_images))
         .route("/api/profile/start", post(api_profile_start))
         .route("/api/profile/status", get(api_profile_status))
         .route("/api/profile/flamegraph", get(api_profile_flamegraph))
         .route("/api/df", get(api_df_get))
         .route("/api/df", post(api_df_post))
+        .route("/api/df/patch", post(api_df_patch))
         .route("/api/df/delete", post(api_df_delete))
         .with_state(state);
 

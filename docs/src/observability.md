@@ -26,6 +26,8 @@ The sections below call out concrete metrics and log events to add per component
 | Status | Metric/log | Rationale |
 | --- | --- | --- |
 | ✅ Implemented | `deltaforge_batch_events{pipeline}` and `deltaforge_batch_bytes{pipeline}` histograms in `Coordinator::process_deliver_and_maybe_commit`. | Tune batching policies with data. |
+| ✅ Implemented | `deltaforge_bytes_total{pipeline}` counter — cumulative bytes processed through the pipeline. `rate()` gives bytes/s throughput. | Monitor data volume and bandwidth utilization. |
+| ✅ Implemented | `deltaforge_source_bytes_total{pipeline,source}` counter — cumulative raw bytes received from the source (WAL/binlog). | Track source-side data ingestion rate. |
 | ✅ Implemented | `deltaforge_stage_latency_seconds{pipeline,stage,trigger}` histogram for processor stage. | Provides batch timing per trigger (timer/limits/shutdown). |
 | ✅ Implemented | `deltaforge_processor_latency_seconds{pipeline,processor}` histogram around every processor invocation. | Identify slow user functions. |
 | 🚧 Gap | `deltaforge_pipeline_channel_depth{pipeline}` gauge from `mpsc::Sender::capacity()`/`len()`. | Detect backpressure between sources and coordinator. |

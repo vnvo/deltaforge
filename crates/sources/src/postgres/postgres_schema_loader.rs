@@ -26,9 +26,11 @@ use crate::schema_loader::{
 };
 
 /// Loaded schema with metadata.
+///
+/// Wrapped fields use `Arc` to avoid deep-cloning per event on cache hits.
 #[derive(Debug, Clone)]
 pub struct LoadedSchema {
-    pub schema: PostgresTableSchema,
+    pub schema: Arc<PostgresTableSchema>,
     pub registry_version: i32,
     pub fingerprint: Arc<str>,
     pub sequence: u64,
@@ -128,7 +130,7 @@ impl PostgresSchemaLoader {
                                 cache.insert(
                                     (schema.clone(), table.clone()),
                                     LoadedSchema {
-                                        schema: pg_schema,
+                                        schema: Arc::new(pg_schema),
                                         registry_version: sv.version,
                                         fingerprint: fingerprint.into(),
                                         sequence: sv.sequence,
@@ -259,7 +261,7 @@ impl PostgresSchemaLoader {
             .map_err(SourceError::Other)?;
 
         let loaded = LoadedSchema {
-            schema: pg_schema,
+            schema: Arc::new(pg_schema),
             registry_version: version,
             fingerprint: fingerprint.into(),
             sequence: self.registry.current_sequence(),
@@ -444,7 +446,7 @@ impl PostgresSchemaLoader {
                 let pg_schema = PostgresTableSchema::new(columns);
                 let fingerprint = pg_schema.fingerprint();
                 let loaded = LoadedSchema {
-                    schema: pg_schema,
+                    schema: Arc::new(pg_schema),
                     registry_version: 1,
                     fingerprint: fingerprint.into(),
                     sequence: 0,
@@ -529,15 +531,18 @@ fn parse_pattern(pattern: &str) -> (String, String) {
 }
 
 fn build_pattern_query(schema_pattern: &str, table_pattern: &str) -> String {
+    // Use LIKE only when the pattern contains a glob wildcard (*).
+    // The `_` character is common in table names and should NOT trigger
+    // LIKE matching — it's a literal underscore, not a wildcard.
     let schema_clause = match schema_pattern {
         "*" | "%" => "table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')".to_string(),
-        s if s.contains('%') || s.contains('_') => format!("table_schema LIKE '{}'", escape_like(s)),
+        s if s.contains('*') => format!("table_schema LIKE '{}'", escape_like(s)),
         s => format!("table_schema = '{}'", escape_sql(s)),
     };
 
     let table_clause = match table_pattern {
         "*" | "%" => "1=1".to_string(),
-        t if t.contains('%') || t.contains('_') => {
+        t if t.contains('*') => {
             format!("table_name LIKE '{}'", escape_like(t))
         }
         t => format!("table_name = '{}'", escape_sql(t)),
@@ -554,8 +559,14 @@ fn escape_sql(s: &str) -> String {
     s.replace('\'', "''")
 }
 
+/// Convert a glob-style pattern (using `*` as wildcard) to a SQL LIKE pattern.
+/// Escapes SQL LIKE metacharacters (`%`, `_`) as literals, then replaces
+/// glob `*` with LIKE `%`.
 fn escape_like(s: &str) -> String {
     s.replace('\'', "''")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+        .replace('*', "%")
 }
 
 fn query_error(e: tokio_postgres::Error) -> SourceError {
@@ -577,7 +588,7 @@ impl SourceSchemaLoader for PostgresSchemaLoader {
         Ok(ApiLoadedSchema {
             database: schema.to_string(),
             table: table.to_string(),
-            schema_json: serde_json::to_value(&loaded.schema)
+            schema_json: serde_json::to_value(&*loaded.schema)
                 .unwrap_or_default(),
             columns: loaded.column_names.iter().cloned().collect(),
             primary_key: loaded.schema.primary_key.clone(),
@@ -596,7 +607,7 @@ impl SourceSchemaLoader for PostgresSchemaLoader {
         Ok(ApiLoadedSchema {
             database: schema.to_string(),
             table: table.to_string(),
-            schema_json: serde_json::to_value(&loaded.schema)
+            schema_json: serde_json::to_value(&*loaded.schema)
                 .unwrap_or_default(),
             columns: loaded.column_names.iter().cloned().collect(),
             primary_key: loaded.schema.primary_key.clone(),
@@ -660,8 +671,13 @@ mod tests {
         assert!(q.contains("table_schema = 'public'"));
         assert!(q.contains("1=1"));
 
-        let q = build_pattern_query("%", "audit%");
+        // Glob `*` triggers LIKE; literal `%` is treated as exact match.
+        let q = build_pattern_query("*", "audit*");
         assert!(q.contains("table_schema NOT IN"));
         assert!(q.contains("table_name LIKE 'audit%'"));
+
+        // Literal `%` in table name — exact match, not LIKE.
+        let q = build_pattern_query("public", "audit%");
+        assert!(q.contains("table_name = 'audit%'"));
     }
 }

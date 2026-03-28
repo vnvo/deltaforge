@@ -118,6 +118,11 @@ pub(crate) struct RunCtx {
     pub identity_store: IdentityStore,
     pub reconciler: SchemaReconciler,
     pub on_schema_drift: OnSchemaDrift,
+    /// Cached metrics counter handles keyed by (qualified_table_name, op).
+    /// Avoids hash-lookup + key-comparison in the metrics registry per event.
+    pub counter_cache: HashMap<(Arc<str>, &'static str), metrics::Counter>,
+    /// Cached LSN string to avoid re-formatting the same LSN on consecutive events.
+    pub cached_lsn: Option<(Lsn, String)>,
 }
 
 // ============================================================================
@@ -339,6 +344,8 @@ impl PostgresSource {
                 self.tenant.clone(),
             ),
             on_schema_drift: self.on_schema_drift.clone(),
+            counter_cache: HashMap::new(),
+            cached_lsn: None,
         };
 
         // Store initial server identity (FirstSeen path).

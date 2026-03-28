@@ -107,7 +107,10 @@ impl ClientContext for KafkaMetricsContext {
 }
 
 /// Default linger time for batching (ms).
-const DEFAULT_LINGER_MS: &str = "20";
+/// Keep at 5ms: the coordinator enqueues entire batches (hundreds–thousands of
+/// messages) in one burst, so rdkafka batches naturally without needing a long
+/// linger wait. Higher values (20ms+) bottleneck throughput on small batches.
+const DEFAULT_LINGER_MS: &str = "5";
 const DEFAULT_BATCH_SIZE: &str = "1048576"; // 1 MB — rdkafka default (16 KB) is too small for high throughput
 
 /// Kafka sink with idempotent production and optional exactly-once semantics.

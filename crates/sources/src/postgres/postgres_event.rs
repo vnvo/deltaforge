@@ -3,6 +3,8 @@
 //! Processes pgoutput protocol messages from logical replication and
 //! converts them to DeltaForge events.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use deltaforge_core::{
     Event, Op, SourceError, SourceInfo, SourcePosition, SourceResult,
@@ -10,13 +12,15 @@ use deltaforge_core::{
 };
 use metrics::counter;
 use pgwire_replication::{Lsn, client::ReplicationEvent};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, info, warn};
 
 use common::watchdog;
 
 use super::RunCtx;
 use super::postgres_errors::LoopControl;
-use super::postgres_helpers::{make_checkpoint_meta, pg_timestamp_to_unix_ms};
+use super::postgres_helpers::{
+    make_checkpoint_meta, make_checkpoint_meta_str, pg_timestamp_to_unix_ms,
+};
 use super::postgres_logical_message;
 use super::postgres_object::{RelationColumn, build_object, parse_tuple_data};
 
@@ -26,13 +30,14 @@ pub struct RelationInfo {
     pub id: u32,
     pub schema: String,
     pub table: String,
-    pub columns: Vec<RelationColumn>,
+    /// Pre-formatted "schema.table" for metrics labels (avoids per-event allocation).
+    pub qualified_name: Arc<str>,
+    pub columns: Arc<Vec<RelationColumn>>,
     /// Replica identity: d=default, n=nothing, f=full, i=index
     pub replica_identity: char,
 }
 
 /// Read next replication event with watchdog timeout.
-#[instrument(skip_all)]
 pub(super) async fn read_next_event(
     ctx: &RunCtx,
 ) -> Result<Option<ReplicationEvent>, LoopControl> {
@@ -75,7 +80,6 @@ pub(super) async fn read_next_event(
 
 /// Dispatch a replication event to appropriate handler.
 /// Returns LoopControl to signal schema reload or fatal errors.
-#[instrument(skip_all)]
 pub(super) async fn dispatch_event(
     ctx: &mut RunCtx,
     event: ReplicationEvent,
@@ -88,6 +92,12 @@ pub(super) async fn dispatch_event(
             ..
         } => {
             debug!(wal_start = %wal_start, wal_end = %wal_end, bytes = data.len(), "xlog data");
+            counter!(
+                "deltaforge_source_bytes_total",
+                "pipeline" => ctx.pipeline.clone(),
+                "source" => ctx.source_id.clone(),
+            )
+            .increment(data.len() as u64);
             ctx.last_lsn = wal_end;
             handle_pgoutput_message(ctx, &data, wal_end).await?;
             ctx.repl_client.lock().await.update_applied_lsn(wal_end);
@@ -163,17 +173,19 @@ async fn handle_pgoutput_message(
     }
 
     let msg_type = data[0];
-    let payload = &data[1..];
+    // Keep a Bytes handle for zero-copy slicing in DML handlers.
+    let payload_bytes = data.slice(1..);
+    let payload = payload_bytes.as_ref();
 
     match msg_type {
         b'R' => handle_relation(ctx, payload),
-        b'I' => handle_insert(ctx, payload, wal_lsn)
+        b'I' => handle_insert(ctx, &payload_bytes, wal_lsn)
             .await
             .map_err(LoopControl::Fail),
-        b'U' => handle_update(ctx, payload, wal_lsn)
+        b'U' => handle_update(ctx, &payload_bytes, wal_lsn)
             .await
             .map_err(LoopControl::Fail),
-        b'D' => handle_delete(ctx, payload, wal_lsn)
+        b'D' => handle_delete(ctx, &payload_bytes, wal_lsn)
             .await
             .map_err(LoopControl::Fail),
         b'T' => handle_truncate(ctx, payload, wal_lsn)
@@ -286,13 +298,15 @@ fn handle_relation(
         .unwrap_or(false);
 
     // Update relation map with new column info
+    let qualified_name: Arc<str> = format!("{schema}.{table}").into();
     ctx.relation_map.insert(
         relation_id,
         RelationInfo {
             id: relation_id,
             schema: schema.clone(),
             table: table.clone(),
-            columns,
+            qualified_name,
+            columns: Arc::new(columns),
             replica_identity,
         },
     );
@@ -333,27 +347,46 @@ fn columns_differ(old: &[RelationColumn], new: &[RelationColumn]) -> bool {
     false
 }
 
-/// Build SourceInfo for PostgreSQL events
+/// Static version string — allocated once, not per event.
+static PG_VERSION: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        concat!("deltaforge-", env!("CARGO_PKG_VERSION")).to_string()
+    });
+
+/// Build SourceInfo for PostgreSQL events.
+///
+/// Caches the formatted LSN string to avoid re-formatting when consecutive
+/// events share the same WAL position (common within a transaction).
 fn build_source_info(
-    ctx: &RunCtx,
+    ctx: &mut RunCtx,
     wal_lsn: &Lsn,
     schema: &str,
     table: &str,
     timestamp_ms: i64,
 ) -> SourceInfo {
+    // Cache the LSN string — only reformat when it changes.
+    let lsn_str = match &ctx.cached_lsn {
+        Some((cached, s)) if cached == wal_lsn => s.clone(),
+        _ => {
+            let s = wal_lsn.to_string();
+            ctx.cached_lsn = Some((*wal_lsn, s.clone()));
+            s
+        }
+    };
+
     SourceInfo {
-        version: concat!("deltaforge-", env!("CARGO_PKG_VERSION")).to_string(),
+        version: PG_VERSION.clone(),
         connector: "postgresql".to_string(),
         name: ctx.pipeline.clone(),
         ts_ms: timestamp_ms,
-        db: ctx.default_schema.clone(), // database name
+        db: ctx.default_schema.clone(),
         schema: Some(schema.to_string()),
         table: table.to_string(),
         snapshot: None,
         position: SourcePosition::postgres(
-            wal_lsn.to_string(),
+            lsn_str,
             ctx.current_tx_id.map(|id| id as i64),
-            None, // xmin not tracked currently
+            None,
         ),
     }
 }
@@ -361,9 +394,10 @@ fn build_source_info(
 /// Handle INSERT message.
 async fn handle_insert(
     ctx: &mut RunCtx,
-    payload: &[u8],
+    payload_bytes: &Bytes,
     wal_lsn: Lsn,
 ) -> SourceResult<()> {
+    let payload = payload_bytes.as_ref();
     if payload.len() < 5 {
         return Ok(());
     }
@@ -386,14 +420,15 @@ async fn handle_insert(
         return Ok(());
     }
 
-    // Clone what we need
+    // Extract all needed data from relation upfront to release the borrow.
+    let columns = Arc::clone(&relation.columns);
+    let qualified_name = Arc::clone(&relation.qualified_name);
     let schema = relation.schema.clone();
     let table = relation.table.clone();
-    let columns = relation.columns.clone();
 
     let loaded = ctx.schema.load_schema(&schema, &table).await?;
 
-    let tuple_data = Bytes::copy_from_slice(&payload[5..]);
+    let tuple_data = payload_bytes.slice(5..);
     let (values, _) = parse_tuple_data(&tuple_data, columns.len());
     let after = build_object(&columns, &values);
 
@@ -404,6 +439,8 @@ async fn handle_insert(
 
     let source_info =
         build_source_info(ctx, &wal_lsn, &schema, &table, timestamp_ms);
+    let lsn_str = &ctx.cached_lsn.as_ref().unwrap().1;
+    let chkpt = make_checkpoint_meta_str(lsn_str, ctx.current_tx_id);
     let mut ev = Event::new_row(
         source_info,
         Op::Create,
@@ -413,7 +450,7 @@ async fn handle_insert(
         payload.len(),
     )
     .with_tenant(ctx.tenant.clone())
-    .with_checkpoint(make_checkpoint_meta(&wal_lsn, ctx.current_tx_id));
+    .with_checkpoint(chkpt);
 
     if let Some(tx_id) = ctx.current_tx_id {
         ev.transaction = Some(Transaction {
@@ -426,16 +463,17 @@ async fn handle_insert(
     ev.schema_version = Some(loaded.fingerprint.to_string());
     ev.schema_sequence = Some(loaded.sequence);
 
-    send_event(ctx, ev, &schema, &table, "c").await;
+    send_event(ctx, ev, &qualified_name, "c").await;
     Ok(())
 }
 
 /// Handle UPDATE message.
 async fn handle_update(
     ctx: &mut RunCtx,
-    payload: &[u8],
+    payload_bytes: &Bytes,
     wal_lsn: Lsn,
 ) -> SourceResult<()> {
+    let payload = payload_bytes.as_ref();
     if payload.len() < 5 {
         return Ok(());
     }
@@ -453,10 +491,10 @@ async fn handle_update(
         return Ok(());
     }
 
-    // Clone what we need before the mutable borrow ends
+    let columns = Arc::clone(&relation.columns);
+    let qualified_name = Arc::clone(&relation.qualified_name);
     let schema = relation.schema.clone();
     let table = relation.table.clone();
-    let columns = relation.columns.clone();
 
     let mut before_values = None;
     let mut after_values = None;
@@ -467,14 +505,14 @@ async fn handle_update(
 
         match marker {
             b'K' | b'O' => {
-                let tuple_data = Bytes::copy_from_slice(&payload[offset..]);
+                let tuple_data = payload_bytes.slice(offset..);
                 let (values, consumed) =
                     parse_tuple_data(&tuple_data, columns.len());
                 before_values = Some(values);
                 offset += consumed;
             }
             b'N' => {
-                let tuple_data = Bytes::copy_from_slice(&payload[offset..]);
+                let tuple_data = payload_bytes.slice(offset..);
                 let (values, _) = parse_tuple_data(&tuple_data, columns.len());
                 after_values = Some(values);
                 break;
@@ -500,6 +538,8 @@ async fn handle_update(
 
     let source_info =
         build_source_info(ctx, &wal_lsn, &schema, &table, timestamp_ms);
+    let lsn_str = &ctx.cached_lsn.as_ref().unwrap().1;
+    let chkpt = make_checkpoint_meta_str(lsn_str, ctx.current_tx_id);
     let mut ev = Event::new_row(
         source_info,
         Op::Update,
@@ -509,7 +549,7 @@ async fn handle_update(
         payload.len(),
     )
     .with_tenant(ctx.tenant.clone())
-    .with_checkpoint(make_checkpoint_meta(&wal_lsn, ctx.current_tx_id));
+    .with_checkpoint(chkpt);
 
     if let Some(tx_id) = ctx.current_tx_id {
         ev.transaction = Some(Transaction {
@@ -522,16 +562,17 @@ async fn handle_update(
     ev.schema_version = Some(loaded.fingerprint.to_string());
     ev.schema_sequence = Some(loaded.sequence);
 
-    send_event(ctx, ev, &schema, &table, "u").await;
+    send_event(ctx, ev, &qualified_name, "u").await;
     Ok(())
 }
 
 /// Handle DELETE message.
 async fn handle_delete(
     ctx: &mut RunCtx,
-    payload: &[u8],
+    payload_bytes: &Bytes,
     wal_lsn: Lsn,
 ) -> SourceResult<()> {
+    let payload = payload_bytes.as_ref();
     if payload.len() < 5 {
         return Ok(());
     }
@@ -554,14 +595,14 @@ async fn handle_delete(
         return Ok(());
     }
 
-    // Clone what we need
+    let columns = Arc::clone(&relation.columns);
+    let qualified_name = Arc::clone(&relation.qualified_name);
     let schema = relation.schema.clone();
     let table = relation.table.clone();
-    let columns = relation.columns.clone();
 
     let loaded = ctx.schema.load_schema(&schema, &table).await?;
 
-    let tuple_data = Bytes::copy_from_slice(&payload[5..]);
+    let tuple_data = payload_bytes.slice(5..);
     let (values, _) = parse_tuple_data(&tuple_data, columns.len());
     let before = build_object(&columns, &values);
 
@@ -572,6 +613,8 @@ async fn handle_delete(
 
     let source_info =
         build_source_info(ctx, &wal_lsn, &schema, &table, timestamp_ms);
+    let lsn_str = &ctx.cached_lsn.as_ref().unwrap().1;
+    let chkpt = make_checkpoint_meta_str(lsn_str, ctx.current_tx_id);
     let mut ev = Event::new_row(
         source_info,
         Op::Delete,
@@ -581,7 +624,7 @@ async fn handle_delete(
         payload.len(),
     )
     .with_tenant(ctx.tenant.clone())
-    .with_checkpoint(make_checkpoint_meta(&wal_lsn, ctx.current_tx_id));
+    .with_checkpoint(chkpt);
 
     if let Some(tx_id) = ctx.current_tx_id {
         ev.transaction = Some(Transaction {
@@ -594,7 +637,7 @@ async fn handle_delete(
     ev.schema_version = Some(loaded.fingerprint.to_string());
     ev.schema_sequence = Some(loaded.sequence);
 
-    send_event(ctx, ev, &schema, &table, "d").await;
+    send_event(ctx, ev, &qualified_name, "d").await;
     Ok(())
 }
 
@@ -681,28 +724,39 @@ async fn handle_truncate(
 }
 
 /// Send event and update metrics.
+///
+/// Uses `try_send` (non-blocking) when the channel has capacity to avoid
+/// the overhead of the async state machine on every single row. Falls back
+/// to the async `send` only when the channel is full (backpressure).
+/// Counter handles are cached per (table, op) to avoid hash lookups per event.
+#[inline]
 async fn send_event(
-    ctx: &RunCtx,
+    ctx: &mut RunCtx,
     ev: Event,
-    schema: &str,
-    table: &str,
+    table_name: &Arc<str>,
     op: &'static str,
 ) {
-    let table_name = format!("{}.{}", schema, table);
-    match ctx.tx.send(ev).await {
-        Ok(_) => {
+    let ok = match ctx.tx.try_send(ev) {
+        Ok(()) => true,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(ev)) => {
+            ctx.tx.send(ev).await.is_ok()
+        }
+        Err(_) => false,
+    };
+    if ok {
+        let key = (Arc::clone(table_name), op);
+        let ctr = ctx.counter_cache.entry(key).or_insert_with_key(|k| {
             counter!(
                 "deltaforge_source_events_total",
                 "pipeline" => ctx.pipeline.clone(),
                 "source" => ctx.source_id.clone(),
-                "table" => table_name,
-                "op" => op,
+                "table" => k.0.to_string(),
+                "op" => k.1,
             )
-            .increment(1);
-        }
-        Err(_) => {
-            error!(source_id = %ctx.source_id, op, "channel send failed");
-        }
+        });
+        ctr.increment(1);
+    } else {
+        error!(source_id = %ctx.source_id, op, "channel send failed");
     }
 }
 

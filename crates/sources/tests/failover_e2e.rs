@@ -62,7 +62,7 @@ async fn start_mysql() -> (ContainerAsync<GenericImage>, u16) {
         .await
         .expect("start mysql");
     let port = c.get_host_port_ipv4(3306).await.expect("mysql port");
-    sleep(Duration::from_secs(10)).await;
+    // No fixed sleep — provision_mysql_cdc_user retries until MySQL accepts TCP.
     provision_mysql_cdc_user(port).await;
     (c, port)
 }
@@ -71,7 +71,18 @@ async fn provision_mysql_cdc_user(port: u16) {
     let dsn = format!("mysql://root:{MYSQL_ROOT_PASSWORD}@127.0.0.1:{port}/");
     let pool =
         mysql_async::Pool::new(mysql_async::Opts::from_url(&dsn).unwrap());
-    let mut conn = pool.get_conn().await.unwrap();
+    // Retry connection — MySQL logs "ready for connections" before TCP is
+    // fully accepting, so the container may look ready while connections fail.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut conn = loop {
+        match pool.get_conn().await {
+            Ok(c) => break c,
+            Err(_) if Instant::now() < deadline => {
+                sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => panic!("MySQL not ready after 30s on port {port}: {e}"),
+        }
+    };
     conn.query_drop(format!(
         "CREATE USER IF NOT EXISTS '{MYSQL_CDC_USER}'@'%' IDENTIFIED BY '{MYSQL_CDC_PASSWORD}'"
     )).await.unwrap();

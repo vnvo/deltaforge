@@ -50,13 +50,19 @@ struct BuildingBatch {
 }
 
 impl BuildingBatch {
-    fn new() -> Self {
+    fn with_capacity(cap: usize) -> Self {
         Self {
             started_at: Instant::now(),
-            raw: Vec::new(),
+            raw: Vec::with_capacity(cap),
             bytes: 0,
         }
     }
+}
+
+/// Item sent from the accumulation loop to the delivery task.
+struct DeliveryItem {
+    batch: BuildingBatch,
+    reason: &'static str,
 }
 
 /// After processing, freeze as Arc<[Event]> for zero-copy sharing.
@@ -74,6 +80,45 @@ fn event_size_hint(ev: &Event) -> usize {
 
 fn is_tx_boundary(ev: &Event) -> bool {
     ev.tx_end
+}
+
+/// Push one event into the building batch. If the batch would exceed limits,
+/// split it first and return the full batch for delivery.
+fn check_and_split(
+    b: &mut BuildingBatch,
+    ev: Event,
+    max_events: usize,
+    max_bytes: usize,
+) -> Option<BuildingBatch> {
+    let would_exceed_events = b.raw.len() >= max_events;
+    let would_exceed_bytes = b.bytes + event_size_hint(&ev) >= max_bytes;
+    let limit_hit = would_exceed_events || would_exceed_bytes;
+    let boundary = is_tx_boundary(&ev);
+
+    let flush = if (!b.raw.is_empty() || !boundary) && limit_hit {
+        Some(std::mem::replace(
+            b,
+            BuildingBatch::with_capacity(max_events),
+        ))
+    } else {
+        None
+    };
+
+    b.bytes += event_size_hint(&ev);
+    b.raw.push(ev);
+    flush
+}
+
+/// Send a completed batch to the delivery task. Returns Err if the delivery
+/// task has stopped (e.g. due to a sink error).
+async fn send_to_delivery(
+    tx: &tokio::sync::mpsc::Sender<DeliveryItem>,
+    batch: BuildingBatch,
+    reason: &'static str,
+) -> Result<()> {
+    tx.send(DeliveryItem { batch, reason })
+        .await
+        .map_err(|_| anyhow::anyhow!("delivery task stopped unexpectedly"))
 }
 
 fn policy_satisfied(
@@ -465,6 +510,12 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
     }
 
     /// Build - process (mutable) - sense - freeze (Arc<[Event]>) - deliver - maybe commit.
+    ///
+    /// When `max_inflight > 1`, accumulation and delivery run concurrently:
+    /// the accumulation loop sends completed batches through a bounded channel
+    /// to a delivery task, so the next batch starts filling while the previous
+    /// one is being delivered to sinks. The delivery task processes batches in
+    /// FIFO order, preserving checkpoint ordering.
     pub async fn run(
         self,
         mut event_rx: tokio::sync::mpsc::Receiver<Event>,
@@ -472,124 +523,149 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
         mut pause_rx: watch::Receiver<bool>,
     ) -> Result<()> {
         let tick_ms = self.batch_cfg_eff.max_ms.unwrap_or(200);
-        let mut ticker = interval(Duration::from_millis(tick_ms));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let max_events = self.batch_cfg_eff.max_events.unwrap_or(usize::MAX);
+        let max_bytes = self.batch_cfg_eff.max_bytes.unwrap_or(usize::MAX);
+        let max_inflight = self.batch_cfg_eff.max_inflight.unwrap_or(1);
 
-        let mut building: Option<BuildingBatch> = None;
+        let coord = Arc::new(self);
 
-        // Reusable buffer for recv_many — avoids allocation per drain cycle.
-        let mut drain_buf: Vec<Event> = Vec::with_capacity(256);
+        // Bounded channel for pipelined delivery — capacity = max_inflight.
+        // When max_inflight=1 this degrades gracefully to back-pressure after
+        // every batch (same throughput as the old sequential path).
+        let (deliver_tx, mut deliver_rx) =
+            tokio::sync::mpsc::channel::<DeliveryItem>(max_inflight.max(1));
 
-        loop {
-            if *pause_rx.borrow() {
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        break;
-                    }
-                    changed = pause_rx.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                        continue;
-                    }
-                }
-            }
+        // Shared error slot: the delivery task writes here on failure.
+        let delivery_error: Arc<Mutex<Option<anyhow::Error>>> =
+            Arc::new(Mutex::new(None));
 
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    if let Some(b) = building.take() && !b.raw.is_empty() {
-                            self.process_deliver_and_maybe_commit(b, "cancelled").await?;
-                        }
+        // Spawn delivery task — processes batches in FIFO order so checkpoints
+        // are committed in sequence.
+        let d_coord = Arc::clone(&coord);
+        let d_cancel = cancel.clone();
+        let d_error = Arc::clone(&delivery_error);
+        let delivery_handle = tokio::spawn(async move {
+            while let Some(item) = deliver_rx.recv().await {
+                if let Err(e) = d_coord
+                    .process_deliver_and_maybe_commit(item.batch, item.reason)
+                    .await
+                {
+                    *d_error.lock() = Some(e);
+                    d_cancel.cancel();
                     break;
                 }
+            }
+        });
 
-                _ = ticker.tick() => {
-                    if let Some(b) = building.take() {
-                        if !b.raw.is_empty() && b.started_at.elapsed() >= Duration::from_millis(tick_ms) {
-                            self.process_deliver_and_maybe_commit(b, "timer").await?;
-                        } else {
-                            building = Some(b);
+        info!(
+            pipeline = %coord.pipeline_name,
+            max_inflight,
+            max_events,
+            tick_ms,
+            "coordinator started"
+        );
+
+        // ── Accumulation loop ────────────────────────────────────────────
+        let mut ticker = interval(Duration::from_millis(tick_ms));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut building: Option<BuildingBatch> = None;
+        let mut drain_buf: Vec<Event> = Vec::with_capacity(256);
+
+        let accum_result: Result<()> = async {
+            loop {
+                if *pause_rx.borrow() {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        changed = pause_rx.changed() => {
+                            if changed.is_err() { break; }
+                            continue;
                         }
                     }
                 }
 
-                changed = pause_rx.changed() => {
-                    if changed.is_err() {
-                        break;
-                    }
-                    continue;
-                }
-
-                maybe_ev = event_rx.recv() => {
-                    let Some(first_ev) = maybe_ev else {
-                        // Channel closed - final flush
-                        if let Some(b) = building.take() && !b.raw.is_empty() {
-                                self.process_deliver_and_maybe_commit(b, "shutdown").await?;
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        if let Some(b) = building.take() {
+                            if !b.raw.is_empty() {
+                                send_to_delivery(&deliver_tx, b, "cancelled").await?;
                             }
+                        }
                         break;
-                    };
-
-                    if building.is_none() {
-                        building = Some(BuildingBatch::new());
-                        debug!(pipeline=%self.pipeline_name, "building new batch");
                     }
 
-                    let cfg = &self.batch_cfg_eff;
-                    let max_events = cfg.max_events.unwrap_or(usize::MAX);
-                    let max_bytes = cfg.max_bytes.unwrap_or(usize::MAX);
-                    let mut b = building.take().unwrap();
+                    _ = ticker.tick() => {
+                        if let Some(b) = building.take() {
+                            if !b.raw.is_empty()
+                                && b.started_at.elapsed()
+                                    >= Duration::from_millis(tick_ms)
+                            {
+                                send_to_delivery(&deliver_tx, b, "timer").await?;
+                            } else {
+                                building = Some(b);
+                            }
+                        }
+                    }
 
-                    // Accumulate the first event we already received.
-                    Self::accumulate_event(&self, &mut b, first_ev, max_events, max_bytes).await?;
+                    changed = pause_rx.changed() => {
+                        if changed.is_err() { break; }
+                        continue;
+                    }
 
-                    // Drain as many additional events as are immediately
-                    // available, up to the remaining batch capacity. This
-                    // amortises the select! overhead across many events when
-                    // the source is producing faster than the coordinator
-                    // consumes.
-                    let remaining = max_events.saturating_sub(b.raw.len()).min(512);
-                    if remaining > 0 {
-                        drain_buf.clear();
-                        let n = event_rx.recv_many(&mut drain_buf, remaining).await;
-                        if n == 0 && b.raw.is_empty() {
-                            // Channel closed with nothing buffered.
+                    maybe_ev = event_rx.recv() => {
+                        let Some(first_ev) = maybe_ev else {
+                            if let Some(b) = building.take() {
+                                if !b.raw.is_empty() {
+                                    send_to_delivery(&deliver_tx, b, "shutdown").await?;
+                                }
+                            }
                             break;
-                        }
-                        for ev in drain_buf.drain(..) {
-                            Self::accumulate_event(&self, &mut b, ev, max_events, max_bytes).await?;
-                        }
-                    }
+                        };
 
-                    building = Some(b);
+                        if building.is_none() {
+                            building = Some(BuildingBatch::with_capacity(max_events));
+                            debug!(pipeline=%coord.pipeline_name, "building new batch");
+                        }
+                        let mut b = building.take().unwrap();
+
+                        // Accumulate the first event, flush if limits hit.
+                        if let Some(full) = check_and_split(&mut b, first_ev, max_events, max_bytes) {
+                            send_to_delivery(&deliver_tx, full, "limits").await?;
+                        }
+
+                        // Drain as many additional events as are immediately
+                        // available, up to the remaining batch capacity.
+                        let remaining = max_events.saturating_sub(b.raw.len()).min(512);
+                        if remaining > 0 {
+                            drain_buf.clear();
+                            let n = event_rx.recv_many(&mut drain_buf, remaining).await;
+                            if n == 0 && b.raw.is_empty() {
+                                break;
+                            }
+                            for ev in drain_buf.drain(..) {
+                                if let Some(full) = check_and_split(&mut b, ev, max_events, max_bytes) {
+                                    send_to_delivery(&deliver_tx, full, "limits").await?;
+                                }
+                            }
+                        }
+
+                        building = Some(b);
+                    }
                 }
             }
+            Ok(())
+        }
+        .await;
+
+        // Signal delivery task to drain remaining items and stop.
+        drop(deliver_tx);
+        let _ = delivery_handle.await;
+
+        // Propagate delivery errors (take precedence over accumulation errors).
+        if let Some(err) = delivery_error.lock().take() {
+            return Err(err);
         }
 
-        Ok(())
-    }
-
-    /// Push one event into the building batch, flushing first if limits are hit.
-    async fn accumulate_event(
-        &self,
-        b: &mut BuildingBatch,
-        ev: Event,
-        max_events: usize,
-        max_bytes: usize,
-    ) -> Result<()> {
-        let would_exceed_events = b.raw.len() >= max_events;
-        let would_exceed_bytes = b.bytes + event_size_hint(&ev) >= max_bytes;
-        let limit_hit = would_exceed_events || would_exceed_bytes;
-        let boundary = is_tx_boundary(&ev);
-
-        if (!b.raw.is_empty() || !boundary) && limit_hit {
-            let full = std::mem::replace(b, BuildingBatch::new());
-            self.process_deliver_and_maybe_commit(full, "limits")
-                .await?;
-        }
-
-        b.bytes += event_size_hint(&ev);
-        b.raw.push(ev);
-        Ok(())
+        accum_result
     }
 
     async fn process_deliver_and_maybe_commit(
@@ -731,6 +807,12 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
             "pipeline" => self.pipeline_name.to_string(),
         )
         .record(bytes as f64);
+
+        counter!(
+            "deltaforge_bytes_total",
+            "pipeline" => self.pipeline_name.to_string(),
+        )
+        .increment(bytes as u64);
 
         // 3) FREEZE for zero-copy sharing
         let frozen = FrozenBatch {

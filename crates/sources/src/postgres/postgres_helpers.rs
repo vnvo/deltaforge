@@ -191,7 +191,10 @@ fn pgwire_error_to_source_error(e: PgWireError) -> SourceError {
         Auth(msg) => SourceError::Auth {
             details: msg.into(),
         },
-        Io(msg) | Task(msg) => SourceError::Connect {
+        Io(err) => SourceError::Connect {
+            details: format!("{err} ({:?})", err.kind()).into(),
+        },
+        Task(msg) => SourceError::Connect {
             details: msg.into(),
         },
         Tls(msg) => SourceError::Incompatible {
@@ -404,19 +407,32 @@ pub(crate) fn redact_password(dsn: &str) -> String {
 }
 
 /// Build checkpoint metadata from LSN.
+///
+/// Hand-writes the JSON to avoid serde_json overhead on every event.
+/// Format: `{"lsn":"X/Y","tx_id":N}` or `{"lsn":"X/Y","tx_id":null}`
 pub(crate) fn make_checkpoint_meta(
     lsn: &Lsn,
     tx_id: Option<u32>,
 ) -> CheckpointMeta {
-    let cp = PostgresCheckpoint {
-        lsn: lsn.to_string(),
-        tx_id,
-    };
-    let bytes = serde_json::to_vec(&cp).unwrap_or_else(|e| {
-        error!(error=%e, "failed to serialize checkpoint");
-        Vec::new()
-    });
-    CheckpointMeta::from_vec(bytes)
+    make_checkpoint_meta_str(&lsn.to_string(), tx_id)
+}
+
+/// Build checkpoint metadata from a pre-formatted LSN string.
+/// Avoids reformatting the LSN when it's already cached.
+pub(crate) fn make_checkpoint_meta_str(
+    lsn_str: &str,
+    tx_id: Option<u32>,
+) -> CheckpointMeta {
+    use std::fmt::Write;
+    let mut buf = String::with_capacity(48);
+    let _ = write!(buf, r#"{{"lsn":"{}","tx_id":"#, lsn_str);
+    match tx_id {
+        Some(id) => {
+            let _ = write!(buf, "{}}}", id);
+        }
+        None => buf.push_str("null}"),
+    }
+    CheckpointMeta::from_vec(buf.into_bytes())
 }
 
 /// Convert PostgreSQL epoch timestamp (microseconds since 2000-01-01) to Unix milliseconds.
@@ -451,12 +467,15 @@ mod tests {
 
     #[test]
     fn test_pgwire_error_to_source_error() {
+        let io =
+            |s| PgWireError::Io(std::sync::Arc::new(std::io::Error::other(s)));
+
         assert!(matches!(
             pgwire_error_to_source_error(PgWireError::Auth("x".into())),
             SourceError::Auth { .. }
         ));
         assert!(matches!(
-            pgwire_error_to_source_error(PgWireError::Io("x".into())),
+            pgwire_error_to_source_error(io("x")),
             SourceError::Connect { .. }
         ));
         assert!(matches!(

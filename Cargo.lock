@@ -2595,7 +2595,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.0",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -3468,7 +3468,7 @@ checksum = "478b0ff3f7d67b79da2b96f56f334431aef65e15ba4b29dd74a4236e29582bdc"
 dependencies = [
  "base64 0.21.7",
  "bigdecimal",
- "bindgen 0.72.1",
+ "bindgen 0.66.1",
  "bitflags 2.9.4",
  "bitvec",
  "btoi",
@@ -3943,9 +3943,9 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pgwire-replication"
-version = "0.2.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a67e3316e07298647331f8ddadd1bf040dc954b18233a1124c0e3e84364dd35b"
+checksum = "bb5dafc8338ae6dd3949b367c9afd1d4004300ae2dc84af5b883303e424822e7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3953,7 +3953,6 @@ dependencies = [
  "hmac",
  "rand 0.9.2",
  "rustls 0.23.31",
- "rustls-pemfile",
  "sha2",
  "thiserror 1.0.69",
  "tokio",

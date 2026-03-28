@@ -69,12 +69,13 @@ services:
 
   postgres:
     image: postgres:17
-    profiles: [pg, pg-app]
+    profiles: [pg, pg-app, pg-soak]
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: orders
     volumes:
       - ./chaos/init/postgres-chaos.sql:/docker-entrypoint-initdb.d/01_init.sql
+      - ./chaos/init/postgres-soak.sql:/docker-entrypoint-initdb.d/02_soak.sql
       - postgres_data:/var/lib/postgresql/data
     command:
       - postgres
@@ -120,24 +121,22 @@ services:
       retries: 10
     networks: [chaos_net]
 
-  # Kafka
-
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.5.0
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-    networks: [chaos_net]
+  # Kafka (KRaft — no Zookeeper)
 
   kafka:
-    image: confluentinc/cp-kafka:7.5.0
-    depends_on: [zookeeper]
+    image: confluentinc/cp-kafka:7.7.1
     environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      # Two listeners: INTERNAL for container-to-container, EXTERNAL for host
-      KAFKA_LISTENERS: BROKER://0.0.0.0:9093,CLIENT://0.0.0.0:9094,EXTERNAL://0.0.0.0:9092
-      KAFKA_ADVERTISED_LISTENERS: BROKER://kafka:9093,CLIENT://toxiproxy:5102,EXTERNAL://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: BROKER:PLAINTEXT,CLIENT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      # KRaft mode — combined broker + controller in a single node
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      # Listeners: CONTROLLER for KRaft consensus, BROKER for inter-broker,
+      # CLIENT for toxiproxy routing, EXTERNAL for host access
+      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:9093,BROKER://0.0.0.0:29092,CLIENT://0.0.0.0:9094,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: BROKER://kafka:29092,CLIENT://toxiproxy:5102,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,BROKER:PLAINTEXT,CLIENT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_INTER_BROKER_LISTENER_NAME: BROKER
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
@@ -262,6 +261,28 @@ services:
     restart: on-failure
     networks: [chaos_net]
 
+  # DeltaForge — PostgreSQL Soak test (Postgres source, 120-table workload)
+  # Profile: pg-soak. Exposes on ports 8083 (health) and 9003 (metrics).
+
+  deltaforge-pg-soak:
+    image: deltaforge:dev-profile
+    command: ["--config", "/etc/deltaforge/pg-soak.yaml", "--storage-path", "/data/deltaforge-pg-soak.db"]
+    profiles: [pg-soak]
+    user: root
+    cap_add: [SYS_ADMIN]
+    security_opt: ["seccomp=unconfined"]
+    volumes:
+      - ./chaos/config:/etc/deltaforge:ro
+      - deltaforge_pg_soak_data:/data
+    environment:
+      RUST_LOG: "deltaforge=info,sources=info,sinks=info,warn"
+    ports:
+      - "8083:8080"   # REST API / health
+      - "9003:9000"   # Prometheus /metrics
+    depends_on: [toxiproxy, postgres]
+    restart: on-failure
+    networks: [chaos_net]
+
   # cAdvisor — container-level CPU, memory, network, and disk I/O metrics
   # Scrapes Docker runtime stats and exposes them to Prometheus.
 
@@ -309,6 +330,7 @@ volumes:
   deltaforge_pg_data:
   deltaforge_tpcc_data:
   deltaforge_soak_data:
+  deltaforge_pg_soak_data:
   grafana_data:
   mysql_data:
   mysql_b_data:

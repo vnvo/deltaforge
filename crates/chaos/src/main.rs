@@ -44,14 +44,19 @@ struct Cli {
 
     // ── Backlog-drain throughput knobs ────────────────────────────────────────
     /// Max events per Kafka batch during the backlog-drain (pipeline spec batch.max_events).
-    /// Higher values reduce produce calls per second. Default: 200.
-    #[arg(long, default_value_t = 200)]
+    /// Higher values reduce produce calls per second.
+    #[arg(long, default_value_t = 4000)]
     drain_max_events: u64,
 
     /// Max batch age in ms during the backlog-drain (pipeline spec batch.max_ms).
-    /// Lower values reduce latency at the cost of smaller batches. Default: 100.
+    /// Lower values reduce latency at the cost of smaller batches.
     #[arg(long, default_value_t = 100)]
     drain_max_ms: u64,
+
+    /// How many batches may be in-flight concurrently during the drain.
+    /// Higher values overlap accumulation with delivery for better throughput.
+    #[arg(long, default_value_t = 4)]
+    drain_max_inflight: u64,
 
     /// Commit mode during the backlog-drain: "required" (safe) or "periodic" (faster).
     #[arg(long, default_value = "required")]
@@ -71,6 +76,11 @@ struct Cli {
     /// Example: --drain-kafka-conf linger.ms=20 --drain-kafka-conf batch.size=1048576
     #[arg(long = "drain-kafka-conf", value_name = "KEY=VALUE")]
     drain_kafka_conf: Vec<String>,
+
+    /// Bypass Toxiproxy: PATCH pipelines to connect directly to source/sink
+    /// before running the scenario. Restores proxied addresses after completion.
+    #[arg(long, default_value_t = false)]
+    no_proxy: bool,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -168,11 +178,17 @@ async fn main() -> Result<()> {
     let drain_cfg = scenarios::backlog_drain::DrainConfig {
         max_events: cli.drain_max_events,
         max_ms: cli.drain_max_ms,
+        max_inflight: cli.drain_max_inflight,
         commit_mode: cli.drain_commit_mode.clone(),
         commit_interval_ms: cli.drain_commit_interval_ms,
         schema_sensing: cli.drain_schema_sensing,
         kafka_client_conf,
     };
+
+    // Apply proxy bypass if requested.
+    if cli.no_proxy {
+        harness::set_proxy_bypass(true).await;
+    }
 
     let results = match cli.source {
         Source::Mysql => {
@@ -187,9 +203,22 @@ async fn main() -> Result<()> {
             .await?
         }
         Source::Postgres => {
-            run_postgres(&harness, &cli.scenario, cli.duration_mins).await?
+            run_postgres(
+                &harness,
+                &cli.scenario,
+                cli.duration_mins,
+                cli.writer_tasks,
+                cli.write_delay_ms,
+                drain_cfg,
+            )
+            .await?
         }
     };
+
+    // Restore proxied connections after scenario completes.
+    if cli.no_proxy {
+        harness::set_proxy_bypass(false).await;
+    }
 
     println!("\n═══════════════════════════════════");
     println!("  Chaos Run Results");
@@ -310,7 +339,10 @@ async fn run_mysql(
 async fn run_postgres(
     harness: &Harness,
     scenario: &Scenario,
-    _duration_mins: u64,
+    duration_mins: u64,
+    writer_tasks: usize,
+    write_delay_ms: u64,
+    drain_cfg: scenarios::backlog_drain::DrainConfig,
 ) -> Result<Vec<harness::ScenarioResult>> {
     let backend = PgBackend;
     let mut results = vec![];
@@ -338,13 +370,35 @@ async fn run_postgres(
         Scenario::SlotDropped => {
             results.push(scenarios::slot_dropped::run(harness).await?);
         }
+        Scenario::Soak => {
+            results.push(
+                scenarios::soak::run_pg(
+                    harness,
+                    duration_mins,
+                    writer_tasks,
+                    write_delay_ms,
+                )
+                .await?,
+            );
+        }
+        Scenario::SoakStable => {
+            results.push(
+                scenarios::soak::run_stable_pg(
+                    harness,
+                    duration_mins,
+                    writer_tasks,
+                    write_delay_ms,
+                )
+                .await?,
+            );
+        }
+        Scenario::BacklogDrain => {
+            results.push(
+                scenarios::backlog_drain::run_pg(harness, drain_cfg).await?,
+            );
+        }
         Scenario::Ui => unreachable!("ui is handled before source dispatch"),
-        Scenario::Soak
-        | Scenario::SoakStable
-        | Scenario::BacklogDrain
-        | Scenario::Tpcc
-        | Scenario::Failover
-        | Scenario::BinlogPurge => {
+        Scenario::Tpcc | Scenario::Failover | Scenario::BinlogPurge => {
             eprintln!(
                 "error: {:?} is a MySQL-specific scenario — use --source mysql",
                 scenario.to_possible_value().unwrap().get_name()

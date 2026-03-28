@@ -217,7 +217,8 @@ Different scenarios require different compose profiles:
 |---------|------|----------|
 | `app` | 8080 | MySQL resilience scenarios |
 | `pg` + `pg-app` | 8080 | PostgreSQL resilience scenarios |
-| `soak` | 8081 | Soak endurance test, backlog-drain benchmark |
+| `soak` | 8081 | MySQL soak endurance, backlog-drain benchmark |
+| `pg-soak` | 8083 | PostgreSQL soak endurance, backlog-drain benchmark |
 | `tpcc` | 8082 | TPC-C benchmark |
 
 ### Run resilience scenarios
@@ -243,20 +244,26 @@ cargo run -p chaos -- --scenario soak --duration-mins 60
 # Soak-stable — same workload, no faults (baseline)
 cargo run -p chaos -- --scenario soak-stable --duration-mins 30
 
-# Backlog-drain — measures catch-up throughput after a planned stop
-cargo run -p chaos -- --scenario backlog-drain
+# Backlog-drain — measures catch-up throughput (1M row replay)
+cargo run -p chaos -- --scenario backlog-drain --source mysql --no-proxy
 
-# Backlog-drain with rdkafka producer tuning
-cargo run -p chaos -- --scenario backlog-drain \
-  --drain-max-events 3500 --drain-max-ms 50 \
-  --drain-kafka-conf batch.size=1048576 \
-  --drain-kafka-conf linger.ms=20 \
-  --drain-kafka-conf batch.num.messages=100000
+# Backlog-drain with custom tuning
+cargo run -p chaos -- --scenario backlog-drain --source mysql --no-proxy \
+  --drain-max-events 4000 --drain-max-ms 100 \
+  --drain-kafka-conf linger.ms=0
+
+# Postgres drain benchmark
+docker compose -f docker-compose.chaos.yml --profile pg-soak up -d
+cargo run -p chaos -- --scenario backlog-drain --source postgres --no-proxy \
+  --drain-max-events 4000 --drain-max-ms 100 \
+  --drain-kafka-conf linger.ms=0
 
 # TPC-C — OLTP transaction mix benchmark
 docker compose -f docker-compose.chaos.yml --profile tpcc up -d
 cargo run -p chaos -- --scenario tpcc --duration-mins 30
 ```
+
+See [Performance Tuning](performance.md) for detailed throughput optimization guidance and profiling instructions.
 
 ### Playground UI
 
@@ -267,7 +274,16 @@ cargo run -p chaos -- --scenario ui
 # Open http://localhost:7474
 ```
 
-The UI provides live service status, one-click fault injection, a scenario runner with live log output, and a full Pipeline API browser for any DeltaForge instance.
+The UI provides:
+- **Live service status** with health dots, port badges, and Docker image selector
+- **Stale image detection** — warns when a container is running an older image after a rebuild
+- **Activity bar** — shows current operation with per-button loading state and task history
+- **Console log** — unified output for all actions (infra, faults, scenarios) with smart auto-scroll
+- **One-click fault injection** via Toxiproxy (partitions, latency, bandwidth throttle)
+- **Scenario runner** with proxy bypass toggle, drain settings, and live log streaming
+- **Pipeline API browser** for any DeltaForge instance
+- **Config Lab** for A/B config comparison with presets
+- **CPU profiler** — captures flamegraphs from running containers with pipeline context in the subtitle
 
 #### Data management
 

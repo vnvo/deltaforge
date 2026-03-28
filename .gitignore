@@ -8,3 +8,5 @@ data/
 docs/book/
 flamegraph.svg
 perf.data*
+# Local pgwire-replication copy for Docker builds during development
+/pgwire-replication
