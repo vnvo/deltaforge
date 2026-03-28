@@ -96,7 +96,10 @@ fn check_and_split(
     let boundary = is_tx_boundary(&ev);
 
     let flush = if (!b.raw.is_empty() || !boundary) && limit_hit {
-        Some(std::mem::replace(b, BuildingBatch::with_capacity(max_events)))
+        Some(std::mem::replace(
+            b,
+            BuildingBatch::with_capacity(max_events),
+        ))
     } else {
         None
     };

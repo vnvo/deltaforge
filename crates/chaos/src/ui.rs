@@ -1019,7 +1019,8 @@ async fn api_profile_start(
     *st.flamegraph.lock().await = None;
 
     // Gather environment context for the flamegraph subtitle.
-    let env_notes = gather_profile_context(&req.container, req.notes.as_deref()).await;
+    let env_notes =
+        gather_profile_context(&req.container, req.notes.as_deref()).await;
 
     let st2 = Arc::clone(&st);
     tokio::spawn(async move {
@@ -1096,7 +1097,10 @@ async fn api_profile_flamegraph(
 }
 
 /// Gather pipeline config and container info for the flamegraph subtitle.
-async fn gather_profile_context(container: &str, notes: Option<&str>) -> String {
+async fn gather_profile_context(
+    container: &str,
+    notes: Option<&str>,
+) -> String {
     let mut parts = Vec::new();
 
     // Try to detect which DeltaForge port this container maps to.
@@ -1129,9 +1133,11 @@ async fn gather_profile_context(container: &str, notes: Option<&str>) -> String 
                             .as_object()
                             .or_else(|| p["spec"]["batch"].as_object());
                         let batch_str = if let Some(b) = batch {
-                            let me = b.get("max_events").and_then(|v| v.as_u64());
+                            let me =
+                                b.get("max_events").and_then(|v| v.as_u64());
                             let mm = b.get("max_ms").and_then(|v| v.as_u64());
-                            let mi = b.get("max_inflight").and_then(|v| v.as_u64());
+                            let mi =
+                                b.get("max_inflight").and_then(|v| v.as_u64());
                             format!(
                                 "batch({}/{}ms/{}inf)",
                                 me.map(|v| v.to_string())
@@ -1146,9 +1152,9 @@ async fn gather_profile_context(container: &str, notes: Option<&str>) -> String 
                         };
 
                         // Check source DSN for proxy vs direct
-                        let conn = if let Some(dsn) = p["spec"]["spec"]["source"]
-                            ["config"]["dsn"]
-                            .as_str()
+                        let conn = if let Some(dsn) =
+                            p["spec"]["spec"]["source"]["config"]["dsn"]
+                                .as_str()
                         {
                             if dsn.contains("toxiproxy") {
                                 "proxied"

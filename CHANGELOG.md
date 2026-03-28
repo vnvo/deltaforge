@@ -11,23 +11,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Postgres soak & backlog-drain** — 120-table soak test and 1M-row drain benchmark for `--source postgres` ([de9e8b2](https://github.com/vnvo/deltaforge/commit/de9e8b2), [9c8fba2](https://github.com/vnvo/deltaforge/commit/9c8fba2))
 - **Config Lab UI** — A/B config comparison with presets, side-by-side editors, and sequential scenario runner ([e611f93](https://github.com/vnvo/deltaforge/commit/e611f93))
-- **Chaos UI** — service refresh button, dynamic port/URL badges, PATCH proxy endpoint, per-scenario proxy bypass toggle ([e611f93](https://github.com/vnvo/deltaforge/commit/e611f93))
+- **Chaos UI improvements** — activity bar with per-button loading state, unified console log with smart auto-scroll, Docker image selector dropdown with stale image detection, service refresh button, dynamic port/URL badges, PATCH proxy endpoint, per-scenario proxy bypass toggle
 - **Bytes throughput metrics** — `deltaforge_source_bytes_total` and `deltaforge_bytes_total` counters for MB/s monitoring
 - **Proxy bypass** — `--no-proxy` CLI flag patches pipeline DSNs to bypass Toxiproxy for direct connections
+- **Performance tuning guide** — new `docs/src/performance.md` covering batch size, linger.ms, max_inflight, source-specific tuning, profiling, and drain benchmarks
 
 ### Changed
 
-- **Coordinator batch pipelining** — `max_inflight` decouples event accumulation from sink delivery; overlaps batch building with Kafka produce for higher throughput
-- **Drain benchmark tuning** — defaults raised to `max_events=5000`, `max_inflight=4`, aggressive Kafka producer settings (`linger.ms=50`, `batch.size=1MB`, `acks=1`, `lz4`)
-- **MySQL drain writer** — batched multi-row INSERTs (64 rows/statement) with connection reuse for faster backlog population
+- **Kafka sink `DEFAULT_LINGER_MS`** — lowered from 20ms to 5ms; the coordinator enqueues full batches in bursts so rdkafka batches naturally without long linger waits (was the primary throughput bottleneck)
+- **Coordinator batch pipelining** — `max_inflight` decouples event accumulation from sink delivery via bounded channel; overlaps batch building with Kafka produce for higher throughput
+- **Drain benchmark defaults** — `max_events=4000`, `max_inflight=4`, `linger.ms=0`; no other kafka overrides (sink defaults are sufficient)
+- **MySQL drain writer** — batched multi-row INSERTs (64 rows/statement) with connection reuse; write TPS: 67K to 145K rows/s
+- **Kafka KRaft** — migrated from `cp-kafka:7.5.0` + Zookeeper to `cp-kafka:7.7.1` in KRaft mode (no Zookeeper dependency)
+- **pgwire-replication v0.3.1** — drain-phase tight loop (up to 256 messages without select!/timeout), reusable `BytesMut` read buffer; Postgres CDC: 37K to 48K events/s (+32%)
 - **Grafana dashboard redesign** — collapsible row sections, multi-pipeline stat panels, running-pipeline filtering for Checkpoint Age and Replication Lag
-- **Postgres CDC at MySQL parity** — 29.4K → 48.5K events/s via fast_uuid_v7, zero-copy tuples, counter/LSN caches, Arc schemas, pre-alloc batches ([e611f93](https://github.com/vnvo/deltaforge/commit/e611f93), [0636159](https://github.com/vnvo/deltaforge/commit/0636159))
-- **pgwire-replication v0.3** — buffered WAL reads, `Io(Arc<io::Error>)` structured errors ([7bbaa82](https://github.com/vnvo/deltaforge/commit/7bbaa82))
+- **Postgres CDC optimizations** — 29.4K to 48.5K events/s via fast_uuid_v7, zero-copy tuples, counter/LSN caches, Arc schemas, pre-alloc batches ([e611f93](https://github.com/vnvo/deltaforge/commit/e611f93), [0636159](https://github.com/vnvo/deltaforge/commit/0636159))
 
 ### Fixed
 
-- **Postgres `escape_like`** — `_` escaped as literal, glob `*` converted to SQL `%` ([9c8fba2](https://github.com/vnvo/deltaforge/commit/9c8fba2))
+- **Postgres `escape_like`** — `_` escaped as literal, glob `*` converted to SQL `%`; fixed `test_build_pattern_query` test ([9c8fba2](https://github.com/vnvo/deltaforge/commit/9c8fba2))
 - **Postgres soak writer** — `f64`→`NUMERIC` type fix, reconnect loop, errors promoted to `warn` ([9c8fba2](https://github.com/vnvo/deltaforge/commit/9c8fba2))
+- **Failover e2e tests** — replaced fixed `sleep(10s)` with connection retry loop (up to 30s) for MySQL container readiness
+- **MySQL drain writer deadlock** — removed `pool.disconnect().await` that could hang when connections were still in scope
 
 - **Filter processor** — native Rust processor that drops events not matching configured criteria ([543e632](https://github.com/vnvo/deltaforge/commit/543e632eca6b159eddbfd9d7e93b4dce056c4610), [52b3fb7](https://github.com/vnvo/deltaforge/commit/52b3fb753b153f3d030ef31ff10d45038c7b63b8), [0b847a5](https://github.com/vnvo/deltaforge/commit/0b847a59dbb382734b16abf37c9b478521d3063c))
   - Three independent gates evaluated in order — all must pass: **op** (create/update/delete/read/truncate), **table** (AllowList glob patterns with include/exclude), **fields** (predicates against `event.after`)
