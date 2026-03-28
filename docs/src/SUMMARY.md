@@ -25,6 +25,7 @@
     - [Schema Sensing](schemasensing.md)
     - [Failover Handling](failover.md)
 - [Observability](observability.md)
+- [Performance Tuning](performance.md)
 - [Examples](examples/README.md)
     - [MySQL to Redis](examples/mysql_to_redis.md)
     - [Turso to Kafka](examples/turso_to_kafka.md)
