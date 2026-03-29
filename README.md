@@ -131,9 +131,10 @@ Output: `{"schema":null,"payload":{...}}`
   - JSON Schema export for downstream consumers
 
 - **Checkpoints**
+  - Per-sink independent checkpoints — fastest sink never waits for slowest
   - Pluggable backends (File, SQLite with versioning, in-memory)
   - Configurable commit policies (all, required, quorum)
-  - Transaction boundary preservation (best effort)
+  - Transaction boundary preservation (`respect_source_tx: true` by default)
 
 - **Processors**
   - JavaScript processor using `deno_core`:
@@ -146,9 +147,9 @@ Output: `{"schema":null,"payload":{...}}`
     - Native Rust processor for dropping events by op type, table pattern, or field predicates (eq, ne, gt, in, regex, changed, and more)
 
 - **Sinks**
-  - Kafka producer sink (via `rdkafka`)
-  - Redis stream sink
-  - NATS JetStream sink (via `async_nats`)
+  - Kafka producer sink (via `rdkafka`) — exactly-once delivery with transactional producer
+  - Redis stream sink — idempotency keys for consumer-side dedup
+  - NATS JetStream sink (via `async_nats`) — server-side dedup via `Nats-Msg-Id`
   - Dynamic routing: per-event topic/stream/subject via templates or JavaScript
   - Configurable envelope formats: Native, Debezium, CloudEvents
   - JSON wire encoding (Avro planned and more to come)
@@ -172,6 +173,7 @@ See [Envelope Formats](docs/src/envelopes.md) for detailed examples and wire for
 ## Documentation
 
 - 📘 Online docs: <https://vnvo.github.io/deltaforge>
+- 🔒 [Guarantees & Correctness](docs/src/guarantees.md) — delivery tiers, ordering model, transaction boundaries, failure isolation, retry behavior
 - 🛠 Local: `mdbook serve docs` (browse at <http://localhost:3000>)
 
 ## Local development helper
@@ -237,20 +239,19 @@ The container runs as a non-root user, writes checkpoints to `/app/data/df_check
 
 ## Architecture Highlights
 
-### At-least-once and Checkpoint Timing Guarantees
+### Delivery Guarantees
 
-DeltaForge guarantees at-least-once delivery through careful checkpoint ordering:
+DeltaForge supports **exactly-once** (Kafka transactions), **at-least-once with server-side dedup** (NATS), and **at-least-once with consumer-side dedup** (Redis). Checkpoints are saved only after sink acknowledgement — never before.
+
+Each sink maintains its own independent checkpoint. The fastest sink is never held back by the slowest. On restart, the source replays from the minimum checkpoint across all sinks.
 
 ```
-Source → Processor → Sink (deliver) → Checkpoint (save)
-                           │
-                    Sink acknowledges
-                    successful delivery
-                           │
-                    THEN checkpoint saved
+Source → Processor → Sinks (deliver concurrently) → Policy check → Per-sink checkpoints
 ```
 
-Checkpoints are never saved before events are delivered. A crash between delivery and checkpoint causes replay (duplicates possible), but never loss.
+Transaction boundaries are preserved: all rows from one database transaction appear in the same batch and are delivered atomically to each sink (`respect_source_tx: true` by default).
+
+📘 Full details: [Guarantees & Correctness](docs/src/guarantees.md)
 
 ### Schema-Checkpoint Correlation
 
