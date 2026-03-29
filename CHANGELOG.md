@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Exactly-once delivery** — Kafka transactional producer (`exactly_once: true`), NATS `Nats-Msg-Id` server-side dedup, Redis `idempotency_key` for consumer-side dedup. Per-sink independent checkpoints: each sink advances its own checkpoint, source replays from min across all sinks. ~7-11% overhead with tuned batching (134K events/s MySQL, 53K Postgres). `SinkError::Fatal` for producer fencing detection.
+- **Exactly-once chaos scenario** — `--scenario exactly-once` crash recovery with `read_committed` consumer verification
+- **Transaction metrics** — `deltaforge_sink_txn_commits_total`, `deltaforge_sink_txn_aborts_total` counters; per-sink checkpoint status/age gauges
+- **Drain benchmark enhancements** — configurable `--drain-target`, `--drain-writers`, `--drain-timeout`, `--drain-max-bytes`, `--exactly-once`; effective config dump before each run
+- **Log aggregation** — Loki + Promtail for centralized container log viewing in Grafana
+- **Docker Compose profile isolation** — `base`, `mysql-infra`, `pg-infra`, `kafka-infra` profiles separate from app profiles; start/stop DeltaForge without affecting infrastructure
+- **Grafana dashboard overhaul** — template variables (instance/pipeline/source/sink/processor), "Checkpoints & Exactly-Once" row, repeating per-pipeline detail rows, Loki datasource
 - **Postgres soak & backlog-drain** — 120-table soak test and 1M-row drain benchmark for `--source postgres` ([de9e8b2](https://github.com/vnvo/deltaforge/commit/de9e8b2), [9c8fba2](https://github.com/vnvo/deltaforge/commit/9c8fba2))
 - **Config Lab UI** — A/B config comparison with presets, side-by-side editors, and sequential scenario runner ([e611f93](https://github.com/vnvo/deltaforge/commit/e611f93))
 - **Chaos UI improvements** — activity bar with per-button loading state, unified console log with smart auto-scroll, Docker image selector dropdown with stale image detection, service refresh button, dynamic port/URL badges, PATCH proxy endpoint, per-scenario proxy bypass toggle
@@ -18,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Default `batch.max_bytes`** — bumped from 3MB to 16MB; the old 3MB default silently capped batches at ~6K events, causing disproportionate exactly-once overhead
+- **Coordinator commit policy** — policy check now runs before per-sink checkpoint commits (not after); returns error instead of warning when unsatisfied
+- **Coordinator checkpoint commits** — per-sink commits run concurrently via `join_all` instead of sequentially
+- **Binlog retention** — extended from 10 min to 1 hour in chaos compose for large drain benchmarks
+- **Prometheus/Loki retention** — both set to 7 days for chaos test environments
 - **Kafka sink `DEFAULT_LINGER_MS`** — lowered from 20ms to 5ms; the coordinator enqueues full batches in bursts so rdkafka batches naturally without long linger waits (was the primary throughput bottleneck)
 - **Coordinator batch pipelining** — `max_inflight` decouples event accumulation from sink delivery via bounded channel; overlaps batch building with Kafka produce for higher throughput
 - **Drain benchmark defaults** — `max_events=4000`, `max_inflight=4`, `linger.ms=0`; no other kafka overrides (sink defaults are sufficient)
@@ -29,6 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Partial batch flush at WAL tail** — `recv_many` blocked indefinitely when the source went idle, preventing the timer from flushing the last partial batch; now wrapped in `timeout(tick_ms)`
+- **Per-sink checkpoint legacy fallback** — `PerSinkCheckpointProxy` now falls back to the legacy plain `source_id` checkpoint key when no per-sink keys exist, enabling seamless migration
+- **Kafka producer fencing in delivery path** — fencing detected via abort_transaction failure (not just begin/commit), returns `SinkError::Fatal`
+- **Kafka abort_transaction logging** — abort failures after commit/delivery errors now logged instead of silently discarded
+- **SQLite `list_with_prefix` LIKE escaping** — `%` and `_` in prefix strings now escaped with `ESCAPE '\'`
 - **Postgres `escape_like`** — `_` escaped as literal, glob `*` converted to SQL `%`; fixed `test_build_pattern_query` test ([9c8fba2](https://github.com/vnvo/deltaforge/commit/9c8fba2))
 - **Postgres soak writer** — `f64`→`NUMERIC` type fix, reconnect loop, errors promoted to `warn` ([9c8fba2](https://github.com/vnvo/deltaforge/commit/9c8fba2))
 - **Failover e2e tests** — replaced fixed `sleep(10s)` with connection retry loop (up to 30s) for MySQL container readiness
