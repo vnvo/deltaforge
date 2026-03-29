@@ -85,6 +85,22 @@ password: ${NATS_PASSWORD}
 token: ${NATS_TOKEN}
 ```
 
+## Deduplication
+
+DeltaForge sets the `Nats-Msg-Id` header on every published message using a deterministic idempotency key derived from the event's source, transaction, and row identity. JetStream uses this header for **server-side deduplication** within the stream's `duplicate_window`.
+
+This means: if DeltaForge replays a batch after a crash, duplicate messages are automatically discarded by the server — no consumer-side dedup needed (within the dedup window).
+
+Configure `duplicate_window` on the stream to match your maximum expected replay window:
+
+```bash
+nats stream add ORDERS \
+  --subjects "orders.>" \
+  --duplicate-window 5m    # Dedup messages replayed within 5 minutes
+```
+
+The default `duplicate_window` is 2 minutes. Increase this if DeltaForge might be down longer before restarting.
+
 ## JetStream setup
 
 Before using the NATS sink with JetStream, create a stream that captures your subject:

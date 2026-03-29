@@ -488,12 +488,14 @@ async fn run_coordinator_bench(
     let cancel = CancellationToken::new();
     let (_pause_tx, pause_rx) = watch::channel(false);
 
-    let coord = Coordinator::builder("bench-pipeline")
-        .sinks(sinks)
+    let mut builder = Coordinator::builder("bench-pipeline")
+        .sinks(sinks.clone())
         .batch_config(batch_config)
-        .commit_fn(noop_commit_fn())
-        .process_fn(noop_process_fn())
-        .build();
+        .process_fn(noop_process_fn());
+    for s in &sinks {
+        builder = builder.commit_fn(s.id(), noop_commit_fn());
+    }
+    let coord = builder.build();
 
     for ev in events {
         tx.send(ev).await?;
@@ -517,13 +519,15 @@ async fn run_coordinator_bench_with_sensing(
 
     let sensor = Arc::new(SchemaSensorState::new(sensing_config));
 
-    let coord = Coordinator::builder("bench-pipeline")
-        .sinks(sinks)
+    let mut builder = Coordinator::builder("bench-pipeline")
+        .sinks(sinks.clone())
         .batch_config(batch_config)
-        .commit_fn(noop_commit_fn())
         .process_fn(noop_process_fn())
-        .schema_sensor(sensor)
-        .build();
+        .schema_sensor(sensor);
+    for s in &sinks {
+        builder = builder.commit_fn(s.id(), noop_commit_fn());
+    }
+    let coord = builder.build();
 
     for ev in events {
         tx.send(ev).await?;

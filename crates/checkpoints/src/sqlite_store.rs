@@ -121,6 +121,46 @@ impl CheckpointStore for SqliteCheckpointStore {
         Ok(())
     }
 
+    async fn put_raw_multi(
+        &self,
+        entries: &[(&str, &[u8])],
+    ) -> CheckpointResult<()> {
+        let owned: Vec<(String, Vec<u8>)> = entries
+            .iter()
+            .map(|&(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+
+        db!(self.conn, move |conn: &Connection| {
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| CheckpointError::Database(e.to_string()))?;
+            for (key, payload) in &owned {
+                let next_version: i64 = tx
+                    .query_row(
+                        "SELECT COALESCE(MAX(version), 0) + 1 \
+                         FROM checkpoints WHERE key = ?1",
+                        params![key],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| CheckpointError::Database(e.to_string()))?;
+                tx.execute(
+                    "INSERT INTO checkpoints (key, version, payload, created_at) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        key,
+                        next_version,
+                        payload,
+                        Utc::now().to_rfc3339()
+                    ],
+                )
+                .map_err(|e| CheckpointError::Database(e.to_string()))?;
+            }
+            tx.commit()
+                .map_err(|e| CheckpointError::Database(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     async fn delete(&self, source_id: &str) -> CheckpointResult<bool> {
         let key = source_id.to_owned();
         db!(self.conn, move |conn: &Connection| {
@@ -137,6 +177,34 @@ impl CheckpointStore for SqliteCheckpointStore {
                 .map_err(|e| CheckpointError::Database(e.to_string()))?;
             let rows = stmt
                 .query_map([], |row| row.get(0))
+                .map_err(|e| CheckpointError::Database(e.to_string()))?;
+            rows.map(|r| {
+                r.map_err(|e| CheckpointError::Database(e.to_string()))
+            })
+            .collect()
+        })
+    }
+
+    async fn list_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> CheckpointResult<Vec<String>> {
+        // Escape LIKE wildcards in the prefix so % and _ are treated as
+        // literal characters, then append % for the actual prefix match.
+        let escaped = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("{}%", escaped);
+        db!(self.conn, move |conn: &Connection| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT key FROM checkpoints \
+                     WHERE key LIKE ?1 ESCAPE '\\' ORDER BY key",
+                )
+                .map_err(|e| CheckpointError::Database(e.to_string()))?;
+            let rows = stmt
+                .query_map(params![pattern], |row| row.get(0))
                 .map_err(|e| CheckpointError::Database(e.to_string()))?;
             rows.map(|r| {
                 r.map_err(|e| CheckpointError::Database(e.to_string()))
@@ -302,6 +370,85 @@ mod tests {
 
         let keys = store.list().await.unwrap();
         assert_eq!(keys, vec!["pipeline-a", "pipeline-b"]);
+    }
+
+    #[tokio::test]
+    async fn test_put_raw_multi_writes_atomically() {
+        let store = SqliteCheckpointStore::in_memory().unwrap();
+
+        let entries: Vec<(&str, &[u8])> = vec![
+            ("mysql::sink::kafka", b"{\"pos\":100}"),
+            ("mysql::sink::redis", b"{\"pos\":200}"),
+            ("mysql::sink::nats", b"{\"pos\":300}"),
+        ];
+        store.put_raw_multi(&entries).await.unwrap();
+
+        // All three were written.
+        assert_eq!(
+            store.get_raw("mysql::sink::kafka").await.unwrap().unwrap(),
+            b"{\"pos\":100}"
+        );
+        assert_eq!(
+            store.get_raw("mysql::sink::redis").await.unwrap().unwrap(),
+            b"{\"pos\":200}"
+        );
+        assert_eq!(
+            store.get_raw("mysql::sink::nats").await.unwrap().unwrap(),
+            b"{\"pos\":300}"
+        );
+
+        // Each key should have exactly 1 version.
+        let keys = store.list().await.unwrap();
+        assert_eq!(keys.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_put_raw_multi_updates_existing() {
+        let store = SqliteCheckpointStore::in_memory().unwrap();
+
+        // Initial write.
+        store.put_raw("mysql::sink::kafka", b"v1").await.unwrap();
+
+        // Batch update.
+        let entries: Vec<(&str, &[u8])> =
+            vec![("mysql::sink::kafka", b"v2"), ("mysql::sink::redis", b"r1")];
+        store.put_raw_multi(&entries).await.unwrap();
+
+        // Kafka advanced to v2, redis created at r1.
+        assert_eq!(
+            store.get_raw("mysql::sink::kafka").await.unwrap().unwrap(),
+            b"v2"
+        );
+        assert_eq!(
+            store.get_raw("mysql::sink::redis").await.unwrap().unwrap(),
+            b"r1"
+        );
+
+        // Kafka should have 2 versions.
+        let versions = store.list_versions("mysql::sink::kafka").await.unwrap();
+        assert_eq!(versions.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_list_with_prefix() {
+        let store = SqliteCheckpointStore::in_memory().unwrap();
+
+        store.put_raw("mysql::sink::kafka", b"k").await.unwrap();
+        store.put_raw("mysql::sink::redis", b"r").await.unwrap();
+        store.put_raw("pg::sink::nats", b"n").await.unwrap();
+        store.put_raw("other-key", b"o").await.unwrap();
+
+        let mysql_sinks =
+            store.list_with_prefix("mysql::sink::").await.unwrap();
+        assert_eq!(mysql_sinks.len(), 2);
+        assert!(mysql_sinks.contains(&"mysql::sink::kafka".to_string()));
+        assert!(mysql_sinks.contains(&"mysql::sink::redis".to_string()));
+
+        let pg_sinks = store.list_with_prefix("pg::sink::").await.unwrap();
+        assert_eq!(pg_sinks.len(), 1);
+
+        let all = store.list_with_prefix("").await.unwrap();
+        assert_eq!(all.len(), 4);
     }
 
     #[tokio::test]

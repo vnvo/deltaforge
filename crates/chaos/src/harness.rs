@@ -116,6 +116,53 @@ pub async fn wait_for_url(url: &str, timeout: Duration) -> Result<()> {
     }
 }
 
+/// Count messages visible to a `read_committed` consumer for the chaos topic
+/// (partition 0) from `start_offset` to the current end. This is the true
+/// committed message count — uncommitted transactional messages are excluded.
+pub async fn kafka_committed_count(start_offset: u64) -> Result<u64> {
+    use rdkafka::Message;
+    use rdkafka::TopicPartitionList;
+    use rdkafka::consumer::StreamConsumer;
+
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", KAFKA_BROKERS)
+        .set("group.id", format!("chaos-rc-{}", start_offset))
+        .set("auto.offset.reset", "earliest")
+        .set("enable.partition.eof", "true")
+        .set("isolation.level", "read_committed")
+        .create()
+        .context("read_committed consumer")?;
+
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition_offset(
+        CHAOS_TOPIC,
+        0,
+        rdkafka::Offset::Offset(start_offset as i64),
+    )?;
+    consumer.assign(&tpl)?;
+
+    let mut count = 0u64;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            consumer.recv(),
+        )
+        .await
+        {
+            Ok(Ok(msg)) => {
+                if msg.payload().is_some() {
+                    count += 1;
+                }
+            }
+            Ok(Err(rdkafka::error::KafkaError::PartitionEOF(_))) => break,
+            Ok(Err(_)) => break,
+            Err(_) => break, // timeout
+        }
+    }
+    Ok(count)
+}
+
 /// Return the high-watermark offset for any topic (partition 0).
 pub async fn kafka_offset_for_topic(topic: &str) -> Result<u64> {
     let consumer: BaseConsumer = ClientConfig::new()

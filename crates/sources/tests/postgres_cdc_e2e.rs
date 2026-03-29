@@ -245,8 +245,8 @@ async fn postgres_schema_loader() -> Result<()> {
     assert!(loaded.schema.column("price").unwrap().nullable);
     info!("✓ schema load + nullable detection");
 
-    // Wildcard expansion
-    let tables = loader.preload(&["public.order%".to_string()]).await?;
+    // Wildcard expansion (use glob `*` — `%` is treated as literal)
+    let tables = loader.preload(&["public.order*".to_string()]).await?;
     assert!(tables.len() >= 2);
     info!("✓ wildcard expansion");
 

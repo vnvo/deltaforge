@@ -4,31 +4,56 @@ This guide covers throughput optimization for DeltaForge CDC pipelines, based on
 
 > **Note:** These results and recommendations are a starting point. Every deployment has unique requirements — hardware, network topology, database workload patterns, event sizes, and downstream consumer capacity all affect real-world throughput. Profile your own workload and iterate.
 
-## Some Benchmark Results
+## Benchmark Results
 
-Measured on Docker containers on a single developer machine (not dedicated infrastructure):
+Measured on Docker containers on a single developer machine (not dedicated infrastructure), draining a 1-10M row backlog to a single-node Kafka broker.
 
-| Source | Batch Size | Avg (events/s) | Peak (events/s) |
-|--------|-----------|----------------|-----------------|
-| MySQL | 4,000 | **117K** | **122K** |
-| Postgres | 4,000 | **48K** | **51K** |
+### With tuned batching (recommended)
+
+`batch.max_events=16000`, `batch.max_bytes=16MB`, `batch.max_inflight=4`, `linger.ms=0`
+
+| Source | Mode | Avg (events/s) | Peak (events/s) |
+|--------|------|----------------|-----------------|
+| MySQL | at-least-once | **151K** | **159K** |
+| MySQL | exactly-once | **134K** | **143K** |
+| Postgres | at-least-once | **57K** | **64K** |
+| Postgres | exactly-once | **53K** | **55K** |
+
+Exactly-once overhead is **~7-11%** when batch sizes are properly tuned.
+
+### Why `max_bytes` matters
+
+These results show the impact of a small `max_bytes` (3MB) with `max_events=8000`:
+
+| Source | Mode | Avg (events/s) | Peak (events/s) |
+|--------|------|----------------|-----------------|
+| MySQL | at-least-once | **110K** | **122K** |
+| MySQL | exactly-once | **48K** | **57K** |
+
+A 3MB byte limit caps batches at ~6,000 events regardless of `max_events`, making transaction commits proportionally expensive. The default `max_bytes` is 16MB — sufficient for batches up to ~32K events at typical event sizes.
 
 Your numbers will differ based on hardware, network latency, event size, and Kafka/database configuration.
 
 ## Key Tuning Parameters
 
-### Batch Size (`batch.max_events`)
+### Batch Size (`batch.max_events` + `batch.max_bytes`)
 
-The single most impactful setting. Larger batches amortize per-batch overhead (Kafka produce, checkpoint commit, metrics recording) across more events. However, very large batches can cause serialization bottlenecks.
+The single most impactful setting. Larger batches amortize per-batch overhead (Kafka produce, transaction commit, checkpoint write, metrics recording) across more events.
 
-Recommended: **2,000-4,000** for high-throughput drain/catch-up workloads. The default (2,000) is a reasonable starting point for steady-state pipelines.
+**Important:** `max_events` and `max_bytes` both cap batch size — whichever triggers first wins. If you set `max_bytes` too low, it will silently cap your batches regardless of `max_events`. The default (16MB) accommodates batch sizes up to ~32K events at typical event sizes.
+
+Recommended for high-throughput drain/catch-up:
 
 ```yaml
 spec:
   batch:
-    max_events: 4000
+    max_events: 16000
+    max_bytes: 16777216   # 16MB — room for 16K events
     max_ms: 100
+    max_inflight: 4
 ```
+
+For steady-state pipelines with lower latency requirements, the defaults (`max_events=2000, max_bytes=3MB`) are fine.
 
 ### Kafka Linger (`linger.ms`)
 
@@ -121,6 +146,45 @@ Postgres logical replication (pgoutput) sends one WAL message per row change, ma
 - **`tables`** — use specific patterns. Broad patterns force schema loading and filtering for unneeded tables.
 
 The throughput gap between Postgres and MySQL is primarily due to protocol-level differences (one WAL message per row vs. batched rows), not code inefficiency.
+
+## Exactly-Once Delivery Overhead
+
+Enabling `exactly_once: true` on sinks adds per-batch transaction overhead:
+
+### Kafka Transactional Producer
+
+Each batch is wrapped in `begin_transaction()` / `commit_transaction()`. The transaction commit adds a constant ~1-3ms per batch (broker-side two-phase commit), so larger batches amortize the cost better.
+
+**Measured overhead** (Docker containers, single developer machine, 1-10M row drain):
+
+| Source | at-least-once | exactly-once | Overhead |
+|--------|--------------|-------------|----------|
+| MySQL | 151K events/s | 134K events/s | ~11% |
+| Postgres | 57K events/s | 53K events/s | ~7% |
+
+These numbers use tuned batch settings (`max_events=16000, max_bytes=16MB`). With a small `max_bytes` (e.g. 3MB), batches are capped at ~6K events regardless of `max_events`, making the transaction commit disproportionately expensive. The default `max_bytes` (16MB) is sufficient for most workloads.
+
+Key considerations:
+
+- **`transaction.timeout.ms`** (set to 60s by DeltaForge): if a batch takes longer than this to deliver, the broker aborts the transaction. Increase for very large batches or high-latency networks.
+- **`transactional.id`** must be unique per pipeline-sink pair. DeltaForge sets this automatically to `deltaforge-{pipeline_id}-{sink_id}`.
+- **Producer fencing**: if two producers share the same `transactional.id`, the broker fences (kills) the older one. This is detected as a `Fatal` error and stops the pipeline. Ensure only one instance of each pipeline runs at a time.
+
+### NATS JetStream
+
+Deduplication uses the `Nats-Msg-Id` header (server-side). No client-side transaction overhead, but the server maintains a dedup window. Configure `duplicate_window` on the stream to match your replay window (default 2 minutes).
+
+### Redis Streams
+
+Idempotency keys are embedded in the XADD payload. No transaction overhead on the Redis side — deduplication is the consumer's responsibility. This is a Tier 2 guarantee (at-least-once with idempotency keys for consumer-side dedup).
+
+### Per-Sink Checkpoints
+
+Each sink maintains its own checkpoint, committed independently after successful delivery. The source replays from the minimum checkpoint across all sinks. This means:
+
+- **Faster sinks are not held back** by slower ones — they advance their own checkpoints independently.
+- **Adding a new sink** to an existing pipeline triggers a replay from the source's earliest available position for that sink only.
+- **Checkpoint storage overhead** scales linearly with the number of sinks (one key per sink per source).
 
 ## Profiling
 

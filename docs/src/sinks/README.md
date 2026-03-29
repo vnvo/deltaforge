@@ -97,6 +97,26 @@ sinks:
       required: true   # Checkpoint waits for this
 ```
 
+### Per-sink independent checkpoints
+
+Each sink maintains its own checkpoint, committed independently after successful delivery. This means:
+
+- **Faster sinks are not held back** by slower ones — each sink advances its own checkpoint
+- The source replays from the **minimum** checkpoint across all sinks, so a slow sink only causes replay for itself, not re-delivery to sinks that are already ahead
+- **Adding a new sink** to an existing pipeline triggers replay from the source's earliest position for that sink only; existing sinks are unaffected
+- **Removing a sink** cleans up its checkpoint automatically on the next pipeline patch
+
+This architecture avoids the common CDC pitfall where the slowest sink becomes a bottleneck for all other sinks.
+
+### Delivery guarantee tiers
+
+| Sink | Guarantee | Mechanism |
+|------|-----------|-----------|
+| Kafka (`exactly_once: true`) | **Exactly-once** | Kafka transactions (two-phase commit) |
+| Kafka (`exactly_once: false`) | At-least-once | Idempotent producer (dedup during retries) |
+| NATS JetStream | At-least-once + server dedup | `Nats-Msg-Id` header within `duplicate_window` |
+| Redis Streams | At-least-once + consumer dedup | `idempotency_key` field in XADD payload |
+
 ### Practical patterns
 
 **Primary + secondary**: One critical sink (Kafka for durability) marked `required: true`, with secondary sinks (Redis for caching, testing or experimentation) marked `required: false`.

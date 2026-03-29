@@ -1699,3 +1699,199 @@ async fn kafka_sink_raw_payload_bypasses_envelope() -> Result<()> {
     delete_topic(&brokers, &topic).await?;
     Ok(())
 }
+
+// =============================================================================
+// Exactly-Once / Transactional Tests
+// =============================================================================
+
+/// Build a KafkaSink with exactly_once enabled (transactional producer).
+fn make_txn_sink(
+    id: &str,
+    brokers: &str,
+    topic: &str,
+    pipeline: &str,
+) -> Result<KafkaSink> {
+    let cfg = KafkaSinkCfg {
+        id: id.into(),
+        brokers: brokers.into(),
+        topic: topic.into(),
+        key: None,
+        envelope: EnvelopeCfg::Native,
+        encoding: EncodingCfg::Json,
+        required: Some(true),
+        exactly_once: Some(true),
+        send_timeout_secs: Some(30),
+        client_conf: HashMap::new(),
+        filter: None,
+    };
+    KafkaSink::new(&cfg, CancellationToken::new(), pipeline)
+}
+
+/// Create a consumer with read_committed isolation — only sees committed
+/// transactional messages.
+fn create_read_committed_consumer(
+    brokers: &str,
+    topic: &str,
+    group_id: &str,
+) -> Result<StreamConsumer> {
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("group.id", group_id)
+        .set("auto.offset.reset", "earliest")
+        .set("enable.partition.eof", "false")
+        .set("session.timeout.ms", "6000")
+        .set("isolation.level", "read_committed")
+        .create()?;
+
+    consumer.subscribe(&[topic])?;
+    Ok(consumer)
+}
+
+/// Verify that a transactional batch is delivered atomically —
+/// a read_committed consumer sees all events from the batch.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_exactly_once_batch_atomic() -> Result<()> {
+    let (brokers, topic) = setup("eo-atomic", 1).await?;
+
+    let sink = make_txn_sink("eo-kafka", &brokers, &topic, "test-eo")?;
+
+    let events: Vec<Event> = (0..50).map(make_test_event).collect();
+    sink.send_batch(&events).await?;
+
+    // read_committed consumer should see all 50 events
+    let consumer =
+        create_read_committed_consumer(&brokers, &topic, "eo-atomic-cg")?;
+    let messages = consume_n(&consumer, 50, 15).await;
+
+    assert_eq!(
+        messages.len(),
+        50,
+        "read_committed consumer must see exactly 50 committed events"
+    );
+
+    // Verify event IDs are correct
+    for (i, msg) in messages.iter().enumerate() {
+        let parsed: Event = serde_json::from_slice(msg)?;
+        assert_eq!(
+            parsed.after.as_ref().unwrap()["id"],
+            json!(i as i64),
+            "event {} should have correct id",
+            i
+        );
+    }
+
+    info!("✓ transactional batch delivered atomically (50 events)");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
+/// Verify that single-event send() also goes through the transactional path.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_exactly_once_single_event() -> Result<()> {
+    let (brokers, topic) = setup("eo-single", 1).await?;
+
+    let sink = make_txn_sink("eo-single-kafka", &brokers, &topic, "test-eo-s")?;
+
+    let event = make_test_event(42);
+    sink.send(&event).await?;
+
+    let consumer =
+        create_read_committed_consumer(&brokers, &topic, "eo-single-cg")?;
+    let messages = consume_n(&consumer, 1, 10).await;
+
+    assert_eq!(
+        messages.len(),
+        1,
+        "should receive exactly 1 committed event"
+    );
+    let parsed: Event = serde_json::from_slice(&messages[0])?;
+    assert_eq!(parsed.event_id, event.event_id);
+
+    info!("✓ single event via transactional send");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
+/// Verify that two producers with the same transactional.id fence each other —
+/// the second producer causes the first to fail with a fatal error.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_exactly_once_producer_fencing() -> Result<()> {
+    let (brokers, topic) = setup("eo-fence", 1).await?;
+
+    // First producer
+    let sink1 = make_txn_sink("eo-fence-kafka", &brokers, &topic, "test-eo-f")?;
+
+    // Send a batch — this works fine
+    let events: Vec<Event> = (0..10).map(make_test_event).collect();
+    sink1.send_batch(&events).await?;
+
+    // Second producer with SAME pipeline name + sink id → same transactional.id
+    // This will fence the first producer
+    let sink2 = make_txn_sink("eo-fence-kafka", &brokers, &topic, "test-eo-f")?;
+
+    // sink2 should work fine
+    let events2: Vec<Event> = (10..20).map(make_test_event).collect();
+    sink2.send_batch(&events2).await?;
+
+    // sink1 should now fail with a fatal error (fenced)
+    let events3: Vec<Event> = (20..30).map(make_test_event).collect();
+    let result = sink1.send_batch(&events3).await;
+    assert!(result.is_err(), "fenced producer should fail");
+
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, deltaforge_core::SinkError::Fatal { .. }),
+        "fenced producer should return Fatal error, got: {:?}",
+        err
+    );
+
+    info!("✓ producer fencing detected as fatal error");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}
+
+/// Verify that multiple transactional batches are delivered in sequence
+/// and a read_committed consumer sees them in order.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn kafka_sink_exactly_once_multiple_batches() -> Result<()> {
+    let (brokers, topic) = setup("eo-multi", 1).await?;
+
+    let sink = make_txn_sink("eo-multi-kafka", &brokers, &topic, "test-eo-m")?;
+
+    // Send 5 batches of 20 events each
+    for batch_idx in 0..5u32 {
+        let start = (batch_idx * 20) as i64;
+        let events: Vec<Event> =
+            (start..start + 20).map(make_test_event).collect();
+        sink.send_batch(&events).await?;
+    }
+
+    let consumer =
+        create_read_committed_consumer(&brokers, &topic, "eo-multi-cg")?;
+    let messages = consume_n(&consumer, 100, 20).await;
+
+    assert_eq!(
+        messages.len(),
+        100,
+        "should receive all 100 events across 5 transactions"
+    );
+
+    // Verify ordering within partition (single partition topic)
+    for (i, msg) in messages.iter().enumerate() {
+        let parsed: Event = serde_json::from_slice(msg)?;
+        assert_eq!(
+            parsed.after.as_ref().unwrap()["id"],
+            json!(i as i64),
+            "event {} out of order",
+            i
+        );
+    }
+
+    info!("✓ 5 transactional batches delivered in order (100 events)");
+    delete_topic(&brokers, &topic).await?;
+    Ok(())
+}

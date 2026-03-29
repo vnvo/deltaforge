@@ -41,16 +41,6 @@ use crate::scenarios::soak::SoakSource;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Number of rows to insert before starting DeltaForge.
-const TARGET_EVENTS: u64 = 1_000_000;
-
-/// Concurrent writer tasks during the population phase.
-/// No artificial delay — we want maximum write throughput.
-const WRITER_TASKS: usize = 32;
-
-/// Maximum time to wait for the drain to complete after resuming.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(600); // 10 min
-
 /// How often to sample the Kafka offset during drain.
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -59,6 +49,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Per-run throughput settings applied via PATCH before the drain starts.
 #[derive(Debug, Clone)]
 pub struct DrainConfig {
+    /// Number of rows to insert before starting DeltaForge.
+    pub target_events: u64,
+    /// Concurrent writer tasks during the population phase.
+    pub writer_tasks: usize,
+    /// Maximum time (seconds) to wait for the drain to complete after resuming.
+    /// 0 = auto-scale based on target_events (10s per 1M events, minimum 120s).
+    pub drain_timeout_secs: u64,
     /// Max events per batch (pipeline spec `batch.max_events`).
     pub max_events: u64,
     /// Max batch age in ms (pipeline spec `batch.max_ms`).
@@ -73,10 +70,30 @@ pub struct DrainConfig {
     /// Whether schema sensing is enabled during the drain.
     /// Disabling it improves throughput significantly.
     pub schema_sensing: bool,
+    /// Max batch size in bytes. 0 = leave unchanged (default 3MB).
+    pub max_bytes: u64,
     /// rdkafka producer overrides applied to the sink's `client_conf`.
     /// Common keys: `linger.ms`, `batch.size`, `batch.num.messages`,
     /// `compression.type`, `queue.buffering.max.messages`.
     pub kafka_client_conf: std::collections::HashMap<String, String>,
+    /// Enable or disable exactly-once (transactional) delivery on the Kafka sink.
+    /// `None` leaves the pipeline's current setting unchanged.
+    pub exactly_once: Option<bool>,
+}
+
+impl DrainConfig {
+    /// Effective drain timeout — auto-scales if `drain_timeout_secs` is 0.
+    pub fn drain_timeout(&self) -> Duration {
+        if self.drain_timeout_secs > 0 {
+            Duration::from_secs(self.drain_timeout_secs)
+        } else {
+            // 30 seconds per 1M events, minimum 120s.
+            // Conservative to accommodate exactly-once transactional overhead.
+            let secs = ((self.target_events as f64 / 1_000_000.0) * 30.0).ceil()
+                as u64;
+            Duration::from_secs(secs.max(120))
+        }
+    }
 }
 
 impl Default for DrainConfig {
@@ -88,13 +105,18 @@ impl Default for DrainConfig {
         kafka.insert("linger.ms".into(), "0".into());
 
         Self {
+            target_events: 1_000_000,
+            writer_tasks: 32,
+            drain_timeout_secs: 0, // auto-scale
             max_events: 4000,
             max_ms: 100,
             max_inflight: 4,
             commit_mode: "required".to_string(),
             commit_interval_ms: 500,
             schema_sensing: false,
+            max_bytes: 0,
             kafka_client_conf: kafka,
+            exactly_once: None,
         }
     }
 }
@@ -131,6 +153,7 @@ async fn run_with_source(
         commit_mode = %cfg.commit_mode,
         commit_interval_ms = cfg.commit_interval_ms,
         schema_sensing = cfg.schema_sensing,
+        exactly_once = ?cfg.exactly_once,
         kafka_overrides = cfg.kafka_client_conf.len(),
         "drain config"
     );
@@ -154,9 +177,13 @@ async fn run_with_source(
     info!(kafka_baseline, "kafka baseline offset recorded");
 
     // Step 4: populate the backlog.
+    let target_events = cfg.target_events;
+    let writer_tasks = cfg.writer_tasks;
+    let drain_timeout = cfg.drain_timeout();
+
     info!(
-        TARGET_EVENTS,
-        WRITER_TASKS,
+        target_events,
+        writer_tasks,
         source = src.name,
         "step 3/6: populating {} backlog ...",
         src.name,
@@ -172,14 +199,14 @@ async fn run_with_source(
         loop {
             sleep(Duration::from_secs(10)).await;
             let current = progress_ctr.load(Ordering::Relaxed);
-            if current >= TARGET_EVENTS {
+            if current >= target_events {
                 break;
             }
             let delta = current.saturating_sub(last);
             let tps = delta as f64 / last_t.elapsed().as_secs_f64();
             info!(
                 written = current,
-                remaining = TARGET_EVENTS.saturating_sub(current),
+                remaining = target_events.saturating_sub(current),
                 tps = format!("{tps:.0}"),
                 "write progress"
             );
@@ -188,13 +215,17 @@ async fn run_with_source(
         }
     });
 
-    let handles: Vec<_> = (0..WRITER_TASKS)
+    let handles: Vec<_> = (0..writer_tasks)
         .map(|id| {
             let ctr = Arc::clone(&counter);
             if is_pg {
-                tokio::spawn(async move { pg_writer(id, ctr).await })
+                tokio::spawn(
+                    async move { pg_writer(id, ctr, target_events).await },
+                )
             } else {
-                tokio::spawn(async move { mysql_writer(id, ctr).await })
+                tokio::spawn(async move {
+                    mysql_writer(id, ctr, target_events).await
+                })
             }
         })
         .collect();
@@ -223,28 +254,41 @@ async fn run_with_source(
         schema_sensing = cfg.schema_sensing,
         "step 4/6: patching pipeline '{pipeline}' and restarting ..."
     );
+    let mut batch_json = serde_json::json!({
+        "max_events": cfg.max_events,
+        "max_ms": cfg.max_ms,
+        "max_inflight": cfg.max_inflight,
+    });
+    if cfg.max_bytes > 0 {
+        batch_json["max_bytes"] = serde_json::json!(cfg.max_bytes);
+    }
     let mut patch_spec = serde_json::json!({
         "schema_sensing": {"enabled": cfg.schema_sensing},
-        "batch": {
-            "max_events": cfg.max_events,
-            "max_ms": cfg.max_ms,
-            "max_inflight": cfg.max_inflight,
-        },
+        "batch": batch_json,
         "commit_policy": {"mode": cfg.commit_mode},
     });
 
-    // If any rdkafka client_conf overrides were provided, patch the first sink.
-    if !cfg.kafka_client_conf.is_empty() {
-        let cc: serde_json::Value = cfg
-            .kafka_client_conf
-            .iter()
-            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-            .collect::<serde_json::Map<String, serde_json::Value>>()
-            .into();
-        info!(?cc, "applying kafka client_conf overrides");
-        patch_spec["sinks"] = serde_json::json!([
-            {"config": {"client_conf": cc}}
-        ]);
+    // Patch the first sink if client_conf or exactly_once is specified.
+    if !cfg.kafka_client_conf.is_empty() || cfg.exactly_once.is_some() {
+        let mut sink_patch = serde_json::json!({"config": {}});
+
+        if !cfg.kafka_client_conf.is_empty() {
+            let cc: serde_json::Value = cfg
+                .kafka_client_conf
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+                .into();
+            info!(?cc, "applying kafka client_conf overrides");
+            sink_patch["config"]["client_conf"] = cc;
+        }
+
+        if let Some(eo) = cfg.exactly_once {
+            info!(exactly_once = eo, "applying exactly_once override");
+            sink_patch["config"]["exactly_once"] = serde_json::json!(eo);
+        }
+
+        patch_spec["sinks"] = serde_json::json!([sink_patch]);
     }
 
     let patch_body = serde_json::json!({ "spec": patch_spec });
@@ -261,6 +305,24 @@ async fn run_with_source(
     if !patch_ok {
         info!("issuing explicit resume after failed patch ...");
         df_post(src.df_base, &format!("/pipelines/{pipeline}/resume")).await?;
+    }
+
+    // Dump the effective pipeline config so there's no ambiguity about what's running.
+    match df_get(src.df_base, &format!("/pipelines/{pipeline}")).await {
+        Ok(body) => {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(spec) = v.get("spec") {
+                    let flat = flatten_json("", spec);
+                    info!("── effective pipeline config ──");
+                    for (k, v) in &flat {
+                        info!("  {k} = {v}");
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not fetch pipeline config for dump")
+        }
     }
 
     let drain_start = Instant::now();
@@ -312,11 +374,11 @@ async fn run_with_source(
             break;
         }
 
-        if elapsed >= DRAIN_TIMEOUT {
+        if elapsed >= drain_timeout {
             let shortfall = rows_written.saturating_sub(delivered);
             return Ok(ScenarioResult::fail(
                 &name,
-                format!("drain timed out after {DRAIN_TIMEOUT:?}: {shortfall} events not yet delivered"),
+                format!("drain timed out after {drain_timeout:?}: {shortfall} events not yet delivered"),
             )
             .note(format!("source: {}", src.name))
             .note(format!("rows written: {rows_written}"))
@@ -349,12 +411,18 @@ async fn run_with_source(
     let mut result = ScenarioResult::pass(&name)
         .note(format!("source: {}", src.name))
         .note(format!("connection: {conn_mode}"))
-        .note(format!("target events: {TARGET_EVENTS}"))
+        .note(format!("target events: {target_events}"))
         .note(format!("rows written: {rows_written}"))
         .note(format!("batch max_events: {}", cfg.max_events))
         .note(format!("batch max_inflight: {}", cfg.max_inflight))
         .note(format!("commit mode: {}", cfg.commit_mode))
-        .note(format!("schema sensing: {}", cfg.schema_sensing));
+        .note(format!("schema sensing: {}", cfg.schema_sensing))
+        .note(format!(
+            "exactly_once: {}",
+            cfg.exactly_once
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "unchanged".into())
+        ));
 
     if !cfg.kafka_client_conf.is_empty() {
         let pairs: Vec<String> = cfg
@@ -382,7 +450,7 @@ async fn run_with_source(
 /// Rows per multi-row INSERT statement in the MySQL writer.
 const MYSQL_BATCH_SIZE: usize = 64;
 
-async fn mysql_writer(id: usize, counter: Arc<AtomicU64>) {
+async fn mysql_writer(id: usize, counter: Arc<AtomicU64>, target: u64) {
     use mysql_async::prelude::Queryable;
 
     let tables = soak_tables();
@@ -392,7 +460,7 @@ async fn mysql_writer(id: usize, counter: Arc<AtomicU64>) {
 
     // Outer loop: acquire a connection and reuse it for many inserts.
     loop {
-        if counter.load(Ordering::Relaxed) >= TARGET_EVENTS {
+        if counter.load(Ordering::Relaxed) >= target {
             return;
         }
 
@@ -410,12 +478,12 @@ async fn mysql_writer(id: usize, counter: Arc<AtomicU64>) {
             // Reserve a batch of rows.
             let batch_start =
                 counter.fetch_add(MYSQL_BATCH_SIZE as u64, Ordering::Relaxed);
-            if batch_start >= TARGET_EVENTS {
+            if batch_start >= target {
                 counter.fetch_sub(MYSQL_BATCH_SIZE as u64, Ordering::Relaxed);
                 return; // pool + conn dropped automatically
             }
             let actual_batch =
-                ((TARGET_EVENTS - batch_start) as usize).min(MYSQL_BATCH_SIZE);
+                ((target - batch_start) as usize).min(MYSQL_BATCH_SIZE);
             if actual_batch < MYSQL_BATCH_SIZE {
                 counter.fetch_sub(
                     (MYSQL_BATCH_SIZE - actual_batch) as u64,
@@ -465,7 +533,7 @@ async fn mysql_writer(id: usize, counter: Arc<AtomicU64>) {
 
 // ── Postgres writer ───────────────────────────────────────────────────────────
 
-async fn pg_writer(id: usize, counter: Arc<AtomicU64>) {
+async fn pg_writer(id: usize, counter: Arc<AtomicU64>, target: u64) {
     let tables = soak_tables();
     let mut rng =
         <rand::rngs::SmallRng as rand::SeedableRng>::seed_from_u64(id as u64);
@@ -473,7 +541,7 @@ async fn pg_writer(id: usize, counter: Arc<AtomicU64>) {
     // Outer loop: reconnect on connection failure.
     loop {
         // Check if target reached before connecting.
-        if counter.load(Ordering::Relaxed) >= TARGET_EVENTS {
+        if counter.load(Ordering::Relaxed) >= target {
             break;
         }
 
@@ -497,7 +565,7 @@ async fn pg_writer(id: usize, counter: Arc<AtomicU64>) {
         // Inner loop: execute queries on active connection.
         loop {
             let prev = counter.fetch_add(1, Ordering::Relaxed);
-            if prev >= TARGET_EVENTS {
+            if prev >= target {
                 counter.fetch_sub(1, Ordering::Relaxed);
                 conn_handle.abort();
                 return;
@@ -581,6 +649,53 @@ async fn df_patch(
         let body = resp.text().await.unwrap_or_default();
         bail!("PATCH {url} returned {status}: {body}")
     }
+}
+
+async fn df_get(base: &str, path: &str) -> Result<String> {
+    let url = format!("{base}{path}");
+    let resp = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("GET {url} connection error: {e}"))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        Ok(body)
+    } else {
+        bail!("GET {url} returned {status}: {body}")
+    }
+}
+
+/// Flatten a JSON value into dot-separated key=value pairs for readable logging.
+fn flatten_json(
+    prefix: &str,
+    value: &serde_json::Value,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let key = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                out.extend(flatten_json(&key, v));
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for (i, v) in arr.iter().enumerate() {
+                out.extend(flatten_json(&format!("{prefix}[{i}]"), v));
+            }
+        }
+        _ => {
+            out.push((prefix.to_string(), value.to_string()));
+        }
+    }
+    out
 }
 
 async fn df_post(base: &str, path: &str) -> Result<()> {

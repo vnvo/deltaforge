@@ -43,10 +43,27 @@ struct Cli {
     write_delay_ms: u64,
 
     // ── Backlog-drain throughput knobs ────────────────────────────────────────
+    /// Total rows to insert for the backlog-drain benchmark. Default: 1M.
+    #[arg(long, default_value_t = 1_000_000)]
+    drain_target: u64,
+
+    /// Concurrent writer tasks during the backlog population phase.
+    #[arg(long, default_value_t = 32)]
+    drain_writers: usize,
+
+    /// Max seconds to wait for the drain to complete. 0 = auto-scale based on target.
+    #[arg(long, default_value_t = 0)]
+    drain_timeout: u64,
+
     /// Max events per Kafka batch during the backlog-drain (pipeline spec batch.max_events).
     /// Higher values reduce produce calls per second.
     #[arg(long, default_value_t = 4000)]
     drain_max_events: u64,
+
+    /// Max batch size in bytes. 0 = leave unchanged (default 3MB).
+    /// Increase alongside max_events to prevent the byte limit from capping batch size.
+    #[arg(long, default_value_t = 0)]
+    drain_max_bytes: u64,
 
     /// Max batch age in ms during the backlog-drain (pipeline spec batch.max_ms).
     /// Lower values reduce latency at the cost of smaller batches.
@@ -77,6 +94,12 @@ struct Cli {
     #[arg(long = "drain-kafka-conf", value_name = "KEY=VALUE")]
     drain_kafka_conf: Vec<String>,
 
+    /// Enable or disable exactly-once (transactional) Kafka delivery.
+    /// Omit to leave the pipeline's current setting unchanged.
+    /// Use --exactly-once=true to enable, --exactly-once=false to disable.
+    #[arg(long)]
+    exactly_once: Option<bool>,
+
     /// Bypass Toxiproxy: PATCH pipelines to connect directly to source/sink
     /// before running the scenario. Restores proxied addresses after completion.
     #[arg(long, default_value_t = false)]
@@ -100,6 +123,10 @@ enum Scenario {
     SinkOutage,
     CrashRecovery,
     SchemaDrift,
+    /// Exactly-once crash recovery: verifies no partial batches are visible
+    /// to a `read_committed` consumer after a crash. Requires `exactly_once: true`
+    /// on the Kafka sink in the DeltaForge config.
+    ExactlyOnce,
     // MySQL-specific
     Failover,
     BinlogPurge,
@@ -176,13 +203,18 @@ async fn main() -> Result<()> {
         .collect();
 
     let drain_cfg = scenarios::backlog_drain::DrainConfig {
+        target_events: cli.drain_target,
+        writer_tasks: cli.drain_writers,
+        drain_timeout_secs: cli.drain_timeout,
         max_events: cli.drain_max_events,
         max_ms: cli.drain_max_ms,
         max_inflight: cli.drain_max_inflight,
         commit_mode: cli.drain_commit_mode.clone(),
         commit_interval_ms: cli.drain_commit_interval_ms,
         schema_sensing: cli.drain_schema_sensing,
+        max_bytes: cli.drain_max_bytes,
         kafka_client_conf,
+        exactly_once: cli.exactly_once,
     };
 
     // Apply proxy bypass if requested.
@@ -267,6 +299,10 @@ async fn run_mysql(
         Scenario::SchemaDrift => {
             results
                 .push(scenarios::schema_drift::run(harness, &backend).await?);
+        }
+        Scenario::ExactlyOnce => {
+            results
+                .push(scenarios::exactly_once::run(harness, &backend).await?);
         }
         Scenario::Failover => {
             results.push(scenarios::failover::run(harness).await?);
@@ -363,6 +399,10 @@ async fn run_postgres(
         Scenario::SchemaDrift => {
             results
                 .push(scenarios::schema_drift::run(harness, &backend).await?);
+        }
+        Scenario::ExactlyOnce => {
+            results
+                .push(scenarios::exactly_once::run(harness, &backend).await?);
         }
         Scenario::PgFailover => {
             results.push(scenarios::pg_failover::run(harness).await?);

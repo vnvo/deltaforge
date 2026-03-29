@@ -1405,14 +1405,15 @@ function renderServices(services) {
   grid.innerHTML = '';
 
   const groups = [
-    { label: 'Base Infra',    profile: '',       names: ['mysql','mysql-b','kafka','toxiproxy'] },
-    { label: 'Observability', profile: null,     names: ['prometheus','grafana','cadvisor'] },
-    { label: 'MySQL app',     profile: 'app',    names: ['deltaforge'] },
-    { label: 'PG app',        profile: 'pg-app', names: ['deltaforge-pg'] },
-    { label: 'Soak',          profile: 'soak',   names: ['deltaforge-soak'] },
-    { label: 'PG Soak',       profile: 'pg-soak', names: ['deltaforge-pg-soak'] },
-    { label: 'TPC-C',         profile: 'tpcc',   names: ['deltaforge-tpcc'] },
-    { label: 'Postgres',      profile: null,     names: ['postgres','postgres-b'] },
+    { label: 'Base',          profile: 'base',          names: ['toxiproxy','prometheus','grafana','cadvisor','loki','promtail'] },
+    { label: 'MySQL Infra',   profile: 'mysql-infra',   names: ['mysql','mysql-b'] },
+    { label: 'PG Infra',      profile: 'pg-infra',      names: ['postgres','postgres-b'] },
+    { label: 'Kafka Infra',   profile: 'kafka-infra',   names: ['kafka'] },
+    { label: 'MySQL app',     profile: 'app',           names: ['deltaforge'] },
+    { label: 'PG app',        profile: 'pg-app',        names: ['deltaforge-pg'] },
+    { label: 'Soak',          profile: 'soak',          names: ['deltaforge-soak'] },
+    { label: 'PG Soak',       profile: 'pg-soak',       names: ['deltaforge-pg-soak'] },
+    { label: 'TPC-C',         profile: 'tpcc',          names: ['deltaforge-tpcc'] },
   ];
 
   const byName = Object.fromEntries(services.map(s => [s.label, s]));

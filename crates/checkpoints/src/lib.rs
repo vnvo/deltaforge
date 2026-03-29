@@ -34,11 +34,40 @@ pub trait CheckpointStore: Send + Sync {
         bytes: &[u8],
     ) -> CheckpointResult<()>;
 
+    /// Store multiple checkpoint entries atomically (single transaction).
+    /// Used for per-sink checkpoint commits — all sink checkpoints from one
+    /// batch are written together to avoid partial state.
+    ///
+    /// **Note:** The default implementation is NOT atomic — it writes entries
+    /// sequentially with individual `put_raw` calls. Backends that support
+    /// transactions (SQLite, PostgreSQL) should override this for true atomicity.
+    // TODO: FileCheckpointStore should override this with rename-based atomicity.
+    async fn put_raw_multi(
+        &self,
+        entries: &[(&str, &[u8])],
+    ) -> CheckpointResult<()> {
+        for &(key, bytes) in entries {
+            self.put_raw(key, bytes).await?;
+        }
+        Ok(())
+    }
+
     /// Delete checkpoint (all versions if versioned).
     async fn delete(&self, source_id: &str) -> CheckpointResult<bool>;
 
     /// List all checkpoint keys.
     async fn list(&self) -> CheckpointResult<Vec<String>>;
+
+    /// List checkpoint keys matching a prefix.
+    /// Default implementation filters `list()`. Backends may override for
+    /// efficiency (e.g. SQL `WHERE key LIKE 'prefix%'`).
+    async fn list_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> CheckpointResult<Vec<String>> {
+        let all = self.list().await?;
+        Ok(all.into_iter().filter(|k| k.starts_with(prefix)).collect())
+    }
 
     // ========== Versioning (optional) ==========
 

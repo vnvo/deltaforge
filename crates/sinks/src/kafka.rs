@@ -46,7 +46,7 @@ use metrics::{counter, gauge};
 use rdkafka::config::ClientConfig;
 use rdkafka::error::KafkaError;
 use rdkafka::message::{Header, OwnedHeaders};
-use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::util::Timeout;
 use rdkafka::{ClientContext, Statistics};
 use serde_json::Value;
@@ -138,6 +138,9 @@ pub struct KafkaSink {
 
     /// Per-message send timeout.
     send_timeout: Duration,
+
+    /// Whether this sink uses Kafka transactions for exactly-once delivery.
+    transactional: bool,
 }
 
 impl KafkaSink {
@@ -177,17 +180,33 @@ impl KafkaSink {
             .set("linger.ms", DEFAULT_LINGER_MS)
             .set("batch.size", DEFAULT_BATCH_SIZE);
 
-        // Timeout configuration
-        client_cfg
-            .set("message.timeout.ms", "60000")
-            .set("delivery.timeout.ms", "120000")
-            .set("request.timeout.ms", "30000")
-            .set("retry.backoff.ms", "100");
-
         // Reliability settings
-        if cfg.exactly_once == Some(true) {
-            // Exactly-once: transactional semantics
+        let transactional = cfg.exactly_once == Some(true);
+
+        // Timeout configuration.
+        // When transactional, all timeouts must be <= transaction.timeout.ms
+        // (default 60000ms). Use shorter timeouts to stay within the bound.
+        if transactional {
             client_cfg
+                .set("transaction.timeout.ms", "60000")
+                .set("message.timeout.ms", "30000")
+                .set("delivery.timeout.ms", "30000")
+                .set("request.timeout.ms", "15000")
+                .set("retry.backoff.ms", "100");
+        } else {
+            client_cfg
+                .set("message.timeout.ms", "60000")
+                .set("delivery.timeout.ms", "120000")
+                .set("request.timeout.ms", "30000")
+                .set("retry.backoff.ms", "100");
+        }
+        if transactional {
+            // Exactly-once: transactional semantics.
+            // transactional.id must be stable across restarts to allow the
+            // broker to fence zombie producers from a previous incarnation.
+            let txn_id = format!("deltaforge-{}-{}", pipeline, cfg.id);
+            client_cfg
+                .set("transactional.id", &txn_id)
                 .set("enable.idempotence", "true")
                 .set("acks", "all")
                 .set("retries", "1000000") // rdkafka caps appropriately
@@ -248,12 +267,27 @@ impl KafkaSink {
             );
         }
 
+        // Initialize transactions if exactly-once is enabled.
+        // This call blocks until the broker confirms the transactional.id
+        // registration and fences any previous producer with the same id.
+        if transactional {
+            producer
+                .init_transactions(std::time::Duration::from_secs(30))
+                .with_context(|| {
+                    format!(
+                        "init_transactions failed for sink {} — is the Kafka broker reachable?",
+                        cfg.id
+                    )
+                })?;
+            info!(sink_id = %cfg.id, "kafka transactions initialized");
+        }
+
         info!(
             brokers = %redact_brokers(&cfg.brokers),
             topic = %cfg.topic,
             envelope = %envelope_type.name(),
             encoding = encoding_type.name(),
-            exactly_once = cfg.exactly_once.unwrap_or(false),
+            exactly_once = transactional,
             send_timeout_ms = send_timeout.as_millis(),
             "kafka sink created"
         );
@@ -270,6 +304,7 @@ impl KafkaSink {
             encoding: encoding_type,
             cancel,
             send_timeout,
+            transactional,
         })
     }
 
@@ -385,6 +420,12 @@ impl Sink for KafkaSink {
 
     #[instrument(skip_all, fields(sink_id = %self.id))]
     async fn send(&self, event: &Event) -> SinkResult<()> {
+        // Transactional producers must wrap every send in begin/commit.
+        // Delegate to send_batch which handles the transaction boundary.
+        if self.transactional {
+            return self.send_batch(std::slice::from_ref(event)).await;
+        }
+
         let payload = self.serialize_event(event)?;
         let topic = self.resolve_topic(event)?;
         let key = self.resolve_key(event);
@@ -487,6 +528,24 @@ impl Sink for KafkaSink {
             }
         };
 
+        // Begin transaction if exactly-once is enabled.
+        if self.transactional {
+            if let Err(e) = self.producer.begin_transaction() {
+                let is_fatal =
+                    matches!(&e, KafkaError::Transaction(re) if re.is_fatal());
+                if is_fatal {
+                    // ProducerFenced or other fatal error — cannot recover.
+                    // The pipeline must stop; retrying is pointless.
+                    return Err(SinkError::Fatal {
+                        details: format!("begin_transaction fatal: {e}").into(),
+                    });
+                }
+                return Err(SinkError::Connect {
+                    details: format!("begin_transaction failed: {e}").into(),
+                });
+            }
+        }
+
         // Enqueue all messages
         let futures: Vec<_> = serialized
             .iter()
@@ -511,6 +570,48 @@ impl Sink for KafkaSink {
 
         match result {
             Ok(_) => {
+                // Commit transaction if exactly-once.
+                if self.transactional {
+                    if let Err(e) = self
+                        .producer
+                        .commit_transaction(std::time::Duration::from_secs(30))
+                    {
+                        let is_fatal = matches!(&e, KafkaError::Transaction(re) if re.is_fatal());
+                        counter!(
+                            "deltaforge_sink_txn_aborts_total",
+                            "pipeline" => self.pipeline.clone(),
+                            "sink" => self.id.clone(),
+                        )
+                        .increment(1);
+                        if let Err(abort_err) = self.producer.abort_transaction(
+                            std::time::Duration::from_secs(10),
+                        ) {
+                            warn!(error = %abort_err, "abort_transaction failed after commit failure");
+                        }
+                        return Err(if is_fatal {
+                            SinkError::Fatal {
+                                details: format!(
+                                    "commit_transaction fatal: {e}"
+                                )
+                                .into(),
+                            }
+                        } else {
+                            SinkError::Connect {
+                                details: format!(
+                                    "commit_transaction failed: {e}"
+                                )
+                                .into(),
+                            }
+                        });
+                    }
+                    counter!(
+                        "deltaforge_sink_txn_commits_total",
+                        "pipeline" => self.pipeline.clone(),
+                        "sink" => self.id.clone(),
+                    )
+                    .increment(1);
+                }
+
                 let total_bytes: u64 =
                     serialized.iter().map(|(p, ..)| p.len() as u64).sum();
                 counter!(
@@ -519,14 +620,49 @@ impl Sink for KafkaSink {
                     "sink" => self.id.clone(),
                 )
                 .increment(total_bytes);
-                debug!(count = events.len(), "batch sent to kafka");
+                debug!(
+                    count = events.len(),
+                    transactional = self.transactional,
+                    "batch sent to kafka"
+                );
                 Ok(())
             }
             Err(e) => {
+                // Abort transaction on delivery failure.
+                let mut fatal = false;
+                if self.transactional {
+                    counter!(
+                        "deltaforge_sink_txn_aborts_total",
+                        "pipeline" => self.pipeline.clone(),
+                        "sink" => self.id.clone(),
+                    )
+                    .increment(1);
+                    if let Err(abort_err) = self
+                        .producer
+                        .abort_transaction(std::time::Duration::from_secs(10))
+                    {
+                        warn!(error = %abort_err, "abort_transaction failed after delivery failure");
+                        // If abort itself fails with a fatal/fenced error, the
+                        // producer is permanently broken.
+                        let msg = abort_err.to_string();
+                        if msg.contains("fenced") || msg.contains("Fatal") {
+                            fatal = true;
+                        }
+                    }
+                }
                 warn!(error = %e, "batch delivery failed");
-                Err(SinkError::Backpressure {
-                    details: format!("kafka batch error: {}", e).into(),
-                })
+                if fatal {
+                    Err(SinkError::Fatal {
+                        details: format!(
+                            "producer fenced during delivery: {e}"
+                        )
+                        .into(),
+                    })
+                } else {
+                    Err(SinkError::Backpressure {
+                        details: format!("kafka batch error: {}", e).into(),
+                    })
+                }
             }
         }
     }

@@ -65,6 +65,17 @@ pub enum SinkCfg {
     Nats(NatsSinkCfg),
 }
 
+impl SinkCfg {
+    /// Return the sink's unique identifier.
+    pub fn sink_id(&self) -> &str {
+        match self {
+            Self::Kafka(c) => &c.id,
+            Self::Redis(c) => &c.id,
+            Self::Nats(c) => &c.id,
+        }
+    }
+}
+
 /// Kafka sink configuration.
 ///
 /// # Example
