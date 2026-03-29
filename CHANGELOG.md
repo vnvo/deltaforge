@@ -5,7 +5,7 @@ All notable changes to DeltaForge will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [v0.1.0-beta.9] - 2026-03-29
 
 ### Added
 
@@ -509,7 +509,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Links
 
-- [Unreleased]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.8...HEAD
+- [Unreleased]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.9...HEAD
+- [0.1.0-beta.9]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.8...v0.1.0-beta.9
 - [0.1.0-beta.8]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.7...v0.1.0-beta.8
 - [0.1.0-beta.7]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.6...v0.1.0-beta.7
 - [0.1.0-beta.6]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.5...v0.1.0-beta.6
