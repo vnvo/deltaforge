@@ -419,7 +419,11 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
     }
 
     /// Register a per-sink checkpoint commit function.
-    pub fn commit_fn(mut self, sink_id: impl Into<String>, f: CommitCpFn<Tok>) -> Self {
+    pub fn commit_fn(
+        mut self,
+        sink_id: impl Into<String>,
+        f: CommitCpFn<Tok>,
+    ) -> Self {
         self.commit_fns.insert(sink_id.into(), f);
         self
     }
@@ -1238,14 +1242,10 @@ mod tests {
             Arc::clone(&redis_sink) as ArcDynSink,
         ];
 
-        let kafka_cp = build_commit_fn(
-            store.clone(),
-            "mysql::sink::kafka".to_string(),
-        );
-        let redis_cp = build_commit_fn(
-            store.clone(),
-            "mysql::sink::redis".to_string(),
-        );
+        let kafka_cp =
+            build_commit_fn(store.clone(), "mysql::sink::kafka".to_string());
+        let redis_cp =
+            build_commit_fn(store.clone(), "mysql::sink::redis".to_string());
 
         let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
             Arc::from(vec![]);
@@ -1331,9 +1331,12 @@ mod tests {
         let sink = MockSink::new("kafka", true);
         let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
 
-        let cp_fn = build_commit_fn(store.clone(), "src::sink::kafka".to_string());
-        let processors: Arc<[deltaforge_core::ArcDynProcessor]> = Arc::from(vec![]);
-        let batch_processor = build_batch_processor(processors, "test".to_string());
+        let cp_fn =
+            build_commit_fn(store.clone(), "src::sink::kafka".to_string());
+        let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![]);
+        let batch_processor =
+            build_batch_processor(processors, "test".to_string());
 
         // Large max_events so the batch never fills, short timer (50ms).
         let coord = Coordinator::builder("test-timer")

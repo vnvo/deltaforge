@@ -14,7 +14,8 @@ use checkpoints::{CheckpointResult, CheckpointStore};
 
 /// Comparison function for opaque checkpoint bytes.
 /// Each source provides its own implementation via `Source::compare_checkpoints`.
-type CheckpointCmpFn = Arc<dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering + Send + Sync>;
+type CheckpointCmpFn =
+    Arc<dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering + Send + Sync>;
 
 /// Wraps a [`CheckpointStore`] to present the **minimum** per-sink checkpoint
 /// when the source calls `get_raw(source_id)`.
@@ -295,9 +296,8 @@ impl PipelineManager {
         // checkpoint — it replays from the position the slowest sink needs.
         // Capture the source's checkpoint comparison function for the proxy.
         let source_ref = Arc::clone(&source);
-        let cmp_fn: CheckpointCmpFn = Arc::new(move |a, b| {
-            source_ref.compare_checkpoints(a, b)
-        });
+        let cmp_fn: CheckpointCmpFn =
+            Arc::new(move |a, b| source_ref.compare_checkpoints(a, b));
         let source_ckpt: Arc<dyn CheckpointStore> =
             Arc::new(PerSinkCheckpointProxy {
                 inner: self.ckpt_store.clone(),
@@ -362,10 +362,7 @@ impl PipelineManager {
         for sink in &sinks {
             let sink_id = sink.id().to_string();
             let cp_key = format!("{}::sink::{}", source_id, sink_id);
-            let commit_fn = build_commit_fn(
-                self.ckpt_store.clone(),
-                cp_key,
-            );
+            let commit_fn = build_commit_fn(self.ckpt_store.clone(), cp_key);
             builder = builder.commit_fn(sink_id, commit_fn);
         }
 
@@ -511,18 +508,10 @@ impl PipelineController for PipelineManager {
 
         // Clean up per-sink checkpoints for removed sinks.
         let source_id = old_spec.spec.source.source_id();
-        let old_sink_ids: std::collections::HashSet<&str> = old_spec
-            .spec
-            .sinks
-            .iter()
-            .map(|s| s.sink_id())
-            .collect();
-        let new_sink_ids: std::collections::HashSet<&str> = new_spec
-            .spec
-            .sinks
-            .iter()
-            .map(|s| s.sink_id())
-            .collect();
+        let old_sink_ids: std::collections::HashSet<&str> =
+            old_spec.spec.sinks.iter().map(|s| s.sink_id()).collect();
+        let new_sink_ids: std::collections::HashSet<&str> =
+            new_spec.spec.sinks.iter().map(|s| s.sink_id()).collect();
 
         for removed in old_sink_ids.difference(&new_sink_ids) {
             let cp_key = format!("{}::sink::{}", source_id, removed);
@@ -782,7 +771,9 @@ mod tests {
     fn test_cmp_fn() -> CheckpointCmpFn {
         Arc::new(|a: &[u8], b: &[u8]| {
             #[derive(serde::Deserialize)]
-            struct Cp { pos: u64 }
+            struct Cp {
+                pos: u64,
+            }
             let a: Cp = serde_json::from_slice(a).unwrap_or(Cp { pos: 0 });
             let b: Cp = serde_json::from_slice(b).unwrap_or(Cp { pos: 0 });
             a.pos.cmp(&b.pos)
@@ -806,10 +797,7 @@ mod tests {
     async fn per_sink_proxy_falls_back_to_legacy_key() {
         let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
         // Write a legacy checkpoint under the plain source_id key (pre per-sink format).
-        store
-            .put_raw("mysql", b"{\"pos\":500}")
-            .await
-            .unwrap();
+        store.put_raw("mysql", b"{\"pos\":500}").await.unwrap();
         let proxy = PerSinkCheckpointProxy {
             inner: store,
             source_id: "mysql".to_string(),
@@ -853,10 +841,7 @@ mod tests {
     #[tokio::test]
     async fn per_sink_proxy_passes_through_other_keys() {
         let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
-        store
-            .put_raw("other-key", b"other-value")
-            .await
-            .unwrap();
+        store.put_raw("other-key", b"other-value").await.unwrap();
 
         let proxy = PerSinkCheckpointProxy {
             inner: store,

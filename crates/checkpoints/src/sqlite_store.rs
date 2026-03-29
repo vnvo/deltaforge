@@ -191,7 +191,10 @@ impl CheckpointStore for SqliteCheckpointStore {
     ) -> CheckpointResult<Vec<String>> {
         // Escape LIKE wildcards in the prefix so % and _ are treated as
         // literal characters, then append % for the actual prefix match.
-        let escaped = prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let escaped = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         let pattern = format!("{}%", escaped);
         db!(self.conn, move |conn: &Connection| {
             let mut stmt = conn
@@ -407,10 +410,8 @@ mod tests {
         store.put_raw("mysql::sink::kafka", b"v1").await.unwrap();
 
         // Batch update.
-        let entries: Vec<(&str, &[u8])> = vec![
-            ("mysql::sink::kafka", b"v2"),
-            ("mysql::sink::redis", b"r1"),
-        ];
+        let entries: Vec<(&str, &[u8])> =
+            vec![("mysql::sink::kafka", b"v2"), ("mysql::sink::redis", b"r1")];
         store.put_raw_multi(&entries).await.unwrap();
 
         // Kafka advanced to v2, redis created at r1.
@@ -437,7 +438,8 @@ mod tests {
         store.put_raw("pg::sink::nats", b"n").await.unwrap();
         store.put_raw("other-key", b"o").await.unwrap();
 
-        let mysql_sinks = store.list_with_prefix("mysql::sink::").await.unwrap();
+        let mysql_sinks =
+            store.list_with_prefix("mysql::sink::").await.unwrap();
         assert_eq!(mysql_sinks.len(), 2);
         assert!(mysql_sinks.contains(&"mysql::sink::kafka".to_string()));
         assert!(mysql_sinks.contains(&"mysql::sink::redis".to_string()));

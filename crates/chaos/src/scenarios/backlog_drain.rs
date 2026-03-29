@@ -89,7 +89,8 @@ impl DrainConfig {
         } else {
             // 30 seconds per 1M events, minimum 120s.
             // Conservative to accommodate exactly-once transactional overhead.
-            let secs = ((self.target_events as f64 / 1_000_000.0) * 30.0).ceil() as u64;
+            let secs = ((self.target_events as f64 / 1_000_000.0) * 30.0).ceil()
+                as u64;
             Duration::from_secs(secs.max(120))
         }
     }
@@ -218,9 +219,13 @@ async fn run_with_source(
         .map(|id| {
             let ctr = Arc::clone(&counter);
             if is_pg {
-                tokio::spawn(async move { pg_writer(id, ctr, target_events).await })
+                tokio::spawn(
+                    async move { pg_writer(id, ctr, target_events).await },
+                )
             } else {
-                tokio::spawn(async move { mysql_writer(id, ctr, target_events).await })
+                tokio::spawn(async move {
+                    mysql_writer(id, ctr, target_events).await
+                })
             }
         })
         .collect();
@@ -315,7 +320,9 @@ async fn run_with_source(
                 }
             }
         }
-        Err(e) => tracing::warn!(error = %e, "could not fetch pipeline config for dump"),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not fetch pipeline config for dump")
+        }
     }
 
     let drain_start = Instant::now();
@@ -663,7 +670,10 @@ async fn df_get(base: &str, path: &str) -> Result<String> {
 }
 
 /// Flatten a JSON value into dot-separated key=value pairs for readable logging.
-fn flatten_json(prefix: &str, value: &serde_json::Value) -> Vec<(String, String)> {
+fn flatten_json(
+    prefix: &str,
+    value: &serde_json::Value,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     match value {
         serde_json::Value::Object(map) => {

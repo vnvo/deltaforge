@@ -250,10 +250,7 @@ impl NatsSink {
     /// JetStream server-side deduplication. On replay after crash recovery,
     /// the server rejects messages with duplicate `Nats-Msg-Id` within the
     /// stream's `duplicate_window` — providing effectively-once delivery.
-    fn build_nats_headers(
-        &self,
-        event: &Event,
-    ) -> async_nats::HeaderMap {
+    fn build_nats_headers(&self, event: &Event) -> async_nats::HeaderMap {
         let mut headers = async_nats::HeaderMap::new();
 
         // Idempotency key for JetStream dedup.

@@ -1801,7 +1801,11 @@ async fn kafka_sink_exactly_once_single_event() -> Result<()> {
         create_read_committed_consumer(&brokers, &topic, "eo-single-cg")?;
     let messages = consume_n(&consumer, 1, 10).await;
 
-    assert_eq!(messages.len(), 1, "should receive exactly 1 committed event");
+    assert_eq!(
+        messages.len(),
+        1,
+        "should receive exactly 1 committed event"
+    );
     let parsed: Event = serde_json::from_slice(&messages[0])?;
     assert_eq!(parsed.event_id, event.event_id);
 
@@ -1861,7 +1865,8 @@ async fn kafka_sink_exactly_once_multiple_batches() -> Result<()> {
     // Send 5 batches of 20 events each
     for batch_idx in 0..5u32 {
         let start = (batch_idx * 20) as i64;
-        let events: Vec<Event> = (start..start + 20).map(make_test_event).collect();
+        let events: Vec<Event> =
+            (start..start + 20).map(make_test_event).collect();
         sink.send_batch(&events).await?;
     }
 

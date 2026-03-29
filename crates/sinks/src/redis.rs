@@ -467,7 +467,8 @@ impl Sink for RedisSink {
 
                     match self
                         .xadd_single(
-                            &mut conn, &stream, &event_id, &key, &idem_key, &payload,
+                            &mut conn, &stream, &event_id, &key, &idem_key,
+                            &payload,
                         )
                         .await
                     {
@@ -580,8 +581,10 @@ impl Sink for RedisSink {
 
         match result {
             Ok(_) => {
-                let total_bytes: u64 =
-                    serialized.iter().map(|(_, _, _, _, p)| p.len() as u64).sum();
+                let total_bytes: u64 = serialized
+                    .iter()
+                    .map(|(_, _, _, _, p)| p.len() as u64)
+                    .sum();
                 counter!(
                     "deltaforge_sink_bytes_total",
                     "pipeline" => self.pipeline.clone(),

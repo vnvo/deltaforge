@@ -127,9 +127,7 @@ pub async fn run<B: SourceBackend>(
     }
 
     // ── Step 7: read_committed check ───────────────────────────────────
-    info!(
-        "step 7/7: verifying read_committed consumer sees all events ..."
-    );
+    info!("step 7/7: verifying read_committed consumer sees all events ...");
     let committed = kafka_committed_count(pre_crash_offset).await?;
     let total_expected = delivered + 10; // pre-crash (10) + post-crash
     info!(

@@ -271,7 +271,6 @@ impl KafkaSink {
         // This call blocks until the broker confirms the transactional.id
         // registration and fences any previous producer with the same id.
         if transactional {
-
             producer
                 .init_transactions(std::time::Duration::from_secs(30))
                 .with_context(|| {
@@ -531,9 +530,9 @@ impl Sink for KafkaSink {
 
         // Begin transaction if exactly-once is enabled.
         if self.transactional {
-
             if let Err(e) = self.producer.begin_transaction() {
-                let is_fatal = matches!(&e, KafkaError::Transaction(re) if re.is_fatal());
+                let is_fatal =
+                    matches!(&e, KafkaError::Transaction(re) if re.is_fatal());
                 if is_fatal {
                     // ProducerFenced or other fatal error — cannot recover.
                     // The pipeline must stop; retrying is pointless.
@@ -573,7 +572,6 @@ impl Sink for KafkaSink {
             Ok(_) => {
                 // Commit transaction if exactly-once.
                 if self.transactional {
-        
                     if let Err(e) = self
                         .producer
                         .commit_transaction(std::time::Duration::from_secs(30))
@@ -585,19 +583,24 @@ impl Sink for KafkaSink {
                             "sink" => self.id.clone(),
                         )
                         .increment(1);
-                        if let Err(abort_err) = self
-                            .producer
-                            .abort_transaction(std::time::Duration::from_secs(10))
-                        {
+                        if let Err(abort_err) = self.producer.abort_transaction(
+                            std::time::Duration::from_secs(10),
+                        ) {
                             warn!(error = %abort_err, "abort_transaction failed after commit failure");
                         }
                         return Err(if is_fatal {
                             SinkError::Fatal {
-                                details: format!("commit_transaction fatal: {e}").into(),
+                                details: format!(
+                                    "commit_transaction fatal: {e}"
+                                )
+                                .into(),
                             }
                         } else {
                             SinkError::Connect {
-                                details: format!("commit_transaction failed: {e}").into(),
+                                details: format!(
+                                    "commit_transaction failed: {e}"
+                                )
+                                .into(),
                             }
                         });
                     }
@@ -650,7 +653,10 @@ impl Sink for KafkaSink {
                 warn!(error = %e, "batch delivery failed");
                 if fatal {
                     Err(SinkError::Fatal {
-                        details: format!("producer fenced during delivery: {e}").into(),
+                        details: format!(
+                            "producer fenced during delivery: {e}"
+                        )
+                        .into(),
                     })
                 } else {
                     Err(SinkError::Backpressure {
