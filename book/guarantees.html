@@ -1,0 +1,519 @@
+<!DOCTYPE HTML>
+<html lang="en" class="navy sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Guarantees &amp; Correctness - DeltaForge CDC Framework - User Guide</title>
+
+
+        <!-- Custom HTML head -->
+        <!-- SEO Meta Tags -->
+        <meta name="author" content="Vahid Negahdari">
+        <meta name="keywords" content="CDC, Change Data Capture, Rust, Kafka, Redis, MySQL, Postgres, streaming, data pipeline, real-time, Debezium alternative, ETL">
+        <meta name="robots" content="index, follow">
+        <link rel="canonical" href="https://vnvo.github.io/deltaforge/">
+        
+        <!-- Open Graph / Facebook -->
+        <meta property="og:type" content="website">
+        <meta property="og:url" content="https://vnvo.github.io/deltaforge/">
+        <meta property="og:title" content="DeltaForge - CDC Framework">
+        <meta property="og:description" content="A modular, config-driven Change Data Capture (CDC) micro-framework built in Rust. Stream database changes to Kafka and Redis.">
+        <meta property="og:image" content="https://vnvo.github.io/deltaforge/assets/deltaforge-blc.png">
+        <meta property="og:site_name" content="DeltaForge Documentation">
+        
+        <!-- Twitter Card -->
+        <meta name="twitter:card" content="summary_large_image">
+        <meta name="twitter:url" content="https://vnvo.github.io/deltaforge/">
+        <meta name="twitter:title" content="DeltaForge - CDC Framework">
+        <meta name="twitter:description" content="A modular, config-driven Change Data Capture (CDC) micro-framework built in Rust. Stream database changes to Kafka and Redis.">
+        <meta name="twitter:image" content="https://vnvo.github.io/deltaforge/assets/deltaforge-blc.png">
+        
+        <!-- Structured Data (JSON-LD) -->
+        <script type="application/ld+json">
+        {
+          "@context": "https://schema.org",
+          "@type": "SoftwareSourceCode",
+          "name": "DeltaForge",
+          "description": "A modular, config-driven Change Data Capture (CDC) micro-framework built in Rust",
+          "url": "https://github.com/vnvo/deltaforge",
+          "codeRepository": "https://github.com/vnvo/deltaforge",
+          "programmingLanguage": "Rust",
+          "license": "https://opensource.org/licenses/MIT",
+          "author": {
+            "@type": "Person",
+            "name": "Vahid Negahdari",
+            "url": "https://github.com/vnvo"
+          },
+          "keywords": ["CDC", "Change Data Capture", "Rust", "Kafka", "Redis", "MySQL", "Postgres", "streaming"]
+        }
+        </script>
+        <meta name="description" content="A modular, config-driven Change Data Capture (CDC) micro-framework built in Rust. Stream database changes to Kafka, Redis and etc.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="favicon-8114d1fc.png">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="css/custom-55d982ab.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "navy";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-48f29c63.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-e56c0c09.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('navy')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div class="sidebar-footer">
+                <a href="https://github.com/vnvo/deltaforge/releases">
+                    <img src="https://img.shields.io/github/v/release/vnvo/deltaforge?label=version" alt="Version">
+                </a>
+                <a href="https://github.com/vnvo/deltaforge/blob/main/LICENSE-MIT">
+                    <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License">
+                </a>
+                <img src="https://img.shields.io/badge/arch-amd64|arm64-blue" alt="Arch">
+                <img src="https://img.shields.io/badge/rustc-1.89+-blue.svg" alt="MSRV">
+            </div>            
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">DeltaForge CDC Framework - User Guide</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/vnvo/deltaforge" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/vnvo/deltaforge/edit/main/docs/src/src/guarantees.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="guarantees--correctness"><a class="header" href="#guarantees--correctness">Guarantees &amp; Correctness</a></h1>
+<p>This page defines DeltaForge’s data delivery guarantees, ordering model, transaction semantics, failure handling, and operational boundaries. Every claim here is backed by the implementation — no aspirational statements.</p>
+<h2 id="delivery-guarantees"><a class="header" href="#delivery-guarantees">Delivery Guarantees</a></h2>
+<h3 id="per-sink-delivery-tiers"><a class="header" href="#per-sink-delivery-tiers">Per-sink delivery tiers</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Sink</th><th>Default mode</th><th>With <code>exactly_once: true</code></th><th>Dedup mechanism</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Kafka</strong></td><td>At-least-once (idempotent producer)</td><td><strong>Exactly-once</strong> (transactional)</td><td>Kafka two-phase commit per batch</td></tr>
+<tr><td><strong>NATS JetStream</strong></td><td>At-least-once + server-side dedup</td><td>—</td><td><code>Nats-Msg-Id</code> header within <code>duplicate_window</code></td></tr>
+<tr><td><strong>Redis Streams</strong></td><td>At-least-once + consumer-side dedup</td><td>—</td><td><code>idempotency_key</code> field in XADD payload</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="what-at-least-once-means"><a class="header" href="#what-at-least-once-means">What “at-least-once” means</a></h3>
+<ul>
+<li><strong>No data loss</strong>: every event from the source is delivered to the sink at least once. Checkpoints are saved only after the sink acknowledges delivery — never before.</li>
+<li><strong>Duplicates on crash recovery</strong>: if DeltaForge crashes after delivering a batch but before saving the checkpoint, that batch is replayed on restart. Consumers must handle duplicates (see <a href="#consumer-guidance">Consumer Guidance</a> below).</li>
+<li><strong>No silent drops</strong>: events are never discarded. If delivery fails, the batch is retried with exponential backoff until it succeeds or a fatal error stops the pipeline.</li>
+</ul>
+<h3 id="what-exactly-once-means-kafka"><a class="header" href="#what-exactly-once-means-kafka">What “exactly-once” means (Kafka)</a></h3>
+<p>With <code>exactly_once: true</code>, each batch is wrapped in a Kafka transaction (<code>begin_transaction</code> / <code>commit_transaction</code>). Consumers using <code>isolation.level=read_committed</code> only see committed batches — no partial deliveries. If a transaction fails, it is aborted and retried from the same checkpoint position.</p>
+<p>Exactly-once overhead is <strong>~7-11%</strong> with properly tuned batch sizes. See the <a href="performance.html#exactly-once-delivery-overhead">Performance guide</a> for benchmark details.</p>
+<h2 id="ordering-model"><a class="header" href="#ordering-model">Ordering Model</a></h2>
+<h3 id="within-a-source"><a class="header" href="#within-a-source">Within a source</a></h3>
+<p>Events are emitted in the source’s native order:</p>
+<ul>
+<li><strong>MySQL</strong>: binlog file + position order. <code>WriteRowsEvent</code> batches preserve row order within each binlog event.</li>
+<li><strong>PostgreSQL</strong>: LSN (Log Sequence Number) order. One WAL message per row change.</li>
+<li><strong>Turso</strong>: <code>change_id</code> order (monotonically increasing).</li>
+</ul>
+<p>DeltaForge does not reorder events. The source order is preserved through the pipeline.</p>
+<h3 id="within-a-batch"><a class="header" href="#within-a-batch">Within a batch</a></h3>
+<p>All events in a batch maintain their source order. The delivery task processes batches in FIFO order from a bounded channel — no reordering between batches.</p>
+<h3 id="within-a-kafka-partition"><a class="header" href="#within-a-kafka-partition">Within a Kafka partition</a></h3>
+<p>Order is preserved if events for the same key go to the same partition. The default Kafka message key is the serialized primary key of the row, so events for the same row always go to the same partition and arrive in order.</p>
+<p>With dynamic routing (<code>key</code> template), partition assignment depends on the resolved key value. Events with the same resolved key are ordered; events with different keys may be in different partitions with no ordering guarantee between them.</p>
+<h3 id="cross-table-ordering"><a class="header" href="#cross-table-ordering">Cross-table ordering</a></h3>
+<p>There is <strong>no global ordering</strong> across tables. Events from different tables may be interleaved across batches. This is by design — enforcing global ordering would require single-threaded delivery, which would cap throughput.</p>
+<p>However, when <code>batch.respect_source_tx: true</code> (the default), all rows from a single database transaction are kept in the same batch (see <a href="#transaction-boundaries">Transaction Boundaries</a> below). This preserves causal ordering within a transaction.</p>
+<h3 id="cross-sink-ordering"><a class="header" href="#cross-sink-ordering">Cross-sink ordering</a></h3>
+<p>All sinks receive the same batch simultaneously. The relative order of events is identical across all sinks.</p>
+<h2 id="transaction-boundaries"><a class="header" href="#transaction-boundaries">Transaction Boundaries</a></h2>
+<h3 id="how-it-works"><a class="header" href="#how-it-works">How it works</a></h3>
+<p>When <code>batch.respect_source_tx: true</code> (the default), the coordinator checks each event’s <code>tx_end</code> flag before splitting a batch:</p>
+<ul>
+<li><strong>MySQL</strong>: <code>tx_end</code> is set on the last row of each XID (transaction commit) event.</li>
+<li><strong>PostgreSQL</strong>: <code>tx_end</code> is set on the COMMIT WAL record.</li>
+<li><strong>Turso</strong>: each change is its own transaction (<code>tx_end</code> always true).</li>
+</ul>
+<p>The batch accumulator will not split a batch at a point that would separate rows from the same transaction. If the batch limit (<code>max_events</code> or <code>max_bytes</code>) is reached mid-transaction, the batch grows beyond the limit to include all remaining rows in that transaction.</p>
+<h3 id="what-this-guarantees"><a class="header" href="#what-this-guarantees">What this guarantees</a></h3>
+<ul>
+<li>All rows from one database transaction appear in the <strong>same batch</strong>.</li>
+<li>Each batch is delivered <strong>atomically</strong> to each sink (all events in the batch succeed or fail together).</li>
+<li>With Kafka <code>exactly_once: true</code>, the entire batch is committed as a single Kafka transaction — consumers see all rows from the DB transaction atomically.</li>
+</ul>
+<h3 id="edge-cases"><a class="header" href="#edge-cases">Edge cases</a></h3>
+<ul>
+<li>A single database transaction that exceeds <code>max_events</code> or <code>max_bytes</code> is still kept in one batch. The limits are exceeded rather than the transaction being split.</li>
+<li>With <code>respect_source_tx: false</code>, batches are split purely by size/time limits regardless of transaction boundaries.</li>
+</ul>
+<h2 id="failure-isolation"><a class="header" href="#failure-isolation">Failure Isolation</a></h2>
+<h3 id="per-sink-independence"><a class="header" href="#per-sink-independence">Per-sink independence</a></h3>
+<p>All sinks deliver concurrently. One sink’s failure does <strong>not</strong> block other sinks:</p>
+<ol>
+<li>The coordinator dispatches the same batch to all sinks simultaneously.</li>
+<li>Each sink’s delivery result is collected independently.</li>
+<li>Only sinks that delivered successfully get their checkpoints advanced.</li>
+<li>Failed sinks remain at their prior checkpoint position — they will receive the same batch again on retry or restart.</li>
+</ol>
+<h3 id="required-vs-optional-sinks"><a class="header" href="#required-vs-optional-sinks">Required vs. optional sinks</a></h3>
+<p>Each sink is marked <code>required: true</code> (default) or <code>required: false</code>:</p>
+<ul>
+<li><strong>Required</strong>: must succeed for the pipeline to consider the batch delivered. If a required sink fails, no checkpoint advances for any sink.</li>
+<li><strong>Optional</strong> (best-effort): failures are logged but don’t prevent the pipeline from advancing. Optional sinks that fail will catch up on restart via replay from their own checkpoint.</li>
+</ul>
+<h3 id="commit-policy"><a class="header" href="#commit-policy">Commit policy</a></h3>
+<p>The commit policy determines when checkpoints advance:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Policy</th><th>Behavior</th></tr>
+</thead>
+<tbody>
+<tr><td><code>required</code> (default)</td><td>All <code>required: true</code> sinks must acknowledge</td></tr>
+<tr><td><code>all</code></td><td>Every sink (required and optional) must acknowledge</td></tr>
+<tr><td><code>quorum</code></td><td>At least N sinks must acknowledge</td></tr>
+</tbody>
+</table>
+</div>
+<p>The policy is checked <strong>before</strong> any checkpoint is committed. If the policy isn’t satisfied, no sink advances — this prevents optional sinks from getting ahead of failed required sinks.</p>
+<h3 id="per-sink-checkpoints"><a class="header" href="#per-sink-checkpoints">Per-sink checkpoints</a></h3>
+<p>Each sink maintains its own checkpoint key (<code>{source_id}::sink::{sink_id}</code>). On restart, the source replays from the <strong>minimum</strong> checkpoint across all sinks. This means:</p>
+<ul>
+<li>A fast sink is never held back by a slow one during normal operation.</li>
+<li>A slow or failed sink only causes replay for itself, not re-delivery to sinks that are already ahead.</li>
+<li>Adding a new sink triggers replay from the source’s earliest available position for that sink only.</li>
+</ul>
+<h3 id="fatal-errors"><a class="header" href="#fatal-errors">Fatal errors</a></h3>
+<p>Some errors are unrecoverable and stop the pipeline immediately:</p>
+<ul>
+<li><strong>Kafka ProducerFenced</strong>: another producer instance started with the same <code>transactional.id</code>. The broker fences the old producer permanently.</li>
+<li><strong>Permanent auth revocation</strong>: credentials are invalid and retrying won’t help.</li>
+</ul>
+<p>Fatal errors return <code>SinkError::Fatal</code> and are not retried. The pipeline stops and requires operator intervention.</p>
+<h2 id="error-classification--retry"><a class="header" href="#error-classification--retry">Error Classification &amp; Retry</a></h2>
+<h3 id="retry-behavior-by-sink"><a class="header" href="#retry-behavior-by-sink">Retry behavior by sink</a></h3>
+<p>All sinks use exponential backoff with jitter. The classification determines whether an error is retried:</p>
+<p><strong>Kafka:</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Error</th><th>Classification</th><th>Behavior</th></tr>
+</thead>
+<tbody>
+<tr><td>Queue full</td><td>Retryable</td><td>Backoff, retry (100ms base, 10s max, 3 attempts)</td></tr>
+<tr><td>Message timeout</td><td>Retryable</td><td>Backoff, retry</td></tr>
+<tr><td>Broker connection failure</td><td>Retryable</td><td>Backoff, retry</td></tr>
+<tr><td>Authentication failure</td><td>Non-retryable</td><td>Fail immediately</td></tr>
+<tr><td>Message too large</td><td>Non-retryable</td><td>Fail immediately</td></tr>
+<tr><td>Producer fenced</td><td><strong>Fatal</strong></td><td>Pipeline stops</td></tr>
+<tr><td>Transaction commit failure (fatal)</td><td><strong>Fatal</strong></td><td>Pipeline stops</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>NATS:</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Error</th><th>Classification</th><th>Behavior</th></tr>
+</thead>
+<tbody>
+<tr><td>Connection failure</td><td>Retryable</td><td>Backoff, retry (50ms base, 5s max, 3 attempts)</td></tr>
+<tr><td>Publish timeout</td><td>Retryable</td><td>Backoff, retry</td></tr>
+<tr><td>Authentication failure</td><td>Non-retryable</td><td>Fail immediately</td></tr>
+<tr><td>No responders</td><td>Non-retryable</td><td>Fail immediately</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Redis:</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Error</th><th>Classification</th><th>Behavior</th></tr>
+</thead>
+<tbody>
+<tr><td>Connection failure</td><td>Retryable</td><td>Backoff, retry (50ms base, 5s max, 3 attempts)</td></tr>
+<tr><td>Command timeout</td><td>Retryable</td><td>Backoff, retry</td></tr>
+<tr><td>NOAUTH / WRONGPASS</td><td>Non-retryable</td><td>Fail immediately</td></tr>
+<tr><td>Permission denied</td><td>Non-retryable</td><td>Fail immediately</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="after-retry-exhaustion"><a class="header" href="#after-retry-exhaustion">After retry exhaustion</a></h3>
+<p>If all retry attempts fail for a retryable error, the error is propagated to the coordinator. The coordinator’s behavior depends on the commit policy:</p>
+<ul>
+<li><strong>Required sink</strong>: the batch is not committed, and the pipeline will retry the entire batch on the next cycle.</li>
+<li><strong>Optional sink</strong>: the failure is logged, and the pipeline continues with other sinks.</li>
+</ul>
+<h2 id="checkpoint-semantics"><a class="header" href="#checkpoint-semantics">Checkpoint Semantics</a></h2>
+<h3 id="when-checkpoints-are-saved"><a class="header" href="#when-checkpoints-are-saved">When checkpoints are saved</a></h3>
+<p>The checkpoint commit follows a strict sequence:</p>
+<pre><code>1. Accumulate events from source into a batch
+2. Run processors (transform, filter)
+3. Deliver batch to ALL sinks concurrently
+4. Check commit policy (required/all/quorum)
+5. Commit per-sink checkpoints (only for successful sinks)
+</code></pre>
+<p><strong>Key invariant</strong>: a checkpoint is saved only after the sink has acknowledged delivery AND the commit policy is satisfied. This is the foundation of at-least-once delivery.</p>
+<h3 id="on-crash-recovery"><a class="header" href="#on-crash-recovery">On crash recovery</a></h3>
+<ol>
+<li>DeltaForge reads per-sink checkpoints from the checkpoint store.</li>
+<li>The source resumes from the <strong>minimum</strong> checkpoint across all sinks.</li>
+<li>Sinks that were already ahead of the minimum position receive duplicate events — they must handle these idempotently (or use exactly-once mode).</li>
+<li>Sinks that were behind receive their missing events.</li>
+</ol>
+<h3 id="checkpoint-storage"><a class="header" href="#checkpoint-storage">Checkpoint storage</a></h3>
+<p>Checkpoints are stored in SQLite (default) with WAL mode and <code>synchronous=NORMAL</code> for durability. The checkpoint store survives <code>SIGKILL</code> — no graceful shutdown required for checkpoint safety.</p>
+<h2 id="backpressure"><a class="header" href="#backpressure">Backpressure</a></h2>
+<p>DeltaForge implements end-to-end backpressure without dropping events:</p>
+<pre><code>Source → [event channel] → Accumulator → [batch channel (max_inflight)] → Delivery → Sinks
+</code></pre>
+<ol>
+<li><strong>Sink slow</strong>: delivery task blocks waiting for sink acknowledgement.</li>
+<li><strong>Batch channel full</strong>: accumulator blocks waiting to enqueue the next batch (bounded by <code>max_inflight</code>).</li>
+<li><strong>Event channel full</strong>: source blocks waiting to enqueue the next event.</li>
+<li><strong>Source slows</strong>: the database connection idles until the channel has capacity.</li>
+</ol>
+<p>No events are dropped at any stage. Backpressure propagates from the slowest sink all the way back to the source connection.</p>
+<p><code>max_inflight</code> controls the pipeline depth: higher values allow overlapping batch building with delivery (better throughput), lower values reduce memory usage and latency.</p>
+<h2 id="consumer-guidance"><a class="header" href="#consumer-guidance">Consumer Guidance</a></h2>
+<h3 id="idempotency-key"><a class="header" href="#idempotency-key">Idempotency key</a></h3>
+<p>Every event has a deterministic idempotency key in the format:</p>
+<pre><code>{tenant}|{db}.{table}|{tx_id}|{event_id}
+</code></pre>
+<p>This key is identical across replays — the same source event always produces the same key.</p>
+<ul>
+<li><strong>Kafka with <code>exactly_once: true</code></strong>: set <code>isolation.level=read_committed</code> on consumers. No application-level dedup needed.</li>
+<li><strong>Kafka without <code>exactly_once</code></strong>: use the event’s <code>id</code> field (UUID v7) or the idempotency key to detect duplicates.</li>
+<li><strong>NATS JetStream</strong>: server-side dedup via <code>Nats-Msg-Id</code> header. Configure <code>duplicate_window</code> on the stream to cover your maximum expected downtime (default: 2 minutes).</li>
+<li><strong>Redis Streams</strong>: check the <code>idempotency_key</code> field in the stream entry before processing. Use a Redis SET or application-level tracking to remember processed keys.</li>
+</ul>
+<h3 id="dedup-window"><a class="header" href="#dedup-window">Dedup window</a></h3>
+<p>How long should consumers remember processed event IDs? Match your maximum expected DeltaForge downtime:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Scenario</th><th>Recommended window</th></tr>
+</thead>
+<tbody>
+<tr><td>Normal operation (no crashes)</td><td>No dedup needed (at-most-once per run)</td></tr>
+<tr><td>Planned restarts</td><td>5 minutes</td></tr>
+<tr><td>Unplanned crashes with auto-restart</td><td>15-30 minutes</td></tr>
+<tr><td>Disaster recovery</td><td>Match your RPO</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
+<p>These are <strong>not guaranteed</strong> and are documented honestly:</p>
+<ul>
+<li><strong>No cross-table global ordering</strong> — events from different tables may be interleaved. This is by design; enforcing global order would require single-threaded delivery and cap throughput. Use <code>respect_source_tx: true</code> to preserve ordering within database transactions.</li>
+<li><strong>No stateful stream processing</strong> — DeltaForge does not support joins, aggregations, or windowing. For stateful processing, consume DeltaForge’s output with Apache Flink, ksqlDB, or Kafka Streams.</li>
+<li><strong>No dead letter queue (yet)</strong> — a single poison event that consistently fails serialization will block the pipeline. Planned for a future release.</li>
+<li><strong>No schema registry integration (yet)</strong> — schema sensing detects structural drift and can halt on breaking changes, but there is no Confluent Schema Registry or Avro/Protobuf encoding support. Planned for a future release.</li>
+<li><strong>Snapshot consistency</strong> — initial snapshots use lock-free parallel reads. The snapshot is eventually consistent with the CDC stream; there may be a brief overlap period where both snapshot rows and CDC events for the same row are delivered. Consumers should use the event timestamp or idempotency key to resolve.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="outbox.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="architecture.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="outbox.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="architecture.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>
