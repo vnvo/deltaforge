@@ -642,11 +642,20 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
 
                         // Drain as many additional events as are immediately
                         // available, up to the remaining batch capacity.
+                        // The timeout ensures we don't block longer than
+                        // tick_ms — when the source goes idle at the WAL tail,
+                        // this returns quickly so the select! loop's ticker
+                        // branch can flush the partial batch.
                         let remaining = max_events.saturating_sub(b.raw.len()).min(512);
                         if remaining > 0 {
                             drain_buf.clear();
-                            let n = event_rx.recv_many(&mut drain_buf, remaining).await;
-                            if n == 0 && b.raw.is_empty() {
+                            let n = tokio::time::timeout(
+                                Duration::from_millis(tick_ms),
+                                event_rx.recv_many(&mut drain_buf, remaining),
+                            )
+                            .await
+                            .unwrap_or(0); // timeout → 0 events drained, not an error
+                            if n == 0 && b.raw.is_empty() && event_rx.is_closed() {
                                 break;
                             }
                             for ev in drain_buf.drain(..) {
@@ -1309,5 +1318,105 @@ mod tests {
         assert_eq!(kafka_sink.delivery_count(), 1);
         // Redis was called but failed.
         assert_eq!(redis_sink.delivery_count(), 0);
+    }
+
+    /// Regression test: a partial batch (fewer events than max_events) must be
+    /// flushed by the timer when the source goes idle — not stuck waiting for
+    /// more events to fill the batch.
+    #[tokio::test]
+    async fn test_partial_batch_flushed_by_timer() {
+        use checkpoints::MemCheckpointStore;
+
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+
+        let cp_fn = build_commit_fn(store.clone(), "src::sink::kafka".to_string());
+        let processors: Arc<[deltaforge_core::ArcDynProcessor]> = Arc::from(vec![]);
+        let batch_processor = build_batch_processor(processors, "test".to_string());
+
+        // Large max_events so the batch never fills, short timer (50ms).
+        let coord = Coordinator::builder("test-timer")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(10000),
+                max_bytes: None,
+                max_ms: Some(50),
+                respect_source_tx: None,
+                max_inflight: Some(1),
+            }))
+            .commit_fn("kafka", cp_fn)
+            .process_fn(batch_processor)
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        let source = deltaforge_core::SourceInfo {
+            version: "test".into(),
+            connector: "mysql".into(),
+            name: "test".into(),
+            db: "db".into(),
+            schema: None,
+            table: "table".into(),
+            ts_ms: 0,
+            snapshot: None,
+            position: deltaforge_core::SourcePosition::default(),
+        };
+
+        // Send 3 events (well below max_events=10000), then go idle.
+        for i in 0..3 {
+            let mut ev = Event::new_row(
+                source.clone(),
+                deltaforge_core::Op::Create,
+                None,
+                Some(serde_json::json!({"id": i})),
+                0,
+                0,
+            );
+            if i == 2 {
+                ev.checkpoint =
+                    Some(CheckpointMeta::from_vec(b"{\"pos\":99}".to_vec()));
+                ev.tx_end = true;
+            }
+            tx.send(ev).await.unwrap();
+        }
+
+        // Don't close the channel — simulate source idle at WAL tail.
+        // The timer should flush the partial batch within max_ms.
+        // Wait up to 2 seconds for the sink to receive the events.
+        let cancel_clone = cancel.clone();
+        let sink_clone = Arc::clone(&sink);
+        let wait_handle = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if sink_clone.delivery_count() >= 3 {
+                    // Events delivered — cancel coordinator to stop the test.
+                    cancel_clone.cancel();
+                    return true;
+                }
+                if tokio::time::Instant::now() > deadline {
+                    cancel_clone.cancel();
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let _ = coord.run(rx, cancel, pause_rx).await;
+        let flushed = wait_handle.await.unwrap();
+
+        assert!(
+            flushed,
+            "partial batch (3 events) should be flushed by timer within max_ms, \
+             but sink received {} events",
+            sink.delivery_count()
+        );
+        assert_eq!(sink.delivery_count(), 3);
+
+        // Checkpoint should also be committed.
+        let cp = store.get_raw("src::sink::kafka").await.unwrap();
+        assert_eq!(cp.unwrap(), b"{\"pos\":99}");
     }
 }
