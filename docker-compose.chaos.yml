@@ -1,23 +1,45 @@
 # Chaos testing environment for DeltaForge
 #
 # Network topology:
-#   DeltaForge ─> toxiproxy ─> mysql / postgres / kafka
+#   DeltaForge -> toxiproxy -> mysql / postgres / kafka
 #
-# Toxiproxy API (port 8474) is the fault injection handle.
-# Scenario runner injects faults via HTTP against localhost:8474.
+# Profiles — infra and app are independent so you can start/stop DeltaForge
+# containers without affecting the underlying infrastructure:
+#
+#   base          — toxiproxy, prometheus, grafana, cadvisor, loki, promtail
+#   mysql-infra   — mysql, mysql-b
+#   pg-infra      — postgres, postgres-b
+#   kafka-infra   — kafka
+#   app           — DeltaForge MySQL->Kafka chaos instance
+#   pg-app        — DeltaForge Postgres->Kafka chaos instance
+#   soak          — DeltaForge MySQL soak/drain benchmark
+#   pg-soak       — DeltaForge Postgres soak/drain benchmark
+#   tpcc          — DeltaForge MySQL TPC-C benchmark
 #
 # Usage:
-#   docker compose -f docker-compose.chaos.yml up -d
-#   docker compose -f docker-compose.chaos.yml --profile pg up -d   # include postgres
-#   open http://localhost:3000   # Grafana (anonymous admin)
-#   open http://localhost:9090   # Prometheus
+#   # Start everything for MySQL chaos testing
+#   docker compose -f docker-compose.chaos.yml \
+#     --profile base --profile mysql-infra --profile kafka-infra --profile app up -d
+#
+#   # Restart only the DeltaForge container (infra stays up)
+#   docker compose -f docker-compose.chaos.yml --profile app restart
+#
+#   # Add Postgres infra + pg-soak without touching anything else
+#   docker compose -f docker-compose.chaos.yml --profile pg-infra --profile pg-soak up -d
+#
+#   # View all container logs in Grafana Explore (Loki datasource)
+#   open http://localhost:3000/explore
+#     Query: {service="deltaforge-soak"} or {container=~"deltaforge.*"}
 
 services:
 
-  # Databases 
+  # ==========================================================================
+  # mysql-infra — MySQL primary + failover replica
+  # ==========================================================================
 
   mysql:
     image: mysql:8.4
+    profiles: [mysql-infra]
     environment:
       MYSQL_ROOT_PASSWORD: password
     volumes:
@@ -33,8 +55,8 @@ services:
       - --gtid-mode=ON
       - --enforce-gtid-consistency=ON
       - --binlog-checksum=NONE
-      # 10 min retention: binlog-purge uses RESET BINARY LOGS (manual), not expiry
-      - --binlog-expire-logs-seconds=600
+      # 1 hour retention — long enough for large drain benchmarks (10M+ rows)
+      - --binlog-expire-logs-seconds=3600
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-ppassword"]
       interval: 5s
@@ -46,6 +68,7 @@ services:
 
   mysql-b:
     image: mysql:8.4
+    profiles: [mysql-infra]
     environment:
       MYSQL_ROOT_PASSWORD: password
     volumes:
@@ -59,7 +82,7 @@ services:
       - --gtid-mode=ON
       - --enforce-gtid-consistency=ON
       - --binlog-checksum=NONE
-      - --binlog-expire-logs-seconds=600
+      - --binlog-expire-logs-seconds=3600
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-ppassword"]
       interval: 5s
@@ -67,9 +90,13 @@ services:
       retries: 15
     networks: [chaos_net]
 
+  # ==========================================================================
+  # pg-infra — PostgreSQL primary + failover replica
+  # ==========================================================================
+
   postgres:
     image: postgres:17
-    profiles: [pg, pg-app, pg-soak]
+    profiles: [pg-infra]
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: orders
@@ -99,7 +126,7 @@ services:
 
   postgres-b:
     image: postgres:17
-    profiles: [pg, pg-app]
+    profiles: [pg-infra]
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: orders
@@ -121,10 +148,13 @@ services:
       retries: 10
     networks: [chaos_net]
 
-  # Kafka (KRaft — no Zookeeper)
+  # ==========================================================================
+  # kafka-infra — Kafka broker (KRaft, no Zookeeper)
+  # ==========================================================================
 
   kafka:
     image: confluentinc/cp-kafka:7.7.1
+    profiles: [kafka-infra]
     environment:
       # KRaft mode — combined broker + controller in a single node
       KAFKA_NODE_ID: 1
@@ -139,6 +169,8 @@ services:
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_INTER_BROKER_LISTENER_NAME: BROKER
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       # Keep topics lean: 5 min retention, 1 min segments so cleanup fires quickly
       KAFKA_LOG_RETENTION_MS: "300000"
@@ -153,10 +185,13 @@ services:
       - "9092:9092"
     networks: [chaos_net]
 
-  # Toxiproxy
+  # ==========================================================================
+  # base — proxy, observability, log aggregation
+  # ==========================================================================
 
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:2.9.0
+    profiles: [base]
     command: ["-host=0.0.0.0", "-config=/etc/toxiproxy/proxies.json"]
     volumes:
       - ./chaos/toxiproxy/proxies.json:/etc/toxiproxy/proxies.json:ro
@@ -165,21 +200,79 @@ services:
       - "5100:5100"   # mysql proxy    <-- also exposed for ad-hoc inspection
       - "5101:5101"   # postgres proxy
       - "5102:5102"   # kafka proxy
-    depends_on:
-      mysql:
-        condition: service_healthy
-      kafka:
-        condition: service_healthy
+    # No depends_on — infra profiles start independently. Toxiproxy retries
+    # upstream connections automatically; backends just need to be up before
+    # DeltaForge connects through the proxy.
     networks: [chaos_net]
 
-  # DeltaForge — MySQL source
-  # Uses debug image so the scenario runner can exec into it for kill -9 tests.
-  # Build first: docker build -t deltaforge:dev-debug -f Dockerfile.debug .
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    profiles: [base]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./chaos/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+    networks: [chaos_net]
 
+  loki:
+    image: grafana/loki:3.0.0
+    profiles: [base]
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./chaos/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+    ports: ["3100:3100"]
+    networks: [chaos_net]
+
+  promtail:
+    image: grafana/promtail:3.0.0
+    profiles: [base]
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - ./chaos/promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    networks: [chaos_net]
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    profiles: [base]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/deltaforge.json
+    volumes:
+      - ./chaos/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./chaos/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports: ["3000:3000"]
+    networks: [chaos_net]
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.2
+    profiles: [base]
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    ports: ["8888:8080"]
+    networks: [chaos_net]
+
+  # ==========================================================================
+  # DeltaForge app instances
+  # ==========================================================================
+
+  # MySQL -> Kafka chaos instance (debug image for kill -9 tests)
   deltaforge:
     image: deltaforge:dev-debug
-    command: ["--config", "/etc/deltaforge/mysql-to-kafka.yaml", "--storage-path", "/data/deltaforge.db"]
     profiles: [app]
+    command: ["--config", "/etc/deltaforge/mysql-to-kafka.yaml", "--storage-path", "/data/deltaforge.db"]
     user: root
     volumes:
       - ./chaos/config:/etc/deltaforge:ro
@@ -189,19 +282,16 @@ services:
     ports:
       - "8080:8080"   # REST API / health
       - "9000:9000"   # Prometheus /metrics
-    depends_on: [toxiproxy]
     # restart: on-failure is intentional — crash-recovery scenario needs this
     restart: on-failure
     networks: [chaos_net]
 
-  # DeltaForge — PostgreSQL source
-  # Runs on the same host ports as deltaforge (8080, 9000). Only one profile
-  # should be active at a time: `app` (MySQL) XOR `pg-app` (Postgres).
-
+  # Postgres -> Kafka chaos instance
+  # Same host ports as deltaforge (8080, 9000) — don't run app + pg-app together
   deltaforge-pg:
     image: deltaforge:dev-debug
-    command: ["--config", "/etc/deltaforge/pg-to-kafka.yaml", "--storage-path", "/data/deltaforge-pg.db"]
     profiles: [pg-app]
+    command: ["--config", "/etc/deltaforge/pg-to-kafka.yaml", "--storage-path", "/data/deltaforge-pg.db"]
     user: root
     volumes:
       - ./chaos/config:/etc/deltaforge:ro
@@ -209,20 +299,16 @@ services:
     environment:
       RUST_LOG: "deltaforge=debug,sources=debug,sinks=info,warn"
     ports:
-      - "8080:8080"   # REST API / health  (same as deltaforge — don't run both)
+      - "8080:8080"   # REST API / health
       - "9000:9000"   # Prometheus /metrics
-    depends_on: [toxiproxy, postgres]
     restart: on-failure
     networks: [chaos_net]
 
-  # DeltaForge — TPC-C soak (MySQL source, 9-table wholesale-supplier workload)
-  # Profile: tpcc. Ports 8082 (health) and 9002 (metrics) so it can run
-  # alongside the regular and soak instances.
-
+  # MySQL TPC-C benchmark (ports 8082/9002)
   deltaforge-tpcc:
     image: deltaforge:dev-debug
-    command: ["--config", "/etc/deltaforge/mysql-tpcc.yaml", "--storage-path", "/data/deltaforge-tpcc.db"]
     profiles: [tpcc]
+    command: ["--config", "/etc/deltaforge/mysql-tpcc.yaml", "--storage-path", "/data/deltaforge-tpcc.db"]
     user: root
     volumes:
       - ./chaos/config:/etc/deltaforge:ro
@@ -232,18 +318,14 @@ services:
     ports:
       - "8082:8080"   # REST API / health
       - "9002:9000"   # Prometheus /metrics
-    depends_on: [toxiproxy]
     restart: on-failure
     networks: [chaos_net]
 
-  # DeltaForge — Soak test (MySQL source, high-throughput, 120-table workload)
-  # Profile: soak. Exposes on ports 8081 (health) and 9001 (metrics) so it can
-  # run alongside the regular deltaforge instance.
-
+  # MySQL soak/drain benchmark (profiling image, ports 8081/9001)
   deltaforge-soak:
     image: deltaforge:dev-profile
-    command: ["--config", "/etc/deltaforge/mysql-soak.yaml", "--storage-path", "/data/deltaforge-soak.db"]
     profiles: [soak]
+    command: ["--config", "/etc/deltaforge/mysql-soak.yaml", "--storage-path", "/data/deltaforge-soak.db"]
     user: root
     # SYS_ADMIN + perf_event_open access needed for CPU profiling via perf.
     # Only effective when running the profiling image; harmless with dev-debug.
@@ -257,17 +339,14 @@ services:
     ports:
       - "8081:8080"   # REST API / health
       - "9001:9000"   # Prometheus /metrics
-    depends_on: [toxiproxy]
     restart: on-failure
     networks: [chaos_net]
 
-  # DeltaForge — PostgreSQL Soak test (Postgres source, 120-table workload)
-  # Profile: pg-soak. Exposes on ports 8083 (health) and 9003 (metrics).
-
+  # Postgres soak/drain benchmark (profiling image, ports 8083/9003)
   deltaforge-pg-soak:
     image: deltaforge:dev-profile
-    command: ["--config", "/etc/deltaforge/pg-soak.yaml", "--storage-path", "/data/deltaforge-pg-soak.db"]
     profiles: [pg-soak]
+    command: ["--config", "/etc/deltaforge/pg-soak.yaml", "--storage-path", "/data/deltaforge-pg-soak.db"]
     user: root
     cap_add: [SYS_ADMIN]
     security_opt: ["seccomp=unconfined"]
@@ -279,47 +358,7 @@ services:
     ports:
       - "8083:8080"   # REST API / health
       - "9003:9000"   # Prometheus /metrics
-    depends_on: [toxiproxy, postgres]
     restart: on-failure
-    networks: [chaos_net]
-
-  # cAdvisor — container-level CPU, memory, network, and disk I/O metrics
-  # Scrapes Docker runtime stats and exposes them to Prometheus.
-
-  cadvisor:
-    image: gcr.io/cadvisor/cadvisor:v0.49.2
-    privileged: true
-    volumes:
-      - /:/rootfs:ro
-      - /var/run:/var/run:ro
-      - /sys:/sys:ro
-      - /var/lib/docker:/var/lib/docker:ro
-      - /dev/disk:/dev/disk:ro
-    ports: ["8888:8080"]
-    networks: [chaos_net]
-
-  # Observability
-
-  prometheus:
-    image: prom/prometheus:v2.53.0
-    volumes:
-      - ./chaos/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-    ports: ["9090:9090"]
-    networks: [chaos_net]
-
-  grafana:
-    image: grafana/grafana:11.1.0
-    environment:
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
-      GF_AUTH_DISABLE_LOGIN_FORM: "true"
-      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/deltaforge.json
-    volumes:
-      - ./chaos/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./chaos/grafana/dashboards:/etc/grafana/dashboards:ro
-      - grafana_data:/var/lib/grafana
-    ports: ["3000:3000"]
-    depends_on: [prometheus]
     networks: [chaos_net]
 
 networks:
@@ -332,6 +371,7 @@ volumes:
   deltaforge_soak_data:
   deltaforge_pg_soak_data:
   grafana_data:
+  loki_data:
   mysql_data:
   mysql_b_data:
   postgres_data:

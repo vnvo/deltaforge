@@ -245,28 +245,31 @@ impl NatsSink {
     }
 
     /// Build NATS headers from routing key + routing headers.
+    ///
+    /// Always sets `Nats-Msg-Id` to the event's idempotency key for
+    /// JetStream server-side deduplication. On replay after crash recovery,
+    /// the server rejects messages with duplicate `Nats-Msg-Id` within the
+    /// stream's `duplicate_window` — providing effectively-once delivery.
     fn build_nats_headers(
         &self,
         event: &Event,
-    ) -> Option<async_nats::HeaderMap> {
-        let key = self.resolve_key(event);
-        let routing_headers =
-            event.routing.as_ref().and_then(|r| r.headers.as_ref());
-
-        if key.is_none() && routing_headers.is_none() {
-            return None;
-        }
-
+    ) -> async_nats::HeaderMap {
         let mut headers = async_nats::HeaderMap::new();
-        if let Some(k) = key {
+
+        // Idempotency key for JetStream dedup.
+        headers.insert("Nats-Msg-Id", event.idempotency_key().as_str());
+
+        if let Some(k) = self.resolve_key(event) {
             headers.insert("df-key", k.as_str());
         }
-        if let Some(map) = routing_headers {
+        if let Some(map) =
+            event.routing.as_ref().and_then(|r| r.headers.as_ref())
+        {
             for (k, v) in map {
                 headers.insert(k.as_str(), v.as_str());
             }
         }
-        Some(headers)
+        headers
     }
 
     /// Serialize event using configured envelope.
@@ -479,7 +482,7 @@ impl Sink for NatsSink {
     async fn send(&self, event: &Event) -> SinkResult<()> {
         let payload = self.serialize_event(event)?;
         let subject = self.resolve_subject(event)?;
-        let headers = self.build_nats_headers(event);
+        let headers = Some(self.build_nats_headers(event));
 
         // Retry loop for transient failures
         let policy = RetryPolicy::new(
@@ -540,7 +543,7 @@ impl Sink for NatsSink {
 
         // Pre-serialize all payloads with resolved subjects and headers
         let serialized: Result<
-            Vec<(String, Vec<u8>, Option<async_nats::HeaderMap>)>,
+            Vec<(String, Vec<u8>, async_nats::HeaderMap)>,
             SinkError,
         > = events
             .iter()
@@ -593,7 +596,8 @@ impl Sink for NatsSink {
                         .await
                         .map_err(|e| NatsRetryError::Connect(e.to_string()))?;
 
-                    // Publish all messages concurrently
+                    // Publish all messages concurrently (always with headers
+                    // since Nats-Msg-Id is always set for dedup).
                     let futures: Vec<_> = serialized
                         .iter()
                         .map(|(subject, payload, headers)| {
@@ -602,20 +606,13 @@ impl Sink for NatsSink {
                             let payload = payload.clone();
                             let headers = headers.clone();
                             async move {
-                                let ack_fut = if let Some(hdrs) = headers {
-                                    jetstream
-                                        .publish_with_headers(
-                                            subject,
-                                            hdrs,
-                                            payload.into(),
-                                        )
-                                        .await
-                                } else {
-                                    jetstream
-                                        .publish(subject, payload.into())
-                                        .await
-                                };
-                                ack_fut
+                                jetstream
+                                    .publish_with_headers(
+                                        subject,
+                                        headers,
+                                        payload.into(),
+                                    )
+                                    .await
                                     .map_err(|e| {
                                         NatsRetryError::Publish(e.to_string())
                                     })?

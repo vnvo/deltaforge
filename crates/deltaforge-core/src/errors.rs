@@ -61,6 +61,12 @@ pub enum SinkError {
     #[error("routing error: {details}")]
     Routing { details: Cow<'static, str> },
 
+    /// Unrecoverable error — the sink cannot recover and the pipeline must stop.
+    /// Examples: Kafka ProducerFenced (another producer with the same
+    /// transactional.id started), permanent auth revocation.
+    #[error("fatal: {details}")]
+    Fatal { details: Cow<'static, str> },
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -74,6 +80,7 @@ impl SinkError {
             SinkError::Serialization { .. } => "serialization error",
             SinkError::Backpressure { .. } => "backpressure",
             SinkError::Routing { .. } => "routing error",
+            SinkError::Fatal { .. } => "fatal error",
             SinkError::Other(_) => "other error",
         }
     }
@@ -85,6 +92,7 @@ impl SinkError {
             SinkError::Backpressure { details } => details.to_string(),
             SinkError::Routing { details } => details.to_string(),
             SinkError::Serialization { details } => details.to_string(),
+            SinkError::Fatal { details } => details.to_string(),
             SinkError::Io(e) => e.to_string(),
             SinkError::Other(e) => e.to_string(),
         }

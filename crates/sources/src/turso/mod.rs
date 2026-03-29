@@ -710,6 +710,25 @@ impl Source for TursoSource {
             join,
         }
     }
+
+    fn compare_checkpoints(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        // TursoCheckpoint: { last_change_id: Option<i64>, timestamp_ms: i64 }
+        let a: TursoCheckpoint = match serde_json::from_slice(a) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "failed to parse checkpoint a in compare_checkpoints");
+                return std::cmp::Ordering::Equal;
+            }
+        };
+        let b: TursoCheckpoint = match serde_json::from_slice(b) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "failed to parse checkpoint b in compare_checkpoints");
+                return std::cmp::Ordering::Equal;
+            }
+        };
+        a.last_change_id.cmp(&b.last_change_id)
+    }
 }
 
 // ============================================================================

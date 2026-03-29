@@ -262,7 +262,7 @@ impl Default for BatchConfig {
     fn default() -> Self {
         Self {
             max_events: Some(2000),
-            max_bytes: Some(3 * 1024 * 1024),
+            max_bytes: Some(16 * 1024 * 1024),
             max_ms: Some(50),
             respect_source_tx: Some(true),
             max_inflight: Some(1),

@@ -7,7 +7,78 @@ use crate::coordinator::{
 };
 use crate::schema_provider::SchemaLoaderAdapter;
 use anyhow::{Context, Result};
-use checkpoints::CheckpointStore;
+use async_trait::async_trait;
+use checkpoints::{CheckpointResult, CheckpointStore};
+
+// ── Per-sink checkpoint proxy ────────────────────────────────────────────────
+
+/// Comparison function for opaque checkpoint bytes.
+/// Each source provides its own implementation via `Source::compare_checkpoints`.
+type CheckpointCmpFn = Arc<dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering + Send + Sync>;
+
+/// Wraps a [`CheckpointStore`] to present the **minimum** per-sink checkpoint
+/// when the source calls `get_raw(source_id)`.
+///
+/// Per-sink checkpoints are stored as `"{source_id}::sink::{sink_id}"`.
+/// On `get_raw(source_id)`, this wrapper reads all per-sink keys and returns
+/// the smallest (earliest) checkpoint so the source replays from the position
+/// that the slowest sink needs.
+///
+/// Uses the source-provided comparison function for correctness — different
+/// sources have different checkpoint formats (MySQL file:pos, Postgres LSN,
+/// Turso change_id) that cannot be compared lexicographically.
+struct PerSinkCheckpointProxy {
+    inner: Arc<dyn CheckpointStore>,
+    source_id: String,
+    cmp_fn: CheckpointCmpFn,
+}
+
+#[async_trait]
+impl CheckpointStore for PerSinkCheckpointProxy {
+    async fn get_raw(&self, key: &str) -> CheckpointResult<Option<Vec<u8>>> {
+        if key == self.source_id {
+            let prefix = format!("{}::sink::", self.source_id);
+            let keys = self.inner.list_with_prefix(&prefix).await?;
+            if keys.is_empty() {
+                // Fallback: check legacy checkpoint key (pre per-sink format).
+                // This allows seamless migration — old pipelines that saved
+                // checkpoints under the plain source_id key still work.
+                return self.inner.get_raw(key).await;
+            }
+            let mut min_cp: Option<Vec<u8>> = None;
+            for k in &keys {
+                if let Some(data) = self.inner.get_raw(k).await? {
+                    min_cp = Some(match min_cp {
+                        None => data,
+                        Some(prev) => {
+                            if (self.cmp_fn)(&data, &prev)
+                                == std::cmp::Ordering::Less
+                            {
+                                data
+                            } else {
+                                prev
+                            }
+                        }
+                    });
+                }
+            }
+            return Ok(min_cp);
+        }
+        self.inner.get_raw(key).await
+    }
+
+    async fn put_raw(&self, key: &str, bytes: &[u8]) -> CheckpointResult<()> {
+        self.inner.put_raw(key, bytes).await
+    }
+
+    async fn delete(&self, key: &str) -> CheckpointResult<bool> {
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self) -> CheckpointResult<Vec<String>> {
+        self.inner.list().await
+    }
+}
 use deltaforge_config::{PipelineSpec, SourceCfg};
 use deltaforge_core::{Event, SourceError, SourceHandle};
 use metrics::{counter, gauge};
@@ -220,7 +291,20 @@ impl PipelineManager {
         let alive = Arc::new(AtomicBool::new(true));
 
         let (event_tx, event_rx) = mpsc::channel::<Event>(32_768);
-        let src_handle = source.run(event_tx, self.ckpt_store.clone()).await;
+        // Wrap checkpoint store so the source reads the minimum per-sink
+        // checkpoint — it replays from the position the slowest sink needs.
+        // Capture the source's checkpoint comparison function for the proxy.
+        let source_ref = Arc::clone(&source);
+        let cmp_fn: CheckpointCmpFn = Arc::new(move |a, b| {
+            source_ref.compare_checkpoints(a, b)
+        });
+        let source_ckpt: Arc<dyn CheckpointStore> =
+            Arc::new(PerSinkCheckpointProxy {
+                inner: self.ckpt_store.clone(),
+                source_id: spec.spec.source.source_id().to_string(),
+                cmp_fn,
+            });
+        let src_handle = source.run(event_tx, source_ckpt).await;
 
         // Wrap the source JoinHandle so alive=false is set immediately when
         // the source task dies without an explicit cancellation.  The
@@ -256,10 +340,10 @@ impl PipelineManager {
 
         let batch_processor =
             build_batch_processor(processors, pipeline_name.clone());
-        let commit_cp = build_commit_fn(
-            self.ckpt_store.clone(),
-            spec.spec.source.source_id().to_string(),
-        );
+
+        // Build per-sink checkpoint commit functions.
+        // Each sink gets its own checkpoint key: "{source_id}::sink::{sink_id}".
+        let source_id = spec.spec.source.source_id().to_string();
 
         let (pause_tx, pause_rx) = watch::channel(false);
 
@@ -270,11 +354,20 @@ impl PipelineManager {
             .then(|| Arc::new(SchemaSensorState::new(sensing_cfg)));
 
         let mut builder = Coordinator::builder(pipeline_name.clone())
-            .sinks(sinks)
+            .sinks(sinks.clone())
             .batch_config(spec.spec.batch.clone())
             .commit_policy(spec.spec.commit_policy.clone())
-            .commit_fn(commit_cp)
             .process_fn(batch_processor);
+
+        for sink in &sinks {
+            let sink_id = sink.id().to_string();
+            let cp_key = format!("{}::sink::{}", source_id, sink_id);
+            let commit_fn = build_commit_fn(
+                self.ckpt_store.clone(),
+                cp_key,
+            );
+            builder = builder.commit_fn(sink_id, commit_fn);
+        }
 
         let sensor_for_runtime = sensor.clone();
         if let Some(s) = sensor {
@@ -414,7 +507,41 @@ impl PipelineController for PipelineManager {
             .spec
             .clone();
 
-        let new_spec = merge_spec(old_spec, patch)?;
+        let new_spec = merge_spec(old_spec.clone(), patch)?;
+
+        // Clean up per-sink checkpoints for removed sinks.
+        let source_id = old_spec.spec.source.source_id();
+        let old_sink_ids: std::collections::HashSet<&str> = old_spec
+            .spec
+            .sinks
+            .iter()
+            .map(|s| s.sink_id())
+            .collect();
+        let new_sink_ids: std::collections::HashSet<&str> = new_spec
+            .spec
+            .sinks
+            .iter()
+            .map(|s| s.sink_id())
+            .collect();
+
+        for removed in old_sink_ids.difference(&new_sink_ids) {
+            let cp_key = format!("{}::sink::{}", source_id, removed);
+            if let Err(e) = self.ckpt_store.delete(&cp_key).await {
+                tracing::warn!(
+                    pipeline = %name,
+                    sink = %removed,
+                    error = %e,
+                    "failed to clean up checkpoint for removed sink"
+                );
+            } else {
+                tracing::info!(
+                    pipeline = %name,
+                    sink = %removed,
+                    "cleaned up per-sink checkpoint for removed sink"
+                );
+            }
+        }
+
         self.stop_pipeline(name).await?;
         self.start_pipeline(new_spec).await
     }
@@ -523,7 +650,39 @@ impl PipelineController for PipelineManager {
     }
 
     async fn delete(&self, name: &str) -> Result<(), PipelineAPIError> {
-        self.stop_pipeline(name).await
+        // Capture source_id before stopping (spec is removed by stop).
+        let source_id = self
+            .pipelines
+            .read()
+            .get(name)
+            .map(|r| r.spec.spec.source.source_id().to_string());
+
+        self.stop_pipeline(name).await?;
+
+        // Clean up all per-sink checkpoints for this pipeline.
+        if let Some(source_id) = source_id {
+            let prefix = format!("{}::sink::", source_id);
+            if let Ok(keys) = self.ckpt_store.list_with_prefix(&prefix).await {
+                for key in keys {
+                    if let Err(e) = self.ckpt_store.delete(&key).await {
+                        tracing::warn!(
+                            pipeline = %name,
+                            key = %key,
+                            error = %e,
+                            "failed to clean up per-sink checkpoint on delete"
+                        );
+                    }
+                }
+                if !prefix.is_empty() {
+                    tracing::info!(
+                        pipeline = %name,
+                        "cleaned up per-sink checkpoints on delete"
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -616,6 +775,139 @@ mod tests {
             },
         }
     }
+
+    // ── Per-sink checkpoint proxy tests ─────────────────────────────────
+
+    /// Test comparison function: parses `{"pos": N}` and compares numerically.
+    fn test_cmp_fn() -> CheckpointCmpFn {
+        Arc::new(|a: &[u8], b: &[u8]| {
+            #[derive(serde::Deserialize)]
+            struct Cp { pos: u64 }
+            let a: Cp = serde_json::from_slice(a).unwrap_or(Cp { pos: 0 });
+            let b: Cp = serde_json::from_slice(b).unwrap_or(Cp { pos: 0 });
+            a.pos.cmp(&b.pos)
+        })
+    }
+
+    #[tokio::test]
+    async fn per_sink_proxy_returns_none_when_no_checkpoints() {
+        let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+        let proxy = PerSinkCheckpointProxy {
+            inner: store,
+            source_id: "mysql".to_string(),
+            cmp_fn: test_cmp_fn(),
+        };
+        // No per-sink checkpoints and no legacy key — fresh start.
+        let result = proxy.get_raw("mysql").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn per_sink_proxy_falls_back_to_legacy_key() {
+        let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+        // Write a legacy checkpoint under the plain source_id key (pre per-sink format).
+        store
+            .put_raw("mysql", b"{\"pos\":500}")
+            .await
+            .unwrap();
+        let proxy = PerSinkCheckpointProxy {
+            inner: store,
+            source_id: "mysql".to_string(),
+            cmp_fn: test_cmp_fn(),
+        };
+        // No per-sink keys exist, so it should fall back to the legacy key.
+        let result = proxy.get_raw("mysql").await.unwrap().unwrap();
+        assert_eq!(result, b"{\"pos\":500}");
+    }
+
+    #[tokio::test]
+    async fn per_sink_proxy_returns_min_checkpoint() {
+        let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+
+        // Write per-sink checkpoints with different positions.
+        // Using simple JSON strings — lexicographic comparison works for these.
+        store
+            .put_raw("mysql::sink::kafka", b"{\"pos\":200}")
+            .await
+            .unwrap();
+        store
+            .put_raw("mysql::sink::redis", b"{\"pos\":100}")
+            .await
+            .unwrap();
+        store
+            .put_raw("mysql::sink::nats", b"{\"pos\":300}")
+            .await
+            .unwrap();
+
+        let proxy = PerSinkCheckpointProxy {
+            inner: store,
+            source_id: "mysql".to_string(),
+            cmp_fn: test_cmp_fn(),
+        };
+
+        // Should return the minimum (redis at pos 100).
+        let result = proxy.get_raw("mysql").await.unwrap().unwrap();
+        assert_eq!(result, b"{\"pos\":100}");
+    }
+
+    #[tokio::test]
+    async fn per_sink_proxy_passes_through_other_keys() {
+        let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+        store
+            .put_raw("other-key", b"other-value")
+            .await
+            .unwrap();
+
+        let proxy = PerSinkCheckpointProxy {
+            inner: store,
+            source_id: "mysql".to_string(),
+            cmp_fn: test_cmp_fn(),
+        };
+
+        // Non-source-id keys pass through directly.
+        let result = proxy.get_raw("other-key").await.unwrap().unwrap();
+        assert_eq!(result, b"other-value");
+    }
+
+    #[tokio::test]
+    async fn per_sink_proxy_single_sink_returns_that_checkpoint() {
+        let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+        store
+            .put_raw("mysql::sink::kafka", b"{\"pos\":500}")
+            .await
+            .unwrap();
+
+        let proxy = PerSinkCheckpointProxy {
+            inner: store,
+            source_id: "mysql".to_string(),
+            cmp_fn: test_cmp_fn(),
+        };
+
+        let result = proxy.get_raw("mysql").await.unwrap().unwrap();
+        assert_eq!(result, b"{\"pos\":500}");
+    }
+
+    // ── SinkCfg::sink_id tests ──────────────────────────────────────────
+
+    #[test]
+    fn sink_cfg_returns_correct_id() {
+        let kafka = SinkCfg::Redis(RedisSinkCfg {
+            id: "my-redis".to_string(),
+            uri: "redis://localhost".to_string(),
+            stream: "events".to_string(),
+            key: None,
+            required: Some(true),
+            send_timeout_secs: None,
+            batch_timeout_secs: None,
+            connect_timeout_secs: None,
+            envelope: deltaforge_config::EnvelopeCfg::Debezium,
+            encoding: deltaforge_config::EncodingCfg::Json,
+            filter: None,
+        });
+        assert_eq!(kafka.sink_id(), "my-redis");
+    }
+
+    // ── Existing tests ──────────────────────────────────────────────────
 
     #[test]
     fn merge_spec_overlays_nested() {

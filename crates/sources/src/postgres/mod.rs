@@ -511,6 +511,38 @@ impl Source for PostgresSource {
             join,
         }
     }
+
+    fn compare_checkpoints(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        // PostgresCheckpoint: { lsn: String, tx_id: Option<u32> }
+        // LSN format: "X/YYYYYYYY" where X and Y are hex.
+        #[derive(serde::Deserialize)]
+        struct Cp {
+            lsn: String,
+        }
+
+        fn parse_lsn(s: &str) -> u64 {
+            let (hi, lo) = s.split_once('/').unwrap_or(("0", s));
+            let hi = u64::from_str_radix(hi, 16).unwrap_or(0);
+            let lo = u64::from_str_radix(lo, 16).unwrap_or(0);
+            (hi << 32) | lo
+        }
+
+        let a: Cp = match serde_json::from_slice(a) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "failed to parse checkpoint a in compare_checkpoints");
+                return std::cmp::Ordering::Equal;
+            }
+        };
+        let b: Cp = match serde_json::from_slice(b) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "failed to parse checkpoint b in compare_checkpoints");
+                return std::cmp::Ordering::Equal;
+            }
+        };
+        parse_lsn(&a.lsn).cmp(&parse_lsn(&b.lsn))
+    }
 }
 
 // ============================================================================

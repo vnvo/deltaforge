@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use checkpoints::CheckpointStore;
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, join_all};
 use metrics::{counter, gauge, histogram};
 use parking_lot::Mutex;
 use tokio::sync::watch;
@@ -365,7 +365,10 @@ pub struct Coordinator<Tok> {
     sinks: Vec<ArcDynSink>,
     batch_cfg_eff: BatchConfig,
     commit_policy: Option<CommitPolicy>,
-    commit_cp: CommitCpFn<Tok>,
+    /// Per-sink checkpoint commit functions, keyed by sink ID.
+    /// Each sink that successfully delivers a batch gets its own checkpoint
+    /// committed independently.
+    commit_cp_per_sink: HashMap<String, CommitCpFn<Tok>>,
     process_batch: ProcessBatchFn<Tok>,
     /// Optional schema sensing
     schema_sensor: Option<Arc<SchemaSensorState>>,
@@ -380,20 +383,20 @@ pub struct CoordinatorBuilder<Tok> {
     sinks: Vec<ArcDynSink>,
     batch_config: Option<BatchConfig>,
     commit_policy: Option<CommitPolicy>,
-    commit_fn: Option<CommitCpFn<Tok>>,
+    commit_fns: HashMap<String, CommitCpFn<Tok>>,
     process_fn: Option<ProcessBatchFn<Tok>>,
     schema_sensor: Option<Arc<SchemaSensorState>>,
     schema_provider: Option<ArcSchemaProvider>,
 }
 
-impl<Tok: Send + 'static> CoordinatorBuilder<Tok> {
+impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             pipeline_name: name.into(),
             sinks: Vec::new(),
             batch_config: None,
             commit_policy: None,
-            commit_fn: None,
+            commit_fns: HashMap::new(),
             process_fn: None,
             schema_sensor: None,
             schema_provider: None,
@@ -415,8 +418,9 @@ impl<Tok: Send + 'static> CoordinatorBuilder<Tok> {
         self
     }
 
-    pub fn commit_fn(mut self, f: CommitCpFn<Tok>) -> Self {
-        self.commit_fn = Some(f);
+    /// Register a per-sink checkpoint commit function.
+    pub fn commit_fn(mut self, sink_id: impl Into<String>, f: CommitCpFn<Tok>) -> Self {
+        self.commit_fns.insert(sink_id.into(), f);
         self
     }
 
@@ -437,13 +441,17 @@ impl<Tok: Send + 'static> CoordinatorBuilder<Tok> {
 
     pub fn build(self) -> Coordinator<Tok> {
         let batch_cfg_eff = Coordinator::<Tok>::effective(&self.batch_config);
+        assert!(
+            !self.commit_fns.is_empty(),
+            "at least one per-sink commit_fn is required"
+        );
 
         Coordinator {
             pipeline_name: self.pipeline_name.into(),
             sinks: self.sinks,
             batch_cfg_eff,
             commit_policy: self.commit_policy,
-            commit_cp: self.commit_fn.expect("commit_fn is required"),
+            commit_cp_per_sink: self.commit_fns,
             process_batch: self.process_fn.expect("process_fn is required"),
             schema_sensor: self.schema_sensor,
             schema_provider: self.schema_provider,
@@ -452,7 +460,7 @@ impl<Tok: Send + 'static> CoordinatorBuilder<Tok> {
     }
 }
 
-impl<Tok: Send + 'static> Coordinator<Tok> {
+impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
     pub fn builder(name: impl Into<String>) -> CoordinatorBuilder<Tok> {
         CoordinatorBuilder::new(name)
     }
@@ -849,18 +857,24 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
             }
         });
 
-        let outcomes = futures::future::join_all(sink_futs).await;
+        let raw_outcomes = futures::future::join_all(sink_futs).await;
 
         let mut required_acks = 0usize;
         let mut total_acks = 0usize;
 
-        for (sink_id, required, elapsed, result) in outcomes {
+        // Collect per-sink success/failure for checkpoint commits.
+        // (sink_id, required, succeeded)
+        let mut sink_results: Vec<(String, bool, bool)> =
+            Vec::with_capacity(raw_outcomes.len());
+
+        for (sink_id, required, elapsed, result) in raw_outcomes {
             match result {
                 Ok(()) => {
                     total_acks += 1;
                     if required {
                         required_acks += 1;
                     }
+                    sink_results.push((sink_id.clone(), required, true));
 
                     counter!(
                         "deltaforge_sink_batch_total",
@@ -884,6 +898,8 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                     .record(elapsed.as_secs_f64());
                 }
                 Err(e) => {
+                    sink_results.push((sink_id.clone(), required, false));
+
                     counter!(
                         "deltaforge_sink_errors_total",
                         "pipeline" => self.pipeline_name.to_string(),
@@ -900,17 +916,103 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                 }
             }
         }
-        // 5) COMMIT checkpoint if policy satisfied
-        if policy_satisfied(
+        // 5) COMMIT per-sink checkpoints.
+        // Emit per-sink delivery status gauges (always, regardless of policy).
+        for (sink_id, required, succeeded) in &sink_results {
+            gauge!(
+                "deltaforge_sink_checkpoint_status",
+                "pipeline" => self.pipeline_name.to_string(),
+                "sink" => sink_id.clone(),
+                "required" => if *required { "true" } else { "false" },
+            )
+            .set(if *succeeded { 1.0 } else { 0.0 });
+        }
+
+        // Policy gate — check BEFORE committing any checkpoints so that a
+        // failed required sink never leaves optional sinks with advanced
+        // checkpoints while the required sink is behind.
+        if !policy_satisfied(
             &self.commit_policy,
             required_total,
             required_acks,
             total_acks,
         ) {
-            if let Some(cp) = last_cp {
-                let commit_start = Instant::now();
-                (self.commit_cp)(cp).await.context("commit checkpoint")?;
+            anyhow::bail!(
+                "commit policy not satisfied: required {required_acks}/{required_total} acks, \
+                 total {total_acks}"
+            );
+        }
 
+        //
+        // Per-sink checkpoint commit — only reached when the commit policy is
+        // satisfied. Each sink that successfully delivered the batch gets its
+        // own checkpoint committed independently. Failed sinks do not advance.
+        // Commits run concurrently to avoid serializing latency across sinks.
+        if let Some(cp) = last_cp {
+            let commit_start = Instant::now();
+
+            // Build futures for all successful sinks that have a commit fn.
+            let commit_futs: Vec<_> = sink_results
+                .iter()
+                .filter(|(_, _, succeeded)| *succeeded)
+                .filter_map(|(sink_id, _, _)| {
+                    if let Some(commit_fn) = self.commit_cp_per_sink.get(sink_id.as_str()) {
+                        Some((sink_id.clone(), (commit_fn)(cp.clone())))
+                    } else {
+                        warn!(
+                            pipeline=%self.pipeline_name,
+                            sink=%sink_id,
+                            "sink delivered successfully but has no checkpoint commit function"
+                        );
+                        None
+                    }
+                })
+                .collect();
+
+            let results = join_all(
+                commit_futs
+                    .into_iter()
+                    .map(|(sink_id, fut)| async move { (sink_id, fut.await) }),
+            )
+            .await;
+
+            let mut committed = 0u64;
+            let mut first_err: Option<anyhow::Error> = None;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+
+            for (sink_id, result) in results {
+                match result {
+                    Ok(()) => {
+                        committed += 1;
+                        gauge!(
+                            "deltaforge_sink_last_checkpoint_ts",
+                            "pipeline" => self.pipeline_name.to_string(),
+                            "sink" => sink_id,
+                        )
+                        .set(now);
+                    }
+                    Err(e) => {
+                        warn!(
+                            pipeline=%self.pipeline_name,
+                            sink=%sink_id,
+                            error=%e,
+                            "per-sink checkpoint commit failed"
+                        );
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+            }
+
+            if let Some(e) = first_err {
+                return Err(e).context("commit checkpoint");
+            }
+
+            if committed > 0 {
                 histogram!(
                     "deltaforge_stage_latency_seconds",
                     "pipeline" => self.pipeline_name.to_string(),
@@ -923,7 +1025,7 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                     "deltaforge_checkpoints_total",
                     "pipeline" => self.pipeline_name.to_string()
                 )
-                .increment(1);
+                .increment(committed);
 
                 gauge!(
                     "deltaforge_last_checkpoint_ts",
@@ -936,14 +1038,6 @@ impl<Tok: Send + 'static> Coordinator<Tok> {
                         .unwrap_or(0.0),
                 );
             }
-        } else {
-            warn!(
-                pipeline=%self.pipeline_name,
-                required_total=%required_total,
-                required_acks=%required_acks,
-                total_acks=%total_acks,
-                "commit policy not satisfied, checkpoint not saved"
-            );
         }
 
         Ok(())
@@ -1038,6 +1132,8 @@ pub fn build_batch_processor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deltaforge_core::{CheckpointMeta, SinkError, SinkResult};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     #[test]
     fn test_effective_batch_config_defaults() {
@@ -1060,7 +1156,158 @@ mod tests {
         let eff = Coordinator::<CheckpointMeta>::effective(&cfg);
         assert_eq!(eff.max_events, Some(500));
         assert_eq!(eff.max_ms, Some(100));
-        // Defaults should fill in
         assert!(eff.max_bytes.is_some());
+    }
+
+    // ── Per-sink commit tests ────────────────────────────────────────────
+
+    /// Mock sink that tracks delivery calls and optionally fails.
+    struct MockSink {
+        id: String,
+        required: bool,
+        fail: AtomicBool,
+        delivered: AtomicUsize,
+    }
+
+    impl MockSink {
+        fn new(id: &str, required: bool) -> Arc<Self> {
+            Arc::new(Self {
+                id: id.to_string(),
+                required,
+                fail: AtomicBool::new(false),
+                delivered: AtomicUsize::new(0),
+            })
+        }
+
+        fn set_fail(&self, fail: bool) {
+            self.fail.store(fail, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn delivery_count(&self) -> usize {
+            self.delivered.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl deltaforge_core::Sink for MockSink {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn required(&self) -> bool {
+            self.required
+        }
+
+        async fn send(&self, _event: &Event) -> SinkResult<()> {
+            self.send_batch(std::slice::from_ref(_event)).await
+        }
+
+        async fn send_batch(&self, events: &[Event]) -> SinkResult<()> {
+            if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(SinkError::Backpressure {
+                    details: "mock failure".into(),
+                });
+            }
+            self.delivered
+                .fetch_add(events.len(), std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_per_sink_checkpoint_only_advances_on_success() {
+        use checkpoints::MemCheckpointStore;
+
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+
+        let kafka_sink = MockSink::new("kafka", true);
+        let redis_sink = MockSink::new("redis", false);
+        redis_sink.set_fail(true); // Redis will fail delivery.
+
+        let sinks: Vec<ArcDynSink> = vec![
+            Arc::clone(&kafka_sink) as ArcDynSink,
+            Arc::clone(&redis_sink) as ArcDynSink,
+        ];
+
+        let kafka_cp = build_commit_fn(
+            store.clone(),
+            "mysql::sink::kafka".to_string(),
+        );
+        let redis_cp = build_commit_fn(
+            store.clone(),
+            "mysql::sink::redis".to_string(),
+        );
+
+        let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![]);
+        let batch_processor =
+            build_batch_processor(processors, "test".to_string());
+
+        let coord = Coordinator::builder("test")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(10),
+                max_bytes: None,
+                max_ms: Some(100),
+                respect_source_tx: None,
+                max_inflight: Some(1),
+            }))
+            .commit_fn("kafka", kafka_cp)
+            .commit_fn("redis", redis_cp)
+            .process_fn(batch_processor)
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        // Send one event with a checkpoint, then drop the sender
+        // so the coordinator sees channel-closed and exits.
+        let source = deltaforge_core::SourceInfo {
+            version: "test".into(),
+            connector: "mysql".into(),
+            name: "test".into(),
+            db: "db".into(),
+            schema: None,
+            table: "table".into(),
+            ts_ms: 0,
+            snapshot: None,
+            position: deltaforge_core::SourcePosition::default(),
+        };
+        let mut event = Event::new_row(
+            source,
+            deltaforge_core::Op::Create,
+            None,
+            Some(serde_json::json!({"id": 1})),
+            0,
+            0,
+        );
+        event.checkpoint =
+            Some(CheckpointMeta::from_vec(b"{\"pos\":42}".to_vec()));
+        event.tx_end = true;
+        tx.send(event).await.unwrap();
+        drop(tx); // Close channel so coordinator exits after processing.
+
+        let _ = coord.run(rx, cancel, pause_rx).await;
+
+        // Kafka succeeded — checkpoint should be written.
+        let kafka_cp = store.get_raw("mysql::sink::kafka").await.unwrap();
+        assert!(
+            kafka_cp.is_some(),
+            "kafka checkpoint should be saved after successful delivery"
+        );
+        assert_eq!(kafka_cp.unwrap(), b"{\"pos\":42}");
+
+        // Redis failed — checkpoint should NOT be written.
+        let redis_cp = store.get_raw("mysql::sink::redis").await.unwrap();
+        assert!(
+            redis_cp.is_none(),
+            "redis checkpoint should not be saved after failed delivery"
+        );
+
+        // Kafka should have received 1 event.
+        assert_eq!(kafka_sink.delivery_count(), 1);
+        // Redis was called but failed.
+        assert_eq!(redis_sink.delivery_count(), 0);
     }
 }

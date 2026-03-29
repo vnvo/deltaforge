@@ -748,6 +748,17 @@ pub trait Source: Send + Sync {
         tx: mpsc::Sender<Event>,
         checkpoint_store: Arc<dyn CheckpointStore>,
     ) -> SourceHandle;
+
+    /// Compare two checkpoint byte slices, returning their ordering.
+    ///
+    /// Used by the per-sink checkpoint system to find the minimum (earliest)
+    /// checkpoint across all sinks so the source replays from the position
+    /// the slowest sink needs.
+    ///
+    /// Each source MUST implement this correctly for its checkpoint format.
+    /// Returning `Equal` on parse failure is safe (no replay regression) but
+    /// may cause unnecessary replay.
+    fn compare_checkpoints(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering;
 }
 
 #[async_trait]

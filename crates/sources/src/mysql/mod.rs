@@ -386,6 +386,31 @@ impl Source for MySqlSource {
             join,
         }
     }
+
+    fn compare_checkpoints(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        // MySqlCheckpoint: { file: String, pos: u64, gtid_set: Option<String> }
+        // Compare by (file, pos) — the binlog position.
+        #[derive(serde::Deserialize)]
+        struct Cp {
+            file: String,
+            pos: u64,
+        }
+        let a: Cp = match serde_json::from_slice(a) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "failed to parse checkpoint a in compare_checkpoints");
+                return std::cmp::Ordering::Equal;
+            }
+        };
+        let b: Cp = match serde_json::from_slice(b) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!(error = %e, "failed to parse checkpoint b in compare_checkpoints");
+                return std::cmp::Ordering::Equal;
+            }
+        };
+        a.file.cmp(&b.file).then(a.pos.cmp(&b.pos))
+    }
 }
 
 // ============================================================================

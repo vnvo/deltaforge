@@ -350,6 +350,7 @@ impl RedisSink {
         stream: &str,
         event_id: &str,
         key: &str,
+        idem_key: &str,
         payload: &[u8],
     ) -> Result<(), RedisRetryError> {
         let result = tokio::time::timeout(self.send_timeout, async {
@@ -358,6 +359,8 @@ impl RedisSink {
                 .arg("*")
                 .arg("event_id")
                 .arg(event_id)
+                .arg("idempotency_key")
+                .arg(idem_key)
                 .arg("df-event")
                 .arg(payload);
 
@@ -384,18 +387,20 @@ impl RedisSink {
     async fn execute_pipeline(
         &self,
         conn: &mut MultiplexedConnection,
-        items: &[(String, String, String, Vec<u8>)], // (stream, event_id, key, payload)
+        items: &[(String, String, String, String, Vec<u8>)], // (stream, event_id, key, idem_key, payload)
     ) -> Result<(), RedisRetryError> {
         let result = tokio::time::timeout(self.batch_timeout, async {
             let mut pipe = redis::pipe();
 
-            for (stream, event_id, key, payload) in items {
+            for (stream, event_id, key, idem_key, payload) in items {
                 let cmd = pipe
                     .cmd("XADD")
                     .arg(stream)
                     .arg("*")
                     .arg("event_id")
                     .arg(event_id)
+                    .arg("idempotency_key")
+                    .arg(idem_key)
                     .arg("df-event")
                     .arg(payload);
 
@@ -434,6 +439,7 @@ impl Sink for RedisSink {
         let event_id =
             event.event_id.map(|id| id.to_string()).unwrap_or_default();
         let key = self.resolve_key(event);
+        let idem_key = event.idempotency_key();
 
         // Retry loop for transient failures
         let policy = RetryPolicy::new(
@@ -449,6 +455,7 @@ impl Sink for RedisSink {
                 let event_id = event_id.clone();
                 let stream = stream.clone();
                 let key = key.clone();
+                let idem_key = idem_key.clone();
 
                 async move {
                     debug!(attempt, "sending event to redis");
@@ -460,7 +467,7 @@ impl Sink for RedisSink {
 
                     match self
                         .xadd_single(
-                            &mut conn, &stream, &event_id, &key, &payload,
+                            &mut conn, &stream, &event_id, &key, &idem_key, &payload,
                         )
                         .await
                     {
@@ -496,9 +503,9 @@ impl Sink for RedisSink {
             return Ok(());
         }
 
-        // Pre-serialize with resolved stream/key
+        // Pre-serialize with resolved stream/key/idempotency_key
         let serialized: Result<
-            Vec<(String, String, String, Vec<u8>)>,
+            Vec<(String, String, String, String, Vec<u8>)>,
             SinkError,
         > = events
             .iter()
@@ -507,8 +514,9 @@ impl Sink for RedisSink {
                 let key = self.resolve_key(e);
                 let event_id =
                     e.event_id.map(|id| id.to_string()).unwrap_or_default();
+                let idem_key = e.idempotency_key();
                 let payload = self.serialize_event(e)?;
-                Ok((stream, event_id, key, payload))
+                Ok((stream, event_id, key, idem_key, payload))
             })
             .collect();
         let serialized = match serialized {
@@ -573,7 +581,7 @@ impl Sink for RedisSink {
         match result {
             Ok(_) => {
                 let total_bytes: u64 =
-                    serialized.iter().map(|(_, _, _, p)| p.len() as u64).sum();
+                    serialized.iter().map(|(_, _, _, _, p)| p.len() as u64).sum();
                 counter!(
                     "deltaforge_sink_bytes_total",
                     "pipeline" => self.pipeline.clone(),

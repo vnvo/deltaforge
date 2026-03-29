@@ -63,6 +63,24 @@ sinks:
 </tr>
 </table>
 
+## Idempotency
+
+Every XADD command includes an `idempotency_key` field in the stream entry payload. This key is deterministic — the same source event always produces the same key, even across replays.
+
+Redis Streams does not deduplicate server-side (entry IDs are auto-generated), so **consumers are responsible for dedup** using this field. A simple approach:
+
+```python
+# Check idempotency_key before processing
+seen = redis.smembers("processed_keys")
+if data[b"idempotency_key"] in seen:
+    r.xack(stream, group, msg_id)  # Skip duplicate
+    continue
+process(event)
+redis.sadd("processed_keys", data[b"idempotency_key"])
+```
+
+This makes Redis a **Tier 2** delivery guarantee: at-least-once with idempotency keys for consumer-side dedup.
+
 ## Consuming events
 
 ### Consumer groups (recommended)

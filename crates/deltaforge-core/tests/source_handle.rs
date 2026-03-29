@@ -109,6 +109,10 @@ impl Source for FakeSource {
             join,
         }
     }
+
+    fn compare_checkpoints(&self, _a: &[u8], _b: &[u8]) -> std::cmp::Ordering {
+        std::cmp::Ordering::Equal
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
