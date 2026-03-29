@@ -126,7 +126,7 @@ pub async fn kafka_committed_count(start_offset: u64) -> Result<u64> {
 
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", KAFKA_BROKERS)
-        .set("group.id", &format!("chaos-rc-{}", start_offset))
+        .set("group.id", format!("chaos-rc-{}", start_offset))
         .set("auto.offset.reset", "earliest")
         .set("enable.partition.eof", "true")
         .set("isolation.level", "read_committed")
