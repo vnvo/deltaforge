@@ -42,7 +42,7 @@ impl Sink for FilteredSink {
         }
     }
 
-    async fn send_batch(&self, events: &[Event]) -> SinkResult<()> {
+    async fn send_batch(&self, events: &[Event]) -> SinkResult<deltaforge_core::BatchResult> {
         // Fast path: nothing filtered
         if events.iter().all(|e| self.filter.allows(e)) {
             return self.inner.send_batch(events).await;
@@ -53,7 +53,7 @@ impl Sink for FilteredSink {
             events.iter().filter(|e| self.filter.allows(e)).collect();
 
         if filtered.is_empty() {
-            return Ok(());
+            return Ok(deltaforge_core::BatchResult::ok());
         }
 
         // Need owned Vec<Event> for send_batch signature — clone only filtered subset
@@ -103,9 +103,9 @@ mod tests {
             self.count.fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
-        async fn send_batch(&self, events: &[Event]) -> SinkResult<()> {
+        async fn send_batch(&self, events: &[Event]) -> SinkResult<deltaforge_core::BatchResult> {
             self.count.fetch_add(events.len(), Ordering::Relaxed);
-            Ok(())
+            Ok(deltaforge_core::BatchResult::ok())
         }
     }
 

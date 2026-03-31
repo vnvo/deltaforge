@@ -1,4 +1,5 @@
 pub mod coordinator;
+pub mod dlq;
 pub mod drift_detector;
 pub mod pipeline_manager;
 mod schema_api;

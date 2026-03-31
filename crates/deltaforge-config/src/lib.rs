@@ -112,6 +112,12 @@ pub struct Spec {
     /// When enabled, automatically infers and tracks schema from event payloads.
     #[serde(default)]
     pub schema_sensing: SchemaSensingConfig,
+
+    /// Event journal configuration (DLQ, future replay).
+    /// When enabled, failed events are routed to a dead letter queue
+    /// instead of blocking the pipeline.
+    #[serde(default)]
+    pub journal: Option<JournalConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -291,6 +297,69 @@ pub enum CommitPolicy {
     Required,
     /// Checkpoint after at least `quorum` sinks ack (availability over consistency).
     Quorum { quorum: usize },
+}
+
+// ── Event journal (DLQ, replay) ──────────────────────────────────────────────
+
+/// Top-level journal configuration. Opt-in: `enabled: false` by default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JournalConfig {
+    /// Master switch. When false, no journal streams are active.
+    pub enabled: bool,
+    /// Maximum event payload size (bytes) stored in journal entries.
+    /// Payloads exceeding this are truncated with `payload_truncated: true`.
+    pub max_event_bytes: usize,
+    /// DLQ stream configuration.
+    pub dlq: DlqStreamConfig,
+}
+
+impl Default for JournalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_event_bytes: 256 * 1024, // 256KB
+            dlq: DlqStreamConfig::default(),
+        }
+    }
+}
+
+/// Dead letter queue stream configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DlqStreamConfig {
+    /// Maximum number of entries in the DLQ queue.
+    pub max_entries: u64,
+    /// Auto-purge entries older than this (seconds). 0 = no age limit.
+    pub max_age_secs: u64,
+    /// What happens when the DLQ reaches max_entries.
+    pub overflow_policy: OverflowPolicy,
+}
+
+impl Default for DlqStreamConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 10_000,
+            max_age_secs: 7 * 24 * 3600, // 7 days
+            overflow_policy: OverflowPolicy::default(),
+        }
+    }
+}
+
+/// Behavior when the DLQ queue is full.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum OverflowPolicy {
+    /// Remove oldest entry, admit newest. Most recent failures are usually
+    /// most valuable for investigation.
+    #[default]
+    DropOldest,
+    /// Reject the write. The failed event is not persisted and is dropped
+    /// after an error log.
+    Reject,
+    /// Block the pipeline until space is available (operator acks entries).
+    /// Visible via health endpoint as `degraded`.
+    Block,
 }
 
 pub fn load_from_path(file_path: &str) -> ConfigResult<PipelineSpec> {

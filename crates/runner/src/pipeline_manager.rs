@@ -761,6 +761,7 @@ mod tests {
                 batch: Some(BatchConfig::default()),
                 commit_policy: None,
                 schema_sensing: Default::default(),
+                journal: None,
             },
         }
     }

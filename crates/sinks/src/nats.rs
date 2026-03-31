@@ -41,7 +41,7 @@ use common::{RetryOutcome, RetryPolicy, retry_async};
 use deltaforge_config::NatsSinkCfg;
 use deltaforge_core::encoding::EncodingType;
 use deltaforge_core::envelope::Envelope;
-use deltaforge_core::{Event, Sink, SinkError, SinkResult};
+use deltaforge_core::{BatchResult, Event, Sink, SinkError, SinkResult};
 use futures::future::try_join_all;
 use metrics::counter;
 use serde_json::Value;
@@ -533,42 +533,51 @@ impl Sink for NatsSink {
     }
 
     #[instrument(skip_all, fields(sink_id = %self.id, count = events.len()))]
-    async fn send_batch(&self, events: &[Event]) -> SinkResult<()> {
+    async fn send_batch(&self, events: &[Event]) -> SinkResult<BatchResult> {
         if events.is_empty() {
-            return Ok(());
+            return Ok(BatchResult::ok());
         }
 
-        // Pre-serialize all payloads with resolved subjects and headers
-        let serialized: Result<
-            Vec<(String, Vec<u8>, async_nats::HeaderMap)>,
-            SinkError,
-        > = events
-            .iter()
-            .map(|e| {
+        // Pre-serialize all payloads with resolved subjects and headers.
+        // Per-event DLQ-eligible errors are collected; non-DLQ errors fail the batch.
+        let mut serialized: Vec<(String, Vec<u8>, async_nats::HeaderMap)> =
+            Vec::with_capacity(events.len());
+        let mut dlq_failures: Vec<(usize, SinkError)> = Vec::new();
+
+        for (i, e) in events.iter().enumerate() {
+            match (|| -> Result<_, SinkError> {
                 let subject = self.resolve_subject(e)?;
                 let payload = self.serialize_event(e)?;
                 let headers = self.build_nats_headers(e);
                 Ok((subject, payload, headers))
-            })
-            .collect();
-        let serialized = match serialized {
-            Ok(s) => s,
-            Err(e) => {
-                let kind = match &e {
-                    SinkError::Serialization { .. } => "serialization",
-                    SinkError::Routing { .. } => "routing",
-                    _ => "other",
-                };
-                counter!(
-                    "deltaforge_sink_routing_errors_total",
-                    "pipeline" => self.pipeline.clone(),
-                    "sink" => self.id.clone(),
-                    "kind" => kind,
-                )
-                .increment(1);
-                return Err(e);
+            })() {
+                Ok(prepared) => serialized.push(prepared),
+                Err(e) if e.is_dlq_eligible() => {
+                    counter!(
+                        "deltaforge_sink_routing_errors_total",
+                        "pipeline" => self.pipeline.clone(),
+                        "sink" => self.id.clone(),
+                        "kind" => e.kind(),
+                    )
+                    .increment(1);
+                    dlq_failures.push((i, e));
+                }
+                Err(e) => {
+                    counter!(
+                        "deltaforge_sink_routing_errors_total",
+                        "pipeline" => self.pipeline.clone(),
+                        "sink" => self.id.clone(),
+                        "kind" => e.kind(),
+                    )
+                    .increment(1);
+                    return Err(e);
+                }
             }
-        };
+        }
+
+        if serialized.is_empty() {
+            return Ok(BatchResult { dlq_failures });
+        }
 
         // Retry loop for transient failures
         let policy = RetryPolicy::new(
@@ -658,8 +667,8 @@ impl Sink for NatsSink {
                     "sink" => self.id.clone(),
                 )
                 .increment(total_bytes);
-                debug!(count = events.len(), "batch sent to nats");
-                Ok(())
+                debug!(count = events.len(), dlq_failures = dlq_failures.len(), "batch sent to nats");
+                Ok(BatchResult { dlq_failures })
             }
             Err(outcome) => Err(outcome_to_sink_error(outcome)),
         }

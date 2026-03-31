@@ -97,6 +97,16 @@ impl SinkError {
             SinkError::Other(e) => e.to_string(),
         }
     }
+
+    /// Whether this error is attributable to a single event and should be
+    /// routed to the DLQ instead of failing the entire batch.
+    /// Only serialization and routing errors are per-event attributable.
+    pub fn is_dlq_eligible(&self) -> bool {
+        matches!(
+            self,
+            SinkError::Serialization { .. } | SinkError::Routing { .. }
+        )
+    }
 }
 
 // Convenience conversion from serde_json::Error
