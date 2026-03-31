@@ -13,7 +13,9 @@ spec:
   template:
     metadata:
       annotations:
+        {{- if not .Values.pipeline.existingConfigMap }}
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -30,6 +32,7 @@ spec:
       serviceAccountName: {{ include "deltaforge.serviceAccountName" . }}
       securityContext:
         {{- toYaml .Values.securityContext | nindent 8 }}
+      terminationGracePeriodSeconds: 30
       containers:
         - name: deltaforge
           image: {{ include "deltaforge.image" . }}
@@ -57,6 +60,7 @@ spec:
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}
+          {{- if or .Values.secrets.create .Values.secrets.existingSecrets .Values.envFrom }}
           envFrom:
             {{- if .Values.secrets.create }}
             - secretRef:
@@ -69,6 +73,7 @@ spec:
             {{- with .Values.envFrom }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          {{- end }}
           {{- with .Values.probes.liveness }}
           livenessProbe:
             {{- toYaml . | nindent 12 }}
