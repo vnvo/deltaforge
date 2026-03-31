@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Sink `BatchResult`** — `send_batch()` now returns per-event DLQ failures alongside successful delivery. All built-in sinks (Kafka, NATS, Redis) collect per-event serialization/routing errors instead of failing the entire batch.
 - **Faulty Events fault injection** — chaos UI button and soak fault that PATCHes sink topic to broken template for 10s → events fail routing → DLQ. Auto-restores.
 - **Guarantees & Correctness page** — ordering model, transaction boundaries, failure isolation, retry behavior, checkpoint semantics, consumer guidance.
+- **Helm chart** — Kubernetes deployment via `deploy/helm/deltaforge/`. StatefulSet with persistent checkpoints, ConfigMap for pipeline config, Secrets for credentials only (`${VAR}` expansion in DSN), health probes, Prometheus ServiceMonitor. PostgreSQL recommended for production storage.
+- **Deployment guide** — new `docs/src/deployment.md` covering Docker, Docker Compose, and Kubernetes/Helm.
+- **Chaos scenario banners** — every scenario now prints description and expected outcome at start.
 
 ### Changed
 

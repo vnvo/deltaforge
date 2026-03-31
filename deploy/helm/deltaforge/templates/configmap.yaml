@@ -1,0 +1,11 @@
+{{- if not .Values.pipeline.existingConfigMap }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "deltaforge.fullname" . }}-config
+  labels:
+    {{- include "deltaforge.labels" . | nindent 4 }}
+data:
+  pipeline.yaml: |
+    {{- .Values.pipeline.config | nindent 4 }}
+{{- end }}

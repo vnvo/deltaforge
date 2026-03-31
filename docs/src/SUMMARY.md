@@ -26,6 +26,7 @@
     - [Schema Registry](schemaregistry.md)
     - [Schema Sensing](schemasensing.md)
     - [Failover Handling](failover.md)
+- [Deployment](deployment.md)
 - [Observability](observability.md)
 - [Performance Tuning](performance.md)
 - [Examples](examples/README.md)

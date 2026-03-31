@@ -81,6 +81,17 @@ docker run --rm \
   --config /etc/deltaforge/pipeline.yaml
 ```
 
+### Deploy on Kubernetes
+
+```bash
+helm install deltaforge ./deploy/helm/deltaforge \
+  --set secrets.create=true \
+  --set secrets.data.MYSQL_USER=cdc_user \
+  --set secrets.data.MYSQL_PASSWORD=s3cret
+```
+
+See the [Helm chart README](deploy/helm/deltaforge/README.md) for full configuration.
+
 That's it! DeltaForge streams changes from `mydb.users` to Kafka.
 
 **Want Debezium-compatible output?**
@@ -180,6 +191,7 @@ See [Envelope Formats](docs/src/envelopes.md) for detailed examples and wire for
 
 - 📘 Online docs: <https://vnvo.github.io/deltaforge>
 - 🔒 [Guarantees & Correctness](docs/src/guarantees.md) — delivery tiers, ordering model, transaction boundaries, failure isolation, retry behavior
+- ⎈ [Helm Chart](deploy/helm/deltaforge/README.md) — Kubernetes deployment with StatefulSet, PVC, ServiceMonitor
 - 🛠 Local: `mdbook serve docs` (browse at <http://localhost:3000>)
 
 ## Local development helper
