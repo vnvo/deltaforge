@@ -1,0 +1,30 @@
+DeltaForge has been deployed!
+
+1. Check pipeline status:
+
+  kubectl port-forward svc/{{ include "deltaforge.fullname" . }} {{ .Values.service.apiPort }}:{{ .Values.service.apiPort }}
+  curl http://localhost:{{ .Values.service.apiPort }}/pipelines
+
+2. Health check:
+
+  curl http://localhost:{{ .Values.service.apiPort }}/health
+
+3. View Prometheus metrics:
+
+  curl http://localhost:{{ .Values.service.metricsPort }}/metrics
+
+4. Inspect DLQ (if journal is enabled):
+
+  curl http://localhost:{{ .Values.service.apiPort }}/pipelines/<pipeline-name>/journal/dlq
+
+5. View logs:
+
+  kubectl logs -f statefulset/{{ include "deltaforge.fullname" . }}
+
+{{- if .Values.serviceMonitor.enabled }}
+
+6. ServiceMonitor is enabled — Prometheus Operator will auto-discover metrics.
+{{- else }}
+
+6. To enable Prometheus Operator auto-discovery, set serviceMonitor.enabled=true
+{{- end }}

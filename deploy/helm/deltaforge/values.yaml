@@ -1,0 +1,176 @@
+# DeltaForge Helm Chart — default values
+# See README.md for full documentation.
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/vnvo/deltaforge
+  tag: ""              # defaults to Chart.appVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# ---------------------------------------------------------------------------
+# Pipeline configuration
+# ---------------------------------------------------------------------------
+# The pipeline YAML that DeltaForge runs. Provide inline or reference an
+# existing ConfigMap. Credentials use ${VAR} references resolved from Secrets.
+pipeline:
+  config: |
+    apiVersion: deltaforge/v1
+    kind: Pipeline
+    metadata:
+      name: my-pipeline
+      tenant: default
+    spec:
+      source:
+        type: mysql
+        config:
+          id: my-source
+          dsn: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql-primary:3306/orders"
+          tables: ["orders.*"]
+          on_schema_drift: adapt
+      sinks:
+        - type: kafka
+          config:
+            id: my-kafka
+            brokers: kafka:9092
+            topic: cdc.orders
+            exactly_once: true
+      batch:
+        max_events: 4000
+        max_bytes: 16777216
+      commit_policy:
+        mode: required
+      journal:
+        enabled: true
+
+  # Use an existing ConfigMap instead of the inline config above.
+  # The ConfigMap must contain a key named "pipeline.yaml".
+  existingConfigMap: ""
+
+# ---------------------------------------------------------------------------
+# Storage backend (checkpoints + DLQ)
+# ---------------------------------------------------------------------------
+storage:
+  backend: sqlite        # sqlite | memory | postgres
+  path: /data/deltaforge.db
+  # For postgres backend, set STORAGE_DSN in secrets and use:
+  #   --storage-backend postgres --storage-dsn ${STORAGE_DSN}
+
+# Persistent volume for SQLite checkpoints + DLQ journal.
+# Disable if using postgres storage backend.
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClass: ""       # use cluster default
+  accessModes:
+    - ReadWriteOnce
+
+# ---------------------------------------------------------------------------
+# Secrets — only sensitive values (credentials, tokens)
+# ---------------------------------------------------------------------------
+# Pipeline config uses ${VAR_NAME} for shell variable expansion.
+# Example: dsn: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@host/db"
+# The Secret only contains MYSQL_USER and MYSQL_PASSWORD.
+secrets:
+  # Create a K8s Secret from values (dev/testing only — not for production)
+  create: false
+  data: {}
+  #   MYSQL_USER: "cdc_user"
+  #   MYSQL_PASSWORD: "s3cret"
+
+  # Reference existing Secret(s) — recommended for production.
+  # Each Secret's keys become env vars in the container.
+  existingSecrets: []
+  # - name: mysql-creds         # keys: MYSQL_USER, MYSQL_PASSWORD
+  # - name: kafka-sasl-creds    # keys: KAFKA_SASL_USER, KAFKA_SASL_PASSWORD
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+env:
+  RUST_LOG: "deltaforge=info,sources=info,sinks=info,warn"
+
+# Additional envFrom entries (raw)
+envFrom: []
+
+# ---------------------------------------------------------------------------
+# Service
+# ---------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  apiPort: 8080
+  metricsPort: 9000
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi
+
+# ---------------------------------------------------------------------------
+# Probes
+# ---------------------------------------------------------------------------
+probes:
+  liveness:
+    httpGet:
+      path: /health
+      port: api
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    failureThreshold: 3
+  readiness:
+    httpGet:
+      path: /ready
+      port: api
+    initialDelaySeconds: 10
+    periodSeconds: 5
+
+# ---------------------------------------------------------------------------
+# Prometheus ServiceMonitor (requires Prometheus Operator CRDs)
+# ---------------------------------------------------------------------------
+serviceMonitor:
+  enabled: false
+  interval: 15s
+  scrapeTimeout: 10s
+  labels: {}             # additional labels on the ServiceMonitor resource
+
+# ---------------------------------------------------------------------------
+# Pod metadata
+# ---------------------------------------------------------------------------
+podLabels: {}
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "9000"
+  prometheus.io/path: "/metrics"
+
+# ---------------------------------------------------------------------------
+# Security
+# ---------------------------------------------------------------------------
+securityContext:
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+
+# ---------------------------------------------------------------------------
+# Service account
+# ---------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# ---------------------------------------------------------------------------
+# Scheduling
+# ---------------------------------------------------------------------------
+nodeSelector: {}
+tolerations: []
+affinity: {}
