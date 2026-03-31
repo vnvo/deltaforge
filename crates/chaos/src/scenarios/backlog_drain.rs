@@ -147,7 +147,10 @@ async fn run_with_source(
 
     crate::harness::print_scenario_banner(
         &name,
-        &format!("Writes {} rows to {}, then measures catch-up throughput from saved checkpoint.", cfg.target_events, src.name),
+        &format!(
+            "Writes {} rows to {}, then measures catch-up throughput from saved checkpoint.",
+            cfg.target_events, src.name
+        ),
         "All events delivered to Kafka. Reports avg/p50/peak events/s.",
     );
     info!(

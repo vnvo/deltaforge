@@ -308,8 +308,7 @@ async fn run_mysql(
                 .push(scenarios::exactly_once::run(harness, &backend).await?);
         }
         Scenario::DlqPoison => {
-            results
-                .push(scenarios::dlq_poison::run(harness, &backend).await?);
+            results.push(scenarios::dlq_poison::run(harness, &backend).await?);
         }
         Scenario::Failover => {
             results.push(scenarios::failover::run(harness).await?);
@@ -412,8 +411,7 @@ async fn run_postgres(
                 .push(scenarios::exactly_once::run(harness, &backend).await?);
         }
         Scenario::DlqPoison => {
-            results
-                .push(scenarios::dlq_poison::run(harness, &backend).await?);
+            results.push(scenarios::dlq_poison::run(harness, &backend).await?);
         }
         Scenario::PgFailover => {
             results.push(scenarios::pg_failover::run(harness).await?);

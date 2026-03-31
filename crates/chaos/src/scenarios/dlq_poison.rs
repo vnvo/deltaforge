@@ -86,7 +86,10 @@ pub async fn run<B: SourceBackend>(
     let dlq_count_url = format!(
         "{}/pipelines/{}/journal/dlq/count",
         df_base,
-        backend.compose_service().replace("deltaforge-", "").replace("deltaforge", "chaos-app")
+        backend
+            .compose_service()
+            .replace("deltaforge-", "")
+            .replace("deltaforge", "chaos-app")
     );
 
     // The DLQ endpoint may return an error if journal is not enabled — that's expected.
@@ -132,7 +135,10 @@ pub async fn run<B: SourceBackend>(
     let dlq_peek_url = format!(
         "{}/pipelines/{}/journal/dlq?limit=10",
         df_base,
-        backend.compose_service().replace("deltaforge-", "").replace("deltaforge", "chaos-app")
+        backend
+            .compose_service()
+            .replace("deltaforge-", "")
+            .replace("deltaforge", "chaos-app")
     );
     let resp = reqwest::get(&dlq_peek_url).await;
     match resp {
