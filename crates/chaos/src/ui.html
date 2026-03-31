@@ -362,6 +362,8 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
               <option value="sink-outage">Sink Outage</option>
               <option value="crash-recovery">Crash Recovery</option>
               <option value="schema-drift">Schema Drift</option>
+              <option value="exactly-once">Exactly-Once (crash + read_committed verify)</option>
+              <option value="dlq-poison">DLQ Poison (REST API + pipeline health)</option>
             </optgroup>
             <optgroup label="MySQL only">
               <option value="failover">MySQL Failover</option>
