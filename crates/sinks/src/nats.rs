@@ -667,7 +667,11 @@ impl Sink for NatsSink {
                     "sink" => self.id.clone(),
                 )
                 .increment(total_bytes);
-                debug!(count = events.len(), dlq_failures = dlq_failures.len(), "batch sent to nats");
+                debug!(
+                    count = events.len(),
+                    dlq_failures = dlq_failures.len(),
+                    "batch sent to nats"
+                );
                 Ok(BatchResult { dlq_failures })
             }
             Err(outcome) => Err(outcome_to_sink_error(outcome)),

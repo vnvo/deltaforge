@@ -423,7 +423,10 @@ impl Sink for KafkaSink {
         // Transactional producers must wrap every send in begin/commit.
         // Delegate to send_batch which handles the transaction boundary.
         if self.transactional {
-            return self.send_batch(std::slice::from_ref(event)).await.map(|_| ());
+            return self
+                .send_batch(std::slice::from_ref(event))
+                .await
+                .map(|_| ());
         }
 
         let payload = self.serialize_event(event)?;
@@ -498,8 +501,12 @@ impl Sink for KafkaSink {
         // Pre-serialize with resolved topic/key/headers.
         // Per-event DLQ-eligible errors (serialization, routing) are collected
         // instead of failing the batch. Non-DLQ errors fail the batch as before.
-        let mut serialized: Vec<(Vec<u8>, String, String, Option<OwnedHeaders>)> =
-            Vec::with_capacity(events.len());
+        let mut serialized: Vec<(
+            Vec<u8>,
+            String,
+            String,
+            Option<OwnedHeaders>,
+        )> = Vec::with_capacity(events.len());
         let mut dlq_failures: Vec<(usize, SinkError)> = Vec::new();
 
         for (i, e) in events.iter().enumerate() {

@@ -898,13 +898,19 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                         if let Some(dlq) = &self.dlq_writer {
                             for &(idx, ref err) in &batch_result.dlq_failures {
                                 if idx < frozen.events.len() {
-                                    dlq.write(&frozen.events[idx], &sink_id, err).await;
+                                    dlq.write(
+                                        &frozen.events[idx],
+                                        &sink_id,
+                                        err,
+                                    )
+                                    .await;
                                 }
                             }
                         }
                     }
 
-                    let delivered = frozen.events.len() - batch_result.dlq_failures.len();
+                    let delivered =
+                        frozen.events.len() - batch_result.dlq_failures.len();
 
                     total_acks += 1;
                     if required {
@@ -1235,10 +1241,15 @@ mod tests {
         }
 
         async fn send(&self, _event: &Event) -> SinkResult<()> {
-            self.send_batch(std::slice::from_ref(_event)).await.map(|_| ())
+            self.send_batch(std::slice::from_ref(_event))
+                .await
+                .map(|_| ())
         }
 
-        async fn send_batch(&self, events: &[Event]) -> SinkResult<deltaforge_core::BatchResult> {
+        async fn send_batch(
+            &self,
+            events: &[Event],
+        ) -> SinkResult<deltaforge_core::BatchResult> {
             if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(SinkError::Backpressure {
                     details: "mock failure".into(),
@@ -1498,7 +1509,10 @@ mod tests {
                     dlq_failures.push((
                         i,
                         SinkError::Serialization {
-                            details: format!("mock serialization failure at index {i}").into(),
+                            details: format!(
+                                "mock serialization failure at index {i}"
+                            )
+                            .into(),
                         },
                     ));
                 } else {

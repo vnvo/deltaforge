@@ -61,12 +61,16 @@ impl DlqWriter {
             timestamp: now_epoch_secs(),
             pipeline: self.pipeline.clone(),
             stream: "dlq".into(),
-            event_id: event.event_id.map(|id| id.to_string()).unwrap_or_default(),
+            event_id: event
+                .event_id
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
             source_cursor: event.checkpoint.as_ref().map(|cp| {
                 serde_json::from_slice(cp.as_bytes())
                     .unwrap_or(serde_json::Value::Null)
             }),
-            event: serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+            event: serde_json::to_value(event)
+                .unwrap_or(serde_json::Value::Null),
             payload_truncated: false,
             meta: DlqMeta {
                 sink_id: sink_id.to_string(),
@@ -81,11 +85,16 @@ impl DlqWriter {
         entry.truncate_payload(self.max_event_bytes);
 
         // Check overflow.
-        let current_len = self.backend.queue_len(JOURNAL_NS, &self.queue_key).await.unwrap_or(0);
+        let current_len = self
+            .backend
+            .queue_len(JOURNAL_NS, &self.queue_key)
+            .await
+            .unwrap_or(0);
         if current_len >= self.config.max_entries {
             match self.config.overflow_policy {
                 OverflowPolicy::DropOldest => {
-                    let to_drop = (current_len - self.config.max_entries + 1) as usize;
+                    let to_drop =
+                        (current_len - self.config.max_entries + 1) as usize;
                     if let Err(e) = self
                         .backend
                         .queue_drop_oldest(JOURNAL_NS, &self.queue_key, to_drop)
@@ -126,7 +135,11 @@ impl DlqWriter {
                     );
                     loop {
                         self.ack_notify.notified().await;
-                        let new_len = self.backend.queue_len(JOURNAL_NS, &self.queue_key).await.unwrap_or(current_len);
+                        let new_len = self
+                            .backend
+                            .queue_len(JOURNAL_NS, &self.queue_key)
+                            .await
+                            .unwrap_or(current_len);
                         if new_len < self.config.max_entries {
                             break;
                         }
@@ -153,7 +166,11 @@ impl DlqWriter {
             }
         };
 
-        match self.backend.queue_push(JOURNAL_NS, &self.queue_key, &bytes).await {
+        match self
+            .backend
+            .queue_push(JOURNAL_NS, &self.queue_key, &bytes)
+            .await
+        {
             Ok(seq) => {
                 debug!(
                     pipeline = %self.pipeline,
@@ -199,8 +216,8 @@ impl DlqWriter {
 
         raw.into_iter()
             .map(|(seq, bytes)| {
-                let mut entry: JournalEntry =
-                    serde_json::from_slice(&bytes).context("deserialize DLQ entry")?;
+                let mut entry: JournalEntry = serde_json::from_slice(&bytes)
+                    .context("deserialize DLQ entry")?;
                 entry.seq = seq;
                 Ok(entry)
             })
@@ -246,7 +263,11 @@ impl DlqWriter {
 
     /// Update the DLQ gauge metrics.
     async fn update_gauges(&self) {
-        let len = self.backend.queue_len(JOURNAL_NS, &self.queue_key).await.unwrap_or(0);
+        let len = self
+            .backend
+            .queue_len(JOURNAL_NS, &self.queue_key)
+            .await
+            .unwrap_or(0);
         gauge!(
             "deltaforge_dlq_entries",
             "pipeline" => self.pipeline.clone(),
@@ -287,8 +308,8 @@ mod tests {
     use super::*;
     use deltaforge_core::{Event, Op, SourceInfo, SourcePosition};
     use serde_json::json;
-    use storage::MemoryStorageBackend;
     use std::sync::Arc;
+    use storage::MemoryStorageBackend;
 
     fn make_test_event(id: i64) -> Event {
         Event::new_row(
@@ -311,7 +332,11 @@ mod tests {
         )
     }
 
-    fn make_dlq_writer(backend: ArcStorageBackend, max_entries: u64, policy: OverflowPolicy) -> DlqWriter {
+    fn make_dlq_writer(
+        backend: ArcStorageBackend,
+        max_entries: u64,
+        policy: OverflowPolicy,
+    ) -> DlqWriter {
         DlqWriter::new(
             backend,
             "test-pipeline".into(),
@@ -351,7 +376,9 @@ mod tests {
         let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
         let dlq = make_dlq_writer(backend, 100, OverflowPolicy::DropOldest);
 
-        let err = SinkError::Serialization { details: "bad".into() };
+        let err = SinkError::Serialization {
+            details: "bad".into(),
+        };
         for i in 0..5 {
             dlq.write(&make_test_event(i), "kafka", &err).await;
         }
@@ -370,7 +397,9 @@ mod tests {
         let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
         let dlq = make_dlq_writer(backend, 100, OverflowPolicy::DropOldest);
 
-        let err = SinkError::Routing { details: "no topic".into() };
+        let err = SinkError::Routing {
+            details: "no topic".into(),
+        };
         for i in 0..3 {
             dlq.write(&make_test_event(i), "nats", &err).await;
         }
@@ -385,7 +414,9 @@ mod tests {
         let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
         let dlq = make_dlq_writer(backend, 3, OverflowPolicy::DropOldest);
 
-        let err = SinkError::Serialization { details: "bad".into() };
+        let err = SinkError::Serialization {
+            details: "bad".into(),
+        };
         for i in 0..5 {
             dlq.write(&make_test_event(i), "kafka", &err).await;
         }
@@ -395,16 +426,25 @@ mod tests {
 
         let entries = dlq.peek(10).await.unwrap();
         // The remaining entries should be the 3 most recent.
-        let ids: Vec<_> = entries.iter().map(|e| e.event["after"]["id"].as_i64().unwrap()).collect();
+        let ids: Vec<_> = entries
+            .iter()
+            .map(|e| e.event["after"]["id"].as_i64().unwrap())
+            .collect();
         assert_eq!(ids, vec![2, 3, 4]);
     }
 
     #[tokio::test]
     async fn overflow_block_waits_for_ack() {
         let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
-        let dlq = Arc::new(make_dlq_writer(Arc::clone(&backend), 2, OverflowPolicy::Block));
+        let dlq = Arc::new(make_dlq_writer(
+            Arc::clone(&backend),
+            2,
+            OverflowPolicy::Block,
+        ));
 
-        let err = SinkError::Serialization { details: "bad".into() };
+        let err = SinkError::Serialization {
+            details: "bad".into(),
+        };
 
         // Fill the queue to capacity.
         dlq.write(&make_test_event(0), "kafka", &err).await;
@@ -414,7 +454,15 @@ mod tests {
         // Spawn a write that should block because queue is full.
         let dlq_clone = Arc::clone(&dlq);
         let write_handle = tokio::spawn(async move {
-            dlq_clone.write(&make_test_event(2), "kafka", &SinkError::Serialization { details: "bad".into() }).await;
+            dlq_clone
+                .write(
+                    &make_test_event(2),
+                    "kafka",
+                    &SinkError::Serialization {
+                        details: "bad".into(),
+                    },
+                )
+                .await;
         });
 
         // Give the write a moment to block.
@@ -426,13 +474,10 @@ mod tests {
         dlq.ack(entries[0].seq).await.unwrap();
 
         // Writer should complete within a reasonable time.
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            write_handle,
-        )
-        .await
-        .expect("write should unblock after ack")
-        .expect("write task should not panic");
+        tokio::time::timeout(std::time::Duration::from_secs(2), write_handle)
+            .await
+            .expect("write should unblock after ack")
+            .expect("write task should not panic");
 
         // Queue should have 2 entries (1 original + 1 new, after 1 acked).
         assert_eq!(dlq.len().await.unwrap(), 2);
@@ -443,7 +488,9 @@ mod tests {
         let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
         let dlq = make_dlq_writer(backend, 2, OverflowPolicy::Reject);
 
-        let err = SinkError::Serialization { details: "bad".into() };
+        let err = SinkError::Serialization {
+            details: "bad".into(),
+        };
         for i in 0..5 {
             dlq.write(&make_test_event(i), "kafka", &err).await;
         }
@@ -452,7 +499,10 @@ mod tests {
         assert_eq!(dlq.len().await.unwrap(), 2);
 
         let entries = dlq.peek(10).await.unwrap();
-        let ids: Vec<_> = entries.iter().map(|e| e.event["after"]["id"].as_i64().unwrap()).collect();
+        let ids: Vec<_> = entries
+            .iter()
+            .map(|e| e.event["after"]["id"].as_i64().unwrap())
+            .collect();
         assert_eq!(ids, vec![0, 1]);
     }
 }
