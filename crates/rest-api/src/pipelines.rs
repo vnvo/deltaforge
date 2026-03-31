@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
 };
@@ -56,6 +56,54 @@ pub trait PipelineController: Send + Sync {
 
     /// Delete a pipeline permanently.
     async fn delete(&self, name: &str) -> Result<(), PipelineAPIError>;
+
+    // ── DLQ endpoints ──────────────────────────────────────────────────
+
+    /// Peek DLQ entries for a pipeline. Returns JSON values.
+    async fn dlq_peek(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<Vec<Value>, PipelineAPIError> {
+        let _ = (name, limit);
+        Err(PipelineAPIError::Failed(anyhow::anyhow!(
+            "DLQ not enabled for this pipeline"
+        )))
+    }
+
+    /// Count of DLQ entries.
+    async fn dlq_count(
+        &self,
+        name: &str,
+    ) -> Result<u64, PipelineAPIError> {
+        let _ = name;
+        Err(PipelineAPIError::Failed(anyhow::anyhow!(
+            "DLQ not enabled for this pipeline"
+        )))
+    }
+
+    /// Acknowledge DLQ entries up to a sequence number.
+    async fn dlq_ack(
+        &self,
+        name: &str,
+        up_to_seq: u64,
+    ) -> Result<usize, PipelineAPIError> {
+        let _ = (name, up_to_seq);
+        Err(PipelineAPIError::Failed(anyhow::anyhow!(
+            "DLQ not enabled for this pipeline"
+        )))
+    }
+
+    /// Purge all DLQ entries.
+    async fn dlq_purge(
+        &self,
+        name: &str,
+    ) -> Result<usize, PipelineAPIError> {
+        let _ = name;
+        Err(PipelineAPIError::Failed(anyhow::anyhow!(
+            "DLQ not enabled for this pipeline"
+        )))
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -70,6 +118,13 @@ pub fn router(state: AppState) -> Router {
         .route("/pipelines/{name}/pause", post(pause_pipeline))
         .route("/pipelines/{name}/resume", post(resume_pipeline))
         .route("/pipelines/{name}/stop", post(stop_pipeline))
+        // DLQ endpoints
+        .route(
+            "/pipelines/{name}/journal/dlq",
+            get(handle_dlq_peek).delete(handle_dlq_purge),
+        )
+        .route("/pipelines/{name}/journal/dlq/count", get(handle_dlq_count))
+        .route("/pipelines/{name}/journal/dlq/ack", post(handle_dlq_ack))
         .with_state(state)
 }
 
@@ -155,6 +210,114 @@ async fn delete_pipeline(
         .await
         .map(|_| StatusCode::NO_CONTENT)
         .map_err(pipeline_error)
+}
+
+// ── DLQ handlers ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct DlqPeekParams {
+    #[serde(default = "default_dlq_limit")]
+    limit: usize,
+    #[allow(dead_code)]
+    sink_id: Option<String>,
+    #[allow(dead_code)]
+    error_kind: Option<String>,
+}
+
+fn default_dlq_limit() -> usize {
+    50
+}
+
+async fn handle_dlq_peek(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    Query(params): Query<DlqPeekParams>,
+) -> ApiResult<Vec<Value>> {
+    let limit = params.limit.min(1000);
+    let mut entries = st
+        .controller
+        .dlq_peek(&name, limit)
+        .await
+        .map_err(pipeline_error)?;
+
+    // Server-side filtering by sink_id and error_kind.
+    if let Some(ref sink_id) = params.sink_id {
+        entries.retain(|e| {
+            e.get("meta")
+                .and_then(|m| m.get("sink_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s == sink_id)
+                .unwrap_or(false)
+        });
+    }
+    if let Some(ref error_kind) = params.error_kind {
+        entries.retain(|e| {
+            e.get("meta")
+                .and_then(|m| m.get("error_kind"))
+                .and_then(|v| v.as_str())
+                .map(|s| s == error_kind)
+                .unwrap_or(false)
+        });
+    }
+
+    Ok(Json(entries))
+}
+
+#[derive(Serialize)]
+struct DlqCountResponse {
+    count: u64,
+}
+
+async fn handle_dlq_count(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<DlqCountResponse> {
+    let count = st
+        .controller
+        .dlq_count(&name)
+        .await
+        .map_err(pipeline_error)?;
+    Ok(Json(DlqCountResponse { count }))
+}
+
+#[derive(Deserialize)]
+struct DlqAckRequest {
+    up_to_seq: u64,
+}
+
+#[derive(Serialize)]
+struct DlqAckResponse {
+    acked: usize,
+}
+
+async fn handle_dlq_ack(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<DlqAckRequest>,
+) -> ApiResult<DlqAckResponse> {
+    let acked = st
+        .controller
+        .dlq_ack(&name, body.up_to_seq)
+        .await
+        .map_err(pipeline_error)?;
+    Ok(Json(DlqAckResponse { acked }))
+}
+
+#[derive(Serialize)]
+struct DlqPurgeResponse {
+    purged: usize,
+}
+
+async fn handle_dlq_purge(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<DlqPurgeResponse> {
+    let purged = st
+        .controller
+        .dlq_purge(&name)
+        .await
+        .map_err(pipeline_error)?;
+    Ok(Json(DlqPurgeResponse { purged }))
 }
 
 #[cfg(test)]
