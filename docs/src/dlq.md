@@ -57,7 +57,7 @@ Events that caused `MessageTooLarge` may also be too large for the DLQ. If the e
 |----------|--------|-------------|
 | `GET /pipelines/{name}/journal/dlq` | GET | Peek entries (oldest first). Params: `?limit=50&sink_id=...&error_kind=...` |
 | `GET /pipelines/{name}/journal/dlq/count` | GET | Count of unacked entries |
-| `POST /pipelines/{name}/journal/dlq/ack` | POST | Ack entries up to seq. Body: `{"up_to_seq": 42}` |
+| `POST /pipelines/{name}/journal/dlq/ack` | POST | Dismiss (remove) entries up to seq. Body: `{"up_to_seq": 42}`. Dismissed entries are permanently deleted — they are not retried or reprocessed. |
 | `DELETE /pipelines/{name}/journal/dlq` | DELETE | Purge all entries |
 
 **Filters** (`sink_id`, `error_kind`) affect listing only. Ack is always cumulative from the queue head — it removes all entries up to `up_to_seq`, regardless of filters used when viewing.
@@ -131,9 +131,24 @@ curl -s -X DELETE http://localhost:8080/pipelines/my-pipeline/journal/dlq
 
 The DLQ is built on DeltaForge's existing `StorageBackend` queue primitives (`queue_push`, `queue_peek`, `queue_ack`). It automatically uses whatever storage backend your pipeline is configured with (SQLite, PostgreSQL, or memory). No additional infrastructure is needed.
 
+## Background Cleanup
+
+When `max_age_secs` is configured (default: 7 days), a background task runs every 60 seconds and removes entries older than the threshold. Age is calculated from insertion time, not source event time. A best-effort startup cleanup pass (bounded to 5 seconds) runs when the pipeline starts.
+
+Cleanup and overflow eviction are independent — `drop_oldest` may remove entries before age-based cleanup fires.
+
+## Operator Workflow
+
+DLQ events are **not retried automatically**. The intended workflow is:
+
+1. **Alert**: monitor `deltaforge_dlq_events_total` or `deltaforge_dlq_entries` in Grafana
+2. **Inspect**: `GET /pipelines/{name}/journal/dlq?sink_id=...` to see what failed and why
+3. **Fix**: resolve the root cause (schema mismatch, oversized column, broken routing template)
+4. **Dismiss**: `POST /pipelines/{name}/journal/dlq/ack` to remove reviewed entries — dismissed entries are permanently deleted
+
+Future versions may add a retry endpoint (`POST .../dlq/retry`) that re-injects events into the pipeline, but this raises ordering and idempotency concerns and is deferred.
+
 ## Limitations
 
 - DLQ is per-pipeline, not per-sink. Use the `sink_id` filter to view entries for a specific sink.
-- There is no automatic retry/reprocessing of DLQ entries. Inspect, fix the root cause, then ack.
 - The `block` overflow policy blocks the entire pipeline, not just the failing sink.
-- Background age-based cleanup is not yet implemented — entries are only removed via ack/purge or overflow eviction.
