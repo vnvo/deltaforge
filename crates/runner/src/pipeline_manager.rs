@@ -198,16 +198,12 @@ impl PipelineManager {
         let runtime = guard
             .get(name)
             .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?;
-        runtime
-            .dlq_writer
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| {
-                PipelineAPIError::Failed(anyhow::anyhow!(
-                    "DLQ not enabled for pipeline '{}'",
-                    name
-                ))
-            })
+        runtime.dlq_writer.as_ref().cloned().ok_or_else(|| {
+            PipelineAPIError::Failed(anyhow::anyhow!(
+                "DLQ not enabled for pipeline '{}'",
+                name
+            ))
+        })
     }
 
     /// Production constructor - wires a `StorageBackend` into both
@@ -732,13 +728,14 @@ impl PipelineController for PipelineManager {
         limit: usize,
     ) -> Result<Vec<serde_json::Value>, PipelineAPIError> {
         let dlq = self.get_dlq_writer(name)?;
-        let entries = dlq
-            .peek(limit)
-            .await
-            .map_err(PipelineAPIError::Failed)?;
+        let entries =
+            dlq.peek(limit).await.map_err(PipelineAPIError::Failed)?;
         entries
             .into_iter()
-            .map(|e| serde_json::to_value(e).map_err(|e| PipelineAPIError::Failed(e.into())))
+            .map(|e| {
+                serde_json::to_value(e)
+                    .map_err(|e| PipelineAPIError::Failed(e.into()))
+            })
             .collect()
     }
 
@@ -753,9 +750,7 @@ impl PipelineController for PipelineManager {
         up_to_seq: u64,
     ) -> Result<usize, PipelineAPIError> {
         let dlq = self.get_dlq_writer(name)?;
-        dlq.ack(up_to_seq)
-            .await
-            .map_err(PipelineAPIError::Failed)
+        dlq.ack(up_to_seq).await.map_err(PipelineAPIError::Failed)
     }
 
     async fn dlq_purge(&self, name: &str) -> Result<usize, PipelineAPIError> {

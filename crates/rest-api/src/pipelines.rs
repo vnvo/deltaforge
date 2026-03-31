@@ -72,10 +72,7 @@ pub trait PipelineController: Send + Sync {
     }
 
     /// Count of DLQ entries.
-    async fn dlq_count(
-        &self,
-        name: &str,
-    ) -> Result<u64, PipelineAPIError> {
+    async fn dlq_count(&self, name: &str) -> Result<u64, PipelineAPIError> {
         let _ = name;
         Err(PipelineAPIError::Failed(anyhow::anyhow!(
             "DLQ not enabled for this pipeline"
@@ -95,10 +92,7 @@ pub trait PipelineController: Send + Sync {
     }
 
     /// Purge all DLQ entries.
-    async fn dlq_purge(
-        &self,
-        name: &str,
-    ) -> Result<usize, PipelineAPIError> {
+    async fn dlq_purge(&self, name: &str) -> Result<usize, PipelineAPIError> {
         let _ = name;
         Err(PipelineAPIError::Failed(anyhow::anyhow!(
             "DLQ not enabled for this pipeline"

@@ -81,7 +81,10 @@ impl Sink for CountingSink {
         Ok(())
     }
 
-    async fn send_batch(&self, events: &[Event]) -> SinkResult<deltaforge_core::BatchResult> {
+    async fn send_batch(
+        &self,
+        events: &[Event],
+    ) -> SinkResult<deltaforge_core::BatchResult> {
         self.event_count
             .fetch_add(events.len() as u64, Ordering::Relaxed);
         self.batch_count.fetch_add(1, Ordering::Relaxed);
@@ -128,7 +131,10 @@ impl Sink for SerializingSink {
         Ok(())
     }
 
-    async fn send_batch(&self, events: &[Event]) -> SinkResult<deltaforge_core::BatchResult> {
+    async fn send_batch(
+        &self,
+        events: &[Event],
+    ) -> SinkResult<deltaforge_core::BatchResult> {
         let mut total = 0u64;
         for event in events {
             let data = serde_json::to_vec(event)
@@ -220,7 +226,10 @@ impl Sink for EnvelopeSink {
         Ok(())
     }
 
-    async fn send_batch(&self, events: &[Event]) -> SinkResult<deltaforge_core::BatchResult> {
+    async fn send_batch(
+        &self,
+        events: &[Event],
+    ) -> SinkResult<deltaforge_core::BatchResult> {
         let mut total_bytes = 0u64;
         for event in events {
             let data = self
