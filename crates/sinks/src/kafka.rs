@@ -268,18 +268,45 @@ impl KafkaSink {
         }
 
         // Initialize transactions if exactly-once is enabled.
-        // This call blocks until the broker confirms the transactional.id
-        // registration and fences any previous producer with the same id.
+        // Retry with backoff because the broker may not be ready yet during startup.
         if transactional {
-            producer
-                .init_transactions(std::time::Duration::from_secs(30))
-                .with_context(|| {
-                    format!(
-                        "init_transactions failed for sink {} — is the Kafka broker reachable?",
-                        cfg.id
-                    )
-                })?;
-            info!(sink_id = %cfg.id, "kafka transactions initialized");
+            let mut retry_policy = common::retry::RetryPolicy::new(
+                Duration::from_secs(1),
+                Duration::from_secs(30),
+                0.2,
+                Some(10),
+            );
+            let mut attempt = 0u32;
+            loop {
+                attempt += 1;
+                match producer
+                    .init_transactions(std::time::Duration::from_secs(30))
+                {
+                    Ok(()) => {
+                        info!(sink_id = %cfg.id, "kafka transactions initialized");
+                        break;
+                    }
+                    Err(e) => {
+                        if !retry_policy.should_retry(attempt) {
+                            anyhow::bail!(
+                                "init_transactions failed after retries for sink {} — \
+                                 is the Kafka broker reachable? Last error: {e}",
+                                cfg.id
+                            );
+                        }
+                        let delay = retry_policy.next_backoff();
+                        warn!(
+                            sink_id = %cfg.id,
+                            error = %e,
+                            delay_ms = delay.as_millis(),
+                            "init_transactions failed, retrying"
+                        );
+                        // Blocking sleep is acceptable here — this is sync construction
+                        // and runs once at pipeline startup, not on the hot path.
+                        std::thread::sleep(delay);
+                    }
+                }
+            }
         }
 
         info!(
