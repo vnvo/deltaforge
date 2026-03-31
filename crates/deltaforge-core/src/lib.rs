@@ -77,6 +77,9 @@ pub use routing::EventRouting;
 pub mod batch_context;
 pub use batch_context::BatchContext;
 
+pub mod journal;
+pub use journal::{DlqMeta, JournalEntry};
+
 // ============================================================================
 // Operation Type
 // ============================================================================
@@ -694,6 +697,24 @@ pub enum ConnectionMode {
 pub type SourceResult<T> = Result<T, SourceError>;
 pub type SinkResult<T> = std::result::Result<T, SinkError>;
 
+/// Result of a batch send. Contains per-event failures that should be
+/// routed to the DLQ alongside the successful delivery.
+#[derive(Debug, Default)]
+pub struct BatchResult {
+    /// Events that failed preparation (serialization/routing).
+    /// Each entry is `(index_in_original_batch, error)`.
+    pub dlq_failures: Vec<(usize, SinkError)>,
+}
+
+impl BatchResult {
+    /// Create an empty result (no DLQ failures).
+    pub fn ok() -> Self {
+        Self {
+            dlq_failures: Vec::new(),
+        }
+    }
+}
+
 // ============================================================================
 // Source Handle
 // ============================================================================
@@ -781,11 +802,17 @@ pub trait Sink: Send + Sync {
 
     async fn send(&self, event: &Event) -> SinkResult<()>;
 
-    async fn send_batch(&self, events: &[Event]) -> SinkResult<()> {
+    /// Send a batch of events. Returns `BatchResult` which may contain
+    /// per-event DLQ failures (serialization/routing errors) alongside
+    /// successful delivery of the remaining events.
+    ///
+    /// The `SinkError` return is for sink-level failures (connection, auth, etc.)
+    /// that affect the entire batch. Per-event failures go in `BatchResult.dlq_failures`.
+    async fn send_batch(&self, events: &[Event]) -> SinkResult<BatchResult> {
         for event in events {
             self.send(event).await?;
         }
-        Ok(())
+        Ok(BatchResult::ok())
     }
 }
 

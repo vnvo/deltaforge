@@ -298,6 +298,11 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
           <span class="f-label">PG Partition</span>
           <span class="f-desc">severs pg source</span>
         </button>
+        <button class="fault-btn" onclick="injectFault('faulty-events', this)" title="PATCHes sink topic to broken template for 10s → events fail routing → DLQ. Auto-restores.">
+          <span class="f-icon">☠️</span>
+          <span class="f-label">Faulty Events</span>
+          <span class="f-desc">poison → DLQ (10s)</span>
+        </button>
         <button class="fault-btn clear-btn" onclick="clearFaults(this)">
           <span class="f-icon">✨</span>
           <span class="f-label">Clear All Faults</span>
@@ -362,6 +367,8 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
               <option value="sink-outage">Sink Outage</option>
               <option value="crash-recovery">Crash Recovery</option>
               <option value="schema-drift">Schema Drift</option>
+              <option value="exactly-once">Exactly-Once (crash + read_committed verify)</option>
+              <option value="dlq-poison">DLQ Poison (REST API + pipeline health)</option>
             </optgroup>
             <optgroup label="MySQL only">
               <option value="failover">MySQL Failover</option>

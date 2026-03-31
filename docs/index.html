@@ -944,6 +944,11 @@ footer {
         <div class="feature-name">Graceful Failover</div>
         <div class="feature-desc">Detects primary server changes via server identity comparison, verifies that prior checkpoints are covered by the new primary's transaction history, reconciles schema drift, and resumes streaming automatically. Configurable halt-on-drift policy for stricter environments.</div>
       </div>
+      <div class="feature-card">
+        <div class="feature-icon amber"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+        <div class="feature-name">Dead Letter Queue</div>
+        <div class="feature-desc">Poison events (serialization or routing failures) are routed to a DLQ instead of blocking the pipeline. Inspect, filter, and ack via REST API. Configurable overflow policies. Built on existing storage — no additional infrastructure.</div>
+      </div>
     </div>
   </div>
 </section>

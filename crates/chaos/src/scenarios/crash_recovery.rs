@@ -32,6 +32,11 @@ pub async fn run<B: SourceBackend>(
     backend: &B,
 ) -> Result<ScenarioResult> {
     let name = format!("{}/crash_recovery", backend.name());
+    crate::harness::print_scenario_banner(
+        &name,
+        "Sends SIGKILL to DeltaForge, inserts rows while down, waits for Docker restart.",
+        "All post-crash events arrive. Checkpoint survives SIGKILL. Duplicates possible.",
+    );
     harness.setup().await?;
 
     info!(

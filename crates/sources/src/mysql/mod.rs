@@ -181,9 +181,44 @@ impl MySqlSource {
             info!(source_id = %self.id, "snapshot complete, starting binlog streaming");
         }
 
-        // binlog streaming
-        let (host, default_db, server_id, mut client) =
-            prepare_client(&self.dsn, &self.id, &chkpt_store).await?;
+        // binlog streaming — retry prepare_client on transient connection errors
+        // (MySQL or toxiproxy may not be ready yet during startup).
+        let (host, default_db, server_id, mut client) = {
+            let mut retry = common::retry::RetryPolicy::default();
+            loop {
+                match prepare_client(&self.dsn, &self.id, &chkpt_store).await {
+                    Ok(result) => break result,
+                    Err(e) => {
+                        let source_err: SourceError = e.into();
+                        let retryable = matches!(
+                            &source_err,
+                            SourceError::Connect { .. }
+                                | SourceError::Io(_)
+                                | SourceError::Timeout { .. }
+                        );
+                        if retryable {
+                            let delay = retry
+                                .next_backoff()
+                                .min(std::time::Duration::from_secs(60));
+                            warn!(
+                                source_id = %self.id,
+                                error = %source_err,
+                                delay_secs = delay.as_secs(),
+                                "prepare_client failed, retrying after backoff"
+                            );
+                            tokio::select! {
+                                _ = tokio::time::sleep(delay) => {}
+                                _ = cancel.cancelled() => {
+                                    return Err(SourceError::Cancelled);
+                                }
+                            }
+                        } else {
+                            return Err(source_err);
+                        }
+                    }
+                }
+            }
+        };
 
         // Capture the original checkpoint position BEFORE any adjustment.
         // This is used later by check_position_reachability to determine whether

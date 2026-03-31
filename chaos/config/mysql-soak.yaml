@@ -47,3 +47,11 @@ spec:
 
   commit_policy:
     mode: required
+
+  journal:
+    enabled: true
+    max_event_bytes: 262144
+    dlq:
+      max_entries: 10000
+      max_age_secs: 3600
+      overflow_policy: drop_oldest

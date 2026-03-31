@@ -145,6 +145,14 @@ async fn run_with_source(
     let name = format!("backlog-drain-{}", src.name);
     let is_pg = src.name == "postgres";
 
+    crate::harness::print_scenario_banner(
+        &name,
+        &format!(
+            "Writes {} rows to {}, then measures catch-up throughput from saved checkpoint.",
+            cfg.target_events, src.name
+        ),
+        "All events delivered to Kafka. Reports avg/p50/peak events/s.",
+    );
     info!(
         source = src.name,
         max_events = cfg.max_events,

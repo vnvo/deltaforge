@@ -127,6 +127,9 @@ enum Scenario {
     /// to a `read_committed` consumer after a crash. Requires `exactly_once: true`
     /// on the Kafka sink in the DeltaForge config.
     ExactlyOnce,
+    /// DLQ validation: verifies REST API endpoints, pipeline continues after
+    /// DLQ operations.
+    DlqPoison,
     // MySQL-specific
     Failover,
     BinlogPurge,
@@ -304,6 +307,9 @@ async fn run_mysql(
             results
                 .push(scenarios::exactly_once::run(harness, &backend).await?);
         }
+        Scenario::DlqPoison => {
+            results.push(scenarios::dlq_poison::run(harness, &backend).await?);
+        }
         Scenario::Failover => {
             results.push(scenarios::failover::run(harness).await?);
         }
@@ -403,6 +409,9 @@ async fn run_postgres(
         Scenario::ExactlyOnce => {
             results
                 .push(scenarios::exactly_once::run(harness, &backend).await?);
+        }
+        Scenario::DlqPoison => {
+            results.push(scenarios::dlq_poison::run(harness, &backend).await?);
         }
         Scenario::PgFailover => {
             results.push(scenarios::pg_failover::run(harness).await?);

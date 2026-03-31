@@ -5,6 +5,26 @@ All notable changes to DeltaForge will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Dead Letter Queue** — per-event failure routing to a durable queue. Poison events (serialization/routing failures) go to DLQ instead of blocking the pipeline. Overflow policies: drop_oldest, reject, block. REST API: peek, count, ack, purge with sink_id/error_kind filters. Background age-based cleanup. Grafana dashboard panels. `--scenario dlq-poison` chaos test.
+- **Sink `BatchResult`** — `send_batch()` now returns per-event DLQ failures alongside successful delivery. All built-in sinks (Kafka, NATS, Redis) collect per-event serialization/routing errors instead of failing the entire batch.
+- **Faulty Events fault injection** — chaos UI button and soak fault that PATCHes sink topic to broken template for 10s → events fail routing → DLQ. Auto-restores.
+- **Guarantees & Correctness page** — ordering model, transaction boundaries, failure isolation, retry behavior, checkpoint semantics, consumer guidance.
+
+### Changed
+
+- **Delivery terminology** — "exactly-once" reserved for Kafka EOS only. NATS and Redis documented as "at-least-once with dedup." Consistent across all docs, README, and landing page.
+- **Soak configs** — DLQ enabled by default (journal.enabled=true) for MySQL and Postgres soak tests.
+- **Soak random faults** — now includes faulty_events alongside network_partition, sink_outage, crash.
+
+### Fixed
+
+- **MySQL startup connection retry** — `prepare_client` (binlog tail resolution) retries with exponential backoff instead of failing immediately when MySQL is not yet ready.
+- **Kafka `init_transactions` retry** — retries up to 10 attempts using RetryPolicy instead of failing immediately when broker is unreachable.
+
 ## [v0.1.0-beta.9] - 2026-03-29
 
 ### Added

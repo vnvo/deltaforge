@@ -136,6 +136,12 @@ Output: `{"schema":null,"payload":{...}}`
   - Configurable commit policies (all, required, quorum)
   - Transaction boundary preservation (`respect_source_tx: true` by default)
 
+- **Dead Letter Queue**
+  - Poison events (serialization/routing failures) routed to DLQ instead of blocking pipeline
+  - REST API: inspect, filter by sink/error, ack, purge
+  - Overflow policies: drop_oldest, reject, block
+  - Built on existing storage backend — no additional infrastructure
+
 - **Processors**
   - JavaScript processor using `deno_core`:
     - Run user defined functions (UDFs) in JS to transform batches of events

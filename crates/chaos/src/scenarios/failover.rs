@@ -35,6 +35,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
     const NAME: &str = "failover";
+    crate::harness::print_scenario_banner(
+        NAME,
+        "Switches Toxiproxy upstream from mysql-a to mysql-b (different server UUID).",
+        "Server identity change detected. Health endpoint goes unhealthy (503). No silent resume from invalid position.",
+    );
     harness.setup().await?;
 
     // ── Warmup ────────────────────────────────────────────────────────────────

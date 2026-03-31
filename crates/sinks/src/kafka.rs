@@ -40,7 +40,7 @@ use common::{RetryOutcome, RetryPolicy, retry_async};
 use deltaforge_config::KafkaSinkCfg;
 use deltaforge_core::encoding::EncodingType;
 use deltaforge_core::envelope::Envelope;
-use deltaforge_core::{Event, Sink, SinkError, SinkResult};
+use deltaforge_core::{BatchResult, Event, Sink, SinkError, SinkResult};
 use futures::future::try_join_all;
 use metrics::{counter, gauge};
 use rdkafka::config::ClientConfig;
@@ -268,18 +268,45 @@ impl KafkaSink {
         }
 
         // Initialize transactions if exactly-once is enabled.
-        // This call blocks until the broker confirms the transactional.id
-        // registration and fences any previous producer with the same id.
+        // Retry with backoff because the broker may not be ready yet during startup.
         if transactional {
-            producer
-                .init_transactions(std::time::Duration::from_secs(30))
-                .with_context(|| {
-                    format!(
-                        "init_transactions failed for sink {} — is the Kafka broker reachable?",
-                        cfg.id
-                    )
-                })?;
-            info!(sink_id = %cfg.id, "kafka transactions initialized");
+            let mut retry_policy = common::retry::RetryPolicy::new(
+                Duration::from_secs(1),
+                Duration::from_secs(30),
+                0.2,
+                Some(10),
+            );
+            let mut attempt = 0u32;
+            loop {
+                attempt += 1;
+                match producer
+                    .init_transactions(std::time::Duration::from_secs(30))
+                {
+                    Ok(()) => {
+                        info!(sink_id = %cfg.id, "kafka transactions initialized");
+                        break;
+                    }
+                    Err(e) => {
+                        if !retry_policy.should_retry(attempt) {
+                            anyhow::bail!(
+                                "init_transactions failed after retries for sink {} — \
+                                 is the Kafka broker reachable? Last error: {e}",
+                                cfg.id
+                            );
+                        }
+                        let delay = retry_policy.next_backoff();
+                        warn!(
+                            sink_id = %cfg.id,
+                            error = %e,
+                            delay_ms = delay.as_millis(),
+                            "init_transactions failed, retrying"
+                        );
+                        // Blocking sleep is acceptable here — this is sync construction
+                        // and runs once at pipeline startup, not on the hot path.
+                        std::thread::sleep(delay);
+                    }
+                }
+            }
         }
 
         info!(
@@ -423,7 +450,10 @@ impl Sink for KafkaSink {
         // Transactional producers must wrap every send in begin/commit.
         // Delegate to send_batch which handles the transaction boundary.
         if self.transactional {
-            return self.send_batch(std::slice::from_ref(event)).await;
+            return self
+                .send_batch(std::slice::from_ref(event))
+                .await
+                .map(|_| ());
         }
 
         let payload = self.serialize_event(event)?;
@@ -490,43 +520,58 @@ impl Sink for KafkaSink {
     /// The `linger.ms` setting controls how long rdkafka waits to batch
     /// messages before sending.
     #[instrument(skip_all, fields(sink_id = %self.id, count = events.len()))]
-    async fn send_batch(&self, events: &[Event]) -> SinkResult<()> {
+    async fn send_batch(&self, events: &[Event]) -> SinkResult<BatchResult> {
         if events.is_empty() {
-            return Ok(());
+            return Ok(BatchResult::ok());
         }
 
-        // Pre-serialize with resolved topic/key/headers
-        let serialized: Result<
-            Vec<(Vec<u8>, String, String, Option<OwnedHeaders>)>,
-            SinkError,
-        > = events
-            .iter()
-            .map(|e| {
+        // Pre-serialize with resolved topic/key/headers.
+        // Per-event DLQ-eligible errors (serialization, routing) are collected
+        // instead of failing the batch. Non-DLQ errors fail the batch as before.
+        let mut serialized: Vec<(
+            Vec<u8>,
+            String,
+            String,
+            Option<OwnedHeaders>,
+        )> = Vec::with_capacity(events.len());
+        let mut dlq_failures: Vec<(usize, SinkError)> = Vec::new();
+
+        for (i, e) in events.iter().enumerate() {
+            match (|| -> Result<_, SinkError> {
                 let payload = self.serialize_event(e)?;
                 let topic = self.resolve_topic(e)?;
                 let key = self.resolve_key(e);
                 let headers = self.build_headers(e);
                 Ok((payload, topic, key, headers))
-            })
-            .collect();
-        let serialized = match serialized {
-            Ok(s) => s,
-            Err(e) => {
-                let kind = match &e {
-                    SinkError::Serialization { .. } => "serialization",
-                    SinkError::Routing { .. } => "routing",
-                    _ => "other",
-                };
-                counter!(
-                    "deltaforge_sink_routing_errors_total",
-                    "pipeline" => self.pipeline.clone(),
-                    "sink" => self.id.clone(),
-                    "kind" => kind,
-                )
-                .increment(1);
-                return Err(e);
+            })() {
+                Ok(prepared) => serialized.push(prepared),
+                Err(e) if e.is_dlq_eligible() => {
+                    counter!(
+                        "deltaforge_sink_routing_errors_total",
+                        "pipeline" => self.pipeline.clone(),
+                        "sink" => self.id.clone(),
+                        "kind" => e.kind(),
+                    )
+                    .increment(1);
+                    dlq_failures.push((i, e));
+                }
+                Err(e) => {
+                    counter!(
+                        "deltaforge_sink_routing_errors_total",
+                        "pipeline" => self.pipeline.clone(),
+                        "sink" => self.id.clone(),
+                        "kind" => e.kind(),
+                    )
+                    .increment(1);
+                    return Err(e);
+                }
             }
-        };
+        }
+
+        if serialized.is_empty() {
+            // All events failed preparation — nothing to send.
+            return Ok(BatchResult { dlq_failures });
+        }
 
         // Begin transaction if exactly-once is enabled.
         if self.transactional {
@@ -622,10 +667,11 @@ impl Sink for KafkaSink {
                 .increment(total_bytes);
                 debug!(
                     count = events.len(),
+                    dlq_failures = dlq_failures.len(),
                     transactional = self.transactional,
                     "batch sent to kafka"
                 );
-                Ok(())
+                Ok(BatchResult { dlq_failures })
             }
             Err(e) => {
                 // Abort transaction on delivery failure.

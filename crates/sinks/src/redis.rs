@@ -37,7 +37,7 @@ use common::{RetryOutcome, RetryPolicy, redact_url_password, retry_async};
 use deltaforge_config::RedisSinkCfg;
 use deltaforge_core::encoding::EncodingType;
 use deltaforge_core::envelope::Envelope;
-use deltaforge_core::{Event, Sink, SinkError, SinkResult};
+use deltaforge_core::{BatchResult, Event, Sink, SinkError, SinkResult};
 use metrics::counter;
 use redis::aio::MultiplexedConnection;
 use serde_json::Value;
@@ -499,18 +499,19 @@ impl Sink for RedisSink {
     }
 
     #[instrument(skip_all, fields(sink_id = %self.id, count = events.len()))]
-    async fn send_batch(&self, events: &[Event]) -> SinkResult<()> {
+    async fn send_batch(&self, events: &[Event]) -> SinkResult<BatchResult> {
         if events.is_empty() {
-            return Ok(());
+            return Ok(BatchResult::ok());
         }
 
-        // Pre-serialize with resolved stream/key/idempotency_key
-        let serialized: Result<
-            Vec<(String, String, String, String, Vec<u8>)>,
-            SinkError,
-        > = events
-            .iter()
-            .map(|e| {
+        // Pre-serialize with resolved stream/key/idempotency_key.
+        // Per-event DLQ-eligible errors are collected; non-DLQ errors fail the batch.
+        let mut serialized: Vec<(String, String, String, String, Vec<u8>)> =
+            Vec::with_capacity(events.len());
+        let mut dlq_failures: Vec<(usize, SinkError)> = Vec::new();
+
+        for (i, e) in events.iter().enumerate() {
+            match (|| -> Result<_, SinkError> {
                 let stream = self.resolve_stream(e)?;
                 let key = self.resolve_key(e);
                 let event_id =
@@ -518,26 +519,34 @@ impl Sink for RedisSink {
                 let idem_key = e.idempotency_key();
                 let payload = self.serialize_event(e)?;
                 Ok((stream, event_id, key, idem_key, payload))
-            })
-            .collect();
-        let serialized = match serialized {
-            Ok(s) => s,
-            Err(e) => {
-                let kind = match &e {
-                    SinkError::Serialization { .. } => "serialization",
-                    SinkError::Routing { .. } => "routing",
-                    _ => "other",
-                };
-                counter!(
-                    "deltaforge_sink_routing_errors_total",
-                    "pipeline" => self.pipeline.clone(),
-                    "sink" => self.id.clone(),
-                    "kind" => kind,
-                )
-                .increment(1);
-                return Err(e);
+            })() {
+                Ok(prepared) => serialized.push(prepared),
+                Err(e) if e.is_dlq_eligible() => {
+                    counter!(
+                        "deltaforge_sink_routing_errors_total",
+                        "pipeline" => self.pipeline.clone(),
+                        "sink" => self.id.clone(),
+                        "kind" => e.kind(),
+                    )
+                    .increment(1);
+                    dlq_failures.push((i, e));
+                }
+                Err(e) => {
+                    counter!(
+                        "deltaforge_sink_routing_errors_total",
+                        "pipeline" => self.pipeline.clone(),
+                        "sink" => self.id.clone(),
+                        "kind" => e.kind(),
+                    )
+                    .increment(1);
+                    return Err(e);
+                }
             }
-        };
+        }
+
+        if serialized.is_empty() {
+            return Ok(BatchResult { dlq_failures });
+        }
 
         // Retry loop for transient failures
         let policy = RetryPolicy::new(
@@ -591,8 +600,8 @@ impl Sink for RedisSink {
                     "sink" => self.id.clone(),
                 )
                 .increment(total_bytes);
-                debug!(stream = %self.stream, count = events.len(), "batch sent to redis");
-                Ok(())
+                debug!(stream = %self.stream, count = events.len(), dlq_failures = dlq_failures.len(), "batch sent to redis");
+                Ok(BatchResult { dlq_failures })
             }
             Err(outcome) => Err(outcome_to_sink_error(outcome)),
         }

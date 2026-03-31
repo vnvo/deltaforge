@@ -31,6 +31,11 @@ pub async fn run<B: SourceBackend>(
     let name = format!("{}/network_partition", backend.name());
     const ROUNDS: u32 = 2;
 
+    crate::harness::print_scenario_banner(
+        &name,
+        "Cuts source DB proxy via Toxiproxy, inserts rows while disconnected, restores connectivity.",
+        "All events delivered after reconnect, no data loss. Reconnect counter increments.",
+    );
     harness.setup().await?;
 
     for round in 1..=ROUNDS {

@@ -135,6 +135,7 @@ pub(crate) struct PipelineRuntime {
     pub(crate) schema_loader: Option<ArcSchemaLoader>,
     pub(crate) table_patterns: Vec<String>,
     pub(crate) sensor_state: Option<Arc<SchemaSensorState>>,
+    pub(crate) dlq_writer: Option<Arc<crate::dlq::DlqWriter>>,
 }
 
 impl PipelineRuntime {
@@ -187,6 +188,24 @@ pub struct PipelineManager {
 }
 
 impl PipelineManager {
+    /// Get the DLQ writer for a pipeline. Clones the Arc so the RwLock guard
+    /// is released before any async calls.
+    fn get_dlq_writer(
+        &self,
+        name: &str,
+    ) -> Result<Arc<crate::dlq::DlqWriter>, PipelineAPIError> {
+        let guard = self.pipelines.read();
+        let runtime = guard
+            .get(name)
+            .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?;
+        runtime.dlq_writer.as_ref().cloned().ok_or_else(|| {
+            PipelineAPIError::Failed(anyhow::anyhow!(
+                "DLQ not enabled for pipeline '{}'",
+                name
+            ))
+        })
+    }
+
     /// Production constructor - wires a `StorageBackend` into both
     /// checkpoint and schema registry subsystems. Replays the schema log
     /// on startup so the cache is warm before any pipeline starts.
@@ -376,6 +395,35 @@ impl PipelineManager {
             builder = builder.schema_provider(provider);
         }
 
+        // DLQ writer — opt-in via journal config.
+        let dlq_writer = if spec
+            .spec
+            .journal
+            .as_ref()
+            .map(|j| j.enabled)
+            .unwrap_or(false)
+        {
+            let journal_cfg = spec.spec.journal.clone().unwrap();
+            let writer = Arc::new(crate::dlq::DlqWriter::new(
+                self.backend.clone(),
+                pipeline_name.clone(),
+                journal_cfg.dlq.clone(),
+                journal_cfg.max_event_bytes,
+            ));
+            builder = builder.dlq_writer(Arc::clone(&writer));
+            // Spawn background cleanup for max_age expiry.
+            let _cleanup_handle = writer.spawn_cleanup_task();
+            tracing::info!(
+                pipeline = %pipeline_name,
+                max_entries = journal_cfg.dlq.max_entries,
+                max_age_secs = journal_cfg.dlq.max_age_secs,
+                "DLQ enabled with background cleanup"
+            );
+            Some(writer)
+        } else {
+            None
+        };
+
         let coord = builder.build();
         let cancel_for_task = cancel.clone();
         let cancel_check = cancel.clone();
@@ -411,6 +459,7 @@ impl PipelineManager {
             schema_loader,
             table_patterns,
             sensor_state: sensor_for_runtime,
+            dlq_writer,
         })
     }
 
@@ -673,6 +722,44 @@ impl PipelineController for PipelineManager {
 
         Ok(())
     }
+
+    // ── DLQ controller methods ───────────────────────────────────────────
+
+    async fn dlq_peek(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>, PipelineAPIError> {
+        let dlq = self.get_dlq_writer(name)?;
+        let entries =
+            dlq.peek(limit).await.map_err(PipelineAPIError::Failed)?;
+        entries
+            .into_iter()
+            .map(|e| {
+                serde_json::to_value(e)
+                    .map_err(|e| PipelineAPIError::Failed(e.into()))
+            })
+            .collect()
+    }
+
+    async fn dlq_count(&self, name: &str) -> Result<u64, PipelineAPIError> {
+        let dlq = self.get_dlq_writer(name)?;
+        dlq.len().await.map_err(PipelineAPIError::Failed)
+    }
+
+    async fn dlq_ack(
+        &self,
+        name: &str,
+        up_to_seq: u64,
+    ) -> Result<usize, PipelineAPIError> {
+        let dlq = self.get_dlq_writer(name)?;
+        dlq.ack(up_to_seq).await.map_err(PipelineAPIError::Failed)
+    }
+
+    async fn dlq_purge(&self, name: &str) -> Result<usize, PipelineAPIError> {
+        let dlq = self.get_dlq_writer(name)?;
+        dlq.purge().await.map_err(PipelineAPIError::Failed)
+    }
 }
 
 // ============================================================================
@@ -761,6 +848,7 @@ mod tests {
                 batch: Some(BatchConfig::default()),
                 commit_policy: None,
                 schema_sensing: Default::default(),
+                journal: None,
             },
         }
     }

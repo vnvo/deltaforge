@@ -376,6 +376,8 @@ pub struct Coordinator<Tok> {
     schema_provider: Option<ArcSchemaProvider>,
     /// Cached DB schemas for fast lookup during batch processing
     db_schema_cache: Mutex<HashMap<String, TableSchemaInfo>>,
+    /// Optional DLQ writer for routing per-event failures.
+    dlq_writer: Option<Arc<crate::dlq::DlqWriter>>,
 }
 
 pub struct CoordinatorBuilder<Tok> {
@@ -387,6 +389,7 @@ pub struct CoordinatorBuilder<Tok> {
     process_fn: Option<ProcessBatchFn<Tok>>,
     schema_sensor: Option<Arc<SchemaSensorState>>,
     schema_provider: Option<ArcSchemaProvider>,
+    dlq_writer: Option<Arc<crate::dlq::DlqWriter>>,
 }
 
 impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
@@ -400,6 +403,7 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             process_fn: None,
             schema_sensor: None,
             schema_provider: None,
+            dlq_writer: None,
         }
     }
 
@@ -443,6 +447,11 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
         self
     }
 
+    pub fn dlq_writer(mut self, writer: Arc<crate::dlq::DlqWriter>) -> Self {
+        self.dlq_writer = Some(writer);
+        self
+    }
+
     pub fn build(self) -> Coordinator<Tok> {
         let batch_cfg_eff = Coordinator::<Tok>::effective(&self.batch_config);
         assert!(
@@ -460,6 +469,7 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             schema_sensor: self.schema_sensor,
             schema_provider: self.schema_provider,
             db_schema_cache: Mutex::new(HashMap::new()),
+            dlq_writer: self.dlq_writer,
         }
     }
 }
@@ -882,7 +892,26 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
 
         for (sink_id, required, elapsed, result) in raw_outcomes {
             match result {
-                Ok(()) => {
+                Ok(batch_result) => {
+                    // Route per-event DLQ failures if a DLQ writer is configured.
+                    if !batch_result.dlq_failures.is_empty() {
+                        if let Some(dlq) = &self.dlq_writer {
+                            for &(idx, ref err) in &batch_result.dlq_failures {
+                                if idx < frozen.events.len() {
+                                    dlq.write(
+                                        &frozen.events[idx],
+                                        &sink_id,
+                                        err,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+
+                    let delivered =
+                        frozen.events.len() - batch_result.dlq_failures.len();
+
                     total_acks += 1;
                     if required {
                         required_acks += 1;
@@ -901,7 +930,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                         "pipeline" => self.pipeline_name.to_string(),
                         "sink" => sink_id.clone()
                     )
-                    .increment(frozen.events.len() as u64);
+                    .increment(delivered as u64);
 
                     histogram!(
                         "deltaforge_sink_latency_seconds",
@@ -1212,10 +1241,15 @@ mod tests {
         }
 
         async fn send(&self, _event: &Event) -> SinkResult<()> {
-            self.send_batch(std::slice::from_ref(_event)).await
+            self.send_batch(std::slice::from_ref(_event))
+                .await
+                .map(|_| ())
         }
 
-        async fn send_batch(&self, events: &[Event]) -> SinkResult<()> {
+        async fn send_batch(
+            &self,
+            events: &[Event],
+        ) -> SinkResult<deltaforge_core::BatchResult> {
             if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(SinkError::Backpressure {
                     details: "mock failure".into(),
@@ -1223,7 +1257,7 @@ mod tests {
             }
             self.delivered
                 .fetch_add(events.len(), std::sync::atomic::Ordering::Relaxed);
-            Ok(())
+            Ok(deltaforge_core::BatchResult::ok())
         }
     }
 
@@ -1421,5 +1455,357 @@ mod tests {
         // Checkpoint should also be committed.
         let cp = store.get_raw("src::sink::kafka").await.unwrap();
         assert_eq!(cp.unwrap(), b"{\"pos\":99}");
+    }
+
+    // ── DLQ integration tests ────────────────────────────────────────────
+
+    /// Mock sink that returns DLQ failures for events at specific indices.
+    /// Simulates a sink where some events fail serialization/routing but
+    /// the rest are delivered successfully.
+    struct DlqMockSink {
+        id: String,
+        /// Event indices (within each batch) that should fail.
+        fail_indices: Vec<usize>,
+        delivered: AtomicUsize,
+    }
+
+    impl DlqMockSink {
+        fn new(id: &str, fail_indices: Vec<usize>) -> Arc<Self> {
+            Arc::new(Self {
+                id: id.to_string(),
+                fail_indices,
+                delivered: AtomicUsize::new(0),
+            })
+        }
+
+        fn delivery_count(&self) -> usize {
+            self.delivered.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl deltaforge_core::Sink for DlqMockSink {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn required(&self) -> bool {
+            true
+        }
+
+        async fn send(&self, _event: &Event) -> SinkResult<()> {
+            Ok(())
+        }
+
+        async fn send_batch(
+            &self,
+            events: &[Event],
+        ) -> SinkResult<deltaforge_core::BatchResult> {
+            let mut dlq_failures = Vec::new();
+            let mut delivered = 0usize;
+
+            for (i, _) in events.iter().enumerate() {
+                if self.fail_indices.contains(&i) {
+                    dlq_failures.push((
+                        i,
+                        SinkError::Serialization {
+                            details: format!(
+                                "mock serialization failure at index {i}"
+                            )
+                            .into(),
+                        },
+                    ));
+                } else {
+                    delivered += 1;
+                }
+            }
+
+            self.delivered
+                .fetch_add(delivered, std::sync::atomic::Ordering::Relaxed);
+            Ok(deltaforge_core::BatchResult { dlq_failures })
+        }
+    }
+
+    /// Send a batch where some events fail serialization → DLQ.
+    /// Verify: good events delivered, bad events in DLQ, pipeline continues,
+    /// checkpoint committed.
+    #[tokio::test]
+    async fn test_dlq_routes_failed_events_and_pipeline_continues() {
+        use checkpoints::MemCheckpointStore;
+        use deltaforge_config::DlqStreamConfig;
+        use storage::MemoryStorageBackend;
+
+        let ckpt_store = Arc::new(MemCheckpointStore::new().unwrap());
+        let storage_backend: storage::ArcStorageBackend =
+            Arc::new(MemoryStorageBackend::new());
+
+        // Sink fails events at index 1 and 3 (out of 5).
+        let sink = DlqMockSink::new("kafka", vec![1, 3]);
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+
+        let cp_fn =
+            build_commit_fn(ckpt_store.clone(), "src::sink::kafka".to_string());
+        let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![]);
+        let batch_processor =
+            build_batch_processor(processors, "test".to_string());
+
+        // Create DLQ writer.
+        let dlq_writer = Arc::new(crate::dlq::DlqWriter::new(
+            storage_backend.clone(),
+            "test-dlq".to_string(),
+            DlqStreamConfig::default(),
+            256 * 1024,
+        ));
+
+        let coord = Coordinator::builder("test-dlq")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(10),
+                max_bytes: None,
+                max_ms: Some(100),
+                respect_source_tx: None,
+                max_inflight: Some(1),
+            }))
+            .commit_fn("kafka", cp_fn)
+            .process_fn(batch_processor)
+            .dlq_writer(dlq_writer.clone())
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        let source = deltaforge_core::SourceInfo {
+            version: "test".into(),
+            connector: "mysql".into(),
+            name: "test".into(),
+            db: "db".into(),
+            schema: None,
+            table: "table".into(),
+            ts_ms: 0,
+            snapshot: None,
+            position: deltaforge_core::SourcePosition::default(),
+        };
+
+        // Send 5 events. Events at index 1 and 3 will fail.
+        for i in 0..5 {
+            let mut ev = Event::new_row(
+                source.clone(),
+                deltaforge_core::Op::Create,
+                None,
+                Some(serde_json::json!({"id": i})),
+                0,
+                0,
+            );
+            if i == 4 {
+                ev.checkpoint =
+                    Some(CheckpointMeta::from_vec(b"{\"pos\":100}".to_vec()));
+                ev.tx_end = true;
+            }
+            tx.send(ev).await.unwrap();
+        }
+        drop(tx);
+
+        let _ = coord.run(rx, cancel, pause_rx).await;
+
+        // 3 events delivered (indices 0, 2, 4).
+        assert_eq!(
+            sink.delivery_count(),
+            3,
+            "only 3 events should be delivered (2 routed to DLQ)"
+        );
+
+        // 2 events in DLQ.
+        let dlq_len = dlq_writer.len().await.unwrap();
+        assert_eq!(dlq_len, 2, "2 events should be in the DLQ");
+
+        // Verify DLQ entries have correct metadata.
+        let dlq_entries = dlq_writer.peek(10).await.unwrap();
+        assert_eq!(dlq_entries.len(), 2);
+
+        let meta0 =
+            deltaforge_core::journal::DlqMeta::from_json(&dlq_entries[0].meta)
+                .expect("DLQ entry should have valid DlqMeta");
+        assert_eq!(meta0.sink_id, "kafka");
+        assert_eq!(meta0.error_kind, "serialization error");
+        assert!(meta0.error_message.contains("index 1"));
+
+        let meta1 =
+            deltaforge_core::journal::DlqMeta::from_json(&dlq_entries[1].meta)
+                .expect("DLQ entry should have valid DlqMeta");
+        assert!(meta1.error_message.contains("index 3"));
+
+        // Checkpoint should still be committed (pipeline continued).
+        let cp = ckpt_store.get_raw("src::sink::kafka").await.unwrap();
+        assert!(
+            cp.is_some(),
+            "checkpoint should be committed despite DLQ events"
+        );
+        assert_eq!(cp.unwrap(), b"{\"pos\":100}");
+    }
+
+    /// Verify that a batch where ALL events fail serialization does not
+    /// call send on the sink and all events go to DLQ.
+    #[tokio::test]
+    async fn test_dlq_all_events_fail_no_send() {
+        use checkpoints::MemCheckpointStore;
+        use deltaforge_config::DlqStreamConfig;
+        use storage::MemoryStorageBackend;
+
+        let ckpt_store = Arc::new(MemCheckpointStore::new().unwrap());
+        let storage_backend: storage::ArcStorageBackend =
+            Arc::new(MemoryStorageBackend::new());
+
+        // All 3 events fail.
+        let sink = DlqMockSink::new("kafka", vec![0, 1, 2]);
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+
+        let cp_fn =
+            build_commit_fn(ckpt_store.clone(), "src::sink::kafka".to_string());
+        let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![]);
+        let batch_processor =
+            build_batch_processor(processors, "test".to_string());
+
+        let dlq_writer = Arc::new(crate::dlq::DlqWriter::new(
+            storage_backend.clone(),
+            "test-all-fail".to_string(),
+            DlqStreamConfig::default(),
+            256 * 1024,
+        ));
+
+        let coord = Coordinator::builder("test-all-fail")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(10),
+                max_bytes: None,
+                max_ms: Some(100),
+                respect_source_tx: None,
+                max_inflight: Some(1),
+            }))
+            .commit_fn("kafka", cp_fn)
+            .process_fn(batch_processor)
+            .dlq_writer(dlq_writer.clone())
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        let source = deltaforge_core::SourceInfo {
+            version: "test".into(),
+            connector: "mysql".into(),
+            name: "test".into(),
+            db: "db".into(),
+            schema: None,
+            table: "table".into(),
+            ts_ms: 0,
+            snapshot: None,
+            position: deltaforge_core::SourcePosition::default(),
+        };
+
+        for i in 0..3 {
+            let mut ev = Event::new_row(
+                source.clone(),
+                deltaforge_core::Op::Create,
+                None,
+                Some(serde_json::json!({"id": i})),
+                0,
+                0,
+            );
+            if i == 2 {
+                ev.checkpoint =
+                    Some(CheckpointMeta::from_vec(b"{\"pos\":50}".to_vec()));
+                ev.tx_end = true;
+            }
+            tx.send(ev).await.unwrap();
+        }
+        drop(tx);
+
+        let _ = coord.run(rx, cancel, pause_rx).await;
+
+        // No events delivered to sink.
+        assert_eq!(sink.delivery_count(), 0);
+
+        // All 3 in DLQ.
+        assert_eq!(dlq_writer.len().await.unwrap(), 3);
+
+        // Checkpoint should still be committed (batch "succeeded" with all
+        // events routed to DLQ — the sink returned Ok(BatchResult) not Err).
+        let cp = ckpt_store.get_raw("src::sink::kafka").await.unwrap();
+        assert!(cp.is_some(), "checkpoint should be committed");
+    }
+
+    /// Without a DLQ writer configured, DLQ failures in BatchResult are
+    /// silently ignored (no panic, no error). Pipeline continues normally.
+    #[tokio::test]
+    async fn test_dlq_failures_ignored_when_no_writer() {
+        use checkpoints::MemCheckpointStore;
+
+        let ckpt_store = Arc::new(MemCheckpointStore::new().unwrap());
+
+        // Sink fails event at index 0 but no DLQ writer is configured.
+        let sink = DlqMockSink::new("kafka", vec![0]);
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+
+        let cp_fn =
+            build_commit_fn(ckpt_store.clone(), "src::sink::kafka".to_string());
+        let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![]);
+        let batch_processor =
+            build_batch_processor(processors, "test".to_string());
+
+        // No DLQ writer — default (None).
+        let coord = Coordinator::builder("test-no-dlq")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(10),
+                max_bytes: None,
+                max_ms: Some(100),
+                respect_source_tx: None,
+                max_inflight: Some(1),
+            }))
+            .commit_fn("kafka", cp_fn)
+            .process_fn(batch_processor)
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        let source = deltaforge_core::SourceInfo {
+            version: "test".into(),
+            connector: "mysql".into(),
+            name: "test".into(),
+            db: "db".into(),
+            schema: None,
+            table: "table".into(),
+            ts_ms: 0,
+            snapshot: None,
+            position: deltaforge_core::SourcePosition::default(),
+        };
+
+        let mut ev = Event::new_row(
+            source,
+            deltaforge_core::Op::Create,
+            None,
+            Some(serde_json::json!({"id": 1})),
+            0,
+            0,
+        );
+        ev.checkpoint =
+            Some(CheckpointMeta::from_vec(b"{\"pos\":10}".to_vec()));
+        ev.tx_end = true;
+        tx.send(ev).await.unwrap();
+        drop(tx);
+
+        // Should not panic even with DLQ failures and no writer.
+        let result = coord.run(rx, cancel, pause_rx).await;
+        assert!(result.is_ok(), "pipeline should complete without error");
+
+        // Checkpoint committed.
+        let cp = ckpt_store.get_raw("src::sink::kafka").await.unwrap();
+        assert!(cp.is_some());
     }
 }

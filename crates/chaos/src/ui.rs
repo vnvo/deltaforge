@@ -355,6 +355,7 @@ async fn api_inject_fault(
                 )
                 .await
         }
+        "faulty-events" => inject_faulty_events().await,
         _ => Err(anyhow::anyhow!("unknown preset")),
     };
     if r.is_ok() {
@@ -362,6 +363,93 @@ async fn api_inject_fault(
     } else {
         StatusCode::BAD_GATEWAY
     }
+}
+
+/// Inject "faulty events" by PATCHing the pipeline's sink topic to a broken
+/// template that references a non-existent field. Events flowing during the
+/// fault window fail routing → DLQ. Restores the original topic after 10 seconds.
+async fn inject_faulty_events() -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    // Try each known DeltaForge instance to find a running pipeline.
+    let df_bases = [
+        ("http://localhost:8080", "chaos-app"),
+        ("http://localhost:8081", "chaos-soak"),
+        ("http://localhost:8083", "chaos-pg-soak"),
+    ];
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?;
+
+    for (base, pipeline) in &df_bases {
+        let url = format!("{base}/pipelines/{pipeline}");
+        let resp = client.get(&url).send().await;
+        if resp.is_ok_and(|r| r.status().is_success()) {
+            tracing::info!(
+                pipeline,
+                "injecting faulty events: PATCHing sink topic to broken template"
+            );
+
+            // PATCH sink topic to a template referencing a non-existent field.
+            // This makes resolve_topic() return SinkError::Routing for every event.
+            let patch = serde_json::json!({
+                "spec": {
+                    "sinks": [{"config": {"topic": "${nonexistent.__poison_field}"}}]
+                }
+            });
+            let patch_resp = client
+                .patch(&url)
+                .json(&patch)
+                .send()
+                .await
+                .context("PATCH faulty topic")?;
+
+            if !patch_resp.status().is_success() {
+                tracing::warn!(
+                    pipeline,
+                    "PATCH failed — pipeline may not support topic templates"
+                );
+                continue;
+            }
+
+            // Spawn a task to restore the original topic after 10 seconds.
+            let client = client.clone();
+            let url = url.clone();
+            let pipeline = pipeline.to_string();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                // PATCH back to the original static topic.
+                // The original topic is stored in the sink config, so we restore
+                // by removing the template (setting it back to the static value).
+                let restore = serde_json::json!({
+                    "spec": {
+                        "sinks": [{"config": {"topic": format!("chaos.{}", if pipeline.contains("pg") { "pg.soak" } else { "soak" })}}]
+                    }
+                });
+                match client.patch(&url).json(&restore).send().await {
+                    Ok(r) if r.status().is_success() => {
+                        tracing::info!(
+                            pipeline = %pipeline,
+                            "faulty events restored: sink topic reset to original"
+                        );
+                    }
+                    _ => {
+                        tracing::warn!(
+                            pipeline = %pipeline,
+                            "failed to restore sink topic — manual PATCH may be needed"
+                        );
+                    }
+                }
+            });
+
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!(
+        "no reachable DeltaForge pipeline found for faulty event injection"
+    )
 }
 
 async fn api_clear_faults(State(st): State<Arc<UiState>>) -> StatusCode {

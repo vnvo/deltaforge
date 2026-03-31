@@ -30,6 +30,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
     const NAME: &str = "binlog_purge";
+    crate::harness::print_scenario_banner(
+        NAME,
+        "Stops DeltaForge, runs RESET BINARY LOGS AND GTIDS, restarts.",
+        "DeltaForge halts rather than silently resuming from a purged position. Must run last.",
+    );
     harness.setup().await?;
 
     // ── Warmup ────────────────────────────────────────────────────────────────

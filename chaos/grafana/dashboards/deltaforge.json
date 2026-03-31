@@ -307,7 +307,56 @@
       "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
     },
 
-    { "id": 103, "type": "row", "title": "Errors & Reliability", "gridPos": { "x": 0, "y": 40, "w": 24, "h": 1 }, "collapsed": false, "panels": [] },
+    { "id": 110, "type": "row", "title": "Dead Letter Queue", "gridPos": { "x": 0, "y": 40, "w": 24, "h": 1 }, "collapsed": false, "panels": [] },
+
+    { "id": 70, "title": "DLQ Entries",
+      "description": "Current unacked entries in the DLQ per pipeline.",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 41, "w": 6, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_dlq_entries{instance=~\"$instance\", pipeline=~\"$pipeline\"}", "legendFormat": "{{pipeline}}" }],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2 },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 100 }, { "color": "red", "value": 1000 }] }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    { "id": 71, "title": "DLQ Events/s",
+      "description": "Rate of events being routed to the DLQ.",
+      "type": "timeseries",
+      "gridPos": { "x": 6, "y": 41, "w": 6, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_dlq_events_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s])", "legendFormat": "{{pipeline}} / {{sink}} / {{error_kind}}" }],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 }, "color": { "fixedColor": "orange", "mode": "fixed" } } },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    { "id": 72, "title": "DLQ Saturation",
+      "description": "DLQ fullness ratio (current/max). >80% triggers warning, >95% error.",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 41, "w": 6, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_dlq_saturation_ratio{instance=~\"$instance\", pipeline=~\"$pipeline\"}", "legendFormat": "{{pipeline}}" }],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "lineWidth": 2 },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 0.8 }, { "color": "red", "value": 0.95 }] }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    { "id": 73, "title": "DLQ Overflow (evicted + rejected)",
+      "description": "Events lost due to DLQ overflow. Evicted = drop_oldest, Rejected = reject policy.",
+      "type": "timeseries",
+      "gridPos": { "x": 18, "y": 41, "w": 6, "h": 8 },
+      "targets": [
+        { "datasource": "Prometheus", "expr": "rate(deltaforge_dlq_evicted_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s])", "legendFormat": "evicted {{pipeline}}" },
+        { "datasource": "Prometheus", "expr": "rate(deltaforge_dlq_rejected_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s])", "legendFormat": "rejected {{pipeline}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 }, "color": { "fixedColor": "red", "mode": "fixed" } } },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    { "id": 103, "type": "row", "title": "Errors & Reliability", "gridPos": { "x": 0, "y": 49, "w": 24, "h": 1 }, "collapsed": false, "panels": [] },
 
     { "id": 7, "title": "Sink Errors (errors/s)",
       "type": "timeseries",
