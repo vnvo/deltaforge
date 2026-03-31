@@ -33,6 +33,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
     const NAME: &str = "postgres/pg_failover";
+    crate::harness::print_scenario_banner(
+        NAME,
+        "Switches upstream to postgres-b (different system_identifier).",
+        "Identity change detected. Health endpoint goes unhealthy. Slot existence verified.",
+    );
     harness.setup().await?;
 
     // ── Warmup ────────────────────────────────────────────────────────────────

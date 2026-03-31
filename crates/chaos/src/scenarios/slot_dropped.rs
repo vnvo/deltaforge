@@ -32,6 +32,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
     const NAME: &str = "postgres/slot_dropped";
+    crate::harness::print_scenario_banner(
+        NAME,
+        "Drops replication slot directly on Postgres while DeltaForge is offline.",
+        "DeltaForge halts on restart (not silent resume from lost position). Must run last.",
+    );
     harness.setup().await?;
 
     // ── Warmup ────────────────────────────────────────────────────────────────

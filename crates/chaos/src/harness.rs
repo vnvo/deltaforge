@@ -377,6 +377,15 @@ pub async fn connection_mode_summary(df_base: &str, pipeline: &str) -> String {
     }
 }
 
+/// Print a banner describing what a scenario does and what to expect.
+pub fn print_scenario_banner(name: &str, description: &str, expects: &str) {
+    info!("───────────────────────────────────────────────────");
+    info!("  Scenario: {name}");
+    info!("  {description}");
+    info!("  Expected: {expects}");
+    info!("───────────────────────────────────────────────────");
+}
+
 /// Scenario outcome — printed at the end of every run.
 #[derive(Debug)]
 pub struct ScenarioResult {

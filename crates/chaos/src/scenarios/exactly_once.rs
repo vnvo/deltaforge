@@ -37,6 +37,11 @@ pub async fn run<B: SourceBackend>(
     backend: &B,
 ) -> Result<ScenarioResult> {
     let name = format!("{}/exactly_once", backend.name());
+    crate::harness::print_scenario_banner(
+        &name,
+        "SIGKILL mid-stream with exactly_once: true. Verifies read_committed consumer sees no partial batches.",
+        "All post-crash events delivered. No uncommitted transactions visible. Duplicates OK (replayed).",
+    );
     harness.setup().await?;
 
     // ── Step 1: warmup ─────────────────────────────────────────────────

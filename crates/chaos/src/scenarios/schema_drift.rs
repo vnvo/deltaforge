@@ -30,6 +30,11 @@ pub async fn run<B: SourceBackend>(
     backend: &B,
 ) -> Result<ScenarioResult> {
     let name = format!("{}/schema_drift", backend.name());
+    crate::harness::print_scenario_banner(
+        &name,
+        "Issues ALTER TABLE ADD COLUMN mid-stream, inserts rows with new column.",
+        "Events with new column arrive in Kafka. Schema reload succeeds without pipeline restart.",
+    );
     harness.setup().await?;
 
     // ── Warmup ────────────────────────────────────────────────────────────────

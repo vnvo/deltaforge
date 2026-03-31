@@ -31,6 +31,11 @@ pub async fn run<B: SourceBackend>(
     backend: &B,
 ) -> Result<ScenarioResult> {
     let name = format!("{}/sink_outage", backend.name());
+    crate::harness::print_scenario_banner(
+        &name,
+        "Cuts Kafka proxy, inserts rows while Kafka is down, restores proxy.",
+        "All events eventually arrive in Kafka. Duplicates possible (at-least-once).",
+    );
     harness.setup().await?;
 
     for round in 1..=ROUNDS {
