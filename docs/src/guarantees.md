@@ -82,6 +82,17 @@ The batch accumulator will not split a batch at a point that would separate rows
 - With Kafka `exactly_once: true`, the entire batch is committed as a single Kafka transaction — consumers see all rows from the DB transaction atomically.
 - **Cross-table transactions**: a transaction spanning tables A and B is emitted as a single batch containing events for both tables, tagged with the same `tx_id`. The batch is delivered atomically. This is stronger than "tagged but not grouped" — all events from one DB transaction are in one batch and delivered as a unit.
 
+### Precise transaction semantics
+
+To avoid ambiguity, here is exactly what DeltaForge guarantees about transactions:
+
+- Events from one source transaction are emitted **contiguously** within a single batch.
+- Multi-table transactions preserve commit grouping — all rows from tables A and B in one DB transaction appear in the same batch.
+- **Within a single sink**, events from one transaction are delivered atomically (the batch succeeds or fails as a unit).
+- **Across heterogeneous sinks**, DeltaForge does not guarantee atomic commit. Kafka may commit a transaction while Redis is still retrying. Each sink's checkpoint tracks its own progress independently.
+- Retries do not break transaction grouping — a retried batch contains the same events in the same order.
+- Under non-sharded operation, no sink may observe partial progress within a source transaction (the batch is the commit unit).
+
 ### Edge cases
 
 - A single database transaction that exceeds `max_events` or `max_bytes` is still kept in one batch. The limits are exceeded rather than the transaction being split.
