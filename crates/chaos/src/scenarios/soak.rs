@@ -244,12 +244,9 @@ async fn run_with_source(
 
         // Pick and inject a random fault.
         let fault_idx = rng.gen_range(0usize..4);
-        let fault_name = [
-            "network_partition",
-            "sink_outage",
-            "crash",
-            "faulty_events",
-        ][fault_idx];
+        let fault_name =
+            ["network_partition", "sink_outage", "crash", "faulty_events"]
+                [fault_idx];
         info!(%fault_name, "injecting fault");
 
         let fault_start = Instant::now();

@@ -406,7 +406,10 @@ async fn inject_faulty_events() -> anyhow::Result<()> {
                 .context("PATCH faulty topic")?;
 
             if !patch_resp.status().is_success() {
-                tracing::warn!(pipeline, "PATCH failed — pipeline may not support topic templates");
+                tracing::warn!(
+                    pipeline,
+                    "PATCH failed — pipeline may not support topic templates"
+                );
                 continue;
             }
 
@@ -444,7 +447,9 @@ async fn inject_faulty_events() -> anyhow::Result<()> {
         }
     }
 
-    anyhow::bail!("no reachable DeltaForge pipeline found for faulty event injection")
+    anyhow::bail!(
+        "no reachable DeltaForge pipeline found for faulty event injection"
+    )
 }
 
 async fn api_clear_faults(State(st): State<Arc<UiState>>) -> StatusCode {
