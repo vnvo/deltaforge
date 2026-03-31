@@ -147,7 +147,7 @@ Output: `{"schema":null,"payload":{...}}`
     - Native Rust processor for dropping events by op type, table pattern, or field predicates (eq, ne, gt, in, regex, changed, and more)
 
 - **Sinks**
-  - Kafka producer sink (via `rdkafka`) — exactly-once delivery with transactional producer
+  - Kafka producer sink (via `rdkafka`) — end-to-end exactly-once via transactional producer
   - Redis stream sink — idempotency keys for consumer-side dedup
   - NATS JetStream sink (via `async_nats`) — server-side dedup via `Nats-Msg-Id`
   - Dynamic routing: per-event topic/stream/subject via templates or JavaScript
@@ -241,7 +241,7 @@ The container runs as a non-root user, writes checkpoints to `/app/data/df_check
 
 ### Delivery Guarantees
 
-DeltaForge supports **exactly-once** (Kafka transactions), **at-least-once with server-side dedup** (NATS), and **at-least-once with consumer-side dedup** (Redis). Checkpoints are saved only after sink acknowledgement — never before.
+DeltaForge supports **end-to-end exactly-once** (Kafka transactions), **at-least-once with server-side dedup** (NATS), and **at-least-once with consumer-side dedup** (Redis). Checkpoints are saved only after sink acknowledgement — never before.
 
 Each sink maintains its own independent checkpoint. The fastest sink is never held back by the slowest. On restart, the source replays from the minimum checkpoint across all sinks.
 

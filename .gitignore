@@ -6,6 +6,7 @@
 .vscode/
 data/
 docs/book/
+docs/specs/
 flamegraph.svg
 perf.data*
 # Local pgwire-replication copy for Docker builds during development

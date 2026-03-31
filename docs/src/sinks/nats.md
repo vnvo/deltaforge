@@ -315,4 +315,4 @@ for _, msg := range msgs {
 - Connection pooling ensures efficient reuse across batches
 - Use replicated streams (`--replicas 3`) for production durability
 - Combine with other sinks to fan out data; use commit policy to control checkpoint behavior
-- JetStream provides exactly-once semantics when combined with message deduplication
+- JetStream provides at-least-once delivery with server-side deduplication via `Nats-Msg-Id` within the configured `duplicate_window`

@@ -110,12 +110,14 @@ This architecture avoids the common CDC pitfall where the slowest sink becomes a
 
 ### Delivery guarantee tiers
 
-| Sink | Guarantee | Mechanism |
-|------|-----------|-----------|
-| Kafka (`exactly_once: true`) | **Exactly-once** | Kafka transactions (two-phase commit) |
-| Kafka (`exactly_once: false`) | At-least-once | Idempotent producer (dedup during retries) |
-| NATS JetStream | At-least-once + server dedup | `Nats-Msg-Id` header within `duplicate_window` |
-| Redis Streams | At-least-once + consumer dedup | `idempotency_key` field in XADD payload |
+| Sink | Guarantee | Mechanism | Consumer action |
+|------|-----------|-----------|-----------------|
+| Kafka (`exactly_once: true`) | **End-to-end exactly-once** | Kafka transactions (two-phase commit) | Set `isolation.level=read_committed` |
+| Kafka (`exactly_once: false`) | At-least-once (idempotent) | Retries deduped; crash-replay produces duplicates | Dedup by event ID |
+| NATS JetStream | At-least-once + server dedup | `Nats-Msg-Id` header within `duplicate_window` | Configure `duplicate_window` |
+| Redis Streams | At-least-once + consumer dedup | `idempotency_key` field in XADD payload | Check key before processing |
+
+"Exactly-once" means DeltaForge guarantees no duplicates without consumer cooperation. All other sinks are "at-least-once" with a stated dedup mechanism.
 
 ### Practical patterns
 

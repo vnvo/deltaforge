@@ -263,16 +263,18 @@ Events must arrive in the correct order for consumers to reconstruct state accur
 
 Kafka sink uses consistent partitioning by primary key to maintain ordering within a partition at the consumer.
 
-### Exactly-once delivery
+### Delivery guarantees
 
-Network failures, process crashes, and consumer restarts can cause duplicates or gaps. True exactly-once semantics require coordination between source, pipeline, and sink.
+Network failures, process crashes, and consumer restarts can cause duplicates or gaps. End-to-end exactly-once requires coordination between source, pipeline, and sink.
 
 **DeltaForge approach**:
 - Checkpoints track the last committed position in the source log.
 - Configurable commit policies (`all`, `required`, `quorum`) control when checkpoints advance.
-- Kafka sink supports idempotent producers; transactional writes available via `exactly_once: true`.
+- **Kafka**: end-to-end exactly-once via transactional producer (`exactly_once: true`). Consumers set `isolation.level=read_committed`.
+- **NATS**: at-least-once with server-side dedup via `Nats-Msg-Id` header within `duplicate_window`.
+- **Redis**: at-least-once with consumer-side dedup via `idempotency_key` field.
 
-**Default behavior**: DeltaForge provides at-least-once delivery out of the box. Exactly-once semantics require sink support and explicit configuration.
+**Default behavior**: DeltaForge provides at-least-once delivery out of the box. End-to-end exactly-once is available for Kafka with `exactly_once: true`. See the [Guarantees page](guarantees.md) for the full delivery tier matrix.
 
 ### High availability
 

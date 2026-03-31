@@ -6,11 +6,14 @@ This page defines DeltaForge's data delivery guarantees, ordering model, transac
 
 ### Per-sink delivery tiers
 
-| Sink | Default mode | With `exactly_once: true` | Dedup mechanism |
-|------|-------------|--------------------------|-----------------|
-| **Kafka** | At-least-once (idempotent producer) | **Exactly-once** (transactional) | Kafka two-phase commit per batch |
-| **NATS JetStream** | At-least-once + server-side dedup | — | `Nats-Msg-Id` header within `duplicate_window` |
-| **Redis Streams** | At-least-once + consumer-side dedup | — | `idempotency_key` field in XADD payload |
+| Sink | Delivery guarantee | Dedup mechanism | Consumer action required |
+|------|-------------------|-----------------|------------------------|
+| **Kafka** (`exactly_once: true`) | **End-to-end exactly-once** | Kafka two-phase commit per batch | Set `isolation.level=read_committed` |
+| **Kafka** (default) | At-least-once (idempotent producer) | Retries are deduped by rdkafka; crash-replay produces duplicates | Dedup by event ID or idempotency key |
+| **NATS JetStream** | At-least-once + server-side dedup | `Nats-Msg-Id` header within `duplicate_window` | Configure `duplicate_window` on stream |
+| **Redis Streams** | At-least-once + consumer-side dedup | `idempotency_key` field in XADD payload | Check `idempotency_key` before processing |
+
+**Terminology rule:** "exactly-once" is used only when DeltaForge guarantees no duplicates without consumer cooperation. All other sinks are "at-least-once" with a stated dedup mechanism. This distinction matters — calling NATS or Redis "exactly-once" would be misleading because dedup depends on server configuration or consumer behavior outside DeltaForge's control.
 
 ### What "at-least-once" means
 
@@ -40,17 +43,21 @@ DeltaForge does not reorder events. The source order is preserved through the pi
 
 All events in a batch maintain their source order. The delivery task processes batches in FIFO order from a bounded channel — no reordering between batches.
 
-### Within a Kafka partition
+### Per-primary-key ordering (the core guarantee)
 
-Order is preserved if events for the same key go to the same partition. The default Kafka message key is the serialized primary key of the row, so events for the same row always go to the same partition and arrive in order.
+**DeltaForge guarantees per-primary-key ordering within a table under non-sharded operation.** This means: for any single row identified by its primary key, all changes (INSERT, UPDATE, DELETE) are delivered to the sink in the exact order they occurred in the source database.
 
-With dynamic routing (`key` template), partition assignment depends on the resolved key value. Events with the same resolved key are ordered; events with different keys may be in different partitions with no ordering guarantee between them.
+For Kafka specifically: the default message key is the serialized primary key, so events for the same row always go to the same partition and arrive in order. With dynamic routing (`key` template), ordering follows the resolved key — events with the same key are ordered; different keys may land in different partitions.
 
 ### Cross-table ordering
 
 There is **no global ordering** across tables. Events from different tables may be interleaved across batches. This is by design — enforcing global ordering would require single-threaded delivery, which would cap throughput.
 
 However, when `batch.respect_source_tx: true` (the default), all rows from a single database transaction are kept in the same batch (see [Transaction Boundaries](#transaction-boundaries) below). This preserves causal ordering within a transaction.
+
+### Ordering under retries
+
+When a batch delivery fails and is retried, the batch is re-delivered as a unit in the same order. No reordering occurs within or across retries. The `max_inflight=1` setting (default) ensures strict ordering; with `max_inflight > 1`, batches are still delivered in FIFO order by the single-threaded delivery task.
 
 ### Cross-sink ordering
 
@@ -73,11 +80,12 @@ The batch accumulator will not split a batch at a point that would separate rows
 - All rows from one database transaction appear in the **same batch**.
 - Each batch is delivered **atomically** to each sink (all events in the batch succeed or fail together).
 - With Kafka `exactly_once: true`, the entire batch is committed as a single Kafka transaction — consumers see all rows from the DB transaction atomically.
+- **Cross-table transactions**: a transaction spanning tables A and B is emitted as a single batch containing events for both tables, tagged with the same `tx_id`. The batch is delivered atomically. This is stronger than "tagged but not grouped" — all events from one DB transaction are in one batch and delivered as a unit.
 
 ### Edge cases
 
 - A single database transaction that exceeds `max_events` or `max_bytes` is still kept in one batch. The limits are exceeded rather than the transaction being split.
-- With `respect_source_tx: false`, batches are split purely by size/time limits regardless of transaction boundaries.
+- With `respect_source_tx: false`, batches are split purely by size/time limits regardless of transaction boundaries. Cross-table transaction atomicity is not preserved in this mode.
 
 ## Failure Isolation
 

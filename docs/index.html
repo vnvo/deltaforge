@@ -4,13 +4,13 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>DeltaForge - High-Performance CDC Engine</title>
-<meta name="description" content="A versatile, high-performance Change Data Capture engine built in Rust. Stream database changes to Kafka, Redis, NATS with exactly-once delivery and per-sink independent checkpoints.">
+<meta name="description" content="A versatile, high-performance Change Data Capture engine built in Rust. Stream database changes to Kafka, Redis, NATS with end-to-end exactly-once delivery (Kafka) and per-sink independent checkpoints.">
 <meta name="keywords" content="CDC, change data capture, Rust, Kafka, Redis, NATS, MySQL, PostgreSQL, Debezium, real-time data, event streaming, database replication">
 <link rel="canonical" href="https://vnvo.github.io/deltaforge/">
 <!-- Open Graph -->
 <meta property="og:type" content="website">
 <meta property="og:title" content="DeltaForge - High-Performance CDC Engine">
-<meta property="og:description" content="Stream database changes from MySQL and PostgreSQL to Kafka, Redis, and NATS. Exactly-once delivery, per-sink independent checkpoints. Built in Rust for minimal overhead and maximum reliability.">
+<meta property="og:description" content="Stream database changes from MySQL and PostgreSQL to Kafka, Redis, and NATS. End-to-end exactly-once (Kafka), at-least-once with dedup (NATS, Redis). Per-sink independent checkpoints. Built in Rust.">
 <meta property="og:url" content="https://vnvo.github.io/deltaforge/">
 <meta property="og:site_name" content="DeltaForge">
 <!-- Twitter -->
@@ -882,7 +882,7 @@ footer {
           <div class="annotation-icon"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg></div>
           <div>
             <div class="annotation-title">Checkpoint</div>
-            <div class="annotation-desc">Exactly-once or at-least-once delivery per sink. Per-sink independent checkpoints — fastest sink is never held back by the slowest.</div>
+            <div class="annotation-desc">End-to-end exactly-once (Kafka) or at-least-once with dedup (NATS, Redis). Per-sink independent checkpoints — fastest sink is never held back by the slowest.</div>
           </div>
         </div>
       </div>
@@ -906,8 +906,8 @@ footer {
       </div>
       <div class="feature-card">
         <div class="feature-icon amber"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/></svg></div>
-        <div class="feature-name">Exactly-Once Delivery</div>
-        <div class="feature-desc">Kafka transactional producer with ~7-11% overhead. NATS server-side dedup via message IDs. Per-sink independent checkpoints — each sink advances at its own pace. Configurable commit policies: all, required, or quorum.</div>
+        <div class="feature-name">Delivery Guarantees</div>
+        <div class="feature-desc">End-to-end exactly-once for Kafka (transactional producer, ~7-11% overhead). At-least-once with server dedup for NATS, consumer dedup for Redis. Per-sink independent checkpoints — each sink advances at its own pace. Configurable commit policies: all, required, or quorum.</div>
       </div>
       <div class="feature-card">
         <div class="feature-icon green"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg></div>
