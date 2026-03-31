@@ -243,16 +243,21 @@ async fn run_with_source(
         }
 
         // Pick and inject a random fault.
-        let fault_idx = rng.gen_range(0usize..3);
-        let fault_name =
-            ["network_partition", "sink_outage", "crash"][fault_idx];
+        let fault_idx = rng.gen_range(0usize..4);
+        let fault_name = [
+            "network_partition",
+            "sink_outage",
+            "crash",
+            "faulty_events",
+        ][fault_idx];
         info!(%fault_name, "injecting fault");
 
         let fault_start = Instant::now();
         let inject_result = match fault_idx {
             0 => inject_network_partition(harness, src).await,
             1 => inject_sink_outage(harness, src).await,
-            _ => inject_crash(src).await,
+            2 => inject_crash(src).await,
+            _ => inject_faulty_events(src).await,
         };
 
         match inject_result {
@@ -685,6 +690,63 @@ async fn inject_crash(src: &SoakSource) -> Result<Duration> {
     docker::kill_service(src.profile, src.service).await?;
     docker::start_service(src.profile, src.service).await?;
     harness::wait_for_url(src.health_url, RECOVERY_TIMEOUT).await?;
+    Ok(start.elapsed())
+}
+
+/// PATCH the sink topic to a broken template for 10 seconds, causing all events
+/// to fail routing → DLQ. Then restore the original topic and wait for recovery.
+async fn inject_faulty_events(src: &SoakSource) -> Result<Duration> {
+    let start = Instant::now();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
+
+    let url = format!("{}/pipelines/{}", src.df_base, src.pipeline);
+
+    // Save the original topic before corrupting it.
+    let original_topic = src.topic;
+
+    // PATCH to a broken topic template.
+    let poison_patch = serde_json::json!({
+        "spec": {
+            "sinks": [{"config": {"topic": "${nonexistent.__poison_field}"}}]
+        }
+    });
+    let resp = client.patch(&url).json(&poison_patch).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("failed to PATCH poison topic: {}", resp.status());
+    }
+    info!("faulty_events: sink topic poisoned for 10s");
+
+    // Hold for 10 seconds — events during this window fail routing → DLQ.
+    sleep(Duration::from_secs(10)).await;
+
+    // Restore the original topic.
+    let restore_patch = serde_json::json!({
+        "spec": {
+            "sinks": [{"config": {"topic": original_topic}}]
+        }
+    });
+    let resp = client.patch(&url).json(&restore_patch).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("failed to restore original topic: {}", resp.status());
+    }
+    info!("faulty_events: sink topic restored");
+
+    // Wait for health.
+    harness::wait_for_url(src.health_url, RECOVERY_TIMEOUT).await?;
+
+    // Log DLQ count after fault.
+    let dlq_url = format!(
+        "{}/pipelines/{}/journal/dlq/count",
+        src.df_base, src.pipeline
+    );
+    if let Ok(resp) = client.get(&dlq_url).send().await {
+        if let Ok(body) = resp.text().await {
+            info!(dlq_count = %body, "DLQ entries after faulty_events fault");
+        }
+    }
+
     Ok(start.elapsed())
 }
 
