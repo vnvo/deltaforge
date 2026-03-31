@@ -5,6 +5,7 @@
 //! Entries are written during batch delivery when individual events fail
 //! serialization or routing. The pipeline continues with the remaining events.
 
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -261,6 +262,64 @@ impl DlqWriter {
         Ok(count)
     }
 
+    /// Remove entries older than `max_age_secs`. Returns count of removed entries.
+    /// Called by the background cleanup task.
+    pub async fn cleanup_expired(&self) -> Result<usize> {
+        if self.config.max_age_secs == 0 {
+            return Ok(0);
+        }
+        let cutoff = now_epoch_secs() - self.config.max_age_secs as i64;
+        // Peek a batch of entries from the head and ack up to the last expired one.
+        // Since the queue is FIFO and entries are ordered by insertion time,
+        // we can stop at the first non-expired entry.
+        let entries = self.peek(1000).await.unwrap_or_default();
+        let mut last_expired_seq: Option<u64> = None;
+        for entry in &entries {
+            if entry.timestamp <= cutoff {
+                last_expired_seq = Some(entry.seq);
+            } else {
+                break; // FIFO order — all remaining are newer
+            }
+        }
+        if let Some(seq) = last_expired_seq {
+            let count = self.ack(seq).await?;
+            if count > 0 {
+                debug!(
+                    pipeline = %self.pipeline,
+                    count,
+                    "DLQ cleanup: removed expired entries"
+                );
+            }
+            Ok(count)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Spawn a background cleanup task that runs every 60 seconds.
+    /// Returns a JoinHandle that can be aborted when the pipeline stops.
+    pub fn spawn_cleanup_task(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let dlq = Arc::clone(self);
+        tokio::spawn(async move {
+            // Best-effort startup cleanup (bounded to 5s).
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                dlq.cleanup_expired(),
+            )
+            .await;
+
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(
+                tokio::time::MissedTickBehavior::Delay,
+            );
+            loop {
+                interval.tick().await;
+                let _ = dlq.cleanup_expired().await;
+            }
+        })
+    }
+
     /// Update the DLQ gauge metrics.
     async fn update_gauges(&self) {
         let len = self
@@ -504,5 +563,67 @@ mod tests {
             .map(|e| e.event["after"]["id"].as_i64().unwrap())
             .collect();
         assert_eq!(ids, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn cleanup_expired_removes_old_entries() {
+        let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        let dlq = DlqWriter::new(
+            backend,
+            "test-cleanup".into(),
+            DlqStreamConfig {
+                max_entries: 100,
+                max_age_secs: 2, // 2 second TTL
+                overflow_policy: OverflowPolicy::DropOldest,
+            },
+            256 * 1024,
+        );
+
+        let err = SinkError::Serialization {
+            details: "bad".into(),
+        };
+
+        // Write 3 entries.
+        for i in 0..3 {
+            dlq.write(&make_test_event(i), "kafka", &err).await;
+        }
+        assert_eq!(dlq.len().await.unwrap(), 3);
+
+        // Cleanup immediately — nothing should expire (entries are <2s old).
+        let removed = dlq.cleanup_expired().await.unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(dlq.len().await.unwrap(), 3);
+
+        // Wait for entries to expire.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+        // Cleanup should remove all expired entries.
+        let removed = dlq.cleanup_expired().await.unwrap();
+        assert_eq!(removed, 3);
+        assert_eq!(dlq.len().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_zero_max_age_is_noop() {
+        let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        let dlq = DlqWriter::new(
+            backend,
+            "test-no-expiry".into(),
+            DlqStreamConfig {
+                max_entries: 100,
+                max_age_secs: 0, // disabled
+                overflow_policy: OverflowPolicy::DropOldest,
+            },
+            256 * 1024,
+        );
+
+        let err = SinkError::Serialization {
+            details: "bad".into(),
+        };
+        dlq.write(&make_test_event(0), "kafka", &err).await;
+
+        let removed = dlq.cleanup_expired().await.unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(dlq.len().await.unwrap(), 1);
     }
 }

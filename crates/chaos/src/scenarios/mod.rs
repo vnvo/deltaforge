@@ -1,5 +1,6 @@
 // Generic scenarios — parameterised over SourceBackend, run for any source.
 pub mod crash_recovery;
+pub mod dlq_poison;
 pub mod exactly_once;
 pub mod network_partition;
 pub mod schema_drift;

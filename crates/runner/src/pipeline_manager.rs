@@ -411,10 +411,13 @@ impl PipelineManager {
                 journal_cfg.max_event_bytes,
             ));
             builder = builder.dlq_writer(Arc::clone(&writer));
+            // Spawn background cleanup for max_age expiry.
+            let _cleanup_handle = writer.spawn_cleanup_task();
             tracing::info!(
                 pipeline = %pipeline_name,
                 max_entries = journal_cfg.dlq.max_entries,
-                "DLQ enabled"
+                max_age_secs = journal_cfg.dlq.max_age_secs,
+                "DLQ enabled with background cleanup"
             );
             Some(writer)
         } else {
