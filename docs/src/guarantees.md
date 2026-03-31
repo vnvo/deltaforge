@@ -266,6 +266,6 @@ These are **not guaranteed** and are documented honestly:
 
 - **No cross-table global ordering** — events from different tables may be interleaved. This is by design; enforcing global order would require single-threaded delivery and cap throughput. Use `respect_source_tx: true` to preserve ordering within database transactions.
 - **No stateful stream processing** — DeltaForge does not support joins, aggregations, or windowing. For stateful processing, consume DeltaForge's output with Apache Flink, ksqlDB, or Kafka Streams.
-- **No dead letter queue (yet)** — a single poison event that consistently fails serialization will block the pipeline. Planned for a future release.
+- **Dead letter queue** — when `journal.enabled: true`, poison events (serialization/routing failures) are routed to a DLQ instead of blocking the pipeline. Without DLQ enabled, a single bad event will still block. See the [DLQ page](dlq.md).
 - **No schema registry integration (yet)** — schema sensing detects structural drift and can halt on breaking changes, but there is no Confluent Schema Registry or Avro/Protobuf encoding support. Planned for a future release.
 - **Snapshot consistency** — initial snapshots use lock-free parallel reads. The snapshot is eventually consistent with the CDC stream; there may be a brief overlap period where both snapshot rows and CDC events for the same row are delivered. Consumers should use the event timestamp or idempotency key to resolve.

@@ -38,6 +38,7 @@ spec:
 | `batch` | object | No | Commit unit thresholds. See [Batching](#batching). |
 | `commit_policy` | object | No | How sink acknowledgements gate checkpoints. See [Commit policy](#commit-policy). |
 | `schema_sensing` | object | No | Automatic schema inference from event payloads. See [Schema sensing](#schema-sensing). |
+| `journal` | object | No | Event journal (DLQ). See [Dead Letter Queue](dlq.md). |
 
 ---
 
