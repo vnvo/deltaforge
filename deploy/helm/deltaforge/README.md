@@ -85,7 +85,7 @@ secrets:
 
 ### Storage
 
-Default: SQLite on a PersistentVolume (checkpoints + DLQ survive restarts).
+**Dev/testing:** SQLite on a PersistentVolume (default):
 
 ```yaml
 storage:
@@ -97,7 +97,7 @@ persistence:
   size: 1Gi
 ```
 
-For PostgreSQL storage backend:
+**Production (recommended):** PostgreSQL — survives pod rescheduling, proper backups, supports future multi-replica:
 
 ```yaml
 storage:
@@ -108,8 +108,10 @@ persistence:
 
 secrets:
   existingSecrets:
-    - name: storage-creds    # must contain key: STORAGE_DSN
+    - name: deltaforge-storage    # must contain key: STORAGE_DSN
 ```
+
+`STORAGE_DSN` example: `postgresql://deltaforge:password@postgres.infra:5432/deltaforge`
 
 ### Monitoring
 

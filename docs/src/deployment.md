@@ -76,19 +76,40 @@ serviceMonitor:
 
 ### Storage
 
-Default: SQLite on a PersistentVolume. For shared state across replicas (future), use PostgreSQL:
+**Development/testing:** SQLite on a PersistentVolume (default). Simple, no external dependencies.
+
+**Production:** PostgreSQL is recommended. Benefits:
+- Survives pod rescheduling without PVC migration
+- Proper backup/restore via `pg_dump`
+- Supports multiple replicas sharing state (future operator/sharding)
+- Better concurrency under high checkpoint commit rates
 
 ```yaml
 storage:
   backend: postgres
 
 persistence:
-  enabled: false
+  enabled: false    # no PVC needed with Postgres
 
 secrets:
   existingSecrets:
-    - name: storage-creds    # key: STORAGE_DSN
+    - name: deltaforge-storage    # must contain key: STORAGE_DSN
 ```
+
+The `STORAGE_DSN` Secret should contain a PostgreSQL connection string:
+
+```
+postgresql://deltaforge:password@postgres.infra:5432/deltaforge
+```
+
+Create the database and user beforehand:
+
+```sql
+CREATE USER deltaforge WITH PASSWORD 'password';
+CREATE DATABASE deltaforge OWNER deltaforge;
+```
+
+DeltaForge creates its tables automatically on first connection.
 
 ### Full values reference
 
