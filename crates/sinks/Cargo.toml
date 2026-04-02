@@ -14,6 +14,8 @@ metrics.workspace = true
 rdkafka.workspace = true
 redis.workspace = true
 async-nats = "0.38"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+shellexpand = "3"
 tokio.workspace = true
 tokio-util.workspace = true
 deltaforge-core = { path = "../deltaforge-core" }
@@ -21,7 +23,8 @@ deltaforge-config = { path = "../deltaforge-config" }
 common = { path = "../common" }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+axum = "0.8"
 ctor = "0.6"
 chrono.workspace = true
 uuid.workspace = true
