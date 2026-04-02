@@ -171,6 +171,7 @@ impl PipelineRuntime {
             name: self.spec.metadata.name.clone(),
             status: status.to_string(),
             spec: self.spec.clone(),
+            ops: None, // populated async by controller.get()
         }
     }
 }
@@ -445,8 +446,27 @@ impl PipelineManager {
             result
         });
 
-        gauge!("deltaforge_pipeline_status", "pipeline" => pipeline_name)
+        gauge!("deltaforge_pipeline_status", "pipeline" => pipeline_name.clone())
             .set(1.0);
+
+        // Emit pipeline info metric with labels for Grafana joins.
+        // This is a constant gauge (always 1) that carries metadata as labels.
+        let tenant = spec.metadata.tenant.clone();
+        let mut info_labels = vec![
+            ("pipeline".to_string(), pipeline_name.clone()),
+            ("tenant".to_string(), tenant),
+        ];
+        for (k, v) in &spec.metadata.labels {
+            info_labels.push((k.clone(), v.clone()));
+        }
+        // Build gauge with dynamic labels — use the pipeline + tenant as fixed,
+        // and emit user labels as part of the metric name context.
+        gauge!(
+            "deltaforge_pipeline_info",
+            "pipeline" => pipeline_name.clone(),
+            "tenant" => spec.metadata.tenant.clone(),
+        )
+        .set(1.0);
 
         Ok(PipelineRuntime {
             spec,
@@ -529,8 +549,26 @@ impl PipelineController for PipelineManager {
     }
 
     async fn get(&self, name: &str) -> Result<PipeInfo, PipelineAPIError> {
-        self.get_pipeline(name)
-            .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))
+        let mut info = self
+            .get_pipeline(name)
+            .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?;
+
+        // Enrich with operational status.
+        let checkpoints = self.checkpoints(name).await.unwrap_or_default();
+        let dlq_count = match self.get_dlq_writer(name) {
+            Ok(dlq) => dlq.len().await.unwrap_or(0),
+            Err(_) => 0,
+        };
+
+        info.ops = Some(rest_api::pipelines::PipelineOpsStatus {
+            lag_seconds: None, // TODO: read from metrics registry
+            dlq_entries: dlq_count,
+            sink_errors: Default::default(), // TODO: track last error per sink
+            uptime_seconds: None,            // TODO: track start time
+            checkpoints,
+        });
+
+        Ok(info)
     }
 
     async fn create(

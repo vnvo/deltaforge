@@ -15,11 +15,24 @@ pub fn router(state: AppState) -> Router {
 
 async fn healthz(State(st): State<AppState>) -> impl IntoResponse {
     let pipelines = st.controller.list().await;
-    if pipelines.iter().any(|p| p.status == "failed") {
-        return (StatusCode::SERVICE_UNAVAILABLE, "pipeline failed\n")
-            .into_response();
+    let failed: Vec<_> = pipelines
+        .iter()
+        .filter(|p| p.status == "failed")
+        .map(|p| p.name.clone())
+        .collect();
+
+    if !failed.is_empty() {
+        let body = serde_json::json!({
+            "status": "unhealthy",
+            "failed_pipelines": failed,
+        });
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
     }
-    (StatusCode::OK, "ok\n").into_response()
+    let body = serde_json::json!({
+        "status": "healthy",
+        "pipelines": pipelines.len(),
+    });
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 #[derive(Serialize)]

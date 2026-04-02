@@ -231,6 +231,7 @@ mod tests {
                     journal: None,
                 },
             },
+            ops: None,
         }
     }
 
@@ -261,7 +262,8 @@ mod tests {
 
         assert_eq!(StatusCode::OK, resp.status());
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(&body[..], b"ok\n");
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "healthy");
 
         let ready = app
             .oneshot(
