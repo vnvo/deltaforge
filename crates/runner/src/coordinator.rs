@@ -811,6 +811,22 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             )
             .set(lag_secs);
 
+            // Per-table lag: track the last event timestamp per table in this batch.
+            let mut table_lag: HashMap<String, f64> = HashMap::new();
+            for ev in &events {
+                let table_key = format!("{}.{}", ev.source.db, ev.source.table);
+                let ev_lag = ((now_ms - ev.ts_ms).max(0) as f64) / 1000.0;
+                table_lag.insert(table_key, ev_lag);
+            }
+            for (table, lag) in &table_lag {
+                gauge!(
+                    "deltaforge_source_table_lag_seconds",
+                    "pipeline" => self.pipeline_name.to_string(),
+                    "table" => table.clone(),
+                )
+                .set(*lag);
+            }
+
             // E2E latency: first event's pipeline-receive time → now (before sink
             // delivery). Uses received_at_ms (wall-clock at parse time) rather than
             // ts_ms (binlog header timestamp, second-precision) so the metric reflects
