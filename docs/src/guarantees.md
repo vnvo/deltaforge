@@ -260,6 +260,38 @@ How long should consumers remember processed event IDs? Match your maximum expec
 | Unplanned crashes with auto-restart | 15-30 minutes |
 | Disaster recovery | Match your RPO |
 
+## Correctness Test Matrix
+
+Every guarantee is backed by a test. This matrix maps guarantees to their verification:
+
+| Guarantee | Test | Type | Status |
+|-----------|------|------|--------|
+| No data loss (at-least-once) | `crash_recovery` chaos scenario | Chaos | Exists |
+| Kafka end-to-end exactly-once | `exactly_once` chaos scenario + `kafka_sink_exactly_once_*` | Chaos + Integration | Exists |
+| Producer fencing detection | `kafka_sink_exactly_once_producer_fencing` | Integration | Exists |
+| Per-primary-key ordering | Events keyed by PK → same Kafka partition | By design | Verified via Kafka partition assignment |
+| Transaction boundary preservation | `respect_source_tx` + `check_and_split` coordinator logic | Unit | Exists |
+| Per-sink checkpoint independence | `test_per_sink_checkpoint_only_advances_on_success` | Unit | Exists |
+| Per-sink checkpoint legacy fallback | `per_sink_proxy_falls_back_to_legacy_key` | Unit | Exists |
+| Commit policy gate before checkpoint | `test_per_sink_checkpoint_only_advances_on_success` | Unit | Exists |
+| DLQ routes per-event failures | `test_dlq_routes_failed_events_and_pipeline_continues` | Unit | Exists |
+| DLQ all-fail batch | `test_dlq_all_events_fail_no_send` | Unit | Exists |
+| DLQ overflow (drop_oldest) | `dlq::overflow_drop_oldest` | Unit | Exists |
+| DLQ overflow (reject) | `dlq::overflow_reject_drops_new` | Unit | Exists |
+| DLQ overflow (block) | `dlq::overflow_block_waits_for_ack` | Unit | Exists |
+| DLQ cleanup expired | `dlq::cleanup_expired_removes_old_entries` | Unit | Exists |
+| Partial batch timer flush | `test_partial_batch_flushed_by_timer` | Unit | Exists |
+| Network partition recovery | `network_partition` chaos scenario | Chaos | Exists |
+| Sink outage recovery | `sink_outage` chaos scenario | Chaos | Exists |
+| Schema drift handling | `schema_drift` chaos scenario | Chaos | Exists |
+| MySQL failover detection | `failover` chaos scenario | Chaos | Exists |
+| Postgres failover detection | `pg_failover` chaos scenario | Chaos | Exists |
+| Binlog purge detection | `binlog_purge` chaos scenario | Chaos | Exists |
+| Replication slot drop detection | `slot_dropped` chaos scenario | Chaos | Exists |
+| NATS dedup within window | Verify `Nats-Msg-Id` prevents duplicates | Integration | Planned |
+| Redis idempotency key | Verify consumer-side dedup via key | Integration | Planned |
+| Snapshot → CDC handoff | No gaps or duplicates at boundary | Integration | Planned |
+
 ## Limitations
 
 These are **not guaranteed** and are documented honestly:

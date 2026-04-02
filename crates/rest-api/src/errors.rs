@@ -1,4 +1,6 @@
+use axum::Json;
 use axum::http::StatusCode;
+use serde::Serialize;
 use tracing::error;
 
 #[derive(Debug)]
@@ -8,6 +10,16 @@ pub enum PipelineAPIError {
     NameMismatch { expected: String, found: String },
     Failed(anyhow::Error),
 }
+
+/// Structured error response — parseable by automation and CLIs.
+#[derive(Serialize)]
+pub struct ApiError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+/// Standard API result type used across all endpoint modules.
+pub type ApiResult<T> = Result<Json<T>, (StatusCode, Json<ApiError>)>;
 
 impl std::fmt::Display for PipelineAPIError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -44,14 +56,28 @@ impl From<anyhow::Error> for PipelineAPIError {
     }
 }
 
-pub fn pipeline_error(err: PipelineAPIError) -> (StatusCode, String) {
+pub fn pipeline_error(err: PipelineAPIError) -> (StatusCode, Json<ApiError>) {
     error!(error=?err, "pipeline lifecycle operation failed");
-    let status = match err {
-        PipelineAPIError::NotFound(_) => StatusCode::NOT_FOUND,
-        PipelineAPIError::AlreadyExists(_) => StatusCode::CONFLICT,
-        PipelineAPIError::NameMismatch { .. } => StatusCode::BAD_REQUEST,
-        PipelineAPIError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    let (status, code) = match &err {
+        PipelineAPIError::NotFound(_) => {
+            (StatusCode::NOT_FOUND, "PIPELINE_NOT_FOUND")
+        }
+        PipelineAPIError::AlreadyExists(_) => {
+            (StatusCode::CONFLICT, "PIPELINE_ALREADY_EXISTS")
+        }
+        PipelineAPIError::NameMismatch { .. } => {
+            (StatusCode::BAD_REQUEST, "PIPELINE_NAME_MISMATCH")
+        }
+        PipelineAPIError::Failed(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")
+        }
     };
 
-    (status, err.to_string())
+    (
+        status,
+        Json(ApiError {
+            code,
+            message: err.to_string(),
+        }),
+    )
 }

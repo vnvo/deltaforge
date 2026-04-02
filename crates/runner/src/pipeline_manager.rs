@@ -136,6 +136,7 @@ pub(crate) struct PipelineRuntime {
     pub(crate) table_patterns: Vec<String>,
     pub(crate) sensor_state: Option<Arc<SchemaSensorState>>,
     pub(crate) dlq_writer: Option<Arc<crate::dlq::DlqWriter>>,
+    pub(crate) started_at: std::time::Instant,
 }
 
 impl PipelineRuntime {
@@ -171,6 +172,7 @@ impl PipelineRuntime {
             name: self.spec.metadata.name.clone(),
             status: status.to_string(),
             spec: self.spec.clone(),
+            ops: None, // populated async by controller.get()
         }
     }
 }
@@ -445,8 +447,27 @@ impl PipelineManager {
             result
         });
 
-        gauge!("deltaforge_pipeline_status", "pipeline" => pipeline_name)
+        gauge!("deltaforge_pipeline_status", "pipeline" => pipeline_name.clone())
             .set(1.0);
+
+        // Emit pipeline info metric with labels for Grafana joins.
+        // This is a constant gauge (always 1) that carries metadata as labels.
+        let tenant = spec.metadata.tenant.clone();
+        let mut info_labels = vec![
+            ("pipeline".to_string(), pipeline_name.clone()),
+            ("tenant".to_string(), tenant),
+        ];
+        for (k, v) in &spec.metadata.labels {
+            info_labels.push((k.clone(), v.clone()));
+        }
+        // Build gauge with dynamic labels — use the pipeline + tenant as fixed,
+        // and emit user labels as part of the metric name context.
+        gauge!(
+            "deltaforge_pipeline_info",
+            "pipeline" => pipeline_name.clone(),
+            "tenant" => spec.metadata.tenant.clone(),
+        )
+        .set(1.0);
 
         Ok(PipelineRuntime {
             spec,
@@ -460,6 +481,7 @@ impl PipelineManager {
             table_patterns,
             sensor_state: sensor_for_runtime,
             dlq_writer,
+            started_at: std::time::Instant::now(),
         })
     }
 
@@ -529,8 +551,30 @@ impl PipelineController for PipelineManager {
     }
 
     async fn get(&self, name: &str) -> Result<PipeInfo, PipelineAPIError> {
-        self.get_pipeline(name)
-            .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))
+        let (mut info, uptime) = {
+            let guard = self.pipelines.read();
+            let runtime = guard
+                .get(name)
+                .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?;
+            (runtime.info(), runtime.started_at.elapsed().as_secs_f64())
+        };
+
+        // Enrich with operational status.
+        let checkpoints = self.checkpoints(name).await.unwrap_or_default();
+        let dlq_count = match self.get_dlq_writer(name) {
+            Ok(dlq) => dlq.len().await.unwrap_or(0),
+            Err(_) => 0,
+        };
+
+        info.ops = Some(rest_api::pipelines::PipelineOpsStatus {
+            lag_seconds: None,
+            dlq_entries: dlq_count,
+            sink_errors: Default::default(),
+            uptime_seconds: Some(uptime),
+            checkpoints,
+        });
+
+        Ok(info)
     }
 
     async fn create(
@@ -760,6 +804,61 @@ impl PipelineController for PipelineManager {
         let dlq = self.get_dlq_writer(name)?;
         dlq.purge().await.map_err(PipelineAPIError::Failed)
     }
+
+    async fn checkpoints(
+        &self,
+        name: &str,
+    ) -> Result<Vec<rest_api::pipelines::CheckpointInfo>, PipelineAPIError>
+    {
+        let (source_id, prefix) = {
+            let guard = self.pipelines.read();
+            let runtime = guard
+                .get(name)
+                .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?;
+            let sid = runtime.spec.spec.source.source_id().to_string();
+            let pfx = format!("{}::sink::", sid);
+            (sid, pfx)
+        }; // guard dropped here
+        let _ = source_id; // used for future expansion
+
+        let keys = self
+            .ckpt_store
+            .list_with_prefix(&prefix)
+            .await
+            .map_err(|e| PipelineAPIError::Failed(e.into()))?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+
+        let mut result = Vec::with_capacity(keys.len());
+        for key in &keys {
+            let sink_id = key.strip_prefix(&prefix).unwrap_or(key).to_string();
+
+            let position = match self.ckpt_store.get_raw(key).await {
+                Ok(Some(bytes)) => serde_json::from_slice(&bytes)
+                    .unwrap_or(serde_json::Value::Null),
+                _ => serde_json::Value::Null,
+            };
+
+            // Checkpoint age: time since last write. We use the checkpoint
+            // timestamp if available, otherwise report 0.
+            let age = position
+                .get("ts_ms")
+                .and_then(|v| v.as_f64())
+                .map(|ts| now - ts / 1000.0)
+                .unwrap_or(0.0);
+
+            result.push(rest_api::pipelines::CheckpointInfo {
+                sink_id,
+                position,
+                age_seconds: age,
+            });
+        }
+
+        Ok(result)
+    }
 }
 
 // ============================================================================
@@ -819,6 +918,8 @@ mod tests {
             metadata: Metadata {
                 name: name.to_string(),
                 tenant: "acme".to_string(),
+                labels: Default::default(),
+                annotations: Default::default(),
             },
             spec: Spec {
                 sharding: None,

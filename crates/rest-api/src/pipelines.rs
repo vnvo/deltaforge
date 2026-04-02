@@ -22,6 +22,24 @@ pub struct PipeInfo {
     pub name: String,
     pub status: String,
     pub spec: PipelineSpec,
+    /// Operational status — populated by the controller, optional for backward compat.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ops: Option<PipelineOpsStatus>,
+}
+
+/// Operational status fields — everything an operator needs in one response.
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct PipelineOpsStatus {
+    /// Replication lag in seconds (source event time vs wall clock).
+    pub lag_seconds: Option<f64>,
+    /// DLQ entry count (0 if journal not enabled).
+    pub dlq_entries: u64,
+    /// Last error per sink (empty if all healthy).
+    pub sink_errors: std::collections::HashMap<String, String>,
+    /// Pipeline uptime in seconds since last start/restart.
+    pub uptime_seconds: Option<f64>,
+    /// Per-sink checkpoint positions.
+    pub checkpoints: Vec<CheckpointInfo>,
 }
 
 #[async_trait]
@@ -98,6 +116,25 @@ pub trait PipelineController: Send + Sync {
             "DLQ not enabled for this pipeline"
         )))
     }
+
+    // ── Checkpoint inspection ──────────────────────────────────────────
+
+    /// Get per-sink checkpoint positions for a pipeline.
+    async fn checkpoints(
+        &self,
+        name: &str,
+    ) -> Result<Vec<CheckpointInfo>, PipelineAPIError> {
+        let _ = name;
+        Ok(vec![])
+    }
+}
+
+/// Per-sink checkpoint position returned by the inspection API.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CheckpointInfo {
+    pub sink_id: String,
+    pub position: Value,
+    pub age_seconds: f64,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -119,13 +156,43 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/pipelines/{name}/journal/dlq/count", get(handle_dlq_count))
         .route("/pipelines/{name}/journal/dlq/ack", post(handle_dlq_ack))
+        // Checkpoint inspection
+        .route("/pipelines/{name}/checkpoints", get(handle_checkpoints))
         .with_state(state)
 }
 
-type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
+use crate::errors::ApiResult;
 
-async fn list_pipelines(State(st): State<AppState>) -> Json<Vec<PipeInfo>> {
-    Json(st.controller.list().await)
+#[derive(Deserialize, Default)]
+struct ListPipelinesParams {
+    /// Filter by label: `?label=env:prod` or `?label=team:platform`.
+    /// Multiple labels: `?label=env:prod&label=team:platform` (AND logic).
+    #[serde(default)]
+    label: Vec<String>,
+}
+
+async fn list_pipelines(
+    State(st): State<AppState>,
+    Query(params): Query<ListPipelinesParams>,
+) -> Json<Vec<PipeInfo>> {
+    let mut pipelines = st.controller.list().await;
+
+    // Filter by labels (AND logic — all specified labels must match).
+    if !params.label.is_empty() {
+        pipelines.retain(|p| {
+            let meta_labels = &p.spec.metadata.labels;
+            params.label.iter().all(|filter| {
+                if let Some((key, value)) = filter.split_once(':') {
+                    meta_labels.get(key).map(|v| v == value).unwrap_or(false)
+                } else {
+                    // Key-only filter: label exists regardless of value
+                    meta_labels.contains_key(filter)
+                }
+            })
+        });
+    }
+
+    Json(pipelines)
 }
 
 async fn get_pipeline(
@@ -198,7 +265,8 @@ async fn stop_pipeline(
 async fn delete_pipeline(
     State(st): State<AppState>,
     Path(name): Path<String>,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<StatusCode, (StatusCode, Json<crate::errors::ApiError>)> {
+    // delete returns StatusCode directly, not wrapped in ApiResult
     st.controller
         .delete(&name)
         .await
@@ -314,6 +382,19 @@ async fn handle_dlq_purge(
     Ok(Json(DlqPurgeResponse { purged }))
 }
 
+// ── Checkpoint inspection handler ────────────────────────────────────────────
+
+async fn handle_checkpoints(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<Vec<CheckpointInfo>> {
+    st.controller
+        .checkpoints(&name)
+        .await
+        .map(Json)
+        .map_err(pipeline_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +416,8 @@ mod tests {
                 metadata: Metadata {
                     name: "demo".to_string(),
                     tenant: "acme".to_string(),
+                    labels: Default::default(),
+                    annotations: Default::default(),
                 },
                 spec: Spec {
                     sharding: None,
@@ -368,6 +451,7 @@ mod tests {
                     journal: None,
                 },
             },
+            ops: None,
         }
     }
 
