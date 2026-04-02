@@ -79,8 +79,8 @@ async fn validate_config(
             let source_type = match &spec.spec.source {
                 deltaforge_config::SourceCfg::Mysql(_) => "mysql",
                 deltaforge_config::SourceCfg::Postgres(_) => "postgres",
-                #[cfg(feature = "turso")]
-                deltaforge_config::SourceCfg::Turso(_) => "turso",
+                #[allow(unreachable_patterns)]
+                _ => "other",
             };
             let sink_count = spec.spec.sinks.len();
 

@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
     routing::get,
 };
 use chrono::{DateTime, Utc};
@@ -280,7 +279,7 @@ mod tests {
     use super::*;
     use axum::{
         body::{Body, to_bytes},
-        http::{Method, Request},
+        http::{Method, Request, StatusCode},
     };
     use tower::ServiceExt;
 

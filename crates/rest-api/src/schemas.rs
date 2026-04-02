@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
