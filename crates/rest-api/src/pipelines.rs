@@ -98,6 +98,25 @@ pub trait PipelineController: Send + Sync {
             "DLQ not enabled for this pipeline"
         )))
     }
+
+    // ── Checkpoint inspection ──────────────────────────────────────────
+
+    /// Get per-sink checkpoint positions for a pipeline.
+    async fn checkpoints(
+        &self,
+        name: &str,
+    ) -> Result<Vec<CheckpointInfo>, PipelineAPIError> {
+        let _ = name;
+        Ok(vec![])
+    }
+}
+
+/// Per-sink checkpoint position returned by the inspection API.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CheckpointInfo {
+    pub sink_id: String,
+    pub position: Value,
+    pub age_seconds: f64,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -119,13 +138,43 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/pipelines/{name}/journal/dlq/count", get(handle_dlq_count))
         .route("/pipelines/{name}/journal/dlq/ack", post(handle_dlq_ack))
+        // Checkpoint inspection
+        .route("/pipelines/{name}/checkpoints", get(handle_checkpoints))
         .with_state(state)
 }
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
 
-async fn list_pipelines(State(st): State<AppState>) -> Json<Vec<PipeInfo>> {
-    Json(st.controller.list().await)
+#[derive(Deserialize, Default)]
+struct ListPipelinesParams {
+    /// Filter by label: `?label=env:prod` or `?label=team:platform`.
+    /// Multiple labels: `?label=env:prod&label=team:platform` (AND logic).
+    #[serde(default)]
+    label: Vec<String>,
+}
+
+async fn list_pipelines(
+    State(st): State<AppState>,
+    Query(params): Query<ListPipelinesParams>,
+) -> Json<Vec<PipeInfo>> {
+    let mut pipelines = st.controller.list().await;
+
+    // Filter by labels (AND logic — all specified labels must match).
+    if !params.label.is_empty() {
+        pipelines.retain(|p| {
+            let meta_labels = &p.spec.metadata.labels;
+            params.label.iter().all(|filter| {
+                if let Some((key, value)) = filter.split_once(':') {
+                    meta_labels.get(key).map(|v| v == value).unwrap_or(false)
+                } else {
+                    // Key-only filter: label exists regardless of value
+                    meta_labels.contains_key(filter)
+                }
+            })
+        });
+    }
+
+    Json(pipelines)
 }
 
 async fn get_pipeline(
@@ -314,6 +363,19 @@ async fn handle_dlq_purge(
     Ok(Json(DlqPurgeResponse { purged }))
 }
 
+// ── Checkpoint inspection handler ────────────────────────────────────────────
+
+async fn handle_checkpoints(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<Vec<CheckpointInfo>> {
+    st.controller
+        .checkpoints(&name)
+        .await
+        .map(Json)
+        .map_err(pipeline_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +397,8 @@ mod tests {
                 metadata: Metadata {
                     name: "demo".to_string(),
                     tenant: "acme".to_string(),
+                    labels: Default::default(),
+                    annotations: Default::default(),
                 },
                 spec: Spec {
                     sharding: None,

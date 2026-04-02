@@ -1,7 +1,7 @@
 use axum::Router;
 mod errors;
 mod health;
-mod pipelines;
+pub mod pipelines;
 mod schemas;
 mod sensing;
 
@@ -196,6 +196,8 @@ mod tests {
                 metadata: Metadata {
                     name: "demo".to_string(),
                     tenant: "acme".to_string(),
+                    labels: Default::default(),
+                    annotations: Default::default(),
                 },
                 spec: Spec {
                     sharding: None,

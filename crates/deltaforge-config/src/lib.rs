@@ -83,6 +83,16 @@ pub struct Metadata {
 
     /// Business oriented tenant identifier
     pub tenant: String,
+
+    /// Key-value labels for filtering, grouping, and Grafana variables.
+    /// Example: `{"env": "prod", "team": "platform", "tier": "critical"}`
+    #[serde(default)]
+    pub labels: std::collections::HashMap<String, String>,
+
+    /// Free-form annotations for non-filtering metadata (docs, links, ownership).
+    /// Example: `{"owner": "team-platform@company.com", "runbook": "https://..."}`
+    #[serde(default)]
+    pub annotations: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

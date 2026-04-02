@@ -760,6 +760,63 @@ impl PipelineController for PipelineManager {
         let dlq = self.get_dlq_writer(name)?;
         dlq.purge().await.map_err(PipelineAPIError::Failed)
     }
+
+    async fn checkpoints(
+        &self,
+        name: &str,
+    ) -> Result<Vec<rest_api::pipelines::CheckpointInfo>, PipelineAPIError> {
+        let (source_id, prefix) = {
+            let guard = self.pipelines.read();
+            let runtime = guard
+                .get(name)
+                .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?;
+            let sid = runtime.spec.spec.source.source_id().to_string();
+            let pfx = format!("{}::sink::", sid);
+            (sid, pfx)
+        }; // guard dropped here
+        let _ = source_id; // used for future expansion
+
+        let keys = self
+            .ckpt_store
+            .list_with_prefix(&prefix)
+            .await
+            .map_err(|e| PipelineAPIError::Failed(e.into()))?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+
+        let mut result = Vec::with_capacity(keys.len());
+        for key in &keys {
+            let sink_id = key
+                .strip_prefix(&prefix)
+                .unwrap_or(key)
+                .to_string();
+
+            let position = match self.ckpt_store.get_raw(key).await {
+                Ok(Some(bytes)) => serde_json::from_slice(&bytes)
+                    .unwrap_or(serde_json::Value::Null),
+                _ => serde_json::Value::Null,
+            };
+
+            // Checkpoint age: time since last write. We use the checkpoint
+            // timestamp if available, otherwise report 0.
+            let age = position
+                .get("ts_ms")
+                .and_then(|v| v.as_f64())
+                .map(|ts| now - ts / 1000.0)
+                .unwrap_or(0.0);
+
+            result.push(rest_api::pipelines::CheckpointInfo {
+                sink_id,
+                position,
+                age_seconds: age,
+            });
+        }
+
+        Ok(result)
+    }
 }
 
 // ============================================================================
@@ -819,6 +876,8 @@ mod tests {
             metadata: Metadata {
                 name: name.to_string(),
                 tenant: "acme".to_string(),
+                labels: Default::default(),
+                annotations: Default::default(),
             },
             spec: Spec {
                 sharding: None,
