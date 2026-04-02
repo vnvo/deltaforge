@@ -18,7 +18,8 @@ The sections below call out concrete metrics and log events to add per component
 | --- | --- | --- |
 | ✅ Implemented | `deltaforge_source_events_total{pipeline,source,table}` counter increments when MySQL events are handed to the coordinator. | Surfaces ingress per table and pipeline. |
 | ✅ Implemented | `deltaforge_source_reconnects_total{pipeline,source}` counter when binlog reads reconnect. | Makes retry storms visible. |
-| 🚧 Gap | `deltaforge_source_lag_seconds{pipeline,source}` gauge based on binlog/WAL position vs. server time. | Alert when sources fall behind. |
+| ✅ Implemented | `deltaforge_source_lag_seconds{pipeline}` gauge — replication lag based on last event timestamp vs. wall clock. | Alert when sources fall behind. |
+| ✅ Implemented | `deltaforge_source_table_lag_seconds{pipeline,table}` gauge — per-table replication lag within each batch. | Identify which tables are lagging. |
 | 🚧 Gap | `deltaforge_source_idle_seconds{pipeline,source}` gauge updated when no events arrive within the inactivity window. | Catch stuck readers before downstream backlogs form. |
 
 ### Coordinator and batching
@@ -31,7 +32,7 @@ The sections below call out concrete metrics and log events to add per component
 | ✅ Implemented | `deltaforge_stage_latency_seconds{pipeline,stage,trigger}` histogram for processor stage. | Provides batch timing per trigger (timer/limits/shutdown). |
 | ✅ Implemented | `deltaforge_processor_latency_seconds{pipeline,processor}` histogram around every processor invocation. | Identify slow user functions. |
 | 🚧 Gap | `deltaforge_pipeline_channel_depth{pipeline}` gauge from `mpsc::Sender::capacity()`/`len()`. | Detect backpressure between sources and coordinator. |
-| 🚧 Gap | Checkpoint outcome counters/logs (`deltaforge_checkpoint_success_total` / `_failure_total`). | Alert on persistence regressions and correlate to data loss risk. |
+| ✅ Implemented | `deltaforge_checkpoints_total{pipeline}` counter — successful checkpoint commits. | Monitor checkpoint throughput. |
 
 ### Sinks (Kafka/Redis/custom)
 
@@ -39,9 +40,12 @@ The sections below call out concrete metrics and log events to add per component
 | --- | --- | --- |
 | ✅ Implemented | `deltaforge_sink_events_total{pipeline,sink}` counter and `deltaforge_sink_latency_seconds{pipeline,sink}` histogram around each send. | Throughput and responsiveness per sink. |
 | ✅ Implemented | `deltaforge_sink_batch_total{pipeline,sink}` counter for send. | Number of batches sent per sink. |
-| 🚧 Gap | Error taxonomy in `deltaforge_sink_failures_total` (add `kind`/`details`). | Easier alerting on specific failure classes (auth, timeout, schema). |
+| ✅ Implemented | `deltaforge_sink_errors_total{pipeline,sink}` counter with per-sink error tracking. | Alert on sink failures. |
+| ✅ Implemented | `deltaforge_sink_txn_commits_total{pipeline,sink}` counter — Kafka transaction commits/s. | Track exactly-once throughput. |
+| ✅ Implemented | `deltaforge_sink_txn_aborts_total{pipeline,sink}` counter — Kafka transaction aborts/s. Should be ~0. | Detect fencing or broker issues. |
+| ✅ Implemented | `deltaforge_sink_checkpoint_status{pipeline,sink}` gauge (1=ok, 0=behind). | Per-sink checkpoint health. |
+| ✅ Implemented | `deltaforge_sink_last_checkpoint_ts{pipeline,sink}` epoch timestamp. | Per-sink checkpoint age. |
 | 🚧 Gap | Backpressure gauge for client buffers (rdkafka queue, Redis pipeline depth). | Early signal before errors occur. |
-| 🚧 Gap | Drop/skip counters from processors/sinks. | Auditing and reconciliation. |
 
 ### Pipeline lifecycle
 
@@ -49,7 +53,9 @@ The sections below call out concrete metrics and log events to add per component
 | --- | --- | --- |
 | ✅ Implemented | `deltaforge_pipeline_status{pipeline}` gauge reflecting the current lifecycle state of each pipeline. | Single gauge to alert on stopped or failed pipelines and drive dashboards. |
 | ✅ Implemented | `deltaforge_e2e_latency_seconds{pipeline}` histogram measuring wall-clock time from when an event was received by DeltaForge to when it was delivered to the sink. | Measures pipeline delivery latency independently of source clock precision. |
-| 🚧 Gap | `deltaforge_replication_lag_seconds{pipeline,source}` gauge based on binlog/WAL event timestamp vs. wall clock. | Alert when the source is behind real time (slow producers, network issues). |
+| ✅ Implemented | `deltaforge_source_lag_seconds{pipeline}` gauge — replication lag based on event timestamp vs. wall clock. | Alert when the source is behind real time. |
+| ✅ Implemented | `deltaforge_checkpoints_total{pipeline}` counter — checkpoint commits/s. | Monitor checkpoint throughput. |
+| ✅ Implemented | `deltaforge_last_checkpoint_ts{pipeline}` epoch timestamp — pipeline-level checkpoint age. | Alert on stale checkpoints. |
 
 #### `deltaforge_pipeline_status` value semantics
 
@@ -80,6 +86,17 @@ count(deltaforge_pipeline_status != 1) > 0
 E2E latency is measured from the wall-clock time the event was **received and parsed** by DeltaForge, not from the binlog `header.timestamp`. MySQL binlog timestamps have one-second precision, which would introduce up to 1 s of phantom latency in the histogram. Using the internal receive time gives sub-millisecond accuracy regardless of source clock granularity.
 
 The **replication lag** metric (separate from E2E latency) uses the binlog timestamp and measures how far behind the source is relative to real time — that one-second precision is acceptable for lag alerting.
+
+### Dead Letter Queue
+
+| Status | Metric/log | Rationale |
+| --- | --- | --- |
+| ✅ Implemented | `deltaforge_dlq_events_total{pipeline,sink,error_kind}` counter. | Track rate of events routed to DLQ. |
+| ✅ Implemented | `deltaforge_dlq_entries{pipeline}` gauge — current unacked entries. | Monitor DLQ backlog size. |
+| ✅ Implemented | `deltaforge_dlq_saturation_ratio{pipeline}` gauge (0.0-1.0). | Alert at 80% (warning) and 95% (critical). |
+| ✅ Implemented | `deltaforge_dlq_evicted_total{pipeline}` counter — entries lost to drop_oldest overflow. | Track data loss from overflow. |
+| ✅ Implemented | `deltaforge_dlq_rejected_total{pipeline}` counter — entries lost to reject overflow. | Track data loss from rejection. |
+| ✅ Implemented | `deltaforge_dlq_write_failures_total{pipeline}` counter — DLQ storage failures. | Alert on DLQ infrastructure issues. |
 
 ### Control plane and health endpoints
 
