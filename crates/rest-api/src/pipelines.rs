@@ -161,7 +161,7 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
+use crate::errors::ApiResult;
 
 #[derive(Deserialize, Default)]
 struct ListPipelinesParams {
@@ -265,7 +265,8 @@ async fn stop_pipeline(
 async fn delete_pipeline(
     State(st): State<AppState>,
     Path(name): Path<String>,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<StatusCode, (StatusCode, Json<crate::errors::ApiError>)> {
+    // delete returns StatusCode directly, not wrapped in ApiResult
     st.controller
         .delete(&name)
         .await

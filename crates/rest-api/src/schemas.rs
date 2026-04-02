@@ -140,7 +140,7 @@ pub fn router(state: SchemaState) -> Router {
         .with_state(state)
 }
 
-type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
+use crate::errors::ApiResult;
 
 async fn list_schemas(
     State(st): State<SchemaState>,

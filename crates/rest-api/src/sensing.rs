@@ -207,7 +207,7 @@ pub fn router(state: SensingState) -> Router {
         .with_state(state)
 }
 
-type ApiResult<T> = Result<Json<T>, (StatusCode, String)>;
+use crate::errors::ApiResult;
 
 async fn list_inferred_schemas(
     State(st): State<SensingState>,
