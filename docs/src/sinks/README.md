@@ -33,6 +33,7 @@ sinks:
 | <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/apachekafka/apachekafka-original.svg" width="24" height="24"> | [`kafka`](kafka.md) | Kafka producer sink |
 | <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/nats/nats-original.svg" width="24" height="24"> | [`nats`](nats.md) | NATS JetStream sink |
 | <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/redis/redis-original.svg" width="24" height="24"> | [`redis`](redis.md) | Redis stream sink |
+| | [`http`](http.md) | HTTP/Webhook sink |
 
 ## Multiple sinks in one pipeline
 
@@ -116,6 +117,7 @@ This architecture avoids the common CDC pitfall where the slowest sink becomes a
 | Kafka (`exactly_once: false`) | At-least-once (idempotent) | Retries deduped; crash-replay produces duplicates | Dedup by event ID |
 | NATS JetStream | At-least-once + server dedup | `Nats-Msg-Id` header within `duplicate_window` | Configure `duplicate_window` |
 | Redis Streams | At-least-once + consumer dedup | `idempotency_key` field in XADD payload | Check key before processing |
+| HTTP/Webhook | At-least-once | Retry on 5xx/timeout; no server-side dedup | Consumer must be idempotent (use event `id`) |
 
 "Exactly-once" means DeltaForge guarantees no duplicates without consumer cooperation. All other sinks are "at-least-once" with a stated dedup mechanism.
 

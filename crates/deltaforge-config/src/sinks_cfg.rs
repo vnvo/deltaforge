@@ -63,6 +63,7 @@ pub enum SinkCfg {
     Kafka(KafkaSinkCfg),
     Redis(RedisSinkCfg),
     Nats(NatsSinkCfg),
+    Http(HttpSinkCfg),
 }
 
 impl SinkCfg {
@@ -72,6 +73,7 @@ impl SinkCfg {
             Self::Kafka(c) => &c.id,
             Self::Redis(c) => &c.id,
             Self::Nats(c) => &c.id,
+            Self::Http(c) => &c.id,
         }
     }
 }
@@ -330,6 +332,66 @@ pub struct NatsSinkCfg {
     /// are silently ignored by this sink.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<SinkFilter>,
+}
+
+/// HTTP/Webhook sink configuration.
+///
+/// Delivers events via HTTP POST (or PUT) to any URL. Supports dynamic URL
+/// templates, custom headers with env var expansion, and optional batch mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpSinkCfg {
+    /// Unique identifier for this sink.
+    pub id: String,
+
+    /// Target URL. Supports `${path}` templates for per-event routing.
+    /// Example: `https://api.example.com/cdc/${source.table}`
+    pub url: String,
+
+    /// HTTP method. Default: POST.
+    #[serde(default = "default_http_method")]
+    pub method: String,
+
+    /// Static headers added to every request. Values support `${ENV_VAR}` expansion.
+    /// Example: `{"Authorization": "Bearer ${API_TOKEN}", "X-Source": "deltaforge"}`
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+
+    /// Batch mode: if true, send a JSON array of events in one request.
+    /// If false (default), send one request per event.
+    #[serde(default)]
+    pub batch_mode: bool,
+
+    /// Envelope format for event serialization.
+    #[serde(default)]
+    pub envelope: EnvelopeCfg,
+
+    /// Wire encoding format.
+    #[serde(default)]
+    pub encoding: EncodingCfg,
+
+    /// Whether this sink must succeed for checkpoint to proceed.
+    #[serde(default)]
+    pub required: Option<bool>,
+
+    /// Timeout for individual HTTP requests (seconds). Default: 10.
+    #[serde(default)]
+    pub send_timeout_secs: Option<u32>,
+
+    /// Timeout for batch operations (seconds). Default: 30.
+    #[serde(default)]
+    pub batch_timeout_secs: Option<u32>,
+
+    /// Timeout for TCP connection establishment (seconds). Default: 5.
+    #[serde(default)]
+    pub connect_timeout_secs: Option<u32>,
+
+    /// Optional filter applied before delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<SinkFilter>,
+}
+
+fn default_http_method() -> String {
+    "POST".to_string()
 }
 
 // ============================================================================

@@ -45,6 +45,7 @@ pub fn make_test_event(id: i64) -> Event {
 }
 
 /// Create a test event with specific data size.
+#[allow(dead_code)]
 pub fn make_large_event(id: i64, size_bytes: usize) -> Event {
     let padding = "x".repeat(size_bytes);
     Event::new_row(

@@ -15,6 +15,7 @@
     - [Redis](sinks/redis.md)
     - [Kafka](sinks/kafka.md)
     - [NATS](sinks/nats.md)
+    - [HTTP/Webhook](sinks/http.md)
 - [Envelopes and Encodings](envelopes.md)
 - [Dynamic Routing](routing.md)
 - [Outbox Pattern Support](outbox.md)

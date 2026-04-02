@@ -39,10 +39,12 @@ use deltaforge_core::ArcDynSink;
 use tokio_util::sync::CancellationToken;
 
 pub mod filter;
+pub mod http;
 pub mod kafka;
 pub mod nats;
 pub mod redis;
 pub use filter::FilteredSink;
+pub use http::HttpSink;
 pub use kafka::KafkaSink;
 pub use nats::NatsSink;
 pub use redis::RedisSink;
@@ -114,6 +116,11 @@ pub fn build_sinks(
                         as ArcDynSink,
                     cfg.filter.clone(),
                 ),
+                SinkCfg::Http(cfg) => (
+                    Arc::new(HttpSink::new(cfg, cancel.clone(), pipeline)?)
+                        as ArcDynSink,
+                    cfg.filter.clone(),
+                ),
             };
             // Only wrap when filter has actual conditions — zero overhead otherwise
             let sink = match filter {
@@ -150,6 +157,9 @@ pub fn build_sink(
         SinkCfg::Nats(nats_sink_cfg) => {
             Arc::new(NatsSink::new(nats_sink_cfg, cancel, pipeline)?)
                 as ArcDynSink
+        }
+        SinkCfg::Http(http_cfg) => {
+            Arc::new(HttpSink::new(http_cfg, cancel, pipeline)?) as ArcDynSink
         }
     };
     Ok(sink)
