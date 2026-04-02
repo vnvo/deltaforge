@@ -136,6 +136,7 @@ pub(crate) struct PipelineRuntime {
     pub(crate) table_patterns: Vec<String>,
     pub(crate) sensor_state: Option<Arc<SchemaSensorState>>,
     pub(crate) dlq_writer: Option<Arc<crate::dlq::DlqWriter>>,
+    pub(crate) started_at: std::time::Instant,
 }
 
 impl PipelineRuntime {
@@ -480,6 +481,7 @@ impl PipelineManager {
             table_patterns,
             sensor_state: sensor_for_runtime,
             dlq_writer,
+            started_at: std::time::Instant::now(),
         })
     }
 
@@ -549,9 +551,13 @@ impl PipelineController for PipelineManager {
     }
 
     async fn get(&self, name: &str) -> Result<PipeInfo, PipelineAPIError> {
-        let mut info = self
-            .get_pipeline(name)
-            .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?;
+        let (mut info, uptime) = {
+            let guard = self.pipelines.read();
+            let runtime = guard
+                .get(name)
+                .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?;
+            (runtime.info(), runtime.started_at.elapsed().as_secs_f64())
+        };
 
         // Enrich with operational status.
         let checkpoints = self.checkpoints(name).await.unwrap_or_default();
@@ -561,10 +567,10 @@ impl PipelineController for PipelineManager {
         };
 
         info.ops = Some(rest_api::pipelines::PipelineOpsStatus {
-            lag_seconds: None, // TODO: read from metrics registry
+            lag_seconds: None,
             dlq_entries: dlq_count,
-            sink_errors: Default::default(), // TODO: track last error per sink
-            uptime_seconds: None,            // TODO: track start time
+            sink_errors: Default::default(),
+            uptime_seconds: Some(uptime),
             checkpoints,
         });
 
