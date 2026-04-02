@@ -25,16 +25,14 @@ GET /health
 Returns `ok` when the process is running and all pipelines are healthy. Returns `503` if any pipeline has entered a failed state (e.g. position lost after failover, binlog purged, unrecoverable source error). Use for Kubernetes liveness probes — a `503` indicates the process should be restarted.
 
 **Response:** `200 OK` — all pipelines healthy
-```
-ok
+```json
+{"status": "healthy", "pipelines": 3}
 ```
 
 **Response:** `503 Service Unavailable` — one or more pipelines failed
+```json
+{"status": "unhealthy", "failed_pipelines": ["orders-cdc"]}
 ```
-pipeline failed
-```
-
-Pipeline status can be inspected via `/ready` or `GET /pipelines` to identify which pipeline failed and why.
 
 ### Readiness Probe
 
@@ -66,9 +64,11 @@ Returns pipeline states. Use for Kubernetes readiness probes.
 
 ```http
 GET /pipelines
+GET /pipelines?label=env:prod
+GET /pipelines?label=env:prod&label=team:platform
 ```
 
-Returns all pipelines with current status.
+Returns all pipelines with current status. Filter by labels with AND logic. Key-only filter (`?label=env`) matches any value.
 
 **Response:** `200 OK`
 ```json
@@ -90,14 +90,22 @@ Returns all pipelines with current status.
 GET /pipelines/{name}
 ```
 
-Returns a single pipeline by name.
+Returns a single pipeline by name with operational status.
 
 **Response:** `200 OK`
 ```json
 {
   "name": "orders-cdc",
   "status": "running",
-  "spec": { ... }
+  "spec": { ... },
+  "ops": {
+    "uptime_seconds": 3600.5,
+    "dlq_entries": 0,
+    "sink_errors": {},
+    "checkpoints": [
+      {"sink_id": "kafka-primary", "position": {"file": "mysql-bin.000005", "pos": 12345}, "age_seconds": 0.3}
+    ]
+  }
 }
 ```
 
@@ -538,19 +546,128 @@ Returns drift detection results for a specific table.
 
 ---
 
+## Dead Letter Queue
+
+See the [DLQ page](dlq.md) for full documentation.
+
+### Peek DLQ Entries
+
+```http
+GET /pipelines/{name}/journal/dlq?limit=50&sink_id=kafka-primary&error_kind=serialization
+```
+
+Returns DLQ entries (oldest first). All query params are optional.
+
+### DLQ Count
+
+```http
+GET /pipelines/{name}/journal/dlq/count
+```
+
+**Response:** `200 OK`
+```json
+{"count": 42}
+```
+
+### Acknowledge DLQ Entries
+
+```http
+POST /pipelines/{name}/journal/dlq/ack
+Content-Type: application/json
+
+{"up_to_seq": 42}
+```
+
+Permanently removes entries from the head up to the given sequence number.
+
+**Response:** `200 OK`
+```json
+{"acked": 12}
+```
+
+### Purge DLQ
+
+```http
+DELETE /pipelines/{name}/journal/dlq
+```
+
+**Response:** `200 OK`
+```json
+{"purged": 42}
+```
+
+---
+
+## Checkpoint Inspection
+
+### Get Checkpoints
+
+```http
+GET /pipelines/{name}/checkpoints
+```
+
+Returns per-sink checkpoint positions and ages.
+
+**Response:** `200 OK`
+```json
+[
+  {"sink_id": "kafka-primary", "position": {"file": "mysql-bin.000005", "pos": 12345}, "age_seconds": 0.3},
+  {"sink_id": "redis-cache", "position": {"file": "mysql-bin.000005", "pos": 11000}, "age_seconds": 2.1}
+]
+```
+
+---
+
+## System Endpoints
+
+### Log Level
+
+```http
+GET /log-level
+```
+
+Returns the current `RUST_LOG` value.
+
+**Response:** `200 OK`
+```json
+{"level": "deltaforge=info,sources=info,sinks=info,warn"}
+```
+
+### Validate Config
+
+```http
+POST /validate
+Content-Type: application/json
+```
+
+Dry-run validation of a pipeline config without creating it.
+
+**Response:** `200 OK` — config is valid
+```json
+{"valid": true, "pipeline": "orders-cdc", "source_type": "mysql", "sink_count": 2}
+```
+
+**Response:** `400 Bad Request` — config has errors
+```json
+{"valid": false, "error": "spec: missing field `processors` at line 7 column 3"}
+```
+
+---
+
 ## Error Responses
 
-All error responses follow this format:
+All error responses return structured JSON:
 
 ```json
 {
-  "error": "Description of the error"
+  "code": "PIPELINE_NOT_FOUND",
+  "message": "pipeline orders-cdc not found"
 }
 ```
 
-| Status Code | Meaning |
-|-------------|---------|
-| `400 Bad Request` | Invalid request body or parameters |
-| `404 Not Found` | Resource doesn't exist |
-| `409 Conflict` | Resource already exists |
-| `500 Internal Server Error` | Unexpected server error |
+| Status Code | Code | Meaning |
+|-------------|------|---------|
+| `400 Bad Request` | `PIPELINE_NAME_MISMATCH` | Invalid request body or name mismatch |
+| `404 Not Found` | `PIPELINE_NOT_FOUND` | Resource doesn't exist |
+| `409 Conflict` | `PIPELINE_ALREADY_EXISTS` | Resource already exists |
+| `500 Internal Server Error` | `INTERNAL_ERROR` | Unexpected server error |
