@@ -22,6 +22,24 @@ pub struct PipeInfo {
     pub name: String,
     pub status: String,
     pub spec: PipelineSpec,
+    /// Operational status — populated by the controller, optional for backward compat.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ops: Option<PipelineOpsStatus>,
+}
+
+/// Operational status fields — everything an operator needs in one response.
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct PipelineOpsStatus {
+    /// Replication lag in seconds (source event time vs wall clock).
+    pub lag_seconds: Option<f64>,
+    /// DLQ entry count (0 if journal not enabled).
+    pub dlq_entries: u64,
+    /// Last error per sink (empty if all healthy).
+    pub sink_errors: std::collections::HashMap<String, String>,
+    /// Pipeline uptime in seconds since last start/restart.
+    pub uptime_seconds: Option<f64>,
+    /// Per-sink checkpoint positions.
+    pub checkpoints: Vec<CheckpointInfo>,
 }
 
 #[async_trait]
@@ -432,6 +450,7 @@ mod tests {
                     journal: None,
                 },
             },
+            ops: None,
         }
     }
 
