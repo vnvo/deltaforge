@@ -9,7 +9,10 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use anyhow::Result;
 use axum::{Json, Router, extract::State, routing::post};
@@ -20,7 +23,9 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 mod sink_test_common;
-use sink_test_common::{init_test_tracing, make_test_event, make_event_for_table};
+use sink_test_common::{
+    init_test_tracing, make_event_for_table, make_test_event,
+};
 
 // =============================================================================
 // Test HTTP Server
@@ -68,16 +73,12 @@ async fn handle_event(
     axum::http::StatusCode::OK
 }
 
-async fn handle_401(
-    State(state): State<TestServer>,
-) -> axum::http::StatusCode {
+async fn handle_401(State(state): State<TestServer>) -> axum::http::StatusCode {
     state.request_count.fetch_add(1, Ordering::Relaxed);
     axum::http::StatusCode::UNAUTHORIZED
 }
 
-async fn handle_500(
-    State(state): State<TestServer>,
-) -> axum::http::StatusCode {
+async fn handle_500(State(state): State<TestServer>) -> axum::http::StatusCode {
     state.request_count.fetch_add(1, Ordering::Relaxed);
     axum::http::StatusCode::INTERNAL_SERVER_ERROR
 }
@@ -86,9 +87,7 @@ async fn handle_500(
 async fn start_test_server(
     handler: Router,
 ) -> (u16, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let handle = tokio::spawn(async move {
         axum::serve(listener, handler).await.unwrap();
@@ -129,7 +128,8 @@ async fn http_sink_sends_single_event() -> Result<()> {
         .with_state(server.clone());
     let (port, _handle) = start_test_server(app).await;
 
-    let cfg = make_http_cfg("test-http", &format!("http://127.0.0.1:{port}/events"));
+    let cfg =
+        make_http_cfg("test-http", &format!("http://127.0.0.1:{port}/events"));
     let sink = HttpSink::new(&cfg, CancellationToken::new(), "test")?;
 
     let event = make_test_event(1);
@@ -153,7 +153,8 @@ async fn http_sink_sends_batch_per_event() -> Result<()> {
         .with_state(server.clone());
     let (port, _handle) = start_test_server(app).await;
 
-    let cfg = make_http_cfg("test-batch", &format!("http://127.0.0.1:{port}/events"));
+    let cfg =
+        make_http_cfg("test-batch", &format!("http://127.0.0.1:{port}/events"));
     let sink = HttpSink::new(&cfg, CancellationToken::new(), "test")?;
 
     let events: Vec<Event> = (0..5).map(make_test_event).collect();
@@ -178,7 +179,10 @@ async fn http_sink_batch_mode_sends_array() -> Result<()> {
         .with_state(server.clone());
     let (port, _handle) = start_test_server(app).await;
 
-    let mut cfg = make_http_cfg("test-batch-mode", &format!("http://127.0.0.1:{port}/events"));
+    let mut cfg = make_http_cfg(
+        "test-batch-mode",
+        &format!("http://127.0.0.1:{port}/events"),
+    );
     cfg.batch_mode = true;
 
     let sink = HttpSink::new(&cfg, CancellationToken::new(), "test")?;
@@ -205,7 +209,8 @@ async fn http_sink_auth_error_fails_immediately() -> Result<()> {
         .with_state(server.clone());
     let (port, _handle) = start_test_server(app).await;
 
-    let cfg = make_http_cfg("test-auth", &format!("http://127.0.0.1:{port}/events"));
+    let cfg =
+        make_http_cfg("test-auth", &format!("http://127.0.0.1:{port}/events"));
     let sink = HttpSink::new(&cfg, CancellationToken::new(), "test")?;
 
     let event = make_test_event(1);
@@ -234,7 +239,8 @@ async fn http_sink_5xx_retries() -> Result<()> {
         .with_state(server.clone());
     let (port, _handle) = start_test_server(app).await;
 
-    let cfg = make_http_cfg("test-retry", &format!("http://127.0.0.1:{port}/events"));
+    let cfg =
+        make_http_cfg("test-retry", &format!("http://127.0.0.1:{port}/events"));
     let sink = HttpSink::new(&cfg, CancellationToken::new(), "test")?;
 
     let event = make_test_event(1);
@@ -307,8 +313,12 @@ async fn http_sink_custom_headers() -> Result<()> {
         .with_state(server.clone());
     let (port, _handle) = start_test_server(app).await;
 
-    let mut cfg = make_http_cfg("test-headers", &format!("http://127.0.0.1:{port}/events"));
-    cfg.headers.insert("X-Custom".into(), "deltaforge-test".into());
+    let mut cfg = make_http_cfg(
+        "test-headers",
+        &format!("http://127.0.0.1:{port}/events"),
+    );
+    cfg.headers
+        .insert("X-Custom".into(), "deltaforge-test".into());
 
     let sink = HttpSink::new(&cfg, CancellationToken::new(), "test")?;
 
@@ -337,7 +347,11 @@ async fn http_sink_connection_refused_retries() -> Result<()> {
     let err = result.unwrap_err();
     // Should be a connection error after retries
     assert!(
-        matches!(err, deltaforge_core::SinkError::Connect { .. } | deltaforge_core::SinkError::Backpressure { .. }),
+        matches!(
+            err,
+            deltaforge_core::SinkError::Connect { .. }
+                | deltaforge_core::SinkError::Backpressure { .. }
+        ),
         "expected Connect or Backpressure error, got: {:?}",
         err
     );

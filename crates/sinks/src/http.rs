@@ -98,11 +98,12 @@ impl HttpSink {
         );
         for (key, value) in &cfg.headers {
             // Expand ${ENV_VAR} in header values.
-            let expanded = shellexpand::env(value)
-                .unwrap_or(Cow::Borrowed(value));
-            let header_name = key
-                .parse::<reqwest::header::HeaderName>()
-                .map_err(|e| anyhow::anyhow!("invalid header name '{key}': {e}"))?;
+            let expanded =
+                shellexpand::env(value).unwrap_or(Cow::Borrowed(value));
+            let header_name =
+                key.parse::<reqwest::header::HeaderName>().map_err(|e| {
+                    anyhow::anyhow!("invalid header name '{key}': {e}")
+                })?;
             let header_value = expanded
                 .parse::<reqwest::header::HeaderValue>()
                 .map_err(|e| {
@@ -160,11 +161,11 @@ impl HttpSink {
                 details: e.to_string().into(),
             }
         })?;
-        self.url_template
-            .resolve_strict(&event_json)
-            .map_err(|e| SinkError::Routing {
+        self.url_template.resolve_strict(&event_json).map_err(|e| {
+            SinkError::Routing {
                 details: e.to_string().into(),
-            })
+            }
+        })
     }
 
     fn serialize_event(&self, event: &Event) -> SinkResult<Vec<u8>> {
@@ -355,7 +356,11 @@ impl Sink for HttpSink {
                     let url = url.clone();
                     let body = array_body.clone();
                     async move {
-                        debug!(attempt, count = event_count, "sending batch via HTTP");
+                        debug!(
+                            attempt,
+                            count = event_count,
+                            "sending batch via HTTP"
+                        );
                         self.do_send(&url, body).await
                     }
                 },
@@ -456,7 +461,10 @@ impl HttpRetryError {
     fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Self::Connect(_) | Self::Timeout | Self::Network(_) | Self::Retryable(_)
+            Self::Connect(_)
+                | Self::Timeout
+                | Self::Network(_)
+                | Self::Retryable(_)
         )
     }
 }
