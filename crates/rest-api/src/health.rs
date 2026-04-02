@@ -1,8 +1,5 @@
 use axum::{
-    Json, Router,
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
+    Json, Router, extract::State, http::StatusCode, response::IntoResponse,
     routing::get,
 };
 use serde::Serialize;
@@ -64,7 +61,8 @@ struct LogLevelResponse {
 }
 
 async fn get_log_level() -> Json<LogLevelResponse> {
-    let level = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+    let level =
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
     Json(LogLevelResponse { level })
 }
 
@@ -72,7 +70,9 @@ async fn get_log_level() -> Json<LogLevelResponse> {
 
 /// Validate a pipeline config without creating it. Accepts JSON body.
 /// Returns {"valid": true, ...} or {"valid": false, "error": "..."}.
-async fn validate_config(Json(body): Json<serde_json::Value>) -> impl IntoResponse {
+async fn validate_config(
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
     match serde_json::from_value::<deltaforge_config::PipelineSpec>(body) {
         Ok(spec) => {
             let name = &spec.metadata.name;

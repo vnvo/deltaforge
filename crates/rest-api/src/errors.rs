@@ -59,11 +59,25 @@ impl From<anyhow::Error> for PipelineAPIError {
 pub fn pipeline_error(err: PipelineAPIError) -> (StatusCode, Json<ApiError>) {
     error!(error=?err, "pipeline lifecycle operation failed");
     let (status, code) = match &err {
-        PipelineAPIError::NotFound(_) => (StatusCode::NOT_FOUND, "PIPELINE_NOT_FOUND"),
-        PipelineAPIError::AlreadyExists(_) => (StatusCode::CONFLICT, "PIPELINE_ALREADY_EXISTS"),
-        PipelineAPIError::NameMismatch { .. } => (StatusCode::BAD_REQUEST, "PIPELINE_NAME_MISMATCH"),
-        PipelineAPIError::Failed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
+        PipelineAPIError::NotFound(_) => {
+            (StatusCode::NOT_FOUND, "PIPELINE_NOT_FOUND")
+        }
+        PipelineAPIError::AlreadyExists(_) => {
+            (StatusCode::CONFLICT, "PIPELINE_ALREADY_EXISTS")
+        }
+        PipelineAPIError::NameMismatch { .. } => {
+            (StatusCode::BAD_REQUEST, "PIPELINE_NAME_MISMATCH")
+        }
+        PipelineAPIError::Failed(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")
+        }
     };
 
-    (status, Json(ApiError { code, message: err.to_string() }))
+    (
+        status,
+        Json(ApiError {
+            code,
+            message: err.to_string(),
+        }),
+    )
 }

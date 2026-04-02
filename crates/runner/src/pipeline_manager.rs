@@ -808,7 +808,8 @@ impl PipelineController for PipelineManager {
     async fn checkpoints(
         &self,
         name: &str,
-    ) -> Result<Vec<rest_api::pipelines::CheckpointInfo>, PipelineAPIError> {
+    ) -> Result<Vec<rest_api::pipelines::CheckpointInfo>, PipelineAPIError>
+    {
         let (source_id, prefix) = {
             let guard = self.pipelines.read();
             let runtime = guard
@@ -833,10 +834,7 @@ impl PipelineController for PipelineManager {
 
         let mut result = Vec::with_capacity(keys.len());
         for key in &keys {
-            let sink_id = key
-                .strip_prefix(&prefix)
-                .unwrap_or(key)
-                .to_string();
+            let sink_id = key.strip_prefix(&prefix).unwrap_or(key).to_string();
 
             let position = match self.ckpt_store.get_raw(key).await {
                 Ok(Some(bytes)) => serde_json::from_slice(&bytes)
