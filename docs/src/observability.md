@@ -106,3 +106,40 @@ The **replication lag** metric (separate from E2E latency) uses the binlog times
 | Ready/Liveness transitions | Logs with pipeline counts and per-pipeline status when readiness changes. | Explain probe failures in log aggregation. |
 | Pipeline lifecycle counters | Counters for create/patch/stop/resume actions with success/error labels. | Auditable control-plane operations. |
 
+## Grafana Dashboard
+
+A production-ready Grafana dashboard is included in the repository, optimized for fleet operations with hundreds of pipelines:
+
+**[Download: deltaforge.json](https://github.com/vnvo/deltaforge/blob/main/chaos/grafana/dashboards/deltaforge.json)**
+
+Import it via Grafana UI → Dashboards → Import → Upload JSON file.
+
+### What's included
+
+| Row | Panels | Purpose |
+|-----|--------|---------|
+| **Fleet Overview** | Running/unhealthy count, total events/s, total data/s, max lag, DLQ total, reconnects, txn aborts, sink errors | One-glance health across all pipelines |
+| **Top Pipelines** | Top 10 laggiest, top 10 throughput, top 10 DLQ backlogs | Identify outliers without drowning in 300 series |
+| **Throughput** | Aggregate events/s, per-pipeline events/s, data throughput | Capacity planning and anomaly detection |
+| **Latency & Lag** | E2E latency p50/p95, source lag, per-table lag (top 10) | SLA monitoring, identify slow tables |
+| **Checkpoints & EOS** | Per-sink status, commit rate, txn commits/aborts | Exactly-once health, checkpoint freshness |
+| **Dead Letter Queue** | Entries, events/s, saturation, overflow rate | DLQ monitoring and alerting |
+| **Errors & Reliability** | Sink errors, reconnects, pipeline state timeline | Incident detection |
+| **Batching & Kafka** | Batch size, batch bytes, sink latency (collapsed) | Tuning reference |
+| **Infrastructure** | Container CPU, memory (collapsed) | Resource monitoring |
+
+### Template variables
+
+The dashboard includes dropdown filters at the top:
+
+- **Instance** — select DeltaForge instances
+- **Tenant** — filter by tenant (from `deltaforge_pipeline_info` metric)
+- **Pipeline** — select specific pipelines
+- **Sink** — filter by sink
+
+### Prerequisites
+
+- Prometheus scraping DeltaForge metrics on port 9000 (`/metrics`)
+- Prometheus datasource configured in Grafana as "Prometheus"
+- For container metrics: cAdvisor scraping enabled
+

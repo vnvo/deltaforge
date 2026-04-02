@@ -2,8 +2,8 @@
   "title": "DeltaForge CDC",
   "uid": "deltaforge-cdc",
   "schemaVersion": 39,
-  "refresh": "5s",
-  "time": { "from": "now-30m", "to": "now" },
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
   "editable": true,
 
   "templating": {
@@ -14,6 +14,18 @@
         "type": "query",
         "datasource": "Prometheus",
         "query": "label_values(deltaforge_pipeline_status, instance)",
+        "multi": true,
+        "includeAll": true,
+        "current": { "text": "All", "value": "$__all" },
+        "refresh": 2,
+        "sort": 1
+      },
+      {
+        "name": "tenant",
+        "label": "Tenant",
+        "type": "query",
+        "datasource": "Prometheus",
+        "query": "label_values(deltaforge_pipeline_info{instance=~\"$instance\"}, tenant)",
         "multi": true,
         "includeAll": true,
         "current": { "text": "All", "value": "$__all" },
@@ -33,35 +45,11 @@
         "sort": 1
       },
       {
-        "name": "source",
-        "label": "Source",
-        "type": "query",
-        "datasource": "Prometheus",
-        "query": "label_values(deltaforge_source_events_total{instance=~\"$instance\", pipeline=~\"$pipeline\", source=~\"$source\"}, source)",
-        "multi": true,
-        "includeAll": true,
-        "current": { "text": "All", "value": "$__all" },
-        "refresh": 2,
-        "sort": 1
-      },
-      {
         "name": "sink",
         "label": "Sink",
         "type": "query",
         "datasource": "Prometheus",
         "query": "label_values(deltaforge_sink_events_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}, sink)",
-        "multi": true,
-        "includeAll": true,
-        "current": { "text": "All", "value": "$__all" },
-        "refresh": 2,
-        "sort": 1
-      },
-      {
-        "name": "processor",
-        "label": "Processor",
-        "type": "query",
-        "datasource": "Prometheus",
-        "query": "label_values(deltaforge_processor_latency_seconds_count{instance=~\"$instance\", pipeline=~\"$pipeline\", processor=~\"$processor\"}, processor)",
         "multi": true,
         "includeAll": true,
         "current": { "text": "All", "value": "$__all" },
@@ -75,132 +63,152 @@
 
     { "id": 100, "type": "row", "title": "Fleet Overview", "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 }, "collapsed": false, "panels": [] },
 
-    { "id": 1, "title": "Pipeline States",
-      "type": "bargauge",
-      "gridPos": { "x": 0, "y": 1, "w": 5, "h": 4 },
+    { "id": 1, "title": "Pipelines",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 1, "w": 3, "h": 4 },
       "targets": [
-        { "datasource": "Prometheus", "expr": "count(deltaforge_pipeline_status{instance=~\"$instance\", pipeline=~\"$pipeline\"} == 1)   or vector(0)", "legendFormat": "RUNNING" },
-        { "datasource": "Prometheus", "expr": "count(deltaforge_pipeline_status{instance=~\"$instance\", pipeline=~\"$pipeline\"} == 0.5) or vector(0)", "legendFormat": "PAUSED" },
-        { "datasource": "Prometheus", "expr": "count(deltaforge_pipeline_status{instance=~\"$instance\", pipeline=~\"$pipeline\"} == 0)   or vector(0)", "legendFormat": "STOPPED" },
-        { "datasource": "Prometheus", "expr": "count(deltaforge_pipeline_status{instance=~\"$instance\", pipeline=~\"$pipeline\"} < 0)    or vector(0)", "legendFormat": "FAILED" }
+        { "datasource": "Prometheus", "expr": "count(deltaforge_pipeline_status{instance=~\"$instance\", pipeline=~\"$pipeline\"} == 1)", "legendFormat": "Running" },
+        { "datasource": "Prometheus", "expr": "count(deltaforge_pipeline_status{instance=~\"$instance\", pipeline=~\"$pipeline\"} < 1) or vector(0)", "legendFormat": "Unhealthy" }
       ],
-      "options": { "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"] }, "displayMode": "basic" },
-      "fieldConfig": {
-        "defaults": { "unit": "short", "min": 0, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }] } },
-        "overrides": [
-          { "matcher": { "id": "byName", "options": "RUNNING" },  "properties": [{ "id": "color", "value": { "fixedColor": "green",  "mode": "fixed" } }] },
-          { "matcher": { "id": "byName", "options": "PAUSED" },   "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
-          { "matcher": { "id": "byName", "options": "STOPPED" },  "properties": [{ "id": "color", "value": { "fixedColor": "gray",   "mode": "fixed" } }] },
-          { "matcher": { "id": "byName", "options": "FAILED" },   "properties": [{ "id": "color", "value": { "fixedColor": "red",    "mode": "fixed" } }] }
-        ]
-      }
-    },
-
-    { "id": 2, "title": "Events Delivered",
-      "type": "stat",
-      "gridPos": { "x": 5, "y": 1, "w": 4, "h": 4 },
-      "targets": [{ "datasource": "Prometheus", "expr": "sum by(pipeline)(deltaforge_sink_events_total{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"})", "legendFormat": "{{pipeline}}" }],
       "fieldConfig": { "defaults": { "unit": "short" } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "value_and_name" }
-    },
-
-    { "id": 32, "title": "Data Moved",
-      "type": "stat",
-      "gridPos": { "x": 9, "y": 1, "w": 4, "h": 4 },
-      "targets": [{ "datasource": "Prometheus", "expr": "sum by(pipeline)(deltaforge_bytes_total{instance=~\"$instance\", pipeline=~\"$pipeline\"})", "legendFormat": "{{pipeline}}" }],
-      "fieldConfig": { "defaults": { "unit": "bytes" } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "value_and_name" }
-    },
-
-    { "id": 3, "title": "Checkpoint Age",
-      "type": "stat",
-      "gridPos": { "x": 13, "y": 1, "w": 4, "h": 4 },
-      "targets": [{ "datasource": "Prometheus", "expr": "(time() - deltaforge_last_checkpoint_ts{instance=~\"$instance\", pipeline=~\"$pipeline\"}) and on(pipeline, instance) (deltaforge_pipeline_status{instance=~\"$instance\", pipeline=~\"$pipeline\"} == 1)", "legendFormat": "{{pipeline}}" }],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 30 }, { "color": "red", "value": 120 }] }
-        }
-      },
       "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "value_and_name", "colorMode": "background" }
     },
 
-    { "id": 6, "title": "Replication Lag",
+    { "id": 2, "title": "Total Events/s",
       "type": "stat",
-      "gridPos": { "x": 17, "y": 1, "w": 3, "h": 4 },
-      "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_source_lag_seconds{instance=~\"$instance\", pipeline=~\"$pipeline\", source=~\"$source\"} and on(pipeline, instance) (deltaforge_pipeline_status{instance=~\"$instance\", pipeline=~\"$pipeline\"} == 1)", "legendFormat": "{{pipeline}}" }],
+      "gridPos": { "x": 3, "y": 1, "w": 3, "h": 4 },
+      "targets": [{ "datasource": "Prometheus", "expr": "sum(rate(deltaforge_sink_events_total{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s]))", "legendFormat": "events/s" }],
+      "fieldConfig": { "defaults": { "unit": "ops" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "value_and_name" }
+    },
+
+    { "id": 3, "title": "Total Data/s",
+      "type": "stat",
+      "gridPos": { "x": 6, "y": 1, "w": 3, "h": 4 },
+      "targets": [{ "datasource": "Prometheus", "expr": "sum(rate(deltaforge_bytes_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s]))", "legendFormat": "bytes/s" }],
+      "fieldConfig": { "defaults": { "unit": "Bps" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "value_and_name" }
+    },
+
+    { "id": 4, "title": "Max Lag",
+      "type": "stat",
+      "gridPos": { "x": 9, "y": 1, "w": 3, "h": 4 },
+      "targets": [{ "datasource": "Prometheus", "expr": "max(deltaforge_source_lag_seconds{instance=~\"$instance\", pipeline=~\"$pipeline\"})", "legendFormat": "worst lag" }],
       "fieldConfig": {
-        "defaults": {
-          "unit": "s", "decimals": 1,
+        "defaults": { "unit": "s", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 5 }, { "color": "red", "value": 30 }] } }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" }
+    },
+
+    { "id": 5, "title": "DLQ Total",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 1, "w": 3, "h": 4 },
+      "targets": [{ "datasource": "Prometheus", "expr": "sum(deltaforge_dlq_entries{instance=~\"$instance\", pipeline=~\"$pipeline\"}) or vector(0)", "legendFormat": "DLQ entries" }],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 10 }, { "color": "red", "value": 100 }] } }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" }
+    },
+
+    { "id": 6, "title": "Reconnects",
+      "type": "stat",
+      "gridPos": { "x": 15, "y": 1, "w": 3, "h": 4 },
+      "targets": [{ "datasource": "Prometheus", "expr": "sum(rate(deltaforge_source_reconnects_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[5m]))", "legendFormat": "reconnects/5m" }],
+      "fieldConfig": { "defaults": { "unit": "ops" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+
+    { "id": 7, "title": "Txn Aborts",
+      "type": "stat",
+      "gridPos": { "x": 18, "y": 1, "w": 3, "h": 4 },
+      "targets": [{ "datasource": "Prometheus", "expr": "sum(rate(deltaforge_sink_txn_aborts_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[5m])) or vector(0)", "legendFormat": "aborts/5m" }],
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "red", "value": 0.01 }] } }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" }
+    },
+
+    { "id": 8, "title": "Sink Errors",
+      "type": "stat",
+      "gridPos": { "x": 21, "y": 1, "w": 3, "h": 4 },
+      "targets": [{ "datasource": "Prometheus", "expr": "sum(rate(deltaforge_sink_errors_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[5m]))", "legendFormat": "errors/5m" }],
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "red", "value": 0.01 }] } }
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" }
+    },
+
+    { "id": 101, "type": "row", "title": "Top Pipelines (worst first)", "gridPos": { "x": 0, "y": 5, "w": 24, "h": 1 }, "collapsed": false, "panels": [] },
+
+    { "id": 10, "title": "Top 10 Laggiest Pipelines",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 6, "w": 8, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "topk(10, deltaforge_source_lag_seconds{instance=~\"$instance\", pipeline=~\"$pipeline\"})", "legendFormat": "{{pipeline}}" }],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2 },
           "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 5 }, { "color": "red", "value": 30 }] }
         }
       },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "value_and_name", "colorMode": "background" }
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] } }
     },
 
-    { "id": 4, "title": "Reconnects",
-      "type": "stat",
-      "gridPos": { "x": 20, "y": 1, "w": 4, "h": 4 },
-      "targets": [
-        { "datasource": "Prometheus", "expr": "sum by(pipeline)(deltaforge_source_reconnects_total{instance=~\"$instance\", pipeline=~\"$pipeline\", source=~\"$source\"})", "legendFormat": "src {{pipeline}}" },
-        { "datasource": "Prometheus", "expr": "sum by(pipeline)(deltaforge_sink_reconnects_total{instance=~\"$instance\", pipeline=~\"$pipeline\"})", "legendFormat": "sink {{pipeline}}" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "short" } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "textMode": "value_and_name" }
-    },
-
-    { "id": 101, "type": "row", "title": "Throughput", "gridPos": { "x": 0, "y": 5, "w": 24, "h": 1 }, "collapsed": false, "panels": [] },
-
-    { "id": 5, "title": "Event Throughput (events/s)",
+    { "id": 11, "title": "Top 10 by Throughput (events/s)",
       "type": "timeseries",
-      "gridPos": { "x": 0, "y": 6, "w": 8, "h": 8 },
+      "gridPos": { "x": 8, "y": 6, "w": 8, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "topk(10, sum by(pipeline)(rate(deltaforge_sink_events_total{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s])))", "legendFormat": "{{pipeline}}" }],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 } } },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] } }
+    },
+
+    { "id": 12, "title": "Top 10 DLQ Backlogs",
+      "type": "timeseries",
+      "gridPos": { "x": 16, "y": 6, "w": 8, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "topk(10, deltaforge_dlq_entries{instance=~\"$instance\", pipeline=~\"$pipeline\"})", "legendFormat": "{{pipeline}}" }],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2 },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 100 }, { "color": "red", "value": 1000 }] }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] } }
+    },
+
+    { "id": 102, "type": "row", "title": "Throughput", "gridPos": { "x": 0, "y": 14, "w": 24, "h": 1 }, "collapsed": false, "panels": [] },
+
+    { "id": 20, "title": "Aggregate Event Throughput (events/s)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 15, "w": 8, "h": 8 },
       "targets": [
-        { "datasource": "Prometheus", "expr": "sum by(pipeline)(rate(deltaforge_source_events_total{instance=~\"$instance\", pipeline=~\"$pipeline\", source=~\"$source\"}[30s]))", "legendFormat": "source {{pipeline}}" },
-        { "datasource": "Prometheus", "expr": "sum by(pipeline)(rate(deltaforge_sink_events_total{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s]))", "legendFormat": "sink {{pipeline}}" }
+        { "datasource": "Prometheus", "expr": "sum(rate(deltaforge_source_events_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s]))", "legendFormat": "source total" },
+        { "datasource": "Prometheus", "expr": "sum(rate(deltaforge_sink_events_total{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s]))", "legendFormat": "sink total" }
       ],
       "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2, "fillOpacity": 15 } } },
       "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
     },
 
-    { "id": 23, "title": "Source-Sink Delta (events/s)",
+    { "id": 21, "title": "Per-Pipeline Throughput (events/s)",
       "type": "timeseries",
-      "gridPos": { "x": 8, "y": 6, "w": 8, "h": 8 },
-      "targets": [
-        { "datasource": "Prometheus", "expr": "sum by(pipeline)(rate(deltaforge_source_events_total{instance=~\"$instance\", pipeline=~\"$pipeline\", source=~\"$source\"}[30s]))", "legendFormat": "source {{pipeline}}" },
-        { "datasource": "Prometheus", "expr": "-sum by(pipeline)(rate(deltaforge_sink_events_total{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s]))", "legendFormat": "sink {{pipeline}}", "hide": true },
-        { "datasource": "Prometheus", "expr": "sum by(pipeline)(rate(deltaforge_source_events_total{instance=~\"$instance\", pipeline=~\"$pipeline\", source=~\"$source\"}[30s])) - sum by(pipeline)(rate(deltaforge_sink_events_total{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s]))", "legendFormat": "delta {{pipeline}}" }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "custom": { "lineWidth": 2, "fillOpacity": 15, "gradientMode": "scheme" },
-          "color": { "mode": "thresholds" },
-          "thresholds": { "mode": "absolute", "steps": [
-            { "color": "#73BF69", "value": null },
-            { "color": "#FF9830", "value": 0 },
-            { "color": "#F2495C", "value": 2000 }
-          ]}
-        }
-      },
-      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+      "gridPos": { "x": 8, "y": 15, "w": 8, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "sum by(pipeline)(rate(deltaforge_sink_events_total{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s]))", "legendFormat": "{{pipeline}}" }],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2, "fillOpacity": 10 } } },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] } }
     },
 
-    { "id": 31, "title": "Data Throughput (bytes/s)",
+    { "id": 22, "title": "Data Throughput (bytes/s)",
       "type": "timeseries",
-      "gridPos": { "x": 16, "y": 6, "w": 8, "h": 8 },
+      "gridPos": { "x": 16, "y": 15, "w": 8, "h": 8 },
       "targets": [
-        { "datasource": "Prometheus", "expr": "sum by(pipeline)(rate(deltaforge_source_bytes_total{instance=~\"$instance\", pipeline=~\"$pipeline\", source=~\"$source\"}[30s]))", "legendFormat": "source {{pipeline}}" },
-        { "datasource": "Prometheus", "expr": "sum by(pipeline)(rate(deltaforge_bytes_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s]))", "legendFormat": "pipeline {{pipeline}}" }
+        { "datasource": "Prometheus", "expr": "sum(rate(deltaforge_bytes_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s]))", "legendFormat": "total" },
+        { "datasource": "Prometheus", "expr": "sum by(pipeline)(rate(deltaforge_bytes_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s]))", "legendFormat": "{{pipeline}}" }
       ],
       "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "lineWidth": 2, "fillOpacity": 15 } } },
-      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] } }
     },
 
-    { "id": 102, "type": "row", "title": "Latency", "gridPos": { "x": 0, "y": 14, "w": 24, "h": 1 }, "collapsed": false, "panels": [] },
+    { "id": 103, "type": "row", "title": "Latency & Lag", "gridPos": { "x": 0, "y": 23, "w": 24, "h": 1 }, "collapsed": false, "panels": [] },
 
-    { "id": 9, "title": "E2E Latency p50 / p95",
+    { "id": 30, "title": "E2E Latency p50 / p95",
       "type": "timeseries",
-      "gridPos": { "x": 0, "y": 15, "w": 8, "h": 8 },
+      "gridPos": { "x": 0, "y": 24, "w": 8, "h": 8 },
       "targets": [
         { "datasource": "Prometheus", "expr": "histogram_quantile(0.50, rate(deltaforge_e2e_latency_seconds_bucket{instance=~\"$instance\", pipeline=~\"$pipeline\"}[60s]))", "legendFormat": "p50 {{pipeline}}" },
         { "datasource": "Prometheus", "expr": "histogram_quantile(0.95, rate(deltaforge_e2e_latency_seconds_bucket{instance=~\"$instance\", pipeline=~\"$pipeline\"}[60s]))", "legendFormat": "p95 {{pipeline}}" }
@@ -209,92 +217,133 @@
       "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
     },
 
-    { "id": 10, "title": "Sink Latency (avg ms)",
+    { "id": 31, "title": "Source Lag (seconds)",
       "type": "timeseries",
-      "gridPos": { "x": 8, "y": 15, "w": 8, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_sink_latency_seconds_sum{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s]) / rate(deltaforge_sink_latency_seconds_count{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s]) * 1000", "legendFormat": "{{pipeline}} / {{sink}}" }],
-      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "lineWidth": 2 } } },
-      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-    },
-
-    { "id": 15, "title": "Stage Latency (avg ms)",
-      "type": "timeseries",
-      "gridPos": { "x": 16, "y": 15, "w": 8, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "sum by(pipeline, stage)(rate(deltaforge_stage_latency_seconds_sum{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s])) / sum by(pipeline, stage)(rate(deltaforge_stage_latency_seconds_count{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s])) * 1000", "legendFormat": "{{pipeline}} {{stage}}" }],
-      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "lineWidth": 2 } } },
-      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-    },
-
-    { "id": 108, "type": "row", "title": "Checkpoints & Exactly-Once", "gridPos": { "x": 0, "y": 23, "w": 24, "h": 1 }, "collapsed": false, "panels": [] },
-
-    { "id": 50, "title": "Per-Sink Checkpoint Status",
-      "description": "1 = caught up, 0 = behind/failed. Breaks down by sink within each pipeline.",
-      "type": "timeseries",
-      "gridPos": { "x": 0, "y": 24, "w": 6, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_sink_checkpoint_status{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}", "legendFormat": "{{pipeline}} / {{sink}}" }],
-      "fieldConfig": {
-        "defaults": { "unit": "short", "min": 0, "max": 1, "custom": { "lineWidth": 2 },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": 0 }, { "color": "green", "value": 1 }] }
-        }
-      },
-      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-    },
-
-    { "id": 51, "title": "Checkpoint Age (seconds)",
-      "type": "timeseries",
-      "gridPos": { "x": 6, "y": 24, "w": 6, "h": 8 },
-      "targets": [
-        { "datasource": "Prometheus", "expr": "(time() - deltaforge_last_checkpoint_ts{instance=~\"$instance\", pipeline=~\"$pipeline\"}) and on(pipeline, instance) (deltaforge_pipeline_status{instance=~\"$instance\", pipeline=~\"$pipeline\"} == 1)", "legendFormat": "pipeline {{pipeline}}" },
-        { "datasource": "Prometheus", "expr": "(time() - deltaforge_sink_last_checkpoint_ts{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}) and on(pipeline, instance) (deltaforge_pipeline_status{instance=~\"$instance\", pipeline=~\"$pipeline\"} == 1)", "legendFormat": "{{pipeline}} / {{sink}}" }
-      ],
-      "fieldConfig": {
-        "defaults": { "unit": "s", "custom": { "lineWidth": 2 },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 30 }, { "color": "red", "value": 120 }] }
-        }
-      },
-      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-    },
-
-    { "id": 52, "title": "Txn Commits (commits/s)",
-      "type": "timeseries",
-      "gridPos": { "x": 12, "y": 24, "w": 6, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_sink_txn_commits_total{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s])", "legendFormat": "{{pipeline}} / {{sink}}" }],
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 }, "color": { "fixedColor": "green", "mode": "fixed" } } },
-      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-    },
-
-    { "id": 53, "title": "Txn Aborts (aborts/s)",
-      "description": "Should be near zero. Spikes indicate Kafka transaction failures or producer fencing.",
-      "type": "timeseries",
-      "gridPos": { "x": 18, "y": 24, "w": 6, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_sink_txn_aborts_total{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s])", "legendFormat": "{{pipeline}} / {{sink}}" }],
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 }, "color": { "fixedColor": "red", "mode": "fixed" } } },
-      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-    },
-
-    { "id": 12, "title": "Checkpoint Rate (commits/s)",
-      "type": "timeseries",
-      "gridPos": { "x": 0, "y": 32, "w": 8, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_checkpoints_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s])", "legendFormat": "{{pipeline}}" }],
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 } } },
-      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-    },
-
-    { "id": 40, "title": "Replication Lag (seconds)",
-      "type": "timeseries",
-      "gridPos": { "x": 8, "y": 32, "w": 8, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_source_lag_seconds{instance=~\"$instance\", pipeline=~\"$pipeline\", source=~\"$source\"}", "legendFormat": "{{pipeline}}" }],
+      "gridPos": { "x": 8, "y": 24, "w": 8, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_source_lag_seconds{instance=~\"$instance\", pipeline=~\"$pipeline\"}", "legendFormat": "{{pipeline}}" }],
       "fieldConfig": {
         "defaults": { "unit": "s", "custom": { "lineWidth": 2 },
           "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 5 }, { "color": "red", "value": 30 }] }
         }
       },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] } }
+    },
+
+    { "id": 32, "title": "Per-Table Lag (Top 10)",
+      "type": "timeseries",
+      "gridPos": { "x": 16, "y": 24, "w": 8, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "topk(10, deltaforge_source_table_lag_seconds{instance=~\"$instance\", pipeline=~\"$pipeline\"})", "legendFormat": "{{pipeline}} / {{table}}" }],
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2 },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 5 }, { "color": "red", "value": 30 }] }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] } }
+    },
+
+    { "id": 104, "type": "row", "title": "Checkpoints & Exactly-Once", "gridPos": { "x": 0, "y": 32, "w": 24, "h": 1 }, "collapsed": false, "panels": [] },
+
+    { "id": 40, "title": "Per-Sink Checkpoint Status",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 33, "w": 6, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_sink_checkpoint_status{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}", "legendFormat": "{{pipeline}} / {{sink}}" }],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "max": 1, "custom": { "lineWidth": 2 } } },
       "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
     },
 
-    { "id": 30, "title": "Pipeline State Timeline",
+    { "id": 41, "title": "Checkpoint Rate (commits/s)",
       "type": "timeseries",
-      "gridPos": { "x": 16, "y": 32, "w": 8, "h": 8 },
+      "gridPos": { "x": 6, "y": 33, "w": 6, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_checkpoints_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s])", "legendFormat": "{{pipeline}}" }],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 } } },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    { "id": 42, "title": "Txn Commits (commits/s)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 33, "w": 6, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_sink_txn_commits_total{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s])", "legendFormat": "{{pipeline}} / {{sink}}" }],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 }, "color": { "fixedColor": "green", "mode": "fixed" } } },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    { "id": 43, "title": "Txn Aborts (aborts/s)",
+      "type": "timeseries",
+      "gridPos": { "x": 18, "y": 33, "w": 6, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_sink_txn_aborts_total{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s])", "legendFormat": "{{pipeline}} / {{sink}}" }],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 }, "color": { "fixedColor": "red", "mode": "fixed" } } },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    { "id": 105, "type": "row", "title": "Dead Letter Queue", "gridPos": { "x": 0, "y": 41, "w": 24, "h": 1 }, "collapsed": false, "panels": [] },
+
+    { "id": 50, "title": "DLQ Entries",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 42, "w": 6, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_dlq_entries{instance=~\"$instance\", pipeline=~\"$pipeline\"}", "legendFormat": "{{pipeline}}" }],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2 },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 100 }, { "color": "red", "value": 1000 }] }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    { "id": 51, "title": "DLQ Events/s",
+      "type": "timeseries",
+      "gridPos": { "x": 6, "y": 42, "w": 6, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_dlq_events_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s])", "legendFormat": "{{pipeline}} / {{sink}} / {{error_kind}}" }],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 }, "color": { "fixedColor": "orange", "mode": "fixed" } } },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    { "id": 52, "title": "DLQ Saturation",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 42, "w": 6, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_dlq_saturation_ratio{instance=~\"$instance\", pipeline=~\"$pipeline\"}", "legendFormat": "{{pipeline}}" }],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "lineWidth": 2 },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 0.8 }, { "color": "red", "value": 0.95 }] }
+        }
+      },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    { "id": 53, "title": "DLQ Overflow (evicted + rejected)",
+      "type": "timeseries",
+      "gridPos": { "x": 18, "y": 42, "w": 6, "h": 8 },
+      "targets": [
+        { "datasource": "Prometheus", "expr": "rate(deltaforge_dlq_evicted_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s])", "legendFormat": "evicted {{pipeline}}" },
+        { "datasource": "Prometheus", "expr": "rate(deltaforge_dlq_rejected_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s])", "legendFormat": "rejected {{pipeline}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 }, "color": { "fixedColor": "red", "mode": "fixed" } } },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    { "id": 106, "type": "row", "title": "Errors & Reliability", "gridPos": { "x": 0, "y": 50, "w": 24, "h": 1 }, "collapsed": false, "panels": [] },
+
+    { "id": 60, "title": "Sink Errors (errors/s)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 51, "w": 8, "h": 8 },
+      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_sink_errors_total{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s])", "legendFormat": "{{pipeline}} / {{sink}}" }],
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "fixedColor": "red", "mode": "fixed" }, "custom": { "lineWidth": 2 } } },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    { "id": 61, "title": "Reconnects (cumulative)",
+      "type": "timeseries",
+      "gridPos": { "x": 8, "y": 51, "w": 8, "h": 8 },
+      "targets": [
+        { "datasource": "Prometheus", "expr": "deltaforge_source_reconnects_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}", "legendFormat": "source {{pipeline}}" },
+        { "datasource": "Prometheus", "expr": "deltaforge_sink_reconnects_total{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}", "legendFormat": "sink {{pipeline}} / {{sink}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "fixedColor": "orange", "mode": "fixed" }, "custom": { "lineWidth": 2 } } },
+      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+    },
+
+    { "id": 62, "title": "Pipeline State Timeline",
+      "type": "timeseries",
+      "gridPos": { "x": 16, "y": 51, "w": 8, "h": 8 },
       "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_pipeline_status{instance=~\"$instance\", pipeline=~\"$pipeline\"}", "legendFormat": "{{pipeline}}" }],
       "fieldConfig": {
         "defaults": { "unit": "short", "custom": { "lineWidth": 2, "fillOpacity": 10 },
@@ -307,256 +356,49 @@
       "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
     },
 
-    { "id": 110, "type": "row", "title": "Dead Letter Queue", "gridPos": { "x": 0, "y": 40, "w": 24, "h": 1 }, "collapsed": false, "panels": [] },
+    { "id": 107, "type": "row", "title": "Batching & Kafka", "gridPos": { "x": 0, "y": 59, "w": 24, "h": 1 }, "collapsed": true, "panels": [
 
-    { "id": 70, "title": "DLQ Entries",
-      "description": "Current unacked entries in the DLQ per pipeline.",
-      "type": "timeseries",
-      "gridPos": { "x": 0, "y": 41, "w": 6, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_dlq_entries{instance=~\"$instance\", pipeline=~\"$pipeline\"}", "legendFormat": "{{pipeline}}" }],
-      "fieldConfig": {
-        "defaults": { "unit": "short", "custom": { "lineWidth": 2 },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 100 }, { "color": "red", "value": 1000 }] }
-        }
-      },
-      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-    },
-
-    { "id": 71, "title": "DLQ Events/s",
-      "description": "Rate of events being routed to the DLQ.",
-      "type": "timeseries",
-      "gridPos": { "x": 6, "y": 41, "w": 6, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_dlq_events_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s])", "legendFormat": "{{pipeline}} / {{sink}} / {{error_kind}}" }],
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 }, "color": { "fixedColor": "orange", "mode": "fixed" } } },
-      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-    },
-
-    { "id": 72, "title": "DLQ Saturation",
-      "description": "DLQ fullness ratio (current/max). >80% triggers warning, >95% error.",
-      "type": "timeseries",
-      "gridPos": { "x": 12, "y": 41, "w": 6, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_dlq_saturation_ratio{instance=~\"$instance\", pipeline=~\"$pipeline\"}", "legendFormat": "{{pipeline}}" }],
-      "fieldConfig": {
-        "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "lineWidth": 2 },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 0.8 }, { "color": "red", "value": 0.95 }] }
-        }
-      },
-      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-    },
-
-    { "id": 73, "title": "DLQ Overflow (evicted + rejected)",
-      "description": "Events lost due to DLQ overflow. Evicted = drop_oldest, Rejected = reject policy.",
-      "type": "timeseries",
-      "gridPos": { "x": 18, "y": 41, "w": 6, "h": 8 },
-      "targets": [
-        { "datasource": "Prometheus", "expr": "rate(deltaforge_dlq_evicted_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s])", "legendFormat": "evicted {{pipeline}}" },
-        { "datasource": "Prometheus", "expr": "rate(deltaforge_dlq_rejected_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s])", "legendFormat": "rejected {{pipeline}}" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2 }, "color": { "fixedColor": "red", "mode": "fixed" } } },
-      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-    },
-
-    { "id": 103, "type": "row", "title": "Errors & Reliability", "gridPos": { "x": 0, "y": 49, "w": 24, "h": 1 }, "collapsed": false, "panels": [] },
-
-    { "id": 7, "title": "Sink Errors (errors/s)",
-      "type": "timeseries",
-      "gridPos": { "x": 0, "y": 41, "w": 8, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_sink_errors_total{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s])", "legendFormat": "{{pipeline}} / {{sink}}" }],
-      "fieldConfig": { "defaults": { "unit": "ops", "color": { "fixedColor": "red", "mode": "fixed" }, "custom": { "lineWidth": 2 } } },
-      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-    },
-
-    { "id": 8, "title": "Source Errors by Kind (errors/s)",
-      "type": "timeseries",
-      "gridPos": { "x": 8, "y": 41, "w": 8, "h": 8 },
-      "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_source_errors_total{instance=~\"$instance\", pipeline=~\"$pipeline\", source=~\"$source\"}[30s])", "legendFormat": "{{pipeline}} / {{kind}}" }],
-      "fieldConfig": { "defaults": { "unit": "ops", "color": { "fixedColor": "dark-red", "mode": "fixed" }, "custom": { "lineWidth": 2 } } },
-      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-    },
-
-    { "id": 13, "title": "Reconnects (cumulative)",
-      "type": "timeseries",
-      "gridPos": { "x": 16, "y": 41, "w": 8, "h": 8 },
-      "targets": [
-        { "datasource": "Prometheus", "expr": "deltaforge_source_reconnects_total{instance=~\"$instance\", pipeline=~\"$pipeline\", source=~\"$source\"}", "legendFormat": "source {{pipeline}}" },
-        { "datasource": "Prometheus", "expr": "deltaforge_sink_reconnects_total{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}", "legendFormat": "sink {{pipeline}} / {{sink}}" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "short", "color": { "fixedColor": "orange", "mode": "fixed" }, "custom": { "lineWidth": 2 } } },
-      "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-    },
-
-    { "id": 109, "type": "row", "title": "Pipeline Detail: $pipeline",
-      "gridPos": { "x": 0, "y": 49, "w": 24, "h": 1 },
-      "collapsed": true,
-      "repeat": "pipeline",
-      "repeatDirection": "h",
-      "panels": [
-
-        { "id": 60, "title": "[$pipeline] Events by Op (events/s)",
-          "type": "timeseries",
-          "gridPos": { "x": 0, "y": 50, "w": 8, "h": 8 },
-          "targets": [{ "datasource": "Prometheus", "expr": "sum by(op)(rate(deltaforge_source_events_total{instance=~\"$instance\", pipeline=~\"$pipeline\", source=~\"$source\"}[30s]))", "legendFormat": "{{op}}" }],
-          "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 1, "fillOpacity": 60, "stacking": { "mode": "normal", "group": "A" } } } },
-          "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-        },
-
-        { "id": 61, "title": "[$pipeline] Sink Throughput (events/s)",
-          "type": "timeseries",
-          "gridPos": { "x": 8, "y": 50, "w": 8, "h": 8 },
-          "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_sink_events_total{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s])", "legendFormat": "{{sink}}" }],
-          "fieldConfig": { "defaults": { "unit": "ops", "custom": { "lineWidth": 2, "fillOpacity": 15 } } },
-          "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-        },
-
-        { "id": 62, "title": "[$pipeline] Sink Latency (avg ms)",
-          "type": "timeseries",
-          "gridPos": { "x": 16, "y": 50, "w": 8, "h": 8 },
-          "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_sink_latency_seconds_sum{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s]) / rate(deltaforge_sink_latency_seconds_count{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s]) * 1000", "legendFormat": "{{sink}}" }],
-          "fieldConfig": { "defaults": { "unit": "ms", "custom": { "lineWidth": 2 } } },
-          "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-        },
-
-        { "id": 63, "title": "[$pipeline] Batch Size (events/batch)",
-          "type": "timeseries",
-          "gridPos": { "x": 0, "y": 58, "w": 8, "h": 8 },
-          "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_batch_events_sum{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s]) / rate(deltaforge_batch_events_count{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s])", "legendFormat": "avg batch" }],
-          "fieldConfig": { "defaults": { "unit": "short", "custom": { "lineWidth": 2 } } },
-          "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-        },
-
-        { "id": 64, "title": "[$pipeline] Sink Errors + Aborts",
-          "type": "timeseries",
-          "gridPos": { "x": 8, "y": 58, "w": 8, "h": 8 },
-          "targets": [
-            { "datasource": "Prometheus", "expr": "rate(deltaforge_sink_errors_total{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s])", "legendFormat": "errors {{sink}}" },
-            { "datasource": "Prometheus", "expr": "rate(deltaforge_sink_txn_aborts_total{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s])", "legendFormat": "txn aborts {{sink}}" }
-          ],
-          "fieldConfig": { "defaults": { "unit": "ops", "color": { "fixedColor": "red", "mode": "fixed" }, "custom": { "lineWidth": 2 } } },
-          "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-        },
-
-        { "id": 65, "title": "[$pipeline] Checkpoint Age per Sink (s)",
-          "type": "timeseries",
-          "gridPos": { "x": 16, "y": 58, "w": 8, "h": 8 },
-          "targets": [{ "datasource": "Prometheus", "expr": "time() - deltaforge_sink_last_checkpoint_ts{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}", "legendFormat": "{{sink}}" }],
-          "fieldConfig": {
-            "defaults": { "unit": "s", "custom": { "lineWidth": 2 },
-              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 30 }, { "color": "red", "value": 120 }] }
-            }
-          },
-          "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-        }
-
-      ]
-    },
-
-    { "id": 104, "type": "row", "title": "Batching & Kafka", "gridPos": { "x": 0, "y": 66, "w": 24, "h": 1 }, "collapsed": true, "panels": [
-
-      { "id": 16, "title": "Avg Batch Size (events/batch)",
+      { "id": 70, "title": "Avg Batch Size (events/batch)",
         "type": "timeseries",
-        "gridPos": { "x": 0, "y": 67, "w": 8, "h": 8 },
+        "gridPos": { "x": 0, "y": 60, "w": 8, "h": 8 },
         "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_batch_events_sum{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s]) / rate(deltaforge_batch_events_count{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s])", "legendFormat": "{{pipeline}}" }],
         "fieldConfig": { "defaults": { "unit": "short", "custom": { "lineWidth": 2 } } },
         "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
       },
 
-      { "id": 33, "title": "Avg Batch Bytes",
+      { "id": 71, "title": "Avg Batch Bytes",
         "type": "timeseries",
-        "gridPos": { "x": 8, "y": 67, "w": 8, "h": 8 },
+        "gridPos": { "x": 8, "y": 60, "w": 8, "h": 8 },
         "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_batch_bytes_sum{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s]) / rate(deltaforge_batch_bytes_count{instance=~\"$instance\", pipeline=~\"$pipeline\"}[30s])", "legendFormat": "{{pipeline}}" }],
         "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "lineWidth": 2 } } },
         "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
       },
 
-      { "id": 14, "title": "Kafka Producer Queue (messages)",
+      { "id": 72, "title": "Sink Latency (avg ms)",
         "type": "timeseries",
-        "gridPos": { "x": 16, "y": 67, "w": 8, "h": 8 },
-        "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_kafka_producer_queue_messages{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}", "legendFormat": "{{pipeline}} / {{sink}}" }],
-        "fieldConfig": {
-          "defaults": { "unit": "short", "custom": { "lineWidth": 2 },
-            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 5000 }, { "color": "red", "value": 50000 }] }
-          }
-        },
-        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-      }
-
-    ]},
-
-    { "id": 105, "type": "row", "title": "Schema & Processors", "gridPos": { "x": 0, "y": 75, "w": 24, "h": 1 }, "collapsed": true, "panels": [
-
-      { "id": 17, "title": "Source Schema Cache Hit Ratio",
-        "type": "timeseries",
-        "gridPos": { "x": 0, "y": 76, "w": 8, "h": 8 },
-        "targets": [{ "datasource": "Prometheus", "expr": "sum by(pipeline)(rate(deltaforge_source_schema_cache_hits_total{instance=~\"$instance\", pipeline=~\"$pipeline\", source=~\"$source\"}[60s])) / (sum by(pipeline)(rate(deltaforge_source_schema_cache_hits_total{instance=~\"$instance\", pipeline=~\"$pipeline\", source=~\"$source\"}[60s])) + sum by(pipeline)(rate(deltaforge_source_schema_cache_misses_total{instance=~\"$instance\", pipeline=~\"$pipeline\", source=~\"$source\"}[60s])))", "legendFormat": "{{pipeline}}" }],
-        "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "lineWidth": 2 } } },
-        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-      },
-
-      { "id": 25, "title": "Schema Sensing Cache Hit Ratio",
-        "type": "timeseries",
-        "gridPos": { "x": 8, "y": 76, "w": 8, "h": 8 },
-        "targets": [{ "datasource": "Prometheus", "expr": "sum by(pipeline)(rate(deltaforge_schema_sensing_cache_hits_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[60s])) / (sum by(pipeline)(rate(deltaforge_schema_sensing_cache_hits_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[60s])) + sum by(pipeline)(rate(deltaforge_schema_sensing_cache_misses_total{instance=~\"$instance\", pipeline=~\"$pipeline\"}[60s])))", "legendFormat": "{{pipeline}}" }],
-        "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "lineWidth": 2 } } },
-        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-      },
-
-      { "id": 18, "title": "Schema Drift Detected",
-        "type": "timeseries",
-        "gridPos": { "x": 16, "y": 76, "w": 8, "h": 8 },
-        "targets": [{ "datasource": "Prometheus", "expr": "deltaforge_schema_drift_detected{instance=~\"$instance\", pipeline=~\"$pipeline\"}", "legendFormat": "{{pipeline}}" }],
-        "fieldConfig": { "defaults": { "unit": "short", "color": { "fixedColor": "purple", "mode": "fixed" }, "custom": { "lineWidth": 2 } } },
-        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-      },
-
-      { "id": 24, "title": "Processor Latency (avg ms)",
-        "type": "timeseries",
-        "gridPos": { "x": 0, "y": 84, "w": 8, "h": 8 },
-        "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_processor_latency_seconds_sum{instance=~\"$instance\", pipeline=~\"$pipeline\", processor=~\"$processor\"}[30s]) / rate(deltaforge_processor_latency_seconds_count{instance=~\"$instance\", pipeline=~\"$pipeline\", processor=~\"$processor\"}[30s]) * 1000", "legendFormat": "{{pipeline}} {{processor}}" }],
+        "gridPos": { "x": 16, "y": 60, "w": 8, "h": 8 },
+        "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_sink_latency_seconds_sum{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s]) / rate(deltaforge_sink_latency_seconds_count{instance=~\"$instance\", pipeline=~\"$pipeline\", sink=~\"$sink\"}[30s]) * 1000", "legendFormat": "{{pipeline}} / {{sink}}" }],
         "fieldConfig": { "defaults": { "unit": "ms", "custom": { "lineWidth": 2 } } },
         "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-      },
-
-      { "id": 19, "title": "Processor Drop Rate (events/s)",
-        "type": "timeseries",
-        "gridPos": { "x": 8, "y": 84, "w": 8, "h": 8 },
-        "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_processor_events_in_total{instance=~\"$instance\", pipeline=~\"$pipeline\", processor=~\"$processor\"}[30s]) - rate(deltaforge_processor_events_out_total{instance=~\"$instance\", pipeline=~\"$pipeline\", processor=~\"$processor\"}[30s])", "legendFormat": "{{pipeline}} / {{processor}}" }],
-        "fieldConfig": { "defaults": { "unit": "ops", "color": { "fixedColor": "orange", "mode": "fixed" }, "custom": { "lineWidth": 2 } } },
-        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
-      },
-
-      { "id": 20, "title": "Processor Errors (errors/s)",
-        "type": "timeseries",
-        "gridPos": { "x": 16, "y": 84, "w": 8, "h": 8 },
-        "targets": [{ "datasource": "Prometheus", "expr": "rate(deltaforge_processor_errors_total{instance=~\"$instance\", pipeline=~\"$pipeline\", processor=~\"$processor\"}[30s])", "legendFormat": "{{pipeline}} / {{processor}}" }],
-        "fieldConfig": { "defaults": { "unit": "ops", "color": { "fixedColor": "dark-orange", "mode": "fixed" }, "custom": { "lineWidth": 2 } } },
-        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
       }
 
     ]},
 
-    { "id": 107, "type": "row", "title": "Infrastructure", "gridPos": { "x": 0, "y": 92, "w": 24, "h": 1 }, "collapsed": true, "panels": [
+    { "id": 108, "type": "row", "title": "Infrastructure", "gridPos": { "x": 0, "y": 68, "w": 24, "h": 1 }, "collapsed": true, "panels": [
 
-      { "id": 21, "title": "Container CPU Usage",
+      { "id": 80, "title": "Container CPU Usage",
         "type": "timeseries",
-        "gridPos": { "x": 0, "y": 93, "w": 12, "h": 8 },
+        "gridPos": { "x": 0, "y": 69, "w": 12, "h": 8 },
         "targets": [{ "datasource": "Prometheus", "expr": "rate(container_cpu_usage_seconds_total{container_label_com_docker_compose_service=~\"deltaforge.*\"}[30s]) * 100", "legendFormat": "{{container_label_com_docker_compose_service}}" }],
-        "fieldConfig": {
-          "defaults": { "unit": "percent", "min": 0, "custom": { "lineWidth": 2 },
-            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 70 }, { "color": "red", "value": 90 }] }
-          }
-        },
+        "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "custom": { "lineWidth": 2 } } },
         "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
       },
 
-      { "id": 22, "title": "Container Memory (working set)",
+      { "id": 81, "title": "Container Memory (working set)",
         "type": "timeseries",
-        "gridPos": { "x": 12, "y": 93, "w": 12, "h": 8 },
+        "gridPos": { "x": 12, "y": 69, "w": 12, "h": 8 },
         "targets": [{ "datasource": "Prometheus", "expr": "container_memory_working_set_bytes{container_label_com_docker_compose_service=~\"deltaforge.*\"}", "legendFormat": "{{container_label_com_docker_compose_service}}" }],
-        "fieldConfig": {
-          "defaults": { "unit": "bytes", "custom": { "lineWidth": 2 },
-            "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 536870912 }, { "color": "red", "value": 1073741824 }] }
-          }
-        },
+        "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "lineWidth": 2 } } },
         "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
       }
 
