@@ -167,7 +167,8 @@ Output: `{"schema":null,"payload":{...}}`
   - Kafka producer sink (via `rdkafka`) — end-to-end exactly-once via transactional producer
   - Redis stream sink — idempotency keys for consumer-side dedup
   - NATS JetStream sink (via `async_nats`) — server-side dedup via `Nats-Msg-Id`
-  - Dynamic routing: per-event topic/stream/subject via templates or JavaScript
+  - HTTP/Webhook sink — POST/PUT to any URL with custom headers, URL templates, batch mode
+  - Dynamic routing: per-event topic/stream/subject/URL via templates or JavaScript
   - Configurable envelope formats: Native, Debezium, CloudEvents
   - JSON wire encoding (Avro planned and more to come)
 
