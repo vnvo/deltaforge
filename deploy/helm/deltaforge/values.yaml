@@ -32,6 +32,7 @@ pipeline:
           dsn: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql-primary:3306/orders"
           tables: ["orders.*"]
           on_schema_drift: adapt
+      processors: []
       sinks:
         - type: kafka
           config:
