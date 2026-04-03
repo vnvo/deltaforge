@@ -776,20 +776,21 @@ footer {
             <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/nats/nats-original.svg" alt="NATS" style="width:28px;height:28px;">
             <span style="font-size:0.7rem;color:var(--text-secondary);">NATS</span>
           </div>
+          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="#e8e8ec" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+            <span style="font-size:0.7rem;color:var(--text-secondary);">HTTP</span>
+          </div>
         </div>
       </div>
       <div class="tech-cell">
         <div class="tech-label">Formats</div>
         <div class="tech-icons" style="display:flex; gap:8px; justify-content:center; align-items:center; flex-wrap:wrap;">
-          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
-            <span class="format-badge native" style="display:block;">Native</span>
-          </div>
-          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
-            <span class="format-badge debezium" style="display:block;">Debezium</span>
-          </div>
-          <div style="display:flex; flex-direction:column; align-items:center; gap:6px;">
-            <span class="format-badge cloudevents" style="display:block;">CloudEvents</span>
-          </div>
+          <span class="format-badge native" style="display:block;">JSON</span>
+          <span class="format-badge debezium" style="display:block;">Avro</span>
+          <span style="color:var(--text-dim); font-size:0.65rem;">·</span>
+          <span class="format-badge native" style="display:block;">Native</span>
+          <span class="format-badge debezium" style="display:block;">Debezium</span>
+          <span class="format-badge cloudevents" style="display:block;">CloudEvents</span>
         </div>
       </div>
     </div>
@@ -1014,6 +1015,9 @@ footer {
   <span class="punc">}</span>
 <span class="punc">}</span></div>
       </div>
+    </div>
+    <div style="text-align:center; margin-top:24px; color:var(--text-secondary); font-size:0.85rem;">
+      All envelopes support both <strong style="color:var(--text-primary);">JSON</strong> and <strong style="color:var(--text-primary);">Avro</strong> wire encoding. Avro uses the Confluent wire format with Schema Registry for compact binary payloads and schema governance.
     </div>
   </div>
 </section>
