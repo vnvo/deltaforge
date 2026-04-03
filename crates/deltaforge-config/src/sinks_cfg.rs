@@ -94,10 +94,7 @@ impl Serialize for EncodingCfg {
                     "schema_registry_url",
                     schema_registry_url,
                 )?;
-                map.serialize_entry(
-                    "subject_strategy",
-                    subject_strategy,
-                )?;
+                map.serialize_entry("subject_strategy", subject_strategy)?;
                 if let Some(u) = username {
                     map.serialize_entry("username", u)?;
                 }

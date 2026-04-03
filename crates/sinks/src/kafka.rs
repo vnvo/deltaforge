@@ -37,8 +37,8 @@ use anyhow::Context;
 use async_trait::async_trait;
 use common::CompiledTemplate;
 use common::{RetryOutcome, RetryPolicy, retry_async};
-use deltaforge_config::KafkaSinkCfg;
 use deltaforge_config::EncodingCfg;
+use deltaforge_config::KafkaSinkCfg;
 use deltaforge_core::encoding::EncodingType;
 use deltaforge_core::encoding::avro::AvroEncoder;
 use deltaforge_core::envelope::Envelope;
@@ -271,12 +271,15 @@ impl KafkaSink {
                 CfgStrategy::TopicRecordName => CoreStrategy::TopicRecordName,
             };
 
-            Some(AvroEncoder::new(
-                schema_registry_url,
-                strategy,
-                username.as_deref(),
-                password.as_deref(),
-            ).context("creating Avro encoder")?)
+            Some(
+                AvroEncoder::new(
+                    schema_registry_url,
+                    strategy,
+                    username.as_deref(),
+                    password.as_deref(),
+                )
+                .context("creating Avro encoder")?,
+            )
         } else {
             None
         };
@@ -473,7 +476,10 @@ impl KafkaSink {
         event: &Event,
         topic: &str,
     ) -> SinkResult<Vec<u8>> {
-        let encoder = self.avro_encoder.as_ref().expect("avro_encoder must be set");
+        let encoder = self
+            .avro_encoder
+            .as_ref()
+            .expect("avro_encoder must be set");
 
         if event.routing.as_ref().is_some_and(|r| r.raw_payload) {
             return serde_json::to_vec(
@@ -488,11 +494,11 @@ impl KafkaSink {
             }
         })?;
 
-        let bytes = encoder
-            .encode(topic, &envelope, None)
-            .await
-            .map_err(|e| SinkError::Serialization {
-                details: e.to_string().into(),
+        let bytes =
+            encoder.encode(topic, &envelope, None).await.map_err(|e| {
+                SinkError::Serialization {
+                    details: e.to_string().into(),
+                }
             })?;
 
         Ok(bytes.to_vec())

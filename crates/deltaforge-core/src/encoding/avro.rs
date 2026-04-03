@@ -20,8 +20,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use apache_avro::types::Value as AvroValue;
 use apache_avro::Schema as AvroSchema;
+use apache_avro::types::Value as AvroValue;
 use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::RwLock;
 use serde::Serialize;
@@ -47,16 +47,12 @@ pub enum SubjectStrategy {
 
 impl SubjectStrategy {
     /// Resolve the subject name for a given topic and optional record name.
-    pub fn resolve(
-        &self,
-        topic: &str,
-        record_name: Option<&str>,
-    ) -> String {
+    pub fn resolve(&self, topic: &str, record_name: Option<&str>) -> String {
         match self {
             SubjectStrategy::TopicName => format!("{topic}-value"),
-            SubjectStrategy::RecordName => record_name
-                .unwrap_or("deltaforge.Event")
-                .to_string(),
+            SubjectStrategy::RecordName => {
+                record_name.unwrap_or("deltaforge.Event").to_string()
+            }
             SubjectStrategy::TopicRecordName => {
                 let rn = record_name.unwrap_or("deltaforge.Event");
                 format!("{topic}-{rn}")
@@ -153,8 +149,7 @@ impl SchemaRegistryClient {
         }
 
         // Register with Schema Registry
-        let url =
-            format!("{}/subjects/{}/versions", self.base_url, subject);
+        let url = format!("{}/subjects/{}/versions", self.base_url, subject);
 
         let body = serde_json::json!({
             "schema": schema_json,
@@ -181,8 +176,7 @@ impl SchemaRegistryClient {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             // Try to parse structured error
-            if let Ok(sr_err) = serde_json::from_str::<SrErrorResponse>(&body)
-            {
+            if let Ok(sr_err) = serde_json::from_str::<SrErrorResponse>(&body) {
                 return Err(EncodingError::SchemaRegistry(format!(
                     "schema registration failed for {subject}: {} (code: {})",
                     sr_err.message.unwrap_or_default(),
@@ -285,12 +279,11 @@ impl SchemaRegistryClient {
             ))
         })?;
 
-        let schema =
-            AvroSchema::parse_str(&lookup.schema).map_err(|e| {
-                EncodingError::Avro(format!(
-                    "failed to parse schema from registry: {e}"
-                ))
-            })?;
+        let schema = AvroSchema::parse_str(&lookup.schema).map_err(|e| {
+            EncodingError::Avro(format!(
+                "failed to parse schema from registry: {e}"
+            ))
+        })?;
         let schema = Arc::new(schema);
 
         // Cache it
@@ -339,11 +332,8 @@ impl AvroEncoder {
         username: Option<&str>,
         password: Option<&str>,
     ) -> Result<Self, EncodingError> {
-        let registry = SchemaRegistryClient::new(
-            schema_registry_url,
-            username,
-            password,
-        )?;
+        let registry =
+            SchemaRegistryClient::new(schema_registry_url, username, password)?;
 
         let auth = match (username, password) {
             (Some(u), Some(p)) => Some((u.to_string(), p.to_string())),
@@ -385,10 +375,7 @@ impl AvroEncoder {
         let subject = self.strategy.resolve(topic, record_name);
 
         // 4. Register schema (idempotent — returns cached ID if unchanged)
-        let auth = self
-            .auth
-            .as_ref()
-            .map(|(u, p)| (u.as_str(), p.as_str()));
+        let auth = self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
         let (schema_id, schema) = self
             .registry
             .register_schema(&subject, &schema_json, auth)
@@ -398,10 +385,10 @@ impl AvroEncoder {
         let avro_value = json_to_avro(&json_value, &schema)?;
 
         // 6. Encode as Avro binary
-        let avro_bytes =
-            apache_avro::to_avro_datum(&schema, avro_value).map_err(
-                |e| EncodingError::Avro(format!("Avro encoding failed: {e}")),
-            )?;
+        let avro_bytes = apache_avro::to_avro_datum(&schema, avro_value)
+            .map_err(|e| {
+                EncodingError::Avro(format!("Avro encoding failed: {e}"))
+            })?;
 
         // 7. Build Confluent wire format: [0x00][schema_id:4][avro_payload]
         let mut buf = BytesMut::with_capacity(5 + avro_bytes.len());
@@ -459,7 +446,9 @@ fn derive_avro_schema(
         }
         _ => {
             // Non-object top-level: wrap in a record with a single "value" field
-            warn!("non-object value for Avro schema derivation, wrapping in record");
+            warn!(
+                "non-object value for Avro schema derivation, wrapping in record"
+            );
             let avro_type = json_type_to_avro(value, "value");
             format!(
                 r#"{{"type":"record","name":"{}","fields":[{{"name":"value","type":{}}}]}}"#,
@@ -488,18 +477,13 @@ fn json_type_to_avro(value: &serde_json::Value, field_name: &str) -> String {
                 // Empty array: default to array of strings
                 r#"["null",{"type":"array","items":"string"}]"#.to_string()
             } else {
-                let item_type =
-                    json_type_to_avro_primitive(&arr[0]);
-                format!(
-                    r#"["null",{{"type":"array","items":{}}}]"#,
-                    item_type
-                )
+                let item_type = json_type_to_avro_primitive(&arr[0]);
+                format!(r#"["null",{{"type":"array","items":{}}}]"#, item_type)
             }
         }
         serde_json::Value::Object(map) => {
             // Nested record: use field_name as record name
-            let nested_name =
-                format!("deltaforge.{}", capitalize(field_name));
+            let nested_name = format!("deltaforge.{}", capitalize(field_name));
             let fields: Vec<String> = map
                 .iter()
                 .map(|(key, val)| {
@@ -593,10 +577,7 @@ mod tests {
             s.resolve("my-topic", Some("com.acme.Order")),
             "com.acme.Order"
         );
-        assert_eq!(
-            s.resolve("my-topic", None),
-            "deltaforge.Event"
-        );
+        assert_eq!(s.resolve("my-topic", None), "deltaforge.Event");
     }
 
     #[test]

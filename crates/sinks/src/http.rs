@@ -134,12 +134,15 @@ impl HttpSink {
                 CfgStrategy::TopicRecordName => CoreStrategy::TopicRecordName,
             };
 
-            Some(AvroEncoder::new(
-                schema_registry_url,
-                strategy,
-                username.as_deref(),
-                password.as_deref(),
-            ).context("creating Avro encoder")?)
+            Some(
+                AvroEncoder::new(
+                    schema_registry_url,
+                    strategy,
+                    username.as_deref(),
+                    password.as_deref(),
+                )
+                .context("creating Avro encoder")?,
+            )
         } else {
             None
         };
@@ -226,7 +229,10 @@ impl HttpSink {
         event: &Event,
         dest: &str,
     ) -> SinkResult<Vec<u8>> {
-        let encoder = self.avro_encoder.as_ref().expect("avro_encoder must be set");
+        let encoder = self
+            .avro_encoder
+            .as_ref()
+            .expect("avro_encoder must be set");
 
         if event.routing.as_ref().is_some_and(|r| r.raw_payload) {
             return serde_json::to_vec(
@@ -241,11 +247,11 @@ impl HttpSink {
             }
         })?;
 
-        let bytes = encoder
-            .encode(dest, &envelope, None)
-            .await
-            .map_err(|e| SinkError::Serialization {
-                details: e.to_string().into(),
+        let bytes =
+            encoder.encode(dest, &envelope, None).await.map_err(|e| {
+                SinkError::Serialization {
+                    details: e.to_string().into(),
+                }
             })?;
 
         Ok(bytes.to_vec())
@@ -374,7 +380,8 @@ impl Sink for HttpSink {
                 let url = self.resolve_url(e)?;
                 let payload = self.encode_event(e, &url).await?;
                 Ok::<_, SinkError>((url, payload))
-            }.await;
+            }
+            .await;
             match prepared {
                 Ok(prepared) => serialized.push(prepared),
                 Err(e) if e.is_dlq_eligible() => {

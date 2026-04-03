@@ -78,10 +78,7 @@ async fn register_schema(
         .next_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    schemas
-        .entry(subject)
-        .or_default()
-        .push((id, schema_str));
+    schemas.entry(subject).or_default().push((id, schema_str));
 
     Json(json!({ "id": id }))
 }
@@ -89,14 +86,10 @@ async fn register_schema(
 async fn start_mock_registry() -> (String, MockSchemaRegistry) {
     let registry = MockSchemaRegistry::new();
     let app = Router::new()
-        .route(
-            "/subjects/{subject}/versions",
-            post(register_schema),
-        )
+        .route("/subjects/{subject}/versions", post(register_schema))
         .with_state(registry.clone());
 
-    let listener =
-        tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let url = format!("http://127.0.0.1:{}", addr.port());
 
@@ -158,10 +151,8 @@ async fn mock_avro_encode_caches_schema_id() -> Result<()> {
     let bytes2 = encoder.encode("cache-topic", &value2, None).await?;
 
     // Both should use the same schema ID (cached)
-    let id1 =
-        u32::from_be_bytes([bytes1[1], bytes1[2], bytes1[3], bytes1[4]]);
-    let id2 =
-        u32::from_be_bytes([bytes2[1], bytes2[2], bytes2[3], bytes2[4]]);
+    let id1 = u32::from_be_bytes([bytes1[1], bytes1[2], bytes1[3], bytes1[4]]);
+    let id2 = u32::from_be_bytes([bytes2[1], bytes2[2], bytes2[3], bytes2[4]]);
     assert_eq!(id1, id2, "same schema structure should get same cached ID");
 
     // Should only have registered once
@@ -177,12 +168,8 @@ async fn mock_avro_encode_record_name_strategy() -> Result<()> {
     init_test_tracing();
 
     let (url, _registry) = start_mock_registry().await;
-    let encoder = AvroEncoder::new(
-        &url,
-        SubjectStrategy::RecordName,
-        None,
-        None,
-    )?;
+    let encoder =
+        AvroEncoder::new(&url, SubjectStrategy::RecordName, None, None)?;
 
     let value = json!({"id": 1, "name": "test"});
     let bytes = encoder
@@ -327,10 +314,7 @@ fn sr_url() -> String {
     format!("http://localhost:{SR_PORT}")
 }
 
-async fn wait_for_schema_registry(
-    url: &str,
-    timeout: Duration,
-) -> Result<()> {
+async fn wait_for_schema_registry(url: &str, timeout: Duration) -> Result<()> {
     let client = reqwest::Client::new();
     let deadline = Instant::now() + timeout;
 
@@ -421,10 +405,7 @@ async fn fetch_schema_by_id(
 /// List all subjects from Schema Registry.
 async fn list_subjects(sr_url: &str) -> Result<Vec<String>> {
     let client = reqwest::Client::new();
-    let resp = client
-        .get(format!("{sr_url}/subjects"))
-        .send()
-        .await?;
+    let resp = client.get(format!("{sr_url}/subjects")).send().await?;
     let subjects: Vec<String> = resp.json().await?;
     Ok(subjects)
 }
@@ -437,12 +418,8 @@ async fn real_sr_encode_and_verify_schema_registered() -> Result<()> {
     init_test_tracing();
     let _infra = get_infra().await;
 
-    let encoder = AvroEncoder::new(
-        &sr_url(),
-        SubjectStrategy::TopicName,
-        None,
-        None,
-    )?;
+    let encoder =
+        AvroEncoder::new(&sr_url(), SubjectStrategy::TopicName, None, None)?;
 
     let value = json!({
         "id": 1,
@@ -486,12 +463,8 @@ async fn real_sr_decode_avro_payload() -> Result<()> {
     init_test_tracing();
     let _infra = get_infra().await;
 
-    let encoder = AvroEncoder::new(
-        &sr_url(),
-        SubjectStrategy::TopicName,
-        None,
-        None,
-    )?;
+    let encoder =
+        AvroEncoder::new(&sr_url(), SubjectStrategy::TopicName, None, None)?;
 
     let original = json!({
         "id": 42,
@@ -524,10 +497,7 @@ async fn real_sr_decode_avro_payload() -> Result<()> {
             fields.iter().map(|(name, _)| name.as_str()).collect();
         assert!(field_names.contains(&"id"), "should have 'id' field");
         assert!(field_names.contains(&"name"), "should have 'name' field");
-        assert!(
-            field_names.contains(&"score"),
-            "should have 'score' field"
-        );
+        assert!(field_names.contains(&"score"), "should have 'score' field");
     } else {
         panic!("expected Record, got: {decoded:?}");
     }
@@ -541,12 +511,8 @@ async fn real_sr_schema_caching_same_id() -> Result<()> {
     init_test_tracing();
     let _infra = get_infra().await;
 
-    let encoder = AvroEncoder::new(
-        &sr_url(),
-        SubjectStrategy::TopicName,
-        None,
-        None,
-    )?;
+    let encoder =
+        AvroEncoder::new(&sr_url(), SubjectStrategy::TopicName, None, None)?;
 
     let val1 = json!({"x": 1, "y": "a"});
     let val2 = json!({"x": 2, "y": "b"});
@@ -573,12 +539,8 @@ async fn real_sr_record_name_strategy() -> Result<()> {
     init_test_tracing();
     let _infra = get_infra().await;
 
-    let encoder = AvroEncoder::new(
-        &sr_url(),
-        SubjectStrategy::RecordName,
-        None,
-        None,
-    )?;
+    let encoder =
+        AvroEncoder::new(&sr_url(), SubjectStrategy::RecordName, None, None)?;
 
     let value = json!({"order_id": 100, "total": 42});
     let bytes = encoder
@@ -606,12 +568,8 @@ async fn real_sr_cdc_event_structure() -> Result<()> {
     init_test_tracing();
     let _infra = get_infra().await;
 
-    let encoder = AvroEncoder::new(
-        &sr_url(),
-        SubjectStrategy::TopicName,
-        None,
-        None,
-    )?;
+    let encoder =
+        AvroEncoder::new(&sr_url(), SubjectStrategy::TopicName, None, None)?;
 
     // Simulate a full CDC event (like what DeltaForge produces after envelope wrapping)
     let cdc_event = json!({
@@ -629,9 +587,7 @@ async fn real_sr_cdc_event_structure() -> Result<()> {
         "ts_ms": 1700000000000_i64
     });
 
-    let bytes = encoder
-        .encode("cdc-avro-test", &cdc_event, None)
-        .await?;
+    let bytes = encoder.encode("cdc-avro-test", &cdc_event, None).await?;
 
     assert_eq!(bytes[0], 0x00);
     let schema_id =
@@ -643,11 +599,8 @@ async fn real_sr_cdc_event_structure() -> Result<()> {
     let schema_str = schema_resp["schema"].as_str().unwrap();
     let avro_schema = apache_avro::Schema::parse_str(schema_str)?;
 
-    let decoded = apache_avro::from_avro_datum(
-        &avro_schema,
-        &mut &bytes[5..],
-        None,
-    )?;
+    let decoded =
+        apache_avro::from_avro_datum(&avro_schema, &mut &bytes[5..], None)?;
 
     if let apache_avro::types::Value::Record(fields) = &decoded {
         let field_names: Vec<&str> =
