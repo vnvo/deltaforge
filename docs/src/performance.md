@@ -240,3 +240,46 @@ The benchmark:
 4. Reports avg/p50/peak events/s with full configuration in the output
 
 Tune `--drain-max-events`, `--drain-max-ms`, and `--drain-kafka-conf` to experiment with different settings. The chaos UI also exposes these as form fields for interactive tuning.
+
+## Avro Encoding Performance
+
+Avro encoding trades slightly higher producer CPU for significantly smaller payloads.
+
+### Expected impact
+
+| Metric | JSON (baseline) | Avro | Notes |
+|--------|-----------------|------|-------|
+| Payload size | Baseline | ~40-60% smaller | No field names, binary encoding |
+| Producer CPU | Baseline | ~10-20% higher | Schema lookup + Avro binary encoding |
+| Kafka broker disk/network | Baseline | ~40-60% less | Significant at scale |
+| First-event latency | Instant | +5-50ms | One-time Schema Registry call per table |
+| Steady-state latency | Baseline | Comparable | Schema cached after first event |
+
+The system-level throughput (events/sec end-to-end) usually stays the same or improves because the bottleneck is typically network/disk I/O, not producer CPU. Smaller payloads reduce broker-side pressure.
+
+### Comparing JSON vs Avro
+
+Run both soak tests side by side (different containers, same source):
+
+```bash
+docker compose -f docker-compose.chaos.yml \
+  --profile base --profile mysql-infra --profile kafka-infra \
+  --profile soak --profile avro-soak up -d
+
+# JSON baseline
+cargo run -p chaos -- --scenario soak-stable --duration-mins 30
+
+# Avro comparison
+cargo run -p chaos -- --scenario soak-stable-avro --duration-mins 30
+```
+
+Compare in Grafana: `rate(deltaforge_sink_events_total[1m])` filtered by instance port 9001 (JSON) vs 9006 (Avro).
+
+### Avro-specific flamegraph areas
+
+| Area | What it means |
+|------|---------------|
+| `encode_event` / `encode_with_schema` | Avro encoding path — schema lookup + binary encoding |
+| `register_schema` | Schema Registry HTTP call (only on first event per table or DDL change) |
+| `json_to_avro` / `to_avro_datum` | JSON → Avro value conversion + binary serialization |
+| `resolve` (in avro module) | Schema cache lookup — should be near-instant |

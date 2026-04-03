@@ -220,6 +220,8 @@ Different scenarios require different compose profiles:
 | `soak` | 8081 | MySQL soak endurance, backlog-drain benchmark |
 | `pg-soak` | 8083 | PostgreSQL soak endurance, backlog-drain benchmark |
 | `tpcc` | 8082 | TPC-C benchmark |
+| `avro-app` | 8084 | MySQL → Kafka with Avro encoding (resilience) |
+| `avro-soak` | 8086 | MySQL Avro soak (performance comparison vs JSON) |
 
 ### Run resilience scenarios
 
@@ -262,6 +264,34 @@ cargo run -p chaos -- --scenario backlog-drain --source postgres --no-proxy \
 docker compose -f docker-compose.chaos.yml --profile tpcc up -d
 cargo run -p chaos -- --scenario tpcc --duration-mins 30
 ```
+
+### Avro encoding tests
+
+Avro tests require the `kafka-infra` profile (includes Schema Registry).
+
+```bash
+# Unit + mock tests (no Docker needed)
+cargo test -p sinks --test avro_encoding_tests
+
+# Real Schema Registry integration tests (Docker)
+cargo test -p sinks --test avro_encoding_tests -- --include-ignored --nocapture --test-threads=1
+
+# Schema Registry outage chaos scenario
+docker compose -f docker-compose.chaos.yml \
+  --profile base --profile mysql-infra --profile kafka-infra --profile avro-app up -d
+cargo run -p chaos -- --source mysql --scenario sr-outage
+
+# Avro soak — performance comparison against JSON
+docker compose -f docker-compose.chaos.yml \
+  --profile base --profile mysql-infra --profile kafka-infra --profile avro-soak up -d
+cargo run -p chaos -- --source mysql --scenario soak-stable-avro --duration-mins 30
+
+# Compare: run JSON soak alongside (different ports, same MySQL source)
+docker compose -f docker-compose.chaos.yml --profile soak up -d
+cargo run -p chaos -- --source mysql --scenario soak-stable --duration-mins 30
+```
+
+Compare throughput in Grafana: `deltaforge_sink_events_total` rate for JSON soak (port 9001) vs Avro soak (port 9006).
 
 See [Performance Tuning](performance.md) for detailed throughput optimization guidance and profiling instructions.
 

@@ -47,6 +47,15 @@ The sections below call out concrete metrics and log events to add per component
 | ✅ Implemented | `deltaforge_sink_last_checkpoint_ts{pipeline,sink}` epoch timestamp. | Per-sink checkpoint age. |
 | 🚧 Gap | Backpressure gauge for client buffers (rdkafka queue, Redis pipeline depth). | Early signal before errors occur. |
 
+### Avro encoding (when `encoding: avro` is configured)
+
+| Status | Metric/log | Rationale |
+| --- | --- | --- |
+| ✅ Implemented | `deltaforge_avro_encode_total{path}` counter — `path=ddl` (DDL-derived schema) or `path=inferred` (JSON fallback). | Track which schema source is being used. DDL is preferred. |
+| ✅ Implemented | `deltaforge_avro_schema_registrations_total` counter — successful Schema Registry registrations. | Monitor schema registration activity. |
+| ✅ Implemented | `deltaforge_avro_sr_cache_fallback_total` counter — events encoded with cached schema because SR was unavailable. | Alert on SR connectivity issues. |
+| ✅ Implemented | `deltaforge_avro_encode_failure_total{reason}` counter — `reason=sr_unavailable` (no cache, can't encode) or `reason=schema_mismatch` (DDL changed, old schema can't encode event). | Alert on encoding failures; events with these errors are routed to DLQ. |
+
 ### Pipeline lifecycle
 
 | Status | Metric/log | Rationale |

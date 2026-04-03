@@ -215,6 +215,9 @@ sinks:
 | `subject_strategy` | string | `topic_name` | Subject naming strategy (see below) |
 | `username` | string | — | Basic auth username for Schema Registry |
 | `password` | string | — | Basic auth password for Schema Registry |
+| `unsigned_bigint_mode` | string | `string` | How to map MySQL `BIGINT UNSIGNED` (`string` or `long`) |
+| `enum_mode` | string | `string` | How to map ENUM types (`string` or `enum`) |
+| `naive_timestamp_mode` | string | `string` | How to map naive timestamps (`string` or `timestamp`) |
 
 #### Subject naming strategies
 
@@ -224,17 +227,45 @@ sinks:
 | `record_name` | `{record_name}` | One schema per record type, shared across topics |
 | `topic_record_name` | `{topic}-{record_name}` | Per-topic, per-record schema |
 
-#### Schema auto-registration
+#### Schema source
 
-DeltaForge automatically derives an Avro schema from the first event's JSON structure and registers it with the Schema Registry. Subsequent events with the same structure reuse the cached schema ID — no per-event HTTP call.
+When source DDL is available (MySQL `INFORMATION_SCHEMA`, PostgreSQL `pg_catalog`), DeltaForge derives precise Avro schemas from the actual column types and nullability. This is the recommended path for production.
 
-- **Nullable fields**: All fields are wrapped in `["null", <type>]` unions since CDC columns may be nullable
-- **Nested objects**: Mapped to nested Avro records
-- **Type mapping**: `string → string`, `integer → long`, `float → double`, `boolean → boolean`
+When DDL is not available (e.g., processor-created synthetic events), DeltaForge falls back to inferring the Avro schema from the JSON event structure. This is less precise (no distinction between `int`/`bigint`, all fields nullable).
+
+Schema IDs are cached per subject — only the first event per table triggers a Schema Registry HTTP call.
+
+#### Type conversion policies
+
+DeltaForge defaults to **safe** type mappings that prioritize correctness over convenience:
+
+| Source type | Default Avro type | Why | Override |
+|-------------|-------------------|-----|----------|
+| MySQL `BIGINT UNSIGNED` | `string` | Values ≥ 2^63 overflow Avro `long` | `unsigned_bigint_mode: long` |
+| MySQL/PG `ENUM` | `string` | Avro enum symbol changes break compatibility | `enum_mode: enum` |
+| MySQL `DATETIME` | `string` (ISO-8601) | Not a UTC instant — Avro `timestamp-millis` is semantically wrong | `naive_timestamp_mode: timestamp` |
+| PG `timestamp` (no tz) | `string` (ISO-8601) | Same as above — naive local time, not an instant | `naive_timestamp_mode: timestamp` |
+| MySQL `TIMESTAMP` | `timestamp-millis` | Stored as UTC — safe to use logical type | — |
+| PG `timestamptz` | `timestamp-micros` | Stored as UTC — safe to use logical type | — |
+| `DECIMAL(p,s)` | `decimal` logical type | Uses exact precision/scale from DDL | — |
+| PG `numeric` (no precision) | `string` | Unbounded precision can't be expressed in Avro `decimal` | — |
+
+**Full type mapping tables** for MySQL and PostgreSQL are documented in the [Avro Schema Registry RFC](https://github.com/deltaforge/deltaforge/blob/main/docs/specs/avro-schema-registry.md).
 
 #### Schema evolution
 
-When the source table schema changes (column added/removed/altered), DeltaForge derives a new Avro schema and registers it as a new version under the same subject. The Schema Registry's compatibility rules (BACKWARD, FORWARD, FULL) control whether the new version is accepted.
+When the source table schema changes (column added/removed/altered), DeltaForge derives a new Avro schema and registers it as a new version. The Schema Registry's compatibility rules control acceptance:
+
+- **Default:** `BACKWARD` — new schema can read old data (consumers can upgrade first)
+- DeltaForge respects existing subject compatibility settings in the SR
+
+#### Schema Registry failure handling
+
+| Condition | Behavior |
+|-----------|----------|
+| SR unavailable, schema cached | Continue encoding with cached schema ID. Metric: `deltaforge_avro_sr_cache_fallback_total` |
+| SR unavailable, no cache | Fail the batch — cannot encode without a schema ID |
+| SR rejects new schema (compatibility) | Try encoding with cached schema; if encoding fails → DLQ |
 
 #### When to use
 

@@ -35,3 +35,59 @@ A `503` means at least one pipeline has entered a permanently failed state — i
 | Unrecoverable source error | `run task ended with error` | Check source logs; fix the root cause and restart |
 
 Use `GET /pipelines` to see which pipeline has `"status": "failed"` and check its logs for the specific error. After fixing the root cause, restart the DeltaForge process (or the container) to reset pipeline state.
+
+## Avro encoding issues
+
+### Schema Registry connection failed
+
+```
+WARN Schema Registry unavailable — using cached schema
+```
+
+DeltaForge is encoding with a previously cached schema ID. Events are still flowing, but new schema registrations (e.g., after DDL changes) will fail until the SR recovers. Check:
+- Schema Registry connectivity: `curl http://<sr-url>/subjects`
+- Network/firewall between DeltaForge and the SR
+- Monitor `deltaforge_avro_sr_cache_fallback_total` — if increasing, the SR is unreachable
+
+### Schema registration rejected (compatibility failure)
+
+```
+WARN DDL change for {table} produced incompatible Avro schema — encoding with previous version
+```
+
+The source table DDL changed and the new Avro schema was rejected by the Schema Registry's compatibility rules. DeltaForge attempts to encode with the previous schema version:
+- If encoding succeeds: events continue flowing (the old schema still covers the new data)
+- If encoding fails: events are routed to DLQ with `schema_mismatch` error
+
+**Resolution:** Either relax the SR subject compatibility mode (e.g., `NONE` or `FORWARD`) or handle the DLQ entries after updating consumer schemas.
+
+### Events routed to DLQ with `schema_mismatch`
+
+A DDL change produced events that can't be encoded under the cached schema. This happens when a non-backward-compatible change is made (e.g., column type change, NOT NULL added to existing column).
+
+**Resolution:**
+1. Check `deltaforge_avro_encode_failure_total{reason="schema_mismatch"}`
+2. Identify the DDL change from source DB logs
+3. Update the SR subject compatibility if needed
+4. Restart the pipeline to clear the schema cache and re-register
+
+### BIGINT UNSIGNED overflow warning
+
+```
+WARN BIGINT UNSIGNED column {col} mapped to long — values >= 2^63 will fail encoding
+```
+
+Only appears when `unsigned_bigint_mode: long` is configured. If a row contains a value ≥ 2^63, encoding will fail and the event is routed to DLQ. The default `unsigned_bigint_mode: string` avoids this entirely.
+
+### Using inferred schema instead of DDL
+
+```
+DEBUG no DDL schema available — falling back to JSON inference (Path C)
+```
+
+DeltaForge couldn't look up the source table schema and is using a less precise JSON-inferred schema. This happens when:
+- The schema loader hasn't cached the table schema yet (first events at startup)
+- The table doesn't match the configured table patterns
+- The source type doesn't support schema loading
+
+Check `deltaforge_avro_encode_total{path="inferred"}` — if this counter is growing while `path="ddl"` is not, investigate why DDL lookup is failing.

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Avro encoding with Confluent Schema Registry** — Confluent wire format `[0x00][schema_id:4][avro_binary]` for all sinks (Kafka, Redis, NATS, HTTP). DDL-derived schemas from MySQL/PostgreSQL column types with exact precision and nullability. Safe type defaults: `BIGINT UNSIGNED → string`, `ENUM → string`, naive timestamps → ISO-8601 string. Schema Registry failure handling with cached schema fallback (continue if encodable, DLQ if not). Subject strategies: TopicName, RecordName, TopicRecordName. 6 mock + 5 real SR integration tests + 37 type conversion unit tests. Configurable via `unsigned_bigint_mode`, `enum_mode`, `naive_timestamp_mode`.
+- **Avro chaos tests** — Schema Registry outage scenario (`sr-outage`): cuts SR proxy, verifies cached schema fallback, verifies recovery. Avro soak benchmarks (`soak-avro`, `soak-stable-avro`) for JSON vs Avro throughput comparison.
 - **Dead Letter Queue** — per-event failure routing to a durable queue. Poison events (serialization/routing failures) go to DLQ instead of blocking the pipeline. Overflow policies: drop_oldest, reject, block. REST API: peek, count, ack, purge with sink_id/error_kind filters. Background age-based cleanup. Grafana dashboard panels. `--scenario dlq-poison` chaos test.
 - **Sink `BatchResult`** — `send_batch()` now returns per-event DLQ failures alongside successful delivery. All built-in sinks (Kafka, NATS, Redis) collect per-event serialization/routing errors instead of failing the entire batch.
 - **Faulty Events fault injection** — chaos UI button and soak fault that PATCHes sink topic to broken template for 10s → events fail routing → DLQ. Auto-restores.

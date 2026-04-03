@@ -10,7 +10,7 @@
 
 # Introduction
 
-DeltaForge is a versatile, high-performance [Change Data Capture](cdc.md) (CDC) engine built in Rust. It streams database changes into downstream systems like Kafka, Redis, and NATS - giving you full control over how events are routed, transformed, and delivered. Built-in schema discovery automatically infers and tracks the shape of your data as it flows through, including deep inspection of nested JSON structures.
+DeltaForge is a versatile, high-performance [Change Data Capture](cdc.md) (CDC) engine built in Rust. It streams database changes into downstream systems like Kafka, Redis, NATS, and HTTP endpoints - giving you full control over how events are routed, transformed, and delivered. Supports JSON and Avro encoding (with Confluent Schema Registry), end-to-end exactly-once delivery via Kafka transactions, and built-in schema discovery that automatically infers and tracks the shape of your data as it flows through.
 
 Pipelines are defined declaratively in YAML, making it straightforward to onboard new use cases without custom code.
 
@@ -50,9 +50,12 @@ Pipelines are defined declaratively in YAML, making it straightforward to onboar
       <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/apachekafka/apachekafka-original.svg" width="40" height="40" alt="Kafka">
       <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/redis/redis-original.svg" width="40" height="40" alt="Redis">
       <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/nats/nats-original.svg" width="40" height="40" alt="NATS">
-      <br><sub>Kafka · Redis · NATS</sub>
+      <br><sub>Kafka · Redis · NATS · HTTP</sub>
     </td>
     <td align="center">
+      <img src="https://img.shields.io/badge/JSON-orange?style=flat-square" alt="JSON">
+      <img src="https://img.shields.io/badge/Avro-purple?style=flat-square" alt="Avro">
+      <br>
       <img src="https://img.shields.io/badge/Native-red?style=flat-square" alt="Native">
       <img src="https://img.shields.io/badge/Debezium-green?style=flat-square" alt="Debezium">
       <img src="https://img.shields.io/badge/CloudEvents-blue?style=flat-square" alt="CloudEvents">
@@ -67,7 +70,9 @@ Pipelines are defined declaratively in YAML, making it straightforward to onboar
 - ⚡ **Powered by Rust** : Predictable performance, memory safety, and minimal resource footprint.
 - 🔌 **Pluggable architecture** : Sources, processors, and sinks are modular and independently extensible.
 - 🧩 **Declarative pipelines** : Define sources, transforms, sinks, and commit policies in version-controlled YAML with environment variable expansion for secrets.
-- 📦 **Reliable checkpointing** : Resume safely after restarts with at-least-once delivery guarantees.
+- 📦 **Reliable checkpointing** : Per-sink independent checkpoints. Exactly-once delivery via Kafka transactions. At-least-once with dedup for NATS and Redis.
+- 🔁 **Avro encoding** : Confluent wire format with Schema Registry. DDL-derived schemas with exact types and nullability. Safe defaults for unsigned integers, enums, and timestamps.
+- 🪦 **Dead letter queue** : Poison events routed to DLQ instead of blocking the pipeline. REST API for inspection, filtering, and replay.
 - 🔀 **Dynamic routing** : Route events to per-table topics, streams, or subjects using templates or JavaScript logic.
 - 📤 **Transactional outbox** : Publish domain events atomically with database writes. Per-aggregate routing, raw payload delivery, zero polling.
 - 🛠️ **Cloud-native ready** : Single binary, Docker images, JSON logs, Prometheus metrics, and liveness/readiness probes for Kubernetes.

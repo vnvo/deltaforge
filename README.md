@@ -116,9 +116,9 @@ Output: `{"schema":null,"payload":{...}}`
 
 ## The Tech
 
-| Built with | Sources | Processors | Sinks | Output Formats |
-|:---:|:---:|:---:|:---:|:---:|
-| Rust | MySQL · PostgreSQL | JavaScript · Outbox · Flatten · Filter | Kafka · Redis · NATS | Native · Debezium · CloudEvents |
+| Built with | Sources | Processors | Sinks | Encodings | Output Formats |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| Rust | MySQL · PostgreSQL | JavaScript · Outbox · Flatten · Filter | Kafka · Redis · NATS · HTTP | JSON · Avro | Native · Debezium · CloudEvents |
 
 ## Features
 
@@ -170,7 +170,7 @@ Output: `{"schema":null,"payload":{...}}`
   - HTTP/Webhook sink — POST/PUT to any URL with custom headers, URL templates, batch mode
   - Dynamic routing: per-event topic/stream/subject/URL via templates or JavaScript
   - Configurable envelope formats: Native, Debezium, CloudEvents
-  - JSON wire encoding (Avro planned and more to come)
+  - JSON and Avro wire encoding (Avro with Confluent Schema Registry, DDL-derived type-accurate schemas)
 
 ### Event Output Formats
 
@@ -184,7 +184,7 @@ DeltaForge supports multiple envelope formats for ecosystem compatibility:
 
 🔄 **Debezium Compatibility**: DeltaForge uses Debezium's **schemaless mode** (`schema: null`), which matches Debezium's `JsonConverter` with `schemas.enable=false` - the recommended configuration for most Kafka deployments. This provides wire compatibility with existing Debezium consumers without the overhead of inline schemas (~500+ bytes per message).
 
-> 💡 **Migrating from Debezium?** If your consumers already use `schemas.enable=false`, configure `envelope: { type: debezium }` on your sinks for drop-in compatibility. For consumers expecting inline schemas, you'll need Schema Registry integration (Avro encoding - planned).
+> 💡 **Migrating from Debezium?** If your consumers already use `schemas.enable=false`, configure `envelope: { type: debezium }` on your sinks for drop-in compatibility. For consumers expecting Avro with Schema Registry, configure `encoding: { type: avro, schema_registry_url: "http://sr:8081" }` — DeltaForge produces the standard Confluent wire format.
 
 See [Envelope Formats](docs/src/envelopes.md) for detailed examples and wire format specifications.
 
@@ -430,9 +430,9 @@ spec:
 | `inline` | JavaScript code for batch processing |
 | `limits` | CPU, memory, and timeout limits |
 | **`spec.sinks`** | One or more sinks - see [Sinks](docs/src/sinks/README.md) |
-| `type` | `kafka`, `redis`, or `nats` |
+| `type` | `kafka`, `redis`, `nats`, or `http` |
 | `config.envelope` | Output format: `native`, `debezium`, or `cloudevents` - see [Envelopes](docs/src/envelopes.md) |
-| `config.encoding` | Wire encoding: `json` (default) |
+| `config.encoding` | Wire encoding: `json` (default) or `avro` (with Schema Registry) - see [Envelopes](docs/src/envelopes.md) |
 | `config.required` | Whether sink must ack for checkpoint (`true` default) |
 | **`spec.batch`** | Commit unit thresholds - see [Batching](docs/src/configuration.md#batching) |
 | `max_events` | Flush after N events (default: 500) |
@@ -463,12 +463,17 @@ View actual examples: [Example Configurations](docs/src/examples/README.md)
 - [x] Filter processor
 - [x] Persistent schema registry (SQLite, then PostgreSQL)
 - [x] Snapshot/backfill (initial load for existing tables)
-- [ ] Protobuf encoding
-- [ ] PostgreSQL/S3 checkpoint backends for HA
+- [x] HTTP/Webhook sink
+- [x] Dead letter queue with per-event routing
+- [x] Per-sink independent checkpoints
+- [x] Exactly-once delivery (Kafka transactions)
+- [x] Avro encoding with Confluent Schema Registry
+- [x] Helm chart for Kubernetes deployment
+- [ ] S3/Parquet sink
 - [ ] MongoDB source
-- [ ] ClickHouse sink  
-- [ ] Event store for time-based replay
-- [ ] Distributed coordination for HA
+- [ ] Event replay from DLQ journal
+- [ ] Kubernetes operator (PipelineTemplate + PipelinePool)
+- [ ] Protobuf encoding
 
 
 ## License
