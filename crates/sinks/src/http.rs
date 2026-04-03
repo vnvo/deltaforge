@@ -10,8 +10,10 @@ use anyhow::Context;
 use async_trait::async_trait;
 use common::retry::{RetryOutcome, RetryPolicy, retry_async};
 use common::routing::CompiledTemplate;
+use deltaforge_config::EncodingCfg;
 use deltaforge_config::HttpSinkCfg;
 use deltaforge_core::encoding::EncodingType;
+use deltaforge_core::encoding::avro::AvroEncoder;
 use deltaforge_core::envelope::Envelope;
 use deltaforge_core::{BatchResult, Event, Sink, SinkError, SinkResult};
 use metrics::counter;
@@ -37,6 +39,7 @@ pub struct HttpSink {
     batch_mode: bool,
     envelope: Box<dyn Envelope>,
     encoding: EncodingType,
+    avro_encoder: Option<AvroEncoder>,
     required: bool,
     send_timeout: Duration,
     batch_timeout: Duration,
@@ -115,6 +118,32 @@ impl HttpSink {
         let envelope_type = cfg.envelope.to_envelope_type();
         let encoding_type = cfg.encoding.to_encoding_type();
 
+        let avro_encoder = if let EncodingCfg::Avro {
+            ref schema_registry_url,
+            ref subject_strategy,
+            ref username,
+            ref password,
+        } = cfg.encoding
+        {
+            use deltaforge_config::SubjectStrategy as CfgStrategy;
+            use deltaforge_core::encoding::avro::SubjectStrategy as CoreStrategy;
+
+            let strategy = match subject_strategy {
+                CfgStrategy::TopicName => CoreStrategy::TopicName,
+                CfgStrategy::RecordName => CoreStrategy::RecordName,
+                CfgStrategy::TopicRecordName => CoreStrategy::TopicRecordName,
+            };
+
+            Some(AvroEncoder::new(
+                schema_registry_url,
+                strategy,
+                username.as_deref(),
+                password.as_deref(),
+            ).context("creating Avro encoder")?)
+        } else {
+            None
+        };
+
         info!(
             url = %cfg.url,
             method = %cfg.method,
@@ -137,6 +166,7 @@ impl HttpSink {
             batch_mode: cfg.batch_mode,
             envelope: envelope_type.build(),
             encoding: encoding_type,
+            avro_encoder,
             required: cfg.required.unwrap_or(true),
             send_timeout,
             batch_timeout,
@@ -188,6 +218,50 @@ impl HttpSink {
             .map_err(|e| SinkError::Serialization {
                 details: e.to_string().into(),
             })
+    }
+
+    /// Serialize event using Avro encoding (async — requires Schema Registry).
+    async fn serialize_event_avro(
+        &self,
+        event: &Event,
+        dest: &str,
+    ) -> SinkResult<Vec<u8>> {
+        let encoder = self.avro_encoder.as_ref().expect("avro_encoder must be set");
+
+        if event.routing.as_ref().is_some_and(|r| r.raw_payload) {
+            return serde_json::to_vec(
+                event.after.as_ref().unwrap_or(&Value::Null),
+            )
+            .map_err(Into::into);
+        }
+
+        let envelope = self.envelope.wrap(event).map_err(|e| {
+            SinkError::Serialization {
+                details: e.to_string().into(),
+            }
+        })?;
+
+        let bytes = encoder
+            .encode(dest, &envelope, None)
+            .await
+            .map_err(|e| SinkError::Serialization {
+                details: e.to_string().into(),
+            })?;
+
+        Ok(bytes.to_vec())
+    }
+
+    /// Serialize event, choosing JSON or Avro path.
+    async fn encode_event(
+        &self,
+        event: &Event,
+        dest: &str,
+    ) -> SinkResult<Vec<u8>> {
+        if self.avro_encoder.is_some() {
+            self.serialize_event_avro(event, dest).await
+        } else {
+            self.serialize_event(event)
+        }
     }
 
     /// Send a single HTTP request with the given body to the given URL.
@@ -242,8 +316,8 @@ impl Sink for HttpSink {
 
     #[instrument(skip_all, fields(sink_id = %self.id))]
     async fn send(&self, event: &Event) -> SinkResult<()> {
-        let payload = self.serialize_event(event)?;
         let url = self.resolve_url(event)?;
+        let payload = self.encode_event(event, &url).await?;
 
         let policy = RetryPolicy::new(
             Duration::from_millis(100),
@@ -296,11 +370,12 @@ impl Sink for HttpSink {
         let mut dlq_failures: Vec<(usize, SinkError)> = Vec::new();
 
         for (i, e) in events.iter().enumerate() {
-            match (|| -> Result<_, SinkError> {
+            let prepared = async {
                 let url = self.resolve_url(e)?;
-                let payload = self.serialize_event(e)?;
-                Ok((url, payload))
-            })() {
+                let payload = self.encode_event(e, &url).await?;
+                Ok::<_, SinkError>((url, payload))
+            }.await;
+            match prepared {
                 Ok(prepared) => serialized.push(prepared),
                 Err(e) if e.is_dlq_eligible() => {
                     counter!(

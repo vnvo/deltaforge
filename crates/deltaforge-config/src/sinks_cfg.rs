@@ -38,19 +38,173 @@ pub enum EnvelopeCfg {
 /// Wire encoding format for sink serialization.
 ///
 /// Controls how the envelope structure is serialized to bytes.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+///
+/// Supports two YAML forms:
+/// - Simple: `encoding: json`
+/// - Structured: `encoding: { type: avro, schema_registry_url: "..." }`
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum EncodingCfg {
     /// JSON encoding (UTF-8).
     #[default]
     Json,
-    // Future:
-    // /// Avro encoding with Schema Registry.
-    // Avro {
-    //     schema_registry: String,
-    //     #[serde(default)]
-    //     subject_strategy: SubjectStrategy,
-    // },
+
+    /// Avro encoding with Confluent Schema Registry.
+    ///
+    /// Produces Confluent wire format: `[0x00][4-byte schema ID][avro payload]`.
+    /// Schemas are auto-registered and cached.
+    ///
+    /// ```yaml
+    /// encoding:
+    ///   type: avro
+    ///   schema_registry_url: "http://localhost:8081"
+    ///   subject_strategy: topic_name   # default
+    /// ```
+    Avro {
+        /// Schema Registry URL (Confluent-compatible API).
+        schema_registry_url: String,
+
+        /// Subject naming strategy for schema registration.
+        subject_strategy: SubjectStrategy,
+
+        /// Basic auth username for Schema Registry.
+        username: Option<String>,
+
+        /// Basic auth password for Schema Registry.
+        password: Option<String>,
+    },
+}
+
+impl Serialize for EncodingCfg {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            EncodingCfg::Json => serializer.serialize_str("json"),
+            EncodingCfg::Avro {
+                schema_registry_url,
+                subject_strategy,
+                username,
+                password,
+            } => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(None)?;
+                map.serialize_entry("type", "avro")?;
+                map.serialize_entry(
+                    "schema_registry_url",
+                    schema_registry_url,
+                )?;
+                map.serialize_entry(
+                    "subject_strategy",
+                    subject_strategy,
+                )?;
+                if let Some(u) = username {
+                    map.serialize_entry("username", u)?;
+                }
+                if let Some(p) = password {
+                    map.serialize_entry("password", p)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EncodingCfg {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de;
+
+        // Try as string first ("json"), then as map ({ type: avro, ... })
+        struct EncodingVisitor;
+
+        impl<'de> de::Visitor<'de> for EncodingVisitor {
+            type Value = EncodingCfg;
+
+            fn expecting(
+                &self,
+                formatter: &mut std::fmt::Formatter<'_>,
+            ) -> std::fmt::Result {
+                formatter.write_str(
+                    r#""json" or { type: "avro", schema_registry_url: "..." }"#,
+                )
+            }
+
+            fn visit_str<E: de::Error>(
+                self,
+                v: &str,
+            ) -> Result<Self::Value, E> {
+                match v {
+                    "json" => Ok(EncodingCfg::Json),
+                    "avro" => Err(de::Error::custom(
+                        "avro encoding requires schema_registry_url; use { type: avro, schema_registry_url: \"...\" }",
+                    )),
+                    other => Err(de::Error::unknown_variant(
+                        other,
+                        &["json", "avro"],
+                    )),
+                }
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                #[derive(Deserialize)]
+                #[serde(tag = "type", rename_all = "lowercase")]
+                enum Tagged {
+                    Json,
+                    Avro {
+                        schema_registry_url: String,
+                        #[serde(default)]
+                        subject_strategy: SubjectStrategy,
+                        #[serde(default)]
+                        username: Option<String>,
+                        #[serde(default)]
+                        password: Option<String>,
+                    },
+                }
+                let tagged = Tagged::deserialize(
+                    de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(match tagged {
+                    Tagged::Json => EncodingCfg::Json,
+                    Tagged::Avro {
+                        schema_registry_url,
+                        subject_strategy,
+                        username,
+                        password,
+                    } => EncodingCfg::Avro {
+                        schema_registry_url,
+                        subject_strategy,
+                        username,
+                        password,
+                    },
+                })
+            }
+        }
+
+        deserializer.deserialize_any(EncodingVisitor)
+    }
+}
+
+/// Subject naming strategy for Schema Registry.
+///
+/// Determines how the Schema Registry subject name is derived.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjectStrategy {
+    /// `{topic}-value` — one schema per Kafka topic (default, most common).
+    #[default]
+    TopicName,
+
+    /// `{record_name}` — one schema per record type (requires `record_name` in event).
+    RecordName,
+
+    /// `{topic}-{record_name}` — per-topic, per-record schema.
+    TopicRecordName,
 }
 
 // ============================================================================
@@ -422,6 +576,11 @@ impl EncodingCfg {
     pub fn to_encoding_type(&self) -> deltaforge_core::encoding::EncodingType {
         match self {
             EncodingCfg::Json => deltaforge_core::encoding::EncodingType::Json,
+            EncodingCfg::Avro { .. } => {
+                // Avro encoding is handled at the sink level (needs async Schema Registry).
+                // The EncodingType returned here is only used for content_type/name.
+                deltaforge_core::encoding::EncodingType::Avro
+            }
         }
     }
 }
@@ -556,6 +715,85 @@ mod tests {
         "#;
         let cfg: KafkaSinkCfg = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.envelope, EnvelopeCfg::Native);
+        assert_eq!(cfg.encoding, EncodingCfg::Json);
+    }
+
+    #[test]
+    fn parse_avro_encoding() {
+        let yaml = r#"
+            id: test-kafka
+            brokers: localhost:9092
+            topic: events
+            encoding:
+              type: avro
+              schema_registry_url: "http://localhost:8081"
+        "#;
+        let cfg: KafkaSinkCfg = serde_yaml::from_str(yaml).unwrap();
+        assert!(matches!(cfg.encoding, EncodingCfg::Avro { .. }));
+        if let EncodingCfg::Avro {
+            schema_registry_url,
+            subject_strategy,
+            ..
+        } = &cfg.encoding
+        {
+            assert_eq!(schema_registry_url, "http://localhost:8081");
+            assert_eq!(*subject_strategy, SubjectStrategy::TopicName);
+        }
+    }
+
+    #[test]
+    fn parse_avro_encoding_with_strategy() {
+        let yaml = r#"
+            id: test-kafka
+            brokers: localhost:9092
+            topic: events
+            encoding:
+              type: avro
+              schema_registry_url: "http://sr:8081"
+              subject_strategy: record_name
+              username: user
+              password: pass
+        "#;
+        let cfg: KafkaSinkCfg = serde_yaml::from_str(yaml).unwrap();
+        if let EncodingCfg::Avro {
+            subject_strategy,
+            username,
+            password,
+            ..
+        } = &cfg.encoding
+        {
+            assert_eq!(*subject_strategy, SubjectStrategy::RecordName);
+            assert_eq!(username.as_deref(), Some("user"));
+            assert_eq!(password.as_deref(), Some("pass"));
+        } else {
+            panic!("expected Avro encoding");
+        }
+    }
+
+    #[test]
+    fn parse_json_string_encoding() {
+        // Backward compat: `encoding: json` as bare string
+        let yaml = r#"
+            id: test-kafka
+            brokers: localhost:9092
+            topic: events
+            encoding: json
+        "#;
+        let cfg: KafkaSinkCfg = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.encoding, EncodingCfg::Json);
+    }
+
+    #[test]
+    fn parse_json_map_encoding() {
+        // encoding: { type: json }
+        let yaml = r#"
+            id: test-kafka
+            brokers: localhost:9092
+            topic: events
+            encoding:
+              type: json
+        "#;
+        let cfg: KafkaSinkCfg = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.encoding, EncodingCfg::Json);
     }
 }

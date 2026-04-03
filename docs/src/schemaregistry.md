@@ -270,3 +270,31 @@ Consider:
 - Narrowing table patterns to reduce the number of tables
 - Using exact table names instead of wildcards
 - Verifying network latency to the MySQL server
+
+## Confluent Schema Registry Integration
+
+DeltaForge supports the [Confluent Schema Registry](https://docs.confluent.io/platform/current/schema-registry/) as the external schema store for **Avro encoding**. This is separate from DeltaForge's internal schema registry (described above) which tracks source table schemas.
+
+### How it works
+
+When a sink is configured with `encoding: { type: avro, schema_registry_url: "..." }`:
+
+1. **Schema derivation**: DeltaForge derives an Avro schema from the first event's JSON structure
+2. **Registration**: The schema is registered with the Confluent Schema Registry (idempotent — same schema returns the same ID)
+3. **Caching**: The schema ID is cached per subject, so subsequent events skip the HTTP call
+4. **Wire format**: Events are encoded as `[0x00][schema_id:4][avro_binary]` (Confluent wire format)
+
+### Relationship to internal schema registry
+
+| Aspect | DeltaForge Internal Registry | Confluent Schema Registry |
+|--------|------------------------------|---------------------------|
+| **Purpose** | Track source table schema evolution | Store Avro schemas for consumers |
+| **Schemas** | Source-owned (MySQL/Postgres types) | Avro schemas (derived from event structure) |
+| **Storage** | Embedded (SQLite/Postgres) | External HTTP service |
+| **Used by** | Schema sensing, replay correlation | Kafka Connect, ksqlDB, Flink |
+
+The two registries serve complementary purposes — the internal registry tracks what the source looks like, while the Confluent registry stores what consumers need to decode the wire format.
+
+### Configuration
+
+See the [Envelopes and Encodings](envelopes.md) page for full Avro encoding configuration, including subject naming strategies and authentication.

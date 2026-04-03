@@ -11,7 +11,7 @@ Event -> Envelope (structure) -> Encoding (bytes) -> Sink
 ```
 
 - **Envelope**: Controls the JSON structure of the output (what fields exist, how they're nested)
-- **Encoding**: Controls the wire format (JSON bytes, future: Avro, Protobuf)
+- **Encoding**: Controls the wire format (JSON bytes, Avro binary with Schema Registry)
 
 ## Envelope Formats
 
@@ -107,8 +107,7 @@ sinks:
 - Tools that specifically parse the `payload` wrapper
 - When you need a stable, well-documented format with broad ecosystem support
 
-> **Note:** For Schema Registry integration with Avro encoding (planned), schema handling 
-> will move to the encoding layer where schema IDs are embedded in the wire format.
+> **Note:** When using Avro encoding with Schema Registry, schema handling is at the encoding layer — schema IDs are embedded in the [Confluent wire format](https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/index.html#wire-format).
 
 ### CloudEvents
 
@@ -183,12 +182,17 @@ sinks:
 - When human readability matters
 - Most use cases (good default)
 
-### Future: Avro
+### Avro (with Schema Registry)
 
-> **Coming soon**: Avro encoding with Schema Registry integration for compact binary serialization and schema evolution support.
+Avro encoding produces compact binary payloads using the [Confluent wire format](https://docs.confluent.io/platform/current/schema-registry/fundamentals/serdes-develop/index.html#wire-format):
+
+```
+[0x00][4-byte schema ID (big-endian)][Avro binary payload]
+```
+
+This format is natively understood by Kafka Connect, ksqlDB, Apache Flink, and any Confluent-compatible consumer.
 
 ```yaml
-# Future configuration (not yet implemented)
 sinks:
   - type: kafka
     config:
@@ -197,8 +201,49 @@ sinks:
       topic: events
       encoding:
         type: avro
-        schema_registry: http://schema-registry:8081
+        schema_registry_url: "http://schema-registry:8081"
+        subject_strategy: topic_name   # default
 ```
+
+**Content-Type:** `application/avro`
+
+#### Configuration
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `schema_registry_url` | string | — | Confluent-compatible Schema Registry URL |
+| `subject_strategy` | string | `topic_name` | Subject naming strategy (see below) |
+| `username` | string | — | Basic auth username for Schema Registry |
+| `password` | string | — | Basic auth password for Schema Registry |
+
+#### Subject naming strategies
+
+| Strategy | Subject pattern | Use case |
+|----------|----------------|----------|
+| `topic_name` | `{topic}-value` | One schema per Kafka topic (default, most common) |
+| `record_name` | `{record_name}` | One schema per record type, shared across topics |
+| `topic_record_name` | `{topic}-{record_name}` | Per-topic, per-record schema |
+
+#### Schema auto-registration
+
+DeltaForge automatically derives an Avro schema from the first event's JSON structure and registers it with the Schema Registry. Subsequent events with the same structure reuse the cached schema ID — no per-event HTTP call.
+
+- **Nullable fields**: All fields are wrapped in `["null", <type>]` unions since CDC columns may be nullable
+- **Nested objects**: Mapped to nested Avro records
+- **Type mapping**: `string → string`, `integer → long`, `float → double`, `boolean → boolean`
+
+#### Schema evolution
+
+When the source table schema changes (column added/removed/altered), DeltaForge derives a new Avro schema and registers it as a new version under the same subject. The Schema Registry's compatibility rules (BACKWARD, FORWARD, FULL) control whether the new version is accepted.
+
+#### When to use
+
+- Kafka Connect sinks expecting Avro (JDBC Sink, S3 Sink, Elasticsearch Sink)
+- ksqlDB streams and tables
+- Apache Flink CDC consumers
+- When you need compact binary payloads (~40-60% smaller than JSON)
+- When you want schema evolution enforcement via Schema Registry compatibility rules
+- Production pipelines where schema governance matters
 
 ## Configuration Examples
 
@@ -245,6 +290,24 @@ sinks:
       envelope:
         type: native
       encoding: json
+```
+
+### Kafka with Avro encoding
+
+```yaml
+sinks:
+  - type: kafka
+    config:
+      id: events-avro
+      brokers: ${KAFKA_BROKERS}
+      topic: cdc-events
+      envelope:
+        type: debezium
+      encoding:
+        type: avro
+        schema_registry_url: "http://schema-registry:8081"
+        subject_strategy: topic_name
+      required: true
 ```
 
 ### Multi-sink with different formats
@@ -306,6 +369,11 @@ These codes appear in the `op` field regardless of envelope format.
 | Debezium | ~14 bytes | Stable (follows Debezium spec) | Kafka Connect, Debezium ecosystem |
 | CloudEvents | ~150-200 bytes | Stable (follows CNCF spec) | Serverless, event-driven architectures |
 
+| Encoding | Size vs JSON | CPU cost | Schema governance |
+|----------|-------------|----------|-------------------|
+| JSON | Baseline | Lowest | None |
+| Avro | ~40-60% smaller | Moderate (schema lookup + binary encoding) | Schema Registry enforced |
+
 The native envelope is recommended for maximum throughput when you control both ends of the pipeline. For interoperability with external systems or when format stability is critical, use `debezium` or `cloudevents`.
 
 ## Defaults
@@ -315,3 +383,5 @@ If not specified, sinks use:
 - **Encoding**: `json`
 
 The native envelope provides the lowest overhead for high-throughput scenarios. If you need format stability guarantees, use `debezium` or `cloudevents` which adhere to their respective established specifications.
+
+For Kafka pipelines where schema governance and compact payloads matter, use `avro` encoding with the Debezium envelope — this is the standard pattern for production Kafka Connect integration.

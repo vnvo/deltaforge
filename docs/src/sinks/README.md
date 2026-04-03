@@ -9,7 +9,7 @@ All sinks support configurable **envelope formats** and **wire encodings**. See 
 | Option | Values | Default | Description |
 |--------|--------|---------|-------------|
 | `envelope` | `native`, `debezium`, `cloudevents` | `native` | Output JSON structure |
-| `encoding` | `json` | `json` | Wire format |
+| `encoding` | `json`, `avro` | `json` | Wire format (`avro` requires Schema Registry) |
 
 **Quick example:**
 

@@ -38,8 +38,10 @@ use async_nats::jetstream::{self, Context as JetStreamContext};
 use async_trait::async_trait;
 use common::CompiledTemplate;
 use common::{RetryOutcome, RetryPolicy, retry_async};
+use deltaforge_config::EncodingCfg;
 use deltaforge_config::NatsSinkCfg;
 use deltaforge_core::encoding::EncodingType;
+use deltaforge_core::encoding::avro::AvroEncoder;
 use deltaforge_core::envelope::Envelope;
 use deltaforge_core::{BatchResult, Event, Sink, SinkError, SinkResult};
 use futures::future::try_join_all;
@@ -81,6 +83,8 @@ pub struct NatsSink {
     /// Encoding type (currently just JSON)
     #[allow(dead_code)]
     encoding: EncodingType,
+    /// Optional Avro encoder (requires Schema Registry).
+    avro_encoder: Option<AvroEncoder>,
     /// Cached NATS client and JetStream context with RwLock for interior mutability.
     /// Using Option to allow lazy initialization and reconnection.
     client: RwLock<Option<ClientState>>,
@@ -137,6 +141,32 @@ impl NatsSink {
         let envelope_type = cfg.envelope.to_envelope_type();
         let encoding_type = cfg.encoding.to_encoding_type();
 
+        let avro_encoder = if let EncodingCfg::Avro {
+            ref schema_registry_url,
+            ref subject_strategy,
+            ref username,
+            ref password,
+        } = cfg.encoding
+        {
+            use deltaforge_config::SubjectStrategy as CfgStrategy;
+            use deltaforge_core::encoding::avro::SubjectStrategy as CoreStrategy;
+
+            let strategy = match subject_strategy {
+                CfgStrategy::TopicName => CoreStrategy::TopicName,
+                CfgStrategy::RecordName => CoreStrategy::RecordName,
+                CfgStrategy::TopicRecordName => CoreStrategy::TopicRecordName,
+            };
+
+            Some(AvroEncoder::new(
+                schema_registry_url,
+                strategy,
+                username.as_deref(),
+                password.as_deref(),
+            ).context("creating Avro encoder")?)
+        } else {
+            None
+        };
+
         let subject_template = CompiledTemplate::parse(&cfg.subject)
             .map_err(|e| anyhow::anyhow!("invalid subject template: {}", e))?;
 
@@ -169,6 +199,7 @@ impl NatsSink {
             key_template,
             envelope: envelope_type.build(),
             encoding: encoding_type,
+            avro_encoder,
             client: RwLock::new(None),
             cancel,
             send_timeout,
@@ -290,6 +321,50 @@ impl NatsSink {
             .map_err(|e| SinkError::Serialization {
                 details: e.to_string().into(),
             })
+    }
+
+    /// Serialize event using Avro encoding (async — requires Schema Registry).
+    async fn serialize_event_avro(
+        &self,
+        event: &Event,
+        dest: &str,
+    ) -> SinkResult<Vec<u8>> {
+        let encoder = self.avro_encoder.as_ref().expect("avro_encoder must be set");
+
+        if event.routing.as_ref().is_some_and(|r| r.raw_payload) {
+            return serde_json::to_vec(
+                event.after.as_ref().unwrap_or(&Value::Null),
+            )
+            .map_err(Into::into);
+        }
+
+        let envelope = self.envelope.wrap(event).map_err(|e| {
+            SinkError::Serialization {
+                details: e.to_string().into(),
+            }
+        })?;
+
+        let bytes = encoder
+            .encode(dest, &envelope, None)
+            .await
+            .map_err(|e| SinkError::Serialization {
+                details: e.to_string().into(),
+            })?;
+
+        Ok(bytes.to_vec())
+    }
+
+    /// Serialize event, choosing JSON or Avro path.
+    async fn encode_event(
+        &self,
+        event: &Event,
+        dest: &str,
+    ) -> SinkResult<Vec<u8>> {
+        if self.avro_encoder.is_some() {
+            self.serialize_event_avro(event, dest).await
+        } else {
+            self.serialize_event(event)
+        }
     }
 
     /// Get or establish a NATS connection with retry logic.
@@ -477,8 +552,8 @@ impl Sink for NatsSink {
 
     #[instrument(skip_all, fields(sink_id = %self.id))]
     async fn send(&self, event: &Event) -> SinkResult<()> {
-        let payload = self.serialize_event(event)?;
         let subject = self.resolve_subject(event)?;
+        let payload = self.encode_event(event, &subject).await?;
         let headers = Some(self.build_nats_headers(event));
 
         // Retry loop for transient failures
@@ -545,12 +620,13 @@ impl Sink for NatsSink {
         let mut dlq_failures: Vec<(usize, SinkError)> = Vec::new();
 
         for (i, e) in events.iter().enumerate() {
-            match (|| -> Result<_, SinkError> {
+            let prepared = async {
                 let subject = self.resolve_subject(e)?;
-                let payload = self.serialize_event(e)?;
+                let payload = self.encode_event(e, &subject).await?;
                 let headers = self.build_nats_headers(e);
-                Ok((subject, payload, headers))
-            })() {
+                Ok::<_, SinkError>((subject, payload, headers))
+            }.await;
+            match prepared {
                 Ok(prepared) => serialized.push(prepared),
                 Err(e) if e.is_dlq_eligible() => {
                     counter!(

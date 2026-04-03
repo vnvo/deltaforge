@@ -30,6 +30,9 @@ chrono.workspace = true
 uuid.workspace = true
 testcontainers = "0.25"
 tracing.workspace = true
+apache-avro.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
 tracing-subscriber = { version = "0.3", features = [
     "env-filter",
     "fmt",

@@ -6,12 +6,9 @@
 //! # Available Encodings
 //!
 //! - [`Json`] — Standard JSON serialization (default)
-//!
-//! # Future Encodings
-//!
-//! - Avro — With Confluent Schema Registry support
-//! - Protobuf — With schema management
+//! - Avro — With Confluent Schema Registry support (see [`avro`] module)
 
+pub mod avro;
 mod json;
 
 pub use json::Json;
@@ -25,6 +22,12 @@ pub enum EncodingError {
     #[error("JSON serialization failed: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("Avro serialization failed: {0}")]
+    Avro(String),
+
+    #[error("Schema Registry error: {0}")]
+    SchemaRegistry(String),
+
     #[error("encoding error: {0}")]
     Other(String),
 }
@@ -37,9 +40,10 @@ pub enum EncodingError {
 pub enum EncodingType {
     #[default]
     Json,
-    // Future:
-    // Avro,
-    // Protobuf,
+    /// Avro encoding — actual serialization is handled by [`avro::AvroEncoder`]
+    /// which needs async Schema Registry access. This variant is used for
+    /// content_type/name identification only.
+    Avro,
 }
 
 impl EncodingType {
@@ -47,6 +51,7 @@ impl EncodingType {
     pub const fn name(&self) -> &'static str {
         match self {
             EncodingType::Json => "json",
+            EncodingType::Avro => "avro",
         }
     }
 
@@ -54,10 +59,14 @@ impl EncodingType {
     pub const fn content_type(&self) -> &'static str {
         match self {
             EncodingType::Json => "application/json",
+            EncodingType::Avro => "application/avro",
         }
     }
 
-    /// Serialize a value to bytes.
+    /// Serialize a value to bytes (JSON only).
+    ///
+    /// For Avro encoding, use [`avro::AvroEncoder`] directly — it requires
+    /// async Schema Registry interaction.
     #[inline]
     pub fn encode<T: Serialize>(
         &self,
@@ -65,6 +74,9 @@ impl EncodingType {
     ) -> Result<Bytes, EncodingError> {
         match self {
             EncodingType::Json => Json.encode(value),
+            EncodingType::Avro => Err(EncodingError::Other(
+                "use AvroEncoder for Avro serialization".into(),
+            )),
         }
     }
 }

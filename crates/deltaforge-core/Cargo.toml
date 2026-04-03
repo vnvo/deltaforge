@@ -17,6 +17,9 @@ tokio-util.workspace = true
 thiserror.workspace = true
 checkpoints = { path = "../checkpoints" }
 bytes.workspace = true
+apache-avro.workspace = true
+reqwest.workspace = true
+parking_lot.workspace = true
 
 [lints]
 workspace = true

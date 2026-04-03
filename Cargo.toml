@@ -33,6 +33,8 @@ base64 = "0.22"
 url = "2.5"
 thiserror = "1"
 bytes = "1"
+apache-avro = "0.17"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [profile.release]
 lto = true
