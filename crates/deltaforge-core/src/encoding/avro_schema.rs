@@ -163,8 +163,7 @@ pub fn build_envelope_schema(
     table: &str,
     value_schema: serde_json::Value,
 ) -> Result<(String, AvroSchema), EncodingError> {
-    let envelope_ns =
-        format!("deltaforge.cdc.{connector}.{db}.{table}");
+    let envelope_ns = format!("deltaforge.cdc.{connector}.{db}.{table}");
     let value_fqn = format!(
         "{}.Value",
         value_schema["namespace"]
@@ -219,9 +218,7 @@ pub fn build_envelope_schema(
     });
 
     let schema_str = serde_json::to_string(&envelope_json).map_err(|e| {
-        EncodingError::Avro(format!(
-            "failed to serialize envelope schema: {e}"
-        ))
+        EncodingError::Avro(format!("failed to serialize envelope schema: {e}"))
     })?;
 
     let schema = AvroSchema::parse_str(&schema_str).map_err(|e| {
@@ -268,11 +265,16 @@ mod tests {
 
     #[test]
     fn build_mysql_envelope_schema_parses() {
-        let value = build_value_schema("mysql", "shop", "orders", vec![
-            json!({"name": "id", "type": "long"}),
-            json!({"name": "name", "type": ["null", "string"], "default": null}),
-            json!({"name": "total", "type": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}}),
-        ]);
+        let value = build_value_schema(
+            "mysql",
+            "shop",
+            "orders",
+            vec![
+                json!({"name": "id", "type": "long"}),
+                json!({"name": "name", "type": ["null", "string"], "default": null}),
+                json!({"name": "total", "type": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}}),
+            ],
+        );
 
         let (schema_str, schema) =
             build_envelope_schema("mysql", "shop", "orders", value)
@@ -323,10 +325,8 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&schema_str).unwrap();
         let fields = parsed["fields"].as_array().unwrap();
-        let field_names: Vec<&str> = fields
-            .iter()
-            .map(|f| f["name"].as_str().unwrap())
-            .collect();
+        let field_names: Vec<&str> =
+            fields.iter().map(|f| f["name"].as_str().unwrap()).collect();
 
         assert_eq!(
             field_names,
@@ -367,9 +367,7 @@ mod tests {
             .unwrap();
 
         // Source should be a record with a position field
-        let source_fields = source_field["type"]["fields"]
-            .as_array()
-            .unwrap();
+        let source_fields = source_field["type"]["fields"].as_array().unwrap();
         let field_names: Vec<&str> = source_fields
             .iter()
             .map(|f| f["name"].as_str().unwrap())
@@ -383,20 +381,15 @@ mod tests {
             field_names.contains(&"connector"),
             "source should have connector field"
         );
-        assert!(
-            field_names.contains(&"db"),
-            "source should have db field"
-        );
+        assert!(field_names.contains(&"db"), "source should have db field");
     }
 
     #[test]
     fn mysql_position_has_binlog_fields() {
         let pos = mysql_position_schema();
         let fields = pos["fields"].as_array().unwrap();
-        let names: Vec<&str> = fields
-            .iter()
-            .map(|f| f["name"].as_str().unwrap())
-            .collect();
+        let names: Vec<&str> =
+            fields.iter().map(|f| f["name"].as_str().unwrap()).collect();
 
         assert!(names.contains(&"file"));
         assert!(names.contains(&"pos"));
@@ -408,10 +401,8 @@ mod tests {
     fn postgres_position_has_wal_fields() {
         let pos = postgres_position_schema();
         let fields = pos["fields"].as_array().unwrap();
-        let names: Vec<&str> = fields
-            .iter()
-            .map(|f| f["name"].as_str().unwrap())
-            .collect();
+        let names: Vec<&str> =
+            fields.iter().map(|f| f["name"].as_str().unwrap()).collect();
 
         assert!(names.contains(&"lsn"));
         assert!(names.contains(&"tx_id"));
@@ -479,8 +470,7 @@ mod tests {
         );
 
         // Should not fail — uses generic position
-        let result =
-            build_envelope_schema("mongodb", "test", "col", value);
+        let result = build_envelope_schema("mongodb", "test", "col", value);
         assert!(result.is_ok());
     }
 }

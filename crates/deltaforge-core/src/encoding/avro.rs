@@ -328,14 +328,9 @@ impl SchemaRegistryClient {
     }
 
     /// Get cached schema for a subject (if previously registered).
-    pub fn get_cached(
-        &self,
-        subject: &str,
-    ) -> Option<(u32, Arc<AvroSchema>)> {
+    pub fn get_cached(&self, subject: &str) -> Option<(u32, Arc<AvroSchema>)> {
         let cache = self.cache.read();
-        cache
-            .get(subject)
-            .map(|c| (c.id, c.schema.clone()))
+        cache.get(subject).map(|c| (c.id, c.schema.clone()))
     }
 
     /// Clear the schema cache (useful for testing or schema evolution).
@@ -498,9 +493,7 @@ impl AvroEncoder {
             {
                 debug!(
                     connector,
-                    db,
-                    table,
-                    "using DDL-derived Avro schema (Path A)"
+                    db, table, "using DDL-derived Avro schema (Path A)"
                 );
                 counter!("deltaforge_avro_encode_total", "path" => "ddl")
                     .increment(1);
@@ -519,9 +512,9 @@ impl AvroEncoder {
         );
         counter!("deltaforge_avro_encode_total", "path" => "inferred")
             .increment(1);
-        let record_name = Some(
-            format!("deltaforge.{connector}.{db}.{table}.Value").leak() as &str
-        );
+        let record_name =
+            Some(format!("deltaforge.{connector}.{db}.{table}.Value").leak()
+                as &str);
         self.encode(topic, value, record_name).await
     }
 
@@ -545,8 +538,7 @@ impl AvroEncoder {
 
         // 2. Register schema with SR (idempotent, cached).
         //    On SR failure, fall back to cached schema if available.
-        let auth =
-            self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+        let auth = self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
         let (schema_id, registered_schema) = match self
             .registry
             .register_schema(&subject, schema_json, auth)
@@ -566,10 +558,8 @@ impl AvroEncoder {
                         cached_schema_id = cached.0,
                         "Schema Registry unavailable — using cached schema"
                     );
-                    counter!(
-                        "deltaforge_avro_sr_cache_fallback_total"
-                    )
-                    .increment(1);
+                    counter!("deltaforge_avro_sr_cache_fallback_total")
+                        .increment(1);
                     (cached.0, cached.1)
                 } else {
                     // No cache — cannot encode
@@ -599,8 +589,8 @@ impl AvroEncoder {
         };
 
         // 4. Encode as Avro binary
-        let avro_bytes =
-            apache_avro::to_avro_datum(schema, avro_value).map_err(|e| {
+        let avro_bytes = apache_avro::to_avro_datum(schema, avro_value)
+            .map_err(|e| {
                 EncodingError::Avro(format!("Avro encoding failed: {e}"))
             })?;
 

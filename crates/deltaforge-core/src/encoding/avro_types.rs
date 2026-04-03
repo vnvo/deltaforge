@@ -264,10 +264,7 @@ pub fn postgres_column_to_avro(
     opts: &TypeConversionOpts,
 ) -> Value {
     if col.is_array {
-        let element_type = col
-            .element_type
-            .as_deref()
-            .unwrap_or("text");
+        let element_type = col.element_type.as_deref().unwrap_or("text");
         let item_avro = postgres_scalar_to_avro(element_type, col, opts);
         let array_type = json!({
             "type": "array",
@@ -276,8 +273,7 @@ pub fn postgres_column_to_avro(
         return wrap_field(&col.name, array_type, col.nullable);
     }
 
-    let avro_type =
-        postgres_scalar_to_avro(&col.data_type, col, opts);
+    let avro_type = postgres_scalar_to_avro(&col.data_type, col, opts);
     wrap_field(&col.name, avro_type, col.nullable)
 }
 
@@ -324,8 +320,8 @@ fn postgres_scalar_to_avro(
         "boolean" | "bool" => json!("boolean"),
 
         // String types
-        "text" | "varchar" | "character varying" | "char"
-        | "character" | "name" | "citext" => json!("string"),
+        "text" | "varchar" | "character varying" | "char" | "character"
+        | "name" | "citext" => json!("string"),
 
         // Binary
         "bytea" => json!("bytes"),
@@ -362,15 +358,16 @@ fn postgres_scalar_to_avro(
         "inet" | "cidr" | "macaddr" | "macaddr8" => json!("string"),
 
         // Geometric types
-        "point" | "line" | "lseg" | "box" | "path" | "polygon"
-        | "circle" => json!("string"),
+        "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle" => {
+            json!("string")
+        }
 
         // hstore
         "hstore" => json!({"type": "map", "values": "string"}),
 
         // Range types
-        "int4range" | "int8range" | "numrange" | "tsrange"
-        | "tstzrange" | "daterange" => json!("string"),
+        "int4range" | "int8range" | "numrange" | "tsrange" | "tstzrange"
+        | "daterange" => json!("string"),
 
         // Money
         "money" => json!("string"),
@@ -525,7 +522,8 @@ mod tests {
     #[test]
     fn mysql_int_types() {
         let o = opts();
-        let f = mysql_column_to_avro(&col("a", "tinyint", "tinyint", false), &o);
+        let f =
+            mysql_column_to_avro(&col("a", "tinyint", "tinyint", false), &o);
         assert_eq!(f["type"], "int");
 
         let f = mysql_column_to_avro(&col("a", "int", "int", false), &o);
@@ -538,10 +536,8 @@ mod tests {
     #[test]
     fn mysql_int_unsigned() {
         let o = opts();
-        let f = mysql_column_to_avro(
-            &unsigned_col("a", "int", "int unsigned"),
-            &o,
-        );
+        let f =
+            mysql_column_to_avro(&unsigned_col("a", "int", "int unsigned"), &o);
         assert_eq!(f["type"], "long"); // INT UNSIGNED fits in long
 
         // BIGINT UNSIGNED → string by default
@@ -583,10 +579,7 @@ mod tests {
     #[test]
     fn mysql_not_null_no_union() {
         let o = opts();
-        let f = mysql_column_to_avro(
-            &col("id", "bigint", "bigint", false),
-            &o,
-        );
+        let f = mysql_column_to_avro(&col("id", "bigint", "bigint", false), &o);
         assert_eq!(f["type"], "long");
         assert!(f.get("default").is_none());
     }
@@ -607,10 +600,8 @@ mod tests {
     #[test]
     fn mysql_decimal_no_precision_fallback() {
         let o = opts();
-        let f = mysql_column_to_avro(
-            &col("x", "decimal", "decimal", false),
-            &o,
-        );
+        let f =
+            mysql_column_to_avro(&col("x", "decimal", "decimal", false), &o);
         assert_eq!(f["type"], "string");
     }
 
@@ -668,19 +659,14 @@ mod tests {
             &o,
         );
         assert_eq!(f["type"]["type"], "enum");
-        let symbols = f["type"]["symbols"]
-            .as_array()
-            .unwrap();
+        let symbols = f["type"]["symbols"].as_array().unwrap();
         assert_eq!(symbols.len(), 2);
     }
 
     #[test]
     fn mysql_json() {
         let o = opts();
-        let f = mysql_column_to_avro(
-            &col("data", "json", "json", true),
-            &o,
-        );
+        let f = mysql_column_to_avro(&col("data", "json", "json", true), &o);
         assert_eq!(f["type"][1], "string");
     }
 
@@ -703,16 +689,12 @@ mod tests {
     #[test]
     fn pg_int_types() {
         let o = opts();
-        let f = postgres_column_to_avro(
-            &col("a", "integer", "integer", false),
-            &o,
-        );
+        let f =
+            postgres_column_to_avro(&col("a", "integer", "integer", false), &o);
         assert_eq!(f["type"], "int");
 
-        let f = postgres_column_to_avro(
-            &col("a", "bigint", "bigint", false),
-            &o,
-        );
+        let f =
+            postgres_column_to_avro(&col("a", "bigint", "bigint", false), &o);
         assert_eq!(f["type"], "long");
     }
 
@@ -770,20 +752,15 @@ mod tests {
     #[test]
     fn pg_uuid() {
         let o = opts();
-        let f = postgres_column_to_avro(
-            &col("id", "uuid", "uuid", false),
-            &o,
-        );
+        let f = postgres_column_to_avro(&col("id", "uuid", "uuid", false), &o);
         assert_eq!(f["type"]["logicalType"], "uuid");
     }
 
     #[test]
     fn pg_jsonb() {
         let o = opts();
-        let f = postgres_column_to_avro(
-            &col("data", "jsonb", "jsonb", true),
-            &o,
-        );
+        let f =
+            postgres_column_to_avro(&col("data", "jsonb", "jsonb", true), &o);
         assert_eq!(f["type"][1], "string");
     }
 
@@ -836,10 +813,7 @@ mod tests {
 
     #[test]
     fn normalize_pg_types() {
-        assert_eq!(
-            normalize_pg_type("character varying(255)"),
-            "varchar"
-        );
+        assert_eq!(normalize_pg_type("character varying(255)"), "varchar");
         assert_eq!(
             normalize_pg_type("timestamp with time zone"),
             "timestamptz"
@@ -848,10 +822,7 @@ mod tests {
             normalize_pg_type("timestamp without time zone"),
             "timestamp"
         );
-        assert_eq!(
-            normalize_pg_type("double precision"),
-            "double precision"
-        );
+        assert_eq!(normalize_pg_type("double precision"), "double precision");
         assert_eq!(normalize_pg_type("integer"), "integer");
         assert_eq!(normalize_pg_type("numeric(10,2)"), "numeric");
     }

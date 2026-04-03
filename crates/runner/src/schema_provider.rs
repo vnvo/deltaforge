@@ -172,17 +172,14 @@ fn extract_column_infos(
                 c.get("nullable").and_then(|v| v.as_bool()).unwrap_or(true);
             let numeric_precision =
                 c.get("numeric_precision").and_then(|v| v.as_i64());
-            let numeric_scale =
-                c.get("numeric_scale").and_then(|v| v.as_i64());
+            let numeric_scale = c.get("numeric_scale").and_then(|v| v.as_i64());
 
             // MySQL: detect unsigned from column_type string
             let unsigned = full_type.to_lowercase().contains("unsigned");
 
             // PostgreSQL: detect arrays
-            let is_array = c
-                .get("is_array")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let is_array =
+                c.get("is_array").and_then(|v| v.as_bool()).unwrap_or(false);
             let element_type = c
                 .get("element_type")
                 .and_then(|v| v.as_str())
@@ -300,8 +297,7 @@ impl AvroSchemaProviderImpl {
         let value_schema =
             build_value_schema(&self.connector, db, table, fields);
 
-        match build_envelope_schema(&self.connector, db, table, value_schema)
-        {
+        match build_envelope_schema(&self.connector, db, table, value_schema) {
             Ok((schema_json, schema)) => {
                 debug!(
                     connector = %self.connector,
@@ -358,9 +354,8 @@ impl SourceSchemaProvider for AvroSchemaProviderImpl {
         // 2. The underlying SchemaLoaderAdapter typically hits an in-memory cache
         let table_key = format!("{db}.{table}");
         let table_schema = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(
-                self.schema_provider.get_table_schema(&table_key),
-            )
+            tokio::runtime::Handle::current()
+                .block_on(self.schema_provider.get_table_schema(&table_key))
         })?;
 
         // Build the envelope schema
@@ -369,10 +364,7 @@ impl SourceSchemaProvider for AvroSchemaProviderImpl {
         // Cache it
         {
             let mut cache = self.cache.write();
-            cache.insert(
-                (db.to_string(), table.to_string()),
-                result.clone(),
-            );
+            cache.insert((db.to_string(), table.to_string()), result.clone());
         }
 
         Some(result)

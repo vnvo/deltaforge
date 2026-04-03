@@ -26,7 +26,9 @@ use tokio::time::sleep;
 use tracing::info;
 
 use crate::backend::SourceBackend;
-use crate::harness::{Harness, ScenarioResult, kafka_offset_for_topic, print_scenario_banner};
+use crate::harness::{
+    Harness, ScenarioResult, kafka_offset_for_topic, print_scenario_banner,
+};
 
 const OUTAGE_HOLD: Duration = Duration::from_secs(15);
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -128,7 +130,9 @@ pub async fn run<B: SourceBackend>(
         sleep(POLL_INTERVAL).await;
     }
 
-    info!("SR outage scenario passed — cached schema fallback worked correctly");
+    info!(
+        "SR outage scenario passed — cached schema fallback worked correctly"
+    );
 
     Ok(ScenarioResult::pass(&name).note(format!(
         "events_during_outage={events_during_outage}, events_after_recovery={inserted_after}"
