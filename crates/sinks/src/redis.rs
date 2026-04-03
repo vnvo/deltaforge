@@ -28,6 +28,7 @@
 //!       connect_timeout_secs: 10    # Connection establishment timeout
 //! ```
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -37,7 +38,7 @@ use common::{RetryOutcome, RetryPolicy, redact_url_password, retry_async};
 use deltaforge_config::EncodingCfg;
 use deltaforge_config::RedisSinkCfg;
 use deltaforge_core::encoding::EncodingType;
-use deltaforge_core::encoding::avro::AvroEncoder;
+use deltaforge_core::encoding::avro::{AvroEncoder, SourceSchemaProvider};
 use deltaforge_core::envelope::Envelope;
 use deltaforge_core::{BatchResult, Event, Sink, SinkError, SinkResult};
 use metrics::counter;
@@ -111,6 +112,7 @@ impl RedisSink {
         cfg: &RedisSinkCfg,
         cancel: CancellationToken,
         pipeline: &str,
+        source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
     ) -> anyhow::Result<Self> {
         let client =
             redis::Client::open(cfg.uri.clone()).with_context(|| {
@@ -155,11 +157,12 @@ impl RedisSink {
             };
 
             Some(
-                AvroEncoder::new(
+                AvroEncoder::with_source_schemas(
                     schema_registry_url,
                     strategy,
                     username.as_deref(),
                     password.as_deref(),
+                    source_schemas,
                 )
                 .context("creating Avro encoder")?,
             )
@@ -297,11 +300,17 @@ impl RedisSink {
             }
         })?;
 
-        let bytes =
-            encoder.encode(dest, &envelope, None).await.map_err(|e| {
-                SinkError::Serialization {
-                    details: e.to_string().into(),
-                }
+        let bytes = encoder
+            .encode_event(
+                dest,
+                &envelope,
+                &event.source.connector,
+                &event.source.db,
+                &event.source.table,
+            )
+            .await
+            .map_err(|e| SinkError::Serialization {
+                details: e.to_string().into(),
             })?;
 
         Ok(bytes.to_vec())

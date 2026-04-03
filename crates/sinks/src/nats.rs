@@ -30,6 +30,7 @@
 //!       credentials_file: /path/to/creds.json  # Optional
 //! ```
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -41,7 +42,7 @@ use common::{RetryOutcome, RetryPolicy, retry_async};
 use deltaforge_config::EncodingCfg;
 use deltaforge_config::NatsSinkCfg;
 use deltaforge_core::encoding::EncodingType;
-use deltaforge_core::encoding::avro::AvroEncoder;
+use deltaforge_core::encoding::avro::{AvroEncoder, SourceSchemaProvider};
 use deltaforge_core::envelope::Envelope;
 use deltaforge_core::{BatchResult, Event, Sink, SinkError, SinkResult};
 use futures::future::try_join_all;
@@ -120,6 +121,7 @@ impl NatsSink {
         cfg: &NatsSinkCfg,
         cancel: CancellationToken,
         pipeline: &str,
+        source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
     ) -> anyhow::Result<Self> {
         // Extract timeouts from config or use defaults
         let send_timeout = cfg
@@ -158,11 +160,12 @@ impl NatsSink {
             };
 
             Some(
-                AvroEncoder::new(
+                AvroEncoder::with_source_schemas(
                     schema_registry_url,
                     strategy,
                     username.as_deref(),
                     password.as_deref(),
+                    source_schemas,
                 )
                 .context("creating Avro encoder")?,
             )
@@ -350,11 +353,17 @@ impl NatsSink {
             }
         })?;
 
-        let bytes =
-            encoder.encode(dest, &envelope, None).await.map_err(|e| {
-                SinkError::Serialization {
-                    details: e.to_string().into(),
-                }
+        let bytes = encoder
+            .encode_event(
+                dest,
+                &envelope,
+                &event.source.connector,
+                &event.source.db,
+                &event.source.table,
+            )
+            .await
+            .map_err(|e| SinkError::Serialization {
+                details: e.to_string().into(),
             })?;
 
         Ok(bytes.to_vec())

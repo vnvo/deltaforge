@@ -130,7 +130,7 @@ async fn http_sink_sends_single_event() -> Result<()> {
 
     let cfg =
         make_http_cfg("test-http", &format!("http://127.0.0.1:{port}/events"));
-    let sink = HttpSink::new(&cfg, CancellationToken::new(), "test")?;
+    let sink = HttpSink::new(&cfg, CancellationToken::new(), "test", None)?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
@@ -155,7 +155,7 @@ async fn http_sink_sends_batch_per_event() -> Result<()> {
 
     let cfg =
         make_http_cfg("test-batch", &format!("http://127.0.0.1:{port}/events"));
-    let sink = HttpSink::new(&cfg, CancellationToken::new(), "test")?;
+    let sink = HttpSink::new(&cfg, CancellationToken::new(), "test", None)?;
 
     let events: Vec<Event> = (0..5).map(make_test_event).collect();
     let result = sink.send_batch(&events).await?;
@@ -185,7 +185,7 @@ async fn http_sink_batch_mode_sends_array() -> Result<()> {
     );
     cfg.batch_mode = true;
 
-    let sink = HttpSink::new(&cfg, CancellationToken::new(), "test")?;
+    let sink = HttpSink::new(&cfg, CancellationToken::new(), "test", None)?;
 
     let events: Vec<Event> = (0..5).map(make_test_event).collect();
     let result = sink.send_batch(&events).await?;
@@ -211,7 +211,7 @@ async fn http_sink_auth_error_fails_immediately() -> Result<()> {
 
     let cfg =
         make_http_cfg("test-auth", &format!("http://127.0.0.1:{port}/events"));
-    let sink = HttpSink::new(&cfg, CancellationToken::new(), "test")?;
+    let sink = HttpSink::new(&cfg, CancellationToken::new(), "test", None)?;
 
     let event = make_test_event(1);
     let result = sink.send(&event).await;
@@ -241,7 +241,7 @@ async fn http_sink_5xx_retries() -> Result<()> {
 
     let cfg =
         make_http_cfg("test-retry", &format!("http://127.0.0.1:{port}/events"));
-    let sink = HttpSink::new(&cfg, CancellationToken::new(), "test")?;
+    let sink = HttpSink::new(&cfg, CancellationToken::new(), "test", None)?;
 
     let event = make_test_event(1);
     let result = sink.send(&event).await;
@@ -271,7 +271,7 @@ async fn http_sink_url_template_routing() -> Result<()> {
         "test-routing",
         &format!("http://127.0.0.1:{port}/events/${{source.table}}"),
     );
-    let sink = HttpSink::new(&cfg, CancellationToken::new(), "test")?;
+    let sink = HttpSink::new(&cfg, CancellationToken::new(), "test", None)?;
 
     let event = make_event_for_table(1, "orders");
     sink.send(&event).await?;
@@ -320,7 +320,7 @@ async fn http_sink_custom_headers() -> Result<()> {
     cfg.headers
         .insert("X-Custom".into(), "deltaforge-test".into());
 
-    let sink = HttpSink::new(&cfg, CancellationToken::new(), "test")?;
+    let sink = HttpSink::new(&cfg, CancellationToken::new(), "test", None)?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
@@ -338,7 +338,7 @@ async fn http_sink_connection_refused_retries() -> Result<()> {
 
     // No server running on this port
     let cfg = make_http_cfg("test-refused", "http://127.0.0.1:19999/events");
-    let sink = HttpSink::new(&cfg, CancellationToken::new(), "test")?;
+    let sink = HttpSink::new(&cfg, CancellationToken::new(), "test", None)?;
 
     let event = make_test_event(1);
     let result = sink.send(&event).await;

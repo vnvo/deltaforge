@@ -486,21 +486,21 @@ mod tests {
                     data_type: "int".into(),
                     full_type: "int".into(),
                     nullable: false,
-                    is_json_like: false,
+                    ..Default::default()
                 },
                 ColumnSchemaInfo {
                     name: "customer_id".into(),
                     data_type: "int".into(),
                     full_type: "int".into(),
                     nullable: false,
-                    is_json_like: false,
+                    ..Default::default()
                 },
                 ColumnSchemaInfo {
                     name: "notes".into(),
                     data_type: "text".into(),
                     full_type: "text".into(),
                     nullable: true,
-                    is_json_like: false,
+                    ..Default::default()
                 },
                 ColumnSchemaInfo {
                     name: "metadata".into(),
@@ -508,6 +508,7 @@ mod tests {
                     full_type: "json".into(),
                     nullable: true,
                     is_json_like: true,
+                    ..Default::default()
                 },
             ],
             primary_key: vec!["id".into()],

@@ -36,6 +36,7 @@ use std::sync::Arc;
 
 use deltaforge_config::{PipelineSpec, SinkCfg, SinkFilter};
 use deltaforge_core::ArcDynSink;
+use deltaforge_core::encoding::avro::SourceSchemaProvider;
 use tokio_util::sync::CancellationToken;
 
 pub mod filter;
@@ -96,29 +97,56 @@ pub fn build_sinks(
     cancel: CancellationToken,
     pipeline: &str,
 ) -> anyhow::Result<Vec<ArcDynSink>> {
+    build_sinks_with_schemas(ps, cancel, pipeline, None)
+}
+
+/// Build all sinks, optionally injecting a DDL-derived schema provider
+/// for Avro encoding (Path A).
+pub fn build_sinks_with_schemas(
+    ps: &PipelineSpec,
+    cancel: CancellationToken,
+    pipeline: &str,
+    source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
+) -> anyhow::Result<Vec<ArcDynSink>> {
     ps.spec
         .sinks
         .iter()
         .map(|s| {
             let (sink, filter): (ArcDynSink, Option<SinkFilter>) = match s {
                 SinkCfg::Kafka(cfg) => (
-                    Arc::new(KafkaSink::new(cfg, cancel.clone(), pipeline)?)
-                        as ArcDynSink,
+                    Arc::new(KafkaSink::new(
+                        cfg,
+                        cancel.clone(),
+                        pipeline,
+                        source_schemas.clone(),
+                    )?) as ArcDynSink,
                     cfg.filter.clone(),
                 ),
                 SinkCfg::Redis(cfg) => (
-                    Arc::new(RedisSink::new(cfg, cancel.clone(), pipeline)?)
-                        as ArcDynSink,
+                    Arc::new(RedisSink::new(
+                        cfg,
+                        cancel.clone(),
+                        pipeline,
+                        source_schemas.clone(),
+                    )?) as ArcDynSink,
                     cfg.filter.clone(),
                 ),
                 SinkCfg::Nats(cfg) => (
-                    Arc::new(NatsSink::new(cfg, cancel.clone(), pipeline)?)
-                        as ArcDynSink,
+                    Arc::new(NatsSink::new(
+                        cfg,
+                        cancel.clone(),
+                        pipeline,
+                        source_schemas.clone(),
+                    )?) as ArcDynSink,
                     cfg.filter.clone(),
                 ),
                 SinkCfg::Http(cfg) => (
-                    Arc::new(HttpSink::new(cfg, cancel.clone(), pipeline)?)
-                        as ArcDynSink,
+                    Arc::new(HttpSink::new(
+                        cfg,
+                        cancel.clone(),
+                        pipeline,
+                        source_schemas.clone(),
+                    )?) as ArcDynSink,
                     cfg.filter.clone(),
                 ),
             };
@@ -149,17 +177,20 @@ pub fn build_sink(
 ) -> anyhow::Result<ArcDynSink> {
     let sink: ArcDynSink = match cfg {
         SinkCfg::Kafka(kafka_cfg) => {
-            Arc::new(KafkaSink::new(kafka_cfg, cancel, pipeline)?) as ArcDynSink
+            Arc::new(KafkaSink::new(kafka_cfg, cancel, pipeline, None)?)
+                as ArcDynSink
         }
         SinkCfg::Redis(redis_cfg) => {
-            Arc::new(RedisSink::new(redis_cfg, cancel, pipeline)?) as ArcDynSink
+            Arc::new(RedisSink::new(redis_cfg, cancel, pipeline, None)?)
+                as ArcDynSink
         }
         SinkCfg::Nats(nats_sink_cfg) => {
-            Arc::new(NatsSink::new(nats_sink_cfg, cancel, pipeline)?)
+            Arc::new(NatsSink::new(nats_sink_cfg, cancel, pipeline, None)?)
                 as ArcDynSink
         }
         SinkCfg::Http(http_cfg) => {
-            Arc::new(HttpSink::new(http_cfg, cancel, pipeline)?) as ArcDynSink
+            Arc::new(HttpSink::new(http_cfg, cancel, pipeline, None)?)
+                as ArcDynSink
         }
     };
     Ok(sink)
@@ -174,17 +205,20 @@ mod tests {
     // (Kafka, Redis) and are in the tests/ directory.
 
     #[test]
+    #[allow(clippy::type_complexity)]
     fn module_exports_are_available() {
         // Compile-time check that re-exports work
         let _: fn(
             &KafkaSinkCfg,
             CancellationToken,
             &str,
+            Option<Arc<dyn SourceSchemaProvider>>,
         ) -> anyhow::Result<KafkaSink> = KafkaSink::new;
         let _: fn(
             &RedisSinkCfg,
             CancellationToken,
             &str,
+            Option<Arc<dyn SourceSchemaProvider>>,
         ) -> anyhow::Result<RedisSink> = RedisSink::new;
     }
 }

@@ -240,6 +240,7 @@ fn make_sink(
         },
         CancellationToken::new(),
         "",
+        None,
     )
 }
 
@@ -659,6 +660,7 @@ async fn nats_sink_large_payload() -> Result<()> {
         },
         CancellationToken::new(),
         "",
+        None,
     )?;
 
     // Test various payload sizes
@@ -708,6 +710,7 @@ async fn nats_sink_batch_large_payload() -> Result<()> {
         },
         CancellationToken::new(),
         "",
+        None,
     )?;
 
     // 20 events at 50KB each = ~1MB total
@@ -755,6 +758,7 @@ async fn nats_sink_concurrent_sends() -> Result<()> {
         },
         CancellationToken::new(),
         "",
+        None,
     )?);
 
     // Spawn multiple concurrent send tasks
@@ -816,6 +820,7 @@ async fn nats_sink_concurrent_batches() -> Result<()> {
         },
         CancellationToken::new(),
         "",
+        None,
     )?);
 
     // Spawn multiple concurrent batch send tasks
@@ -999,6 +1004,7 @@ async fn nats_sink_handles_rapid_sends() -> Result<()> {
         },
         CancellationToken::new(),
         "",
+        None,
     )?);
 
     // Send multiple events rapidly
@@ -1057,6 +1063,7 @@ async fn nats_sink_batch_resilience() -> Result<()> {
         },
         CancellationToken::new(),
         "",
+        None,
     )?;
 
     // Send multiple batches in sequence
@@ -1112,6 +1119,7 @@ async fn nats_sink_respects_cancellation() -> Result<()> {
         },
         cancel.clone(),
         "",
+        None,
     )?);
 
     let sink_clone = sink.clone();
@@ -1237,6 +1245,7 @@ async fn nats_sink_optional() -> Result<()> {
         },
         CancellationToken::new(),
         "",
+        None,
     )?;
 
     assert!(!sink.required(), "sink should be optional");

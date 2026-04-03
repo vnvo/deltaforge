@@ -9,6 +9,8 @@
 //! - Avro — With Confluent Schema Registry support (see [`avro`] module)
 
 pub mod avro;
+pub mod avro_schema;
+pub mod avro_types;
 mod json;
 
 pub use json::Json;

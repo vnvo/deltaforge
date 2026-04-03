@@ -4907,6 +4907,7 @@ name = "runner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "apache-avro",
  "async-trait",
  "axum 0.8.4",
  "checkpoints",

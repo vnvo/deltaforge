@@ -289,7 +289,7 @@ fn make_sink(
         client_conf: HashMap::new(),
         filter: None,
     };
-    KafkaSink::new(&cfg, CancellationToken::new(), "")
+    KafkaSink::new(&cfg, CancellationToken::new(), "", None)
 }
 
 /// Consume up to `n` messages, waiting at most `secs` seconds.
@@ -845,6 +845,7 @@ async fn kafka_sink_idempotent_mode() -> Result<()> {
         },
         CancellationToken::new(),
         "",
+        None,
     )?;
 
     // Send multiple events
@@ -886,6 +887,7 @@ async fn kafka_sink_exactly_once_mode() -> Result<()> {
         },
         CancellationToken::new(),
         "",
+        None,
     )?;
 
     // Note: Full EOS testing requires transaction support; this just validates
@@ -1035,7 +1037,7 @@ async fn kafka_sink_custom_config() -> Result<()> {
         filter: None,
     };
 
-    let sink = KafkaSink::new(&cfg, CancellationToken::new(), "")?;
+    let sink = KafkaSink::new(&cfg, CancellationToken::new(), "", None)?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
@@ -1102,7 +1104,7 @@ async fn kafka_sink_optional() -> Result<()> {
         filter: None,
     };
 
-    let sink = KafkaSink::new(&cfg, CancellationToken::new(), "")?;
+    let sink = KafkaSink::new(&cfg, CancellationToken::new(), "", None)?;
 
     assert!(!sink.required(), "sink should be optional");
 
@@ -1172,6 +1174,7 @@ async fn kafka_sink_recovers_after_restart() -> Result<()> {
         },
         cancel.clone(),
         "",
+        None,
     )?);
 
     // Send first event successfully
@@ -1321,6 +1324,7 @@ async fn kafka_sink_respects_cancellation() -> Result<()> {
         },
         cancel.clone(),
         "",
+        None,
     )?);
 
     let sink_clone = sink.clone();
@@ -1566,7 +1570,7 @@ async fn kafka_sink_routing_key_and_headers() -> Result<()> {
         filter: None,
     };
 
-    let sink = KafkaSink::new(&cfg, CancellationToken::new(), "")?;
+    let sink = KafkaSink::new(&cfg, CancellationToken::new(), "", None)?;
 
     let mut event = make_event_for_table(1, "orders");
     event.after = Some(json!({"id": 1, "customer_id": "cust-42"}));
@@ -1724,7 +1728,7 @@ fn make_txn_sink(
         client_conf: HashMap::new(),
         filter: None,
     };
-    KafkaSink::new(&cfg, CancellationToken::new(), pipeline)
+    KafkaSink::new(&cfg, CancellationToken::new(), pipeline, None)
 }
 
 /// Create a consumer with read_committed isolation — only sees committed

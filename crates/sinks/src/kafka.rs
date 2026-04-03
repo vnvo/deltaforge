@@ -31,6 +31,7 @@
 //!         sasl.mechanism: PLAIN
 //! ```
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -40,7 +41,7 @@ use common::{RetryOutcome, RetryPolicy, retry_async};
 use deltaforge_config::EncodingCfg;
 use deltaforge_config::KafkaSinkCfg;
 use deltaforge_core::encoding::EncodingType;
-use deltaforge_core::encoding::avro::AvroEncoder;
+use deltaforge_core::encoding::avro::{AvroEncoder, SourceSchemaProvider};
 use deltaforge_core::envelope::Envelope;
 use deltaforge_core::{BatchResult, Event, Sink, SinkError, SinkResult};
 use futures::future::try_join_all;
@@ -170,6 +171,7 @@ impl KafkaSink {
         cfg: &KafkaSinkCfg,
         cancel: CancellationToken,
         pipeline: &str,
+        source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
     ) -> anyhow::Result<Self> {
         let mut client_cfg = ClientConfig::new();
 
@@ -272,11 +274,12 @@ impl KafkaSink {
             };
 
             Some(
-                AvroEncoder::new(
+                AvroEncoder::with_source_schemas(
                     schema_registry_url,
                     strategy,
                     username.as_deref(),
                     password.as_deref(),
+                    source_schemas,
                 )
                 .context("creating Avro encoder")?,
             )
@@ -494,11 +497,17 @@ impl KafkaSink {
             }
         })?;
 
-        let bytes =
-            encoder.encode(topic, &envelope, None).await.map_err(|e| {
-                SinkError::Serialization {
-                    details: e.to_string().into(),
-                }
+        let bytes = encoder
+            .encode_event(
+                topic,
+                &envelope,
+                &event.source.connector,
+                &event.source.db,
+                &event.source.table,
+            )
+            .await
+            .map_err(|e| SinkError::Serialization {
+                details: e.to_string().into(),
             })?;
 
         Ok(bytes.to_vec())

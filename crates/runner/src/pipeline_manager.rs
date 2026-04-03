@@ -87,7 +87,6 @@ use parking_lot::RwLock;
 use processors::build_processors;
 use rest_api::{PipeInfo, PipelineAPIError, PipelineController};
 use serde_json::Value;
-use sinks::build_sinks;
 use sources::{ArcSchemaLoader, build_schema_loader, build_source};
 use storage::{
     ArcStorageBackend, BackendCheckpointStore, DurableSchemaRegistry,
@@ -99,6 +98,53 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::info;
+
+use crate::schema_provider::AvroSchemaProviderImpl;
+use deltaforge_core::encoding::avro::SourceSchemaProvider;
+use deltaforge_core::encoding::avro_types::TypeConversionOpts;
+
+/// Build an Avro source schema provider if any sink uses Avro encoding.
+///
+/// Returns `None` if no sinks use Avro — zero overhead in that case.
+fn build_avro_provider(
+    spec: &PipelineSpec,
+    schema_loader: &Option<ArcSchemaLoader>,
+) -> Option<Arc<dyn SourceSchemaProvider>> {
+    use deltaforge_config::{EncodingCfg, SinkCfg};
+
+    // Check if any sink uses Avro encoding
+    let has_avro = spec.spec.sinks.iter().any(|s| {
+        let encoding = match s {
+            SinkCfg::Kafka(c) => &c.encoding,
+            SinkCfg::Redis(c) => &c.encoding,
+            SinkCfg::Nats(c) => &c.encoding,
+            SinkCfg::Http(c) => &c.encoding,
+        };
+        matches!(encoding, EncodingCfg::Avro { .. })
+    });
+
+    if !has_avro {
+        return None;
+    }
+
+    let loader = schema_loader.as_ref()?;
+
+    let connector = match &spec.spec.source {
+        SourceCfg::Mysql(_) => "mysql",
+        SourceCfg::Postgres(_) => "postgresql",
+        #[cfg(feature = "turso")]
+        SourceCfg::Turso(_) => "turso",
+    };
+
+    let schema_provider =
+        Arc::new(SchemaLoaderAdapter::new(Arc::clone(loader)));
+
+    Some(Arc::new(AvroSchemaProviderImpl::new(
+        schema_provider,
+        connector,
+        TypeConversionOpts::default(),
+    )))
+}
 
 // ============================================================================
 // Pipeline Runtime (internal)
@@ -299,9 +345,18 @@ impl PipelineManager {
         .context("build source")?;
         let processors = build_processors(&spec, &pipeline_name)
             .context("build processors")?;
-        let sinks = build_sinks(&spec, cancel.clone(), &pipeline_name)
-            .context("build sinks")?;
         let schema_loader = build_schema_loader(&spec, self.registry.clone());
+
+        // Build Avro schema provider if any sink uses Avro encoding
+        let avro_source_schemas = build_avro_provider(&spec, &schema_loader);
+
+        let sinks = sinks::build_sinks_with_schemas(
+            &spec,
+            cancel.clone(),
+            &pipeline_name,
+            avro_source_schemas,
+        )
+        .context("build sinks")?;
 
         let table_patterns = match &spec.spec.source {
             SourceCfg::Mysql(c) => c.tables.clone(),

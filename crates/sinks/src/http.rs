@@ -4,6 +4,7 @@
 //! batch mode (JSON array), and retry with exponential backoff on 5xx/network errors.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -13,7 +14,7 @@ use common::routing::CompiledTemplate;
 use deltaforge_config::EncodingCfg;
 use deltaforge_config::HttpSinkCfg;
 use deltaforge_core::encoding::EncodingType;
-use deltaforge_core::encoding::avro::AvroEncoder;
+use deltaforge_core::encoding::avro::{AvroEncoder, SourceSchemaProvider};
 use deltaforge_core::envelope::Envelope;
 use deltaforge_core::{BatchResult, Event, Sink, SinkError, SinkResult};
 use metrics::counter;
@@ -52,6 +53,7 @@ impl HttpSink {
         cfg: &HttpSinkCfg,
         cancel: CancellationToken,
         pipeline: &str,
+        source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
     ) -> anyhow::Result<Self> {
         let connect_timeout = cfg
             .connect_timeout_secs
@@ -135,11 +137,12 @@ impl HttpSink {
             };
 
             Some(
-                AvroEncoder::new(
+                AvroEncoder::with_source_schemas(
                     schema_registry_url,
                     strategy,
                     username.as_deref(),
                     password.as_deref(),
+                    source_schemas,
                 )
                 .context("creating Avro encoder")?,
             )
@@ -247,11 +250,17 @@ impl HttpSink {
             }
         })?;
 
-        let bytes =
-            encoder.encode(dest, &envelope, None).await.map_err(|e| {
-                SinkError::Serialization {
-                    details: e.to_string().into(),
-                }
+        let bytes = encoder
+            .encode_event(
+                dest,
+                &envelope,
+                &event.source.connector,
+                &event.source.db,
+                &event.source.table,
+            )
+            .await
+            .map_err(|e| SinkError::Serialization {
+                details: e.to_string().into(),
             })?;
 
         Ok(bytes.to_vec())

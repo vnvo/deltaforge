@@ -184,6 +184,7 @@ fn make_sink(
         },
         CancellationToken::new(),
         "",
+        None,
     )
 }
 
@@ -768,6 +769,7 @@ async fn redis_sink_respects_cancellation() -> Result<()> {
         },
         cancel.clone(),
         "",
+        None,
     )?);
 
     let sink_clone = sink.clone();
@@ -813,6 +815,7 @@ async fn redis_sink_large_events() -> Result<()> {
         },
         CancellationToken::new(),
         "",
+        None,
     )?;
 
     // Send a 1MB event
@@ -849,6 +852,7 @@ async fn redis_sink_large_batch() -> Result<()> {
         },
         CancellationToken::new(),
         "",
+        None,
     )?;
 
     // Send 10 events of 100KB each
@@ -890,6 +894,7 @@ async fn redis_sink_concurrent_sends() -> Result<()> {
         },
         CancellationToken::new(),
         "",
+        None,
     )?);
 
     // Spawn 10 concurrent tasks, each sending 10 events
@@ -1121,6 +1126,7 @@ async fn redis_sink_optional() -> Result<()> {
         },
         CancellationToken::new(),
         "",
+        None,
     )?;
 
     assert!(!sink.required(), "sink should be optional");

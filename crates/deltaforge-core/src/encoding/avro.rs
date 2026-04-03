@@ -30,6 +30,31 @@ use tracing::{debug, warn};
 use super::EncodingError;
 
 // =============================================================================
+// Source schema provider trait
+// =============================================================================
+
+/// Provides DDL-derived Avro schemas for CDC events (Path A).
+///
+/// Implementors look up source table schemas and convert them to Avro
+/// field definitions using the type converters in [`super::avro_types`].
+///
+/// The returned schema string is a complete Avro envelope schema JSON
+/// (built by [`super::avro_schema::build_envelope_schema`]).
+pub trait SourceSchemaProvider: Send + Sync {
+    /// Look up the Avro envelope schema for a given source table.
+    ///
+    /// Returns `Some((schema_json, parsed_schema))` if DDL is available
+    /// for the given connector/db/table, or `None` to fall back to
+    /// JSON inference (Path C).
+    fn get_envelope_schema(
+        &self,
+        connector: &str,
+        db: &str,
+        table: &str,
+    ) -> Option<(String, Arc<AvroSchema>)>;
+}
+
+// =============================================================================
 // Subject naming strategy
 // =============================================================================
 
@@ -322,15 +347,40 @@ pub struct AvroEncoder {
     registry: SchemaRegistryClient,
     strategy: SubjectStrategy,
     auth: Option<(String, String)>,
+    /// Optional DDL-derived schema provider (Path A).
+    /// When set, the encoder uses precise DDL-derived Avro schemas
+    /// instead of inferring from JSON (Path C).
+    source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
 }
 
 impl AvroEncoder {
-    /// Create a new Avro encoder.
+    /// Create a new Avro encoder (Path C only — JSON inference fallback).
     pub fn new(
         schema_registry_url: &str,
         strategy: SubjectStrategy,
         username: Option<&str>,
         password: Option<&str>,
+    ) -> Result<Self, EncodingError> {
+        Self::with_source_schemas(
+            schema_registry_url,
+            strategy,
+            username,
+            password,
+            None,
+        )
+    }
+
+    /// Create a new Avro encoder with an optional DDL schema provider.
+    ///
+    /// When `source_schemas` is provided, the encoder uses DDL-derived
+    /// Avro schemas (Path A) for events whose source table is known.
+    /// Falls back to JSON inference (Path C) for unknown tables.
+    pub fn with_source_schemas(
+        schema_registry_url: &str,
+        strategy: SubjectStrategy,
+        username: Option<&str>,
+        password: Option<&str>,
+        source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
     ) -> Result<Self, EncodingError> {
         let registry =
             SchemaRegistryClient::new(schema_registry_url, username, password)?;
@@ -344,7 +394,16 @@ impl AvroEncoder {
             registry,
             strategy,
             auth,
+            source_schemas,
         })
+    }
+
+    /// Set the source schema provider after construction.
+    pub fn set_source_schemas(
+        &mut self,
+        provider: Arc<dyn SourceSchemaProvider>,
+    ) {
+        self.source_schemas = Some(provider);
     }
 
     /// Encode a serializable value to Confluent Avro wire format.
@@ -394,6 +453,98 @@ impl AvroEncoder {
         let mut buf = BytesMut::with_capacity(5 + avro_bytes.len());
         buf.put_u8(0x00); // magic byte
         buf.put_u32(schema_id); // schema ID (big-endian)
+        buf.extend_from_slice(&avro_bytes);
+
+        Ok(buf.freeze())
+    }
+
+    /// Encode a CDC event using DDL-derived schema when available (Path A),
+    /// falling back to JSON inference (Path C).
+    ///
+    /// This is the preferred entry point for CDC events where the source
+    /// metadata (connector, db, table) is known.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - Destination topic/stream/subject (used for SR subject naming)
+    /// * `value` - Serializable envelope data
+    /// * `connector` - Source connector type ("mysql", "postgresql", etc.)
+    /// * `db` - Source database name
+    /// * `table` - Source table name
+    pub async fn encode_event<T: Serialize>(
+        &self,
+        topic: &str,
+        value: &T,
+        connector: &str,
+        db: &str,
+        table: &str,
+    ) -> Result<Bytes, EncodingError> {
+        // 1. Try Path A: DDL-derived schema
+        if let Some(ref provider) = self.source_schemas {
+            if let Some((schema_json, schema)) =
+                provider.get_envelope_schema(connector, db, table)
+            {
+                debug!(
+                    connector,
+                    db,
+                    table,
+                    "using DDL-derived Avro schema (Path A)"
+                );
+                return self
+                    .encode_with_schema(topic, value, &schema_json, &schema)
+                    .await;
+            }
+        }
+
+        // 2. Fall back to Path C: JSON inference
+        debug!(
+            connector,
+            db,
+            table,
+            "no DDL schema available — falling back to JSON inference (Path C)"
+        );
+        let record_name = Some(
+            format!("deltaforge.{connector}.{db}.{table}.Value").leak() as &str
+        );
+        self.encode(topic, value, record_name).await
+    }
+
+    /// Encode a value using a pre-built Avro schema.
+    ///
+    /// Shared encoding logic for both Path A (DDL-derived) and Path C (inferred).
+    async fn encode_with_schema<T: Serialize>(
+        &self,
+        topic: &str,
+        value: &T,
+        schema_json: &str,
+        schema: &AvroSchema,
+    ) -> Result<Bytes, EncodingError> {
+        // 1. Resolve subject name
+        let subject = self.strategy.resolve(topic, None);
+
+        // 2. Register schema with SR (idempotent, cached)
+        let auth =
+            self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+        let (schema_id, registered_schema) = self
+            .registry
+            .register_schema(&subject, schema_json, auth)
+            .await?;
+
+        // 3. Serialize value to JSON, then convert to Avro
+        let json_value = serde_json::to_value(value)
+            .map_err(|e| EncodingError::Avro(e.to_string()))?;
+        let avro_value = json_to_avro(&json_value, &registered_schema)?;
+
+        // 4. Encode as Avro binary
+        let avro_bytes =
+            apache_avro::to_avro_datum(schema, avro_value).map_err(|e| {
+                EncodingError::Avro(format!("Avro encoding failed: {e}"))
+            })?;
+
+        // 5. Build Confluent wire format
+        let mut buf = BytesMut::with_capacity(5 + avro_bytes.len());
+        buf.put_u8(0x00);
+        buf.put_u32(schema_id);
         buf.extend_from_slice(&avro_bytes);
 
         Ok(buf.freeze())

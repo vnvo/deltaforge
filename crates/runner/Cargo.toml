@@ -25,6 +25,7 @@ tracing.workspace = true
 axum.workspace = true
 clap = { version = "4", features = ["derive"] }
 deltaforge-core = { path = "../deltaforge-core" }
+apache-avro.workspace = true
 storage = { path = "../storage" }
 schema-sensing = { path = "../schema-sensing" }
 deltaforge-config = { path = "../deltaforge-config" }
