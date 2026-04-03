@@ -1528,6 +1528,7 @@ dependencies = [
  "bytes",
  "checkpoints",
  "chrono",
+ "metrics",
  "parking_lot",
  "reqwest",
  "serde",

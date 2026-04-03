@@ -71,6 +71,18 @@ pub enum EncodingCfg {
 
         /// Basic auth password for Schema Registry.
         password: Option<String>,
+
+        /// How to map MySQL BIGINT UNSIGNED. Default: "string" (safe).
+        /// "long" risks overflow for values >= 2^63.
+        unsigned_bigint_mode: Option<String>,
+
+        /// How to map MySQL/PostgreSQL ENUM types. Default: "string" (safe).
+        /// "enum" uses Avro enum (compatibility risk on symbol changes).
+        enum_mode: Option<String>,
+
+        /// How to map naive (timezone-unaware) timestamps. Default: "string" (ISO-8601).
+        /// "timestamp" uses Avro timestamp logical types (semantically misleading for non-UTC).
+        naive_timestamp_mode: Option<String>,
     },
 }
 
@@ -86,6 +98,9 @@ impl Serialize for EncodingCfg {
                 subject_strategy,
                 username,
                 password,
+                unsigned_bigint_mode,
+                enum_mode,
+                naive_timestamp_mode,
             } => {
                 use serde::ser::SerializeMap;
                 let mut map = serializer.serialize_map(None)?;
@@ -100,6 +115,15 @@ impl Serialize for EncodingCfg {
                 }
                 if let Some(p) = password {
                     map.serialize_entry("password", p)?;
+                }
+                if let Some(v) = unsigned_bigint_mode {
+                    map.serialize_entry("unsigned_bigint_mode", v)?;
+                }
+                if let Some(v) = enum_mode {
+                    map.serialize_entry("enum_mode", v)?;
+                }
+                if let Some(v) = naive_timestamp_mode {
+                    map.serialize_entry("naive_timestamp_mode", v)?;
                 }
                 map.end()
             }
@@ -161,6 +185,12 @@ impl<'de> Deserialize<'de> for EncodingCfg {
                         username: Option<String>,
                         #[serde(default)]
                         password: Option<String>,
+                        #[serde(default)]
+                        unsigned_bigint_mode: Option<String>,
+                        #[serde(default)]
+                        enum_mode: Option<String>,
+                        #[serde(default)]
+                        naive_timestamp_mode: Option<String>,
                     },
                 }
                 let tagged = Tagged::deserialize(
@@ -173,11 +203,17 @@ impl<'de> Deserialize<'de> for EncodingCfg {
                         subject_strategy,
                         username,
                         password,
+                        unsigned_bigint_mode,
+                        enum_mode,
+                        naive_timestamp_mode,
                     } => EncodingCfg::Avro {
                         schema_registry_url,
                         subject_strategy,
                         username,
                         password,
+                        unsigned_bigint_mode,
+                        enum_mode,
+                        naive_timestamp_mode,
                     },
                 })
             }

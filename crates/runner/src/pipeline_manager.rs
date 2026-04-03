@@ -112,21 +112,34 @@ fn build_avro_provider(
 ) -> Option<Arc<dyn SourceSchemaProvider>> {
     use deltaforge_config::{EncodingCfg, SinkCfg};
 
-    // Check if any sink uses Avro encoding
-    let has_avro = spec.spec.sinks.iter().any(|s| {
+    use deltaforge_core::encoding::avro_types::{
+        EnumMode, NaiveTimestampMode, UnsignedBigintMode,
+    };
+
+    // Find the first Avro-encoded sink and extract type conversion options
+    let avro_cfg = spec.spec.sinks.iter().find_map(|s| {
         let encoding = match s {
             SinkCfg::Kafka(c) => &c.encoding,
             SinkCfg::Redis(c) => &c.encoding,
             SinkCfg::Nats(c) => &c.encoding,
             SinkCfg::Http(c) => &c.encoding,
         };
-        matches!(encoding, EncodingCfg::Avro { .. })
+        match encoding {
+            EncodingCfg::Avro {
+                unsigned_bigint_mode,
+                enum_mode,
+                naive_timestamp_mode,
+                ..
+            } => Some((
+                unsigned_bigint_mode.clone(),
+                enum_mode.clone(),
+                naive_timestamp_mode.clone(),
+            )),
+            _ => None,
+        }
     });
 
-    if !has_avro {
-        return None;
-    }
-
+    let (ubm, em, ntm) = avro_cfg?;
     let loader = schema_loader.as_ref()?;
 
     let connector = match &spec.spec.source {
@@ -136,13 +149,28 @@ fn build_avro_provider(
         SourceCfg::Turso(_) => "turso",
     };
 
+    let opts = TypeConversionOpts {
+        unsigned_bigint_mode: match ubm.as_deref() {
+            Some("long") => UnsignedBigintMode::Long,
+            _ => UnsignedBigintMode::String,
+        },
+        enum_mode: match em.as_deref() {
+            Some("enum") => EnumMode::Enum,
+            _ => EnumMode::String,
+        },
+        naive_timestamp_mode: match ntm.as_deref() {
+            Some("timestamp") => NaiveTimestampMode::Timestamp,
+            _ => NaiveTimestampMode::String,
+        },
+    };
+
     let schema_provider =
         Arc::new(SchemaLoaderAdapter::new(Arc::clone(loader)));
 
     Some(Arc::new(AvroSchemaProviderImpl::new(
         schema_provider,
         connector,
-        TypeConversionOpts::default(),
+        opts,
     )))
 }
 

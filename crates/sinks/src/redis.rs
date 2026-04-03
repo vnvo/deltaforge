@@ -145,6 +145,7 @@ impl RedisSink {
             ref subject_strategy,
             ref username,
             ref password,
+            ..
         } = cfg.encoding
         {
             use deltaforge_config::SubjectStrategy as CfgStrategy;

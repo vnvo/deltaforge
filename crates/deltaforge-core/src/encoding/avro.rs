@@ -23,6 +23,7 @@ use std::sync::Arc;
 use apache_avro::Schema as AvroSchema;
 use apache_avro::types::Value as AvroValue;
 use bytes::{BufMut, Bytes, BytesMut};
+use metrics::counter;
 use parking_lot::RwLock;
 use serde::Serialize;
 use tracing::{debug, warn};
@@ -326,6 +327,17 @@ impl SchemaRegistryClient {
         Ok(Some((lookup.id, schema)))
     }
 
+    /// Get cached schema for a subject (if previously registered).
+    pub fn get_cached(
+        &self,
+        subject: &str,
+    ) -> Option<(u32, Arc<AvroSchema>)> {
+        let cache = self.cache.read();
+        cache
+            .get(subject)
+            .map(|c| (c.id, c.schema.clone()))
+    }
+
     /// Clear the schema cache (useful for testing or schema evolution).
     #[allow(dead_code)]
     pub fn clear_cache(&self) {
@@ -490,6 +502,8 @@ impl AvroEncoder {
                     table,
                     "using DDL-derived Avro schema (Path A)"
                 );
+                counter!("deltaforge_avro_encode_total", "path" => "ddl")
+                    .increment(1);
                 return self
                     .encode_with_schema(topic, value, &schema_json, &schema)
                     .await;
@@ -503,6 +517,8 @@ impl AvroEncoder {
             table,
             "no DDL schema available — falling back to JSON inference (Path C)"
         );
+        counter!("deltaforge_avro_encode_total", "path" => "inferred")
+            .increment(1);
         let record_name = Some(
             format!("deltaforge.{connector}.{db}.{table}.Value").leak() as &str
         );
@@ -512,6 +528,11 @@ impl AvroEncoder {
     /// Encode a value using a pre-built Avro schema.
     ///
     /// Shared encoding logic for both Path A (DDL-derived) and Path C (inferred).
+    ///
+    /// If the Schema Registry is unavailable but a schema is already cached
+    /// for this subject, encoding continues with the cached schema ID.
+    /// If encoding fails under the cached schema (e.g., DDL changed), the
+    /// error is propagated for DLQ routing.
     async fn encode_with_schema<T: Serialize>(
         &self,
         topic: &str,
@@ -522,18 +543,60 @@ impl AvroEncoder {
         // 1. Resolve subject name
         let subject = self.strategy.resolve(topic, None);
 
-        // 2. Register schema with SR (idempotent, cached)
+        // 2. Register schema with SR (idempotent, cached).
+        //    On SR failure, fall back to cached schema if available.
         let auth =
             self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
-        let (schema_id, registered_schema) = self
+        let (schema_id, registered_schema) = match self
             .registry
             .register_schema(&subject, schema_json, auth)
-            .await?;
+            .await
+        {
+            Ok(result) => {
+                counter!("deltaforge_avro_schema_registrations_total")
+                    .increment(1);
+                result
+            }
+            Err(e) => {
+                // SR unavailable — try cached schema
+                if let Some(cached) = self.registry.get_cached(&subject) {
+                    warn!(
+                        subject = %subject,
+                        error = %e,
+                        cached_schema_id = cached.0,
+                        "Schema Registry unavailable — using cached schema"
+                    );
+                    counter!(
+                        "deltaforge_avro_sr_cache_fallback_total"
+                    )
+                    .increment(1);
+                    (cached.0, cached.1)
+                } else {
+                    // No cache — cannot encode
+                    counter!(
+                        "deltaforge_avro_encode_failure_total",
+                        "reason" => "sr_unavailable"
+                    )
+                    .increment(1);
+                    return Err(e);
+                }
+            }
+        };
 
         // 3. Serialize value to JSON, then convert to Avro
         let json_value = serde_json::to_value(value)
             .map_err(|e| EncodingError::Avro(e.to_string()))?;
-        let avro_value = json_to_avro(&json_value, &registered_schema)?;
+        let avro_value = match json_to_avro(&json_value, &registered_schema) {
+            Ok(v) => v,
+            Err(e) => {
+                counter!(
+                    "deltaforge_avro_encode_failure_total",
+                    "reason" => "schema_mismatch"
+                )
+                .increment(1);
+                return Err(e);
+            }
+        };
 
         // 4. Encode as Avro binary
         let avro_bytes =
