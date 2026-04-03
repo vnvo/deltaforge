@@ -102,6 +102,17 @@ pub const PG_SOAK: SoakSource = SoakSource {
     pipeline: "chaos-pg-soak",
 };
 
+pub const AVRO_SOAK: SoakSource = SoakSource {
+    name: "mysql-avro",
+    profile: "avro-soak",
+    service: "deltaforge-avro-soak",
+    health_url: "http://localhost:8086/health",
+    topic: "chaos.soak.avro",
+    proxy: "mysql",
+    df_base: "http://localhost:8086",
+    pipeline: "chaos-soak-avro",
+};
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub async fn run(
@@ -390,6 +401,41 @@ pub async fn run_stable_pg(
     run_stable_with_source(
         harness,
         &PG_SOAK,
+        duration_mins,
+        writer_tasks,
+        write_delay_ms,
+    )
+    .await
+}
+
+/// Avro soak: same workload as MySQL soak but with Avro encoding.
+/// Compare throughput against JSON soak to measure Avro overhead.
+pub async fn run_avro(
+    harness: &Harness,
+    duration_mins: u64,
+    writer_tasks: usize,
+    write_delay_ms: u64,
+) -> Result<ScenarioResult> {
+    run_with_source(
+        harness,
+        &AVRO_SOAK,
+        duration_mins,
+        writer_tasks,
+        write_delay_ms,
+    )
+    .await
+}
+
+/// Avro stable baseline: same as Avro soak but with no fault injection.
+pub async fn run_stable_avro(
+    harness: &Harness,
+    duration_mins: u64,
+    writer_tasks: usize,
+    write_delay_ms: u64,
+) -> Result<ScenarioResult> {
+    run_stable_with_source(
+        harness,
+        &AVRO_SOAK,
         duration_mins,
         writer_tasks,
         write_delay_ms,

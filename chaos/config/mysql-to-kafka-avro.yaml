@@ -1,0 +1,40 @@
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: chaos-mysql-avro
+  tenant: chaos
+
+spec:
+  source:
+    type: mysql
+    config:
+      id: chaos-mysql-avro
+      dsn: "mysql://cdc_user:cdc_password@toxiproxy:5100/orders"
+      tables:
+        - "orders.*"
+      on_schema_drift: adapt
+
+  processors: []
+
+  sinks:
+    - type: kafka
+      config:
+        id: chaos-kafka-avro
+        brokers: "toxiproxy:5102"
+        topic: chaos.avro
+        required: true
+        send_timeout_secs: 3
+        envelope:
+          type: native
+        encoding:
+          type: avro
+          schema_registry_url: "http://toxiproxy:5103"
+          subject_strategy: topic_name
+
+  batch:
+    max_events: 500
+    max_ms: 100
+    respect_source_tx: true
+
+  commit_policy:
+    mode: required

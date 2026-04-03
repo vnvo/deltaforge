@@ -19,6 +19,9 @@ pub mod tpc_di;
 pub mod tpc_e;
 pub mod tpcc;
 
+// Avro / Schema Registry scenarios.
+pub mod sr_outage;
+
 // PostgreSQL-specific scenarios.
 pub mod pg_failover;
 pub mod slot_dropped;

@@ -11,6 +11,8 @@
 #   pg-infra      — postgres, postgres-b
 #   kafka-infra   — kafka
 #   app           — DeltaForge MySQL->Kafka chaos instance
+#   avro-app      — DeltaForge MySQL->Kafka with Avro encoding (needs kafka-infra for SR)
+#   avro-soak     — DeltaForge MySQL Avro soak benchmark (compare vs JSON soak)
 #   pg-app        — DeltaForge Postgres->Kafka chaos instance
 #   soak          — DeltaForge MySQL soak/drain benchmark
 #   pg-soak       — DeltaForge Postgres soak/drain benchmark
@@ -185,6 +187,23 @@ services:
       - "9092:9092"
     networks: [chaos_net]
 
+  # Confluent Schema Registry (for Avro encoding tests)
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.7.1
+    profiles: [kafka-infra]
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "8085:8081"   # host port 8085 to avoid conflict with DeltaForge on 8081
+    networks: [chaos_net]
+
   # ==========================================================================
   # base — proxy, observability, log aggregation
   # ==========================================================================
@@ -200,6 +219,7 @@ services:
       - "5100:5100"   # mysql proxy    <-- also exposed for ad-hoc inspection
       - "5101:5101"   # postgres proxy
       - "5102:5102"   # kafka proxy
+      - "5103:5103"   # schema-registry proxy
     # No depends_on — infra profiles start independently. Toxiproxy retries
     # upstream connections automatically; backends just need to be up before
     # DeltaForge connects through the proxy.
@@ -286,6 +306,24 @@ services:
     restart: on-failure
     networks: [chaos_net]
 
+  # MySQL -> Kafka with Avro encoding (Schema Registry required)
+  # Uses different host ports so it can run alongside the JSON app
+  deltaforge-avro:
+    image: deltaforge:dev-debug
+    profiles: [avro-app]
+    command: ["--config", "/etc/deltaforge/mysql-to-kafka-avro.yaml", "--storage-path", "/data/deltaforge-avro.db"]
+    user: root
+    volumes:
+      - ./chaos/config:/etc/deltaforge:ro
+      - deltaforge_avro_data:/data
+    environment:
+      RUST_LOG: "deltaforge=debug,sources=debug,sinks=info,warn"
+    ports:
+      - "8084:8080"   # REST API / health
+      - "9004:9000"   # Prometheus /metrics
+    restart: on-failure
+    networks: [chaos_net]
+
   # Postgres -> Kafka chaos instance
   # Same host ports as deltaforge (8080, 9000) — don't run app + pg-app together
   deltaforge-pg:
@@ -342,6 +380,26 @@ services:
     restart: on-failure
     networks: [chaos_net]
 
+  # MySQL Avro soak benchmark — same as soak but with Avro encoding (ports 8086/9006)
+  # Compare throughput against JSON soak to measure Avro overhead.
+  deltaforge-avro-soak:
+    image: deltaforge:dev-profile
+    profiles: [avro-soak]
+    command: ["--config", "/etc/deltaforge/mysql-soak-avro.yaml", "--storage-path", "/data/deltaforge-avro-soak.db"]
+    user: root
+    cap_add: [SYS_ADMIN]
+    security_opt: ["seccomp=unconfined"]
+    volumes:
+      - ./chaos/config:/etc/deltaforge:ro
+      - deltaforge_avro_soak_data:/data
+    environment:
+      RUST_LOG: "deltaforge=info,sources=info,sinks=info,warn"
+    ports:
+      - "8086:8080"   # REST API / health
+      - "9006:9000"   # Prometheus /metrics
+    restart: on-failure
+    networks: [chaos_net]
+
   # Postgres soak/drain benchmark (profiling image, ports 8083/9003)
   deltaforge-pg-soak:
     image: deltaforge:dev-profile
@@ -366,6 +424,8 @@ networks:
 
 volumes:
   deltaforge_data:
+  deltaforge_avro_data:
+  deltaforge_avro_soak_data:
   deltaforge_pg_data:
   deltaforge_tpcc_data:
   deltaforge_soak_data:

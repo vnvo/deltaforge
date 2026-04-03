@@ -16,5 +16,11 @@
     "listen": "0.0.0.0:5102",
     "upstream": "kafka:9094",
     "enabled": true
+  },
+  {
+    "name": "schema-registry",
+    "listen": "0.0.0.0:5103",
+    "upstream": "schema-registry:8081",
+    "enabled": true
   }
 ]

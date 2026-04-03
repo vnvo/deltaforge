@@ -1,0 +1,63 @@
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: chaos-soak-avro
+  tenant: chaos
+
+spec:
+  source:
+    type: mysql
+    config:
+      id: chaos-soak-avro-mysql
+      dsn: "mysql://cdc_user:cdc_password@toxiproxy:5100/orders"
+      tables:
+        - "orders.*"
+      on_schema_drift: adapt
+
+  schema_sensing:
+    enabled: true
+    sampling:
+      warmup_events: 100
+      sample_rate: 50
+      structure_cache: true
+    deep_inspect:
+      enabled: true
+      max_depth: 3
+      max_sample_size: 100
+    tracking:
+      field_statistics: false
+      null_rates: false
+      enum_detection: false
+
+  processors: []
+
+  sinks:
+    - type: kafka
+      config:
+        id: chaos-soak-avro-kafka
+        brokers: "toxiproxy:5102"
+        topic: chaos.soak.avro
+        required: true
+        send_timeout_secs: 5
+        envelope:
+          type: native
+        encoding:
+          type: avro
+          schema_registry_url: "http://schema-registry:8081"
+          subject_strategy: topic_name
+
+  batch:
+    max_events: 2000
+    max_ms: 50
+    respect_source_tx: false
+
+  commit_policy:
+    mode: required
+
+  journal:
+    enabled: true
+    max_event_bytes: 262144
+    dlq:
+      max_entries: 10000
+      max_age_secs: 3600
+      overflow_policy: drop_oldest

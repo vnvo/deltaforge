@@ -130,6 +130,11 @@ enum Scenario {
     /// DLQ validation: verifies REST API endpoints, pipeline continues after
     /// DLQ operations.
     DlqPoison,
+    // Avro / Schema Registry
+    /// Schema Registry outage: cuts SR proxy, verifies events continue
+    /// via cached schema fallback, then verifies recovery.
+    /// Requires `avro-app` profile with SR behind Toxiproxy.
+    SrOutage,
     // MySQL-specific
     Failover,
     BinlogPurge,
@@ -143,6 +148,11 @@ enum Scenario {
     /// Writers and ALTER TABLE operations run for the full duration.
     /// Use to measure cache hit ratio, latency, and resource usage without chaos.
     SoakStable,
+    /// Avro soak: same as Soak but with Avro encoding via Schema Registry.
+    /// Requires `avro-soak` compose profile. Compare throughput against JSON Soak.
+    SoakAvro,
+    /// Avro stable baseline: no fault injection, Avro encoding.
+    SoakStableAvro,
     // Heavy benchmark scenarios — not included in `all`.
     // Each prints a preamble explaining what it proves before running.
     /// TPC-C inspired endurance test: New-Order / Payment / Delivery transaction
@@ -184,6 +194,8 @@ async fn main() -> Result<()> {
         cli.scenario,
         Scenario::Soak
             | Scenario::SoakStable
+            | Scenario::SoakAvro
+            | Scenario::SoakStableAvro
             | Scenario::BacklogDrain
             | Scenario::Tpcc
             | Scenario::TpcDi
@@ -310,6 +322,9 @@ async fn run_mysql(
         Scenario::DlqPoison => {
             results.push(scenarios::dlq_poison::run(harness, &backend).await?);
         }
+        Scenario::SrOutage => {
+            results.push(scenarios::sr_outage::run(harness, &backend).await?);
+        }
         Scenario::Failover => {
             results.push(scenarios::failover::run(harness).await?);
         }
@@ -330,6 +345,28 @@ async fn run_mysql(
         Scenario::SoakStable => {
             results.push(
                 scenarios::soak::run_stable(
+                    harness,
+                    duration_mins,
+                    writer_tasks,
+                    write_delay_ms,
+                )
+                .await?,
+            );
+        }
+        Scenario::SoakAvro => {
+            results.push(
+                scenarios::soak::run_avro(
+                    harness,
+                    duration_mins,
+                    writer_tasks,
+                    write_delay_ms,
+                )
+                .await?,
+            );
+        }
+        Scenario::SoakStableAvro => {
+            results.push(
+                scenarios::soak::run_stable_avro(
                     harness,
                     duration_mins,
                     writer_tasks,
@@ -413,6 +450,9 @@ async fn run_postgres(
         Scenario::DlqPoison => {
             results.push(scenarios::dlq_poison::run(harness, &backend).await?);
         }
+        Scenario::SrOutage => {
+            results.push(scenarios::sr_outage::run(harness, &backend).await?);
+        }
         Scenario::PgFailover => {
             results.push(scenarios::pg_failover::run(harness).await?);
         }
@@ -447,7 +487,11 @@ async fn run_postgres(
             );
         }
         Scenario::Ui => unreachable!("ui is handled before source dispatch"),
-        Scenario::Tpcc | Scenario::Failover | Scenario::BinlogPurge => {
+        Scenario::Tpcc
+        | Scenario::Failover
+        | Scenario::BinlogPurge
+        | Scenario::SoakAvro
+        | Scenario::SoakStableAvro => {
             eprintln!(
                 "error: {:?} is a MySQL-specific scenario — use --source mysql",
                 scenario.to_possible_value().unwrap().get_name()
