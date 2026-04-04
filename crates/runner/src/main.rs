@@ -25,8 +25,10 @@ mod version;
 #[command(version = version::VERSION)]
 #[command(about = "High-performance Change Data Capture Engine")]
 struct Args {
+    /// Pipeline config file or directory. Omit to start with no pipelines
+    /// (pipelines can be added via REST API).
     #[arg(short, long)]
-    config: String,
+    config: Option<String>,
     #[arg(long, default_value = "0.0.0.0:8080")]
     api_addr: String,
     #[arg(long, default_value = "0.0.0.0:9095")]
@@ -66,8 +68,16 @@ async fn main() -> Result<()> {
         version::BUILD_DATE,
     );
 
-    let pipeline_specs =
-        load_pipeline_cfgs(&args.config).context("load pipeline specs")?;
+    let pipeline_specs = match &args.config {
+        Some(path) => load_pipeline_cfgs(path).context("load pipeline specs")?,
+        None => vec![],
+    };
+
+    // Build summary lines before specs are consumed by manager.create()
+    let pipeline_specs_summary: Vec<String> = pipeline_specs
+        .iter()
+        .map(format_pipeline_summary)
+        .collect();
 
     // ── Build storage backend ─────────────────────────────────────────────────
     let storage_cfg = StorageConfig {
@@ -98,6 +108,20 @@ async fn main() -> Result<()> {
     for ps in pipeline_specs {
         manager.create(ps).await?;
     }
+
+    version::print_runtime_info(
+        &args.api_addr,
+        &args.metrics_addr,
+        &args.storage_backend,
+        pipeline_specs_summary.len(),
+    );
+    for summary in &pipeline_specs_summary {
+        eprintln!("{summary}");
+    }
+    if pipeline_specs_summary.is_empty() {
+        eprintln!("  Use REST API to add pipelines: POST http://{}/pipelines", args.api_addr);
+    }
+    eprintln!();
 
     // ── HTTP server ───────────────────────────────────────────────────────────
     let app: Router = router_full(
@@ -162,4 +186,55 @@ fn load_pipeline_cfgs(
     info!(specs_found = specs.len(), "pipeline specs loaded");
     debug!(pipeline_specs = ?specs, "pipeline spec");
     Ok(specs)
+}
+
+fn format_pipeline_summary(ps: &deltaforge_config::PipelineSpec) -> String {
+    use deltaforge_config::{ProcessorCfg, SourceCfg};
+
+    let name = &ps.metadata.name;
+
+    let source_type = match &ps.spec.source {
+        SourceCfg::Mysql(_) => "mysql",
+        SourceCfg::Postgres(_) => "postgres",
+        #[cfg(feature = "turso")]
+        SourceCfg::Turso(_) => "turso",
+    };
+    let source_id = ps.spec.source.source_id();
+
+    let processors: Vec<&str> = ps
+        .spec
+        .processors
+        .iter()
+        .map(|p| match p {
+            ProcessorCfg::Javascript { id, .. } => id.as_str(),
+            ProcessorCfg::Outbox { .. } => "outbox",
+            ProcessorCfg::Flatten { .. } => "flatten",
+        })
+        .collect();
+
+    let sinks: Vec<String> = ps
+        .spec
+        .sinks
+        .iter()
+        .map(|s| {
+            let kind = match s {
+                deltaforge_config::SinkCfg::Kafka(_) => "kafka",
+                deltaforge_config::SinkCfg::Redis(_) => "redis",
+                deltaforge_config::SinkCfg::Nats(_) => "nats",
+                deltaforge_config::SinkCfg::Http(_) => "http",
+            };
+            format!("{kind}:{}", s.sink_id())
+        })
+        .collect();
+
+    let procs_str = if processors.is_empty() {
+        "none".to_string()
+    } else {
+        processors.join(", ")
+    };
+
+    format!(
+        "  [{name}]  {source_type}:{source_id} -> [{procs_str}] -> {sinks}",
+        sinks = sinks.join(", "),
+    )
 }

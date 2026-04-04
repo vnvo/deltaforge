@@ -211,87 +211,97 @@ docker build -t deltaforge:dev-debug -f Dockerfile.debug .
 
 ### Stack profiles
 
-Different scenarios require different compose profiles:
+The `df` compose profile starts 3 DeltaForge instances — one per build variant:
 
-| Profile | Port | Use case |
-|---------|------|----------|
-| `app` | 8080 | MySQL resilience scenarios |
-| `pg` + `pg-app` | 8080 | PostgreSQL resilience scenarios |
-| `soak` | 8081 | MySQL soak endurance, backlog-drain benchmark |
-| `pg-soak` | 8083 | PostgreSQL soak endurance, backlog-drain benchmark |
-| `tpcc` | 8082 | TPC-C benchmark |
-| `avro-app` | 8084 | MySQL → Kafka with Avro encoding (resilience) |
-| `avro-soak` | 8086 | MySQL Avro soak (performance comparison vs JSON) |
+| Instance | Port | Image | Use case |
+|----------|------|-------|----------|
+| `deltaforge-release` | 8080 | `deltaforge:latest` | Production behavior, regression testing |
+| `deltaforge-debug` | 8081 | `deltaforge:dev-debug` | Verbose logging, assertions, chaos scenarios |
+| `deltaforge-profile` | 8082 | `deltaforge:dev-profile` | Flamegraphs, CPU profiling, benchmarks |
+
+Pipeline configs are selected dynamically — either via the chaos UI config dropdown, or the CLI `--port` flag. All 3 instances start with a default config (`mysql-to-kafka.yaml`) and can be swapped at runtime.
+
+### Start the chaos environment
+
+```bash
+docker compose -f docker-compose.chaos.yml \
+  --profile base --profile mysql-infra --profile kafka-infra --profile df up -d
+```
+
+Add `--profile pg-infra` if testing PostgreSQL scenarios.
 
 ### Run resilience scenarios
 
 ```bash
-docker compose -f docker-compose.chaos.yml up -d
-docker compose -f docker-compose.chaos.yml --profile app up -d
-
-cargo run -p chaos -- --scenario all           # all MySQL scenarios
-cargo run -p chaos -- --scenario network-partition
-cargo run -p chaos -- --scenario all --source postgres
+# Target the debug instance (default --port 8080, override with --port)
+cargo run -p chaos -- --scenario all --source mysql
+cargo run -p chaos -- --scenario network-partition --port 8081
+cargo run -p chaos -- --scenario all --source postgres --port 8080
 ```
 
 Exit code is `0` on full pass, `1` on any failure — suitable for CI.
 
 ### Run endurance and benchmark scenarios
 
+Before running soak/drain, apply the appropriate config via the UI or REST API:
+
 ```bash
+# Apply soak config to the profile instance (for flamegraphs)
+curl -X POST http://localhost:7474/api/apply-config \
+  -H 'Content-Type: application/json' \
+  -d '{"port": 8082, "config": "mysql-soak.yaml"}'
+
 # Soak — long-running with random fault injection
-docker compose -f docker-compose.chaos.yml --profile soak up -d
-cargo run -p chaos -- --scenario soak --duration-mins 60
+cargo run -p chaos -- --scenario soak --port 8082 --topic chaos.soak
 
 # Soak-stable — same workload, no faults (baseline)
-cargo run -p chaos -- --scenario soak-stable --duration-mins 30
+cargo run -p chaos -- --scenario soak-stable --port 8082 --topic chaos.soak --duration-mins 30
 
 # Backlog-drain — measures catch-up throughput (1M row replay)
-cargo run -p chaos -- --scenario backlog-drain --source mysql --no-proxy
+cargo run -p chaos -- --scenario backlog-drain --port 8082 --topic chaos.soak --no-proxy
 
 # Backlog-drain with custom tuning
-cargo run -p chaos -- --scenario backlog-drain --source mysql --no-proxy \
+cargo run -p chaos -- --scenario backlog-drain --port 8082 --topic chaos.soak --no-proxy \
   --drain-max-events 4000 --drain-max-ms 100 \
   --drain-kafka-conf linger.ms=0
 
-# Postgres drain benchmark
-docker compose -f docker-compose.chaos.yml --profile pg-soak up -d
-cargo run -p chaos -- --scenario backlog-drain --source postgres --no-proxy \
-  --drain-max-events 4000 --drain-max-ms 100 \
-  --drain-kafka-conf linger.ms=0
-
-# TPC-C — OLTP transaction mix benchmark
-docker compose -f docker-compose.chaos.yml --profile tpcc up -d
-cargo run -p chaos -- --scenario tpcc --duration-mins 30
+# TPC-C — apply tpcc config first, then run
+curl -X POST http://localhost:7474/api/apply-config \
+  -H 'Content-Type: application/json' \
+  -d '{"port": 8081, "config": "mysql-tpcc.yaml"}'
+cargo run -p chaos -- --scenario tpcc --port 8081 --duration-mins 30
 ```
 
 ### Avro encoding tests
-
-Avro tests require the `kafka-infra` profile (includes Schema Registry).
 
 ```bash
 # Unit + mock tests (no Docker needed)
 cargo test -p sinks --test avro_encoding_tests
 
-# Real Schema Registry integration tests (Docker)
+# Real Schema Registry integration tests (Docker, needs kafka-infra for SR)
 cargo test -p sinks --test avro_encoding_tests -- --include-ignored --nocapture --test-threads=1
 
-# Schema Registry outage chaos scenario
-docker compose -f docker-compose.chaos.yml \
-  --profile base --profile mysql-infra --profile kafka-infra --profile avro-app up -d
-cargo run -p chaos -- --source mysql --scenario sr-outage
+# Avro chaos scenario: apply Avro config, then run SR outage
+curl -X POST http://localhost:7474/api/apply-config \
+  -H 'Content-Type: application/json' \
+  -d '{"port": 8081, "config": "mysql-to-kafka-avro.yaml"}'
+cargo run -p chaos -- --scenario sr-outage --port 8081
 
-# Avro soak — performance comparison against JSON
-docker compose -f docker-compose.chaos.yml \
-  --profile base --profile mysql-infra --profile kafka-infra --profile avro-soak up -d
-cargo run -p chaos -- --source mysql --scenario soak-stable-avro --duration-mins 30
+# JSON vs Avro throughput comparison:
+# Instance 1 (debug): JSON soak
+curl -X POST http://localhost:7474/api/apply-config \
+  -H 'Content-Type: application/json' \
+  -d '{"port": 8081, "config": "mysql-soak.yaml"}'
+cargo run -p chaos -- --scenario soak-stable --port 8081 --topic chaos.soak --duration-mins 30
 
-# Compare: run JSON soak alongside (different ports, same MySQL source)
-docker compose -f docker-compose.chaos.yml --profile soak up -d
-cargo run -p chaos -- --source mysql --scenario soak-stable --duration-mins 30
+# Instance 2 (profile): Avro soak
+curl -X POST http://localhost:7474/api/apply-config \
+  -H 'Content-Type: application/json' \
+  -d '{"port": 8082, "config": "mysql-soak-avro.yaml"}'
+cargo run -p chaos -- --scenario soak-stable --port 8082 --topic chaos.soak.avro --duration-mins 30
 ```
 
-Compare throughput in Grafana: `deltaforge_sink_events_total` rate for JSON soak (port 9001) vs Avro soak (port 9006).
+Compare in Grafana: `rate(deltaforge_sink_events_total[1m])` by instance port.
 
 See [Performance Tuning](performance.md) for detailed throughput optimization guidance and profiling instructions.
 
