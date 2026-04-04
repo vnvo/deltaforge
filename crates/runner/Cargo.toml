@@ -40,6 +40,12 @@ tikv-jemallocator = { version = "0.6", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
+testcontainers = "0.25"
+ctor = "0.6"
+reqwest.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+mysql-binlog-connector-rust = "0.3"
+bytes.workspace = true
 
 [[bench]]
 name = "pipeline_e2e"
