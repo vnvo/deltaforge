@@ -67,87 +67,44 @@ const ALTER_MAX_SECS: u64 = 1800; // 30 min
 /// Encapsulates everything that differs between MySQL and Postgres soak runs.
 #[derive(Clone)]
 pub struct SoakSource {
-    pub name: &'static str,
-    pub profile: &'static str,
-    pub service: &'static str,
-    pub health_url: &'static str,
-    pub topic: &'static str,
+    pub name: String,
+    pub profile: String,
+    pub service: String,
+    pub health_url: String,
+    pub topic: String,
     /// Toxiproxy proxy name for the source DB.
-    pub proxy: &'static str,
+    pub proxy: String,
     /// DeltaForge REST API base URL (e.g. "http://localhost:8081").
-    pub df_base: &'static str,
+    pub df_base: String,
     /// Pipeline name managed by this DeltaForge instance.
-    pub pipeline: &'static str,
+    pub pipeline: String,
 }
 
-pub const MYSQL_SOAK: SoakSource = SoakSource {
-    name: "mysql",
-    profile: "soak",
-    service: "deltaforge-soak",
-    health_url: "http://localhost:8081/health",
-    topic: "chaos.soak",
-    proxy: "mysql",
-    df_base: "http://localhost:8081",
-    pipeline: "chaos-soak",
-};
-
-pub const PG_SOAK: SoakSource = SoakSource {
-    name: "postgres",
-    profile: "pg-soak",
-    service: "deltaforge-pg-soak",
-    health_url: "http://localhost:8083/health",
-    topic: "chaos.pg.soak",
-    proxy: "postgres",
-    df_base: "http://localhost:8083",
-    pipeline: "chaos-pg-soak",
-};
-
-pub const AVRO_SOAK: SoakSource = SoakSource {
-    name: "mysql-avro",
-    profile: "avro-soak",
-    service: "deltaforge-avro-soak",
-    health_url: "http://localhost:8086/health",
-    topic: "chaos.soak.avro",
-    proxy: "mysql",
-    df_base: "http://localhost:8086",
-    pipeline: "chaos-soak-avro",
-};
+impl SoakSource {
+    pub fn new(port: u16, source: &str, pipeline: &str, topic: &str) -> Self {
+        let service = match port {
+            8080 => "deltaforge-release",
+            8081 => "deltaforge-debug",
+            8082 => "deltaforge-profile",
+            _ => "deltaforge-debug",
+        };
+        let proxy = if source == "postgres" { "postgres" } else { "mysql" };
+        Self {
+            name: format!("{source}-{port}"),
+            profile: "df".to_string(),
+            service: service.to_string(),
+            health_url: format!("http://localhost:{port}/health"),
+            topic: topic.to_string(),
+            proxy: proxy.to_string(),
+            df_base: format!("http://localhost:{port}"),
+            pipeline: pipeline.to_string(),
+        }
+    }
+}
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-pub async fn run(
-    harness: &Harness,
-    duration_mins: u64,
-    writer_tasks: usize,
-    write_delay_ms: u64,
-) -> Result<ScenarioResult> {
-    run_with_source(
-        harness,
-        &MYSQL_SOAK,
-        duration_mins,
-        writer_tasks,
-        write_delay_ms,
-    )
-    .await
-}
-
-pub async fn run_pg(
-    harness: &Harness,
-    duration_mins: u64,
-    writer_tasks: usize,
-    write_delay_ms: u64,
-) -> Result<ScenarioResult> {
-    run_with_source(
-        harness,
-        &PG_SOAK,
-        duration_mins,
-        writer_tasks,
-        write_delay_ms,
-    )
-    .await
-}
-
-async fn run_with_source(
+pub async fn run_with_source(
     harness: &Harness,
     src: &SoakSource,
     duration_mins: u64,
@@ -162,13 +119,13 @@ async fn run_with_source(
         "step 1/4: waiting for soak DeltaForge at {} ...",
         src.health_url
     );
-    harness::wait_for_url(src.health_url, Duration::from_secs(60)).await?;
+    harness::wait_for_url(&src.health_url, Duration::from_secs(60)).await?;
     info!("soak DeltaForge is healthy");
 
     // Step 2: seed tables if needed (init SQL already created them).
     info!(
         tables = DOMAINS.len() * TABLES_PER_DOMAIN,
-        source = src.name,
+        source = %src.name,
         "step 2/4: verifying soak tables exist ..."
     );
     seed_tables(src).await?;
@@ -191,12 +148,11 @@ async fn run_with_source(
         writer_tasks,
         write_delay_ms, "step 3/4: starting writer tasks ..."
     );
-    let src_name = src.name;
+    let is_pg = src.name == "postgres";
     let writer_handles: Vec<_> = (0..writer_tasks)
         .map(|id| {
             let written = Arc::clone(&total_written);
             let flag = Arc::clone(&stop_flag);
-            let is_pg = src_name == "postgres";
             tokio::spawn(async move {
                 if is_pg {
                     pg_writer_loop(id, written, flag, write_delay_ms).await
@@ -210,7 +166,6 @@ async fn run_with_source(
     let alter_handle = {
         let flag = Arc::clone(&stop_flag);
         let w = Arc::clone(&wake);
-        let is_pg = src_name == "postgres";
         tokio::spawn(async move {
             if is_pg {
                 pg_alter_loop(flag, w).await
@@ -228,7 +183,7 @@ async fn run_with_source(
     let mut stats_samples: Vec<ResourceSample> = Vec::new();
 
     // Kafka baseline so we can count delivered events over the run.
-    let kafka_start = harness::kafka_offset_for_topic(src.topic)
+    let kafka_start = harness::kafka_offset_for_topic(&src.topic)
         .await
         .unwrap_or(0);
 
@@ -304,7 +259,7 @@ async fn run_with_source(
     let alters = alter_handle.await.unwrap_or_default();
 
     // Gather totals.
-    let kafka_end = harness::kafka_offset_for_topic(src.topic)
+    let kafka_end = harness::kafka_offset_for_topic(&src.topic)
         .await
         .unwrap_or(0);
     let delivered = kafka_end.saturating_sub(kafka_start);
@@ -373,77 +328,11 @@ async fn run_with_source(
 
 // ── Stable (no-fault) variant ─────────────────────────────────────────────────
 
-/// Same as [`run`] but with **no fault injection** — only writers and ALTER TABLE
-/// run for the full duration. Use this to establish a steady-state baseline
-/// for metrics like cache hit ratio, E2E latency, and resource usage.
-pub async fn run_stable(
-    harness: &Harness,
-    duration_mins: u64,
-    writer_tasks: usize,
-    write_delay_ms: u64,
-) -> Result<ScenarioResult> {
-    run_stable_with_source(
-        harness,
-        &MYSQL_SOAK,
-        duration_mins,
-        writer_tasks,
-        write_delay_ms,
-    )
-    .await
-}
-
-pub async fn run_stable_pg(
-    harness: &Harness,
-    duration_mins: u64,
-    writer_tasks: usize,
-    write_delay_ms: u64,
-) -> Result<ScenarioResult> {
-    run_stable_with_source(
-        harness,
-        &PG_SOAK,
-        duration_mins,
-        writer_tasks,
-        write_delay_ms,
-    )
-    .await
-}
-
-/// Avro soak: same workload as MySQL soak but with Avro encoding.
-/// Compare throughput against JSON soak to measure Avro overhead.
-pub async fn run_avro(
-    harness: &Harness,
-    duration_mins: u64,
-    writer_tasks: usize,
-    write_delay_ms: u64,
-) -> Result<ScenarioResult> {
-    run_with_source(
-        harness,
-        &AVRO_SOAK,
-        duration_mins,
-        writer_tasks,
-        write_delay_ms,
-    )
-    .await
-}
-
-/// Avro stable baseline: same as Avro soak but with no fault injection.
-pub async fn run_stable_avro(
-    harness: &Harness,
-    duration_mins: u64,
-    writer_tasks: usize,
-    write_delay_ms: u64,
-) -> Result<ScenarioResult> {
-    run_stable_with_source(
-        harness,
-        &AVRO_SOAK,
-        duration_mins,
-        writer_tasks,
-        write_delay_ms,
-    )
-    .await
-}
-
-async fn run_stable_with_source(
+/// Same as [`run_with_source`] but with **no fault injection** — only writers
+/// and ALTER TABLE run for the full duration. Use this to establish a
+/// steady-state baseline for metrics like cache hit ratio, E2E latency, and
+/// resource usage.
+pub async fn run_stable_with_source(
     harness: &Harness,
     src: &SoakSource,
     duration_mins: u64,
@@ -457,12 +346,12 @@ async fn run_stable_with_source(
         "step 1/3: waiting for soak DeltaForge at {} ...",
         src.health_url
     );
-    harness::wait_for_url(src.health_url, Duration::from_secs(60)).await?;
+    harness::wait_for_url(&src.health_url, Duration::from_secs(60)).await?;
     info!("soak DeltaForge is healthy");
 
     info!(
         tables = DOMAINS.len() * TABLES_PER_DOMAIN,
-        source = src.name,
+        source = %src.name,
         "step 2/3: verifying soak tables exist ..."
     );
     seed_tables(src).await?;
@@ -476,7 +365,7 @@ async fn run_stable_with_source(
     } else {
         writer_tasks
     };
-    let src_name = src.name;
+    let is_pg = src.name == "postgres";
     info!(
         writer_tasks,
         write_delay_ms, "step 3/3: starting writer tasks (no faults) ..."
@@ -485,7 +374,6 @@ async fn run_stable_with_source(
         .map(|id| {
             let written = Arc::clone(&total_written);
             let flag = Arc::clone(&stop_flag);
-            let is_pg = src_name == "postgres";
             tokio::spawn(async move {
                 if is_pg {
                     pg_writer_loop(id, written, flag, write_delay_ms).await
@@ -499,7 +387,6 @@ async fn run_stable_with_source(
     let alter_handle = {
         let flag = Arc::clone(&stop_flag);
         let w = Arc::clone(&wake);
-        let is_pg = src_name == "postgres";
         tokio::spawn(async move {
             if is_pg {
                 pg_alter_loop(flag, w).await
@@ -509,7 +396,7 @@ async fn run_stable_with_source(
         })
     };
 
-    let kafka_start = harness::kafka_offset_for_topic(src.topic)
+    let kafka_start = harness::kafka_offset_for_topic(&src.topic)
         .await
         .unwrap_or(0);
     let deadline = Instant::now() + Duration::from_secs(duration_mins * 60);
@@ -530,7 +417,7 @@ async fn run_stable_with_source(
     }
     let alters = alter_handle.await.unwrap_or_default();
 
-    let kafka_end = harness::kafka_offset_for_topic(src.topic)
+    let kafka_end = harness::kafka_offset_for_topic(&src.topic)
         .await
         .unwrap_or(0);
     let delivered = kafka_end.saturating_sub(kafka_start);
@@ -545,7 +432,7 @@ async fn run_stable_with_source(
         .unwrap_or(0);
 
     let conn_mode =
-        harness::connection_mode_summary(src.df_base, src.pipeline).await;
+        harness::connection_mode_summary(&src.df_base, &src.pipeline).await;
 
     let result = ScenarioResult::pass(name)
         .note(format!("duration: {duration_mins} min"))
@@ -705,10 +592,10 @@ async fn inject_network_partition(
     src: &SoakSource,
 ) -> Result<Duration> {
     let start = Instant::now();
-    harness.toxi.disable(src.proxy).await?;
+    harness.toxi.disable(&src.proxy).await?;
     sleep(Duration::from_secs(PARTITION_HOLD_SECS)).await;
-    harness.toxi.enable(src.proxy).await?;
-    harness::wait_for_url(src.health_url, RECOVERY_TIMEOUT).await?;
+    harness.toxi.enable(&src.proxy).await?;
+    harness::wait_for_url(&src.health_url, RECOVERY_TIMEOUT).await?;
     Ok(start.elapsed())
 }
 
@@ -722,7 +609,7 @@ async fn inject_sink_outage(
     harness.toxi.disable("kafka").await?;
     sleep(Duration::from_secs(OUTAGE_HOLD_SECS)).await;
     harness.toxi.enable("kafka").await?;
-    harness::wait_for_url(src.health_url, RECOVERY_TIMEOUT).await?;
+    harness::wait_for_url(&src.health_url, RECOVERY_TIMEOUT).await?;
     Ok(start.elapsed())
 }
 
@@ -730,9 +617,9 @@ async fn inject_sink_outage(
 /// it back, then wait for the health endpoint.
 async fn inject_crash(src: &SoakSource) -> Result<Duration> {
     let start = Instant::now();
-    docker::kill_service(src.profile, src.service).await?;
-    docker::start_service(src.profile, src.service).await?;
-    harness::wait_for_url(src.health_url, RECOVERY_TIMEOUT).await?;
+    docker::kill_service(&src.profile, &src.service).await?;
+    docker::start_service(&src.profile, &src.service).await?;
+    harness::wait_for_url(&src.health_url, RECOVERY_TIMEOUT).await?;
     Ok(start.elapsed())
 }
 
@@ -747,7 +634,7 @@ async fn inject_faulty_events(src: &SoakSource) -> Result<Duration> {
     let url = format!("{}/pipelines/{}", src.df_base, src.pipeline);
 
     // Save the original topic before corrupting it.
-    let original_topic = src.topic;
+    let original_topic = &src.topic;
 
     // PATCH to a broken topic template.
     let poison_patch = serde_json::json!({
@@ -777,7 +664,7 @@ async fn inject_faulty_events(src: &SoakSource) -> Result<Duration> {
     info!("faulty_events: sink topic restored");
 
     // Wait for health.
-    harness::wait_for_url(src.health_url, RECOVERY_TIMEOUT).await?;
+    harness::wait_for_url(&src.health_url, RECOVERY_TIMEOUT).await?;
 
     // Log DLQ count after fault.
     let dlq_url = format!(
@@ -805,7 +692,7 @@ async fn sample_and_log(
     samples: &mut Vec<ResourceSample>,
     written: &Arc<AtomicU64>,
 ) {
-    match docker::sample_stats(src.profile, src.service).await {
+    match docker::sample_stats(&src.profile, &src.service).await {
         Ok(s) if s.mem_bytes > 0 => {
             info!(
                 cpu = s.cpu_percent,

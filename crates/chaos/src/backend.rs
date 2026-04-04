@@ -58,7 +58,16 @@ pub trait SourceBackend: Send + Sync {
 
 // ── MySQL backend ─────────────────────────────────────────────────────────────
 
-pub struct MysqlBackend;
+pub struct MysqlBackend {
+    pub compose_profile: String,
+    pub compose_service: String,
+}
+
+impl MysqlBackend {
+    pub fn new(compose_profile: String, compose_service: String) -> Self {
+        Self { compose_profile, compose_service }
+    }
+}
 
 impl SourceBackend for MysqlBackend {
     fn name(&self) -> &str {
@@ -68,10 +77,10 @@ impl SourceBackend for MysqlBackend {
         "mysql"
     }
     fn compose_profile(&self) -> &str {
-        "app"
+        &self.compose_profile
     }
     fn compose_service(&self) -> &str {
-        "deltaforge"
+        &self.compose_service
     }
 
     async fn insert_rows(&self, tag: &str, n: i64) -> Result<i64> {
@@ -133,7 +142,16 @@ impl SourceBackend for MysqlBackend {
 
 // ── PostgreSQL backend ────────────────────────────────────────────────────────
 
-pub struct PgBackend;
+pub struct PgBackend {
+    pub compose_profile: String,
+    pub compose_service: String,
+}
+
+impl PgBackend {
+    pub fn new(compose_profile: String, compose_service: String) -> Self {
+        Self { compose_profile, compose_service }
+    }
+}
 
 impl SourceBackend for PgBackend {
     fn name(&self) -> &str {
@@ -143,10 +161,10 @@ impl SourceBackend for PgBackend {
         "postgres"
     }
     fn compose_profile(&self) -> &str {
-        "pg-app"
+        &self.compose_profile
     }
     fn compose_service(&self) -> &str {
-        "deltaforge-pg"
+        &self.compose_service
     }
 
     async fn insert_rows(&self, tag: &str, n: i64) -> Result<i64> {

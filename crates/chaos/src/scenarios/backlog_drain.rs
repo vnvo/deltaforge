@@ -121,23 +121,9 @@ impl Default for DrainConfig {
     }
 }
 
-// ── Entry points ──────────────────────────────────────────────────────────────
+// ── Entry point ───────────────────────────────────────────────────────────────
 
-pub async fn run(
-    harness: &Harness,
-    cfg: DrainConfig,
-) -> Result<ScenarioResult> {
-    run_with_source(harness, &super::soak::MYSQL_SOAK, cfg).await
-}
-
-pub async fn run_pg(
-    harness: &Harness,
-    cfg: DrainConfig,
-) -> Result<ScenarioResult> {
-    run_with_source(harness, &super::soak::PG_SOAK, cfg).await
-}
-
-async fn run_with_source(
+pub async fn run_with_source(
     harness: &Harness,
     src: &SoakSource,
     cfg: DrainConfig,
@@ -154,7 +140,7 @@ async fn run_with_source(
         "All events delivered to Kafka. Reports avg/p50/peak events/s.",
     );
     info!(
-        source = src.name,
+        source = %src.name,
         max_events = cfg.max_events,
         max_ms = cfg.max_ms,
         max_inflight = cfg.max_inflight,
@@ -169,19 +155,47 @@ async fn run_with_source(
 
     // Step 1: verify DeltaForge is healthy.
     info!("step 1/6: waiting for DeltaForge at {} ...", src.health_url);
-    harness::wait_for_url(src.health_url, Duration::from_secs(60)).await?;
+    harness::wait_for_url(&src.health_url, Duration::from_secs(60)).await?;
     info!("DeltaForge is healthy");
 
     // Step 2: stop the pipeline so DeltaForge disconnects and saves its checkpoint.
-    let pipeline = src.pipeline;
+    let pipeline = &src.pipeline;
     info!("step 2/6: stopping pipeline '{pipeline}' ...");
-    df_post(src.df_base, &format!("/pipelines/{pipeline}/stop")).await?;
-    info!("pipeline stopped — checkpoint saved");
+    match df_post(&src.df_base, &format!("/pipelines/{pipeline}/stop")).await {
+        Ok(_) => info!("pipeline stopped — checkpoint saved"),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("404") || msg.contains("NOT_FOUND") {
+                // Pipeline doesn't exist — check if it was previously configured
+                bail!(
+                    "pipeline '{pipeline}' not found on {}. \
+                     Apply a config first (UI: select config → Apply, \
+                     or POST the YAML to {}/pipelines).",
+                    src.df_base,
+                    src.df_base,
+                );
+            } else if msg.contains("409") || msg.contains("already") {
+                info!("pipeline already stopped — continuing");
+            } else {
+                return Err(e);
+            }
+        }
+    }
 
     // Step 3: baseline Kafka offset.
-    let kafka_baseline = harness::kafka_offset_for_topic(src.topic)
-        .await
-        .unwrap_or(0);
+    // If the topic is a template (contains ${...}), poll all matching topics by prefix.
+    let topic_is_template = src.topic.contains("${");
+    let topic_prefix = if topic_is_template {
+        src.topic.split("${").next().unwrap_or(&src.topic).to_string()
+    } else {
+        String::new()
+    };
+    let kafka_baseline = if topic_is_template {
+        info!(prefix = %topic_prefix, "topic is a template — polling all matching topics");
+        harness::kafka_offset_for_prefix(&topic_prefix).await.unwrap_or(0)
+    } else {
+        harness::kafka_offset_for_topic(&src.topic).await.unwrap_or(0)
+    };
     info!(kafka_baseline, "kafka baseline offset recorded");
 
     // Step 4: populate the backlog.
@@ -192,7 +206,7 @@ async fn run_with_source(
     info!(
         target_events,
         writer_tasks,
-        source = src.name,
+        source = %src.name,
         "step 3/6: populating {} backlog ...",
         src.name,
     );
@@ -300,7 +314,7 @@ async fn run_with_source(
     }
 
     let patch_body = serde_json::json!({ "spec": patch_spec });
-    let patch_ok = df_patch(src.df_base, &format!("/pipelines/{pipeline}"), patch_body)
+    let patch_ok = df_patch(&src.df_base, &format!("/pipelines/{pipeline}"), patch_body)
         .await
         .map(|_| true)
         .unwrap_or_else(|e| {
@@ -312,11 +326,11 @@ async fn run_with_source(
     // checkpoint. If it failed, issue an explicit resume so the drain still runs.
     if !patch_ok {
         info!("issuing explicit resume after failed patch ...");
-        df_post(src.df_base, &format!("/pipelines/{pipeline}/resume")).await?;
+        df_post(&src.df_base, &format!("/pipelines/{pipeline}/resume")).await?;
     }
 
     // Dump the effective pipeline config so there's no ambiguity about what's running.
-    match df_get(src.df_base, &format!("/pipelines/{pipeline}")).await {
+    match df_get(&src.df_base, &format!("/pipelines/{pipeline}")).await {
         Ok(body) => {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
                 if let Some(spec) = v.get("spec") {
@@ -335,7 +349,7 @@ async fn run_with_source(
 
     let drain_start = Instant::now();
     let conn_mode =
-        harness::connection_mode_summary(src.df_base, pipeline).await;
+        harness::connection_mode_summary(&src.df_base, pipeline).await;
     info!(connection = %conn_mode, "pipeline restarted — backlog drain started");
 
     // Step 6: poll Kafka until the offset advances by rows_written.
@@ -351,9 +365,15 @@ async fn run_with_source(
     loop {
         sleep(POLL_INTERVAL).await;
 
-        let current_offset = harness::kafka_offset_for_topic(src.topic)
-            .await
-            .unwrap_or(kafka_baseline);
+        let current_offset = if topic_is_template {
+            harness::kafka_offset_for_prefix(&topic_prefix)
+                .await
+                .unwrap_or(kafka_baseline)
+        } else {
+            harness::kafka_offset_for_topic(&src.topic)
+                .await
+                .unwrap_or(kafka_baseline)
+        };
         let delivered = current_offset.saturating_sub(kafka_baseline);
         let elapsed = drain_start.elapsed();
 

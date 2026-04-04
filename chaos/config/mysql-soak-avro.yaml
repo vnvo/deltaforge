@@ -36,7 +36,7 @@ spec:
       config:
         id: chaos-soak-avro-kafka
         brokers: "toxiproxy:5102"
-        topic: chaos.soak.avro
+        topic: "chaos.avro.${source.table}"
         required: true
         send_timeout_secs: 5
         envelope:

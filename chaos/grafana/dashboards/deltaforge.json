@@ -384,7 +384,43 @@
 
     ]},
 
-    { "id": 108, "type": "row", "title": "Infrastructure", "gridPos": { "x": 0, "y": 68, "w": 24, "h": 1 }, "collapsed": true, "panels": [
+    { "id": 109, "type": "row", "title": "Avro Encoding", "gridPos": { "x": 0, "y": 68, "w": 24, "h": 1 }, "collapsed": true, "panels": [
+
+      { "id": 90, "title": "Avro Encode Path (DDL vs Inferred)",
+        "type": "timeseries",
+        "gridPos": { "x": 0, "y": 69, "w": 8, "h": 8 },
+        "targets": [
+          { "datasource": "Prometheus", "expr": "rate(deltaforge_avro_encode_total{instance=~\"$instance\", path=\"ddl\"}[1m])", "legendFormat": "DDL (Path A)" },
+          { "datasource": "Prometheus", "expr": "rate(deltaforge_avro_encode_total{instance=~\"$instance\", path=\"inferred\"}[1m])", "legendFormat": "Inferred (Path C)" }
+        ],
+        "fieldConfig": { "defaults": { "unit": "ops", "min": 0, "custom": { "lineWidth": 2, "fillOpacity": 15 } } },
+        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+      },
+
+      { "id": 91, "title": "Schema Registrations",
+        "type": "timeseries",
+        "gridPos": { "x": 8, "y": 69, "w": 8, "h": 8 },
+        "targets": [
+          { "datasource": "Prometheus", "expr": "rate(deltaforge_avro_schema_registrations_total{instance=~\"$instance\"}[1m])", "legendFormat": "registrations/s" }
+        ],
+        "fieldConfig": { "defaults": { "unit": "ops", "min": 0, "custom": { "lineWidth": 2 } } },
+        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+      },
+
+      { "id": 92, "title": "SR Cache Fallback & Encode Failures",
+        "type": "timeseries",
+        "gridPos": { "x": 16, "y": 69, "w": 8, "h": 8 },
+        "targets": [
+          { "datasource": "Prometheus", "expr": "rate(deltaforge_avro_sr_cache_fallback_total{instance=~\"$instance\"}[1m])", "legendFormat": "SR cache fallback" },
+          { "datasource": "Prometheus", "expr": "rate(deltaforge_avro_encode_failure_total{instance=~\"$instance\"}[1m])", "legendFormat": "encode failure ({{reason}})" }
+        ],
+        "fieldConfig": { "defaults": { "unit": "ops", "min": 0, "custom": { "lineWidth": 2 } }, "overrides": [{ "matcher": { "id": "byRegexp", "options": "failure" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }] },
+        "options": { "tooltip": { "mode": "multi" }, "legend": { "displayMode": "list", "placement": "bottom" } }
+      }
+
+    ]},
+
+    { "id": 108, "type": "row", "title": "Infrastructure", "gridPos": { "x": 0, "y": 78, "w": 24, "h": 1 }, "collapsed": true, "panels": [
 
       { "id": 80, "title": "Container CPU Usage",
         "type": "timeseries",

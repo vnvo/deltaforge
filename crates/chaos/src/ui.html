@@ -298,6 +298,11 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
           <span class="f-label">PG Partition</span>
           <span class="f-desc">severs pg source</span>
         </button>
+        <button class="fault-btn danger" onclick="injectFault('sr-outage', this)" title="Cuts Schema Registry proxy — Avro encoding falls back to cached schema">
+          <span class="f-icon">📋</span>
+          <span class="f-label">SR Outage</span>
+          <span class="f-desc">cuts schema registry</span>
+        </button>
         <button class="fault-btn" onclick="injectFault('faulty-events', this)" title="PATCHes sink topic to broken template for 10s → events fail routing → DLQ. Auto-restores.">
           <span class="f-icon">☠️</span>
           <span class="f-label">Faulty Events</span>
@@ -324,10 +329,9 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
         <div class="form-row">
           <label style="width:70px;font-size:11px;color:var(--muted)">Target</label>
           <select id="profile-container" style="flex:1;font-size:11px;padding:3px 6px" onchange="updateProfileAvailability()">
-            <option value="deltaforge-deltaforge-soak-1">soak (:8081)</option>
-            <option value="deltaforge-deltaforge-pg-soak-1">pg-soak (:8083)</option>
-            <option value="deltaforge-deltaforge-1">app (:8080)</option>
-            <option value="deltaforge-deltaforge-tpcc-1">tpcc (:8082)</option>
+            <option value="deltaforge-deltaforge-release-1">release (:8080)</option>
+            <option value="deltaforge-deltaforge-debug-1">debug (:8081)</option>
+            <option value="deltaforge-deltaforge-profile-1">profile (:8082)</option>
           </select>
         </div>
         <div class="form-row">
@@ -399,6 +403,26 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
             <button id="src-postgres" onclick="setSource('postgres')">Postgres</button>
           </div>
         </div>
+
+        <div class="form-row">
+          <label>Instance</label>
+          <div class="source-toggle">
+            <button id="run-port-8080" onclick="setRunPort(8080)">Release</button>
+            <button id="run-port-8081" class="active" onclick="setRunPort(8081)">Debug</button>
+            <button id="run-port-8082" onclick="setRunPort(8082)">Profile</button>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <label>Config</label>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <select id="run-config-select" style="font-size:11px;padding:3px 6px;min-width:140px">
+              <option value="">-- keep current --</option>
+            </select>
+            <button class="btn btn-green btn-sm" onclick="applyRunConfig()" title="Apply config to selected instance before running">Apply</button>
+          </div>
+        </div>
+        <div id="run-pipeline-status" style="padding:6px 10px;border-radius:4px;font-size:11px;font-weight:600;margin-bottom:4px;"></div>
 
         <div class="form-row">
           <label>Proxy</label>
@@ -534,10 +558,9 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
         <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
           <span style="font-size:11px;color:var(--muted)">Instance</span>
           <div class="source-toggle">
-            <button id="api-8080" class="active" onclick="apiSetPort(8080)">:8080</button>
-            <button id="api-8081" onclick="apiSetPort(8081)">soak</button>
-            <button id="api-8082" onclick="apiSetPort(8082)">tpcc</button>
-            <button id="api-8083" onclick="apiSetPort(8083)">pg-soak</button>
+            <button id="api-8080" onclick="apiSetPort(8080)">release</button>
+            <button id="api-8081" class="active" onclick="apiSetPort(8081)">debug</button>
+            <button id="api-8082" onclick="apiSetPort(8082)">profile</button>
           </div>
         </div>
         <div style="display:flex;align-items:center;gap:6px;flex:1;min-width:220px">
@@ -634,11 +657,16 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
       <div class="lab-toolbar">
         <span style="font-size:11px;color:var(--muted)">Instance</span>
         <div class="source-toggle">
-          <button id="lab-8080" onclick="labSetPort(8080)">:8080</button>
-          <button id="lab-8081" class="active" onclick="labSetPort(8081)">soak</button>
-          <button id="lab-8082" onclick="labSetPort(8082)">tpcc</button>
-          <button id="lab-8083" onclick="labSetPort(8083)">pg-soak</button>
+          <button id="lab-8080" onclick="labSetPort(8080)">release</button>
+          <button id="lab-8081" class="active" onclick="labSetPort(8081)">debug</button>
+          <button id="lab-8082" onclick="labSetPort(8082)">profile</button>
         </div>
+        <span style="font-size:11px;color:var(--muted)">Config</span>
+        <select id="config-select" style="font-size:11px;padding:3px 6px;min-width:160px">
+          <option value="">-- select config --</option>
+        </select>
+        <button class="btn btn-green btn-sm" onclick="applyConfig()" title="DELETE current pipeline + POST selected config">Apply Config</button>
+        <span id="active-pipeline" style="font-size:11px;color:var(--muted);margin-left:8px;"></span>
         <span style="font-size:11px;color:var(--muted)">Pipeline</span>
         <select id="lab-pipeline" style="font-size:11px;padding:3px 6px;min-width:160px">
           <option value="">— select —</option>
@@ -745,6 +773,85 @@ function setSource(s) {
   source = s;
   document.getElementById('src-mysql').classList.toggle('active', s === 'mysql');
   document.getElementById('src-postgres').classList.toggle('active', s === 'postgres');
+}
+
+// ── Instance selector (scenario runner) ───────────────────────────────────
+let runPort = 8081;
+
+function setRunPort(p) {
+  runPort = p;
+  [8080, 8081, 8082].forEach(x =>
+    document.getElementById('run-port-' + x).classList.toggle('active', x === p));
+  refreshRunPipeline();
+}
+
+async function loadRunConfigs() {
+  try {
+    const r = await fetch('/api/configs');
+    const configs = await r.json();
+    const sel = document.getElementById('run-config-select');
+    const current = sel.value;
+    sel.innerHTML = '<option value="">-- keep current --</option>';
+    for (const c of configs) {
+      const opt = document.createElement('option');
+      opt.value = c.name;
+      opt.textContent = c.name.replace('.yaml', '').replace('.yml', '');
+      sel.appendChild(opt);
+    }
+    sel.value = current;
+  } catch(e) { /* ignore */ }
+}
+
+async function applyRunConfig() {
+  const config = document.getElementById('run-config-select').value;
+  if (!config) { toast('Select a config first', 'err'); return; }
+  toast(`Applying ${config} to :${runPort}...`, 'ok');
+  try {
+    const r = await fetch('/api/apply-config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ port: runPort, config })
+    });
+    if (r.ok) {
+      toast(`\u2705 ${config} applied to :${runPort}`, 'ok');
+      refreshRunPipeline();
+    } else {
+      toast(`\u274C Failed to apply config: ${r.status}`, 'err');
+    }
+  } catch(e) { toast(`\u274C ${e}`, 'err'); }
+}
+
+async function refreshRunPipeline() {
+  const el = document.getElementById('run-pipeline-status');
+  try {
+    const r = await fetch(`/api/df?port=${runPort}&path=/pipelines`);
+    if (!r.ok) { setPipelineStatus(el, null); return; }
+    const data = await r.json();
+    const pipelines = data || [];
+    if (pipelines.length === 0) {
+      setPipelineStatus(el, null);
+    } else {
+      const info = pipelines.map(p => {
+        const sinkTypes = (p.spec?.spec?.sinks || []).map(s => s.type).join(', ');
+        return `${p.name} (${p.spec?.spec?.source?.type || '?'} \u2192 ${sinkTypes})`;
+      }).join(' | ');
+      setPipelineStatus(el, info);
+    }
+  } catch(e) { setPipelineStatus(el, null); }
+}
+
+function setPipelineStatus(el, info) {
+  if (!info) {
+    el.textContent = '\u26A0 No pipeline applied — select a config and click Apply before running';
+    el.style.background = '#f8717133';
+    el.style.color = '#f87171';
+    el.style.border = '1px solid #f8717144';
+  } else {
+    el.textContent = '\u25B6 ' + info;
+    el.style.background = '#34d39922';
+    el.style.color = '#34d399';
+    el.style.border = '1px solid #34d39933';
+  }
 }
 
 function setProxy(on) {
@@ -946,15 +1053,16 @@ async function swapImage(service, profile, image) {
 // ── CPU Profiling ─────────────────────────────────────────────────────────
 function updateProfileAvailability() {
   const container = document.getElementById('profile-container').value;
-  const isSoak = container === 'deltaforge-deltaforge-soak-1';
-  const available = isSoak ? window._soakIsProfile : true;
+  const isProfileInstance = container === 'deltaforge-deltaforge-profile-1';
   const btn = document.getElementById('btn-profile-start');
   const status = document.getElementById('profile-status-text');
-  if (!available && !profilePollTimer) {
+  if (!isProfileInstance && !profilePollTimer) {
     btn.disabled = true;
-    status.innerHTML = '⚠️ Soak is using <code>dev-debug</code> — click the image tag in Services to swap to <code>dev-profile</code>.';
+    status.innerHTML = '⚠️ Profiling is only available on the <code>profile</code> instance (:8082). Select it above.';
+    btn.title = 'Switch to the profile (:8082) instance to record';
   } else if (!profilePollTimer) {
     btn.disabled = false;
+    btn.title = '';
     status.innerHTML = 'Ready to record. Requires the <code>profiling</code> image with perf installed.';
   }
 }
@@ -1035,6 +1143,7 @@ async function injectFault(preset, btn) {
     'kafka-latency':   'Kafka latency 1 s',
     'mysql-bandwidth': 'MySQL throttle 100 kbps',
     'pg-partition':    'PG partition',
+    'sr-outage':       'Schema Registry outage',
   };
   await runTask(`Inject: ${labels[preset] || preset}`, async () => {
     const r = await api('POST', '/api/fault', { preset });
@@ -1055,12 +1164,41 @@ async function clearFaults(btn) {
 
 // ── Scenario ──────────────────────────────────────────────────────────────
 async function startScenario() {
+  // Check if a pipeline is running and extract its name + topic
+  let detectedPipeline = null;
+  let detectedTopic = null;
+  try {
+    const check = await fetch(`/api/df?port=${runPort}&path=/pipelines`);
+    if (check.ok) {
+      const pipelines = await check.json();
+      if (!pipelines || pipelines.length === 0) {
+        toast('\u26A0 No pipeline on :' + runPort + ' — apply a config first', 'err');
+        return;
+      }
+      const p = pipelines[0];
+      detectedPipeline = p.name;
+      // Extract topic from first sink
+      const sinks = p.spec?.spec?.sinks;
+      if (sinks && sinks.length > 0) {
+        detectedTopic = sinks[0].config?.topic;
+      }
+    }
+  } catch(e) {
+    toast('\u26A0 Cannot reach DeltaForge on :' + runPort + ' — is it running?', 'err');
+    return;
+  }
+
   const scenario = document.getElementById('scenario-select').value;
   const duration_mins = parseInt(document.getElementById('duration-slider').value, 10);
   const writer_tasks = parseInt(document.getElementById('writers-slider').value, 10);
   const write_delay_ms = parseInt(document.getElementById('delay-slider').value, 10);
 
-  const body = { scenario, source, duration_mins, writer_tasks, write_delay_ms, use_proxy: useProxy };
+  const body = {
+    scenario, source, port: runPort,
+    pipeline: detectedPipeline,
+    topic: detectedTopic,
+    duration_mins, writer_tasks, write_delay_ms, use_proxy: useProxy
+  };
 
   if (scenario === 'backlog-drain') {
     body.drain_max_events = parseInt(document.getElementById('drain-max-events').value, 10);
@@ -1245,11 +1383,11 @@ function switchTab(tab) {
 }
 
 // ── Pipeline API tab ───────────────────────────────────────────────────────
-let apiPort = 8080;
+let apiPort = 8081;
 
 function apiSetPort(p) {
   apiPort = p;
-  [8080, 8081, 8082, 8083].forEach(x =>
+  [8080, 8081, 8082].forEach(x =>
     document.getElementById('api-' + x).classList.toggle('active', x === p));
 }
 
@@ -1415,12 +1553,8 @@ function renderServices(services) {
     { label: 'Base',          profile: 'base',          names: ['toxiproxy','prometheus','grafana','cadvisor','loki','promtail'] },
     { label: 'MySQL Infra',   profile: 'mysql-infra',   names: ['mysql','mysql-b'] },
     { label: 'PG Infra',      profile: 'pg-infra',      names: ['postgres','postgres-b'] },
-    { label: 'Kafka Infra',   profile: 'kafka-infra',   names: ['kafka'] },
-    { label: 'MySQL app',     profile: 'app',           names: ['deltaforge'] },
-    { label: 'PG app',        profile: 'pg-app',        names: ['deltaforge-pg'] },
-    { label: 'Soak',          profile: 'soak',          names: ['deltaforge-soak'] },
-    { label: 'PG Soak',       profile: 'pg-soak',       names: ['deltaforge-pg-soak'] },
-    { label: 'TPC-C',         profile: 'tpcc',          names: ['deltaforge-tpcc'] },
+    { label: 'Kafka Infra',   profile: 'kafka-infra',   names: ['kafka','schema-registry'] },
+    { label: 'DeltaForge',    profile: 'df',            names: ['deltaforge-release','deltaforge-debug','deltaforge-profile'] },
   ];
 
   const byName = Object.fromEntries(services.map(s => [s.label, s]));
@@ -1572,9 +1706,8 @@ function renderServices(services) {
         };
         row.appendChild(wrap);
 
-        // Track soak profile image for CPU profiling card
-        if (name === 'deltaforge-soak') {
-          window._soakIsProfile = tag.includes('profile');
+        // Track profile image for CPU profiling card
+        if (name === 'deltaforge-profile') {
           updateProfileAvailability();
         }
       }
@@ -1669,6 +1802,8 @@ refreshScenario();
 setInterval(refreshStatus, 3000);
 setInterval(refreshProxies, 4000);
 setInterval(refreshScenario, 1500);
+loadRunConfigs();
+refreshRunPipeline();
 
 // ── Config Lab ──────────────────────────────────────────────────────────────
 let labPort = 8081;
@@ -1679,7 +1814,7 @@ const LAB_PRESETS_KEY = 'deltaforge-lab-presets';
 
 function labSetPort(p) {
   labPort = p;
-  [8080, 8081, 8082, 8083].forEach(x =>
+  [8080, 8081, 8082].forEach(x =>
     document.getElementById('lab-' + x).classList.toggle('active', x === p));
   labRefreshPipelines();
 }
@@ -1943,7 +2078,7 @@ async function labRunComparison() {
 
   const scenarioBody = {
     scenario,
-    source: labPort === 8083 ? 'postgres' : 'mysql',
+    source,
     duration_mins: duration,
     writer_tasks: 16,
     write_delay_ms: 30,
@@ -2023,8 +2158,55 @@ async function labRunComparison() {
   }
 }
 
+// ── Config management ────────────────────────────────────────────────────────
+async function loadConfigs() {
+  try {
+    const r = await fetch('/api/configs');
+    const configs = await r.json();
+    const sel = document.getElementById('config-select');
+    sel.innerHTML = '<option value="">-- select config --</option>';
+    for (const c of configs) {
+      const opt = document.createElement('option');
+      opt.value = c.name;
+      opt.textContent = c.name.replace('.yaml', '').replace('.yml', '');
+      sel.appendChild(opt);
+    }
+  } catch(e) { console.error('loadConfigs', e); }
+}
+
+async function applyConfig() {
+  const config = document.getElementById('config-select').value;
+  if (!config) { toast('Select a config first', 'err'); return; }
+  const port = labPort;
+  toast(`Applying ${config} to :${port}...`, 'ok');
+  try {
+    const r = await fetch('/api/apply-config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ port, config })
+    });
+    if (r.ok) {
+      toast(`${config} applied to :${port}`, 'ok');
+      refreshActivePipeline();
+    } else {
+      toast(`Failed to apply config: ${r.status}`, 'err');
+    }
+  } catch(e) { toast(`${e}`, 'err'); }
+}
+
+async function refreshActivePipeline() {
+  try {
+    const r = await fetch(`/api/df?port=${labPort}&path=/pipelines`);
+    if (!r.ok) return;
+    const data = await r.json();
+    const names = (data || []).map(p => p.name).join(', ');
+    document.getElementById('active-pipeline').textContent = names ? `Active: ${names}` : 'No pipeline';
+  } catch(e) {}
+}
+
 // Init presets on load
 labRefreshPresetDropdowns();
+loadConfigs();
 </script>
 </body>
 </html>

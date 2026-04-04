@@ -12,12 +12,14 @@ pub const CHAOS_TOPIC: &str = "chaos.cdc";
 
 pub struct Harness {
     pub toxi: ToxiproxyClient,
+    pub port: u16,
 }
 
 impl Harness {
-    pub fn new() -> Self {
+    pub fn new(port: u16) -> Self {
         Self {
             toxi: ToxiproxyClient::new(),
+            port,
         }
     }
 
@@ -25,7 +27,7 @@ impl Harness {
     pub async fn wait_for_deltaforge(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
-            match reqwest::get("http://localhost:8080/health").await {
+            match reqwest::get(format!("http://localhost:{}/health", self.port)).await {
                 Ok(r) if r.status().is_success() => return Ok(()),
                 _ => {}
             }
@@ -84,7 +86,8 @@ impl Harness {
     /// Fetch current source event counter from DeltaForge Prometheus metrics.
     #[allow(dead_code)]
     pub async fn source_event_count(&self) -> Result<f64> {
-        let body = reqwest::get("http://localhost:9000/metrics")
+        let metrics_port = self.port - 8080 + 9000;
+        let body = reqwest::get(format!("http://localhost:{}/metrics", metrics_port))
             .await?
             .text()
             .await?;
@@ -93,7 +96,8 @@ impl Harness {
 
     /// Fetch current reconnect counter.
     pub async fn reconnect_count(&self) -> Result<f64> {
-        let body = reqwest::get("http://localhost:9000/metrics")
+        let metrics_port = self.port - 8080 + 9000;
+        let body = reqwest::get(format!("http://localhost:{}/metrics", metrics_port))
             .await?
             .text()
             .await?;
@@ -163,6 +167,40 @@ pub async fn kafka_committed_count(start_offset: u64) -> Result<u64> {
     Ok(count)
 }
 
+/// Return the total high-watermark offset across all topics matching a prefix.
+/// Used when the topic is a template like `chaos.avro.${source.table}`.
+pub async fn kafka_offset_for_prefix(prefix: &str) -> Result<u64> {
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", KAFKA_BROKERS)
+        .set("group.id", "chaos-watermark-prefix")
+        .create()
+        .context("kafka consumer")?;
+
+    let prefix_owned = prefix.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        let metadata = consumer
+            .fetch_metadata(None, std::time::Duration::from_secs(10))?;
+        let mut total: u64 = 0;
+        for topic in metadata.topics() {
+            if topic.name().starts_with(&prefix_owned) {
+                for partition in topic.partitions() {
+                    if let Ok((_, high)) = consumer.fetch_watermarks(
+                        topic.name(),
+                        partition.id(),
+                        std::time::Duration::from_secs(5),
+                    ) {
+                        total += high as u64;
+                    }
+                }
+            }
+        }
+        Ok::<u64, rdkafka::error::KafkaError>(total)
+    })
+    .await??;
+
+    Ok(result)
+}
+
 /// Return the high-watermark offset for any topic (partition 0).
 pub async fn kafka_offset_for_topic(topic: &str) -> Result<u64> {
     let consumer: BaseConsumer = ClientConfig::new()
@@ -215,7 +253,7 @@ const PROXY_ADDRS: &[(&str, &str, &str)] = &[
 ];
 
 /// DeltaForge instance ports to scan for pipelines.
-const DF_PORTS: &[u16] = &[8080, 8081, 8082, 8083];
+const DF_PORTS: &[u16] = &[8080, 8081, 8082];
 
 /// PATCH all running pipelines to use direct connections (bypass proxy)
 /// or restore proxied connections. Returns the number of pipelines patched.

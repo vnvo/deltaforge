@@ -18,6 +18,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
+use axum::extract::Path;
+
 use crate::toxiproxy::ToxiproxyClient;
 
 const HTML: &str = include_str!("ui.html");
@@ -207,8 +209,9 @@ struct ServiceLink {
 /// If not listed here, falls back to showing the port number.
 fn port_label(host_port: u16) -> Option<(&'static str, String)> {
     match host_port {
-        8080..=8083 => Some(("API", format!("http://localhost:{host_port}"))),
-        9000..=9003 => {
+        8085 => Some(("SR API", "http://localhost:8085/subjects".to_string())),
+        8080..=8082 => Some(("API", format!("http://localhost:{host_port}"))),
+        9000..=9002 => {
             Some(("metrics", format!("http://localhost:{host_port}/metrics")))
         }
         3000 => Some(("UI", "http://localhost:3000".to_string())),
@@ -262,29 +265,24 @@ async fn api_status() -> Json<Vec<ServiceInfo>> {
             Some("http://localhost:8888/healthz"),
         ),
         (
-            "deltaforge",
-            "deltaforge-deltaforge-1",
+            "deltaforge-release",
+            "deltaforge-deltaforge-release-1",
             Some("http://localhost:8080/health"),
         ),
         (
-            "deltaforge-pg",
-            "deltaforge-deltaforge-pg-1",
-            Some("http://localhost:8080/health"),
-        ),
-        (
-            "deltaforge-soak",
-            "deltaforge-deltaforge-soak-1",
+            "deltaforge-debug",
+            "deltaforge-deltaforge-debug-1",
             Some("http://localhost:8081/health"),
         ),
         (
-            "deltaforge-tpcc",
-            "deltaforge-deltaforge-tpcc-1",
+            "deltaforge-profile",
+            "deltaforge-deltaforge-profile-1",
             Some("http://localhost:8082/health"),
         ),
         (
-            "deltaforge-pg-soak",
-            "deltaforge-deltaforge-pg-soak-1",
-            Some("http://localhost:8083/health"),
+            "schema-registry",
+            "deltaforge-schema-registry-1",
+            Some("http://localhost:8085/subjects"),
         ),
         ("postgres", "deltaforge-postgres-1", None),
         ("postgres-b", "deltaforge-postgres-b-1", None),
@@ -355,6 +353,7 @@ async fn api_inject_fault(
                 )
                 .await
         }
+        "sr-outage" => st.toxi.disable("schema-registry").await,
         "faulty-events" => inject_faulty_events().await,
         _ => Err(anyhow::anyhow!("unknown preset")),
     };
@@ -374,8 +373,8 @@ async fn inject_faulty_events() -> anyhow::Result<()> {
     // Try each known DeltaForge instance to find a running pipeline.
     let df_bases = [
         ("http://localhost:8080", "chaos-app"),
-        ("http://localhost:8081", "chaos-soak"),
-        ("http://localhost:8083", "chaos-pg-soak"),
+        ("http://localhost:8081", "chaos-app"),
+        ("http://localhost:8082", "chaos-app"),
     ];
 
     let client = reqwest::Client::builder()
@@ -475,11 +474,9 @@ async fn api_reset_volumes(Json(req): Json<ResetRequest>) -> StatusCode {
             // Remove DeltaForge SQLite checkpoint DBs from each app volume.
             // Stop DeltaForge services first, then clear, then leave stopped.
             let profiles = &[
-                ("app", "deltaforge"),
-                ("pg-app", "deltaforge-pg"),
-                ("soak", "deltaforge-soak"),
-                ("pg-soak", "deltaforge-pg-soak"),
-                ("tpcc", "deltaforge-tpcc"),
+                ("df", "deltaforge-release"),
+                ("df", "deltaforge-debug"),
+                ("df", "deltaforge-profile"),
             ];
             for (profile, service) in profiles {
                 // Best-effort stop — service may already be stopped.
@@ -536,15 +533,7 @@ async fn api_reset_volumes(Json(req): Json<ResetRequest>) -> StatusCode {
                     "--profile",
                     "kafka-infra",
                     "--profile",
-                    "app",
-                    "--profile",
-                    "pg-app",
-                    "--profile",
-                    "soak",
-                    "--profile",
-                    "pg-soak",
-                    "--profile",
-                    "tpcc",
+                    "df",
                     "down",
                     "-v",
                     "--remove-orphans",
@@ -568,6 +557,12 @@ async fn api_reset_volumes(Json(req): Json<ResetRequest>) -> StatusCode {
 struct RunRequest {
     scenario: String,
     source: String,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    pipeline: Option<String>,
+    #[serde(default)]
+    topic: Option<String>,
     duration_mins: u64,
     #[serde(default)]
     writer_tasks: usize,
@@ -618,6 +613,15 @@ async fn api_scenario_start(
     let mut cmd = Command::new(&binary);
     cmd.arg("--scenario").arg(&req.scenario);
     cmd.arg("--source").arg(&req.source);
+    if let Some(port) = req.port {
+        cmd.arg("--port").arg(port.to_string());
+    }
+    if let Some(ref pipeline) = req.pipeline {
+        cmd.arg("--pipeline").arg(pipeline);
+    }
+    if let Some(ref topic) = req.topic {
+        cmd.arg("--topic").arg(topic);
+    }
     if req.duration_mins > 0 {
         cmd.arg("--duration-mins")
             .arg(req.duration_mins.to_string());
@@ -1204,11 +1208,9 @@ async fn gather_profile_context(
 
     // Try to detect which DeltaForge port this container maps to.
     let port_map: &[(&str, u16)] = &[
-        ("deltaforge-deltaforge-soak-1", 8081),
-        ("deltaforge-deltaforge-pg-soak-1", 8083),
-        ("deltaforge-deltaforge-1", 8080),
-        ("deltaforge-deltaforge-pg-1", 8080),
-        ("deltaforge-deltaforge-tpcc-1", 8082),
+        ("deltaforge-deltaforge-release-1", 8080),
+        ("deltaforge-deltaforge-debug-1", 8081),
+        ("deltaforge-deltaforge-profile-1", 8082),
     ];
     if let Some(&(_, port)) = port_map.iter().find(|&&(c, _)| c == container) {
         // Fetch pipeline list to get config summary.
@@ -1394,6 +1396,118 @@ async fn run_profile(
     Ok(svg)
 }
 
+// ── Config management ─────────────────────────────────────────────────────────
+
+async fn api_configs() -> Json<Vec<serde_json::Value>> {
+    let config_dir = workspace_root().join("chaos/config");
+    let mut configs = vec![];
+    if let Ok(entries) = std::fs::read_dir(&config_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .extension()
+                .map(|e| e == "yaml" || e == "yml")
+                .unwrap_or(false)
+            {
+                let name =
+                    path.file_name().unwrap().to_string_lossy().to_string();
+                configs.push(serde_json::json!({ "name": name }));
+            }
+        }
+    }
+    configs.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Json(configs)
+}
+
+async fn api_config_content(
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let config_dir = workspace_root().join("chaos/config");
+    let path = config_dir.join(&name);
+    // Security: ensure the path is within config dir
+    if !path.starts_with(&config_dir) || !path.exists() {
+        return (StatusCode::NOT_FOUND, "config not found".to_string());
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(content) => (StatusCode::OK, content),
+        Err(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "read error".to_string())
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ApplyConfigRequest {
+    port: u16,
+    config: String, // config file name
+}
+
+async fn api_apply_config(
+    Json(req): Json<ApplyConfigRequest>,
+) -> StatusCode {
+    let config_dir = workspace_root().join("chaos/config");
+    let path = config_dir.join(&req.config);
+    if !path.starts_with(&config_dir) || !path.exists() {
+        return StatusCode::NOT_FOUND;
+    }
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+    };
+
+    // Parse the YAML to get the pipeline spec
+    let spec: serde_json::Value = match serde_yaml::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return StatusCode::BAD_REQUEST,
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+    let base = format!("http://localhost:{}", req.port);
+
+    // Delete existing pipelines
+    if let Ok(resp) = client.get(format!("{base}/pipelines")).send().await {
+        if let Ok(pipelines) = resp.json::<serde_json::Value>().await {
+            if let Some(arr) = pipelines.as_array() {
+                for p in arr {
+                    if let Some(name) = p["name"].as_str() {
+                        let _ = client
+                            .delete(format!("{base}/pipelines/{name}"))
+                            .send()
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+
+    // Small delay to let pipeline cleanup complete
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // POST the new config
+    match client
+        .post(format!("{base}/pipelines"))
+        .json(&spec)
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => StatusCode::OK,
+        Ok(r) => {
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            tracing::warn!(%status, %body, "apply-config POST failed");
+            StatusCode::BAD_GATEWAY
+        }
+        Err(e) => {
+            tracing::warn!(%e, "apply-config POST failed");
+            StatusCode::BAD_GATEWAY
+        }
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn run(port: u16) -> Result<()> {
@@ -1416,6 +1530,9 @@ pub async fn run(port: u16) -> Result<()> {
         .route("/api/profile/start", post(api_profile_start))
         .route("/api/profile/status", get(api_profile_status))
         .route("/api/profile/flamegraph", get(api_profile_flamegraph))
+        .route("/api/configs", get(api_configs))
+        .route("/api/config/{name}", get(api_config_content))
+        .route("/api/apply-config", post(api_apply_config))
         .route("/api/df", get(api_df_get))
         .route("/api/df", post(api_df_post))
         .route("/api/df/patch", post(api_df_patch))
