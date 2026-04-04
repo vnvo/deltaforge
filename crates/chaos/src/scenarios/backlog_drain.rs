@@ -186,15 +186,23 @@ pub async fn run_with_source(
     // If the topic is a template (contains ${...}), poll all matching topics by prefix.
     let topic_is_template = src.topic.contains("${");
     let topic_prefix = if topic_is_template {
-        src.topic.split("${").next().unwrap_or(&src.topic).to_string()
+        src.topic
+            .split("${")
+            .next()
+            .unwrap_or(&src.topic)
+            .to_string()
     } else {
         String::new()
     };
     let kafka_baseline = if topic_is_template {
         info!(prefix = %topic_prefix, "topic is a template — polling all matching topics");
-        harness::kafka_offset_for_prefix(&topic_prefix).await.unwrap_or(0)
+        harness::kafka_offset_for_prefix(&topic_prefix)
+            .await
+            .unwrap_or(0)
     } else {
-        harness::kafka_offset_for_topic(&src.topic).await.unwrap_or(0)
+        harness::kafka_offset_for_topic(&src.topic)
+            .await
+            .unwrap_or(0)
     };
     info!(kafka_baseline, "kafka baseline offset recorded");
 

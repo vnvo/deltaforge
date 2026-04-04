@@ -190,7 +190,7 @@ use deltaforge_core::encoding::avro_schema::{
     build_envelope_schema, build_value_schema,
 };
 use deltaforge_core::encoding::avro_types::{
-    mysql_column_to_avro, ColumnDesc, TypeConversionOpts,
+    ColumnDesc, TypeConversionOpts, mysql_column_to_avro,
 };
 
 /// Build envelope schema from MySQL column definitions, encode a CDC event,
@@ -215,8 +215,7 @@ async fn ddl_roundtrip(
 
     let (url, _registry) = start_mock_registry().await;
     let encoder =
-        AvroEncoder::new(&url, SubjectStrategy::TopicName, None, None)
-            .unwrap();
+        AvroEncoder::new(&url, SubjectStrategy::TopicName, None, None).unwrap();
 
     // Build a CDC INSERT event
     let event = json!({
@@ -244,9 +243,7 @@ async fn ddl_roundtrip(
         .encode(&format!("cdc.{table}"), &event, None)
         .await
         .unwrap_or_else(|e| {
-            panic!(
-                "Avro encode failed for {table}: {e}\nSchema: {schema_json}"
-            )
+            panic!("Avro encode failed for {table}: {e}\nSchema: {schema_json}")
         });
 
     // Verify Confluent wire format
@@ -254,7 +251,12 @@ async fn ddl_roundtrip(
     assert!(bytes.len() > 5, "{table}: payload should exist");
 }
 
-fn col(name: &str, data_type: &str, column_type: &str, nullable: bool) -> ColumnDesc {
+fn col(
+    name: &str,
+    data_type: &str,
+    column_type: &str,
+    nullable: bool,
+) -> ColumnDesc {
     ColumnDesc {
         name: name.to_string(),
         data_type: data_type.to_string(),
@@ -268,11 +270,21 @@ fn col(name: &str, data_type: &str, column_type: &str, nullable: bool) -> Column
     }
 }
 
-fn decimal_col(name: &str, precision: i64, scale: i64, nullable: bool) -> ColumnDesc {
+fn decimal_col(
+    name: &str,
+    precision: i64,
+    scale: i64,
+    nullable: bool,
+) -> ColumnDesc {
     ColumnDesc {
         precision: Some(precision),
         scale: Some(scale),
-        ..col(name, "decimal", &format!("decimal({precision},{scale})"), nullable)
+        ..col(
+            name,
+            "decimal",
+            &format!("decimal({precision},{scale})"),
+            nullable,
+        )
     }
 }
 
@@ -532,7 +544,8 @@ async fn ddl_mysql_delete_event() {
 
     let value_schema = build_value_schema("mysql", "orders", "users", fields);
     let (schema_json, _) =
-        build_envelope_schema("mysql", "orders", "users", value_schema).unwrap();
+        build_envelope_schema("mysql", "orders", "users", value_schema)
+            .unwrap();
 
     let (url, _) = start_mock_registry().await;
     let encoder =
@@ -658,7 +671,7 @@ async fn ddl_mysql_all_nulls() {
 // =============================================================================
 
 use deltaforge_core::encoding::avro_types::{
-    postgres_column_to_avro, EnumMode, NaiveTimestampMode, UnsignedBigintMode,
+    EnumMode, NaiveTimestampMode, UnsignedBigintMode, postgres_column_to_avro,
 };
 
 fn unsigned_col(name: &str, data_type: &str, column_type: &str) -> ColumnDesc {
@@ -691,7 +704,12 @@ fn pg_decimal_col(name: &str, precision: i64, scale: i64) -> ColumnDesc {
     ColumnDesc {
         precision: Some(precision),
         scale: Some(scale),
-        ..col(name, "numeric", &format!("numeric({precision},{scale})"), true)
+        ..col(
+            name,
+            "numeric",
+            &format!("numeric({precision},{scale})"),
+            true,
+        )
     }
 }
 
@@ -717,7 +735,9 @@ async fn ddl_encode_roundtrip(
     let value_schema = build_value_schema(connector, "testdb", table, fields);
     let (schema_json, _) =
         build_envelope_schema(connector, "testdb", table, value_schema)
-            .unwrap_or_else(|e| panic!("{connector}.{table} schema build failed: {e}"));
+            .unwrap_or_else(|e| {
+                panic!("{connector}.{table} schema build failed: {e}")
+            });
 
     let (url, _) = start_mock_registry().await;
     let encoder =
@@ -884,8 +904,8 @@ async fn ddl_mysql_datetime_types() {
         "datetime_types",
         vec![
             col("c_date", "date", "date", true),
-            col("c_datetime", "datetime", "datetime", true),      // → string (default)
-            col("c_timestamp", "timestamp", "timestamp", true),    // → timestamp-millis
+            col("c_datetime", "datetime", "datetime", true), // → string (default)
+            col("c_timestamp", "timestamp", "timestamp", true), // → timestamp-millis
             col("c_time", "time", "time", true),
             col("c_year", "year", "year", true),
         ],
@@ -931,10 +951,10 @@ async fn ddl_mysql_special_types() {
         "special_types",
         vec![
             col("c_bool", "boolean", "tinyint(1)", true),
-            bit_col("c_bit1", 1),               // BIT(1) → boolean
-            bit_col("c_bit8", 8),                // BIT(8) → bytes
+            bit_col("c_bit1", 1), // BIT(1) → boolean
+            bit_col("c_bit8", 8), // BIT(8) → bytes
             col("c_json", "json", "json", true),
-            col("c_enum", "enum", "enum('a','b','c')", true),  // → string (default)
+            col("c_enum", "enum", "enum('a','b','c')", true), // → string (default)
             col("c_set", "set", "set('x','y','z')", true),
         ],
         json!({
@@ -959,9 +979,12 @@ async fn ddl_mysql_enum_mode_enum() {
     ddl_encode_roundtrip(
         "mysql",
         "enum_strict",
-        vec![
-            col("c_enum", "enum", "enum('pending','shipped','delivered')", false),
-        ],
+        vec![col(
+            "c_enum",
+            "enum",
+            "enum('pending','shipped','delivered')",
+            false,
+        )],
         json!({"c_enum": "shipped"}),
         &opts,
     )
@@ -977,9 +1000,11 @@ async fn ddl_mysql_unsigned_bigint_long_mode() {
     ddl_encode_roundtrip(
         "mysql",
         "unsigned_long",
-        vec![
-            unsigned_col("c_bigint_unsigned", "bigint", "bigint unsigned"),
-        ],
+        vec![unsigned_col(
+            "c_bigint_unsigned",
+            "bigint",
+            "bigint unsigned",
+        )],
         json!({"c_bigint_unsigned": 9223372036854775000_i64}),
         &opts,
     )
@@ -1085,10 +1110,10 @@ async fn ddl_pg_temporal_types() {
         "pg_temporal_types",
         vec![
             pg_col("c_date", "date", true),
-            pg_col("c_timestamp", "timestamp", true),        // → string (default)
-            pg_col("c_timestamptz", "timestamptz", true),    // → timestamp-micros
+            pg_col("c_timestamp", "timestamp", true), // → string (default)
+            pg_col("c_timestamptz", "timestamptz", true), // → timestamp-micros
             pg_col("c_time", "time", true),
-            pg_col("c_timetz", "timetz", true),              // → string
+            pg_col("c_timetz", "timetz", true), // → string
             pg_col("c_interval", "interval", true),
         ],
         json!({
@@ -1627,13 +1652,16 @@ async fn real_sr_ddl_roundtrip(
     let topic = format!("real-sr-ddl.{table}");
     let bytes = encoder.encode(&topic, &event, None).await?;
     assert_eq!(bytes[0], 0x00);
-    let schema_id = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+    let schema_id =
+        u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
     assert!(schema_id > 0);
 
     // Fetch from SR, decode, verify
     let sr = fetch_schema_by_id(&sr_url(), schema_id).await?;
-    let schema = apache_avro::Schema::parse_str(sr["schema"].as_str().unwrap())?;
-    let decoded = apache_avro::from_avro_datum(&schema, &mut &bytes[5..], None)?;
+    let schema =
+        apache_avro::Schema::parse_str(sr["schema"].as_str().unwrap())?;
+    let decoded =
+        apache_avro::from_avro_datum(&schema, &mut &bytes[5..], None)?;
     if let apache_avro::types::Value::Record(f) = &decoded {
         let names: Vec<&str> = f.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"after"));
@@ -1729,7 +1757,8 @@ async fn real_sr_ddl_mysql_all_types() -> Result<()> {
 async fn real_sr_ddl_postgres_all_types() -> Result<()> {
     init_test_tracing();
     real_sr_ddl_roundtrip(
-        "postgresql", "all_pg_types",
+        "postgresql",
+        "all_pg_types",
         vec![
             pg_col("c_smallint", "smallint", false),
             pg_col("c_integer", "integer", false),
@@ -1769,7 +1798,8 @@ async fn real_sr_ddl_postgres_all_types() -> Result<()> {
             "c_int_arr": [1, 2, 3], "c_text_arr": ["a", "b"]
         }),
         &TypeConversionOpts::default(),
-    ).await
+    )
+    .await
 }
 
 #[tokio::test]
@@ -1783,8 +1813,10 @@ async fn real_sr_ddl_crud_operations() -> Result<()> {
         col("name", "varchar", "varchar(255)", true),
         decimal_col("balance", 10, 2, true),
     ];
-    let fields: Vec<serde_json::Value> =
-        cols.iter().map(|c| mysql_column_to_avro(c, &opts)).collect();
+    let fields: Vec<serde_json::Value> = cols
+        .iter()
+        .map(|c| mysql_column_to_avro(c, &opts))
+        .collect();
     let vs = build_value_schema("mysql", "testdb", "accts", fields);
     let _ = build_envelope_schema("mysql", "testdb", "accts", vs)?;
 
@@ -1793,14 +1825,49 @@ async fn real_sr_ddl_crud_operations() -> Result<()> {
     let topic = "real-sr-ddl.accts";
     let src = json!({"version":"t","connector":"mysql","name":"t","ts_ms":1700000000000_i64,"db":"testdb","schema":null,"table":"accts","snapshot":null,"position":null});
 
-    let mk = |op, before, after, ts_ms: i64| json!({
-        "before": before, "after": after, "source": src, "op": op,
-        "ts_ms": ts_ms, "event_id": null, "schema_version": null, "transaction": null
-    });
+    let mk = |op, before, after, ts_ms: i64| {
+        json!({
+            "before": before, "after": after, "source": src, "op": op,
+            "ts_ms": ts_ms, "event_id": null, "schema_version": null, "transaction": null
+        })
+    };
 
-    let ib = encoder.encode(topic, &mk("c", json!(null), json!({"id":1,"name":"Alice","balance":"100.50"}), 1700000000000), None).await?;
-    let ub = encoder.encode(topic, &mk("u", json!({"id":1,"name":"Alice","balance":"100.50"}), json!({"id":1,"name":"Alicia","balance":"200.75"}), 1700000000001), None).await?;
-    let db = encoder.encode(topic, &mk("d", json!({"id":1,"name":"Alicia","balance":"200.75"}), json!(null), 1700000000002), None).await?;
+    let ib = encoder
+        .encode(
+            topic,
+            &mk(
+                "c",
+                json!(null),
+                json!({"id":1,"name":"Alice","balance":"100.50"}),
+                1700000000000,
+            ),
+            None,
+        )
+        .await?;
+    let ub = encoder
+        .encode(
+            topic,
+            &mk(
+                "u",
+                json!({"id":1,"name":"Alice","balance":"100.50"}),
+                json!({"id":1,"name":"Alicia","balance":"200.75"}),
+                1700000000001,
+            ),
+            None,
+        )
+        .await?;
+    let db = encoder
+        .encode(
+            topic,
+            &mk(
+                "d",
+                json!({"id":1,"name":"Alicia","balance":"200.75"}),
+                json!(null),
+                1700000000002,
+            ),
+            None,
+        )
+        .await?;
 
     let id = |b: &[u8]| u32::from_be_bytes([b[1], b[2], b[3], b[4]]);
     assert_eq!(id(&ib), id(&ub));
@@ -1808,7 +1875,8 @@ async fn real_sr_ddl_crud_operations() -> Result<()> {
 
     // Decode all
     let sr = fetch_schema_by_id(&sr_url(), id(&ib)).await?;
-    let schema = apache_avro::Schema::parse_str(sr["schema"].as_str().unwrap())?;
+    let schema =
+        apache_avro::Schema::parse_str(sr["schema"].as_str().unwrap())?;
     for (label, b) in [("INSERT", &ib), ("UPDATE", &ub), ("DELETE", &db)] {
         let d = apache_avro::from_avro_datum(&schema, &mut &b[5..], None)?;
         assert!(matches!(d, apache_avro::types::Value::Record(_)), "{label}");
@@ -1827,15 +1895,23 @@ async fn real_sr_ddl_per_table_subjects() -> Result<()> {
         AvroEncoder::new(&sr_url(), SubjectStrategy::TopicName, None, None)?;
 
     let mk_fields = |cols: &[ColumnDesc]| -> Vec<serde_json::Value> {
-        cols.iter().map(|c| mysql_column_to_avro(c, &opts)).collect()
+        cols.iter()
+            .map(|c| mysql_column_to_avro(c, &opts))
+            .collect()
     };
 
-    let c1 = [col("id", "int", "int", false), col("name", "varchar", "varchar(100)", true)];
+    let c1 = [
+        col("id", "int", "int", false),
+        col("name", "varchar", "varchar(100)", true),
+    ];
     let f1 = mk_fields(&c1);
     let vs1 = build_value_schema("mysql", "testdb", "tbl_a", f1);
     let _ = build_envelope_schema("mysql", "testdb", "tbl_a", vs1)?;
 
-    let c2 = [col("id", "int", "int", false), decimal_col("price", 8, 2, true)];
+    let c2 = [
+        col("id", "int", "int", false),
+        decimal_col("price", 8, 2, true),
+    ];
     let f2 = mk_fields(&c2);
     let vs2 = build_value_schema("mysql", "testdb", "tbl_b", f2);
     let _ = build_envelope_schema("mysql", "testdb", "tbl_b", vs2)?;
@@ -1843,8 +1919,20 @@ async fn real_sr_ddl_per_table_subjects() -> Result<()> {
     let src = json!({"version":"t","connector":"mysql","name":"t","ts_ms":1700000000000_i64,"db":"testdb","schema":null,"table":"x","snapshot":null,"position":null});
     let mk = |after| json!({"before":null,"after":after,"source":src,"op":"c","ts_ms":1700000000000_i64,"event_id":null,"schema_version":null,"transaction":null});
 
-    let b1 = encoder.encode("real-sr-ddl-subj.tbl_a", &mk(json!({"id":1,"name":"A"})), None).await?;
-    let b2 = encoder.encode("real-sr-ddl-subj.tbl_b", &mk(json!({"id":1,"price":"9.99"})), None).await?;
+    let b1 = encoder
+        .encode(
+            "real-sr-ddl-subj.tbl_a",
+            &mk(json!({"id":1,"name":"A"})),
+            None,
+        )
+        .await?;
+    let b2 = encoder
+        .encode(
+            "real-sr-ddl-subj.tbl_b",
+            &mk(json!({"id":1,"price":"9.99"})),
+            None,
+        )
+        .await?;
 
     let id1 = u32::from_be_bytes([b1[1], b1[2], b1[3], b1[4]]);
     let id2 = u32::from_be_bytes([b2[1], b2[2], b2[3], b2[4]]);

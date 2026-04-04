@@ -578,7 +578,7 @@ async fn e2e_mysql_all_types() -> Result<()> {
             ColumnValue::Long(2147483647), // INT
             ColumnValue::LongLong(9223372036854775000), // BIGINT
             ColumnValue::Float(3.15),   // FLOAT
-            ColumnValue::Double(2.72), // DOUBLE
+            ColumnValue::Double(2.72),  // DOUBLE
             ColumnValue::Decimal("12345678.99".to_string()), // DECIMAL
             ColumnValue::String(b"hello world".to_vec()), // VARCHAR
             ColumnValue::String(b"USD".to_vec()), // CHAR

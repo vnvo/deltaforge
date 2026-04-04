@@ -65,7 +65,10 @@ pub struct MysqlBackend {
 
 impl MysqlBackend {
     pub fn new(compose_profile: String, compose_service: String) -> Self {
-        Self { compose_profile, compose_service }
+        Self {
+            compose_profile,
+            compose_service,
+        }
     }
 }
 
@@ -149,7 +152,10 @@ pub struct PgBackend {
 
 impl PgBackend {
     pub fn new(compose_profile: String, compose_service: String) -> Self {
-        Self { compose_profile, compose_service }
+        Self {
+            compose_profile,
+            compose_service,
+        }
     }
 }
 

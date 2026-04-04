@@ -69,15 +69,15 @@ async fn main() -> Result<()> {
     );
 
     let pipeline_specs = match &args.config {
-        Some(path) => load_pipeline_cfgs(path).context("load pipeline specs")?,
+        Some(path) => {
+            load_pipeline_cfgs(path).context("load pipeline specs")?
+        }
         None => vec![],
     };
 
     // Build summary lines before specs are consumed by manager.create()
-    let pipeline_specs_summary: Vec<String> = pipeline_specs
-        .iter()
-        .map(format_pipeline_summary)
-        .collect();
+    let pipeline_specs_summary: Vec<String> =
+        pipeline_specs.iter().map(format_pipeline_summary).collect();
 
     // ── Build storage backend ─────────────────────────────────────────────────
     let storage_cfg = StorageConfig {
@@ -119,7 +119,10 @@ async fn main() -> Result<()> {
         eprintln!("{summary}");
     }
     if pipeline_specs_summary.is_empty() {
-        eprintln!("  Use REST API to add pipelines: POST http://{}/pipelines", args.api_addr);
+        eprintln!(
+            "  Use REST API to add pipelines: POST http://{}/pipelines",
+            args.api_addr
+        );
     }
     eprintln!();
 

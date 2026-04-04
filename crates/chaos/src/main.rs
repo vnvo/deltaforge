@@ -236,12 +236,8 @@ async fn main() -> Result<()> {
     )
     .await;
 
-    let soak_src = SoakSource::new(
-        cli.port,
-        source_name,
-        &pipeline_name,
-        &topic,
-    );
+    let soak_src =
+        SoakSource::new(cli.port, source_name, &pipeline_name, &topic);
 
     let service = service_for_port(cli.port).to_string();
 
@@ -315,7 +311,7 @@ async fn detect_pipeline_info(
                     .map(|s| s.to_string())
                     .unwrap_or(default_pipeline),
                 default_topic,
-            )
+            );
         }
     };
 
@@ -331,7 +327,7 @@ async fn detect_pipeline_info(
                     .map(|s| s.to_string())
                     .unwrap_or(default_pipeline),
                 default_topic,
-            )
+            );
         }
     };
 
@@ -343,7 +339,7 @@ async fn detect_pipeline_info(
                     .map(|s| s.to_string())
                     .unwrap_or(default_pipeline),
                 default_topic,
-            )
+            );
         }
     };
 
@@ -355,7 +351,7 @@ async fn detect_pipeline_info(
                     .map(|s| s.to_string())
                     .unwrap_or(default_pipeline),
                 default_topic,
-            )
+            );
         }
     };
 
@@ -416,31 +412,23 @@ async fn run_scenarios<B: backend::SourceBackend>(
             );
         }
         Scenario::SinkOutage => {
-            results
-                .push(scenarios::sink_outage::run(harness, backend).await?);
+            results.push(scenarios::sink_outage::run(harness, backend).await?);
         }
         Scenario::CrashRecovery => {
-            results.push(
-                scenarios::crash_recovery::run(harness, backend).await?,
-            );
+            results
+                .push(scenarios::crash_recovery::run(harness, backend).await?);
         }
         Scenario::SchemaDrift => {
-            results.push(
-                scenarios::schema_drift::run(harness, backend).await?,
-            );
+            results.push(scenarios::schema_drift::run(harness, backend).await?);
         }
         Scenario::ExactlyOnce => {
-            results.push(
-                scenarios::exactly_once::run(harness, backend).await?,
-            );
+            results.push(scenarios::exactly_once::run(harness, backend).await?);
         }
         Scenario::DlqPoison => {
-            results
-                .push(scenarios::dlq_poison::run(harness, backend).await?);
+            results.push(scenarios::dlq_poison::run(harness, backend).await?);
         }
         Scenario::SrOutage => {
-            results
-                .push(scenarios::sr_outage::run(harness, backend).await?);
+            results.push(scenarios::sr_outage::run(harness, backend).await?);
         }
 
         // ── MySQL-specific ──────────────────────────────────────────────
@@ -491,7 +479,9 @@ async fn run_scenarios<B: backend::SourceBackend>(
         Scenario::BacklogDrain => {
             results.push(
                 scenarios::backlog_drain::run_with_source(
-                    harness, &soak.src, soak.drain_cfg.clone(),
+                    harness,
+                    &soak.src,
+                    soak.drain_cfg.clone(),
                 )
                 .await?,
             );
@@ -510,29 +500,22 @@ async fn run_scenarios<B: backend::SourceBackend>(
             results.push(
                 scenarios::network_partition::run(harness, backend).await?,
             );
+            results.push(scenarios::sink_outage::run(harness, backend).await?);
             results
-                .push(scenarios::sink_outage::run(harness, backend).await?);
-            results.push(
-                scenarios::crash_recovery::run(harness, backend).await?,
-            );
+                .push(scenarios::crash_recovery::run(harness, backend).await?);
             if is_mysql {
                 results.push(scenarios::failover::run(harness).await?);
             }
             if is_postgres {
-                results
-                    .push(scenarios::pg_failover::run(harness).await?);
+                results.push(scenarios::pg_failover::run(harness).await?);
             }
-            results.push(
-                scenarios::schema_drift::run(harness, backend).await?,
-            );
+            results.push(scenarios::schema_drift::run(harness, backend).await?);
             // Destructive scenarios last
             if is_mysql {
-                results
-                    .push(scenarios::binlog_purge::run(harness).await?);
+                results.push(scenarios::binlog_purge::run(harness).await?);
             }
             if is_postgres {
-                results
-                    .push(scenarios::slot_dropped::run(harness).await?);
+                results.push(scenarios::slot_dropped::run(harness).await?);
             }
         }
 

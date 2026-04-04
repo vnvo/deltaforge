@@ -27,7 +27,9 @@ impl Harness {
     pub async fn wait_for_deltaforge(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
-            match reqwest::get(format!("http://localhost:{}/health", self.port)).await {
+            match reqwest::get(format!("http://localhost:{}/health", self.port))
+                .await
+            {
                 Ok(r) if r.status().is_success() => return Ok(()),
                 _ => {}
             }
@@ -87,20 +89,22 @@ impl Harness {
     #[allow(dead_code)]
     pub async fn source_event_count(&self) -> Result<f64> {
         let metrics_port = self.port - 8080 + 9000;
-        let body = reqwest::get(format!("http://localhost:{}/metrics", metrics_port))
-            .await?
-            .text()
-            .await?;
+        let body =
+            reqwest::get(format!("http://localhost:{}/metrics", metrics_port))
+                .await?
+                .text()
+                .await?;
         parse_counter(&body, "deltaforge_source_events_total")
     }
 
     /// Fetch current reconnect counter.
     pub async fn reconnect_count(&self) -> Result<f64> {
         let metrics_port = self.port - 8080 + 9000;
-        let body = reqwest::get(format!("http://localhost:{}/metrics", metrics_port))
-            .await?
-            .text()
-            .await?;
+        let body =
+            reqwest::get(format!("http://localhost:{}/metrics", metrics_port))
+                .await?
+                .text()
+                .await?;
         parse_counter(&body, "deltaforge_source_reconnects_total")
     }
 }

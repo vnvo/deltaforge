@@ -1419,9 +1419,7 @@ async fn api_configs() -> Json<Vec<serde_json::Value>> {
     Json(configs)
 }
 
-async fn api_config_content(
-    Path(name): Path<String>,
-) -> impl IntoResponse {
+async fn api_config_content(Path(name): Path<String>) -> impl IntoResponse {
     let config_dir = workspace_root().join("chaos/config");
     let path = config_dir.join(&name);
     // Security: ensure the path is within config dir
@@ -1430,9 +1428,7 @@ async fn api_config_content(
     }
     match std::fs::read_to_string(&path) {
         Ok(content) => (StatusCode::OK, content),
-        Err(_) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, "read error".to_string())
-        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "read error".to_string()),
     }
 }
 
@@ -1442,9 +1438,7 @@ struct ApplyConfigRequest {
     config: String, // config file name
 }
 
-async fn api_apply_config(
-    Json(req): Json<ApplyConfigRequest>,
-) -> StatusCode {
+async fn api_apply_config(Json(req): Json<ApplyConfigRequest>) -> StatusCode {
     let config_dir = workspace_root().join("chaos/config");
     let path = config_dir.join(&req.config);
     if !path.starts_with(&config_dir) || !path.exists() {

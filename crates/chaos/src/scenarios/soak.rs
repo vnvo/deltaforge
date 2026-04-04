@@ -88,7 +88,11 @@ impl SoakSource {
             8082 => "deltaforge-profile",
             _ => "deltaforge-debug",
         };
-        let proxy = if source == "postgres" { "postgres" } else { "mysql" };
+        let proxy = if source == "postgres" {
+            "postgres"
+        } else {
+            "mysql"
+        };
         Self {
             name: format!("{source}-{port}"),
             profile: "df".to_string(),
