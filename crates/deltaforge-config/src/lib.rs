@@ -416,6 +416,12 @@ pub fn load_from_dir(dir_path: &str) -> ConfigResult<Vec<PipelineSpec>> {
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.metadata().map(|m| m.is_file()).unwrap_or(false))
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "yaml" || ext == "yml")
+                .unwrap_or(false)
+        })
     {
         if let Some(path_str) = entry.path().to_str() {
             let spec = load_from_path(path_str)?;

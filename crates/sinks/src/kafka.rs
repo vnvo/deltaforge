@@ -507,8 +507,15 @@ impl KafkaSink {
                 &event.source.table,
             )
             .await
-            .map_err(|e| SinkError::Serialization {
-                details: e.to_string().into(),
+            .map_err(|e| {
+                warn!(
+                    table = %event.source.table,
+                    error = %e,
+                    "Avro encoding failed"
+                );
+                SinkError::Serialization {
+                    details: e.to_string().into(),
+                }
             })?;
 
         Ok(bytes.to_vec())

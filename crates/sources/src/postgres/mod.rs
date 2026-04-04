@@ -29,7 +29,7 @@ use postgres_helpers::{
     prepare_replication_client,
 };
 
-mod postgres_object;
+pub mod postgres_object;
 
 mod postgres_schema_loader;
 pub use postgres_schema_loader::{LoadedSchema, PostgresSchemaLoader};
@@ -38,7 +38,7 @@ mod postgres_event;
 pub use postgres_event::RelationInfo;
 use postgres_event::*;
 
-mod postgres_table_schema;
+pub mod postgres_table_schema;
 pub use postgres_table_schema::{PostgresColumn, PostgresTableSchema};
 
 mod postgres_logical_message;

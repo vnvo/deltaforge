@@ -25,7 +25,7 @@ pub use mysql_errors::{LoopControl, MySqlSourceError, MySqlSourceResult};
 mod mysql_helpers;
 use mysql_helpers::prepare_client;
 
-mod mysql_object;
+pub mod mysql_object;
 
 mod mysql_schema_loader;
 pub use mysql_schema_loader::{LoadedSchema, MySqlSchemaLoader};

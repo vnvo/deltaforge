@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use tracing::debug;
 
 /// Build a JSON object using the included-columns bitmap and the compact values vector.
-pub(super) fn build_object(
+pub fn build_object(
     cols: &[String],
     included: &[bool],
     values: &[ColumnValue],

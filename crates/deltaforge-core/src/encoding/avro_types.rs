@@ -150,23 +150,11 @@ fn mysql_type_to_avro(
         "float" => json!("float"),
         "double" | "real" => json!("double"),
 
-        // Fixed-point decimal
-        "decimal" | "numeric" => {
-            if let (Some(p), Some(s)) = (col.precision, col.scale) {
-                json!({
-                    "type": "bytes",
-                    "logicalType": "decimal",
-                    "precision": p,
-                    "scale": s
-                })
-            } else {
-                warn!(
-                    column = %col.name,
-                    "DECIMAL without precision/scale — mapping to string"
-                );
-                json!("string")
-            }
-        }
+        // Fixed-point decimal — map to string for now.
+        // Avro Decimal requires two's complement BigInt encoding which
+        // the JSON intermediary can't provide (values come as string "1234.56").
+        // TD-003 in tech-debt.md tracks proper Decimal support.
+        "decimal" | "numeric" => json!("string"),
 
         // String types
         "varchar" | "char" | "text" | "tinytext" | "mediumtext"
@@ -298,15 +286,11 @@ fn postgres_scalar_to_avro(
         "real" | "float4" => json!("float"),
         "double precision" | "float8" => json!("double"),
 
-        // Fixed-point decimal
+        // Fixed-point decimal — map to string for now (same as MySQL).
+        // TD-003 in tech-debt.md tracks proper Decimal support.
         "numeric" | "decimal" => {
-            if let (Some(p), Some(s)) = (col.precision, col.scale) {
-                json!({
-                    "type": "bytes",
-                    "logicalType": "decimal",
-                    "precision": p,
-                    "scale": s
-                })
+            if let (Some(_p), Some(_s)) = (col.precision, col.scale) {
+                json!("string")
             } else {
                 warn!(
                     column = %col.name,
@@ -585,16 +569,14 @@ mod tests {
     }
 
     #[test]
-    fn mysql_decimal() {
+    fn mysql_decimal_maps_to_string() {
+        // Decimal maps to string (proper Avro Decimal encoding is TD-003)
         let o = opts();
         let f = mysql_column_to_avro(
             &col_with_precision("total", "decimal", false, 10, 2),
             &o,
         );
-        let t = &f["type"];
-        assert_eq!(t["logicalType"], "decimal");
-        assert_eq!(t["precision"], 10);
-        assert_eq!(t["scale"], 2);
+        assert_eq!(f["type"], "string");
     }
 
     #[test]
@@ -700,13 +682,13 @@ mod tests {
 
     #[test]
     fn pg_numeric_with_precision() {
+        // Decimal maps to string (proper Avro Decimal encoding is TD-003)
         let o = opts();
         let f = postgres_column_to_avro(
             &col_with_precision("total", "numeric", false, 12, 4),
             &o,
         );
-        assert_eq!(f["type"]["logicalType"], "decimal");
-        assert_eq!(f["type"]["precision"], 12);
+        assert_eq!(f["type"], "string");
     }
 
     #[test]

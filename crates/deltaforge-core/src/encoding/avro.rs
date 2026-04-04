@@ -744,19 +744,305 @@ fn escape_json_string(s: &str) -> String {
 // =============================================================================
 
 /// Convert a JSON value to an Avro value using the given schema.
+///
+/// `AvroValue::from(serde_json::Value)` maps JSON objects to `Value::Map`
+/// which doesn't match `Record` types in unions. This function does
+/// schema-aware conversion: JSON objects become `Value::Record` when the
+/// schema expects a record.
 fn json_to_avro(
     json: &serde_json::Value,
     schema: &AvroSchema,
 ) -> Result<AvroValue, EncodingError> {
-    // Use apache-avro's built-in JSON → Avro conversion
-    let avro_value = AvroValue::from(json.clone());
+    // Schema-aware conversion produces correctly-typed Avro values.
+    // No resolve() pass — our converter handles all schema types
+    // including unions, records, refs, and logical types.
+    json_to_avro_with_schema(json, schema)
+}
 
-    // Resolve against the schema to ensure correct types
-    let resolved = avro_value.resolve(schema).map_err(|e| {
-        EncodingError::Avro(format!("Avro schema resolution failed: {e}"))
-    })?;
+/// Recursively convert JSON to Avro values guided by the schema.
+fn json_to_avro_with_schema(
+    json: &serde_json::Value,
+    schema: &AvroSchema,
+) -> Result<AvroValue, EncodingError> {
+    match schema {
+        AvroSchema::Null => Ok(AvroValue::Null),
+        AvroSchema::Boolean => match json {
+            serde_json::Value::Bool(b) => Ok(AvroValue::Boolean(*b)),
+            serde_json::Value::Null => Ok(AvroValue::Null),
+            _ => Ok(AvroValue::from(json.clone())),
+        },
+        AvroSchema::Int => match json {
+            serde_json::Value::Number(n) => {
+                Ok(AvroValue::Int(n.as_i64().unwrap_or(0) as i32))
+            }
+            serde_json::Value::Null => Ok(AvroValue::Null),
+            _ => Ok(AvroValue::from(json.clone())),
+        },
+        AvroSchema::Long => match json {
+            serde_json::Value::Number(n) => {
+                Ok(AvroValue::Long(n.as_i64().unwrap_or(0)))
+            }
+            serde_json::Value::Null => Ok(AvroValue::Null),
+            _ => Ok(AvroValue::from(json.clone())),
+        },
+        AvroSchema::Float => match json {
+            serde_json::Value::Number(n) => {
+                Ok(AvroValue::Float(n.as_f64().unwrap_or(0.0) as f32))
+            }
+            serde_json::Value::Null => Ok(AvroValue::Null),
+            _ => Ok(AvroValue::from(json.clone())),
+        },
+        AvroSchema::Double => match json {
+            serde_json::Value::Number(n) => {
+                Ok(AvroValue::Double(n.as_f64().unwrap_or(0.0)))
+            }
+            serde_json::Value::Null => Ok(AvroValue::Null),
+            _ => Ok(AvroValue::from(json.clone())),
+        },
+        // Logical types on Long
+        AvroSchema::TimestampMillis | AvroSchema::TimestampMicros => {
+            match json {
+                serde_json::Value::Number(n) => {
+                    Ok(AvroValue::Long(n.as_i64().unwrap_or(0)))
+                }
+                serde_json::Value::Null => Ok(AvroValue::Null),
+                serde_json::Value::String(s) => {
+                    // Try parse as epoch millis/micros
+                    Ok(AvroValue::Long(s.parse::<i64>().unwrap_or(0)))
+                }
+                _ => Ok(AvroValue::Long(0)),
+            }
+        }
+        // Logical type on Int
+        AvroSchema::Date | AvroSchema::TimeMillis => match json {
+            serde_json::Value::Number(n) => {
+                Ok(AvroValue::Int(n.as_i64().unwrap_or(0) as i32))
+            }
+            serde_json::Value::Null => Ok(AvroValue::Null),
+            _ => Ok(AvroValue::Int(0)),
+        },
+        // Logical type on Long
+        AvroSchema::TimeMicros => match json {
+            serde_json::Value::Number(n) => {
+                Ok(AvroValue::Long(n.as_i64().unwrap_or(0)))
+            }
+            serde_json::Value::Null => Ok(AvroValue::Null),
+            _ => Ok(AvroValue::Long(0)),
+        },
+        // Decimal logical type — in CDC events, decimals come as strings
+        AvroSchema::Decimal(_) => match json {
+            serde_json::Value::String(s) => {
+                // Store decimal as string-encoded Avro bytes
+                Ok(AvroValue::Bytes(s.as_bytes().to_vec()))
+            }
+            serde_json::Value::Number(n) => {
+                let s = n.to_string();
+                Ok(AvroValue::Bytes(s.as_bytes().to_vec()))
+            }
+            serde_json::Value::Null => Ok(AvroValue::Null),
+            _ => Ok(AvroValue::Bytes(json.to_string().into_bytes())),
+        },
+        // Raw bytes
+        AvroSchema::Bytes => match json {
+            serde_json::Value::String(s) => {
+                Ok(AvroValue::Bytes(s.as_bytes().to_vec()))
+            }
+            serde_json::Value::Null => Ok(AvroValue::Null),
+            // Handle DeltaForge's _base64 wrapper for BLOB columns
+            serde_json::Value::Object(map)
+                if map.contains_key("_base64") =>
+            {
+                let b64 = map["_base64"].as_str().unwrap_or("");
+                Ok(AvroValue::Bytes(
+                    base64_decode(b64)
+                        .unwrap_or_else(|| b64.as_bytes().to_vec()),
+                ))
+            }
+            _ => Ok(AvroValue::Bytes(json.to_string().into_bytes())),
+        },
+        AvroSchema::String | AvroSchema::Uuid => match json {
+            serde_json::Value::String(s) => {
+                Ok(AvroValue::String(s.clone()))
+            }
+            serde_json::Value::Null => Ok(AvroValue::Null),
+            // Handle DeltaForge's _base64 wrapper for TEXT/BLOB columns
+            serde_json::Value::Object(map)
+                if map.contains_key("_base64") =>
+            {
+                let b64 = map["_base64"].as_str().unwrap_or("");
+                // For String schema, decode base64 and try as UTF-8
+                match base64_decode(b64) {
+                    Some(bytes) => Ok(AvroValue::String(
+                        String::from_utf8_lossy(&bytes).into_owned(),
+                    )),
+                    None => Ok(AvroValue::String(b64.to_string())),
+                }
+            }
+            // Coerce non-string types to string
+            other => Ok(AvroValue::String(other.to_string())),
+        },
+        AvroSchema::Record(record_schema) => {
+            match json {
+                serde_json::Value::Object(map) => {
+                    let mut fields = Vec::with_capacity(
+                        record_schema.fields.len(),
+                    );
+                    for field in &record_schema.fields {
+                        let field_json = map
+                            .get(&field.name)
+                            .unwrap_or(&serde_json::Value::Null);
+                        let field_value = json_to_avro_with_schema(
+                            field_json,
+                            &field.schema,
+                        )?;
+                        fields
+                            .push((field.name.clone(), field_value));
+                    }
+                    Ok(AvroValue::Record(fields))
+                }
+                serde_json::Value::Null => Ok(AvroValue::Null),
+                _ => Err(EncodingError::Avro(format!(
+                    "expected object for record {}, got {}",
+                    record_schema.name.fullname(None),
+                    json_type_name(json),
+                ))),
+            }
+        }
+        AvroSchema::Union(union_schema) => {
+            if json.is_null() {
+                // Find the null branch
+                for (i, variant) in
+                    union_schema.variants().iter().enumerate()
+                {
+                    if matches!(variant, AvroSchema::Null) {
+                        return Ok(AvroValue::Union(
+                            i as u32,
+                            Box::new(AvroValue::Null),
+                        ));
+                    }
+                }
+                return Ok(AvroValue::Null);
+            }
+            // Find the first non-null branch and convert
+            for (i, variant) in
+                union_schema.variants().iter().enumerate()
+            {
+                if matches!(variant, AvroSchema::Null) {
+                    continue;
+                }
+                match json_to_avro_with_schema(json, variant) {
+                    Ok(v) => {
+                        return Ok(AvroValue::Union(
+                            i as u32,
+                            Box::new(v),
+                        ));
+                    }
+                    Err(_) => continue,
+                }
+            }
+            Err(EncodingError::Avro(format!(
+                "no matching union branch for JSON {}",
+                json_type_name(json),
+            )))
+        }
+        AvroSchema::Array(array_schema) => match json {
+            serde_json::Value::Array(arr) => {
+                let items: Result<Vec<_>, _> = arr
+                    .iter()
+                    .map(|item| {
+                        json_to_avro_with_schema(
+                            item,
+                            &array_schema.items,
+                        )
+                    })
+                    .collect();
+                Ok(AvroValue::Array(items?))
+            }
+            serde_json::Value::Null => Ok(AvroValue::Null),
+            _ => Ok(AvroValue::from(json.clone())),
+        },
+        AvroSchema::Map(map_schema) => match json {
+            serde_json::Value::Object(map) => {
+                let entries: Result<HashMap<String, AvroValue>, _> =
+                    map.iter()
+                        .map(|(k, v)| {
+                            json_to_avro_with_schema(
+                                v,
+                                &map_schema.types,
+                            )
+                            .map(|av| (k.clone(), av))
+                        })
+                        .collect();
+                Ok(AvroValue::Map(entries?))
+            }
+            serde_json::Value::Null => Ok(AvroValue::Null),
+            _ => Ok(AvroValue::from(json.clone())),
+        },
+        // Ref: named type reference — for JSON objects, treat as Record
+        // by creating a Record from the object keys. The Avro encoder
+        // will resolve the ref to the actual schema during encoding.
+        AvroSchema::Ref { .. } => match json {
+            serde_json::Value::Object(map) => {
+                // Build a Record with field names from the JSON object.
+                // Field order may not match the schema, but the encoder
+                // uses field names for lookup.
+                let fields: Vec<(String, AvroValue)> = map
+                    .iter()
+                    .map(|(k, v)| {
+                        // Without the resolved schema, we can't do
+                        // schema-aware conversion — use best-effort
+                        let av = match v {
+                            serde_json::Value::Null => AvroValue::Null,
+                            serde_json::Value::Bool(b) => {
+                                AvroValue::Boolean(*b)
+                            }
+                            serde_json::Value::Number(n) => {
+                                if n.is_i64() {
+                                    AvroValue::Long(
+                                        n.as_i64().unwrap_or(0),
+                                    )
+                                } else {
+                                    AvroValue::Double(
+                                        n.as_f64().unwrap_or(0.0),
+                                    )
+                                }
+                            }
+                            serde_json::Value::String(s) => {
+                                AvroValue::String(s.clone())
+                            }
+                            other => AvroValue::from(other.clone()),
+                        };
+                        (k.clone(), av)
+                    })
+                    .collect();
+                Ok(AvroValue::Record(fields))
+            }
+            serde_json::Value::Null => Ok(AvroValue::Null),
+            _ => Ok(AvroValue::from(json.clone())),
+        },
+        // For other schema types (Bytes, Fixed, Enum, Decimal, etc.),
+        // fall back to the default conversion
+        _ => Ok(AvroValue::from(json.clone())),
+    }
+}
 
-    Ok(resolved)
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Decode a base64 string. Returns None if decoding fails.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(input)
+        .ok()
 }
 
 // =============================================================================
@@ -859,5 +1145,486 @@ mod tests {
             42
         ); // schema ID
         assert_eq!(&bytes[5..], &[1, 2, 3, 4]); // payload
+    }
+
+    // ── json_to_avro tests ──────────────────────────────────────────────
+
+    /// Helper: derive schema from JSON, parse it, convert value, encode to datum.
+    /// This exercises the full path that was failing in production.
+    fn roundtrip_json_to_avro(value: &serde_json::Value) {
+        let schema_json = derive_avro_schema(value, None);
+        let schema = AvroSchema::parse_str(&schema_json)
+            .expect("derived schema should parse");
+        let avro_value =
+            json_to_avro(value, &schema).expect("json_to_avro should succeed");
+        let encoded = apache_avro::to_avro_datum(&schema, avro_value);
+        assert!(
+            encoded.is_ok(),
+            "to_avro_datum should succeed: {:?}",
+            encoded.err()
+        );
+    }
+
+    #[test]
+    fn json_to_avro_simple_object() {
+        roundtrip_json_to_avro(&json!({
+            "id": 42,
+            "name": "Alice",
+            "active": true
+        }));
+    }
+
+    #[test]
+    fn json_to_avro_with_nulls() {
+        roundtrip_json_to_avro(&json!({
+            "id": 1,
+            "name": "Bob",
+            "deleted_at": null,
+            "notes": null
+        }));
+    }
+
+    #[test]
+    fn json_to_avro_nested_object_in_union() {
+        // This is the exact pattern that was failing: nested objects
+        // inside nullable unions (CDC events have before/after/source as
+        // nullable records).
+        roundtrip_json_to_avro(&json!({
+            "before": null,
+            "after": {"id": 1, "name": "Alice", "email": "alice@test.com"},
+            "source": {
+                "connector": "mysql",
+                "db": "orders",
+                "table": "customers",
+                "ts_ms": 1700000000000_i64
+            },
+            "op": "c",
+            "ts_ms": 1700000000000_i64
+        }));
+    }
+
+    #[test]
+    fn json_to_avro_all_null_nested() {
+        // DELETE event: after is null, before has data
+        roundtrip_json_to_avro(&json!({
+            "before": {"id": 1, "name": "Alice"},
+            "after": null,
+            "op": "d",
+            "ts_ms": 1700000000000_i64
+        }));
+    }
+
+    #[test]
+    fn json_to_avro_mixed_types() {
+        roundtrip_json_to_avro(&json!({
+            "id": 42,
+            "score": 3.15,
+            "active": true,
+            "name": "test",
+            "tags": ["a", "b", "c"],
+            "meta": null
+        }));
+    }
+
+    #[test]
+    fn json_to_avro_with_integer_types() {
+        // Verify int vs long handling in unions
+        roundtrip_json_to_avro(&json!({
+            "small_int": 42,
+            "big_int": 1700000000000_i64,
+            "float_val": 3.15,
+            "flag": true
+        }));
+    }
+
+    // ── Edge case: union null handling ──────────────────────────────────
+
+    #[test]
+    fn json_to_avro_null_in_nullable_string() {
+        let schema_json = r#"["null", "string"]"#;
+        let schema = AvroSchema::parse_str(schema_json).unwrap();
+        let val = json_to_avro(&json!(null), &schema).unwrap();
+        assert!(
+            matches!(val, AvroValue::Union(0, _)),
+            "null should map to union branch 0: {val:?}"
+        );
+    }
+
+    #[test]
+    fn json_to_avro_value_in_nullable_string() {
+        let schema_json = r#"["null", "string"]"#;
+        let schema = AvroSchema::parse_str(schema_json).unwrap();
+        let val = json_to_avro(&json!("hello"), &schema).unwrap();
+        match &val {
+            AvroValue::Union(idx, inner) => {
+                assert_eq!(*idx, 1);
+                assert!(matches!(inner.as_ref(), AvroValue::String(_)));
+            }
+            _ => panic!("expected Union, got {val:?}"),
+        }
+    }
+
+    #[test]
+    fn json_to_avro_number_coerced_to_string() {
+        let schema_json = r#"["null", "string"]"#;
+        let schema = AvroSchema::parse_str(schema_json).unwrap();
+        // Number should be coerced to string when schema expects string
+        let val = json_to_avro(&json!(42), &schema).unwrap();
+        match &val {
+            AvroValue::Union(_, inner) => {
+                assert!(
+                    matches!(inner.as_ref(), AvroValue::String(_)),
+                    "number should coerce to string: {inner:?}"
+                );
+            }
+            _ => panic!("expected Union, got {val:?}"),
+        }
+    }
+
+    #[test]
+    fn json_to_avro_null_in_nullable_long() {
+        let schema_json = r#"["null", "long"]"#;
+        let schema = AvroSchema::parse_str(schema_json).unwrap();
+        let val = json_to_avro(&json!(null), &schema).unwrap();
+        assert!(matches!(val, AvroValue::Union(0, _)));
+    }
+
+    #[test]
+    fn json_to_avro_int_in_nullable_long() {
+        let schema_json = r#"["null", "long"]"#;
+        let schema = AvroSchema::parse_str(schema_json).unwrap();
+        let val = json_to_avro(&json!(12345), &schema).unwrap();
+        match &val {
+            AvroValue::Union(1, inner) => {
+                assert!(matches!(inner.as_ref(), AvroValue::Long(12345)));
+            }
+            _ => panic!("expected Union(1, Long), got {val:?}"),
+        }
+    }
+
+    // ── Edge case: nullable records ─────────────────────────────────────
+
+    #[test]
+    fn json_to_avro_null_in_nullable_record() {
+        let schema_json = r#"["null", {"type":"record","name":"R","fields":[{"name":"id","type":"long"}]}]"#;
+        let schema = AvroSchema::parse_str(schema_json).unwrap();
+        let val = json_to_avro(&json!(null), &schema).unwrap();
+        assert!(matches!(val, AvroValue::Union(0, _)));
+    }
+
+    #[test]
+    fn json_to_avro_object_in_nullable_record() {
+        let schema_json = r#"["null", {"type":"record","name":"R","fields":[{"name":"id","type":"long"},{"name":"name","type":["null","string"],"default":null}]}]"#;
+        let schema = AvroSchema::parse_str(schema_json).unwrap();
+        let val = json_to_avro(&json!({"id": 42, "name": "Alice"}), &schema).unwrap();
+        match &val {
+            AvroValue::Union(1, inner) => {
+                assert!(matches!(inner.as_ref(), AvroValue::Record(_)));
+            }
+            _ => panic!("expected Union(1, Record), got {val:?}"),
+        }
+        // Should encode successfully
+        let encoded = apache_avro::to_avro_datum(&schema, val);
+        assert!(encoded.is_ok(), "encoding failed: {:?}", encoded.err());
+    }
+
+    // ── Edge case: record with missing/extra fields ─────────────────────
+
+    #[test]
+    fn json_to_avro_record_missing_nullable_field() {
+        // JSON is missing "name" field — should default to null
+        let schema_json = r#"{"type":"record","name":"R","fields":[{"name":"id","type":"long"},{"name":"name","type":["null","string"],"default":null}]}"#;
+        let schema = AvroSchema::parse_str(schema_json).unwrap();
+        let val = json_to_avro(&json!({"id": 1}), &schema).unwrap();
+        if let AvroValue::Record(fields) = &val {
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[1].0, "name");
+            // Missing field should be null (wrapped in union)
+        } else {
+            panic!("expected Record, got {val:?}");
+        }
+        let encoded = apache_avro::to_avro_datum(&schema, val);
+        assert!(encoded.is_ok(), "encoding failed: {:?}", encoded.err());
+    }
+
+    #[test]
+    fn json_to_avro_record_extra_fields_ignored() {
+        // JSON has "extra_field" not in schema — should be ignored
+        let schema_json = r#"{"type":"record","name":"R","fields":[{"name":"id","type":"long"}]}"#;
+        let schema = AvroSchema::parse_str(schema_json).unwrap();
+        let val = json_to_avro(&json!({"id": 1, "extra_field": "ignored"}), &schema).unwrap();
+        if let AvroValue::Record(fields) = &val {
+            assert_eq!(fields.len(), 1);
+            assert_eq!(fields[0].0, "id");
+        } else {
+            panic!("expected Record, got {val:?}");
+        }
+        let encoded = apache_avro::to_avro_datum(&schema, val);
+        assert!(encoded.is_ok(), "encoding failed: {:?}", encoded.err());
+    }
+
+    // ── Edge case: arrays ───────────────────────────────────────────────
+
+    #[test]
+    fn json_to_avro_empty_array() {
+        let schema_json = r#"{"type":"array","items":"string"}"#;
+        let schema = AvroSchema::parse_str(schema_json).unwrap();
+        let val = json_to_avro(&json!([]), &schema).unwrap();
+        assert!(matches!(val, AvroValue::Array(ref a) if a.is_empty()));
+        let encoded = apache_avro::to_avro_datum(&schema, val);
+        assert!(encoded.is_ok());
+    }
+
+    #[test]
+    fn json_to_avro_array_of_records() {
+        let schema_json = r#"{"type":"array","items":{"type":"record","name":"Item","fields":[{"name":"sku","type":"string"},{"name":"qty","type":"int"}]}}"#;
+        let schema = AvroSchema::parse_str(schema_json).unwrap();
+        let val = json_to_avro(
+            &json!([{"sku": "A1", "qty": 5}, {"sku": "B2", "qty": 10}]),
+            &schema,
+        )
+        .unwrap();
+        if let AvroValue::Array(items) = &val {
+            assert_eq!(items.len(), 2);
+            assert!(matches!(&items[0], AvroValue::Record(_)));
+        } else {
+            panic!("expected Array, got {val:?}");
+        }
+        let encoded = apache_avro::to_avro_datum(&schema, val);
+        assert!(encoded.is_ok(), "encoding failed: {:?}", encoded.err());
+    }
+
+    // ── Edge case: type coercion ────────────────────────────────────────
+
+    #[test]
+    fn json_to_avro_large_int_as_long() {
+        // Number > i32 range should work with Long schema
+        let schema_json = r#""long""#;
+        let schema = AvroSchema::parse_str(schema_json).unwrap();
+        let val = json_to_avro(&json!(1700000000000_i64), &schema).unwrap();
+        assert!(matches!(val, AvroValue::Long(1700000000000)));
+    }
+
+    #[test]
+    fn json_to_avro_float_as_double() {
+        let schema_json = r#""double""#;
+        let schema = AvroSchema::parse_str(schema_json).unwrap();
+        let val = json_to_avro(&json!(3.15), &schema).unwrap();
+        assert!(matches!(val, AvroValue::Double(_)));
+    }
+
+    #[test]
+    fn json_to_avro_bool_coercion() {
+        let schema_json = r#""boolean""#;
+        let schema = AvroSchema::parse_str(schema_json).unwrap();
+        let val = json_to_avro(&json!(true), &schema).unwrap();
+        assert!(matches!(val, AvroValue::Boolean(true)));
+    }
+
+    // ── Edge case: map ──────────────────────────────────────────────────
+
+    #[test]
+    fn json_to_avro_map_string_values() {
+        let schema_json = r#"{"type":"map","values":"string"}"#;
+        let schema = AvroSchema::parse_str(schema_json).unwrap();
+        let val = json_to_avro(
+            &json!({"key1": "val1", "key2": "val2"}),
+            &schema,
+        )
+        .unwrap();
+        assert!(matches!(val, AvroValue::Map(_)));
+        let encoded = apache_avro::to_avro_datum(&schema, val);
+        assert!(encoded.is_ok());
+    }
+
+    // ── Full CDC roundtrip tests ────────────────────────────────────────
+
+    #[test]
+    fn json_to_avro_cdc_insert_roundtrip() {
+        // INSERT: before=null, after=row
+        roundtrip_json_to_avro(&json!({
+            "before": null,
+            "after": {"id": 1, "name": "Alice"},
+            "op": "c",
+            "ts_ms": 1700000000000_i64,
+            "source": {
+                "connector": "mysql",
+                "db": "shop",
+                "table": "users"
+            }
+        }));
+    }
+
+    #[test]
+    fn json_to_avro_cdc_update_roundtrip() {
+        // UPDATE: before=old row, after=new row
+        roundtrip_json_to_avro(&json!({
+            "before": {"id": 1, "name": "Alice"},
+            "after": {"id": 1, "name": "Alicia"},
+            "op": "u",
+            "ts_ms": 1700000000001_i64,
+            "source": {
+                "connector": "mysql",
+                "db": "shop",
+                "table": "users"
+            }
+        }));
+    }
+
+    #[test]
+    fn json_to_avro_cdc_delete_roundtrip() {
+        // DELETE: before=row, after=null
+        roundtrip_json_to_avro(&json!({
+            "before": {"id": 1, "name": "Alice"},
+            "after": null,
+            "op": "d",
+            "ts_ms": 1700000000002_i64,
+            "source": {
+                "connector": "mysql",
+                "db": "shop",
+                "table": "users"
+            }
+        }));
+    }
+
+    // ── Envelope schema tests ───────────────────────────────────────────
+
+    #[test]
+    fn json_to_avro_envelope_schema() {
+        // Test with the actual CDC envelope schema structure
+        // (built by avro_schema module)
+        use super::super::avro_schema::{
+            build_envelope_schema, build_value_schema,
+        };
+
+        let value_schema = build_value_schema(
+            "mysql",
+            "orders",
+            "customers",
+            vec![
+                json!({"name": "id", "type": "long"}),
+                json!({"name": "name", "type": ["null", "string"], "default": null}),
+                json!({"name": "email", "type": ["null", "string"], "default": null}),
+            ],
+        );
+
+        let (schema_json, schema) =
+            build_envelope_schema("mysql", "orders", "customers", value_schema)
+                .expect("envelope schema should build");
+
+        // Simulate a CDC INSERT event
+        let event = json!({
+            "before": null,
+            "after": {"id": 1, "name": "Alice", "email": "alice@test.com"},
+            "source": {
+                "version": "deltaforge-test",
+                "connector": "mysql",
+                "name": "test-pipeline",
+                "ts_ms": 1700000000000_i64,
+                "db": "orders",
+                "schema": null,
+                "table": "customers",
+                "snapshot": null,
+                "position": {
+                    "server_id": 1,
+                    "file": "mysql-bin.000001",
+                    "pos": 12345,
+                    "gtid": null,
+                    "row": null
+                }
+            },
+            "op": "c",
+            "ts_ms": 1700000000000_i64,
+            "event_id": null,
+            "schema_version": null,
+            "transaction": null
+        });
+
+        let avro_value = json_to_avro(&event, &schema);
+        assert!(
+            avro_value.is_ok(),
+            "CDC envelope should convert: schema={schema_json}, error={:?}",
+            avro_value.err()
+        );
+
+        let encoded =
+            apache_avro::to_avro_datum(&schema, avro_value.unwrap());
+        assert!(
+            encoded.is_ok(),
+            "CDC envelope should encode to Avro datum: {:?}",
+            encoded.err()
+        );
+    }
+
+    // ── _base64 wrapper tests (MySQL TEXT/BLOB columns) ─────────────
+
+    #[test]
+    fn json_to_avro_base64_wrapper_as_string() {
+        // MySQL TEXT column → JSON {"_base64": "aGVsbG8="} → Avro String
+        let schema_json = r#"["null", "string"]"#;
+        let schema = AvroSchema::parse_str(schema_json).unwrap();
+        let val = json_to_avro(
+            &json!({"_base64": "aGVsbG8="}), // "hello" in base64
+            &schema,
+        )
+        .unwrap();
+        match &val {
+            AvroValue::Union(_, inner) => {
+                if let AvroValue::String(s) = inner.as_ref() {
+                    assert_eq!(s, "hello");
+                } else {
+                    panic!("expected String, got {inner:?}");
+                }
+            }
+            _ => panic!("expected Union, got {val:?}"),
+        }
+    }
+
+    #[test]
+    fn json_to_avro_base64_wrapper_as_bytes() {
+        // MySQL BLOB column → JSON {"_base64": "AQID"} → Avro Bytes
+        let schema_json = r#"["null", "bytes"]"#;
+        let schema = AvroSchema::parse_str(schema_json).unwrap();
+        let val = json_to_avro(
+            &json!({"_base64": "AQID"}), // [1, 2, 3] in base64
+            &schema,
+        )
+        .unwrap();
+        match &val {
+            AvroValue::Union(_, inner) => {
+                if let AvroValue::Bytes(b) = inner.as_ref() {
+                    assert_eq!(b, &[1, 2, 3]);
+                } else {
+                    panic!("expected Bytes, got {inner:?}");
+                }
+            }
+            _ => panic!("expected Union, got {val:?}"),
+        }
+    }
+
+    #[test]
+    fn json_to_avro_base64_roundtrip() {
+        // Full roundtrip: record with _base64 field → encode → datum
+        let schema_json = r#"{"type":"record","name":"R","fields":[
+            {"name":"id","type":"int"},
+            {"name":"data","type":["null","string"],"default":null},
+            {"name":"blob_col","type":["null","bytes"],"default":null}
+        ]}"#;
+        let schema = AvroSchema::parse_str(schema_json).unwrap();
+        let val = json_to_avro(
+            &json!({
+                "id": 1,
+                "data": {"_base64": "aGVsbG8gd29ybGQ="},
+                "blob_col": {"_base64": "AQIDBA=="}
+            }),
+            &schema,
+        )
+        .unwrap();
+        let encoded = apache_avro::to_avro_datum(&schema, val);
+        assert!(
+            encoded.is_ok(),
+            "base64 record should encode: {:?}",
+            encoded.err()
+        );
     }
 }

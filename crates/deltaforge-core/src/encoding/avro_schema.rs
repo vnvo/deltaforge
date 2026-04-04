@@ -164,12 +164,17 @@ pub fn build_envelope_schema(
     value_schema: serde_json::Value,
 ) -> Result<(String, AvroSchema), EncodingError> {
     let envelope_ns = format!("deltaforge.cdc.{connector}.{db}.{table}");
-    let value_fqn = format!(
-        "{}.Value",
-        value_schema["namespace"]
-            .as_str()
-            .unwrap_or(&format!("deltaforge.{connector}.{db}.{table}"))
-    );
+
+    // Build separate Value records for before and after to avoid Ref nodes.
+    // Ref nodes are hard to handle during JSON→Avro conversion because
+    // they don't carry the full record schema. Inlining both copies means
+    // the parser sees two independent records (with different namespaces
+    // to avoid name collision).
+    let mut before_value = value_schema.clone();
+    before_value["name"] = json!("BeforeValue");
+
+    let mut after_value = value_schema;
+    after_value["name"] = json!("AfterValue");
 
     let envelope_json = json!({
         "type": "record",
@@ -179,12 +184,12 @@ pub fn build_envelope_schema(
         "fields": [
             {
                 "name": "before",
-                "type": ["null", value_schema],
+                "type": ["null", before_value],
                 "default": null
             },
             {
                 "name": "after",
-                "type": ["null", value_fqn],
+                "type": ["null", after_value],
                 "default": null
             },
             {
@@ -409,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn before_and_after_share_value_type() {
+    fn before_and_after_have_separate_value_records() {
         let value = build_value_schema(
             "mysql",
             "shop",
@@ -423,17 +428,17 @@ mod tests {
             serde_json::from_str(&schema_str).unwrap();
         let fields = parsed["fields"].as_array().unwrap();
 
-        // `before` should inline the Value record
+        // `before` should inline the BeforeValue record
         let before_type = &fields[0]["type"];
         assert_eq!(before_type[0], "null");
-        // The second element should be the full record
-        assert_eq!(before_type[1]["name"], "Value");
+        assert_eq!(before_type[1]["name"], "BeforeValue");
 
-        // `after` should reference Value by fully-qualified name
+        // `after` should inline the AfterValue record (no Ref)
         let after_type = &fields[1]["type"];
         assert_eq!(after_type[0], "null");
+        assert_eq!(after_type[1]["name"], "AfterValue");
         assert!(
-            after_type[1].as_str().unwrap().contains("Value"),
+            after_type[1]["fields"].is_array(),
             "after should reference Value by name: {:?}",
             after_type[1]
         );
