@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Avro encoding hot-path optimization** — fast/slow path split in `AvroEncoder`: warm events skip Schema Registry lookup, subject resolution, and schema provider entirely. Subject name cache eliminates `format!` allocation per event. Steady-state throughput ~47K events/s (p50), up from ~28K baseline.
 - **Delivery terminology** — "exactly-once" reserved for Kafka EOS only. NATS and Redis documented as "at-least-once with dedup." Consistent across all docs, README, and landing page.
 - **Soak configs** — DLQ enabled by default (journal.enabled=true) for MySQL and Postgres soak tests.
 - **Soak random faults** — now includes faulty_events alongside network_partition, sink_outage, crash.

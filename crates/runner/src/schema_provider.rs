@@ -236,8 +236,8 @@ pub struct AvroSchemaProviderImpl {
     connector: String,
     /// Type conversion options.
     opts: TypeConversionOpts,
-    /// Cache: (db, table) → (schema_json, parsed AvroSchema)
-    cache: RwLock<HashMap<(String, String), CachedAvroSchema>>,
+    /// Cache: "db.table" → (schema_json, parsed AvroSchema)
+    cache: RwLock<HashMap<String, CachedAvroSchema>>,
 }
 
 impl AvroSchemaProviderImpl {
@@ -257,8 +257,9 @@ impl AvroSchemaProviderImpl {
 
     /// Invalidate cached schema for a table (called on DDL change).
     pub fn invalidate(&self, db: &str, table: &str) {
+        let key = format!("{db}.{table}");
         let mut cache = self.cache.write();
-        if cache.remove(&(db.to_string(), table.to_string())).is_some() {
+        if cache.remove(&key).is_some() {
             debug!(db, table, "invalidated cached Avro schema");
         }
     }
@@ -333,12 +334,12 @@ impl SourceSchemaProvider for AvroSchemaProviderImpl {
             return None;
         }
 
+        let key = format!("{db}.{table}");
+
         // Check cache
         {
             let cache = self.cache.read();
-            if let Some(cached) =
-                cache.get(&(db.to_string(), table.to_string()))
-            {
+            if let Some(cached) = cache.get(&key) {
                 return Some(cached.clone());
             }
         }
@@ -352,10 +353,9 @@ impl SourceSchemaProvider for AvroSchemaProviderImpl {
         // to call the async method. This is acceptable because:
         // 1. Schema lookups are rare (only on first event per table + DDL changes)
         // 2. The underlying SchemaLoaderAdapter typically hits an in-memory cache
-        let table_key = format!("{db}.{table}");
         let table_schema = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(self.schema_provider.get_table_schema(&table_key))
+                .block_on(self.schema_provider.get_table_schema(&key))
         })?;
 
         // Build the envelope schema
@@ -364,7 +364,7 @@ impl SourceSchemaProvider for AvroSchemaProviderImpl {
         // Cache it
         {
             let mut cache = self.cache.write();
-            cache.insert((db.to_string(), table.to_string()), result.clone());
+            cache.insert(key, result.clone());
         }
 
         Some(result)

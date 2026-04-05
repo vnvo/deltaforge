@@ -358,6 +358,8 @@ pub struct AvroEncoder {
     /// When set, the encoder uses precise DDL-derived Avro schemas
     /// instead of inferring from JSON (Path C).
     source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
+    /// Cache: topic → resolved subject name (avoids format! per event)
+    subject_cache: RwLock<HashMap<String, String>>,
 }
 
 impl AvroEncoder {
@@ -402,6 +404,7 @@ impl AvroEncoder {
             strategy,
             auth,
             source_schemas,
+            subject_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -411,6 +414,22 @@ impl AvroEncoder {
         provider: Arc<dyn SourceSchemaProvider>,
     ) {
         self.source_schemas = Some(provider);
+    }
+
+    /// Resolve subject name with caching (avoids format! allocation per event).
+    fn resolve_subject(&self, topic: &str) -> String {
+        {
+            let cache = self.subject_cache.read();
+            if let Some(cached) = cache.get(topic) {
+                return cached.clone();
+            }
+        }
+        let subject = self.strategy.resolve(topic, None);
+        {
+            let mut cache = self.subject_cache.write();
+            cache.insert(topic.to_string(), subject.clone());
+        }
+        subject
     }
 
     /// Encode a serializable value to Confluent Avro wire format.
@@ -486,6 +505,19 @@ impl AvroEncoder {
         db: &str,
         table: &str,
     ) -> Result<Bytes, EncodingError> {
+        // Fast path: if SR cache already has this subject, skip schema lookup entirely
+        let subject = self.resolve_subject(topic);
+
+        if let Some((schema_id, cached_schema)) =
+            self.registry.get_cached(&subject)
+        {
+            // Hot path: schema registered, encode directly
+            return self
+                .encode_fast(schema_id, &cached_schema, value)
+                .await;
+        }
+
+        // Slow path: need to register schema with SR (first event per subject)
         // 1. Try Path A: DDL-derived schema
         if let Some(ref provider) = self.source_schemas {
             if let Some((schema_json, schema)) =
@@ -498,7 +530,12 @@ impl AvroEncoder {
                 counter!("deltaforge_avro_encode_total", "path" => "ddl")
                     .increment(1);
                 return self
-                    .encode_with_schema(topic, value, &schema_json, &schema)
+                    .encode_with_schema(
+                        &subject,
+                        value,
+                        &schema_json,
+                        &schema,
+                    )
                     .await;
             }
         }
@@ -518,30 +555,52 @@ impl AvroEncoder {
         self.encode(topic, value, record_name).await
     }
 
-    /// Encode a value using a pre-built Avro schema.
+    /// Hot-path encoder: schema already registered, SR cache hit.
     ///
-    /// Shared encoding logic for both Path A (DDL-derived) and Path C (inferred).
+    /// Skips subject resolution, schema lookup, and SR registration.
+    /// Only does: JSON serialization → schema-aware Avro conversion → binary encode.
+    async fn encode_fast<T: Serialize>(
+        &self,
+        schema_id: u32,
+        schema: &AvroSchema,
+        value: &T,
+    ) -> Result<Bytes, EncodingError> {
+        // 1. Serialize value to JSON, then convert to Avro
+        let json_value = serde_json::to_value(value)
+            .map_err(|e| EncodingError::Avro(e.to_string()))?;
+        let avro_value = json_to_avro(&json_value, schema)?;
+
+        // 2. Encode as Avro binary
+        let avro_bytes = apache_avro::to_avro_datum(schema, avro_value)
+            .map_err(|e| {
+                EncodingError::Avro(format!("Avro encoding failed: {e}"))
+            })?;
+
+        // 3. Build Confluent wire format
+        let mut buf = BytesMut::with_capacity(5 + avro_bytes.len());
+        buf.put_u8(0x00);
+        buf.put_u32(schema_id);
+        buf.extend_from_slice(&avro_bytes);
+
+        Ok(buf.freeze())
+    }
+
+    /// Slow-path encoder: register schema with SR, then encode.
     ///
-    /// If the Schema Registry is unavailable but a schema is already cached
-    /// for this subject, encoding continues with the cached schema ID.
-    /// If encoding fails under the cached schema (e.g., DDL changed), the
-    /// error is propagated for DLQ routing.
+    /// Called only on first event per subject, or after cache eviction.
     async fn encode_with_schema<T: Serialize>(
         &self,
-        topic: &str,
+        subject: &str,
         value: &T,
         schema_json: &str,
         schema: &AvroSchema,
     ) -> Result<Bytes, EncodingError> {
-        // 1. Resolve subject name
-        let subject = self.strategy.resolve(topic, None);
-
-        // 2. Register schema with SR (idempotent, cached).
-        //    On SR failure, fall back to cached schema if available.
-        let auth = self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+        // 1. Register with SR (idempotent — returns cached ID if unchanged)
+        let auth =
+            self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
         let (schema_id, registered_schema) = match self
             .registry
-            .register_schema(&subject, schema_json, auth)
+            .register_schema(subject, schema_json, auth)
             .await
         {
             Ok(result) => {
@@ -550,30 +609,16 @@ impl AvroEncoder {
                 result
             }
             Err(e) => {
-                // SR unavailable — try cached schema
-                if let Some(cached) = self.registry.get_cached(&subject) {
-                    warn!(
-                        subject = %subject,
-                        error = %e,
-                        cached_schema_id = cached.0,
-                        "Schema Registry unavailable — using cached schema"
-                    );
-                    counter!("deltaforge_avro_sr_cache_fallback_total")
-                        .increment(1);
-                    (cached.0, cached.1)
-                } else {
-                    // No cache — cannot encode
-                    counter!(
-                        "deltaforge_avro_encode_failure_total",
-                        "reason" => "sr_unavailable"
-                    )
-                    .increment(1);
-                    return Err(e);
-                }
+                counter!(
+                    "deltaforge_avro_encode_failure_total",
+                    "reason" => "sr_unavailable"
+                )
+                .increment(1);
+                return Err(e);
             }
         };
 
-        // 3. Serialize value to JSON, then convert to Avro
+        // 2. Serialize value to JSON, then convert to Avro
         let json_value = serde_json::to_value(value)
             .map_err(|e| EncodingError::Avro(e.to_string()))?;
         let avro_value = match json_to_avro(&json_value, &registered_schema) {
@@ -588,13 +633,13 @@ impl AvroEncoder {
             }
         };
 
-        // 4. Encode as Avro binary
+        // 3. Encode as Avro binary
         let avro_bytes = apache_avro::to_avro_datum(schema, avro_value)
             .map_err(|e| {
                 EncodingError::Avro(format!("Avro encoding failed: {e}"))
             })?;
 
-        // 5. Build Confluent wire format
+        // 4. Build Confluent wire format
         let mut buf = BytesMut::with_capacity(5 + avro_bytes.len());
         buf.put_u8(0x00);
         buf.put_u32(schema_id);
