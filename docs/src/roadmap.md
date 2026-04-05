@@ -12,6 +12,7 @@
 
 ## In Progress
 
+- **Avro encoding performance** — hot-path optimization (47K events/s steady-state). TD-001 (direct ColumnValue→Avro conversion, eliminating JSON intermediary) planned for further gains.
 - **Avro Schema Registry Phase 2** — publish sensed schemas to external Schema Registry as catalog metadata (under `sensed.` prefix). See [RFC](https://github.com/deltaforge/deltaforge/blob/main/docs/specs/avro-schema-registry.md).
 
 ## Planned
