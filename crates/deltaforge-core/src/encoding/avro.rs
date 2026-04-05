@@ -512,9 +512,7 @@ impl AvroEncoder {
             self.registry.get_cached(&subject)
         {
             // Hot path: schema registered, encode directly
-            return self
-                .encode_fast(schema_id, &cached_schema, value)
-                .await;
+            return self.encode_fast(schema_id, &cached_schema, value).await;
         }
 
         // Slow path: need to register schema with SR (first event per subject)
@@ -530,12 +528,7 @@ impl AvroEncoder {
                 counter!("deltaforge_avro_encode_total", "path" => "ddl")
                     .increment(1);
                 return self
-                    .encode_with_schema(
-                        &subject,
-                        value,
-                        &schema_json,
-                        &schema,
-                    )
+                    .encode_with_schema(&subject, value, &schema_json, &schema)
                     .await;
             }
         }
@@ -596,8 +589,7 @@ impl AvroEncoder {
         schema: &AvroSchema,
     ) -> Result<Bytes, EncodingError> {
         // 1. Register with SR (idempotent — returns cached ID if unchanged)
-        let auth =
-            self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+        let auth = self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
         let (schema_id, registered_schema) = match self
             .registry
             .register_schema(subject, schema_json, auth)
