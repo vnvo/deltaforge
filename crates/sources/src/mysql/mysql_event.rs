@@ -761,6 +761,7 @@ mod tests {
                 column_types: vec![],
                 column_metas: vec![],
                 null_bits: vec![],
+                table_metadata: None,
             },
         );
 
