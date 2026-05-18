@@ -44,6 +44,7 @@ pub mod http;
 pub mod kafka;
 pub mod nats;
 pub mod redis;
+pub mod s3;
 pub use filter::FilteredSink;
 pub use http::HttpSink;
 pub use kafka::KafkaSink;

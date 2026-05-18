@@ -22,6 +22,15 @@ deltaforge-core = { path = "../deltaforge-core" }
 deltaforge-config = { path = "../deltaforge-config" }
 common = { path = "../common" }
 
+# S3 / Parquet / JSONL file sink
+object_store = { version = "0.13", features = ["aws"] }
+parquet = { version = "58", features = ["async", "object_store"] }
+arrow-array = "58"
+arrow-schema = "58"
+ulid = "1"
+flate2 = "1"
+bytes.workspace = true
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 axum = "0.8"
@@ -29,6 +38,7 @@ ctor = "0.6"
 chrono.workspace = true
 uuid.workspace = true
 testcontainers = "0.25"
+tempfile = "3"
 tracing.workspace = true
 apache-avro.workspace = true
 reqwest.workspace = true
