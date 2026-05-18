@@ -17,7 +17,8 @@ use object_store::path::Path;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_reader::ParquetObjectReader;
 use sinks::s3::{
-    ObjectStoreParams, ParquetSinkWriter, SimpleRow, build_object_store,
+    Compression, FileFormat, JsonLinesFormat, ObjectStoreParams, ParquetFormat,
+    ParquetSinkWriter, SimpleRow, build_object_store,
 };
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -176,5 +177,66 @@ async fn phase1a_writes_large_file_via_multipart() -> Result<()> {
 
     let read = read_back_rows(store, &path).await?;
     assert_eq!(read, 200_000);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn phase1b_writes_jsonl_gzip_to_minio() -> Result<()> {
+    let infra = minio().await;
+    let store = build_object_store(&params_for(&infra.endpoint))?;
+    let format = JsonLinesFormat::new(Compression::Gzip);
+
+    let path = Path::from("phase1b/jsonl_gzip.jsonl.gz");
+    let rows = sample_rows(10_000);
+    let res = format.write_rows(store.clone(), &path, &rows).await?;
+    assert_eq!(res.rows_written, 10_000);
+    assert!(res.bytes_written > 0);
+
+    // Sanity: file exists and is non-empty.
+    let meta = store.head(&path).await?;
+    assert!(meta.size > 0);
+    assert_eq!(meta.size, res.bytes_written);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn phase1b_writes_jsonl_plain_to_minio() -> Result<()> {
+    let infra = minio().await;
+    let store = build_object_store(&params_for(&infra.endpoint))?;
+    let format = JsonLinesFormat::new(Compression::None);
+
+    let path = Path::from("phase1b/jsonl_plain.jsonl");
+    let rows = sample_rows(1000);
+    let res = format.write_rows(store.clone(), &path, &rows).await?;
+    assert_eq!(res.rows_written, 1000);
+
+    // Plain JSONL must be larger than gzipped equivalent.
+    // 1000 rows of ~45-byte objects + newlines → ~45KiB.
+    let meta = store.head(&path).await?;
+    assert!(
+        meta.size > 30_000,
+        "1000 rows of plain jsonl should be >30KiB, got {}",
+        meta.size
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn phase1b_parquet_via_format_trait() -> Result<()> {
+    let infra = minio().await;
+    let store = build_object_store(&params_for(&infra.endpoint))?;
+    let format = ParquetFormat::default();
+
+    let path = Path::from("phase1b/via_trait.parquet");
+    let rows = sample_rows(5000);
+    let res = format.write_rows(store.clone(), &path, &rows).await?;
+    assert_eq!(res.rows_written, 5000);
+    assert!(res.bytes_written > 0);
+
+    let read = read_back_rows(store, &path).await?;
+    assert_eq!(read, 5000);
     Ok(())
 }

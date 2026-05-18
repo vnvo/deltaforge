@@ -1,11 +1,11 @@
 //! Parquet writer over `object_store`.
 //!
-//! Phase 1a scope: write a fixed-schema batch of rows to a single Parquet file
-//! at a given object-store path. No schema mapping, no rolling, no partitioning,
-//! no DLQ — those are Phase 1b-1f.
+//! Phase 1a/1b scope: write a fixed-schema batch of rows to a single Parquet
+//! file at a given object-store path. No partitioning, no DLQ — those are
+//! Phase 1d-1f.
 //!
-//! The fixed schema below (`id`, `name`, `ts`) is a placeholder to validate the
-//! end-to-end plumbing. Phase 1c replaces it with a DDL-derived schema.
+//! The fixed schema below (`id`, `name`, `ts`) is a placeholder to validate
+//! the end-to-end plumbing. Phase 1c replaces it with a DDL-derived schema.
 
 use std::sync::Arc;
 
@@ -14,10 +14,13 @@ use arrow_array::{
     Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use object_store::{ObjectStore, path::Path};
+use async_trait::async_trait;
+use object_store::{ObjectStore, ObjectStoreExt, path::Path};
 use parquet::arrow::AsyncArrowWriter;
-use parquet::basic::Compression;
+use parquet::basic::Compression as ParquetCompression;
 use parquet::file::properties::WriterProperties;
+
+use super::file_format::{Compression, FileFormat, WriteResult};
 
 /// Placeholder row type — replaced in Phase 1c by a generic `Event` mapper.
 #[derive(Debug, Clone)]
@@ -27,48 +30,71 @@ pub struct SimpleRow {
     pub ts_ms: i64,
 }
 
-/// Writes Parquet files to an `object_store::ObjectStore`.
-///
-/// Phase 1a is single-shot: build → write_rows → close.
-pub struct ParquetSinkWriter {
-    store: Arc<dyn ObjectStore>,
+/// Parquet implementation of `FileFormat`.
+#[derive(Debug, Clone)]
+pub struct ParquetFormat {
     schema: Arc<Schema>,
-    compression: Compression,
+    compression: ParquetCompression,
 }
 
-impl ParquetSinkWriter {
-    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, true),
-            Field::new(
-                "ts",
-                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
-                false,
-            ),
-        ]));
+impl ParquetFormat {
+    pub fn new(compression: Compression) -> Self {
         Self {
-            store,
-            schema,
-            compression: Compression::SNAPPY,
+            schema: default_schema(),
+            compression: map_compression(compression),
         }
     }
 
     pub fn schema(&self) -> Arc<Schema> {
         self.schema.clone()
     }
+}
 
-    /// Write `rows` to a Parquet file at the given object-store `path`.
-    ///
-    /// Uses the parquet AsyncArrowWriter over a `BufWriter` against
-    /// `object_store`. The writer issues multipart uploads automatically
-    /// once buffered bytes exceed the threshold; on `close()` it finalizes
-    /// the upload atomically.
-    pub async fn write_rows(
+impl Default for ParquetFormat {
+    fn default() -> Self {
+        Self::new(Compression::Snappy)
+    }
+}
+
+fn default_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            false,
+        ),
+    ]))
+}
+
+fn map_compression(c: Compression) -> ParquetCompression {
+    match c {
+        Compression::None => ParquetCompression::UNCOMPRESSED,
+        Compression::Snappy => ParquetCompression::SNAPPY,
+        Compression::Gzip => ParquetCompression::GZIP(Default::default()),
+        Compression::Zstd => ParquetCompression::ZSTD(Default::default()),
+    }
+}
+
+#[async_trait]
+impl FileFormat for ParquetFormat {
+    fn extension(&self) -> &'static str {
+        "parquet"
+    }
+    fn content_type(&self) -> &'static str {
+        "application/vnd.apache.parquet"
+    }
+    fn label(&self) -> &'static str {
+        "parquet"
+    }
+
+    async fn write_rows(
         &self,
+        store: Arc<dyn ObjectStore>,
         path: &Path,
         rows: &[SimpleRow],
-    ) -> Result<u64> {
+    ) -> Result<WriteResult> {
         let batch = rows_to_record_batch(&self.schema, rows)
             .context("convert rows to record batch")?;
 
@@ -76,11 +102,8 @@ impl ParquetSinkWriter {
             .set_compression(self.compression)
             .build();
 
-        // object_store BufWriter handles multipart upload semantics.
-        let buf_writer = object_store::buffered::BufWriter::new(
-            self.store.clone(),
-            path.clone(),
-        );
+        let buf_writer =
+            object_store::buffered::BufWriter::new(store.clone(), path.clone());
 
         let mut writer = AsyncArrowWriter::try_new(
             buf_writer,
@@ -92,7 +115,46 @@ impl ParquetSinkWriter {
         writer.write(&batch).await.context("write record batch")?;
         let metadata = writer.close().await.context("close parquet writer")?;
 
-        Ok(metadata.file_metadata().num_rows() as u64)
+        // BufWriter::shutdown has happened inside writer.close(); the file is
+        // visible at `path` now. Query its size to report bytes_written.
+        let bytes = store.head(path).await.map(|m| m.size).unwrap_or(0);
+
+        Ok(WriteResult {
+            rows_written: metadata.file_metadata().num_rows() as u64,
+            bytes_written: bytes,
+        })
+    }
+}
+
+/// Backward-compatible facade kept for Phase 1a tests.
+/// Will be retired when Phase 1c switches to the generic `Event` flow.
+pub struct ParquetSinkWriter {
+    store: Arc<dyn ObjectStore>,
+    format: ParquetFormat,
+}
+
+impl ParquetSinkWriter {
+    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            store,
+            format: ParquetFormat::default(),
+        }
+    }
+
+    pub fn schema(&self) -> Arc<Schema> {
+        self.format.schema()
+    }
+
+    pub async fn write_rows(
+        &self,
+        path: &Path,
+        rows: &[SimpleRow],
+    ) -> Result<u64> {
+        let res = self
+            .format
+            .write_rows(self.store.clone(), path, rows)
+            .await?;
+        Ok(res.rows_written)
     }
 }
 
@@ -118,7 +180,6 @@ mod tests {
     use super::*;
     use crate::s3::object_writer::{ObjectStoreHandle, ObjectStoreParams};
     use arrow_array::RecordBatch;
-    use object_store::ObjectStoreExt;
     use parquet::arrow::ParquetRecordBatchStreamBuilder;
     use parquet::arrow::async_reader::ParquetObjectReader;
 
@@ -180,6 +241,50 @@ mod tests {
 
         let read = read_back_rows(&handle, &path).await?;
         assert_eq!(read, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parquet_format_trait_works() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let params =
+            ObjectStoreParams::local(tmp.path().to_string_lossy().to_string());
+        let handle = ObjectStoreHandle::new(params)?;
+        let format = ParquetFormat::default();
+
+        let path = Path::from("phase1b/via_trait.parquet");
+        let rows = sample_rows(500);
+        let res = format
+            .write_rows(handle.store.clone(), &path, &rows)
+            .await?;
+        assert_eq!(res.rows_written, 500);
+        assert!(res.bytes_written > 0);
+        assert_eq!(format.extension(), "parquet");
+        assert_eq!(format.label(), "parquet");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parquet_compression_options() -> Result<()> {
+        for compression in [
+            Compression::None,
+            Compression::Snappy,
+            Compression::Gzip,
+            Compression::Zstd,
+        ] {
+            let tmp = tempfile::tempdir()?;
+            let params = ObjectStoreParams::local(
+                tmp.path().to_string_lossy().to_string(),
+            );
+            let handle = ObjectStoreHandle::new(params)?;
+            let format = ParquetFormat::new(compression);
+            let path =
+                Path::from(format!("compression/{compression:?}.parquet"));
+            let res = format
+                .write_rows(handle.store.clone(), &path, &sample_rows(500))
+                .await?;
+            assert_eq!(res.rows_written, 500, "compression {compression:?}");
+        }
         Ok(())
     }
 }

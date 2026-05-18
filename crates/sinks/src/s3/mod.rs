@@ -5,11 +5,15 @@
 //!
 //! See `docs/specs/s3-parquet-sink.md` for the full design.
 //!
-//! Phase 1a status: object_store + parquet plumbing only. Sink trait wire-up
-//! and full feature set follow in later phases.
+//! Phase 1a/1b status: file format plumbing only (Parquet + JSON Lines). Sink
+//! trait wire-up and full feature set follow in later phases.
 
+mod file_format;
+mod jsonl_writer;
 mod object_writer;
 mod parquet_writer;
 
+pub use file_format::{Compression, FileFormat, WriteResult};
+pub use jsonl_writer::JsonLinesFormat;
 pub use object_writer::{ObjectStoreParams, build_object_store};
-pub use parquet_writer::{ParquetSinkWriter, SimpleRow};
+pub use parquet_writer::{ParquetFormat, ParquetSinkWriter, SimpleRow};
