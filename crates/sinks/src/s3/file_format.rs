@@ -1,21 +1,21 @@
-//! `FileFormat` trait — the shared interface for Parquet and JSON Lines writers.
+//! `FileFormat` + `FileWriter` traits — the shared interface for Parquet and
+//! JSON Lines writers.
 //!
-//! Both formats share the same rolling, multipart, atomic-commit, DLQ, and
-//! metrics infrastructure (built in Phases 1d-1f). The format itself only
-//! decides:
-//!   1. The file extension and `Content-Type`
-//!   2. How rows are serialized into the on-the-wire bytes
+//! `FileFormat` is the factory: given an object store + path + Arrow schema,
+//! it opens a `FileWriter`. `FileWriter` is the per-file state holder that
+//! ingests `Event` batches incrementally and finalizes on `close`.
 //!
-//! Phase 1b keeps the API single-shot (`write_rows` → file appears). Phase 1d
-//! introduces `FileWriter` for incremental append.
+//! Both formats share the same rolling, partitioning, multipart, atomic-commit,
+//! DLQ and metrics machinery (built in this and subsequent phases). The trait
+//! isolates serialization concerns from coordination concerns.
 
 use std::sync::Arc;
 
 use anyhow::Result;
+use arrow_schema::Schema;
 use async_trait::async_trait;
+use deltaforge_core::Event;
 use object_store::{ObjectStore, path::Path};
-
-use super::SimpleRow;
 
 /// Outcome of writing a single file.
 #[derive(Debug, Clone, Copy)]
@@ -36,7 +36,8 @@ pub enum Compression {
     Zstd,
 }
 
-/// A pluggable file format. Implementations are stateless and cheap to clone.
+/// A pluggable file format. Implementations are stateless factories — the
+/// actual write state lives in the `FileWriter` they produce.
 #[async_trait]
 pub trait FileFormat: Send + Sync {
     /// File extension *without* the dot (e.g. `"parquet"`, `"jsonl"`, `"jsonl.gz"`).
@@ -48,12 +49,39 @@ pub trait FileFormat: Send + Sync {
     /// Format identifier for metrics labels.
     fn label(&self) -> &'static str;
 
-    /// Write `rows` to a single file at `path` in this format.
-    /// Returns the row + byte counts on success.
-    async fn write_rows(
+    /// Open a new writer targeting `path`. The schema is used by Parquet and
+    /// ignored by JSON Lines. The returned writer accepts incremental
+    /// `append` calls and must be `close`d to finalize the upload.
+    async fn open_writer(
         &self,
         store: Arc<dyn ObjectStore>,
-        path: &Path,
-        rows: &[SimpleRow],
-    ) -> Result<WriteResult>;
+        path: Path,
+        schema: Arc<Schema>,
+    ) -> Result<Box<dyn FileWriter>>;
+}
+
+/// An open file writer. Appends are incremental; `close` finalizes (Parquet
+/// footer + multipart complete, or JSONL flush + put).
+///
+/// Implementations are expected to be `!Sync` — writers are owned exclusively
+/// by the partition they belong to and never shared across tasks.
+#[async_trait]
+pub trait FileWriter: Send {
+    /// Append a batch of events to this writer.
+    ///
+    /// Per-event coercion failures bubble up as an error and fail the whole
+    /// append; per-row DLQ routing lands in Phase 1f via a return-type change.
+    async fn append(&mut self, events: &[Event]) -> Result<()>;
+
+    /// Bytes accumulated so far. For Parquet this is an estimate (the final
+    /// size is known only after the footer is written), for JSONL it is the
+    /// in-memory buffer size before any compression.
+    fn bytes_written(&self) -> u64;
+
+    /// Events written so far across all `append` calls.
+    fn events_written(&self) -> u64;
+
+    /// Close the writer, flush the footer (Parquet) or final blob (JSONL),
+    /// complete the multipart upload, and return the final result.
+    async fn close(self: Box<Self>) -> Result<WriteResult>;
 }

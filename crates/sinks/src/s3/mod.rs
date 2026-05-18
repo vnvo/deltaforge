@@ -13,12 +13,15 @@ mod file_format;
 mod jsonl_writer;
 mod object_writer;
 mod parquet_writer;
+mod rolling;
 mod router;
+mod writer_pool;
 
 pub use encoder::events_to_record_batch;
-
-pub use file_format::{Compression, FileFormat, WriteResult};
+pub use file_format::{Compression, FileFormat, FileWriter, WriteResult};
 pub use jsonl_writer::JsonLinesFormat;
 pub use object_writer::{ObjectStoreParams, build_object_store};
 pub use parquet_writer::{ParquetFormat, ParquetSinkWriter, SimpleRow};
+pub use rolling::{RollReason, RollingConfig};
 pub use router::{PartitionKey, partition_for};
+pub use writer_pool::{CommittedFile, WriterPool, WriterPoolConfig};

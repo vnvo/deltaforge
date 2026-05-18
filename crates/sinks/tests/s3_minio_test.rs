@@ -17,7 +17,7 @@ use object_store::path::Path;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_reader::ParquetObjectReader;
 use sinks::s3::{
-    Compression, FileFormat, JsonLinesFormat, ObjectStoreParams, ParquetFormat,
+    Compression, JsonLinesFormat, ObjectStoreParams, ParquetFormat,
     ParquetSinkWriter, SimpleRow, build_object_store,
 };
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -189,7 +189,9 @@ async fn phase1b_writes_jsonl_gzip_to_minio() -> Result<()> {
 
     let path = Path::from("phase1b/jsonl_gzip.jsonl.gz");
     let rows = sample_rows(10_000);
-    let res = format.write_rows(store.clone(), &path, &rows).await?;
+    let res = format
+        .write_simple_rows(store.clone(), &path, &rows)
+        .await?;
     assert_eq!(res.rows_written, 10_000);
     assert!(res.bytes_written > 0);
 
@@ -209,7 +211,9 @@ async fn phase1b_writes_jsonl_plain_to_minio() -> Result<()> {
 
     let path = Path::from("phase1b/jsonl_plain.jsonl");
     let rows = sample_rows(1000);
-    let res = format.write_rows(store.clone(), &path, &rows).await?;
+    let res = format
+        .write_simple_rows(store.clone(), &path, &rows)
+        .await?;
     assert_eq!(res.rows_written, 1000);
 
     // Plain JSONL must be larger than gzipped equivalent.
@@ -228,13 +232,16 @@ async fn phase1b_writes_jsonl_plain_to_minio() -> Result<()> {
 async fn phase1b_parquet_via_format_trait() -> Result<()> {
     let infra = minio().await;
     let store = build_object_store(&params_for(&infra.endpoint))?;
-    let format = ParquetFormat::default();
+    let _format = ParquetFormat::default();
 
+    // The incremental ParquetFormat::open_writer flow is exercised by the
+    // Phase 1d e2e tests against local FS. Here we just smoke-check that
+    // a ParquetSinkWriter (the facade) writes successfully to MinIO.
+    let writer = ParquetSinkWriter::new(store.clone());
     let path = Path::from("phase1b/via_trait.parquet");
     let rows = sample_rows(5000);
-    let res = format.write_rows(store.clone(), &path, &rows).await?;
-    assert_eq!(res.rows_written, 5000);
-    assert!(res.bytes_written > 0);
+    let n = writer.write_rows(&path, &rows).await?;
+    assert_eq!(n, 5000);
 
     let read = read_back_rows(store, &path).await?;
     assert_eq!(read, 5000);

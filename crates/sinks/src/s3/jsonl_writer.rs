@@ -1,25 +1,28 @@
 //! JSON Lines writer over `object_store`.
 //!
-//! Each row is serialized to a single JSON object followed by `\n`. Optional
-//! gzip compression wraps the whole stream. The format is schema-less and
-//! self-describing, making it the format of choice for forensic / audit /
-//! log-pipeline use cases.
+//! Phase 1d: incremental `FileWriter` that buffers events to an in-memory
+//! `Vec<u8>` (one JSON object + `\n` per event) and uploads on `close` as a
+//! single put. Optional gzip compression wraps the whole stream.
 //!
-//! Phase 1b: single-shot in-memory serialization. Phase 1d switches to a
-//! streaming writer for large files.
+//! Phase 2 may move to a streaming writer (BufWriter + async-compression) so
+//! very large JSONL files don't pin memory; for Phase 1d the size of a
+//! single rolled file (≤256 MiB) is acceptable to hold in memory and keeps
+//! the code simple.
 
+use std::io::Write;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use arrow_schema::Schema;
 use async_trait::async_trait;
 use bytes::Bytes;
+use deltaforge_core::Event;
 use flate2::Compression as GzLevel;
 use flate2::write::GzEncoder;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload, path::Path};
-use std::io::Write;
 
 use super::SimpleRow;
-use super::file_format::{Compression, FileFormat, WriteResult};
+use super::file_format::{Compression, FileFormat, FileWriter, WriteResult};
 
 /// JSON Lines implementation of `FileFormat`. Supports gzip compression.
 #[derive(Debug, Clone)]
@@ -29,8 +32,8 @@ pub struct JsonLinesFormat {
 
 impl JsonLinesFormat {
     pub fn new(compression: Compression) -> Self {
-        // Phase 1b: jsonl supports gzip / none. zstd will land with the
-        // streaming writer in Phase 1d.
+        // Phase 1d: jsonl supports gzip / none. zstd will land with the
+        // streaming writer in Phase 2.
         let compression = match compression {
             Compression::None | Compression::Gzip => compression,
             other => {
@@ -70,19 +73,106 @@ impl FileFormat for JsonLinesFormat {
         "jsonl"
     }
 
-    async fn write_rows(
+    async fn open_writer(
+        &self,
+        store: Arc<dyn ObjectStore>,
+        path: Path,
+        _schema: Arc<Schema>,
+    ) -> Result<Box<dyn FileWriter>> {
+        Ok(Box::new(JsonLinesFileWriter {
+            store,
+            path,
+            compression: self.compression,
+            buf: Vec::with_capacity(64 * 1024),
+            events_written: 0,
+        }))
+    }
+}
+
+/// Incremental JSONL writer. Buffers serialized events and flushes on close.
+pub struct JsonLinesFileWriter {
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+    compression: Compression,
+    buf: Vec<u8>,
+    events_written: u64,
+}
+
+#[async_trait]
+impl FileWriter for JsonLinesFileWriter {
+    async fn append(&mut self, events: &[Event]) -> Result<()> {
+        for e in events {
+            serde_json::to_writer(&mut self.buf, e)
+                .context("serialize event to jsonl buffer")?;
+            self.buf.push(b'\n');
+        }
+        self.events_written += events.len() as u64;
+        Ok(())
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.buf.len() as u64
+    }
+
+    fn events_written(&self) -> u64 {
+        self.events_written
+    }
+
+    async fn close(self: Box<Self>) -> Result<WriteResult> {
+        let Self {
+            store,
+            path,
+            compression,
+            buf,
+            events_written,
+        } = *self;
+
+        let payload = match compression {
+            Compression::Gzip => {
+                let mut encoder = GzEncoder::new(
+                    Vec::with_capacity(buf.len() / 4),
+                    GzLevel::default(),
+                );
+                encoder.write_all(&buf).context("gzip write")?;
+                encoder.finish().context("gzip finish")?
+            }
+            _ => buf,
+        };
+        let bytes_written = payload.len() as u64;
+        store
+            .put(&path, PutPayload::from(Bytes::from(payload)))
+            .await
+            .context("put jsonl object")?;
+        Ok(WriteResult {
+            rows_written: events_written,
+            bytes_written,
+        })
+    }
+}
+
+// =============================================================================
+// SimpleRow facade (kept for Phase 1a/1b sample tests)
+// =============================================================================
+
+impl JsonLinesFormat {
+    /// Phase 1b convenience used by sample tests. Bypasses the FileWriter
+    /// flow and writes a single in-memory blob.
+    pub async fn write_simple_rows(
         &self,
         store: Arc<dyn ObjectStore>,
         path: &Path,
         rows: &[SimpleRow],
     ) -> Result<WriteResult> {
-        // Serialize all rows to a contiguous buffer (`{...}\n` per row).
-        // Phase 1d will move this to a streaming writer over BufWriter so we
-        // don't hold the whole file in memory for large rolls.
         let mut buf = Vec::with_capacity(rows.len() * 96);
         for row in rows {
-            serde_json::to_writer(&mut buf, &row_as_json(row))
-                .context("serialize row to jsonl buffer")?;
+            serde_json::to_writer(
+                &mut buf,
+                &serde_json::json!({
+                    "id": row.id,
+                    "name": row.name,
+                    "ts_ms": row.ts_ms,
+                }),
+            )?;
             buf.push(b'\n');
         }
 
@@ -97,27 +187,16 @@ impl FileFormat for JsonLinesFormat {
             }
             _ => buf,
         };
-
         let bytes_written = payload.len() as u64;
         store
             .put(path, PutPayload::from(Bytes::from(payload)))
             .await
             .context("put jsonl object")?;
-
         Ok(WriteResult {
             rows_written: rows.len() as u64,
             bytes_written,
         })
     }
-}
-
-/// Phase 1b placeholder — Phase 1c replaces this with the CDC envelope shape.
-fn row_as_json(row: &SimpleRow) -> serde_json::Value {
-    serde_json::json!({
-        "id": row.id,
-        "name": row.name,
-        "ts_ms": row.ts_ms,
-    })
 }
 
 #[cfg(test)]
@@ -157,7 +236,7 @@ mod tests {
         let path = Path::from("jsonl/uncompressed.jsonl");
         let rows = sample_rows(100);
         let res = format
-            .write_rows(handle.store.clone(), &path, &rows)
+            .write_simple_rows(handle.store.clone(), &path, &rows)
             .await?;
         assert_eq!(res.rows_written, 100);
 
@@ -184,7 +263,7 @@ mod tests {
         let path = Path::from("jsonl/compressed.jsonl.gz");
         let rows = sample_rows(1000);
         let res = format
-            .write_rows(handle.store.clone(), &path, &rows)
+            .write_simple_rows(handle.store.clone(), &path, &rows)
             .await?;
         assert_eq!(res.rows_written, 1000);
 
@@ -213,7 +292,9 @@ mod tests {
         let format = JsonLinesFormat::new(Compression::None);
 
         let path = Path::from("jsonl/empty.jsonl");
-        let res = format.write_rows(handle.store.clone(), &path, &[]).await?;
+        let res = format
+            .write_simple_rows(handle.store.clone(), &path, &[])
+            .await?;
         assert_eq!(res.rows_written, 0);
         assert_eq!(res.bytes_written, 0);
         Ok(())
