@@ -23,9 +23,10 @@ spec:
     - type: s3
       config:
         id: chaos-s3-jsonl
-        bucket: deltaforge-test
+        bucket: deltaforge-chaos
         prefix: audit
-        endpoint: "http://minio:9000"
+        # MinIO via toxiproxy — see mysql-to-s3.yaml for rationale.
+        endpoint: "http://toxiproxy:5104"
         region: us-east-1
         access_key_id: minioadmin
         secret_access_key: minioadmin

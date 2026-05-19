@@ -22,11 +22,11 @@ spec:
     - type: s3
       config:
         id: chaos-s3-parquet
-        bucket: deltaforge-test
+        bucket: deltaforge-chaos
         prefix: lake
-        # MinIO endpoint inside docker compose chaos net. For AWS S3 leave
-        # `endpoint: null` and set `region:` accordingly.
-        endpoint: "http://minio:9000"
+        # MinIO via toxiproxy so we can inject S3 faults (network partition,
+        # latency, 5xx). Direct address is "http://minio:9000".
+        endpoint: "http://toxiproxy:5104"
         region: us-east-1
         access_key_id: minioadmin
         secret_access_key: minioadmin

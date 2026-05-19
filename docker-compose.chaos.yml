@@ -185,6 +185,64 @@ services:
       - "9092:9092"
     networks: [chaos_net]
 
+  # MinIO (S3-compatible object storage for S3/Parquet sink tests)
+  minio:
+    image: minio/minio:latest
+    profiles: [s3-infra]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    # Pre-create the test bucket via filesystem trick (MinIO filesystem mode
+    # treats top-level dirs under /data as buckets). The bucket lifecycle
+    # policy for abort-incomplete-multipart-upload (production requirement)
+    # is documented in docs/specs/s3-parquet-sink.md and applied via mc in
+    # `mc-bootstrap` below.
+    entrypoint: ["/bin/sh"]
+    command:
+      - "-c"
+      - "mkdir -p /data/deltaforge-chaos && minio server /data --console-address :9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "9000:9000"   # S3 API (also proxied at toxiproxy:5104)
+      - "9001:9001"   # Web console (host access for inspection)
+    networks: [chaos_net]
+
+  # mc bootstrap: apply the lifecycle policy that aborts abandoned
+  # multipart uploads (operational prereq for the S3 sink — see
+  # docs/specs/s3-parquet-sink.md). One-shot container.
+  mc-bootstrap:
+    image: minio/mc:latest
+    profiles: [s3-infra]
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh"]
+    command:
+      - "-c"
+      - |
+        set -e
+        mc alias set local http://minio:9000 minioadmin minioadmin
+        # Idempotent: ignore if bucket already exists
+        mc mb -p local/deltaforge-chaos || true
+        # Apply lifecycle: abort multipart uploads older than 1 day
+        cat >/tmp/lifecycle.json <<'JSON'
+        {
+          "Rules": [{
+            "ID": "abort-abandoned-multiparts",
+            "Status": "Enabled",
+            "Filter": {},
+            "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}
+          }]
+        }
+        JSON
+        mc ilm import local/deltaforge-chaos < /tmp/lifecycle.json
+        echo "MinIO bucket and lifecycle policy ready"
+    networks: [chaos_net]
+
   # Confluent Schema Registry (for Avro encoding tests)
   schema-registry:
     image: confluentinc/cp-schema-registry:7.7.1
@@ -218,6 +276,7 @@ services:
       - "5101:5101"   # postgres proxy
       - "5102:5102"   # kafka proxy
       - "5103:5103"   # schema-registry proxy
+      - "5104:5104"   # minio (S3) proxy — chaos S3 sink target
     # No depends_on — infra profiles start independently. Toxiproxy retries
     # upstream connections automatically; backends just need to be up before
     # DeltaForge connects through the proxy.
