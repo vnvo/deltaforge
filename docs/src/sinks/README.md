@@ -34,6 +34,7 @@ sinks:
 | <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/nats/nats-original.svg" width="24" height="24"> | [`nats`](nats.md) | NATS JetStream sink |
 | <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/redis/redis-original.svg" width="24" height="24"> | [`redis`](redis.md) | Redis stream sink |
 | | [`http`](http.md) | HTTP/Webhook sink |
+| <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/amazonwebservices/amazonwebservices-original-wordmark.svg" width="24" height="24"> | [`s3`](s3.md) | S3-compatible object storage (Parquet / JSON Lines) — AWS S3, MinIO, GCS, Azure, local FS |
 
 ## Multiple sinks in one pipeline
 

@@ -2,6 +2,7 @@
 
 ## Completed
 
+- **S3 / Parquet / JSON Lines sink** — direct lakehouse path; AWS S3, MinIO, GCS, Azure, local FS via `object_store`. DDL-derived Arrow schemas with native `Decimal128`. Hive-style partitioning by table + UTC date. Atomic multipart commits. File rolling on size/events/age/idle. See [S3 sink docs](sinks/s3.md).
 - **Avro encoding with Confluent Schema Registry** — DDL-derived Avro schemas, Confluent wire format, all sinks supported, type conversion policies, Schema Registry failure handling with cached fallback
 - **HTTP/Webhook sink** — POST/PUT to any URL, URL templates, batch mode, retry with backoff
 - **Dead Letter Queue** — per-event failure routing, overflow policies, REST API for inspection
@@ -17,8 +18,10 @@
 
 ## Planned
 
+- **Iceberg / Delta Lake table formats** — exactly-once at event level via atomic snapshot commits; schema evolution and time travel on top of the Phase 1 S3 sink
+- **Per-row DLQ for S3 sink** — slow-path retry isolates bad rows instead of failing the whole batch
+- **Streaming JSONL writer + List/Map columns** — Phase 2 S3 sink refinements
 - **MongoDB source** — change streams CDC
-- **S3/Parquet sink** — data lake integration
 - **Event replay** — replay DLQ entries or historical events
 - **Kubernetes operator** — PipelineTemplate + PipelinePool for fleet management
 - **OpenAPI spec generation** — auto-generated REST API documentation

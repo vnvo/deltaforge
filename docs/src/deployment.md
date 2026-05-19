@@ -114,3 +114,54 @@ DeltaForge creates its tables automatically on first connection.
 ### Full values reference
 
 See the [Helm chart README](https://github.com/vnvo/deltaforge/blob/main/deploy/helm/deltaforge/README.md) for all configurable values.
+
+## S3 sink prerequisites
+
+If any pipeline uses the [S3 sink](sinks/s3.md), the target bucket **must** have a lifecycle rule that aborts incomplete multipart uploads. DeltaForge does not track multipart upload IDs externally; partial uploads from process crashes are reclaimed by the bucket's lifecycle policy.
+
+**Required policy:**
+
+```json
+{
+  "Rules": [{
+    "ID": "abort-abandoned-multiparts",
+    "Status": "Enabled",
+    "Filter": {},
+    "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 1 }
+  }]
+}
+```
+
+Apply via AWS CLI:
+```bash
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket my-data-lake \
+  --lifecycle-configuration file://lifecycle.json
+```
+
+All major S3-compatible providers (AWS S3, MinIO, Wasabi, Backblaze B2, GCS S3-interop, R2) support this rule. Without it, S3 storage costs accumulate with every aborted DeltaForge batch.
+
+### IAM permissions
+
+The S3 sink needs `s3:PutObject`, `s3:GetObject`, `s3:ListBucket`, `s3:AbortMultipartUpload`, and `s3:ListBucketMultipartUploads` on the target bucket and its key prefix:
+
+```json
+{
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": [
+      "s3:PutObject",
+      "s3:GetObject",
+      "s3:ListBucket",
+      "s3:AbortMultipartUpload",
+      "s3:ListBucketMultipartUploads"
+    ],
+    "Resource": [
+      "arn:aws:s3:::my-data-lake",
+      "arn:aws:s3:::my-data-lake/*"
+    ]
+  }]
+}
+```
+
+On EKS, prefer **IRSA** (IAM Roles for Service Accounts) over inline access keys. DeltaForge's S3 sink uses the AWS default credential chain when `access_key_id` is omitted from the sink config, so IRSA works without code changes.
