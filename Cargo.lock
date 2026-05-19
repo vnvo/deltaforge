@@ -5347,6 +5347,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "apache-avro",
+ "arrow-schema",
  "async-trait",
  "axum 0.8.9",
  "bytes",

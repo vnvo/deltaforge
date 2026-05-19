@@ -99,16 +99,17 @@ pub fn build_sinks(
     cancel: CancellationToken,
     pipeline: &str,
 ) -> anyhow::Result<Vec<ArcDynSink>> {
-    build_sinks_with_schemas(ps, cancel, pipeline, None)
+    build_sinks_with_schemas(ps, cancel, pipeline, None, None)
 }
 
-/// Build all sinks, optionally injecting a DDL-derived schema provider
-/// for Avro encoding (Path A).
+/// Build all sinks, optionally injecting a DDL-derived schema provider for
+/// Avro encoding (Path A) and/or an Arrow `SchemaResolver` for the S3 sink.
 pub fn build_sinks_with_schemas(
     ps: &PipelineSpec,
     cancel: CancellationToken,
     pipeline: &str,
     source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
+    arrow_schema_resolver: Option<s3::SchemaResolver>,
 ) -> anyhow::Result<Vec<ArcDynSink>> {
     ps.spec
         .sinks
@@ -156,10 +157,7 @@ pub fn build_sinks_with_schemas(
                         cfg,
                         cancel.clone(),
                         pipeline,
-                        // Phase 1g.1: no Arrow schema resolver yet — fallback
-                        // to envelope-only schema with a warning. Phase 1g.2
-                        // wires a DDL-derived resolver from the runner.
-                        None,
+                        arrow_schema_resolver.clone(),
                     )?) as ArcDynSink,
                     cfg.filter.clone(),
                 ),

@@ -34,6 +34,7 @@ schema-registry = { path = "../schema-registry" }
 sources = { path = "../sources" }
 sinks = { path = "../sinks" }
 processors = { path = "../processors" }
+arrow-schema = "58"
 rest-api = { path = "../rest-api" }
 checkpoints = { path = "../checkpoints" }
 tikv-jemallocator = { version = "0.6", optional = true }

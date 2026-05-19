@@ -177,6 +177,41 @@ fn build_avro_provider(
     )))
 }
 
+/// Build an Arrow schema resolver if any sink is an S3/Parquet sink.
+/// Returns `None` when no S3 sink is configured, so the factory can skip
+/// the (cheap but unnecessary) closure construction.
+fn build_arrow_resolver(
+    spec: &PipelineSpec,
+    schema_loader: &Option<ArcSchemaLoader>,
+) -> Option<sinks::s3::SchemaResolver> {
+    use deltaforge_config::SinkCfg;
+    use deltaforge_core::encoding::avro_types::TypeConversionOpts;
+
+    let has_s3 = spec.spec.sinks.iter().any(|s| matches!(s, SinkCfg::S3(_)));
+    if !has_s3 {
+        return None;
+    }
+
+    let loader = schema_loader.as_ref()?;
+    let connector = match &spec.spec.source {
+        SourceCfg::Mysql(_) => "mysql",
+        SourceCfg::Postgres(_) => "postgresql",
+        #[cfg(feature = "turso")]
+        SourceCfg::Turso(_) => "turso",
+    };
+
+    let schema_provider =
+        Arc::new(SchemaLoaderAdapter::new(Arc::clone(loader)));
+
+    // For Phase 1g.2: use default TypeConversionOpts. S3SinkCfg could expose
+    // per-sink type-conversion options later (mirroring EncodingCfg::Avro).
+    Some(crate::schema_provider::build_arrow_schema_resolver(
+        schema_provider,
+        connector,
+        TypeConversionOpts::default(),
+    ))
+}
+
 // ============================================================================
 // Pipeline Runtime (internal)
 // ============================================================================
@@ -381,11 +416,15 @@ impl PipelineManager {
         // Build Avro schema provider if any sink uses Avro encoding
         let avro_source_schemas = build_avro_provider(&spec, &schema_loader);
 
+        // Build Arrow schema resolver if any sink is an S3/Parquet sink
+        let arrow_schema_resolver = build_arrow_resolver(&spec, &schema_loader);
+
         let sinks = sinks::build_sinks_with_schemas(
             &spec,
             cancel.clone(),
             &pipeline_name,
             avro_source_schemas,
+            arrow_schema_resolver,
         )
         .context("build sinks")?;
 

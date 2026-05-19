@@ -386,6 +386,92 @@ fn column_info_to_desc(col: &ColumnSchemaInfo) -> ColumnDesc {
     }
 }
 
+// ============================================================================
+// Arrow schema resolver (for S3 / Parquet sink)
+// ============================================================================
+
+/// Build a `SchemaResolver` closure for the S3 sink that maps a partition's
+/// table name to a DDL-derived Arrow envelope schema.
+///
+/// Behavior:
+/// - Looks up `TableSchemaInfo` for `(connector, source.table)` from the
+///   provided `SchemaProvider`.
+/// - Converts each column via the same `column_info_to_desc` used by the
+///   Avro path (one source of truth for type policy).
+/// - Builds the Arrow envelope schema with the configured `TypeConversionOpts`.
+/// - Caches results per `(connector, table)` so repeated lookups are O(1).
+///
+/// Fallback: if no `TableSchemaInfo` is registered for a table (e.g.,
+/// snapshot has not yet completed, schema sensing not yet warmed up), an
+/// envelope-only schema (meta columns only) is returned. The fallback is
+/// logged once per table so operators notice.
+pub fn build_arrow_schema_resolver(
+    schema_provider: ArcSchemaProvider,
+    connector: &str,
+    opts: deltaforge_core::encoding::avro_types::TypeConversionOpts,
+) -> sinks::s3::SchemaResolver {
+    use deltaforge_core::encoding::arrow_schema::{
+        Connector as ArrowConnector, build_envelope_arrow_schema_arc,
+    };
+    use parking_lot::RwLock;
+    use sinks::s3::PartitionKey;
+    use std::sync::Arc;
+
+    let arrow_connector = match connector {
+        "mysql" => ArrowConnector::Mysql,
+        "postgresql" | "postgres" => ArrowConnector::Postgres,
+        _ => ArrowConnector::Mysql, // generic fallback
+    };
+
+    // Use the re-exported arrow_schema types from the parquet/sinks crates'
+    // dependency closure — we rely on arrow_schema being on the same major
+    // version (58) as the sinks crate that consumes the returned closure.
+    use ::arrow_schema::Schema as ArrowSchema;
+    let cache: Arc<RwLock<HashMap<String, Arc<ArrowSchema>>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+    let fallback_logged: Arc<RwLock<HashMap<String, ()>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+
+    Arc::new(move |partition: &PartitionKey| {
+        let table = &partition.table;
+        if let Some(cached) = cache.read().get(table) {
+            return Ok(cached.clone());
+        }
+
+        // Look up table schema. The provider lookup is async; we block on
+        // the current runtime — same pattern as `AvroSchemaProviderImpl`.
+        let lookup_key = table.clone();
+        let provider_clone = schema_provider.clone();
+        let table_schema = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(provider_clone.get_table_schema(&lookup_key))
+        });
+
+        let schema = match table_schema {
+            Some(ts) => {
+                let cols: Vec<ColumnDesc> =
+                    ts.columns.iter().map(column_info_to_desc).collect();
+                build_envelope_arrow_schema_arc(arrow_connector, &cols, &opts)
+            }
+            None => {
+                // Log the fallback once per table.
+                let mut logged = fallback_logged.write();
+                if logged.insert(table.clone(), ()).is_none() {
+                    warn!(
+                        table,
+                        "no TableSchemaInfo available — S3 sink will write envelope-only \
+                         columns for this partition. Run snapshot to populate the registry."
+                    );
+                }
+                build_envelope_arrow_schema_arc(arrow_connector, &[], &opts)
+            }
+        };
+
+        cache.write().insert(table.clone(), schema.clone());
+        Ok(schema)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,5 +522,181 @@ mod tests {
         assert_eq!(schema.json_columns().count(), 1);
         assert!(schema.is_json_column("metadata"));
         assert!(!schema.is_json_column("id"));
+    }
+
+    // -----------------------------------------------------------------------
+    // build_arrow_schema_resolver
+    // -----------------------------------------------------------------------
+
+    use async_trait::async_trait;
+    use sinks::s3::PartitionKey;
+
+    struct FakeProvider {
+        tables: HashMap<String, TableSchemaInfo>,
+    }
+
+    #[async_trait]
+    impl SchemaProvider for FakeProvider {
+        async fn get_table_schema(
+            &self,
+            table: &str,
+        ) -> Option<TableSchemaInfo> {
+            self.tables.get(table).cloned()
+        }
+        async fn list_schemas(&self) -> Vec<TableSchemaInfo> {
+            self.tables.values().cloned().collect()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn arrow_resolver_returns_schema_with_user_columns() {
+        let mut tables = HashMap::new();
+        tables.insert(
+            "orders".to_string(),
+            TableSchemaInfo {
+                database: "shop".into(),
+                table: "orders".into(),
+                columns: vec![
+                    ColumnSchemaInfo {
+                        name: "id".into(),
+                        data_type: "bigint".into(),
+                        full_type: "bigint".into(),
+                        nullable: false,
+                        is_json_like: false,
+                        unsigned: false,
+                        is_array: false,
+                        numeric_precision: None,
+                        numeric_scale: None,
+                        element_type: None,
+                    },
+                    ColumnSchemaInfo {
+                        name: "amount".into(),
+                        data_type: "decimal".into(),
+                        full_type: "decimal(10,2)".into(),
+                        nullable: true,
+                        is_json_like: false,
+                        unsigned: false,
+                        is_array: false,
+                        numeric_precision: Some(10),
+                        numeric_scale: Some(2),
+                        element_type: None,
+                    },
+                ],
+                primary_key: vec!["id".into()],
+            },
+        );
+
+        let provider: ArcSchemaProvider = Arc::new(FakeProvider { tables });
+        let resolver = build_arrow_schema_resolver(
+            provider,
+            "mysql",
+            deltaforge_core::encoding::avro_types::TypeConversionOpts::default(
+            ),
+        );
+
+        let key = PartitionKey {
+            table: "orders".into(),
+            year: 2026,
+            month: 5,
+            day: 19,
+        };
+        let schema = resolver(&key).unwrap();
+        let names: Vec<&str> =
+            schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert!(names.contains(&"op"));
+        assert!(names.contains(&"after_id"));
+        assert!(names.contains(&"after_amount"));
+        // Decimal128 round-trip: schema should declare it natively, not Utf8.
+        let amount = schema
+            .field_with_name("after_amount")
+            .unwrap()
+            .data_type()
+            .clone();
+        assert!(matches!(amount, arrow_schema::DataType::Decimal128(10, 2)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn arrow_resolver_caches_lookups() {
+        // Run the resolver twice for the same table; second call must not
+        // hit the underlying provider (the fake panics on second call).
+        struct OneShotProvider {
+            schema: parking_lot::Mutex<Option<TableSchemaInfo>>,
+        }
+        #[async_trait]
+        impl SchemaProvider for OneShotProvider {
+            async fn get_table_schema(
+                &self,
+                _table: &str,
+            ) -> Option<TableSchemaInfo> {
+                self.schema.lock().take()
+            }
+            async fn list_schemas(&self) -> Vec<TableSchemaInfo> {
+                vec![]
+            }
+        }
+
+        let schema_info = TableSchemaInfo {
+            database: "shop".into(),
+            table: "orders".into(),
+            columns: vec![ColumnSchemaInfo {
+                name: "id".into(),
+                data_type: "bigint".into(),
+                full_type: "bigint".into(),
+                nullable: false,
+                is_json_like: false,
+                unsigned: false,
+                is_array: false,
+                numeric_precision: None,
+                numeric_scale: None,
+                element_type: None,
+            }],
+            primary_key: vec!["id".into()],
+        };
+        let provider: ArcSchemaProvider = Arc::new(OneShotProvider {
+            schema: parking_lot::Mutex::new(Some(schema_info)),
+        });
+        let resolver = build_arrow_schema_resolver(
+            provider,
+            "mysql",
+            deltaforge_core::encoding::avro_types::TypeConversionOpts::default(
+            ),
+        );
+
+        let key = PartitionKey {
+            table: "orders".into(),
+            year: 2026,
+            month: 5,
+            day: 19,
+        };
+        let s1 = resolver(&key).unwrap();
+        let s2 = resolver(&key).unwrap(); // would unwrap None from OneShotProvider without cache
+        assert_eq!(Arc::as_ptr(&s1), Arc::as_ptr(&s2), "cached schema reused");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn arrow_resolver_falls_back_to_envelope_only_when_no_schema() {
+        let provider: ArcSchemaProvider = Arc::new(FakeProvider {
+            tables: HashMap::new(),
+        });
+        let resolver = build_arrow_schema_resolver(
+            provider,
+            "mysql",
+            deltaforge_core::encoding::avro_types::TypeConversionOpts::default(
+            ),
+        );
+
+        let key = PartitionKey {
+            table: "missing".into(),
+            year: 2026,
+            month: 5,
+            day: 19,
+        };
+        let schema = resolver(&key).unwrap();
+        let names: Vec<&str> =
+            schema.fields().iter().map(|f| f.name().as_str()).collect();
+        // Envelope meta only; no before_*/after_* user columns.
+        assert!(names.contains(&"op"));
+        assert!(!names.iter().any(|n| n.starts_with("before_")));
+        assert!(!names.iter().any(|n| n.starts_with("after_")));
     }
 }
