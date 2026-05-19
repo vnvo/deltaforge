@@ -47,6 +47,10 @@ reqwest.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 mysql-binlog-connector-rust = "0.3"
 bytes.workspace = true
+object_store = { version = "0.13", features = ["aws"] }
+parquet = { version = "58", features = ["async", "object_store"] }
+arrow-array = "58"
+flate2 = "1"
 
 [[bench]]
 name = "pipeline_e2e"

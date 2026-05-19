@@ -8,8 +8,8 @@ mod sensing_api;
 
 pub use schema_provider::{
     ArcSchemaProvider, AvroSchemaProviderImpl, ColumnSchemaInfo,
-    SchemaLoaderAdapter, SchemaProvider, TableSchemaInfo, is_json_type,
-    might_be_json,
+    SchemaLoaderAdapter, SchemaProvider, TableSchemaInfo,
+    build_arrow_schema_resolver, is_json_type, might_be_json,
 };
 
 pub use coordinator::{
