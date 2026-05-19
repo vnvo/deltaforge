@@ -98,7 +98,7 @@ impl FileFormat for ParquetFormat {
         store: Arc<dyn ObjectStore>,
         path: Path,
         schema: Arc<Schema>,
-    ) -> Result<Box<dyn FileWriter>> {
+    ) -> Result<Box<dyn FileWriter + Send>> {
         let props = WriterProperties::builder()
             .set_compression(self.compression)
             .build();

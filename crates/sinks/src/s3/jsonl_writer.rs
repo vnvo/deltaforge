@@ -78,7 +78,7 @@ impl FileFormat for JsonLinesFormat {
         store: Arc<dyn ObjectStore>,
         path: Path,
         _schema: Arc<Schema>,
-    ) -> Result<Box<dyn FileWriter>> {
+    ) -> Result<Box<dyn FileWriter + Send>> {
         Ok(Box::new(JsonLinesFileWriter {
             store,
             path,

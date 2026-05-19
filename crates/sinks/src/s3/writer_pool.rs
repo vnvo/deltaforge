@@ -38,7 +38,7 @@ pub struct CommittedFile {
 
 /// One row in the pool — an open writer plus its lifecycle metadata.
 struct ActiveWriter {
-    writer: Box<dyn FileWriter>,
+    writer: Box<dyn FileWriter + Send>,
     path: Path,
     opened_at: Instant,
     last_event_at: Instant,
@@ -187,9 +187,11 @@ impl WriterPool {
     }
 
     async fn open_new_writer(
-        &self,
+        &mut self,
         key: &PartitionKey,
     ) -> Result<ActiveWriter> {
+        // Pull the pieces we need out of `self` before the await so the
+        // future doesn't capture `&Self` (which would require WriterPool: Sync).
         let ulid = Ulid::new().to_string();
         let ext = self.format.extension();
         let prefix = if self.cfg.prefix.is_empty() {
@@ -203,12 +205,15 @@ impl WriterPool {
         );
         let path = Path::from(path_str);
 
-        let writer = self
-            .format
-            .open_writer(self.store.clone(), path.clone(), self.schema.clone())
+        let store = self.store.clone();
+        let schema = self.schema.clone();
+        let format = self.format.clone();
+        let hive_path = key.hive_path();
+        let writer = format
+            .open_writer(store, path.clone(), schema)
             .await
             .with_context(|| {
-                format!("open writer for partition {}", key.hive_path())
+                format!("open writer for partition {hive_path}")
             })?;
 
         let opened_at = Instant::now();

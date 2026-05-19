@@ -57,7 +57,7 @@ pub trait FileFormat: Send + Sync {
         store: Arc<dyn ObjectStore>,
         path: Path,
         schema: Arc<Schema>,
-    ) -> Result<Box<dyn FileWriter>>;
+    ) -> Result<Box<dyn FileWriter + Send>>;
 }
 
 /// An open file writer. Appends are incremental; `close` finalizes (Parquet

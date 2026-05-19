@@ -15,6 +15,7 @@ mod object_writer;
 mod parquet_writer;
 mod rolling;
 mod router;
+mod sink;
 mod writer_pool;
 
 pub use encoder::events_to_record_batch;
@@ -24,4 +25,5 @@ pub use object_writer::{ObjectStoreParams, build_object_store};
 pub use parquet_writer::{ParquetFormat, ParquetSinkWriter, SimpleRow};
 pub use rolling::{RollReason, RollingConfig};
 pub use router::{PartitionKey, partition_for};
+pub use sink::{S3Sink, S3SinkArgs};
 pub use writer_pool::{CommittedFile, WriterPool, WriterPoolConfig};
