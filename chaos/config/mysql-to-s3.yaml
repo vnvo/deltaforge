@@ -38,6 +38,9 @@ spec:
           max_events: 50000          # 50K events
           max_age_secs: 30           # 30s wall-clock age
           idle_age_secs: 60          # 60s idle window
+        # Bound per-batch wait so a stuck S3 returns Backpressure instead
+        # of blocking the coordinator. Coordinator handles per `required`.
+        send_timeout_secs: 30
         required: true
 
   batch:

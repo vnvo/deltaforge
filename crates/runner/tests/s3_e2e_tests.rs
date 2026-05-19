@@ -287,6 +287,7 @@ fn s3_cfg(format: S3FileFormat, prefix: &str, max_events: u64) -> S3SinkCfg {
             max_age_secs: 300,
             idle_age_secs: 600,
         },
+        send_timeout_secs: 60,
         required: Some(true),
         filter: None,
     }

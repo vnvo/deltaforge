@@ -235,6 +235,7 @@ All sinks use exponential backoff with jitter. The classification determines whe
 |-------|---------------|----------|
 | Network timeout / partition | Retryable (in-batch) | `object_store` retries the part upload with its built-in backoff; if still failing, `send_batch` returns `SinkError::Io` |
 | `503 SlowDown` (throttling) | Retryable (in-batch) | `object_store` honors `Retry-After`; `send_batch` waits |
+| `send_timeout_secs` exceeded | Bounded wait | After `send_timeout_secs` (default 60s), `send_batch` returns `SinkError::Backpressure`. Caps the worst-case latency a single batch can contribute. Coordinator routes per `required` — block (default) or log+continue. Useful when upstream `object_store` retries would otherwise stack into multi-minute waits. |
 | `403 AccessDenied` / SigV4 mismatch | Non-retryable | `SinkError::Io` immediately; check credentials and region |
 | `NoSuchBucket` | Non-retryable | `SinkError::Io`; create the bucket or fix the config |
 | Encoder failure (e.g. value doesn't fit Decimal128 precision) | Non-retryable | `SinkError::Serialization`; Phase 1 fails the whole batch (per-row DLQ is Phase 2) |

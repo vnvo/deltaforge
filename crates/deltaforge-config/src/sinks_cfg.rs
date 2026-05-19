@@ -670,6 +670,15 @@ pub struct S3SinkCfg {
     #[serde(default)]
     pub file_roll: S3FileRoll,
 
+    /// Max seconds to wait for a single `send_batch` to complete inside
+    /// the sink. If a batch (including any file rolls + multipart uploads
+    /// triggered by it) exceeds this, the sink returns
+    /// `SinkError::Backpressure` and the coordinator handles it per the
+    /// `required` flag. Bounds worst-case latency contribution to the
+    /// pipeline. Default: 60s.
+    #[serde(default = "default_s3_send_timeout_secs")]
+    pub send_timeout_secs: u32,
+
     /// Whether this sink must succeed for the checkpoint to advance.
     #[serde(default)]
     pub required: Option<bool>,
@@ -745,6 +754,9 @@ fn default_s3_max_age_secs() -> u64 {
 }
 fn default_s3_idle_age_secs() -> u64 {
     600
+}
+fn default_s3_send_timeout_secs() -> u32 {
+    60
 }
 
 // ============================================================================
@@ -1047,6 +1059,26 @@ mod tests {
         assert_eq!(cfg.file_roll.max_bytes, 256 * 1024 * 1024);
         assert!(!cfg.local);
         assert!(!cfg.virtual_hosted_style);
+    }
+
+    #[test]
+    fn parse_s3_sink_send_timeout_default_and_override() {
+        // Default applies when omitted.
+        let yaml_default = r#"
+            id: t
+            bucket: b
+        "#;
+        let cfg: S3SinkCfg = serde_yaml::from_str(yaml_default).unwrap();
+        assert_eq!(cfg.send_timeout_secs, 60);
+
+        // Override is respected.
+        let yaml_override = r#"
+            id: t
+            bucket: b
+            send_timeout_secs: 30
+        "#;
+        let cfg: S3SinkCfg = serde_yaml::from_str(yaml_override).unwrap();
+        assert_eq!(cfg.send_timeout_secs, 30);
     }
 
     #[test]

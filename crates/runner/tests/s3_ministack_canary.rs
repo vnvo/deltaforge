@@ -329,6 +329,7 @@ async fn ministack_canary_parquet_roundtrip() -> Result<()> {
             max_age_secs: 300,
             idle_age_secs: 600,
         },
+        send_timeout_secs: 60,
         required: Some(true),
         filter: None,
     });

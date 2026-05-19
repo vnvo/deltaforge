@@ -40,6 +40,7 @@ pub struct S3Sink {
     id: String,
     pipeline: String,
     required: bool,
+    send_timeout: std::time::Duration,
     pool: Mutex<WriterPool>,
     cancel: CancellationToken,
 }
@@ -49,6 +50,7 @@ pub struct S3SinkArgs {
     pub id: String,
     pub pipeline: String,
     pub required: bool,
+    pub send_timeout: std::time::Duration,
     pub store: Arc<dyn object_store::ObjectStore>,
     pub format: Arc<dyn FileFormat>,
     pub schema_resolver: SchemaResolver,
@@ -62,6 +64,7 @@ impl S3Sink {
             id,
             pipeline,
             required,
+            send_timeout,
             store,
             format,
             schema_resolver,
@@ -69,11 +72,17 @@ impl S3Sink {
             cancel,
         } = args;
         let pool = WriterPool::new(store, format, schema_resolver, pool_cfg);
-        info!(sink = %id, pipeline = %pipeline, "s3 sink initialized");
+        info!(
+            sink = %id,
+            pipeline = %pipeline,
+            send_timeout_secs = send_timeout.as_secs(),
+            "s3 sink initialized"
+        );
         Self {
             id,
             pipeline,
             required,
+            send_timeout,
             pool: Mutex::new(pool),
             cancel,
         }
@@ -179,9 +188,27 @@ impl Sink for S3Sink {
         }
 
         let mut pool = self.pool.lock().await;
-        let committed = match pool.append_batch(events).await {
-            Ok(committed) => committed,
-            Err(e) => {
+        // Wrap the entire append in a per-batch timeout. If a writer's
+        // multipart upload (or any pool-internal close) is stuck, this
+        // bounds the worst-case wait the coordinator sees. On timeout we
+        // surface SinkError::Backpressure — the coordinator routes per
+        // `required` (block or log+continue).
+        let append =
+            tokio::time::timeout(self.send_timeout, pool.append_batch(events))
+                .await;
+        let committed = match append {
+            Err(_elapsed) => {
+                self.observe_put_error("timeout");
+                return Err(SinkError::Backpressure {
+                    details: format!(
+                        "S3 send_batch exceeded {}s timeout",
+                        self.send_timeout.as_secs()
+                    )
+                    .into(),
+                });
+            }
+            Ok(Ok(committed)) => committed,
+            Ok(Err(e)) => {
                 // Distinguish encoding errors (Serialization, recoverable
                 // batch-level) from object-store errors (Io, may be transient).
                 let msg = format!("{e:#}");
@@ -312,6 +339,9 @@ pub fn build_s3_sink(
         id: cfg.id.clone(),
         pipeline: pipeline.to_string(),
         required: cfg.required.unwrap_or(true),
+        send_timeout: std::time::Duration::from_secs(
+            cfg.send_timeout_secs.into(),
+        ),
         store,
         format,
         schema_resolver: resolver,
@@ -439,6 +469,7 @@ mod tests {
             id: "test-s3".into(),
             pipeline: "test-pipeline".into(),
             required: true,
+            send_timeout: std::time::Duration::from_secs(30),
             store,
             format,
             schema_resolver,
@@ -547,5 +578,80 @@ mod tests {
         assert_eq!(roll_label(RollReason::Events), "events");
         assert_eq!(roll_label(RollReason::Age), "age");
         assert_eq!(roll_label(RollReason::Idle), "idle");
+    }
+
+    /// Slow FileFormat: every operation sleeps long enough to trip the
+    /// sink's send_timeout. Used to verify the timeout fires.
+    struct SlowFormat;
+
+    #[async_trait::async_trait]
+    impl FileFormat for SlowFormat {
+        fn extension(&self) -> &'static str {
+            "slow"
+        }
+        fn content_type(&self) -> &'static str {
+            "application/octet-stream"
+        }
+        fn label(&self) -> &'static str {
+            "slow"
+        }
+        async fn open_writer(
+            &self,
+            _store: Arc<dyn object_store::ObjectStore>,
+            _path: object_store::path::Path,
+            _schema: Arc<arrow_schema::Schema>,
+        ) -> anyhow::Result<Box<dyn crate::s3::FileWriter + Send>> {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            anyhow::bail!("slow format unreachable");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_batch_times_out_on_slow_sink() -> anyhow::Result<()> {
+        use crate::s3::object_writer::{ObjectStoreParams, build_object_store};
+        use deltaforge_core::encoding::arrow_schema::{
+            Connector, build_envelope_arrow_schema,
+        };
+        use deltaforge_core::encoding::avro_types::TypeConversionOpts;
+
+        let tmp = tempfile::tempdir()?;
+        let params =
+            ObjectStoreParams::local(tmp.path().to_string_lossy().to_string());
+        let store = build_object_store(&params).unwrap();
+        let cols = [col("id", "bigint")];
+        let schema = Arc::new(build_envelope_arrow_schema(
+            Connector::Mysql,
+            &cols,
+            &TypeConversionOpts::default(),
+        ));
+        let format: Arc<dyn FileFormat> = Arc::new(SlowFormat);
+        let schema_resolver: SchemaResolver =
+            Arc::new(move |_| Ok(schema.clone()));
+        let sink = S3Sink::new(S3SinkArgs {
+            id: "slow-s3".into(),
+            pipeline: "test".into(),
+            required: true,
+            // Very short timeout so the test runs fast.
+            send_timeout: std::time::Duration::from_millis(100),
+            store,
+            format,
+            schema_resolver,
+            pool_cfg: WriterPoolConfig::default(),
+            cancel: CancellationToken::new(),
+        });
+        let err = sink
+            .send_batch(&[event_with("orders", json!({"id": 1}))])
+            .await
+            .unwrap_err();
+        match err {
+            SinkError::Backpressure { details } => {
+                assert!(
+                    details.contains("timeout"),
+                    "expected timeout message, got: {details}"
+                );
+            }
+            other => panic!("expected Backpressure, got {other:?}"),
+        }
+        Ok(())
     }
 }

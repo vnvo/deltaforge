@@ -37,6 +37,7 @@ spec:
           max_events: 25000
           max_age_secs: 30
           idle_age_secs: 60
+        send_timeout_secs: 30
         required: true
 
   batch:
