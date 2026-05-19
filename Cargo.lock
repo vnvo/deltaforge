@@ -5361,6 +5361,8 @@ dependencies = [
  "deltaforge-core",
  "flate2",
  "futures",
+ "hex",
+ "hmac 0.12.1",
  "metrics",
  "mysql-binlog-connector-rust",
  "o11y",
@@ -5374,6 +5376,7 @@ dependencies = [
  "schema-sensing",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sinks",
  "sources",
  "storage",
@@ -5383,6 +5386,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 

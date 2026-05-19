@@ -51,6 +51,11 @@ object_store = { version = "0.13", features = ["aws"] }
 parquet = { version = "58", features = ["async", "object_store"] }
 arrow-array = "58"
 flate2 = "1"
+# MiniStack canary test SigV4 helpers
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+url = "2"
 
 [[bench]]
 name = "pipeline_e2e"
