@@ -12,6 +12,8 @@ This page defines DeltaForge's data delivery guarantees, ordering model, transac
 | **Kafka** (default) | At-least-once (idempotent producer) | Retries are deduped by rdkafka; crash-replay produces duplicates | Dedup by event ID or idempotency key |
 | **NATS JetStream** | At-least-once + server-side dedup | `Nats-Msg-Id` header within `duplicate_window` | Configure `duplicate_window` on stream |
 | **Redis Streams** | At-least-once + consumer-side dedup | `idempotency_key` field in XADD payload | Check `idempotency_key` before processing |
+| **HTTP/Webhook** | At-least-once | Retry on 5xx/timeout; no server-side dedup | Consumer must be idempotent (use event `id`) |
+| **S3** (Parquet / JSON Lines) | At-least-once at file granularity, atomic at file boundary | Same file may be re-emitted with a different ULID on retry/replay | Dedup downstream via `MERGE INTO` or `event_id` |
 
 **Terminology rule:** "exactly-once" is used only when DeltaForge guarantees no duplicates without consumer cooperation. All other sinks are "at-least-once" with a stated dedup mechanism. This distinction matters — calling NATS or Redis "exactly-once" would be misleading because dedup depends on server configuration or consumer behavior outside DeltaForge's control.
 
@@ -113,8 +115,43 @@ All sinks deliver concurrently. One sink's failure does **not** block other sink
 
 Each sink is marked `required: true` (default) or `required: false`:
 
-- **Required**: must succeed for the pipeline to consider the batch delivered. If a required sink fails, no checkpoint advances for any sink.
-- **Optional** (best-effort): failures are logged but don't prevent the pipeline from advancing. Optional sinks that fail will catch up on restart via replay from their own checkpoint.
+- **Required**: must succeed for the pipeline to consider the batch delivered. If a required sink fails, no checkpoint advances for any sink. The same batch is retried until success or operator intervention.
+- **Optional** (best-effort): failures are logged but don't prevent the pipeline from advancing. The failed sink's own checkpoint stays at its last-successful position; the source's MIN-checkpoint reader doesn't go back, but **on the next pipeline restart**, the source replays from the failed sink's stuck position and the failed sink catches up.
+
+#### What an optional sink failure means in practice
+
+When an optional sink fails for batch B (events at LSN 100):
+
+1. Required sinks succeed → their checkpoints advance to LSN 100.
+2. The optional sink's checkpoint **stays at its prior position** (LSN 50, say).
+3. The pipeline continues to batch B+1 (events at LSN 101+). The source's in-memory position is now 101, not 50.
+4. The optional sink receives batch B+1 with events at LSN 101+. It may succeed or fail again — irrelevant to LSN 100, which was already "passed over" in this session.
+5. **Until restart**: if the optional sink stays failing, the source's in-memory position keeps marching forward. The failed events between the sink's stuck checkpoint and "now" are **not in any retry queue** for this session.
+6. **On restart**: the source reads `MIN(required_cp, optional_cp) = 50` and replays from 50. The optional sink (back from outage, presumably) catches up. Required sinks see duplicates and dedup or accept (idempotent design).
+
+This is the practical reality of `required: false`:
+
+- ✅ A failed optional sink **does not stall the pipeline**.
+- ✅ A failed optional sink **does not lose data permanently** — restart-replay recovers it.
+- ❌ A failed optional sink **does not catch up in-flight** — events between failure and restart are only delivered on restart.
+- ❌ A long-running pipeline with a chronically failing optional sink **accumulates a growing replay gap** — the longer between failures and restart, the more events the failed sink will re-deliver after restart.
+
+For the S3 sink specifically (where extended outages are realistic — S3 throttling, regional issues), the operational choice is:
+
+| Goal | Configuration |
+|------|---------------|
+| **S3 must not miss any event in-flight, accept source backpressure** | `required: true` (default). Slow/down S3 backpressures the source. |
+| **Kafka must keep flowing during S3 outages, accept replay-on-restart latency for S3 catch-up** | `required: false` on S3, `required: true` on Kafka. Pipeline keeps moving for Kafka; S3 catches up after the next restart. |
+| **Truly independent throughput** | Run two pipelines with the same source DSN — one for Kafka, one for S3. Each has its own coordinator and backpressure. Or use a Kappa-style architecture (Kafka → second pipeline → S3) with Kafka's retention as the natural retry buffer. |
+
+#### Multi-batch retries vs in-batch retries
+
+Two distinct retry layers exist and should not be conflated:
+
+1. **In-batch retries** (within a single `send_batch` call): each sink's internal retry policy (exponential backoff, finite attempts). These are fast (<1s typical) and apply to transient errors like `Queue full` or `Connection timeout`.
+2. **Pipeline-level retries** (across batches): triggered by `required: true` failures. The coordinator does NOT auto-retry the same batch from the source channel — instead, the source-side replay mechanism handles recovery on restart.
+
+`required: false` skips pipeline-level retries for the failing sink. There is no "background queue" that retries the failed batch later in the same session.
 
 ### Commit policy
 
@@ -144,6 +181,17 @@ Some errors are unrecoverable and stop the pipeline immediately:
 - **Permanent auth revocation**: credentials are invalid and retrying won't help.
 
 Fatal errors return `SinkError::Fatal` and are not retried. The pipeline stops and requires operator intervention.
+
+### S3 sink atomicity guarantees
+
+The S3 sink commits at **file granularity**, not event granularity. Specifically:
+
+- **File-level atomicity**: a Parquet or JSONL file is only visible at its final S3 key after the multipart-complete call returns success. Readers never see a partial file. Verified by tests (`abandon_all_produces_no_visible_file`, `drop_pool_without_close_produces_no_visible_file`).
+- **At-least-once per file**: if `send_batch` succeeds and the process crashes before the source checkpoint is committed, the same events will be re-delivered on restart and produce a **new file with a different ULID**. The original file is also retained — there is no automatic deduplication. Downstream consumers must dedup via `MERGE INTO` or `event_id`.
+- **Mid-upload crash**: a process killed during a multipart upload leaves orphan parts on S3 (not a visible file). The bucket lifecycle policy `AbortIncompleteMultipartUpload: DaysAfterInitiation=1` reclaims them within 24h. **This policy is an operational prerequisite** — without it, abandoned uploads accumulate storage cost. See [deployment](deployment.md#s3-sink-prerequisites).
+- **No per-row DLQ in Phase 1**: an encoder failure for one row in a batch fails the entire batch as `SinkError::Serialization`. Phase 2 adds a slow-path per-row retry that isolates bad rows via `BatchResult.dlq_failures`.
+
+For exactly-once at the event level (i.e., dedup without consumer cooperation), the planned Iceberg sink in Phase 2 uses atomic snapshot commits to make file appearance and event commit equivalent operations.
 
 ## Error Classification & Retry
 
@@ -180,6 +228,17 @@ All sinks use exponential backoff with jitter. The classification determines whe
 | Command timeout | Retryable | Backoff, retry |
 | NOAUTH / WRONGPASS | Non-retryable | Fail immediately |
 | Permission denied | Non-retryable | Fail immediately |
+
+**S3:**
+
+| Error | Classification | Behavior |
+|-------|---------------|----------|
+| Network timeout / partition | Retryable (in-batch) | `object_store` retries the part upload with its built-in backoff; if still failing, `send_batch` returns `SinkError::Io` |
+| `503 SlowDown` (throttling) | Retryable (in-batch) | `object_store` honors `Retry-After`; `send_batch` waits |
+| `403 AccessDenied` / SigV4 mismatch | Non-retryable | `SinkError::Io` immediately; check credentials and region |
+| `NoSuchBucket` | Non-retryable | `SinkError::Io`; create the bucket or fix the config |
+| Encoder failure (e.g. value doesn't fit Decimal128 precision) | Non-retryable | `SinkError::Serialization`; Phase 1 fails the whole batch (per-row DLQ is Phase 2) |
+| Mid-multipart abandon (process killed) | N/A | File never becomes visible at the destination key. Orphan parts cleaned by the bucket's lifecycle policy (operational prerequisite — see [deployment](deployment.md#s3-sink-prerequisites)) |
 
 ### After retry exhaustion
 
@@ -299,5 +358,8 @@ These are **not guaranteed** and are documented honestly:
 - **No cross-table global ordering** — events from different tables may be interleaved. This is by design; enforcing global order would require single-threaded delivery and cap throughput. Use `respect_source_tx: true` to preserve ordering within database transactions.
 - **No stateful stream processing** — DeltaForge does not support joins, aggregations, or windowing. For stateful processing, consume DeltaForge's output with Apache Flink, ksqlDB, or Kafka Streams.
 - **Dead letter queue** — when `journal.enabled: true`, poison events (serialization/routing failures) are routed to a DLQ instead of blocking the pipeline. Without DLQ enabled, a single bad event will still block. See the [DLQ page](dlq.md).
-- **No schema registry integration (yet)** — schema sensing detects structural drift and can halt on breaking changes, but there is no Confluent Schema Registry or Avro/Protobuf encoding support. Planned for a future release.
+- **No in-session retry for optional sinks** — when `required: false` and a sink fails, the failed batch is **not retried in the same session**. The failed sink's checkpoint stays at its prior position; events are re-delivered only on pipeline restart via source replay. For sinks with realistic outage windows (e.g., S3 throttling, cross-region issues), the operator must weigh source backpressure (`required: true`) against replay-on-restart latency (`required: false`). See [Required vs. optional sinks](#required-vs-optional-sinks).
+- **S3 sink — per-row DLQ not implemented in Phase 1** — an encoder failure for any row in a batch fails the entire batch as `SinkError::Serialization`. Per-row DLQ via slow-path retry is a Phase 2 refinement. See [S3 sink atomicity guarantees](#s3-sink-atomicity-guarantees).
+- **S3 sink — at-least-once at file granularity** — same events may appear in two files with different ULIDs across a crash boundary. Consumers must dedup downstream via `MERGE INTO` or `event_id`. Exactly-once at the event level is planned via the Phase 2 Iceberg sink.
+- **S3 sink — lifecycle policy required for production** — DeltaForge does not track multipart upload IDs externally. Abandoned multiparts are reclaimed by the bucket's `AbortIncompleteMultipartUpload` lifecycle rule. Without this rule, S3 storage cost accumulates on every aborted batch.
 - **Snapshot consistency** — initial snapshots use lock-free parallel reads. The snapshot is eventually consistent with the CDC stream; there may be a brief overlap period where both snapshot rows and CDC events for the same row are delivered. Consumers should use the event timestamp or idempotency key to resolve.
