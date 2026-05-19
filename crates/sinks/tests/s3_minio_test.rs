@@ -229,6 +229,117 @@ async fn phase1b_writes_jsonl_plain_to_minio() -> Result<()> {
 
 #[tokio::test]
 #[ignore]
+async fn phase1e_abandoned_writer_produces_no_visible_object() -> Result<()> {
+    use deltaforge_core::encoding::arrow_schema::{
+        Connector, build_envelope_arrow_schema,
+    };
+    use deltaforge_core::encoding::avro_types::{
+        ColumnDesc, TypeConversionOpts,
+    };
+    use deltaforge_core::{Event, Op, SourceInfo, SourcePosition};
+    use serde_json::json;
+    use sinks::s3::{
+        ParquetFormat, RollingConfig, WriterPool, WriterPoolConfig,
+    };
+    use std::sync::Arc;
+
+    let infra = minio().await;
+    let store = build_object_store(&params_for(&infra.endpoint))?;
+
+    let cols = vec![ColumnDesc {
+        name: "id".into(),
+        data_type: "bigint".into(),
+        column_type: "bigint".into(),
+        nullable: true,
+        precision: None,
+        scale: None,
+        unsigned: false,
+        is_array: false,
+        element_type: None,
+    }];
+    let schema = Arc::new(build_envelope_arrow_schema(
+        Connector::Mysql,
+        &cols,
+        &TypeConversionOpts::default(),
+    ));
+
+    let format: Arc<dyn sinks::s3::FileFormat> =
+        Arc::new(ParquetFormat::default());
+    // High thresholds so the writer doesn't roll on its own.
+    let mut pool = WriterPool::new(
+        store.clone(),
+        format,
+        schema,
+        WriterPoolConfig {
+            prefix: "phase1e".into(),
+            rolling: RollingConfig::default(),
+        },
+    );
+
+    let ts_ms = chrono::NaiveDate::from_ymd_opt(2026, 6, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+    let events: Vec<Event> = (0..50_000)
+        .map(|i| Event {
+            before: None,
+            after: Some(json!({"id": i as i64})),
+            source: SourceInfo {
+                version: "1".into(),
+                connector: "mysql".into(),
+                name: "t".into(),
+                ts_ms,
+                db: "shop".into(),
+                schema: None,
+                table: "orders".into(),
+                snapshot: None,
+                position: SourcePosition::default(),
+            },
+            op: Op::Create,
+            ts_ms,
+            transaction: None,
+            event_id: None,
+            tenant_id: None,
+            schema_version: None,
+            schema_sequence: None,
+            ddl: None,
+            trace_id: None,
+            tags: None,
+            synthetic: None,
+            routing: None,
+            tx_end: false,
+            checkpoint: None,
+            size_bytes: 0,
+            received_at_ms: ts_ms,
+        })
+        .collect();
+
+    pool.append_batch(&events).await?;
+    assert_eq!(pool.open_writer_count(), 1);
+
+    // Force-abandon — never call close.
+    let abandoned = pool.abandon_all();
+    assert_eq!(abandoned, 1);
+
+    // No completed file under the prefix should be visible.
+    let prefix = Path::from("phase1e");
+    let listed: Vec<_> =
+        futures::TryStreamExt::try_collect::<Vec<_>>(store.list(Some(&prefix)))
+            .await?;
+    assert!(
+        listed.is_empty(),
+        "abandoned writer leaked a visible object: {} entries",
+        listed.len()
+    );
+    // The orphan multipart still exists on MinIO until lifecycle expires
+    // it — that's the operational requirement, not a test failure.
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
 async fn phase1b_parquet_via_format_trait() -> Result<()> {
     let infra = minio().await;
     let store = build_object_store(&params_for(&infra.endpoint))?;

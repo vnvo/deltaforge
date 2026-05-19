@@ -130,7 +130,7 @@ impl WriterPool {
     }
 
     /// Close all open writers and return the committed files. Call this on
-    /// pipeline shutdown to flush in-flight partitions.
+    /// **graceful** pipeline shutdown to flush in-flight partitions.
     pub async fn close_all(&mut self) -> Vec<CommittedFile> {
         let keys: Vec<_> = self.writers.keys().cloned().collect();
         let pairs: Vec<_> = keys
@@ -138,6 +138,27 @@ impl WriterPool {
             .map(|k| (k, RollReason::Age /* shutdown */))
             .collect();
         self.close_many(pairs).await
+    }
+
+    /// Abandon all open writers without finalizing their files.
+    ///
+    /// Use this on **forced** shutdown (cancellation token fired, panic
+    /// during batch, source replay needed) when you do not want partial
+    /// data to land. Returns the number of writers that were abandoned.
+    ///
+    /// **Atomicity guarantee:** abandoned writers never produce a visible
+    /// file at the object store. For S3-compatible backends, dropping a
+    /// `BufWriter` mid-multipart leaves orphan parts that the bucket's
+    /// lifecycle policy is expected to expire (see
+    /// `docs/specs/s3-parquet-sink.md` for the recommended policy).
+    pub fn abandon_all(&mut self) -> usize {
+        let n = self.writers.len();
+        // Just drop everything. `Box<dyn FileWriter>::drop` cascades to the
+        // underlying AsyncArrowWriter and BufWriter; neither calls
+        // shutdown/abort on drop, so the multipart is left abandoned. No
+        // partial file appears at the target path.
+        self.writers.clear();
+        n
     }
 
     /// Number of currently open writers (one per active partition).
@@ -465,6 +486,80 @@ mod tests {
         let committed = pool.close_all().await;
         assert_eq!(committed.len(), 2);
         assert_eq!(pool.open_writer_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn abandon_all_produces_no_visible_file() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut pool = make_pool(
+            tmp.path(),
+            &[col("id", "bigint")],
+            WriterPoolConfig::default(),
+        )
+        .await;
+        let events: Vec<_> = (0..1000)
+            .map(|i| make_event("orders", 10, i as i64))
+            .collect();
+        pool.append_batch(&events).await?;
+        assert_eq!(pool.open_writer_count(), 1);
+
+        // Force-abandon — no close call.
+        let abandoned = pool.abandon_all();
+        assert_eq!(abandoned, 1);
+        assert_eq!(pool.open_writer_count(), 0);
+
+        // No file should be visible at any path under the prefix.
+        let params =
+            ObjectStoreParams::local(tmp.path().to_string_lossy().to_string());
+        let store = build_object_store(&params)?;
+        let mut listed: Vec<_> =
+            futures::TryStreamExt::try_collect::<Vec<_>>(store.list(None))
+                .await?;
+        listed.sort_by(|a, b| a.location.cmp(&b.location));
+        assert!(
+            listed.is_empty(),
+            "abandoned writer must not produce a visible file; got {} files",
+            listed.len()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drop_pool_without_close_produces_no_visible_file() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        {
+            let mut pool = make_pool(
+                tmp.path(),
+                &[col("id", "bigint")],
+                WriterPoolConfig::default(),
+            )
+            .await;
+            let events: Vec<_> = (0..1000)
+                .map(|i| make_event("orders", 10, i as i64))
+                .collect();
+            pool.append_batch(&events).await?;
+            assert_eq!(pool.open_writer_count(), 1);
+            // Pool drops here without close_all / abandon_all.
+        }
+
+        let params =
+            ObjectStoreParams::local(tmp.path().to_string_lossy().to_string());
+        let store = build_object_store(&params)?;
+        let listed: Vec<_> =
+            futures::TryStreamExt::try_collect::<Vec<_>>(store.list(None))
+                .await?;
+        // Local FS may leave a zero-byte file as multipart upload stub.
+        // Either there is no file at all or any file is empty. The
+        // atomicity guarantee is that no readable Parquet content lands.
+        for entry in &listed {
+            assert!(
+                entry.size == 0,
+                "dropped writer produced a non-empty file: {} ({} bytes)",
+                entry.location,
+                entry.size
+            );
+        }
         Ok(())
     }
 
