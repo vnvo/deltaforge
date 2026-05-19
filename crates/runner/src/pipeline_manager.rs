@@ -116,13 +116,16 @@ fn build_avro_provider(
         EnumMode, NaiveTimestampMode, UnsignedBigintMode,
     };
 
-    // Find the first Avro-encoded sink and extract type conversion options
+    // Find the first Avro-encoded sink and extract type conversion options.
+    // S3 sinks don't use EncodingCfg (they have their own format/compression)
+    // so they are skipped here.
     let avro_cfg = spec.spec.sinks.iter().find_map(|s| {
         let encoding = match s {
             SinkCfg::Kafka(c) => &c.encoding,
             SinkCfg::Redis(c) => &c.encoding,
             SinkCfg::Nats(c) => &c.encoding,
             SinkCfg::Http(c) => &c.encoding,
+            SinkCfg::S3(_) => return None,
         };
         match encoding {
             EncodingCfg::Avro {

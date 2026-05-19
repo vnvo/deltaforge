@@ -1,0 +1,47 @@
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: chaos-pg-s3-jsonl
+  tenant: chaos
+
+spec:
+  source:
+    type: postgres
+    config:
+      id: chaos-pg-s3
+      dsn: "postgres://cdc_user:cdc_password@toxiproxy:5101/orders"
+      publication: chaos_pub
+      slot: chaos_slot
+      tables:
+        - "public.*"
+
+  processors: []
+
+  sinks:
+    # JSON Lines (gzipped) to MinIO — universal compat, easy to inspect.
+    # Files appear at: deltaforge-test/audit/table={t}/year={y}/.../<ulid>.jsonl.gz
+    - type: s3
+      config:
+        id: chaos-s3-jsonl
+        bucket: deltaforge-test
+        prefix: audit
+        endpoint: "http://minio:9000"
+        region: us-east-1
+        access_key_id: minioadmin
+        secret_access_key: minioadmin
+        format: jsonl
+        compression: gzip
+        file_roll:
+          max_bytes: 8388608         # 8 MiB
+          max_events: 25000
+          max_age_secs: 30
+          idle_age_secs: 60
+        required: true
+
+  batch:
+    max_events: 500
+    max_ms: 100
+    respect_source_tx: true
+
+  commit_policy:
+    mode: required

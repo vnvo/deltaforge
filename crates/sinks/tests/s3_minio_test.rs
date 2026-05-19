@@ -266,7 +266,7 @@ async fn phase1e_abandoned_writer_produces_no_visible_object() -> Result<()> {
     let format: Arc<dyn sinks::s3::FileFormat> =
         Arc::new(ParquetFormat::default());
     // High thresholds so the writer doesn't roll on its own.
-    let mut pool = WriterPool::new(
+    let mut pool = WriterPool::with_fixed_schema(
         store.clone(),
         format,
         schema,

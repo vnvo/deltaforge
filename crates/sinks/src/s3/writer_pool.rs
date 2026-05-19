@@ -52,12 +52,18 @@ pub struct WriterPoolConfig {
     pub rolling: RollingConfig,
 }
 
+/// Resolves the Arrow schema for a given partition. Called once per new
+/// partition writer. Implementations typically derive the schema from
+/// source DDL via `deltaforge_core::encoding::arrow_schema`.
+pub type SchemaResolver =
+    Arc<dyn Fn(&PartitionKey) -> Result<Arc<Schema>> + Send + Sync>;
+
 /// Multi-partition writer pool. Single-owner: not `Sync`. Wrap in a `Mutex`
 /// or own from a single task if shared.
 pub struct WriterPool {
     store: Arc<dyn ObjectStore>,
     format: Arc<dyn FileFormat>,
-    schema: Arc<Schema>,
+    schema_resolver: SchemaResolver,
     cfg: WriterPoolConfig,
     writers: HashMap<PartitionKey, ActiveWriter>,
 }
@@ -66,16 +72,27 @@ impl WriterPool {
     pub fn new(
         store: Arc<dyn ObjectStore>,
         format: Arc<dyn FileFormat>,
-        schema: Arc<Schema>,
+        schema_resolver: SchemaResolver,
         cfg: WriterPoolConfig,
     ) -> Self {
         Self {
             store,
             format,
-            schema,
+            schema_resolver,
             cfg,
             writers: HashMap::new(),
         }
+    }
+
+    /// Convenience: build a pool with a single fixed schema for all partitions.
+    /// Useful for tests and single-table use cases.
+    pub fn with_fixed_schema(
+        store: Arc<dyn ObjectStore>,
+        format: Arc<dyn FileFormat>,
+        schema: Arc<Schema>,
+        cfg: WriterPoolConfig,
+    ) -> Self {
+        Self::new(store, format, Arc::new(move |_| Ok(schema.clone())), cfg)
     }
 
     /// Append a batch of events.
@@ -205,8 +222,11 @@ impl WriterPool {
         );
         let path = Path::from(path_str);
 
+        let schema = (self.schema_resolver)(key).with_context(|| {
+            format!("resolve schema for partition {}", key.hive_path())
+        })?;
+
         let store = self.store.clone();
-        let schema = self.schema.clone();
         let format = self.format.clone();
         let hive_path = key.hive_path();
         let writer = format
@@ -390,7 +410,7 @@ mod tests {
         let format: Arc<dyn FileFormat> =
             Arc::new(ParquetFormat::new(Compression::Snappy));
         let schema = build_schema(cols);
-        WriterPool::new(store, format, schema, cfg)
+        WriterPool::with_fixed_schema(store, format, schema, cfg)
     }
 
     #[tokio::test]

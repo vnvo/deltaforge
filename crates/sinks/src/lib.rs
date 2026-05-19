@@ -50,6 +50,7 @@ pub use http::HttpSink;
 pub use kafka::KafkaSink;
 pub use nats::NatsSink;
 pub use redis::RedisSink;
+pub use s3::{S3Sink, build_s3_sink};
 
 /// Build all sinks from a pipeline specification.
 ///
@@ -150,6 +151,18 @@ pub fn build_sinks_with_schemas(
                     )?) as ArcDynSink,
                     cfg.filter.clone(),
                 ),
+                SinkCfg::S3(cfg) => (
+                    Arc::new(build_s3_sink(
+                        cfg,
+                        cancel.clone(),
+                        pipeline,
+                        // Phase 1g.1: no Arrow schema resolver yet — fallback
+                        // to envelope-only schema with a warning. Phase 1g.2
+                        // wires a DDL-derived resolver from the runner.
+                        None,
+                    )?) as ArcDynSink,
+                    cfg.filter.clone(),
+                ),
             };
             // Only wrap when filter has actual conditions — zero overhead otherwise
             let sink = match filter {
@@ -191,6 +204,10 @@ pub fn build_sink(
         }
         SinkCfg::Http(http_cfg) => {
             Arc::new(HttpSink::new(http_cfg, cancel, pipeline, None)?)
+                as ArcDynSink
+        }
+        SinkCfg::S3(s3_cfg) => {
+            Arc::new(build_s3_sink(s3_cfg, cancel, pipeline, None)?)
                 as ArcDynSink
         }
     };

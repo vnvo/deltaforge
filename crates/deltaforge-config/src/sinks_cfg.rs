@@ -251,6 +251,7 @@ pub enum SinkCfg {
     Redis(RedisSinkCfg),
     Nats(NatsSinkCfg),
     Http(HttpSinkCfg),
+    S3(S3SinkCfg),
 }
 
 impl SinkCfg {
@@ -261,6 +262,7 @@ impl SinkCfg {
             Self::Redis(c) => &c.id,
             Self::Nats(c) => &c.id,
             Self::Http(c) => &c.id,
+            Self::S3(c) => &c.id,
         }
     }
 }
@@ -582,6 +584,170 @@ fn default_http_method() -> String {
 }
 
 // ============================================================================
+// S3 / Parquet / JSON Lines file sink
+// ============================================================================
+
+/// S3 + Parquet (or JSON Lines) sink configuration.
+///
+/// Writes CDC events to S3-compatible object storage (S3, MinIO, GCS, Azure,
+/// local FS) as Parquet or JSON Lines files. Files are partitioned by table +
+/// UTC date in Hive style and roll on configurable size / event-count / age
+/// thresholds.
+///
+/// # Example
+///
+/// ```yaml
+/// sinks:
+///   - type: s3
+///     config:
+///       id: orders-lake
+///       bucket: my-data-lake
+///       prefix: "deltaforge/orders"
+///       region: us-east-1
+///       endpoint: null              # null for AWS S3; set for MinIO/etc
+///       access_key_id: "${S3_ACCESS_KEY}"
+///       secret_access_key: "${S3_SECRET_KEY}"
+///       format: parquet              # parquet | jsonl
+///       compression: snappy          # snappy | gzip | zstd | none
+///       file_roll:
+///         max_bytes: 268435456       # 256 MiB
+///         max_events: 1000000        # 1M
+///         max_age_secs: 300          # 5 min
+///         idle_age_secs: 600         # 10 min
+///       required: true
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct S3SinkCfg {
+    /// Unique identifier for this sink instance.
+    pub id: String,
+
+    /// Target bucket name (S3) or root directory (for `local: true`).
+    pub bucket: String,
+
+    /// Prefix prepended to the Hive partition path. Trailing slashes are stripped.
+    /// Final layout: `{prefix}/table={t}/year={y}/month={m:02}/day={d:02}/<ulid>.{ext}`
+    #[serde(default)]
+    pub prefix: String,
+
+    /// AWS region. Required for AWS S3, ignored by MinIO/local.
+    #[serde(default)]
+    pub region: Option<String>,
+
+    /// Override endpoint for non-AWS S3 services (MinIO, Ceph, R2, etc.).
+    /// Leave `None` for AWS S3.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+
+    /// Inline access key (supports `${ENV_VAR}` expansion). Prefer IAM
+    /// instance roles in production.
+    #[serde(default)]
+    pub access_key_id: Option<String>,
+
+    /// Inline secret key (supports `${ENV_VAR}` expansion).
+    #[serde(default)]
+    pub secret_access_key: Option<String>,
+
+    /// Use virtual-hosted-style addressing. Defaults to `false` (path-style),
+    /// which works for MinIO. Set `true` for AWS S3 with custom domains.
+    #[serde(default)]
+    pub virtual_hosted_style: bool,
+
+    /// Use local filesystem (`object_store::local::LocalFileSystem`) rooted
+    /// at `bucket`. For tests and single-node deployments.
+    #[serde(default)]
+    pub local: bool,
+
+    /// Output file format.
+    #[serde(default)]
+    pub format: S3FileFormat,
+
+    /// Compression. Per-format: Parquet supports `snappy` (default), `gzip`,
+    /// `zstd`, `none`. JSON Lines supports `gzip` (default) and `none`.
+    #[serde(default)]
+    pub compression: S3Compression,
+
+    /// File rolling thresholds. A writer is rolled when any threshold fires.
+    #[serde(default)]
+    pub file_roll: S3FileRoll,
+
+    /// Whether this sink must succeed for the checkpoint to advance.
+    #[serde(default)]
+    pub required: Option<bool>,
+
+    /// Optional filter applied before delivery. Events not matching the filter
+    /// are silently ignored by this sink.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<SinkFilter>,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum S3FileFormat {
+    #[default]
+    Parquet,
+    Jsonl,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum S3Compression {
+    None,
+    #[default]
+    Snappy,
+    Gzip,
+    Zstd,
+}
+
+/// File rolling thresholds. Writer rolls when any threshold is reached.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct S3FileRoll {
+    /// Maximum buffered bytes (Parquet estimate / JSONL exact) before rolling.
+    #[serde(default = "default_s3_max_bytes")]
+    pub max_bytes: u64,
+
+    /// Maximum events written to a single file before rolling.
+    #[serde(default = "default_s3_max_events")]
+    pub max_events: u64,
+
+    /// Maximum age (seconds) of a writer measured from its first event.
+    #[serde(default = "default_s3_max_age_secs")]
+    pub max_age_secs: u64,
+
+    /// Idle age (seconds): if no new events arrive within this window, the
+    /// writer is rolled. Lets low-volume partitions land data eventually.
+    #[serde(default = "default_s3_idle_age_secs")]
+    pub idle_age_secs: u64,
+}
+
+impl Default for S3FileRoll {
+    fn default() -> Self {
+        Self {
+            max_bytes: default_s3_max_bytes(),
+            max_events: default_s3_max_events(),
+            max_age_secs: default_s3_max_age_secs(),
+            idle_age_secs: default_s3_idle_age_secs(),
+        }
+    }
+}
+
+fn default_s3_max_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+fn default_s3_max_events() -> u64 {
+    1_000_000
+}
+fn default_s3_max_age_secs() -> u64 {
+    300
+}
+fn default_s3_idle_age_secs() -> u64 {
+    600
+}
+
+// ============================================================================
 // Conversion helpers (config → core types)
 // ============================================================================
 
@@ -828,5 +994,99 @@ mod tests {
         "#;
         let cfg: KafkaSinkCfg = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.encoding, EncodingCfg::Json);
+    }
+
+    #[test]
+    fn parse_s3_sink_parquet_default() {
+        let yaml = r#"
+            id: test-s3
+            bucket: my-data-lake
+            prefix: deltaforge/orders
+            region: us-east-1
+            access_key_id: ${S3_KEY}
+            secret_access_key: ${S3_SECRET}
+            format: parquet
+            compression: snappy
+            file_roll:
+              max_bytes: 268435456
+              max_events: 1000000
+              max_age_secs: 300
+              idle_age_secs: 600
+            required: true
+        "#;
+        let cfg: S3SinkCfg = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.id, "test-s3");
+        assert_eq!(cfg.bucket, "my-data-lake");
+        assert_eq!(cfg.prefix, "deltaforge/orders");
+        assert_eq!(cfg.region.as_deref(), Some("us-east-1"));
+        assert_eq!(cfg.format, S3FileFormat::Parquet);
+        assert_eq!(cfg.compression, S3Compression::Snappy);
+        assert_eq!(cfg.file_roll.max_bytes, 268_435_456);
+        assert_eq!(cfg.file_roll.max_events, 1_000_000);
+        assert_eq!(cfg.required, Some(true));
+    }
+
+    #[test]
+    fn parse_s3_sink_jsonl_gzip_minio() {
+        let yaml = r#"
+            id: chaos-s3-jsonl
+            bucket: deltaforge-test
+            prefix: audit
+            endpoint: "http://minio:9000"
+            region: us-east-1
+            access_key_id: minioadmin
+            secret_access_key: minioadmin
+            format: jsonl
+            compression: gzip
+        "#;
+        let cfg: S3SinkCfg = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.endpoint.as_deref(), Some("http://minio:9000"));
+        assert_eq!(cfg.format, S3FileFormat::Jsonl);
+        assert_eq!(cfg.compression, S3Compression::Gzip);
+        // Defaults applied where unset.
+        assert_eq!(cfg.file_roll.max_bytes, 256 * 1024 * 1024);
+        assert!(!cfg.local);
+        assert!(!cfg.virtual_hosted_style);
+    }
+
+    #[test]
+    fn parse_s3_sink_local_filesystem() {
+        let yaml = r#"
+            id: local-sink
+            bucket: /tmp/deltaforge-out
+            local: true
+        "#;
+        let cfg: S3SinkCfg = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.local);
+        assert_eq!(cfg.bucket, "/tmp/deltaforge-out");
+        // Format defaults to parquet
+        assert_eq!(cfg.format, S3FileFormat::Parquet);
+    }
+
+    #[test]
+    fn parse_full_pipeline_with_s3_sink() {
+        let yaml = r#"
+            sinks:
+              - type: s3
+                config:
+                  id: orders-lake
+                  bucket: my-lake
+                  prefix: cdc/orders
+                  format: parquet
+                  compression: snappy
+        "#;
+        #[derive(serde::Deserialize)]
+        struct Holder {
+            sinks: Vec<SinkCfg>,
+        }
+        let h: Holder = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(h.sinks.len(), 1);
+        match &h.sinks[0] {
+            SinkCfg::S3(c) => {
+                assert_eq!(c.id, "orders-lake");
+                assert_eq!(c.format, S3FileFormat::Parquet);
+            }
+            other => panic!("expected S3, got {other:?}"),
+        }
     }
 }

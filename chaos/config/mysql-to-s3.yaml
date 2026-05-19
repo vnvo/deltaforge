@@ -1,0 +1,49 @@
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: chaos-mysql-s3
+  tenant: chaos
+
+spec:
+  source:
+    type: mysql
+    config:
+      id: chaos-mysql-s3
+      dsn: "mysql://cdc_user:cdc_password@toxiproxy:5100/orders"
+      tables:
+        - "orders.*"
+      on_schema_drift: adapt
+
+  processors: []
+
+  sinks:
+    # Parquet to MinIO (S3-compatible) — partitioned by table + UTC date.
+    # Files appear at: deltaforge-test/lake/table={t}/year={y}/month={m}/day={d}/<ulid>.parquet
+    - type: s3
+      config:
+        id: chaos-s3-parquet
+        bucket: deltaforge-test
+        prefix: lake
+        # MinIO endpoint inside docker compose chaos net. For AWS S3 leave
+        # `endpoint: null` and set `region:` accordingly.
+        endpoint: "http://minio:9000"
+        region: us-east-1
+        access_key_id: minioadmin
+        secret_access_key: minioadmin
+        virtual_hosted_style: false
+        format: parquet
+        compression: snappy
+        file_roll:
+          max_bytes: 16777216        # 16 MiB roll for chaos test (smaller files, more rolls)
+          max_events: 50000          # 50K events
+          max_age_secs: 30           # 30s wall-clock age
+          idle_age_secs: 60          # 60s idle window
+        required: true
+
+  batch:
+    max_events: 500
+    max_ms: 100
+    respect_source_tx: true
+
+  commit_policy:
+    mode: required

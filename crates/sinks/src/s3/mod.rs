@@ -25,5 +25,6 @@ pub use object_writer::{ObjectStoreParams, build_object_store};
 pub use parquet_writer::{ParquetFormat, ParquetSinkWriter, SimpleRow};
 pub use rolling::{RollReason, RollingConfig};
 pub use router::{PartitionKey, partition_for};
-pub use sink::{S3Sink, S3SinkArgs};
+pub use sink::{S3Sink, S3SinkArgs, build_s3_sink};
+pub use writer_pool::SchemaResolver;
 pub use writer_pool::{CommittedFile, WriterPool, WriterPoolConfig};

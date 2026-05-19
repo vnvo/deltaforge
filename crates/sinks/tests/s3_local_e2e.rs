@@ -117,7 +117,8 @@ async fn e2e_writes_partitioned_parquet_to_local_fs() -> Result<()> {
             ..Default::default()
         },
     };
-    let mut pool = WriterPool::new(store.clone(), format, schema, cfg);
+    let mut pool =
+        WriterPool::with_fixed_schema(store.clone(), format, schema, cfg);
 
     // 30 events across 3 partitions (3 tables on same day) → 3 files of 10 each.
     let mut events = Vec::new();
@@ -159,7 +160,8 @@ async fn e2e_close_all_flushes_in_progress_writers() -> Result<()> {
         prefix: String::new(),
         rolling: RollingConfig::default(), // very lenient
     };
-    let mut pool = WriterPool::new(store.clone(), format, schema, cfg);
+    let mut pool =
+        WriterPool::with_fixed_schema(store.clone(), format, schema, cfg);
 
     let events: Vec<_> = (0..50)
         .map(|i| event_on(20, "orders", i, &format!("u{i}@x")))
@@ -192,7 +194,7 @@ async fn e2e_separate_days_produce_separate_files() -> Result<()> {
         &TypeConversionOpts::default(),
     ));
     let format: Arc<dyn FileFormat> = Arc::new(ParquetFormat::default());
-    let mut pool = WriterPool::new(
+    let mut pool = WriterPool::with_fixed_schema(
         store.clone(),
         format,
         schema,
