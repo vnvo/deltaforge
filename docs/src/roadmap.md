@@ -19,7 +19,7 @@
 ## Planned
 
 - **Iceberg / Delta Lake table formats** — exactly-once at event level via atomic snapshot commits; schema evolution and time travel on top of the Phase 1 S3 sink
-- **Streaming JSONL writer + List/Map columns** — Phase 2 S3 sink refinements
+- **List/Map columns in Parquet** — Phase 2 S3 sink refinement (Phase 1 falls back to JSON-string for these)
 - **Coordinator-level per-sink deadline** — bound how long the coordinator awaits any one sink, even if its internal timeout misfires
 - **MongoDB source** — change streams CDC
 - **Event replay** — replay DLQ entries or historical events

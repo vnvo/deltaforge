@@ -29,6 +29,7 @@ arrow-array = "58"
 arrow-schema = "58"
 ulid = "1"
 flate2 = "1"
+async-compression = { version = "0.4", features = ["tokio", "gzip", "zstd"] }
 bytes.workspace = true
 chrono.workspace = true
 base64.workspace = true
