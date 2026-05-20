@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use deltaforge_config::{BatchConfig, CommitPolicy, SchemaSensingConfig};
 use deltaforge_core::{
-    ArcDynProcessor, ArcDynSink, BatchContext, CheckpointMeta, Event,
+    ArcDynProcessor, ArcDynSink, BatchContext, CheckpointMeta, Event, SinkError,
 };
 use schema_sensing::{ObserveResult, SchemaSensor};
 
@@ -365,6 +365,9 @@ pub struct Coordinator<Tok> {
     sinks: Vec<ArcDynSink>,
     batch_cfg_eff: BatchConfig,
     commit_policy: Option<CommitPolicy>,
+    /// Coordinator-level deadline for any single sink's `send_batch`.
+    /// `None` disables the outer bound. See `Spec::sink_batch_deadline_secs`.
+    sink_batch_deadline: Option<std::time::Duration>,
     /// Per-sink checkpoint commit functions, keyed by sink ID.
     /// Each sink that successfully delivers a batch gets its own checkpoint
     /// committed independently.
@@ -385,6 +388,7 @@ pub struct CoordinatorBuilder<Tok> {
     sinks: Vec<ArcDynSink>,
     batch_config: Option<BatchConfig>,
     commit_policy: Option<CommitPolicy>,
+    sink_batch_deadline: Option<std::time::Duration>,
     commit_fns: HashMap<String, CommitCpFn<Tok>>,
     process_fn: Option<ProcessBatchFn<Tok>>,
     schema_sensor: Option<Arc<SchemaSensorState>>,
@@ -399,6 +403,7 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             sinks: Vec::new(),
             batch_config: None,
             commit_policy: None,
+            sink_batch_deadline: None,
             commit_fns: HashMap::new(),
             process_fn: None,
             schema_sensor: None,
@@ -419,6 +424,17 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
 
     pub fn commit_policy(mut self, policy: Option<CommitPolicy>) -> Self {
         self.commit_policy = policy;
+        self
+    }
+
+    /// Set the coordinator-level deadline for any single sink's `send_batch`.
+    /// `None` disables the outer bound. Pass the `sink_batch_deadline_secs`
+    /// from the pipeline spec converted to a `Duration`.
+    pub fn sink_batch_deadline(
+        mut self,
+        d: Option<std::time::Duration>,
+    ) -> Self {
+        self.sink_batch_deadline = d;
         self
     }
 
@@ -464,6 +480,7 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             sinks: self.sinks,
             batch_cfg_eff,
             commit_policy: self.commit_policy,
+            sink_batch_deadline: self.sink_batch_deadline,
             commit_cp_per_sink: self.commit_fns,
             process_batch: self.process_fn.expect("process_fn is required"),
             schema_sensor: self.schema_sensor,
@@ -884,14 +901,51 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         );
 
         // Build one future per sink, tagged with its id and required flag.
+        // Each future is optionally wrapped in `tokio::time::timeout` using
+        // the coordinator-level `sink_batch_deadline` (see
+        // `Spec::sink_batch_deadline_secs`). A timeout becomes
+        // `SinkError::Backpressure` for that sink, routed per `required`.
+        let deadline = self.sink_batch_deadline;
+        let pipeline_name_str: String = self.pipeline_name.to_string();
         let sink_futs = self.sinks.iter().map(|sink| {
             let start = Instant::now();
             let events = Arc::clone(&frozen.events);
             let required = is_sink_required(sink);
             let sink_id = sink.id().to_string();
+            let pipeline = pipeline_name_str.clone();
 
             async move {
-                let result = sink.send_batch(&events).await;
+                let result = match deadline {
+                    Some(d) => {
+                        match tokio::time::timeout(d, sink.send_batch(&events))
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(_elapsed) => {
+                                counter!(
+                                    "deltaforge_coordinator_sink_timeout_total",
+                                    "pipeline" => pipeline.clone(),
+                                    "sink" => sink_id.clone(),
+                                )
+                                .increment(1);
+                                tracing::warn!(
+                                    pipeline = %pipeline,
+                                    sink = %sink_id,
+                                    deadline_secs = d.as_secs(),
+                                    "sink exceeded coordinator deadline"
+                                );
+                                Err(SinkError::Backpressure {
+                                    details: format!(
+                                        "sink exceeded coordinator deadline of {}s",
+                                        d.as_secs()
+                                    )
+                                    .into(),
+                                })
+                            }
+                        }
+                    }
+                    None => sink.send_batch(&events).await,
+                };
                 (sink_id, required, start.elapsed(), result)
             }
         });
@@ -1823,5 +1877,225 @@ mod tests {
         // Checkpoint committed.
         let cp = ckpt_store.get_raw("src::sink::kafka").await.unwrap();
         assert!(cp.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Coordinator-level sink_batch_deadline (Phase 2d)
+    // -----------------------------------------------------------------------
+
+    /// A sink that sleeps for `delay` inside `send_batch`. Used to drive the
+    /// coordinator's outer deadline.
+    struct SlowSink {
+        id: String,
+        required: bool,
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl deltaforge_core::Sink for SlowSink {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn required(&self) -> bool {
+            self.required
+        }
+        async fn send(&self, e: &Event) -> SinkResult<()> {
+            self.send_batch(std::slice::from_ref(e)).await.map(|_| ())
+        }
+        async fn send_batch(
+            &self,
+            _events: &[Event],
+        ) -> SinkResult<deltaforge_core::BatchResult> {
+            tokio::time::sleep(self.delay).await;
+            Ok(deltaforge_core::BatchResult::ok())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn slow_sink_trips_coordinator_deadline_required() {
+        // required: true → the coordinator's commit policy fails, but the
+        // pipeline doesn't lose data (source replays on restart). We assert
+        // the timeout categorization (SinkError::Backpressure) by observing
+        // that the failed sink's checkpoint never advances.
+        use checkpoints::MemCheckpointStore;
+
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let slow: Arc<SlowSink> = Arc::new(SlowSink {
+            id: "slow".into(),
+            required: true,
+            delay: Duration::from_millis(500),
+        });
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&slow) as ArcDynSink];
+
+        let cp_fn =
+            build_commit_fn(store.clone(), "src::sink::slow".to_string());
+        let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![]);
+        let batch_processor =
+            build_batch_processor(processors, "test-deadline".to_string());
+
+        let coord = Coordinator::builder("test-deadline")
+            .sinks(sinks)
+            // Tight deadline forces the timeout to fire well before the
+            // 500ms sink delay completes.
+            .sink_batch_deadline(Some(Duration::from_millis(50)))
+            .batch_config(Some(BatchConfig {
+                max_events: Some(1),
+                max_bytes: None,
+                max_ms: Some(50),
+                respect_source_tx: None,
+                max_inflight: Some(1),
+            }))
+            .commit_fn("slow", cp_fn)
+            .process_fn(batch_processor)
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        let source = deltaforge_core::SourceInfo {
+            version: "test".into(),
+            connector: "mysql".into(),
+            name: "test".into(),
+            db: "db".into(),
+            schema: None,
+            table: "t".into(),
+            ts_ms: 0,
+            snapshot: None,
+            position: deltaforge_core::SourcePosition::default(),
+        };
+        let mut ev = Event::new_row(
+            source,
+            deltaforge_core::Op::Create,
+            None,
+            Some(serde_json::json!({"id": 1})),
+            0,
+            0,
+        );
+        ev.checkpoint = Some(CheckpointMeta::from_vec(b"{\"pos\":1}".to_vec()));
+        ev.tx_end = true;
+        tx.send(ev).await.unwrap();
+        drop(tx);
+
+        // Give the coordinator enough time to trip the deadline (50ms) and
+        // attempt cleanup; the sink's sleep (500ms) is bypassed by the
+        // timeout.
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            cancel_clone.cancel();
+        });
+
+        let _ = coord.run(rx, cancel, pause_rx).await;
+
+        // The required sink timed out → policy unsatisfied → checkpoint
+        // never advanced. (If the deadline didn't fire, the 500ms sink
+        // delay would have succeeded and the checkpoint would be set.)
+        let cp = store.get_raw("src::sink::slow").await.unwrap();
+        assert!(
+            cp.is_none(),
+            "checkpoint must not advance when required sink hits coordinator deadline"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn slow_sink_trips_coordinator_deadline_optional_kafka_progresses() {
+        // Two sinks: one slow + optional, one fast + required.
+        // With the coordinator deadline, the slow one times out, but the
+        // fast sink still succeeds and its checkpoint advances.
+        use checkpoints::MemCheckpointStore;
+
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let fast = MockSink::new("kafka", true);
+        let slow: Arc<SlowSink> = Arc::new(SlowSink {
+            id: "slow-s3".into(),
+            required: false,
+            delay: Duration::from_millis(500),
+        });
+        let sinks: Vec<ArcDynSink> = vec![
+            Arc::clone(&fast) as ArcDynSink,
+            Arc::clone(&slow) as ArcDynSink,
+        ];
+
+        let cp_fast =
+            build_commit_fn(store.clone(), "src::sink::kafka".to_string());
+        let cp_slow =
+            build_commit_fn(store.clone(), "src::sink::slow-s3".to_string());
+        let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![]);
+        let batch_processor = build_batch_processor(
+            processors,
+            "test-deadline-mixed".to_string(),
+        );
+
+        let coord = Coordinator::builder("test-deadline-mixed")
+            .sinks(sinks)
+            .sink_batch_deadline(Some(Duration::from_millis(50)))
+            .batch_config(Some(BatchConfig {
+                max_events: Some(1),
+                max_bytes: None,
+                max_ms: Some(50),
+                respect_source_tx: None,
+                max_inflight: Some(1),
+            }))
+            .commit_fn("kafka", cp_fast)
+            .commit_fn("slow-s3", cp_slow)
+            .process_fn(batch_processor)
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        let source = deltaforge_core::SourceInfo {
+            version: "t".into(),
+            connector: "mysql".into(),
+            name: "t".into(),
+            db: "db".into(),
+            schema: None,
+            table: "t".into(),
+            ts_ms: 0,
+            snapshot: None,
+            position: deltaforge_core::SourcePosition::default(),
+        };
+        let mut ev = Event::new_row(
+            source,
+            deltaforge_core::Op::Create,
+            None,
+            Some(serde_json::json!({"id": 1})),
+            0,
+            0,
+        );
+        ev.checkpoint = Some(CheckpointMeta::from_vec(b"{\"pos\":1}".to_vec()));
+        ev.tx_end = true;
+        tx.send(ev).await.unwrap();
+        drop(tx);
+
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            cancel_clone.cancel();
+        });
+
+        let _ = coord.run(rx, cancel, pause_rx).await;
+
+        // Fast sink delivered the event → its checkpoint advanced.
+        assert_eq!(
+            fast.delivery_count(),
+            1,
+            "required fast sink should have received the event"
+        );
+        let cp_fast = store.get_raw("src::sink::kafka").await.unwrap();
+        assert!(
+            cp_fast.is_some(),
+            "fast sink's checkpoint advances despite slow optional sink timing out"
+        );
+        // Slow optional sink did NOT advance.
+        let cp_slow = store.get_raw("src::sink::slow-s3").await.unwrap();
+        assert!(
+            cp_slow.is_none(),
+            "slow optional sink's checkpoint stays behind on coordinator timeout"
+        );
     }
 }

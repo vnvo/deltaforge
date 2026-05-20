@@ -503,6 +503,11 @@ impl PipelineManager {
             .sinks(sinks.clone())
             .batch_config(spec.spec.batch.clone())
             .commit_policy(spec.spec.commit_policy.clone())
+            .sink_batch_deadline(
+                spec.spec
+                    .sink_batch_deadline_secs
+                    .map(|s| std::time::Duration::from_secs(s.into())),
+            )
             .process_fn(batch_processor);
 
         for sink in &sinks {
@@ -1073,6 +1078,7 @@ mod tests {
                 connection_policy: None,
                 batch: Some(BatchConfig::default()),
                 commit_policy: None,
+                sink_batch_deadline_secs: None,
                 schema_sensing: Default::default(),
                 journal: None,
             },

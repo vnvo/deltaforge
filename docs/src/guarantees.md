@@ -111,6 +111,28 @@ All sinks deliver concurrently. One sink's failure does **not** block other sink
 3. Only sinks that delivered successfully get their checkpoints advanced.
 4. Failed sinks remain at their prior checkpoint position — they will receive the same batch again on retry or restart.
 
+### Coordinator-level deadline (defense in depth)
+
+In addition to each sink's own internal timeout (e.g. `send_timeout_secs` on the S3/Kafka/Redis/NATS/HTTP sinks), the pipeline supports an outer deadline that the coordinator applies to every `send_batch` call:
+
+```yaml
+spec:
+  sink_batch_deadline_secs: 60   # outer bound on any one sink's send_batch
+```
+
+Behavior:
+- Each sink's future is wrapped in `tokio::time::timeout(deadline, ...)`. If a sink exceeds the deadline, the coordinator gives up on it for that batch, classifies it as `SinkError::Backpressure`, and continues with the others.
+- A timed-out **required** sink causes its checkpoint to stay behind (same as any failure); the source replays from `MIN(checkpoints)` on restart.
+- A timed-out **optional** sink advances none of its state for that batch; same in-session-loss / on-restart-recovery semantics as documented in [Required vs. optional sinks](#required-vs-optional-sinks).
+- Metric: `deltaforge_coordinator_sink_timeout_total{pipeline,sink}`.
+- Default: `None` (no outer bound). Set this for defense-in-depth against a sink that hangs despite its own internal timeout (bug, deadlock, infinite retry loop in a dependency).
+
+The two timeout layers are complementary:
+| Layer | Catches | Granularity |
+|-------|---------|-------------|
+| `send_timeout_secs` (sink-internal) | Misbehavior of the sink's underlying API/library (e.g. object_store retries, rdkafka queue) | Per sink, per batch |
+| `sink_batch_deadline_secs` (coordinator) | Misbehavior of the sink itself (deadlock, slow Rust code, ignored cancellation) | All sinks, per batch |
+
 ### Required vs. optional sinks
 
 Each sink is marked `required: true` (default) or `required: false`:

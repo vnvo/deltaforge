@@ -118,6 +118,20 @@ pub struct Spec {
     /// How sink acknowledgements gate checkpoint commits.
     pub commit_policy: Option<CommitPolicy>,
 
+    /// Coordinator-level safety net: max wall-clock seconds the coordinator
+    /// waits for any single sink's `send_batch` per batch. A timeout here
+    /// is treated as `SinkError::Backpressure` for that sink (then routed
+    /// per `required`).
+    ///
+    /// This is the outer bound — *in addition to* each sink's own internal
+    /// timeout (e.g. `send_timeout_secs` on the S3/Kafka/Redis/NATS/HTTP
+    /// sinks). The internal timeout catches sink-specific library/protocol
+    /// misbehavior; this outer timeout catches the sink itself misbehaving
+    /// (deadlock, infinite retry loop, slow Rust code). `None` disables
+    /// the outer bound.
+    #[serde(default)]
+    pub sink_batch_deadline_secs: Option<u32>,
+
     /// Schema sensing configuration.
     /// When enabled, automatically infers and tracks schema from event payloads.
     #[serde(default)]
