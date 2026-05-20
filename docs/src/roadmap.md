@@ -19,8 +19,8 @@
 ## Planned
 
 - **Iceberg / Delta Lake table formats** — exactly-once at event level via atomic snapshot commits; schema evolution and time travel on top of the Phase 1 S3 sink
-- **Per-row DLQ for S3 sink** — slow-path retry isolates bad rows instead of failing the whole batch
 - **Streaming JSONL writer + List/Map columns** — Phase 2 S3 sink refinements
+- **Coordinator-level per-sink deadline** — bound how long the coordinator awaits any one sink, even if its internal timeout misfires
 - **MongoDB source** — change streams CDC
 - **Event replay** — replay DLQ entries or historical events
 - **Kubernetes operator** — PipelineTemplate + PipelinePool for fleet management

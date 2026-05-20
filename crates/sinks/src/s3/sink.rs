@@ -1,19 +1,22 @@
 //! `S3Sink` — the `deltaforge_core::Sink` implementation that plugs the
 //! S3/Parquet writer pool into the DeltaForge runtime.
 //!
-//! Phase 1f scope:
+//! Architecture:
 //! - Owns the `WriterPool` behind a `tokio::sync::Mutex` (interior mutability
 //!   for the `&self` Sink trait contract).
 //! - Translates `send_batch` calls into `WriterPool::append_batch`.
-//! - Emits metrics for committed files, bytes, open writers, and roll reasons.
+//! - Bounds per-batch latency via `send_timeout` (returns `Backpressure` on
+//!   timeout); coordinator handles per `required` flag.
+//! - Emits metrics for committed files, bytes, open writers, roll reasons,
+//!   encoder errors, and put errors.
 //! - Graceful shutdown via a cancellation token; on cancel, `WriterPool::abandon_all`
 //!   is called to prevent partial files from landing.
 //!
-//! DLQ semantics:
-//! - Per-row DLQ is not yet implemented. Encoder failures fail the whole batch
-//!   as `SinkError::Serialization`. Phase 2 adds the slow-path per-row retry.
-//! - Sink-level failures (object-store unreachable, auth, etc.) bubble up as
-//!   `SinkError::Io` / `SinkError::Fatal` from `object_store`.
+//! Error semantics:
+//! - Per-row encoder failures are isolated by the pool's slow-path retry
+//!   and surface in `BatchResult.dlq_failures` (Phase 2a).
+//! - Sink-level failures (object-store unreachable, auth, etc.) bubble up
+//!   as `SinkError::Io` / `SinkError::Fatal`.
 
 use std::sync::Arc;
 
@@ -196,7 +199,7 @@ impl Sink for S3Sink {
         let append =
             tokio::time::timeout(self.send_timeout, pool.append_batch(events))
                 .await;
-        let committed = match append {
+        let outcome = match append {
             Err(_elapsed) => {
                 self.observe_put_error("timeout");
                 return Err(SinkError::Backpressure {
@@ -207,37 +210,39 @@ impl Sink for S3Sink {
                     .into(),
                 });
             }
-            Ok(Ok(committed)) => committed,
+            Ok(Ok(outcome)) => outcome,
             Ok(Err(e)) => {
-                // Distinguish encoding errors (Serialization, recoverable
-                // batch-level) from object-store errors (Io, may be transient).
+                // Batch-level failure (object store unreachable, auth,
+                // etc.) — the pool returns a top-level error for these
+                // (per-row encoder errors are isolated into `outcome.failed`
+                // and don't reach this arm).
                 let msg = format!("{e:#}");
-                let lower = msg.to_lowercase();
-                if lower.contains("record batch")
-                    || lower.contains("decimal")
-                    || lower.contains("parse")
-                    || lower.contains("base64")
-                    || lower.contains("expected")
-                    || lower.contains("number not")
-                    || lower.contains("overflows")
-                {
-                    self.observe_encode_failure("encoder");
-                    return Err(SinkError::Serialization {
-                        details: msg.into(),
-                    });
-                }
                 self.observe_put_error("object_store");
                 return Err(SinkError::Io(std::io::Error::other(msg)));
             }
         };
 
-        self.observe_committed(&committed);
+        self.observe_committed(&outcome.committed);
         self.observe_writer_count(pool.open_writer_count());
 
-        // No per-row DLQ in Phase 1f — successful batches yield an empty
-        // BatchResult. Per-row isolation lands in Phase 2 via a slow-path
-        // retry.
-        Ok(BatchResult::ok())
+        // Per-row DLQ: surface each isolated failure as
+        // SinkError::Serialization at its original batch index. The
+        // coordinator routes these to the DLQ writer.
+        let dlq_failures: Vec<(usize, SinkError)> = outcome
+            .failed
+            .into_iter()
+            .map(|(idx, err)| {
+                self.observe_encode_failure("per_row");
+                (
+                    idx,
+                    SinkError::Serialization {
+                        details: format!("{err:#}").into(),
+                    },
+                )
+            })
+            .collect();
+
+        Ok(BatchResult { dlq_failures })
     }
 }
 
@@ -557,17 +562,97 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encoding_failure_returns_serialization_error() -> anyhow::Result<()>
-    {
+    async fn encoding_failure_isolated_as_per_row_dlq() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         let sink = build_sink(tmp.path(), RollingConfig::default()).await;
         // `id` declared bigint; sending a string that's not a parseable
-        // integer must fail encoder.
+        // integer must trip the encoder for that row.
         let bad = event_with("orders", json!({"id": "not-a-number"}));
-        let err = sink.send_batch(&[bad]).await.unwrap_err();
-        match err {
-            SinkError::Serialization { .. } => {}
+        let result = sink.send_batch(&[bad]).await.unwrap();
+        // Phase 2: the batch returns Ok with one DLQ failure isolated.
+        assert_eq!(result.dlq_failures.len(), 1);
+        assert_eq!(result.dlq_failures[0].0, 0);
+        match &result.dlq_failures[0].1 {
+            SinkError::Serialization { details } => {
+                assert!(
+                    details.contains("not-a-number")
+                        || details.contains("parse"),
+                    "expected encoder details, got: {details}"
+                );
+            }
             other => panic!("expected Serialization, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_isolates_only_bad_row() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let sink = build_sink(
+            tmp.path(),
+            // Force a roll so we can inspect the committed file's row count.
+            RollingConfig {
+                max_events: 1_000_000,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // 4 events in one batch: indices 0, 1, 3 are good, index 2 is bad.
+        let events = vec![
+            event_with("orders", json!({"id": 100})),
+            event_with("orders", json!({"id": 200})),
+            event_with("orders", json!({"id": "broken"})),
+            event_with("orders", json!({"id": 300})),
+        ];
+        let result = sink.send_batch(&events).await.unwrap();
+        assert_eq!(
+            result.dlq_failures.len(),
+            1,
+            "exactly one bad row should be isolated"
+        );
+        assert_eq!(result.dlq_failures[0].0, 2, "index of the bad row");
+
+        // The 3 good rows should have landed; flush to verify.
+        let committed = sink.flush_on_shutdown().await;
+        assert_eq!(committed.len(), 1, "single rolled file");
+        assert_eq!(
+            committed[0].result.rows_written, 3,
+            "exactly the 3 good rows written; bad row was isolated"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn all_bad_rows_produce_full_dlq_no_committed_file()
+    -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let sink = build_sink(
+            tmp.path(),
+            RollingConfig {
+                max_events: 100,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let events = vec![
+            event_with("orders", json!({"id": "broken-1"})),
+            event_with("orders", json!({"id": "broken-2"})),
+        ];
+        let result = sink.send_batch(&events).await.unwrap();
+        assert_eq!(result.dlq_failures.len(), 2);
+        // No commit yet (no roll), but the writer was opened (even if it
+        // received zero events). flush_on_shutdown handles the empty case.
+        let committed = sink.flush_on_shutdown().await;
+        // Either 0 (writer was never opened because all events failed before
+        // any good row) or 1 (writer opened but zero rows written). Both
+        // are atomicity-safe — readers see no bad data.
+        for c in &committed {
+            assert_eq!(
+                c.result.rows_written, 0,
+                "no rows written for all-bad batch"
+            );
         }
         Ok(())
     }

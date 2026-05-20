@@ -127,7 +127,8 @@ async fn e2e_writes_partitioned_parquet_to_local_fs() -> Result<()> {
             events.push(event_on(19, table, i, &format!("u{i}@x")));
         }
     }
-    let committed = pool.append_batch(&events).await?;
+    let outcome = pool.append_batch(&events).await?;
+    let committed = outcome.committed;
     assert_eq!(committed.len(), 3, "one file per table partition");
 
     // Each file contains 10 rows.
@@ -166,7 +167,8 @@ async fn e2e_close_all_flushes_in_progress_writers() -> Result<()> {
     let events: Vec<_> = (0..50)
         .map(|i| event_on(20, "orders", i, &format!("u{i}@x")))
         .collect();
-    let committed = pool.append_batch(&events).await?;
+    let outcome = pool.append_batch(&events).await?;
+    let committed = outcome.committed;
     assert!(
         committed.is_empty(),
         "50 events well under rolling thresholds"

@@ -101,9 +101,16 @@ pub struct JsonLinesFileWriter {
 #[async_trait]
 impl FileWriter for JsonLinesFileWriter {
     async fn append(&mut self, events: &[Event]) -> Result<()> {
+        // Record the buffer length so we can roll back on partial failure.
+        // This keeps the writer state consistent — either all events in
+        // the call are appended, or none are — which is the contract the
+        // pool's per-row DLQ retry depends on.
+        let start_len = self.buf.len();
         for e in events {
-            serde_json::to_writer(&mut self.buf, e)
-                .context("serialize event to jsonl buffer")?;
+            if let Err(err) = serde_json::to_writer(&mut self.buf, e) {
+                self.buf.truncate(start_len);
+                return Err(err).context("serialize event to jsonl buffer");
+            }
             self.buf.push(b'\n');
         }
         self.events_written += events.len() as u64;

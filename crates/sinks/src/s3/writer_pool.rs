@@ -36,6 +36,39 @@ pub struct CommittedFile {
     pub reason: RollReason,
 }
 
+/// Result of an `append_batch` call.
+///
+/// `committed` is the list of files that rolled and uploaded during this call.
+/// `failed` is `(index_in_input_events, error)` for events that could not be
+/// encoded by their target format — these should be routed to the DLQ by the
+/// caller (typically `S3Sink` mapping them into `BatchResult.dlq_failures`).
+///
+/// A batch-level error (the outer `Result::Err`) means the whole batch failed
+/// in a way unrelated to per-event encoding (object store unreachable, etc.).
+#[derive(Debug, Default)]
+pub struct AppendOutcome {
+    pub committed: Vec<CommittedFile>,
+    pub failed: Vec<(usize, anyhow::Error)>,
+}
+
+/// Returns true if an error from `FileWriter::append` is an encoding-side
+/// failure (per-row recoverable) rather than an object-store failure
+/// (batch-level fatal). Used to gate the per-row DLQ retry path.
+fn is_encoder_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let msg = cause.to_string().to_lowercase();
+        msg.contains("convert rows to record batch")
+            || msg.contains("build recordbatch")
+            || msg.contains("decimal")
+            || msg.contains("parse")
+            || msg.contains("overflows")
+            || msg.contains("base64")
+            || msg.contains("expected ")
+            || msg.contains("number not")
+            || msg.contains("serialize event to jsonl")
+    })
+}
+
 /// One row in the pool — an open writer plus its lifecycle metadata.
 struct ActiveWriter {
     writer: Box<dyn FileWriter + Send>,
@@ -103,37 +136,92 @@ impl WriterPool {
     pub async fn append_batch(
         &mut self,
         events: &[Event],
-    ) -> Result<Vec<CommittedFile>> {
+    ) -> Result<AppendOutcome> {
         if events.is_empty() {
-            return Ok(self.idle_sweep().await);
+            return Ok(AppendOutcome {
+                committed: self.idle_sweep().await,
+                failed: Vec::new(),
+            });
         }
 
-        // 1. Group events by partition key. The number of distinct
-        //    partitions per batch is small (typically 1-3), so an index
-        //    vector is cheaper than a HashMap.
-        let mut groups: Vec<(PartitionKey, Vec<&Event>)> = Vec::new();
-        for e in events {
+        // 1. Group events by partition key, preserving each event's
+        //    original index so per-row DLQ entries can reference it.
+        let mut groups: Vec<(PartitionKey, Vec<(usize, &Event)>)> = Vec::new();
+        for (idx, e) in events.iter().enumerate() {
             let key = partition_for(e);
             match groups.iter_mut().find(|(k, _)| *k == key) {
-                Some((_, vec)) => vec.push(e),
-                None => groups.push((key, vec![e])),
+                Some((_, vec)) => vec.push((idx, e)),
+                None => groups.push((key, vec![(idx, e)])),
             }
         }
 
-        // 2. Append each group, creating writers on demand.
+        // 2. Append each group. Fast path = single batched append. On
+        //    encoder errors, slow path = per-event retry on the same
+        //    writer to isolate bad rows (those become DLQ failures).
         let now = Instant::now();
+        let mut failed: Vec<(usize, anyhow::Error)> = Vec::new();
         for (key, group) in groups {
-            // Borrow events as a slice. We collected &Event so reborrow.
-            let owned: Vec<Event> = group.into_iter().cloned().collect();
+            let owned: Vec<Event> =
+                group.iter().map(|(_, e)| (*e).clone()).collect();
             let writer = self.writer_for(&key, now).await?;
-            writer.writer.append(&owned).await.with_context(|| {
-                format!("append to writer for {}", key.hive_path())
-            })?;
-            writer.last_event_at = now;
+
+            match writer.writer.append(&owned).await {
+                Ok(()) => {
+                    writer.last_event_at = now;
+                }
+                Err(e) if is_encoder_error(&e) => {
+                    debug!(
+                        partition = key.hive_path(),
+                        error = %e,
+                        "encoder error on batch — retrying per-event for DLQ isolation"
+                    );
+                    // Both ParquetFileWriter and JsonLinesFileWriter roll
+                    // back their state on per-call failure (Parquet's
+                    // events_to_record_batch fails before writing; JSONL
+                    // truncates its buf). The writer is safe to reuse.
+                    let mut group_good: Vec<Event> =
+                        Vec::with_capacity(group.len());
+                    let mut group_good_count = 0;
+                    for (orig_idx, event) in &group {
+                        match writer
+                            .writer
+                            .append(std::slice::from_ref(*event))
+                            .await
+                        {
+                            Ok(()) => {
+                                group_good.push((**event).clone());
+                                group_good_count += 1;
+                            }
+                            Err(per_row_err) => {
+                                failed.push((
+                                    *orig_idx,
+                                    per_row_err.context(format!(
+                                        "encoding event {} for partition {}",
+                                        orig_idx,
+                                        key.hive_path()
+                                    )),
+                                ));
+                            }
+                        }
+                    }
+                    if group_good_count > 0 {
+                        writer.last_event_at = now;
+                    }
+                }
+                Err(e) => {
+                    // Non-encoder error (object store, etc.) — propagate
+                    // as a batch-level failure.
+                    return Err(e.context(format!(
+                        "append to writer for {}",
+                        key.hive_path()
+                    )));
+                }
+            }
         }
 
         // 3. Roll any writers that crossed a threshold.
-        self.roll_threshold_writers(now).await
+        let committed = self.roll_threshold_writers(now).await?;
+        Ok(AppendOutcome { committed, failed })
     }
 
     /// Close any writer that has been idle longer than `idle_age` without
@@ -422,7 +510,8 @@ mod tests {
             WriterPoolConfig::default(),
         )
         .await;
-        let committed = pool.append_batch(&[]).await?;
+        let outcome = pool.append_batch(&[]).await?;
+        let committed = outcome.committed;
         assert!(committed.is_empty());
         Ok(())
     }
@@ -441,7 +530,8 @@ mod tests {
             make_event("orders", 11, 2),
             make_event("customers", 10, 3),
         ];
-        let committed = pool.append_batch(&events).await?;
+        let outcome = pool.append_batch(&events).await?;
+        let committed = outcome.committed;
         assert!(committed.is_empty(), "no rolling threshold hit yet");
         assert_eq!(pool.open_writer_count(), 3);
         Ok(())
@@ -460,7 +550,8 @@ mod tests {
         let mut pool = make_pool(tmp.path(), &[col("id", "bigint")], cfg).await;
         let events: Vec<_> =
             (0..5).map(|i| make_event("orders", 10, i as i64)).collect();
-        let committed = pool.append_batch(&events).await?;
+        let outcome = pool.append_batch(&events).await?;
+        let committed = outcome.committed;
         assert_eq!(committed.len(), 1, "should roll on event count");
         assert_eq!(committed[0].reason, RollReason::Events);
         assert_eq!(committed[0].partition.table, "orders");
@@ -488,7 +579,8 @@ mod tests {
         // Sleep past idle threshold then call append_batch with no events,
         // which triggers an idle sweep.
         tokio::time::sleep(Duration::from_millis(120)).await;
-        let committed = pool.append_batch(&[]).await?;
+        let outcome = pool.append_batch(&[]).await?;
+        let committed = outcome.committed;
         assert_eq!(committed.len(), 1);
         assert_eq!(committed[0].reason, RollReason::Idle);
         assert_eq!(pool.open_writer_count(), 0);
@@ -600,7 +692,8 @@ mod tests {
         };
         let mut pool = make_pool(tmp.path(), &[col("id", "bigint")], cfg).await;
         let events = vec![make_event("orders", 15, 1)];
-        let committed = pool.append_batch(&events).await?;
+        let outcome = pool.append_batch(&events).await?;
+        let committed = outcome.committed;
         assert_eq!(committed.len(), 1);
         let path = &committed[0].path;
         // expected: deltaforge/orders/table=orders/year=2026/month=05/day=15/<ULID>.parquet
