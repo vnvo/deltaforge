@@ -3,18 +3,19 @@
 //! Converts a batch of CDC events into a `RecordBatch` matching the envelope
 //! schema produced by `deltaforge_core::encoding::arrow_schema`.
 //!
-//! Phase 1d coverage:
+//! Coverage:
 //! - All envelope meta columns (`op`, `op_ts`, `source_*`, `event_id`, ...)
 //! - User-data scalars: Int32/Int64, Float32/Float64, Boolean, Utf8, Binary
 //!   (via `{"_base64": "..."}` unwrap), Date32, Timestamp(ms/us, _),
 //!   Decimal128(p, s) via string-decimal parsing
+//! - List<T> with scalar element types (Int32, Int64, Float32, Float64,
+//!   Boolean, Utf8, Binary). Nested lists fall back to JSON-string with a warn.
+//! - Map<Utf8, Utf8> (PostgreSQL hstore semantics). Other key/value types
+//!   fall back to JSON-string.
 //!
-//! Phase 1d skips List/Map columns — those fall back to JSON-string Utf8
-//! when the schema declares them but the data is present. Phase 2 wires
-//! Arrow ListBuilder/MapBuilder for proper columnar nesting.
-//!
-//! Encoding errors fail the whole batch as `SinkError::Serialization`. Phase
-//! 1f introduces per-row DLQ routing.
+//! Encoding errors are caught by the pool's per-row DLQ slow-path retry
+//! (see `writer_pool::AppendOutcome`) — a single bad row no longer fails
+//! the whole batch.
 
 use std::sync::Arc;
 
@@ -231,15 +232,11 @@ fn build_user_column(
         DataType::Decimal128(p, s) => {
             build_decimal128(events, col_name, after, *p, *s)
         }
-        // Phase 1d fallback: serialize whatever JSON is there as a UTF-8 string
-        // (best-effort) and emit a warning. Phase 2 wires proper builders.
-        DataType::List(_) | DataType::Map(_, _) => {
-            tracing::warn!(
-                column = col_name,
-                data_type = ?dt,
-                "List/Map columns not yet supported by Parquet encoder — falling back to JSON-string column"
-            );
-            build_utf8_from_json(events, col_name, after)
+        DataType::List(item_field) => {
+            build_list(events, col_name, after, item_field)
+        }
+        DataType::Map(entries_field, _sorted) => {
+            build_map(events, col_name, after, entries_field)
         }
         other => {
             bail!(
@@ -576,6 +573,326 @@ fn build_utf8_from_json(
         match lookup(e, col, after) {
             None | Some(Value::Null) => b.append_null(),
             Some(v) => b.append_value(v.to_string()),
+        }
+    }
+    Ok(Arc::new(b.finish()))
+}
+
+// -----------------------------------------------------------------------
+// List<T> and Map<Utf8, Utf8> builders (Phase 2c)
+// -----------------------------------------------------------------------
+
+fn build_list(
+    events: &[Event],
+    col: &str,
+    after: bool,
+    item_field: &arrow_schema::FieldRef,
+) -> Result<ArrayRef> {
+    use arrow_array::builder::{
+        BinaryBuilder, BooleanBuilder, Float32Builder, Float64Builder,
+        Int32Builder, Int64Builder, ListBuilder, StringBuilder,
+    };
+
+    let item_dt = item_field.data_type();
+    match item_dt {
+        DataType::Int32 => {
+            let mut b = ListBuilder::new(Int32Builder::new());
+            for e in events {
+                match lookup(e, col, after) {
+                    None | Some(Value::Null) => b.append_null(),
+                    Some(Value::Array(items)) => {
+                        for item in items {
+                            match item {
+                                Value::Null => b.values().append_null(),
+                                Value::Number(n) => {
+                                    let v = n.as_i64().ok_or_else(|| {
+                                        anyhow!("{col}: list item not i64")
+                                    })?;
+                                    let v: i32 =
+                                        v.try_into().map_err(|_| {
+                                            anyhow!(
+                                                "{col}: list item {v} overflows i32"
+                                            )
+                                        })?;
+                                    b.values().append_value(v);
+                                }
+                                other => bail!(
+                                    "{col}: expected number list item, got {other:?}"
+                                ),
+                            }
+                        }
+                        b.append(true);
+                    }
+                    Some(other) => {
+                        bail!("{col}: expected array, got {other:?}")
+                    }
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Int64 => {
+            let mut b = ListBuilder::new(Int64Builder::new());
+            for e in events {
+                match lookup(e, col, after) {
+                    None | Some(Value::Null) => b.append_null(),
+                    Some(Value::Array(items)) => {
+                        for item in items {
+                            match item {
+                                Value::Null => b.values().append_null(),
+                                Value::Number(n) => {
+                                    let v = n.as_i64().ok_or_else(|| {
+                                        anyhow!("{col}: list item not i64")
+                                    })?;
+                                    b.values().append_value(v);
+                                }
+                                Value::String(s) => {
+                                    let v: i64 =
+                                        s.parse().with_context(|| {
+                                            format!(
+                                                "{col}: parse list item {s} as i64"
+                                            )
+                                        })?;
+                                    b.values().append_value(v);
+                                }
+                                other => bail!(
+                                    "{col}: expected number list item, got {other:?}"
+                                ),
+                            }
+                        }
+                        b.append(true);
+                    }
+                    Some(other) => {
+                        bail!("{col}: expected array, got {other:?}")
+                    }
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Float32 => {
+            let mut b = ListBuilder::new(Float32Builder::new());
+            for e in events {
+                match lookup(e, col, after) {
+                    None | Some(Value::Null) => b.append_null(),
+                    Some(Value::Array(items)) => {
+                        for item in items {
+                            match item {
+                                Value::Null => b.values().append_null(),
+                                Value::Number(n) => {
+                                    let v = n.as_f64().ok_or_else(|| {
+                                        anyhow!("{col}: list item not f64")
+                                    })?;
+                                    b.values().append_value(v as f32);
+                                }
+                                other => bail!(
+                                    "{col}: expected number list item, got {other:?}"
+                                ),
+                            }
+                        }
+                        b.append(true);
+                    }
+                    Some(other) => {
+                        bail!("{col}: expected array, got {other:?}")
+                    }
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Float64 => {
+            let mut b = ListBuilder::new(Float64Builder::new());
+            for e in events {
+                match lookup(e, col, after) {
+                    None | Some(Value::Null) => b.append_null(),
+                    Some(Value::Array(items)) => {
+                        for item in items {
+                            match item {
+                                Value::Null => b.values().append_null(),
+                                Value::Number(n) => {
+                                    let v = n.as_f64().ok_or_else(|| {
+                                        anyhow!("{col}: list item not f64")
+                                    })?;
+                                    b.values().append_value(v);
+                                }
+                                other => bail!(
+                                    "{col}: expected number list item, got {other:?}"
+                                ),
+                            }
+                        }
+                        b.append(true);
+                    }
+                    Some(other) => {
+                        bail!("{col}: expected array, got {other:?}")
+                    }
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Boolean => {
+            let mut b = ListBuilder::new(BooleanBuilder::new());
+            for e in events {
+                match lookup(e, col, after) {
+                    None | Some(Value::Null) => b.append_null(),
+                    Some(Value::Array(items)) => {
+                        for item in items {
+                            match item {
+                                Value::Null => b.values().append_null(),
+                                Value::Bool(v) => b.values().append_value(*v),
+                                other => bail!(
+                                    "{col}: expected bool list item, got {other:?}"
+                                ),
+                            }
+                        }
+                        b.append(true);
+                    }
+                    Some(other) => {
+                        bail!("{col}: expected array, got {other:?}")
+                    }
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Utf8 => {
+            let mut b = ListBuilder::new(StringBuilder::new());
+            for e in events {
+                match lookup(e, col, after) {
+                    None | Some(Value::Null) => b.append_null(),
+                    Some(Value::Array(items)) => {
+                        for item in items {
+                            match item {
+                                Value::Null => b.values().append_null(),
+                                Value::String(s) => b.values().append_value(s),
+                                // Coerce other scalars to string (matches
+                                // the scalar Utf8 builder behavior).
+                                other => {
+                                    b.values().append_value(other.to_string())
+                                }
+                            }
+                        }
+                        b.append(true);
+                    }
+                    Some(other) => {
+                        bail!("{col}: expected array, got {other:?}")
+                    }
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        DataType::Binary => {
+            let mut b = ListBuilder::new(BinaryBuilder::new());
+            for e in events {
+                match lookup(e, col, after) {
+                    None | Some(Value::Null) => b.append_null(),
+                    Some(Value::Array(items)) => {
+                        for item in items {
+                            match item {
+                                Value::Null => b.values().append_null(),
+                                Value::Object(m)
+                                    if m.contains_key("_base64") =>
+                                {
+                                    let s = m["_base64"].as_str().ok_or_else(
+                                        || {
+                                            anyhow!(
+                                            "{col}: list item _base64 not a string"
+                                        )
+                                        },
+                                    )?;
+                                    let bytes =
+                                        base64::engine::general_purpose::STANDARD
+                                            .decode(s)
+                                            .with_context(|| {
+                                                format!(
+                                                    "{col}: invalid base64 in list item"
+                                                )
+                                            })?;
+                                    b.values().append_value(&bytes);
+                                }
+                                Value::String(s) => {
+                                    b.values().append_value(s.as_bytes())
+                                }
+                                other => bail!(
+                                    "{col}: expected binary list item, got {other:?}"
+                                ),
+                            }
+                        }
+                        b.append(true);
+                    }
+                    Some(other) => {
+                        bail!("{col}: expected array, got {other:?}")
+                    }
+                }
+            }
+            Ok(Arc::new(b.finish()))
+        }
+        // Nested lists or unsupported element types — fall back to
+        // JSON-string column with a warn so the data survives even if
+        // not in columnar form.
+        other => {
+            tracing::warn!(
+                column = col,
+                element_type = ?other,
+                "list of unsupported element type — falling back to JSON-string column"
+            );
+            build_utf8_from_json(events, col, after)
+        }
+    }
+}
+
+fn build_map(
+    events: &[Event],
+    col: &str,
+    after: bool,
+    entries_field: &arrow_schema::FieldRef,
+) -> Result<ArrayRef> {
+    use arrow_array::builder::{MapBuilder, MapFieldNames, StringBuilder};
+
+    // Validate the entries field shape: Struct<key: Utf8, value: Utf8?>.
+    // Anything else (e.g. non-string keys) falls back to JSON-string.
+    let is_string_utf8_map = match entries_field.data_type() {
+        DataType::Struct(fields) if fields.len() == 2 => {
+            matches!(fields[0].data_type(), DataType::Utf8)
+                && matches!(fields[1].data_type(), DataType::Utf8)
+        }
+        _ => false,
+    };
+    if !is_string_utf8_map {
+        tracing::warn!(
+            column = col,
+            entries = ?entries_field.data_type(),
+            "map column not <Utf8, Utf8> — falling back to JSON-string column"
+        );
+        return build_utf8_from_json(events, col, after);
+    }
+
+    // The arrow_schema declaration (in encoding/arrow_types.rs) uses
+    // `key`/`value` field names for hstore; MapBuilder's default is
+    // `keys`/`values`. Override to match the schema, otherwise
+    // RecordBatch::try_new errors with a schema-mismatch.
+    let field_names = MapFieldNames {
+        entry: "entries".to_string(),
+        key: "key".to_string(),
+        value: "value".to_string(),
+    };
+    let mut b = MapBuilder::new(
+        Some(field_names),
+        StringBuilder::new(),
+        StringBuilder::new(),
+    );
+    for e in events {
+        match lookup(e, col, after) {
+            None | Some(Value::Null) => {
+                b.append(false).context("map append null")?;
+            }
+            Some(Value::Object(m)) => {
+                for (k, v) in m {
+                    b.keys().append_value(k);
+                    match v {
+                        Value::Null => b.values().append_null(),
+                        Value::String(s) => b.values().append_value(s),
+                        other => b.values().append_value(other.to_string()),
+                    }
+                }
+                b.append(true).context("map append")?;
+            }
+            Some(other) => bail!("{col}: expected object/map, got {other:?}"),
         }
     }
     Ok(Arc::new(b.finish()))
@@ -1082,5 +1399,185 @@ mod tests {
             Some(json!({"id": 99})),
         )];
         let _batch = events_to_record_batch(&schema, &events).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // List<T> and Map<Utf8, Utf8> column tests (Phase 2c)
+    // -----------------------------------------------------------------------
+
+    fn pg_array_col(name: &str, element_type: &str) -> ColumnDesc {
+        ColumnDesc {
+            name: name.into(),
+            data_type: format!("_{element_type}"),
+            column_type: format!("_{element_type}"),
+            nullable: true,
+            precision: None,
+            scale: None,
+            unsigned: false,
+            is_array: true,
+            element_type: Some(element_type.into()),
+        }
+    }
+
+    #[test]
+    fn list_of_int32_encodes() {
+        use arrow_array::ListArray;
+        let schema = Arc::new(build_envelope_arrow_schema(
+            Connector::Postgres,
+            &[pg_array_col("ids", "integer")],
+            &TypeConversionOpts::default(),
+        ));
+        let events = vec![
+            make_event(
+                Op::Create,
+                "t",
+                0,
+                None,
+                Some(json!({"ids": [1, 2, 3]})),
+            ),
+            make_event(Op::Create, "t", 0, None, Some(json!({"ids": []}))),
+            make_event(Op::Create, "t", 0, None, Some(json!({"ids": null}))),
+        ];
+        let batch = events_to_record_batch(&schema, &events).unwrap();
+        let arr = batch
+            .column_by_name("after_ids")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert_eq!(arr.value(0).len(), 3);
+        assert_eq!(arr.value(1).len(), 0);
+        assert!(arr.is_null(2));
+    }
+
+    #[test]
+    fn list_of_strings_encodes() {
+        use arrow_array::ListArray;
+        let schema = Arc::new(build_envelope_arrow_schema(
+            Connector::Postgres,
+            &[pg_array_col("tags", "text")],
+            &TypeConversionOpts::default(),
+        ));
+        let events = vec![make_event(
+            Op::Create,
+            "t",
+            0,
+            None,
+            Some(json!({"tags": ["red", "green", "blue"]})),
+        )];
+        let batch = events_to_record_batch(&schema, &events).unwrap();
+        let arr = batch
+            .column_by_name("after_tags")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let strs = arr
+            .value(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .iter()
+            .map(|s| s.unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(strs, vec!["red", "green", "blue"]);
+    }
+
+    #[test]
+    fn list_with_null_items_preserved() {
+        use arrow_array::ListArray;
+        let schema = Arc::new(build_envelope_arrow_schema(
+            Connector::Postgres,
+            &[pg_array_col("nums", "bigint")],
+            &TypeConversionOpts::default(),
+        ));
+        let events = vec![make_event(
+            Op::Create,
+            "t",
+            0,
+            None,
+            Some(json!({"nums": [1, null, 3, null, 5]})),
+        )];
+        let batch = events_to_record_batch(&schema, &events).unwrap();
+        let arr = batch
+            .column_by_name("after_nums")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let items = arr.value(0);
+        assert_eq!(items.len(), 5);
+        assert!(items.is_null(1));
+        assert!(items.is_null(3));
+        assert!(items.is_valid(0));
+    }
+
+    fn pg_hstore_col(name: &str) -> ColumnDesc {
+        ColumnDesc {
+            name: name.into(),
+            data_type: "hstore".into(),
+            column_type: "hstore".into(),
+            nullable: true,
+            precision: None,
+            scale: None,
+            unsigned: false,
+            is_array: false,
+            element_type: None,
+        }
+    }
+
+    #[test]
+    fn map_utf8_to_utf8_encodes() {
+        use arrow_array::MapArray;
+        let schema = Arc::new(build_envelope_arrow_schema(
+            Connector::Postgres,
+            &[pg_hstore_col("attrs")],
+            &TypeConversionOpts::default(),
+        ));
+        let events = vec![
+            make_event(
+                Op::Create,
+                "t",
+                0,
+                None,
+                Some(json!({"attrs": {"color": "red", "size": "large"}})),
+            ),
+            make_event(Op::Create, "t", 0, None, Some(json!({"attrs": {}}))),
+            make_event(Op::Create, "t", 0, None, Some(json!({"attrs": null}))),
+        ];
+        let batch = events_to_record_batch(&schema, &events).unwrap();
+        let arr = batch
+            .column_by_name("after_attrs")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<MapArray>()
+            .unwrap();
+        // Row 0: 2 entries
+        assert_eq!(arr.value(0).len(), 2);
+        // Row 1: 0 entries
+        assert_eq!(arr.value(1).len(), 0);
+        // Row 2: null
+        assert!(arr.is_null(2));
+    }
+
+    #[test]
+    fn list_of_int_overflow_fails() {
+        let schema = Arc::new(build_envelope_arrow_schema(
+            Connector::Postgres,
+            &[pg_array_col("ids", "integer")],
+            &TypeConversionOpts::default(),
+        ));
+        // i64::MAX is too large for the Int32 element type.
+        let events = vec![make_event(
+            Op::Create,
+            "t",
+            0,
+            None,
+            Some(json!({"ids": [1, i64::MAX, 3]})),
+        )];
+        let res = events_to_record_batch(&schema, &events);
+        assert!(res.is_err(), "expected overflow error");
+        let err_msg = format!("{:#}", res.unwrap_err());
+        assert!(err_msg.contains("overflows"), "got: {err_msg}");
     }
 }
