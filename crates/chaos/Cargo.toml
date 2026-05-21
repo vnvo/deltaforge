@@ -26,6 +26,8 @@ mysql_async = "0.35"
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 chrono.workspace = true
 inferno = { version = "0.12", default-features = false, features = ["multithreaded", "nameattr"] }
+object_store = { version = "0.13", features = ["aws"] }
+futures.workspace = true
 
 [lints]
 workspace = true

@@ -1,6 +1,7 @@
 mod backend;
 mod docker;
 mod harness;
+mod preflight;
 mod scenarios;
 mod toxiproxy;
 mod ui;
@@ -103,6 +104,12 @@ struct Cli {
     /// Bypass Toxiproxy: PATCH pipelines to connect directly to source/sink.
     #[arg(long, default_value_t = false)]
     no_proxy: bool,
+
+    /// Print all available scenarios grouped by category, with their
+    /// descriptions, expected outcomes, and required Docker Compose
+    /// profiles. Then exit.
+    #[arg(long, default_value_t = false)]
+    list_scenarios: bool,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -128,6 +135,10 @@ enum Scenario {
     DlqPoison,
     /// Schema Registry outage (Avro encoding).
     SrOutage,
+    /// S3 sink sustained writes — throughput baseline + memory stability.
+    S3Soak,
+    /// MinIO outage via toxiproxy — verify backpressure and recovery.
+    S3Outage,
     // MySQL-specific
     Failover,
     BinlogPurge,
@@ -158,6 +169,75 @@ fn service_for_port(port: u16) -> &'static str {
     }
 }
 
+/// Map a `Scenario` enum variant to its registry metadata (for pre-flight
+/// checks and listing). Returns `None` for non-scenario variants (`Ui`, `All`).
+fn meta_for_scenario(
+    s: &Scenario,
+) -> Option<&'static scenarios::meta::ScenarioMeta> {
+    use scenarios::meta::lookup;
+    let name = match s {
+        Scenario::Ui | Scenario::All => return None,
+        Scenario::NetworkPartition => "network-partition",
+        Scenario::SinkOutage => "sink-outage",
+        Scenario::CrashRecovery => "crash-recovery",
+        Scenario::SchemaDrift => "schema-drift",
+        Scenario::ExactlyOnce => "exactly-once",
+        Scenario::DlqPoison => "dlq-poison",
+        Scenario::SrOutage => "sr-outage",
+        Scenario::S3Soak => "s3-soak",
+        Scenario::S3Outage => "s3-outage",
+        Scenario::Failover => "failover",
+        Scenario::BinlogPurge => "binlog-purge",
+        Scenario::PgFailover => "pg-failover",
+        Scenario::SlotDropped => "slot-dropped",
+        Scenario::Soak => "soak",
+        Scenario::SoakStable => "soak",
+        Scenario::Tpcc => "tpcc",
+        Scenario::BacklogDrain => "backlog-drain",
+        Scenario::TpcDi => "tpc-di",
+        Scenario::TpcE => "tpc-e",
+    };
+    lookup(name)
+}
+
+/// Pretty-print the scenario registry grouped by category. Used by
+/// `chaos --list-scenarios` so a newcomer can see what's available
+/// without spinning up Docker.
+fn print_scenarios_list() {
+    println!("DeltaForge chaos scenarios\n");
+    for (category, metas) in scenarios::meta::grouped() {
+        if metas.is_empty() {
+            continue;
+        }
+        println!("── {} ──", category.label());
+        for m in &metas {
+            let tags = if m.tags.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "  [{}]",
+                    m.tags
+                        .iter()
+                        .map(|t| format!("#{t}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            };
+            println!("  {}{tags}", m.name);
+            println!("      {}", m.description);
+            println!("      → {}", m.expected);
+            println!("      profiles: {}", m.required_profiles.join(" + "));
+            println!();
+        }
+    }
+    println!(
+        "Run a scenario:  chaos --scenario <name> --source <mysql|postgres>"
+    );
+    println!(
+        "Bring up infra:  docker compose -f docker-compose.chaos.yml \\\n                   --profile base --profile mysql-infra --profile kafka-infra --profile df up -d"
+    );
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -168,11 +248,31 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // `--list-scenarios` is handled before any setup — useful from a fresh
+    // checkout to see what's available without spinning up Docker.
+    if cli.list_scenarios {
+        print_scenarios_list();
+        return Ok(());
+    }
+
     let harness = Harness::new(cli.port);
 
     // UI mode: start the web playground and exit.
     if matches!(cli.scenario, Scenario::Ui) {
         return ui::run(7474).await;
+    }
+
+    // Pre-flight: verify the Docker Compose profiles this scenario needs
+    // are actually running. Skip for All (multi-scenario) and Ui (handled
+    // above). On Docker unreachable, the check warns and continues.
+    if !matches!(cli.scenario, Scenario::All) {
+        if let Some(meta) = meta_for_scenario(&cli.scenario)
+            && let Err(err) = preflight::check_or_advise(meta)
+        {
+            eprintln!("\n{}", err.render(meta));
+            std::process::exit(2);
+        }
     }
 
     // Soak/Tpcc/TpcDi/TpcE have their own health checks —
@@ -429,6 +529,23 @@ async fn run_scenarios<B: backend::SourceBackend>(
         }
         Scenario::SrOutage => {
             results.push(scenarios::sr_outage::run(harness, backend).await?);
+        }
+
+        // ── S3 / Lakehouse ──────────────────────────────────────────────
+        Scenario::S3Soak => {
+            results.push(
+                scenarios::s3_soak::run(
+                    harness,
+                    backend,
+                    soak.duration_mins,
+                    1000, // rows_per_batch
+                    soak.write_delay_ms,
+                )
+                .await?,
+            );
+        }
+        Scenario::S3Outage => {
+            results.push(scenarios::s3_outage::run(harness, backend).await?);
         }
 
         // ── MySQL-specific ──────────────────────────────────────────────

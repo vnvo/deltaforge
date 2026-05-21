@@ -1,3 +1,6 @@
+// Scenario metadata registry (single source of truth for CLI + pre-flight).
+pub mod meta;
+
 // Generic scenarios — parameterised over SourceBackend, run for any source.
 pub mod crash_recovery;
 pub mod dlq_poison;
@@ -21,6 +24,10 @@ pub mod tpcc;
 
 // Avro / Schema Registry scenarios.
 pub mod sr_outage;
+
+// S3 / Lakehouse scenarios.
+pub mod s3_outage;
+pub mod s3_soak;
 
 // PostgreSQL-specific scenarios.
 pub mod pg_failover;
