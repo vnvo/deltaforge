@@ -419,6 +419,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn memory_per_path_sums_its_components() {
+        // hll = 1<<4 = 16, ss = 10*80 = 800, rs = 5*40 = 200, +256 = 1272.
+        // Pins the shift, both `*`, and the three `+`.
+        let hc = HighCardinalityConfig {
+            hll_precision: 4,
+            heavy_hitter_capacity: 10,
+            sample_size: 5,
+            ..Default::default()
+        };
+        assert_eq!(hc.memory_per_path(), 1272);
+    }
+
+    #[test]
     fn test_default_config_disabled() {
         let config = SchemaSensingConfig::default();
         assert!(!config.enabled);

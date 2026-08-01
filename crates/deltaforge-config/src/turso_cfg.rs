@@ -164,6 +164,43 @@ impl TursoSrcCfg {
 mod tests {
     use super::*;
 
+    fn cfg_with_url(url: &str) -> TursoSrcCfg {
+        serde_json::from_str(&format!(
+            r#"{{"id":"t","url":"{url}","tables":[]}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn turso_is_local_file_vs_cloud() {
+        // Local file paths: no libsql/http(s) scheme.
+        assert!(cfg_with_url("/data/app.db").is_local_file());
+        assert!(cfg_with_url("file:local.db").is_local_file());
+        // Remote schemes are NOT local (pins each `!starts_with` clause).
+        assert!(!cfg_with_url("libsql://x.turso.io").is_local_file());
+        assert!(!cfg_with_url("http://host").is_local_file());
+        assert!(!cfg_with_url("https://host").is_local_file());
+    }
+
+    #[test]
+    fn turso_is_cloud_requires_libsql_scheme_and_turso_host() {
+        assert!(cfg_with_url("libsql://db.turso.io").is_turso_cloud());
+        // libsql but not a turso.io host → not cloud (pins the `&&`).
+        assert!(!cfg_with_url("libsql://self.hosted").is_turso_cloud());
+        // turso.io host but wrong scheme → not cloud.
+        assert!(!cfg_with_url("https://db.turso.io").is_turso_cloud());
+    }
+
+    #[test]
+    fn turso_cdc_table_defaults_when_unset() {
+        assert_eq!(cfg_with_url("/x.db").cdc_table(), "turso_cdc");
+        let custom: TursoSrcCfg = serde_json::from_str(
+            r#"{"id":"t","url":"/x.db","tables":[],"cdc_table_name":"my_cdc"}"#,
+        )
+        .unwrap();
+        assert_eq!(custom.cdc_table(), "my_cdc");
+    }
+
     #[test]
     fn test_native_cdc_level_default() {
         let level = NativeCdcLevel::default();

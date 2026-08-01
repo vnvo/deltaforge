@@ -869,6 +869,65 @@ impl SinkFilter {
 mod tests {
     use super::*;
 
+    fn event(synthetic: Option<&str>) -> deltaforge_core::Event {
+        use deltaforge_core::{Event, Op, SourceInfo, SourcePosition};
+        let source = SourceInfo {
+            version: "t".into(),
+            connector: "mysql".into(),
+            name: "t".into(),
+            db: "db".into(),
+            schema: None,
+            table: "t".into(),
+            ts_ms: 0,
+            snapshot: None,
+            position: SourcePosition::default(),
+        };
+        let mut e = Event::new_row(source, Op::Create, None, None, 0, 0);
+        e.synthetic = synthetic.map(|s| s.to_string());
+        e
+    }
+
+    #[test]
+    fn sink_filter_is_active_when_any_condition_set() {
+        assert!(!SinkFilter::default().is_active());
+        assert!(
+            SinkFilter { exclude_synthetic: true, ..Default::default() }
+                .is_active()
+        );
+        assert!(
+            SinkFilter { synthetic_only: true, ..Default::default() }
+                .is_active()
+        );
+        assert!(
+            SinkFilter { producers: vec!["p".into()], ..Default::default() }
+                .is_active()
+        );
+    }
+
+    #[test]
+    fn sink_filter_allows_by_synthetic_and_producer() {
+        // exclude_synthetic drops synthetic events, keeps real ones.
+        let excl = SinkFilter { exclude_synthetic: true, ..Default::default() };
+        assert!(!excl.allows(&event(Some("proc"))));
+        assert!(excl.allows(&event(None)));
+
+        // synthetic_only keeps synthetic, drops real.
+        let only = SinkFilter { synthetic_only: true, ..Default::default() };
+        assert!(only.allows(&event(Some("proc"))));
+        assert!(!only.allows(&event(None)));
+
+        // producers allow-list: only listed producers pass.
+        let prod = SinkFilter {
+            producers: vec!["good".into()],
+            ..Default::default()
+        };
+        assert!(prod.allows(&event(Some("good"))));
+        assert!(!prod.allows(&event(Some("bad"))));
+
+        // No filter → everything allowed.
+        assert!(SinkFilter::default().allows(&event(None)));
+    }
+
     #[test]
     fn parse_native_envelope() {
         let yaml = r#"
