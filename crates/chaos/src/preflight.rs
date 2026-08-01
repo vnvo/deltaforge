@@ -186,14 +186,15 @@ mod tests {
         assert!(services_for_profile("kafka-infra").contains(&"kafka"));
         // Assert every profile arm resolves to its own distinct services so a
         // deleted/merged match arm is caught.
-        assert_eq!(
-            services_for_profile("mysql-infra"),
-            &["mysql", "mysql-b"]
-        );
+        assert_eq!(services_for_profile("mysql-infra"), &["mysql", "mysql-b"]);
         assert_eq!(services_for_profile("pg-infra"), &["postgres"]);
         assert_eq!(
             services_for_profile("df"),
-            &["deltaforge-release", "deltaforge-debug", "deltaforge-profile"]
+            &[
+                "deltaforge-release",
+                "deltaforge-debug",
+                "deltaforge-profile"
+            ]
         );
         assert_eq!(services_for_profile("nonexistent").len(), 0);
     }

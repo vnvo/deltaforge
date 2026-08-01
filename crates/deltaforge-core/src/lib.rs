@@ -1016,26 +1016,39 @@ mod tests {
         let a = fast_uuid_v7().as_u128();
         let b = fast_uuid_v7().as_u128();
         let c = fast_uuid_v7().as_u128();
-        assert!(a < b && b < c, "successive UUIDs must increase: {a} {b} {c}");
+        assert!(
+            a < b && b < c,
+            "successive UUIDs must increase: {a} {b} {c}"
+        );
     }
 
     #[test]
     fn sink_error_dlq_eligibility() {
         // Only per-event serialization/routing errors are DLQ-eligible.
         assert!(
-            SinkError::Serialization { details: "bad".into() }
-                .is_dlq_eligible()
+            SinkError::Serialization {
+                details: "bad".into()
+            }
+            .is_dlq_eligible()
         );
         assert!(
-            SinkError::Routing { details: "no route".into() }.is_dlq_eligible()
+            SinkError::Routing {
+                details: "no route".into()
+            }
+            .is_dlq_eligible()
         );
         // Batch-fatal / transport errors are NOT (must fail the batch).
         assert!(
-            !SinkError::Fatal { details: "fenced".into() }.is_dlq_eligible()
+            !SinkError::Fatal {
+                details: "fenced".into()
+            }
+            .is_dlq_eligible()
         );
         assert!(
-            !SinkError::Connect { details: "refused".into() }
-                .is_dlq_eligible()
+            !SinkError::Connect {
+                details: "refused".into()
+            }
+            .is_dlq_eligible()
         );
     }
 

@@ -1263,10 +1263,7 @@ mod tests {
             "uuid-a:1-10,uuid-a:0"
         );
         // no colon at all → appended verbatim.
-        assert_eq!(
-            merge_gtid("uuid-a:1-10", "garbage"),
-            "uuid-a:1-10,garbage"
-        );
+        assert_eq!(merge_gtid("uuid-a:1-10", "garbage"), "uuid-a:1-10,garbage");
     }
 
     // =========================================================================
@@ -1401,7 +1398,13 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<Event>(1);
         let mut ctx = make_runctx(tx);
         ctx.last_gtid = Some("uuid-a:1-10".to_string());
-        handle_gtid(&mut ctx, GtidEvent { flags: 0, gtid: "uuid-a:11".into() });
+        handle_gtid(
+            &mut ctx,
+            GtidEvent {
+                flags: 0,
+                gtid: "uuid-a:11".into(),
+            },
+        );
         assert_eq!(ctx.last_gtid.as_deref(), Some("uuid-a:1-11"));
     }
 

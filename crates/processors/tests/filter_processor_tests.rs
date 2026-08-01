@@ -386,10 +386,7 @@ async fn regex_invalid_pattern_fails_construction() {
 // 2-event count assertion survives a swap of which event passes).
 // ============================================================================
 
-fn update_event(
-    before: serde_json::Value,
-    after: serde_json::Value,
-) -> Event {
+fn update_event(before: serde_json::Value, after: serde_json::Value) -> Event {
     Event::new_row(
         source("db", "t"),
         Op::Update,
@@ -408,13 +405,23 @@ async fn field_ne_passes_only_when_not_equal() {
     };
     let out = run(
         mk(),
-        vec![make_event("db", "t", Op::Create, json!({"status": "other"}))],
+        vec![make_event(
+            "db",
+            "t",
+            Op::Create,
+            json!({"status": "other"}),
+        )],
     )
     .await;
     assert_eq!(out.len(), 1, "not-equal passes Ne");
     let out = run(
         mk(),
-        vec![make_event("db", "t", Op::Create, json!({"status": "active"}))],
+        vec![make_event(
+            "db",
+            "t",
+            Op::Create,
+            json!({"status": "active"}),
+        )],
     )
     .await;
     assert!(out.is_empty(), "equal fails Ne");
@@ -427,9 +434,11 @@ async fn field_eq_int_vs_float_single_event() {
         fields: vec![pred("score", FieldOp::Eq, json!(42))],
         ..Default::default()
     };
-    let out =
-        run(cfg, vec![make_event("db", "t", Op::Create, json!({"score": 42.0}))])
-            .await;
+    let out = run(
+        cfg,
+        vec![make_event("db", "t", Op::Create, json!({"score": 42.0}))],
+    )
+    .await;
     assert_eq!(out.len(), 1);
 }
 
@@ -439,13 +448,17 @@ async fn field_gt_orders_numbers_and_strings() {
         fields: vec![pred("n", FieldOp::Gt, json!(v))],
         ..Default::default()
     };
-    let out =
-        run(num(3), vec![make_event("db", "t", Op::Create, json!({"n": 5}))])
-            .await;
+    let out = run(
+        num(3),
+        vec![make_event("db", "t", Op::Create, json!({"n": 5}))],
+    )
+    .await;
     assert_eq!(out.len(), 1, "5 > 3 passes (numeric cmp_values)");
-    let out =
-        run(num(3), vec![make_event("db", "t", Op::Create, json!({"n": 2}))])
-            .await;
+    let out = run(
+        num(3),
+        vec![make_event("db", "t", Op::Create, json!({"n": 2}))],
+    )
+    .await;
     assert!(out.is_empty(), "2 > 3 drops");
     // String ordering exercises the String arm of cmp_values.
     let scfg = FilterProcessorCfg {
@@ -496,17 +509,23 @@ async fn field_changed_detects_value_change() {
         fields: vec![pred_no_value("status", FieldOp::Changed)],
         ..Default::default()
     };
-    let out =
-        run(mk(), vec![update_event(json!({"status": "a"}), json!({"status": "b"}))])
-            .await;
+    let out = run(
+        mk(),
+        vec![update_event(json!({"status": "a"}), json!({"status": "b"}))],
+    )
+    .await;
     assert_eq!(out.len(), 1, "a→b is a change");
-    let out =
-        run(mk(), vec![update_event(json!({"status": "a"}), json!({"status": "a"}))])
-            .await;
+    let out = run(
+        mk(),
+        vec![update_event(json!({"status": "a"}), json!({"status": "a"}))],
+    )
+    .await;
     assert!(out.is_empty(), "a→a is not a change");
     // Field absent in both images → not changed (pins the (None,None) arm).
-    let out =
-        run(mk(), vec![update_event(json!({"other": 1}), json!({"other": 2}))])
-            .await;
+    let out = run(
+        mk(),
+        vec![update_event(json!({"other": 1}), json!({"other": 2}))],
+    )
+    .await;
     assert!(out.is_empty(), "field absent in both → not changed");
 }

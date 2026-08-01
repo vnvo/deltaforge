@@ -773,8 +773,9 @@ mod tests {
         assert!(cancelled.is_cancelled() && !cancelled.is_timeout());
         assert_eq!(cancelled.into_inner(), None);
 
-        let timeout: RetryOutcome<String> =
-            RetryOutcome::Timeout { action: "connect".into() };
+        let timeout: RetryOutcome<String> = RetryOutcome::Timeout {
+            action: "connect".into(),
+        };
         assert!(timeout.is_timeout() && !timeout.is_cancelled());
 
         let failed: RetryOutcome<String> = RetryOutcome::Failed("boom".into());

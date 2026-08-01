@@ -343,8 +343,8 @@ mod tests {
         // Leading, interleaved, and trailing literals around two variables —
         // exercises the offset arithmetic in parse (after_open / end_abs /
         // offset advance) with non-trivial, non-zero positions.
-        let t = CompiledTemplate::parse("a${source.db}b${source.table}c")
-            .unwrap();
+        let t =
+            CompiledTemplate::parse("a${source.db}b${source.table}c").unwrap();
         let ev = sample_event_json();
         assert_eq!(t.resolve_strict(&ev).unwrap(), "ashopbordersc");
         // raw() must return the original template (pins the accessor).

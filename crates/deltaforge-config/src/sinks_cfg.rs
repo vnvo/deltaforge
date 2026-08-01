@@ -891,28 +891,43 @@ mod tests {
     fn sink_filter_is_active_when_any_condition_set() {
         assert!(!SinkFilter::default().is_active());
         assert!(
-            SinkFilter { exclude_synthetic: true, ..Default::default() }
-                .is_active()
+            SinkFilter {
+                exclude_synthetic: true,
+                ..Default::default()
+            }
+            .is_active()
         );
         assert!(
-            SinkFilter { synthetic_only: true, ..Default::default() }
-                .is_active()
+            SinkFilter {
+                synthetic_only: true,
+                ..Default::default()
+            }
+            .is_active()
         );
         assert!(
-            SinkFilter { producers: vec!["p".into()], ..Default::default() }
-                .is_active()
+            SinkFilter {
+                producers: vec!["p".into()],
+                ..Default::default()
+            }
+            .is_active()
         );
     }
 
     #[test]
     fn sink_filter_allows_by_synthetic_and_producer() {
         // exclude_synthetic drops synthetic events, keeps real ones.
-        let excl = SinkFilter { exclude_synthetic: true, ..Default::default() };
+        let excl = SinkFilter {
+            exclude_synthetic: true,
+            ..Default::default()
+        };
         assert!(!excl.allows(&event(Some("proc"))));
         assert!(excl.allows(&event(None)));
 
         // synthetic_only keeps synthetic, drops real.
-        let only = SinkFilter { synthetic_only: true, ..Default::default() };
+        let only = SinkFilter {
+            synthetic_only: true,
+            ..Default::default()
+        };
         assert!(only.allows(&event(Some("proc"))));
         assert!(!only.allows(&event(None)));
 

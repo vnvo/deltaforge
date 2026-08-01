@@ -476,8 +476,11 @@ mod tests {
         // Both fields appear every event → classified stable (a broken
         // observation counter would drop them or panic on underflow).
         let class = stats.classify(&config).unwrap();
-        let names: Vec<_> =
-            class.stable_fields.iter().map(|f| f.name.as_str()).collect();
+        let names: Vec<_> = class
+            .stable_fields
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
         assert!(names.contains(&"id") && names.contains(&"name"));
     }
 }

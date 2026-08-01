@@ -464,11 +464,7 @@ mod tests {
 
     #[test]
     fn classify_server_error_admin_shutdown_and_default() {
-        for s in [
-            "57P01",
-            "terminating connection",
-            "administrator command",
-        ] {
+        for s in ["57P01", "terminating connection", "administrator command"] {
             assert!(
                 matches!(
                     LoopControl::classify_server_error(s),
@@ -518,13 +514,18 @@ mod tests {
     fn is_retryable_only_for_transient_controls() {
         assert!(LoopControl::Reconnect.is_retryable());
         assert!(
-            LoopControl::ReloadSchema { schema: None, table: None }
-                .is_retryable()
+            LoopControl::ReloadSchema {
+                schema: None,
+                table: None
+            }
+            .is_retryable()
         );
         assert!(!LoopControl::Stop.is_retryable());
         assert!(
-            !LoopControl::Fail(SourceError::Auth { details: "x".into() })
-                .is_retryable()
+            !LoopControl::Fail(SourceError::Auth {
+                details: "x".into()
+            })
+            .is_retryable()
         );
     }
 }

@@ -143,7 +143,10 @@ mod tests {
         assert_eq!(keys, vec!["a".to_string(), "b".to_string()]);
 
         assert!(store.delete("a").await.unwrap(), "delete reports existed");
-        assert!(!store.delete("a").await.unwrap(), "second delete is a no-op");
+        assert!(
+            !store.delete("a").await.unwrap(),
+            "second delete is a no-op"
+        );
         assert_eq!(store.list().await.unwrap(), vec!["b".to_string()]);
         let _ = tokio::fs::remove_file(&path).await;
     }
