@@ -140,11 +140,19 @@ pub async fn run<B: SourceBackend>(
 
     // After restore, the pipeline should drain the backlog. Object count
     // must grow within RECOVERY_WAIT.
+    //
+    // Keep inserting during recovery: a real workload resumes traffic after an
+    // outage, and — more importantly — the S3 writer only rolls a file into a
+    // visible object on size/age/idle triggers. Without fresh events the
+    // replayed batch sits in an open writer and no *new* object appears until
+    // the idle timer fires, which can outlast RECOVERY_WAIT and cause a false
+    // "stuck pipeline" failure even though recovery succeeded.
     let restore_deadline = Instant::now() + RECOVERY_WAIT;
     let recovered = loop {
         if Instant::now() > restore_deadline {
             break false;
         }
+        backend.insert_rows("s3-outage-recovery", 200).await?;
         sleep(POLL_INTERVAL).await;
         let count = count_objects(&store, &prefix).await.unwrap_or(0);
         if count > objects_during_outage {
