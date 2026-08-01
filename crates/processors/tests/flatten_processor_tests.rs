@@ -291,3 +291,21 @@ fn event_with_no_payload_passes_through_unchanged() {
     assert!(out[0].before.is_none());
     assert!(out[0].after.is_none());
 }
+
+#[test]
+fn index_list_recursion_respects_max_depth() {
+    // Array (indexed at depth 0) → its object item recurses to depth 1, which
+    // hits max_depth=1 and is kept opaque. A `depth+1`→`depth*1` bug in the
+    // Index branch would recurse one level too far and flatten the item.
+    let cfg = FlattenProcessorCfg {
+        max_depth: Some(1),
+        lists: ListPolicy::Index,
+        ..Default::default()
+    };
+    let result = flatten(cfg, json!({ "arr": [ { "x": 1 } ] }));
+    assert_eq!(result["arr__0"], json!({ "x": 1 }));
+    assert!(
+        result.get("arr__0__x").is_none(),
+        "must not over-flatten past max_depth"
+    );
+}

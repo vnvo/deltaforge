@@ -465,3 +465,26 @@ impl Processor for JsProcessor {
             .context("JS worker dropped reply channel")?
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn normalize_to_i64_converts_only_whole_in_range_numbers() {
+        // Whole-number float → i64.
+        let mut whole = json!(42.0);
+        assert!(whole.is_f64());
+        normalize_to_i64(&mut whole);
+        assert!(whole.is_i64(), "whole float must become i64");
+        assert_eq!(whole.as_i64(), Some(42));
+
+        // Fractional float must be left untouched — pins the `&&` (a `||`
+        // mutation would truncate 1.5 to 1).
+        let mut frac = json!(1.5);
+        normalize_to_i64(&mut frac);
+        assert!(frac.is_f64(), "fractional float must stay f64");
+        assert_eq!(frac.as_f64(), Some(1.5));
+    }
+}

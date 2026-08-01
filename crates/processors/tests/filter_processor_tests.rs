@@ -379,3 +379,134 @@ async fn regex_invalid_pattern_fails_construction() {
     };
     assert!(FilterProcessor::new(cfg).is_err());
 }
+
+// ============================================================================
+// Predicate arms the existing count-based tests leave unpinned. Each uses a
+// SINGLE event so a mutation that flips its pass/drop changes the total (a
+// 2-event count assertion survives a swap of which event passes).
+// ============================================================================
+
+fn update_event(
+    before: serde_json::Value,
+    after: serde_json::Value,
+) -> Event {
+    Event::new_row(
+        source("db", "t"),
+        Op::Update,
+        Some(before),
+        Some(after),
+        1_700_000_000_000,
+        64,
+    )
+}
+
+#[tokio::test]
+async fn field_ne_passes_only_when_not_equal() {
+    let mk = || FilterProcessorCfg {
+        fields: vec![pred("status", FieldOp::Ne, json!("active"))],
+        ..Default::default()
+    };
+    let out = run(
+        mk(),
+        vec![make_event("db", "t", Op::Create, json!({"status": "other"}))],
+    )
+    .await;
+    assert_eq!(out.len(), 1, "not-equal passes Ne");
+    let out = run(
+        mk(),
+        vec![make_event("db", "t", Op::Create, json!({"status": "active"}))],
+    )
+    .await;
+    assert!(out.is_empty(), "equal fails Ne");
+}
+
+#[tokio::test]
+async fn field_eq_int_vs_float_single_event() {
+    // Single event: a json_eq `==`→`!=` flip drops it (0 vs 1).
+    let cfg = FilterProcessorCfg {
+        fields: vec![pred("score", FieldOp::Eq, json!(42))],
+        ..Default::default()
+    };
+    let out =
+        run(cfg, vec![make_event("db", "t", Op::Create, json!({"score": 42.0}))])
+            .await;
+    assert_eq!(out.len(), 1);
+}
+
+#[tokio::test]
+async fn field_gt_orders_numbers_and_strings() {
+    let num = |v| FilterProcessorCfg {
+        fields: vec![pred("n", FieldOp::Gt, json!(v))],
+        ..Default::default()
+    };
+    let out =
+        run(num(3), vec![make_event("db", "t", Op::Create, json!({"n": 5}))])
+            .await;
+    assert_eq!(out.len(), 1, "5 > 3 passes (numeric cmp_values)");
+    let out =
+        run(num(3), vec![make_event("db", "t", Op::Create, json!({"n": 2}))])
+            .await;
+    assert!(out.is_empty(), "2 > 3 drops");
+    // String ordering exercises the String arm of cmp_values.
+    let scfg = FilterProcessorCfg {
+        fields: vec![pred("s", FieldOp::Gt, json!("apple"))],
+        ..Default::default()
+    };
+    let out = run(
+        scfg,
+        vec![make_event("db", "t", Op::Create, json!({"s": "banana"}))],
+    )
+    .await;
+    assert_eq!(out.len(), 1, "banana > apple passes (string cmp_values)");
+}
+
+#[tokio::test]
+async fn field_in_and_not_in_membership() {
+    let out = run(
+        FilterProcessorCfg {
+            fields: vec![pred("c", FieldOp::In, json!(["a", "b", "c"]))],
+            ..Default::default()
+        },
+        vec![make_event("db", "t", Op::Create, json!({"c": "b"}))],
+    )
+    .await;
+    assert_eq!(out.len(), 1, "member passes In");
+
+    let notin = || FilterProcessorCfg {
+        fields: vec![pred("c", FieldOp::NotIn, json!(["a", "b"]))],
+        ..Default::default()
+    };
+    let out = run(
+        notin(),
+        vec![make_event("db", "t", Op::Create, json!({"c": "z"}))],
+    )
+    .await;
+    assert_eq!(out.len(), 1, "non-member passes NotIn");
+    let out = run(
+        notin(),
+        vec![make_event("db", "t", Op::Create, json!({"c": "a"}))],
+    )
+    .await;
+    assert!(out.is_empty(), "member fails NotIn");
+}
+
+#[tokio::test]
+async fn field_changed_detects_value_change() {
+    let mk = || FilterProcessorCfg {
+        fields: vec![pred_no_value("status", FieldOp::Changed)],
+        ..Default::default()
+    };
+    let out =
+        run(mk(), vec![update_event(json!({"status": "a"}), json!({"status": "b"}))])
+            .await;
+    assert_eq!(out.len(), 1, "a→b is a change");
+    let out =
+        run(mk(), vec![update_event(json!({"status": "a"}), json!({"status": "a"}))])
+            .await;
+    assert!(out.is_empty(), "a→a is not a change");
+    // Field absent in both images → not changed (pins the (None,None) arm).
+    let out =
+        run(mk(), vec![update_event(json!({"other": 1}), json!({"other": 2}))])
+            .await;
+    assert!(out.is_empty(), "field absent in both → not changed");
+}
