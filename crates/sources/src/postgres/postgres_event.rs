@@ -804,6 +804,47 @@ mod tests {
     }
 
     #[test]
+    fn read_cstring_without_terminator_stops_at_end() {
+        // No trailing NUL: the scan must stop exactly at data.len() and NOT
+        // advance past it (pins the two `<` bounds against `<=`, which would
+        // over-read/panic or push offset beyond the buffer).
+        let data = b"abc";
+        let mut offset = 0;
+        assert_eq!(read_cstring(data, &mut offset), "abc");
+        assert_eq!(offset, 3);
+    }
+
+    #[test]
+    fn columns_differ_on_name_or_oid_change() {
+        let base = vec![RelationColumn {
+            name: "id".into(),
+            type_oid: 23,
+            type_modifier: -1,
+            flags: 1,
+        }];
+        // Name differs only → differ (pins `||`: `&&` would need oid to differ too).
+        let name_only = vec![RelationColumn {
+            name: "ID".into(),
+            type_oid: 23,
+            type_modifier: -1,
+            flags: 1,
+        }];
+        assert!(columns_differ(&base, &name_only));
+        // OID differs only → differ.
+        let oid_only = vec![RelationColumn {
+            name: "id".into(),
+            type_oid: 25,
+            type_modifier: -1,
+            flags: 1,
+        }];
+        assert!(columns_differ(&base, &oid_only));
+        // Identical → no difference.
+        assert!(!columns_differ(&base, &base.clone()));
+        // Length mismatch → differ.
+        assert!(columns_differ(&base, &[]));
+    }
+
+    #[test]
     fn test_relation_column_is_key() {
         let key_col = RelationColumn {
             name: "id".into(),

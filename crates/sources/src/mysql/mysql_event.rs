@@ -729,6 +729,9 @@ mod tests {
     use common::AllowList;
     use mysql_binlog_connector_rust::column::column_value::ColumnValue;
     use mysql_binlog_connector_rust::event::delete_rows_event::DeleteRowsEvent;
+    use mysql_binlog_connector_rust::event::gtid_event::GtidEvent;
+    use mysql_binlog_connector_rust::event::query_event::QueryEvent;
+    use mysql_binlog_connector_rust::event::rotate_event::RotateEvent;
     use mysql_binlog_connector_rust::event::row_event::RowEvent;
     use mysql_binlog_connector_rust::event::table_map_event::TableMapEvent;
     use mysql_binlog_connector_rust::event::update_rows_event::UpdateRowsEvent;
@@ -1242,5 +1245,179 @@ mod tests {
         let result =
             merge_gtid("uuid-a:1-10,uuid-b:1-20,uuid-c:1-30", "uuid-b:21");
         assert_eq!(result, "uuid-a:1-10,uuid-b:1-21,uuid-c:1-30");
+    }
+
+    #[test]
+    fn merge_gtid_preserves_nonzero_range_start() {
+        // Existing range does NOT start at 1 — pins the `colon + 1` range
+        // slice. A wrong offset silently falls back to start=1, which every
+        // other test (all start at 1) fails to catch.
+        assert_eq!(merge_gtid("uuid-a:5-10", "uuid-a:11"), "uuid-a:5-11");
+    }
+
+    #[test]
+    fn merge_gtid_rejects_zero_or_unparseable_sequence() {
+        // seq 0 fails the `n > 0` guard → appended verbatim, not merged.
+        assert_eq!(
+            merge_gtid("uuid-a:1-10", "uuid-a:0"),
+            "uuid-a:1-10,uuid-a:0"
+        );
+        // no colon at all → appended verbatim.
+        assert_eq!(
+            merge_gtid("uuid-a:1-10", "garbage"),
+            "uuid-a:1-10,garbage"
+        );
+    }
+
+    // =========================================================================
+    // extract_identifier / RENAME TABLE
+    // =========================================================================
+
+    #[test]
+    fn extract_identifier_stops_at_each_delimiter() {
+        // Each unquoted terminator individually — pins the `||` chain.
+        assert_eq!(extract_identifier("foo bar").as_deref(), Some("foo"));
+        assert_eq!(extract_identifier("foo(x)").as_deref(), Some("foo"));
+        assert_eq!(extract_identifier("foo;").as_deref(), Some("foo"));
+        assert_eq!(extract_identifier("foo,bar").as_deref(), Some("foo"));
+        // Backtick-quoted schema.table.
+        assert_eq!(
+            extract_identifier("`sch`.`tbl`").as_deref(),
+            Some("sch.tbl")
+        );
+        assert_eq!(extract_identifier(""), None);
+    }
+
+    #[test]
+    fn extract_table_from_ddl_rename() {
+        // The RENAME TABLE branch — untested, so its `+ 6` offset survived.
+        assert_eq!(
+            extract_table_from_ddl("RENAME TABLE foo TO bar").as_deref(),
+            Some("foo")
+        );
+    }
+
+    fn query_event(sql: &str) -> QueryEvent {
+        QueryEvent {
+            thread_id: 1,
+            exec_time: 0,
+            error_code: 0,
+            schema: "shop".to_string(),
+            query: sql.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_query_emits_ddl_event() {
+        // Every DDL keyword must be detected independently — pins each clause
+        // of the `||` chain (a `&&` mutation on any one suppresses that keyword
+        // only, so a single-keyword test would miss the others).
+        for sql in [
+            "ALTER TABLE orders ADD COLUMN x INT",
+            "CREATE TABLE orders (id INT)",
+            "DROP TABLE orders",
+            "TRUNCATE TABLE orders",
+            "RENAME TABLE orders TO archived",
+        ] {
+            let (tx, mut rx) = mpsc::channel::<Event>(8);
+            let mut ctx = make_runctx(tx);
+            handle_query(&mut ctx, &make_header(), query_event(sql))
+                .await
+                .expect("handle_query should succeed");
+
+            let ev = rx
+                .recv()
+                .await
+                .unwrap_or_else(|| panic!("DDL must emit an event: {sql}"));
+            assert_eq!(ev.op, Op::Read, "DDL events use Debezium op 'r'");
+            assert!(ev.ddl.is_some(), "DDL event must carry a ddl payload");
+            assert_eq!(ev.source.table, "_ddl");
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_query_ignores_non_ddl() {
+        // A plain DML/marker query must NOT emit a DDL event.
+        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let mut ctx = make_runctx(tx);
+        handle_query(&mut ctx, &make_header(), query_event("BEGIN"))
+            .await
+            .expect("ok");
+        assert!(
+            rx.try_recv().is_err(),
+            "transaction markers must not emit events"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_write_rows_marks_only_configured_outbox_tables() {
+        let row = || RowEvent {
+            column_values: vec![
+                ColumnValue::LongLong(1),
+                ColumnValue::String(b"sku-1".to_vec()),
+            ],
+        };
+        let write = || WriteRowsEvent {
+            table_id: TABLE_ID,
+            included_columns: vec![true, true],
+            rows: vec![row()],
+        };
+
+        // (a) Table IS in the outbox allow-list → schema tagged with sentinel.
+        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let mut ctx = make_runctx(tx);
+        ctx.outbox_tables = AllowList::new(&["shop.orders".to_string()]);
+        handle_write_rows(&mut ctx, &make_header(), write())
+            .await
+            .expect("ok");
+        let ev = rx.recv().await.expect("event");
+        assert_eq!(
+            ev.source.schema.as_deref(),
+            Some(OUTBOX_SCHEMA_SENTINEL),
+            "table in outbox list must be tagged"
+        );
+
+        // (b) Outbox list is non-empty but does NOT contain this table → NOT
+        // tagged. Pins the `&&` (a `||` mutation would tag it anyway) and the
+        // `!is_empty()` guard.
+        let (tx2, mut rx2) = mpsc::channel::<Event>(8);
+        let mut ctx2 = make_runctx(tx2);
+        ctx2.outbox_tables = AllowList::new(&["other.table".to_string()]);
+        handle_write_rows(&mut ctx2, &make_header(), write())
+            .await
+            .expect("ok");
+        let ev2 = rx2.recv().await.expect("event");
+        assert_ne!(
+            ev2.source.schema.as_deref(),
+            Some(OUTBOX_SCHEMA_SENTINEL),
+            "table absent from outbox list must NOT be tagged"
+        );
+    }
+
+    #[test]
+    fn handle_gtid_accumulates_executed_set() {
+        // handle_gtid must extend the resume GTID set; a no-op body would
+        // lose progress and cause re-delivery on reconnect.
+        let (tx, _rx) = mpsc::channel::<Event>(1);
+        let mut ctx = make_runctx(tx);
+        ctx.last_gtid = Some("uuid-a:1-10".to_string());
+        handle_gtid(&mut ctx, GtidEvent { flags: 0, gtid: "uuid-a:11".into() });
+        assert_eq!(ctx.last_gtid.as_deref(), Some("uuid-a:1-11"));
+    }
+
+    #[test]
+    fn handle_rotate_advances_binlog_file() {
+        // handle_rotate must record the new binlog file for checkpointing;
+        // a no-op body would pin the position to the old file.
+        let (tx, _rx) = mpsc::channel::<Event>(1);
+        let mut ctx = make_runctx(tx);
+        handle_rotate(
+            &mut ctx,
+            RotateEvent {
+                binlog_filename: "mysql-bin.000042".into(),
+                binlog_position: 999,
+            },
+        );
+        assert_eq!(ctx.last_file, "mysql-bin.000042");
     }
 }

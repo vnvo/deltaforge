@@ -343,3 +343,188 @@ fn is_schema_error(s: &str) -> bool {
     (s.contains("relation") || s.contains("column") || s.contains("type"))
         && s.contains("does not exist")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Pure string classifiers. Each case matches exactly ONE clause so a
+    //    `||`→`&&` mutation on any clause flips that case to false. ──────────
+
+    #[test]
+    fn is_auth_error_matches_each_signal() {
+        for s in [
+            "password authentication failed",
+            "permission denied",
+            "no pg_hba.conf entry for host",
+            "insufficient privilege",
+        ] {
+            assert!(is_auth_error(s), "should be auth: {s}");
+        }
+        assert!(!is_auth_error("connection reset"));
+    }
+
+    #[test]
+    fn is_connection_error_matches_each_signal() {
+        for s in [
+            "connection reset by peer",
+            "connection refused",
+            "broken pipe",
+            "connection closed",
+            "operation timed out",
+            "unexpected eof",
+            "early eof",
+            "failed to fill whole buffer",
+            // Kept as separate single-clause strings so a `||`→`&&` mutation
+            // on either clause is caught (a combined string would mask it).
+            "terminating connection",
+            "administrator command",
+            "57p01",
+        ] {
+            assert!(is_connection_error(s), "should be connection: {s}");
+        }
+        assert!(!is_connection_error("syntax error"));
+    }
+
+    #[test]
+    fn is_schema_error_requires_object_and_absence() {
+        // Each object kind, paired with "does not exist".
+        assert!(is_schema_error("relation \"x\" does not exist"));
+        assert!(is_schema_error("column \"y\" does not exist"));
+        assert!(is_schema_error("type \"z\" does not exist"));
+        // Object word WITHOUT "does not exist" must NOT classify (pins the
+        // `&&`; a `&&`→`||` mutation would wrongly match).
+        assert!(!is_schema_error("relation \"x\" already exists"));
+        // "does not exist" without an object word must NOT classify.
+        assert!(!is_schema_error("database does not exist"));
+    }
+
+    // ── classify_server_error — returns LoopControl. ────────────────────────
+
+    #[test]
+    fn classify_server_error_auth_signals() {
+        for s in [
+            "28P01",
+            "28000",
+            "password authentication failed",
+            "no pg_hba.conf entry",
+        ] {
+            assert!(
+                matches!(
+                    LoopControl::classify_server_error(s),
+                    LoopControl::Fail(SourceError::Auth { .. })
+                ),
+                "expected Auth for: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_server_error_schema_signals() {
+        for s in ["42P01", "42703", "42704", "relation foo does not exist"] {
+            assert!(
+                matches!(
+                    LoopControl::classify_server_error(s),
+                    LoopControl::ReloadSchema { .. }
+                ),
+                "expected ReloadSchema for: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_server_error_slot_and_wal() {
+        assert!(matches!(
+            LoopControl::classify_server_error(
+                "replication slot \"s\" does not exist"
+            ),
+            LoopControl::Fail(SourceError::Checkpoint { .. })
+        ));
+        assert!(matches!(
+            LoopControl::classify_server_error(
+                "replication slot \"s\" is already active"
+            ),
+            LoopControl::Reconnect
+        ));
+        assert!(matches!(
+            LoopControl::classify_server_error(
+                "requested WAL segment 00A has already been removed"
+            ),
+            LoopControl::Fail(SourceError::Checkpoint { .. })
+        ));
+        // "requested wal segment" WITHOUT "removed" must fall through to
+        // Reconnect — pins the `&&` against a `||` mutation.
+        assert!(matches!(
+            LoopControl::classify_server_error(
+                "requested WAL segment 00A is available"
+            ),
+            LoopControl::Reconnect
+        ));
+    }
+
+    #[test]
+    fn classify_server_error_admin_shutdown_and_default() {
+        for s in [
+            "57P01",
+            "terminating connection",
+            "administrator command",
+        ] {
+            assert!(
+                matches!(
+                    LoopControl::classify_server_error(s),
+                    LoopControl::Reconnect
+                ),
+                "expected Reconnect for: {s}"
+            );
+        }
+        // Unknown server error defaults to Reconnect.
+        assert!(matches!(
+            LoopControl::classify_server_error("some novel error"),
+            LoopControl::Reconnect
+        ));
+    }
+
+    // ── from_error_message ──────────────────────────────────────────────────
+
+    #[test]
+    fn from_error_message_classifies_by_signal() {
+        assert!(matches!(
+            LoopControl::from_error_message("invalid dsn"),
+            LoopControl::Fail(SourceError::Incompatible { .. })
+        ));
+        assert!(matches!(
+            LoopControl::from_error_message("invalid connection string"),
+            LoopControl::Fail(SourceError::Incompatible { .. })
+        ));
+        assert!(matches!(
+            LoopControl::from_error_message("permission denied"),
+            LoopControl::Fail(SourceError::Auth { .. })
+        ));
+        assert!(matches!(
+            LoopControl::from_error_message("connection refused"),
+            LoopControl::Reconnect
+        ));
+        assert!(matches!(
+            LoopControl::from_error_message("relation x does not exist"),
+            LoopControl::ReloadSchema { .. }
+        ));
+        assert!(matches!(
+            LoopControl::from_error_message("something unclassifiable"),
+            LoopControl::Fail(SourceError::Other(_))
+        ));
+    }
+
+    #[test]
+    fn is_retryable_only_for_transient_controls() {
+        assert!(LoopControl::Reconnect.is_retryable());
+        assert!(
+            LoopControl::ReloadSchema { schema: None, table: None }
+                .is_retryable()
+        );
+        assert!(!LoopControl::Stop.is_retryable());
+        assert!(
+            !LoopControl::Fail(SourceError::Auth { details: "x".into() })
+                .is_retryable()
+        );
+    }
+}
