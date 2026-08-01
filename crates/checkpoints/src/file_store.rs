@@ -79,3 +79,72 @@ impl CheckpointStore for FileCheckpointStore {
         Ok(map.keys().cloned().collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_path() -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut p = std::env::temp_dir();
+        p.push(format!("df_ckpt_{}_{}.json", std::process::id(), n));
+        p
+    }
+
+    #[tokio::test]
+    async fn put_then_get_roundtrips() {
+        let path = temp_path();
+        let store = FileCheckpointStore::new(&path).unwrap();
+        store.put_raw("src-1", b"pos-42").await.unwrap();
+        // Reading back an EXISTING file must return the data. Pins the
+        // `!try_exists` guard: deleting the `!` would treat an existing file
+        // as absent and return an empty map → silent checkpoint loss.
+        let got = store.get_raw("src-1").await.unwrap();
+        assert_eq!(got.as_deref(), Some(&b"pos-42"[..]));
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_survives_store_reopen() {
+        // The actual resume scenario: a fresh store on the same path must
+        // load the previously persisted checkpoint.
+        let path = temp_path();
+        {
+            let s = FileCheckpointStore::new(&path).unwrap();
+            s.put_raw("s", b"v1").await.unwrap();
+        }
+        let reopened = FileCheckpointStore::new(&path).unwrap();
+        assert_eq!(
+            reopened.get_raw("s").await.unwrap().as_deref(),
+            Some(&b"v1"[..])
+        );
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn get_missing_source_is_none() {
+        let path = temp_path();
+        let store = FileCheckpointStore::new(&path).unwrap();
+        assert_eq!(store.get_raw("absent").await.unwrap(), None);
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn list_and_delete() {
+        let path = temp_path();
+        let store = FileCheckpointStore::new(&path).unwrap();
+        store.put_raw("a", b"1").await.unwrap();
+        store.put_raw("b", b"2").await.unwrap();
+        let mut keys = store.list().await.unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["a".to_string(), "b".to_string()]);
+
+        assert!(store.delete("a").await.unwrap(), "delete reports existed");
+        assert!(!store.delete("a").await.unwrap(), "second delete is a no-op");
+        assert_eq!(store.list().await.unwrap(), vec!["b".to_string()]);
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+}
