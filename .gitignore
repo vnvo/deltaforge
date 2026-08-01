@@ -9,3 +9,4 @@ docs/book/
 docs/specs/
 flamegraph.svg
 perf.data*
+mutants.out*/
