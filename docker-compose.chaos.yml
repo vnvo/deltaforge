@@ -207,8 +207,11 @@ services:
       timeout: 5s
       retries: 10
     ports:
-      - "9000:9000"   # S3 API (also proxied at toxiproxy:5104)
-      - "9001:9001"   # Web console (host access for inspection)
+      # Host ports shifted to avoid clashes with DeltaForge container
+      # metrics on 9000/9001/9002. Inside the chaos_net (where the
+      # toxiproxy route points), MinIO is still on container port 9000.
+      - "9100:9000"   # S3 API on host (also proxied at toxiproxy:5104 for chaos)
+      - "9101:9001"   # Web console (host access for inspection)
     networks: [chaos_net]
 
   # mc bootstrap: apply the lifecycle policy that aborts abandoned

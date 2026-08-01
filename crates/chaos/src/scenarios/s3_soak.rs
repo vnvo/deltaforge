@@ -44,7 +44,9 @@ pub const META: ScenarioMeta = ScenarioMeta {
 };
 
 // Direct (non-toxiproxied) MinIO endpoint reachable from the chaos runner.
-const MINIO_ENDPOINT: &str = "http://localhost:9000";
+// Host port 9100 → MinIO container port 9000 (mapped in docker-compose.chaos.yml
+// to avoid conflict with DeltaForge containers' metrics on 9000-9002).
+const MINIO_ENDPOINT: &str = "http://localhost:9100";
 const MINIO_KEY: &str = "minioadmin";
 const MINIO_SECRET: &str = "minioadmin";
 const BUCKET: &str = "deltaforge-chaos";

@@ -43,7 +43,8 @@ pub const META: ScenarioMeta = ScenarioMeta {
     tags: &["s3", "resilience", "backpressure"],
 };
 
-const MINIO_ENDPOINT: &str = "http://localhost:9000";
+// Host port 9100 → MinIO container port 9000 (see s3_soak.rs comment).
+const MINIO_ENDPOINT: &str = "http://localhost:9100";
 const MINIO_KEY: &str = "minioadmin";
 const MINIO_SECRET: &str = "minioadmin";
 const BUCKET: &str = "deltaforge-chaos";
