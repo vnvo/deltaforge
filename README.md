@@ -205,6 +205,13 @@ Use the bundled `dev.sh` CLI to spin up the dependency stack and run common work
 ./dev.sh check  # fmt --check + clippy + tests (matches CI)
 ```
 
+Enable the pre-push hook once per clone to run the CI lint checks (`cargo fmt --check`
++ `cargo clippy -D warnings`) before every push, so lint failures are caught locally:
+
+```bash
+git config core.hooksPath .githooks   # run once; git push --no-verify to skip
+```
+
 See the [Development guide](docs/src/development.md) for the full layout and additional info.
 
 ## Container image

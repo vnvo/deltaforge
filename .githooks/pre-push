@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Pre-push hook: run the same lint checks CI enforces, so a push that would
+# fail CI is caught locally first.
+#
+# Enable (once per clone):  git config core.hooksPath .githooks
+# Skip for one push:        git push --no-verify
+set -euo pipefail
+
+echo "pre-push: cargo fmt --all -- --check"
+if ! cargo fmt --all -- --check; then
+    echo
+    echo "✗ formatting check failed — run:  cargo fmt --all" >&2
+    exit 1
+fi
+
+echo "pre-push: cargo clippy --workspace -- -D warnings"
+if ! cargo clippy --workspace -- -D warnings; then
+    echo
+    echo "✗ clippy found warnings — fix them before pushing" >&2
+    exit 1
+fi
+
+echo "pre-push: lint OK"
