@@ -449,4 +449,35 @@ mod tests {
         let error = (estimate as f64 - 1000.0).abs() / 1000.0;
         assert!(error < 0.05, "HLL error {error:.2} too high");
     }
+
+    #[test]
+    fn memory_per_path_sums_components() {
+        // 1<<4=16, 10*80=800, 5*40=200, +256 = 1272.
+        let config = HighCardinalityConfig {
+            hll_precision: 4,
+            heavy_hitter_capacity: 10,
+            sample_size: 5,
+            ..Default::default()
+        };
+        assert_eq!(config.memory_per_path(), 1272);
+    }
+
+    #[test]
+    fn observe_owned_tracks_events_and_feeds_classification() {
+        // observe_owned is the owned-string path, parallel to observe() and
+        // otherwise untested — its counters drive frequency classification.
+        let config = test_config();
+        let mut stats = PathFieldStats::new(&config);
+        let fields = vec!["id".to_string(), "name".to_string()];
+        for _ in 0..20 {
+            stats.observe_owned(&fields);
+        }
+        assert_eq!(stats.total_events, 20);
+        // Both fields appear every event → classified stable (a broken
+        // observation counter would drop them or panic on underflow).
+        let class = stats.classify(&config).unwrap();
+        let names: Vec<_> =
+            class.stable_fields.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"id") && names.contains(&"name"));
+    }
 }
