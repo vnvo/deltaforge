@@ -1271,6 +1271,142 @@ mod tests {
         assert!(eff.max_bytes.is_some());
     }
 
+    // ── Pure batch-accumulation helpers (check_and_split / policy) ───────
+
+    /// Build a minimal row event with a controllable size hint and tx-end
+    /// flag — the only two fields `check_and_split` reads.
+    fn sized_event(size_bytes: usize, tx_end: bool) -> Event {
+        let source = deltaforge_core::SourceInfo {
+            version: "test".into(),
+            connector: "mysql".into(),
+            name: "test".into(),
+            db: "db".into(),
+            schema: None,
+            table: "t".into(),
+            ts_ms: 0,
+            snapshot: None,
+            position: deltaforge_core::SourcePosition::default(),
+        };
+        let mut e = Event::new_row(
+            source,
+            deltaforge_core::Op::Create,
+            None,
+            Some(serde_json::json!({"id": 1})),
+            0,
+            0,
+        );
+        e.size_bytes = size_bytes;
+        e.tx_end = tx_end;
+        e
+    }
+
+    #[test]
+    fn check_and_split_flushes_at_max_events() {
+        // max_events=2, byte limit effectively unbounded.
+        let mut b = BuildingBatch::with_capacity(4);
+        assert!(
+            check_and_split(&mut b, sized_event(1, false), 2, usize::MAX)
+                .is_none(),
+            "1st event fits"
+        );
+        assert!(
+            check_and_split(&mut b, sized_event(1, false), 2, usize::MAX)
+                .is_none(),
+            "2nd event fits (len 1 < 2)"
+        );
+        // 3rd event: len 2 >= max_events(2) → flush the full batch, restart.
+        let flushed =
+            check_and_split(&mut b, sized_event(1, false), 2, usize::MAX)
+                .expect("must flush at max_events");
+        assert_eq!(flushed.raw.len(), 2);
+        assert_eq!(b.raw.len(), 1, "current event carried into new batch");
+    }
+
+    #[test]
+    fn check_and_split_flushes_at_max_bytes_and_accumulates() {
+        // max_bytes=100, event count effectively unbounded.
+        let mut b = BuildingBatch::with_capacity(64);
+        assert!(
+            check_and_split(&mut b, sized_event(60, false), 10_000, 100)
+                .is_none()
+        );
+        assert_eq!(b.bytes, 60, "byte hint accumulated (kills +=/size-hint)");
+        // 60 + 60 = 120 >= 100 → flush. Distinguishes `+` from `-` (0 >= 100
+        // would not flush) at the size check.
+        let flushed =
+            check_and_split(&mut b, sized_event(60, false), 10_000, 100)
+                .expect("must flush at max_bytes");
+        assert_eq!(flushed.bytes, 60);
+        assert_eq!(b.bytes, 60, "new batch seeded with current event bytes");
+    }
+
+    #[test]
+    fn check_and_split_size_check_is_addition_not_product() {
+        // Accumulator already holds 60 bytes (seeded directly), a zero-sized
+        // event arrives, max_bytes=50. Sum: 60 + 0 = 60 >= 50 → flush.
+        // Product (mutant): 60 * 0 = 0 >= 50 → no flush. Pins `+` vs `*`.
+        let mut b = BuildingBatch::with_capacity(64);
+        b.bytes = 60;
+        b.raw.push(sized_event(60, false)); // non-empty so the guard allows flush
+        let flushed =
+            check_and_split(&mut b, sized_event(0, false), 10_000, 50);
+        assert!(flushed.is_some(), "60 + 0 >= 50 must flush");
+    }
+
+    #[test]
+    fn check_and_split_transaction_boundary_guard() {
+        // Case B: empty batch + a tx-boundary event that alone exceeds the
+        // byte limit → do NOT flush (nothing to flush; can't split a lone
+        // boundary). Pins both `!` operators in the guard.
+        let mut b = BuildingBatch::with_capacity(64);
+        assert!(
+            check_and_split(&mut b, sized_event(20, true), 10_000, 10)
+                .is_none(),
+            "empty batch + boundary event must not flush"
+        );
+
+        // Case C: non-empty batch, incoming event IS a boundary, limit hit →
+        // flush (the || must stay ||; && would suppress it).
+        let mut b = BuildingBatch::with_capacity(64);
+        assert!(
+            check_and_split(&mut b, sized_event(1, false), 1, usize::MAX)
+                .is_none()
+        );
+        assert!(
+            check_and_split(&mut b, sized_event(1, true), 1, usize::MAX)
+                .is_some(),
+            "full batch must flush even when next event is a boundary"
+        );
+
+        // Case D: empty batch, NON-boundary event over the byte limit →
+        // flush. Pins is_tx_boundary against a constant `true`.
+        let mut b = BuildingBatch::with_capacity(64);
+        assert!(
+            check_and_split(&mut b, sized_event(20, false), 10_000, 10)
+                .is_some(),
+            "empty batch + non-boundary oversized event must flush"
+        );
+    }
+
+    #[test]
+    fn policy_satisfied_covers_each_variant() {
+        use deltaforge_config::CommitPolicy;
+        // Default (None) behaves as Required: required_acks == required_total.
+        assert!(policy_satisfied(&None, 2, 2, 5));
+        assert!(!policy_satisfied(&None, 2, 1, 5));
+        // Required: only required-sink acks count.
+        assert!(policy_satisfied(&Some(CommitPolicy::Required), 3, 3, 3));
+        assert!(!policy_satisfied(&Some(CommitPolicy::Required), 3, 2, 9));
+        // All: total_acks must equal required_total (== not !=).
+        assert!(policy_satisfied(&Some(CommitPolicy::All), 4, 4, 4));
+        assert!(!policy_satisfied(&Some(CommitPolicy::All), 4, 4, 3));
+        // Quorum: total_acks >= quorum (>= not <).
+        let q = Some(CommitPolicy::Quorum { quorum: 2 });
+        assert!(policy_satisfied(&q, 5, 0, 2));
+        assert!(policy_satisfied(&q, 5, 0, 3));
+        assert!(!policy_satisfied(&q, 5, 0, 1));
+    }
+
     // ── Per-sink commit tests ────────────────────────────────────────────
 
     /// Mock sink that tracks delivery calls and optionally fails.
