@@ -967,6 +967,79 @@ mod tests {
     }
 
     #[test]
+    fn op_parses_from_debezium_codes() {
+        assert_eq!("c".parse::<Op>().unwrap(), Op::Create);
+        assert_eq!("u".parse::<Op>().unwrap(), Op::Update);
+        assert_eq!("d".parse::<Op>().unwrap(), Op::Delete);
+        assert_eq!("r".parse::<Op>().unwrap(), Op::Read);
+        assert_eq!("t".parse::<Op>().unwrap(), Op::Truncate);
+        assert!("x".parse::<Op>().is_err());
+    }
+
+    #[test]
+    fn fast_uuid_v7_has_version_and_variant_bits() {
+        let u = fast_uuid_v7();
+        assert_eq!(u.get_version_num(), 7, "must be a v7 UUID");
+        // RFC 4122 variant: top two bits of byte 8 must be 0b10.
+        assert_eq!(u.as_bytes()[8] & 0xC0, 0x80, "variant must be 0b10");
+    }
+
+    #[test]
+    fn fast_uuid_v7_encodes_current_timestamp() {
+        let now = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+        };
+        let before = now();
+        let b = *fast_uuid_v7().as_bytes();
+        let after = now();
+        // Reconstruct the 48-bit big-endian millisecond timestamp. A flipped
+        // shift direction (>> vs <<) would place the bits wildly out of range.
+        let ts = ((b[0] as u64) << 40)
+            | ((b[1] as u64) << 32)
+            | ((b[2] as u64) << 24)
+            | ((b[3] as u64) << 16)
+            | ((b[4] as u64) << 8)
+            | (b[5] as u64);
+        assert!(
+            ts >= before - 1000 && ts <= after + 1000,
+            "embedded timestamp {ts} not within [{before}, {after}] window"
+        );
+    }
+
+    #[test]
+    fn fast_uuid_v7_is_monotonic_within_a_burst() {
+        // The per-process counter must make rapid successive UUIDs strictly
+        // increasing — pins the counter shifts and the function body itself.
+        let a = fast_uuid_v7().as_u128();
+        let b = fast_uuid_v7().as_u128();
+        let c = fast_uuid_v7().as_u128();
+        assert!(a < b && b < c, "successive UUIDs must increase: {a} {b} {c}");
+    }
+
+    #[test]
+    fn sink_error_dlq_eligibility() {
+        // Only per-event serialization/routing errors are DLQ-eligible.
+        assert!(
+            SinkError::Serialization { details: "bad".into() }
+                .is_dlq_eligible()
+        );
+        assert!(
+            SinkError::Routing { details: "no route".into() }.is_dlq_eligible()
+        );
+        // Batch-fatal / transport errors are NOT (must fail the batch).
+        assert!(
+            !SinkError::Fatal { details: "fenced".into() }.is_dlq_eligible()
+        );
+        assert!(
+            !SinkError::Connect { details: "refused".into() }
+                .is_dlq_eligible()
+        );
+    }
+
+    #[test]
     fn event_serializes_to_debezium_structure() {
         let event = Event::new_row(
             test_source(),
