@@ -337,6 +337,19 @@ fn resolve_path(root: &Value, path: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_template_with_interleaved_literals() {
+        // Leading, interleaved, and trailing literals around two variables —
+        // exercises the offset arithmetic in parse (after_open / end_abs /
+        // offset advance) with non-trivial, non-zero positions.
+        let t = CompiledTemplate::parse("a${source.db}b${source.table}c")
+            .unwrap();
+        let ev = sample_event_json();
+        assert_eq!(t.resolve_strict(&ev).unwrap(), "ashopbordersc");
+        // raw() must return the original template (pins the accessor).
+        assert_eq!(t.raw(), "a${source.db}b${source.table}c");
+    }
     use serde_json::json;
 
     // =========================================================================

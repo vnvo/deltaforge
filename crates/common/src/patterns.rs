@@ -263,6 +263,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn allowlist_exact_pattern_does_not_prefix_match() {
+        // An exact (non-wildcard) pattern must match only the whole name.
+        // Pins the `ends_with('%')` / `ends_with('*')` guards: if either were
+        // forced true, "orders" would wrongly prefix-match "orders_archive".
+        let exact = AllowList::from_strs(&["orders"]);
+        assert!(exact.matches_name("orders"));
+        assert!(!exact.matches_name("orders_archive"));
+
+        // Wildcards DO prefix-match.
+        assert!(AllowList::from_strs(&["order%"]).matches_name("orders"));
+        assert!(AllowList::from_strs(&["order*"]).matches_name("orders"));
+    }
+
+    #[test]
+    fn table_filter_is_empty_requires_both_sides_empty() {
+        assert!(TableFilter::new(vec![], vec![]).is_empty());
+        // Only include set → not empty (pins the `&&`).
+        assert!(!TableFilter::new(vec!["a.b".into()], vec![]).is_empty());
+        // Only exclude set → not empty.
+        assert!(!TableFilter::new(vec![], vec!["a.b".into()]).is_empty());
+    }
+
+    #[test]
     fn empty_list_matches_everything() {
         let list = AllowList::new(&[]);
         assert!(list.matches("any", "table"));

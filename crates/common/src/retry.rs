@@ -732,6 +732,56 @@ pub fn is_permanent_failure(msg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_retryable_message_matches_each_signal() {
+        // Every clause individually — pins the `||` chain.
+        for m in [
+            "connection reset",
+            "broken pipe",
+            "eof",
+            "end of file",
+            "timeout",
+            "timed out",
+            "connection refused",
+            "temporarily unavailable",
+            "try again",
+        ] {
+            assert!(is_retryable_message(m), "should be retryable: {m}");
+        }
+        assert!(!is_retryable_message("authentication failed"));
+    }
+
+    #[test]
+    fn is_permanent_failure_matches_each_signal() {
+        for m in [
+            "authentication",
+            "permission denied",
+            "access denied",
+            "unauthorized",
+            "invalid",
+            "not found",
+        ] {
+            assert!(is_permanent_failure(m), "should be permanent: {m}");
+        }
+        assert!(!is_permanent_failure("connection reset"));
+    }
+
+    #[test]
+    fn retry_outcome_predicates_and_into_inner() {
+        let cancelled: RetryOutcome<String> = RetryOutcome::Cancelled;
+        assert!(cancelled.is_cancelled() && !cancelled.is_timeout());
+        assert_eq!(cancelled.into_inner(), None);
+
+        let timeout: RetryOutcome<String> =
+            RetryOutcome::Timeout { action: "connect".into() };
+        assert!(timeout.is_timeout() && !timeout.is_cancelled());
+
+        let failed: RetryOutcome<String> = RetryOutcome::Failed("boom".into());
+        assert!(!failed.is_cancelled() && !failed.is_timeout());
+        // into_inner must return the error for Failed (pins that match arm).
+        assert_eq!(failed.into_inner().as_deref(), Some("boom"));
+    }
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
 

@@ -128,6 +128,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ts_sec_to_ms_i64_multiplies_by_1000() {
+        // Pins the `* 1000` against +/÷ and constant replacements.
+        assert_eq!(ts_sec_to_ms_i64(5), 5_000);
+        assert_eq!(ts_sec_to_ms_i64(1), 1_000);
+        assert_eq!(ts_sec_to_ms_i64(0), 0);
+        assert_eq!(ts_sec_to_ms_i64(-2), -2_000);
+    }
+
+    #[test]
     fn pg_epoch_converts_to_correct_unix_timestamp() {
         // PostgreSQL epoch (2000-01-01 00:00:00 UTC) = 0 in PG
         // Unix epoch for same date = 946684800 seconds = 946684800000 ms

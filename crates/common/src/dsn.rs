@@ -299,6 +299,20 @@ pub fn extract_host_from_url(url: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn redact_dsn_hides_password_but_keeps_the_rest() {
+        // URL style: password gone, host retained. The positive assertions
+        // pin `redact_dsn` against being replaced by "" / a constant.
+        let url = redact_dsn("mysql://root:secret@localhost/db");
+        assert!(!url.contains("secret"), "password must be redacted: {url}");
+        assert!(url.contains("localhost"), "host must survive: {url}");
+
+        // Key-value style.
+        let kv = redact_dsn("host=localhost password=secret");
+        assert!(!kv.contains("secret"), "password must be redacted: {kv}");
+        assert!(kv.contains("host=localhost"), "host must survive: {kv}");
+    }
+
     mod dsn_components {
         use super::*;
 
