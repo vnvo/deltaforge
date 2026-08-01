@@ -77,7 +77,17 @@ pub fn check_or_advise(meta: &ScenarioMeta) -> Result<(), PreflightError> {
         );
         return Ok(());
     };
+    evaluate(meta, &running)
+}
 
+/// Pure decision logic for the pre-flight check: given the set of running
+/// service names, return the profiles whose services are all absent. Split
+/// out of [`check_or_advise`] (which owns the `docker ps` I/O) so the rule
+/// is unit-testable without a live Docker daemon.
+fn evaluate(
+    meta: &ScenarioMeta,
+    running: &HashSet<String>,
+) -> Result<(), PreflightError> {
     let mut missing: Vec<(&'static str, Vec<&'static str>)> = Vec::new();
     for profile in meta.required_profiles {
         let needed = services_for_profile(profile);
@@ -174,6 +184,57 @@ mod tests {
         assert!(!services_for_profile("base").is_empty());
         assert!(services_for_profile("s3-infra").contains(&"minio"));
         assert!(services_for_profile("kafka-infra").contains(&"kafka"));
+        // Assert every profile arm resolves to its own distinct services so a
+        // deleted/merged match arm is caught.
+        assert_eq!(
+            services_for_profile("mysql-infra"),
+            &["mysql", "mysql-b"]
+        );
+        assert_eq!(services_for_profile("pg-infra"), &["postgres"]);
+        assert_eq!(
+            services_for_profile("df"),
+            &["deltaforge-release", "deltaforge-debug", "deltaforge-profile"]
+        );
         assert_eq!(services_for_profile("nonexistent").len(), 0);
+    }
+
+    fn running_set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn evaluate_passes_when_a_required_service_is_running() {
+        let meta = fake_meta(&["s3-infra"]);
+        assert!(evaluate(&meta, &running_set(&["minio"])).is_ok());
+    }
+
+    #[test]
+    fn evaluate_fails_when_no_service_of_a_profile_is_running() {
+        let meta = fake_meta(&["s3-infra"]);
+        let err = evaluate(&meta, &running_set(&["mysql"])).unwrap_err();
+        assert_eq!(err.missing.len(), 1);
+        assert_eq!(err.missing[0].0, "s3-infra");
+    }
+
+    #[test]
+    fn evaluate_treats_one_running_service_as_profile_up() {
+        // mysql-infra expects both mysql + mysql-b, but a single running
+        // service must satisfy the "any one" rule (mysql-b is a secondary).
+        let meta = fake_meta(&["mysql-infra"]);
+        assert!(evaluate(&meta, &running_set(&["mysql"])).is_ok());
+    }
+
+    #[test]
+    fn evaluate_skips_unknown_profiles() {
+        // Unknown profiles map to no services and must not be reported missing.
+        let meta = fake_meta(&["totally-unknown"]);
+        assert!(evaluate(&meta, &HashSet::new()).is_ok());
+    }
+
+    #[test]
+    fn evaluate_reports_every_missing_profile() {
+        let meta = fake_meta(&["s3-infra", "kafka-infra"]);
+        let err = evaluate(&meta, &HashSet::new()).unwrap_err();
+        assert_eq!(err.missing.len(), 2);
     }
 }
