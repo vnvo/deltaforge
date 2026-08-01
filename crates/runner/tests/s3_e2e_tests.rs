@@ -190,7 +190,11 @@ fn orders_schema() -> TableSchemaInfo {
 
 fn fake_provider() -> ArcSchemaProvider {
     let mut by_table = std::collections::HashMap::new();
-    by_table.insert("orders".to_string(), orders_schema());
+    // The real schema registry is keyed by the db-qualified name ("db.table"),
+    // and the S3 sink's resolver looks up that qualified key. Register the same
+    // way so this test exercises the production lookup path (the events carry
+    // db="shop", table="orders").
+    by_table.insert("shop.orders".to_string(), orders_schema());
     Arc::new(FakeSchemaProvider { by_table })
 }
 

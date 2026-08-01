@@ -17,6 +17,13 @@ use deltaforge_core::Event;
 /// and so partitions can be sorted for stable test output.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PartitionKey {
+    /// Namespace qualifying the table for schema lookup: the database for
+    /// MySQL, or the schema for PostgreSQL (`event.source.schema`, falling
+    /// back to `event.source.db`). Part of the key so same-named tables in
+    /// different namespaces route to distinct writers — and so schema
+    /// resolution can look the table up by its qualified `namespace.table`
+    /// name. Not included in `hive_path`.
+    pub namespace: String,
     pub table: String,
     pub year: i32,
     pub month: u8,
@@ -47,6 +54,13 @@ pub fn partition_for(event: &Event) -> PartitionKey {
     let dt: DateTime<Utc> = DateTime::<Utc>::from_timestamp_millis(event.ts_ms)
         .unwrap_or_else(Utc::now);
     PartitionKey {
+        // MySQL qualifies by database (schema is None); PostgreSQL qualifies
+        // by schema. Match whatever the source's schema loader keys on.
+        namespace: event
+            .source
+            .schema
+            .clone()
+            .unwrap_or_else(|| event.source.db.clone()),
         table: event.source.table.clone(),
         year: dt.year(),
         month: dt.month() as u8,
@@ -105,6 +119,7 @@ mod tests {
         assert_eq!(
             p,
             PartitionKey {
+                namespace: "shop".into(),
                 table: "orders".into(),
                 year: 2026,
                 month: 5,
@@ -116,11 +131,13 @@ mod tests {
     #[test]
     fn hive_path_zero_pads_month_and_day() {
         let p = PartitionKey {
+            namespace: "shop".into(),
             table: "orders".into(),
             year: 2026,
             month: 1,
             day: 5,
         };
+        // db is intentionally NOT part of the path (no lake-layout change).
         assert_eq!(p.hive_path(), "table=orders/year=2026/month=01/day=05");
     }
 

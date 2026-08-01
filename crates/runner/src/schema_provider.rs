@@ -433,18 +433,28 @@ pub fn build_arrow_schema_resolver(
         Arc::new(RwLock::new(HashMap::new()));
 
     Arc::new(move |partition: &PartitionKey| {
-        let table = &partition.table;
-        if let Some(cached) = cache.read().get(table) {
+        // Resolve by fully-qualified name. The schema registry is keyed by
+        // "db.table", but the partition carries the bare table name — without
+        // the db qualifier the lookup misses and the sink silently falls back
+        // to an envelope-only schema (meta columns, no row data). Fall back to
+        // the bare name when the source has no database concept (db empty).
+        let lookup_key = if partition.namespace.is_empty() {
+            partition.table.clone()
+        } else {
+            format!("{}.{}", partition.namespace, partition.table)
+        };
+
+        if let Some(cached) = cache.read().get(&lookup_key) {
             return Ok(cached.clone());
         }
 
-        // Look up table schema. The provider lookup is async; we block on
-        // the current runtime — same pattern as `AvroSchemaProviderImpl`.
-        let lookup_key = table.clone();
+        // The provider lookup is async; we block on the current runtime —
+        // same pattern as `AvroSchemaProviderImpl`.
         let provider_clone = schema_provider.clone();
+        let key_for_lookup = lookup_key.clone();
         let table_schema = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(provider_clone.get_table_schema(&lookup_key))
+                .block_on(provider_clone.get_table_schema(&key_for_lookup))
         });
 
         let schema = match table_schema {
@@ -456,18 +466,19 @@ pub fn build_arrow_schema_resolver(
             None => {
                 // Log the fallback once per table.
                 let mut logged = fallback_logged.write();
-                if logged.insert(table.clone(), ()).is_none() {
+                if logged.insert(lookup_key.clone(), ()).is_none() {
                     warn!(
-                        table,
-                        "no TableSchemaInfo available — S3 sink will write envelope-only \
-                         columns for this partition. Run snapshot to populate the registry."
+                        table = %lookup_key,
+                        "no schema registered for this table — S3 sink will write \
+                         envelope-only columns (meta only, no row data). Ensure the \
+                         source has loaded the table schema before events flow."
                     );
                 }
                 build_envelope_arrow_schema_arc(arrow_connector, &[], &opts)
             }
         };
 
-        cache.write().insert(table.clone(), schema.clone());
+        cache.write().insert(lookup_key.clone(), schema.clone());
         Ok(schema)
     })
 }
@@ -595,6 +606,7 @@ mod tests {
         );
 
         let key = PartitionKey {
+            namespace: String::new(),
             table: "orders".into(),
             year: 2026,
             month: 5,
@@ -613,6 +625,59 @@ mod tests {
             .data_type()
             .clone();
         assert!(matches!(amount, arrow_schema::DataType::Decimal128(10, 2)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn arrow_resolver_looks_up_db_qualified_name() {
+        // Regression: the S3 partition carries the bare table name, but the
+        // registry is keyed by "db.table". The resolver must query the
+        // qualified name — otherwise it silently returns an envelope-only
+        // schema (meta columns only, no row data).
+        let mut tables = HashMap::new();
+        tables.insert(
+            "shop.orders".to_string(),
+            TableSchemaInfo {
+                database: "shop".into(),
+                table: "orders".into(),
+                columns: vec![ColumnSchemaInfo {
+                    name: "id".into(),
+                    data_type: "bigint".into(),
+                    full_type: "bigint".into(),
+                    nullable: false,
+                    is_json_like: false,
+                    unsigned: false,
+                    is_array: false,
+                    numeric_precision: None,
+                    numeric_scale: None,
+                    element_type: None,
+                }],
+                primary_key: vec!["id".into()],
+            },
+        );
+
+        let provider: ArcSchemaProvider = Arc::new(FakeProvider { tables });
+        let resolver = build_arrow_schema_resolver(
+            provider,
+            "mysql",
+            deltaforge_core::encoding::avro_types::TypeConversionOpts::default(
+            ),
+        );
+
+        // Bare "orders" alone would miss the "shop.orders" registry key.
+        let key = PartitionKey {
+            namespace: "shop".into(),
+            table: "orders".into(),
+            year: 2026,
+            month: 5,
+            day: 19,
+        };
+        let schema = resolver(&key).unwrap();
+        let names: Vec<&str> =
+            schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert!(
+            names.contains(&"after_id"),
+            "resolver must resolve user columns via db.table, got {names:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -663,6 +728,7 @@ mod tests {
         );
 
         let key = PartitionKey {
+            namespace: String::new(),
             table: "orders".into(),
             year: 2026,
             month: 5,
@@ -686,6 +752,7 @@ mod tests {
         );
 
         let key = PartitionKey {
+            namespace: String::new(),
             table: "missing".into(),
             year: 2026,
             month: 5,

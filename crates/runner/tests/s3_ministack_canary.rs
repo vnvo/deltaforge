@@ -237,8 +237,10 @@ fn col(
 
 fn fake_provider() -> ArcSchemaProvider {
     let mut by_table = std::collections::HashMap::new();
+    // Keyed by the db-qualified name ("db.table") to match the real schema
+    // registry and the S3 sink resolver's lookup (events carry db="shop").
     by_table.insert(
-        "orders".to_string(),
+        "shop.orders".to_string(),
         TableSchemaInfo {
             database: "shop".into(),
             table: "orders".into(),
