@@ -231,19 +231,27 @@ services:
         mc alias set local http://minio:9000 minioadmin minioadmin
         # Idempotent: ignore if bucket already exists
         mc mb -p local/deltaforge-chaos || true
-        # Apply lifecycle: abort multipart uploads older than 1 day
+        # Apply lifecycle: abort incomplete multipart uploads older than 1 day.
+        # This is the operational requirement for the S3 sink on AWS S3
+        # (see docs/specs/s3-parquet-sink.md). Best-effort here: MinIO
+        # RELEASE.2025-09-07 rejects a standalone AbortIncompleteMultipartUpload
+        # lifecycle rule (verified with both mc and the AWS CLI — the server
+        # returns InvalidArgument / silently drops the action), so don't fail
+        # the bootstrap when it can't be applied.
         cat >/tmp/lifecycle.json <<'JSON'
         {
           "Rules": [{
             "ID": "abort-abandoned-multiparts",
             "Status": "Enabled",
-            "Filter": {},
             "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}
           }]
         }
         JSON
-        mc ilm import local/deltaforge-chaos < /tmp/lifecycle.json
-        echo "MinIO bucket and lifecycle policy ready"
+        if mc ilm import local/deltaforge-chaos < /tmp/lifecycle.json 2>/dev/null; then
+          echo "MinIO bucket and lifecycle policy ready"
+        else
+          echo "MinIO bucket ready (lifecycle rule skipped — not supported by this MinIO version)"
+        fi
     networks: [chaos_net]
 
   # Confluent Schema Registry (for Avro encoding tests)
