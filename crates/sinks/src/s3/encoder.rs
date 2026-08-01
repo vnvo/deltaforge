@@ -1308,6 +1308,36 @@ mod tests {
     }
 
     #[test]
+    fn decimal128_scales_json_numbers() {
+        // Decimal columns may arrive as JSON numbers (not strings) when a
+        // source carries integers/floats through. The value must be scaled
+        // by 10^scale — exercises the Number arm that the string tests miss.
+        let mut c = col("amount", "decimal", "decimal(18,4)");
+        c.precision = Some(18);
+        c.scale = Some(4);
+        let schema = Arc::new(build_envelope_arrow_schema(
+            Connector::Mysql,
+            &[c],
+            &TypeConversionOpts::default(),
+        ));
+        let events = vec![
+            // integer 100 with scale 4 → 100 * 10^4 = 1_000_000
+            make_event(Op::Create, "i", 0, None, Some(json!({"amount": 100}))),
+            // float 12.5 with scale 4 → round(12.5 * 10^4) = 125_000
+            make_event(Op::Create, "i", 0, None, Some(json!({"amount": 12.5}))),
+        ];
+        let batch = events_to_record_batch(&schema, &events).unwrap();
+        let arr = batch
+            .column_by_name("after_amount")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(arr.value(0), 1_000_000);
+        assert_eq!(arr.value(1), 125_000);
+    }
+
+    #[test]
     fn decimal128_truncates_excess_precision() {
         // scale=2 column receiving "1.999" → 199 (truncates last digit)
         let mut c = col("p", "decimal", "decimal(5,2)");

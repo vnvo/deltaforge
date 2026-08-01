@@ -425,6 +425,42 @@ mod tests {
     use serde_json::json;
     use std::time::Duration;
 
+    /// Each recoverable (per-row) cause must be classified as an encoder
+    /// error so it routes to the per-row DLQ rather than failing the batch.
+    /// Every message below matches exactly one clause of `is_encoder_error`,
+    /// so a dropped/`&&`-ed clause is caught.
+    #[test]
+    fn is_encoder_error_classifies_each_recoverable_cause() {
+        let recoverable = [
+            "convert rows to record batch: boom",
+            "build recordbatch failed",
+            "bad decimal digits",
+            "could not parse value",
+            "value overflows i128",
+            "invalid base64 input",
+            "expected array",
+            "number not representable",
+            "serialize event to jsonl",
+        ];
+        for msg in recoverable {
+            assert!(
+                is_encoder_error(&anyhow::anyhow!("{msg}")),
+                "should be classified as encoder error: {msg}"
+            );
+        }
+    }
+
+    /// Object-store / transport failures are batch-fatal, NOT per-row DLQ
+    /// candidates — misclassifying them would silently drop good rows.
+    #[test]
+    fn is_encoder_error_rejects_transport_failures() {
+        assert!(!is_encoder_error(&anyhow::anyhow!(
+            "connection reset by peer"
+        )));
+        assert!(!is_encoder_error(&anyhow::anyhow!("503 slow down")));
+        assert!(!is_encoder_error(&anyhow::anyhow!("access denied")));
+    }
+
     fn col(name: &str, data_type: &str) -> ColumnDesc {
         ColumnDesc {
             name: name.into(),
