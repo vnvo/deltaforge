@@ -1,7 +1,7 @@
 //! Database schema provider abstraction.
 //!
 //! Provides a unified interface for accessing database schema information
-//! from various sources (MySQL, Postgres, Turso, etc.).
+//! from various sources (MySQL, Postgres, etc.).
 
 use async_trait::async_trait;
 use sources::ArcSchemaLoader;

@@ -5,7 +5,7 @@
 //!
 //! - **URL format**: `postgres://user:pass@host:port/db`
 //! - **Key-value format**: `host=localhost user=postgres password=secret`
-//! - **Query parameter auth**: `libsql://db.turso.io?authToken=secret`
+//! - **Query parameter auth**: `https://api.example.com/db?authToken=secret`
 //!
 //! # Security
 //!
@@ -59,7 +59,7 @@ impl DsnComponents {
     /// Supports standard database URL schemes:
     /// - `mysql://`, `postgres://`, `postgresql://`
     /// - `redis://`, `rediss://` (TLS)
-    /// - `libsql://`, `http://`, `https://`
+    /// - `http://`, `https://`
     ///
     /// # Arguments
     ///
@@ -234,14 +234,14 @@ pub fn redact_dsn(dsn: &str) -> String {
 /// Redact auth token from a URL query parameter for safe logging.
 ///
 /// Used primarily for services that use query parameter authentication,
-/// such as Turso/libSQL (`authToken=`) or signed URLs.
+/// such as services using token/signed-URL auth (`authToken=`).
 ///
 /// # Examples
 ///
 /// ```
 /// use common::dsn::redact_auth_token;
 ///
-/// let url = "libsql://db.turso.io?authToken=secret123";
+/// let url = "https://api.example.com/db?authToken=secret123";
 /// let safe = redact_auth_token(url);
 /// assert!(!safe.contains("secret123"));
 /// assert!(safe.contains("authToken=***"));
@@ -270,7 +270,7 @@ pub fn redact_auth_token(url: &str) -> String {
 /// use common::dsn::extract_host_from_url;
 ///
 /// assert_eq!(extract_host_from_url("postgres://user:pass@db.example.com:5432/mydb"), "db.example.com");
-/// assert_eq!(extract_host_from_url("libsql://mydb.turso.io"), "mydb.turso.io");
+/// assert_eq!(extract_host_from_url("https://mydb.example.com"), "mydb.example.com");
 /// ```
 pub fn extract_host_from_url(url: &str) -> String {
     // Try proper URL parsing first
@@ -441,7 +441,7 @@ mod tests {
 
         #[test]
         fn redact_auth_token_in_query_string() {
-            let url = "libsql://db.turso.io?authToken=secret123";
+            let url = "https://api.example.com/db?authToken=secret123";
             let redacted = redact_auth_token(url);
             assert!(!redacted.contains("secret123"));
             assert!(redacted.contains("authToken=***"));
@@ -449,7 +449,8 @@ mod tests {
 
         #[test]
         fn redact_auth_token_preserves_other_params() {
-            let url = "libsql://db.turso.io?foo=bar&authToken=secret&baz=qux";
+            let url =
+                "https://api.example.com/db?foo=bar&authToken=secret&baz=qux";
             let redacted = redact_auth_token(url);
             assert!(!redacted.contains("secret"));
             assert!(redacted.contains("foo=bar"));
@@ -473,8 +474,8 @@ mod tests {
         #[test]
         fn extract_host_from_simple_url() {
             assert_eq!(
-                extract_host_from_url("libsql://mydb.turso.io"),
-                "mydb.turso.io"
+                extract_host_from_url("https://mydb.example.com"),
+                "mydb.example.com"
             );
         }
     }

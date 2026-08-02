@@ -7,7 +7,6 @@ Complete pipeline configurations demonstrating common DeltaForge use cases. Each
 | Example | Source | Sink(s) | Key Features |
 |---------|--------|---------|--------------|
 | [MySQL to Redis](mysql_to_redis.md) | MySQL | Redis | JavaScript processor, PII redaction |
-| [Turso to Kafka](turso_to_kafka.md) | Turso/libSQL | Kafka | Native CDC, CloudEvents envelope |
 | [PostgreSQL to NATS](postgres_to_nats.md) | PostgreSQL | NATS | Logical replication, CloudEvents |
 | [Multi-Sink Fan-Out](multi_sink_fanout.md) | MySQL | Kafka + Redis + NATS | Multiple envelopes, selective checkpointing |
 | [Event Filtering](event_filtering.md) | MySQL | Kafka | JavaScript filtering, PII redaction |
@@ -33,7 +32,6 @@ Complete pipeline configurations demonstrating common DeltaForge use cases. Each
 | Example | Description |
 |---------|-------------|
 | [MySQL to Redis](mysql_to_redis.md) | Simple pipeline with JavaScript transformation |
-| [Turso to Kafka](turso_to_kafka.md) | Edge database to Kafka with CloudEvents |
 | [PostgreSQL to NATS](postgres_to_nats.md) | PostgreSQL logical replication to NATS |
 
 ### Production Patterns
@@ -64,7 +62,7 @@ Complete pipeline configurations demonstrating common DeltaForge use cases. Each
 |--------|---------|
 | Native | [MySQL to Redis](mysql_to_redis.md), [Event Filtering](event_filtering.md), [Cache Invalidation](cache_invalidation.md) |
 | Debezium | [Schema Sensing](schema_sensing.md), [Multi-Sink Fan-Out](multi_sink_fanout.md), [Production Kafka](kafka_production.md) |
-| CloudEvents | [Turso to Kafka](turso_to_kafka.md), [PostgreSQL to NATS](postgres_to_nats.md) |
+| CloudEvents | [PostgreSQL to NATS](postgres_to_nats.md) |
 
 ### JavaScript Processors
 
@@ -72,7 +70,7 @@ Complete pipeline configurations demonstrating common DeltaForge use cases. Each
 |----------|---------|
 | PII Redaction | [MySQL to Redis](mysql_to_redis.md), [Audit Trail](audit_trail.md) |
 | Event Filtering | [Event Filtering](event_filtering.md) |
-| Enrichment | [Turso to Kafka](turso_to_kafka.md), [Analytics Preprocessing](analytics_preprocessing.md) |
+| Enrichment | [Analytics Preprocessing](analytics_preprocessing.md) |
 | Cache Key Generation | [Cache Invalidation](cache_invalidation.md) |
 | Audit Metadata | [Audit Trail](audit_trail.md) |
 

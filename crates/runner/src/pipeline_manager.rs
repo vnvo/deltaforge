@@ -26,8 +26,8 @@ type CheckpointCmpFn =
 /// that the slowest sink needs.
 ///
 /// Uses the source-provided comparison function for correctness — different
-/// sources have different checkpoint formats (MySQL file:pos, Postgres LSN,
-/// Turso change_id) that cannot be compared lexicographically.
+/// sources have different checkpoint formats (MySQL file:pos, Postgres LSN)
+/// that cannot be compared lexicographically.
 struct PerSinkCheckpointProxy {
     inner: Arc<dyn CheckpointStore>,
     source_id: String,
@@ -148,8 +148,6 @@ fn build_avro_provider(
     let connector = match &spec.spec.source {
         SourceCfg::Mysql(_) => "mysql",
         SourceCfg::Postgres(_) => "postgresql",
-        #[cfg(feature = "turso")]
-        SourceCfg::Turso(_) => "turso",
     };
 
     let opts = TypeConversionOpts {
@@ -196,8 +194,6 @@ fn build_arrow_resolver(
     let connector = match &spec.spec.source {
         SourceCfg::Mysql(_) => "mysql",
         SourceCfg::Postgres(_) => "postgresql",
-        #[cfg(feature = "turso")]
-        SourceCfg::Turso(_) => "turso",
     };
 
     let schema_provider =
@@ -431,8 +427,6 @@ impl PipelineManager {
         let table_patterns = match &spec.spec.source {
             SourceCfg::Mysql(c) => c.tables.clone(),
             SourceCfg::Postgres(_) => vec![],
-            #[cfg(feature = "turso")]
-            SourceCfg::Turso(c) => c.tables.clone(),
         };
 
         let alive = Arc::new(AtomicBool::new(true));

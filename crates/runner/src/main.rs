@@ -199,8 +199,6 @@ fn format_pipeline_summary(ps: &deltaforge_config::PipelineSpec) -> String {
     let source_type = match &ps.spec.source {
         SourceCfg::Mysql(_) => "mysql",
         SourceCfg::Postgres(_) => "postgres",
-        #[cfg(feature = "turso")]
-        SourceCfg::Turso(_) => "turso",
     };
     let source_id = ps.spec.source.source_id();
 

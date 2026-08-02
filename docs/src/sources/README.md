@@ -8,7 +8,6 @@ DeltaForge captures database changes through pluggable source connectors. Each s
 |--------|--------|-------------|
 | <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/mysql/mysql-original.svg" width="20" height="20"> [`mysql`](mysql.md) | ✅ Production | MySQL binlog CDC with GTID support |
 | <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/postgresql/postgresql-original.svg" width="20" height="20"> [`postgres`](postgres.md) | ✅ Production | PostgreSQL logical replication via pgoutput |
-| [`turso`](turso.md) | 🔧 Beta | Turso/libSQL CDC with multiple modes |
 
 ## Common Behavior
 

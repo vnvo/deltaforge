@@ -30,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Soak configs** — DLQ enabled by default (journal.enabled=true) for MySQL and Postgres soak tests.
 - **Soak random faults** — now includes faulty_events alongside network_partition, sink_outage, crash.
 
+### Removed
+
+- **Turso/libSQL source** — the experimental, feature-gated (`--features turso`, never in default builds) Turso source has been removed, along with its config, docs, and the optional `libsql` dependency. It was built against Turso's old unstable CDC pragma and never reached production quality. Turso's CDC has since gone stable (v0.5.0, with a v2 `change_txn_id`/`COMMIT` record format) — a future Turso source should be a fresh implementation against that stable API; the removed code remains in git history.
+
 ### Fixed
 
 - **MySQL startup connection retry** — `prepare_client` (binlog tail resolution) retries with exponential backoff instead of failing immediately when MySQL is not yet ready.

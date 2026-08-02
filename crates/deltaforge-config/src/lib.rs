@@ -4,11 +4,6 @@ use thiserror::Error;
 use tracing::{error, warn};
 use walkdir::WalkDir;
 
-#[cfg(feature = "turso")]
-mod turso_cfg;
-#[cfg(feature = "turso")]
-pub use turso_cfg::{NativeCdcLevel, TursoSrcCfg};
-
 mod storage;
 pub use storage::*;
 
@@ -209,8 +204,6 @@ pub struct MysqlSrcCfg {
 pub enum SourceCfg {
     Postgres(PostgresSrcCfg),
     Mysql(MysqlSrcCfg),
-    #[cfg(feature = "turso")]
-    Turso(turso_cfg::TursoSrcCfg),
 }
 
 impl SourceCfg {
@@ -218,8 +211,6 @@ impl SourceCfg {
         match self {
             SourceCfg::Postgres(c) => &c.id,
             SourceCfg::Mysql(c) => &c.id,
-            #[cfg(feature = "turso")]
-            SourceCfg::Turso(c) => &c.id,
         }
     }
 }

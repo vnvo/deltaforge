@@ -62,7 +62,7 @@ impl From<&LoadedSchema> for SchemaListEntry {
 /// Trait for loading and caching database schemas.
 #[async_trait]
 pub trait SourceSchemaLoader: Send + Sync {
-    /// Source type identifier ("mysql", "turso", "postgres").
+    /// Source type identifier ("mysql", "postgres").
     fn source_type(&self) -> &'static str;
 
     /// Load schema for a table (cached if available).

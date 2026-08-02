@@ -7,7 +7,6 @@ license = "MIT OR Apache-2.0"
 [features]
 default = ["jemalloc"]
 jemalloc = ["tikv-jemallocator"]
-turso = []
 
 [dependencies]
 metrics.workspace = true

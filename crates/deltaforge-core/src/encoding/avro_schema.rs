@@ -59,26 +59,11 @@ fn postgres_position_schema() -> serde_json::Value {
     })
 }
 
-/// Turso/libSQL position schema JSON.
-fn turso_position_schema() -> serde_json::Value {
-    json!({
-        "type": "record",
-        "name": "Position",
-        "namespace": "deltaforge.cdc.turso",
-        "doc": "Turso/libSQL change position.",
-        "fields": [
-            {"name": "change_id", "type": ["null", "long"], "default": null},
-            {"name": "sequence", "type": ["null", "string"], "default": null}
-        ]
-    })
-}
-
 /// Get the position schema for a connector type.
 fn position_schema_for(connector: &str) -> serde_json::Value {
     match connector {
         "mysql" => mysql_position_schema(),
         "postgresql" | "postgres" => postgres_position_schema(),
-        "turso" | "libsql" => turso_position_schema(),
         _ => {
             // Generic fallback: just a sequence string
             json!({

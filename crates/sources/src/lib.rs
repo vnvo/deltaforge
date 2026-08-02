@@ -4,7 +4,6 @@
 //!
 //! - **MySQL**: Binlog-based CDC using `mysql_binlog_connector_rust`
 //! - **PostgreSQL**: Logical replication using pgoutput protocol
-//! - **Turso**: Experimental SQLite CDC (paused)
 //!
 //! Each source captures row-level changes and emits them as `Event`s
 //! to be processed by the pipeline coordinator.
@@ -13,8 +12,6 @@ pub mod failover;
 pub mod mysql;
 pub mod postgres;
 pub mod schema_loader;
-#[cfg(feature = "turso")]
-pub mod turso;
 
 use anyhow::Result;
 use deltaforge_config::{PipelineSpec, SourceCfg};
@@ -29,8 +26,6 @@ pub use schema_loader::{
 
 pub use mysql::{MySqlCheckpoint, MySqlSchemaLoader, MySqlSource};
 pub use postgres::{PostgresCheckpoint, PostgresSource};
-#[cfg(feature = "turso")]
-pub use turso::{TursoCheckpoint, TursoSource};
 
 /// Build a CDC source from pipeline configuration.
 pub fn build_source(
@@ -74,14 +69,6 @@ pub fn build_source(
             snapshot_cfg: c.snapshot.clone(),
             on_schema_drift: c.on_schema_drift.clone(),
         })),
-
-        #[cfg(feature = "turso")]
-        SourceCfg::Turso(c) => Ok(Arc::new(turso::TursoSource::new(
-            c.clone(),
-            pipeline.metadata.tenant.clone(),
-            pipeline.metadata.name.clone(),
-            registry,
-        ))),
     }
 }
 
@@ -106,8 +93,5 @@ pub fn build_schema_loader(
             registry,
             &pipeline.metadata.tenant,
         ))),
-
-        #[cfg(feature = "turso")]
-        SourceCfg::Turso(_) => None,
     }
 }

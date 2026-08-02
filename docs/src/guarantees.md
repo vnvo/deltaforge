@@ -37,7 +37,6 @@ Events are emitted in the source's native order:
 
 - **MySQL**: binlog file + position order. `WriteRowsEvent` batches preserve row order within each binlog event.
 - **PostgreSQL**: LSN (Log Sequence Number) order. One WAL message per row change.
-- **Turso**: `change_id` order (monotonically increasing).
 
 DeltaForge does not reorder events. The source order is preserved through the pipeline.
 
@@ -73,7 +72,6 @@ When `batch.respect_source_tx: true` (the default), the coordinator checks each 
 
 - **MySQL**: `tx_end` is set on the last row of each XID (transaction commit) event.
 - **PostgreSQL**: `tx_end` is set on the COMMIT WAL record.
-- **Turso**: each change is its own transaction (`tx_end` always true).
 
 The batch accumulator will not split a batch at a point that would separate rows from the same transaction. If the batch limit (`max_events` or `max_bytes`) is reached mid-transaction, the batch grows beyond the limit to include all remaining rows in that transaction.
 
