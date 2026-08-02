@@ -43,12 +43,20 @@ use sources::postgres::postgres_table_schema::type_oids;
 
 /// Must not conflict with the sinks tests' SR (port 8181).
 const SR_PORT: u16 = 8282;
-/// The Kafka BROKER listener inside the docker-compose chaos network.
-const KAFKA_BOOTSTRAP: &str = "kafka:29092";
-/// The docker-compose network that Kafka is on.
-const DOCKER_NETWORK: &str = "deltaforge_chaos_net";
+/// Private, auto-created testcontainers network shared by this file's Kafka +
+/// Schema Registry. Self-provisioned so the suite is hermetic — it no longer
+/// depends on an externally-running docker-compose Kafka.
+const PRIVATE_NETWORK: &str = "df-avro-e2e-net";
+/// Stable container name for Kafka so Schema Registry can resolve it by DNS on
+/// the shared network. Must be unique across this file's containers.
+const KAFKA_HOST: &str = "df-avro-e2e-kafka";
+/// Kafka broker (PLAINTEXT) port, reachable only inside PRIVATE_NETWORK.
+const KAFKA_INTERNAL_PORT: u16 = 29092;
 
 struct SrInfra {
+    // Kept alive for the whole test process; dropped/cleaned up in the dtor.
+    #[allow(dead_code)]
+    kafka: ContainerAsync<GenericImage>,
     #[allow(dead_code)]
     schema_registry: ContainerAsync<GenericImage>,
 }
@@ -78,36 +86,90 @@ async fn wait_for_sr(url: &str, timeout: Duration) -> Result<()> {
     anyhow::bail!("SR not ready after {timeout:?}")
 }
 
-/// Force-remove the SR container on process exit (including panics).
+/// Force-remove the Kafka + SR containers on process exit (including panics).
 #[dtor]
 fn cleanup_sr() {
     if let Some(infra) = SR_INFRA.get() {
-        std::process::Command::new("docker")
-            .args(["rm", "-f", infra.schema_registry.id()])
-            .output()
-            .ok();
+        for id in [infra.schema_registry.id(), infra.kafka.id()] {
+            std::process::Command::new("docker")
+                .args(["rm", "-f", id])
+                .output()
+                .ok();
+        }
     }
+}
+
+/// Start a single-node KRaft Kafka on `PRIVATE_NETWORK` under a stable name so
+/// Schema Registry can reach it by DNS. The broker is only advertised on the
+/// internal network — the host never talks to Kafka directly (tests use the SR
+/// HTTP API only), so no host port is mapped.
+async fn start_kafka() -> ContainerAsync<GenericImage> {
+    // Remove any leftover container from a hard-killed prior run so the fixed
+    // name doesn't collide.
+    std::process::Command::new("docker")
+        .args(["rm", "-f", KAFKA_HOST])
+        .output()
+        .ok();
+
+    GenericImage::new("confluentinc/cp-kafka", "7.5.0")
+        .with_wait_for(WaitFor::Duration {
+            length: Duration::from_secs(15),
+        })
+        .with_container_name(KAFKA_HOST)
+        .with_network(PRIVATE_NETWORK)
+        .with_env_var("KAFKA_NODE_ID", "1")
+        .with_env_var("KAFKA_PROCESS_ROLES", "broker,controller")
+        .with_env_var("KAFKA_CONTROLLER_QUORUM_VOTERS", "1@localhost:29093")
+        .with_env_var(
+            "KAFKA_LISTENERS",
+            format!("PLAINTEXT://0.0.0.0:{KAFKA_INTERNAL_PORT},CONTROLLER://0.0.0.0:29093"),
+        )
+        .with_env_var(
+            "KAFKA_ADVERTISED_LISTENERS",
+            format!("PLAINTEXT://{KAFKA_HOST}:{KAFKA_INTERNAL_PORT}"),
+        )
+        .with_env_var(
+            "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP",
+            "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT",
+        )
+        .with_env_var("KAFKA_CONTROLLER_LISTENER_NAMES", "CONTROLLER")
+        .with_env_var("KAFKA_INTER_BROKER_LISTENER_NAME", "PLAINTEXT")
+        .with_env_var("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
+        .with_env_var("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "0")
+        .with_env_var("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "true")
+        .with_env_var("CLUSTER_ID", "MkU3OEVBNTcwNTJENDM2Qg")
+        .start()
+        .await
+        .expect("start kafka container")
 }
 
 async fn get_sr() -> &'static SrInfra {
     SR_INFRA
         .get_or_init(|| async {
+            info!("starting private Kafka (KRaft) for Schema Registry...");
+            let kafka = start_kafka().await;
+
             let sr =
                 GenericImage::new("confluentinc/cp-schema-registry", "7.5.0")
                     .with_wait_for(WaitFor::Duration {
                         length: Duration::from_secs(10),
                     })
+                    .with_container_name("df-avro-e2e-sr")
+                    .with_network(PRIVATE_NETWORK)
                     .with_env_var("SCHEMA_REGISTRY_HOST_NAME", "localhost")
                     .with_env_var(
                         "SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS",
-                        format!("PLAINTEXT://{KAFKA_BOOTSTRAP}"),
+                        format!(
+                            "PLAINTEXT://{KAFKA_HOST}:{KAFKA_INTERNAL_PORT}"
+                        ),
                     )
                     .with_env_var(
                         "SCHEMA_REGISTRY_LISTENERS",
                         format!("http://0.0.0.0:{SR_PORT}"),
                     )
                     .with_mapped_port(SR_PORT, SR_PORT.tcp())
-                    .with_network(DOCKER_NETWORK)
                     .start()
                     .await
                     .expect("start schema-registry container");
@@ -117,6 +179,7 @@ async fn get_sr() -> &'static SrInfra {
                 .expect("SR should be ready");
 
             SrInfra {
+                kafka,
                 schema_registry: sr,
             }
         })

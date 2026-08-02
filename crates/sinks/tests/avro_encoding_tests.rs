@@ -1274,16 +1274,21 @@ use tokio::sync::OnceCell;
 /// Schema Registry port (must not conflict with other services).
 const SR_PORT: u16 = 8181;
 
-/// Kafka broker address from inside the docker-compose network.
-/// The chaos-env Kafka listens on kafka:29092 (BROKER) within
-/// the `deltaforge_chaos_net` network.
-const KAFKA_BOOTSTRAP: &str = "kafka:29092";
+/// Private, auto-created testcontainers network shared by this file's Kafka +
+/// Schema Registry. Self-provisioned so the suite is hermetic — it no longer
+/// depends on an externally-running docker-compose Kafka.
+const PRIVATE_NETWORK: &str = "df-avro-encoding-net";
+/// Stable container name for Kafka so Schema Registry can resolve it by DNS on
+/// the shared network. Must be unique across this file's containers.
+const KAFKA_HOST: &str = "df-avro-encoding-kafka";
+/// Kafka broker (PLAINTEXT) port, reachable only inside PRIVATE_NETWORK.
+const KAFKA_INTERNAL_PORT: u16 = 29092;
 
-/// Docker network to join (same as docker-compose chaos environment).
-const DOCKER_NETWORK: &str = "deltaforge_chaos_net";
-
-/// Shared Schema Registry container.
+/// Shared Kafka + Schema Registry containers.
 struct AvroInfra {
+    // Kept alive for the whole test process; dropped/cleaned up in the dtor.
+    #[allow(dead_code)]
+    kafka: ContainerAsync<GenericImage>,
     #[allow(dead_code)]
     schema_registry: ContainerAsync<GenericImage>,
 }
@@ -1293,10 +1298,12 @@ static AVRO_INFRA: OnceCell<AvroInfra> = OnceCell::const_new();
 #[dtor]
 fn cleanup() {
     if let Some(infra) = AVRO_INFRA.get() {
-        std::process::Command::new("docker")
-            .args(["rm", "-f", infra.schema_registry.id()])
-            .output()
-            .ok();
+        for id in [infra.schema_registry.id(), infra.kafka.id()] {
+            std::process::Command::new("docker")
+                .args(["rm", "-f", id])
+                .output()
+                .ok();
+        }
     }
 }
 
@@ -1328,37 +1335,85 @@ async fn wait_for_schema_registry(url: &str, timeout: Duration) -> Result<()> {
     anyhow::bail!("Schema Registry not ready after {timeout:?}")
 }
 
-/// Start a real Confluent Schema Registry container.
+/// Start a single-node KRaft Kafka on `PRIVATE_NETWORK` under a stable name so
+/// Schema Registry can reach it by DNS. The broker is only advertised on the
+/// internal network — the host never talks to Kafka directly (tests use the SR
+/// HTTP API only), so no host port is mapped.
+async fn start_kafka() -> ContainerAsync<GenericImage> {
+    // Remove any leftover container from a hard-killed prior run so the fixed
+    // name doesn't collide.
+    std::process::Command::new("docker")
+        .args(["rm", "-f", KAFKA_HOST])
+        .output()
+        .ok();
+
+    GenericImage::new("confluentinc/cp-kafka", "7.5.0")
+        .with_wait_for(WaitFor::Duration {
+            length: Duration::from_secs(15),
+        })
+        .with_container_name(KAFKA_HOST)
+        .with_network(PRIVATE_NETWORK)
+        .with_env_var("KAFKA_NODE_ID", "1")
+        .with_env_var("KAFKA_PROCESS_ROLES", "broker,controller")
+        .with_env_var("KAFKA_CONTROLLER_QUORUM_VOTERS", "1@localhost:29093")
+        .with_env_var(
+            "KAFKA_LISTENERS",
+            format!("PLAINTEXT://0.0.0.0:{KAFKA_INTERNAL_PORT},CONTROLLER://0.0.0.0:29093"),
+        )
+        .with_env_var(
+            "KAFKA_ADVERTISED_LISTENERS",
+            format!("PLAINTEXT://{KAFKA_HOST}:{KAFKA_INTERNAL_PORT}"),
+        )
+        .with_env_var(
+            "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP",
+            "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT",
+        )
+        .with_env_var("KAFKA_CONTROLLER_LISTENER_NAMES", "CONTROLLER")
+        .with_env_var("KAFKA_INTER_BROKER_LISTENER_NAME", "PLAINTEXT")
+        .with_env_var("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
+        .with_env_var("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "0")
+        .with_env_var("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "true")
+        .with_env_var("CLUSTER_ID", "MkU3OEVBNTcwNTJENDM2Qg")
+        .start()
+        .await
+        .expect("start kafka container")
+}
+
+/// Start a self-provisioned Kafka (KRaft) + Confluent Schema Registry.
 ///
-/// Reuses the existing Kafka from docker-compose (port 9092).
-/// Only spins up the Schema Registry via testcontainers.
+/// Both run on a private testcontainers network; SR reaches Kafka by its
+/// container name. Fully hermetic — no external docker-compose dependency.
 async fn get_infra() -> &'static AvroInfra {
     AVRO_INFRA
         .get_or_init(|| async {
-            info!("starting Schema Registry container (using existing Kafka on {KAFKA_BOOTSTRAP})...");
+            info!("starting private Kafka (KRaft) for Schema Registry...");
+            let kafka = start_kafka().await;
 
-            let sr = GenericImage::new(
-                "confluentinc/cp-schema-registry",
-                "7.5.0",
-            )
-            .with_wait_for(WaitFor::Duration {
-                length: Duration::from_secs(10),
-            })
-            .with_env_var("SCHEMA_REGISTRY_HOST_NAME", "localhost")
-            .with_env_var(
-                "SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS",
-                format!("PLAINTEXT://{KAFKA_BOOTSTRAP}"),
-            )
-            .with_env_var(
-                "SCHEMA_REGISTRY_LISTENERS",
-                format!("http://0.0.0.0:{SR_PORT}"),
-            )
-            .with_env_var("SCHEMA_REGISTRY_DEBUG", "true")
-            .with_mapped_port(SR_PORT, SR_PORT.tcp())
-            .with_network(DOCKER_NETWORK)
-            .start()
-            .await
-            .expect("start schema-registry container");
+            let sr =
+                GenericImage::new("confluentinc/cp-schema-registry", "7.5.0")
+                    .with_wait_for(WaitFor::Duration {
+                        length: Duration::from_secs(10),
+                    })
+                    .with_container_name("df-avro-encoding-sr")
+                    .with_network(PRIVATE_NETWORK)
+                    .with_env_var("SCHEMA_REGISTRY_HOST_NAME", "localhost")
+                    .with_env_var(
+                        "SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS",
+                        format!(
+                            "PLAINTEXT://{KAFKA_HOST}:{KAFKA_INTERNAL_PORT}"
+                        ),
+                    )
+                    .with_env_var(
+                        "SCHEMA_REGISTRY_LISTENERS",
+                        format!("http://0.0.0.0:{SR_PORT}"),
+                    )
+                    .with_env_var("SCHEMA_REGISTRY_DEBUG", "true")
+                    .with_mapped_port(SR_PORT, SR_PORT.tcp())
+                    .start()
+                    .await
+                    .expect("start schema-registry container");
 
             info!("Schema Registry started: {}", sr.id());
 
@@ -1367,6 +1422,7 @@ async fn get_infra() -> &'static AvroInfra {
                 .expect("Schema Registry should be ready");
 
             AvroInfra {
+                kafka,
                 schema_registry: sr,
             }
         })
