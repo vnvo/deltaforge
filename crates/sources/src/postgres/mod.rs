@@ -299,10 +299,7 @@ impl PostgresSource {
             "postgres source starting"
         );
 
-        let config = pgwire_replication::ReplicationConfig {
-            start_lsn,
-            ..config
-        };
+        let config = config.with_start_lsn(start_lsn);
 
         let client = connect_replication_with_retries(
             &self.id,
@@ -354,10 +351,7 @@ impl PostgresSource {
         // If failover was detected, ctx.last_lsn was reset to B's slot position.
         // The existing stream was opened from A's stale LSN — reconnect from the correct point.
         if ctx.last_lsn != start_lsn {
-            let reconnect_config = pgwire_replication::ReplicationConfig {
-                start_lsn: ctx.last_lsn,
-                ..config.clone()
-            };
+            let reconnect_config = config.clone().with_start_lsn(ctx.last_lsn);
             let new_client = connect_replication_with_retries(
                 &self.id,
                 reconnect_config,
@@ -415,10 +409,7 @@ impl PostgresSource {
                     }
 
                     let reconnect_config =
-                        pgwire_replication::ReplicationConfig {
-                            start_lsn: ctx.last_lsn,
-                            ..config.clone()
-                        };
+                        config.clone().with_start_lsn(ctx.last_lsn);
 
                     match connect_replication_with_retries(
                         &self.id,

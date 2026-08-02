@@ -76,21 +76,22 @@ pub(super) async fn prepare_replication_client(
         Lsn::parse("0/0").unwrap()
     };
 
-    let config = ReplicationConfig {
-        host: components.host.clone(),
-        port: components.port,
-        user: components.user.clone(),
-        password: components.password.clone(),
-        database: components.database.clone(),
-        tls: TlsConfig::disabled(),
-        slot: slot.to_string(),
-        publication: publication.to_string(),
-        start_lsn,
-        stop_at_lsn: None,
-        status_interval: Duration::from_secs(STATUS_INTERVAL_SECS),
-        idle_wakeup_interval: Duration::from_secs(IDLE_WAKEUP_INTERVAL_SECS),
-        buffer_events: BUFFER_EVENTS,
-    };
+    // ReplicationConfig is #[non_exhaustive] as of 0.4.0 — build it via the
+    // constructor + builder methods rather than a struct literal.
+    let config = ReplicationConfig::new(
+        components.host.clone(),
+        components.user.clone(),
+        components.password.clone(),
+        components.database.clone(),
+        slot,
+        publication,
+    )
+    .with_port(components.port)
+    .with_tls(TlsConfig::disabled())
+    .with_start_lsn(start_lsn)
+    .with_status_interval(Duration::from_secs(STATUS_INTERVAL_SECS))
+    .with_wakeup_interval(Duration::from_secs(IDLE_WAKEUP_INTERVAL_SECS))
+    .with_buffer_size(BUFFER_EVENTS);
 
     Ok((components, config, last_checkpoint))
 }

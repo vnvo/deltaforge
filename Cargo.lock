@@ -4055,9 +4055,9 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pgwire-replication"
-version = "0.3.2"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7eec6334b2466a0163bd91c29e06a25b391c155231934aee80381b99560e240e"
+checksum = "62dd737cbc9ef6eb7d0702a80b5a53ca974088a4edf04da40bc2b946747ca810"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
