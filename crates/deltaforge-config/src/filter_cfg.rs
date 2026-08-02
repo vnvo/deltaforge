@@ -127,12 +127,15 @@ pub struct FilterProcessorCfg {
     pub id: String,
 
     /// Operations to keep. Empty = keep all.
+    #[serde(default)]
     pub ops: Vec<OpFilter>,
 
     /// Table include/exclude patterns.
+    #[serde(default)]
     pub tables: TableFilter,
 
     /// Field predicates evaluated against `event.after`.
+    #[serde(default)]
     pub fields: Vec<FieldPredicate>,
 
     /// How to combine multiple `fields` predicates.

@@ -807,6 +807,55 @@ spec:
 
 #[test]
 #[serial]
+fn filter_processor_parses() {
+    let yaml = r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata: { name: filter_proc_test, tenant: t }
+spec:
+  source:
+    type: mysql
+    config:
+      id: m
+      dsn: mysql://root:pw@localhost/db
+      tables: [orders]
+  processors:
+    - type: filter
+      id: only-active
+      ops: [create, update]
+      tables:
+        include: ["shop.orders"]
+      fields:
+        - path: status
+          op: eq
+          value: "active"
+    - type: filter   # bare filter: ops/tables/fields all omitted (defaults)
+  sinks: []
+"#;
+
+    let path = write_temp(yaml);
+    let spec = load_from_path(path.to_str().unwrap()).expect("parse ok");
+
+    assert_eq!(spec.spec.processors.len(), 2);
+    match &spec.spec.processors[0] {
+        ProcessorCfg::Filter { config } => {
+            assert_eq!(config.id, "only-active");
+            assert_eq!(config.ops.len(), 2);
+            assert_eq!(config.fields.len(), 1);
+        }
+        other => panic!("expected Filter, got {other:?}"),
+    }
+    // Bare `type: filter` must parse via serde defaults (empty ops/tables/fields).
+    match &spec.spec.processors[1] {
+        ProcessorCfg::Filter { config } => {
+            assert!(config.ops.is_empty() && config.fields.is_empty());
+        }
+        other => panic!("expected Filter, got {other:?}"),
+    }
+}
+
+#[test]
+#[serial]
 fn sink_filter_exclude_synthetic_parses() {
     let yaml = r#"
 apiVersion: deltaforge/v1

@@ -212,6 +212,7 @@ fn format_pipeline_summary(ps: &deltaforge_config::PipelineSpec) -> String {
             ProcessorCfg::Javascript { id, .. } => id.as_str(),
             ProcessorCfg::Outbox { .. } => "outbox",
             ProcessorCfg::Flatten { .. } => "flatten",
+            ProcessorCfg::Filter { .. } => "filter",
         })
         .collect();
 

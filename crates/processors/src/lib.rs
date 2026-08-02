@@ -40,6 +40,10 @@ pub fn build_processors(
                 Arc::new(FlattenProcessor::new(config.as_ref().clone())?)
                     as ArcDynProcessor
             }
+            ProcessorCfg::Filter { config } => {
+                Arc::new(FilterProcessor::new(config.as_ref().clone())?)
+                    as ArcDynProcessor
+            }
         };
         out.push(SyntheticMarkingProcessor::wrap(proc));
     }

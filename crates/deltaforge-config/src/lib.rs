@@ -243,6 +243,11 @@ pub enum ProcessorCfg {
         #[serde(flatten)]
         config: Box<FlattenProcessorCfg>,
     },
+    #[serde(rename = "filter")]
+    Filter {
+        #[serde(flatten)]
+        config: Box<FilterProcessorCfg>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
