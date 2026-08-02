@@ -29,7 +29,7 @@
 
 > ⚠️ **Status:** Active development. APIs, configuration, and semantics may change.
 
-DeltaForge streams database changes into downstream systems like Kafka, Redis, and NATS - giving you full control over routing, transformation, and delivery. Built-in schema discovery automatically infers and tracks the shape of your data as it flows through, including deep inspection of nested JSON structures.
+DeltaForge streams database changes into downstream systems like Kafka, Redis, NATS, and S3 object storage - giving you full control over routing, transformation, and delivery. Built-in schema discovery automatically infers and tracks the shape of your data as it flows through, including deep inspection of nested JSON structures.
 
 > DeltaForge is _not_ a DAG based stream processor. It is a focused CDC engine meant to replace tools like Debezium when you need a lighter, cloud-native, and more customizable runtime.
 
@@ -118,7 +118,7 @@ Output: `{"schema":null,"payload":{...}}`
 
 | Built with | Sources | Processors | Sinks | Encodings | Output Formats |
 |:---:|:---:|:---:|:---:|:---:|:---:|
-| Rust | MySQL · PostgreSQL | JavaScript · Outbox · Flatten · Filter | Kafka · Redis · NATS · HTTP | JSON · Avro | Native · Debezium · CloudEvents |
+| Rust | MySQL · PostgreSQL | JavaScript · Outbox · Flatten · Filter | Kafka · Redis · NATS · HTTP · S3 | JSON · Avro | Native · Debezium · CloudEvents |
 
 ## Features
 
@@ -168,6 +168,7 @@ Output: `{"schema":null,"payload":{...}}`
   - Redis stream sink — idempotency keys for consumer-side dedup
   - NATS JetStream sink (via `async_nats`) — server-side dedup via `Nats-Msg-Id`
   - HTTP/Webhook sink — POST/PUT to any URL with custom headers, URL templates, batch mode
+  - S3 / object-storage sink — Parquet or JSON Lines to any S3-compatible store (AWS S3, MinIO); Hive-partitioned by table + UTC date, atomic multipart-complete visibility, size/count/age file rolling, DDL-derived typed columns (native Decimal128, List/Map), per-row DLQ
   - Dynamic routing: per-event topic/stream/subject/URL via templates or JavaScript
   - Configurable envelope formats: Native, Debezium, CloudEvents
   - JSON and Avro wire encoding (Avro with Confluent Schema Registry, DDL-derived type-accurate schemas)
