@@ -40,8 +40,8 @@ Pipelines are defined declaratively in YAML. This enables:
 │             │  Registry   │  + Batch    │             │  Plane  │
 ├─────────────┼─────────────┼─────────────┼─────────────┼─────────┤
 │ MySQL       │ Durable     │ Batching    │ Kafka       │ REST API│
-│ PostgreSQL  │ Schema      │ Commit      │ Redis       │ Metrics │
-│             │ Registry    │ Policy      │ NATS        │ Health  │
+│ PostgreSQL  │ Schema      │ Commit      │ Redis / NATS│ Metrics │
+│             │ Registry    │ Policy      │ HTTP / S3   │ Health  │
 └─────────────┴──────┬──────┴─────────────┴─────────────┴─────────┘
                      │
           ┌──────────┴──────────┐
@@ -268,7 +268,6 @@ Performance is tracked via:
 
 Planned enhancements:
 
-- **Initial snapshot/backfill** using the Slot primitive for cursor tracking
 - **Event store**: time-based replay and schema evolution using the Log primitive
 - **Distributed coordination**: leader election via the Slot primitive with TTL-based leases
 - **Additional sources**: MongoDB, SQL Server, TiDB

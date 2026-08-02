@@ -36,9 +36,9 @@ GRANT CONNECT ON DATABASE your_database TO deltaforge;
 GRANT USAGE ON SCHEMA public TO deltaforge;
 GRANT SELECT ON ALL TABLES IN SCHEMA public TO deltaforge;
 
--- For automatic publication/slot creation (optional)
--- If you prefer manual setup, skip this and create them yourself
-ALTER ROLE deltaforge SUPERUSER;  -- Or use manual setup below
+-- The replication SLOT is auto-created on first run using the REPLICATION
+-- attribute granted above. The PUBLICATION is NOT auto-created — create it
+-- yourself (see "Replication Slot and Publication" below).
 ```
 
 ### pg_hba.conf
@@ -53,7 +53,7 @@ host    your_database   deltaforge      0.0.0.0/0               scram-sha-256
 
 ### Replication Slot and Publication
 
-DeltaForge can automatically create the replication slot and publication on first run. Alternatively, create them manually:
+DeltaForge automatically creates the replication **slot** on first run. The **publication** is not auto-created — you must create it yourself. Create both manually if you prefer:
 
 ```sql
 -- Create publication for specific tables
@@ -93,7 +93,7 @@ Set `spec.source.type` to `postgres` and provide a config object:
 | `slot` | string | Yes | — | Replication slot name |
 | `publication` | string | Yes | — | Publication name |
 | `tables` | array | Yes | — | Table patterns to capture |
-| `start_position` | string/object | No | `earliest` | Where to start when no checkpoint exists |
+| `start_position` | string/object | No | — | ⚠️ Parsed but not yet implemented — a new slot always starts at the current WAL LSN |
 
 ### DSN Formats
 
@@ -124,7 +124,9 @@ System schemas (`pg_catalog`, `information_schema`, `pg_toast`) are always exclu
 
 ### Start Position
 
-Controls where replication begins when no checkpoint exists:
+> ⚠️ **Not yet implemented.** `start_position` is accepted by the config parser but currently ignored — a new slot always starts from the current WAL position (`pg_current_wal_lsn()`). The forms below are aspirational.
+
+Intended to control where replication begins when no checkpoint exists:
 
 ```yaml
 # Start from the earliest available position (slot's restart_lsn)
@@ -151,7 +153,6 @@ source:
     tables:
       - public.orders
       - public.order_items
-    start_position: earliest
 ```
 
 ## Resume Behavior
@@ -160,7 +161,7 @@ DeltaForge checkpoints progress using PostgreSQL's LSN (Log Sequence Number):
 
 1. **With checkpoint**: Resumes from the stored LSN
 2. **Without checkpoint**: Uses the slot's `confirmed_flush_lsn` or `restart_lsn`
-3. **New slot**: Starts from `pg_current_wal_lsn()` or the configured `start_position`
+3. **New slot**: Starts from `pg_current_wal_lsn()` (current WAL position)
 
 Checkpoints are stored using the `id` field as the key.
 

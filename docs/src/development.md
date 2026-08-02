@@ -135,7 +135,7 @@ docker run --rm \
 Notes:
 
 - The container listens on `0.0.0.0:8080` for the control plane API with metrics on `:9000`.
-- Checkpoints are written to `/app/data/df_checkpoints.json`; mount a volume to persist them across restarts.
+- State (checkpoints, schema registry) is written to the SQLite database at `/app/data/deltaforge.db`; mount a volume to persist it across restarts.
 - Environment variables inside the YAML are expanded before parsing.
 - Pass any other runner flags as needed (e.g., `--api-addr` or `--metrics-addr`).
 

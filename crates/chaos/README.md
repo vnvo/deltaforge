@@ -9,56 +9,54 @@ A **web UI playground** is also included for interactive fault injection, scenar
 ## Prerequisites
 
 - Docker with Compose V2
-- The debug image built locally: `docker build -t deltaforge:dev-debug -f Dockerfile.debug .`
+- The DeltaForge images built locally (the `df` profile uses all three):
+  - `docker build -t deltaforge:dev .` (release)
+  - `docker build --build-arg CARGO_PROFILE=dev -t deltaforge:dev-debug -f Dockerfile.debug .` (debug)
+  - `docker build --build-arg CARGO_PROFILE=profiling -t deltaforge:dev-profile -f Dockerfile.debug .` (profile)
 - Rust toolchain (to compile and run the scenario runner)
 
 ## Stack profiles
 
-The compose file uses profiles to bring up only what a given test needs.
+The compose file uses profiles so you bring up only the infra a given test needs. Nothing starts without a `--profile` flag — infra and app profiles are independent, so you can restart DeltaForge without touching the databases.
 
-| Profile | Services added | Use case |
-|---------|---------------|----------|
-| *(base)* | MySQL, MySQL-B, Kafka, Zookeeper, Toxiproxy, Prometheus, Grafana, cAdvisor | Always required |
-| `app` | `deltaforge` (MySQL source, port 8080) | Resilience scenarios against MySQL |
-| `pg-app` | `deltaforge-pg` (PostgreSQL source, port 8080) | Resilience scenarios against PostgreSQL |
-| `pg` | `postgres`, `postgres-b` | Required alongside `pg-app` |
-| `soak` | `deltaforge-soak` (MySQL source, port 8081) | Soak test and backlog-drain benchmark |
-| `tpcc` | `deltaforge-tpcc` (MySQL source, port 8082) | TPC-C endurance benchmark |
+| Profile | Services | Use case |
+|---------|----------|----------|
+| `base` | toxiproxy, prometheus, grafana, cadvisor, loki, promtail | Fault injection + observability (always) |
+| `mysql-infra` | mysql, mysql-b | MySQL source + failover replica |
+| `pg-infra` | postgres, postgres-b | PostgreSQL source + failover replica |
+| `kafka-infra` | kafka (KRaft, no Zookeeper), schema-registry | Kafka sink + Avro tests |
+| `s3-infra` | minio, mc-bootstrap | S3/Parquet sink tests (MinIO) — see [S3_CHAOS.md](S3_CHAOS.md) |
+| `df` | deltaforge-release, deltaforge-debug, deltaforge-profile | The three DeltaForge instances |
 
-> **Note:** `app` and `pg-app` both bind to ports 8080 and 9000. Only one should be active at a time.
+The `df` profile starts one container per build variant: release (`:8080`, metrics `:9000`), debug (`:8081`/`:9001`), profile (`:8082`/`:9002`). All start with a default config; the pipeline for each scenario is selected at runtime via the REST API (`DELETE` + `POST /pipelines`), **not** by profile or by separate per-source services.
 
 ## Stack setup
 
-### MySQL resilience scenarios
+Start `base`, the infra you need, and `df`:
 
 ```bash
-docker compose -f docker-compose.chaos.yml up -d
-docker compose -f docker-compose.chaos.yml --profile app up -d
+# MySQL resilience scenarios
+docker compose -f docker-compose.chaos.yml \
+  --profile base --profile mysql-infra --profile df up -d
 curl http://localhost:8080/health   # should return "ok"
+
+# PostgreSQL resilience scenarios
+docker compose -f docker-compose.chaos.yml \
+  --profile base --profile pg-infra --profile df up -d
+
+# Kafka / Avro scenarios (add kafka-infra)
+docker compose -f docker-compose.chaos.yml \
+  --profile base --profile mysql-infra --profile kafka-infra --profile df up -d
+
+# S3 / Parquet sink scenarios (add s3-infra)
+docker compose -f docker-compose.chaos.yml \
+  --profile base --profile mysql-infra --profile s3-infra --profile df up -d
 ```
 
-### PostgreSQL resilience scenarios
+Restart just the DeltaForge containers without touching infra:
 
 ```bash
-docker compose -f docker-compose.chaos.yml up -d
-docker compose -f docker-compose.chaos.yml --profile pg --profile pg-app up -d
-curl http://localhost:8080/health   # should return "ok"
-```
-
-### Soak test and backlog-drain benchmark
-
-```bash
-docker compose -f docker-compose.chaos.yml up -d
-docker compose -f docker-compose.chaos.yml --profile soak up -d
-curl http://localhost:8081/health   # should return "ok"
-```
-
-### TPC-C benchmark
-
-```bash
-docker compose -f docker-compose.chaos.yml up -d
-docker compose -f docker-compose.chaos.yml --profile tpcc up -d
-curl http://localhost:8082/health   # should return "ok"
+docker compose -f docker-compose.chaos.yml --profile df restart
 ```
 
 Grafana is available at `http://localhost:3000` (anonymous admin). Prometheus at `http://localhost:9090`.
@@ -276,18 +274,23 @@ These settings are also available in the **Playground UI** under the "Kafka Prod
 ## Network topology
 
 ```
-DeltaForge (app)    ──► Toxiproxy ──► mysql          (port 5100)
-DeltaForge (soak)   ──►           ──► mysql-b         (MySQL failover target)
-DeltaForge (tpcc)   ──►           ──► postgres        (port 5101)
-DeltaForge (pg-app) ──►           ──► kafka           (port 5102)
+The three DeltaForge instances differ by build variant, not by source. Each
+runs whatever pipeline config is pushed to it, routing through Toxiproxy:
 
-Toxiproxy API:        localhost:8474  (scenario runner injects faults here)
-DeltaForge (app):     localhost:8080  (health/REST API · metrics :9000)
-DeltaForge (soak):    localhost:8081  (health/REST API · metrics :9001)
-DeltaForge (tpcc):    localhost:8082  (health/REST API · metrics :9002)
-Kafka (direct):       localhost:9092  (scenario runner reads offsets here)
-MySQL (direct):       localhost:3306  (scenario runner inserts rows here)
-Postgres (direct):    localhost:5432  (scenario runner inserts rows here)
+DeltaForge (release/debug/profile) ──► Toxiproxy ──► mysql            (proxy 5100)
+                                                 ──► postgres         (proxy 5101)
+                                                 ──► kafka            (proxy 5102)
+                                                 ──► schema-registry  (proxy 5103)
+                                                 ──► minio (S3)       (proxy 5104)
+
+Toxiproxy API:          localhost:8474  (scenario runner injects faults here)
+DeltaForge (release):   localhost:8080  (health/REST API · metrics :9000)
+DeltaForge (debug):     localhost:8081  (health/REST API · metrics :9001)
+DeltaForge (profile):   localhost:8082  (health/REST API · metrics :9002)
+Kafka (direct):         localhost:9092  (scenario runner reads offsets here)
+MySQL (direct):         localhost:3306  (scenario runner inserts rows here)
+Postgres (direct):      localhost:5432  (scenario runner inserts rows here)
+MinIO (direct):         localhost:9100  (S3 API · console :9101)
 ```
 
 `postgres-b` has no host port — it is only reachable via the Toxiproxy upstream switch.

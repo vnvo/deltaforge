@@ -224,7 +224,7 @@ curl http://localhost:8080/pipelines/{name}/schemas
 
 ## Limitations
 
-- **In-memory registry** - Schema versions are lost on restart. Persistent backends (SQLite, then PostgreSQL for HA) are planned.
+- **Durable by default** - Schema versions are persisted via the storage backend's Log primitive (SQLite by default) and replayed on restart, so they survive process restarts. A pure in-memory backend is also available for tests.
 - **No cross-pipeline sharing** - Each pipeline maintains its own registry instance
 - **Pattern expansion at startup** - New tables matching patterns require pipeline restart or reload
 

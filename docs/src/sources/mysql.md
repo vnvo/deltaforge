@@ -48,7 +48,7 @@ Set `spec.source.type` to `mysql` and provide a config object:
 |-------|------|----------|-------------|
 | `id` | string | Yes | Unique identifier used for checkpoints, server_id derivation, and metrics |
 | `dsn` | string | Yes | MySQL connection string with replication privileges |
-| `tables` | array | No | Table patterns to capture; omit or leave empty to capture all user tables |
+| `tables` | array | Yes | Table patterns to capture. The key is required, but an empty list `[]` captures all user tables. |
 
 ### Table Patterns
 
@@ -60,7 +60,7 @@ tables:
   - shop.order_%         # LIKE pattern: tables starting with "order_" in "shop"
   - analytics.*          # wildcard: all tables in "analytics" database
   - %.audit_log          # cross-database: "audit_log" table in any database
-  # omit entirely to capture all user tables (excludes system schemas)
+  # use an empty list [] to capture all user tables (excludes system schemas)
 ```
 
 System schemas (`mysql`, `information_schema`, `performance_schema`, `sys`) are always excluded.

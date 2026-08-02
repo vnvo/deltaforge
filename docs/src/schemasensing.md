@@ -117,14 +117,14 @@ spec:
 |-------|------|---------|-------------|
 | `enabled` | bool | `false` | Enable schema sensing |
 | **deep_inspect** |
-| `enabled` | bool | `false` | Inspect nested JSON |
-| `max_depth` | int | `3` | Max nesting depth |
-| `max_sample_size` | int | `500` | Max events for deep analysis |
+| `enabled` | bool | `true` | Inspect nested JSON |
+| `max_depth` | int | `10` | Max nesting depth |
+| `max_sample_size` | int | `1000` | Max events for deep analysis |
 | **sampling** |
-| `warmup_events` | int | `50` | Full analysis before sampling |
-| `sample_rate` | int | `5` | After warmup, analyze 1 in N |
+| `warmup_events` | int | `1000` | Full analysis before sampling |
+| `sample_rate` | int | `10` | After warmup, analyze 1 in N |
 | `structure_cache` | bool | `true` | Cache structure hashes |
-| `structure_cache_size` | int | `50` | Max cached per table |
+| `structure_cache_size` | int | `100` | Max cached per table |
 | **high_cardinality** |
 | `enabled` | bool | `true` | Detect dynamic map keys |
 | `min_events` | int | `100` | Events before classification |

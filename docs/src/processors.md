@@ -14,7 +14,7 @@ Processors can transform, modify or take extra action per event batch between th
 
 ## JavaScript
 
-Run arbitrary JavaScript against each event batch. Uses the V8 engine via `deno_core` for near-native speed with configurable resource limits.
+Run arbitrary JavaScript against each event batch. Uses the V8 engine via `deno_core` for near-native speed.
 
 ```yaml
 processors:
@@ -37,9 +37,11 @@ processors:
 |-------|------|---------|-------------|
 | `id` | string | *(required)* | Processor identifier |
 | `inline` | string | *(required)* | JavaScript source code |
-| `limits.cpu_ms` | int | `50` | CPU time limit per batch |
-| `limits.mem_mb` | int | `128` | V8 heap memory limit |
-| `limits.timeout_ms` | int | `500` | Wall-clock timeout per batch |
+| `limits.cpu_ms` | int | – | ⚠️ Accepted by the parser but **not yet enforced** |
+| `limits.mem_mb` | int | – | ⚠️ Accepted by the parser but **not yet enforced** |
+| `limits.timeout_ms` | int | – | ⚠️ Accepted by the parser but **not yet enforced** |
+
+> ⚠️ **`limits` are not currently enforced.** The fields deserialize but the JS runtime applies only a fixed ~5s reply timeout per batch — there is no CPU-time or heap limiting yet.
 
 ### Performance
 

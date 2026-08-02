@@ -10,7 +10,7 @@
 
 # Introduction
 
-DeltaForge is a versatile, high-performance [Change Data Capture](cdc.md) (CDC) engine built in Rust. It streams database changes into downstream systems like Kafka, Redis, NATS, and HTTP endpoints - giving you full control over how events are routed, transformed, and delivered. Supports JSON and Avro encoding (with Confluent Schema Registry), end-to-end exactly-once delivery via Kafka transactions, and built-in schema discovery that automatically infers and tracks the shape of your data as it flows through.
+DeltaForge is a versatile, high-performance [Change Data Capture](cdc.md) (CDC) engine built in Rust. It streams database changes into downstream systems like Kafka, Redis, NATS, HTTP endpoints, and S3 object storage - giving you full control over how events are routed, transformed, and delivered. Supports JSON and Avro encoding (with Confluent Schema Registry), end-to-end exactly-once delivery via Kafka transactions, and built-in schema discovery that automatically infers and tracks the shape of your data as it flows through.
 
 Pipelines are defined declaratively in YAML, making it straightforward to onboard new use cases without custom code.
 
@@ -50,7 +50,7 @@ Pipelines are defined declaratively in YAML, making it straightforward to onboar
       <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/apachekafka/apachekafka-original.svg" width="40" height="40" alt="Kafka">
       <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/redis/redis-original.svg" width="40" height="40" alt="Redis">
       <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/nats/nats-original.svg" width="40" height="40" alt="NATS">
-      <br><sub>Kafka · Redis · NATS · HTTP</sub>
+      <br><sub>Kafka · Redis · NATS · HTTP · S3</sub>
     </td>
     <td align="center">
       <img src="https://img.shields.io/badge/JSON-orange?style=flat-square" alt="JSON">
@@ -134,9 +134,11 @@ spec:
   processors:
     - type: javascript
       inline: |
-        (event) => {
-          event.processed_at = Date.now();
-          return [event];
+        function processBatch(events) {
+          for (const event of events) {
+            event.processed_at = Date.now();
+          }
+          return events;
         }
 
   sinks:

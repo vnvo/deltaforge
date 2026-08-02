@@ -36,6 +36,7 @@ helm install deltaforge ./deploy/helm/deltaforge \
 | Service | ClusterIP with API (8080) and metrics (9000) ports |
 | ServiceAccount | Pod identity |
 | ServiceMonitor | Prometheus Operator integration (optional) |
+| PodDisruptionBudget | Availability guard during voluntary disruptions |
 | Secret | Credentials (optional, dev only) |
 
 ### Secrets

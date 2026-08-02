@@ -263,7 +263,7 @@ When the source table schema changes (column added/removed/altered), DeltaForge 
 
 | Condition | Behavior |
 |-----------|----------|
-| SR unavailable, schema cached | Continue encoding with cached schema ID. Metric: `deltaforge_avro_sr_cache_fallback_total` |
+| SR unavailable, schema cached | Continue encoding with the cached schema ID (succeeds; no failure metric fires) |
 | SR unavailable, no cache | Fail the batch — cannot encode without a schema ID |
 | SR rejects new schema (compatibility) | Try encoding with cached schema; if encoding fails → DLQ |
 

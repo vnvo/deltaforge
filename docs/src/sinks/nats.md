@@ -310,7 +310,7 @@ for _, msg := range msgs {
 
 ## Notes
 
-- When `stream` is specified, the sink verifies the stream exists at connection time
+- When `stream` is specified, events are published to that JetStream stream (the stream must already exist; the sink does not create or verify it)
 - Without `stream`, events are published to core NATS (no persistence guarantees)
 - Connection pooling ensures efficient reuse across batches
 - Use replicated streams (`--replicas 3`) for production durability

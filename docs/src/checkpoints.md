@@ -70,7 +70,7 @@ Set `required: true` only on sinks where delivery is mandatory for correctness. 
 
 ```bash
 sqlite3 ./data/deltaforge.db \
-  "SELECT key, length(value) FROM kv WHERE namespace = 'checkpoints';"
+  "SELECT key, length(val) FROM df_kv WHERE ns = 'checkpoints';"
 ```
 
 ### Resetting a Pipeline
@@ -78,12 +78,10 @@ sqlite3 ./data/deltaforge.db \
 To force a pipeline to re-read from the beginning, delete its checkpoint:
 
 ```bash
-# Via API
-curl -X DELETE http://localhost:8080/pipelines/{name}/checkpoint
-
-# Directly in SQLite
+# Stop the pipeline, then delete its checkpoint directly in SQLite
+# (there is no checkpoint-reset REST endpoint).
 sqlite3 ./data/deltaforge.db \
-  "DELETE FROM kv WHERE namespace = 'checkpoints' AND key = '{source-id}';"
+  "DELETE FROM df_kv WHERE ns = 'checkpoints' AND key = '{source-id}';"
 ```
 
 ### Best Practices

@@ -25,6 +25,8 @@ spec:
 |-------|------|----------|-------------|
 | `name` | string | Yes | Unique pipeline identifier. Used in API routes and metrics. |
 | `tenant` | string | Yes | Business-oriented tenant label for multi-tenancy. |
+| `labels` | map | No | Arbitrary key/value labels. `GET /pipelines?label=k=v` filters on these. |
+| `annotations` | map | No | Arbitrary key/value annotations (non-identifying metadata). |
 
 ## Spec fields
 
@@ -37,6 +39,7 @@ spec:
 | `connection_policy` | object | No | How the runtime establishes upstream connections. |
 | `batch` | object | No | Commit unit thresholds. See [Batching](#batching). |
 | `commit_policy` | object | No | How sink acknowledgements gate checkpoints. See [Commit policy](#commit-policy). |
+| `sink_batch_deadline_secs` | int | No | Outer per-batch delivery deadline across all sinks (unset = no outer deadline). |
 | `schema_sensing` | object | No | Automatic schema inference from event payloads. See [Schema sensing](#schema-sensing). |
 | `journal` | object | No | Event journal (DLQ). See [Dead Letter Queue](dlq.md). |
 
@@ -287,7 +290,8 @@ Sinks deliver events to downstream systems. Each sink supports configurable [env
 
 ### Envelope and encoding
 
-All sinks support these serialization options:
+The Kafka, Redis, NATS, and HTTP sinks support these serialization options.
+(The S3 sink uses `format`/`compression` instead — see [S3](sinks/s3.md).)
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -464,6 +468,37 @@ sinks:
 </tr>
 </table>
 
+### HTTP / Webhook
+
+See [HTTP sink documentation](sinks/http.md) for full configuration. POST/PUT events to any URL with custom headers, URL templates, and batch mode.
+
+```yaml
+sinks:
+  - type: http
+    config:
+      id: orders-webhook
+      url: "https://example.com/hooks/{source.table}"
+      method: POST
+```
+
+### S3 / Object storage
+
+See [S3 sink documentation](sinks/s3.md) for full configuration. Writes Parquet or JSON Lines to any S3-compatible store, Hive-partitioned by table + date. Uses `format`/`compression` (not `envelope`/`encoding`).
+
+```yaml
+sinks:
+  - type: s3
+    config:
+      id: lake
+      bucket: my-lake
+      prefix: cdc
+      endpoint: "http://localhost:9000"
+      region: us-east-1
+      format: parquet
+      compression: snappy
+      required: true
+```
+
 ---
 
 ## Batching
@@ -486,11 +521,11 @@ batch:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_events` | int | `500` | Flush after this many events |
-| `max_bytes` | int | `1048576` | Flush after size reaches limit |
-| `max_ms` | int | `1000` | Flush after time (ms) |
+| `max_events` | int | `2000` | Flush after this many events |
+| `max_bytes` | int | `16777216` | Flush after size reaches limit (16 MiB) |
+| `max_ms` | int | `50` | Flush after time (ms) |
 | `respect_source_tx` | bool | `true` | Never split source transactions |
-| `max_inflight` | int | `2` | Max concurrent batches |
+| `max_inflight` | int | `1` | Max concurrent batches |
 
 </td>
 </tr>

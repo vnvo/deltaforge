@@ -135,7 +135,7 @@ for {
     for _, stream := range streams {
         for _, msg := range stream.Messages {
             var event Event
-            json.Unmarshal([]byte(msg.Values["event"].(string)), &event)
+            json.Unmarshal([]byte(msg.Values["df-event"].(string)), &event)
             process(event)
             rdb.XAck(ctx, "orders.events", "mygroup", msg.ID)
         }
@@ -168,7 +168,7 @@ loop {
     
     for stream in results {
         for msg in stream.ids {
-            let event: Event = serde_json::from_str(&msg.map["event"])?;
+            let event: Event = serde_json::from_str(&msg.map["df-event"])?;
             process(event);
             con.xack("orders.events", "mygroup", &[&msg.id]).await?;
         }
@@ -195,7 +195,7 @@ while True:
     events = r.xreadgroup("mygroup", "worker1", {"orders.events": ">"}, count=10, block=5000)
     for stream, messages in events:
         for msg_id, data in messages:
-            event = json.loads(data[b"event"])
+            event = json.loads(data[b"df-event"])
             process(event)
             r.xack("orders.events", "mygroup", msg_id)
 ```
@@ -248,7 +248,7 @@ while True:
 processed_ids = set()  # Or use Redis SET for distributed dedup
 
 for msg_id, data in messages:
-    event = json.loads(data[b"event"])
+    event = json.loads(data[b"df-event"])
     event_id = event["id"]
     
     if event_id in processed_ids:

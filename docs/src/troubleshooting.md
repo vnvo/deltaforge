@@ -47,7 +47,7 @@ WARN Schema Registry unavailable — using cached schema
 DeltaForge is encoding with a previously cached schema ID. Events are still flowing, but new schema registrations (e.g., after DDL changes) will fail until the SR recovers. Check:
 - Schema Registry connectivity: `curl http://<sr-url>/subjects`
 - Network/firewall between DeltaForge and the SR
-- Monitor `deltaforge_avro_sr_cache_fallback_total` — if increasing, the SR is unreachable
+- Monitor `deltaforge_avro_encode_failure_total{reason="sr_unavailable"}` — if increasing, the SR is unreachable and there's no cached schema to fall back to
 
 ### Schema registration rejected (compatibility failure)
 

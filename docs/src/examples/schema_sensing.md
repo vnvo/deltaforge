@@ -76,12 +76,12 @@ spec:
       structure_cache_size: 100
     
     tracking:
-      detect_drift: true     # Enable drift detection
-      drift_threshold: 0.1   # Alert if >10% of events have new fields
+      null_rates: true       # Track per-field null rates
+      enum_detection: true   # Detect low-cardinality enum-like fields
     
     output:
-      emit_schemas: true     # Include schema info in API responses
-      json_schema_format: draft-07
+      expose_api: true          # Expose inferred schemas via the REST API
+      export_json_schema: true  # Emit JSON Schema for downstream consumers
 ```
 
 ## Table Structure

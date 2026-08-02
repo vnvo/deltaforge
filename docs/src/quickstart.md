@@ -24,9 +24,11 @@ spec:
     - type: javascript
       id: transform
       inline: |
-        (event) => {
-          event.tags = ["processed"];
-          return [event];
+        function processBatch(events) {
+          for (const event of events) {
+            event.tags = ["processed"];
+          }
+          return events;
         }
 
   sinks:
@@ -70,7 +72,7 @@ cargo run -p runner -- --config ./pipeline.yaml
 |------|---------|-------------|
 | `--config` | (required) | Path to pipeline spec file or directory |
 | `--api-addr` | `0.0.0.0:8080` | REST API address |
-| `--metrics-addr` | `0.0.0.0:9095` | Prometheus metrics address |
+| `--metrics-addr` | `0.0.0.0:9095` | Address shown in the startup banner. Note: the Prometheus `/metrics` listener is currently bound to `:9000`. |
 
 ## 3. Verify it's running
 

@@ -109,7 +109,7 @@ When `exactly_once: true`, DeltaForge automatically configures:
 | `message.timeout.ms` | `30000` | Must be ≤ transaction.timeout.ms |
 | `delivery.timeout.ms` | `30000` | Must be ≤ transaction.timeout.ms |
 
-You do **not** need to set these in `client_conf` — they are applied automatically and cannot be overridden.
+You do **not** need to set these — they are applied automatically as defaults. Your `client_conf` is merged last, so any value you set there takes precedence (override at your own risk; these defaults are chosen for correct transactional behavior).
 
 ### Fatal errors
 

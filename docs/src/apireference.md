@@ -333,16 +333,23 @@ Returns detailed schema information including all columns.
   "columns": [
     {
       "name": "id",
-      "type": "bigint(20) unsigned",
+      "column_type": "bigint(20) unsigned",
+      "data_type": "bigint",
       "nullable": false,
-      "default": null,
-      "extra": "auto_increment"
+      "ordinal_position": 1,
+      "default_value": null,
+      "extra": "auto_increment",
+      "is_primary_key": true
     },
     {
       "name": "customer_id",
-      "type": "bigint(20)",
+      "column_type": "bigint(20)",
+      "data_type": "bigint",
       "nullable": false,
-      "default": null
+      "ordinal_position": 2,
+      "default_value": null,
+      "extra": null,
+      "is_primary_key": false
     }
   ],
   "primary_key": ["id"],
