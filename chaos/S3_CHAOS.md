@@ -19,21 +19,23 @@ docker compose -f docker-compose.chaos.yml \
   --profile df \
   up -d
 
-# Verify MinIO is up and the lifecycle policy was applied.
-docker compose -f docker-compose.chaos.yml exec mc-bootstrap \
-  mc ilm list local/deltaforge-chaos
+# Verify MinIO is up (the one-shot mc-bootstrap container creates the
+# `deltaforge-chaos` bucket). Host S3 API is on port 9100, console on 9101.
+curl -fsS http://localhost:9100/minio/health/live && echo "MinIO OK"
 ```
 
 Apply a pipeline that targets S3:
 
+The REST API accepts JSON, so convert the YAML config on the fly (needs `yq`):
+
 ```bash
-curl -X POST http://localhost:8080/pipelines \
-  -H 'Content-Type: application/json' \
-  --data-binary @chaos/config/mysql-to-s3.yaml
+yq -o=json chaos/config/mysql-to-s3.yaml | \
+  curl -X POST http://localhost:8080/pipelines \
+    -H 'Content-Type: application/json' --data-binary @-
 ```
 
 Browse output:
-- **MinIO web console**: <http://localhost:9001> (login: `minioadmin` / `minioadmin`)
+- **MinIO web console**: <http://localhost:9101> (login: `minioadmin` / `minioadmin`)
 - **Bucket**: `deltaforge-chaos`, prefix `lake/table=...`
 
 ## Scenarios
@@ -108,7 +110,8 @@ docker compose -f docker-compose.chaos.yml kill deltaforge-release
 #   - `mc ls local/deltaforge-chaos/lake/...` shows only files that
 #     COMPLETED before the kill — no partial Parquet files visible
 #   - `mc ls --incomplete local/deltaforge-chaos/` shows orphan multipart
-#     uploads (cleaned by the lifecycle policy within 24h)
+#     uploads (in production these are reaped by the
+#     AbortIncompleteMultipartUpload lifecycle rule — see Operational notes)
 
 # Restart DeltaForge — it replays from the last committed checkpoint
 docker compose -f docker-compose.chaos.yml up -d deltaforge-release
@@ -139,9 +142,11 @@ profile. The standard CDC dashboard shows them under the "Sink" panels.
 ## Operational notes
 
 - **Lifecycle policy**: production deployments MUST configure
-  `AbortIncompleteMultipartUpload: 1 day` on the target bucket. The
-  `mc-bootstrap` container in the chaos compose applies this to MinIO.
-  Without it, S3 storage costs grow with every abandoned batch.
+  `AbortIncompleteMultipartUpload: 1 day` on the target bucket, or S3 storage
+  costs grow with every abandoned batch. The `mc-bootstrap` container attempts
+  to apply it, but the pinned MinIO version rejects a standalone abort-multipart
+  lifecycle rule (verified with both `mc` and the AWS CLI), so in the chaos
+  stack it is best-effort — the bucket is still created, the rule is skipped.
 - **Direct vs proxied endpoint**: switch `endpoint` in the sink config
   between `http://minio:9000` (direct, no fault injection) and
   `http://toxiproxy:5104` (chaos path) as needed.
