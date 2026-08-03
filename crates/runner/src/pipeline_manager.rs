@@ -210,6 +210,29 @@ fn build_arrow_resolver(
     ))
 }
 
+/// Build a ClickHouse column resolver if the pipeline has a ClickHouse sink.
+fn build_clickhouse_resolver(
+    spec: &deltaforge_config::PipelineSpec,
+    schema_loader: &Option<ArcSchemaLoader>,
+) -> Option<sinks::clickhouse::ClickHouseSchemaResolver> {
+    use deltaforge_config::SinkCfg;
+
+    let has_ch = spec
+        .spec
+        .sinks
+        .iter()
+        .any(|s| matches!(s, SinkCfg::ClickHouse(_)));
+    if !has_ch {
+        return None;
+    }
+    let loader = schema_loader.as_ref()?;
+    let schema_provider =
+        Arc::new(SchemaLoaderAdapter::new(Arc::clone(loader)));
+    Some(crate::schema_provider::build_clickhouse_schema_resolver(
+        schema_provider,
+    ))
+}
+
 // ============================================================================
 // Pipeline Runtime (internal)
 // ============================================================================
@@ -417,12 +440,17 @@ impl PipelineManager {
         // Build Arrow schema resolver if any sink is an S3/Parquet sink
         let arrow_schema_resolver = build_arrow_resolver(&spec, &schema_loader);
 
+        // Build ClickHouse column resolver if any sink is a ClickHouse sink
+        let clickhouse_resolver =
+            build_clickhouse_resolver(&spec, &schema_loader);
+
         let sinks = sinks::build_sinks_with_schemas(
             &spec,
             cancel.clone(),
             &pipeline_name,
             avro_source_schemas,
             arrow_schema_resolver,
+            clickhouse_resolver,
         )
         .context("build sinks")?;
 
