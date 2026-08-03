@@ -35,6 +35,7 @@ sinks:
 | <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/redis/redis-original.svg" width="24" height="24"> | [`redis`](redis.md) | Redis stream sink |
 | | [`http`](http.md) | HTTP/Webhook sink |
 | <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/amazonwebservices/amazonwebservices-original-wordmark.svg" width="24" height="24"> | [`s3`](s3.md) | S3-compatible object storage (Parquet / JSON Lines) — AWS S3, MinIO, GCS, Azure, local FS |
+| <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/clickhouse/clickhouse-original.svg" width="24" height="24"> | [`clickhouse`](clickhouse.md) | ClickHouse (HTTP + RowBinary) — change-log or current-state (ReplacingMergeTree), auto table creation |
 
 ## Multiple sinks in one pipeline
 
