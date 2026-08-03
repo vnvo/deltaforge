@@ -38,14 +38,28 @@ use super::writer_pool::{
 use crate::s3::RollReason;
 use anyhow::Context as _;
 
+/// How often the background task sweeps for aged/idle writers to roll.
+///
+/// Time-based rolling (`max_age` / `idle_age`) is only evaluated inside
+/// `append_batch`, which the coordinator calls only when events are flowing.
+/// Without this timer, once the source goes idle the last open writers are
+/// never rolled — their buffers (and uncommitted tail data) linger until the
+/// pipeline stops. This background sweep makes idle/age rolling actually fire.
+const IDLE_SWEEP_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 /// `Sink` implementation for S3 + Parquet (or JSONL).
 pub struct S3Sink {
     id: String,
     pipeline: String,
     required: bool,
     send_timeout: std::time::Duration,
-    pool: Mutex<WriterPool>,
+    pool: Arc<Mutex<WriterPool>>,
     cancel: CancellationToken,
+    /// Background task that periodically rolls aged/idle writers so time-based
+    /// rolling works even when the source is idle (no `send_batch` calls).
+    /// Aborted on drop.
+    sweeper: tokio::task::JoinHandle<()>,
 }
 
 /// Constructor inputs for `S3Sink`. Phase 1g wires these from `S3SinkCfg`.
@@ -59,6 +73,8 @@ pub struct S3SinkArgs {
     pub schema_resolver: SchemaResolver,
     pub pool_cfg: WriterPoolConfig,
     pub cancel: CancellationToken,
+    /// How often the background task rolls aged/idle writers.
+    pub idle_sweep_interval: std::time::Duration,
 }
 
 impl S3Sink {
@@ -73,22 +89,70 @@ impl S3Sink {
             schema_resolver,
             pool_cfg,
             cancel,
+            idle_sweep_interval,
         } = args;
         let pool = WriterPool::new(store, format, schema_resolver, pool_cfg);
+        let pool = Arc::new(Mutex::new(pool));
         info!(
             sink = %id,
             pipeline = %pipeline,
             send_timeout_secs = send_timeout.as_secs(),
+            idle_sweep_secs = idle_sweep_interval.as_secs(),
             "s3 sink initialized"
+        );
+        let sweeper = Self::spawn_idle_sweeper(
+            Arc::clone(&pool),
+            cancel.clone(),
+            pipeline.clone(),
+            id.clone(),
+            idle_sweep_interval,
         );
         Self {
             id,
             pipeline,
             required,
             send_timeout,
-            pool: Mutex::new(pool),
+            pool,
             cancel,
+            sweeper,
         }
+    }
+
+    /// Spawn the background task that periodically rolls aged/idle writers.
+    ///
+    /// It calls `WriterPool::idle_sweep` on a fixed interval — independent of
+    /// `send_batch` — so `max_age` / `idle_age` rolling fires even when the
+    /// source is idle. Stops when the pipeline `cancel` token fires or the
+    /// task is aborted on drop. The first tick is delayed by one interval so a
+    /// freshly-opened writer isn't swept immediately.
+    fn spawn_idle_sweeper(
+        pool: Arc<Mutex<WriterPool>>,
+        cancel: CancellationToken,
+        pipeline: String,
+        sink: String,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval_at(
+                tokio::time::Instant::now() + interval,
+                interval,
+            );
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let mut guard = pool.lock().await;
+                        let committed = guard.idle_sweep().await;
+                        let open = guard.open_writer_count();
+                        drop(guard);
+                        if !committed.is_empty() {
+                            record_committed(&pipeline, &sink, &committed);
+                        }
+                        record_writer_gauge(&pipeline, &sink, open);
+                    }
+                }
+            }
+        })
     }
 
     /// Flush all in-flight writers on graceful shutdown. Returns the
@@ -107,32 +171,11 @@ impl S3Sink {
     }
 
     fn observe_committed(&self, committed: &[CommittedFile]) {
-        for c in committed {
-            counter!(
-                "deltaforge_sink_s3_files_committed_total",
-                "pipeline" => self.pipeline.clone(),
-                "sink" => self.id.clone(),
-                "table" => c.partition.table.clone(),
-                "reason" => roll_label(c.reason),
-            )
-            .increment(1);
-            counter!(
-                "deltaforge_sink_bytes_total",
-                "pipeline" => self.pipeline.clone(),
-                "sink" => self.id.clone(),
-                "table" => c.partition.table.clone(),
-            )
-            .increment(c.result.bytes_written);
-        }
+        record_committed(&self.pipeline, &self.id, committed);
     }
 
     fn observe_writer_count(&self, n: usize) {
-        gauge!(
-            "deltaforge_sink_s3_writer_open",
-            "pipeline" => self.pipeline.clone(),
-            "sink" => self.id.clone(),
-        )
-        .set(n as f64);
+        record_writer_gauge(&self.pipeline, &self.id, n);
     }
 
     fn observe_encode_failure(&self, reason: &str) {
@@ -154,6 +197,38 @@ impl S3Sink {
         )
         .increment(1);
     }
+}
+
+/// Record commit + bytes metrics for a set of rolled files. Free function so
+/// both `send_batch` and the background sweeper can call it.
+fn record_committed(pipeline: &str, sink: &str, committed: &[CommittedFile]) {
+    for c in committed {
+        counter!(
+            "deltaforge_sink_s3_files_committed_total",
+            "pipeline" => pipeline.to_string(),
+            "sink" => sink.to_string(),
+            "table" => c.partition.table.clone(),
+            "reason" => roll_label(c.reason),
+        )
+        .increment(1);
+        counter!(
+            "deltaforge_sink_bytes_total",
+            "pipeline" => pipeline.to_string(),
+            "sink" => sink.to_string(),
+            "table" => c.partition.table.clone(),
+        )
+        .increment(c.result.bytes_written);
+    }
+}
+
+/// Set the open-writer gauge. Free function for the same reason.
+fn record_writer_gauge(pipeline: &str, sink: &str, n: usize) {
+    gauge!(
+        "deltaforge_sink_s3_writer_open",
+        "pipeline" => pipeline.to_string(),
+        "sink" => sink.to_string(),
+    )
+    .set(n as f64);
 }
 
 fn roll_label(reason: RollReason) -> String {
@@ -248,6 +323,9 @@ impl Sink for S3Sink {
 
 impl Drop for S3Sink {
     fn drop(&mut self) {
+        // Stop the background sweeper so it doesn't outlive the sink (it holds
+        // an Arc clone of the pool).
+        self.sweeper.abort();
         // If the sink is dropped without `flush_on_shutdown`, abandon all
         // in-progress writers so no partial files appear at the destination.
         // The Mutex::try_lock here is best-effort: in a panicking task the
@@ -352,6 +430,7 @@ pub fn build_s3_sink(
         schema_resolver: resolver,
         pool_cfg,
         cancel,
+        idle_sweep_interval: IDLE_SWEEP_INTERVAL,
     }))
 }
 
@@ -457,6 +536,21 @@ mod tests {
         tmp: &std::path::Path,
         rolling: RollingConfig,
     ) -> S3Sink {
+        // Default: disable the background sweep (very long interval) so it
+        // never interferes with tests that assert on writers staying open.
+        build_sink_with_sweep(
+            tmp,
+            rolling,
+            std::time::Duration::from_secs(3600),
+        )
+        .await
+    }
+
+    async fn build_sink_with_sweep(
+        tmp: &std::path::Path,
+        rolling: RollingConfig,
+        idle_sweep_interval: std::time::Duration,
+    ) -> S3Sink {
         let params =
             ObjectStoreParams::local(tmp.to_string_lossy().to_string());
         let store = build_object_store(&params).unwrap();
@@ -483,6 +577,7 @@ mod tests {
                 rolling,
             },
             cancel: CancellationToken::new(),
+            idle_sweep_interval,
         })
     }
 
@@ -558,6 +653,45 @@ mod tests {
         let committed = sink.flush_on_shutdown().await;
         assert_eq!(committed.len(), 1, "single writer flushed on shutdown");
         assert_eq!(committed[0].result.rows_written, 10);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn idle_writer_rolls_via_background_sweep() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        // idle_age tiny + a fast sweep interval; the size/count/age thresholds
+        // are huge, so ONLY the idle sweep can roll the writer.
+        let sink = build_sink_with_sweep(
+            tmp.path(),
+            RollingConfig {
+                max_bytes: 1 << 30,
+                max_events: 1_000_000,
+                max_age: std::time::Duration::from_secs(3600),
+                idle_age: std::time::Duration::from_millis(50),
+            },
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+
+        // One event opens a writer that hits no size/count/age threshold, so
+        // without an idle sweep it would stay open forever (the bug this fixes).
+        sink.send_batch(&[event_with("orders", json!({"id": 1}))])
+            .await
+            .unwrap();
+
+        // Wait for the background sweeper to see the writer go idle and roll it
+        // — with NO further send_batch call.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        // The writer must already be closed by the sweep, so flush finds
+        // nothing open. Before this fix, flush would return the stranded writer.
+        let committed = sink.flush_on_shutdown().await;
+        assert!(
+            committed.is_empty(),
+            "background idle sweep should have rolled the idle writer, \
+             but flush still found {} open",
+            committed.len()
+        );
         Ok(())
     }
 
@@ -723,6 +857,7 @@ mod tests {
             schema_resolver,
             pool_cfg: WriterPoolConfig::default(),
             cancel: CancellationToken::new(),
+            idle_sweep_interval: std::time::Duration::from_secs(3600),
         });
         let err = sink
             .send_batch(&[event_with("orders", json!({"id": 1}))])

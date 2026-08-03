@@ -36,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **MySQL startup connection retry** — `prepare_client` (binlog tail resolution) retries with exponential backoff instead of failing immediately when MySQL is not yet ready.
+- **S3 sink: idle writers now roll on a timer** — time-based file rolling (`max_age` / `idle_age`) was only evaluated inside `send_batch`, which the coordinator calls only when events are flowing. Once the source went idle, the last open Parquet writers were never rolled: their buffers lingered (elevated RSS) and, worse, their tail data stayed **uncommitted** in the object store until the pipeline stopped — a durability gap (a crash while idle could lose the tail, since the checkpoint advances at buffer-time). The sink now runs a background sweep (every 5s) that rolls aged/idle writers independent of `send_batch`, so `max_age`/`idle_age` fire when idle and the uncommitted-tail window is bounded. Verified by a new unit test that rolls an idle writer with no further `send_batch`.
 - **Kafka `init_transactions` retry** — retries up to 10 attempts using RetryPolicy instead of failing immediately when broker is unreachable.
 
 ## [v0.1.0-beta.9] - 2026-03-29
