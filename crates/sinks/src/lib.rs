@@ -39,6 +39,7 @@ use deltaforge_core::ArcDynSink;
 use deltaforge_core::encoding::avro::SourceSchemaProvider;
 use tokio_util::sync::CancellationToken;
 
+pub mod clickhouse;
 pub mod filter;
 pub mod http;
 pub mod kafka;
