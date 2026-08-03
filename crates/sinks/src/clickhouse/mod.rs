@@ -3,6 +3,7 @@
 //! Modules are added task-by-task per `docs/specs/clickhouse-sink-plan.md`.
 
 pub mod ddl;
+pub mod project;
 pub mod rowbinary;
 pub mod types;
 pub mod version;
