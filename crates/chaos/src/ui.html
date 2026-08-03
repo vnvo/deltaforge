@@ -374,6 +374,13 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
               <option value="exactly-once">Exactly-Once (crash + read_committed verify)</option>
               <option value="dlq-poison">DLQ Poison (REST API + pipeline health)</option>
             </optgroup>
+            <optgroup label="S3 / Lakehouse (MySQL)">
+              <option value="s3-soak">S3 Soak (sustained Parquet writes)</option>
+              <option value="s3-outage">S3 Outage (MinIO cut + restore)</option>
+            </optgroup>
+            <optgroup label="Avro / Schema Registry (MySQL)">
+              <option value="sr-outage">SR Outage (cached-schema fallback)</option>
+            </optgroup>
             <optgroup label="MySQL only">
               <option value="failover">MySQL Failover</option>
               <option value="binlog-purge">Binlog Purge</option>
@@ -385,10 +392,11 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
             <optgroup label="Endurance">
               <option value="soak">Soak (random faults, long-running)</option>
               <option value="soak-stable">Soak Stable (no faults, baseline)</option>
-              <option value="tpcc">TPC-C (OLTP benchmark)</option>
             </optgroup>
             <optgroup label="Benchmarks">
-              <option value="backlog-drain">Backlog Drain (1 M row catch-up throughput)</option>
+              <option value="backlog-drain">Backlog Drain — Kafka (1 M row catch-up)</option>
+              <option value="s3-backlog-drain">Backlog Drain — S3 (MySQL→S3 throughput)</option>
+              <option value="tpcc">TPC-C (OLTP benchmark)</option>
             </optgroup>
             <optgroup label="Suite">
               <option value="all">All (runs every scenario in order)</option>
@@ -407,8 +415,8 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
         <div class="form-row">
           <label>Instance</label>
           <div class="source-toggle">
-            <button id="run-port-8080" onclick="setRunPort(8080)">Release</button>
-            <button id="run-port-8081" class="active" onclick="setRunPort(8081)">Debug</button>
+            <button id="run-port-8080" class="active" onclick="setRunPort(8080)">Release</button>
+            <button id="run-port-8081" onclick="setRunPort(8081)">Debug</button>
             <button id="run-port-8082" onclick="setRunPort(8082)">Profile</button>
           </div>
         </div>
@@ -461,6 +469,13 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
 
         <!-- Drain settings — only shown for backlog-drain -->
         <div id="drain-settings" style="display:none;border:1px solid var(--border);border-radius:6px;padding:10px;display:none;flex-direction:column;gap:8px;background:var(--surface2)">
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <span class="muted" style="font-size:10px;width:55px">Target</span>
+            <input type="number" id="drain-target" value="200000" min="1000" max="100000000" step="1000" style="width:90px;font-size:11px;padding:2px 4px" title="rows to preload before the drain (--drain-target)">
+            <span class="muted" style="font-size:9px">rows</span>
+            <span class="muted" style="font-size:10px;margin-left:10px">Writers</span>
+            <input type="number" id="drain-writers" value="32" min="1" max="256" style="width:50px;font-size:11px;padding:2px 4px" title="concurrent preload writers (--drain-writers)">
+          </div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
 
             <!-- Left: Pipeline batch settings -->
@@ -490,8 +505,8 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
               </div>
             </div>
 
-            <!-- Right: Kafka producer tuning -->
-            <div style="display:flex;flex-direction:column;gap:6px">
+            <!-- Right: Kafka producer tuning (hidden for non-Kafka sinks) -->
+            <div id="drain-kafka-panel" style="display:flex;flex-direction:column;gap:6px">
               <div style="font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted)">Kafka <span style="text-transform:none;letter-spacing:0">(rdkafka)</span></div>
               <div style="display:flex;gap:4px;align-items:center">
                 <span class="muted" style="font-size:10px;width:65px">batch.size</span>
@@ -558,8 +573,8 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
         <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
           <span style="font-size:11px;color:var(--muted)">Instance</span>
           <div class="source-toggle">
-            <button id="api-8080" onclick="apiSetPort(8080)">release</button>
-            <button id="api-8081" class="active" onclick="apiSetPort(8081)">debug</button>
+            <button id="api-8080" class="active" onclick="apiSetPort(8080)">release</button>
+            <button id="api-8081" onclick="apiSetPort(8081)">debug</button>
             <button id="api-8082" onclick="apiSetPort(8082)">profile</button>
           </div>
         </div>
@@ -657,8 +672,8 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
       <div class="lab-toolbar">
         <span style="font-size:11px;color:var(--muted)">Instance</span>
         <div class="source-toggle">
-          <button id="lab-8080" onclick="labSetPort(8080)">release</button>
-          <button id="lab-8081" class="active" onclick="labSetPort(8081)">debug</button>
+          <button id="lab-8080" class="active" onclick="labSetPort(8080)">release</button>
+          <button id="lab-8081" onclick="labSetPort(8081)">debug</button>
           <button id="lab-8082" onclick="labSetPort(8082)">profile</button>
         </div>
         <span style="font-size:11px;color:var(--muted)">Config</span>
@@ -776,7 +791,7 @@ function setSource(s) {
 }
 
 // ── Instance selector (scenario runner) ───────────────────────────────────
-let runPort = 8081;
+let runPort = 8080;
 
 function setRunPort(p) {
   runPort = p;
@@ -878,17 +893,51 @@ document.getElementById('writers-slider').addEventListener('input', function() {
   updateRateEst();
 });
 
+// Scenarios that only run against a specific source. Anything not listed
+// supports both MySQL and Postgres. Keep in sync with the scenario registry
+// (crates/chaos/src/scenarios/meta.rs).
+const SCENARIO_SOURCES = {
+  'failover': ['mysql'],
+  'binlog-purge': ['mysql'],
+  's3-soak': ['mysql'],
+  's3-outage': ['mysql'],
+  's3-backlog-drain': ['mysql'],
+  'sr-outage': ['mysql'],
+  'pg-failover': ['postgres'],
+  'slot-dropped': ['postgres'],
+};
+
+// Enforce a scenario's source requirement so the UI can't launch an
+// impossible combination: lock the source toggle to the allowed source(s)
+// and switch off any currently-selected source that isn't supported.
+function applyScenarioSourceConstraint(sc) {
+  const allowed = SCENARIO_SOURCES[sc] || ['mysql', 'postgres'];
+  const btns = { mysql: document.getElementById('src-mysql'),
+                 postgres: document.getElementById('src-postgres') };
+  for (const [src, btn] of Object.entries(btns)) {
+    const ok = allowed.includes(src);
+    btn.disabled = !ok;
+    btn.title = ok ? '' : `The "${sc}" scenario does not support ${src === 'mysql' ? 'MySQL' : 'Postgres'}.`;
+  }
+  if (!allowed.includes(source)) setSource(allowed[0]);
+}
+
 function onScenarioChange() {
   const sc = document.getElementById('scenario-select').value;
-  const needsDuration = sc === 'soak' || sc === 'soak-stable' || sc === 'tpcc';
+  const needsDuration = sc === 'soak' || sc === 'soak-stable' || sc === 'tpcc' || sc === 's3-soak';
   const isSoak = sc === 'soak' || sc === 'soak-stable';
-  const isDrain = sc === 'backlog-drain';
+  const isDrain = sc === 'backlog-drain' || sc === 's3-backlog-drain';
   document.getElementById('duration-row').style.display = needsDuration ? '' : 'none';
   document.getElementById('writers-row').style.display = isSoak ? '' : 'none';
   document.getElementById('delay-row').style.display = isSoak ? '' : 'none';
   const ds = document.getElementById('drain-settings');
   ds.style.display = isDrain ? 'flex' : 'none';
   ds.style.flexDirection = isDrain ? 'column' : '';
+  // The Kafka producer knobs only apply to the Kafka drain; hide them for the
+  // S3 drain (measured via the sink-agnostic metric, no rdkafka config).
+  const kpanel = document.getElementById('drain-kafka-panel');
+  if (kpanel) kpanel.style.display = (sc === 's3-backlog-drain') ? 'none' : '';
+  applyScenarioSourceConstraint(sc);
 }
 
 function setDrainCommit(mode) {
@@ -1005,11 +1054,12 @@ function consoleLog(text, kind) {
 })();
 
 // ── Infrastructure ─────────────────────────────────────────────────────────
-async function infraAction(action, profile, btn) {
-  const label = `docker compose ${action} ${profile || '(base)'}`;
+async function infraAction(action, profile, service, btn) {
+  const target = service || profile || '(base)';
+  const label = `docker compose ${action} ${target}`;
   await runTask(label, async () => {
-    const r = await api('POST', '/api/infra', { action, profile });
-    toast(r.ok ? `\u2705 ${action} ${profile || 'base'} done` : `\u274C ${action} failed`, r.ok ? 'ok' : 'err');
+    const r = await api('POST', '/api/infra', { action, profile, service: service || '' });
+    toast(r.ok ? `\u2705 ${action} ${target} done` : `\u274C ${action} failed`, r.ok ? 'ok' : 'err');
     return r;
   }, btn);
 }
@@ -1200,27 +1250,35 @@ async function startScenario() {
     duration_mins, writer_tasks, write_delay_ms, use_proxy: useProxy
   };
 
-  if (scenario === 'backlog-drain') {
+  if (scenario === 'backlog-drain' || scenario === 's3-backlog-drain') {
+    body.drain_target = parseInt(document.getElementById('drain-target').value, 10);
+    body.drain_writers = parseInt(document.getElementById('drain-writers').value, 10);
     body.drain_max_events = parseInt(document.getElementById('drain-max-events').value, 10);
     body.drain_max_ms = parseInt(document.getElementById('drain-max-ms').value, 10);
     body.drain_commit_mode = drainCommitMode;
     body.drain_schema_sensing = drainSensing;
 
-    // rdkafka producer tuning overrides
-    const kafkaConf = [];
-    const batchSize = document.getElementById('drain-kafka-batch-size').value;
-    const linger = document.getElementById('drain-kafka-linger').value;
-    const batchNum = document.getElementById('drain-kafka-batch-num').value;
-    if (batchSize) kafkaConf.push('batch.size=' + batchSize);
-    if (linger) kafkaConf.push('linger.ms=' + linger);
-    if (batchNum) kafkaConf.push('batch.num.messages=' + batchNum);
-    if (drainCompression) kafkaConf.push('compression.type=' + drainCompression);
-    body.drain_kafka_conf = kafkaConf;
+    // rdkafka producer tuning — Kafka drain only.
+    if (scenario === 'backlog-drain') {
+      const kafkaConf = [];
+      const batchSize = document.getElementById('drain-kafka-batch-size').value;
+      const linger = document.getElementById('drain-kafka-linger').value;
+      const batchNum = document.getElementById('drain-kafka-batch-num').value;
+      if (batchSize) kafkaConf.push('batch.size=' + batchSize);
+      if (linger) kafkaConf.push('linger.ms=' + linger);
+      if (batchNum) kafkaConf.push('batch.num.messages=' + batchNum);
+      if (drainCompression) kafkaConf.push('compression.type=' + drainCompression);
+      body.drain_kafka_conf = kafkaConf;
+    }
   }
 
   const r = await api('POST', '/api/scenario/start', body);
-  if (r.status === 409) { toast('A scenario is already running', 'err'); return; }
-  if (!r.ok) { toast('Failed to start scenario', 'err'); return; }
+  if (r.status === 409) { toast('A scenario is already running — stop it first', 'err'); return; }
+  if (!r.ok) {
+    const reason = (await r.text().catch(() => '')) || `HTTP ${r.status}`;
+    toast(`Failed to start scenario: ${reason}`, 'err');
+    return;
+  }
   toast(`▶ ${scenario} started`, 'ok');
   logLength = 0;
 }
@@ -1383,7 +1441,7 @@ function switchTab(tab) {
 }
 
 // ── Pipeline API tab ───────────────────────────────────────────────────────
-let apiPort = 8081;
+let apiPort = 8080;
 
 function apiSetPort(p) {
   apiPort = p;
@@ -1554,7 +1612,10 @@ function renderServices(services) {
     { label: 'MySQL Infra',   profile: 'mysql-infra',   names: ['mysql','mysql-b'] },
     { label: 'PG Infra',      profile: 'pg-infra',      names: ['postgres','postgres-b'] },
     { label: 'Kafka Infra',   profile: 'kafka-infra',   names: ['kafka','schema-registry'] },
-    { label: 'DeltaForge',    profile: 'df',            names: ['deltaforge-release','deltaforge-debug','deltaforge-profile'] },
+    { label: 'S3 Infra',      profile: 's3-infra',      names: ['minio'] },
+    { label: 'DeltaForge · release (:8080)', profile: 'df', service: 'deltaforge-release', names: ['deltaforge-release'] },
+    { label: 'DeltaForge · debug (:8081)',   profile: 'df', service: 'deltaforge-debug',   names: ['deltaforge-debug'] },
+    { label: 'DeltaForge · profile (:8082)', profile: 'df', service: 'deltaforge-profile', names: ['deltaforge-profile'] },
   ];
 
   const byName = Object.fromEntries(services.map(s => [s.label, s]));
@@ -1570,18 +1631,20 @@ function renderServices(services) {
 
     if (group.profile !== null) {
       const p = group.profile;
+      const svcTarget = group.service || '';
+      const upTitle = svcTarget || p || '(base)';
       const up = document.createElement('button');
       up.className = 'btn btn-green btn-sm';
       up.textContent = '\u25B2 Start';
-      up.title = `docker compose up ${p || '(base)'}`;
-      up.onclick = function() { infraAction('up', p, this); };
+      up.title = `docker compose up ${upTitle}`;
+      up.onclick = function() { infraAction('up', p, svcTarget, this); };
       header.appendChild(up);
 
       const dn = document.createElement('button');
       dn.className = 'btn btn-red btn-sm';
       dn.textContent = '\u25BC Stop';
-      dn.title = `docker compose stop ${p || '(base)'}`;
-      dn.onclick = function() { infraAction('stop', p, this); };
+      dn.title = `docker compose stop ${upTitle}`;
+      dn.onclick = function() { infraAction('stop', p, svcTarget, this); };
       header.appendChild(dn);
 
       // Refresh button for DeltaForge app services (not base infra / observability)
@@ -1806,7 +1869,7 @@ loadRunConfigs();
 refreshRunPipeline();
 
 // ── Config Lab ──────────────────────────────────────────────────────────────
-let labPort = 8081;
+let labPort = 8080;
 let labRunning = false;
 let labAbort = false;
 

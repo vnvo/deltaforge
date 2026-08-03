@@ -139,6 +139,8 @@ enum Scenario {
     S3Soak,
     /// MinIO outage via toxiproxy — verify backpressure and recovery.
     S3Outage,
+    /// Backlog drain against the S3 sink — MySQL→S3 catch-up throughput.
+    S3BacklogDrain,
     // MySQL-specific
     Failover,
     BinlogPurge,
@@ -186,6 +188,7 @@ fn meta_for_scenario(
         Scenario::SrOutage => "sr-outage",
         Scenario::S3Soak => "s3-soak",
         Scenario::S3Outage => "s3-outage",
+        Scenario::S3BacklogDrain => "s3-backlog-drain",
         Scenario::Failover => "failover",
         Scenario::BinlogPurge => "binlog-purge",
         Scenario::PgFailover => "pg-failover",
@@ -303,6 +306,9 @@ async fn main() -> Result<()> {
         .collect();
 
     let drain_cfg = scenarios::backlog_drain::DrainConfig {
+        // Default measurement is Kafka offset; the s3-backlog-drain dispatch
+        // switches this to the sink-agnostic metric.
+        measure: scenarios::backlog_drain::DrainMeasure::KafkaOffset,
         target_events: cli.drain_target,
         writer_tasks: cli.drain_writers,
         drain_timeout_secs: cli.drain_timeout,
@@ -546,6 +552,21 @@ async fn run_scenarios<B: backend::SourceBackend>(
         }
         Scenario::S3Outage => {
             results.push(scenarios::s3_outage::run(harness, backend).await?);
+        }
+        Scenario::S3BacklogDrain => {
+            // Same drain flow as the Kafka benchmark, but measured via the
+            // sink-agnostic delivered-events metric (S3 has no offsets), and
+            // without the Kafka-only producer overrides.
+            let mut cfg = soak.drain_cfg.clone();
+            cfg.measure = scenarios::backlog_drain::DrainMeasure::SinkMetric;
+            cfg.kafka_client_conf.clear();
+            cfg.exactly_once = None;
+            results.push(
+                scenarios::backlog_drain::run_with_source(
+                    harness, &soak.src, cfg,
+                )
+                .await?,
+            );
         }
 
         // ── MySQL-specific ──────────────────────────────────────────────

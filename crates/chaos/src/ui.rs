@@ -221,6 +221,8 @@ fn port_label(host_port: u16) -> Option<(&'static str, String)> {
         3306 | 3307 => Some(("mysql", format!("localhost:{host_port}"))),
         5432 | 5433 => Some(("psql", format!("localhost:{host_port}"))),
         9092 => Some(("broker", "localhost:9092".to_string())),
+        9100 => Some(("S3 API", "http://localhost:9100".to_string())),
+        9101 => Some(("console", "http://localhost:9101".to_string())),
         _ => None,
     }
 }
@@ -283,6 +285,11 @@ async fn api_status() -> Json<Vec<ServiceInfo>> {
             "schema-registry",
             "deltaforge-schema-registry-1",
             Some("http://localhost:8085/subjects"),
+        ),
+        (
+            "minio",
+            "deltaforge-minio-1",
+            Some("http://localhost:9100/minio/health/live"),
         ),
         ("postgres", "deltaforge-postgres-1", None),
         ("postgres-b", "deltaforge-postgres-b-1", None),
@@ -533,6 +540,8 @@ async fn api_reset_volumes(Json(req): Json<ResetRequest>) -> StatusCode {
                     "--profile",
                     "kafka-infra",
                     "--profile",
+                    "s3-infra",
+                    "--profile",
                     "df",
                     "down",
                     "-v",
@@ -572,6 +581,12 @@ struct RunRequest {
     #[serde(default = "default_true")]
     use_proxy: bool,
     // Backlog-drain throughput settings
+    /// Total rows to preload before the drain (CLI `--drain-target`).
+    #[serde(default)]
+    drain_target: Option<u64>,
+    /// Concurrent writer tasks during preload (CLI `--drain-writers`).
+    #[serde(default)]
+    drain_writers: Option<usize>,
     #[serde(default)]
     drain_max_events: Option<u64>,
     #[serde(default)]
@@ -600,14 +615,22 @@ struct ScenarioStatus {
 async fn api_scenario_start(
     State(st): State<Arc<UiState>>,
     Json(req): Json<RunRequest>,
-) -> StatusCode {
+) -> (StatusCode, String) {
     if st.running.load(Ordering::Relaxed) {
-        return StatusCode::CONFLICT;
+        return (
+            StatusCode::CONFLICT,
+            "a scenario is already running — stop it first".to_string(),
+        );
     }
 
     let binary = match std::env::current_exe() {
         Ok(p) => p,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("cannot locate chaos binary: {e}"),
+            );
+        }
     };
 
     let mut cmd = Command::new(&binary);
@@ -632,6 +655,12 @@ async fn api_scenario_start(
     if req.write_delay_ms > 0 {
         cmd.arg("--write-delay-ms")
             .arg(req.write_delay_ms.to_string());
+    }
+    if let Some(v) = req.drain_target {
+        cmd.arg("--drain-target").arg(v.to_string());
+    }
+    if let Some(v) = req.drain_writers {
+        cmd.arg("--drain-writers").arg(v.to_string());
     }
     if let Some(v) = req.drain_max_events {
         cmd.arg("--drain-max-events").arg(v.to_string());
@@ -660,7 +689,12 @@ async fn api_scenario_start(
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to spawn scenario process: {e}"),
+            );
+        }
     };
 
     let stdout = child.stdout.take().unwrap();
@@ -724,7 +758,7 @@ async fn api_scenario_start(
         }
     });
 
-    StatusCode::OK
+    (StatusCode::OK, String::new())
 }
 
 async fn api_scenario_stop(State(st): State<Arc<UiState>>) -> StatusCode {
@@ -754,6 +788,11 @@ async fn api_scenario_status(
 struct InfraRequest {
     action: String,  // "up" or "stop"
     profile: String, // "", "app", "pg-app", "soak", "tpcc"
+    /// Optional: a single compose service to target within the profile
+    /// (e.g. "deltaforge-release"). Lets the UI bring up one instance
+    /// without pulling images for the others.
+    #[serde(default)]
+    service: String,
 }
 
 async fn api_infra(Json(req): Json<InfraRequest>) -> StatusCode {
@@ -770,6 +809,9 @@ async fn api_infra(Json(req): Json<InfraRequest>) -> StatusCode {
     args.push(req.action.clone());
     if req.action == "up" {
         args.push("-d".to_string());
+    }
+    if !req.service.is_empty() {
+        args.push(req.service.clone());
     }
 
     let ok = Command::new("docker")

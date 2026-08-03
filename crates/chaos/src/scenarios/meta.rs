@@ -234,11 +234,23 @@ pub const REGISTRY: &[ScenarioMeta] = &[
     ),
     meta(
         "backlog-drain",
-        "Drains a 1M-row backlog and measures catch-up throughput.",
+        "Drains a 1M-row backlog and measures catch-up throughput (Kafka sink; \
+         measured via Kafka high-watermark offset).",
         "All 1M rows delivered; reports avg/p50/peak events/s.",
         Benchmark,
         MYSQL_KAFKA,
-        &["benchmark", "throughput"],
+        &["benchmark", "throughput", "kafka"],
+    ),
+    meta(
+        "s3-backlog-drain",
+        "Drains a large MySQL backlog to the S3 (Parquet) sink and measures \
+         catch-up throughput — the S3 analogue of backlog-drain. Completion is \
+         measured via DeltaForge's sink-agnostic delivered-events metric, so it \
+         needs no Kafka.",
+        "All preloaded rows land in the bucket; reports avg/p50/peak events/s.",
+        Benchmark,
+        MYSQL_S3,
+        &["benchmark", "throughput", "s3", "parquet"],
     ),
     meta(
         "tpcc",

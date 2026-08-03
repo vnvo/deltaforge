@@ -107,6 +107,22 @@ impl Harness {
                 .await?;
         parse_counter(&body, "deltaforge_source_reconnects_total")
     }
+
+    /// Fetch total events delivered across all sinks from DeltaForge metrics.
+    ///
+    /// Sink-agnostic: sums `deltaforge_sink_events_total` across every
+    /// `{pipeline,sink}` label set, so it works for any sink type (S3, Redis,
+    /// NATS, HTTP, …), not just Kafka. Used by the backlog-drain benchmark in
+    /// `SinkMetric` measurement mode.
+    pub async fn sink_events_total(&self) -> Result<f64> {
+        let metrics_port = self.port - 8080 + 9000;
+        let body =
+            reqwest::get(format!("http://localhost:{}/metrics", metrics_port))
+                .await?
+                .text()
+                .await?;
+        Ok(parse_counter_sum(&body, "deltaforge_sink_events_total"))
+    }
 }
 
 /// Wait until any health endpoint returns 200 (URL configurable).
@@ -245,6 +261,35 @@ fn parse_counter(body: &str, name: &str) -> Result<f64> {
         }
     }
     Ok(0.0)
+}
+
+/// Sum a Prometheus counter across all of its label sets.
+///
+/// Matches `<name> <val>` and `<name>{labels} <val>` lines (a metric with
+/// labels emits one series per label set), and adds up the values. Guards
+/// against matching a different metric that merely shares the prefix (e.g.
+/// `<name>_created`) by requiring the char after `name` to be a space or `{`.
+fn parse_counter_sum(body: &str, name: &str) -> f64 {
+    let mut total = 0.0;
+    for line in body.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix(name) else {
+            continue;
+        };
+        if !(rest.starts_with(' ') || rest.starts_with('{')) {
+            continue;
+        }
+        if let Some(v) = line
+            .split_whitespace()
+            .last()
+            .and_then(|s| s.parse::<f64>().ok())
+        {
+            total += v;
+        }
+    }
+    total
 }
 
 // ── Proxy bypass ─────────────────────────────────────────────────────────────

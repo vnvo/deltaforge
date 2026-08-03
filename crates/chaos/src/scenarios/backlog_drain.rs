@@ -46,9 +46,23 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 // ── Drain config ──────────────────────────────────────────────────────────────
 
+/// How the drain detects "all events delivered".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainMeasure {
+    /// Poll the Kafka high-watermark offset. Kafka-only, but highest fidelity
+    /// (confirms bytes actually landed in the topic).
+    KafkaOffset,
+    /// Poll DeltaForge's sink-agnostic `deltaforge_sink_events_total` metric.
+    /// Works for any sink — S3, Redis, NATS, HTTP — since the coordinator
+    /// increments it centrally on every delivered batch.
+    SinkMetric,
+}
+
 /// Per-run throughput settings applied via PATCH before the drain starts.
 #[derive(Debug, Clone)]
 pub struct DrainConfig {
+    /// How to measure delivery completion. Defaults to `KafkaOffset`.
+    pub measure: DrainMeasure,
     /// Number of rows to insert before starting DeltaForge.
     pub target_events: u64,
     /// Concurrent writer tasks during the population phase.
@@ -105,6 +119,7 @@ impl Default for DrainConfig {
         kafka.insert("linger.ms".into(), "0".into());
 
         Self {
+            measure: DrainMeasure::KafkaOffset,
             target_events: 1_000_000,
             writer_tasks: 32,
             drain_timeout_secs: 0, // auto-scale
@@ -117,6 +132,30 @@ impl Default for DrainConfig {
             max_bytes: 0,
             kafka_client_conf: kafka,
             exactly_once: None,
+        }
+    }
+}
+
+/// Read the current cumulative "events delivered" count for the configured
+/// measurement strategy. Returns `None` on a transient read error so the
+/// caller can fall back to the last known value.
+async fn measure_delivered(
+    measure: DrainMeasure,
+    harness: &Harness,
+    topic_is_template: bool,
+    topic_prefix: &str,
+    topic: &str,
+) -> Option<u64> {
+    match measure {
+        DrainMeasure::KafkaOffset => {
+            if topic_is_template {
+                harness::kafka_offset_for_prefix(topic_prefix).await.ok()
+            } else {
+                harness::kafka_offset_for_topic(topic).await.ok()
+            }
+        }
+        DrainMeasure::SinkMetric => {
+            harness.sink_events_total().await.ok().map(|v| v as u64)
         }
     }
 }
@@ -137,7 +176,7 @@ pub async fn run_with_source(
             "Writes {} rows to {}, then measures catch-up throughput from saved checkpoint.",
             cfg.target_events, src.name
         ),
-        "All events delivered to Kafka. Reports avg/p50/peak events/s.",
+        "All events delivered to the sink. Reports avg/p50/peak events/s.",
     );
     info!(
         source = %src.name,
@@ -182,8 +221,9 @@ pub async fn run_with_source(
         }
     }
 
-    // Step 3: baseline Kafka offset.
-    // If the topic is a template (contains ${...}), poll all matching topics by prefix.
+    // Step 3: baseline delivered count.
+    // For Kafka-offset mode with a templated topic (contains ${...}), poll all
+    // matching topics by prefix. SinkMetric mode ignores the topic entirely.
     let topic_is_template = src.topic.contains("${");
     let topic_prefix = if topic_is_template {
         src.topic
@@ -194,17 +234,19 @@ pub async fn run_with_source(
     } else {
         String::new()
     };
-    let kafka_baseline = if topic_is_template {
+    if cfg.measure == DrainMeasure::KafkaOffset && topic_is_template {
         info!(prefix = %topic_prefix, "topic is a template — polling all matching topics");
-        harness::kafka_offset_for_prefix(&topic_prefix)
-            .await
-            .unwrap_or(0)
-    } else {
-        harness::kafka_offset_for_topic(&src.topic)
-            .await
-            .unwrap_or(0)
-    };
-    info!(kafka_baseline, "kafka baseline offset recorded");
+    }
+    let baseline = measure_delivered(
+        cfg.measure,
+        harness,
+        topic_is_template,
+        &topic_prefix,
+        &src.topic,
+    )
+    .await
+    .unwrap_or(0);
+    info!(measure = ?cfg.measure, baseline, "delivery baseline recorded");
 
     // Step 4: populate the backlog.
     let target_events = cfg.target_events;
@@ -360,12 +402,13 @@ pub async fn run_with_source(
         harness::connection_mode_summary(&src.df_base, pipeline).await;
     info!(connection = %conn_mode, "pipeline restarted — backlog drain started");
 
-    // Step 6: poll Kafka until the offset advances by rows_written.
+    // Step 6: poll the sink until the delivered count advances by rows_written.
     info!(
         target = rows_written,
-        "step 5/6: waiting for Kafka to reflect all events ..."
+        measure = ?cfg.measure,
+        "step 5/6: waiting for the sink to reflect all events ..."
     );
-    let mut last_offset = kafka_baseline;
+    let mut last_measure = baseline;
     let mut last_sample_time = Instant::now();
     let mut peak_drain_tps: f64 = 0.0;
     let mut throughput_samples: Vec<f64> = Vec::new();
@@ -373,22 +416,23 @@ pub async fn run_with_source(
     loop {
         sleep(POLL_INTERVAL).await;
 
-        let current_offset = if topic_is_template {
-            harness::kafka_offset_for_prefix(&topic_prefix)
-                .await
-                .unwrap_or(kafka_baseline)
-        } else {
-            harness::kafka_offset_for_topic(&src.topic)
-                .await
-                .unwrap_or(kafka_baseline)
-        };
-        let delivered = current_offset.saturating_sub(kafka_baseline);
+        let current = measure_delivered(
+            cfg.measure,
+            harness,
+            topic_is_template,
+            &topic_prefix,
+            &src.topic,
+        )
+        .await
+        .unwrap_or(last_measure);
+        let delivered = current.saturating_sub(baseline);
         let elapsed = drain_start.elapsed();
 
-        // Sample throughput every 5 s.
+        // Sample throughput every 1 s (fine enough that short drains still
+        // record at least one sample for peak/p50).
         let sample_secs = last_sample_time.elapsed().as_secs_f64();
-        if sample_secs >= 5.0 {
-            let delta = current_offset.saturating_sub(last_offset);
+        if sample_secs >= 1.0 {
+            let delta = current.saturating_sub(last_measure);
             let tps = delta as f64 / sample_secs;
             throughput_samples.push(tps);
             if tps > peak_drain_tps {
@@ -401,7 +445,7 @@ pub async fn run_with_source(
                 elapsed_secs = format!("{:.1}", elapsed.as_secs_f64()),
                 "drain progress"
             );
-            last_offset = current_offset;
+            last_measure = current;
             last_sample_time = Instant::now();
         }
 
@@ -418,7 +462,7 @@ pub async fn run_with_source(
             )
             .note(format!("source: {}", src.name))
             .note(format!("rows written: {rows_written}"))
-            .note(format!("events delivered to Kafka: {delivered}"))
+            .note(format!("events delivered: {delivered}"))
             .note(format!("write throughput: {write_tps:.0} rows/s"))
             .note(format!("write duration: {write_secs:.1}s")));
         }
@@ -435,6 +479,13 @@ pub async fn run_with_source(
         sorted.sort_by(f64::total_cmp);
         sorted[sorted.len() / 2]
     };
+
+    // A drain that finished before the first 1 s sample records no samples, so
+    // peak stays at its 0.0 seed. Fall back to the average — for a run that
+    // short we can't distinguish a peak, and 0 reads as broken.
+    if peak_drain_tps <= 0.0 {
+        peak_drain_tps = avg_drain_tps;
+    }
 
     info!(
         rows_written,

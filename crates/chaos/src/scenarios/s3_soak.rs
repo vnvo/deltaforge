@@ -33,14 +33,15 @@ use crate::scenarios::meta::{ScenarioCategory, ScenarioMeta};
 
 pub const META: ScenarioMeta = ScenarioMeta {
     name: "s3-soak",
-    description: "Sustained writes to S3 (Parquet) — throughput baseline + memory \
-         stability over time. Exercises file rolling, partitioning, multipart \
-         upload, and per-row DLQ.",
+    description: "Sustained, steady offered load to S3 (Parquet) — a stability \
+         test, not a throughput benchmark: memory must stay bounded over time \
+         while file rolling, partitioning, multipart upload, and per-row DLQ all \
+         keep working. (For peak MySQL→S3 throughput, use s3-backlog-drain.)",
     expected: "All written rows present in the bucket; memory does not grow \
-               unboundedly; reported throughput is stable.",
+               unboundedly; the pipeline keeps up with the steady offered load.",
     category: ScenarioCategory::S3,
     required_profiles: &["base", "mysql-infra", "s3-infra", "df"],
-    tags: &["s3", "parquet", "soak", "throughput"],
+    tags: &["s3", "parquet", "soak", "stability"],
 };
 
 // Direct (non-toxiproxied) MinIO endpoint reachable from the chaos runner.
