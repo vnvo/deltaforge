@@ -15,12 +15,12 @@ use deltaforge_core::{BatchResult, Event, Sink, SinkError, SinkResult};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use super::ClickHouseSchemaResolver;
 use super::client::{ChTransport, ClickHouseClient};
 use super::ddl::create_table_ddl;
-use super::project::{project_row, TableProjection};
+use super::project::{TableProjection, project_row};
 use super::types::map_column;
 use super::version::derive_version;
-use super::ClickHouseSchemaResolver;
 
 pub struct ClickHouseSink {
     id: String,
@@ -52,7 +52,10 @@ impl ClickHouseSink {
 
     /// Resolve (and cache) the projection for an event's source table, ensuring
     /// the target table exists on first use.
-    async fn projection_for(&self, ev: &Event) -> Result<Arc<TableProjection>, SinkError> {
+    async fn projection_for(
+        &self,
+        ev: &Event,
+    ) -> Result<Arc<TableProjection>, SinkError> {
         let key = Self::source_key(ev);
         if let Some(p) = self.projections.read().unwrap().get(&key) {
             return Ok(p.clone());
@@ -108,7 +111,9 @@ impl Sink for ClickHouseSink {
     }
 
     async fn send(&self, event: &Event) -> SinkResult<()> {
-        self.send_batch(std::slice::from_ref(event)).await.map(|_| ())
+        self.send_batch(std::slice::from_ref(event))
+            .await
+            .map(|_| ())
     }
 
     async fn send_batch(&self, events: &[Event]) -> SinkResult<BatchResult> {
@@ -124,14 +129,17 @@ impl Sink for ClickHouseSink {
             let proj = self.projection_for(ev).await?;
             match project_row(&proj, ev) {
                 Ok(bytes) => {
-                    first_version
-                        .get_or_insert_with(|| derive_version(ev, self.version_source.clone()));
+                    first_version.get_or_insert_with(|| {
+                        derive_version(ev, self.version_source.clone())
+                    });
                     body.extend_from_slice(&bytes);
                     rows += 1;
                 }
                 Err(e) => dlq.push((
                     i,
-                    SinkError::Serialization { details: e.to_string().into() },
+                    SinkError::Serialization {
+                        details: e.to_string().into(),
+                    },
                 )),
             }
         }
@@ -145,7 +153,9 @@ impl Sink for ClickHouseSink {
                 rows
             );
             let start = std::time::Instant::now();
-            self.transport.insert_rowbinary(&self.table, &token, body).await?;
+            self.transport
+                .insert_rowbinary(&self.table, &token, body)
+                .await?;
             metrics::histogram!(
                 "deltaforge_sink_clickhouse_insert_seconds",
                 "pipeline" => self.pipeline.clone(),
@@ -209,10 +219,10 @@ pub fn build_clickhouse_sink(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clickhouse::types::ColDesc;
     use crate::clickhouse::TableColumns;
+    use crate::clickhouse::types::ColDesc;
     use deltaforge_core::{Op, SourceInfo, SourcePosition};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -320,8 +330,16 @@ mod tests {
 
         assert_eq!(res.dlq_failures.len(), 1);
         assert_eq!(res.dlq_failures[0].0, 1, "second event failed");
-        assert_eq!(cap.inserts.lock().unwrap().len(), 1, "one insert for the good row");
-        assert_eq!(cap.ddls.lock().unwrap().len(), 1, "auto-created the table once");
+        assert_eq!(
+            cap.inserts.lock().unwrap().len(),
+            1,
+            "one insert for the good row"
+        );
+        assert_eq!(
+            cap.ddls.lock().unwrap().len(),
+            1,
+            "auto-created the table once"
+        );
         assert!(cap.ddls.lock().unwrap()[0].contains("ReplacingMergeTree"));
     }
 }

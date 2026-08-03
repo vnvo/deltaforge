@@ -10,7 +10,7 @@ pub mod sink;
 pub mod types;
 pub mod version;
 
-pub use sink::{build_clickhouse_sink, ClickHouseSink};
+pub use sink::{ClickHouseSink, build_clickhouse_sink};
 
 use std::sync::Arc;
 use types::ColDesc;

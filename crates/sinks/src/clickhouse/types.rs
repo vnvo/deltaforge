@@ -50,7 +50,9 @@ pub fn map_column(c: &ColDesc) -> ChType {
             p: c.precision.unwrap_or(38) as u32,
             s: c.scale.unwrap_or(0) as u32,
         },
-        "date" | "datetime" | "timestamp" | "timestamptz" => ChType::DateTime64_3,
+        "date" | "datetime" | "timestamp" | "timestamptz" => {
+            ChType::DateTime64_3
+        }
         // varchar/text/json/uuid/enum/arrays → String (JSON kept as text in v1)
         _ => ChType::String,
     }
@@ -120,7 +122,10 @@ mod tests {
     #[test]
     fn ddl_names_render() {
         assert_eq!(ChType::Int64.ddl_name(), "Int64");
-        assert_eq!(ChType::Decimal { p: 12, s: 2 }.ddl_name(), "Decimal(12, 2)");
+        assert_eq!(
+            ChType::Decimal { p: 12, s: 2 }.ddl_name(),
+            "Decimal(12, 2)"
+        );
         assert_eq!(ChType::DateTime64_3.ddl_name(), "DateTime64(3)");
     }
 }

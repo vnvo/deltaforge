@@ -221,10 +221,9 @@ pub fn build_sink(
             Arc::new(build_s3_sink(s3_cfg, cancel, pipeline, None)?)
                 as ArcDynSink
         }
-        SinkCfg::ClickHouse(cfg) => {
-            Arc::new(clickhouse::build_clickhouse_sink(cfg, cancel, pipeline, None)?)
-                as ArcDynSink
-        }
+        SinkCfg::ClickHouse(cfg) => Arc::new(clickhouse::build_clickhouse_sink(
+            cfg, cancel, pipeline, None,
+        )?) as ArcDynSink,
     };
     Ok(sink)
 }

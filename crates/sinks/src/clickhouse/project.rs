@@ -5,7 +5,7 @@
 //! `_source_ts` (DateTime64(3) = `ts_ms`). The `Op::Delete` image is the
 //! before-image (keys present); all other ops use the after-image.
 
-use super::rowbinary::{encode_value, write_varuint, EncodeError};
+use super::rowbinary::{EncodeError, encode_value, write_varuint};
 use super::types::{ChType, ColDesc};
 use super::version::derive_version;
 use deltaforge_config::ChVersionSource;
@@ -32,7 +32,10 @@ fn op_str(op: Op) -> &'static str {
 
 /// Project a single event into RowBinary bytes. Returns `EncodeError` if a value
 /// can't be encoded for its column (caller isolates it into the DLQ).
-pub fn project_row(p: &TableProjection, event: &Event) -> Result<Vec<u8>, EncodeError> {
+pub fn project_row(
+    p: &TableProjection,
+    event: &Event,
+) -> Result<Vec<u8>, EncodeError> {
     let image = match event.op {
         Op::Delete => event.before.as_ref(),
         _ => event.after.as_ref(),
@@ -123,7 +126,11 @@ mod tests {
 
     #[test]
     fn projects_insert_uses_after_and_appends_meta() {
-        let bytes = project_row(&proj(), &ev(Op::Create, json!({"id": 7}), json!(null))).unwrap();
+        let bytes = project_row(
+            &proj(),
+            &ev(Op::Create, json!({"id": 7}), json!(null)),
+        )
+        .unwrap();
         let mut want = Vec::new();
         want.extend_from_slice(&7i64.to_le_bytes()); // id
         want.push(1);
@@ -136,7 +143,11 @@ mod tests {
 
     #[test]
     fn projects_delete_uses_before_and_sets_deleted() {
-        let bytes = project_row(&proj(), &ev(Op::Delete, json!(null), json!({"id": 9}))).unwrap();
+        let bytes = project_row(
+            &proj(),
+            &ev(Op::Delete, json!(null), json!({"id": 9})),
+        )
+        .unwrap();
         assert_eq!(&bytes[..8], &9i64.to_le_bytes()); // key from before-image
         assert_eq!(bytes[8], 1);
         assert_eq!(bytes[9], b'd'); // _op = "d"
@@ -147,6 +158,12 @@ mod tests {
     #[test]
     fn bad_value_returns_encode_error() {
         // id is Int64 but the event carries a string → EncodeError (caller DLQs).
-        assert!(project_row(&proj(), &ev(Op::Create, json!({"id": "abc"}), json!(null))).is_err());
+        assert!(
+            project_row(
+                &proj(),
+                &ev(Op::Create, json!({"id": "abc"}), json!(null))
+            )
+            .is_err()
+        );
     }
 }

@@ -72,10 +72,18 @@ pub fn encode_value(
 
     match ty {
         ChType::Bool | ChType::UInt8 => buf.push(as_i128(v, ty)? as u8),
-        ChType::Int16 => buf.extend_from_slice(&(as_i128(v, ty)? as i16).to_le_bytes()),
-        ChType::Int32 => buf.extend_from_slice(&(as_i128(v, ty)? as i32).to_le_bytes()),
-        ChType::Int64 => buf.extend_from_slice(&(as_i128(v, ty)? as i64).to_le_bytes()),
-        ChType::UInt64 => buf.extend_from_slice(&(as_i128(v, ty)? as u64).to_le_bytes()),
+        ChType::Int16 => {
+            buf.extend_from_slice(&(as_i128(v, ty)? as i16).to_le_bytes())
+        }
+        ChType::Int32 => {
+            buf.extend_from_slice(&(as_i128(v, ty)? as i32).to_le_bytes())
+        }
+        ChType::Int64 => {
+            buf.extend_from_slice(&(as_i128(v, ty)? as i64).to_le_bytes())
+        }
+        ChType::UInt64 => {
+            buf.extend_from_slice(&(as_i128(v, ty)? as u64).to_le_bytes())
+        }
         ChType::Float64 => {
             let f = v.as_f64().ok_or_else(|| type_err(ty, v))?;
             buf.extend_from_slice(&f.to_le_bytes());
@@ -119,7 +127,12 @@ fn datetime_millis(v: &Value) -> Result<i64, EncodeError> {
     })
 }
 
-fn encode_decimal(buf: &mut Vec<u8>, p: u32, s: u32, v: &Value) -> Result<(), EncodeError> {
+fn encode_decimal(
+    buf: &mut Vec<u8>,
+    p: u32,
+    s: u32,
+    v: &Value,
+) -> Result<(), EncodeError> {
     let text = match v {
         Value::String(t) => t.clone(),
         Value::Number(n) => n.to_string(),
@@ -127,13 +140,14 @@ fn encode_decimal(buf: &mut Vec<u8>, p: u32, s: u32, v: &Value) -> Result<(), En
             return Err(EncodeError::Type {
                 expected: format!("Decimal({p}, {s})"),
                 got: v.to_string(),
-            })
+            });
         }
     };
-    let unscaled = decimal_str_to_unscaled(&text, s).ok_or_else(|| EncodeError::Type {
-        expected: format!("Decimal({p}, {s})"),
-        got: text.clone(),
-    })?;
+    let unscaled =
+        decimal_str_to_unscaled(&text, s).ok_or_else(|| EncodeError::Type {
+            expected: format!("Decimal({p}, {s})"),
+            got: text.clone(),
+        })?;
     if p <= 9 {
         buf.extend_from_slice(&(unscaled as i32).to_le_bytes());
     } else if p <= 18 {
@@ -205,13 +219,21 @@ mod tests {
     #[test]
     fn non_null_column_with_null_errors() {
         let mut b = Vec::new();
-        assert!(encode_value(&mut b, &ChType::Int64, false, &json!(null)).is_err());
+        assert!(
+            encode_value(&mut b, &ChType::Int64, false, &json!(null)).is_err()
+        );
     }
 
     #[test]
     fn decimal_encodes_unscaled_int64() {
         let mut b = Vec::new();
-        encode_value(&mut b, &ChType::Decimal { p: 12, s: 2 }, false, &json!("12.34")).unwrap();
+        encode_value(
+            &mut b,
+            &ChType::Decimal { p: 12, s: 2 },
+            false,
+            &json!("12.34"),
+        )
+        .unwrap();
         assert_eq!(b, 1234i64.to_le_bytes().to_vec());
     }
 

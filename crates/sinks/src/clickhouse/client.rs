@@ -32,8 +32,8 @@ pub struct ClickHouseClient {
 
 impl ClickHouseClient {
     pub fn new(cfg: &ClickHouseSinkCfg) -> anyhow::Result<Self> {
-        let mut b =
-            reqwest::Client::builder().timeout(Duration::from_secs(cfg.send_timeout_secs));
+        let mut b = reqwest::Client::builder()
+            .timeout(Duration::from_secs(cfg.send_timeout_secs));
         if let Some(tls) = &cfg.tls {
             if tls.insecure_skip_verify {
                 b = b.danger_accept_invalid_certs(true);
@@ -62,7 +62,9 @@ impl ClickHouseClient {
             params.push((k.to_string(), v.clone()));
         }
         let url = reqwest::Url::parse_with_params(&self.base, &params)
-            .map_err(|e| SinkError::Routing { details: e.to_string().into() })?;
+            .map_err(|e| SinkError::Routing {
+                details: e.to_string().into(),
+            })?;
 
         let mut req = self.http.post(url).body(body);
         if let Some(u) = &self.user {
@@ -75,10 +77,16 @@ impl ClickHouseClient {
         let resp = req.send().await.map_err(|e| {
             if e.is_timeout() {
                 SinkError::Backpressure {
-                    details: format!("clickhouse request timeout after {:?}", self.timeout).into(),
+                    details: format!(
+                        "clickhouse request timeout after {:?}",
+                        self.timeout
+                    )
+                    .into(),
                 }
             } else if e.is_connect() {
-                SinkError::Connect { details: e.to_string().into() }
+                SinkError::Connect {
+                    details: e.to_string().into(),
+                }
             } else {
                 SinkError::Io(std::io::Error::other(e.to_string()))
             }
@@ -89,10 +97,16 @@ impl ClickHouseClient {
         }
         let code = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        if code == reqwest::StatusCode::UNAUTHORIZED || code == reqwest::StatusCode::FORBIDDEN {
-            return Err(SinkError::Auth { details: text.into() });
+        if code == reqwest::StatusCode::UNAUTHORIZED
+            || code == reqwest::StatusCode::FORBIDDEN
+        {
+            return Err(SinkError::Auth {
+                details: text.into(),
+            });
         }
-        Err(SinkError::Io(std::io::Error::other(format!("clickhouse {code}: {text}"))))
+        Err(SinkError::Io(std::io::Error::other(format!(
+            "clickhouse {code}: {text}"
+        ))))
     }
 
     /// The `INSERT` query string for a table (public for unit testing).

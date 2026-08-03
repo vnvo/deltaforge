@@ -39,7 +39,9 @@ pub fn create_table_ddl(
             "ReplacingMergeTree(_version, _deleted)".to_string(),
             order_by_clause(pk, false),
         ),
-        ChMode::Changelog => ("MergeTree".to_string(), order_by_clause(pk, true)),
+        ChMode::Changelog => {
+            ("MergeTree".to_string(), order_by_clause(pk, true))
+        }
     };
 
     format!(
@@ -97,19 +99,34 @@ mod tests {
 
     #[test]
     fn upsert_uses_replacingmergetree_and_pk_order() {
-        let sql = create_table_ddl("analytics", "orders", &cols(), &["id".into()], ChMode::Upsert);
-        assert!(sql.contains("CREATE TABLE IF NOT EXISTS `analytics`.`orders`"));
+        let sql = create_table_ddl(
+            "analytics",
+            "orders",
+            &cols(),
+            &["id".into()],
+            ChMode::Upsert,
+        );
+        assert!(
+            sql.contains("CREATE TABLE IF NOT EXISTS `analytics`.`orders`")
+        );
         assert!(sql.contains("`id` Int64"));
         assert!(sql.contains("`email` Nullable(String)"));
         assert!(sql.contains("`_version` UInt64"));
-        assert!(sql.contains("ENGINE = ReplacingMergeTree(_version, _deleted)"));
+        assert!(
+            sql.contains("ENGINE = ReplacingMergeTree(_version, _deleted)")
+        );
         assert!(sql.contains("ORDER BY (`id`)"), "got: {sql}");
     }
 
     #[test]
     fn changelog_uses_mergetree_and_appends_version_to_order() {
-        let sql =
-            create_table_ddl("d", "t", &cols(), &["id".into()], ChMode::Changelog);
+        let sql = create_table_ddl(
+            "d",
+            "t",
+            &cols(),
+            &["id".into()],
+            ChMode::Changelog,
+        );
         assert!(sql.contains("ENGINE = MergeTree"));
         assert!(sql.contains("ORDER BY (`id`, `_version`)"), "got: {sql}");
     }

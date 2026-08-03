@@ -8,13 +8,15 @@ use std::time::{Duration, Instant};
 
 use deltaforge_config::{ChMode, ChVersionSource, ClickHouseSinkCfg};
 use deltaforge_core::{Event, Op, Sink, SourceInfo, SourcePosition};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sinks::clickhouse::types::ColDesc;
-use sinks::clickhouse::{build_clickhouse_sink, ClickHouseSchemaResolver, TableColumns};
+use sinks::clickhouse::{
+    ClickHouseSchemaResolver, TableColumns, build_clickhouse_sink,
+};
 use testcontainers::{
+    GenericImage, ImageExt,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
-    GenericImage, ImageExt,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -49,7 +51,12 @@ fn resolver() -> ClickHouseSchemaResolver {
     })
 }
 
-fn cfg(url: &str, table: &str, mode: ChMode, auto_create: bool) -> ClickHouseSinkCfg {
+fn cfg(
+    url: &str,
+    table: &str,
+    mode: ChMode,
+    auto_create: bool,
+) -> ClickHouseSinkCfg {
     ClickHouseSinkCfg {
         id: "ch-test".into(),
         url: url.into(),
@@ -66,7 +73,13 @@ fn cfg(url: &str, table: &str, mode: ChMode, auto_create: bool) -> ClickHouseSin
     }
 }
 
-fn mk_event(op: Op, after: Value, before: Value, table: &str, ts: i64) -> Event {
+fn mk_event(
+    op: Op,
+    after: Value,
+    before: Value,
+    table: &str,
+    ts: i64,
+) -> Event {
     Event {
         before: if before.is_null() { None } else { Some(before) },
         after: if after.is_null() { None } else { Some(after) },
@@ -110,7 +123,10 @@ async fn ch(base: &str, sql: &str) -> String {
         .expect("clickhouse http request");
     let status = r.status();
     let body = r.text().await.unwrap_or_default();
-    assert!(status.is_success(), "clickhouse error ({status}): {body}\nsql: {sql}");
+    assert!(
+        status.is_success(),
+        "clickhouse error ({status}): {body}\nsql: {sql}"
+    );
     body
 }
 
@@ -129,7 +145,8 @@ async fn wait_ready(base: &str) {
     }
 }
 
-async fn start_clickhouse() -> (testcontainers::ContainerAsync<GenericImage>, String) {
+async fn start_clickhouse()
+-> (testcontainers::ContainerAsync<GenericImage>, String) {
     let container = GenericImage::new("clickhouse/clickhouse-server", "24.8")
         .with_wait_for(WaitFor::Duration {
             length: Duration::from_secs(3),
@@ -159,12 +176,34 @@ async fn upsert_mode_auto_creates_and_reflects_current_state() {
 
     // insert id=1 amount=10.00 (v=1); update id=1 -> 20.00 (v=2); delete id=2 (v=3)
     let batch = vec![
-        mk_event(Op::Create, json!({"id": 1, "amount": "10.00"}), json!(null), table, 1),
-        mk_event(Op::Update, json!({"id": 1, "amount": "20.00"}), json!(null), table, 2),
-        mk_event(Op::Delete, json!(null), json!({"id": 2, "amount": null}), table, 3),
+        mk_event(
+            Op::Create,
+            json!({"id": 1, "amount": "10.00"}),
+            json!(null),
+            table,
+            1,
+        ),
+        mk_event(
+            Op::Update,
+            json!({"id": 1, "amount": "20.00"}),
+            json!(null),
+            table,
+            2,
+        ),
+        mk_event(
+            Op::Delete,
+            json!(null),
+            json!({"id": 2, "amount": null}),
+            table,
+            3,
+        ),
     ];
     let res = sink.send_batch(&batch).await.unwrap();
-    assert!(res.dlq_failures.is_empty(), "no per-row failures: {:?}", res.dlq_failures);
+    assert!(
+        res.dlq_failures.is_empty(),
+        "no per-row failures: {:?}",
+        res.dlq_failures
+    );
 
     let out = ch(
         &base,
@@ -189,20 +228,47 @@ async fn changelog_mode_retains_all_changes() {
     .unwrap();
 
     let batch = vec![
-        mk_event(Op::Create, json!({"id": 1, "amount": "10.00"}), json!(null), table, 1),
-        mk_event(Op::Update, json!({"id": 1, "amount": "20.00"}), json!(null), table, 2),
-        mk_event(Op::Delete, json!(null), json!({"id": 1, "amount": null}), table, 3),
+        mk_event(
+            Op::Create,
+            json!({"id": 1, "amount": "10.00"}),
+            json!(null),
+            table,
+            1,
+        ),
+        mk_event(
+            Op::Update,
+            json!({"id": 1, "amount": "20.00"}),
+            json!(null),
+            table,
+            2,
+        ),
+        mk_event(
+            Op::Delete,
+            json!(null),
+            json!({"id": 1, "amount": null}),
+            table,
+            3,
+        ),
     ];
     sink.send_batch(&batch).await.unwrap();
 
-    let n = ch(&base, &format!("SELECT count() FROM default.{table} FORMAT TSV")).await;
+    let n = ch(
+        &base,
+        &format!("SELECT count() FROM default.{table} FORMAT TSV"),
+    )
+    .await;
     assert_eq!(n.trim(), "3", "change-log retains all 3 changes");
     let ops = ch(
         &base,
-        &format!("SELECT _op FROM default.{table} ORDER BY _version FORMAT TSV"),
+        &format!(
+            "SELECT _op FROM default.{table} ORDER BY _version FORMAT TSV"
+        ),
     )
     .await;
-    assert_eq!(ops.split_whitespace().collect::<Vec<_>>(), vec!["c", "u", "d"]);
+    assert_eq!(
+        ops.split_whitespace().collect::<Vec<_>>(),
+        vec!["c", "u", "d"]
+    );
 }
 
 #[tokio::test]
@@ -231,13 +297,33 @@ async fn dedup_token_prevents_double_insert() {
     .unwrap();
 
     let batch = vec![
-        mk_event(Op::Create, json!({"id": 1, "amount": "10.00"}), json!(null), table, 1),
-        mk_event(Op::Create, json!({"id": 2, "amount": "11.00"}), json!(null), table, 2),
+        mk_event(
+            Op::Create,
+            json!({"id": 1, "amount": "10.00"}),
+            json!(null),
+            table,
+            1,
+        ),
+        mk_event(
+            Op::Create,
+            json!({"id": 2, "amount": "11.00"}),
+            json!(null),
+            table,
+            2,
+        ),
     ];
     // Send the SAME batch twice — the deterministic dedup token must suppress the replay.
     sink.send_batch(&batch).await.unwrap();
     sink.send_batch(&batch).await.unwrap();
 
-    let n = ch(&base, &format!("SELECT count() FROM default.{table} FORMAT TSV")).await;
-    assert_eq!(n.trim(), "2", "dedup token prevented the replayed batch from doubling rows");
+    let n = ch(
+        &base,
+        &format!("SELECT count() FROM default.{table} FORMAT TSV"),
+    )
+    .await;
+    assert_eq!(
+        n.trim(),
+        "2",
+        "dedup token prevented the replayed batch from doubling rows"
+    );
 }

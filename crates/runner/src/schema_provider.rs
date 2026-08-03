@@ -490,8 +490,8 @@ pub fn build_arrow_schema_resolver(
 pub fn build_clickhouse_schema_resolver(
     schema_provider: ArcSchemaProvider,
 ) -> sinks::clickhouse::ClickHouseSchemaResolver {
-    use sinks::clickhouse::types::ColDesc;
     use sinks::clickhouse::TableColumns;
+    use sinks::clickhouse::types::ColDesc;
     use std::sync::Arc;
 
     Arc::new(move |key: &str| {
