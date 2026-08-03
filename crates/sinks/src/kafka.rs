@@ -11,7 +11,7 @@
 //! - **Compression**: LZ4 compression by default
 //! - **Graceful shutdown**: Respects cancellation tokens
 //! - **Configurable envelope**: Native, Debezium, or CloudEvents
-//! - **Configurable encoding**: JSON (Avro/Protobuf planned)
+//! - **Configurable encoding**: JSON or Avro (Confluent Schema Registry)
 //!
 //! # Configuration
 //!
@@ -22,7 +22,7 @@
 //!       brokers: localhost:9092
 //!       topic: deltaforge-events
 //!       envelope: debezium          # native | debezium | cloudevents
-//!       encoding: json              # json (avro, protobuf planned)
+//!       encoding: json              # or: avro
 //!       exactly_once: false
 //!       required: true
 //!       send_timeout_secs: 30

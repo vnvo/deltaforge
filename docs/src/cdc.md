@@ -248,7 +248,7 @@ CDC naturally supports CQRS by populating read-optimized projections from the wr
 Databases change. Columns get added, renamed, or removed. Types change. CDC pipelines need to handle this gracefully.
 
 **Strategies**:
-- **Schema registry**: Store and version schemas centrally (e.g., Confluent Schema Registry with Avro/Protobuf).
+- **Schema registry**: Store and version schemas centrally (e.g., Confluent Schema Registry with Avro).
 - **Forward compatibility**: Add columns as nullable; avoid removing columns that consumers depend on.
 - **Consumer tolerance**: Design consumers to ignore unknown fields and handle missing optional fields.
 - **Processor transforms**: Use DeltaForge's JavaScript processors to normalize schemas before sinks.

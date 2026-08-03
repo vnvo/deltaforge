@@ -44,7 +44,7 @@ Pipelines are defined declaratively in YAML, making it straightforward to onboar
     </td>
     <td align="center">
       <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/javascript/javascript-original.svg" width="40" height="40" alt="JavaScript">
-      <br><sub>JavaScript · Outbox</sub>
+      <br><sub>JavaScript · Outbox · Flatten · Filter</sub>
     </td>
     <td align="center">
       <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/apachekafka/apachekafka-original.svg" width="40" height="40" alt="Kafka">

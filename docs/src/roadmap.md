@@ -19,7 +19,6 @@
 ## Planned
 
 - **Iceberg / Delta Lake table formats** — exactly-once at event level via atomic snapshot commits; schema evolution and time travel on top of the Phase 1 S3 sink
-- **MongoDB source** — change streams CDC
 - **Event replay** — replay DLQ entries or historical events
 - **Kubernetes operator** — PipelineTemplate + PipelinePool for fleet management
 - **OpenAPI spec generation** — auto-generated REST API documentation

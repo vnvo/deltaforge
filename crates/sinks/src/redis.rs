@@ -10,7 +10,7 @@
 //! - **Pipelining**: Batch operations use Redis pipelines for single round-trip
 //! - **Graceful shutdown**: Respects cancellation tokens during operations
 //! - **Configurable envelope**: Native, Debezium, or CloudEvents
-//! - **Configurable encoding**: JSON (Avro/Protobuf planned)
+//! - **Configurable encoding**: JSON or Avro (Confluent Schema Registry)
 //!
 //! # Configuration
 //!
@@ -21,7 +21,7 @@
 //!       uri: redis://localhost:6379
 //!       stream: deltaforge-events
 //!       envelope: native            # native | debezium | cloudevents
-//!       encoding: json              # json (avro, protobuf planned)
+//!       encoding: json              # or: avro
 //!       required: true
 //!       send_timeout_secs: 5        # Per-message timeout
 //!       batch_timeout_secs: 30      # Batch pipeline timeout

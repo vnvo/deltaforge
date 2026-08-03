@@ -180,7 +180,7 @@ pub struct SourceInfo {
     #[serde(default = "default_version")]
     pub version: String,
 
-    /// Connector type: "mysql", "postgresql", "mongodb", etc.
+    /// Connector type: "mysql", "postgresql", etc.
     pub connector: String,
 
     /// Logical server/pipeline name - primary identifier for consumers

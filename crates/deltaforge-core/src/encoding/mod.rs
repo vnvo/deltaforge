@@ -1,6 +1,6 @@
 //! Event encoding formats for wire serialization.
 //!
-//! Encodings control the serialization format (JSON, Avro, Protobuf, etc.)
+//! Encodings control the serialization format (JSON, Avro, etc.)
 //! independent of the envelope structure.
 //!
 //! # Available Encodings

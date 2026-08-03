@@ -438,7 +438,7 @@ spec:
 | `inline` | JavaScript code for batch processing |
 | `limits` | CPU, memory, and timeout limits |
 | **`spec.sinks`** | One or more sinks - see [Sinks](docs/src/sinks/README.md) |
-| `type` | `kafka`, `redis`, `nats`, or `http` |
+| `type` | `kafka`, `redis`, `nats`, `http`, or `s3` |
 | `config.envelope` | Output format: `native`, `debezium`, or `cloudevents` - see [Envelopes](docs/src/envelopes.md) |
 | `config.encoding` | Wire encoding: `json` (default) or `avro` (with Schema Registry) - see [Envelopes](docs/src/envelopes.md) |
 | `config.required` | Whether sink must ack for checkpoint (`true` default) |
@@ -477,11 +477,9 @@ View actual examples: [Example Configurations](docs/src/examples/README.md)
 - [x] Exactly-once delivery (Kafka transactions)
 - [x] Avro encoding with Confluent Schema Registry
 - [x] Helm chart for Kubernetes deployment
-- [ ] S3/Parquet sink
-- [ ] MongoDB source
+- [x] S3/Parquet/JSON Lines sink
 - [ ] Event replay from DLQ journal
 - [ ] Kubernetes operator (PipelineTemplate + PipelinePool)
-- [ ] Protobuf encoding
 
 
 ## License

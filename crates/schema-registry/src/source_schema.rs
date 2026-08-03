@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 /// The schema registry can store schemas as JSON, using this trait
 /// for common operations like fingerprinting and column extraction.
 pub trait SourceSchema: Serialize + DeserializeOwned + Send + Sync {
-    /// Source type identifier (e.g., "mysql", "postgres", "mongodb").
+    /// Source type identifier (e.g., "mysql", "postgres").
     fn source_kind(&self) -> &'static str;
 
     /// Content-addressable fingerprint for change detection.

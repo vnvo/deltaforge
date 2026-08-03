@@ -453,14 +453,14 @@ mod tests {
     #[test]
     fn unknown_connector_uses_generic_position() {
         let value = build_value_schema(
-            "mongodb",
+            "unknown_db",
             "test",
             "col",
             vec![json!({"name": "id", "type": "string"})],
         );
 
         // Should not fail — uses generic position
-        let result = build_envelope_schema("mongodb", "test", "col", value);
+        let result = build_envelope_schema("unknown_db", "test", "col", value);
         assert!(result.is_ok());
     }
 }

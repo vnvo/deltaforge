@@ -10,7 +10,7 @@ DeltaForge avoids imposing a universal data model on all sources. Instead, each 
 
 - **MySQL** captures MySQL-specific types, collations, and engine information
 - **PostgreSQL** captures PostgreSQL-specific types, OIDs, and replica identity
-- **Future sources** (MongoDB, ClickHouse, TiDB) will capture their native semantics
+- **Future sources** (ClickHouse, TiDB) will capture their native semantics
 
 This approach means downstream consumers receive schemas that accurately reflect the source database rather than a lowest-common-denominator normalization.
 
@@ -270,5 +270,5 @@ Planned enhancements:
 
 - **Event store**: time-based replay and schema evolution using the Log primitive
 - **Distributed coordination**: leader election via the Slot primitive with TTL-based leases
-- **Additional sources**: MongoDB, SQL Server, TiDB
+- **Additional sources**: SQL Server, TiDB
 - **PostgreSQL storage validation**: chaos/recovery testing to bring it to production parity with SQLite

@@ -20,7 +20,7 @@ Every CDC source implements the `SourceSchema` trait, which provides a common in
 
 ```rust
 pub trait SourceSchema: Serialize + DeserializeOwned + Send + Sync {
-    /// Source type identifier (e.g., "mysql", "postgres", "mongodb").
+    /// Source type identifier (e.g., "mysql", "postgres").
     fn source_kind(&self) -> &'static str;
 
     /// Content-addressable fingerprint for change detection.

@@ -10,7 +10,7 @@
 //! - **Batch optimization**: Publishes batches concurrently for throughput
 //! - **Graceful shutdown**: Respects cancellation tokens during operations
 //! - **Configurable envelope**: Native, Debezium, or CloudEvents
-//! - **Configurable encoding**: JSON (Avro/Protobuf planned)
+//! - **Configurable encoding**: JSON or Avro (Confluent Schema Registry)
 //!
 //! # Configuration
 //!
@@ -22,7 +22,7 @@
 //!       subject: deltaforge.events
 //!       stream: DELTAFORGE          # Optional: JetStream stream name
 //!       envelope: cloudevents       # native | debezium | cloudevents
-//!       encoding: json              # json (avro, protobuf planned)
+//!       encoding: json              # or: avro
 //!       required: true
 //!       send_timeout_secs: 5        # Per-message timeout
 //!       batch_timeout_secs: 30      # Batch publish timeout
