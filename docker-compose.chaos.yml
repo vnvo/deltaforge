@@ -376,6 +376,10 @@ services:
       - deltaforge_release_data:/data
     environment:
       RUST_LOG: "deltaforge=info,sources=info,sinks=info,warn"
+      # Enable jemalloc's background purge thread so freed memory is returned
+      # to the OS after load bursts (drains/soaks) instead of being held as
+      # dirty pages. Lets RSS decay back toward baseline within seconds.
+      _RJEM_MALLOC_CONF: "background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000"
     ports:
       - "8080:8080"   # REST API / health
       - "9000:9000"   # Prometheus /metrics
@@ -392,6 +396,7 @@ services:
       - deltaforge_debug_data:/data
     environment:
       RUST_LOG: "deltaforge=debug,sources=debug,sinks=info,warn"
+      _RJEM_MALLOC_CONF: "background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000"
     ports:
       - "8081:8080"   # REST API / health
       - "9001:9000"   # Prometheus /metrics
@@ -411,6 +416,7 @@ services:
       - deltaforge_profile_data:/data
     environment:
       RUST_LOG: "deltaforge=info,sources=info,sinks=info,warn"
+      _RJEM_MALLOC_CONF: "background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000"
     ports:
       - "8082:8080"   # REST API / health
       - "9002:9000"   # Prometheus /metrics
