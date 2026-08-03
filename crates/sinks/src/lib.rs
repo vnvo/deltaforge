@@ -161,6 +161,11 @@ pub fn build_sinks_with_schemas(
                     )?) as ArcDynSink,
                     cfg.filter.clone(),
                 ),
+                // Wired in the ClickHouse "Task 8"; placeholder keeps the match
+                // exhaustive while the sink module is under construction.
+                SinkCfg::ClickHouse(_) => {
+                    anyhow::bail!("clickhouse sink wiring pending")
+                }
             };
             // Only wrap when filter has actual conditions — zero overhead otherwise
             let sink = match filter {
@@ -207,6 +212,9 @@ pub fn build_sink(
         SinkCfg::S3(s3_cfg) => {
             Arc::new(build_s3_sink(s3_cfg, cancel, pipeline, None)?)
                 as ArcDynSink
+        }
+        SinkCfg::ClickHouse(_) => {
+            anyhow::bail!("clickhouse sink wiring pending")
         }
     };
     Ok(sink)

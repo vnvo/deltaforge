@@ -126,6 +126,8 @@ fn build_avro_provider(
             SinkCfg::Nats(c) => &c.encoding,
             SinkCfg::Http(c) => &c.encoding,
             SinkCfg::S3(_) => return None,
+            // ClickHouse has its own RowBinary encoding, not EncodingCfg.
+            SinkCfg::ClickHouse(_) => return None,
         };
         match encoding {
             EncodingCfg::Avro {

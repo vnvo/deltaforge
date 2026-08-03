@@ -252,6 +252,7 @@ pub enum SinkCfg {
     Nats(NatsSinkCfg),
     Http(HttpSinkCfg),
     S3(S3SinkCfg),
+    ClickHouse(ClickHouseSinkCfg),
 }
 
 impl SinkCfg {
@@ -263,8 +264,94 @@ impl SinkCfg {
             Self::Nats(c) => &c.id,
             Self::Http(c) => &c.id,
             Self::S3(c) => &c.id,
+            Self::ClickHouse(c) => &c.id,
         }
     }
+}
+
+// ============================================================================
+// ClickHouse sink configuration
+// ============================================================================
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_send_timeout_secs() -> u64 {
+    30
+}
+
+/// Target-table write shape. Selects validation + documents intent; the sink's
+/// inserted row layout is identical either way (the target table engine decides
+/// change-log vs current-state).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ChMode {
+    /// `ReplacingMergeTree` target — current-state / mirror.
+    Upsert,
+    /// `MergeTree` target — retain every change (default).
+    #[default]
+    Changelog,
+}
+
+/// Source of the monotonic `_version` used for `ReplacingMergeTree` replacement.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ChVersionSource {
+    /// Source LSN / binlog position (monotonic). Default.
+    #[default]
+    SourcePosition,
+    /// Event `ts_ms` — weaker (ms ties per key are undefined).
+    TsMs,
+}
+
+/// TLS options for the ClickHouse HTTPS endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChTls {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub ca_file: Option<String>,
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
+}
+
+/// ClickHouse sink configuration (`type: clickhouse`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClickHouseSinkCfg {
+    /// Unique identifier for this sink.
+    pub id: String,
+    /// HTTP(S) endpoint, e.g. `https://clickhouse:8443` or `http://clickhouse:8123`.
+    pub url: String,
+    /// Target database.
+    pub database: String,
+    /// Target table (must be pre-created by the operator in v1).
+    pub table: String,
+    /// Write shape — see [`ChMode`]. Defaults to `changelog`.
+    #[serde(default)]
+    pub mode: ChMode,
+    /// ClickHouse user. Values support `${ENV_VAR}` expansion.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// ClickHouse password/key. Values support `${ENV_VAR}` expansion.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// TLS options (for `https://` endpoints).
+    #[serde(default)]
+    pub tls: Option<ChTls>,
+    /// Where `_version` comes from. Defaults to the source position.
+    #[serde(default)]
+    pub version_source: ChVersionSource,
+    /// Per-batch insert timeout. Timeouts surface as `Backpressure`.
+    #[serde(default = "default_send_timeout_secs")]
+    pub send_timeout_secs: u64,
+    /// Whether delivery is required (blocks) or best-effort (log + continue).
+    #[serde(default)]
+    pub required: Option<bool>,
+    /// Auto-create the target table on first event (default true). Set false to
+    /// require a pre-created table (locked-down environments).
+    #[serde(default = "default_true")]
+    pub auto_create: bool,
 }
 
 /// Kafka sink configuration.
@@ -1194,5 +1281,57 @@ mod tests {
             }
             other => panic!("expected S3, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_clickhouse_sink() {
+        let yaml = r#"
+            sinks:
+              - type: clickhouse
+                config:
+                  id: ch-orders
+                  url: "https://clickhouse:8443"
+                  database: analytics
+                  table: orders
+                  mode: upsert
+                  user: default
+                  password: "secret"
+                  version_source: source_position
+                  send_timeout_secs: 45
+                  required: true
+        "#;
+        #[derive(serde::Deserialize)]
+        struct Holder {
+            sinks: Vec<SinkCfg>,
+        }
+        let h: Holder = serde_yaml::from_str(yaml).unwrap();
+        match &h.sinks[0] {
+            SinkCfg::ClickHouse(c) => {
+                assert_eq!(c.id, "ch-orders");
+                assert_eq!(c.database, "analytics");
+                assert_eq!(c.table, "orders");
+                assert_eq!(c.mode, ChMode::Upsert);
+                assert_eq!(c.version_source, ChVersionSource::SourcePosition);
+                assert_eq!(c.send_timeout_secs, 45);
+                assert_eq!(c.required, Some(true));
+            }
+            other => panic!("expected ClickHouse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clickhouse_defaults() {
+        let yaml = r#"
+            id: c
+            url: "http://ch:8123"
+            database: d
+            table: t
+        "#;
+        let c: ClickHouseSinkCfg = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(c.mode, ChMode::Changelog);
+        assert_eq!(c.version_source, ChVersionSource::SourcePosition);
+        assert_eq!(c.send_timeout_secs, 30);
+        assert!(c.tls.is_none());
+        assert!(c.auto_create, "auto_create defaults to true");
     }
 }
