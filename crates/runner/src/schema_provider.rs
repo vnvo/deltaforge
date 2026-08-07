@@ -483,6 +483,44 @@ pub fn build_arrow_schema_resolver(
     })
 }
 
+/// Build a `ClickHouseSchemaResolver` for the ClickHouse sink: maps a source
+/// table (`"namespace.table"`) to its columns + primary key from the schema
+/// registry. Mirrors `build_arrow_schema_resolver`'s inversion so the `sinks`
+/// crate never depends on `runner`.
+pub fn build_clickhouse_schema_resolver(
+    schema_provider: ArcSchemaProvider,
+) -> sinks::clickhouse::ClickHouseSchemaResolver {
+    use sinks::clickhouse::TableColumns;
+    use sinks::clickhouse::types::ColDesc;
+    use std::sync::Arc;
+
+    Arc::new(move |key: &str| {
+        let provider = schema_provider.clone();
+        let key_owned = key.to_string();
+        let ts = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(provider.get_table_schema(&key_owned))
+        })?;
+        let columns = ts
+            .columns
+            .iter()
+            .map(|c| ColDesc {
+                name: c.name.clone(),
+                data_type: c.data_type.clone(),
+                full_type: c.full_type.clone(),
+                nullable: c.nullable,
+                unsigned: c.unsigned,
+                precision: c.numeric_precision,
+                scale: c.numeric_scale,
+            })
+            .collect();
+        Some(TableColumns {
+            columns,
+            primary_key: ts.primary_key.clone(),
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

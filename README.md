@@ -118,7 +118,7 @@ Output: `{"schema":null,"payload":{...}}`
 
 | Built with | Sources | Processors | Sinks | Encodings | Output Formats |
 |:---:|:---:|:---:|:---:|:---:|:---:|
-| Rust | MySQL · PostgreSQL | JavaScript · Outbox · Flatten · Filter | Kafka · Redis · NATS · HTTP · S3 | JSON · Avro | Native · Debezium · CloudEvents |
+| Rust | MySQL · PostgreSQL | JavaScript · Outbox · Flatten · Filter | Kafka · Redis · NATS · HTTP · S3 · ClickHouse | JSON · Avro | Native · Debezium · CloudEvents |
 
 ## Features
 
@@ -169,6 +169,7 @@ Output: `{"schema":null,"payload":{...}}`
   - NATS JetStream sink (via `async_nats`) — server-side dedup via `Nats-Msg-Id`
   - HTTP/Webhook sink — POST/PUT to any URL with custom headers, URL templates, batch mode
   - S3 / object-storage sink — Parquet or JSON Lines to any S3-compatible store (AWS S3, MinIO); Hive-partitioned by table + UTC date, atomic multipart-complete visibility, size/count/age file rolling, DDL-derived typed columns (native Decimal128, List/Map), per-row DLQ
+  - ClickHouse sink — HTTP + RowBinary; change-log (`MergeTree`) or current-state upsert (`ReplacingMergeTree`) selected by target engine; auto table creation from source DDL; per-row DLQ
   - Dynamic routing: per-event topic/stream/subject/URL via templates or JavaScript
   - Configurable envelope formats: Native, Debezium, CloudEvents
   - JSON and Avro wire encoding (Avro with Confluent Schema Registry, DDL-derived type-accurate schemas)
@@ -438,7 +439,7 @@ spec:
 | `inline` | JavaScript code for batch processing |
 | `limits` | CPU, memory, and timeout limits |
 | **`spec.sinks`** | One or more sinks - see [Sinks](docs/src/sinks/README.md) |
-| `type` | `kafka`, `redis`, `nats`, `http`, or `s3` |
+| `type` | `kafka`, `redis`, `nats`, `http`, `s3`, or `clickhouse` |
 | `config.envelope` | Output format: `native`, `debezium`, or `cloudevents` - see [Envelopes](docs/src/envelopes.md) |
 | `config.encoding` | Wire encoding: `json` (default) or `avro` (with Schema Registry) - see [Envelopes](docs/src/envelopes.md) |
 | `config.required` | Whether sink must ack for checkpoint (`true` default) |
@@ -478,6 +479,7 @@ View actual examples: [Example Configurations](docs/src/examples/README.md)
 - [x] Avro encoding with Confluent Schema Registry
 - [x] Helm chart for Kubernetes deployment
 - [x] S3/Parquet/JSON Lines sink
+- [x] ClickHouse sink (change-log + current-state upsert, auto table creation)
 - [ ] Event replay from DLQ journal
 - [ ] Kubernetes operator (PipelineTemplate + PipelinePool)
 

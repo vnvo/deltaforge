@@ -39,6 +39,7 @@ use deltaforge_core::ArcDynSink;
 use deltaforge_core::encoding::avro::SourceSchemaProvider;
 use tokio_util::sync::CancellationToken;
 
+pub mod clickhouse;
 pub mod filter;
 pub mod http;
 pub mod kafka;
@@ -99,17 +100,19 @@ pub fn build_sinks(
     cancel: CancellationToken,
     pipeline: &str,
 ) -> anyhow::Result<Vec<ArcDynSink>> {
-    build_sinks_with_schemas(ps, cancel, pipeline, None, None)
+    build_sinks_with_schemas(ps, cancel, pipeline, None, None, None)
 }
 
 /// Build all sinks, optionally injecting a DDL-derived schema provider for
-/// Avro encoding (Path A) and/or an Arrow `SchemaResolver` for the S3 sink.
+/// Avro encoding (Path A), an Arrow `SchemaResolver` for the S3 sink, and/or a
+/// `ClickHouseSchemaResolver` (source columns + PK) for the ClickHouse sink.
 pub fn build_sinks_with_schemas(
     ps: &PipelineSpec,
     cancel: CancellationToken,
     pipeline: &str,
     source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
     arrow_schema_resolver: Option<s3::SchemaResolver>,
+    clickhouse_resolver: Option<clickhouse::ClickHouseSchemaResolver>,
 ) -> anyhow::Result<Vec<ArcDynSink>> {
     ps.spec
         .sinks
@@ -161,6 +164,16 @@ pub fn build_sinks_with_schemas(
                     )?) as ArcDynSink,
                     cfg.filter.clone(),
                 ),
+                SinkCfg::ClickHouse(cfg) => (
+                    Arc::new(clickhouse::build_clickhouse_sink(
+                        cfg,
+                        cancel.clone(),
+                        pipeline,
+                        clickhouse_resolver.clone(),
+                    )?) as ArcDynSink,
+                    // v1: ClickHouse sink does not support sink-level filters.
+                    None,
+                ),
             };
             // Only wrap when filter has actual conditions — zero overhead otherwise
             let sink = match filter {
@@ -208,6 +221,9 @@ pub fn build_sink(
             Arc::new(build_s3_sink(s3_cfg, cancel, pipeline, None)?)
                 as ArcDynSink
         }
+        SinkCfg::ClickHouse(cfg) => Arc::new(clickhouse::build_clickhouse_sink(
+            cfg, cancel, pipeline, None,
+        )?) as ArcDynSink,
     };
     Ok(sink)
 }
