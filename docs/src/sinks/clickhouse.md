@@ -95,6 +95,16 @@ are not transactional with the DeltaForge checkpoint.
 makes `ReplacingMergeTree` replacement correct. Only fall back to `ts_ms` when the
 source lacks a usable position (millisecond ties per key are undefined).
 
+## Requirements
+
+The sink needs the **source table's column types + primary key** (RowBinary is
+positional and auto-create derives the DDL from them), so the schema must be in
+the registry. Enable a **snapshot** (`snapshot.mode: initial`) or **schema
+sensing** on the source — with `snapshot: never` *and* sensing off, the registry
+is empty and the sink can't project (unlike the S3 sink, which falls back to
+envelope-only). The v1 sink targets a **single table**; capture one source table
+per ClickHouse sink (not a wildcard).
+
 ## Auto table creation
 
 By default the sink creates the target table on the first event, deriving column
