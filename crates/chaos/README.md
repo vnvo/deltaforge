@@ -26,6 +26,7 @@ The compose file uses profiles so you bring up only the infra a given test needs
 | `pg-infra` | postgres, postgres-b | PostgreSQL source + failover replica |
 | `kafka-infra` | kafka (KRaft, no Zookeeper), schema-registry | Kafka sink + Avro tests |
 | `s3-infra` | minio, mc-bootstrap | S3/Parquet sink tests (MinIO) — see [S3_CHAOS.md](S3_CHAOS.md) |
+| `ch-infra` | clickhouse | ClickHouse sink tests (HTTP on host `:8124`, proxied at `toxiproxy:5105`) |
 | `df` | deltaforge-release, deltaforge-debug, deltaforge-profile | The three DeltaForge instances |
 
 The `df` profile starts one container per build variant: release (`:8080`, metrics `:9000`), debug (`:8081`/`:9001`), profile (`:8082`/`:9002`). All start with a default config; the pipeline for each scenario is selected at runtime via the REST API (`DELETE` + `POST /pipelines`), **not** by profile or by separate per-source services.
@@ -51,7 +52,16 @@ docker compose -f docker-compose.chaos.yml \
 # S3 / Parquet sink scenarios (add s3-infra)
 docker compose -f docker-compose.chaos.yml \
   --profile base --profile mysql-infra --profile s3-infra --profile df up -d
+
+# ClickHouse sink scenarios (add ch-infra)
+docker compose -f docker-compose.chaos.yml \
+  --profile base --profile mysql-infra --profile ch-infra --profile df up -d
 ```
+
+The ClickHouse sink pipeline config is `chaos/config/mysql-to-clickhouse.yaml`
+(apply it via the UI or `POST /pipelines`); the `ch-outage` scenario then cuts
+ClickHouse via Toxiproxy and verifies the required sink backpressures and
+recovers.
 
 Restart just the DeltaForge containers without touching infra:
 

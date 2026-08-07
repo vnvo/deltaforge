@@ -141,6 +141,8 @@ enum Scenario {
     S3Outage,
     /// Backlog drain against the S3 sink — MySQL→S3 catch-up throughput.
     S3BacklogDrain,
+    /// ClickHouse outage via toxiproxy — verify backpressure and recovery.
+    ChOutage,
     // MySQL-specific
     Failover,
     BinlogPurge,
@@ -189,6 +191,7 @@ fn meta_for_scenario(
         Scenario::S3Soak => "s3-soak",
         Scenario::S3Outage => "s3-outage",
         Scenario::S3BacklogDrain => "s3-backlog-drain",
+        Scenario::ChOutage => "ch-outage",
         Scenario::Failover => "failover",
         Scenario::BinlogPurge => "binlog-purge",
         Scenario::PgFailover => "pg-failover",
@@ -552,6 +555,9 @@ async fn run_scenarios<B: backend::SourceBackend>(
         }
         Scenario::S3Outage => {
             results.push(scenarios::s3_outage::run(harness, backend).await?);
+        }
+        Scenario::ChOutage => {
+            results.push(scenarios::ch_outage::run(harness, backend).await?);
         }
         Scenario::S3BacklogDrain => {
             // Same drain flow as the Kafka benchmark, but measured via the

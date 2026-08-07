@@ -29,6 +29,9 @@ pub mod sr_outage;
 pub mod s3_outage;
 pub mod s3_soak;
 
+// ClickHouse scenarios.
+pub mod ch_outage;
+
 // PostgreSQL-specific scenarios.
 pub mod pg_failover;
 pub mod slot_dropped;

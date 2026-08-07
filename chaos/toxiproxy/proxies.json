@@ -28,5 +28,11 @@
     "listen": "0.0.0.0:5104",
     "upstream": "minio:9000",
     "enabled": true
+  },
+  {
+    "name": "clickhouse",
+    "listen": "0.0.0.0:5105",
+    "upstream": "clickhouse:8123",
+    "enabled": true
   }
 ]

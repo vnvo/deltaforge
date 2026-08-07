@@ -381,6 +381,9 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
             <optgroup label="Avro / Schema Registry (MySQL)">
               <option value="sr-outage">SR Outage (cached-schema fallback)</option>
             </optgroup>
+            <optgroup label="ClickHouse (MySQL)">
+              <option value="ch-outage">ClickHouse Outage (cut + restore)</option>
+            </optgroup>
             <optgroup label="MySQL only">
               <option value="failover">MySQL Failover</option>
               <option value="binlog-purge">Binlog Purge</option>
@@ -903,6 +906,7 @@ const SCENARIO_SOURCES = {
   's3-outage': ['mysql'],
   's3-backlog-drain': ['mysql'],
   'sr-outage': ['mysql'],
+  'ch-outage': ['mysql'],
   'pg-failover': ['postgres'],
   'slot-dropped': ['postgres'],
 };
@@ -1613,6 +1617,7 @@ function renderServices(services) {
     { label: 'PG Infra',      profile: 'pg-infra',      names: ['postgres','postgres-b'] },
     { label: 'Kafka Infra',   profile: 'kafka-infra',   names: ['kafka','schema-registry'] },
     { label: 'S3 Infra',      profile: 's3-infra',      names: ['minio'] },
+    { label: 'ClickHouse Infra', profile: 'ch-infra',   names: ['clickhouse'] },
     { label: 'DeltaForge · release (:8080)', profile: 'df', service: 'deltaforge-release', names: ['deltaforge-release'] },
     { label: 'DeltaForge · debug (:8081)',   profile: 'df', service: 'deltaforge-debug',   names: ['deltaforge-debug'] },
     { label: 'DeltaForge · profile (:8082)', profile: 'df', service: 'deltaforge-profile', names: ['deltaforge-profile'] },
