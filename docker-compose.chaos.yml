@@ -254,6 +254,29 @@ services:
         fi
     networks: [chaos_net]
 
+  # ClickHouse (for the ClickHouse sink chaos scenarios). DeltaForge writes
+  # through the toxiproxy route (toxiproxy:5105) so the sink can be cut; the
+  # chaos harness queries ground-truth directly on host port 8124.
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    profiles: [ch-infra]
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    ports:
+      - "8124:8123"   # HTTP on host (harness queries this directly, bypassing proxy)
+      - "9010:9000"   # native TCP (host access for inspection)
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [chaos_net]
+
   # Confluent Schema Registry (for Avro encoding tests)
   schema-registry:
     image: confluentinc/cp-schema-registry:7.7.1

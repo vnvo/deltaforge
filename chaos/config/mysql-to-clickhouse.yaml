@@ -1,0 +1,44 @@
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: chaos-mysql-clickhouse
+  tenant: chaos
+
+spec:
+  source:
+    type: mysql
+    config:
+      id: chaos-mysql-clickhouse
+      dsn: "mysql://cdc_user:cdc_password@toxiproxy:5100/orders"
+      tables:
+        - "orders.*"
+      on_schema_drift: adapt
+
+  processors: []
+
+  sinks:
+    # ClickHouse via toxiproxy (toxiproxy:5105) so we can inject faults
+    # (network partition). Direct address is "http://clickhouse:8123".
+    # change-log mode: every change is a row, so the row count grows
+    # monotonically with inserts — easy to assert backpressure/recovery.
+    - type: clickhouse
+      config:
+        id: chaos-clickhouse
+        url: "http://toxiproxy:5105"
+        database: default
+        table: customers
+        mode: changelog
+        user: default
+        auto_create: true
+        # Bound per-batch wait so a cut ClickHouse returns Backpressure
+        # instead of blocking the coordinator. Coordinator handles per `required`.
+        send_timeout_secs: 10
+        required: true
+
+  batch:
+    max_events: 500
+    max_ms: 100
+    respect_source_tx: true
+
+  commit_policy:
+    mode: required

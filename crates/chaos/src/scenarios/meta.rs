@@ -28,6 +28,8 @@ pub enum ScenarioCategory {
     S3,
     /// Avro / Schema Registry focused.
     Avro,
+    /// ClickHouse sink focused.
+    ClickHouse,
 }
 
 impl ScenarioCategory {
@@ -39,6 +41,7 @@ impl ScenarioCategory {
             Self::Benchmark => "Benchmark",
             Self::S3 => "S3 / Lakehouse",
             Self::Avro => "Avro / Schema Registry",
+            Self::ClickHouse => "ClickHouse",
         }
     }
 }
@@ -105,6 +108,7 @@ const PG_BASE_DF: &[&str] = &["base", "pg-infra", "df"];
 const MYSQL_KAFKA: &[&str] = &["base", "mysql-infra", "kafka-infra", "df"];
 const PG_KAFKA: &[&str] = &["base", "pg-infra", "kafka-infra", "df"];
 const MYSQL_S3: &[&str] = &["base", "mysql-infra", "s3-infra", "df"];
+const MYSQL_CLICKHOUSE: &[&str] = &["base", "mysql-infra", "ch-infra", "df"];
 #[allow(dead_code)]
 const PG_S3: &[&str] = &["base", "pg-infra", "s3-infra", "df"];
 
@@ -178,6 +182,16 @@ pub const REGISTRY: &[ScenarioMeta] = &[
         S3,
         MYSQL_S3,
         &["s3", "resilience", "backpressure"],
+    ),
+    // ── ClickHouse ──
+    meta(
+        "ch-outage",
+        "Cuts ClickHouse via toxiproxy mid-stream then restores it.",
+        "Required ClickHouse sink backpressures the source; no rows land during \
+         the outage; the pipeline catches up cleanly after ClickHouse returns.",
+        ClickHouse,
+        MYSQL_CLICKHOUSE,
+        &["clickhouse", "resilience", "backpressure"],
     ),
     // ── Avro / Schema Registry ──
     meta(
@@ -289,7 +303,7 @@ pub fn lookup(name: &str) -> Option<&'static ScenarioMeta> {
 
 /// Group scenarios by category in a stable display order.
 pub fn grouped() -> Vec<(ScenarioCategory, Vec<&'static ScenarioMeta>)> {
-    let order = [Generic, S3, Avro, Mysql, Postgres, Benchmark];
+    let order = [Generic, S3, Avro, ClickHouse, Mysql, Postgres, Benchmark];
     order
         .iter()
         .map(|&cat| {

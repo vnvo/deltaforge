@@ -223,6 +223,7 @@ fn port_label(host_port: u16) -> Option<(&'static str, String)> {
         9092 => Some(("broker", "localhost:9092".to_string())),
         9100 => Some(("S3 API", "http://localhost:9100".to_string())),
         9101 => Some(("console", "http://localhost:9101".to_string())),
+        8124 => Some(("HTTP", "http://localhost:8124/play".to_string())),
         _ => None,
     }
 }
@@ -290,6 +291,11 @@ async fn api_status() -> Json<Vec<ServiceInfo>> {
             "minio",
             "deltaforge-minio-1",
             Some("http://localhost:9100/minio/health/live"),
+        ),
+        (
+            "clickhouse",
+            "deltaforge-clickhouse-1",
+            Some("http://localhost:8124/ping"),
         ),
         ("postgres", "deltaforge-postgres-1", None),
         ("postgres-b", "deltaforge-postgres-b-1", None),
@@ -541,6 +547,8 @@ async fn api_reset_volumes(Json(req): Json<ResetRequest>) -> StatusCode {
                     "kafka-infra",
                     "--profile",
                     "s3-infra",
+                    "--profile",
+                    "ch-infra",
                     "--profile",
                     "df",
                     "down",
