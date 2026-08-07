@@ -46,16 +46,43 @@ pub fn map_column(c: &ColDesc) -> ChType {
             }
         }
         "float" | "double" | "real" => ChType::Float64,
-        "decimal" | "numeric" => ChType::Decimal {
-            p: c.precision.unwrap_or(38) as u32,
-            s: c.scale.unwrap_or(0) as u32,
-        },
+        "decimal" | "numeric" => {
+            let (p, s) = decimal_params(c);
+            ChType::Decimal { p, s }
+        }
         "date" | "datetime" | "timestamp" | "timestamptz" => {
             ChType::DateTime64_3
         }
         // varchar/text/json/uuid/enum/arrays → String (JSON kept as text in v1)
         _ => ChType::String,
     }
+}
+
+/// Resolve decimal precision/scale: prefer the numeric metadata, else parse it
+/// out of the full type string (e.g. `"decimal(10,2)"`). Some schema loaders
+/// leave `numeric_precision`/`numeric_scale` unset even for `DECIMAL` columns.
+fn decimal_params(c: &ColDesc) -> (u32, u32) {
+    if let Some(p) = c.precision {
+        return (p as u32, c.scale.unwrap_or(0) as u32);
+    }
+    if let Some((p, s)) = parse_decimal_str(&c.full_type) {
+        return (p, s);
+    }
+    (38, 0)
+}
+
+/// Parse `(p, s)` from a type like `"decimal(10,2)"` / `"numeric(38)"`.
+fn parse_decimal_str(full_type: &str) -> Option<(u32, u32)> {
+    let open = full_type.find('(')?;
+    let close = full_type.find(')')?;
+    let inner = full_type.get(open + 1..close)?;
+    let mut parts = inner.split(',');
+    let p: u32 = parts.next()?.trim().parse().ok()?;
+    let s: u32 = parts
+        .next()
+        .and_then(|x| x.trim().parse().ok())
+        .unwrap_or(0);
+    Some((p, s))
 }
 
 impl ChType {
@@ -117,6 +144,15 @@ mod tests {
             ..col("decimal", "decimal(12,2)")
         };
         assert_eq!(map_column(&c), ChType::Decimal { p: 12, s: 2 });
+    }
+
+    #[test]
+    fn decimal_precision_parsed_from_type_string_when_metadata_missing() {
+        // Some schema loaders leave numeric_precision unset — parse from the type.
+        let c = col("decimal", "decimal(10,2)");
+        assert_eq!(map_column(&c), ChType::Decimal { p: 10, s: 2 });
+        let c2 = col("numeric", "numeric(38)");
+        assert_eq!(map_column(&c2), ChType::Decimal { p: 38, s: 0 });
     }
 
     #[test]

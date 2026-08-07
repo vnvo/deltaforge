@@ -21,6 +21,7 @@ use testcontainers::{
 use tokio_util::sync::CancellationToken;
 
 const CH_HTTP: u16 = 8123;
+const CH_PASSWORD: &str = "chtest";
 
 /// Columns for a test `orders` table: `id BIGINT PK`, `amount DECIMAL(12,2)`.
 fn resolver() -> ClickHouseSchemaResolver {
@@ -64,7 +65,7 @@ fn cfg(
         table: table.into(),
         mode,
         user: Some("default".into()),
-        password: None,
+        password: Some(CH_PASSWORD.into()),
         tls: None,
         version_source: ChVersionSource::TsMs,
         send_timeout_secs: 30,
@@ -115,9 +116,13 @@ fn mk_event(
 
 /// Run a SQL statement over the ClickHouse HTTP interface, returning the body.
 async fn ch(base: &str, sql: &str) -> String {
+    // Send the SQL in the body (non-empty → Content-Length set). Query-in-URL
+    // with an empty body returns HTTP 411 on this ClickHouse build.
     let r = reqwest::Client::new()
         .post(base)
-        .query(&[("query", sql)])
+        .header("X-ClickHouse-User", "default")
+        .header("X-ClickHouse-Key", CH_PASSWORD)
+        .body(sql.to_string())
         .send()
         .await
         .expect("clickhouse http request");
@@ -152,6 +157,7 @@ async fn start_clickhouse()
             length: Duration::from_secs(3),
         })
         .with_mapped_port(0, CH_HTTP.tcp())
+        .with_env_var("CLICKHOUSE_PASSWORD", CH_PASSWORD)
         .start()
         .await
         .expect("start clickhouse container");
@@ -207,11 +213,22 @@ async fn upsert_mode_auto_creates_and_reflects_current_state() {
 
     let out = ch(
         &base,
-        &format!("SELECT id, toString(amount) FROM default.{table} FINAL ORDER BY id FORMAT TSV"),
+        &format!("SELECT id, toFloat64(amount) FROM default.{table} FINAL ORDER BY id FORMAT TSV"),
     )
     .await;
     // Only id=1 at amount 20.00 survives; the delete of never-seen id=2 collapses.
-    assert_eq!(out.trim(), "1\t20.00", "current state, got: {out:?}");
+    let lines: Vec<&str> = out.trim().lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected one current-state row, got {out:?}"
+    );
+    let cols: Vec<&str> = lines[0].split('\t').collect();
+    assert_eq!(cols[0], "1", "current-state id, got {out:?}");
+    assert!(
+        (cols[1].parse::<f64>().unwrap() - 20.0).abs() < 1e-9,
+        "current-state amount should be 20.00 (the update), got {out:?}"
+    );
 }
 
 #[tokio::test]

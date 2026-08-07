@@ -10,9 +10,17 @@ spec:
     config:
       id: chaos-mysql-clickhouse
       dsn: "mysql://cdc_user:cdc_password@toxiproxy:5100/orders"
+      # The ClickHouse sink (v1) targets a single table, so capture just one
+      # source table (not orders.* — the shared chaos DB has many tables).
       tables:
-        - "orders.*"
+        - "orders.customers"
       on_schema_drift: adapt
+      # The ClickHouse sink needs the source column types + PK (RowBinary is
+      # positional), so the schema must be in the registry. snapshot: initial
+      # loads + registers it (and backfills existing rows). Without a snapshot
+      # (or schema sensing) the registry is empty and the sink can't project.
+      snapshot:
+        mode: initial
 
   processors: []
 

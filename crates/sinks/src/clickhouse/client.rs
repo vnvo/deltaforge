@@ -57,21 +57,34 @@ impl ClickHouseClient {
         extra: &[(&str, String)],
         body: Vec<u8>,
     ) -> Result<(), SinkError> {
-        let mut params = vec![("query".to_string(), query)];
+        let mut params: Vec<(String, String)> = Vec::new();
+        // Only add ?query= when non-empty. DDL is sent as the request *body*
+        // (see `execute_ddl`) — a query-in-URL with an empty body triggers
+        // HTTP 411 (no Content-Length / not chunked).
+        if !query.is_empty() {
+            params.push(("query".to_string(), query));
+        }
         for (k, v) in extra {
             params.push((k.to_string(), v.clone()));
         }
-        let url = reqwest::Url::parse_with_params(&self.base, &params)
-            .map_err(|e| SinkError::Routing {
-                details: e.to_string().into(),
-            })?;
+        let url = if params.is_empty() {
+            reqwest::Url::parse(&self.base)
+        } else {
+            reqwest::Url::parse_with_params(&self.base, &params)
+        }
+        .map_err(|e| SinkError::Routing {
+            details: e.to_string().into(),
+        })?;
 
         let mut req = self.http.post(url).body(body);
+        // Pair the auth headers: some ClickHouse builds reject an
+        // `X-ClickHouse-User` sent without an `X-ClickHouse-Key` (even for a
+        // no-password user), so always send the key (empty when no password).
         if let Some(u) = &self.user {
-            req = req.header("X-ClickHouse-User", u);
-        }
-        if let Some(p) = &self.password {
-            req = req.header("X-ClickHouse-Key", p);
+            req = req.header("X-ClickHouse-User", u).header(
+                "X-ClickHouse-Key",
+                self.password.as_deref().unwrap_or(""),
+            );
         }
 
         let resp = req.send().await.map_err(|e| {
@@ -132,7 +145,9 @@ impl ChTransport for ClickHouseClient {
     }
 
     async fn execute_ddl(&self, sql: &str) -> Result<(), SinkError> {
-        self.post(sql.to_string(), &[], Vec::new()).await
+        // Send the DDL as the request body (ClickHouse executes the POST body as
+        // SQL). An empty body with the query in the URL returns HTTP 411.
+        self.post(String::new(), &[], sql.as_bytes().to_vec()).await
     }
 }
 
