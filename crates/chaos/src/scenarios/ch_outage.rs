@@ -54,9 +54,13 @@ const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// query fails (e.g. during warmup before auto-create, or a transient error).
 async fn ch_count(table: &str) -> u64 {
     let sql = format!("SELECT count() FROM {table} FORMAT TSV");
+    // Send SQL in the body (non-empty → Content-Length); query-in-URL with an
+    // empty body returns HTTP 411. Auth matches the sink (default, empty key).
     let resp = reqwest::Client::new()
         .post(CH_HTTP)
-        .query(&[("query", sql.as_str())])
+        .header("X-ClickHouse-User", "default")
+        .header("X-ClickHouse-Key", "")
+        .body(sql)
         .send()
         .await;
     match resp {
