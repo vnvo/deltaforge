@@ -43,8 +43,12 @@ fn resolver() -> ClickHouseSchemaResolver {
                     full_type: "decimal(12,2)".into(),
                     nullable: true,
                     unsigned: false,
-                    precision: Some(12),
-                    scale: Some(2),
+                    // Mirror the real MySQL schema loader, which leaves
+                    // numeric_precision/scale unset and only carries the type
+                    // string — so this exercises the parse-from-`full_type` path
+                    // (the decimal(38,0) default bug lived here).
+                    precision: None,
+                    scale: None,
                 },
             ],
             primary_key: vec!["id".into()],
@@ -191,7 +195,9 @@ async fn upsert_mode_auto_creates_and_reflects_current_state() {
         ),
         mk_event(
             Op::Update,
-            json!({"id": 1, "amount": "20.00"}),
+            // fractional value so a scale-0 mismap (the Decimal(38,0) default
+            // bug) would truncate 20.50 → 20 and fail the assertion below.
+            json!({"id": 1, "amount": "20.50"}),
             json!(null),
             table,
             2,
@@ -226,8 +232,8 @@ async fn upsert_mode_auto_creates_and_reflects_current_state() {
     let cols: Vec<&str> = lines[0].split('\t').collect();
     assert_eq!(cols[0], "1", "current-state id, got {out:?}");
     assert!(
-        (cols[1].parse::<f64>().unwrap() - 20.0).abs() < 1e-9,
-        "current-state amount should be 20.00 (the update), got {out:?}"
+        (cols[1].parse::<f64>().unwrap() - 20.50).abs() < 1e-9,
+        "current-state amount should be 20.50 (exact decimal scale), got {out:?}"
     );
 }
 
