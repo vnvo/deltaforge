@@ -72,7 +72,8 @@ fn decimal_params(c: &ColDesc) -> (u32, u32) {
 }
 
 /// Parse `(p, s)` from a type like `"decimal(10,2)"` / `"numeric(38)"`.
-fn parse_decimal_str(full_type: &str) -> Option<(u32, u32)> {
+/// Shared with the Elasticsearch sink's mapping generation.
+pub(crate) fn parse_decimal_str(full_type: &str) -> Option<(u32, u32)> {
     let open = full_type.find('(')?;
     let close = full_type.find(')')?;
     let inner = full_type.get(open + 1..close)?;

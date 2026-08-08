@@ -253,6 +253,7 @@ pub enum SinkCfg {
     Http(HttpSinkCfg),
     S3(S3SinkCfg),
     ClickHouse(ClickHouseSinkCfg),
+    Elasticsearch(ElasticsearchSinkCfg),
 }
 
 impl SinkCfg {
@@ -265,6 +266,7 @@ impl SinkCfg {
             Self::Http(c) => &c.id,
             Self::S3(c) => &c.id,
             Self::ClickHouse(c) => &c.id,
+            Self::Elasticsearch(c) => &c.id,
         }
     }
 }
@@ -352,6 +354,84 @@ pub struct ClickHouseSinkCfg {
     /// require a pre-created table (locked-down environments).
     #[serde(default = "default_true")]
     pub auto_create: bool,
+}
+
+// ============================================================================
+// Elasticsearch sink configuration
+// ============================================================================
+
+fn default_id_separator() -> String {
+    "_".to_string()
+}
+
+/// Source of the external `version` used for idempotent ES upserts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EsVersionSource {
+    /// Source LSN / binlog position (monotonic). Default.
+    #[default]
+    SourcePosition,
+    /// Event `ts_ms` — weaker (ms ties per key are undefined).
+    TsMs,
+}
+
+/// Elasticsearch authentication. Tagged by `type`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EsAuth {
+    /// HTTP basic auth (self-hosted).
+    Basic { username: String, password: String },
+    /// Elastic Cloud / serverless API key (`Authorization: ApiKey <key>`).
+    ApiKey { api_key: String },
+    /// No auth.
+    None,
+}
+
+/// TLS options for the Elasticsearch HTTPS endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EsTls {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub ca_file: Option<String>,
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
+}
+
+/// Elasticsearch sink configuration (`type: elasticsearch`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ElasticsearchSinkCfg {
+    /// Unique identifier for this sink.
+    pub id: String,
+    /// HTTP(S) endpoint, e.g. `https://es:9200`. Supports `${ENV}` expansion.
+    pub url: String,
+    /// Target index name or template (`{db}`, `{schema}`, `{table}`).
+    pub index: String,
+    /// Create each index with a generated mapping on first use (default true).
+    /// Set false to rely on a pre-created index / ES dynamic mapping.
+    #[serde(default = "default_true")]
+    pub auto_create_index: bool,
+    /// Fields forming the document `_id`. Empty → use the source primary key.
+    #[serde(default)]
+    pub id_fields: Vec<String>,
+    /// Separator joining composite `_id` values. Defaults to `_`.
+    #[serde(default = "default_id_separator")]
+    pub id_separator: String,
+    /// Where the external `version` comes from. Defaults to the source position.
+    #[serde(default)]
+    pub version_source: EsVersionSource,
+    /// Authentication. Values support `${ENV_VAR}` expansion.
+    #[serde(default)]
+    pub auth: Option<EsAuth>,
+    /// TLS options (for `https://` endpoints).
+    #[serde(default)]
+    pub tls: Option<EsTls>,
+    /// Per-batch `_bulk` timeout. Timeouts surface as `Backpressure`.
+    #[serde(default = "default_send_timeout_secs")]
+    pub send_timeout_secs: u64,
+    /// Whether delivery is required (blocks) or best-effort (log + continue).
+    #[serde(default)]
+    pub required: Option<bool>,
 }
 
 /// Kafka sink configuration.
@@ -1333,5 +1413,55 @@ mod tests {
         assert_eq!(c.send_timeout_secs, 30);
         assert!(c.tls.is_none());
         assert!(c.auto_create, "auto_create defaults to true");
+    }
+
+    #[test]
+    fn parses_elasticsearch_sink() {
+        let yaml = r#"
+            sinks:
+              - type: elasticsearch
+                config:
+                  id: es-orders
+                  url: "https://es:9200"
+                  index: "cdc-{db}.{table}"
+                  auth:
+                    type: basic
+                    username: elastic
+                    password: "secret"
+        "#;
+        #[derive(serde::Deserialize)]
+        struct Holder {
+            sinks: Vec<SinkCfg>,
+        }
+        let h: Holder = serde_yaml::from_str(yaml).unwrap();
+        match &h.sinks[0] {
+            SinkCfg::Elasticsearch(c) => {
+                assert_eq!(c.id, "es-orders");
+                assert_eq!(c.index, "cdc-{db}.{table}");
+                assert!(c.auto_create_index, "auto_create_index defaults true");
+                assert_eq!(c.id_separator, "_", "id_separator defaults _");
+                assert_eq!(c.version_source, EsVersionSource::SourcePosition);
+                assert!(matches!(c.auth, Some(EsAuth::Basic { .. })));
+            }
+            other => panic!("expected Elasticsearch, got {other:?}"),
+        }
+        assert_eq!(h.sinks[0].sink_id(), "es-orders");
+    }
+
+    #[test]
+    fn elasticsearch_defaults() {
+        let yaml = r#"
+            id: e
+            url: "http://es:9200"
+            index: "t"
+        "#;
+        let c: ElasticsearchSinkCfg = serde_yaml::from_str(yaml).unwrap();
+        assert!(c.auto_create_index);
+        assert_eq!(c.id_separator, "_");
+        assert!(c.id_fields.is_empty());
+        assert_eq!(c.version_source, EsVersionSource::SourcePosition);
+        assert_eq!(c.send_timeout_secs, 30);
+        assert!(c.auth.is_none());
+        assert!(c.tls.is_none());
     }
 }

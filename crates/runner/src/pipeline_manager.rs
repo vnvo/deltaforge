@@ -126,6 +126,7 @@ fn build_avro_provider(
             SinkCfg::Nats(c) => &c.encoding,
             SinkCfg::Http(c) => &c.encoding,
             SinkCfg::S3(_) => return None,
+            SinkCfg::Elasticsearch(_) => return None,
             // ClickHouse has its own RowBinary encoding, not EncodingCfg.
             SinkCfg::ClickHouse(_) => return None,
         };
@@ -229,6 +230,29 @@ fn build_clickhouse_resolver(
     let schema_provider =
         Arc::new(SchemaLoaderAdapter::new(Arc::clone(loader)));
     Some(crate::schema_provider::build_clickhouse_schema_resolver(
+        schema_provider,
+    ))
+}
+
+/// Build an Elasticsearch column resolver if the pipeline has an ES sink.
+fn build_elasticsearch_resolver(
+    spec: &deltaforge_config::PipelineSpec,
+    schema_loader: &Option<ArcSchemaLoader>,
+) -> Option<sinks::elasticsearch::EsSchemaResolver> {
+    use deltaforge_config::SinkCfg;
+
+    let has_es = spec
+        .spec
+        .sinks
+        .iter()
+        .any(|s| matches!(s, SinkCfg::Elasticsearch(_)));
+    if !has_es {
+        return None;
+    }
+    let loader = schema_loader.as_ref()?;
+    let schema_provider =
+        Arc::new(SchemaLoaderAdapter::new(Arc::clone(loader)));
+    Some(crate::schema_provider::build_elasticsearch_schema_resolver(
         schema_provider,
     ))
 }
@@ -444,6 +468,9 @@ impl PipelineManager {
         let clickhouse_resolver =
             build_clickhouse_resolver(&spec, &schema_loader);
 
+        // Build Elasticsearch column resolver if any sink is an ES sink
+        let es_resolver = build_elasticsearch_resolver(&spec, &schema_loader);
+
         let sinks = sinks::build_sinks_with_schemas(
             &spec,
             cancel.clone(),
@@ -451,6 +478,7 @@ impl PipelineManager {
             avro_source_schemas,
             arrow_schema_resolver,
             clickhouse_resolver,
+            es_resolver,
         )
         .context("build sinks")?;
 
