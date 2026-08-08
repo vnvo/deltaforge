@@ -8,6 +8,7 @@ pub mod client;
 pub mod id;
 pub mod index;
 pub mod mapping;
+pub mod sink;
 pub mod version;
 
 #[cfg(test)]
@@ -17,6 +18,7 @@ use std::sync::Arc;
 
 /// Reuse the ClickHouse resolver output — source columns (types) + primary key.
 pub use crate::clickhouse::TableColumns;
+pub use sink::{ElasticsearchSink, build_elasticsearch_sink};
 
 /// Resolve a source table (`"namespace.table"`) to its columns + PK.
 ///
