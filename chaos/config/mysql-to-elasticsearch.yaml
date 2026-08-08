@@ -1,0 +1,53 @@
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: chaos-mysql-elasticsearch
+  tenant: chaos
+
+# MySQL → Elasticsearch soak/drain pipeline. Captures all 120 soak tables and
+# upserts each into a per-table index (cdc-orders.<table>). The ES sink loads
+# each table's columns + PK on demand (INFORMATION_SCHEMA), so no snapshot is
+# needed; the generated mapping keeps decimals/dates typed.
+
+spec:
+  source:
+    type: mysql
+    config:
+      id: chaos-mysql-elasticsearch
+      dsn: "mysql://cdc_user:cdc_password@toxiproxy:5100/orders"
+      tables:
+        - "orders.*"
+      on_schema_drift: adapt
+
+  processors: []
+
+  sinks:
+    - type: elasticsearch
+      config:
+        id: chaos-elasticsearch
+        # Direct address (no toxiproxy) — the drain benchmark measures
+        # throughput, not fault injection.
+        url: "http://elasticsearch:9200"
+        index: "cdc-{db}.{table}"
+        auto_create_index: true
+        # xpack security is disabled on the chaos ES container.
+        auth:
+          type: none
+        required: true
+        send_timeout_secs: 30
+
+  batch:
+    max_events: 2000
+    max_ms: 50
+    respect_source_tx: false
+
+  commit_policy:
+    mode: required
+
+  journal:
+    enabled: true
+    max_event_bytes: 262144
+    dlq:
+      max_entries: 10000
+      max_age_secs: 3600
+      overflow_policy: drop_oldest

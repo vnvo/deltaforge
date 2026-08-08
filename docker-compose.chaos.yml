@@ -277,6 +277,28 @@ services:
       retries: 12
     networks: [chaos_net]
 
+  # Elasticsearch — target for the elasticsearch sink (es-backlog-drain).
+  # Security disabled for the chaos harness; single-node. Host port 9201 avoids
+  # clashing with a local Elasticsearch on 9200.
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    profiles: [es-infra]
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    ports:
+      - "9201:9200"   # HTTP on host (harness/inspection); services use elasticsearch:9200
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    networks: [chaos_net]
+
   # Confluent Schema Registry (for Avro encoding tests)
   schema-registry:
     image: confluentinc/cp-schema-registry:7.7.1
