@@ -16,7 +16,9 @@ use tracing::warn;
 
 use super::EsSchemaResolver;
 use super::TableColumns;
-use super::bulk::{BulkAction, ItemOutcome, build_bulk_body, parse_bulk_response};
+use super::bulk::{
+    BulkAction, ItemOutcome, build_bulk_body, parse_bulk_response,
+};
 use super::client::{ElasticsearchClient, EsTransport};
 use super::id::derive_id;
 use super::index::render_index;
@@ -107,7 +109,9 @@ impl Sink for ElasticsearchSink {
     }
 
     async fn send(&self, event: &Event) -> SinkResult<()> {
-        self.send_batch(std::slice::from_ref(event)).await.map(|_| ())
+        self.send_batch(std::slice::from_ref(event))
+            .await
+            .map(|_| ())
     }
 
     async fn send_batch(&self, events: &[Event]) -> SinkResult<BatchResult> {
@@ -129,7 +133,10 @@ impl Sink for ElasticsearchSink {
                 // A missing/late schema is transient → replay the whole batch.
                 self.schema_for(ev)?
             } else {
-                Arc::new(TableColumns { columns: vec![], primary_key: vec![] })
+                Arc::new(TableColumns {
+                    columns: vec![],
+                    primary_key: vec![],
+                })
             };
 
             let index = render_index(&self.index_template, ev);
@@ -170,7 +177,12 @@ impl Sink for ElasticsearchSink {
             };
 
             let version = derive_es_version(ev, self.version_source.clone());
-            actions.push(BulkAction { index, id, version, doc });
+            actions.push(BulkAction {
+                index,
+                id,
+                version,
+                doc,
+            });
             action_event_idx.push(i);
         }
 
@@ -188,10 +200,13 @@ impl Sink for ElasticsearchSink {
             match outcome {
                 ItemOutcome::Ok | ItemOutcome::Superseded => applied += 1,
                 ItemOutcome::Failed(msg) => {
-                    let orig = action_event_idx.get(pos).copied().unwrap_or(pos);
+                    let orig =
+                        action_event_idx.get(pos).copied().unwrap_or(pos);
                     dlq.push((
                         orig,
-                        SinkError::Serialization { details: msg.into() },
+                        SinkError::Serialization {
+                            details: msg.into(),
+                        },
                     ));
                 }
             }
@@ -295,7 +310,9 @@ mod tests {
         async fn bulk(&self, body: Vec<u8>) -> Result<Vec<u8>, SinkError> {
             self.bulk_bodies.lock().unwrap().push(body);
             if self.bulk_err {
-                return Err(SinkError::Backpressure { details: "down".into() });
+                return Err(SinkError::Backpressure {
+                    details: "down".into(),
+                });
             }
             Ok(self.response.to_string().into_bytes())
         }
@@ -385,8 +402,18 @@ mod tests {
         })));
         let sink = sink_with(fake.clone());
         let batch = vec![
-            ev(Op::Create, json!({"id": 1, "amount": "10.00"}), json!(null), 1),
-            ev(Op::Update, json!({"id": 1, "amount": "20.50"}), json!(null), 2),
+            ev(
+                Op::Create,
+                json!({"id": 1, "amount": "10.00"}),
+                json!(null),
+                1,
+            ),
+            ev(
+                Op::Update,
+                json!({"id": 1, "amount": "20.50"}),
+                json!(null),
+                2,
+            ),
             ev(Op::Delete, json!(null), json!({"id": 2}), 3),
         ];
         let res = sink.send_batch(&batch).await.unwrap();
@@ -432,8 +459,7 @@ mod tests {
         ft.bulk_err = true;
         let fake = Arc::new(ft);
         let sink = sink_with(fake);
-        let batch =
-            vec![ev(Op::Create, json!({"id": 1}), json!(null), 1)];
+        let batch = vec![ev(Op::Create, json!({"id": 1}), json!(null), 1)];
         let err = sink.send_batch(&batch).await.unwrap_err();
         assert!(matches!(err, SinkError::Backpressure { .. }));
     }

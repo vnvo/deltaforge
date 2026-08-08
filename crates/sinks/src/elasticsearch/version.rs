@@ -29,7 +29,16 @@ mod tests {
     use serde_json::json;
 
     fn ev(lsn: Option<&str>, ts_ms: i64) -> Event {
-        mk_event(Op::Update, json!({}), json!(null), "d", None, "t", ts_ms, lsn)
+        mk_event(
+            Op::Update,
+            json!({}),
+            json!(null),
+            "d",
+            None,
+            "t",
+            ts_ms,
+            lsn,
+        )
     }
 
     #[test]
@@ -44,7 +53,10 @@ mod tests {
     #[test]
     fn falls_back_to_ts_ms_without_lsn() {
         let e = ev(None, 1234);
-        assert_eq!(derive_es_version(&e, EsVersionSource::SourcePosition), 1234);
+        assert_eq!(
+            derive_es_version(&e, EsVersionSource::SourcePosition),
+            1234
+        );
     }
 
     #[test]

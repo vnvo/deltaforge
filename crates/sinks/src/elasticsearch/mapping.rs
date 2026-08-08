@@ -106,7 +106,10 @@ mod tests {
 
     #[test]
     fn core_type_mappings() {
-        assert_eq!(es_field_type(&col("id", "bigint", "bigint"))["type"], "long");
+        assert_eq!(
+            es_field_type(&col("id", "bigint", "bigint"))["type"],
+            "long"
+        );
         assert_eq!(es_field_type(&col("n", "int", "int"))["type"], "integer");
         assert_eq!(
             es_field_type(&col("ok", "boolean", "tinyint(1)"))["type"],
@@ -116,7 +119,10 @@ mod tests {
             es_field_type(&col("t", "datetime", "datetime"))["type"],
             "date"
         );
-        assert_eq!(es_field_type(&col("j", "json", "json"))["type"], "flattened");
+        assert_eq!(
+            es_field_type(&col("j", "json", "json"))["type"],
+            "flattened"
+        );
         let v = es_field_type(&col("name", "varchar", "varchar(255)"));
         assert_eq!(v["type"], "text");
         assert_eq!(v["fields"]["keyword"]["type"], "keyword");

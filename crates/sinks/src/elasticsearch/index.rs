@@ -28,13 +28,25 @@ mod tests {
     use serde_json::json;
 
     fn ev(db: &str, schema: Option<&str>, table: &str) -> Event {
-        mk_event(Op::Create, json!({}), json!(null), db, schema, table, 1, None)
+        mk_event(
+            Op::Create,
+            json!({}),
+            json!(null),
+            db,
+            schema,
+            table,
+            1,
+            None,
+        )
     }
 
     #[test]
     fn substitutes_db_and_table() {
         let e = ev("orders", None, "customers");
-        assert_eq!(render_index("cdc-{db}.{table}", &e), "cdc-orders.customers");
+        assert_eq!(
+            render_index("cdc-{db}.{table}", &e),
+            "cdc-orders.customers"
+        );
     }
 
     #[test]
@@ -58,6 +70,9 @@ mod tests {
     #[test]
     fn result_is_lowercased() {
         let e = ev("Orders", None, "Customers");
-        assert_eq!(render_index("CDC-{db}.{table}", &e), "cdc-orders.customers");
+        assert_eq!(
+            render_index("CDC-{db}.{table}", &e),
+            "cdc-orders.customers"
+        );
     }
 }

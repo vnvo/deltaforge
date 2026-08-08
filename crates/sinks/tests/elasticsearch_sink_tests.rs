@@ -134,9 +134,7 @@ async fn refresh(base: &str, index: &str) {
 async fn wait_ready(base: &str) {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        if let Ok(r) =
-            reqwest::get(format!("{base}/_cluster/health")).await
-        {
+        if let Ok(r) = reqwest::get(format!("{base}/_cluster/health")).await {
             if r.status().is_success() {
                 return;
             }
@@ -150,18 +148,20 @@ async fn wait_ready(base: &str) {
 
 async fn start_elasticsearch()
 -> (testcontainers::ContainerAsync<GenericImage>, String) {
-    let container =
-        GenericImage::new("docker.elastic.co/elasticsearch/elasticsearch", "8.15.0")
-            .with_wait_for(WaitFor::Duration {
-                length: Duration::from_secs(3),
-            })
-            .with_mapped_port(0, ES_HTTP.tcp())
-            .with_env_var("discovery.type", "single-node")
-            .with_env_var("xpack.security.enabled", "false")
-            .with_env_var("ES_JAVA_OPTS", "-Xms512m -Xmx512m")
-            .start()
-            .await
-            .expect("start elasticsearch container");
+    let container = GenericImage::new(
+        "docker.elastic.co/elasticsearch/elasticsearch",
+        "8.15.0",
+    )
+    .with_wait_for(WaitFor::Duration {
+        length: Duration::from_secs(3),
+    })
+    .with_mapped_port(0, ES_HTTP.tcp())
+    .with_env_var("discovery.type", "single-node")
+    .with_env_var("xpack.security.enabled", "false")
+    .with_env_var("ES_JAVA_OPTS", "-Xms512m -Xmx512m")
+    .start()
+    .await
+    .expect("start elasticsearch container");
     let port = container.get_host_port_ipv4(ES_HTTP).await.unwrap();
     let base = format!("http://localhost:{port}");
     wait_ready(&base).await;
@@ -183,8 +183,18 @@ async fn upsert_delete_and_typed_mapping() {
 
     // insert id=1 amount 10.00 (v=1); update id=1 -> 20.50 (v=2); delete id=2 (v=3)
     let batch = vec![
-        mk_event(Op::Create, json!({"id": 1, "amount": "10.00"}), json!(null), 1),
-        mk_event(Op::Update, json!({"id": 1, "amount": "20.50"}), json!(null), 2),
+        mk_event(
+            Op::Create,
+            json!({"id": 1, "amount": "10.00"}),
+            json!(null),
+            1,
+        ),
+        mk_event(
+            Op::Update,
+            json!({"id": 1, "amount": "20.50"}),
+            json!(null),
+            2,
+        ),
         mk_event(Op::Delete, json!(null), json!({"id": 2}), 3),
     ];
     let res = sink.send_batch(&batch).await.unwrap();
@@ -194,18 +204,24 @@ async fn upsert_delete_and_typed_mapping() {
     // Generated mapping is typed: amount is scaled_float, not float/text.
     let (_s, mapping) = es_get(&base, &format!("/{index}/_mapping")).await;
     let m: Value = serde_json::from_str(&mapping).unwrap();
-    let amount_type =
-        &m[index]["mappings"]["properties"]["amount"]["type"];
+    let amount_type = &m[index]["mappings"]["properties"]["amount"]["type"];
     assert_eq!(amount_type, "scaled_float", "mapping: {mapping}");
 
     // Current state: id=1 at 20.50; id=2 never existed so the delete is a no-op.
     let (_s, doc) = es_get(&base, &format!("/{index}/_doc/1")).await;
     let d: Value = serde_json::from_str(&doc).unwrap();
     let amt = as_f64_loose(&d["_source"]["amount"]);
-    assert!((amt - 20.50).abs() < 1e-9, "amount should be 20.50, got {doc}");
+    assert!(
+        (amt - 20.50).abs() < 1e-9,
+        "amount should be 20.50, got {doc}"
+    );
 
     let (status2, _b) = es_get(&base, &format!("/{index}/_doc/2")).await;
-    assert_eq!(status2, reqwest::StatusCode::NOT_FOUND, "id=2 must not exist");
+    assert_eq!(
+        status2,
+        reqwest::StatusCode::NOT_FOUND,
+        "id=2 must not exist"
+    );
 }
 
 #[tokio::test]
@@ -222,8 +238,12 @@ async fn replay_and_out_of_order_are_idempotent() {
     .unwrap();
 
     // Establish id=1 at version 10, amount 10.00.
-    let insert =
-        vec![mk_event(Op::Create, json!({"id": 1, "amount": "10.00"}), json!(null), 10)];
+    let insert = vec![mk_event(
+        Op::Create,
+        json!({"id": 1, "amount": "10.00"}),
+        json!(null),
+        10,
+    )];
     sink.send_batch(&insert).await.unwrap();
 
     // Replay the same batch — external version 10 == 10, ES returns 409, which
@@ -232,13 +252,21 @@ async fn replay_and_out_of_order_are_idempotent() {
     assert!(res.dlq_failures.is_empty(), "replay must not DLQ");
 
     // A stale (out-of-order) update at version 5 must NOT overwrite.
-    let stale =
-        vec![mk_event(Op::Update, json!({"id": 1, "amount": "99.99"}), json!(null), 5)];
+    let stale = vec![mk_event(
+        Op::Update,
+        json!({"id": 1, "amount": "99.99"}),
+        json!(null),
+        5,
+    )];
     sink.send_batch(&stale).await.unwrap();
 
     // A newer update at version 20 applies.
-    let newer =
-        vec![mk_event(Op::Update, json!({"id": 1, "amount": "20.50"}), json!(null), 20)];
+    let newer = vec![mk_event(
+        Op::Update,
+        json!({"id": 1, "amount": "20.50"}),
+        json!(null),
+        20,
+    )];
     sink.send_batch(&newer).await.unwrap();
     refresh(&base, index).await;
 
@@ -286,16 +314,30 @@ async fn per_document_error_routes_to_dlq() {
     // Row 0: amount "abc" cannot map to integer -> per-doc failure -> DLQ.
     // Row 1: amount 5 is fine -> lands.
     let batch = vec![
-        mk_event(Op::Create, json!({"id": 1, "amount": "abc"}), json!(null), 1),
+        mk_event(
+            Op::Create,
+            json!({"id": 1, "amount": "abc"}),
+            json!(null),
+            1,
+        ),
         mk_event(Op::Create, json!({"id": 2, "amount": 5}), json!(null), 2),
     ];
     let res = sink.send_batch(&batch).await.unwrap();
-    assert_eq!(res.dlq_failures.len(), 1, "one row to DLQ: {:?}", res.dlq_failures);
+    assert_eq!(
+        res.dlq_failures.len(),
+        1,
+        "one row to DLQ: {:?}",
+        res.dlq_failures
+    );
     assert_eq!(res.dlq_failures[0].0, 0, "row 0 failed");
     refresh(&base, index).await;
 
     let (status_good, _b) = es_get(&base, &format!("/{index}/_doc/2")).await;
-    assert_eq!(status_good, reqwest::StatusCode::OK, "row 1 must have landed");
+    assert_eq!(
+        status_good,
+        reqwest::StatusCode::OK,
+        "row 1 must have landed"
+    );
     let (status_bad, _b) = es_get(&base, &format!("/{index}/_doc/1")).await;
     assert_eq!(
         status_bad,

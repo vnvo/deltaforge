@@ -61,7 +61,10 @@ impl ElasticsearchClient {
     }
 
     /// Apply the configured auth to a request builder.
-    fn with_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn with_auth(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
         match &self.auth {
             Some(EsAuth::Basic { username, password }) => {
                 req.basic_auth(username, Some(password))
@@ -77,8 +80,11 @@ impl ElasticsearchClient {
     fn send_err(&self, e: reqwest::Error) -> SinkError {
         if e.is_timeout() {
             SinkError::Backpressure {
-                details: format!("elasticsearch request timeout after {:?}", self.timeout)
-                    .into(),
+                details: format!(
+                    "elasticsearch request timeout after {:?}",
+                    self.timeout
+                )
+                .into(),
             }
         } else if e.is_connect() {
             SinkError::Connect {
@@ -93,13 +99,15 @@ impl ElasticsearchClient {
     fn status_err(code: reqwest::StatusCode, text: String) -> SinkError {
         use reqwest::StatusCode as S;
         match code {
-            S::UNAUTHORIZED | S::FORBIDDEN => SinkError::Auth { details: text.into() },
+            S::UNAUTHORIZED | S::FORBIDDEN => SinkError::Auth {
+                details: text.into(),
+            },
             // Overloaded / unavailable → retry the whole batch.
-            S::TOO_MANY_REQUESTS | S::SERVICE_UNAVAILABLE | S::GATEWAY_TIMEOUT => {
-                SinkError::Backpressure {
-                    details: format!("elasticsearch {code}: {text}").into(),
-                }
-            }
+            S::TOO_MANY_REQUESTS
+            | S::SERVICE_UNAVAILABLE
+            | S::GATEWAY_TIMEOUT => SinkError::Backpressure {
+                details: format!("elasticsearch {code}: {text}").into(),
+            },
             _ => SinkError::Io(std::io::Error::other(format!(
                 "elasticsearch {code}: {text}"
             ))),
@@ -115,7 +123,11 @@ impl EsTransport for ElasticsearchClient {
             .post(self.bulk_url())
             .header("Content-Type", "application/x-ndjson")
             .body(body);
-        let resp = self.with_auth(req).send().await.map_err(|e| self.send_err(e))?;
+        let resp = self
+            .with_auth(req)
+            .send()
+            .await
+            .map_err(|e| self.send_err(e))?;
         let code = resp.status();
         if code.is_success() {
             let bytes = resp.bytes().await.map_err(|e| self.send_err(e))?;
@@ -132,7 +144,11 @@ impl EsTransport for ElasticsearchClient {
     ) -> Result<(), SinkError> {
         let body = json!({ "mappings": mapping });
         let req = self.http.put(self.index_url(index)).json(&body);
-        let resp = self.with_auth(req).send().await.map_err(|e| self.send_err(e))?;
+        let resp = self
+            .with_auth(req)
+            .send()
+            .await
+            .map_err(|e| self.send_err(e))?;
         let code = resp.status();
         if code.is_success() {
             return Ok(());

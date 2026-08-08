@@ -85,8 +85,16 @@ mod tests {
 
     #[test]
     fn delete_uses_before_body() {
-        let e =
-            mk_event(Op::Delete, json!(null), json!({"id": 9}), "d", None, "t", 1, None);
+        let e = mk_event(
+            Op::Delete,
+            json!(null),
+            json!({"id": 9}),
+            "d",
+            None,
+            "t",
+            1,
+            None,
+        );
         assert_eq!(derive_id(&e, &[], &["id".into()], "_").unwrap(), "9");
     }
 

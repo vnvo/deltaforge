@@ -1440,10 +1440,7 @@ mod tests {
                 assert_eq!(c.index, "cdc-{db}.{table}");
                 assert!(c.auto_create_index, "auto_create_index defaults true");
                 assert_eq!(c.id_separator, "_", "id_separator defaults _");
-                assert_eq!(
-                    c.version_source,
-                    EsVersionSource::SourcePosition
-                );
+                assert_eq!(c.version_source, EsVersionSource::SourcePosition);
                 assert!(matches!(c.auth, Some(EsAuth::Basic { .. })));
             }
             other => panic!("expected Elasticsearch, got {other:?}"),
