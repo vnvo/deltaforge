@@ -40,6 +40,7 @@ use deltaforge_core::encoding::avro::SourceSchemaProvider;
 use tokio_util::sync::CancellationToken;
 
 pub mod clickhouse;
+pub mod elasticsearch;
 pub mod filter;
 pub mod http;
 pub mod kafka;
@@ -174,6 +175,13 @@ pub fn build_sinks_with_schemas(
                     // v1: ClickHouse sink does not support sink-level filters.
                     None,
                 ),
+                // Scaffold: replaced with the real arm in "register elasticsearch
+                // sink in build_sinks" once build_elasticsearch_sink exists.
+                SinkCfg::Elasticsearch(_) => {
+                    return Err(anyhow::anyhow!(
+                        "elasticsearch sink not yet wired"
+                    ));
+                }
             };
             // Only wrap when filter has actual conditions — zero overhead otherwise
             let sink = match filter {
@@ -220,6 +228,9 @@ pub fn build_sink(
         SinkCfg::S3(s3_cfg) => {
             Arc::new(build_s3_sink(s3_cfg, cancel, pipeline, None)?)
                 as ArcDynSink
+        }
+        SinkCfg::Elasticsearch(_) => {
+            anyhow::bail!("elasticsearch sink not yet wired")
         }
         SinkCfg::ClickHouse(cfg) => Arc::new(clickhouse::build_clickhouse_sink(
             cfg, cancel, pipeline, None,
