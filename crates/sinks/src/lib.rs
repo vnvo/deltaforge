@@ -101,7 +101,7 @@ pub fn build_sinks(
     cancel: CancellationToken,
     pipeline: &str,
 ) -> anyhow::Result<Vec<ArcDynSink>> {
-    build_sinks_with_schemas(ps, cancel, pipeline, None, None, None)
+    build_sinks_with_schemas(ps, cancel, pipeline, None, None, None, None)
 }
 
 /// Build all sinks, optionally injecting a DDL-derived schema provider for
@@ -114,6 +114,7 @@ pub fn build_sinks_with_schemas(
     source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
     arrow_schema_resolver: Option<s3::SchemaResolver>,
     clickhouse_resolver: Option<clickhouse::ClickHouseSchemaResolver>,
+    es_resolver: Option<elasticsearch::EsSchemaResolver>,
 ) -> anyhow::Result<Vec<ArcDynSink>> {
     ps.spec
         .sinks
@@ -175,13 +176,16 @@ pub fn build_sinks_with_schemas(
                     // v1: ClickHouse sink does not support sink-level filters.
                     None,
                 ),
-                // Scaffold: replaced with the real arm in "register elasticsearch
-                // sink in build_sinks" once build_elasticsearch_sink exists.
-                SinkCfg::Elasticsearch(_) => {
-                    return Err(anyhow::anyhow!(
-                        "elasticsearch sink not yet wired"
-                    ));
-                }
+                SinkCfg::Elasticsearch(cfg) => (
+                    Arc::new(elasticsearch::build_elasticsearch_sink(
+                        cfg,
+                        cancel.clone(),
+                        pipeline,
+                        es_resolver.clone(),
+                    )?) as ArcDynSink,
+                    // v1: Elasticsearch sink does not support sink-level filters.
+                    None,
+                ),
             };
             // Only wrap when filter has actual conditions — zero overhead otherwise
             let sink = match filter {
@@ -229,8 +233,10 @@ pub fn build_sink(
             Arc::new(build_s3_sink(s3_cfg, cancel, pipeline, None)?)
                 as ArcDynSink
         }
-        SinkCfg::Elasticsearch(_) => {
-            anyhow::bail!("elasticsearch sink not yet wired")
+        SinkCfg::Elasticsearch(cfg) => {
+            Arc::new(elasticsearch::build_elasticsearch_sink(
+                cfg, cancel, pipeline, None,
+            )?) as ArcDynSink
         }
         SinkCfg::ClickHouse(cfg) => Arc::new(clickhouse::build_clickhouse_sink(
             cfg, cancel, pipeline, None,
@@ -263,5 +269,25 @@ mod tests {
             &str,
             Option<Arc<dyn SourceSchemaProvider>>,
         ) -> anyhow::Result<RedisSink> = RedisSink::new;
+    }
+
+    #[test]
+    fn build_sink_constructs_elasticsearch() {
+        use deltaforge_config::{ElasticsearchSinkCfg, EsVersionSource};
+        let cfg = SinkCfg::Elasticsearch(ElasticsearchSinkCfg {
+            id: "es1".into(),
+            url: "http://es:9200".into(),
+            index: "t".into(),
+            auto_create_index: false,
+            id_fields: vec!["id".into()],
+            id_separator: "_".into(),
+            version_source: EsVersionSource::SourcePosition,
+            auth: None,
+            tls: None,
+            send_timeout_secs: 30,
+            required: Some(true),
+        });
+        let sink = build_sink(&cfg, CancellationToken::new(), "p").unwrap();
+        assert_eq!(sink.id(), "es1");
     }
 }
