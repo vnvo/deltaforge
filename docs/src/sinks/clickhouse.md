@@ -98,12 +98,14 @@ source lacks a usable position (millisecond ties per key are undefined).
 ## Requirements
 
 The sink needs the **source table's column types + primary key** (RowBinary is
-positional and auto-create derives the DDL from them), so the schema must be in
-the registry. Enable a **snapshot** (`snapshot.mode: initial`) or **schema
-sensing** on the source — with `snapshot: never` *and* sensing off, the registry
-is empty and the sink can't project (unlike the S3 sink, which falls back to
-envelope-only). The v1 sink targets a **single table**; capture one source table
-per ClickHouse sink (not a wildcard).
+positional and auto-create derives the DDL from them). It loads these **on
+demand** the first time it sees a table: the schema resolver queries the source
+database's catalog (MySQL `INFORMATION_SCHEMA`, Postgres `pg_catalog`) and caches
+the result. So the sink works under **any snapshot mode**, including
+`snapshot: never` — no snapshot or schema sensing is required. The only
+prerequisite is that the source database is reachable and the table exists, which
+is already true for CDC. The v1 sink targets a **single table**; capture one
+source table per ClickHouse sink (not a wildcard).
 
 ## Auto table creation
 

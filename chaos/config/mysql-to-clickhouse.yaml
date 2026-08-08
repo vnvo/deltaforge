@@ -15,10 +15,11 @@ spec:
       tables:
         - "orders.customers"
       on_schema_drift: adapt
-      # The ClickHouse sink needs the source column types + PK (RowBinary is
-      # positional), so the schema must be in the registry. snapshot: initial
-      # loads + registers it (and backfills existing rows). Without a snapshot
-      # (or schema sensing) the registry is empty and the sink can't project.
+      # The ClickHouse sink loads the source column types + PK on demand (it
+      # queries INFORMATION_SCHEMA the first time it sees a table), so it does
+      # NOT need a snapshot for schema — snapshot: never works too. We keep
+      # snapshot: initial here only to backfill existing rows so the scenario
+      # starts with data.
       snapshot:
         mode: initial
 

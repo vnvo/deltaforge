@@ -161,6 +161,7 @@ async fn mysql_schema_loader() -> Result<()> {
         r#"CREATE TABLE orders (
             id INT PRIMARY KEY,
             sku VARCHAR(64),
+            amount DECIMAL(12,2),
             payload JSON,
             blobz BLOB
         )"#,
@@ -185,10 +186,10 @@ async fn mysql_schema_loader() -> Result<()> {
         let loaded = schema_loader.load_schema(&db_name, "orders").await?;
         let schema = &loaded.schema;
 
-        assert_eq!(schema.columns.len(), 4);
+        assert_eq!(schema.columns.len(), 5);
         assert_eq!(
             schema.column_names(),
-            vec!["id", "sku", "payload", "blobz"]
+            vec!["id", "sku", "amount", "payload", "blobz"]
         );
         assert_eq!(schema.primary_key, vec!["id".to_string()]);
 
@@ -200,6 +201,15 @@ async fn mysql_schema_loader() -> Result<()> {
         assert_eq!(sku_col.data_type, "varchar");
         assert!(sku_col.nullable);
         assert_eq!(sku_col.char_max_length, Some(64));
+
+        // DECIMAL(12,2): the loader reads NUMERIC_PRECISION/NUMERIC_SCALE from
+        // INFORMATION_SCHEMA on demand — no snapshot required. Downstream sinks
+        // (e.g. ClickHouse) rely on these being populated so they map to an
+        // exact Decimal(p,s) rather than falling back to a default scale.
+        let amount_col = schema.column("amount").expect("amount column");
+        assert_eq!(amount_col.data_type, "decimal");
+        assert_eq!(amount_col.numeric_precision, Some(12));
+        assert_eq!(amount_col.numeric_scale, Some(2));
 
         info!("✓ load_schema returns correct columns");
     }
@@ -260,7 +270,7 @@ async fn mysql_schema_loader() -> Result<()> {
         let reloaded = schema_loader.reload_schema(&db_name, "orders").await?;
 
         assert_ne!(fp_before, reloaded.fingerprint);
-        assert_eq!(reloaded.schema.columns.len(), 5);
+        assert_eq!(reloaded.schema.columns.len(), 6);
         assert!(reloaded.schema.column("notes").is_some());
 
         let versions = registry.list_versions("acme", &db_name, "orders");
