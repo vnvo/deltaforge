@@ -35,3 +35,6 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           coveralls-token: ${{ secrets.COVERALLS_TOKEN }}
           path-to-lcov: lcov.info
+          # Don't fail the build if the Coveralls upload errors (e.g. a 503
+          # "queue full" outage). Coverage generation already succeeded.
+          fail-on-error: false
