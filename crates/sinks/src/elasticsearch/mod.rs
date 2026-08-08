@@ -4,6 +4,7 @@
 //! Modules are added task-by-task per `docs/specs/elasticsearch-sink-plan.md`.
 
 pub mod id;
+pub mod index;
 pub mod mapping;
 
 #[cfg(test)]
