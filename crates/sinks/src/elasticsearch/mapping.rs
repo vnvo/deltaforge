@@ -26,8 +26,18 @@ pub fn es_field_type(c: &ColDesc) -> Value {
         "float" | "double" | "real" => json!({"type": "double"}),
         "decimal" | "numeric" => {
             // scaling_factor = 10^scale keeps `scaled_float` exact for the
-            // declared scale (e.g. decimal(12,2) -> factor 100).
-            let scale = c.scale.unwrap_or(0).max(0) as u32;
+            // declared scale (e.g. decimal(12,2) -> factor 100). Prefer the
+            // numeric metadata; fall back to parsing the type string, since some
+            // loaders (and Postgres) leave `scale` unset but carry it in
+            // `full_type` — without this a decimal collapses to factor 1.
+            let scale = c
+                .scale
+                .map(|s| s.max(0) as u32)
+                .or_else(|| {
+                    crate::clickhouse::types::parse_decimal_str(&c.full_type)
+                        .map(|(_, s)| s)
+                })
+                .unwrap_or(0);
             let factor = 10f64.powi(scale as i32);
             json!({"type": "scaled_float", "scaling_factor": factor})
         }
@@ -77,6 +87,17 @@ mod tests {
             scale: Some(2),
             ..col("amount", "decimal", "decimal(12,2)")
         };
+        assert_eq!(
+            es_field_type(&c),
+            json!({"type": "scaled_float", "scaling_factor": 100.0})
+        );
+    }
+
+    #[test]
+    fn decimal_scale_parsed_from_type_when_metadata_missing() {
+        // Mirrors the real loader path where scale is unset but the type string
+        // carries it — must not collapse to scaling_factor 1.
+        let c = col("amount", "decimal", "decimal(12,2)");
         assert_eq!(
             es_field_type(&c),
             json!({"type": "scaled_float", "scaling_factor": 100.0})
