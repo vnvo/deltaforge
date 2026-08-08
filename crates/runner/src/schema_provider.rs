@@ -521,6 +521,16 @@ pub fn build_clickhouse_schema_resolver(
     })
 }
 
+/// Build an `EsSchemaResolver` for the Elasticsearch sink. It needs the same
+/// source columns + primary key (types drive the generated index mapping, the
+/// PK drives `_id`), so it reuses the ClickHouse resolver — both alias the same
+/// `TableColumns` closure type.
+pub fn build_elasticsearch_schema_resolver(
+    schema_provider: ArcSchemaProvider,
+) -> sinks::elasticsearch::EsSchemaResolver {
+    build_clickhouse_schema_resolver(schema_provider)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

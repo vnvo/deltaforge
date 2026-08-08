@@ -226,6 +226,7 @@ fn format_pipeline_summary(ps: &deltaforge_config::PipelineSpec) -> String {
                 deltaforge_config::SinkCfg::Http(_) => "http",
                 deltaforge_config::SinkCfg::S3(_) => "s3",
                 deltaforge_config::SinkCfg::ClickHouse(_) => "clickhouse",
+                deltaforge_config::SinkCfg::Elasticsearch(_) => "elasticsearch",
             };
             format!("{kind}:{}", s.sink_id())
         })
