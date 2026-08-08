@@ -6,6 +6,7 @@
 pub mod id;
 pub mod index;
 pub mod mapping;
+pub mod version;
 
 #[cfg(test)]
 pub(crate) mod test_support;
