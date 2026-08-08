@@ -17,6 +17,7 @@
     - [HTTP/Webhook](sinks/http.md)
     - [S3 (Parquet / JSON Lines)](sinks/s3.md)
     - [ClickHouse](sinks/clickhouse.md)
+    - [Elasticsearch](sinks/elasticsearch.md)
 - [Envelopes and Encodings](envelopes.md)
 - [Dynamic Routing](routing.md)
 - [Outbox Pattern Support](outbox.md)
