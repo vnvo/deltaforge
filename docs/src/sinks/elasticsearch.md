@@ -121,3 +121,33 @@ demand** the first time it sees a table (querying the source catalog — MySQL
 `INFORMATION_SCHEMA`, Postgres `pg_catalog`) and caches them, so it works under
 **any snapshot mode**, including `snapshot: never`. If you set `id_fields`
 explicitly *and* `auto_create_index: false`, no schema lookup is needed at all.
+
+## Examples
+
+**Elastic Cloud — API-key auth, one fixed index, explicit `_id`:**
+
+```yaml
+sinks:
+  - type: elasticsearch
+    config:
+      id: es-customers
+      url: "https://my-cluster.es.cloud:9243"
+      index: customers               # static index (no placeholders)
+      id_fields: [customer_id]       # override the source PK
+      auth:
+        type: api_key
+        api_key: "${ES_API_KEY}"
+```
+
+**Self-hosted / dev — no auth, one index per source table:**
+
+```yaml
+sinks:
+  - type: elasticsearch
+    config:
+      id: es-dev
+      url: "http://elasticsearch:9200"
+      index: "cdc-{db}.{table}"      # per-table indices
+      auth:
+        type: none
+```

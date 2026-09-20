@@ -126,3 +126,34 @@ Set `auto_create: false` to require a pre-created table (locked-down setups).
 | `varchar` / `text` / `json` / other | `String` |
 
 Nullable source columns map to `Nullable(T)`. JSON is stored as text in v1.
+
+## Examples
+
+**Self-hosted — change-log (audit) table over plain HTTP, auto-created:**
+
+```yaml
+sinks:
+  - type: clickhouse
+    config:
+      id: ch-audit
+      url: "http://clickhouse:8123"
+      database: analytics
+      table: orders_changelog
+      mode: changelog                # MergeTree: retains every change
+```
+
+**Current-state mirror into a pre-created `ReplacingMergeTree`:**
+
+```yaml
+sinks:
+  - type: clickhouse
+    config:
+      id: ch-orders-current
+      url: "https://clickhouse:8443"
+      database: analytics
+      table: orders
+      mode: upsert
+      user: cdc
+      password: "${CLICKHOUSE_PASSWORD}"
+      auto_create: false             # operator pre-creates the table
+```
