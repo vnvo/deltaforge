@@ -42,8 +42,21 @@ pub fn es_field_type(c: &ColDesc) -> Value {
             json!({"type": "scaled_float", "scaling_factor": factor})
         }
         "date" | "datetime" | "timestamp" | "timestamptz" => {
-            json!({"type": "date"})
+            // Accept both encodings the source produces: converted epoch millis
+            // (binlog TIMESTAMP, normalized) and ISO / MySQL datetime strings
+            // (snapshot + binlog DATETIME).
+            json!({
+                "type": "date",
+                "format": "epoch_millis||strict_date_optional_time||\
+                           yyyy-MM-dd HH:mm:ss||yyyy-MM-dd HH:mm:ss.SSSSSS||\
+                           yyyy-MM-dd"
+            })
         }
+        // TIME is a duration, not a point in time — keep it as an exact keyword.
+        "time" => json!({"type": "keyword"}),
+        // Binary/BLOB columns arrive base64-encoded; ES `binary` stores base64.
+        "blob" | "tinyblob" | "mediumblob" | "longblob" | "binary"
+        | "varbinary" => json!({"type": "binary"}),
         "json" | "jsonb" => json!({"type": "flattened"}),
         // varchar/text/uuid/enum/other -> text with a keyword sub-field so both
         // full-text search and exact-match/aggregations work.
@@ -126,6 +139,24 @@ mod tests {
         let v = es_field_type(&col("name", "varchar", "varchar(255)"));
         assert_eq!(v["type"], "text");
         assert_eq!(v["fields"]["keyword"]["type"], "keyword");
+    }
+
+    #[test]
+    fn binary_time_and_date_format_mappings() {
+        assert_eq!(es_field_type(&col("b", "blob", "blob"))["type"], "binary");
+        assert_eq!(
+            es_field_type(&col("bin", "varbinary", "varbinary(16)"))["type"],
+            "binary"
+        );
+        assert_eq!(es_field_type(&col("t", "time", "time"))["type"], "keyword");
+        // date/datetime/timestamp carry a permissive format that includes
+        // epoch_millis (for the normalized numeric timestamp).
+        let ts = es_field_type(&col("ts", "timestamp", "timestamp"));
+        assert_eq!(ts["type"], "date");
+        assert!(
+            ts["format"].as_str().unwrap().contains("epoch_millis"),
+            "date format must accept epoch_millis: {ts}"
+        );
     }
 
     #[test]

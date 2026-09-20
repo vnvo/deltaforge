@@ -8,6 +8,7 @@ pub mod client;
 pub mod id;
 pub mod index;
 pub mod mapping;
+pub mod normalize;
 pub mod sink;
 pub mod version;
 

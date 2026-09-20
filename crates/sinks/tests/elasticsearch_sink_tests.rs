@@ -48,10 +48,45 @@ fn resolver() -> EsSchemaResolver {
                     precision: None,
                     scale: None,
                 },
+                // TEXT (binlog delivers it base64-wrapped), TIMESTAMP (binlog
+                // delivers integer microseconds), and BLOB — the real CDC value
+                // shapes that must be normalized to match the mapping.
+                ColDesc {
+                    name: "data".into(),
+                    data_type: "text".into(),
+                    full_type: "text".into(),
+                    nullable: true,
+                    unsigned: false,
+                    precision: None,
+                    scale: None,
+                },
+                ColDesc {
+                    name: "created_at".into(),
+                    data_type: "timestamp".into(),
+                    full_type: "timestamp".into(),
+                    nullable: true,
+                    unsigned: false,
+                    precision: None,
+                    scale: None,
+                },
+                ColDesc {
+                    name: "blobby".into(),
+                    data_type: "blob".into(),
+                    full_type: "blob".into(),
+                    nullable: true,
+                    unsigned: false,
+                    precision: None,
+                    scale: None,
+                },
             ],
             primary_key: vec!["id".into()],
         })
     })
+}
+
+fn b64(s: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(s.as_bytes())
 }
 
 fn cfg(url: &str, index: &str, auto_create: bool) -> ElasticsearchSinkCfg {
@@ -222,6 +257,68 @@ async fn upsert_delete_and_typed_mapping() {
         reqwest::StatusCode::NOT_FOUND,
         "id=2 must not exist"
     );
+}
+
+#[tokio::test]
+#[ignore]
+async fn real_cdc_value_shapes_land_and_map_correctly() {
+    // Regression guard for the DLQ-everything bug: real MySQL CDC payloads carry
+    // base64-wrapped TEXT/BLOB and microsecond TIMESTAMP integers, which ES
+    // rejected against the generated text/date mappings. Feed those exact shapes
+    // and assert the documents actually land, decoded/typed correctly.
+    let (_c, base) = start_elasticsearch().await;
+    let index = "orders_shapes";
+    let sink = build_elasticsearch_sink(
+        &cfg(&base, index, true),
+        CancellationToken::new(),
+        "p",
+        Some(resolver()),
+    )
+    .unwrap();
+
+    let batch = vec![mk_event(
+        Op::Create,
+        json!({
+            "id": 1,
+            "amount": "20.50",
+            "data": { "_base64": b64("backlog-hello") },   // TEXT via binlog
+            "created_at": 1789934706000000i64,              // TIMESTAMP micros
+            "blobby": { "_base64": b64("\u{0}\u{1}raw") },  // BLOB
+        }),
+        json!(null),
+        1,
+    )];
+    let res = sink.send_batch(&batch).await.unwrap();
+    assert!(
+        res.dlq_failures.is_empty(),
+        "must not DLQ: {:?}",
+        res.dlq_failures
+    );
+    refresh(&base, index).await;
+
+    // Document landed with decoded text and a normalized timestamp.
+    let (status, doc) = es_get(&base, &format!("/{index}/_doc/1")).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "doc must land: {doc}");
+    let d: Value = serde_json::from_str(&doc).unwrap();
+    assert_eq!(d["_source"]["data"], json!("backlog-hello"), "text decoded");
+    assert_eq!(
+        d["_source"]["blobby"],
+        json!(b64("\u{0}\u{1}raw")),
+        "blob b64"
+    );
+    assert_eq!(
+        d["_source"]["created_at"].as_i64().unwrap(),
+        1789934706000i64,
+        "timestamp micros normalized to millis"
+    );
+
+    // Mapping is correctly typed for the new columns.
+    let (_s, mapping) = es_get(&base, &format!("/{index}/_mapping")).await;
+    let m: Value = serde_json::from_str(&mapping).unwrap();
+    let props = &m[index]["mappings"]["properties"];
+    assert_eq!(props["data"]["type"], "text");
+    assert_eq!(props["blobby"]["type"], "binary");
+    assert_eq!(props["created_at"]["type"], "date");
 }
 
 #[tokio::test]

@@ -23,6 +23,7 @@ use super::client::{ElasticsearchClient, EsTransport};
 use super::id::derive_id;
 use super::index::render_index;
 use super::mapping::build_mapping;
+use super::normalize::normalize_doc;
 use super::version::derive_es_version;
 use crate::clickhouse::types::ColDesc;
 
@@ -160,8 +161,11 @@ impl Sink for ElasticsearchSink {
             let doc = if ev.op == Op::Delete {
                 None
             } else {
-                match ev.after.clone() {
-                    Some(d) => Some(d),
+                match ev.after.as_ref() {
+                    // Normalize source value shapes (base64-wrapped binary/text,
+                    // microsecond timestamps) to what the generated mapping and
+                    // Elasticsearch accept.
+                    Some(d) => Some(normalize_doc(&tc.columns, d)),
                     None => {
                         dlq.push((
                             i,
