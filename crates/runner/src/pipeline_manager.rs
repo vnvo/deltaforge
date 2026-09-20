@@ -677,6 +677,15 @@ impl PipelineManager {
             return Err(PipelineAPIError::AlreadyExists(name));
         }
 
+        // Reject impossible commit-policy configurations up front (e.g. a
+        // quorum larger than the sink count) so the operator gets an actionable
+        // error instead of a pipeline that can never commit a checkpoint.
+        crate::coordinator::validate_commit_policy(
+            &spec.spec.commit_policy,
+            spec.spec.sinks.len(),
+        )
+        .map_err(|e| PipelineAPIError::Failed(anyhow::anyhow!(e)))?;
+
         let runtime = self
             .spawn_pipeline(spec)
             .await

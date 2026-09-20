@@ -123,15 +123,41 @@ async fn send_to_delivery(
 
 fn policy_satisfied(
     policy: &Option<CommitPolicy>,
+    total_sinks: usize,
     required_total: usize,
     required_acks: usize,
     total_acks: usize,
 ) -> bool {
     match policy.as_ref().unwrap_or(&CommitPolicy::Required) {
-        CommitPolicy::All => total_acks == required_total,
+        // `All` means *every* sink acked — required and optional alike. It must
+        // compare against the total sink count, not the required count (else a
+        // pipeline with any optional sink could never satisfy `All`, and a
+        // *failed* optional sink would spuriously satisfy it).
+        CommitPolicy::All => total_acks == total_sinks,
         CommitPolicy::Required => required_acks == required_total,
         CommitPolicy::Quorum { quorum } => total_acks >= *quorum,
     }
+}
+
+/// Validate a commit policy against the number of sinks in the pipeline.
+/// Rejects impossible quorum configurations before the pipeline starts, so an
+/// operator gets an actionable error instead of a pipeline that can never
+/// commit.
+pub fn validate_commit_policy(
+    policy: &Option<CommitPolicy>,
+    sink_count: usize,
+) -> Result<(), String> {
+    if let Some(CommitPolicy::Quorum { quorum }) = policy.as_ref() {
+        if *quorum == 0 {
+            return Err("commit_policy quorum must be >= 1".to_string());
+        }
+        if *quorum > sink_count {
+            return Err(format!(
+                "commit_policy quorum {quorum} exceeds sink count {sink_count}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn is_sink_required(sink: &ArcDynSink) -> bool {
@@ -1045,6 +1071,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         // checkpoints while the required sink is behind.
         if !policy_satisfied(
             &self.commit_policy,
+            self.sinks.len(),
             required_total,
             required_acks,
             total_acks,
@@ -1390,21 +1417,58 @@ mod tests {
 
     #[test]
     fn policy_satisfied_covers_each_variant() {
-        use deltaforge_config::CommitPolicy;
-        // Default (None) behaves as Required: required_acks == required_total.
-        assert!(policy_satisfied(&None, 2, 2, 5));
-        assert!(!policy_satisfied(&None, 2, 1, 5));
-        // Required: only required-sink acks count.
-        assert!(policy_satisfied(&Some(CommitPolicy::Required), 3, 3, 3));
-        assert!(!policy_satisfied(&Some(CommitPolicy::Required), 3, 2, 9));
-        // All: total_acks must equal required_total (== not !=).
-        assert!(policy_satisfied(&Some(CommitPolicy::All), 4, 4, 4));
-        assert!(!policy_satisfied(&Some(CommitPolicy::All), 4, 4, 3));
-        // Quorum: total_acks >= quorum (>= not <).
+        // signature: (policy, total_sinks, required_total, required_acks, total_acks)
+        // Default (Required): all required sinks must ack.
+        assert!(policy_satisfied(&None, 5, 2, 2, 5));
+        assert!(!policy_satisfied(&None, 5, 2, 1, 5));
+        // Required
+        assert!(policy_satisfied(&Some(CommitPolicy::Required), 3, 3, 3, 3));
+        assert!(!policy_satisfied(&Some(CommitPolicy::Required), 9, 3, 2, 9));
+        // All: every sink (required + optional) must ack.
+        assert!(policy_satisfied(&Some(CommitPolicy::All), 4, 2, 2, 4));
+        assert!(!policy_satisfied(&Some(CommitPolicy::All), 4, 2, 2, 3));
+        // Quorum
         let q = Some(CommitPolicy::Quorum { quorum: 2 });
-        assert!(policy_satisfied(&q, 5, 0, 2));
-        assert!(policy_satisfied(&q, 5, 0, 3));
-        assert!(!policy_satisfied(&q, 5, 0, 1));
+        assert!(policy_satisfied(&q, 5, 0, 0, 2));
+        assert!(!policy_satisfied(&q, 5, 0, 0, 1));
+    }
+
+    #[test]
+    fn all_policy_requires_every_sink_including_optional() {
+        // 1 required + 1 optional (total_sinks=2, required_total=1).
+        // Both ack → satisfied.
+        assert!(policy_satisfied(&Some(CommitPolicy::All), 2, 1, 1, 2));
+        // Optional sink fails (total_acks=1): must NOT be satisfied. Regression
+        // guard — the old code compared total_acks to required_total (1) and
+        // spuriously passed here.
+        assert!(!policy_satisfied(&Some(CommitPolicy::All), 2, 1, 1, 1));
+    }
+
+    #[test]
+    fn validate_commit_policy_rejects_impossible_quorum() {
+        assert!(
+            validate_commit_policy(
+                &Some(CommitPolicy::Quorum { quorum: 0 }),
+                3
+            )
+            .is_err()
+        );
+        assert!(
+            validate_commit_policy(
+                &Some(CommitPolicy::Quorum { quorum: 4 }),
+                3
+            )
+            .is_err()
+        );
+        assert!(
+            validate_commit_policy(
+                &Some(CommitPolicy::Quorum { quorum: 2 }),
+                3
+            )
+            .is_ok()
+        );
+        assert!(validate_commit_policy(&Some(CommitPolicy::All), 3).is_ok());
+        assert!(validate_commit_policy(&None, 0).is_ok());
     }
 
     // ── Per-sink commit tests ────────────────────────────────────────────
