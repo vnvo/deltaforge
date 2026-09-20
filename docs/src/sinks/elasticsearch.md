@@ -31,7 +31,7 @@ sinks:
 | `id_separator` | no | `_` | Separator joining composite `_id` values |
 | `version_source` | no | `source_position` | External `version`: `source_position` (LSN/binlog) or `ts_ms` |
 | `auth` | no | none | `basic` (`username`/`password`) or `api_key` (`api_key`); `${ENV}` supported |
-| `tls.enabled` | no | `true` | TLS for `https://` endpoints |
+| `tls.enabled` | no | `true` | Accepted for parity; TLS is active whenever `url` is `https://` |
 | `tls.ca_file` | no | — | PEM CA bundle for a private CA |
 | `tls.insecure_skip_verify` | no | `false` | Skip certificate verification |
 | `send_timeout_secs` | no | `30` | Per-`_bulk` timeout (timeouts → backpressure) |
@@ -49,9 +49,10 @@ Each batch is sent as **one `_bulk` request**:
 ### Document `_id`
 
 `_id` is built from `id_fields` if set, otherwise from the source table's
-**primary key**, joined by `id_separator`. A table with no primary key and no
-`id_fields` is rejected at startup — the sink never falls back to an
-auto-generated id (which would silently break upsert and delete).
+**primary key**, joined by `id_separator`. Rows from a table with no primary key
+and no `id_fields` are routed to the **DLQ** (a per-row serialization failure) —
+the sink never falls back to an auto-generated id, which would silently break
+upsert and delete.
 
 ### Index naming
 
@@ -75,9 +76,24 @@ Elasticsearch dynamic mapping (decimals → `float`, dates → `text`). Set
 | `decimal(p,s)` | `scaled_float` (`scaling_factor = 10^s`) |
 | `float` / `double` | `double` |
 | `boolean` | `boolean` |
-| `date` / `datetime` / `timestamp` | `date` |
+| `date` / `datetime` / `timestamp` | `date` (format accepts epoch millis + ISO/MySQL strings) |
+| `time` | `keyword` (a duration, not a point in time) |
+| `blob` / `binary` / `varbinary` | `binary` (base64) |
 | `json` | `flattened` |
 | `varchar` / `text` / other | `text` with a `keyword` sub-field |
+
+### Value handling
+
+Source column values are normalized to match these mappings before indexing, so
+real CDC payloads land correctly regardless of source path:
+
+- **TEXT/BLOB** arrive base64-wrapped from the MySQL binlog (`{"_base64": …}`).
+  Character columns are decoded to UTF-8 text; binary columns keep the base64
+  string and map to an ES `binary` field.
+- **`TIMESTAMP`** arrives as epoch **microseconds** and is converted to
+  `epoch_millis`; string temporals (snapshot ISO-8601, binlog `DATETIME`) pass
+  through and are parsed by the `date` field's format list.
+- **`DECIMAL`** arrives as a string and is stored exactly via `scaled_float`.
 
 ## Delivery guarantees
 
