@@ -21,7 +21,7 @@
   <a href="https://coveralls.io/github/vnvo/deltaforge?branch=main">
     <img src="https://coveralls.io/repos/github/vnvo/deltaforge/badge.svg?branch=main" alt="Coverage Status">
   </a>
-  <img src="https://img.shields.io/badge/rustc-1.89+-orange.svg" alt="MSRV">
+  <img src="https://img.shields.io/badge/rustc-1.91+-orange.svg" alt="MSRV">
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License">
 </p>
 
@@ -242,7 +242,7 @@ Run it by mounting your pipeline specs (environment variables are expanded insid
 docker run --rm \
   -p 8080:8080 -p 9000:9000 \
   -v $(pwd)/examples/dev.yaml:/etc/deltaforge/pipelines.yaml:ro \
-  -v deltaforge-checkpoints:/app/data \
+  -v deltaforge-data:/data \
   deltaforge:local \
   --config /etc/deltaforge/pipelines.yaml
 ```
@@ -258,12 +258,14 @@ docker run --rm \
   -e MYSQL_DSN="mysql://user:pass@host:3306/db" \
   -e KAFKA_BROKERS="kafka:9092" \
   -v $(pwd)/pipeline.yaml:/etc/deltaforge/pipeline.yaml:ro \
-  -v deltaforge-checkpoints:/app/data \
+  -v deltaforge-data:/data \
   ghcr.io/vnvo/deltaforge:latest \
   --config /etc/deltaforge/pipeline.yaml
 ```
 
-The container runs as a non-root user, writes checkpoints to `/app/data/df_checkpoints.json`, and listens on `0.0.0.0:8080` for the control plane API with metrics served on `:9000`.
+The container persists state to a SQLite database at `./data/deltaforge.db` by default — override with `--storage-backend` / `--storage-path`. In the published (`scratch`-based) image the working directory is `/`, so that path resolves to `/data/deltaforge.db`; mount a volume at `/data` to persist state across restarts. The control-plane API listens on `0.0.0.0:8080` and metrics on `:9000`.
+
+> **Note:** the published production image currently runs as **root**. Run it with a read-only root filesystem and a dropped capability set, or use your orchestrator's `runAsUser`, until the non-root image variant lands.
 
 
 ## Architecture Highlights

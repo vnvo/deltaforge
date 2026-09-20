@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.1.0-beta.10] - 2026-09-21
+
 ### Added
 
 - **Elasticsearch sink** (`type: elasticsearch`) — streams CDC into Elasticsearch over the HTTP `_bulk` API as a **current-state mirror**. Upsert by primary key (`_id` from the source PK, or configurable `id_fields`) with `version_type=external` keyed on the source LSN/binlog position, so retries and out-of-order batches converge to the source's current state; a `409 version_conflict` is treated as already-superseded (success), not a failure. Deletes remove the document. **Per-table index templating** (`index: "cdc-{db}.{table}"`) — one sink spans many indices. **Explicit index mapping generated from the source schema** (`auto_create_index: true` default): decimals → `scaled_float`, dates → `date`, json → `flattened`, strings → `text`+`keyword` — avoiding dynamic-mapping mistypes. Basic and API-key auth + TLS. **Source value normalization** so real MySQL CDC payloads land: base64-wrapped TEXT/BLOB (`{"_base64":…}`) is decoded to text or kept as ES `binary`, and microsecond `TIMESTAMP` integers are converted to `epoch_millis` — matching the generated `date`/`binary` mappings (binlog and snapshot encodings both handled). Delivery is at-least-once and idempotent; per-row DLQ isolation; reuses the existing sink scaffolding, batching, and metrics. Unit + live testcontainers integration tests (incl. real base64/µs-timestamp shapes). Docs at `docs/src/sinks/elasticsearch.md`.
@@ -546,7 +548,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Links
 
-- [Unreleased]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.9...HEAD
+- [Unreleased]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.10...HEAD
+- [0.1.0-beta.10]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.9...v0.1.0-beta.10
 - [0.1.0-beta.9]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.8...v0.1.0-beta.9
 - [0.1.0-beta.8]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.7...v0.1.0-beta.8
 - [0.1.0-beta.7]: https://github.com/vnvo/deltaforge/compare/v0.1.0-beta.6...v0.1.0-beta.7
