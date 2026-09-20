@@ -399,6 +399,7 @@ select:focus,input:focus{outline:none;border-color:var(--blue)}
             <optgroup label="Benchmarks">
               <option value="backlog-drain">Backlog Drain — Kafka (1 M row catch-up)</option>
               <option value="s3-backlog-drain">Backlog Drain — S3 (MySQL→S3 throughput)</option>
+              <option value="es-backlog-drain">Backlog Drain — Elasticsearch (MySQL→ES throughput)</option>
               <option value="tpcc">TPC-C (OLTP benchmark)</option>
             </optgroup>
             <optgroup label="Suite">
@@ -905,6 +906,7 @@ const SCENARIO_SOURCES = {
   's3-soak': ['mysql'],
   's3-outage': ['mysql'],
   's3-backlog-drain': ['mysql'],
+  'es-backlog-drain': ['mysql'],
   'sr-outage': ['mysql'],
   'ch-outage': ['mysql'],
   'pg-failover': ['postgres'],
@@ -930,7 +932,7 @@ function onScenarioChange() {
   const sc = document.getElementById('scenario-select').value;
   const needsDuration = sc === 'soak' || sc === 'soak-stable' || sc === 'tpcc' || sc === 's3-soak';
   const isSoak = sc === 'soak' || sc === 'soak-stable';
-  const isDrain = sc === 'backlog-drain' || sc === 's3-backlog-drain';
+  const isDrain = sc === 'backlog-drain' || sc === 's3-backlog-drain' || sc === 'es-backlog-drain';
   document.getElementById('duration-row').style.display = needsDuration ? '' : 'none';
   document.getElementById('writers-row').style.display = isSoak ? '' : 'none';
   document.getElementById('delay-row').style.display = isSoak ? '' : 'none';
@@ -938,9 +940,10 @@ function onScenarioChange() {
   ds.style.display = isDrain ? 'flex' : 'none';
   ds.style.flexDirection = isDrain ? 'column' : '';
   // The Kafka producer knobs only apply to the Kafka drain; hide them for the
-  // S3 drain (measured via the sink-agnostic metric, no rdkafka config).
+  // S3 / Elasticsearch drains (measured via the sink-agnostic metric, no
+  // rdkafka config).
   const kpanel = document.getElementById('drain-kafka-panel');
-  if (kpanel) kpanel.style.display = (sc === 's3-backlog-drain') ? 'none' : '';
+  if (kpanel) kpanel.style.display = (sc === 's3-backlog-drain' || sc === 'es-backlog-drain') ? 'none' : '';
   applyScenarioSourceConstraint(sc);
 }
 
@@ -1254,7 +1257,7 @@ async function startScenario() {
     duration_mins, writer_tasks, write_delay_ms, use_proxy: useProxy
   };
 
-  if (scenario === 'backlog-drain' || scenario === 's3-backlog-drain') {
+  if (scenario === 'backlog-drain' || scenario === 's3-backlog-drain' || scenario === 'es-backlog-drain') {
     body.drain_target = parseInt(document.getElementById('drain-target').value, 10);
     body.drain_writers = parseInt(document.getElementById('drain-writers').value, 10);
     body.drain_max_events = parseInt(document.getElementById('drain-max-events').value, 10);

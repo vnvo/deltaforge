@@ -141,6 +141,8 @@ enum Scenario {
     S3Outage,
     /// Backlog drain against the S3 sink — MySQL→S3 catch-up throughput.
     S3BacklogDrain,
+    /// Backlog drain against the Elasticsearch sink — MySQL→ES catch-up throughput.
+    EsBacklogDrain,
     /// ClickHouse outage via toxiproxy — verify backpressure and recovery.
     ChOutage,
     // MySQL-specific
@@ -191,6 +193,7 @@ fn meta_for_scenario(
         Scenario::S3Soak => "s3-soak",
         Scenario::S3Outage => "s3-outage",
         Scenario::S3BacklogDrain => "s3-backlog-drain",
+        Scenario::EsBacklogDrain => "es-backlog-drain",
         Scenario::ChOutage => "ch-outage",
         Scenario::Failover => "failover",
         Scenario::BinlogPurge => "binlog-purge",
@@ -563,6 +566,21 @@ async fn run_scenarios<B: backend::SourceBackend>(
             // Same drain flow as the Kafka benchmark, but measured via the
             // sink-agnostic delivered-events metric (S3 has no offsets), and
             // without the Kafka-only producer overrides.
+            let mut cfg = soak.drain_cfg.clone();
+            cfg.measure = scenarios::backlog_drain::DrainMeasure::SinkMetric;
+            cfg.kafka_client_conf.clear();
+            cfg.exactly_once = None;
+            results.push(
+                scenarios::backlog_drain::run_with_source(
+                    harness, &soak.src, cfg,
+                )
+                .await?,
+            );
+        }
+        Scenario::EsBacklogDrain => {
+            // Same drain flow as s3-backlog-drain: the sink-agnostic
+            // delivered-events metric (Elasticsearch has no offsets), no
+            // Kafka-only producer overrides.
             let mut cfg = soak.drain_cfg.clone();
             cfg.measure = scenarios::backlog_drain::DrainMeasure::SinkMetric;
             cfg.kafka_client_conf.clear();

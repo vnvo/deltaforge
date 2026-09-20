@@ -109,6 +109,7 @@ const MYSQL_KAFKA: &[&str] = &["base", "mysql-infra", "kafka-infra", "df"];
 const PG_KAFKA: &[&str] = &["base", "pg-infra", "kafka-infra", "df"];
 const MYSQL_S3: &[&str] = &["base", "mysql-infra", "s3-infra", "df"];
 const MYSQL_CLICKHOUSE: &[&str] = &["base", "mysql-infra", "ch-infra", "df"];
+const MYSQL_ELASTICSEARCH: &[&str] = &["base", "mysql-infra", "es-infra", "df"];
 #[allow(dead_code)]
 const PG_S3: &[&str] = &["base", "pg-infra", "s3-infra", "df"];
 
@@ -265,6 +266,17 @@ pub const REGISTRY: &[ScenarioMeta] = &[
         Benchmark,
         MYSQL_S3,
         &["benchmark", "throughput", "s3", "parquet"],
+    ),
+    meta(
+        "es-backlog-drain",
+        "Drains a large MySQL backlog to the Elasticsearch sink and measures \
+         catch-up throughput — the Elasticsearch analogue of backlog-drain. \
+         Completion is measured via DeltaForge's sink-agnostic delivered-events \
+         metric, so it needs no Kafka.",
+        "All preloaded rows land in Elasticsearch; reports avg/p50/peak events/s.",
+        Benchmark,
+        MYSQL_ELASTICSEARCH,
+        &["benchmark", "throughput", "elasticsearch"],
     ),
     meta(
         "tpcc",
