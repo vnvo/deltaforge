@@ -118,7 +118,7 @@ Output: `{"schema":null,"payload":{...}}`
 
 | Built with | Sources | Processors | Sinks | Encodings | Output Formats |
 |:---:|:---:|:---:|:---:|:---:|:---:|
-| Rust | MySQL · PostgreSQL | JavaScript · Outbox · Flatten · Filter | Kafka · Redis · NATS · HTTP · S3 · ClickHouse | JSON · Avro | Native · Debezium · CloudEvents |
+| Rust | MySQL · PostgreSQL | JavaScript · Outbox · Flatten · Filter | Kafka · Redis · NATS · HTTP · S3 · ClickHouse · Elasticsearch | JSON · Avro | Native · Debezium · CloudEvents |
 
 ## Features
 
@@ -170,6 +170,7 @@ Output: `{"schema":null,"payload":{...}}`
   - HTTP/Webhook sink — POST/PUT to any URL with custom headers, URL templates, batch mode
   - S3 / object-storage sink — Parquet or JSON Lines to any S3-compatible store (AWS S3, MinIO); Hive-partitioned by table + UTC date, atomic multipart-complete visibility, size/count/age file rolling, DDL-derived typed columns (native Decimal128, List/Map), per-row DLQ
   - ClickHouse sink — HTTP + RowBinary; change-log (`MergeTree`) or current-state upsert (`ReplacingMergeTree`) selected by target engine; auto table creation from source DDL; per-row DLQ
+  - Elasticsearch sink — HTTP `_bulk`; current-state mirror upserted by primary key with `version_type=external` (idempotent, order-correct replay); deletes remove docs; per-table index templating; explicit index mapping generated from source DDL (decimals → `scaled_float`, dates → `date`); basic / API-key auth + TLS; per-row DLQ
   - Dynamic routing: per-event topic/stream/subject/URL via templates or JavaScript
   - Configurable envelope formats: Native, Debezium, CloudEvents
   - JSON and Avro wire encoding (Avro with Confluent Schema Registry, DDL-derived type-accurate schemas)
