@@ -2177,3 +2177,353 @@ async fn pg_keyless_table_rejected_before_rows() -> Result<()> {
     pg_drop_db(&db).await;
     Ok(())
 }
+
+/// Restart midway through a snapshot resumes with the SAME generation, and the
+/// rows emitted before the interruption keep identical ids afterward.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_snapshot_resumes_midway_with_stable_ids() -> Result<()> {
+    let (db, client) = pg_setup("pg_snap_resume").await?;
+    client
+        .batch_execute(
+            "CREATE TABLE orders (id int PRIMARY KEY, sku text); \
+             INSERT INTO orders SELECT g, 'sku-'||g FROM generate_series(1,40) g;",
+        )
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
+        .await?;
+    create_pub_slot(
+        &client,
+        "pub_snap_resume",
+        "slot_snap_resume",
+        &["orders"],
+    )
+    .await?;
+
+    // Shared backend (generation) AND checkpoint store (table progress) so the
+    // second run genuinely resumes rather than starting fresh.
+    let backend = make_storage_backend().await;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let cfg = || deltaforge_config::SnapshotCfg {
+        mode: SnapshotMode::Initial,
+        chunk_size: 5,
+        ..Default::default()
+    };
+
+    // Run 1: interrupt after only a few rows (snapshot left incomplete).
+    let src1 = make_snap_source(
+        "pg-snap-resume",
+        &db,
+        "slot_snap_resume",
+        "pub_snap_resume",
+        vec!["public.orders".into()],
+        cfg(),
+        backend.clone(),
+        Default::default(),
+    )
+    .await;
+    let (tx1, mut rx1) = mpsc::channel(128);
+    let h1 = src1.run(tx1, ckpt.clone()).await;
+    let partial = collect_until(&mut rx1, Duration::from_secs(30), |e| {
+        e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 3
+    })
+    .await;
+    h1.stop();
+    h1.join().await.ok();
+    let before: std::collections::HashMap<_, _> = snap_reads(&partial)
+        .iter()
+        .filter_map(|e| {
+            let id = e.after.as_ref()?.get("id")?.as_i64()?;
+            Some((id, e.source.position.provisional_event_id?))
+        })
+        .collect();
+    assert!(!before.is_empty(), "run 1 emitted no snapshot rows");
+
+    // Run 2: resume to completion on the same backend + checkpoint store.
+    let src2 = make_snap_source(
+        "pg-snap-resume",
+        &db,
+        "slot_snap_resume",
+        "pub_snap_resume",
+        vec!["public.orders".into()],
+        cfg(),
+        backend.clone(),
+        Default::default(),
+    )
+    .await;
+    let (tx2, mut rx2) = mpsc::channel(256);
+    let h2 = src2.run(tx2, ckpt.clone()).await;
+    let full = collect_until(&mut rx2, Duration::from_secs(45), |e| {
+        e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 40
+    })
+    .await;
+    h2.stop();
+    h2.join().await.ok();
+
+    // Same generation across the interruption, and every pre-interruption row
+    // has an identical id in the resumed run.
+    for e in snap_reads(&partial).iter().chain(snap_reads(&full).iter()) {
+        assert_eq!(e.source.position.snapshot_generation, Some(1));
+    }
+    for e in snap_reads(&full) {
+        if let (Some(id), Some(new_id)) = (
+            e.after
+                .as_ref()
+                .and_then(|v| v.get("id"))
+                .and_then(|v| v.as_i64()),
+            e.source.position.provisional_event_id,
+        ) {
+            if let Some(old_id) = before.get(&id) {
+                assert_eq!(*old_id, new_id, "row {id} id changed after resume");
+            }
+        }
+    }
+
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+/// Temporal identities come from the binary wire form, so DateStyle / TimeZone
+/// session settings do not change the ids.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_temporal_ids_are_datestyle_timezone_invariant() -> Result<()> {
+    let (db, client) = pg_setup("pg_snap_temporal").await?;
+    client
+        .batch_execute(
+            "CREATE TABLE ev (ts timestamptz PRIMARY KEY, v text); \
+             INSERT INTO ev VALUES \
+               ('2021-03-04 05:06:07.123456+00','a'), \
+               ('2022-07-08 09:10:11.222222+00','b');",
+        )
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON ev TO {PG_CDC_USER}"), &[])
+        .await?;
+    create_pub_slot(
+        &client,
+        "pub_snap_temporal",
+        "slot_snap_temporal",
+        &["ev"],
+    )
+    .await?;
+
+    // Both runs use Initial with a fresh checkpoint store (so each re-scans) but
+    // a SHARED backend, so the generation is reused (Resume) and stays 1 — the
+    // only variable across the two runs is the session DateStyle/TimeZone.
+    let backend = make_storage_backend().await;
+    let run = || {
+        let backend = backend.clone();
+        let db = db.clone();
+        async move {
+            let src = make_snap_source(
+                "pg-snap-temporal",
+                &db,
+                "slot_snap_temporal",
+                "pub_snap_temporal",
+                vec!["public.ev".into()],
+                deltaforge_config::SnapshotCfg {
+                    mode: SnapshotMode::Initial,
+                    ..Default::default()
+                },
+                backend,
+                Default::default(),
+            )
+            .await;
+            let ckpt: Arc<dyn CheckpointStore> =
+                Arc::new(MemCheckpointStore::new().unwrap());
+            let (tx, mut rx) = mpsc::channel(128);
+            let handle = src.run(tx, ckpt).await;
+            let events = collect_until(&mut rx, Duration::from_secs(30), |e| {
+                e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 2
+            })
+            .await;
+            handle.stop();
+            handle.join().await.ok();
+            snap_ids(&events)
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+        }
+    };
+
+    client
+        .batch_execute(&format!(
+            "ALTER DATABASE {db} SET timezone='UTC'; \
+             ALTER DATABASE {db} SET datestyle='ISO, MDY';"
+        ))
+        .await?;
+    let ids_utc = run().await;
+
+    client
+        .batch_execute(&format!(
+            "ALTER DATABASE {db} SET timezone='America/New_York'; \
+             ALTER DATABASE {db} SET datestyle='German, DMY';"
+        ))
+        .await?;
+    let ids_other = run().await;
+
+    assert_eq!(ids_utc.len(), 2, "expected 2 temporal ids");
+    // Same generation + timezone/datestyle-independent binary ⇒ identical ids.
+    assert_eq!(
+        ids_utc, ids_other,
+        "temporal ids must not depend on DateStyle/TimeZone"
+    );
+
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+/// The intra-table parallel PK path and the sequential PK path produce
+/// identical ids for the same rows (they share one extraction function).
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_parallel_and_sequential_pk_produce_identical_ids() -> Result<()> {
+    let (db, client) = pg_setup("pg_snap_parallel").await?;
+    client
+        .batch_execute(
+            "CREATE TABLE orders (id int PRIMARY KEY, sku text); \
+             INSERT INTO orders SELECT g, 'sku-'||g FROM generate_series(1,50) g;",
+        )
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
+        .await?;
+    create_pub_slot(
+        &client,
+        "pub_snap_parallel",
+        "slot_snap_parallel",
+        &["orders"],
+    )
+    .await?;
+
+    let backend = make_storage_backend().await;
+    let run = |mode, parallel| {
+        let backend = backend.clone();
+        let db = db.clone();
+        async move {
+            let src = make_snap_source(
+                "pg-snap-parallel",
+                &db,
+                "slot_snap_parallel",
+                "pub_snap_parallel",
+                vec!["public.orders".into()],
+                deltaforge_config::SnapshotCfg {
+                    mode,
+                    chunk_size: 5,
+                    intra_table_parallel: parallel,
+                    ..Default::default()
+                },
+                backend,
+                Default::default(),
+            )
+            .await;
+            let ckpt: Arc<dyn CheckpointStore> =
+                Arc::new(MemCheckpointStore::new().unwrap());
+            let (tx, mut rx) = mpsc::channel(256);
+            let handle = src.run(tx, ckpt).await;
+            let events = collect_until(&mut rx, Duration::from_secs(45), |e| {
+                e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 50
+            })
+            .await;
+            handle.stop();
+            handle.join().await.ok();
+            // Map id → provisional event id.
+            snap_reads(&events)
+                .iter()
+                .filter_map(|e| {
+                    let k = e.after.as_ref()?.get("id")?.as_i64()?;
+                    Some((k, e.source.position.provisional_event_id?))
+                })
+                .collect::<std::collections::HashMap<_, _>>()
+        }
+    };
+
+    // Fresh checkpoint store each run (so each re-scans the whole table) but a
+    // shared backend (so the generation is reused at 1) — the only difference
+    // between the runs is the scan path.
+    let sequential = run(SnapshotMode::Initial, false).await;
+    let parallel = run(SnapshotMode::Initial, true).await;
+
+    assert_eq!(sequential.len(), 50);
+    assert_eq!(parallel.len(), 50);
+    assert_eq!(
+        sequential, parallel,
+        "parallel and sequential PK scans must yield identical ids"
+    );
+
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+/// Enum and domain identity columns extract end-to-end (enum via label+type,
+/// domain resolved to its base type).
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_enum_and_domain_identities_work() -> Result<()> {
+    let (db, client) = pg_setup("pg_snap_enumdom").await?;
+    client
+        .batch_execute(
+            "CREATE TYPE mood AS ENUM('happy','sad','ok'); \
+             CREATE TABLE em (m mood PRIMARY KEY, v text); \
+             INSERT INTO em VALUES ('happy','a'),('sad','b'),('ok','c'); \
+             CREATE DOMAIN uid AS uuid; \
+             CREATE TABLE dm (id uid PRIMARY KEY, v text); \
+             INSERT INTO dm VALUES \
+               ('11111111-1111-1111-1111-111111111111','x'), \
+               ('22222222-2222-2222-2222-222222222222','y');",
+        )
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON em, dm TO {PG_CDC_USER}"), &[])
+        .await?;
+    create_pub_slot(
+        &client,
+        "pub_snap_enumdom",
+        "slot_snap_enumdom",
+        &["em", "dm"],
+    )
+    .await?;
+
+    let src = make_snap_source(
+        "pg-snap-enumdom",
+        &db,
+        "slot_snap_enumdom",
+        "pub_snap_enumdom",
+        vec!["public.em".into(), "public.dm".into()],
+        deltaforge_config::SnapshotCfg {
+            mode: SnapshotMode::Initial,
+            ..Default::default()
+        },
+        make_storage_backend().await,
+        Default::default(),
+    )
+    .await;
+
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = mpsc::channel(128);
+    let handle = src.run(tx, ckpt).await;
+    let events = collect_until(&mut rx, Duration::from_secs(30), |e| {
+        e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 5
+    })
+    .await;
+    handle.stop();
+    handle.join().await.ok();
+
+    let reads = snap_reads(&events);
+    assert_eq!(reads.len(), 5, "3 enum rows + 2 domain rows");
+    for e in &reads {
+        let id = e
+            .source
+            .position
+            .provisional_event_id
+            .expect("enum/domain row carries a provisional id");
+        assert_eq!(id.class(), EventClass::Snap);
+    }
+    let ids = snap_ids(&events);
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), 5, "enum + domain ids must be unique");
+
+    pg_drop_db(&db).await;
+    Ok(())
+}
