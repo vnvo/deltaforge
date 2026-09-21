@@ -1214,3 +1214,168 @@ async fn stable_event_ids_are_replay_stable() -> Result<()> {
     mysql_drop_db(&pool, &db_name).await;
     Ok(())
 }
+
+// ============================================================================
+// Final stable-ID acceptance: DDL + derived-event identity across replay
+// ============================================================================
+
+/// Replay the source from `checkpoint` and return the first DDL event's id.
+async fn replay_ddl_id(
+    dsn: &str,
+    db: &str,
+    checkpoint: MySqlCheckpoint,
+) -> Result<String> {
+    let store: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let src = make_source(
+        "replay-ddl",
+        dsn,
+        vec![format!("{db}.t")],
+        AllowList::default(),
+    )
+    .await;
+    store.put(&src.id, checkpoint).await?;
+    let (tx, mut rx) = mpsc::channel::<Event>(128);
+    let handle = src.run(tx, store).await;
+    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
+    let events =
+        collect_events_until(&mut rx, Duration::from_secs(15), |evs| {
+            evs.iter().any(|e| e.ddl.is_some())
+        })
+        .await;
+    handle.cancel.cancel();
+    let ddl = events
+        .iter()
+        .find(|e| e.ddl.is_some())
+        .ok_or_else(|| anyhow::anyhow!("no DDL event observed"))?;
+    ddl.event_id
+        .map(|id| id.to_string())
+        .ok_or_else(|| anyhow::anyhow!("DDL event missing event_id"))
+}
+
+/// A DDL event's stable id must be identical when the same binlog is re-read.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn ddl_event_ids_are_replay_stable() -> Result<()> {
+    let (db_name, pool, dsn) = mysql_setup("ddl_stable").await?;
+    let mut conn = pool.get_conn().await?;
+    conn.query_drop(format!("USE {}", db_name)).await?;
+    conn.query_drop("CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(32))")
+        .await?;
+
+    // Checkpoint BEFORE the DDL so each run re-reads the same ALTER event.
+    let status: mysql_async::Row = conn
+        .query_first("SHOW BINARY LOG STATUS")
+        .await?
+        .expect("binary log status");
+    let checkpoint = MySqlCheckpoint {
+        file: status.get("File").unwrap(),
+        pos: status.get("Position").unwrap(),
+        gtid_set: status
+            .get::<String, _>("Executed_Gtid_Set")
+            .filter(|s| !s.is_empty()),
+    };
+
+    conn.query_drop("ALTER TABLE t ADD COLUMN c INT").await?;
+
+    let a = replay_ddl_id(&dsn, &db_name, checkpoint.clone()).await?;
+    let b = replay_ddl_id(&dsn, &db_name, checkpoint).await?;
+    assert_eq!(a, b, "DDL id must be identical across reconnect/replay");
+    assert!(a.starts_with("dfid:v1:ddl:"), "ddl-class id expected: {a}");
+
+    mysql_drop_db(&pool, &db_name).await;
+    Ok(())
+}
+
+/// Replay source rows from `checkpoint`, run them through a JS processor that
+/// derives one extra event per input, and return the derived (synthetic) ids.
+async fn replay_derived_ids(
+    dsn: &str,
+    db: &str,
+    checkpoint: MySqlCheckpoint,
+    want_rows: usize,
+) -> Result<Vec<String>> {
+    use deltaforge_core::{EventClass, Processor};
+    use processors::JsProcessor;
+
+    let store: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let src = make_source(
+        "replay-derived",
+        dsn,
+        vec![format!("{db}.t")],
+        AllowList::default(),
+    )
+    .await;
+    store.put(&src.id, checkpoint).await?;
+    let (tx, mut rx) = mpsc::channel::<Event>(128);
+    let handle = src.run(tx, store).await;
+    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
+    let events =
+        collect_events_until(&mut rx, Duration::from_secs(15), |evs| {
+            evs.len() >= want_rows
+        })
+        .await;
+    handle.cancel.cancel();
+
+    // Compose source → processor: derive one extra event per input row.
+    let js = r#"function processBatch(e){
+        const out = [];
+        for (const x of e) { out.push(x); out.push(derive(x, { ...x })); }
+        return out;
+    }"#;
+    let proc = JsProcessor::new("derive".into(), js.into(), None)?;
+    let ctx = BatchContext::from_batch(&events);
+    let out = proc.process(events, &ctx).await?;
+
+    Ok(out
+        .iter()
+        .filter(|e| {
+            e.event_id
+                .map(|id| id.class() == EventClass::Syn)
+                .unwrap_or(false)
+        })
+        .map(|e| e.event_id.unwrap().to_string())
+        .collect())
+}
+
+/// Pipeline composition: a derived event's id must be identical across replay —
+/// stable parent id ∘ constant processor digest ∘ deterministic ordinal.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn derived_event_ids_are_replay_stable() -> Result<()> {
+    let (db_name, pool, dsn) = mysql_setup("derived_stable").await?;
+    let mut conn = pool.get_conn().await?;
+    conn.query_drop(format!("USE {}", db_name)).await?;
+    conn.query_drop("CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(32))")
+        .await?;
+
+    let status: mysql_async::Row = conn
+        .query_first("SHOW BINARY LOG STATUS")
+        .await?
+        .expect("binary log status");
+    let checkpoint = MySqlCheckpoint {
+        file: status.get("File").unwrap(),
+        pos: status.get("Position").unwrap(),
+        gtid_set: status
+            .get::<String, _>("Executed_Gtid_Set")
+            .filter(|s| !s.is_empty()),
+    };
+
+    conn.query_drop("INSERT INTO t VALUES (1,'a'),(2,'b')")
+        .await?;
+
+    let a = replay_derived_ids(&dsn, &db_name, checkpoint.clone(), 2).await?;
+    let b = replay_derived_ids(&dsn, &db_name, checkpoint, 2).await?;
+    assert_eq!(a.len(), 2, "one derived event per input row, got {a:?}");
+    assert_eq!(
+        a, b,
+        "derived ids must be identical across reconnect/replay"
+    );
+    let unique: std::collections::HashSet<_> = a.iter().collect();
+    assert_eq!(unique.len(), 2, "derived ids must be distinct: {a:?}");
+    for id in &a {
+        assert!(id.starts_with("dfid:v1:syn:"), "synthetic id: {id}");
+    }
+
+    mysql_drop_db(&pool, &db_name).await;
+    Ok(())
+}

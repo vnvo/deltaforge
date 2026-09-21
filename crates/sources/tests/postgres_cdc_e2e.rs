@@ -2521,3 +2521,71 @@ async fn pg_enum_and_domain_identities_work() -> Result<()> {
     pg_drop_db(&db).await;
     Ok(())
 }
+
+// ============================================================================
+// Final stable-ID acceptance: logical-message identity across replay
+// ============================================================================
+
+/// Replay from an independent slot and return the first logical-message event's
+/// stable id.
+async fn pg_replay_message_id(
+    db: &str,
+    slot: &str,
+    pub_name: &str,
+) -> Result<String> {
+    let src = make_source(
+        "replay-msg",
+        db,
+        slot,
+        pub_name,
+        vec!["public.t".into()],
+        AllowList::default(),
+    )
+    .await;
+    let (mut rx, handle) = start_source(src).await?;
+    let events = collect_until(&mut rx, Duration::from_secs(20), |e| {
+        e.iter()
+            .any(|x| x.source.schema.as_deref() == Some("__wal_message"))
+    })
+    .await;
+    handle.cancel.cancel();
+    let msg = events
+        .iter()
+        .find(|e| e.source.schema.as_deref() == Some("__wal_message"))
+        .ok_or_else(|| anyhow::anyhow!("no logical-message event observed"))?;
+    msg.event_id
+        .map(|id| id.to_string())
+        .ok_or_else(|| anyhow::anyhow!("message event missing event_id"))
+}
+
+/// A logical message's stable id must be identical when the same WAL is
+/// re-decoded from an independent slot.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn logical_message_ids_are_replay_stable() -> Result<()> {
+    let (db, client) = pg_setup("msg_stable").await?;
+    client
+        .batch_execute("CREATE TABLE t (id INT PRIMARY KEY);")
+        .await?;
+
+    // Two independent slots created BEFORE the message → each re-decodes it once.
+    create_pub_slot(&client, "pub_a", "slot_a", &["t"]).await?;
+    create_pub_slot(&client, "pub_b", "slot_b", &["t"]).await?;
+
+    // A transactional logical message (prefix 'audit' → __wal_message).
+    client
+        .batch_execute(
+            "SELECT pg_logical_emit_message(true, 'audit', '{\"k\":1}');",
+        )
+        .await?;
+
+    let a = pg_replay_message_id(&db, "slot_a", "pub_a").await?;
+    let b = pg_replay_message_id(&db, "slot_b", "pub_b").await?;
+    assert_eq!(a, b, "message id must be identical across reconnect/replay");
+    assert!(a.starts_with("dfid:v1:msg:"), "msg-class id expected: {a}");
+
+    cleanup_repl(&client, "pub_a", "slot_a").await;
+    cleanup_repl(&client, "pub_b", "slot_b").await;
+    pg_drop_db(&db).await;
+    Ok(())
+}
