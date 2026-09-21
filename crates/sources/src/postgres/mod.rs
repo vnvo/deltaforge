@@ -138,6 +138,10 @@ pub(crate) struct RunCtx {
     /// identity-bearing change (insert/update/delete/truncate/transactional
     /// message) before filtering.
     pub change_ordinal: u32,
+    /// Cluster `system_identifier` (per-connection lineage) — captured once at
+    /// startup and mixed into provisional row/DDL/message ids. `0` if the
+    /// catalog function was unavailable (provisional ids are then skipped).
+    pub system_identifier: u64,
     pub repl_client: Arc<Mutex<ReplicationClient>>,
     pub outbox_prefixes: AllowList,
     pub identity_store: IdentityStore,
@@ -510,6 +514,14 @@ impl PostgresSource {
 
         let backend = Arc::clone(&self.backend);
         let cancel_ref = cancel.clone();
+        // Capture the cluster lineage once for provisional row/DDL/message ids
+        // (the same authority used by snapshot + failover identity).
+        let system_identifier = fetch_server_identity(&self.dsn)
+            .await
+            .ok()
+            .flatten()
+            .map(|id| id.system_identifier as u64)
+            .unwrap_or(0);
         let mut ctx = RunCtx {
             source_id: self.id.clone(),
             pipeline: self.pipeline.clone(),
@@ -533,6 +545,7 @@ impl PostgresSource {
             current_tx_commit_time: None,
             current_final_lsn: None,
             change_ordinal: 0,
+            system_identifier,
             repl_client: Arc::new(Mutex::new(client)),
             outbox_prefixes: self.outbox_prefixes.clone(),
             identity_store: IdentityStore::new(Arc::clone(&backend)),

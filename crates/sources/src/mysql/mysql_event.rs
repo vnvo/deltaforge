@@ -160,7 +160,7 @@ fn build_source_info(
     table: &str,
     row_ordinal: u32,
 ) -> SourceInfo {
-    SourceInfo {
+    let mut source = SourceInfo {
         version: concat!("deltaforge-", env!("CARGO_PKG_VERSION")).to_string(),
         connector: "mysql".to_string(),
         name: ctx.pipeline.clone(),
@@ -180,7 +180,14 @@ fn build_source_info(
             Some(ctx.last_pos),
             Some(row_ordinal),
         ),
+    };
+    // Provisional stable id (out of `Event.event_id` until the cutover). MySQL
+    // always has a `server_id`, so the id is always derivable (GTID form when a
+    // GTID is present, else the server_id+file fallback).
+    if let Ok(id) = super::mysql_row_event_id(&source) {
+        source.position.provisional_event_id = Some(id);
     }
+    source
 }
 
 async fn handle_write_rows(

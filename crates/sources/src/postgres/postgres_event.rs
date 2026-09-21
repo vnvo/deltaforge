@@ -409,7 +409,7 @@ fn build_source_info(
         }
     };
 
-    SourceInfo {
+    let mut source = SourceInfo {
         version: PG_VERSION.clone(),
         connector: "postgresql".to_string(),
         name: ctx.pipeline.clone(),
@@ -430,7 +430,15 @@ fn build_source_info(
             p.change_ordinal = Some(change_ordinal);
             p
         },
+    };
+    // Provisional stable id (out of `Event.event_id` until the cutover). Needs
+    // both an active transaction (final LSN) and a captured system_identifier.
+    if ctx.system_identifier != 0 {
+        if let Ok(id) = super::pg_row_event_id(&source, ctx.system_identifier) {
+            source.position.provisional_event_id = Some(id);
+        }
     }
+    source
 }
 
 /// Handle INSERT message.
