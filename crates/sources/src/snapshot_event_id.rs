@@ -11,6 +11,7 @@
 
 use deltaforge_core::{
     EventId, IdentityCell, IdentityKind, IdentityValue, SourceLineage,
+    TemporalKind,
 };
 
 /// Owned mirror of [`IdentityCell`] (see module docs).
@@ -24,6 +25,33 @@ pub enum OwnedIdentityCell {
     Text(String),
     /// Raw byte-string value.
     Bytes(Vec<u8>),
+    /// UUID as raw 16 bytes.
+    Uuid([u8; 16]),
+    /// Exact numeric (sign, big-endian unscaled magnitude, declared scale).
+    Decimal {
+        /// Sign of the value.
+        negative: bool,
+        /// Big-endian unscaled magnitude bytes.
+        unscaled: Vec<u8>,
+        /// Declared scale.
+        scale: i32,
+    },
+    /// Boolean value.
+    Bool(bool),
+    /// Date/time: source-semantic integer plus temporal sub-kind.
+    DateTime {
+        /// Temporal sub-kind.
+        kind: TemporalKind,
+        /// Source-semantic integer.
+        value: i64,
+    },
+    /// Enumerated value: declared enum type name + label.
+    Enum {
+        /// Declared enum/source type name.
+        enum_type: String,
+        /// The enum label.
+        label: String,
+    },
     /// A null value in a column of the given type category.
     Null(IdentityKind),
 }
@@ -45,6 +73,26 @@ impl OwnedIdentityValue {
             OwnedIdentityCell::UInt(v) => IdentityCell::UInt(*v),
             OwnedIdentityCell::Text(s) => IdentityCell::Text(s),
             OwnedIdentityCell::Bytes(b) => IdentityCell::Bytes(b),
+            OwnedIdentityCell::Uuid(u) => IdentityCell::Uuid(*u),
+            OwnedIdentityCell::Decimal {
+                negative,
+                unscaled,
+                scale,
+            } => IdentityCell::Decimal {
+                negative: *negative,
+                unscaled,
+                scale: *scale,
+            },
+            OwnedIdentityCell::Bool(b) => IdentityCell::Bool(*b),
+            OwnedIdentityCell::DateTime { kind, value } => {
+                IdentityCell::DateTime {
+                    kind: *kind,
+                    value: *value,
+                }
+            }
+            OwnedIdentityCell::Enum { enum_type, label } => {
+                IdentityCell::Enum { enum_type, label }
+            }
             OwnedIdentityCell::Null(k) => IdentityCell::Null(*k),
         };
         IdentityValue {

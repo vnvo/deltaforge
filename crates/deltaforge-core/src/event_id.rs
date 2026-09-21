@@ -173,6 +173,16 @@ pub enum IdentityKind {
     Text,
     /// Raw bytes.
     Bytes,
+    /// UUID (encoded as its raw 16 bytes).
+    Uuid,
+    /// Exact numeric / decimal (sign + unscaled integer + declared scale).
+    Decimal,
+    /// Boolean.
+    Bool,
+    /// Date / time (a source-semantic integer plus a temporal sub-kind).
+    DateTime,
+    /// Enumerated label (declared enum type + label).
+    Enum,
 }
 
 impl IdentityKind {
@@ -182,6 +192,37 @@ impl IdentityKind {
             IdentityKind::UInt => 0x02,
             IdentityKind::Text => 0x03,
             IdentityKind::Bytes => 0x04,
+            IdentityKind::Uuid => 0x05,
+            IdentityKind::Decimal => 0x06,
+            IdentityKind::Bool => 0x07,
+            IdentityKind::DateTime => 0x08,
+            IdentityKind::Enum => 0x09,
+        }
+    }
+}
+
+/// Temporal sub-kind for a [`IdentityCell::DateTime`]. Distinguishes, e.g., a
+/// null (or value) in a `date` column from one in a `timestamp` column, and
+/// fixes the source-semantic meaning of the accompanying integer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemporalKind {
+    /// Calendar date (integer = days from the source epoch).
+    Date,
+    /// Time of day (integer = sub-day units, e.g. microseconds).
+    Time,
+    /// Timestamp without time zone (integer = units from the source epoch).
+    Timestamp,
+    /// Timestamp with time zone (integer = units from the UTC epoch).
+    TimestampTz,
+}
+
+impl TemporalKind {
+    const fn tag(self) -> u8 {
+        match self {
+            TemporalKind::Date => 0x01,
+            TemporalKind::Time => 0x02,
+            TemporalKind::Timestamp => 0x03,
+            TemporalKind::TimestampTz => 0x04,
         }
     }
 }
@@ -198,6 +239,39 @@ pub enum IdentityCell<'a> {
     Text(&'a str),
     /// Raw byte-string value.
     Bytes(&'a [u8]),
+    /// UUID as its raw 16 bytes (not display text).
+    Uuid([u8; 16]),
+    /// Exact numeric: `negative` sign, big-endian `unscaled` magnitude (the
+    /// integer value with the decimal point removed), and the declared `scale`
+    /// (digits after the point). Encoding normalizes the magnitude (leading
+    /// zero bytes stripped) and forbids negative zero, but keeps the declared
+    /// scale — so `1.0` (scale 1) and `1.00` (scale 2) differ, as their column
+    /// types do.
+    Decimal {
+        /// Sign of the value.
+        negative: bool,
+        /// Big-endian unscaled magnitude bytes.
+        unscaled: &'a [u8],
+        /// Declared scale (digits after the decimal point).
+        scale: i32,
+    },
+    /// Boolean value.
+    Bool(bool),
+    /// Date/time: a source-semantic integer plus its temporal sub-kind.
+    DateTime {
+        /// Temporal sub-kind (fixes the integer's meaning).
+        kind: TemporalKind,
+        /// Source-semantic integer (e.g. days, or micros from the epoch).
+        value: i64,
+    },
+    /// Enumerated value: the declared enum type name and the label.
+    Enum {
+        /// Declared enum/source type name (so equal labels of different enum
+        /// types do not collide).
+        enum_type: &'a str,
+        /// The enum label.
+        label: &'a str,
+    },
     /// A null value in a column of the given type category.
     Null(IdentityKind),
 }
@@ -228,6 +302,44 @@ impl IdentityValue<'_> {
             }
             IdentityCell::Bytes(b) => {
                 c.u8(IdentityKind::Bytes.tag()).u8(1).bytes_lp(b);
+            }
+            IdentityCell::Uuid(u) => {
+                c.u8(IdentityKind::Uuid.tag()).u8(1).bytes16(u);
+            }
+            IdentityCell::Decimal {
+                negative,
+                unscaled,
+                scale,
+            } => {
+                // Normalize: strip leading zero bytes; zero is never negative.
+                let mag = {
+                    let first = unscaled
+                        .iter()
+                        .position(|&b| b != 0)
+                        .unwrap_or(unscaled.len());
+                    &unscaled[first..]
+                };
+                let neg = if mag.is_empty() { false } else { *negative };
+                c.u8(IdentityKind::Decimal.tag())
+                    .u8(1)
+                    .u8(neg as u8)
+                    .u32(*scale as u32)
+                    .bytes_lp(mag);
+            }
+            IdentityCell::Bool(b) => {
+                c.u8(IdentityKind::Bool.tag()).u8(1).u8(*b as u8);
+            }
+            IdentityCell::DateTime { kind, value } => {
+                c.u8(IdentityKind::DateTime.tag())
+                    .u8(1)
+                    .u8(kind.tag())
+                    .u64(*value as u64);
+            }
+            IdentityCell::Enum { enum_type, label } => {
+                c.u8(IdentityKind::Enum.tag())
+                    .u8(1)
+                    .str(enum_type)
+                    .str(label);
             }
             // Presence marker 0 = null; the column's type tag still
             // participates, so a null distinguishes by column type.
@@ -761,6 +873,114 @@ mod tests {
         );
         assert_ne!(base, swapped);
         assert_ne!(base, renamed);
+    }
+
+    #[test]
+    fn snapshot_extended_identity_types_are_distinct_and_stable() {
+        let d =
+            |c| EventId::snapshot(&pg_lineage(), 1, "d", "t", &[iv("k", c)]);
+        let uuid = [0xABu8; 16];
+        let variants = [
+            d(IdentityCell::Uuid(uuid)),
+            d(IdentityCell::Decimal {
+                negative: false,
+                unscaled: &[1, 0],
+                scale: 2,
+            }),
+            d(IdentityCell::Bool(true)),
+            d(IdentityCell::Bool(false)),
+            d(IdentityCell::DateTime {
+                kind: TemporalKind::Date,
+                value: 19_000,
+            }),
+            d(IdentityCell::DateTime {
+                kind: TemporalKind::Timestamp,
+                value: 19_000,
+            }),
+            d(IdentityCell::Enum {
+                enum_type: "mood",
+                label: "happy",
+            }),
+            // Same textual bytes as the UUID, but as raw Bytes → distinct kind.
+            d(IdentityCell::Bytes(&uuid)),
+        ];
+        // All variants must be pairwise distinct.
+        for (i, a) in variants.iter().enumerate() {
+            for b in &variants[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        // Stable: same coordinates reproduce the same id.
+        assert_eq!(
+            d(IdentityCell::Uuid(uuid)),
+            EventId::snapshot(
+                &pg_lineage(),
+                1,
+                "d",
+                "t",
+                &[iv("k", IdentityCell::Uuid(uuid))]
+            )
+        );
+    }
+
+    #[test]
+    fn decimal_scale_and_normalization() {
+        let d = |neg, unscaled: &[u8], scale| {
+            EventId::snapshot(
+                &pg_lineage(),
+                1,
+                "d",
+                "t",
+                &[iv(
+                    "k",
+                    IdentityCell::Decimal {
+                        negative: neg,
+                        unscaled,
+                        scale,
+                    },
+                )],
+            )
+        };
+        // Leading zero bytes are normalized away (same value).
+        assert_eq!(d(false, &[0, 0, 1, 0], 2), d(false, &[1, 0], 2));
+        // Declared scale is part of identity: 1.0 (scale 1) != 1.00 (scale 2).
+        assert_ne!(d(false, &[10], 1), d(false, &[100], 2));
+        // Negative zero normalizes to positive zero.
+        assert_eq!(d(true, &[0], 0), d(false, &[], 0));
+        // Sign matters for non-zero.
+        assert_ne!(d(true, &[5], 0), d(false, &[5], 0));
+    }
+
+    #[test]
+    fn null_distinguishes_all_extended_kinds() {
+        let kinds = [
+            IdentityKind::Int,
+            IdentityKind::UInt,
+            IdentityKind::Text,
+            IdentityKind::Bytes,
+            IdentityKind::Uuid,
+            IdentityKind::Decimal,
+            IdentityKind::Bool,
+            IdentityKind::DateTime,
+            IdentityKind::Enum,
+        ];
+        let ids: Vec<_> = kinds
+            .iter()
+            .map(|k| {
+                EventId::snapshot(
+                    &pg_lineage(),
+                    1,
+                    "d",
+                    "t",
+                    &[iv("k", IdentityCell::Null(*k))],
+                )
+            })
+            .collect();
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b, "null of distinct kinds must differ");
+            }
+        }
     }
 
     #[test]

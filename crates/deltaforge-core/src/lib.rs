@@ -80,7 +80,7 @@ pub use batch_context::BatchContext;
 pub mod event_id;
 pub use event_id::{
     EventClass, EventId, IdentityCell, IdentityKind, IdentityValue,
-    SourceLineage,
+    SourceLineage, TemporalKind,
 };
 
 pub mod journal;
