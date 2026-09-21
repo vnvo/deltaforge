@@ -41,6 +41,11 @@ pub mod postgres_event_id;
 use postgres_event::*;
 pub use postgres_event_id::pg_row_event_id;
 
+pub mod postgres_identity;
+pub use postgres_identity::{
+    PgIdentityError, PgIdentityRaw, pg_identity_cell, pg_identity_kind,
+};
+
 pub mod postgres_table_schema;
 pub use postgres_table_schema::{PostgresColumn, PostgresTableSchema};
 
