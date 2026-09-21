@@ -142,6 +142,10 @@ pub(crate) struct RunCtx {
     /// startup and mixed into provisional row/DDL/message ids. `0` if the
     /// catalog function was unavailable (provisional ids are then skipped).
     pub system_identifier: u64,
+    /// Logical-message ordinal: reset at every transaction boundary (BEGIN and
+    /// COMMIT), incremented **before filtering** for each logical message so a
+    /// filtered message never renumbers a retained one.
+    pub message_ordinal: u32,
     pub repl_client: Arc<Mutex<ReplicationClient>>,
     pub outbox_prefixes: AllowList,
     pub identity_store: IdentityStore,
@@ -546,6 +550,7 @@ impl PostgresSource {
             current_final_lsn: None,
             change_ordinal: 0,
             system_identifier,
+            message_ordinal: 0,
             repl_client: Arc::new(Mutex::new(client)),
             outbox_prefixes: self.outbox_prefixes.clone(),
             identity_store: IdentityStore::new(Arc::clone(&backend)),

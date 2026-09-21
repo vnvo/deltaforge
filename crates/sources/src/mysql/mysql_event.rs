@@ -475,6 +475,8 @@ fn handle_gtid(
     // The exact per-transaction GTID (`uuid:gno`) is the immutable identity
     // coordinate — captured before it is merged into the accumulated set below.
     ctx.current_gtid = Some(gtid_str.clone());
+    // New transaction boundary: reset the DDL message ordinal.
+    ctx.message_ordinal = 0;
 
     // Accumulate the full executed GTID set rather than storing just the last
     // transaction. MySQL needs the full set to resume correctly on reconnect.
@@ -649,6 +651,24 @@ fn extract_identifier(s: &str) -> Option<String> {
 }
 
 #[instrument(skip_all)]
+/// Source lineage for DDL identity: prefer the exact GTID source UUID; fall
+/// back to server-id + current binlog file when GTIDs are unavailable.
+fn ddl_source_lineage(ctx: &RunCtx) -> deltaforge_core::SourceLineage<'_> {
+    if let Some(gtid) = &ctx.current_gtid {
+        if let Some(sid) = gtid.split(':').next() {
+            if let Some(uuid) = super::mysql_event_id::parse_uuid16(sid) {
+                return deltaforge_core::SourceLineage::MysqlGtid {
+                    source_uuid: uuid,
+                };
+            }
+        }
+    }
+    deltaforge_core::SourceLineage::MysqlServer {
+        server_id: ctx.server_id as u32,
+        file: &ctx.last_file,
+    }
+}
+
 async fn handle_query(
     ctx: &mut RunCtx,
     header: &EventHeader,
@@ -676,8 +696,12 @@ async fn handle_query(
             "DDL detected"
         );
 
+        // DDL message ordinal assigned before any downstream filtering.
+        let message_ordinal = ctx.message_ordinal;
+        ctx.message_ordinal += 1;
+
         // For DDL, we use the query's schema as both db and table context
-        let source_info = SourceInfo {
+        let mut source_info = SourceInfo {
             version: concat!("deltaforge-", env!("CARGO_PKG_VERSION"))
                 .to_string(),
             connector: "mysql".to_string(),
@@ -695,6 +719,16 @@ async fn handle_query(
                 None,
             ),
         };
+
+        // Provisional `ddl` id: source lineage + "file:pos" + message ordinal.
+        let lineage = ddl_source_lineage(ctx);
+        let source_position = format!("{}:{}", ctx.last_file, ctx.last_pos);
+        source_info.position.provisional_event_id =
+            Some(deltaforge_core::EventId::ddl(
+                &lineage,
+                &source_position,
+                message_ordinal,
+            ));
 
         let ddl_payload = serde_json::json!({
             "sql": q.query,
@@ -815,6 +849,7 @@ mod tests {
             last_pos: 1234,
             last_gtid: Some("GTID-UNIT".to_string()),
             current_gtid: None,
+            message_ordinal: 0,
             checkpoint_gtid: Some("GTID-UNIT".to_string()),
             checkpoint_file: "mysql-bin.000001".to_string(),
             tables: vec!["shop.orders".to_string()],

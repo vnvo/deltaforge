@@ -117,6 +117,10 @@ struct RunCtx {
     /// event before it is merged into `last_gtid`'s accumulated executed set.
     /// Used as the immutable per-event identity coordinate.
     current_gtid: Option<String>,
+    /// DDL message ordinal: reset per transaction (GTID / BEGIN), incremented
+    /// **before filtering** for each DDL so a skipped DDL never renumbers a
+    /// retained one.
+    message_ordinal: u32,
     /// Original checkpoint position, preserved even after a pre-connect failover
     /// adjustment clears last_gtid/last_file. Used by check_position_reachability
     /// to verify whether A's position actually exists on B.
@@ -474,6 +478,7 @@ impl MySqlSource {
             last_pos: init_pos,
             last_gtid: init_gtid,
             current_gtid: None,
+            message_ordinal: 0,
             checkpoint_gtid,
             checkpoint_file,
             tables: self.tables.clone(),
@@ -919,6 +924,7 @@ async fn run_failover_reconciliation(
     // was already open when the switch happened.
     ctx.last_gtid = None;
     ctx.current_gtid = None;
+    ctx.message_ordinal = 0;
     ctx.last_file = String::new();
     ctx.last_pos = 0;
 

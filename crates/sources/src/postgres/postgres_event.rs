@@ -122,6 +122,7 @@ pub(super) async fn dispatch_event(
             // reset the per-transaction change ordinal exactly at BEGIN.
             ctx.current_final_lsn = Some(final_lsn.to_string());
             ctx.change_ordinal = 0;
+            ctx.message_ordinal = 0;
         }
         ReplicationEvent::Commit { lsn, end_lsn, .. } => {
             debug!(commit_lsn = %lsn, end_lsn = %end_lsn, "transaction commit");
@@ -129,6 +130,7 @@ pub(super) async fn dispatch_event(
             ctx.current_tx_id = None;
             ctx.current_tx_commit_time = None;
             ctx.current_final_lsn = None;
+            ctx.message_ordinal = 0;
         }
         ReplicationEvent::StoppedAt { reached } => {
             info!(reached = %reached, "replication stopped at target LSN");
@@ -152,8 +154,12 @@ pub(super) async fn dispatch_event(
             if transactional {
                 ctx.change_ordinal += 1;
             }
+            // Message ordinal is assigned BEFORE filtering so a filtered message
+            // never renumbers a retained one.
+            let message_ordinal = ctx.message_ordinal;
+            ctx.message_ordinal += 1;
 
-            if let Some(event) = postgres_logical_message::to_event(
+            if let Some(mut event) = postgres_logical_message::to_event(
                 &prefix,
                 &content,
                 lsn,
@@ -163,6 +169,19 @@ pub(super) async fn dispatch_event(
                 ctx.current_tx_commit_time,
                 &ctx.outbox_prefixes,
             ) {
+                // Provisional `msg` id from lineage + this message's LSN +
+                // ordinal (out of Event.event_id until the cutover).
+                if ctx.system_identifier != 0 {
+                    let lineage = deltaforge_core::SourceLineage::Postgres {
+                        system_identifier: ctx.system_identifier,
+                    };
+                    event.source.position.provisional_event_id =
+                        Some(deltaforge_core::EventId::logical_message(
+                            &lineage,
+                            &lsn.to_string(),
+                            message_ordinal,
+                        ));
+                }
                 ctx.tx.send(event).await.map_err(|e| {
                     LoopControl::Fail(SourceError::Other(e.into()))
                 })?;
@@ -781,6 +800,17 @@ async fn handle_truncate(
                 p
             },
         };
+
+        // Truncate carries row-like identity coordinates (relation OID +
+        // per-tx change ordinal), so its provisional id is a `pgrow`.
+        let mut source_info = source_info;
+        if ctx.system_identifier != 0 {
+            if let Ok(id) =
+                super::pg_row_event_id(&source_info, ctx.system_identifier)
+            {
+                source_info.position.provisional_event_id = Some(id);
+            }
+        }
 
         let ddl_payload = serde_json::json!({
             "sql": "TRUNCATE",
