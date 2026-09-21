@@ -48,11 +48,17 @@ pub struct FilterProcessor {
     cfg: FilterProcessorCfg,
     /// Pre-compiled regexes keyed by predicate index.
     regexes: HashMap<usize, Regex>,
+    digest: String,
 }
+
+/// Bump when a code change alters this processor's output for identical config.
+const FILTER_IMPL_VERSION: u32 = 1;
 
 impl FilterProcessor {
     pub fn new(cfg: FilterProcessorCfg) -> Result<Self> {
         let id = cfg.id.clone();
+        let digest =
+            crate::digest::builtin_digest("filter", FILTER_IMPL_VERSION, &cfg);
 
         // Compile all regex predicates upfront — fail fast on bad patterns.
         let mut regexes = HashMap::new();
@@ -76,7 +82,12 @@ impl FilterProcessor {
             }
         }
 
-        Ok(Self { id, cfg, regexes })
+        Ok(Self {
+            id,
+            cfg,
+            regexes,
+            digest,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -218,6 +229,10 @@ impl FilterProcessor {
 impl Processor for FilterProcessor {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn identity_digest(&self) -> &str {
+        &self.digest
     }
 
     async fn process(

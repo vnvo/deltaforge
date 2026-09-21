@@ -158,8 +158,9 @@ fn build_source_info(
     header: &EventHeader,
     db: &str,
     table: &str,
-) -> SourceInfo {
-    SourceInfo {
+    row_ordinal: u32,
+) -> SourceResult<(SourceInfo, deltaforge_core::EventId)> {
+    let source = SourceInfo {
         version: concat!("deltaforge-", env!("CARGO_PKG_VERSION")).to_string(),
         connector: "mysql".to_string(),
         name: ctx.pipeline.clone(),
@@ -170,12 +171,23 @@ fn build_source_info(
         snapshot: None,
         position: SourcePosition::mysql(
             ctx.server_id as u32,
-            ctx.last_gtid.clone(),
+            // The current transaction's exact GTID — the immutable identity
+            // coordinate — not the accumulated executed set (which stays in the
+            // checkpoint for resume).
+            ctx.current_gtid.clone(),
             Some(ctx.last_file.clone()),
+            // `last_pos` is the current event's end_log_pos (next_event_position).
             Some(ctx.last_pos),
-            None, // row number within event not tracked currently
+            Some(row_ordinal),
         ),
-    }
+    };
+    // The stable id is required at the source boundary — fail closed if it
+    // cannot be derived (MySQL always has a server_id, so the server-id+file
+    // fallback keeps this derivable even without GTIDs).
+    let id = super::mysql_row_event_id(&source).map_err(|e| {
+        SourceError::Other(anyhow::anyhow!("mysql row identity: {e}"))
+    })?;
+    Ok((source, id))
 }
 
 async fn handle_write_rows(
@@ -209,20 +221,24 @@ async fn handle_write_rows(
             && ctx.outbox_tables.matches(&tm.database_name, &tm.table_name);
 
         let mut sent = 0u64;
-        for row in wr.rows {
+        // Row ordinal resets per rows event and increments per row; combined
+        // with the event's end_log_pos it uniquely identifies each row change.
+        for (row_ordinal, row) in wr.rows.into_iter().enumerate() {
             let after = build_object(
                 &loaded.column_names,
                 &wr.included_columns,
                 &row.column_values,
             );
 
-            let source_info = build_source_info(
+            let (source_info, event_id) = build_source_info(
                 ctx,
                 header,
                 &tm.database_name,
                 &tm.table_name,
-            );
+                row_ordinal as u32,
+            )?;
             let mut ev = Event::new_row(
+                event_id,
                 source_info,
                 Op::Create,
                 None,
@@ -292,7 +308,11 @@ async fn handle_update_rows(
         let sequence = ctx.schema.current_sequence();
 
         let mut sent = 0u64;
-        for (before_row, after_row) in ur.rows {
+        // One ordinal per before/after pair — an update is a single row change,
+        // not two images.
+        for (row_ordinal, (before_row, after_row)) in
+            ur.rows.into_iter().enumerate()
+        {
             let before = build_object(
                 &loaded.column_names,
                 &ur.included_columns_before,
@@ -304,13 +324,15 @@ async fn handle_update_rows(
                 &after_row.column_values,
             );
 
-            let source_info = build_source_info(
+            let (source_info, event_id) = build_source_info(
                 ctx,
                 header,
                 &tm.database_name,
                 &tm.table_name,
-            );
+                row_ordinal as u32,
+            )?;
             let mut ev = Event::new_row(
+                event_id,
                 source_info,
                 Op::Update,
                 Some(before),
@@ -376,20 +398,22 @@ async fn handle_delete_rows(
         let sequence = ctx.schema.current_sequence();
 
         let mut sent = 0u64;
-        for row in dr.rows {
+        for (row_ordinal, row) in dr.rows.into_iter().enumerate() {
             let before = build_object(
                 &loaded.column_names,
                 &dr.included_columns,
                 &row.column_values,
             );
 
-            let source_info = build_source_info(
+            let (source_info, event_id) = build_source_info(
                 ctx,
                 header,
                 &tm.database_name,
                 &tm.table_name,
-            );
+                row_ordinal as u32,
+            )?;
             let mut ev = Event::new_row(
+                event_id,
                 source_info,
                 Op::Delete,
                 Some(before),
@@ -450,6 +474,12 @@ fn handle_gtid(
 ) {
     let gtid_str = gt.gtid.clone();
     debug!(source_id=%ctx.source_id, gtid=%gtid_str, "gtid");
+
+    // The exact per-transaction GTID (`uuid:gno`) is the immutable identity
+    // coordinate — captured before it is merged into the accumulated set below.
+    ctx.current_gtid = Some(gtid_str.clone());
+    // New transaction boundary: reset the DDL message ordinal.
+    ctx.message_ordinal = 0;
 
     // Accumulate the full executed GTID set rather than storing just the last
     // transaction. MySQL needs the full set to resume correctly on reconnect.
@@ -624,6 +654,24 @@ fn extract_identifier(s: &str) -> Option<String> {
 }
 
 #[instrument(skip_all)]
+/// Source lineage for DDL identity: prefer the exact GTID source UUID; fall
+/// back to server-id + current binlog file when GTIDs are unavailable.
+fn ddl_source_lineage(ctx: &RunCtx) -> deltaforge_core::SourceLineage<'_> {
+    if let Some(gtid) = &ctx.current_gtid {
+        if let Some(sid) = gtid.split(':').next() {
+            if let Some(uuid) = super::mysql_event_id::parse_uuid16(sid) {
+                return deltaforge_core::SourceLineage::MysqlGtid {
+                    source_uuid: uuid,
+                };
+            }
+        }
+    }
+    deltaforge_core::SourceLineage::MysqlServer {
+        server_id: ctx.server_id as u32,
+        file: &ctx.last_file,
+    }
+}
+
 async fn handle_query(
     ctx: &mut RunCtx,
     header: &EventHeader,
@@ -651,6 +699,10 @@ async fn handle_query(
             "DDL detected"
         );
 
+        // DDL message ordinal assigned before any downstream filtering.
+        let message_ordinal = ctx.message_ordinal;
+        ctx.message_ordinal += 1;
+
         // For DDL, we use the query's schema as both db and table context
         let source_info = SourceInfo {
             version: concat!("deltaforge-", env!("CARGO_PKG_VERSION"))
@@ -671,12 +723,22 @@ async fn handle_query(
             ),
         };
 
+        // `ddl` id: source lineage + "file:pos" + message ordinal.
+        let lineage = ddl_source_lineage(ctx);
+        let source_position = format!("{}:{}", ctx.last_file, ctx.last_pos);
+        let ddl_id = deltaforge_core::EventId::ddl(
+            &lineage,
+            &source_position,
+            message_ordinal,
+        );
+
         let ddl_payload = serde_json::json!({
             "sql": q.query,
             "database": q.schema,
         });
 
         let ev = Event::new_ddl(
+            ddl_id,
             source_info,
             ddl_payload,
             ts_sec_to_ms(header.timestamp),
@@ -789,6 +851,8 @@ mod tests {
             last_file: "mysql-bin.000001".to_string(),
             last_pos: 1234,
             last_gtid: Some("GTID-UNIT".to_string()),
+            current_gtid: None,
+            message_ordinal: 0,
             checkpoint_gtid: Some("GTID-UNIT".to_string()),
             checkpoint_file: "mysql-bin.000001".to_string(),
             tables: vec!["shop.orders".to_string()],
@@ -938,10 +1002,15 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<Event>(8);
         let mut ctx = make_runctx(tx);
 
-        // Set known position
+        // Set known position. `last_gtid` is the accumulated executed set (used
+        // for the resume checkpoint); `current_gtid` is the exact per-transaction
+        // GTID (used as the per-event identity coordinate).
         ctx.last_file = "mysql-bin.000005".to_string();
         ctx.last_pos = 12345;
         ctx.last_gtid = Some("abc-123:1-10".to_string());
+        // A real per-transaction GTID is always a single valid `uuid:gno`.
+        ctx.current_gtid =
+            Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:10".to_string());
 
         let row = RowEvent {
             column_values: vec![
@@ -973,11 +1042,14 @@ mod tests {
         let cp: MySqlCheckpoint = serde_json::from_slice(cp_meta.as_bytes())
             .expect("checkpoint must deserialize");
 
+        // Checkpoint carries the accumulated executed set (for resume).
         assert_eq!(cp.file, "mysql-bin.000005");
         assert_eq!(cp.pos, 12345);
         assert_eq!(cp.gtid_set.as_deref(), Some("abc-123:1-10"));
 
-        // Verify source position info
+        // The per-event source position carries the *exact* per-transaction GTID
+        // (the identity coordinate) plus the row ordinal — distinct from the
+        // checkpoint's accumulated set.
         assert_eq!(
             produced.source.position.file,
             Some("mysql-bin.000005".to_string())
@@ -985,8 +1057,10 @@ mod tests {
         assert_eq!(produced.source.position.pos, Some(12345));
         assert_eq!(
             produced.source.position.gtid,
-            Some("abc-123:1-10".to_string())
+            Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:10".to_string()),
+            "position.gtid must be the exact per-tx GTID, not the merged set"
         );
+        assert_eq!(produced.source.position.row, Some(0));
     }
 
     #[tokio::test]

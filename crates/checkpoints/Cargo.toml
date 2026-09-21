@@ -7,6 +7,8 @@ license = "MIT OR Apache-2.0"
 [features]
 default = []
 cp-sqlite = ["rusqlite"]
+# Exposes the shared SnapshotStateStore contract suite for cross-crate tests.
+test-support = []
 
 [dependencies]
 thiserror.workspace = true

@@ -29,6 +29,8 @@ deltaforge-core = { path = "../deltaforge-core" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+# Reuse the shared SnapshotStateStore contract suite in adapter tests.
+checkpoints = { path = "../checkpoints", features = ["test-support"] }
 
 [lints]
 workspace = true

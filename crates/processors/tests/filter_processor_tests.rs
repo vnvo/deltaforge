@@ -33,6 +33,7 @@ fn make_event(
     after: serde_json::Value,
 ) -> Event {
     Event::new_row(
+        deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         source(db, table),
         op,
         None,
@@ -388,6 +389,7 @@ async fn regex_invalid_pattern_fails_construction() {
 
 fn update_event(before: serde_json::Value, after: serde_json::Value) -> Event {
     Event::new_row(
+        deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         source("db", "t"),
         Op::Update,
         Some(before),

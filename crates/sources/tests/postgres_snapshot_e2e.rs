@@ -21,6 +21,7 @@ use ctor::dtor;
 use sources::postgres::postgres_snapshot::{
     self, SnapshotProgress, progress_key, run_snapshot,
 };
+use sources::snapshot_generation::PersistedLineage;
 
 #[dtor]
 fn cleanup() {
@@ -98,6 +99,11 @@ async fn pg_snapshot_captures_all_rows_integer_pk() -> Result<()> {
         tx: tx.clone(),
         cancel: CancellationToken::new(),
         slot_name: None,
+        generation: 1,
+        lineage: PersistedLineage::Postgres {
+            system_identifier: 0,
+        },
+        identity_map: Default::default(),
     };
 
     run_snapshot(&snapshot_ctx, &[("public".into(), "orders".into())]).await?;
@@ -162,6 +168,11 @@ async fn pg_snapshot_parallel_tables() -> Result<()> {
         tx: tx.clone(),
         cancel: CancellationToken::new(),
         slot_name: None,
+        generation: 1,
+        lineage: PersistedLineage::Postgres {
+            system_identifier: 0,
+        },
+        identity_map: Default::default(),
     };
 
     run_snapshot(
@@ -245,6 +256,11 @@ async fn pg_snapshot_resumes_after_partial_completion() -> Result<()> {
         tx: tx.clone(),
         cancel: CancellationToken::new(),
         slot_name: None,
+        generation: 1,
+        lineage: PersistedLineage::Postgres {
+            system_identifier: 0,
+        },
+        identity_map: Default::default(),
     };
 
     run_snapshot(
@@ -300,6 +316,11 @@ async fn pg_snapshot_ctid_fallback_for_uuid_pk() -> Result<()> {
         tx: tx.clone(),
         cancel: CancellationToken::new(),
         slot_name: None,
+        generation: 1,
+        lineage: PersistedLineage::Postgres {
+            system_identifier: 0,
+        },
+        identity_map: Default::default(),
     };
 
     run_snapshot(&snapshot_ctx, &[("public".into(), "events".into())]).await?;
@@ -340,6 +361,11 @@ async fn pg_snapshot_persists_lsn_and_marks_finished() -> Result<()> {
         tx: tx.clone(),
         cancel: CancellationToken::new(),
         slot_name: None,
+        generation: 1,
+        lineage: PersistedLineage::Postgres {
+            system_identifier: 0,
+        },
+        identity_map: Default::default(),
     };
 
     let returned_lsn =
@@ -385,6 +411,11 @@ async fn pg_snapshot_already_finished_returns_saved_lsn() -> Result<()> {
         tx,
         cancel: CancellationToken::new(),
         slot_name: None,
+        generation: 1,
+        lineage: PersistedLineage::Postgres {
+            system_identifier: 0,
+        },
+        identity_map: Default::default(),
     };
 
     let (tx1, mut rx1) = mpsc::channel(64);

@@ -368,6 +368,25 @@ impl StorageBackend for PostgresStorageBackend {
         Ok(n == 1)
     }
 
+    async fn slot_create(
+        &self,
+        ns: &str,
+        key: &str,
+        state: &[u8],
+    ) -> Result<Option<u64>> {
+        let c = client!(self);
+        let row = c
+            .query_opt(
+                "INSERT INTO df_slot(ns, key, version, state, updated_at)
+                 VALUES($1, $2, 1, $3, $4)
+                 ON CONFLICT(ns, key) DO NOTHING
+                 RETURNING version",
+                &[&ns, &key, &state, &now_secs()],
+            )
+            .await?;
+        Ok(row.map(|r| r.get::<_, i64>(0) as u64))
+    }
+
     async fn slot_delete(&self, ns: &str, key: &str) -> Result<bool> {
         let c = client!(self);
         let n = c

@@ -6,6 +6,7 @@ use serde::{Serialize, de::DeserializeOwned};
 mod errors;
 mod file_store;
 mod mem_store;
+mod snapshot_state;
 
 #[cfg(feature = "cp-sqlite")]
 mod sqlite_store;
@@ -13,6 +14,10 @@ mod sqlite_store;
 pub use errors::{CheckpointError, CheckpointResult};
 pub use file_store::FileCheckpointStore;
 pub use mem_store::MemCheckpointStore;
+pub use snapshot_state::{CasOutcome, SnapshotStateStore};
+
+#[cfg(any(test, feature = "test-support"))]
+pub use snapshot_state::assert_snapshot_state_contract;
 
 #[cfg(feature = "cp-sqlite")]
 pub use sqlite_store::SqliteCheckpointStore;

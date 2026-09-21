@@ -57,6 +57,7 @@ async fn make_source(
         snapshot_cfg,
         backend: make_storage_backend().await,
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
+        table_options: Default::default(),
     }
 }
 
@@ -458,6 +459,245 @@ async fn mysql_snapshot_always_reruns() -> Result<()> {
         handle.join().await.ok();
     }
 
+    mysql_drop_db(&pool, &db).await;
+    Ok(())
+}
+
+// ============================================================================
+// Stable snapshot identity (dfid:v1) — generation lifecycle + keyless rejection
+// ============================================================================
+
+use deltaforge_core::EventId;
+use storage::ArcStorageBackend;
+
+/// Build a source sharing a specific storage backend (so the durable snapshot
+/// generation persists across runs) and optional per-table options.
+async fn make_source_on(
+    backend: ArcStorageBackend,
+    id: &str,
+    db: &str,
+    tables: Vec<String>,
+    snapshot_cfg: SnapshotCfg,
+    table_options: std::collections::BTreeMap<
+        String,
+        deltaforge_config::TableOptions,
+    >,
+) -> MySqlSource {
+    let dsn = mysql_cdc_dsn(db).await;
+    MySqlSource {
+        id: id.into(),
+        dsn,
+        tables,
+        tenant: "acme".into(),
+        pipeline: "test".into(),
+        registry: make_registry().await,
+        outbox_tables: AllowList::default(),
+        snapshot_cfg,
+        backend,
+        on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
+        table_options,
+    }
+}
+
+fn snapshot_ids(events: &[Event]) -> Vec<EventId> {
+    events
+        .iter()
+        .filter(|e| matches!(e.op, Op::Read))
+        .filter_map(|e| e.event_id)
+        .collect()
+}
+
+/// Every snapshot row carries the allocated generation and a provisional
+/// stable id; ids are unique per row and all `snap`-class.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_snapshot_rows_carry_generation_and_stable_ids() -> Result<()> {
+    let (db, pool, _dsn) = mysql_setup("snap_ids").await?;
+    let mut conn = pool.get_conn().await?;
+    conn.query_drop(format!("USE {db}")).await?;
+    conn.query_drop(
+        "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64))",
+    )
+    .await?;
+    conn.query_drop(format!(
+        "GRANT SELECT ON {db}.orders TO '{MYSQL_CDC_USER}'@'%'"
+    ))
+    .await?;
+    for i in 1..=5 {
+        conn.query_drop(format!("INSERT INTO orders VALUES ({i}, 'sku-{i}')"))
+            .await?;
+    }
+
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let src = make_source_on(
+        make_storage_backend().await,
+        "snap-ids",
+        &db,
+        vec![format!("{db}.orders")],
+        SnapshotCfg {
+            mode: SnapshotMode::Initial,
+            ..Default::default()
+        },
+        Default::default(),
+    )
+    .await;
+
+    let (tx, mut rx) = mpsc::channel(128);
+    let handle = src.run(tx, ckpt).await;
+    let events = collect_until(&mut rx, Duration::from_secs(30), |e| {
+        e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 5
+    })
+    .await;
+
+    let reads: Vec<_> =
+        events.iter().filter(|e| matches!(e.op, Op::Read)).collect();
+    assert_eq!(reads.len(), 5);
+    for e in &reads {
+        assert_eq!(e.source.position.snapshot_generation, Some(1));
+        assert!(
+            e.event_id.is_some(),
+            "snapshot row must carry a provisional stable id"
+        );
+        assert_eq!(
+            e.event_id.unwrap().class(),
+            deltaforge_core::EventClass::Snap
+        );
+    }
+    let ids = snapshot_ids(&events);
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), ids.len(), "ids must be unique per row");
+
+    handle.stop();
+    handle.join().await.ok();
+    mysql_drop_db(&pool, &db).await;
+    Ok(())
+}
+
+/// An explicit re-snapshot (`SnapshotMode::Always`) allocates a NEW generation,
+/// so the same rows get different ids. Uses a shared backend so the generation
+/// counter persists across runs.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_resnapshot_allocates_new_generation() -> Result<()> {
+    let (db, pool, _dsn) = mysql_setup("snap_resnap").await?;
+    let mut conn = pool.get_conn().await?;
+    conn.query_drop(format!("USE {db}")).await?;
+    conn.query_drop(
+        "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64))",
+    )
+    .await?;
+    conn.query_drop(format!(
+        "GRANT SELECT ON {db}.orders TO '{MYSQL_CDC_USER}'@'%'"
+    ))
+    .await?;
+    for i in 1..=3 {
+        conn.query_drop(format!("INSERT INTO orders VALUES ({i}, 'sku-{i}')"))
+            .await?;
+    }
+
+    let backend = make_storage_backend().await;
+    let run = |mode| {
+        let backend = backend.clone();
+        let db = db.clone();
+        async move {
+            let ckpt: Arc<dyn CheckpointStore> =
+                Arc::new(MemCheckpointStore::new().unwrap());
+            let src = make_source_on(
+                backend,
+                "snap-resnap",
+                &db,
+                vec![format!("{db}.orders")],
+                SnapshotCfg {
+                    mode,
+                    ..Default::default()
+                },
+                Default::default(),
+            )
+            .await;
+            let (tx, mut rx) = mpsc::channel(128);
+            let handle = src.run(tx, ckpt).await;
+            let events = collect_until(&mut rx, Duration::from_secs(30), |e| {
+                e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 3
+            })
+            .await;
+            handle.stop();
+            handle.join().await.ok();
+            events
+        }
+    };
+
+    let first = run(SnapshotMode::Initial).await;
+    let second = run(SnapshotMode::Always).await;
+
+    let first_read = first
+        .iter()
+        .find(|e| matches!(e.op, Op::Read))
+        .expect("initial snapshot emitted no rows");
+    let second_read = second
+        .iter()
+        .find(|e| matches!(e.op, Op::Read))
+        .expect("resnapshot emitted no rows");
+    assert_eq!(first_read.source.position.snapshot_generation, Some(1));
+    assert_eq!(
+        second_read.source.position.snapshot_generation,
+        Some(2),
+        "resnapshot must allocate a new generation"
+    );
+
+    let ids1: std::collections::HashSet<_> =
+        snapshot_ids(&first).into_iter().collect();
+    let ids2: std::collections::HashSet<_> =
+        snapshot_ids(&second).into_iter().collect();
+    assert!(
+        ids1.is_disjoint(&ids2),
+        "a new generation must change every row's id"
+    );
+
+    mysql_drop_db(&pool, &db).await;
+    Ok(())
+}
+
+/// A keyless table (no PK, no `identity_columns`) is rejected before any
+/// snapshot row is emitted — no `Op::Read` events arrive.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_keyless_table_rejected_before_rows() -> Result<()> {
+    let (db, pool, _dsn) = mysql_setup("snap_keyless").await?;
+    let mut conn = pool.get_conn().await?;
+    conn.query_drop(format!("USE {db}")).await?;
+    // No primary key.
+    conn.query_drop("CREATE TABLE logs (msg VARCHAR(64), lvl VARCHAR(8))")
+        .await?;
+    conn.query_drop(format!(
+        "GRANT SELECT ON {db}.logs TO '{MYSQL_CDC_USER}'@'%'"
+    ))
+    .await?;
+    conn.query_drop("INSERT INTO logs VALUES ('boot', 'info')")
+        .await?;
+
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let src = make_source_on(
+        make_storage_backend().await,
+        "snap-keyless",
+        &db,
+        vec![format!("{db}.logs")],
+        SnapshotCfg {
+            mode: SnapshotMode::Initial,
+            ..Default::default()
+        },
+        Default::default(),
+    )
+    .await;
+
+    let (tx, mut rx) = mpsc::channel(128);
+    let handle = src.run(tx, ckpt).await;
+    let events =
+        collect_until(&mut rx, Duration::from_secs(8), |_| false).await;
+    let reads = events.iter().filter(|e| matches!(e.op, Op::Read)).count();
+    assert_eq!(reads, 0, "keyless table must emit no snapshot rows");
+
+    handle.stop();
+    handle.join().await.ok();
     mysql_drop_db(&pool, &db).await;
     Ok(())
 }

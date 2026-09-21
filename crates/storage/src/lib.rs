@@ -102,6 +102,16 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
         expected_version: u64,
         state: &[u8],
     ) -> Result<bool>;
+    /// Atomically create a slot **only if absent**. Returns `Some(1)` when this
+    /// call created it, or `None` if it already existed. Unlike `slot_upsert`,
+    /// this never overwrites — it makes initial allocation race-free (a plain
+    /// version-based CAS cannot express expect-absent).
+    async fn slot_create(
+        &self,
+        ns: &str,
+        key: &str,
+        state: &[u8],
+    ) -> Result<Option<u64>>;
     /// Returns `true` if the slot existed.
     async fn slot_delete(&self, ns: &str, key: &str) -> Result<bool>;
 

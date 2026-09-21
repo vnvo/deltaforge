@@ -26,6 +26,7 @@ pub const WAL_MESSAGE_SCHEMA: &str = "__wal_message";
 /// Returns `None` if content is not valid JSON.
 #[allow(clippy::too_many_arguments)]
 pub fn to_event(
+    event_id: deltaforge_core::EventId,
     prefix: &str,
     content: &Bytes,
     lsn: Lsn,
@@ -78,6 +79,7 @@ pub fn to_event(
     debug!(prefix = %prefix, lsn = %lsn, tx_id = ?tx_id, schema = schema, "emitted WAL message event");
 
     Some(Event::new_row(
+        event_id,
         source,
         Op::Create,
         None,
@@ -91,6 +93,16 @@ pub fn to_event(
 mod tests {
     use super::*;
 
+    fn msg_id() -> deltaforge_core::EventId {
+        deltaforge_core::EventId::logical_message(
+            &deltaforge_core::SourceLineage::Postgres {
+                system_identifier: 1,
+            },
+            "0/1",
+            0,
+        )
+    }
+
     fn allow(patterns: &[&str]) -> AllowList {
         AllowList::from_strs(patterns)
     }
@@ -98,6 +110,7 @@ mod tests {
     #[test]
     fn matching_prefix_tags_outbox() {
         let ev = to_event(
+            msg_id(),
             "outbox",
             &Bytes::from(r#"{"id":"1"}"#),
             Lsn::from(1u64),
@@ -114,6 +127,7 @@ mod tests {
     #[test]
     fn glob_prefix_match() {
         let ev = to_event(
+            msg_id(),
             "outbox_orders",
             &Bytes::from(r#"{}"#),
             Lsn::from(1u64),
@@ -130,6 +144,7 @@ mod tests {
     #[test]
     fn non_matching_prefix_tags_wal_message() {
         let ev = to_event(
+            msg_id(),
             "audit",
             &Bytes::from(r#"{}"#),
             Lsn::from(1u64),
@@ -146,6 +161,7 @@ mod tests {
     #[test]
     fn empty_allow_list_tags_wal_message() {
         let ev = to_event(
+            msg_id(),
             "outbox",
             &Bytes::from(r#"{}"#),
             Lsn::from(1u64),
@@ -163,6 +179,7 @@ mod tests {
     fn invalid_json_returns_none() {
         assert!(
             to_event(
+                msg_id(),
                 "x",
                 &Bytes::from("nope"),
                 Lsn::from(0u64),

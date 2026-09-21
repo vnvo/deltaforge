@@ -78,6 +78,7 @@ impl Source for FakeSource {
                 };
 
                 let ev = Event::new_row(
+                    deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
                     source_info,
                     Op::Create,
                     None,

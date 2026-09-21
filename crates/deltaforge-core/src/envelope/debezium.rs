@@ -59,6 +59,7 @@ mod tests {
     #[test]
     fn debezium_wraps_in_payload() {
         let event = Event::new_row(
+            crate::EventId::mysql_row_server(1, "t", 1, 0),
             SourceInfo {
                 version: "test".into(),
                 connector: "mysql".into(),

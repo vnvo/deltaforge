@@ -376,6 +376,26 @@ impl StorageBackend for SqliteStorageBackend {
         })
     }
 
+    async fn slot_create(
+        &self,
+        ns: &str,
+        key: &str,
+        state: &[u8],
+    ) -> Result<Option<u64>> {
+        let ns = ns.to_string();
+        let key = key.to_string();
+        let state = state.to_vec();
+        db!(self, move |conn: &Connection| {
+            let n = conn.execute(
+                "INSERT INTO df_slot(ns, key, version, state, updated_at)
+                 VALUES(?1, ?2, 1, ?3, ?4)
+                 ON CONFLICT(ns, key) DO NOTHING",
+                params![ns, key, state, now_secs()],
+            )?;
+            Ok(if n == 1 { Some(1u64) } else { None })
+        })
+    }
+
     async fn slot_delete(&self, ns: &str, key: &str) -> Result<bool> {
         let ns = ns.to_string();
         let key = key.to_string();

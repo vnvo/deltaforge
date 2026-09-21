@@ -234,6 +234,7 @@ async fn make_mysql_source(
         outbox_tables: AllowList::default(),
         snapshot_cfg: SnapshotCfg::default(),
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
+        table_options: Default::default(),
     }
 }
 
@@ -257,6 +258,7 @@ async fn make_pg_source(
         outbox_prefixes: AllowList::default(),
         snapshot_cfg: SnapshotCfg::default(),
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
+        table_options: Default::default(),
     }
 }
 
@@ -515,6 +517,7 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
             outbox_tables: AllowList::default(),
             snapshot_cfg: SnapshotCfg::default(),
             on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
+            table_options: Default::default(),
         };
         let (tx, mut rx) = mpsc::channel(64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -563,6 +566,7 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
             outbox_tables: AllowList::default(),
             snapshot_cfg: SnapshotCfg::default(),
             on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
+            table_options: Default::default(),
         };
         let (tx, mut rx) = mpsc::channel(64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -655,6 +659,7 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
             outbox_tables: AllowList::default(),
             snapshot_cfg: SnapshotCfg::default(),
             on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
+            table_options: Default::default(),
         };
         let (tx, mut rx) = mpsc::channel(64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -702,6 +707,7 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
             outbox_tables: AllowList::default(),
             snapshot_cfg: SnapshotCfg::default(),
             on_schema_drift: deltaforge_config::OnSchemaDrift::Halt,
+            table_options: Default::default(),
         };
         let (tx, _rx) = mpsc::channel(64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -792,6 +798,7 @@ async fn mysql_failover_schema_drift_halt_no_drift_continues() -> Result<()> {
             outbox_tables: AllowList::default(),
             snapshot_cfg: SnapshotCfg::default(),
             on_schema_drift: deltaforge_config::OnSchemaDrift::Halt,
+            table_options: Default::default(),
         };
         let (tx, mut rx) = mpsc::channel(64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;

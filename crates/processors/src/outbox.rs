@@ -52,7 +52,11 @@ pub struct OutboxProcessor {
     table_filter: AllowList,
     topic_template: Option<CompiledTemplate>,
     key_template: Option<CompiledTemplate>,
+    digest: String,
 }
+
+/// Bump when a code change alters this processor's output for identical config.
+const OUTBOX_IMPL_VERSION: u32 = 1;
 
 impl OutboxProcessor {
     pub fn new(cfg: OutboxProcessorCfg, pipeline: String) -> Result<Self> {
@@ -74,6 +78,8 @@ impl OutboxProcessor {
 
         let table_filter = AllowList::new(&cfg.tables);
         let id = cfg.id.clone();
+        let digest =
+            crate::digest::builtin_digest("outbox", OUTBOX_IMPL_VERSION, &cfg);
 
         Ok(Self {
             id,
@@ -82,6 +88,7 @@ impl OutboxProcessor {
             table_filter,
             topic_template,
             key_template,
+            digest,
         })
     }
 
@@ -308,6 +315,10 @@ impl Processor for OutboxProcessor {
         &self.id
     }
 
+    fn identity_digest(&self) -> &str {
+        &self.digest
+    }
+
     async fn process(
         &self,
         events: Vec<Event>,
@@ -356,6 +367,7 @@ mod tests {
 
     fn outbox_event(table: &str, after: Value) -> Event {
         Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
             SourceInfo {
                 version: "test".into(),
                 connector: "postgresql".into(),
@@ -377,6 +389,7 @@ mod tests {
 
     fn table_event(table: &str) -> Event {
         Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
             SourceInfo {
                 version: "test".into(),
                 connector: "mysql".into(),

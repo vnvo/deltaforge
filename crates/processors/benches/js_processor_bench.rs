@@ -36,6 +36,7 @@ fn make_source_info() -> SourceInfo {
 
 fn make_small_event() -> Event {
     Event::new_row(
+        deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         make_source_info(),
         Op::Create,
         None,
@@ -48,6 +49,7 @@ fn make_small_event() -> Event {
 fn make_large_event(bytes: usize) -> Event {
     let big = "x".repeat(bytes);
     Event::new_row(
+        deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         make_source_info(),
         Op::Create,
         None,
@@ -66,6 +68,7 @@ fn make_batch(size: usize) -> Vec<Event> {
     (0..size)
         .map(|i| {
             Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
                 make_source_info(),
                 Op::Create,
                 None,
@@ -86,6 +89,9 @@ struct RustNoop;
 #[async_trait::async_trait]
 impl Processor for RustNoop {
     fn id(&self) -> &str {
+        "noop"
+    }
+    fn identity_digest(&self) -> &str {
         "noop"
     }
     async fn process(
@@ -136,8 +142,8 @@ fn bench_js_passthrough(c: &mut Criterion) {
         }
     "#;
 
-    let proc =
-        JsProcessor::new("passthrough".into(), js.into()).expect("init ok");
+    let proc = JsProcessor::new("passthrough".into(), js.into(), None)
+        .expect("init ok");
     let ev = make_small_event();
 
     group.bench_function("passthrough", |b| {
@@ -174,7 +180,8 @@ fn bench_js_mutation(c: &mut Criterion) {
         }
     "#;
 
-    let proc = JsProcessor::new("mutation".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("mutation".into(), js.into(), None).expect("init ok");
     let ev = make_small_event();
 
     group.bench_function("mutation", |b| {
@@ -214,7 +221,7 @@ fn bench_js_expansion(c: &mut Criterion) {
     "#;
 
     let proc =
-        JsProcessor::new("expansion".into(), js.into()).expect("init ok");
+        JsProcessor::new("expansion".into(), js.into(), None).expect("init ok");
     let ev = make_small_event();
 
     group.bench_function("expansion_1to2", |b| {
@@ -247,7 +254,7 @@ fn bench_js_filtering(c: &mut Criterion) {
     "#;
 
     let proc =
-        JsProcessor::new("filtering".into(), js.into()).expect("init ok");
+        JsProcessor::new("filtering".into(), js.into(), None).expect("init ok");
     let batch = make_batch(100);
     group.throughput(Throughput::Elements(100));
 
@@ -279,7 +286,8 @@ fn bench_js_large_payload(c: &mut Criterion) {
         }
     "#;
 
-    let proc = JsProcessor::new("large".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("large".into(), js.into(), None).expect("init ok");
     let ev = make_large_event(64 * 1024);
 
     group.bench_function("64kb_passthrough", |b| {
@@ -312,7 +320,8 @@ fn bench_js_batch_sizes(c: &mut Criterion) {
         }
     "#;
 
-    let proc = JsProcessor::new("batch".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("batch".into(), js.into(), None).expect("init ok");
 
     for size in [1, 10, 50, 100, 500] {
         let batch = make_batch(size);

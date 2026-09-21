@@ -249,6 +249,24 @@ impl StorageBackend for MemoryStorageBackend {
         }
     }
 
+    async fn slot_create(
+        &self,
+        ns: &str,
+        key: &str,
+        state: &[u8],
+    ) -> Result<Option<u64>> {
+        use std::collections::hash_map::Entry;
+        let mut store = self.slot.write().await;
+        let k = (ns.to_string(), key.to_string());
+        match store.0.entry(k) {
+            Entry::Occupied(_) => Ok(None),
+            Entry::Vacant(v) => {
+                v.insert((1, state.to_vec()));
+                Ok(Some(1))
+            }
+        }
+    }
+
     async fn slot_delete(&self, ns: &str, key: &str) -> Result<bool> {
         let mut store = self.slot.write().await;
         Ok(store.0.remove(&(ns.to_string(), key.to_string())).is_some())

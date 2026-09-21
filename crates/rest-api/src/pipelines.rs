@@ -425,6 +425,7 @@ mod tests {
                         id: "mysql".to_string(),
                         dsn: "mysql://root:root@localhost/db".to_string(),
                         tables: vec![],
+                        table_options: Default::default(),
                         outbox: None,
                         snapshot: SnapshotCfg::default(),
                         on_schema_drift:

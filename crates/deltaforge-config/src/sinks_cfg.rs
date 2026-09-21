@@ -1049,7 +1049,15 @@ mod tests {
             snapshot: None,
             position: SourcePosition::default(),
         };
-        let mut e = Event::new_row(source, Op::Create, None, None, 0, 0);
+        let mut e = Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
+            source,
+            Op::Create,
+            None,
+            None,
+            0,
+            0,
+        );
         e.synthetic = synthetic.map(|s| s.to_string());
         e
     }

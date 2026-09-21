@@ -693,6 +693,7 @@ async fn kafka_sink_cloudevents_operations() -> Result<()> {
 
     // Create events with different operations
     let create_event = Event::new_row(
+        deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         SourceInfo {
             version: "deltaforge-test".into(),
             connector: "test".into(),
@@ -712,6 +713,7 @@ async fn kafka_sink_cloudevents_operations() -> Result<()> {
     );
 
     let update_event = Event::new_row(
+        deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         SourceInfo {
             version: "deltaforge-test".into(),
             connector: "test".into(),
@@ -731,6 +733,7 @@ async fn kafka_sink_cloudevents_operations() -> Result<()> {
     );
 
     let delete_event = Event::new_row(
+        deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         SourceInfo {
             version: "deltaforge-test".into(),
             connector: "test".into(),

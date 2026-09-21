@@ -9,9 +9,12 @@
 //! to be processed by the pipeline coordinator.
 
 pub mod failover;
+pub mod identity_resolution;
 pub mod mysql;
 pub mod postgres;
 pub mod schema_loader;
+pub mod snapshot_event_id;
+pub mod snapshot_generation;
 
 use anyhow::Result;
 use deltaforge_config::{PipelineSpec, SourceCfg};
@@ -51,6 +54,7 @@ pub fn build_source(
                 .unwrap_or_default(),
             snapshot_cfg: c.snapshot.clone(),
             on_schema_drift: c.on_schema_drift.clone(),
+            table_options: c.table_options.clone(),
         })),
 
         SourceCfg::Mysql(c) => Ok(Arc::new(mysql::MySqlSource {
@@ -68,6 +72,7 @@ pub fn build_source(
                 .unwrap_or_default(),
             snapshot_cfg: c.snapshot.clone(),
             on_schema_drift: c.on_schema_drift.clone(),
+            table_options: c.table_options.clone(),
         })),
     }
 }

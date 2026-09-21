@@ -58,6 +58,7 @@ fn cdc_source_info() -> SourceInfo {
 
 fn make_outbox_event(i: usize) -> Event {
     Event::new_row(
+        deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         outbox_source_info("outbox"),
         Op::Create,
         None,
@@ -79,6 +80,7 @@ fn make_large_outbox_event(payload_keys: usize) -> Event {
         payload.insert(format!("field_{k}"), json!(format!("value_{k}")));
     }
     Event::new_row(
+        deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         outbox_source_info("outbox"),
         Op::Create,
         None,
@@ -96,6 +98,7 @@ fn make_large_outbox_event(payload_keys: usize) -> Event {
 
 fn make_cdc_event(i: usize) -> Event {
     Event::new_row(
+        deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         cdc_source_info(),
         Op::Create,
         None,
@@ -139,6 +142,7 @@ fn cfg_with_key() -> OutboxProcessorCfg {
 
 fn make_outbox_event_with_extra_headers(i: usize) -> Event {
     Event::new_row(
+        deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         outbox_source_info("outbox"),
         Op::Create,
         None,

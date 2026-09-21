@@ -4,6 +4,8 @@ use anyhow::Result;
 use deltaforge_config::{PipelineSpec, ProcessorCfg};
 use deltaforge_core::ArcDynProcessor;
 
+pub mod digest;
+
 pub mod synthetic;
 pub use synthetic::SyntheticMarkingProcessor;
 
@@ -27,10 +29,10 @@ pub fn build_processors(
 
     for p in &ps.spec.processors {
         let proc: ArcDynProcessor = match p {
-            ProcessorCfg::Javascript { id, inline, .. } => {
-                Arc::new(JsProcessor::new(id.clone(), inline.clone())?)
-                    as ArcDynProcessor
-            }
+            ProcessorCfg::Javascript { id, inline, limits } => Arc::new(
+                JsProcessor::new(id.clone(), inline.clone(), limits.clone())?,
+            )
+                as ArcDynProcessor,
             ProcessorCfg::Outbox { config } => Arc::new(OutboxProcessor::new(
                 config.as_ref().clone(),
                 pipeline.to_string(),

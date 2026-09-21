@@ -118,12 +118,19 @@ pub(super) async fn dispatch_event(
             debug!(final_lsn = %final_lsn, xid, "transaction begin");
             ctx.current_tx_id = Some(xid);
             ctx.current_tx_commit_time = Some(commit_time_micros);
+            // The transaction's final LSN is the stable identity coordinate;
+            // reset the per-transaction change ordinal exactly at BEGIN.
+            ctx.current_final_lsn = Some(final_lsn.to_string());
+            ctx.change_ordinal = 0;
+            ctx.message_ordinal = 0;
         }
         ReplicationEvent::Commit { lsn, end_lsn, .. } => {
             debug!(commit_lsn = %lsn, end_lsn = %end_lsn, "transaction commit");
             ctx.last_lsn = end_lsn;
             ctx.current_tx_id = None;
             ctx.current_tx_commit_time = None;
+            ctx.current_final_lsn = None;
+            ctx.message_ordinal = 0;
         }
         ReplicationEvent::StoppedAt { reached } => {
             info!(reached = %reached, "replication stopped at target LSN");
@@ -140,7 +147,36 @@ pub(super) async fn dispatch_event(
                 "logical decoding message"
             );
 
+            // A transactional message is an identity-bearing change: it consumes
+            // a change-ordinal slot so subsequent rows in the transaction do not
+            // collide. (Non-transactional messages occur outside BEGIN/COMMIT
+            // and have their own identity — they do not consume a tx ordinal.)
+            if transactional {
+                ctx.change_ordinal += 1;
+            }
+            // Message ordinal is assigned BEFORE filtering so a filtered message
+            // never renumbers a retained one.
+            let message_ordinal = ctx.message_ordinal;
+            ctx.message_ordinal += 1;
+
+            // The stable `msg` id is required — fail closed without lineage.
+            if ctx.system_identifier == 0 {
+                return Err(LoopControl::Fail(SourceError::Other(
+                    anyhow::anyhow!(
+                        "logical message identity: system_identifier unavailable"
+                    ),
+                )));
+            }
+            let msg_id = deltaforge_core::EventId::logical_message(
+                &deltaforge_core::SourceLineage::Postgres {
+                    system_identifier: ctx.system_identifier,
+                },
+                &lsn.to_string(),
+                message_ordinal,
+            );
+
             if let Some(event) = postgres_logical_message::to_event(
+                msg_id,
                 &prefix,
                 &content,
                 lsn,
@@ -177,20 +213,39 @@ async fn handle_pgoutput_message(
     let payload_bytes = data.slice(1..);
     let payload = payload_bytes.as_ref();
 
+    // Identity-bearing changes consume a change ordinal *before* filtering, so
+    // filtering one table cannot renumber later events. Protocol metadata
+    // (Relation/Type/Origin/Begin/Commit) does not.
     match msg_type {
         b'R' => handle_relation(ctx, payload),
-        b'I' => handle_insert(ctx, &payload_bytes, wal_lsn)
-            .await
-            .map_err(LoopControl::Fail),
-        b'U' => handle_update(ctx, &payload_bytes, wal_lsn)
-            .await
-            .map_err(LoopControl::Fail),
-        b'D' => handle_delete(ctx, &payload_bytes, wal_lsn)
-            .await
-            .map_err(LoopControl::Fail),
-        b'T' => handle_truncate(ctx, payload, wal_lsn)
-            .await
-            .map_err(LoopControl::Fail),
+        b'I' => {
+            let ordinal = ctx.change_ordinal;
+            ctx.change_ordinal += 1;
+            handle_insert(ctx, &payload_bytes, wal_lsn, ordinal)
+                .await
+                .map_err(LoopControl::Fail)
+        }
+        b'U' => {
+            let ordinal = ctx.change_ordinal;
+            ctx.change_ordinal += 1;
+            handle_update(ctx, &payload_bytes, wal_lsn, ordinal)
+                .await
+                .map_err(LoopControl::Fail)
+        }
+        b'D' => {
+            let ordinal = ctx.change_ordinal;
+            ctx.change_ordinal += 1;
+            handle_delete(ctx, &payload_bytes, wal_lsn, ordinal)
+                .await
+                .map_err(LoopControl::Fail)
+        }
+        b'T' => {
+            let ordinal = ctx.change_ordinal;
+            ctx.change_ordinal += 1;
+            handle_truncate(ctx, payload, wal_lsn, ordinal)
+                .await
+                .map_err(LoopControl::Fail)
+        }
         b'B' | b'C' => Ok(()), // Begin/Commit handled in ReplicationEvent
         b'O' => {
             debug!("origin message");
@@ -357,13 +412,16 @@ static PG_VERSION: std::sync::LazyLock<String> =
 ///
 /// Caches the formatted LSN string to avoid re-formatting when consecutive
 /// events share the same WAL position (common within a transaction).
+#[allow(clippy::too_many_arguments)]
 fn build_source_info(
     ctx: &mut RunCtx,
     wal_lsn: &Lsn,
     schema: &str,
     table: &str,
     timestamp_ms: i64,
-) -> SourceInfo {
+    relation_oid: u32,
+    change_ordinal: u32,
+) -> SourceResult<(SourceInfo, deltaforge_core::EventId)> {
     // Cache the LSN string — only reformat when it changes.
     let lsn_str = match &ctx.cached_lsn {
         Some((cached, s)) if cached == wal_lsn => s.clone(),
@@ -374,7 +432,7 @@ fn build_source_info(
         }
     };
 
-    SourceInfo {
+    let source = SourceInfo {
         version: PG_VERSION.clone(),
         connector: "postgresql".to_string(),
         name: ctx.pipeline.clone(),
@@ -383,12 +441,29 @@ fn build_source_info(
         schema: Some(schema.to_string()),
         table: table.to_string(),
         snapshot: None,
-        position: SourcePosition::postgres(
-            lsn_str,
-            ctx.current_tx_id.map(|id| id as i64),
-            None,
-        ),
+        position: {
+            let mut p = SourcePosition::postgres(
+                lsn_str,
+                ctx.current_tx_id.map(|id| id as i64),
+                None,
+            );
+            // Immutable stable-identity coordinates.
+            p.tx_final_lsn = ctx.current_final_lsn.clone();
+            p.relation_oid = Some(relation_oid);
+            p.change_ordinal = Some(change_ordinal);
+            p
+        },
+    };
+    // The stable id is required at the source boundary — fail closed if the
+    // system_identifier is missing or the row has no active transaction.
+    if ctx.system_identifier == 0 {
+        return Err(SourceError::Other(anyhow::anyhow!(
+            "pg row identity: system_identifier unavailable"
+        )));
     }
+    let id = super::pg_row_event_id(&source, ctx.system_identifier)
+        .map_err(|e| SourceError::Other(anyhow::anyhow!(e)))?;
+    Ok((source, id))
 }
 
 /// Handle INSERT message.
@@ -396,6 +471,7 @@ async fn handle_insert(
     ctx: &mut RunCtx,
     payload_bytes: &Bytes,
     wal_lsn: Lsn,
+    change_ordinal: u32,
 ) -> SourceResult<()> {
     let payload = payload_bytes.as_ref();
     if payload.len() < 5 {
@@ -437,11 +513,19 @@ async fn handle_insert(
         .map(pg_timestamp_to_unix_ms)
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
-    let source_info =
-        build_source_info(ctx, &wal_lsn, &schema, &table, timestamp_ms);
+    let (source_info, event_id) = build_source_info(
+        ctx,
+        &wal_lsn,
+        &schema,
+        &table,
+        timestamp_ms,
+        relation_id,
+        change_ordinal,
+    )?;
     let lsn_str = &ctx.cached_lsn.as_ref().unwrap().1;
     let chkpt = make_checkpoint_meta_str(lsn_str, ctx.current_tx_id);
     let mut ev = Event::new_row(
+        event_id,
         source_info,
         Op::Create,
         None,
@@ -472,6 +556,7 @@ async fn handle_update(
     ctx: &mut RunCtx,
     payload_bytes: &Bytes,
     wal_lsn: Lsn,
+    change_ordinal: u32,
 ) -> SourceResult<()> {
     let payload = payload_bytes.as_ref();
     if payload.len() < 5 {
@@ -536,11 +621,19 @@ async fn handle_update(
         .map(pg_timestamp_to_unix_ms)
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
-    let source_info =
-        build_source_info(ctx, &wal_lsn, &schema, &table, timestamp_ms);
+    let (source_info, event_id) = build_source_info(
+        ctx,
+        &wal_lsn,
+        &schema,
+        &table,
+        timestamp_ms,
+        relation_id,
+        change_ordinal,
+    )?;
     let lsn_str = &ctx.cached_lsn.as_ref().unwrap().1;
     let chkpt = make_checkpoint_meta_str(lsn_str, ctx.current_tx_id);
     let mut ev = Event::new_row(
+        event_id,
         source_info,
         Op::Update,
         before,
@@ -571,6 +664,7 @@ async fn handle_delete(
     ctx: &mut RunCtx,
     payload_bytes: &Bytes,
     wal_lsn: Lsn,
+    change_ordinal: u32,
 ) -> SourceResult<()> {
     let payload = payload_bytes.as_ref();
     if payload.len() < 5 {
@@ -611,11 +705,19 @@ async fn handle_delete(
         .map(pg_timestamp_to_unix_ms)
         .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
-    let source_info =
-        build_source_info(ctx, &wal_lsn, &schema, &table, timestamp_ms);
+    let (source_info, event_id) = build_source_info(
+        ctx,
+        &wal_lsn,
+        &schema,
+        &table,
+        timestamp_ms,
+        relation_id,
+        change_ordinal,
+    )?;
     let lsn_str = &ctx.cached_lsn.as_ref().unwrap().1;
     let chkpt = make_checkpoint_meta_str(lsn_str, ctx.current_tx_id);
     let mut ev = Event::new_row(
+        event_id,
         source_info,
         Op::Delete,
         Some(before),
@@ -646,6 +748,7 @@ async fn handle_truncate(
     ctx: &mut RunCtx,
     payload: &[u8],
     wal_lsn: Lsn,
+    change_ordinal: u32,
 ) -> SourceResult<()> {
     if payload.len() < 9 {
         return Ok(());
@@ -673,7 +776,7 @@ async fn handle_truncate(
         offset += 4;
 
         if let Some(rel) = ctx.relation_map.get(&rel_id) {
-            tables.push((rel.schema.clone(), rel.table.clone()));
+            tables.push((rel_id, rel.schema.clone(), rel.table.clone()));
         }
     }
 
@@ -681,7 +784,7 @@ async fn handle_truncate(
 
     let timestamp_ms = chrono::Utc::now().timestamp_millis();
 
-    for (schema, table) in &tables {
+    for (rel_id, schema, table) in &tables {
         let source_info = SourceInfo {
             version: concat!("deltaforge-", env!("CARGO_PKG_VERSION"))
                 .to_string(),
@@ -692,12 +795,31 @@ async fn handle_truncate(
             schema: Some(schema.clone()),
             table: table.clone(),
             snapshot: None,
-            position: SourcePosition::postgres(
-                wal_lsn.to_string(),
-                ctx.current_tx_id.map(|id| id as i64),
-                None,
-            ),
+            position: {
+                let mut p = SourcePosition::postgres(
+                    wal_lsn.to_string(),
+                    ctx.current_tx_id.map(|id| id as i64),
+                    None,
+                );
+                // One ordinal for the truncate message; relation OID
+                // disambiguates the truncated tables.
+                p.tx_final_lsn = ctx.current_final_lsn.clone();
+                p.relation_oid = Some(*rel_id);
+                p.change_ordinal = Some(change_ordinal);
+                p
+            },
         };
+
+        // Truncate carries row-like identity coordinates (relation OID +
+        // per-tx change ordinal), so its id is a `pgrow`. Required — fail closed.
+        if ctx.system_identifier == 0 {
+            return Err(SourceError::Other(anyhow::anyhow!(
+                "truncate identity: system_identifier unavailable"
+            )));
+        }
+        let truncate_id =
+            super::pg_row_event_id(&source_info, ctx.system_identifier)
+                .map_err(|e| SourceError::Other(anyhow::anyhow!(e)))?;
 
         let ddl_payload = serde_json::json!({
             "sql": "TRUNCATE",
@@ -705,9 +827,15 @@ async fn handle_truncate(
             "restart_identity": restart_identity,
         });
 
-        let mut ev = Event::new_ddl(source_info, ddl_payload, timestamp_ms, 0)
-            .with_tenant(ctx.tenant.clone())
-            .with_checkpoint(make_checkpoint_meta(&wal_lsn, ctx.current_tx_id));
+        let mut ev = Event::new_ddl(
+            truncate_id,
+            source_info,
+            ddl_payload,
+            timestamp_ms,
+            0,
+        )
+        .with_tenant(ctx.tenant.clone())
+        .with_checkpoint(make_checkpoint_meta(&wal_lsn, ctx.current_tx_id));
 
         if let Some(tx_id) = ctx.current_tx_id {
             ev.transaction = Some(Transaction {

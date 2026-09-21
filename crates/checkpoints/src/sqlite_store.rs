@@ -4,6 +4,7 @@
 //! Tokio worker thread is never stalled by synchronous SQLite I/O.
 
 use super::{CheckpointError, CheckpointResult, CheckpointStore, VersionInfo};
+use crate::snapshot_state::{CasOutcome, SnapshotStateStore, cas_decision};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -304,6 +305,88 @@ impl CheckpointStore for SqliteCheckpointStore {
 }
 
 // ---------------------------------------------------------------------------
+// SnapshotStateStore impl (atomic versioned CAS via a single transaction)
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl SnapshotStateStore for SqliteCheckpointStore {
+    async fn get_versioned(
+        &self,
+        key: &str,
+    ) -> CheckpointResult<Option<(u64, Vec<u8>)>> {
+        let key = key.to_owned();
+        db!(self.conn, move |conn: &Connection| {
+            conn.query_row(
+                "SELECT version, payload FROM checkpoints \
+                 WHERE key = ?1 ORDER BY version DESC LIMIT 1",
+                params![key],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, Vec<u8>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| CheckpointError::Database(e.to_string()))
+        })
+    }
+
+    async fn compare_and_swap(
+        &self,
+        key: &str,
+        expected_version: Option<u64>,
+        value: &[u8],
+    ) -> CheckpointResult<CasOutcome> {
+        let key = key.to_owned();
+        let value = value.to_vec();
+        db!(self.conn, move |conn: &Connection| {
+            // Single transaction, serialized by the connection mutex — the
+            // read, the decision, and the write are one atomic unit.
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| CheckpointError::Database(e.to_string()))?;
+            let current: Option<(u64, Vec<u8>)> = tx
+                .query_row(
+                    "SELECT version, payload FROM checkpoints \
+                     WHERE key = ?1 ORDER BY version DESC LIMIT 1",
+                    params![key],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)? as u64,
+                            row.get::<_, Vec<u8>>(1)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| CheckpointError::Database(e.to_string()))?;
+            match cas_decision(&current, expected_version) {
+                Some(new_version) => {
+                    tx.execute(
+                        "INSERT INTO checkpoints(key, version, payload, created_at) \
+                         VALUES(?1, ?2, ?3, ?4)",
+                        params![
+                            key,
+                            new_version as i64,
+                            value,
+                            Utc::now().to_rfc3339()
+                        ],
+                    )
+                    .map_err(|e| CheckpointError::Database(e.to_string()))?;
+                    tx.commit().map_err(|e| {
+                        CheckpointError::Database(e.to_string())
+                    })?;
+                    Ok(CasOutcome::Committed {
+                        version: new_version,
+                    })
+                }
+                None => Ok(CasOutcome::Mismatch { current }),
+            }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -351,6 +434,12 @@ mod tests {
         let versions = store.list_versions("k1").await.unwrap();
         assert_eq!(versions.len(), 4);
         assert_eq!(versions[0].version, 4); // newest first
+    }
+
+    #[tokio::test]
+    async fn snapshot_state_contract() {
+        let store = SqliteCheckpointStore::in_memory().unwrap();
+        crate::snapshot_state::assert_snapshot_state_contract(&store).await;
     }
 
     #[tokio::test]

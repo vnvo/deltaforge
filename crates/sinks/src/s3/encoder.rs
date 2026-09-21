@@ -919,7 +919,6 @@ mod tests {
     };
     use deltaforge_core::{Op, SourceInfo, SourcePosition, Transaction};
     use serde_json::json;
-    use uuid::Uuid;
 
     fn make_event(
         op: Op,
@@ -953,7 +952,9 @@ mod tests {
                 total_order: None,
                 data_collection_order: None,
             }),
-            event_id: Some(Uuid::nil()),
+            event_id: Some(deltaforge_core::EventId::mysql_row_server(
+                1, "t", 1, 0,
+            )),
             tenant_id: None,
             schema_version: Some("v1".into()),
             schema_sequence: None,
