@@ -14,7 +14,7 @@ use anyhow::Result;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
 use common::AllowList;
 use deltaforge_config::SnapshotCfg;
-use deltaforge_core::{Event, Source};
+use deltaforge_core::{Event, Source, SourceItem};
 use mysql_async::prelude::Queryable;
 use sources::failover::identity::{
     IdentityComparison, IdentityStore, ServerIdentity,
@@ -267,7 +267,7 @@ async fn make_pg_source(
 // ============================================================================
 
 async fn collect_until<F>(
-    rx: &mut mpsc::Receiver<Event>,
+    rx: &mut mpsc::Receiver<SourceItem>,
     dur: Duration,
     mut cond: F,
 ) -> Vec<Event>
@@ -279,12 +279,13 @@ where
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match timeout(remaining, rx.recv()).await {
-            Ok(Some(e)) => {
+            Ok(Some(SourceItem::Event(e))) => {
                 events.push(e);
                 if cond(&events) {
                     break;
                 }
             }
+            Ok(Some(SourceItem::TxCommit { .. })) => continue,
             _ => break,
         }
     }

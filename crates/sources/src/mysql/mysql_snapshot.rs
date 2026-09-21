@@ -22,7 +22,9 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow};
 use checkpoints::CheckpointStore;
 use deltaforge_config::SnapshotCfg;
-use deltaforge_core::{Event, EventId, Op, SourceInfo, SourcePosition};
+use deltaforge_core::{
+    Event, EventId, Op, SourceInfo, SourceItem, SourcePosition,
+};
 use metrics::counter;
 use mysql_async::{Pool, Row, Value, prelude::Queryable};
 use std::collections::HashMap;
@@ -88,7 +90,7 @@ pub struct SnapshotCtx<'a> {
     pub cfg: &'a SnapshotCfg,
     pub schema_loader: &'a MySqlSchemaLoader,
     pub chkpt_store: Arc<dyn CheckpointStore>,
-    pub tx: mpsc::Sender<Event>,
+    pub tx: mpsc::Sender<SourceItem>,
     pub cancel: CancellationToken,
     /// Durable snapshot generation (allocated before any row).
     pub generation: u64,
@@ -406,7 +408,7 @@ struct TableWorker {
     pipeline: String,
     tenant: String,
     cfg: SnapshotCfg,
-    tx: mpsc::Sender<Event>,
+    tx: mpsc::Sender<SourceItem>,
     schema_loader: MySqlSchemaLoader,
     cancel: CancellationToken,
     /// Durable snapshot generation for stable-id derivation.
@@ -521,7 +523,12 @@ impl TableWorker {
                 // conversion, then build the event.
                 let id = self.provisional_id(&row)?;
                 let json = row_to_json(row)?;
-                if self.tx.send(self.make_event(json, id)).await.is_err() {
+                if self
+                    .tx
+                    .send(SourceItem::Event(self.make_event(json, id)))
+                    .await
+                    .is_err()
+                {
                     anyhow::bail!("event channel closed");
                 }
             }
@@ -552,7 +559,12 @@ impl TableWorker {
         for row in rows {
             let id = self.provisional_id(&row)?;
             let json = row_to_json(row)?;
-            if self.tx.send(self.make_event(json, id)).await.is_err() {
+            if self
+                .tx
+                .send(SourceItem::Event(self.make_event(json, id)))
+                .await
+                .is_err()
+            {
                 anyhow::bail!("event channel closed");
             }
         }

@@ -6,7 +6,9 @@ use anyhow::Result;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
 use common::AllowList;
 use ctor::dtor;
-use deltaforge_core::{BatchContext, Event, Op, Source, SourceHandle};
+use deltaforge_core::{
+    BatchContext, Event, Op, Source, SourceHandle, SourceItem,
+};
 
 use sources::postgres::{
     PostgresSchemaLoader, PostgresSource, pg_row_event_id,
@@ -89,7 +91,7 @@ async fn wait_ready(handle: &SourceHandle, dur: Duration) -> Result<()> {
 }
 
 async fn collect_until<F>(
-    rx: &mut mpsc::Receiver<Event>,
+    rx: &mut mpsc::Receiver<SourceItem>,
     dur: Duration,
     pred: F,
 ) -> Vec<Event>
@@ -100,7 +102,7 @@ where
     let deadline = Instant::now() + dur;
     while Instant::now() < deadline {
         match timeout(Duration::from_millis(100), rx.recv()).await {
-            Ok(Some(e)) => {
+            Ok(Some(SourceItem::Event(e))) => {
                 events.push(e);
                 if pred(&events) {
                     return events;
@@ -110,6 +112,22 @@ where
         }
     }
     events
+}
+
+/// Receive the next data event, skipping transaction-commit markers.
+async fn next_event(
+    rx: &mut mpsc::Receiver<SourceItem>,
+    dur: Duration,
+) -> Option<Event> {
+    let deadline = Instant::now() + dur;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match timeout(remaining, rx.recv()).await {
+            Ok(Some(SourceItem::Event(e))) => return Some(e),
+            Ok(Some(SourceItem::TxCommit { .. })) => continue,
+            _ => return None,
+        }
+    }
 }
 
 fn has_id(e: &Event, id: i32) -> bool {
@@ -213,7 +231,7 @@ async fn make_source(
 /// Returns (rx, handle).
 async fn start_source(
     src: PostgresSource,
-) -> Result<(mpsc::Receiver<Event>, SourceHandle)> {
+) -> Result<(mpsc::Receiver<SourceItem>, SourceHandle)> {
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     let (tx, rx) = mpsc::channel(128);
     let handle = src.run(tx, ckpt).await;
@@ -880,8 +898,8 @@ async fn postgres_cdc_slot_auto_created() -> Result<()> {
         .execute("INSERT INTO orders (id, name) VALUES (1, 'test')", &[])
         .await?;
 
-    let event = timeout(Duration::from_secs(10), rx.recv())
-        .await?
+    let event = next_event(&mut rx, Duration::from_secs(10))
+        .await
         .expect("should receive create event");
     // Debezium uses Op::Create for inserts
     assert!(is_create_op(&event), "should be CREATE op");
@@ -968,8 +986,8 @@ async fn postgres_cdc_publication_missing_then_created() -> Result<()> {
         .execute("INSERT INTO orders (id, name) VALUES (1, 'test')", &[])
         .await?;
 
-    let event = timeout(Duration::from_secs(15), rx.recv())
-        .await?
+    let event = next_event(&mut rx, Duration::from_secs(15))
+        .await
         .expect("should receive create event after publication created");
     assert!(is_create_op(&event), "should be CREATE op");
     info!("✓ captured create event after admin created publication");

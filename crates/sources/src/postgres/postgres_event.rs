@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use deltaforge_core::{
-    Event, Op, SourceError, SourceInfo, SourcePosition, SourceResult,
-    Transaction,
+    Event, Op, SourceError, SourceInfo, SourceItem, SourcePosition,
+    SourceResult, Transaction,
 };
 use metrics::counter;
 use pgwire_replication::{Lsn, client::ReplicationEvent};
@@ -127,6 +127,21 @@ pub(super) async fn dispatch_event(
         ReplicationEvent::Commit { lsn, end_lsn, .. } => {
             debug!(commit_lsn = %lsn, end_lsn = %end_lsn, "transaction commit");
             ctx.last_lsn = end_lsn;
+            // The COMMIT record is the transaction boundary: emit an explicit
+            // marker carrying the commit-record checkpoint. tx_id matches the
+            // xid stamped on this transaction's row events. (pgoutput never
+            // decodes aborted transactions, so a rollback emits nothing here.)
+            if let Some(tx_id) = ctx.current_tx_id {
+                let checkpoint =
+                    make_checkpoint_meta(&end_lsn, ctx.current_tx_id);
+                let _ = ctx
+                    .tx
+                    .send(SourceItem::TxCommit {
+                        tx_id: tx_id.to_string(),
+                        checkpoint,
+                    })
+                    .await;
+            }
             ctx.current_tx_id = None;
             ctx.current_tx_commit_time = None;
             ctx.current_final_lsn = None;
@@ -186,7 +201,7 @@ pub(super) async fn dispatch_event(
                 ctx.current_tx_commit_time,
                 &ctx.outbox_prefixes,
             ) {
-                ctx.tx.send(event).await.map_err(|e| {
+                ctx.tx.send(SourceItem::Event(event)).await.map_err(|e| {
                     LoopControl::Fail(SourceError::Other(e.into()))
                 })?;
             }
@@ -845,7 +860,7 @@ async fn handle_truncate(
             });
         }
 
-        let _ = ctx.tx.send(ev).await;
+        let _ = ctx.tx.send(SourceItem::Event(ev)).await;
     }
 
     Ok(())
@@ -864,10 +879,10 @@ async fn send_event(
     table_name: &Arc<str>,
     op: &'static str,
 ) {
-    let ok = match ctx.tx.try_send(ev) {
+    let ok = match ctx.tx.try_send(SourceItem::Event(ev)) {
         Ok(()) => true,
-        Err(tokio::sync::mpsc::error::TrySendError::Full(ev)) => {
-            ctx.tx.send(ev).await.is_ok()
+        Err(tokio::sync::mpsc::error::TrySendError::Full(item)) => {
+            ctx.tx.send(item).await.is_ok()
         }
         Err(_) => false,
     };

@@ -81,7 +81,7 @@ impl CheckpointStore for PerSinkCheckpointProxy {
     }
 }
 use deltaforge_config::{PipelineSpec, SourceCfg};
-use deltaforge_core::{Event, SourceError, SourceHandle};
+use deltaforge_core::{SourceError, SourceHandle, SourceItem};
 use metrics::{counter, gauge};
 use parking_lot::RwLock;
 use processors::build_processors;
@@ -489,7 +489,7 @@ impl PipelineManager {
 
         let alive = Arc::new(AtomicBool::new(true));
 
-        let (event_tx, event_rx) = mpsc::channel::<Event>(32_768);
+        let (event_tx, event_rx) = mpsc::channel::<SourceItem>(32_768);
         // Wrap checkpoint store so the source reads the minimum per-sink
         // checkpoint — it replays from the position the slowest sink needs.
         // Capture the source's checkpoint comparison function for the proxy.

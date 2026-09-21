@@ -21,7 +21,7 @@ use checkpoints::CheckpointStore;
 use common::redact_url_password;
 use deltaforge_config::SnapshotCfg;
 use deltaforge_core::{
-    Event, EventId, IdentityKind, Op, SourceInfo, SourcePosition,
+    Event, EventId, IdentityKind, Op, SourceInfo, SourceItem, SourcePosition,
 };
 use std::collections::HashMap;
 
@@ -150,7 +150,7 @@ pub struct PgSnapshotCtx<'a> {
     pub cfg: &'a SnapshotCfg,
     pub schema_loader: &'a PostgresSchemaLoader,
     pub chkpt_store: Arc<dyn CheckpointStore>,
-    pub tx: mpsc::Sender<Event>,
+    pub tx: mpsc::Sender<SourceItem>,
     pub cancel: CancellationToken,
     pub slot_name: Option<&'a str>,
     /// Durable snapshot generation (allocated before any row).
@@ -388,7 +388,7 @@ struct TableWorker {
     pipeline: String,
     tenant: String,
     cfg: SnapshotCfg,
-    tx: mpsc::Sender<Event>,
+    tx: mpsc::Sender<SourceItem>,
     schema_loader: PostgresSchemaLoader,
     #[allow(unused)]
     chkpt_store: Arc<dyn CheckpointStore>,
@@ -646,7 +646,7 @@ impl TableWorker {
     async fn read_pk_range_with_tx(
         &self,
         client: &tokio_postgres::Client,
-        tx: &mpsc::Sender<Event>,
+        tx: &mpsc::Sender<SourceItem>,
         pk_col: &str,
         from: i64,
         to: i64,
@@ -686,7 +686,7 @@ impl TableWorker {
                 })?;
             let size = json_str.len();
             let event = self.make_event(after, size, id);
-            if tx.send(event).await.is_err() {
+            if tx.send(SourceItem::Event(event)).await.is_err() {
                 anyhow::bail!("event channel closed");
             }
         }
@@ -761,7 +761,7 @@ impl TableWorker {
                     serde_json::from_str(json_str).context("parse ctid row")?;
                 let size = json_str.len();
                 let event = self.make_event(after, size, id);
-                if self.tx.send(event).await.is_err() {
+                if self.tx.send(SourceItem::Event(event)).await.is_err() {
                     anyhow::bail!("event channel closed");
                 }
             }
@@ -844,7 +844,7 @@ impl ChunkWorkerCtx {
     async fn read_pk_range_with_tx(
         &self,
         client: &tokio_postgres::Client,
-        tx: &mpsc::Sender<Event>,
+        tx: &mpsc::Sender<SourceItem>,
         pk_col: &str,
         from: i64,
         to: i64,
@@ -913,7 +913,7 @@ impl ChunkWorkerCtx {
                 size,
             )
             .with_tenant(self.tenant.clone());
-            if tx.send(event).await.is_err() {
+            if tx.send(SourceItem::Event(event)).await.is_err() {
                 anyhow::bail!("event channel closed");
             }
         }

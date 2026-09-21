@@ -12,7 +12,9 @@ use checkpoints::{CheckpointStore, CheckpointStoreExt, MemCheckpointStore};
 use common::AllowList;
 use ctor::dtor;
 use deltaforge_config::SnapshotCfg;
-use deltaforge_core::{BatchContext, Event, Op, Source, SourceHandle};
+use deltaforge_core::{
+    BatchContext, Event, Op, Source, SourceHandle, SourceItem,
+};
 use mysql_async::prelude::Queryable;
 use schema_registry::SourceSchema;
 use sources::MySqlCheckpoint;
@@ -44,7 +46,7 @@ fn cleanup() {
 
 /// Collect events until condition is met or timeout.
 async fn collect_events_until<F>(
-    rx: &mut mpsc::Receiver<Event>,
+    rx: &mut mpsc::Receiver<SourceItem>,
     timeout_duration: Duration,
     mut condition: F,
 ) -> Vec<Event>
@@ -57,13 +59,14 @@ where
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match timeout(remaining, rx.recv()).await {
-            Ok(Some(e)) => {
+            Ok(Some(SourceItem::Event(e))) => {
                 debug!(op = ?e.op, table = %e.source.full_table_name(), "received event");
                 events.push(e);
                 if condition(&events) {
                     break;
                 }
             }
+            Ok(Some(SourceItem::TxCommit { .. })) => continue,
             Ok(None) | Err(_) => break,
         }
     }
@@ -138,10 +141,10 @@ async fn make_source(
 /// for 3 seconds. Returns (rx, handle).
 async fn start_source(
     src: MySqlSource,
-) -> Result<(mpsc::Receiver<Event>, SourceHandle)> {
+) -> Result<(mpsc::Receiver<SourceItem>, SourceHandle)> {
     let ckpt_store: Arc<dyn CheckpointStore> =
         Arc::new(MemCheckpointStore::new()?);
-    let (tx, rx) = mpsc::channel::<Event>(128);
+    let (tx, rx) = mpsc::channel::<SourceItem>(128);
     let handle = src.run(tx, ckpt_store).await;
     wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
     sleep(Duration::from_secs(3)).await;
@@ -542,7 +545,7 @@ async fn mysql_cdc_checkpoint_resume() -> Result<()> {
     // First run
     info!("--- First run ---");
     {
-        let (tx, mut rx) = mpsc::channel::<Event>(128);
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(128);
         let src = make_source(
             "ckpt-test",
             &dsn,
@@ -584,7 +587,7 @@ async fn mysql_cdc_checkpoint_resume() -> Result<()> {
     // Second run - should resume from checkpoint
     info!("--- Second run ---");
     {
-        let (tx, mut rx) = mpsc::channel::<Event>(128);
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(128);
         let src = make_source(
             "ckpt-test",
             &dsn,
@@ -1132,7 +1135,7 @@ async fn replay_stable_ids(
     // Resume from the pre-write checkpoint so each run re-reads the same events.
     store.put(&src.id, checkpoint).await?;
 
-    let (tx, mut rx) = mpsc::channel::<Event>(128);
+    let (tx, mut rx) = mpsc::channel::<SourceItem>(128);
     let handle = src.run(tx, store).await;
     wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
     let events =
@@ -1234,7 +1237,7 @@ async fn replay_ddl_id(
     )
     .await;
     store.put(&src.id, checkpoint).await?;
-    let (tx, mut rx) = mpsc::channel::<Event>(128);
+    let (tx, mut rx) = mpsc::channel::<SourceItem>(128);
     let handle = src.run(tx, store).await;
     wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
     let events =
@@ -1306,7 +1309,7 @@ async fn replay_derived_ids(
     )
     .await;
     store.put(&src.id, checkpoint).await?;
-    let (tx, mut rx) = mpsc::channel::<Event>(128);
+    let (tx, mut rx) = mpsc::channel::<SourceItem>(128);
     let handle = src.run(tx, store).await;
     wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
     let events =

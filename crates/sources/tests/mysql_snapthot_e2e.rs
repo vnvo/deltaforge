@@ -6,7 +6,7 @@ use checkpoints::{CheckpointStore, MemCheckpointStore};
 use common::AllowList;
 use ctor::dtor;
 use deltaforge_config::{SnapshotCfg, SnapshotMode};
-use deltaforge_core::{Event, Op, Source};
+use deltaforge_core::{Event, Op, Source, SourceItem};
 use mysql_async::prelude::Queryable;
 use sources::mysql::MySqlSource;
 use std::sync::Arc;
@@ -62,7 +62,7 @@ async fn make_source(
 }
 
 async fn collect_until<F>(
-    rx: &mut mpsc::Receiver<Event>,
+    rx: &mut mpsc::Receiver<SourceItem>,
     dur: Duration,
     pred: F,
 ) -> Vec<Event>
@@ -73,7 +73,7 @@ where
     let deadline = Instant::now() + dur;
     while Instant::now() < deadline {
         match timeout(Duration::from_millis(100), rx.recv()).await {
-            Ok(Some(e)) => {
+            Ok(Some(SourceItem::Event(e))) => {
                 events.push(e);
                 if pred(&events) {
                     return events;

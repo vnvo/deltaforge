@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use deltaforge_config::{BatchConfig, SamplingConfig, SchemaSensingConfig};
 use deltaforge_core::{
     ArcDynSink, CheckpointMeta, Event, Op, Sink, SinkResult, SourceInfo,
-    SourcePosition,
+    SourceItem, SourcePosition,
     encoding::EncodingType,
     envelope::{Envelope, EnvelopeType},
 };
@@ -499,7 +499,7 @@ async fn run_coordinator_bench(
     sinks: Vec<ArcDynSink>,
     batch_config: Option<BatchConfig>,
 ) -> Result<()> {
-    let (tx, rx) = mpsc::channel::<Event>(events.len() + 100);
+    let (tx, rx) = mpsc::channel::<SourceItem>(events.len() + 100);
     let cancel = CancellationToken::new();
     let (_pause_tx, pause_rx) = watch::channel(false);
 
@@ -513,7 +513,7 @@ async fn run_coordinator_bench(
     let coord = builder.build();
 
     for ev in events {
-        tx.send(ev).await?;
+        tx.send(SourceItem::Event(ev)).await?;
     }
     drop(tx);
 
@@ -528,7 +528,7 @@ async fn run_coordinator_bench_with_sensing(
     batch_config: Option<BatchConfig>,
     sensing_config: SchemaSensingConfig,
 ) -> Result<()> {
-    let (tx, rx) = mpsc::channel::<Event>(events.len() + 100);
+    let (tx, rx) = mpsc::channel::<SourceItem>(events.len() + 100);
     let cancel = CancellationToken::new();
     let (_pause_tx, pause_rx) = watch::channel(false);
 
@@ -545,7 +545,7 @@ async fn run_coordinator_bench_with_sensing(
     let coord = builder.build();
 
     for ev in events {
-        tx.send(ev).await?;
+        tx.send(SourceItem::Event(ev)).await?;
     }
     drop(tx);
 

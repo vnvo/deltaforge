@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::Result;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
 use deltaforge_config::{SnapshotCfg, SnapshotMode};
-use deltaforge_core::{Event, Op};
+use deltaforge_core::{Event, Op, SourceItem};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -38,14 +38,16 @@ fn cleanup() {
 // ============================================================================
 
 async fn collect_reads(
-    rx: &mut mpsc::Receiver<Event>,
+    rx: &mut mpsc::Receiver<SourceItem>,
     timeout: Duration,
 ) -> Vec<Event> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut events = Vec::new();
     loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(ev)) if ev.op == Op::Read => events.push(ev),
+            Ok(Some(SourceItem::Event(ev))) if ev.op == Op::Read => {
+                events.push(ev)
+            }
             _ => break,
         }
     }
@@ -400,23 +402,24 @@ async fn pg_snapshot_already_finished_returns_saved_lsn() -> Result<()> {
     let schema_loader = pg_make_schema_loader(&pg_admin_dsn(&db).await).await?;
     let dsn = pg_admin_dsn(&db).await;
     let cfg = initial_cfg();
-    let make_ctx = |tx: mpsc::Sender<Event>| postgres_snapshot::PgSnapshotCtx {
-        dsn: &dsn,
-        source_id: "snap-idempotent",
-        pipeline: "test",
-        tenant: "acme",
-        cfg: &cfg,
-        schema_loader: &schema_loader,
-        chkpt_store: chkpt.clone(),
-        tx,
-        cancel: CancellationToken::new(),
-        slot_name: None,
-        generation: 1,
-        lineage: PersistedLineage::Postgres {
-            system_identifier: 0,
-        },
-        identity_map: Default::default(),
-    };
+    let make_ctx =
+        |tx: mpsc::Sender<SourceItem>| postgres_snapshot::PgSnapshotCtx {
+            dsn: &dsn,
+            source_id: "snap-idempotent",
+            pipeline: "test",
+            tenant: "acme",
+            cfg: &cfg,
+            schema_loader: &schema_loader,
+            chkpt_store: chkpt.clone(),
+            tx,
+            cancel: CancellationToken::new(),
+            slot_name: None,
+            generation: 1,
+            lineage: PersistedLineage::Postgres {
+                system_identifier: 0,
+            },
+            identity_map: Default::default(),
+        };
 
     let (tx1, mut rx1) = mpsc::channel(64);
     let lsn1 =

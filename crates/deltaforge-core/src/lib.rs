@@ -706,6 +706,43 @@ impl BatchResult {
 }
 
 // ============================================================================
+// Source stream item
+// ============================================================================
+
+/// An item on the source→coordinator stream. `TxCommit` is an **internal**
+/// transaction-boundary marker — never a public wire event and never delivered
+/// to sinks. It lets the coordinator form transaction-aligned batches and
+/// checkpoint only at commit boundaries (even for empty or fully-filtered
+/// transactions).
+// `Event` is the hot-path variant — one per row — and was already moved by
+// value through the old `Sender<Event>`. Boxing it to shrink the enum would add
+// a heap allocation per event that the previous channel never paid; `TxCommit`
+// is rare (once per transaction), so the size difference is intentional.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+pub enum SourceItem {
+    /// A change event.
+    Event(Event),
+    /// A committed-transaction boundary. `checkpoint` is the COMMIT/XID
+    /// **record's** position (not the last data event's), generated once by the
+    /// source and passed through unchanged; `tx_id` matches the `transaction.id`
+    /// carried by that transaction's events. Only an actual commit emits this —
+    /// never a rollback, and never a transactional logical message (those are
+    /// transaction *contents*).
+    TxCommit {
+        tx_id: String,
+        checkpoint: CheckpointMeta,
+    },
+}
+
+impl SourceItem {
+    /// Convenience: wrap an event as a stream item.
+    pub fn event(ev: Event) -> Self {
+        SourceItem::Event(ev)
+    }
+}
+
+// ============================================================================
 // Source Handle
 // ============================================================================
 
@@ -756,7 +793,7 @@ impl SourceHandle {
 pub trait Source: Send + Sync {
     async fn run(
         &self,
-        tx: mpsc::Sender<Event>,
+        tx: mpsc::Sender<SourceItem>,
         checkpoint_store: Arc<dyn CheckpointStore>,
     ) -> SourceHandle;
 

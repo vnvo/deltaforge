@@ -17,7 +17,8 @@ use uuid::Uuid;
 
 use deltaforge_config::{BatchConfig, CommitPolicy, SchemaSensingConfig};
 use deltaforge_core::{
-    ArcDynProcessor, ArcDynSink, BatchContext, CheckpointMeta, Event, SinkError,
+    ArcDynProcessor, ArcDynSink, BatchContext, CheckpointMeta, Event,
+    SinkError, SourceItem,
 };
 use schema_sensing::{ObserveResult, SchemaSensor};
 
@@ -583,7 +584,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
     /// FIFO order, preserving checkpoint ordering.
     pub async fn run(
         self,
-        mut event_rx: tokio::sync::mpsc::Receiver<Event>,
+        mut event_rx: tokio::sync::mpsc::Receiver<SourceItem>,
         cancel: CancellationToken,
         mut pause_rx: watch::Receiver<bool>,
     ) -> Result<()> {
@@ -634,7 +635,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         let mut ticker = interval(Duration::from_millis(tick_ms));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut building: Option<BuildingBatch> = None;
-        let mut drain_buf: Vec<Event> = Vec::with_capacity(256);
+        let mut drain_buf: Vec<SourceItem> = Vec::with_capacity(256);
 
         let accum_result: Result<()> = async {
             loop {
@@ -677,13 +678,19 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                     }
 
                     maybe_ev = event_rx.recv() => {
-                        let Some(first_ev) = maybe_ev else {
+                        let Some(item) = maybe_ev else {
                             if let Some(b) = building.take() {
                                 if !b.raw.is_empty() {
                                     send_to_delivery(&deliver_tx, b, "shutdown").await?;
                                 }
                             }
                             break;
+                        };
+                        // Commit-boundary markers are ignored for now (Commit 1 —
+                        // transaction-aware flushing lands in a later commit).
+                        let first_ev = match item {
+                            SourceItem::Event(ev) => ev,
+                            SourceItem::TxCommit { .. } => continue,
                         };
 
                         if building.is_none() {
@@ -715,7 +722,10 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                             if n == 0 && b.raw.is_empty() && event_rx.is_closed() {
                                 break;
                             }
-                            for ev in drain_buf.drain(..) {
+                            for item in drain_buf.drain(..) {
+                                let SourceItem::Event(ev) = item else {
+                                    continue; // ignore markers (Commit 1)
+                                };
                                 if let Some(full) = check_and_split(&mut b, ev, max_events, max_bytes) {
                                     send_to_delivery(&deliver_tx, full, "limits").await?;
                                 }
@@ -1600,7 +1610,7 @@ mod tests {
         event.checkpoint =
             Some(CheckpointMeta::from_vec(b"{\"pos\":42}".to_vec()));
         event.tx_end = true;
-        tx.send(event).await.unwrap();
+        tx.send(SourceItem::Event(event)).await.unwrap();
         drop(tx); // Close channel so coordinator exits after processing.
 
         let _ = coord.run(rx, cancel, pause_rx).await;
@@ -1690,7 +1700,7 @@ mod tests {
                     Some(CheckpointMeta::from_vec(b"{\"pos\":99}".to_vec()));
                 ev.tx_end = true;
             }
-            tx.send(ev).await.unwrap();
+            tx.send(SourceItem::Event(ev)).await.unwrap();
         }
 
         // Don't close the channel — simulate source idle at WAL tail.
@@ -1877,7 +1887,7 @@ mod tests {
                     Some(CheckpointMeta::from_vec(b"{\"pos\":100}".to_vec()));
                 ev.tx_end = true;
             }
-            tx.send(ev).await.unwrap();
+            tx.send(SourceItem::Event(ev)).await.unwrap();
         }
         drop(tx);
 
@@ -1994,7 +2004,7 @@ mod tests {
                     Some(CheckpointMeta::from_vec(b"{\"pos\":50}".to_vec()));
                 ev.tx_end = true;
             }
-            tx.send(ev).await.unwrap();
+            tx.send(SourceItem::Event(ev)).await.unwrap();
         }
         drop(tx);
 
@@ -2073,7 +2083,7 @@ mod tests {
         ev.checkpoint =
             Some(CheckpointMeta::from_vec(b"{\"pos\":10}".to_vec()));
         ev.tx_end = true;
-        tx.send(ev).await.unwrap();
+        tx.send(SourceItem::Event(ev)).await.unwrap();
         drop(tx);
 
         // Should not panic even with DLQ failures and no writer.
@@ -2182,7 +2192,7 @@ mod tests {
         );
         ev.checkpoint = Some(CheckpointMeta::from_vec(b"{\"pos\":1}".to_vec()));
         ev.tx_end = true;
-        tx.send(ev).await.unwrap();
+        tx.send(SourceItem::Event(ev)).await.unwrap();
         drop(tx);
 
         // Give the coordinator enough time to trip the deadline (50ms) and
@@ -2277,7 +2287,7 @@ mod tests {
         );
         ev.checkpoint = Some(CheckpointMeta::from_vec(b"{\"pos\":1}".to_vec()));
         ev.tx_end = true;
-        tx.send(ev).await.unwrap();
+        tx.send(SourceItem::Event(ev)).await.unwrap();
         drop(tx);
 
         let cancel_clone = cancel.clone();

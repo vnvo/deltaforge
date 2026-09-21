@@ -3,8 +3,8 @@ use crate::mysql::LoopControl;
 use crate::mysql::RunCtx;
 use common::{ts_sec_to_ms, watchdog};
 use deltaforge_core::{
-    Event, Op, SourceError, SourceInfo, SourcePosition, SourceResult,
-    Transaction,
+    Event, Op, SourceError, SourceInfo, SourceItem, SourcePosition,
+    SourceResult, Transaction,
 };
 use metrics::counter;
 use mysql_binlog_connector_rust::{
@@ -27,12 +27,15 @@ use deltaforge_config::OUTBOX_SCHEMA_SENTINEL;
 /// the overhead of the async state machine on every single row. Falls back
 /// to the async `send` only when the channel is full (backpressure).
 #[inline]
-async fn send_event(tx: &tokio::sync::mpsc::Sender<Event>, ev: Event) -> bool {
-    match tx.try_send(ev) {
+async fn send_event(
+    tx: &tokio::sync::mpsc::Sender<SourceItem>,
+    ev: Event,
+) -> bool {
+    match tx.try_send(SourceItem::Event(ev)) {
         Ok(()) => true,
-        Err(tokio::sync::mpsc::error::TrySendError::Full(ev)) => {
+        Err(tokio::sync::mpsc::error::TrySendError::Full(item)) => {
             // Channel full — apply backpressure via async wait.
-            tx.send(ev).await.is_ok()
+            tx.send(item).await.is_ok()
         }
         Err(_) => false, // channel closed
     }
@@ -547,7 +550,26 @@ fn handle_rotate(
 
 async fn handle_xid(ctx: &mut RunCtx) {
     debug!(source_id=%ctx.source_id, "xid (commit)");
-    // Transaction boundary - could emit tx_end marker here if needed
+    // The XID event is the InnoDB transaction commit record — emit an explicit
+    // boundary marker carrying the commit-record checkpoint.
+    emit_tx_commit(ctx).await;
+}
+
+/// Emit a `TxCommit` boundary marker for the current transaction. `tx_id` is the
+/// exact per-transaction GTID (falling back to the binlog position when GTIDs
+/// are off); the checkpoint is the commit record's position. Best-effort send
+/// (a closed channel means shutdown).
+async fn emit_tx_commit(ctx: &mut RunCtx) {
+    let tx_id = ctx
+        .current_gtid
+        .clone()
+        .unwrap_or_else(|| format!("{}:{}", ctx.last_file, ctx.last_pos));
+    let checkpoint =
+        make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid);
+    let _ = ctx
+        .tx
+        .send(SourceItem::TxCommit { tx_id, checkpoint })
+        .await;
 }
 
 /// Extract table name from DDL statement.
@@ -751,9 +773,11 @@ async fn handle_query(
             &ctx.last_gtid,
         ));
 
-        if (ctx.tx.send(ev).await).is_err() {
+        if (ctx.tx.send(SourceItem::Event(ev)).await).is_err() {
             error!(source_id=%ctx.source_id, "channel send failed (op=ddl)");
         }
+        // DDL is auto-committed (its own transaction) → emit its boundary.
+        emit_tx_commit(ctx).await;
 
         // Reload schema after DDL to pick up changes
         // Try to extract table name from DDL for targeted reload
@@ -807,7 +831,16 @@ mod tests {
 
     const TABLE_ID: u64 = 42;
 
-    fn make_runctx(tx: mpsc::Sender<Event>) -> RunCtx {
+    async fn recv_event(rx: &mut mpsc::Receiver<SourceItem>) -> Option<Event> {
+        while let Some(item) = rx.recv().await {
+            if let SourceItem::Event(ev) = item {
+                return Some(ev);
+            }
+        }
+        None
+    }
+
+    fn make_runctx(tx: mpsc::Sender<SourceItem>) -> RunCtx {
         // Use from_static to create a test schema loader
         let cols: HashMap<(String, String), Arc<Vec<String>>> =
             HashMap::from([(
@@ -882,7 +915,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_write_rows_emits_create_event() {
-        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
         let mut ctx = make_runctx(tx);
 
         let row = RowEvent {
@@ -902,7 +935,7 @@ mod tests {
             .await
             .expect("write rows should succeed");
 
-        let produced = rx.recv().await.expect("expected one event");
+        let produced = recv_event(&mut rx).await.expect("expected one event");
         assert_eq!(produced.op, Op::Create);
         assert!(produced.before.is_none(), "insert must not have `before`");
         let after = produced.after.expect("insert must have `after`");
@@ -920,7 +953,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_update_rows_emits_update_with_before_and_after() {
-        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
         let mut ctx = make_runctx(tx);
 
         let before_row = RowEvent {
@@ -947,7 +980,7 @@ mod tests {
             .await
             .expect("update rows should succeed");
 
-        let produced = rx.recv().await.expect("expected one event");
+        let produced = recv_event(&mut rx).await.expect("expected one event");
         assert_eq!(produced.op, Op::Update);
 
         let before = produced.before.expect("update must have `before`");
@@ -965,7 +998,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_delete_rows_emits_delete_with_before_only() {
-        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
         let mut ctx = make_runctx(tx);
 
         let row = RowEvent {
@@ -985,7 +1018,7 @@ mod tests {
             .await
             .expect("delete rows should succeed");
 
-        let produced = rx.recv().await.expect("expected one event");
+        let produced = recv_event(&mut rx).await.expect("expected one event");
         assert_eq!(produced.op, Op::Delete);
         assert!(produced.after.is_none(), "delete must not have `after`");
         let before = produced.before.expect("delete must have `before`");
@@ -999,7 +1032,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_carry_checkpoint_metadata() {
-        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
         let mut ctx = make_runctx(tx);
 
         // Set known position. `last_gtid` is the accumulated executed set (used
@@ -1029,7 +1062,7 @@ mod tests {
             .await
             .expect("write rows should succeed");
 
-        let produced = rx.recv().await.expect("expected one event");
+        let produced = recv_event(&mut rx).await.expect("expected one event");
         assert!(
             produced.schema_sequence.is_some(),
             "event must have schema_sequence"
@@ -1065,7 +1098,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_carry_schema_metadata() {
-        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
         let mut ctx = make_runctx(tx);
 
         ctx.last_file = "mysql-bin.000005".to_string();
@@ -1089,7 +1122,7 @@ mod tests {
             .await
             .expect("write rows should succeed");
 
-        let produced = rx.recv().await.expect("expected one event");
+        let produced = recv_event(&mut rx).await.expect("expected one event");
 
         // Verify checkpoint
         let cp_meta = produced.checkpoint.expect("event must have checkpoint");
@@ -1122,7 +1155,7 @@ mod tests {
 
     #[tokio::test]
     async fn schema_metadata_consistent_across_ops() {
-        let (tx, mut rx) = mpsc::channel::<Event>(16);
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(16);
         let mut ctx = make_runctx(tx);
 
         // Insert
@@ -1180,9 +1213,9 @@ mod tests {
             .unwrap();
 
         // Collect all events
-        let insert = rx.recv().await.unwrap();
-        let update = rx.recv().await.unwrap();
-        let delete = rx.recv().await.unwrap();
+        let insert = recv_event(&mut rx).await.unwrap();
+        let update = recv_event(&mut rx).await.unwrap();
+        let delete = recv_event(&mut rx).await.unwrap();
 
         // All should have same schema metadata (same table, same schema)
         assert_eq!(insert.schema_version, update.schema_version);
@@ -1390,14 +1423,13 @@ mod tests {
             "TRUNCATE TABLE orders",
             "RENAME TABLE orders TO archived",
         ] {
-            let (tx, mut rx) = mpsc::channel::<Event>(8);
+            let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
             let mut ctx = make_runctx(tx);
             handle_query(&mut ctx, &make_header(), query_event(sql))
                 .await
                 .expect("handle_query should succeed");
 
-            let ev = rx
-                .recv()
+            let ev = recv_event(&mut rx)
                 .await
                 .unwrap_or_else(|| panic!("DDL must emit an event: {sql}"));
             assert_eq!(ev.op, Op::Read, "DDL events use Debezium op 'r'");
@@ -1409,7 +1441,7 @@ mod tests {
     #[tokio::test]
     async fn handle_query_ignores_non_ddl() {
         // A plain DML/marker query must NOT emit a DDL event.
-        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
         let mut ctx = make_runctx(tx);
         handle_query(&mut ctx, &make_header(), query_event("BEGIN"))
             .await
@@ -1435,13 +1467,13 @@ mod tests {
         };
 
         // (a) Table IS in the outbox allow-list → schema tagged with sentinel.
-        let (tx, mut rx) = mpsc::channel::<Event>(8);
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
         let mut ctx = make_runctx(tx);
         ctx.outbox_tables = AllowList::new(&["shop.orders".to_string()]);
         handle_write_rows(&mut ctx, &make_header(), write())
             .await
             .expect("ok");
-        let ev = rx.recv().await.expect("event");
+        let ev = recv_event(&mut rx).await.expect("event");
         assert_eq!(
             ev.source.schema.as_deref(),
             Some(OUTBOX_SCHEMA_SENTINEL),
@@ -1451,13 +1483,13 @@ mod tests {
         // (b) Outbox list is non-empty but does NOT contain this table → NOT
         // tagged. Pins the `&&` (a `||` mutation would tag it anyway) and the
         // `!is_empty()` guard.
-        let (tx2, mut rx2) = mpsc::channel::<Event>(8);
+        let (tx2, mut rx2) = mpsc::channel::<SourceItem>(8);
         let mut ctx2 = make_runctx(tx2);
         ctx2.outbox_tables = AllowList::new(&["other.table".to_string()]);
         handle_write_rows(&mut ctx2, &make_header(), write())
             .await
             .expect("ok");
-        let ev2 = rx2.recv().await.expect("event");
+        let ev2 = recv_event(&mut rx2).await.expect("event");
         assert_ne!(
             ev2.source.schema.as_deref(),
             Some(OUTBOX_SCHEMA_SENTINEL),
@@ -1469,7 +1501,7 @@ mod tests {
     fn handle_gtid_accumulates_executed_set() {
         // handle_gtid must extend the resume GTID set; a no-op body would
         // lose progress and cause re-delivery on reconnect.
-        let (tx, _rx) = mpsc::channel::<Event>(1);
+        let (tx, _rx) = mpsc::channel::<SourceItem>(1);
         let mut ctx = make_runctx(tx);
         ctx.last_gtid = Some("uuid-a:1-10".to_string());
         handle_gtid(
@@ -1486,7 +1518,7 @@ mod tests {
     fn handle_rotate_advances_binlog_file() {
         // handle_rotate must record the new binlog file for checkpointing;
         // a no-op body would pin the position to the old file.
-        let (tx, _rx) = mpsc::channel::<Event>(1);
+        let (tx, _rx) = mpsc::channel::<SourceItem>(1);
         let mut ctx = make_runctx(tx);
         handle_rotate(
             &mut ctx,
