@@ -44,10 +44,17 @@ pub type ProcessBatchFn<Tok> = Arc<
 >;
 
 /// During accumulation, we own a mutable Vec<Event>.
+///
+/// `committed_len`/`committed_bytes` track the prefix of `raw` that forms whole
+/// transactions (or standalone boundary events) and is therefore safe to flush.
+/// Anything past that prefix is an open transaction whose commit marker has not
+/// arrived yet; it must never be flushed or checkpointed on its own.
 struct BuildingBatch {
     started_at: Instant,
     raw: Vec<Event>,
     bytes: usize,
+    committed_len: usize,
+    committed_bytes: usize,
 }
 
 impl BuildingBatch {
@@ -56,8 +63,95 @@ impl BuildingBatch {
             started_at: Instant::now(),
             raw: Vec::with_capacity(cap),
             bytes: 0,
+            committed_len: 0,
+            committed_bytes: 0,
         }
     }
+
+    /// Number of events in the currently-open (uncommitted) transaction.
+    fn open_events(&self) -> usize {
+        self.raw.len() - self.committed_len
+    }
+
+    /// Serialized bytes accumulated for the currently-open transaction.
+    fn open_bytes(&self) -> usize {
+        self.bytes - self.committed_bytes
+    }
+
+    /// True while events past the last committed boundary await their marker.
+    fn mid_tx(&self) -> bool {
+        self.raw.len() > self.committed_len
+    }
+}
+
+/// A single source transaction exceeded the configured accumulation caps.
+#[derive(Debug, Clone, Copy)]
+struct OversizedTx {
+    events: usize,
+    bytes: usize,
+}
+
+/// Append one transactional event to the open transaction, enforcing the hard
+/// per-transaction caps (the `oversized_tx` safety valve). Never splits: the
+/// event is always buffered; an `Err` signals the caps were breached and the
+/// caller must fail the pipeline (`OversizedTxPolicy::Fail`).
+fn push_tx_event(
+    b: &mut BuildingBatch,
+    ev: Event,
+    max_tx_events: usize,
+    max_tx_bytes: usize,
+) -> Result<(), OversizedTx> {
+    b.bytes += event_size_hint(&ev);
+    b.raw.push(ev);
+    let events = b.open_events();
+    let bytes = b.open_bytes();
+    if events > max_tx_events || bytes > max_tx_bytes {
+        return Err(OversizedTx { events, bytes });
+    }
+    Ok(())
+}
+
+/// Close the open transaction at a commit marker. The boundary `checkpoint`
+/// (the commit record's position) is stamped onto the batch's last event so the
+/// batch checkpoints at the boundary rather than at the last data row. For an
+/// empty or fully source-filtered transaction (no new events since the last
+/// boundary) the checkpoint is advanced onto the prior boundary event when one
+/// exists; otherwise the next transaction covers it. Returns whether the
+/// transaction contributed events.
+fn close_tx(b: &mut BuildingBatch, checkpoint: CheckpointMeta) -> bool {
+    let had_events = b.mid_tx();
+    if let Some(last) = b.raw.last_mut() {
+        last.checkpoint = Some(checkpoint);
+    }
+    b.committed_len = b.raw.len();
+    b.committed_bytes = b.bytes;
+    had_events
+}
+
+/// Record that a standalone (non-transactional) event is its own boundary.
+fn commit_standalone(b: &mut BuildingBatch) {
+    b.committed_len = b.raw.len();
+    b.committed_bytes = b.bytes;
+}
+
+/// A flush is due when the whole-transaction prefix has reached the soft size
+/// limits. Only ever evaluated at a boundary, so it never splits a transaction.
+fn soft_limit_reached(
+    b: &BuildingBatch,
+    max_events: usize,
+    max_bytes: usize,
+) -> bool {
+    b.committed_len >= max_events || b.committed_bytes >= max_bytes
+}
+
+/// Drop any open (uncommitted) transaction suffix, keeping only whole
+/// transactions. Used on shutdown/cancel: a transaction with no commit marker
+/// was never durable at the source and is replayed on restart. Returns the
+/// batch only if whole transactions remain to flush.
+fn keep_whole_txs(mut b: BuildingBatch) -> Option<BuildingBatch> {
+    b.raw.truncate(b.committed_len);
+    b.bytes = b.committed_bytes;
+    if b.raw.is_empty() { None } else { Some(b) }
 }
 
 /// Item sent from the accumulation loop to the delivery task.
@@ -108,6 +202,30 @@ fn check_and_split(
     b.bytes += event_size_hint(&ev);
     b.raw.push(ev);
     flush
+}
+
+/// Emit an approaching-limit warning + metric once, as the open transaction
+/// crosses 80% of the event cap. Fires on the exact count so it logs once per
+/// oversized-approaching transaction rather than on every subsequent event.
+fn maybe_warn_approaching(
+    b: &BuildingBatch,
+    max_tx_events: usize,
+    pipeline: &str,
+) {
+    let threshold = (max_tx_events.saturating_mul(8) / 10).max(1);
+    if b.open_events() == threshold {
+        warn!(
+            pipeline = %pipeline,
+            open_events = b.open_events(),
+            max_tx_events,
+            "source transaction approaching the event cap"
+        );
+        counter!(
+            "deltaforge_tx_approaching_limit_total",
+            "pipeline" => pipeline.to_string(),
+        )
+        .increment(1);
+    }
 }
 
 /// Send a completed batch to the delivery task. Returns Err if the delivery
@@ -597,6 +715,10 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         let max_inflight = self.batch_cfg_eff.max_inflight.unwrap_or(1);
         let respect_source_tx =
             self.batch_cfg_eff.respect_source_tx.unwrap_or(false);
+        let max_tx_events =
+            self.batch_cfg_eff.max_tx_events.unwrap_or(usize::MAX);
+        let max_tx_bytes =
+            self.batch_cfg_eff.max_tx_bytes.unwrap_or(usize::MAX);
 
         // Transaction-aligned batching is single-in-flight for the first cut: a
         // second concurrent delivery could flush part of a transaction before
@@ -669,7 +791,16 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                 tokio::select! {
                     _ = cancel.cancelled() => {
                         if let Some(b) = building.take() {
-                            if !b.raw.is_empty() {
+                            let to_flush = if respect_source_tx {
+                                // Never flush a partial transaction — discard the
+                                // uncommitted suffix, replayed on restart.
+                                keep_whole_txs(b)
+                            } else if b.raw.is_empty() {
+                                None
+                            } else {
+                                Some(b)
+                            };
+                            if let Some(b) = to_flush {
                                 send_to_delivery(&deliver_tx, b, "cancelled").await?;
                             }
                         }
@@ -678,10 +809,16 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
 
                     _ = ticker.tick() => {
                         if let Some(b) = building.take() {
-                            if !b.raw.is_empty()
-                                && b.started_at.elapsed()
-                                    >= Duration::from_millis(tick_ms)
-                            {
+                            let elapsed = b.started_at.elapsed()
+                                >= Duration::from_millis(tick_ms);
+                            // In tx-aligned mode only whole transactions may
+                            // flush — never mid-transaction.
+                            let flushable = if respect_source_tx {
+                                b.committed_len > 0 && !b.mid_tx()
+                            } else {
+                                !b.raw.is_empty()
+                            };
+                            if flushable && elapsed {
                                 send_to_delivery(&deliver_tx, b, "timer").await?;
                             } else {
                                 building = Some(b);
@@ -695,19 +832,20 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                     }
 
                     maybe_ev = event_rx.recv() => {
-                        let Some(item) = maybe_ev else {
+                        let Some(first) = maybe_ev else {
                             if let Some(b) = building.take() {
-                                if !b.raw.is_empty() {
+                                let to_flush = if respect_source_tx {
+                                    keep_whole_txs(b)
+                                } else if b.raw.is_empty() {
+                                    None
+                                } else {
+                                    Some(b)
+                                };
+                                if let Some(b) = to_flush {
                                     send_to_delivery(&deliver_tx, b, "shutdown").await?;
                                 }
                             }
                             break;
-                        };
-                        // Commit-boundary markers are ignored for now (Commit 1 —
-                        // transaction-aware flushing lands in a later commit).
-                        let first_ev = match item {
-                            SourceItem::Event(ev) => ev,
-                            SourceItem::TxCommit { .. } => continue,
                         };
 
                         if building.is_none() {
@@ -716,33 +854,74 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                         }
                         let mut b = building.take().unwrap();
 
-                        // Accumulate the first event, flush if limits hit.
-                        if let Some(full) = check_and_split(&mut b, first_ev, max_events, max_bytes) {
-                            send_to_delivery(&deliver_tx, full, "limits").await?;
-                        }
+                        // Gather the first item plus an immediately-available
+                        // burst. The timeout bounds the wait so an idle source
+                        // at the WAL tail lets the ticker branch flush.
+                        drain_buf.clear();
+                        drain_buf.push(first);
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(tick_ms),
+                            event_rx.recv_many(&mut drain_buf, 512),
+                        )
+                        .await;
 
-                        // Drain as many additional events as are immediately
-                        // available, up to the remaining batch capacity.
-                        // The timeout ensures we don't block longer than
-                        // tick_ms — when the source goes idle at the WAL tail,
-                        // this returns quickly so the select! loop's ticker
-                        // branch can flush the partial batch.
-                        let remaining = max_events.saturating_sub(b.raw.len()).min(512);
-                        if remaining > 0 {
-                            drain_buf.clear();
-                            let n = tokio::time::timeout(
-                                Duration::from_millis(tick_ms),
-                                event_rx.recv_many(&mut drain_buf, remaining),
-                            )
-                            .await
-                            .unwrap_or(0); // timeout → 0 events drained, not an error
-                            if n == 0 && b.raw.is_empty() && event_rx.is_closed() {
-                                break;
-                            }
-                            for item in drain_buf.drain(..) {
-                                let SourceItem::Event(ev) = item else {
-                                    continue; // ignore markers (Commit 1)
-                                };
+                        for item in drain_buf.drain(..) {
+                            if respect_source_tx {
+                                match item {
+                                    SourceItem::Event(ev) => {
+                                        if ev.transaction.is_some() {
+                                            // In-transaction event: buffer without
+                                            // splitting; enforce the hard caps.
+                                            if let Err(o) = push_tx_event(
+                                                &mut b, ev, max_tx_events, max_tx_bytes,
+                                            ) {
+                                                counter!(
+                                                    "deltaforge_oversized_tx_total",
+                                                    "pipeline" => coord.pipeline_name.to_string(),
+                                                )
+                                                .increment(1);
+                                                return Err(anyhow::anyhow!(
+                                                    "source transaction exceeds limits \
+                                                     ({} events, {} bytes); oversized_tx \
+                                                     policy is Fail — the transaction is \
+                                                     replayed whole on restart",
+                                                    o.events, o.bytes,
+                                                ));
+                                            }
+                                            maybe_warn_approaching(
+                                                &b, max_tx_events, &coord.pipeline_name,
+                                            );
+                                        } else {
+                                            // Standalone/snapshot event: its own
+                                            // boundary; split by soft limits.
+                                            b.bytes += event_size_hint(&ev);
+                                            b.raw.push(ev);
+                                            commit_standalone(&mut b);
+                                            if soft_limit_reached(&b, max_events, max_bytes) {
+                                                let full = std::mem::replace(
+                                                    &mut b,
+                                                    BuildingBatch::with_capacity(max_events),
+                                                );
+                                                send_to_delivery(&deliver_tx, full, "limits").await?;
+                                            }
+                                        }
+                                    }
+                                    SourceItem::TxCommit { checkpoint, .. } => {
+                                        // Commit boundary: close the open tx and
+                                        // flush only if soft limits are reached.
+                                        close_tx(&mut b, checkpoint);
+                                        if soft_limit_reached(&b, max_events, max_bytes) {
+                                            let full = std::mem::replace(
+                                                &mut b,
+                                                BuildingBatch::with_capacity(max_events),
+                                            );
+                                            send_to_delivery(&deliver_tx, full, "tx_commit").await?;
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Legacy path: soft-limit splitting; markers ignored.
+                                let SourceItem::Event(ev) = item else { continue; };
                                 if let Some(full) = check_and_split(&mut b, ev, max_events, max_bytes) {
                                     send_to_delivery(&deliver_tx, full, "limits").await?;
                                 }
@@ -1370,6 +1549,308 @@ mod tests {
         );
     }
 
+    // ── Transaction-aligned batching (respect_source_tx) ─────────────────
+
+    /// Build an in-transaction row event carrying its own per-event checkpoint.
+    fn tx_event(id: i64, tx_id: &str, checkpoint: &[u8]) -> Event {
+        let source = deltaforge_core::SourceInfo {
+            version: "test".into(),
+            connector: "mysql".into(),
+            name: "test".into(),
+            db: "db".into(),
+            schema: None,
+            table: "t".into(),
+            ts_ms: 0,
+            snapshot: None,
+            position: deltaforge_core::SourcePosition::default(),
+        };
+        let mut e = Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, id as u32),
+            source,
+            deltaforge_core::Op::Create,
+            None,
+            Some(serde_json::json!({ "id": id })),
+            0,
+            10,
+        );
+        e.transaction = Some(deltaforge_core::Transaction {
+            id: tx_id.to_string(),
+            total_order: None,
+            data_collection_order: None,
+        });
+        e.checkpoint = Some(CheckpointMeta::from_vec(checkpoint.to_vec()));
+        e
+    }
+
+    /// Build a coordinator wired to one `MockSink` with the given batch config.
+    fn tx_coord(
+        store: Arc<checkpoints::MemCheckpointStore>,
+        sink: Arc<MockSink>,
+        cfg: BatchConfig,
+    ) -> Coordinator<CheckpointMeta> {
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        let cp_fn = build_commit_fn(store, "src::sink::kafka".to_string());
+        let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![]);
+        let batch_processor =
+            build_batch_processor(processors, "test".to_string());
+        Coordinator::builder("tx-test")
+            .sinks(sinks)
+            .batch_config(Some(cfg))
+            .commit_fn("kafka", cp_fn)
+            .process_fn(batch_processor)
+            .build()
+    }
+
+    /// A transaction larger than the soft `max_events` limit is delivered whole
+    /// (one batch, never split), and the committed checkpoint is the commit
+    /// marker's position — not any data event's.
+    #[tokio::test]
+    async fn tx_not_split_at_soft_limit_and_checkpoints_at_marker() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let coord = tx_coord(
+            store.clone(),
+            Arc::clone(&sink),
+            BatchConfig {
+                max_events: Some(3),  // soft limit far below the tx size
+                max_ms: Some(60_000), // timer must not interfere
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            },
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        for i in 0..10 {
+            tx.send(SourceItem::Event(tx_event(
+                i,
+                "gtid:1",
+                format!("row-{i}").as_bytes(),
+            )))
+            .await
+            .unwrap();
+        }
+        tx.send(SourceItem::TxCommit {
+            tx_id: "gtid:1".into(),
+            checkpoint: CheckpointMeta::from_vec(b"commit-1".to_vec()),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        coord.run(rx, cancel, pause_rx).await.unwrap();
+
+        assert_eq!(
+            sink.batch_sizes(),
+            vec![10],
+            "the 10-event transaction must be delivered as one unsplit batch"
+        );
+        let cp = store.get_raw("src::sink::kafka").await.unwrap();
+        assert_eq!(
+            cp.as_deref(),
+            Some(&b"commit-1"[..]),
+            "checkpoint must be the commit marker's position, not a data row's"
+        );
+    }
+
+    /// Several whole transactions accumulate into a single batch and flush
+    /// together at the soft limit, checkpointing at the last marker.
+    #[tokio::test]
+    async fn multiple_whole_txs_share_one_batch() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let coord = tx_coord(
+            store.clone(),
+            Arc::clone(&sink),
+            BatchConfig {
+                max_events: Some(100),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            },
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        for (txn, cp) in [("gtid:1", "cp-1"), ("gtid:2", "cp-2")] {
+            for i in 0..2 {
+                tx.send(SourceItem::Event(tx_event(i, txn, b"row")))
+                    .await
+                    .unwrap();
+            }
+            tx.send(SourceItem::TxCommit {
+                tx_id: txn.into(),
+                checkpoint: CheckpointMeta::from_vec(cp.as_bytes().to_vec()),
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+
+        coord.run(rx, cancel, pause_rx).await.unwrap();
+
+        assert_eq!(
+            sink.batch_sizes(),
+            vec![4],
+            "both whole transactions flush together as one batch on shutdown"
+        );
+        let cp = store.get_raw("src::sink::kafka").await.unwrap();
+        assert_eq!(cp.as_deref(), Some(&b"cp-2"[..]));
+    }
+
+    /// A transaction that exceeds `max_tx_events` fails the pipeline
+    /// (OversizedTxPolicy::Fail) and never advances the checkpoint.
+    #[tokio::test]
+    async fn oversized_transaction_fails_pipeline() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let coord = tx_coord(
+            store.clone(),
+            Arc::clone(&sink),
+            BatchConfig {
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                max_tx_events: Some(3),
+                ..BatchConfig::default()
+            },
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        for i in 0..4 {
+            tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
+                .await
+                .unwrap();
+        }
+        // No marker: the 4th in-tx event breaches the cap.
+        drop(tx);
+
+        let err = coord
+            .run(rx, cancel, pause_rx)
+            .await
+            .expect_err("oversized transaction must fail the pipeline");
+        assert!(
+            err.to_string().contains("exceeds limits"),
+            "unexpected error: {err}"
+        );
+        let cp = store.get_raw("src::sink::kafka").await.unwrap();
+        assert!(cp.is_none(), "oversized tx must not advance the checkpoint");
+    }
+
+    /// Shutdown mid-transaction discards the uncommitted suffix: only whole
+    /// transactions (those with a commit marker) are flushed and checkpointed.
+    #[tokio::test]
+    async fn shutdown_discards_partial_transaction() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let coord = tx_coord(
+            store.clone(),
+            Arc::clone(&sink),
+            BatchConfig {
+                max_events: Some(1000),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            },
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        // One whole tx (2 events + marker) ...
+        for i in 0..2 {
+            tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
+                .await
+                .unwrap();
+        }
+        tx.send(SourceItem::TxCommit {
+            tx_id: "gtid:1".into(),
+            checkpoint: CheckpointMeta::from_vec(b"cp-1".to_vec()),
+        })
+        .await
+        .unwrap();
+        // ... then a partial tx (no marker) that must be discarded.
+        tx.send(SourceItem::Event(tx_event(99, "gtid:2", b"row")))
+            .await
+            .unwrap();
+        drop(tx);
+
+        coord.run(rx, cancel, pause_rx).await.unwrap();
+
+        assert_eq!(
+            sink.batch_sizes(),
+            vec![2],
+            "only the whole transaction is flushed; the partial suffix is dropped"
+        );
+        let cp = store.get_raw("src::sink::kafka").await.unwrap();
+        assert_eq!(cp.as_deref(), Some(&b"cp-1"[..]));
+    }
+
+    /// An empty (or fully source-filtered) transaction carries no events; the
+    /// next committed transaction's boundary advances the checkpoint past it.
+    #[tokio::test]
+    async fn empty_transaction_covered_by_next_boundary() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let coord = tx_coord(
+            store.clone(),
+            Arc::clone(&sink),
+            BatchConfig {
+                max_events: Some(1000),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            },
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        // Empty transaction: a marker with no preceding events.
+        tx.send(SourceItem::TxCommit {
+            tx_id: "gtid:1".into(),
+            checkpoint: CheckpointMeta::from_vec(b"empty".to_vec()),
+        })
+        .await
+        .unwrap();
+        // A real transaction follows.
+        tx.send(SourceItem::Event(tx_event(1, "gtid:2", b"row")))
+            .await
+            .unwrap();
+        tx.send(SourceItem::TxCommit {
+            tx_id: "gtid:2".into(),
+            checkpoint: CheckpointMeta::from_vec(b"real".to_vec()),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        coord.run(rx, cancel, pause_rx).await.unwrap();
+
+        assert_eq!(sink.batch_sizes(), vec![1]);
+        let cp = store.get_raw("src::sink::kafka").await.unwrap();
+        assert_eq!(cp.as_deref(), Some(&b"real"[..]));
+    }
+
     // ── Pure batch-accumulation helpers (check_and_split / policy) ───────
 
     /// Build a minimal row event with a controllable size hint and tx-end
@@ -1552,6 +2033,7 @@ mod tests {
         required: bool,
         fail: AtomicBool,
         delivered: AtomicUsize,
+        batch_sizes: std::sync::Mutex<Vec<usize>>,
     }
 
     impl MockSink {
@@ -1561,6 +2043,7 @@ mod tests {
                 required,
                 fail: AtomicBool::new(false),
                 delivered: AtomicUsize::new(0),
+                batch_sizes: std::sync::Mutex::new(Vec::new()),
             })
         }
 
@@ -1570,6 +2053,11 @@ mod tests {
 
         fn delivery_count(&self) -> usize {
             self.delivered.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        /// Event counts of each delivered batch, in order.
+        fn batch_sizes(&self) -> Vec<usize> {
+            self.batch_sizes.lock().unwrap().clone()
         }
     }
 
@@ -1600,6 +2088,7 @@ mod tests {
             }
             self.delivered
                 .fetch_add(events.len(), std::sync::atomic::Ordering::Relaxed);
+            self.batch_sizes.lock().unwrap().push(events.len());
             Ok(deltaforge_core::BatchResult::ok())
         }
     }
