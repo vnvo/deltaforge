@@ -36,7 +36,10 @@ pub use postgres_schema_loader::{LoadedSchema, PostgresSchemaLoader};
 
 mod postgres_event;
 pub use postgres_event::RelationInfo;
+
+pub mod postgres_event_id;
 use postgres_event::*;
+pub use postgres_event_id::pg_row_event_id;
 
 pub mod postgres_table_schema;
 pub use postgres_table_schema::{PostgresColumn, PostgresTableSchema};
@@ -113,6 +116,14 @@ pub(crate) struct RunCtx {
     pub last_lsn: Lsn,
     pub current_tx_id: Option<u32>,
     pub current_tx_commit_time: Option<i64>,
+    /// The current transaction's final LSN (from `BEGIN`) — the stable identity
+    /// coordinate for row/message changes in this transaction. `None` outside a
+    /// transaction.
+    pub current_final_lsn: Option<String>,
+    /// Per-transaction change ordinal: reset at `BEGIN`, incremented for every
+    /// identity-bearing change (insert/update/delete/truncate/transactional
+    /// message) before filtering.
+    pub change_ordinal: u32,
     pub repl_client: Arc<Mutex<ReplicationClient>>,
     pub outbox_prefixes: AllowList,
     pub identity_store: IdentityStore,
@@ -332,6 +343,8 @@ impl PostgresSource {
             last_lsn: start_lsn,
             current_tx_id: None,
             current_tx_commit_time: None,
+            current_final_lsn: None,
+            change_ordinal: 0,
             repl_client: Arc::new(Mutex::new(client)),
             outbox_prefixes: self.outbox_prefixes.clone(),
             identity_store: IdentityStore::new(Arc::clone(&backend)),

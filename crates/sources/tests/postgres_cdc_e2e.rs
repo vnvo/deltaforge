@@ -8,7 +8,9 @@ use common::AllowList;
 use ctor::dtor;
 use deltaforge_core::{BatchContext, Event, Op, Source, SourceHandle};
 
-use sources::postgres::{PostgresSchemaLoader, PostgresSource};
+use sources::postgres::{
+    PostgresSchemaLoader, PostgresSource, pg_row_event_id,
+};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::{
@@ -1804,6 +1806,125 @@ async fn postgres_cdc_outbox_full_pipeline() -> Result<()> {
     handle.stop();
     handle.join().await.ok();
     cleanup_repl(&client, "pub_obpipe", "slot_obpipe").await;
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+/// Run a source once on `slot`/`pub_name`, collect `want` events, and return the
+/// provisional pgrow ids + per-event change ordinals.
+async fn pg_run_once(
+    db: &str,
+    slot: &str,
+    pub_name: &str,
+    system_identifier: u64,
+    want: usize,
+) -> Result<(Vec<String>, Vec<u32>)> {
+    let src = make_source(
+        "replay",
+        db,
+        slot,
+        pub_name,
+        vec!["public.t1".into(), "public.t2".into()], // 'ignored' excluded
+        AllowList::default(),
+    )
+    .await;
+    let (mut rx, handle) = start_source(src).await?;
+    let events =
+        collect_until(&mut rx, Duration::from_secs(20), |e| e.len() >= want)
+            .await;
+    handle.cancel.cancel();
+
+    let ids = events
+        .iter()
+        .map(|e| {
+            pg_row_event_id(&e.source, system_identifier)
+                .map(|id| id.to_string())
+                .map_err(|err| anyhow::anyhow!(err))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let ordinals = events
+        .iter()
+        .map(|e| e.source.position.change_ordinal.unwrap_or(u32::MAX))
+        .collect();
+    Ok((ids, ordinals))
+}
+
+/// Provisional pgrow ids must be replay-stable across an independent re-decode
+/// of the same WAL, must not collide across relations, and a filtered relation's
+/// change must still consume an ordinal so later events are not renumbered.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn stable_event_ids_are_replay_stable() -> Result<()> {
+    let (db, client) = pg_setup("stable_ids").await?;
+    client
+        .batch_execute(
+            "CREATE TABLE t1 (id INT PRIMARY KEY, v TEXT);
+             CREATE TABLE t2 (id INT PRIMARY KEY, v TEXT);
+             CREATE TABLE ignored (id INT PRIMARY KEY);
+             ALTER TABLE t1 REPLICA IDENTITY FULL;
+             ALTER TABLE t2 REPLICA IDENTITY FULL;",
+        )
+        .await?;
+    client
+        .batch_execute(&format!(
+            "GRANT SELECT ON t1, t2, ignored TO {PG_CDC_USER};"
+        ))
+        .await?;
+
+    // Cluster lineage (constant per cluster) — same for both replay runs.
+    let sysid: u64 = client
+        .query_one(
+            "SELECT system_identifier::text FROM pg_control_system()",
+            &[],
+        )
+        .await?
+        .get::<_, String>(0)
+        .parse()?;
+
+    // Two independent slots created BEFORE the writes → each re-decodes the same
+    // WAL once (clean replay without slot-advancement concerns).
+    create_pub_slot(&client, "pub_a", "slot_a", &["t1", "t2", "ignored"])
+        .await?;
+    create_pub_slot(&client, "pub_b", "slot_b", &["t1", "t2", "ignored"])
+        .await?;
+
+    // One transaction, mixed ops across two relations, with a filtered relation
+    // interleaved (ordinal 1) between kept changes.
+    client
+        .batch_execute(
+            "BEGIN;
+             INSERT INTO t1 VALUES (1,'a');       -- ordinal 0 (kept)
+             INSERT INTO ignored VALUES (1);      -- ordinal 1 (filtered)
+             UPDATE t1 SET v='b' WHERE id=1;      -- ordinal 2 (kept)
+             INSERT INTO t2 VALUES (10,'x');      -- ordinal 3 (kept)
+             DELETE FROM t1 WHERE id=1;           -- ordinal 4 (kept)
+             COMMIT;",
+        )
+        .await?;
+
+    let (ids_a, ordinals_a) =
+        pg_run_once(&db, "slot_a", "pub_a", sysid, 4).await?;
+    let (ids_b, _) = pg_run_once(&db, "slot_b", "pub_b", sysid, 4).await?;
+
+    assert_eq!(ids_a.len(), 4, "t1 ins/upd/del + t2 ins, got {ids_a:?}");
+    assert_eq!(ids_a, ids_b, "ids must be identical across replay");
+
+    let unique: std::collections::HashSet<_> = ids_a.iter().collect();
+    assert_eq!(unique.len(), 4, "no collision across relations: {ids_a:?}");
+    for id in &ids_a {
+        assert!(id.starts_with("dfid:v1:pgrow:"), "pgrow form: {id}");
+    }
+
+    // The filtered `ignored` insert consumed ordinal 1, so the kept events keep
+    // ordinals 0,2,3,4 — filtering did not renumber later events.
+    assert_eq!(
+        ordinals_a,
+        vec![0, 2, 3, 4],
+        "filtered change must not renumber"
+    );
+
+    cleanup_repl(&client, "pub_a", "slot_a").await;
+    cleanup_repl(&client, "pub_b", "slot_b").await;
     pg_drop_db(&db).await;
     Ok(())
 }

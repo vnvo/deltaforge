@@ -262,6 +262,20 @@ pub struct SourcePosition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub xmin: Option<i64>,
 
+    /// The transaction's final LSN (from the `BEGIN` message) — the stable
+    /// identity coordinate, distinct from the per-message `lsn`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_final_lsn: Option<String>,
+
+    /// The relation OID for the changed table (stable across rename).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relation_oid: Option<u32>,
+
+    /// Per-transaction change ordinal — reset at `BEGIN`, incremented for every
+    /// identity-bearing change before filtering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_ordinal: Option<u32>,
+
     // Generic sequence (for other sources)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sequence: Option<String>,
