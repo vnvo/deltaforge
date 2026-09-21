@@ -597,11 +597,7 @@ impl TableWorker {
         ))
     }
 
-    fn make_event(
-        &self,
-        after: serde_json::Value,
-        provisional_id: EventId,
-    ) -> Event {
+    fn make_event(&self, after: serde_json::Value, event_id: EventId) -> Event {
         let size = after.to_string().len();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -609,6 +605,7 @@ impl TableWorker {
             .as_millis() as i64;
 
         let mut ev = Event::new_row(
+            event_id,
             SourceInfo {
                 version: concat!("deltaforge-", env!("CARGO_PKG_VERSION"))
                     .to_string(),
@@ -621,7 +618,6 @@ impl TableWorker {
                 snapshot: Some("true".to_string()),
                 position: SourcePosition {
                     snapshot_generation: Some(self.generation),
-                    provisional_event_id: Some(provisional_id),
                     ..Default::default()
                 },
             },

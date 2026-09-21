@@ -1315,6 +1315,7 @@ mod tests {
             position: deltaforge_core::SourcePosition::default(),
         };
         let mut e = Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
             source,
             deltaforge_core::Op::Create,
             None,
@@ -1588,6 +1589,7 @@ mod tests {
             position: deltaforge_core::SourcePosition::default(),
         };
         let mut event = Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
             source,
             deltaforge_core::Op::Create,
             None,
@@ -1675,6 +1677,7 @@ mod tests {
         // Send 3 events (well below max_events=10000), then go idle.
         for i in 0..3 {
             let mut ev = Event::new_row(
+                deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
                 source.clone(),
                 deltaforge_core::Op::Create,
                 None,
@@ -1861,6 +1864,7 @@ mod tests {
         // Send 5 events. Events at index 1 and 3 will fail.
         for i in 0..5 {
             let mut ev = Event::new_row(
+                deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
                 source.clone(),
                 deltaforge_core::Op::Create,
                 None,
@@ -1977,6 +1981,7 @@ mod tests {
 
         for i in 0..3 {
             let mut ev = Event::new_row(
+                deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
                 source.clone(),
                 deltaforge_core::Op::Create,
                 None,
@@ -2057,6 +2062,7 @@ mod tests {
         };
 
         let mut ev = Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
             source,
             deltaforge_core::Op::Create,
             None,
@@ -2166,6 +2172,7 @@ mod tests {
             position: deltaforge_core::SourcePosition::default(),
         };
         let mut ev = Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
             source,
             deltaforge_core::Op::Create,
             None,
@@ -2260,6 +2267,7 @@ mod tests {
             position: deltaforge_core::SourcePosition::default(),
         };
         let mut ev = Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
             source,
             deltaforge_core::Op::Create,
             None,

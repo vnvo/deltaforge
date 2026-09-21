@@ -18,9 +18,22 @@ use deltaforge_core::{
 use pretty_assertions::assert_eq;
 use processors::JsProcessor;
 use serde_json::json;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static TEST_ID: AtomicU32 = AtomicU32::new(1);
+/// Distinct stable id per call (real events never share an id).
+fn next_test_id() -> deltaforge_core::EventId {
+    deltaforge_core::EventId::mysql_row_server(
+        1,
+        "t",
+        TEST_ID.fetch_add(1, Ordering::Relaxed) as u64,
+        0,
+    )
+}
 
 fn new_event() -> Event {
     Event::new_row(
+        next_test_id(),
         SourceInfo {
             version: "1.0.0".into(),
             connector: "mysql".into(),
@@ -42,6 +55,7 @@ fn new_event() -> Event {
 
 fn new_update_event() -> Event {
     Event::new_row(
+        next_test_id(),
         SourceInfo {
             version: "1.0.0".into(),
             connector: "mysql".into(),
@@ -63,6 +77,7 @@ fn new_update_event() -> Event {
 
 fn new_delete_event() -> Event {
     Event::new_row(
+        next_test_id(),
         SourceInfo {
             version: "1.0.0".into(),
             connector: "mysql".into(),
@@ -262,11 +277,11 @@ async fn js_can_add_events_to_batch() {
             const out = [];
             for (const ev of events) {
                 out.push(ev);
-                // Clone for audit - use spread to avoid reference sharing
+                // A new (audit) event must declare its parent via derive().
                 const audit = JSON.parse(JSON.stringify(ev));
                 audit.after = audit.after || {};
                 audit.after.is_audit = true;
-                out.push(audit);
+                out.push(derive(ev, audit));
             }
             return out;
         }
@@ -275,12 +290,19 @@ async fn js_can_add_events_to_batch() {
     let proc =
         JsProcessor::new("expand".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
+    let parent = events[0].event_id.unwrap();
     let ctx = BatchContext::from_batch(&events);
     let out = proc.process(events, &ctx).await.expect("ok");
 
     assert_eq!(out.len(), 2);
     assert_eq!(out[0].after.as_ref().unwrap()["note"], "original");
     assert_eq!(out[1].after.as_ref().unwrap()["is_audit"], true);
+    // 1:1 output keeps the parent id; the derived audit event is synthetic.
+    assert_eq!(out[0].event_id, Some(parent));
+    assert_eq!(
+        out[1].event_id.unwrap().class(),
+        deltaforge_core::EventClass::Syn
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -633,7 +655,7 @@ async fn js_clone_gets_separate_routing() {
 
                 const clone = JSON.parse(JSON.stringify(ev));
                 route(clone, { topic: "audit" });
-                out.push(clone);
+                out.push(derive(ev, clone));
             }
             return out;
         }
@@ -789,7 +811,7 @@ use deltaforge_core::{EventClass, EventId};
 /// A row event carrying a specific provisional stable id.
 fn event_with_id(id: EventId) -> Event {
     let mut ev = new_event();
-    ev.source.position.provisional_event_id = Some(id);
+    ev.event_id = Some(id);
     ev
 }
 
@@ -813,7 +835,7 @@ async fn js_one_to_one_retains_parent_id() {
     .await
     .unwrap();
     assert_eq!(out.len(), 1);
-    assert_eq!(out[0].source.position.provisional_event_id, Some(p));
+    assert_eq!(out[0].event_id, Some(p));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -825,9 +847,9 @@ async fn js_derive_mints_synthetic_id() {
     let out = run(js, vec![event_with_id(p)]).await.unwrap();
     assert_eq!(out.len(), 2);
     // 1:1 output keeps the parent id.
-    assert_eq!(out[0].source.position.provisional_event_id, Some(p));
+    assert_eq!(out[0].event_id, Some(p));
     // Derived output gets a distinct synthetic id.
-    let syn = out[1].source.position.provisional_event_id.unwrap();
+    let syn = out[1].event_id.unwrap();
     assert_eq!(syn.class(), EventClass::Syn);
     assert_ne!(syn, p);
 }
@@ -878,13 +900,13 @@ async fn js_ordinals_are_deterministic_per_parent() {
     }"#;
     let a = run(js, vec![event_with_id(p)]).await.unwrap();
     let b = run(js, vec![event_with_id(p)]).await.unwrap();
-    let a0 = a[0].source.position.provisional_event_id.unwrap();
-    let a1 = a[1].source.position.provisional_event_id.unwrap();
+    let a0 = a[0].event_id.unwrap();
+    let a1 = a[1].event_id.unwrap();
     // Two derived outputs from the same parent get distinct (ordinal 0 vs 1) ids.
     assert_ne!(a0, a1);
     // Deterministic across runs.
-    assert_eq!(a0, b[0].source.position.provisional_event_id.unwrap());
-    assert_eq!(a1, b[1].source.position.provisional_event_id.unwrap());
+    assert_eq!(a0, b[0].event_id.unwrap());
+    assert_eq!(a1, b[1].event_id.unwrap());
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -896,8 +918,8 @@ async fn js_interleaved_parents_attributed_correctly() {
     let out = run(js, vec![event_with_id(p0), event_with_id(p1)])
         .await
         .unwrap();
-    let from_p1 = out[0].source.position.provisional_event_id.unwrap();
-    let from_p0 = out[1].source.position.provisional_event_id.unwrap();
+    let from_p1 = out[0].event_id.unwrap();
+    let from_p0 = out[1].event_id.unwrap();
     // Each derived id is tied to its DECLARED parent (not output position):
     // recompute the exact synthetic id from that parent + the processor digest.
     let digest =
@@ -905,4 +927,43 @@ async fn js_interleaved_parents_attributed_correctly() {
     assert_eq!(from_p0, EventId::synthetic(&p0, &digest, 0));
     assert_eq!(from_p1, EventId::synthetic(&p1, &digest, 0));
     assert_ne!(from_p0, from_p1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_reserved_lineage_metadata_never_leaks() {
+    // A 1:1 passthrough and a derived output: neither may leak __df_id/__df_parent
+    // into the emitted event (payload or serialized form).
+    let p = parent_id(0);
+    let js = r#"function processBatch(e){
+        return [e[0], derive(e[0], { ...e[0], after: { x: 1 } })];
+    }"#;
+    let out = run(js, vec![event_with_id(p)]).await.unwrap();
+    assert_eq!(out.len(), 2);
+    for ev in &out {
+        let json = serde_json::to_string(ev).unwrap();
+        assert!(!json.contains("__df_id"), "__df_id leaked: {json}");
+        assert!(!json.contains("__df_parent"), "__df_parent leaked: {json}");
+        if let Some(after) = ev.after.as_ref() {
+            assert!(after.get("__df_id").is_none());
+            assert!(after.get("__df_parent").is_none());
+        }
+        // Every emitted event carries a stable EventId.
+        assert!(ev.event_id.is_some(), "emitted event missing event_id");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_forged_out_of_batch_retained_id_is_rejected() {
+    // A script cannot forge retention of an id that isn't in the input batch.
+    let forged = EventId::mysql_row_server(7, "other", 9, 0).to_string();
+    let js = format!(
+        r#"function processBatch(e){{
+            let o = {{ ...e[0] }}; o.__df_id = "{forged}";
+            return [o];
+        }}"#
+    );
+    let err = run(&js, vec![event_with_id(parent_id(0))])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not an input event"), "{err}");
 }

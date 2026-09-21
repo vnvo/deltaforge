@@ -372,6 +372,7 @@ mod tests {
 
     fn make_test_event(id: i64) -> Event {
         Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
             SourceInfo {
                 version: "test".into(),
                 connector: "test".into(),

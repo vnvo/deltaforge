@@ -4,7 +4,6 @@
 //! This envelope restructures the Event to match the CloudEvents spec.
 
 use serde::Serialize;
-use uuid::Uuid;
 
 use super::{Envelope, EnvelopeData, EnvelopeError};
 use crate::{Event, Op};
@@ -82,10 +81,9 @@ impl Envelope for CloudEvents {
 
         let wrapper = CloudEventsWrapper {
             specversion: "1.0",
-            id: event
-                .event_id
-                .map(|u| u.to_string())
-                .unwrap_or_else(|| Uuid::now_v7().to_string()),
+            // No random fallback: a stable EventId is the only id source. An
+            // id-less event must never reach an envelope (enforced upstream).
+            id: event.event_id.map(|id| id.to_string()).unwrap_or_default(),
             source: format!(
                 "deltaforge/{}/{}",
                 event.source.name,
@@ -117,6 +115,7 @@ mod tests {
     #[test]
     fn cloudevents_structure() {
         let event = Event::new_row(
+            crate::EventId::mysql_row_server(1, "t", 1, 0),
             SourceInfo {
                 version: "test".into(),
                 connector: "mysql".into(),

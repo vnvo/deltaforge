@@ -1,7 +1,6 @@
 use std::collections::HashSet;
-use uuid::Uuid;
 
-use crate::Event;
+use crate::{Event, EventId};
 
 /// Immutable context passed through the entire processor chain for one batch.
 ///
@@ -12,7 +11,7 @@ use crate::Event;
 pub struct BatchContext {
     /// IDs of events that existed when this batch entered the chain.
     /// Used by `SyntheticMarkingProcessor` to detect newly created events.
-    pub original_ids: HashSet<Uuid>,
+    pub original_ids: HashSet<EventId>,
 }
 
 impl BatchContext {

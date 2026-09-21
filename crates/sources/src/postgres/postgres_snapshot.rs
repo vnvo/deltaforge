@@ -793,13 +793,20 @@ impl TableWorker {
             snapshot: Some("true".into()),
             position: SourcePosition {
                 snapshot_generation: Some(self.generation),
-                provisional_event_id: Some(provisional_id),
                 ..Default::default()
             },
         };
 
-        Event::new_row(source, Op::Read, None, Some(after), ts_ms, size_bytes)
-            .with_tenant(self.tenant.clone())
+        Event::new_row(
+            provisional_id,
+            source,
+            Op::Read,
+            None,
+            Some(after),
+            ts_ms,
+            size_bytes,
+        )
+        .with_tenant(self.tenant.clone())
     }
 
     /// Shallow clone for intra-table parallel workers.
@@ -893,11 +900,11 @@ impl ChunkWorkerCtx {
                 snapshot: Some("true".into()),
                 position: SourcePosition {
                     snapshot_generation: Some(self.generation),
-                    provisional_event_id: Some(id),
                     ..Default::default()
                 },
             };
             let event = Event::new_row(
+                id,
                 source,
                 Op::Read,
                 None,

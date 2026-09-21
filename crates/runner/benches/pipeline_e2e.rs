@@ -273,6 +273,7 @@ fn make_events(count: usize) -> Vec<Event> {
     (0..count)
         .map(|i| {
             let mut ev = Event::new_row(
+                deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
                 make_source_info("benchdb", "events", "bench"),
                 Op::Create,
                 None,
@@ -298,6 +299,7 @@ fn make_events_with_json(count: usize) -> Vec<Event> {
     (0..count)
         .map(|i| {
             let mut ev = Event::new_row(
+                deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
                 make_source_info("shop", "orders", "mysql"),
                 Op::Create,
                 None,
@@ -358,6 +360,7 @@ fn make_events_heterogeneous(count: usize) -> Vec<Event> {
             };
 
             let mut ev = Event::new_row(
+                deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
                 make_source_info("shop", "transactions", "mysql"),
                 Op::Create,
                 None,
@@ -378,6 +381,7 @@ fn make_small_events(count: usize) -> Vec<Event> {
     (0..count)
         .map(|i| {
             Event::new_row(
+                deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
                 make_source_info("d", "t", "b"),
                 Op::Create,
                 None,
@@ -394,6 +398,7 @@ fn make_medium_events(count: usize) -> Vec<Event> {
     (0..count)
         .map(|i| {
             Event::new_row(
+                deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
                 make_source_info("shop", "orders", "mysql"),
                 Op::Update,
                 Some(json!({"id": i, "status": "pending", "amount": 99.99})),
@@ -413,6 +418,7 @@ fn make_large_events(count: usize) -> Vec<Event> {
                 .map(|j| json!({"idx": j, "data": "x".repeat(50)}))
                 .collect();
             Event::new_row(
+                deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
                 make_source_info("warehouse", "inventory", "mysql"),
                 Op::Create,
                 None,

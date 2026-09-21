@@ -367,6 +367,7 @@ mod tests {
 
     fn outbox_event(table: &str, after: Value) -> Event {
         Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
             SourceInfo {
                 version: "test".into(),
                 connector: "postgresql".into(),
@@ -388,6 +389,7 @@ mod tests {
 
     fn table_event(table: &str) -> Event {
         Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
             SourceInfo {
                 version: "test".into(),
                 connector: "mysql".into(),

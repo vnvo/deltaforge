@@ -45,6 +45,7 @@ mod tests {
     #[test]
     fn native_produces_debezium_payload() {
         let event = Event::new_row(
+            crate::EventId::mysql_row_server(1, "t", 1, 0),
             SourceInfo {
                 version: "test".into(),
                 connector: "mysql".into(),

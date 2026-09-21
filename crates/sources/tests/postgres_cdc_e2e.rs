@@ -1976,7 +1976,7 @@ fn snap_reads(events: &[Event]) -> Vec<&Event> {
 fn snap_ids(events: &[Event]) -> Vec<EventId> {
     snap_reads(events)
         .iter()
-        .filter_map(|e| e.source.position.provisional_event_id)
+        .filter_map(|e| e.event_id)
         .collect()
 }
 
@@ -2028,11 +2028,7 @@ async fn pg_uuid_pk_snapshot_ids_are_stable() -> Result<()> {
     assert_eq!(reads.len(), 3);
     for e in &reads {
         assert_eq!(e.source.position.snapshot_generation, Some(1));
-        let id = e
-            .source
-            .position
-            .provisional_event_id
-            .expect("snapshot row carries a provisional id");
+        let id = e.event_id.expect("snapshot row carries a provisional id");
         assert_eq!(id.class(), EventClass::Snap);
     }
     let ids = snap_ids(&events);
@@ -2235,7 +2231,7 @@ async fn pg_snapshot_resumes_midway_with_stable_ids() -> Result<()> {
         .iter()
         .filter_map(|e| {
             let id = e.after.as_ref()?.get("id")?.as_i64()?;
-            Some((id, e.source.position.provisional_event_id?))
+            Some((id, e.event_id?))
         })
         .collect();
     assert!(!before.is_empty(), "run 1 emitted no snapshot rows");
@@ -2272,7 +2268,7 @@ async fn pg_snapshot_resumes_midway_with_stable_ids() -> Result<()> {
                 .as_ref()
                 .and_then(|v| v.get("id"))
                 .and_then(|v| v.as_i64()),
-            e.source.position.provisional_event_id,
+            e.event_id,
         ) {
             if let Some(old_id) = before.get(&id) {
                 assert_eq!(*old_id, new_id, "row {id} id changed after resume");
@@ -2433,7 +2429,7 @@ async fn pg_parallel_and_sequential_pk_produce_identical_ids() -> Result<()> {
                 .iter()
                 .filter_map(|e| {
                     let k = e.after.as_ref()?.get("id")?.as_i64()?;
-                    Some((k, e.source.position.provisional_event_id?))
+                    Some((k, e.event_id?))
                 })
                 .collect::<std::collections::HashMap<_, _>>()
         }
@@ -2514,9 +2510,7 @@ async fn pg_enum_and_domain_identities_work() -> Result<()> {
     assert_eq!(reads.len(), 5, "3 enum rows + 2 domain rows");
     for e in &reads {
         let id = e
-            .source
-            .position
-            .provisional_event_id
+            .event_id
             .expect("enum/domain row carries a provisional id");
         assert_eq!(id.class(), EventClass::Snap);
     }

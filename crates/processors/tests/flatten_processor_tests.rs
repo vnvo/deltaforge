@@ -20,6 +20,7 @@ fn default_cfg() -> FlattenProcessorCfg {
 
 fn make_event(after: serde_json::Value) -> Event {
     Event::new_row(
+        deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         SourceInfo {
             version: "1.0.0".into(),
             connector: "mysql".into(),

@@ -7,7 +7,7 @@
 use std::str::FromStr;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
 };
 
 use anyhow::{Result, anyhow};
@@ -21,50 +21,6 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
-use uuid::Uuid;
-
-// ── Fast UUID v7 ─────────────────────────────────────────────────────────────
-// Standard `Uuid::now_v7()` calls `getrandom` per UUID (~3% CPU in benchmarks).
-// This implementation uses a global atomic counter for the random portion,
-// avoiding the syscall entirely. The result is a valid RFC 9562 UUID v7 with
-// monotonic ordering within a millisecond — ideal for CDC event IDs where
-// uniqueness matters but cryptographic randomness does not.
-
-static UUID_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Generate a UUID v7 using timestamp + atomic counter (no getrandom syscall).
-#[inline]
-pub fn fast_uuid_v7() -> Uuid {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    let seq = UUID_COUNTER.fetch_add(1, Ordering::Relaxed);
-
-    let mut b = [0u8; 16];
-    // 48-bit unix timestamp (ms), big-endian
-    b[0] = (millis >> 40) as u8;
-    b[1] = (millis >> 32) as u8;
-    b[2] = (millis >> 24) as u8;
-    b[3] = (millis >> 16) as u8;
-    b[4] = (millis >> 8) as u8;
-    b[5] = millis as u8;
-    // version 7 (4 bits) + 12 bits from counter
-    b[6] = 0x70 | ((seq >> 8) as u8 & 0x0F);
-    b[7] = seq as u8;
-    // variant 10 (2 bits) + 62 bits from counter
-    b[8] = 0x80 | ((seq >> 56) as u8 & 0x3F);
-    b[9] = (seq >> 48) as u8;
-    b[10] = (seq >> 40) as u8;
-    b[11] = (seq >> 32) as u8;
-    b[12] = (seq >> 24) as u8;
-    b[13] = (seq >> 16) as u8;
-    b[14] = (seq >> 8) as u8;
-    b[15] = seq as u8;
-
-    Uuid::from_bytes(b)
-}
 
 pub mod encoding;
 pub mod envelope;
@@ -285,13 +241,6 @@ pub struct SourcePosition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_generation: Option<u64>,
 
-    /// **Temporary, internal** provisional stable event id, computed in the
-    /// snapshot worker from native identity values and the allocated generation.
-    /// Never serialized (no JSON/Avro/Arrow/DLQ/API exposure); removed at the
-    /// atomic cutover, when it becomes `Event.event_id`.
-    #[serde(skip)]
-    pub provisional_event_id: Option<EventId>,
-
     // Generic sequence (for other sources)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sequence: Option<String>,
@@ -421,9 +370,13 @@ pub struct Event {
     // ========================================================================
     // DeltaForge extensions (Debezium consumers ignore unknown fields)
     // ========================================================================
-    /// Globally unique event ID for deduplication and tracing
+    /// Stable, deterministic event identity (`dfid:v1:…`) for deduplication and
+    /// tracing. The single authoritative identity location: every event that
+    /// leaves a source or processor carries one. `Option` only so the JS bridge
+    /// can build a transient event before assigning the resolved id — such an
+    /// event must never escape without it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub event_id: Option<Uuid>,
+    pub event_id: Option<EventId>,
 
     /// Tenant ID for multi-tenant deployments
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -496,9 +449,11 @@ fn now_ms() -> i64 {
 }
 
 impl Event {
-    /// Create a new row-change event.
+    /// Create a new row-change event. The stable `event_id` is required —
+    /// sources must derive it before emission.
     #[allow(clippy::too_many_arguments)]
     pub fn new_row(
+        event_id: EventId,
         source: SourceInfo,
         op: Op,
         before: Option<Value>,
@@ -513,7 +468,7 @@ impl Event {
             op,
             ts_ms,
             transaction: None,
-            event_id: Some(fast_uuid_v7()),
+            event_id: Some(event_id),
             tenant_id: None,
             schema_version: None,
             schema_sequence: None,
@@ -529,8 +484,9 @@ impl Event {
         }
     }
 
-    /// Create a new DDL/schema change event.
+    /// Create a new DDL/schema change event. `event_id` is required.
     pub fn new_ddl(
+        event_id: EventId,
         source: SourceInfo,
         ddl: Value,
         ts_ms: i64,
@@ -543,7 +499,7 @@ impl Event {
             op: Op::Read, // DDL events use "r" in Debezium
             ts_ms,
             transaction: None,
-            event_id: Some(fast_uuid_v7()),
+            event_id: Some(event_id),
             tenant_id: None,
             schema_version: None,
             schema_sequence: None,
@@ -559,8 +515,9 @@ impl Event {
         }
     }
 
-    /// Create a snapshot read event.
+    /// Create a snapshot read event. `event_id` is required.
     pub fn new_snapshot(
+        event_id: EventId,
         source: SourceInfo,
         after: Value,
         ts_ms: i64,
@@ -573,7 +530,7 @@ impl Event {
             op: Op::Read,
             ts_ms,
             transaction: None,
-            event_id: Some(fast_uuid_v7()),
+            event_id: Some(event_id),
             tenant_id: None,
             schema_version: None,
             schema_sequence: None,
@@ -628,10 +585,10 @@ impl Event {
                 .map(|t| t.id.as_str())
                 .unwrap_or(""),
         );
-        match self.event_id {
-            Some(u) => {
-                // Write UUID hyphenated directly into the buffer (no intermediate String).
-                let _ = write!(key, "{}", u.as_hyphenated());
+        match &self.event_id {
+            // The stable EventId's textual form is already globally unique.
+            Some(id) => {
+                let _ = write!(key, "{id}");
             }
             None => key.push('_'),
         }
@@ -1017,52 +974,6 @@ mod tests {
     }
 
     #[test]
-    fn fast_uuid_v7_has_version_and_variant_bits() {
-        let u = fast_uuid_v7();
-        assert_eq!(u.get_version_num(), 7, "must be a v7 UUID");
-        // RFC 4122 variant: top two bits of byte 8 must be 0b10.
-        assert_eq!(u.as_bytes()[8] & 0xC0, 0x80, "variant must be 0b10");
-    }
-
-    #[test]
-    fn fast_uuid_v7_encodes_current_timestamp() {
-        let now = || {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64
-        };
-        let before = now();
-        let b = *fast_uuid_v7().as_bytes();
-        let after = now();
-        // Reconstruct the 48-bit big-endian millisecond timestamp. A flipped
-        // shift direction (>> vs <<) would place the bits wildly out of range.
-        let ts = ((b[0] as u64) << 40)
-            | ((b[1] as u64) << 32)
-            | ((b[2] as u64) << 24)
-            | ((b[3] as u64) << 16)
-            | ((b[4] as u64) << 8)
-            | (b[5] as u64);
-        assert!(
-            ts >= before - 1000 && ts <= after + 1000,
-            "embedded timestamp {ts} not within [{before}, {after}] window"
-        );
-    }
-
-    #[test]
-    fn fast_uuid_v7_is_monotonic_within_a_burst() {
-        // The per-process counter must make rapid successive UUIDs strictly
-        // increasing — pins the counter shifts and the function body itself.
-        let a = fast_uuid_v7().as_u128();
-        let b = fast_uuid_v7().as_u128();
-        let c = fast_uuid_v7().as_u128();
-        assert!(
-            a < b && b < c,
-            "successive UUIDs must increase: {a} {b} {c}"
-        );
-    }
-
-    #[test]
     fn sink_error_dlq_eligibility() {
         // Only per-event serialization/routing errors are DLQ-eligible.
         assert!(
@@ -1095,6 +1006,7 @@ mod tests {
     #[test]
     fn event_serializes_to_debezium_structure() {
         let event = Event::new_row(
+            crate::EventId::mysql_row_server(1, "t", 1, 0),
             test_source(),
             Op::Create,
             None,
@@ -1125,6 +1037,7 @@ mod tests {
     #[test]
     fn event_roundtrip() {
         let original = Event::new_row(
+            crate::EventId::mysql_row_server(1, "t", 1, 0),
             test_source(),
             Op::Update,
             Some(json!({"id": 1, "name": "Alice"})),

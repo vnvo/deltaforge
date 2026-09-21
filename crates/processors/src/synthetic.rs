@@ -11,7 +11,7 @@
 //! | Processor transforms in place | same ID -> not marked |
 //! | JS creates `{...e, after: newVal}` spread | copies event_id -> not marked |
 //! | JS creates fresh object with no event_id | `None` -> marked |
-//! | Metrics processor calls `Event::new_row(...)` | fresh UUID -> marked |
+//! | Metrics processor calls `Event::new_row(...)` | fresh id -> marked |
 //! | Outbox reshapes existing row | same ID -> not marked |
 //!
 //! # Explicit override
@@ -78,6 +78,7 @@ mod tests {
 
     fn make_event() -> Event {
         Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
             SourceInfo {
                 version: "1".into(),
                 connector: "mysql".into(),
@@ -134,8 +135,11 @@ mod tests {
             let mut out = Vec::with_capacity(events.len() * 2);
             for e in &events {
                 out.push(e.clone());
-                // Fresh event — new UUID, no explicit synthetic
+                // Fresh event with a DISTINCT id (not in original_ids).
                 out.push(Event::new_row(
+                    deltaforge_core::EventId::mysql_row_server(
+                        2, "fresh", 99, 0,
+                    ),
                     e.source.clone(),
                     Op::Create,
                     None,
@@ -166,6 +170,7 @@ mod tests {
             let mut out = Vec::new();
             for e in &events {
                 let mut fresh = Event::new_row(
+                    deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
                     e.source.clone(),
                     Op::Create,
                     None,

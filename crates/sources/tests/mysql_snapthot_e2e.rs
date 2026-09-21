@@ -503,7 +503,7 @@ fn snapshot_ids(events: &[Event]) -> Vec<EventId> {
     events
         .iter()
         .filter(|e| matches!(e.op, Op::Read))
-        .filter_map(|e| e.source.position.provisional_event_id)
+        .filter_map(|e| e.event_id)
         .collect()
 }
 
@@ -555,11 +555,11 @@ async fn mysql_snapshot_rows_carry_generation_and_stable_ids() -> Result<()> {
     for e in &reads {
         assert_eq!(e.source.position.snapshot_generation, Some(1));
         assert!(
-            e.source.position.provisional_event_id.is_some(),
+            e.event_id.is_some(),
             "snapshot row must carry a provisional stable id"
         );
         assert_eq!(
-            e.source.position.provisional_event_id.unwrap().class(),
+            e.event_id.unwrap().class(),
             deltaforge_core::EventClass::Snap
         );
     }

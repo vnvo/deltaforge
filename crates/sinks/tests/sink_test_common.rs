@@ -25,6 +25,7 @@ pub fn init_test_tracing() {
 /// Create a test event with a specific ID.
 pub fn make_test_event(id: i64) -> Event {
     Event::new_row(
+        deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         SourceInfo {
             version: "deltaforge-test".into(),
             connector: "test".into(),
@@ -49,6 +50,7 @@ pub fn make_test_event(id: i64) -> Event {
 pub fn make_large_event(id: i64, size_bytes: usize) -> Event {
     let padding = "x".repeat(size_bytes);
     Event::new_row(
+        deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         SourceInfo {
             version: "deltaforge-test".into(),
             connector: "test".into(),
@@ -71,6 +73,7 @@ pub fn make_large_event(id: i64, size_bytes: usize) -> Event {
 /// Create a test event for a specific table (for routing tests).
 pub fn make_event_for_table(id: i64, table: &str) -> Event {
     Event::new_row(
+        deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         SourceInfo {
             version: "deltaforge-test".into(),
             connector: "test".into(),

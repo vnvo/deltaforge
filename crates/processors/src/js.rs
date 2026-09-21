@@ -262,10 +262,8 @@ fn process_batch_in_runtime(
 
     // The stable provisional ids of the input batch — the only valid parents
     // for derive() and the retained-id set for 1:1 transforms.
-    let input_ids: std::collections::HashSet<EventId> = events
-        .iter()
-        .filter_map(|e| e.source.position.provisional_event_id)
-        .collect();
+    let input_ids: std::collections::HashSet<EventId> =
+        events.iter().filter_map(|e| e.event_id).collect();
 
     let mut json_events =
         serde_json::to_value(&events).context("serialize events for JS")?;
@@ -275,9 +273,7 @@ fn process_batch_in_runtime(
     // #[serde(skip)], hence not in the serialized form).
     if let Value::Array(arr) = &mut json_events {
         for (i, obj) in arr.iter_mut().enumerate() {
-            if let (Value::Object(o), Some(pid)) =
-                (obj, events[i].source.position.provisional_event_id)
-            {
+            if let (Value::Object(o), Some(pid)) = (obj, events[i].event_id) {
                 o.insert(DF_ID.into(), Value::String(pid.to_string()));
             }
         }
@@ -377,7 +373,7 @@ fn finalize_output(
     let ids = resolve_output_lineage(&mut val, input_ids, digest)?;
     let mut events = deserialize_events_with_routing(val)?;
     for (event, id) in events.iter_mut().zip(ids) {
-        event.source.position.provisional_event_id = id;
+        event.event_id = id;
     }
     Ok(events)
 }

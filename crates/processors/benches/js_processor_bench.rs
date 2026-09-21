@@ -36,6 +36,7 @@ fn make_source_info() -> SourceInfo {
 
 fn make_small_event() -> Event {
     Event::new_row(
+        deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         make_source_info(),
         Op::Create,
         None,
@@ -48,6 +49,7 @@ fn make_small_event() -> Event {
 fn make_large_event(bytes: usize) -> Event {
     let big = "x".repeat(bytes);
     Event::new_row(
+        deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
         make_source_info(),
         Op::Create,
         None,
@@ -66,6 +68,7 @@ fn make_batch(size: usize) -> Vec<Event> {
     (0..size)
         .map(|i| {
             Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
                 make_source_info(),
                 Op::Create,
                 None,

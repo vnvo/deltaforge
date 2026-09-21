@@ -159,8 +159,8 @@ fn build_source_info(
     db: &str,
     table: &str,
     row_ordinal: u32,
-) -> SourceInfo {
-    let mut source = SourceInfo {
+) -> SourceResult<(SourceInfo, deltaforge_core::EventId)> {
+    let source = SourceInfo {
         version: concat!("deltaforge-", env!("CARGO_PKG_VERSION")).to_string(),
         connector: "mysql".to_string(),
         name: ctx.pipeline.clone(),
@@ -181,13 +181,13 @@ fn build_source_info(
             Some(row_ordinal),
         ),
     };
-    // Provisional stable id (out of `Event.event_id` until the cutover). MySQL
-    // always has a `server_id`, so the id is always derivable (GTID form when a
-    // GTID is present, else the server_id+file fallback).
-    if let Ok(id) = super::mysql_row_event_id(&source) {
-        source.position.provisional_event_id = Some(id);
-    }
-    source
+    // The stable id is required at the source boundary — fail closed if it
+    // cannot be derived (MySQL always has a server_id, so the server-id+file
+    // fallback keeps this derivable even without GTIDs).
+    let id = super::mysql_row_event_id(&source).map_err(|e| {
+        SourceError::Other(anyhow::anyhow!("mysql row identity: {e}"))
+    })?;
+    Ok((source, id))
 }
 
 async fn handle_write_rows(
@@ -230,14 +230,15 @@ async fn handle_write_rows(
                 &row.column_values,
             );
 
-            let source_info = build_source_info(
+            let (source_info, event_id) = build_source_info(
                 ctx,
                 header,
                 &tm.database_name,
                 &tm.table_name,
                 row_ordinal as u32,
-            );
+            )?;
             let mut ev = Event::new_row(
+                event_id,
                 source_info,
                 Op::Create,
                 None,
@@ -323,14 +324,15 @@ async fn handle_update_rows(
                 &after_row.column_values,
             );
 
-            let source_info = build_source_info(
+            let (source_info, event_id) = build_source_info(
                 ctx,
                 header,
                 &tm.database_name,
                 &tm.table_name,
                 row_ordinal as u32,
-            );
+            )?;
             let mut ev = Event::new_row(
+                event_id,
                 source_info,
                 Op::Update,
                 Some(before),
@@ -403,14 +405,15 @@ async fn handle_delete_rows(
                 &row.column_values,
             );
 
-            let source_info = build_source_info(
+            let (source_info, event_id) = build_source_info(
                 ctx,
                 header,
                 &tm.database_name,
                 &tm.table_name,
                 row_ordinal as u32,
-            );
+            )?;
             let mut ev = Event::new_row(
+                event_id,
                 source_info,
                 Op::Delete,
                 Some(before),
@@ -701,7 +704,7 @@ async fn handle_query(
         ctx.message_ordinal += 1;
 
         // For DDL, we use the query's schema as both db and table context
-        let mut source_info = SourceInfo {
+        let source_info = SourceInfo {
             version: concat!("deltaforge-", env!("CARGO_PKG_VERSION"))
                 .to_string(),
             connector: "mysql".to_string(),
@@ -720,15 +723,14 @@ async fn handle_query(
             ),
         };
 
-        // Provisional `ddl` id: source lineage + "file:pos" + message ordinal.
+        // `ddl` id: source lineage + "file:pos" + message ordinal.
         let lineage = ddl_source_lineage(ctx);
         let source_position = format!("{}:{}", ctx.last_file, ctx.last_pos);
-        source_info.position.provisional_event_id =
-            Some(deltaforge_core::EventId::ddl(
-                &lineage,
-                &source_position,
-                message_ordinal,
-            ));
+        let ddl_id = deltaforge_core::EventId::ddl(
+            &lineage,
+            &source_position,
+            message_ordinal,
+        );
 
         let ddl_payload = serde_json::json!({
             "sql": q.query,
@@ -736,6 +738,7 @@ async fn handle_query(
         });
 
         let ev = Event::new_ddl(
+            ddl_id,
             source_info,
             ddl_payload,
             ts_sec_to_ms(header.timestamp),
@@ -1005,7 +1008,9 @@ mod tests {
         ctx.last_file = "mysql-bin.000005".to_string();
         ctx.last_pos = 12345;
         ctx.last_gtid = Some("abc-123:1-10".to_string());
-        ctx.current_gtid = Some("abc-123:10".to_string());
+        // A real per-transaction GTID is always a single valid `uuid:gno`.
+        ctx.current_gtid =
+            Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:10".to_string());
 
         let row = RowEvent {
             column_values: vec![
@@ -1052,7 +1057,7 @@ mod tests {
         assert_eq!(produced.source.position.pos, Some(12345));
         assert_eq!(
             produced.source.position.gtid,
-            Some("abc-123:10".to_string()),
+            Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:10".to_string()),
             "position.gtid must be the exact per-tx GTID, not the merged set"
         );
         assert_eq!(produced.source.position.row, Some(0));
