@@ -5,9 +5,16 @@
 //! `"checkpoints"` namespace.
 
 use async_trait::async_trait;
-use checkpoints::{CheckpointError, CheckpointResult, CheckpointStore};
+use checkpoints::{
+    CasOutcome, CheckpointError, CheckpointResult, CheckpointStore,
+    SnapshotStateStore,
+};
 
 use crate::ArcStorageBackend;
+
+/// Namespace for snapshot-generation allocation slots, kept separate from the
+/// `"checkpoints"` KV namespace.
+const SNAPSHOT_STATE_NS: &str = "snapshot_state";
 
 /// Implements [`CheckpointStore`] on top of any [`StorageBackend`].
 pub struct BackendCheckpointStore {
@@ -64,5 +71,83 @@ impl CheckpointStore for BackendCheckpointStore {
     fn supports_versioning(&self) -> bool {
         // Versioning is handled at the schema log level, not the checkpoint level.
         false
+    }
+}
+
+/// Atomic snapshot-generation allocation, delegated to the backend's native
+/// versioned slot primitives (`slot_create` / `slot_cas` / `slot_get`). This
+/// gives real multi-writer atomicity on transactional backends (Postgres,
+/// SQLite).
+#[async_trait]
+impl SnapshotStateStore for BackendCheckpointStore {
+    async fn get_versioned(
+        &self,
+        key: &str,
+    ) -> CheckpointResult<Option<(u64, Vec<u8>)>> {
+        self.backend
+            .slot_get(SNAPSHOT_STATE_NS, key)
+            .await
+            .map_err(map_err)
+    }
+
+    async fn compare_and_swap(
+        &self,
+        key: &str,
+        expected_version: Option<u64>,
+        value: &[u8],
+    ) -> CheckpointResult<CasOutcome> {
+        match expected_version {
+            // Expect-absent: atomic create-only.
+            None => {
+                match self
+                    .backend
+                    .slot_create(SNAPSHOT_STATE_NS, key, value)
+                    .await
+                    .map_err(map_err)?
+                {
+                    Some(version) => Ok(CasOutcome::Committed { version }),
+                    None => Ok(CasOutcome::Mismatch {
+                        current: self
+                            .backend
+                            .slot_get(SNAPSHOT_STATE_NS, key)
+                            .await
+                            .map_err(map_err)?,
+                    }),
+                }
+            }
+            // Expect a specific version: native CAS (bumps version by one).
+            Some(v) => {
+                if self
+                    .backend
+                    .slot_cas(SNAPSHOT_STATE_NS, key, v, value)
+                    .await
+                    .map_err(map_err)?
+                {
+                    Ok(CasOutcome::Committed { version: v + 1 })
+                } else {
+                    Ok(CasOutcome::Mismatch {
+                        current: self
+                            .backend
+                            .slot_get(SNAPSHOT_STATE_NS, key)
+                            .await
+                            .map_err(map_err)?,
+                    })
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::MemoryStorageBackend;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn backend_snapshot_state_contract() {
+        let store =
+            BackendCheckpointStore::new(Arc::new(MemoryStorageBackend::new()));
+        checkpoints::assert_snapshot_state_contract(&store).await;
     }
 }

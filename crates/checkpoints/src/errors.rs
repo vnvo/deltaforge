@@ -18,6 +18,9 @@ pub enum CheckpointError {
     #[error("operation not supported: {0}")]
     NotSupported(String),
 
+    #[error("storage backend does not support atomic snapshot state: {0}")]
+    UnsupportedAtomicOperation(String),
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

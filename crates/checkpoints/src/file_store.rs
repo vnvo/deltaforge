@@ -1,5 +1,8 @@
 use super::CheckpointResult;
 use super::CheckpointStore;
+use crate::snapshot_state::{
+    CasOutcome, SnapshotStateStore, VersionedRecord, cas_decision,
+};
 use async_trait::async_trait;
 use std::{
     collections::HashMap,
@@ -80,6 +83,52 @@ impl CheckpointStore for FileCheckpointStore {
     }
 }
 
+/// Atomicity is **process-local**: the `guard` mutex serializes the
+/// read-modify-write within this process, and `save` replaces the file via
+/// tmp-write + rename. This does **not** coordinate across separate processes
+/// sharing the same file — for multi-process safety use a storage-backed store.
+#[async_trait]
+impl SnapshotStateStore for FileCheckpointStore {
+    async fn get_versioned(
+        &self,
+        key: &str,
+    ) -> CheckpointResult<Option<(u64, Vec<u8>)>> {
+        let _g = self.guard.lock().await;
+        let map = self.load().await?;
+        match map.get(key) {
+            Some(bytes) => Ok(Some(VersionedRecord::decode(bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    async fn compare_and_swap(
+        &self,
+        key: &str,
+        expected_version: Option<u64>,
+        value: &[u8],
+    ) -> CheckpointResult<CasOutcome> {
+        let _g = self.guard.lock().await;
+        let mut map = self.load().await?;
+        let current = match map.get(key) {
+            Some(bytes) => Some(VersionedRecord::decode(bytes)?),
+            None => None,
+        };
+        match cas_decision(&current, expected_version) {
+            Some(new_version) => {
+                map.insert(
+                    key.to_string(),
+                    VersionedRecord::encode(new_version, value)?,
+                );
+                self.save(&map).await?;
+                Ok(CasOutcome::Committed {
+                    version: new_version,
+                })
+            }
+            None => Ok(CasOutcome::Mismatch { current }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +197,35 @@ mod tests {
             "second delete is a no-op"
         );
         assert_eq!(store.list().await.unwrap(), vec!["b".to_string()]);
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_state_contract() {
+        let path = temp_path();
+        let store = FileCheckpointStore::new(&path).unwrap();
+        crate::snapshot_state::assert_snapshot_state_contract(&store).await;
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_state_survives_reopen() {
+        // The allocation record must be durable across a store reopen (resume).
+        let path = temp_path();
+        {
+            let s = FileCheckpointStore::new(&path).unwrap();
+            s.compare_and_swap("snapshot_generation:s", None, b"gen1")
+                .await
+                .unwrap();
+        }
+        let reopened = FileCheckpointStore::new(&path).unwrap();
+        assert_eq!(
+            reopened
+                .get_versioned("snapshot_generation:s")
+                .await
+                .unwrap(),
+            Some((1, b"gen1".to_vec()))
+        );
         let _ = tokio::fs::remove_file(&path).await;
     }
 }
