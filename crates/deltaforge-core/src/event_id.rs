@@ -116,6 +116,13 @@ impl Coordinates {
         self.buf.extend_from_slice(b);
         self
     }
+    /// Raw bytes, `u32` big-endian byte-length prefixed. Used for binary
+    /// identity values, which can exceed a `u16` length.
+    fn bytes_lp(&mut self, b: &[u8]) -> &mut Self {
+        self.buf.extend_from_slice(&(b.len() as u32).to_be_bytes());
+        self.buf.extend_from_slice(b);
+        self
+    }
     /// A component count for a following list.
     fn count(&mut self, n: u16) -> &mut Self {
         self.buf.extend_from_slice(&n.to_be_bytes());
@@ -123,10 +130,10 @@ impl Coordinates {
     }
 }
 
-/// Immutable source lineage, mixed into DDL / logical-message identity so the
-/// same textual position in two independent clusters/lineages cannot collide.
-/// (Row and snapshot ids already embed lineage via the GTID SID /
-/// `system_identifier` / snapshot generation.)
+/// Immutable source lineage, mixed into snapshot, DDL, and logical-message
+/// identity so the same coordinates in two independent clusters/lineages cannot
+/// collide. (MySQL/PostgreSQL row ids already embed lineage via the GTID SID /
+/// `system_identifier`.)
 pub enum SourceLineage<'a> {
     /// PostgreSQL cluster identity.
     Postgres { system_identifier: u64 },
@@ -147,6 +154,85 @@ impl SourceLineage<'_> {
             }
             SourceLineage::MysqlServer { server_id, file } => {
                 c.u8(0x03).u32(*server_id).str(file);
+            }
+        }
+    }
+}
+
+/// Canonical type category of an identity (primary-key / `identity_columns`)
+/// value. Hashed before the value bytes so the integer `42` and the text `"42"`
+/// — and a null in a text column versus a null in an integer column — can never
+/// collide in a snapshot id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityKind {
+    /// Signed integer.
+    Int,
+    /// Unsigned integer.
+    UInt,
+    /// UTF-8 text.
+    Text,
+    /// Raw bytes.
+    Bytes,
+}
+
+impl IdentityKind {
+    const fn tag(self) -> u8 {
+        match self {
+            IdentityKind::Int => 0x01,
+            IdentityKind::UInt => 0x02,
+            IdentityKind::Text => 0x03,
+            IdentityKind::Bytes => 0x04,
+        }
+    }
+}
+
+/// A typed identity cell — the canonical value of one identity column. Each
+/// variant carries an explicit type tag (including for nulls), so distinct
+/// source types with equal textual/byte forms hash to distinct ids.
+pub enum IdentityCell<'a> {
+    /// Signed integer value.
+    Int(i64),
+    /// Unsigned integer value.
+    UInt(u64),
+    /// UTF-8 text value.
+    Text(&'a str),
+    /// Raw byte-string value.
+    Bytes(&'a [u8]),
+    /// A null value in a column of the given type category.
+    Null(IdentityKind),
+}
+
+/// One identity column's contribution to a snapshot id: its name plus a typed,
+/// canonical value. Ordering within the identity list is significant.
+pub struct IdentityValue<'a> {
+    /// Column name. Included so a renamed/reordered composite key cannot
+    /// silently alias to a different key with the same values.
+    pub name: &'a str,
+    /// The typed cell value.
+    pub cell: IdentityCell<'a>,
+}
+
+impl IdentityValue<'_> {
+    /// Encode `name || type_tag || presence_marker || canonical_value_bytes`.
+    fn encode(&self, c: &mut Coordinates) {
+        c.str(self.name);
+        match &self.cell {
+            IdentityCell::Int(v) => {
+                c.u8(IdentityKind::Int.tag()).u8(1).u64(*v as u64);
+            }
+            IdentityCell::UInt(v) => {
+                c.u8(IdentityKind::UInt.tag()).u8(1).u64(*v);
+            }
+            IdentityCell::Text(s) => {
+                c.u8(IdentityKind::Text.tag()).u8(1).str(s);
+            }
+            IdentityCell::Bytes(b) => {
+                c.u8(IdentityKind::Bytes.tag()).u8(1).bytes_lp(b);
+            }
+            // Presence marker 0 = null; the column's type tag still
+            // participates, so a null distinguishes by column type.
+            IdentityCell::Null(kind) => {
+                c.u8(kind.tag()).u8(0);
             }
         }
     }
@@ -225,21 +311,30 @@ impl EventId {
         Self::from_coordinates(EventClass::PgRow, &c)
     }
 
-    /// Snapshot row: snapshot generation + table identity + primary-key values
-    /// (in declared order).
+    /// Snapshot row: source lineage + snapshot generation + table identity +
+    /// typed identity-column values (in declared order).
+    ///
+    /// Lineage prevents two independent source instances with identical database
+    /// / table names and identical rows from colliding. Identity values are
+    /// typed and length-prefixed, so the integer `42` and the text `"42"` (and
+    /// nulls of different column types) produce different ids. The generation is
+    /// durably allocated per (re)snapshot, so a deliberate resnapshot yields a
+    /// fresh id space while a resumed snapshot reproduces the same ids.
     pub fn snapshot(
+        lineage: &SourceLineage<'_>,
         generation: u64,
         db: &str,
         table: &str,
-        primary_key: &[String],
+        identity: &[IdentityValue<'_>],
     ) -> Self {
         let mut c = Coordinates::default();
+        lineage.encode(&mut c);
         c.u64(generation)
             .str(db)
             .str(table)
-            .count(primary_key.len() as u16);
-        for v in primary_key {
-            c.str(v);
+            .count(identity.len() as u16);
+        for col in identity {
+            col.encode(&mut c);
         }
         Self::from_coordinates(EventClass::Snap, &c)
     }
@@ -370,6 +465,18 @@ mod tests {
         b
     }
 
+    /// Canonical PostgreSQL lineage used across the snapshot vectors/tests.
+    fn pg_lineage() -> SourceLineage<'static> {
+        SourceLineage::Postgres {
+            system_identifier: 0x1234_5678_90AB_CDEF,
+        }
+    }
+
+    /// Terse identity-column constructor for tests.
+    fn iv<'a>(name: &'a str, cell: IdentityCell<'a>) -> IdentityValue<'a> {
+        IdentityValue { name, cell }
+    }
+
     #[test]
     fn pinned_vector_mysql_gtid() {
         // Reproduced independently from the RFC's binary encoding.
@@ -383,10 +490,18 @@ mod tests {
 
     #[test]
     fn pinned_vector_snapshot() {
-        let id = EventId::snapshot(1, "orders", "customers", &["42".into()]);
+        // PG lineage (sysid 0x1234567890ABCDEF), generation 1,
+        // orders.customers, single Int identity column id=42.
+        let id = EventId::snapshot(
+            &pg_lineage(),
+            1,
+            "orders",
+            "customers",
+            &[iv("id", IdentityCell::Int(42))],
+        );
         assert_eq!(
             id.to_string(),
-            "dfid:v1:snap:67994950b9ad4240be0a4e73135c5257"
+            "dfid:v1:snap:a50e51a36b9842393e2a4283c0c7d341"
         );
     }
 
@@ -458,7 +573,16 @@ mod tests {
             EventId::mysql_row_gtid(&sid(), 7, 100, 3),
             EventId::mysql_row_server(42, "mysql-bin.000008", 15248355, 2),
             EventId::pg_row(0xABCD_1234_5678_9ABC, 0x16_B374_D848, 16384, 5),
-            EventId::snapshot(2, "shop", "orders", &["a".into(), "b".into()]),
+            EventId::snapshot(
+                &pg_lineage(),
+                2,
+                "shop",
+                "orders",
+                &[
+                    iv("a", IdentityCell::Text("x")),
+                    iv("b", IdentityCell::Bytes(b"\x00\x01")),
+                ],
+            ),
             EventId::ddl(
                 &SourceLineage::Postgres {
                     system_identifier: 9,
@@ -475,7 +599,13 @@ mod tests {
                 2,
             ),
             EventId::synthetic(
-                &EventId::snapshot(1, "d", "t", &["1".into()]),
+                &EventId::snapshot(
+                    &pg_lineage(),
+                    1,
+                    "d",
+                    "t",
+                    &[iv("id", IdentityCell::UInt(1))],
+                ),
                 "outbox:v1",
                 0,
             ),
@@ -487,9 +617,15 @@ mod tests {
 
     #[test]
     fn serde_json_roundtrip() {
-        let id = EventId::snapshot(1, "orders", "customers", &["42".into()]);
+        let id = EventId::snapshot(
+            &pg_lineage(),
+            1,
+            "orders",
+            "customers",
+            &[iv("id", IdentityCell::Int(42))],
+        );
         let json = serde_json::to_string(&id).unwrap();
-        assert_eq!(json, "\"dfid:v1:snap:67994950b9ad4240be0a4e73135c5257\"");
+        assert_eq!(json, "\"dfid:v1:snap:a50e51a36b9842393e2a4283c0c7d341\"");
         let back: EventId = serde_json::from_str(&json).unwrap();
         assert_eq!(back, id);
     }
@@ -526,9 +662,119 @@ mod tests {
     #[test]
     fn usable_in_hashset() {
         use std::collections::HashSet;
+        let one = || {
+            EventId::snapshot(
+                &pg_lineage(),
+                1,
+                "d",
+                "t",
+                &[iv("id", IdentityCell::Int(1))],
+            )
+        };
+        let two = EventId::snapshot(
+            &pg_lineage(),
+            1,
+            "d",
+            "t",
+            &[iv("id", IdentityCell::Int(2))],
+        );
         let mut set = HashSet::new();
-        set.insert(EventId::snapshot(1, "d", "t", &["1".into()]));
-        assert!(set.contains(&EventId::snapshot(1, "d", "t", &["1".into()])));
-        assert!(!set.contains(&EventId::snapshot(1, "d", "t", &["2".into()])));
+        set.insert(one());
+        assert!(set.contains(&one()));
+        assert!(!set.contains(&two));
+    }
+
+    #[test]
+    fn snapshot_distinguishes_type_from_text_and_bytes() {
+        // The reviewer's core requirement: int 42, uint 42, text "42" and the
+        // bytes b"42" must never conflate.
+        let d =
+            |c| EventId::snapshot(&pg_lineage(), 1, "d", "t", &[iv("id", c)]);
+        let as_int = d(IdentityCell::Int(42));
+        let as_uint = d(IdentityCell::UInt(42));
+        let as_text = d(IdentityCell::Text("42"));
+        let as_bytes = d(IdentityCell::Bytes(b"42"));
+        assert_ne!(as_int, as_uint);
+        assert_ne!(as_int, as_text);
+        assert_ne!(as_int, as_bytes);
+        assert_ne!(as_text, as_bytes);
+    }
+
+    #[test]
+    fn snapshot_identity_includes_lineage() {
+        // Two independent sources with identical db/table/rows must not collide.
+        let d = |lin: &SourceLineage<'_>| {
+            EventId::snapshot(
+                lin,
+                1,
+                "d",
+                "t",
+                &[iv("id", IdentityCell::Int(1))],
+            )
+        };
+        let a = d(&SourceLineage::Postgres {
+            system_identifier: 1,
+        });
+        let b = d(&SourceLineage::Postgres {
+            system_identifier: 2,
+        });
+        let c = d(&SourceLineage::MysqlGtid { source_uuid: sid() });
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn snapshot_null_distinct_by_column_type_and_from_present() {
+        let d =
+            |c| EventId::snapshot(&pg_lineage(), 1, "d", "t", &[iv("id", c)]);
+        let null_int = d(IdentityCell::Null(IdentityKind::Int));
+        let null_text = d(IdentityCell::Null(IdentityKind::Text));
+        let present_zero = d(IdentityCell::Int(0));
+        assert_ne!(null_int, null_text); // null differs by column type
+        assert_ne!(null_int, present_zero); // null differs from a present value
+    }
+
+    #[test]
+    fn snapshot_composite_key_order_and_names_matter() {
+        let base = EventId::snapshot(
+            &pg_lineage(),
+            1,
+            "d",
+            "t",
+            &[iv("a", IdentityCell::Int(1)), iv("b", IdentityCell::Int(2))],
+        );
+        // Swapped column order → different id.
+        let swapped = EventId::snapshot(
+            &pg_lineage(),
+            1,
+            "d",
+            "t",
+            &[iv("b", IdentityCell::Int(2)), iv("a", IdentityCell::Int(1))],
+        );
+        // Same order/values, different column name → different id.
+        let renamed = EventId::snapshot(
+            &pg_lineage(),
+            1,
+            "d",
+            "t",
+            &[iv("a", IdentityCell::Int(1)), iv("x", IdentityCell::Int(2))],
+        );
+        assert_ne!(base, swapped);
+        assert_ne!(base, renamed);
+    }
+
+    #[test]
+    fn snapshot_generation_changes_id_but_is_stable_within_generation() {
+        let at = |g| {
+            EventId::snapshot(
+                &pg_lineage(),
+                g,
+                "d",
+                "t",
+                &[iv("id", IdentityCell::Int(1))],
+            )
+        };
+        assert_ne!(at(1), at(2)); // a resnapshot (new generation) mints new ids
+        assert_eq!(at(1), at(1)); // resume reproduces the same ids
     }
 }

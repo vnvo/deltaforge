@@ -78,7 +78,10 @@ pub mod batch_context;
 pub use batch_context::BatchContext;
 
 pub mod event_id;
-pub use event_id::{EventClass, EventId, SourceLineage};
+pub use event_id::{
+    EventClass, EventId, IdentityCell, IdentityKind, IdentityValue,
+    SourceLineage,
+};
 
 pub mod journal;
 pub use journal::{DlqMeta, JournalEntry};
