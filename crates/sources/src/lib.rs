@@ -12,6 +12,7 @@ pub mod failover;
 pub mod mysql;
 pub mod postgres;
 pub mod schema_loader;
+pub mod snapshot_generation;
 
 use anyhow::Result;
 use deltaforge_config::{PipelineSpec, SourceCfg};
