@@ -77,6 +77,9 @@ pub use routing::EventRouting;
 pub mod batch_context;
 pub use batch_context::BatchContext;
 
+pub mod event_id;
+pub use event_id::{EventClass, EventId};
+
 pub mod journal;
 pub use journal::{DlqMeta, JournalEntry};
 
