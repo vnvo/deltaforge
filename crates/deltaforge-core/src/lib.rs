@@ -279,6 +279,19 @@ pub struct SourcePosition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub change_ordinal: Option<u32>,
 
+    // Snapshot-specific fields
+    /// Durable snapshot generation for stable snapshot-row identity. Serialized
+    /// (optional) — has lasting operational value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_generation: Option<u64>,
+
+    /// **Temporary, internal** provisional stable event id, computed in the
+    /// snapshot worker from native identity values and the allocated generation.
+    /// Never serialized (no JSON/Avro/Arrow/DLQ/API exposure); removed at the
+    /// atomic cutover, when it becomes `Event.event_id`.
+    #[serde(skip)]
+    pub provisional_event_id: Option<EventId>,
+
     // Generic sequence (for other sources)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sequence: Option<String>,

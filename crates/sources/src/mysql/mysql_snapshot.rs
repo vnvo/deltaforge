@@ -19,12 +19,17 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use checkpoints::CheckpointStore;
 use deltaforge_config::SnapshotCfg;
-use deltaforge_core::{Event, Op, SourceInfo, SourcePosition};
+use deltaforge_core::{Event, EventId, Op, SourceInfo, SourcePosition};
 use metrics::counter;
 use mysql_async::{Pool, Row, Value, prelude::Queryable};
+use std::collections::HashMap;
+
+use super::mysql_identity::mysql_identity_cell;
+use crate::snapshot_event_id::{OwnedIdentityValue, snapshot_row_event_id};
+use crate::snapshot_generation::PersistedLineage;
 use scopeguard;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, mpsc};
@@ -85,6 +90,12 @@ pub struct SnapshotCtx<'a> {
     pub chkpt_store: Arc<dyn CheckpointStore>,
     pub tx: mpsc::Sender<Event>,
     pub cancel: CancellationToken,
+    /// Durable snapshot generation (allocated before any row).
+    pub generation: u64,
+    /// Frozen source lineage for snapshot identity.
+    pub lineage: PersistedLineage,
+    /// `db.table` → resolved identity column names (identity order).
+    pub identity_map: HashMap<String, Vec<String>>,
 }
 
 /// Spawns a background task that polls SHOW BINARY LOGS every POSITION_GUARD_INTERVAL seconds.
@@ -243,6 +254,11 @@ pub async fn run_snapshot(
         }
 
         let permit = semaphore.clone().acquire_owned().await?;
+        let identity = ctx
+            .identity_map
+            .get(&fqn(db, table))
+            .cloned()
+            .unwrap_or_default();
         let worker = TableWorker {
             db: db.clone(),
             table: table.clone(),
@@ -254,6 +270,10 @@ pub async fn run_snapshot(
             tx: ctx.tx.clone(),
             schema_loader: ctx.schema_loader.clone(),
             cancel: ctx.cancel.clone(),
+            generation: ctx.generation,
+            lineage: ctx.lineage.clone(),
+            identity,
+            schema: None,
         };
         let handle = tokio::spawn(async move {
             let result = worker.run().await;
@@ -389,6 +409,14 @@ struct TableWorker {
     tx: mpsc::Sender<Event>,
     schema_loader: MySqlSchemaLoader,
     cancel: CancellationToken,
+    /// Durable snapshot generation for stable-id derivation.
+    generation: u64,
+    /// Frozen source lineage.
+    lineage: PersistedLineage,
+    /// Resolved identity column names (identity order).
+    identity: Vec<String>,
+    /// Loaded schema, populated in `run` before any scan.
+    schema: Option<super::MySqlTableSchema>,
 }
 
 impl TableWorker {
@@ -402,8 +430,10 @@ impl TableWorker {
             .load_schema(&self.db, &self.table)
             .await
             .with_context(|| format!("load schema for {table_fqn}"))?;
+        // Retain the schema for schema-directed native identity extraction.
+        self.schema = Some(loaded.schema.clone());
 
-        let pk = &loaded.schema.primary_key;
+        let pk = loaded.schema.primary_key.clone();
         let rows_sent = if pk.len() == 1
             && is_integer_pk(loaded.schema.column(pk[0].as_str()))
         {
@@ -487,12 +517,11 @@ impl TableWorker {
 
             let n = rows.len() as u64;
             for row in rows {
-                if self
-                    .tx
-                    .send(self.make_event(row_to_json(row)?))
-                    .await
-                    .is_err()
-                {
+                // Derive identity from NATIVE values before the lossy JSON
+                // conversion, then build the event.
+                let id = self.provisional_id(&row)?;
+                let json = row_to_json(row)?;
+                if self.tx.send(self.make_event(json, id)).await.is_err() {
                     anyhow::bail!("event channel closed");
                 }
             }
@@ -521,12 +550,9 @@ impl TableWorker {
 
         let n = rows.len() as u64;
         for row in rows {
-            if self
-                .tx
-                .send(self.make_event(row_to_json(row)?))
-                .await
-                .is_err()
-            {
+            let id = self.provisional_id(&row)?;
+            let json = row_to_json(row)?;
+            if self.tx.send(self.make_event(json, id)).await.is_err() {
                 anyhow::bail!("event channel closed");
             }
         }
@@ -534,7 +560,48 @@ impl TableWorker {
         Ok(n)
     }
 
-    fn make_event(&self, after: serde_json::Value) -> Event {
+    /// Compute the provisional snapshot [`EventId`] from the row's **native**
+    /// identity values (schema-directed) and the allocated generation.
+    fn provisional_id(&self, row: &Row) -> Result<EventId> {
+        let schema = self
+            .schema
+            .as_ref()
+            .ok_or_else(|| anyhow!("schema not loaded before scan"))?;
+        let mut values: Vec<OwnedIdentityValue> =
+            Vec::with_capacity(self.identity.len());
+        for name in &self.identity {
+            let col = schema
+                .column(name)
+                .ok_or_else(|| anyhow!("identity column {name:?} missing"))?;
+            let idx = row
+                .columns_ref()
+                .iter()
+                .position(|c| c.name_str() == name.as_str())
+                .ok_or_else(|| {
+                    anyhow!("identity column {name:?} not present in row")
+                })?;
+            let val = row.as_ref(idx).cloned().unwrap_or(Value::NULL);
+            let cell = mysql_identity_cell(col, &val)
+                .map_err(|e| anyhow!("{name}: {e}"))?;
+            values.push(OwnedIdentityValue {
+                name: name.clone(),
+                cell,
+            });
+        }
+        Ok(snapshot_row_event_id(
+            &self.lineage.as_source_lineage(),
+            self.generation,
+            &self.db,
+            &self.table,
+            &values,
+        ))
+    }
+
+    fn make_event(
+        &self,
+        after: serde_json::Value,
+        provisional_id: EventId,
+    ) -> Event {
         let size = after.to_string().len();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -552,7 +619,11 @@ impl TableWorker {
                 schema: None,
                 table: self.table.clone(),
                 snapshot: Some("true".to_string()),
-                position: SourcePosition::default(),
+                position: SourcePosition {
+                    snapshot_generation: Some(self.generation),
+                    provisional_event_id: Some(provisional_id),
+                    ..Default::default()
+                },
             },
             Op::Read,
             None,

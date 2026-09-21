@@ -87,6 +87,10 @@ pub struct PostgresSource {
     pub outbox_prefixes: AllowList,
     pub snapshot_cfg: deltaforge_config::SnapshotCfg,
     pub on_schema_drift: OnSchemaDrift,
+    /// Per-table options (identity_columns, assume_unique), keyed by
+    /// fully-qualified `schema.table`.
+    pub table_options:
+        std::collections::BTreeMap<String, deltaforge_config::TableOptions>,
 }
 
 // ============================================================================

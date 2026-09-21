@@ -205,6 +205,7 @@ async fn make_source(
         snapshot_cfg: deltaforge_config::SnapshotCfg::default(),
         backend: make_storage_backend().await,
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
+        table_options: Default::default(),
     }
 }
 

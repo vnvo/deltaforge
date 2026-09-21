@@ -18,6 +18,9 @@ use tracing::{debug, error, info, warn};
 
 use checkpoints::{CheckpointStore, CheckpointStoreExt};
 use common::{AllowList, RetryPolicy, pause_until_resumed};
+use storage::BackendCheckpointStore;
+
+use crate::snapshot_generation::PersistedLineage;
 use deltaforge_core::{Event, Source, SourceError, SourceHandle, SourceResult};
 mod mysql_errors;
 pub use mysql_errors::{LoopControl, MySqlSourceError, MySqlSourceResult};
@@ -79,6 +82,10 @@ pub struct MySqlSource {
     pub outbox_tables: AllowList,
     pub snapshot_cfg: deltaforge_config::SnapshotCfg,
     pub on_schema_drift: deltaforge_config::OnSchemaDrift,
+    /// Per-table options (identity_columns, assume_unique), keyed by
+    /// fully-qualified `db.table`.
+    pub table_options:
+        std::collections::BTreeMap<String, deltaforge_config::TableOptions>,
 }
 
 const HEARTBEAT_INTERVAL_SECS: u64 = 15;
@@ -122,7 +129,140 @@ struct RunCtx {
     on_schema_drift: deltaforge_config::OnSchemaDrift,
 }
 
+/// Outcome of the pre-snapshot validate/allocate flow: the frozen generation,
+/// its persisted lineage, and the per-table resolved identity columns.
+struct SnapshotPlan {
+    generation: u64,
+    lineage: PersistedLineage,
+    /// `db.table` → resolved identity column names (in identity order).
+    identity_map: HashMap<String, Vec<String>>,
+}
+
 impl MySqlSource {
+    /// Validate every selected table's identity, freeze source lineage, compute
+    /// the config fingerprint, and atomically allocate (or resume) the snapshot
+    /// generation — all **before** any row is emitted. Keyless tables or
+    /// unsupported identity types fail here, before allocation.
+    async fn prepare_snapshot_generation(
+        &self,
+        loader: &MySqlSchemaLoader,
+        tracked: &[(String, String)],
+    ) -> SourceResult<SnapshotPlan> {
+        use crate::identity_resolution::{
+            IdentitySchemaView, resolve_identity,
+        };
+        use crate::snapshot_generation::{
+            AllocationMode, SnapshotConfigFingerprint, TableIdentitySpec,
+            allocate_generation,
+        };
+
+        let mut specs: Vec<TableIdentitySpec> =
+            Vec::with_capacity(tracked.len());
+        let mut identity_map: HashMap<String, Vec<String>> = HashMap::new();
+
+        // Steps 2-4: schema, identity resolution, and type validation for
+        // EVERY table — so an invalid table fails before a generation is
+        // allocated or any row emitted.
+        for (db, table) in tracked {
+            let loaded = loader.load_schema(db, table).await?;
+            let schema = &loaded.schema;
+            let col_names: Vec<String> =
+                schema.columns.iter().map(|c| c.name.clone()).collect();
+            let fqn = format!("{db}.{table}");
+            let opts = self.table_options.get(&fqn);
+            let view = IdentitySchemaView {
+                columns: &col_names,
+                primary_key: &schema.primary_key,
+                unique_constraints: &[],
+            };
+            let resolved = resolve_identity(
+                db,
+                table,
+                &view,
+                opts.and_then(|o| o.identity_columns.as_deref()),
+                opts.map(|o| o.assume_unique).unwrap_or(false),
+            )
+            .map_err(|e| SourceError::Other(anyhow::anyhow!(e)))?;
+            for name in &resolved.columns {
+                let col = schema.column(name).ok_or_else(|| {
+                    SourceError::Other(anyhow::anyhow!(
+                        "identity column {name:?} vanished from schema"
+                    ))
+                })?;
+                mysql_identity_kind(col)
+                    .map_err(|e| SourceError::Other(anyhow::anyhow!(e)))?;
+            }
+            specs.push(TableIdentitySpec {
+                db: db.clone(),
+                schema: None,
+                table: table.clone(),
+                identity_columns: resolved.columns.clone(),
+            });
+            identity_map.insert(fqn, resolved.columns);
+        }
+
+        // Step 5: freeze lineage. Step 6: fingerprint. Step 7: allocate.
+        let lineage = self.capture_snapshot_lineage().await?;
+        let fingerprint = SnapshotConfigFingerprint::compute(&specs);
+        let mode = if self.snapshot_cfg.mode == SnapshotMode::Always {
+            AllocationMode::ForceNew
+        } else {
+            AllocationMode::Resume
+        };
+        let store = BackendCheckpointStore::new(self.backend.clone());
+        let key = format!("snapshot_generation:{}", self.id);
+        let alloc =
+            allocate_generation(&store, &key, lineage, &fingerprint, mode)
+                .await
+                .map_err(|e| SourceError::Other(anyhow::anyhow!(e)))?;
+
+        info!(
+            source_id = %self.id,
+            generation = alloc.record.generation,
+            tables = tracked.len(),
+            "snapshot generation allocated"
+        );
+        Ok(SnapshotPlan {
+            generation: alloc.record.generation,
+            lineage: alloc.record.lineage,
+            identity_map,
+        })
+    }
+
+    /// Freeze the source lineage for snapshot identity: prefer the stable
+    /// `@@server_uuid` (file-free, rotation-immune); fall back to
+    /// `server_id` + the current binlog file.
+    async fn capture_snapshot_lineage(&self) -> SourceResult<PersistedLineage> {
+        use mysql_async::{Pool, Row, prelude::Queryable};
+        let pool = Pool::new(self.dsn.as_str());
+        let mut conn = pool
+            .get_conn()
+            .await
+            .map_err(|e| SourceError::Other(e.into()))?;
+        let uuid: Option<String> = conn
+            .query_first("SELECT @@global.server_uuid")
+            .await
+            .map_err(|e| SourceError::Other(e.into()))?;
+        if let Some(u) = uuid {
+            if let Some(bytes) = mysql_event_id::parse_uuid16(&u) {
+                return Ok(PersistedLineage::MysqlGtid { source_uuid: bytes });
+            }
+        }
+        let server_id: u32 = conn
+            .query_first("SELECT @@server_id")
+            .await
+            .map_err(|e| SourceError::Other(e.into()))?
+            .unwrap_or(0);
+        let file: String = conn
+            .query_first::<Row, _>("SHOW BINARY LOG STATUS")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|mut r| r.take::<String, _>(0))
+            .unwrap_or_default();
+        Ok(PersistedLineage::MysqlServer { server_id, file })
+    }
+
     async fn run_inner(
         &self,
         tx: mpsc::Sender<Event>,
@@ -169,6 +309,13 @@ impl MySqlSource {
                 &self.tenant,
             );
             let tracked = snap_schema_loader.preload(&self.tables).await?;
+
+            // Validate every table + freeze lineage + allocate the generation
+            // BEFORE emitting any row (keyless/unsupported tables fail here).
+            let plan = self
+                .prepare_snapshot_generation(&snap_schema_loader, &tracked)
+                .await?;
+
             let snapshot_ctx = mysql_snapshot::SnapshotCtx {
                 dsn: &self.dsn,
                 source_id: &self.id,
@@ -179,6 +326,9 @@ impl MySqlSource {
                 chkpt_store: chkpt_store.clone(),
                 tx: tx.clone(),
                 cancel: cancel.clone(),
+                generation: plan.generation,
+                lineage: plan.lineage,
+                identity_map: plan.identity_map,
             };
             let snapshot_position =
                 mysql_snapshot::run_snapshot(&snapshot_ctx, &tracked)

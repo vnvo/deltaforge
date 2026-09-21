@@ -11,7 +11,7 @@ use deltaforge_core::{EventId, SourceInfo};
 
 /// Parse a MySQL GTID UUID (`3e11fa47-71ca-11e1-9e33-c80aa9429562`) into 16
 /// bytes. Returns `None` if it isn't a well-formed 32-hex-digit (dashed) UUID.
-fn parse_uuid16(uuid: &str) -> Option<[u8; 16]> {
+pub(crate) fn parse_uuid16(uuid: &str) -> Option<[u8; 16]> {
     let hex: String = uuid.chars().filter(|c| *c != '-').collect();
     if hex.len() != 32 {
         return None;
