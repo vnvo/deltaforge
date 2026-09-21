@@ -75,6 +75,8 @@ pub struct JsProcessor {
     id: String,
     tx: mpsc::Sender<JsJob>,
     worker_handle: Option<std::thread::JoinHandle<()>>,
+    /// Stable identity digest over the exact source bytes + canonical limits.
+    digest: String,
 }
 
 impl JsProcessor {
@@ -94,7 +96,14 @@ impl JsProcessor {
     /// - JS syntax is invalid
     /// - `processBatch` function is not defined
     /// - Thread spawn fails
-    pub fn new(id: String, inline: String) -> Result<Self> {
+    pub fn new(
+        id: String,
+        inline: String,
+        limits: Option<deltaforge_config::Limits>,
+    ) -> Result<Self> {
+        // Identity digest over the EXACT source bytes + canonical limits.
+        let digest = crate::digest::js_digest(&inline, &limits);
+
         // Channel to send jobs to JS thread
         let (tx, mut rx) = mpsc::channel::<JsJob>(1024);
 
@@ -118,6 +127,7 @@ impl JsProcessor {
             id,
             tx,
             worker_handle: Some(worker_handle),
+            digest,
         })
     }
 
@@ -442,6 +452,10 @@ fn value_type_name(v: &Value) -> &'static str {
 impl Processor for JsProcessor {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn identity_digest(&self) -> &str {
+        &self.digest
     }
 
     async fn process(

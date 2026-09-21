@@ -42,6 +42,10 @@ impl Processor for SyntheticMarkingProcessor {
         self.inner.id()
     }
 
+    fn identity_digest(&self) -> &str {
+        self.inner.identity_digest()
+    }
+
     async fn process(
         &self,
         events: Vec<Event>,
@@ -100,6 +104,9 @@ mod tests {
         fn id(&self) -> &str {
             &self.0
         }
+        fn identity_digest(&self) -> &str {
+            "test-digest"
+        }
         async fn process(
             &self,
             events: Vec<Event>,
@@ -115,6 +122,9 @@ mod tests {
     impl Processor for FanOut {
         fn id(&self) -> &str {
             &self.0
+        }
+        fn identity_digest(&self) -> &str {
+            "test-digest"
         }
         async fn process(
             &self,
@@ -144,6 +154,9 @@ mod tests {
     impl Processor for ExplicitSynthetic {
         fn id(&self) -> &str {
             &self.0
+        }
+        fn identity_digest(&self) -> &str {
+            "test-digest"
         }
         async fn process(
             &self,

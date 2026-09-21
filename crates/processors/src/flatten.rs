@@ -29,12 +29,21 @@ use tracing::debug;
 pub struct FlattenProcessor {
     id: String,
     cfg: FlattenProcessorCfg,
+    digest: String,
 }
+
+/// Bump when a code change alters this processor's output for identical config.
+const FLATTEN_IMPL_VERSION: u32 = 1;
 
 impl FlattenProcessor {
     pub fn new(cfg: FlattenProcessorCfg) -> Result<Self> {
         let id = cfg.id.clone();
-        Ok(Self { id, cfg })
+        let digest = crate::digest::builtin_digest(
+            "flatten",
+            FLATTEN_IMPL_VERSION,
+            &cfg,
+        );
+        Ok(Self { id, cfg, digest })
     }
 
     /// Flatten every object-valued field present on the event.
@@ -187,6 +196,10 @@ impl FlattenProcessor {
 impl Processor for FlattenProcessor {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn identity_digest(&self) -> &str {
+        &self.digest
     }
 
     async fn process(

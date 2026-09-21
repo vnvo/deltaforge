@@ -823,6 +823,13 @@ pub trait Processor: Send + Sync {
         events: Vec<Event>,
         ctx: &BatchContext,
     ) -> Result<Vec<Event>>;
+
+    /// Stable identity digest for this processor — the `processor_digest`
+    /// component of a synthetic [`EventId`]. Sensitive to anything that changes
+    /// the processor's output (source bytes and/or canonical config). Computed
+    /// once at construction and returned by reference; never recomputed per
+    /// event.
+    fn identity_digest(&self) -> &str;
 }
 
 #[async_trait]

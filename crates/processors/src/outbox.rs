@@ -52,7 +52,11 @@ pub struct OutboxProcessor {
     table_filter: AllowList,
     topic_template: Option<CompiledTemplate>,
     key_template: Option<CompiledTemplate>,
+    digest: String,
 }
+
+/// Bump when a code change alters this processor's output for identical config.
+const OUTBOX_IMPL_VERSION: u32 = 1;
 
 impl OutboxProcessor {
     pub fn new(cfg: OutboxProcessorCfg, pipeline: String) -> Result<Self> {
@@ -74,6 +78,8 @@ impl OutboxProcessor {
 
         let table_filter = AllowList::new(&cfg.tables);
         let id = cfg.id.clone();
+        let digest =
+            crate::digest::builtin_digest("outbox", OUTBOX_IMPL_VERSION, &cfg);
 
         Ok(Self {
             id,
@@ -82,6 +88,7 @@ impl OutboxProcessor {
             table_filter,
             topic_template,
             key_template,
+            digest,
         })
     }
 
@@ -306,6 +313,10 @@ fn value_type_name(v: &Value) -> &'static str {
 impl Processor for OutboxProcessor {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn identity_digest(&self) -> &str {
+        &self.digest
     }
 
     async fn process(

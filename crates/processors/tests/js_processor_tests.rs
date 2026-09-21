@@ -94,8 +94,8 @@ async fn js_passthrough_returns_events_unchanged() {
         }
     "#;
 
-    let proc =
-        JsProcessor::new("passthrough".into(), js.into()).expect("init ok");
+    let proc = JsProcessor::new("passthrough".into(), js.into(), None)
+        .expect("init ok");
     let ev = new_event();
 
     let events = vec![ev.clone()];
@@ -124,7 +124,8 @@ async fn js_mutates_event_payload() {
         }
     "#;
 
-    let proc = JsProcessor::new("mutate".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("mutate".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
     let ctx = BatchContext::from_batch(&events);
     let out = proc.process(events, &ctx).await.expect("ok");
@@ -148,8 +149,8 @@ async fn js_accesses_source_info_fields() {
         }
     "#;
 
-    let proc =
-        JsProcessor::new("source_access".into(), js.into()).expect("init ok");
+    let proc = JsProcessor::new("source_access".into(), js.into(), None)
+        .expect("init ok");
     let events = vec![new_event()];
     let ctx = BatchContext::from_batch(&events);
     let out = proc.process(events, &ctx).await.expect("ok");
@@ -178,7 +179,8 @@ async fn js_handles_update_with_before_and_after() {
         }
     "#;
 
-    let proc = JsProcessor::new("update".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("update".into(), js.into(), None).expect("init ok");
     let events = vec![new_update_event()];
     let ctx = BatchContext::from_batch(&events);
     let out = proc.process(events, &ctx).await.expect("ok");
@@ -201,7 +203,8 @@ async fn js_handles_delete_operation() {
         }
     "#;
 
-    let proc = JsProcessor::new("delete".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("delete".into(), js.into(), None).expect("init ok");
     let events = vec![new_delete_event()];
     let ctx = BatchContext::from_batch(&events);
     let out = proc.process(events, &ctx).await.expect("ok");
@@ -232,7 +235,8 @@ async fn js_routes_by_op_type() {
         }
     "#;
 
-    let proc = JsProcessor::new("router".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("router".into(), js.into(), None).expect("init ok");
 
     let create = new_event();
     let update = new_update_event();
@@ -268,7 +272,8 @@ async fn js_can_add_events_to_batch() {
         }
     "#;
 
-    let proc = JsProcessor::new("expand".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("expand".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
     let ctx = BatchContext::from_batch(&events);
     let out = proc.process(events, &ctx).await.expect("ok");
@@ -286,7 +291,8 @@ async fn js_can_filter_events() {
         }
     "#;
 
-    let proc = JsProcessor::new("filter".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("filter".into(), js.into(), None).expect("init ok");
     let events = vec![new_event(), new_update_event(), new_delete_event()];
     let ctx = BatchContext::from_batch(&events);
     let out = proc.process(events, &ctx).await.expect("ok");
@@ -303,7 +309,8 @@ async fn js_empty_return_drops_all() {
         }
     "#;
 
-    let proc = JsProcessor::new("drop".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("drop".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
     let ctx = BatchContext::from_batch(&events);
     let out = proc.process(events, &ctx).await.expect("ok");
@@ -313,7 +320,8 @@ async fn js_empty_return_drops_all() {
 #[tokio::test(flavor = "current_thread")]
 async fn js_empty_input_batch() {
     let js = "function processBatch(events) { return events; }";
-    let proc = JsProcessor::new("empty".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("empty".into(), js.into(), None).expect("init ok");
     let events = vec![];
     let ctx = BatchContext::from_batch(&events);
     let out = proc.process(events, &ctx).await.expect("ok");
@@ -334,7 +342,8 @@ async fn js_single_object_return_wrapped() {
         }
     "#;
 
-    let proc = JsProcessor::new("single".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("single".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
     let ctx = BatchContext::from_batch(&events);
     let out = proc.process(events, &ctx).await.expect("ok");
@@ -351,7 +360,8 @@ async fn js_invalid_return_type_errors() {
         }
     "#;
 
-    let proc = JsProcessor::new("invalid".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("invalid".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
     let ctx = BatchContext::from_batch(&events);
     let err = proc.process(events, &ctx).await.expect_err("should fail");
@@ -370,7 +380,8 @@ async fn js_throw_propagates_error() {
         }
     "#;
 
-    let proc = JsProcessor::new("throw".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("throw".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
     let ctx = BatchContext::from_batch(&events);
     let err = proc.process(events, &ctx).await.expect_err("should fail");
@@ -399,7 +410,8 @@ async fn js_runtime_persists_state_across_batches() {
         }
     "#;
 
-    let proc = JsProcessor::new("stateful".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("stateful".into(), js.into(), None).expect("init ok");
 
     let events = vec![new_event()];
     let ctx = BatchContext::from_batch(&events);
@@ -426,7 +438,8 @@ async fn js_calls_rust_op_log() {
         }
     "#;
 
-    let proc = JsProcessor::new("op_log".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("op_log".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
     let ctx = BatchContext::from_batch(&events);
     let out = proc.process(events, &ctx).await.expect("ok");
@@ -454,7 +467,7 @@ async fn js_transforms_payload_structure() {
     "#;
 
     let proc =
-        JsProcessor::new("transform".into(), js.into()).expect("init ok");
+        JsProcessor::new("transform".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
     let ctx = BatchContext::from_batch(&events);
     let out = proc.process(events, &ctx).await.expect("ok");
@@ -478,8 +491,8 @@ async fn js_payload_integers_become_floats() {
         }
     "#;
 
-    let proc =
-        JsProcessor::new("float_test".into(), js.into()).expect("init ok");
+    let proc = JsProcessor::new("float_test".into(), js.into(), None)
+        .expect("init ok");
 
     let mut ev = new_event();
     ev.after = Some(json!({
@@ -511,7 +524,7 @@ async fn js_payload_integers_become_floats() {
 #[test]
 fn js_syntax_error_fails_initialization() {
     let js = "function processBatch(events { return events; }"; // missing )
-    let result = JsProcessor::new("syntax".into(), js.into());
+    let result = JsProcessor::new("syntax".into(), js.into(), None);
     // May fail at init or when worker thread validates - either is acceptable
     // Worker thread crash makes is_alive() return false
     if let Ok(proc) = result {
@@ -526,7 +539,7 @@ fn js_syntax_error_fails_initialization() {
 #[test]
 fn js_missing_process_batch_fails_initialization() {
     let js = "function wrongName(events) { return events; }";
-    let result = JsProcessor::new("missing".into(), js.into());
+    let result = JsProcessor::new("missing".into(), js.into(), None);
     if let Ok(proc) = result {
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(
@@ -551,7 +564,8 @@ async fn js_sets_routing_topic() {
         }
     "#;
 
-    let proc = JsProcessor::new("route".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("route".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
     let ctx = BatchContext::from_batch(&events);
     let out = proc.process(events, &ctx).await.expect("ok");
@@ -576,7 +590,8 @@ async fn js_sets_routing_key_and_headers() {
         }
     "#;
 
-    let proc = JsProcessor::new("route_kh".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("route_kh".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
     let ctx = BatchContext::from_batch(&events);
     let out = proc.process(events, &ctx).await.expect("ok");
@@ -590,7 +605,8 @@ async fn js_sets_routing_key_and_headers() {
 async fn js_preserves_existing_routing() {
     let js = "function processBatch(events) { return events; }";
 
-    let proc = JsProcessor::new("preserve".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("preserve".into(), js.into(), None).expect("init ok");
     let mut ev = new_event();
     ev.routing = Some(EventRouting {
         topic: Some("pre-existing".into()),
@@ -623,8 +639,8 @@ async fn js_clone_gets_separate_routing() {
         }
     "#;
 
-    let proc =
-        JsProcessor::new("clone_route".into(), js.into()).expect("init ok");
+    let proc = JsProcessor::new("clone_route".into(), js.into(), None)
+        .expect("init ok");
     let events = vec![new_event()];
     let ctx = BatchContext::from_batch(&events);
     let out = proc.process(events, &ctx).await.expect("ok");
@@ -644,7 +660,8 @@ async fn js_clone_gets_separate_routing() {
 async fn js_no_route_call_means_no_routing() {
     let js = "function processBatch(events) { return events; }";
 
-    let proc = JsProcessor::new("no_route".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("no_route".into(), js.into(), None).expect("init ok");
     let events = vec![new_event()];
     let ctx = BatchContext::from_batch(&events);
     let out = proc.process(events, &ctx).await.expect("ok");
@@ -662,8 +679,8 @@ async fn js_filter_drops_routed_events() {
         }
     "#;
 
-    let proc =
-        JsProcessor::new("filter_drop".into(), js.into()).expect("init ok");
+    let proc = JsProcessor::new("filter_drop".into(), js.into(), None)
+        .expect("init ok");
     let events = vec![new_event()];
     let ctx = BatchContext::from_batch(&events);
     let out = proc.process(events, &ctx).await.expect("ok");
@@ -682,7 +699,7 @@ async fn js_route_overwrites_existing_routing() {
     "#;
 
     let proc =
-        JsProcessor::new("overwrite".into(), js.into()).expect("init ok");
+        JsProcessor::new("overwrite".into(), js.into(), None).expect("init ok");
     let mut ev = new_event();
     ev.routing = Some(EventRouting {
         topic: Some("old-topic".into()),
@@ -714,7 +731,8 @@ async fn js_conditional_routing_by_payload() {
         }
     "#;
 
-    let proc = JsProcessor::new("cond".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("cond".into(), js.into(), None).expect("init ok");
 
     let mut low = new_event();
     low.after = Some(json!({"id": 2}));
@@ -749,7 +767,8 @@ async fn js_route_only_some_events() {
         }
     "#;
 
-    let proc = JsProcessor::new("partial".into(), js.into()).expect("init ok");
+    let proc =
+        JsProcessor::new("partial".into(), js.into(), None).expect("init ok");
     let events = vec![new_event(), new_delete_event()];
     let ctx = BatchContext::from_batch(&events);
     let out = proc.process(events, &ctx).await.expect("ok");
