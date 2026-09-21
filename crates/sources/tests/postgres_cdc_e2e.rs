@@ -1929,3 +1929,244 @@ async fn stable_event_ids_are_replay_stable() -> Result<()> {
     pg_drop_db(&db).await;
     Ok(())
 }
+
+// ============================================================================
+// Stable snapshot identity (dfid:v1) — native binary extraction end-to-end
+// ============================================================================
+
+use deltaforge_config::SnapshotMode;
+use deltaforge_core::{EventClass, EventId};
+use storage::ArcStorageBackend;
+
+#[allow(clippy::too_many_arguments)]
+async fn make_snap_source(
+    id: &str,
+    db: &str,
+    slot: &str,
+    publication: &str,
+    tables: Vec<String>,
+    snapshot_cfg: deltaforge_config::SnapshotCfg,
+    backend: ArcStorageBackend,
+    table_options: std::collections::BTreeMap<
+        String,
+        deltaforge_config::TableOptions,
+    >,
+) -> PostgresSource {
+    PostgresSource {
+        id: id.into(),
+        dsn: pg_cdc_dsn(db).await,
+        slot: slot.into(),
+        publication: publication.into(),
+        tables,
+        tenant: "acme".into(),
+        pipeline: "test".into(),
+        registry: make_registry().await,
+        outbox_prefixes: AllowList::default(),
+        snapshot_cfg,
+        backend,
+        on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
+        table_options,
+    }
+}
+
+fn snap_reads(events: &[Event]) -> Vec<&Event> {
+    events.iter().filter(|e| matches!(e.op, Op::Read)).collect()
+}
+
+fn snap_ids(events: &[Event]) -> Vec<EventId> {
+    snap_reads(events)
+        .iter()
+        .filter_map(|e| e.source.position.provisional_event_id)
+        .collect()
+}
+
+/// A UUID primary key (scanned via ctid) yields stable `snap` ids from the raw
+/// 16 UUID bytes, each stamped with the allocated generation.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_uuid_pk_snapshot_ids_are_stable() -> Result<()> {
+    let (db, client) = pg_setup("pg_snap_uuid").await?;
+    client
+        .batch_execute(
+            "CREATE TABLE items (id uuid PRIMARY KEY, name text); \
+             INSERT INTO items VALUES \
+               ('11111111-1111-1111-1111-111111111111','a'), \
+               ('22222222-2222-2222-2222-222222222222','b'), \
+               ('33333333-3333-3333-3333-333333333333','c');",
+        )
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON items TO {PG_CDC_USER}"), &[])
+        .await?;
+    create_pub_slot(&client, "pub_snap_uuid", "slot_snap_uuid", &["items"])
+        .await?;
+
+    let src = make_snap_source(
+        "pg-snap-uuid",
+        &db,
+        "slot_snap_uuid",
+        "pub_snap_uuid",
+        vec!["public.items".into()],
+        deltaforge_config::SnapshotCfg {
+            mode: SnapshotMode::Initial,
+            ..Default::default()
+        },
+        make_storage_backend().await,
+        Default::default(),
+    )
+    .await;
+
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = mpsc::channel(128);
+    let handle = src.run(tx, ckpt).await;
+    let events = collect_until(&mut rx, Duration::from_secs(30), |e| {
+        e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 3
+    })
+    .await;
+
+    let reads = snap_reads(&events);
+    assert_eq!(reads.len(), 3);
+    for e in &reads {
+        assert_eq!(e.source.position.snapshot_generation, Some(1));
+        let id = e
+            .source
+            .position
+            .provisional_event_id
+            .expect("snapshot row carries a provisional id");
+        assert_eq!(id.class(), EventClass::Snap);
+    }
+    let ids = snap_ids(&events);
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), 3, "UUID identities must be unique");
+
+    handle.stop();
+    handle.join().await.ok();
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+/// An explicit re-snapshot allocates a new generation → different ids.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_resnapshot_allocates_new_generation() -> Result<()> {
+    let (db, client) = pg_setup("pg_snap_resnap").await?;
+    client
+        .batch_execute(
+            "CREATE TABLE orders (id int PRIMARY KEY, sku text); \
+             INSERT INTO orders VALUES (1,'a'),(2,'b'),(3,'c');",
+        )
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
+        .await?;
+    create_pub_slot(
+        &client,
+        "pub_snap_resnap",
+        "slot_snap_resnap",
+        &["orders"],
+    )
+    .await?;
+
+    let backend = make_storage_backend().await;
+    let run = |mode| {
+        let backend = backend.clone();
+        let db = db.clone();
+        async move {
+            let src = make_snap_source(
+                "pg-snap-resnap",
+                &db,
+                "slot_snap_resnap",
+                "pub_snap_resnap",
+                vec!["public.orders".into()],
+                deltaforge_config::SnapshotCfg {
+                    mode,
+                    ..Default::default()
+                },
+                backend,
+                Default::default(),
+            )
+            .await;
+            let ckpt: Arc<dyn CheckpointStore> =
+                Arc::new(MemCheckpointStore::new().unwrap());
+            let (tx, mut rx) = mpsc::channel(128);
+            let handle = src.run(tx, ckpt).await;
+            let events = collect_until(&mut rx, Duration::from_secs(30), |e| {
+                e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 3
+            })
+            .await;
+            handle.stop();
+            handle.join().await.ok();
+            events
+        }
+    };
+
+    let first = run(SnapshotMode::Initial).await;
+    let second = run(SnapshotMode::Always).await;
+
+    assert_eq!(first[0].source.position.snapshot_generation, Some(1));
+    let g2 = snap_reads(&second)[0].source.position.snapshot_generation;
+    assert_eq!(g2, Some(2), "resnapshot must bump the generation");
+
+    let a: std::collections::HashSet<_> =
+        snap_ids(&first).into_iter().collect();
+    let b: std::collections::HashSet<_> =
+        snap_ids(&second).into_iter().collect();
+    assert!(a.is_disjoint(&b), "a new generation changes every id");
+
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+/// A keyless table is rejected before any snapshot row is emitted.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_keyless_table_rejected_before_rows() -> Result<()> {
+    let (db, client) = pg_setup("pg_snap_keyless").await?;
+    client
+        .batch_execute(
+            "CREATE TABLE logs (msg text, lvl text); \
+             INSERT INTO logs VALUES ('boot','info');",
+        )
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON logs TO {PG_CDC_USER}"), &[])
+        .await?;
+    create_pub_slot(
+        &client,
+        "pub_snap_keyless",
+        "slot_snap_keyless",
+        &["logs"],
+    )
+    .await?;
+
+    let src = make_snap_source(
+        "pg-snap-keyless",
+        &db,
+        "slot_snap_keyless",
+        "pub_snap_keyless",
+        vec!["public.logs".into()],
+        deltaforge_config::SnapshotCfg {
+            mode: SnapshotMode::Initial,
+            ..Default::default()
+        },
+        make_storage_backend().await,
+        Default::default(),
+    )
+    .await;
+
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = mpsc::channel(128);
+    let handle = src.run(tx, ckpt).await;
+    let events =
+        collect_until(&mut rx, Duration::from_secs(8), |_| false).await;
+    assert_eq!(
+        snap_reads(&events).len(),
+        0,
+        "keyless table must emit no snapshot rows"
+    );
+
+    handle.stop();
+    handle.join().await.ok();
+    pg_drop_db(&db).await;
+    Ok(())
+}

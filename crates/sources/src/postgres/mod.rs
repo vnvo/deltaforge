@@ -18,6 +18,10 @@ use tracing::{debug, error, info, warn};
 use checkpoints::{CheckpointStore, CheckpointStoreExt};
 use common::{AllowList, RetryPolicy, pause_until_resumed};
 use deltaforge_core::{Event, Source, SourceError, SourceHandle, SourceResult};
+use storage::BackendCheckpointStore;
+
+use crate::snapshot_generation::PersistedLineage;
+use postgres_snapshot::IdentitySpec;
 
 mod postgres_errors;
 use postgres_errors::LoopControl;
@@ -44,6 +48,7 @@ pub use postgres_event_id::pg_row_event_id;
 pub mod postgres_identity;
 pub use postgres_identity::{
     PgIdentityError, PgIdentityRaw, pg_identity_cell, pg_identity_kind,
+    quote_ident, resolve_identity_kinds,
 };
 
 pub mod postgres_table_schema;
@@ -151,7 +156,155 @@ pub(crate) struct RunCtx {
 
 const MAX_STARTUP_BACKOFF_SECS: u64 = 60;
 
+/// Outcome of the pre-snapshot validate/allocate flow.
+struct SnapshotPlan {
+    generation: u64,
+    lineage: PersistedLineage,
+    /// `schema.table` → resolved identity columns (name + kind).
+    identity_map: HashMap<String, Vec<IdentitySpec>>,
+}
+
 impl PostgresSource {
+    /// Validate every selected table's identity (resolution + catalog type
+    /// support), freeze the cluster lineage, compute the config fingerprint, and
+    /// atomically allocate (or resume) the snapshot generation — all **before**
+    /// any row is emitted. Keyless tables or unsupported identity types fail
+    /// here, before allocation.
+    async fn prepare_snapshot_generation(
+        &self,
+        loader: &PostgresSchemaLoader,
+        tracked: &[(String, String)],
+    ) -> SourceResult<SnapshotPlan> {
+        use crate::identity_resolution::{
+            IdentitySchemaView, resolve_identity,
+        };
+        use crate::snapshot_generation::{
+            AllocationMode, SnapshotConfigFingerprint, TableIdentitySpec,
+            allocate_generation,
+        };
+        use tokio_postgres::NoTls;
+
+        // One catalog connection for identity-kind resolution + lineage.
+        let (client, conn) = tokio_postgres::connect(&self.dsn, NoTls)
+            .await
+            .map_err(|e| SourceError::Other(e.into()))?;
+        let conn_task = tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let mut specs: Vec<TableIdentitySpec> =
+            Vec::with_capacity(tracked.len());
+        let mut identity_map: HashMap<String, Vec<IdentitySpec>> =
+            HashMap::new();
+
+        for (schema, table) in tracked {
+            let loaded = loader.load_schema(schema, table).await?;
+            let s = &loaded.schema;
+            let col_names: Vec<String> =
+                s.columns.iter().map(|c| c.name.clone()).collect();
+            let fqn = format!("{schema}.{table}");
+            let opts = self.table_options.get(&fqn);
+            let view = IdentitySchemaView {
+                columns: &col_names,
+                primary_key: &s.primary_key,
+                // Unique constraints are not captured in the schema today;
+                // non-PK identity columns require assume_unique.
+                unique_constraints: &[],
+            };
+            let resolved = resolve_identity(
+                schema,
+                table,
+                &view,
+                opts.and_then(|o| o.identity_columns.as_deref()),
+                opts.map(|o| o.assume_unique).unwrap_or(false),
+            )
+            .map_err(|e| SourceError::Other(anyhow::anyhow!(e)))?;
+
+            // Resolve + validate the identity column types from the catalog
+            // (rejects unsupported types before allocation).
+            let kinds = resolve_identity_kinds(
+                &client,
+                schema,
+                table,
+                &resolved.columns,
+            )
+            .await
+            .map_err(SourceError::Other)?;
+
+            specs.push(TableIdentitySpec {
+                db: schema.clone(),
+                schema: Some(schema.clone()),
+                table: table.clone(),
+                identity_columns: resolved.columns.clone(),
+            });
+            identity_map.insert(
+                fqn,
+                kinds
+                    .into_iter()
+                    .map(|(name, kind)| IdentitySpec { name, kind })
+                    .collect(),
+            );
+        }
+
+        // Freeze lineage from the existing system_identifier authority.
+        let lineage = self.capture_snapshot_lineage(&client).await?;
+        conn_task.abort();
+
+        let fingerprint = SnapshotConfigFingerprint::compute(&specs);
+        let mode = if self.snapshot_cfg.mode == SnapshotMode::Always {
+            AllocationMode::ForceNew
+        } else {
+            AllocationMode::Resume
+        };
+        let store = BackendCheckpointStore::new(self.backend.clone());
+        let key = format!("snapshot_generation:{}", self.id);
+        let alloc =
+            allocate_generation(&store, &key, lineage, &fingerprint, mode)
+                .await
+                .map_err(|e| SourceError::Other(anyhow::anyhow!(e)))?;
+
+        info!(
+            source_id = %self.id,
+            generation = alloc.record.generation,
+            tables = tracked.len(),
+            "snapshot generation allocated"
+        );
+        Ok(SnapshotPlan {
+            generation: alloc.record.generation,
+            lineage: alloc.record.lineage,
+            identity_map,
+        })
+    }
+
+    /// Freeze the PostgreSQL cluster lineage from `system_identifier` — the same
+    /// authority used by the failover identity path (`pg_control_system()`, no
+    /// superuser). Fails with an actionable error if it is unavailable.
+    async fn capture_snapshot_lineage(
+        &self,
+        client: &tokio_postgres::Client,
+    ) -> SourceResult<PersistedLineage> {
+        let row = client
+            .query_opt("SELECT system_identifier FROM pg_control_system()", &[])
+            .await
+            .map_err(|e| {
+                SourceError::Other(anyhow::anyhow!(
+                    "reading system_identifier (pg_control_system): {e}; the \
+                     CDC role needs EXECUTE on pg_control_system()"
+                ))
+            })?;
+        let sysid: i64 = row
+            .ok_or_else(|| {
+                SourceError::Other(anyhow::anyhow!(
+                    "system_identifier unavailable; cannot mint stable \
+                     snapshot ids"
+                ))
+            })?
+            .get(0);
+        Ok(PersistedLineage::Postgres {
+            system_identifier: sysid as u64,
+        })
+    }
+
     async fn run_inner(
         &self,
         tx: mpsc::Sender<Event>,
@@ -282,6 +435,29 @@ impl PostgresSource {
 
         let start_lsn = if needs_snapshot {
             info!(source_id = %self.id, "starting initial snapshot");
+
+            // An explicit re-snapshot re-scans every table: reset table-level
+            // progress so completed tables are not skipped (generation is
+            // separately bumped via ForceNew below).
+            if self.snapshot_cfg.mode == SnapshotMode::Always {
+                if let Ok(bytes) =
+                    serde_json::to_vec(&SnapshotProgress::default())
+                {
+                    let _ = chkpt_store
+                        .put_raw(
+                            &postgres_snapshot::progress_key(&self.id),
+                            &bytes,
+                        )
+                        .await;
+                }
+            }
+
+            // Validate every table + freeze lineage + allocate the generation
+            // BEFORE emitting any row (keyless/unsupported tables fail here).
+            let plan = self
+                .prepare_snapshot_generation(&schema_loader, &tracked)
+                .await?;
+
             let snapshot_ctx = postgres_snapshot::PgSnapshotCtx {
                 dsn: &self.dsn,
                 source_id: &self.id,
@@ -293,6 +469,9 @@ impl PostgresSource {
                 tx: tx.clone(),
                 cancel: cancel.clone(),
                 slot_name: Some(&self.slot),
+                generation: plan.generation,
+                lineage: plan.lineage,
+                identity_map: plan.identity_map,
             };
             postgres_snapshot::run_snapshot(&snapshot_ctx, &tracked)
                 .await

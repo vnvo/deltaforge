@@ -16,11 +16,18 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use checkpoints::CheckpointStore;
 use common::redact_url_password;
 use deltaforge_config::SnapshotCfg;
-use deltaforge_core::{Event, Op, SourceInfo, SourcePosition};
+use deltaforge_core::{
+    Event, EventId, IdentityKind, Op, SourceInfo, SourcePosition,
+};
+use std::collections::HashMap;
+
+use super::postgres_identity::{PgIdentityRaw, pg_identity_cell, quote_ident};
+use crate::snapshot_event_id::{OwnedIdentityValue, snapshot_row_event_id};
+use crate::snapshot_generation::PersistedLineage;
 use metrics::counter;
 use pgwire_replication::Lsn;
 use scopeguard;
@@ -72,6 +79,69 @@ pub fn progress_key(source_id: &str) -> String {
 // Entry point
 // ============================================================================
 
+/// One identity column: its name and the canonical kind (for null-tagging).
+#[derive(Debug, Clone)]
+pub struct IdentitySpec {
+    pub name: String,
+    pub kind: IdentityKind,
+}
+
+/// The `, t."col"...` suffix that adds native identity columns to a snapshot
+/// SELECT (column 0 is always the `row_to_json` payload).
+fn identity_select_suffix(specs: &[IdentitySpec]) -> String {
+    specs
+        .iter()
+        .map(|s| format!(", t.{}", quote_ident(&s.name)))
+        .collect()
+}
+
+/// The single, shared identity-extraction path used by **all** scan strategies
+/// (PK sequential, PK parallel, ctid). Reads the native binary identity columns
+/// (indices `1..=specs.len()`) and mints the provisional snapshot id.
+fn provisional_snapshot_id(
+    row: &tokio_postgres::Row,
+    specs: &[IdentitySpec],
+    lineage: &PersistedLineage,
+    generation: u64,
+    schema: &str,
+    table: &str,
+) -> Result<EventId> {
+    let expected = 1 + specs.len();
+    if row.len() != expected {
+        bail!(
+            "snapshot row has {} columns, expected {expected} (payload + {} \
+             identity columns)",
+            row.len(),
+            specs.len()
+        );
+    }
+    let mut values = Vec::with_capacity(specs.len());
+    for (i, spec) in specs.iter().enumerate() {
+        // ctid is never an identity input; identity columns are explicit.
+        let raw: Option<PgIdentityRaw> = row
+            .try_get(1 + i)
+            .with_context(|| format!("read identity column {:?}", spec.name))?;
+        let cell = match raw {
+            Some(r) => pg_identity_cell(&r)
+                .map_err(|e| anyhow!("identity column {}: {e}", spec.name))?,
+            None => {
+                crate::snapshot_event_id::OwnedIdentityCell::Null(spec.kind)
+            }
+        };
+        values.push(OwnedIdentityValue {
+            name: spec.name.clone(),
+            cell,
+        });
+    }
+    Ok(snapshot_row_event_id(
+        &lineage.as_source_lineage(),
+        generation,
+        schema,
+        table,
+        &values,
+    ))
+}
+
 pub struct PgSnapshotCtx<'a> {
     pub dsn: &'a str,
     pub source_id: &'a str,
@@ -83,6 +153,12 @@ pub struct PgSnapshotCtx<'a> {
     pub tx: mpsc::Sender<Event>,
     pub cancel: CancellationToken,
     pub slot_name: Option<&'a str>,
+    /// Durable snapshot generation (allocated before any row).
+    pub generation: u64,
+    /// Frozen source lineage for snapshot identity.
+    pub lineage: PersistedLineage,
+    /// `schema.table` → resolved identity columns (name + kind, identity order).
+    pub identity_map: HashMap<String, Vec<IdentitySpec>>,
 }
 
 /// Run a consistent snapshot of `tables`.
@@ -196,6 +272,11 @@ pub async fn run_snapshot(
 
         let permit = semaphore.clone().acquire_owned().await?;
 
+        let identity = ctx
+            .identity_map
+            .get(&fqn(schema, table))
+            .cloned()
+            .unwrap_or_default();
         let worker = TableWorker {
             dsn: ctx.dsn.to_string(),
             schema: schema.clone(),
@@ -209,6 +290,9 @@ pub async fn run_snapshot(
             schema_loader: ctx.schema_loader.clone(),
             chkpt_store: ctx.chkpt_store.clone(),
             cancel: ctx.cancel.clone(),
+            generation: ctx.generation,
+            lineage: ctx.lineage.clone(),
+            identity,
         };
 
         let handle = tokio::spawn(async move {
@@ -307,6 +391,12 @@ struct TableWorker {
     #[allow(unused)]
     chkpt_store: Arc<dyn CheckpointStore>,
     cancel: CancellationToken,
+    /// Durable snapshot generation for stable-id derivation.
+    generation: u64,
+    /// Frozen source lineage.
+    lineage: PersistedLineage,
+    /// Resolved identity columns (name + kind, identity order).
+    identity: Vec<IdentitySpec>,
 }
 
 impl TableWorker {
@@ -560,14 +650,16 @@ impl TableWorker {
         to: i64,
         fqn: &str,
     ) -> Result<u64> {
-        // row_to_json does the Rust type-mapping for free — every row becomes
-        // a JSON object with correct types using PostgreSQL's own serialiser.
+        // row_to_json (column 0) is the payload; native identity columns follow
+        // and are the ONLY identity input (schema-directed, never the JSON).
         let sql = format!(
-            r#"SELECT row_to_json(t)::text
+            r#"SELECT row_to_json(t)::text{}
                FROM (SELECT * FROM "{}"."{}"
                      WHERE "{pk_col}" >= $1 AND "{pk_col}" < $2
                      ORDER BY "{pk_col}") t"#,
-            self.schema, self.table
+            identity_select_suffix(&self.identity),
+            self.schema,
+            self.table
         );
 
         let rows = client
@@ -577,13 +669,21 @@ impl TableWorker {
 
         let n = rows.len() as u64;
         for row in rows {
+            let id = provisional_snapshot_id(
+                &row,
+                &self.identity,
+                &self.lineage,
+                self.generation,
+                &self.schema,
+                &self.table,
+            )?;
             let json_str: &str = row.get(0);
             let after: serde_json::Value = serde_json::from_str(json_str)
                 .with_context(|| {
                     format!("parse row_to_json output for {fqn}")
                 })?;
             let size = json_str.len();
-            let event = self.make_event(after, size);
+            let event = self.make_event(after, size, id);
             if tx.send(event).await.is_err() {
                 anyhow::bail!("event channel closed");
             }
@@ -632,12 +732,16 @@ impl TableWorker {
                 anyhow::bail!("snapshot cancelled");
             }
             let end_page = (page + pages_per_chunk).min(total_pages);
+            // ctid drives pagination ONLY; identity comes from the explicit
+            // native identity columns, never ctid.
             let sql = format!(
-                r#"SELECT row_to_json(t)::text
+                r#"SELECT row_to_json(t)::text{}
                    FROM (SELECT * FROM "{}"."{}"
                          WHERE ctid >= '({page},1)'::tid
                            AND ctid < '({end_page},1)'::tid) t"#,
-                self.schema, self.table
+                identity_select_suffix(&self.identity),
+                self.schema,
+                self.table
             );
 
             let rows = client.query(&sql, &[]).await.with_context(|| {
@@ -646,11 +750,19 @@ impl TableWorker {
 
             let n = rows.len() as u64;
             for row in rows {
+                let id = provisional_snapshot_id(
+                    &row,
+                    &self.identity,
+                    &self.lineage,
+                    self.generation,
+                    &self.schema,
+                    &self.table,
+                )?;
                 let json_str: &str = row.get(0);
                 let after: serde_json::Value =
                     serde_json::from_str(json_str).context("parse ctid row")?;
                 let size = json_str.len();
-                let event = self.make_event(after, size);
+                let event = self.make_event(after, size, id);
                 if self.tx.send(event).await.is_err() {
                     anyhow::bail!("event channel closed");
                 }
@@ -664,7 +776,12 @@ impl TableWorker {
     }
 
     //Helpers
-    fn make_event(&self, after: serde_json::Value, size_bytes: usize) -> Event {
+    fn make_event(
+        &self,
+        after: serde_json::Value,
+        size_bytes: usize,
+        provisional_id: EventId,
+    ) -> Event {
         let ts_ms = chrono::Utc::now().timestamp_millis();
         let source = SourceInfo {
             version: concat!("deltaforge-", env!("CARGO_PKG_VERSION"))
@@ -676,7 +793,11 @@ impl TableWorker {
             schema: Some(self.schema.clone()),
             table: self.table.clone(),
             snapshot: Some("true".into()),
-            position: SourcePosition::default(),
+            position: SourcePosition {
+                snapshot_generation: Some(self.generation),
+                provisional_event_id: Some(provisional_id),
+                ..Default::default()
+            },
         };
 
         Event::new_row(source, Op::Read, None, Some(after), ts_ms, size_bytes)
@@ -693,6 +814,9 @@ impl TableWorker {
             dsn: self.dsn.clone(),
             snapshot_id: self.snapshot_id.clone(),
             chunk_size: self.cfg.chunk_size,
+            generation: self.generation,
+            lineage: self.lineage.clone(),
+            identity: self.identity.clone(),
         }
     }
 }
@@ -706,6 +830,9 @@ struct ChunkWorkerCtx {
     dsn: String,
     snapshot_id: String,
     chunk_size: usize,
+    generation: u64,
+    lineage: PersistedLineage,
+    identity: Vec<IdentitySpec>,
 }
 
 impl ChunkWorkerCtx {
@@ -727,11 +854,13 @@ impl ChunkWorkerCtx {
         );
 
         let sql = format!(
-            r#"SELECT row_to_json(t)::text
+            r#"SELECT row_to_json(t)::text{}
                FROM (SELECT * FROM "{}"."{}"
                      WHERE "{pk_col}" >= $1 AND "{pk_col}" < $2
                      ORDER BY "{pk_col}") t"#,
-            self.schema, self.table
+            identity_select_suffix(&self.identity),
+            self.schema,
+            self.table
         );
 
         let rows = client
@@ -741,6 +870,14 @@ impl ChunkWorkerCtx {
 
         let n = rows.len() as u64;
         for row in rows {
+            let id = provisional_snapshot_id(
+                &row,
+                &self.identity,
+                &self.lineage,
+                self.generation,
+                &self.schema,
+                &self.table,
+            )?;
             let json_str: &str = row.get(0);
             let after: serde_json::Value =
                 serde_json::from_str(json_str).context("parse row")?;
@@ -756,7 +893,11 @@ impl ChunkWorkerCtx {
                 schema: Some(self.schema.clone()),
                 table: self.table.clone(),
                 snapshot: Some("true".into()),
-                position: SourcePosition::default(),
+                position: SourcePosition {
+                    snapshot_generation: Some(self.generation),
+                    provisional_event_id: Some(id),
+                    ..Default::default()
+                },
             };
             let event = Event::new_row(
                 source,

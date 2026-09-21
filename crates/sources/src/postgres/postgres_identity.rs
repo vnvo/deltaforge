@@ -10,10 +10,93 @@
 
 use std::error::Error;
 
+use anyhow::{Context, Result, anyhow};
 use deltaforge_core::{IdentityKind, TemporalKind};
 use tokio_postgres::types::{FromSql, Kind, Type};
 
 use crate::snapshot_event_id::OwnedIdentityCell;
+
+/// Quote a PostgreSQL identifier safely (doubling embedded quotes).
+pub fn quote_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// Resolve each identity column's canonical [`IdentityKind`] from the catalog in
+/// **one batched query** (never per row), resolving domains recursively to their
+/// base type. Returns kinds in the same order as `cols`, or an error if any
+/// column's type is unsupported for stable identity (composite, range,
+/// multirange, array, or unknown custom type).
+pub async fn resolve_identity_kinds(
+    client: &tokio_postgres::Client,
+    schema: &str,
+    table: &str,
+    cols: &[String],
+) -> Result<Vec<(String, IdentityKind)>> {
+    use std::collections::HashMap;
+
+    // Recursively peel domains (`typtype = 'd'`) down to the base type, then
+    // return the terminal (non-domain) type per identity column.
+    let sql = r#"
+        WITH RECURSIVE resolved AS (
+            SELECT a.attname::text AS name,
+                   a.atttypid       AS oid,
+                   t.typtype::text  AS typtype,
+                   t.typbasetype    AS base
+            FROM pg_attribute a
+            JOIN pg_type t ON t.oid = a.atttypid
+            WHERE a.attrelid = format('%I.%I', $1::text, $2::text)::regclass
+              AND a.attname::text = ANY($3::text[])
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+            UNION ALL
+            SELECT r.name, t.oid, t.typtype::text, t.typbasetype
+            FROM resolved r
+            JOIN pg_type t ON t.oid = r.base
+            WHERE r.typtype = 'd'
+        )
+        SELECT name, oid, typtype FROM resolved WHERE typtype <> 'd'
+    "#;
+
+    let cols_vec: Vec<String> = cols.to_vec();
+    let rows = client
+        .query(sql, &[&schema, &table, &cols_vec])
+        .await
+        .context("resolve identity column types from catalog")?;
+
+    let mut found: HashMap<String, (u32, String)> = HashMap::new();
+    for row in rows {
+        let name: String = row.get(0);
+        let oid: u32 = row.get(1);
+        let typtype: String = row.get(2);
+        found.insert(name, (oid, typtype));
+    }
+
+    let mut out = Vec::with_capacity(cols.len());
+    for c in cols {
+        let (oid, typtype) = found.get(c).ok_or_else(|| {
+            anyhow!("identity column {c:?} not found in catalog")
+        })?;
+        let kind = classify_catalog_type(*oid, typtype).ok_or_else(|| {
+            anyhow!(
+                "identity column {c:?} has a type unsupported for stable \
+                 identity (composite, range, array, or unknown custom type)"
+            )
+        })?;
+        out.push((c.clone(), kind));
+    }
+    Ok(out)
+}
+
+/// Classify a terminal (domain-resolved) catalog type into an [`IdentityKind`].
+fn classify_catalog_type(oid: u32, typtype: &str) -> Option<IdentityKind> {
+    match typtype {
+        "e" => Some(IdentityKind::Enum),
+        // Base type: defer to the wire-type mapping (rejects arrays/float/etc.).
+        "b" => Type::from_oid(oid).and_then(|t| pg_identity_kind(&t)),
+        // Composite ('c'), range ('r'), multirange ('m'), pseudo ('p'): reject.
+        _ => None,
+    }
+}
 
 /// Raw native field bytes plus the (domain-resolved) column type, captured via
 /// `FromSql` so we see PostgreSQL's exact binary wire form.
