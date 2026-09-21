@@ -1874,6 +1874,195 @@ mod tests {
         assert_eq!(cp.as_deref(), Some(&b"real"[..]));
     }
 
+    /// Drops every event — models a transaction whose rows are all filtered by a
+    /// processor.
+    struct DropAllProcessor;
+    #[async_trait::async_trait]
+    impl deltaforge_core::Processor for DropAllProcessor {
+        fn id(&self) -> &str {
+            "drop-all"
+        }
+        async fn process(
+            &self,
+            _events: Vec<Event>,
+            _ctx: &BatchContext,
+        ) -> anyhow::Result<Vec<Event>> {
+            Ok(Vec::new())
+        }
+        fn identity_digest(&self) -> &str {
+            "drop-all-v1"
+        }
+    }
+
+    /// A transaction whose every event is processor-filtered still advances the
+    /// commit checkpoint: the marker's position rides on the pre-processing
+    /// events, so the boundary is committed even though nothing is delivered.
+    #[tokio::test]
+    async fn fully_filtered_transaction_still_checkpoints() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        let cp_fn =
+            build_commit_fn(store.clone(), "src::sink::kafka".to_string());
+        let procs: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![Arc::new(DropAllProcessor) as _]);
+        let batch_processor = build_batch_processor(procs, "test".to_string());
+        let coord = Coordinator::builder("tx-test")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(1000),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_fn("kafka", cp_fn)
+            .process_fn(batch_processor)
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        for i in 0..3 {
+            tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
+                .await
+                .unwrap();
+        }
+        tx.send(SourceItem::TxCommit {
+            tx_id: "gtid:1".into(),
+            checkpoint: CheckpointMeta::from_vec(b"cp-1".to_vec()),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        coord.run(rx, cancel, pause_rx).await.unwrap();
+
+        assert_eq!(sink.delivery_count(), 0, "all events were filtered");
+        let cp = store.get_raw("src::sink::kafka").await.unwrap();
+        assert_eq!(
+            cp.as_deref(),
+            Some(&b"cp-1"[..]),
+            "a fully-filtered transaction must still advance the checkpoint"
+        );
+    }
+
+    /// A completed transaction that never reaches the soft size limit is flushed
+    /// by the timer once the source goes idle — while it stays open (no marker)
+    /// the timer must not flush it.
+    #[tokio::test]
+    async fn timer_flushes_whole_tx_when_idle() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let coord = tx_coord(
+            store.clone(),
+            Arc::clone(&sink),
+            BatchConfig {
+                max_events: Some(1000), // never reached
+                max_ms: Some(50),       // short timer
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            },
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        for i in 0..2 {
+            tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
+                .await
+                .unwrap();
+        }
+        tx.send(SourceItem::TxCommit {
+            tx_id: "gtid:1".into(),
+            checkpoint: CheckpointMeta::from_vec(b"cp-1".to_vec()),
+        })
+        .await
+        .unwrap();
+        // Keep the channel open (idle source at the WAL tail).
+
+        let cancel_c = cancel.clone();
+        let sink_c = Arc::clone(&sink);
+        let waiter = tokio::spawn(async move {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if sink_c.delivery_count() >= 2 {
+                    cancel_c.cancel();
+                    return true;
+                }
+                if Instant::now() > deadline {
+                    cancel_c.cancel();
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        coord.run(rx, cancel, pause_rx).await.unwrap();
+        assert!(
+            waiter.await.unwrap(),
+            "timer should flush the idle whole tx"
+        );
+        assert_eq!(sink.batch_sizes(), vec![2]);
+        let cp = store.get_raw("src::sink::kafka").await.unwrap();
+        assert_eq!(cp.as_deref(), Some(&b"cp-1"[..]));
+    }
+
+    /// The soft `max_events` limit closes a batch only at a commit boundary:
+    /// transactions accumulate until a marker pushes the batch past the limit,
+    /// splitting the stream into batches that each contain whole transactions.
+    #[tokio::test]
+    async fn soft_limit_splits_batches_at_tx_boundaries() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let coord = tx_coord(
+            store.clone(),
+            Arc::clone(&sink),
+            BatchConfig {
+                max_events: Some(3),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            },
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        for (txn, cp) in
+            [("gtid:1", "cp-1"), ("gtid:2", "cp-2"), ("gtid:3", "cp-3")]
+        {
+            for i in 0..2 {
+                tx.send(SourceItem::Event(tx_event(i, txn, b"row")))
+                    .await
+                    .unwrap();
+            }
+            tx.send(SourceItem::TxCommit {
+                tx_id: txn.into(),
+                checkpoint: CheckpointMeta::from_vec(cp.as_bytes().to_vec()),
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+
+        coord.run(rx, cancel, pause_rx).await.unwrap();
+
+        // tx1+tx2 (4 events) cross the limit at tx2's marker → one batch; tx3
+        // (2 events) flushes on shutdown → second batch. Neither splits a tx.
+        assert_eq!(sink.batch_sizes(), vec![4, 2]);
+        let cp = store.get_raw("src::sink::kafka").await.unwrap();
+        assert_eq!(cp.as_deref(), Some(&b"cp-3"[..]));
+    }
+
     // ── Pure batch-accumulation helpers (check_and_split / policy) ───────
 
     /// Build a minimal row event with a controllable size hint and tx-end
