@@ -2103,9 +2103,16 @@ async fn pg_resnapshot_allocates_new_generation() -> Result<()> {
     let first = run(SnapshotMode::Initial).await;
     let second = run(SnapshotMode::Always).await;
 
-    assert_eq!(first[0].source.position.snapshot_generation, Some(1));
-    let g2 = snap_reads(&second)[0].source.position.snapshot_generation;
-    assert_eq!(g2, Some(2), "resnapshot must bump the generation");
+    let first_reads = snap_reads(&first);
+    let second_reads = snap_reads(&second);
+    assert!(!first_reads.is_empty(), "initial snapshot emitted no rows");
+    assert!(!second_reads.is_empty(), "resnapshot emitted no rows");
+    assert_eq!(first_reads[0].source.position.snapshot_generation, Some(1));
+    assert_eq!(
+        second_reads[0].source.position.snapshot_generation,
+        Some(2),
+        "resnapshot must bump the generation"
+    );
 
     let a: std::collections::HashSet<_> =
         snap_ids(&first).into_iter().collect();

@@ -319,7 +319,9 @@ pub async fn run_snapshot(
                 info!(table = %name, "snapshot complete");
             }
             Ok(Err(e)) => {
-                error!(table = %name, error = %e, "table snapshot failed");
+                // Preserve the full anyhow cause chain, not just the outer message.
+                let chain = format!("{e:#}");
+                error!(table = %name, error = %chain, "table snapshot failed");
                 failed.push(name);
             }
             Err(e) => {
@@ -655,7 +657,7 @@ impl TableWorker {
         let sql = format!(
             r#"SELECT row_to_json(t)::text{}
                FROM (SELECT * FROM "{}"."{}"
-                     WHERE "{pk_col}" >= $1 AND "{pk_col}" < $2
+                     WHERE "{pk_col}" >= $1::bigint AND "{pk_col}" < $2::bigint
                      ORDER BY "{pk_col}") t"#,
             identity_select_suffix(&self.identity),
             self.schema,
@@ -696,31 +698,27 @@ impl TableWorker {
     async fn by_ctid(&self, client: &tokio_postgres::Client) -> Result<u64> {
         let fqn = fqn(&self.schema, &self.table);
 
-        // relpages is 0 on tables that have never been ANALYZEd (common in
-        // tests and freshly loaded tables). ANALYZE first so stats are current.
-        client
-            .execute(
-                &format!(r#"ANALYZE "{}"."{}" "#, self.schema, self.table),
-                &[],
-            )
-            .await
-            .ok();
-
+        // Page count from the REAL on-disk size (`pg_relation_size`), never from
+        // `pg_class.relpages` — relpages is a planner statistic that is 0/stale
+        // until an ANALYZE the CDC role may not be permitted to run, and a stale
+        // 0 must never be mistaken for an empty table. `pg_relation_size` reads
+        // the actual file size, so 0 here means genuinely empty.
         let page_row = client
             .query_one(
-                "SELECT relpages FROM pg_class c \
-                 JOIN pg_namespace n ON n.oid = c.relnamespace \
-                 WHERE n.nspname = $1 AND c.relname = $2",
+                "SELECT (pg_relation_size(\
+                     format('%I.%I', $1::text, $2::text)::regclass) \
+                 / current_setting('block_size')::bigint)::bigint",
                 &[&self.schema, &self.table],
             )
             .await
-            .context("fetch page count")?;
+            .context("fetch relation size")?;
 
-        let total_pages: i32 = page_row.get(0);
+        let total_pages: i64 = page_row.get(0);
         if total_pages == 0 {
-            debug!(table = %fqn, "empty table");
+            debug!(table = %fqn, "empty relation (0 data pages)");
             return Ok(0);
         }
+        let total_pages: i32 = total_pages.min(i32::MAX as i64) as i32;
 
         // Aim for ~chunk_size rows per batch (assume ~100 rows/page).
         let pages_per_chunk = ((self.cfg.chunk_size / 100) as i32).max(1);
@@ -856,7 +854,7 @@ impl ChunkWorkerCtx {
         let sql = format!(
             r#"SELECT row_to_json(t)::text{}
                FROM (SELECT * FROM "{}"."{}"
-                     WHERE "{pk_col}" >= $1 AND "{pk_col}" < $2
+                     WHERE "{pk_col}" >= $1::bigint AND "{pk_col}" < $2::bigint
                      ORDER BY "{pk_col}") t"#,
             identity_select_suffix(&self.identity),
             self.schema,

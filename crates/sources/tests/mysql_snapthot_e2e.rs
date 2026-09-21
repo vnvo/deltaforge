@@ -629,13 +629,20 @@ async fn mysql_resnapshot_allocates_new_generation() -> Result<()> {
     let first = run(SnapshotMode::Initial).await;
     let second = run(SnapshotMode::Always).await;
 
-    let g1 = first[0].source.position.snapshot_generation;
-    let g2 = second
+    let first_read = first
         .iter()
         .find(|e| matches!(e.op, Op::Read))
-        .and_then(|e| e.source.position.snapshot_generation);
-    assert_eq!(g1, Some(1));
-    assert_eq!(g2, Some(2), "resnapshot must allocate a new generation");
+        .expect("initial snapshot emitted no rows");
+    let second_read = second
+        .iter()
+        .find(|e| matches!(e.op, Op::Read))
+        .expect("resnapshot emitted no rows");
+    assert_eq!(first_read.source.position.snapshot_generation, Some(1));
+    assert_eq!(
+        second_read.source.position.snapshot_generation,
+        Some(2),
+        "resnapshot must allocate a new generation"
+    );
 
     let ids1: std::collections::HashSet<_> =
         snapshot_ids(&first).into_iter().collect();
