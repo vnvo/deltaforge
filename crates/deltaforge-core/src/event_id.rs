@@ -32,6 +32,8 @@ pub enum EventClass {
     Ddl,
     /// Logical message.
     Msg,
+    /// Synthetic (processor-generated) event.
+    Syn,
 }
 
 impl EventClass {
@@ -43,6 +45,7 @@ impl EventClass {
             EventClass::Snap => 0x03,
             EventClass::Ddl => 0x04,
             EventClass::Msg => 0x05,
+            EventClass::Syn => 0x06,
         }
     }
 
@@ -54,6 +57,7 @@ impl EventClass {
             EventClass::Snap => "snap",
             EventClass::Ddl => "ddl",
             EventClass::Msg => "msg",
+            EventClass::Syn => "syn",
         }
     }
 
@@ -64,6 +68,7 @@ impl EventClass {
             "snap" => EventClass::Snap,
             "ddl" => EventClass::Ddl,
             "msg" => EventClass::Msg,
+            "syn" => EventClass::Syn,
             _ => return None,
         })
     }
@@ -115,6 +120,35 @@ impl Coordinates {
     fn count(&mut self, n: u16) -> &mut Self {
         self.buf.extend_from_slice(&n.to_be_bytes());
         self
+    }
+}
+
+/// Immutable source lineage, mixed into DDL / logical-message identity so the
+/// same textual position in two independent clusters/lineages cannot collide.
+/// (Row and snapshot ids already embed lineage via the GTID SID /
+/// `system_identifier` / snapshot generation.)
+pub enum SourceLineage<'a> {
+    /// PostgreSQL cluster identity.
+    Postgres { system_identifier: u64 },
+    /// MySQL GTID lineage — the transaction's source UUID.
+    MysqlGtid { source_uuid: [u8; 16] },
+    /// MySQL non-GTID fallback — server id + binlog filename context.
+    MysqlServer { server_id: u32, file: &'a str },
+}
+
+impl SourceLineage<'_> {
+    fn encode(&self, c: &mut Coordinates) {
+        match self {
+            SourceLineage::Postgres { system_identifier } => {
+                c.u8(0x01).u64(*system_identifier);
+            }
+            SourceLineage::MysqlGtid { source_uuid } => {
+                c.u8(0x02).bytes16(source_uuid);
+            }
+            SourceLineage::MysqlServer { server_id, file } => {
+                c.u8(0x03).u32(*server_id).str(file);
+            }
+        }
     }
 }
 
@@ -208,6 +242,53 @@ impl EventId {
             c.str(v);
         }
         Self::from_coordinates(EventClass::Snap, &c)
+    }
+
+    /// DDL / schema change: source lineage + source position (LSN/binlog string)
+    /// + a per-position message ordinal.
+    pub fn ddl(
+        lineage: &SourceLineage<'_>,
+        source_position: &str,
+        message_ordinal: u32,
+    ) -> Self {
+        let mut c = Coordinates::default();
+        lineage.encode(&mut c);
+        c.str(source_position).u32(message_ordinal);
+        Self::from_coordinates(EventClass::Ddl, &c)
+    }
+
+    /// Logical message: source lineage + source position + per-position ordinal.
+    pub fn logical_message(
+        lineage: &SourceLineage<'_>,
+        source_position: &str,
+        message_ordinal: u32,
+    ) -> Self {
+        let mut c = Coordinates::default();
+        lineage.encode(&mut c);
+        c.str(source_position).u32(message_ordinal);
+        Self::from_coordinates(EventClass::Msg, &c)
+    }
+
+    /// Synthetic (processor-generated) event: derived from the parent event's
+    /// identity, a stable processor digest (e.g. a normalized code+config hash
+    /// for inline JS, or `"<name>:<version>"` for built-ins), and the output's
+    /// ordinal among the parent's newly-emitted events.
+    ///
+    /// A 1:1 transformation should **retain the parent's `EventId`** rather than
+    /// mint a synthetic one; this constructor is only for *newly emitted*
+    /// outputs. A non-deterministic processor cannot promise replay-stable
+    /// synthetic identity.
+    pub fn synthetic(
+        parent: &EventId,
+        processor_digest: &str,
+        output_ordinal: u32,
+    ) -> Self {
+        let mut c = Coordinates::default();
+        c.u8(parent.class.byte())
+            .bytes16(&parent.hash)
+            .str(processor_digest)
+            .u32(output_ordinal);
+        Self::from_coordinates(EventClass::Syn, &c)
     }
 }
 
@@ -310,12 +391,94 @@ mod tests {
     }
 
     #[test]
+    fn pinned_vector_ddl_msg_synthetic() {
+        let pg = SourceLineage::Postgres {
+            system_identifier: 0x1234_5678_90AB_CDEF,
+        };
+        assert_eq!(
+            EventId::ddl(&pg, "0/16B374D8", 0).to_string(),
+            "dfid:v1:ddl:bfa60f51fbf665a7129e6566f0f2cc39"
+        );
+        let my = SourceLineage::MysqlGtid { source_uuid: sid() };
+        assert_eq!(
+            EventId::logical_message(&my, "mysql-bin.000008:15248355", 0)
+                .to_string(),
+            "dfid:v1:msg:d5f3b61c68d8e522c998c54ae149b459"
+        );
+        // Synthetic derives from the parent (the myrow pinned vector), a
+        // processor digest, and the output ordinal.
+        let parent = EventId::mysql_row_gtid(&sid(), 23, 1547, 0);
+        assert_eq!(
+            EventId::synthetic(&parent, "js:abc123", 0).to_string(),
+            "dfid:v1:syn:e6e4b2a25cdb888cf8ff42bc36c64934"
+        );
+    }
+
+    #[test]
+    fn ddl_identity_includes_source_lineage() {
+        // Same position + ordinal, different lineage → different id (no
+        // cross-cluster collision).
+        let a = EventId::ddl(
+            &SourceLineage::Postgres {
+                system_identifier: 1,
+            },
+            "0/16B374D8",
+            0,
+        );
+        let b = EventId::ddl(
+            &SourceLineage::Postgres {
+                system_identifier: 2,
+            },
+            "0/16B374D8",
+            0,
+        );
+        let c = EventId::ddl(
+            &SourceLineage::MysqlGtid { source_uuid: sid() },
+            "0/16B374D8",
+            0,
+        );
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn synthetic_is_sensitive_to_parent_digest_and_ordinal() {
+        let p1 = EventId::mysql_row_gtid(&sid(), 23, 1547, 0);
+        let p2 = EventId::mysql_row_gtid(&sid(), 23, 1547, 1);
+        let base = EventId::synthetic(&p1, "js:abc123", 0);
+        assert_ne!(base, EventId::synthetic(&p2, "js:abc123", 0)); // parent
+        assert_ne!(base, EventId::synthetic(&p1, "js:def456", 0)); // digest
+        assert_ne!(base, EventId::synthetic(&p1, "js:abc123", 1)); // ordinal
+        assert_eq!(base, EventId::synthetic(&p1, "js:abc123", 0)); // stable
+    }
+
+    #[test]
     fn roundtrip_display_fromstr() {
         for id in [
             EventId::mysql_row_gtid(&sid(), 7, 100, 3),
             EventId::mysql_row_server(42, "mysql-bin.000008", 15248355, 2),
             EventId::pg_row(0xABCD_1234_5678_9ABC, 0x16_B374_D848, 16384, 5),
             EventId::snapshot(2, "shop", "orders", &["a".into(), "b".into()]),
+            EventId::ddl(
+                &SourceLineage::Postgres {
+                    system_identifier: 9,
+                },
+                "0/16B374D8",
+                1,
+            ),
+            EventId::logical_message(
+                &SourceLineage::MysqlServer {
+                    server_id: 7,
+                    file: "mysql-bin.000008",
+                },
+                "0/16B374D8",
+                2,
+            ),
+            EventId::synthetic(
+                &EventId::snapshot(1, "d", "t", &["1".into()]),
+                "outbox:v1",
+                0,
+            ),
         ] {
             let s = id.to_string();
             assert_eq!(s.parse::<EventId>().unwrap(), id, "roundtrip {s}");
