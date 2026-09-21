@@ -8,15 +8,16 @@
 //! ```
 
 use anyhow::Result;
-use checkpoints::{CheckpointStore, MemCheckpointStore};
+use checkpoints::{CheckpointStore, CheckpointStoreExt, MemCheckpointStore};
 use common::AllowList;
 use ctor::dtor;
 use deltaforge_config::SnapshotCfg;
 use deltaforge_core::{BatchContext, Event, Op, Source, SourceHandle};
 use mysql_async::prelude::Queryable;
 use schema_registry::SourceSchema;
+use sources::MySqlCheckpoint;
 use sources::SourceSchemaLoader;
-use sources::mysql::{MySqlSchemaLoader, MySqlSource};
+use sources::mysql::{MySqlSchemaLoader, MySqlSource, mysql_row_event_id};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::{
@@ -1105,6 +1106,108 @@ async fn mysql_cdc_outbox_full_pipeline() -> Result<()> {
 
     handle.stop();
     let _ = handle.join().await;
+    mysql_drop_db(&pool, &db_name).await;
+    Ok(())
+}
+
+/// Seed a source at `checkpoint`, stream the events, and return the provisional
+/// stable EventIds (as strings) for each event in order.
+async fn replay_stable_ids(
+    dsn: &str,
+    db: &str,
+    checkpoint: MySqlCheckpoint,
+    want: usize,
+) -> Result<Vec<String>> {
+    let store: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let src = make_source(
+        "replay",
+        dsn,
+        vec![format!("{db}.t")],
+        AllowList::default(),
+    )
+    .await;
+    // Resume from the pre-write checkpoint so each run re-reads the same events.
+    store.put(&src.id, checkpoint).await?;
+
+    let (tx, mut rx) = mpsc::channel::<Event>(128);
+    let handle = src.run(tx, store).await;
+    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
+    let events =
+        collect_events_until(&mut rx, Duration::from_secs(15), |evs| {
+            evs.len() >= want
+        })
+        .await;
+    handle.cancel.cancel();
+
+    events
+        .iter()
+        .map(|e| {
+            mysql_row_event_id(&e.source)
+                .map(|id| id.to_string())
+                .map_err(|err| anyhow::anyhow!(err))
+        })
+        .collect()
+}
+
+/// Provisional stable EventIds must be identical when the same binlog events are
+/// re-read from the same prior checkpoint, and must not collide across multiple
+/// rows events in one transaction (identical row ordinals, different positions).
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn stable_event_ids_are_replay_stable() -> Result<()> {
+    let (db_name, pool, dsn) = mysql_setup("stable_ids").await?;
+    let mut conn = pool.get_conn().await?;
+    conn.query_drop(format!("USE {}", db_name)).await?;
+    conn.query_drop("CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(32))")
+        .await?;
+
+    // Capture the binlog coordinates + executed GTID set BEFORE the writes
+    // (MySQL 8.4: SHOW BINARY LOG STATUS).
+    let status: mysql_async::Row = conn
+        .query_first("SHOW BINARY LOG STATUS")
+        .await?
+        .expect("binary log status");
+    let checkpoint = MySqlCheckpoint {
+        file: status.get("File").unwrap(),
+        pos: status.get("Position").unwrap(),
+        gtid_set: status
+            .get::<String, _>("Executed_Gtid_Set")
+            .filter(|s| !s.is_empty()),
+    };
+
+    // One transaction, three rows events (insert 2 / update 1 / delete 1) → one
+    // GTID, three distinct end_log_pos.
+    conn.query_drop("BEGIN").await?;
+    conn.query_drop("INSERT INTO t VALUES (1,'a'),(2,'b')")
+        .await?;
+    conn.query_drop("UPDATE t SET v='x' WHERE id=1").await?;
+    conn.query_drop("DELETE FROM t WHERE id=2").await?;
+    conn.query_drop("COMMIT").await?;
+
+    let ids_a =
+        replay_stable_ids(&dsn, &db_name, checkpoint.clone(), 4).await?;
+    let ids_b = replay_stable_ids(&dsn, &db_name, checkpoint, 4).await?;
+
+    assert_eq!(
+        ids_a.len(),
+        4,
+        "insert(2)+update(1)+delete(1), got {ids_a:?}"
+    );
+    assert_eq!(
+        ids_a, ids_b,
+        "ids must be identical across reconnect/replay"
+    );
+
+    let unique: std::collections::HashSet<_> = ids_a.iter().collect();
+    assert_eq!(
+        unique.len(),
+        4,
+        "no collision across rows events despite reset ordinals: {ids_a:?}"
+    );
+    for id in &ids_a {
+        assert!(id.starts_with("dfid:v1:myrow:"), "GTID form expected: {id}");
+    }
+
     mysql_drop_db(&pool, &db_name).await;
     Ok(())
 }

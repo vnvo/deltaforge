@@ -31,7 +31,10 @@ mod mysql_schema_loader;
 pub use mysql_schema_loader::{LoadedSchema, MySqlSchemaLoader};
 
 mod mysql_event;
+
+pub mod mysql_event_id;
 use mysql_event::*;
+pub use mysql_event_id::mysql_row_event_id;
 
 mod mysql_table_schema;
 use crate::mysql::mysql_helpers::{
@@ -98,6 +101,10 @@ struct RunCtx {
     last_file: String,
     last_pos: u64,
     last_gtid: Option<String>,
+    /// The current transaction's exact GTID (`uuid:gno`), captured from the GTID
+    /// event before it is merged into `last_gtid`'s accumulated executed set.
+    /// Used as the immutable per-event identity coordinate.
+    current_gtid: Option<String>,
     /// Original checkpoint position, preserved even after a pre-connect failover
     /// adjustment clears last_gtid/last_file. Used by check_position_reachability
     /// to verify whether A's position actually exists on B.
@@ -311,6 +318,7 @@ impl MySqlSource {
             last_file: init_file,
             last_pos: init_pos,
             last_gtid: init_gtid,
+            current_gtid: None,
             checkpoint_gtid,
             checkpoint_file,
             tables: self.tables.clone(),
@@ -755,6 +763,7 @@ async fn run_failover_reconciliation(
     // rather than re-sending A's GTID. Covers mid-run failovers where the stream
     // was already open when the switch happened.
     ctx.last_gtid = None;
+    ctx.current_gtid = None;
     ctx.last_file = String::new();
     ctx.last_pos = 0;
 
