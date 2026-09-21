@@ -539,6 +539,9 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                     .respect_source_tx
                     .or(defaults.respect_source_tx),
                 max_inflight: c.max_inflight.or(defaults.max_inflight),
+                max_tx_events: c.max_tx_events.or(defaults.max_tx_events),
+                max_tx_bytes: c.max_tx_bytes.or(defaults.max_tx_bytes),
+                oversized_tx: c.oversized_tx.or(defaults.oversized_tx),
             },
             None => defaults,
         }
@@ -592,6 +595,20 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         let max_events = self.batch_cfg_eff.max_events.unwrap_or(usize::MAX);
         let max_bytes = self.batch_cfg_eff.max_bytes.unwrap_or(usize::MAX);
         let max_inflight = self.batch_cfg_eff.max_inflight.unwrap_or(1);
+        let respect_source_tx =
+            self.batch_cfg_eff.respect_source_tx.unwrap_or(false);
+
+        // Transaction-aligned batching is single-in-flight for the first cut: a
+        // second concurrent delivery could flush part of a transaction before
+        // its commit marker arrives, breaking the all-or-nothing boundary. Fail
+        // fast at startup rather than silently splitting transactions.
+        if respect_source_tx && max_inflight != 1 {
+            return Err(anyhow::anyhow!(
+                "respect_source_tx requires max_inflight = 1 (got {max_inflight}); \
+                 transaction-aligned batching does not yet support concurrent \
+                 in-flight batches"
+            ));
+        }
 
         let coord = Arc::new(self);
 
@@ -1300,12 +1317,57 @@ mod tests {
             max_ms: Some(100),
             respect_source_tx: None,
             max_inflight: None,
+            ..BatchConfig::default()
         });
 
         let eff = Coordinator::<CheckpointMeta>::effective(&cfg);
         assert_eq!(eff.max_events, Some(500));
         assert_eq!(eff.max_ms, Some(100));
         assert!(eff.max_bytes.is_some());
+    }
+
+    /// Transaction-aligned batching does not yet support more than one in-flight
+    /// batch: a concurrent delivery task could flush half a transaction before
+    /// the commit marker arrives. `run` must reject that combination at startup.
+    #[tokio::test]
+    async fn respect_source_tx_requires_max_inflight_one() {
+        use checkpoints::MemCheckpointStore;
+
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        let cp_fn =
+            build_commit_fn(store.clone(), "src::sink::kafka".to_string());
+        let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![]);
+        let batch_processor =
+            build_batch_processor(processors, "test".to_string());
+
+        let coord = Coordinator::builder("test-validate")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                respect_source_tx: Some(true),
+                max_inflight: Some(2),
+                ..BatchConfig::default()
+            }))
+            .commit_fn("kafka", cp_fn)
+            .process_fn(batch_processor)
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        drop(tx); // Closed channel: without validation, run() would exit Ok(()).
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        let err = coord
+            .run(rx, cancel, pause_rx)
+            .await
+            .expect_err("must reject max_inflight > 1 with respect_source_tx");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("respect_source_tx") && msg.contains("max_inflight"),
+            "error should explain the constraint, got: {msg}"
+        );
     }
 
     // ── Pure batch-accumulation helpers (check_and_split / policy) ───────
@@ -1575,6 +1637,7 @@ mod tests {
                 max_ms: Some(100),
                 respect_source_tx: None,
                 max_inflight: Some(1),
+                ..BatchConfig::default()
             }))
             .commit_fn("kafka", kafka_cp)
             .commit_fn("redis", redis_cp)
@@ -1663,6 +1726,7 @@ mod tests {
                 max_ms: Some(50),
                 respect_source_tx: None,
                 max_inflight: Some(1),
+                ..BatchConfig::default()
             }))
             .commit_fn("kafka", cp_fn)
             .process_fn(batch_processor)
@@ -1849,6 +1913,7 @@ mod tests {
                 max_ms: Some(100),
                 respect_source_tx: None,
                 max_inflight: Some(1),
+                ..BatchConfig::default()
             }))
             .commit_fn("kafka", cp_fn)
             .process_fn(batch_processor)
@@ -1967,6 +2032,7 @@ mod tests {
                 max_ms: Some(100),
                 respect_source_tx: None,
                 max_inflight: Some(1),
+                ..BatchConfig::default()
             }))
             .commit_fn("kafka", cp_fn)
             .process_fn(batch_processor)
@@ -2050,6 +2116,7 @@ mod tests {
                 max_ms: Some(100),
                 respect_source_tx: None,
                 max_inflight: Some(1),
+                ..BatchConfig::default()
             }))
             .commit_fn("kafka", cp_fn)
             .process_fn(batch_processor)
@@ -2161,6 +2228,7 @@ mod tests {
                 max_ms: Some(50),
                 respect_source_tx: None,
                 max_inflight: Some(1),
+                ..BatchConfig::default()
             }))
             .commit_fn("slow", cp_fn)
             .process_fn(batch_processor)
@@ -2255,6 +2323,7 @@ mod tests {
                 max_ms: Some(50),
                 respect_source_tx: None,
                 max_inflight: Some(1),
+                ..BatchConfig::default()
             }))
             .commit_fn("kafka", cp_fast)
             .commit_fn("slow-s3", cp_slow)

@@ -462,6 +462,7 @@ fn make_batch_config(max_events: usize, max_ms: u64) -> Option<BatchConfig> {
         max_ms: Some(max_ms),
         respect_source_tx: Some(false),
         max_inflight: Some(1),
+        ..BatchConfig::default()
     })
 }
 
