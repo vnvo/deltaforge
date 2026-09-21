@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use thiserror::Error;
 use tracing::{error, warn};
@@ -153,6 +154,25 @@ pub enum OnSchemaDrift {
     Halt,
 }
 
+/// Per-table options keyed by a **fully-qualified, exact** table name (no
+/// wildcards) in `table_options`. Kept separate from `tables` (which holds
+/// selection patterns) so the selector/settings distinction stays clear and
+/// future per-table settings can be added without new parallel maps.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct TableOptions {
+    /// Override the identity columns used for stable snapshot ids, in the
+    /// **declared order** (order participates in identity). When absent, the
+    /// table's declared primary key is used.
+    #[serde(default)]
+    pub identity_columns: Option<Vec<String>>,
+    /// Explicit operator acknowledgement that `identity_columns` uniquely
+    /// identify rows even though the database metadata cannot prove it (no
+    /// matching primary key or unique constraint). Without this, unprovable
+    /// `identity_columns` are rejected rather than silently assumed unique.
+    #[serde(default)]
+    pub assume_unique: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostgresSrcCfg {
     pub id: String,
@@ -160,6 +180,9 @@ pub struct PostgresSrcCfg {
     pub publication: String,
     pub slot: String,
     pub tables: Vec<String>,
+    /// Options for concrete (fully-qualified) tables selected by `tables`.
+    #[serde(default)]
+    pub table_options: BTreeMap<String, TableOptions>,
     /// Starting position when no checkpoint exists.
     /// - "earliest" (default) starts from the beginning (LSN 0 / publication snapshot)
     /// - "latest" starts from pg_current_wal_lsn()
@@ -190,6 +213,9 @@ pub struct MysqlSrcCfg {
     pub id: String,
     pub dsn: String,
     pub tables: Vec<String>,
+    /// Options for concrete (fully-qualified) tables selected by `tables`.
+    #[serde(default)]
+    pub table_options: BTreeMap<String, TableOptions>,
     #[serde(default)]
     pub outbox: Option<MysqlOutboxCapture>,
     #[serde(default)]
@@ -453,5 +479,54 @@ pub fn load_cfg(path: &str) -> ConfigResult<Vec<PipelineSpec>> {
             let spec = load_from_path(path)?;
             Ok(vec![spec])
         }
+    }
+}
+
+#[cfg(test)]
+mod table_options_tests {
+    use super::*;
+
+    #[test]
+    fn mysql_table_options_parse_with_identity_columns() {
+        let yaml = r#"
+id: m1
+dsn: "mysql://root@localhost/shop"
+tables:
+  - shop.orders
+  - shop.events_*
+table_options:
+  shop.orders:
+    identity_columns: [tenant_id, order_id]
+    assume_unique: true
+"#;
+        let cfg: MysqlSrcCfg = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.tables, vec!["shop.orders", "shop.events_*"]);
+        let opts = cfg.table_options.get("shop.orders").unwrap();
+        assert_eq!(
+            opts.identity_columns.as_deref(),
+            Some(&["tenant_id".to_string(), "order_id".to_string()][..])
+        );
+        assert!(opts.assume_unique);
+    }
+
+    #[test]
+    fn table_options_defaults_when_absent() {
+        let yaml = r#"
+id: p1
+dsn: "postgres://localhost/shop"
+publication: pub1
+slot: slot1
+tables:
+  - public.orders
+"#;
+        let cfg: PostgresSrcCfg = serde_yaml::from_str(yaml).unwrap();
+        assert!(cfg.table_options.is_empty());
+    }
+
+    #[test]
+    fn assume_unique_defaults_false() {
+        let opts: TableOptions =
+            serde_yaml::from_str("identity_columns: [id]").unwrap();
+        assert!(!opts.assume_unique);
     }
 }
