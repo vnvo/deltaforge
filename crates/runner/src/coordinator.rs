@@ -154,6 +154,41 @@ fn keep_whole_txs(mut b: BuildingBatch) -> Option<BuildingBatch> {
     if b.raw.is_empty() { None } else { Some(b) }
 }
 
+/// Prepare the in-flight batch for a terminal flush (cancel / source-closed /
+/// disconnect). In tx-aligned mode any uncommitted partial transaction is
+/// discarded — it was never durable at the source, so its checkpoint must not
+/// advance and it replays whole on restart. The discard is recorded so an
+/// operator can see it happened. Returns the remainder to flush, if any.
+///
+/// A rolled-back transaction needs no special handling here: MySQL binlog and
+/// PostgreSQL logical replication only stream committed transactions, so the
+/// coordinator never sees aborted events — an in-progress suffix at shutdown is
+/// simply a transaction whose commit had not yet been read.
+fn finalize_batch(
+    b: BuildingBatch,
+    respect_source_tx: bool,
+    pipeline: &str,
+) -> Option<BuildingBatch> {
+    if !respect_source_tx {
+        return if b.raw.is_empty() { None } else { Some(b) };
+    }
+    let discarded = b.raw.len() - b.committed_len;
+    if discarded > 0 {
+        warn!(
+            pipeline = %pipeline,
+            discarded_events = discarded,
+            "discarding uncommitted partial transaction; it replays from the \
+             prior committed boundary on restart"
+        );
+        counter!(
+            "deltaforge_discarded_partial_tx_events_total",
+            "pipeline" => pipeline.to_string(),
+        )
+        .increment(discarded as u64);
+    }
+    keep_whole_txs(b)
+}
+
 /// Item sent from the accumulation loop to the delivery task.
 struct DeliveryItem {
     batch: BuildingBatch,
@@ -791,16 +826,9 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                 tokio::select! {
                     _ = cancel.cancelled() => {
                         if let Some(b) = building.take() {
-                            let to_flush = if respect_source_tx {
-                                // Never flush a partial transaction — discard the
-                                // uncommitted suffix, replayed on restart.
-                                keep_whole_txs(b)
-                            } else if b.raw.is_empty() {
-                                None
-                            } else {
-                                Some(b)
-                            };
-                            if let Some(b) = to_flush {
+                            if let Some(b) = finalize_batch(
+                                b, respect_source_tx, &coord.pipeline_name,
+                            ) {
                                 send_to_delivery(&deliver_tx, b, "cancelled").await?;
                             }
                         }
@@ -834,14 +862,9 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                     maybe_ev = event_rx.recv() => {
                         let Some(first) = maybe_ev else {
                             if let Some(b) = building.take() {
-                                let to_flush = if respect_source_tx {
-                                    keep_whole_txs(b)
-                                } else if b.raw.is_empty() {
-                                    None
-                                } else {
-                                    Some(b)
-                                };
-                                if let Some(b) = to_flush {
+                                if let Some(b) = finalize_batch(
+                                    b, respect_source_tx, &coord.pipeline_name,
+                                ) {
                                     send_to_delivery(&deliver_tx, b, "shutdown").await?;
                                 }
                             }
