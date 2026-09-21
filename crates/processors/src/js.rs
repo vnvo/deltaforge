@@ -36,7 +36,7 @@ use std::thread;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use deltaforge_core::{BatchContext, Event, EventRouting, Processor};
+use deltaforge_core::{BatchContext, Event, EventId, EventRouting, Processor};
 use deno_core::{JsRuntime, RuntimeOptions, extension};
 use deno_core::{serde_v8, v8};
 use serde_json::Value;
@@ -60,6 +60,14 @@ fn op_log(#[string] msg: &str) {
 /// The `__df_setup` function is called by Rust before each processBatch invocation.
 const JS_PREAMBLE: &str = r#"
 function route(ev, opts) { ev.__routing = opts; }
+// Declare explicit lineage for a newly-created (derived) event. `parent` is an
+// input event (or its id string); `output` is the new event object. The Rust
+// bridge reads `__df_parent`, mints a stable synthetic id, and strips it.
+function derive(parent, output) {
+    output.__df_parent =
+        (parent && typeof parent === 'object') ? parent.__df_id : parent;
+    return output;
+}
 function __df_setup(events, existingRouting) {
     for (let i = 0; i < events.length; i++) {
         const ev = events[i];
@@ -68,6 +76,12 @@ function __df_setup(events, existingRouting) {
     }
 }
 "#;
+
+/// Reserved JS field carrying an input event's stable id (injected by the
+/// bridge, stripped before the output becomes a Rust `Event`).
+const DF_ID: &str = "__df_id";
+/// Reserved JS field set by `derive(parent, output)` naming the parent's id.
+const DF_PARENT: &str = "__df_parent";
 
 type JsJob = (Vec<Event>, oneshot::Sender<Result<Vec<Event>>>);
 
@@ -110,11 +124,14 @@ impl JsProcessor {
         // Clone things needed in the thread
         let id_clone = id.clone();
         let script = inline.clone();
+        let digest_clone = digest.clone();
 
         let worker_handle = thread::Builder::new()
             .name(format!("df-js-{}", id_clone))
             .spawn(move || {
-                if let Err(e) = js_worker_thread(id_clone, script, &mut rx) {
+                if let Err(e) =
+                    js_worker_thread(id_clone, script, digest_clone, &mut rx)
+                {
                     error!(error=?e, "js worker thread crashed");
                 }
             })
@@ -142,6 +159,7 @@ impl JsProcessor {
 fn js_worker_thread(
     id: String,
     script: String,
+    digest: String,
     rx: &mut mpsc::Receiver<JsJob>,
 ) -> Result<()> {
     let ext = df_ext::init();
@@ -179,7 +197,7 @@ fn js_worker_thread(
     while let Some((events, reply_tx)) = rx.blocking_recv() {
         let start = std::time::Instant::now();
         let input_len = events.len();
-        let res = process_batch_in_runtime(&mut rt, &id, events);
+        let res = process_batch_in_runtime(&mut rt, &id, &digest, events);
         if let Err(ref e) = res {
             error!(processor_id=%id, error=%e, "JS batch processing failed");
         }
@@ -226,6 +244,7 @@ fn js_worker_thread(
 fn process_batch_in_runtime(
     rt: &mut JsRuntime,
     id: &str,
+    digest: &str,
     events: Vec<Event>,
 ) -> Result<Vec<Event>> {
     debug!(processor_id=%id, in_len=events.len(), "JS processing batch");
@@ -241,8 +260,28 @@ fn process_batch_in_runtime(
         })
         .collect();
 
-    let json_events =
+    // The stable provisional ids of the input batch — the only valid parents
+    // for derive() and the retained-id set for 1:1 transforms.
+    let input_ids: std::collections::HashSet<EventId> = events
+        .iter()
+        .filter_map(|e| e.source.position.provisional_event_id)
+        .collect();
+
+    let mut json_events =
         serde_json::to_value(&events).context("serialize events for JS")?;
+
+    // Inject each input's stable id as `__df_id` so scripts can pass it to
+    // derive() and so retained ids are visible (provisional_event_id is
+    // #[serde(skip)], hence not in the serialized form).
+    if let Value::Array(arr) = &mut json_events {
+        for (i, obj) in arr.iter_mut().enumerate() {
+            if let (Value::Object(o), Some(pid)) =
+                (obj, events[i].source.position.provisional_event_id)
+            {
+                o.insert(DF_ID.into(), Value::String(pid.to_string()));
+            }
+        }
+    }
 
     let scope = &mut rt.handle_scope();
     let ctx = scope.get_current_context();
@@ -306,7 +345,7 @@ fn process_batch_in_runtime(
     if result.is_null_or_undefined() {
         let mutated_val: Value = serde_v8::from_v8(&mut try_catch, arg)
             .context("failed to read mutated JS events arg")?;
-        return deserialize_events_with_routing(mutated_val);
+        return finalize_output(mutated_val, &input_ids, digest);
     }
 
     // Interpret return value
@@ -314,9 +353,9 @@ fn process_batch_in_runtime(
         .context("failed to convert JS return value to JSON")?;
 
     match ret_json {
-        Value::Array(_) => deserialize_events_with_routing(ret_json),
+        Value::Array(_) => finalize_output(ret_json, &input_ids, digest),
         Value::Object(_) => {
-            deserialize_events_with_routing(Value::Array(vec![ret_json]))
+            finalize_output(Value::Array(vec![ret_json]), &input_ids, digest)
         }
         other => {
             bail!(
@@ -325,6 +364,114 @@ fn process_batch_in_runtime(
             );
         }
     }
+}
+
+/// Resolve explicit lineage on each output, deserialize, and stamp the
+/// provisional stable id. Fails closed on missing / cross-batch / duplicate
+/// parentage.
+fn finalize_output(
+    mut val: Value,
+    input_ids: &std::collections::HashSet<EventId>,
+    digest: &str,
+) -> Result<Vec<Event>> {
+    let ids = resolve_output_lineage(&mut val, input_ids, digest)?;
+    let mut events = deserialize_events_with_routing(val)?;
+    for (event, id) in events.iter_mut().zip(ids) {
+        event.source.position.provisional_event_id = id;
+    }
+    Ok(events)
+}
+
+/// For each output object: strip the reserved lineage fields and compute its
+/// provisional [`EventId`]. A `__df_parent` marks a derived (synthetic) output;
+/// otherwise the output must retain an input's `__df_id` (a 1:1 transform).
+/// Missing lineage, an unknown/cross-batch parent, or a parent id retained by
+/// more than one output are all errors — never guessed.
+fn resolve_output_lineage(
+    val: &mut Value,
+    input_ids: &std::collections::HashSet<EventId>,
+    digest: &str,
+) -> Result<Vec<Option<EventId>>> {
+    let arr = match val {
+        Value::Array(a) => a,
+        _ => return Ok(vec![]),
+    };
+    // The lineage contract binds only when the input batch actually carries
+    // stable ids. Real source events always do (post cutover, unconditionally);
+    // an entirely id-less batch predates identity and is passed through as-is.
+    if input_ids.is_empty() {
+        for out in arr.iter_mut() {
+            if let Value::Object(obj) = out {
+                obj.remove(DF_PARENT);
+                obj.remove(DF_ID);
+            }
+        }
+        return Ok(vec![None; arr.len()]);
+    }
+    let mut ids = Vec::with_capacity(arr.len());
+    let mut retained: std::collections::HashSet<EventId> =
+        std::collections::HashSet::new();
+    let mut ordinals: std::collections::HashMap<EventId, u32> =
+        std::collections::HashMap::new();
+
+    for out in arr.iter_mut() {
+        let obj = match out {
+            Value::Object(o) => o,
+            _ => bail!("JS processor output must be objects"),
+        };
+        let parent = obj.remove(DF_PARENT);
+        let retained_id = obj.remove(DF_ID);
+
+        let id = match parent {
+            // Derived output: mint a synthetic id from the declared parent.
+            Some(p) => {
+                let ps = p.as_str().ok_or_else(|| {
+                    anyhow!("derive() parent id must be a string")
+                })?;
+                let parent_id: EventId = ps.parse().map_err(|e| {
+                    anyhow!("invalid derive() parent id {ps:?}: {e}")
+                })?;
+                if !input_ids.contains(&parent_id) {
+                    bail!(
+                        "derive() parent {ps} is not an input event of this batch"
+                    );
+                }
+                let ord = ordinals.entry(parent_id).or_insert(0);
+                let id = EventId::synthetic(&parent_id, digest, *ord);
+                *ord += 1;
+                id
+            }
+            // 1:1 transform: the output must retain exactly one input id.
+            None => {
+                let rs = retained_id
+                    .as_ref()
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "JS processor produced a new event without lineage; \
+                             use derive(parent, output) to create derived events"
+                        )
+                    })?;
+                let rid: EventId = rs.parse().map_err(|e| {
+                    anyhow!("invalid retained event id {rs:?}: {e}")
+                })?;
+                if !input_ids.contains(&rid) {
+                    bail!(
+                        "retained event id {rs} is not an input event of this batch"
+                    );
+                }
+                if !retained.insert(rid) {
+                    bail!(
+                        "event id {rs} is retained by more than one output; \
+                         fan-out must derive() its additional outputs"
+                    );
+                }
+                rid
+            }
+        };
+        ids.push(Some(id));
+    }
+    Ok(ids)
 }
 
 /// Deserialize events with lenient number handling.

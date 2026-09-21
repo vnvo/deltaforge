@@ -779,3 +779,130 @@ async fn js_route_only_some_events() {
         Some("deletes")
     );
 }
+
+// ============================================================================
+// Explicit synthetic lineage (derive) contract
+// ============================================================================
+
+use deltaforge_core::{EventClass, EventId};
+
+/// A row event carrying a specific provisional stable id.
+fn event_with_id(id: EventId) -> Event {
+    let mut ev = new_event();
+    ev.source.position.provisional_event_id = Some(id);
+    ev
+}
+
+fn parent_id(row: u32) -> EventId {
+    EventId::mysql_row_server(1, "mysql-bin.000001", 100, row)
+}
+
+async fn run(js: &str, events: Vec<Event>) -> anyhow::Result<Vec<Event>> {
+    let proc = JsProcessor::new("t".into(), js.into(), None).unwrap();
+    let ctx = BatchContext::from_batch(&events);
+    proc.process(events, &ctx).await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_one_to_one_retains_parent_id() {
+    let p = parent_id(0);
+    let out = run(
+        "function processBatch(e){ return e; }",
+        vec![event_with_id(p)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].source.position.provisional_event_id, Some(p));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_derive_mints_synthetic_id() {
+    let p = parent_id(0);
+    let js = r#"function processBatch(e){
+        return [e[0], derive(e[0], { ...e[0], after: { audit: true } })];
+    }"#;
+    let out = run(js, vec![event_with_id(p)]).await.unwrap();
+    assert_eq!(out.len(), 2);
+    // 1:1 output keeps the parent id.
+    assert_eq!(out[0].source.position.provisional_event_id, Some(p));
+    // Derived output gets a distinct synthetic id.
+    let syn = out[1].source.position.provisional_event_id.unwrap();
+    assert_eq!(syn.class(), EventClass::Syn);
+    assert_ne!(syn, p);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_new_event_without_lineage_is_rejected() {
+    let js = r#"function processBatch(e){
+        let o = { ...e[0] }; delete o.__df_id; o.after = { x: 1 };
+        return [e[0], o];
+    }"#;
+    let err = run(js, vec![event_with_id(parent_id(0))])
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("derive"),
+        "error should guide to derive(): {err}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_cross_batch_parent_is_rejected() {
+    // A derive() parent id that is not in the input batch.
+    let bogus = EventId::mysql_row_server(9, "other", 1, 0).to_string();
+    let js = format!(
+        r#"function processBatch(e){{ return [e[0], derive("{bogus}", {{...e[0]}})]; }}"#
+    );
+    let err = run(&js, vec![event_with_id(parent_id(0))])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not an input event"), "{err}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_duplicate_retained_parent_is_rejected() {
+    // Two outputs retain the same input id — fan-out must derive() extras.
+    let js = r#"function processBatch(e){ return [e[0], e[0]]; }"#;
+    let err = run(js, vec![event_with_id(parent_id(0))])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("more than one output"), "{err}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_ordinals_are_deterministic_per_parent() {
+    let p = parent_id(0);
+    let js = r#"function processBatch(e){
+        return [derive(e[0], {...e[0], n:1}), derive(e[0], {...e[0], n:2})];
+    }"#;
+    let a = run(js, vec![event_with_id(p)]).await.unwrap();
+    let b = run(js, vec![event_with_id(p)]).await.unwrap();
+    let a0 = a[0].source.position.provisional_event_id.unwrap();
+    let a1 = a[1].source.position.provisional_event_id.unwrap();
+    // Two derived outputs from the same parent get distinct (ordinal 0 vs 1) ids.
+    assert_ne!(a0, a1);
+    // Deterministic across runs.
+    assert_eq!(a0, b[0].source.position.provisional_event_id.unwrap());
+    assert_eq!(a1, b[1].source.position.provisional_event_id.unwrap());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn js_interleaved_parents_attributed_correctly() {
+    let (p0, p1) = (parent_id(0), parent_id(1));
+    let js = r#"function processBatch(e){
+        return [derive(e[1], {...e[1]}), derive(e[0], {...e[0]})];
+    }"#;
+    let out = run(js, vec![event_with_id(p0), event_with_id(p1)])
+        .await
+        .unwrap();
+    let from_p1 = out[0].source.position.provisional_event_id.unwrap();
+    let from_p0 = out[1].source.position.provisional_event_id.unwrap();
+    // Each derived id is tied to its DECLARED parent (not output position):
+    // recompute the exact synthetic id from that parent + the processor digest.
+    let digest =
+        processors::digest::js_digest(js, &None::<deltaforge_config::Limits>);
+    assert_eq!(from_p0, EventId::synthetic(&p0, &digest, 0));
+    assert_eq!(from_p1, EventId::synthetic(&p1, &digest, 0));
+    assert_ne!(from_p0, from_p1);
+}
