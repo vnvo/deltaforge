@@ -5,26 +5,18 @@
 //! otherwise the declared primary key (in its declared order) is used; a table
 //! with neither is **keyless** and rejected *before* any snapshot row is
 //! emitted (Postgres `ctid` is not a durable identity and is never used here).
+//!
+//! This stage is purely **name-based** (existence, duplicates, emptiness, and
+//! uniqueness are all name checks). Mapping each resolved column to its
+//! canonical identity type — and rejecting unsupported types — is the source's
+//! job (schema-directed), done after resolution and still before allocation.
 
 use std::collections::BTreeSet;
 
-use deltaforge_core::IdentityKind;
-
-/// A column reduced to what identity resolution needs: its name and the
-/// canonical [`IdentityKind`] its source type maps to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IdentityColumnInfo {
-    /// Column name.
-    pub name: String,
-    /// Canonical identity type category.
-    pub kind: IdentityKind,
-}
-
-/// A table's schema reduced to what identity resolution needs. Each source
-/// builds this from its own schema type, mapping DB types to [`IdentityKind`].
+/// A table's schema reduced to what identity resolution needs.
 pub struct IdentitySchemaView<'a> {
-    /// All columns.
-    pub columns: &'a [IdentityColumnInfo],
+    /// All column names in the table.
+    pub columns: &'a [String],
     /// Declared primary key, in declared order (empty if none).
     pub primary_key: &'a [String],
     /// Column sets that each form a UNIQUE constraint (order within a set is
@@ -32,11 +24,12 @@ pub struct IdentitySchemaView<'a> {
     pub unique_constraints: &'a [Vec<String>],
 }
 
-/// The resolved effective identity for a table — ordered, typed columns.
+/// The resolved effective identity for a table: the ordered column names whose
+/// values form the row identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedIdentity {
     /// Identity columns in the order that participates in the id.
-    pub columns: Vec<IdentityColumnInfo>,
+    pub columns: Vec<String>,
 }
 
 /// Why identity resolution failed. Every variant is caught before allocation
@@ -90,19 +83,19 @@ pub enum IdentityResolutionError {
     },
 }
 
-fn lookup<'a>(
-    schema: &'a IdentitySchemaView<'_>,
+fn require_exists(
+    schema: &IdentitySchemaView<'_>,
     table: &str,
     name: &str,
-) -> Result<&'a IdentityColumnInfo, IdentityResolutionError> {
-    schema
-        .columns
-        .iter()
-        .find(|c| c.name == name)
-        .ok_or_else(|| IdentityResolutionError::UnknownIdentityColumn {
+) -> Result<(), IdentityResolutionError> {
+    if schema.columns.iter().any(|c| c == name) {
+        Ok(())
+    } else {
+        Err(IdentityResolutionError::UnknownIdentityColumn {
             table: table.to_string(),
             column: name.to_string(),
         })
+    }
 }
 
 /// Resolve the effective identity columns for one table.
@@ -135,10 +128,9 @@ pub fn resolve_identity(
                     );
                 }
             }
-            // Existence + type, preserving configured order.
-            let mut resolved = Vec::with_capacity(cols.len());
+            // Existence, preserving configured order.
             for c in cols {
-                resolved.push(lookup(schema, table, c)?.clone());
+                require_exists(schema, table, c)?;
             }
             // Uniqueness proof: match the PK set, or any unique-constraint set
             // (as sets — column order does not affect uniqueness). Otherwise
@@ -158,7 +150,9 @@ pub fn resolve_identity(
                     columns: cols.to_vec(),
                 });
             }
-            Ok(ResolvedIdentity { columns: resolved })
+            Ok(ResolvedIdentity {
+                columns: cols.to_vec(),
+            })
         }
         None => {
             if schema.primary_key.is_empty() {
@@ -167,11 +161,12 @@ pub fn resolve_identity(
                     table: table.to_string(),
                 });
             }
-            let mut resolved = Vec::with_capacity(schema.primary_key.len());
             for c in schema.primary_key {
-                resolved.push(lookup(schema, table, c)?.clone());
+                require_exists(schema, table, c)?;
             }
-            Ok(ResolvedIdentity { columns: resolved })
+            Ok(ResolvedIdentity {
+                columns: schema.primary_key.to_vec(),
+            })
         }
     }
 }
@@ -180,15 +175,16 @@ pub fn resolve_identity(
 mod tests {
     use super::*;
 
-    fn col(name: &str, kind: IdentityKind) -> IdentityColumnInfo {
-        IdentityColumnInfo {
-            name: name.into(),
-            kind,
-        }
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    fn cols() -> Vec<String> {
+        s(&["tenant_id", "order_id", "email"])
     }
 
     fn schema<'a>(
-        columns: &'a [IdentityColumnInfo],
+        columns: &'a [String],
         pk: &'a [String],
         uniques: &'a [Vec<String>],
     ) -> IdentitySchemaView<'a> {
@@ -199,32 +195,13 @@ mod tests {
         }
     }
 
-    fn cols() -> Vec<IdentityColumnInfo> {
-        vec![
-            col("tenant_id", IdentityKind::Int),
-            col("order_id", IdentityKind::UInt),
-            col("email", IdentityKind::Text),
-        ]
-    }
-
-    fn s(v: &[&str]) -> Vec<String> {
-        v.iter().map(|x| x.to_string()).collect()
-    }
-
     #[test]
     fn primary_key_used_in_declared_order_when_no_override() {
         let c = cols();
         let pk = s(&["tenant_id", "order_id"]);
         let sv = schema(&c, &pk, &[]);
         let r = resolve_identity("d", "orders", &sv, None, false).unwrap();
-        assert_eq!(
-            r.columns
-                .iter()
-                .map(|c| c.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["tenant_id", "order_id"]
-        );
-        assert_eq!(r.columns[1].kind, IdentityKind::UInt);
+        assert_eq!(r.columns, s(&["tenant_id", "order_id"]));
     }
 
     #[test]
@@ -246,17 +223,10 @@ mod tests {
         let c = cols();
         let pk = s(&["tenant_id", "order_id"]);
         let sv = schema(&c, &pk, &[]);
-        // Override lists the PK columns in the opposite order — still unique.
-        let cols_cfg = s(&["order_id", "tenant_id"]);
-        let r = resolve_identity("d", "orders", &sv, Some(&cols_cfg), false)
-            .unwrap();
-        assert_eq!(
-            r.columns
-                .iter()
-                .map(|c| c.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["order_id", "tenant_id"] // configured order preserved
-        );
+        let cfg = s(&["order_id", "tenant_id"]); // opposite order, still unique
+        let r =
+            resolve_identity("d", "orders", &sv, Some(&cfg), false).unwrap();
+        assert_eq!(r.columns, s(&["order_id", "tenant_id"])); // config order kept
     }
 
     #[test]
@@ -283,7 +253,6 @@ mod tests {
             err,
             IdentityResolutionError::UnprovableUniqueness { .. }
         ));
-        // With the explicit acknowledgement it resolves.
         assert!(resolve_identity("d", "orders", &sv, Some(&cfg), true).is_ok());
     }
 

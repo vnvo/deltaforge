@@ -36,6 +36,11 @@ pub mod mysql_event_id;
 use mysql_event::*;
 pub use mysql_event_id::mysql_row_event_id;
 
+pub mod mysql_identity;
+pub use mysql_identity::{
+    MysqlIdentityError, mysql_identity_cell, mysql_identity_kind,
+};
+
 mod mysql_table_schema;
 use crate::mysql::mysql_helpers::{
     connect_binlog_with_retries, resolve_binlog_tail,
