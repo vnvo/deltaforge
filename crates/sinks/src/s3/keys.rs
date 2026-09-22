@@ -17,8 +17,9 @@ use sha2::{Digest, Sha256};
 /// identical bytes but different domains hash differently and never collide.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodingDomain {
-    /// Format label, e.g. `"parquet"` or `"jsonl"`.
-    pub format: &'static str,
+    /// Format label, e.g. `"parquet"` or `"jsonl"`. Owned so it can be
+    /// reconstructed from a manifest record during recovery.
+    pub format: String,
     /// Encoder version. Bump when the byte layout of an unchanged input changes.
     pub format_version: u16,
     /// Schema identity for the encoded rows (e.g. the Arrow schema fingerprint).
@@ -27,12 +28,12 @@ pub struct EncodingDomain {
 
 impl EncodingDomain {
     pub fn new(
-        format: &'static str,
+        format: impl Into<String>,
         format_version: u16,
         schema_id: impl Into<String>,
     ) -> Self {
         Self {
-            format,
+            format: format.into(),
             format_version,
             schema_id: schema_id.into(),
         }

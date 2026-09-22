@@ -63,6 +63,15 @@ impl ManifestObject {
     fn sort_key(&self) -> (&str, &str) {
         (self.table.as_str(), self.key.as_str())
     }
+
+    /// Reconstruct the encoding domain (for recovery-time content-hash checks).
+    pub fn encoding_domain(&self) -> super::keys::EncodingDomain {
+        super::keys::EncodingDomain::new(
+            self.format.clone(),
+            self.format_version,
+            self.schema_id.clone(),
+        )
+    }
 }
 
 /// Reference to the previous entry in the chain (absent for genesis).

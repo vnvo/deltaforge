@@ -24,6 +24,7 @@ use tokio::sync::Mutex;
 use deltaforge_core::{CheckpointComparator, CheckpointOrder};
 
 use super::batch_upload::{DurableError, TableObject, upload_batch};
+use super::keys::content_hash;
 use super::manifest::{
     ManifestEntry, ManifestObject, PrevRef, WrittenEntry, propose_seq,
     write_entry,
@@ -35,6 +36,13 @@ pub const HEAD_VERSION: u16 = 1;
 
 /// Bounded reconcile attempts for a single publish before giving up (retryable).
 const MAX_PUBLISH_ATTEMPTS: usize = 8;
+
+/// Bounded acquisition attempts (each is a verify + CAS; a CAS conflict restarts).
+const MAX_ACQUIRE_ATTEMPTS: usize = 8;
+
+/// Hard cap on manifest-chain length walked during recovery (cycle / runaway
+/// guard). Chains longer than this fail closed rather than walk forever.
+const MAX_CHAIN_WALK: usize = 5_000_000;
 
 /// The authoritative HEAD state. Genesis is `epoch >= 1, seq == 0` with no entry
 /// or watermark; after the first publish `seq >= 1` with entry + watermark set.
@@ -181,13 +189,240 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+async fn load_entry<S: ConditionalStore + ?Sized>(
+    store: &S,
+    key: &str,
+) -> Result<ManifestEntry, HeadError> {
+    match store
+        .get_with_etag(&object_store::path::Path::from(key))
+        .await
+        .map_err(|e| HeadError::Store(e.to_string()))?
+    {
+        Some((raw, _)) => serde_json::from_slice(&raw).map_err(|e| {
+            HeadError::Integrity(format!("entry {key} unparseable: {e}"))
+        }),
+        None => Err(HeadError::Integrity(format!("missing entry {key}"))),
+    }
+}
+
+/// Verify HEAD's authoritative chain and all referenced data objects. Walks from
+/// the head entry back to genesis (rollup-aware walking lands with the rollup
+/// commit; a HEAD that references a rollup fails closed here rather than trusting
+/// an unvalidated one). Every failure is fatal - no `Before`/`Equal` skipping is
+/// enabled unless this returns `Ok`.
+async fn verify_chain<S: ConditionalStore + ?Sized>(
+    store: &S,
+    _prefix: &str,
+    pipeline: &str,
+    source_id: &str,
+    sink_id: &str,
+    head: &Head,
+    comparator: &dyn CheckpointComparator,
+) -> Result<(), HeadError> {
+    // Genesis HEAD (no entry) has nothing to walk; structure was checked by
+    // Head::parse.
+    let Some(head_entry_key) = head.head_entry_key.clone() else {
+        return Ok(());
+    };
+    let head_entry_hash = head
+        .head_entry_hash
+        .clone()
+        .ok_or_else(|| HeadError::Integrity("HEAD hash missing".into()))?;
+
+    // Rollups are not produced yet; a HEAD claiming one is unexpected and cannot
+    // be validated, so fail closed rather than trust it.
+    if head.rollup_key.is_some() {
+        return Err(HeadError::Integrity(
+            "HEAD references a rollup, but rollup verification is not yet \
+             supported"
+                .into(),
+        ));
+    }
+
+    let mut cur_key = head_entry_key;
+    let mut expected_hash = head_entry_hash;
+    let mut expected_seq: Option<u64> = None;
+    let mut later_epoch: Option<u64> = None;
+    let mut later_wm: Option<Vec<u8>> = None;
+    let mut is_head_entry = true;
+
+    for _ in 0..MAX_CHAIN_WALK {
+        let entry = load_entry(store, &cur_key).await?;
+
+        // 1. Bytes match the referenced hash (and thus the key hash).
+        if entry.entry_hash() != expected_hash {
+            return Err(HeadError::Integrity(format!(
+                "entry {cur_key} hash mismatch"
+            )));
+        }
+        // 2. Identity.
+        if entry.pipeline != pipeline
+            || entry.source_id != source_id
+            || entry.sink_id != sink_id
+        {
+            return Err(HeadError::Integrity(format!(
+                "entry {cur_key} identity mismatch"
+            )));
+        }
+        // 3. Sequence continuity.
+        if let Some(es) = expected_seq {
+            if entry.seq != es {
+                return Err(HeadError::Integrity(format!(
+                    "sequence discontinuity at {cur_key}: expected {es}, got {}",
+                    entry.seq
+                )));
+            }
+        }
+        // 4. Epoch never regresses toward HEAD (earlier entry <= later entry;
+        //    jumps are allowed).
+        if let Some(le) = later_epoch {
+            if entry.epoch > le {
+                return Err(HeadError::Integrity(format!(
+                    "epoch regression at {cur_key}: {} > later {le}",
+                    entry.epoch
+                )));
+            }
+        }
+        // 5. Watermark strictly advances toward HEAD (later After earlier).
+        let cur_wm = unhex(&entry.watermark_hex).ok_or_else(|| {
+            HeadError::Integrity(format!("entry {cur_key} watermark not hex"))
+        })?;
+        if let Some(lw) = &later_wm {
+            match comparator.order(lw, &cur_wm) {
+                CheckpointOrder::After => {}
+                other => {
+                    return Err(HeadError::Integrity(format!(
+                        "non-monotonic watermark at {cur_key}: later is {other:?} \
+                         relative to it"
+                    )));
+                }
+            }
+        }
+        // HEAD watermark exactly matches its selected (head) entry.
+        if is_head_entry
+            && head.watermark_hex.as_deref()
+                != Some(entry.watermark_hex.as_str())
+        {
+            return Err(HeadError::Integrity(
+                "HEAD watermark does not match its selected entry".into(),
+            ));
+        }
+        // 6. Every referenced data object exists and matches.
+        for mobj in &entry.objects {
+            verify_data_object(store, mobj).await?;
+        }
+
+        // Advance to the previous entry, or stop at genesis.
+        match &entry.prev {
+            None => {
+                if entry.seq != 1 {
+                    return Err(HeadError::Integrity(format!(
+                        "genesis entry {cur_key} has seq {} (expected 1)",
+                        entry.seq
+                    )));
+                }
+                return Ok(());
+            }
+            Some(PrevRef { key, hash }) => {
+                let next_seq = entry.seq.checked_sub(1).ok_or_else(|| {
+                    HeadError::Integrity("sequence underflow".into())
+                })?;
+                if next_seq == 0 {
+                    return Err(HeadError::Integrity(format!(
+                        "entry {cur_key} has a prev link but seq would reach 0"
+                    )));
+                }
+                later_epoch = Some(entry.epoch);
+                later_wm = Some(cur_wm);
+                expected_seq = Some(next_seq);
+                expected_hash = hash.clone();
+                cur_key = key.clone();
+                is_head_entry = false;
+            }
+        }
+    }
+    Err(HeadError::Integrity(
+        "manifest chain exceeded the maximum walk length (cycle or runaway)"
+            .into(),
+    ))
+}
+
+/// Verify only HEAD's directly-referenced entry (exists, hash matches, and its
+/// watermark matches HEAD). Cheap check used when a same-epoch reconcile adopts
+/// a HEAD mid-publish; the full chain was already verified at acquisition.
+async fn verify_head_entry<S: ConditionalStore + ?Sized>(
+    store: &S,
+    head: &Head,
+) -> Result<(), HeadError> {
+    let (Some(key), Some(hash)) = (&head.head_entry_key, &head.head_entry_hash)
+    else {
+        return Ok(()); // genesis: nothing referenced
+    };
+    let entry = load_entry(store, key).await?;
+    if entry.entry_hash() != *hash {
+        return Err(HeadError::Integrity(format!(
+            "adopted HEAD entry {key} hash mismatch"
+        )));
+    }
+    if head.watermark_hex.as_deref() != Some(entry.watermark_hex.as_str()) {
+        return Err(HeadError::Integrity(
+            "adopted HEAD watermark does not match its entry".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn verify_data_object<S: ConditionalStore + ?Sized>(
+    store: &S,
+    mobj: &ManifestObject,
+) -> Result<(), HeadError> {
+    match store
+        .get_with_etag(&object_store::path::Path::from(mobj.key.as_str()))
+        .await
+        .map_err(|e| HeadError::Store(e.to_string()))?
+    {
+        Some((bytes, _)) => {
+            if bytes.len() as u64 != mobj.byte_len {
+                return Err(HeadError::Integrity(format!(
+                    "data object {} size {} != manifest {}",
+                    mobj.key,
+                    bytes.len(),
+                    mobj.byte_len
+                )));
+            }
+            let domain = mobj.encoding_domain();
+            if content_hash(&bytes, &domain) != mobj.content_hash {
+                return Err(HeadError::Integrity(format!(
+                    "data object {} content hash mismatch",
+                    mobj.key
+                )));
+            }
+            Ok(())
+        }
+        None => Err(HeadError::Integrity(format!(
+            "referenced data object {} is missing",
+            mobj.key
+        ))),
+    }
+}
+
+/// Proof that a HEAD (and the authoritative chain it selects) was fully verified
+/// and then acquired under a fenced epoch. It is only constructed by a successful
+/// [`DurableWriter::acquire`] (recovery) or extended by a successful publication
+/// (verified by construction). A `Before`/`Equal` acknowledgement - which lets
+/// the sink skip a write - is only ever made against a `VerifiedHead`, so it can
+/// never happen before validation.
+struct VerifiedHead {
+    epoch: u64,
+    head: Head,
+    /// ETag of the verified HEAD, for the next `If-Match` CAS.
+    etag: String,
+}
+
 /// Per-instance mutable state, guarded so concurrent `send_batch` calls on one
 /// sink instance serialize their HEAD publication and cannot race.
 struct WriterState {
-    epoch: u64,
-    head: Head,
-    /// ETag of the last-known HEAD, for the next `If-Match` CAS.
-    etag: String,
+    verified: VerifiedHead,
     /// Once fenced, every further publish fails permanently.
     fenced: Option<u64>,
 }
@@ -222,91 +457,141 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         comparator: Arc<dyn CheckpointComparator>,
     ) -> Result<Self, HeadError> {
         let hkey = head_key(prefix, pipeline);
-        let (head, etag) = match store
-            .get_with_etag(&hkey)
-            .await
-            .map_err(|e| HeadError::Store(e.to_string()))?
-        {
-            Some((raw, Some(etag))) => {
-                let head = Head::parse(&raw)?;
-                Self::verify_referenced_entry(store.as_ref(), &head).await?;
-                let new_epoch = head.epoch.checked_add(1).ok_or_else(|| {
-                    HeadError::Integrity("epoch overflow".into())
-                })?;
-                let next = Head {
-                    epoch: new_epoch,
-                    ..head.clone()
-                };
-                match store
-                    .cas_put(&hkey, next.canonical_bytes(), &etag)
-                    .await
-                    .map_err(|e| HeadError::Store(e.to_string()))?
-                {
-                    PutOutcome::Written {
-                        etag: Some(new_etag),
-                    } => (next, new_etag),
-                    PutOutcome::Written { etag: None } => {
-                        return Err(HeadError::Store(
-                            "HEAD CAS returned no ETag".into(),
-                        ));
-                    }
-                    PutOutcome::Conflict => {
-                        return Err(HeadError::Store(
-                            "lost the epoch-acquisition race; retry acquire"
-                                .into(),
-                        ));
-                    }
-                    PutOutcome::AlreadyExists => unreachable!("cas_put"),
-                }
-            }
-            Some((_, None)) => {
-                return Err(HeadError::Integrity(
-                    "HEAD has no ETag; cannot fence".into(),
-                ));
-            }
-            None => {
-                // No HEAD. If any manifest entries exist this is recovery.
-                let entries_prefix = object_store::path::Path::from_iter(
-                    prefix
-                        .split('/')
-                        .filter(|p| !p.is_empty())
-                        .chain([pipeline, "_manifest", "entries"])
-                        .map(str::to_string),
-                );
-                let existing = store
-                    .list(&entries_prefix)
-                    .await
-                    .map_err(|e| HeadError::Store(e.to_string()))?;
-                if !existing.is_empty() {
-                    return Err(HeadError::RecoveryRequired(format!(
-                        "HEAD missing but {} manifest entr(ies) exist",
-                        existing.len()
-                    )));
-                }
-                let genesis = Head::genesis(1);
-                match store
-                    .put_if_absent(&hkey, genesis.canonical_bytes())
-                    .await
-                    .map_err(|e| HeadError::Store(e.to_string()))?
-                {
-                    PutOutcome::Written { etag: Some(etag) } => (genesis, etag),
-                    PutOutcome::Written { etag: None } => {
-                        return Err(HeadError::Store(
-                            "genesis HEAD create returned no ETag".into(),
-                        ));
-                    }
-                    PutOutcome::AlreadyExists => {
-                        return Err(HeadError::Store(
-                            "HEAD created concurrently; retry acquire".into(),
-                        ));
-                    }
-                    PutOutcome::Conflict => unreachable!("put_if_absent"),
-                }
-            }
-        };
 
-        let epoch = head.epoch;
-        Ok(Self {
+        for _ in 0..MAX_ACQUIRE_ATTEMPTS {
+            match store
+                .get_with_etag(&hkey)
+                .await
+                .map_err(|e| HeadError::Store(e.to_string()))?
+            {
+                Some((raw, Some(etag))) => {
+                    let head = Head::parse(&raw)?;
+                    // Verify HEAD + the authoritative chain + referenced data
+                    // objects BEFORE acquiring, using the same ETag we will CAS
+                    // against (steps 2-3).
+                    verify_chain(
+                        store.as_ref(),
+                        prefix,
+                        pipeline,
+                        source_id,
+                        sink_id,
+                        &head,
+                        comparator.as_ref(),
+                    )
+                    .await?;
+
+                    let new_epoch =
+                        head.epoch.checked_add(1).ok_or_else(|| {
+                            HeadError::Integrity("epoch overflow".into())
+                        })?;
+                    let next = Head {
+                        epoch: new_epoch,
+                        ..head.clone()
+                    };
+                    match store
+                        .cas_put(&hkey, next.canonical_bytes(), &etag)
+                        .await
+                        .map_err(|e| HeadError::Store(e.to_string()))?
+                    {
+                        PutOutcome::Written {
+                            etag: Some(new_etag),
+                        } => {
+                            return Ok(Self::build(
+                                store,
+                                prefix,
+                                pipeline,
+                                source_id,
+                                sink_id,
+                                comparator,
+                                VerifiedHead {
+                                    epoch: new_epoch,
+                                    head: next,
+                                    etag: new_etag,
+                                },
+                            ));
+                        }
+                        PutOutcome::Written { etag: None } => {
+                            return Err(HeadError::Store(
+                                "HEAD CAS returned no ETag".into(),
+                            ));
+                        }
+                        // Someone advanced HEAD between verify and acquire:
+                        // discard the verification and restart (step 5).
+                        PutOutcome::Conflict => continue,
+                        PutOutcome::AlreadyExists => unreachable!("cas_put"),
+                    }
+                }
+                Some((_, None)) => {
+                    return Err(HeadError::Integrity(
+                        "HEAD has no ETag; cannot fence".into(),
+                    ));
+                }
+                None => {
+                    // No HEAD. If any manifest entries exist this is recovery.
+                    let entries_prefix = object_store::path::Path::from_iter(
+                        prefix
+                            .split('/')
+                            .filter(|p| !p.is_empty())
+                            .chain([pipeline, "_manifest", "entries"])
+                            .map(str::to_string),
+                    );
+                    let existing = store
+                        .list(&entries_prefix)
+                        .await
+                        .map_err(|e| HeadError::Store(e.to_string()))?;
+                    if !existing.is_empty() {
+                        return Err(HeadError::RecoveryRequired(format!(
+                            "HEAD missing but {} manifest entr(ies) exist",
+                            existing.len()
+                        )));
+                    }
+                    let genesis = Head::genesis(1);
+                    match store
+                        .put_if_absent(&hkey, genesis.canonical_bytes())
+                        .await
+                        .map_err(|e| HeadError::Store(e.to_string()))?
+                    {
+                        PutOutcome::Written { etag: Some(etag) } => {
+                            return Ok(Self::build(
+                                store,
+                                prefix,
+                                pipeline,
+                                source_id,
+                                sink_id,
+                                comparator,
+                                VerifiedHead {
+                                    epoch: 1,
+                                    head: genesis,
+                                    etag,
+                                },
+                            ));
+                        }
+                        PutOutcome::Written { etag: None } => {
+                            return Err(HeadError::Store(
+                                "genesis HEAD create returned no ETag".into(),
+                            ));
+                        }
+                        // Concurrent create: restart and take the CAS path.
+                        PutOutcome::AlreadyExists => continue,
+                        PutOutcome::Conflict => unreachable!("put_if_absent"),
+                    }
+                }
+            }
+        }
+        Err(HeadError::RetriesExhausted(MAX_ACQUIRE_ATTEMPTS))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        store: Arc<S>,
+        prefix: &str,
+        pipeline: &str,
+        source_id: &str,
+        sink_id: &str,
+        comparator: Arc<dyn CheckpointComparator>,
+        verified: VerifiedHead,
+    ) -> Self {
+        Self {
             store,
             prefix: prefix.to_string(),
             pipeline: pipeline.to_string(),
@@ -314,54 +599,15 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
             sink_id: sink_id.to_string(),
             comparator,
             state: Mutex::new(WriterState {
-                epoch,
-                head,
-                etag,
+                verified,
                 fenced: None,
             }),
-        })
-    }
-
-    async fn verify_referenced_entry(
-        store: &S,
-        head: &Head,
-    ) -> Result<(), HeadError> {
-        if let (Some(key), Some(hash)) =
-            (&head.head_entry_key, &head.head_entry_hash)
-        {
-            let path = object_store::path::Path::from(key.as_str());
-            match store
-                .get_with_etag(&path)
-                .await
-                .map_err(|e| HeadError::Store(e.to_string()))?
-            {
-                Some((raw, _)) => {
-                    // The stored entry's canonical hash must match HEAD's ref.
-                    let entry: ManifestEntry = serde_json::from_slice(&raw)
-                        .map_err(|e| {
-                            HeadError::Integrity(format!(
-                                "referenced entry unparseable: {e}"
-                            ))
-                        })?;
-                    if entry.entry_hash() != *hash {
-                        return Err(HeadError::Integrity(format!(
-                            "referenced entry {key} hash mismatch"
-                        )));
-                    }
-                }
-                None => {
-                    return Err(HeadError::Integrity(format!(
-                        "HEAD references missing entry {key}"
-                    )));
-                }
-            }
         }
-        Ok(())
     }
 
     /// Current epoch (test/observability).
     pub async fn epoch(&self) -> u64 {
-        self.state.lock().await.epoch
+        self.state.lock().await.verified.epoch
     }
 
     /// Order a proposed watermark against the current HEAD watermark.
@@ -407,13 +653,13 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         let mut st = self.state.lock().await;
         if let Some(observed) = st.fenced {
             return Err(HeadError::Fenced {
-                our: st.epoch,
+                our: st.verified.epoch,
                 observed,
             });
         }
 
         // Ordering gate: only an After (or genesis) proposal does any work.
-        match self.order_vs_head(&st.head, watermark)? {
+        match self.order_vs_head(&st.verified.head, watermark)? {
             None | Some(CheckpointOrder::After) => {}
             // Already durable at or beyond this position (a valid replay under a
             // possibly-newer epoch): acknowledge without moving HEAD.
@@ -451,7 +697,7 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         for _ in 0..MAX_PUBLISH_ATTEMPTS {
             // HEAD may have advanced (same-epoch race, or catch-up reaching an
             // already-published position). Re-order before proposing again.
-            match self.order_vs_head(&st.head, watermark)? {
+            match self.order_vs_head(&st.verified.head, watermark)? {
                 None | Some(CheckpointOrder::After) => {}
                 Some(CheckpointOrder::Equal)
                 | Some(CheckpointOrder::Before) => {
@@ -468,9 +714,11 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                     )));
                 }
             }
-            let seq = propose_seq(st.head.seq);
-            let prev = match (&st.head.head_entry_key, &st.head.head_entry_hash)
-            {
+            let seq = propose_seq(st.verified.head.seq);
+            let prev = match (
+                &st.verified.head.head_entry_key,
+                &st.verified.head.head_entry_hash,
+            ) {
                 (Some(k), Some(h)) => Some(PrevRef {
                     key: k.clone(),
                     hash: h.clone(),
@@ -482,7 +730,7 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                 pipeline: self.pipeline.clone(),
                 source_id: self.source_id.clone(),
                 sink_id: self.sink_id.clone(),
-                epoch: st.epoch,
+                epoch: st.verified.epoch,
                 seq,
                 watermark_hex: watermark_hex.clone(),
                 event_count,
@@ -496,28 +744,28 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
 
             let next_head = Head {
                 version: HEAD_VERSION,
-                epoch: st.epoch,
+                epoch: st.verified.epoch,
                 seq,
                 head_entry_key: Some(written.key.clone()),
                 head_entry_hash: Some(written.hash.clone()),
                 // Rollup references are preserved unchanged during ordinary
                 // batch publication.
-                rollup_key: st.head.rollup_key.clone(),
-                rollup_hash: st.head.rollup_hash.clone(),
+                rollup_key: st.verified.head.rollup_key.clone(),
+                rollup_hash: st.verified.head.rollup_hash.clone(),
                 watermark_hex: Some(watermark_hex.clone()),
             };
 
             let cas = self
                 .store
-                .cas_put(&hkey, next_head.canonical_bytes(), &st.etag)
+                .cas_put(&hkey, next_head.canonical_bytes(), &st.verified.etag)
                 .await;
 
             match cas {
                 Ok(PutOutcome::Written {
                     etag: Some(new_etag),
                 }) => {
-                    st.head = next_head;
-                    st.etag = new_etag;
+                    st.verified.head = next_head;
+                    st.verified.etag = new_etag;
                     return Ok(()); // ACKNOWLEDGE
                 }
                 Ok(PutOutcome::Written { etag: None }) => {
@@ -551,30 +799,33 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                     // Lost/ambiguous response that actually succeeded: HEAD
                     // references our exact entry -> idempotent success.
                     if cur.references(&written) {
-                        st.head = cur;
-                        st.etag = etag;
+                        st.verified.head = cur;
+                        st.verified.etag = etag;
                         return Ok(()); // ACKNOWLEDGE (idempotent)
                     }
                     // A higher epoch published: fenced, permanently.
-                    if cur.epoch > st.epoch {
+                    if cur.epoch > st.verified.epoch {
                         st.fenced = Some(cur.epoch);
                         return Err(HeadError::Fenced {
-                            our: st.epoch,
+                            our: st.verified.epoch,
                             observed: cur.epoch,
                         });
                     }
                     // A lower epoch is impossible (epochs are monotonic).
-                    if cur.epoch < st.epoch {
+                    if cur.epoch < st.verified.epoch {
                         return Err(HeadError::Integrity(format!(
                             "HEAD epoch regressed: {} < our {}",
-                            cur.epoch, st.epoch
+                            cur.epoch, st.verified.epoch
                         )));
                     }
-                    // Same epoch, different head: adopt it and retry with a
-                    // fresh seq + prev. (The already-written entry becomes an
-                    // unreferenced reconciliation candidate.)
-                    st.head = cur;
-                    st.etag = etag;
+                    // Same epoch, different head: verify the adopted HEAD's
+                    // referenced entry before trusting its watermark for a later
+                    // Before/Equal skip, then retry with a fresh seq + prev. (Our
+                    // already-written entry becomes an unreferenced reconciliation
+                    // candidate.)
+                    verify_head_entry(self.store.as_ref(), &cur).await?;
+                    st.verified.head = cur;
+                    st.verified.etag = etag;
                     continue;
                 }
             }
@@ -695,10 +946,10 @@ mod tests {
             .await
             .unwrap();
         let st = w.state.lock().await;
-        assert_eq!(st.head.seq, 1);
-        assert!(st.head.head_entry_key.is_some());
+        assert_eq!(st.verified.head.seq, 1);
+        assert!(st.verified.head.head_entry_key.is_some());
         assert_eq!(
-            st.head.watermark_hex.as_deref(),
+            st.verified.head.watermark_hex.as_deref(),
             Some(wm_hex(0, 1).as_str())
         );
     }
@@ -714,9 +965,12 @@ mod tests {
             .await
             .unwrap();
         let st = w.state.lock().await;
-        assert_eq!(st.head.seq, 2);
+        assert_eq!(st.verified.head.seq, 2);
         // rollup refs untouched by ordinary publication.
-        assert!(st.head.rollup_key.is_none() && st.head.rollup_hash.is_none());
+        assert!(
+            st.verified.head.rollup_key.is_none()
+                && st.verified.head.rollup_hash.is_none()
+        );
     }
 
     #[tokio::test]
@@ -842,18 +1096,33 @@ mod tests {
             .unwrap();
 
         // Out-of-band: read HEAD, advance seq to 2 at epoch 1 referencing a
-        // (fake but present) entry, using the current ETag.
+        // REAL entry (so the adopted HEAD passes verify_head_entry), using the
+        // current ETag.
         let hkey = head_key("pfx", "pipe");
         let (raw, etag) = s.get_with_etag(&hkey).await.unwrap().unwrap();
         let mut cur = Head::parse(&raw).unwrap();
-        let fake_entry_key =
-            "pfx/pipe/_manifest/entries/00000000000000000002-face.json";
-        s.put_if_absent(&Path::from(fake_entry_key), Bytes::from_static(b"{}"))
-            .await
-            .unwrap();
+        let entry2 = super::super::manifest::ManifestEntry {
+            version: super::super::manifest::MANIFEST_ENTRY_VERSION,
+            pipeline: "pipe".into(),
+            source_id: "src".into(),
+            sink_id: "sink".into(),
+            epoch: 1,
+            seq: 2,
+            watermark_hex: wm_hex(0, 2),
+            event_count: 1,
+            objects: vec![],
+            prev: Some(super::super::manifest::PrevRef {
+                key: cur.head_entry_key.clone().unwrap(),
+                hash: cur.head_entry_hash.clone().unwrap(),
+            }),
+        };
+        let w2 =
+            super::super::manifest::write_entry(s.as_ref(), "pfx", &entry2)
+                .await
+                .unwrap();
         cur.seq = 2;
-        cur.head_entry_key = Some(fake_entry_key.to_string());
-        cur.head_entry_hash = Some("face".into());
+        cur.head_entry_key = Some(w2.key);
+        cur.head_entry_hash = Some(w2.hash);
         cur.watermark_hex = Some(wm_hex(0, 2));
         s.cas_put(&hkey, cur.canonical_bytes(), etag.as_deref().unwrap())
             .await
@@ -865,8 +1134,8 @@ mod tests {
             .await
             .unwrap();
         let st = w.state.lock().await;
-        assert_eq!(st.epoch, 1);
-        assert_eq!(st.head.seq, 3);
+        assert_eq!(st.verified.epoch, 1);
+        assert_eq!(st.verified.head.seq, 3);
     }
 
     // A store wrapper whose Nth cas_put applies the write but reports a Store
@@ -935,7 +1204,7 @@ mod tests {
             .await
             .expect("lost response but write succeeded -> ack");
         let st = w.state.lock().await;
-        assert_eq!(st.head.seq, 1);
+        assert_eq!(st.verified.head.seq, 1);
     }
 
     async fn entry_count(s: &ObjectStoreConditional) -> usize {
@@ -977,9 +1246,9 @@ mod tests {
             .await
             .unwrap();
         let st = w2.state.lock().await;
-        assert_eq!(st.head.seq, 1, "HEAD must not advance on replay");
+        assert_eq!(st.verified.head.seq, 1, "HEAD must not advance on replay");
         assert_eq!(
-            st.head.watermark_hex.as_deref(),
+            st.verified.head.watermark_hex.as_deref(),
             Some(wm_hex(0, 5).as_str()),
             "HEAD watermark must not move backward"
         );
@@ -1004,7 +1273,7 @@ mod tests {
             .await
             .unwrap(); // Equal -> ack, no move
         let st = w.state.lock().await;
-        assert_eq!(st.head.seq, 1);
+        assert_eq!(st.verified.head.seq, 1);
         drop(st);
         assert_eq!(entry_count(&s).await, entries);
     }
@@ -1026,7 +1295,7 @@ mod tests {
         assert!(err.is_fatal());
         let st = w.state.lock().await;
         assert_eq!(
-            st.head.watermark_hex.as_deref(),
+            st.verified.head.watermark_hex.as_deref(),
             Some(wm_hex(0, 2).as_str())
         );
     }
@@ -1062,10 +1331,173 @@ mod tests {
             .await
             .unwrap(); // After -> advances
         let st = w2.state.lock().await;
-        assert_eq!(st.head.seq, 2, "the newer watermark advanced HEAD");
         assert_eq!(
-            st.head.watermark_hex.as_deref(),
+            st.verified.head.seq, 2,
+            "the newer watermark advanced HEAD"
+        );
+        assert_eq!(
+            st.verified.head.watermark_hex.as_deref(),
             Some(wm_hex(0, 6).as_str())
         );
+    }
+
+    // ── Recovery / chain verification ───────────────────────────────────────
+
+    use object_store::ObjectStore;
+    use object_store::ObjectStoreExt;
+
+    /// A store whose inner InMemory is also held directly, so tests can tamper
+    /// objects behind the conditional layer.
+    fn cond_with_inner() -> (Arc<dyn ObjectStore>, Arc<ObjectStoreConditional>)
+    {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let cs = Arc::new(ObjectStoreConditional::new(Arc::clone(&inner)));
+        (inner, cs)
+    }
+
+    /// Publish a two-entry chain and return the store.
+    async fn build_chain() -> (Arc<dyn ObjectStore>, Arc<ObjectStoreConditional>)
+    {
+        let (inner, cs) = cond_with_inner();
+        let w = DurableWriter::acquire(
+            Arc::clone(&cs),
+            "pfx",
+            "pipe",
+            "src",
+            "sink",
+            cmp(),
+        )
+        .await
+        .unwrap();
+        w.publish(&wm(0, 1), vec![tobj("orders", b"a")], 1)
+            .await
+            .unwrap();
+        w.publish(&wm(0, 2), vec![tobj("orders", b"bb")], 1)
+            .await
+            .unwrap();
+        (inner, cs)
+    }
+
+    async fn head_of(cs: &ObjectStoreConditional) -> Head {
+        let (raw, _) = cs
+            .get_with_etag(&head_key("pfx", "pipe"))
+            .await
+            .unwrap()
+            .unwrap();
+        Head::parse(&raw).unwrap()
+    }
+
+    async fn recover(cs: Arc<ObjectStoreConditional>) -> Result<(), HeadError> {
+        DurableWriter::acquire(cs, "pfx", "pipe", "src", "sink", cmp())
+            .await
+            .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn recovery_verifies_valid_chain_and_bumps_epoch() {
+        let (_inner, cs) = build_chain().await;
+        let w = DurableWriter::acquire(
+            Arc::clone(&cs),
+            "pfx",
+            "pipe",
+            "src",
+            "sink",
+            cmp(),
+        )
+        .await
+        .unwrap();
+        // Genesis writer was epoch 1; recovery bumps to 2.
+        assert_eq!(w.epoch().await, 2);
+        assert_eq!(w.state.lock().await.verified.head.seq, 2);
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_tampered_entry() {
+        let (inner, cs) = build_chain().await;
+        let head = head_of(&cs).await;
+        // Overwrite the head entry with different (but valid-JSON) bytes.
+        let key = Path::from(head.head_entry_key.unwrap().as_str());
+        inner
+            .put(
+                &key,
+                object_store::PutPayload::from(Bytes::from_static(
+                    br#"{"version":1,"pipeline":"pipe","source_id":"src","sink_id":"sink","epoch":1,"seq":2,"watermark_hex":"00","event_count":1,"objects":[],"prev":null}"#,
+                )),
+            )
+            .await
+            .unwrap();
+        let err = expect_err(recover(cs).await);
+        assert!(matches!(err, HeadError::Integrity(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_corrupted_data_object() {
+        let (inner, cs) = build_chain().await;
+        let head = head_of(&cs).await;
+        let entry =
+            load_entry(cs.as_ref(), head.head_entry_key.as_ref().unwrap())
+                .await
+                .unwrap();
+        let dkey = Path::from(entry.objects[0].key.as_str());
+        // Same length as "bb" so the size check passes but the hash fails.
+        inner
+            .put(
+                &dkey,
+                object_store::PutPayload::from(Bytes::from_static(b"XX")),
+            )
+            .await
+            .unwrap();
+        let err = expect_err(recover(cs).await);
+        assert!(matches!(err, HeadError::Integrity(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_missing_data_object() {
+        let (inner, cs) = build_chain().await;
+        let head = head_of(&cs).await;
+        let entry =
+            load_entry(cs.as_ref(), head.head_entry_key.as_ref().unwrap())
+                .await
+                .unwrap();
+        inner
+            .delete(&Path::from(entry.objects[0].key.as_str()))
+            .await
+            .unwrap();
+        let err = expect_err(recover(cs).await);
+        assert!(matches!(err, HeadError::Integrity(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_head_referencing_rollup() {
+        let (inner, cs) = build_chain().await;
+        let mut head = head_of(&cs).await;
+        // Claim a rollup that we cannot validate.
+        head.rollup_key = Some("pfx/pipe/_manifest/rollups/x.json".into());
+        head.rollup_hash = Some("deadbeef".into());
+        inner
+            .put(
+                &head_key("pfx", "pipe"),
+                object_store::PutPayload::from(head.canonical_bytes()),
+            )
+            .await
+            .unwrap();
+        let err = expect_err(recover(cs).await);
+        assert!(matches!(err, HeadError::Integrity(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_head_watermark_not_matching_entry() {
+        let (inner, cs) = build_chain().await;
+        let mut head = head_of(&cs).await;
+        head.watermark_hex = Some(wm_hex(0, 99)); // does not match the entry
+        inner
+            .put(
+                &head_key("pfx", "pipe"),
+                object_store::PutPayload::from(head.canonical_bytes()),
+            )
+            .await
+            .unwrap();
+        let err = expect_err(recover(cs).await);
+        assert!(matches!(err, HeadError::Integrity(_)), "got {err:?}");
     }
 }
