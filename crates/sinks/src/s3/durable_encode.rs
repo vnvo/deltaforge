@@ -95,6 +95,198 @@ mod tests {
         ]))
     }
 
+    // ── Golden fixture: a fixed, representative batch exercising nulls, binary,
+    // nested lists, booleans and multiple rows. Its encoded bytes are pinned
+    // below; see the golden test for the change protocol.
+
+    fn golden_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("op", DataType::Utf8, false),
+            Field::new("source_table", DataType::Utf8, false),
+            Field::new("after_id", DataType::Int64, true),
+            Field::new("after_name", DataType::Utf8, true),
+            Field::new("after_blob", DataType::Binary, true),
+            Field::new(
+                "after_tags",
+                DataType::List(Arc::new(Field::new(
+                    "item",
+                    DataType::Utf8,
+                    true,
+                ))),
+                true,
+            ),
+            Field::new("after_active", DataType::Boolean, true),
+        ]))
+    }
+
+    fn golden_event(op: Op, after: Value) -> Event {
+        Event {
+            before: None,
+            after: Some(after),
+            source: SourceInfo {
+                version: "1".into(),
+                connector: "mysql".into(),
+                name: "golden".into(),
+                ts_ms: 1_700_000_000_000,
+                db: "shop".into(),
+                schema: None,
+                table: "orders".into(),
+                snapshot: Some("false".into()),
+                position: SourcePosition {
+                    file: Some("mysql-bin.000007".into()),
+                    pos: Some(42),
+                    ..Default::default()
+                },
+            },
+            op,
+            ts_ms: 1_700_000_000_000,
+            transaction: Some(Transaction {
+                id: "tx-golden".into(),
+                total_order: None,
+                data_collection_order: None,
+            }),
+            event_id: Some(deltaforge_core::EventId::mysql_row_server(
+                1, "orders", 1, 0,
+            )),
+            tenant_id: None,
+            schema_version: Some("v1".into()),
+            schema_sequence: None,
+            ddl: None,
+            trace_id: None,
+            tags: None,
+            synthetic: None,
+            routing: None,
+            tx_end: false,
+            checkpoint: None,
+            size_bytes: 0,
+            received_at_ms: 1_700_000_000_000,
+        }
+    }
+
+    fn golden_events() -> Vec<Event> {
+        vec![
+            golden_event(
+                Op::Create,
+                json!({
+                    "id": 1,
+                    "name": "alpha",
+                    // binary via the {"_base64": ...} convention: bytes "hi"
+                    "blob": {"_base64": "aGk="},
+                    "tags": ["x", "y"],
+                    "active": true
+                }),
+            ),
+            golden_event(
+                Op::Update,
+                json!({
+                    "id": 2,
+                    // name/blob absent -> nulls
+                    "tags": [],
+                    "active": false
+                }),
+            ),
+            golden_event(
+                Op::Delete,
+                json!({
+                    "id": 3,
+                    "name": "gamma",
+                    // bytes 0x00 0x01 0xff
+                    "blob": {"_base64": "AAH/"},
+                    "tags": ["z"],
+                    "active": null
+                }),
+            ),
+        ]
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let d = Sha256::new().chain_update(bytes).finalize();
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Pinned golden vectors. A "fixed created_by" does not by itself guarantee
+    /// byte stability: a parquet/compression library upgrade, a metadata-ordering
+    /// or dictionary-encoding change, or an encoder tweak can all shift the bytes
+    /// silently, and the `EncodingDomain` version only prevents *collisions* if
+    /// someone remembers to bump it. These vectors make any such drift a loud
+    /// test failure.
+    ///
+    /// If this test fails after an intentional encoder or dependency change:
+    /// 1. bump the relevant `*_ENCODER_VERSION` (so new bytes cannot collide with
+    ///    previously written content at the same content-addressed key), then
+    /// 2. re-run `print_golden_vectors` (`--ignored --nocapture`) and paste the
+    ///    new length + SHA-256 below.
+    ///
+    /// If it fails WITHOUT an intentional change, a dependency silently altered
+    /// the output: investigate before touching these constants.
+    #[test]
+    fn golden_vectors_are_pinned() {
+        let s = golden_schema();
+        let evs = golden_events();
+        let expected_parquet = [
+            (
+                Compression::None,
+                2199,
+                "de8fd743863a472c3f51ed3f3091a2654c240978c5ac2fd3d385fc7d7d9ec637",
+            ),
+            (
+                Compression::Snappy,
+                2223,
+                "ce9023b7584c4f25ec929b5d574b68ca83b205fea95737b7ed2ef3f21db0c7ec",
+            ),
+            (
+                Compression::Gzip,
+                2440,
+                "ae0fb649215faf56697046c192ffcd0fc780c9bc4312b7976e5667a987a0e7d3",
+            ),
+            (
+                Compression::Zstd,
+                2317,
+                "01d8ec4a9a2a40029ebc35db1e69a540270bd043a687a058cff9c5d08822e541",
+            ),
+        ];
+        for (c, len, sha) in expected_parquet {
+            let bytes = encode_parquet(&s, &evs, c).unwrap();
+            assert_eq!(
+                bytes.len(),
+                len,
+                "Parquet {c:?} byte length drifted; see the change protocol"
+            );
+            assert_eq!(
+                sha256_hex(&bytes),
+                sha,
+                "Parquet {c:?} bytes drifted; see the change protocol"
+            );
+        }
+        let j = encode_jsonl(&evs).unwrap();
+        assert_eq!(j.len(), 1200, "JSONL byte length drifted");
+        assert_eq!(
+            sha256_hex(&j),
+            "d767ad745904a312600043cac8210a3c5a8ecad4be00f2807f51ca88f31fb627",
+            "JSONL bytes drifted; see the change protocol"
+        );
+    }
+
+    // Capture helper: prints the golden hashes so they can be re-pinned.
+    #[test]
+    #[ignore = "capture-only: run to (re)generate golden vectors"]
+    fn print_golden_vectors() {
+        let s = golden_schema();
+        let evs = golden_events();
+        for c in [
+            Compression::None,
+            Compression::Snappy,
+            Compression::Gzip,
+            Compression::Zstd,
+        ] {
+            let bytes = encode_parquet(&s, &evs, c).unwrap();
+            println!("PARQUET {c:?} {} {}", bytes.len(), sha256_hex(&bytes));
+        }
+        let j = encode_jsonl(&evs).unwrap();
+        println!("JSONL {} {}", j.len(), sha256_hex(&j));
+    }
+
     fn event(id: i64, after: Option<Value>) -> Event {
         Event {
             before: None,
