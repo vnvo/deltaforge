@@ -729,16 +729,40 @@ pub enum SourceItem {
     /// the coordinator can tell a valid **empty** transaction (a begin followed
     /// immediately by a commit) from a commit for an unknown transaction.
     TxBegin { tx_id: String },
-    /// A committed-transaction boundary. `checkpoint` is the COMMIT/XID
-    /// **record's** position (not the last data event's), generated once by the
-    /// source and passed through unchanged; `tx_id` matches the `transaction.id`
+    /// A committed-transaction boundary. `boundary` carries the COMMIT/XID
+    /// **record's** checkpoint (not the last data event's) and, atomically, the
+    /// durable watermark for that same boundary - both generated together by the
+    /// source and passed through unchanged. `tx_id` matches the `transaction.id`
     /// carried by that transaction's events. Only an actual commit emits this -
     /// never a rollback, and never a transactional logical message (those are
     /// transaction *contents*).
     TxCommit {
         tx_id: String,
-        checkpoint: CheckpointMeta,
+        boundary: SourceBoundary,
     },
+}
+
+/// A legal checkpoint boundary emitted by a source: the resume `checkpoint`
+/// (the source's own persisted/deserialized format) plus, atomically, the
+/// `durable_watermark` for the *same* boundary state. The two are always
+/// produced together so a sink can never pair a checkpoint with a watermark
+/// from a different snapshot state. The watermark is opaque here (a serialized,
+/// source-aware watermark); the durable S3 sink's injected comparator interprets
+/// it, and legacy sinks ignore it.
+#[derive(Debug, Clone)]
+pub struct SourceBoundary {
+    pub checkpoint: CheckpointMeta,
+    pub durable_watermark: Option<Arc<[u8]>>,
+}
+
+impl SourceBoundary {
+    /// A boundary carrying only a resume checkpoint (no durable watermark).
+    pub fn checkpoint_only(checkpoint: CheckpointMeta) -> Self {
+        Self {
+            checkpoint,
+            durable_watermark: None,
+        }
+    }
 }
 
 impl SourceItem {

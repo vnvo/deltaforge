@@ -1055,14 +1055,17 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                             }
                                         }
                                     }
-                                    SourceItem::TxCommit { tx_id, checkpoint } => {
+                                    SourceItem::TxCommit { tx_id, boundary } => {
                                         // The marker must match the open tx and
                                         // may close it exactly once - a stale or
                                         // duplicate marker cannot advance twice.
                                         tx_tracker.commit(&tx_id)?;
-                                        // Commit boundary: close the open tx and
-                                        // flush only if soft limits are reached.
-                                        close_tx(&mut b, checkpoint);
+                                        // Commit boundary: close the open tx with
+                                        // the boundary's checkpoint, flush only if
+                                        // soft limits are reached. (Threading the
+                                        // boundary watermark into the context
+                                        // lands with source-side population.)
+                                        close_tx(&mut b, boundary.checkpoint);
                                         if soft_limit_reached(&b, max_events, max_bytes) {
                                             let full = std::mem::replace(
                                                 &mut b,
@@ -1818,7 +1821,9 @@ mod tests {
         }
         tx.send(SourceItem::TxCommit {
             tx_id: "gtid:1".into(),
-            checkpoint: CheckpointMeta::from_vec(b"commit-1".to_vec()),
+            boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                CheckpointMeta::from_vec(b"commit-1".to_vec()),
+            ),
         })
         .await
         .unwrap();
@@ -1873,7 +1878,9 @@ mod tests {
             }
             tx.send(SourceItem::TxCommit {
                 tx_id: txn.into(),
-                checkpoint: CheckpointMeta::from_vec(cp.as_bytes().to_vec()),
+                boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                    CheckpointMeta::from_vec(cp.as_bytes().to_vec()),
+                ),
             })
             .await
             .unwrap();
@@ -1975,7 +1982,9 @@ mod tests {
         }
         tx.send(SourceItem::TxCommit {
             tx_id: "gtid:1".into(),
-            checkpoint: CheckpointMeta::from_vec(b"cp-1".to_vec()),
+            boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                CheckpointMeta::from_vec(b"cp-1".to_vec()),
+            ),
         })
         .await
         .unwrap();
@@ -2032,7 +2041,9 @@ mod tests {
         .unwrap();
         tx.send(SourceItem::TxCommit {
             tx_id: "gtid:1".into(),
-            checkpoint: CheckpointMeta::from_vec(b"empty".to_vec()),
+            boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                CheckpointMeta::from_vec(b"empty".to_vec()),
+            ),
         })
         .await
         .unwrap();
@@ -2047,7 +2058,9 @@ mod tests {
             .unwrap();
         tx.send(SourceItem::TxCommit {
             tx_id: "gtid:2".into(),
-            checkpoint: CheckpointMeta::from_vec(b"real".to_vec()),
+            boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                CheckpointMeta::from_vec(b"real".to_vec()),
+            ),
         })
         .await
         .unwrap();
@@ -2097,7 +2110,9 @@ mod tests {
     fn commit(tx_id: &str, cp: &[u8]) -> SourceItem {
         SourceItem::TxCommit {
             tx_id: tx_id.into(),
-            checkpoint: CheckpointMeta::from_vec(cp.to_vec()),
+            boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                CheckpointMeta::from_vec(cp.to_vec()),
+            ),
         }
     }
 
@@ -2254,7 +2269,9 @@ mod tests {
         }
         tx.send(SourceItem::TxCommit {
             tx_id: "gtid:1".into(),
-            checkpoint: CheckpointMeta::from_vec(b"cp-1".to_vec()),
+            boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                CheckpointMeta::from_vec(b"cp-1".to_vec()),
+            ),
         })
         .await
         .unwrap();
@@ -2307,7 +2324,9 @@ mod tests {
         }
         tx.send(SourceItem::TxCommit {
             tx_id: "gtid:1".into(),
-            checkpoint: CheckpointMeta::from_vec(b"cp-1".to_vec()),
+            boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                CheckpointMeta::from_vec(b"cp-1".to_vec()),
+            ),
         })
         .await
         .unwrap();
@@ -2377,7 +2396,9 @@ mod tests {
             }
             tx.send(SourceItem::TxCommit {
                 tx_id: txn.into(),
-                checkpoint: CheckpointMeta::from_vec(cp.as_bytes().to_vec()),
+                boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                    CheckpointMeta::from_vec(cp.as_bytes().to_vec()),
+                ),
             })
             .await
             .unwrap();

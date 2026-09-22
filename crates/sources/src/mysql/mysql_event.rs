@@ -34,7 +34,7 @@ async fn send_event(
     match tx.try_send(SourceItem::Event(ev)) {
         Ok(()) => true,
         Err(tokio::sync::mpsc::error::TrySendError::Full(item)) => {
-            // Channel full — apply backpressure via async wait.
+            // Channel full - apply backpressure via async wait.
             tx.send(item).await.is_ok()
         }
         Err(_) => false, // channel closed
@@ -174,8 +174,8 @@ fn build_source_info(
         snapshot: None,
         position: SourcePosition::mysql(
             ctx.server_id as u32,
-            // The current transaction's exact GTID — the immutable identity
-            // coordinate — not the accumulated executed set (which stays in the
+            // The current transaction's exact GTID - the immutable identity
+            // coordinate - not the accumulated executed set (which stays in the
             // checkpoint for resume).
             ctx.current_gtid.clone(),
             Some(ctx.last_file.clone()),
@@ -184,7 +184,7 @@ fn build_source_info(
             Some(row_ordinal),
         ),
     };
-    // The stable id is required at the source boundary — fail closed if it
+    // The stable id is required at the source boundary - fail closed if it
     // cannot be derived (MySQL always has a server_id, so the server-id+file
     // fallback keeps this derivable even without GTIDs).
     let id = super::mysql_row_event_id(&source).map_err(|e| {
@@ -311,7 +311,7 @@ async fn handle_update_rows(
         let sequence = ctx.schema.current_sequence();
 
         let mut sent = 0u64;
-        // One ordinal per before/after pair — an update is a single row change,
+        // One ordinal per before/after pair - an update is a single row change,
         // not two images.
         for (row_ordinal, (before_row, after_row)) in
             ur.rows.into_iter().enumerate()
@@ -479,7 +479,7 @@ async fn handle_gtid(
     debug!(source_id=%ctx.source_id, gtid=%gtid_str, "gtid");
 
     // The exact per-transaction GTID (`uuid:gno`) is the immutable identity
-    // coordinate — captured before it is merged into the accumulated set below.
+    // coordinate - captured before it is merged into the accumulated set below.
     ctx.current_gtid = Some(gtid_str.clone());
     // New transaction boundary: reset the DDL message ordinal.
     ctx.message_ordinal = 0;
@@ -493,7 +493,7 @@ async fn handle_gtid(
     });
 
     // The GTID event is the unambiguous start of every transaction (row, DDL,
-    // or empty) — open it on the coordinator's stream.
+    // or empty) - open it on the coordinator's stream.
     emit_tx_begin(ctx).await;
 }
 
@@ -519,7 +519,7 @@ fn merge_gtid(existing: &str, new_gtid: &str) -> String {
         existing.split(',').map(str::to_owned).collect();
     let mut found = false;
     for entry in &mut entries {
-        // find(':') is correct here — individual entries never contain commas,
+        // find(':') is correct here - individual entries never contain commas,
         // so find and rfind are equivalent, but find is explicit about intent.
         if let Some(colon) = entry.find(':') {
             if &entry[..colon] == n_uuid {
@@ -554,13 +554,13 @@ fn handle_rotate(
 
 async fn handle_xid(ctx: &mut RunCtx) {
     debug!(source_id=%ctx.source_id, "xid (commit)");
-    // The XID event is the InnoDB transaction commit record — emit an explicit
+    // The XID event is the InnoDB transaction commit record - emit an explicit
     // boundary marker carrying the commit-record checkpoint.
     emit_tx_commit(ctx).await;
 }
 
 /// Open the current transaction on the coordinator's stream. `tx_id` is the
-/// exact per-transaction GTID — the same identity stamped on this transaction's
+/// exact per-transaction GTID - the same identity stamped on this transaction's
 /// events and its closing `TxCommit`. Only emitted in GTID mode; without a GTID
 /// there is no stable per-transaction identity, so events flow as standalone
 /// boundaries and no markers are sent. Best-effort (a closed channel = shutdown).
@@ -581,11 +581,11 @@ async fn emit_tx_commit(ctx: &mut RunCtx) {
     };
     let checkpoint =
         make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid);
-    let _ = ctx
-        .tx
-        .send(SourceItem::TxCommit { tx_id, checkpoint })
-        .await;
-    // Transaction closed — the next transaction opens with its own GTID event.
+    // TODO(P0.4): populate boundary.durable_watermark with the source-aware CDC
+    // watermark (GTID set + lineage) once lineage is threaded to RunCtx.
+    let boundary = deltaforge_core::SourceBoundary::checkpoint_only(checkpoint);
+    let _ = ctx.tx.send(SourceItem::TxCommit { tx_id, boundary }).await;
+    // Transaction closed - the next transaction opens with its own GTID event.
     ctx.current_gtid = None;
 }
 
@@ -725,7 +725,7 @@ async fn handle_query(
     // COMMIT / ROLLBACK close the transaction. Both are commit boundaries here:
     // the binlog only contains durable changes (a mixed-engine rollback still
     // persisted its non-transactional writes), and emitting the marker cleanly
-    // closes the transaction opened at BEGIN — including an empty one.
+    // closes the transaction opened at BEGIN - including an empty one.
     if sql_upper == "COMMIT" || sql_upper == "ROLLBACK" {
         emit_tx_commit(ctx).await;
         return Ok(());
@@ -796,7 +796,7 @@ async fn handle_query(
             ctx.last_pos,
             &ctx.last_gtid,
         ));
-        // DDL is its own GTID transaction — stamp its identity so it belongs to
+        // DDL is its own GTID transaction - stamp its identity so it belongs to
         // the transaction opened at the GTID event and closed just below.
         ev.transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
             id: gtid.clone(),
@@ -1120,7 +1120,7 @@ mod tests {
         assert_eq!(cp.gtid_set.as_deref(), Some("abc-123:1-10"));
 
         // The per-event source position carries the *exact* per-transaction GTID
-        // (the identity coordinate) plus the row ordinal — distinct from the
+        // (the identity coordinate) plus the row ordinal - distinct from the
         // checkpoint's accumulated set.
         assert_eq!(
             produced.source.position.file,
@@ -1395,7 +1395,7 @@ mod tests {
 
     #[test]
     fn merge_gtid_preserves_nonzero_range_start() {
-        // Existing range does NOT start at 1 — pins the `colon + 1` range
+        // Existing range does NOT start at 1 - pins the `colon + 1` range
         // slice. A wrong offset silently falls back to start=1, which every
         // other test (all start at 1) fails to catch.
         assert_eq!(merge_gtid("uuid-a:5-10", "uuid-a:11"), "uuid-a:5-11");
@@ -1418,7 +1418,7 @@ mod tests {
 
     #[test]
     fn extract_identifier_stops_at_each_delimiter() {
-        // Each unquoted terminator individually — pins the `||` chain.
+        // Each unquoted terminator individually - pins the `||` chain.
         assert_eq!(extract_identifier("foo bar").as_deref(), Some("foo"));
         assert_eq!(extract_identifier("foo(x)").as_deref(), Some("foo"));
         assert_eq!(extract_identifier("foo;").as_deref(), Some("foo"));
@@ -1433,7 +1433,7 @@ mod tests {
 
     #[test]
     fn extract_table_from_ddl_rename() {
-        // The RENAME TABLE branch — untested, so its `+ 6` offset survived.
+        // The RENAME TABLE branch - untested, so its `+ 6` offset survived.
         assert_eq!(
             extract_table_from_ddl("RENAME TABLE foo TO bar").as_deref(),
             Some("foo")
@@ -1452,7 +1452,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_query_emits_ddl_event() {
-        // Every DDL keyword must be detected independently — pins each clause
+        // Every DDL keyword must be detected independently - pins each clause
         // of the `||` chain (a `&&` mutation on any one suppresses that keyword
         // only, so a single-keyword test would miss the others).
         for sql in [
