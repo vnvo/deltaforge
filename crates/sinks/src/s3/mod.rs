@@ -12,6 +12,7 @@ mod batch_upload;
 mod durable_encode;
 mod encoder;
 mod file_format;
+mod head;
 mod jsonl_writer;
 mod keys;
 mod manifest;

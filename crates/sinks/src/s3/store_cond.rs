@@ -89,6 +89,10 @@ pub trait ConditionalStore: Send + Sync {
     /// Delete `key`. Used by reconciliation/compaction only - never on the ack
     /// path. Deleting an absent key is a no-op.
     async fn delete(&self, key: &Path) -> CondResult<()>;
+
+    /// List keys under `prefix` (recursively). Used by recovery/reconciliation to
+    /// detect existing state, never on the hot ack path.
+    async fn list(&self, prefix: &Path) -> CondResult<Vec<Path>>;
 }
 
 /// [`ConditionalStore`] backed by an `object_store` client.
@@ -174,6 +178,17 @@ impl ConditionalStore for ObjectStoreConditional {
             Ok(()) | Err(OsError::NotFound { .. }) => Ok(()),
             Err(e) => Err(CondError::Store(format!("{e}"))),
         }
+    }
+
+    async fn list(&self, prefix: &Path) -> CondResult<Vec<Path>> {
+        use futures::StreamExt;
+        let mut stream = self.store.list(Some(prefix));
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            let meta = item.map_err(|e| CondError::Store(format!("{e}")))?;
+            out.push(meta.location);
+        }
+        Ok(out)
     }
 }
 
@@ -418,6 +433,18 @@ mod tests {
             self.map.lock().await.remove(&key.to_string());
             Ok(())
         }
+
+        async fn list(&self, prefix: &Path) -> CondResult<Vec<Path>> {
+            let p = format!("{prefix}/");
+            Ok(self
+                .map
+                .lock()
+                .await
+                .keys()
+                .filter(|k| k.starts_with(&p) || **k == prefix.to_string())
+                .map(|k| Path::from(k.as_str()))
+                .collect())
+        }
     }
 
     /// A backend that ignores conditions: every write overwrites and reports
@@ -464,6 +491,15 @@ mod tests {
         async fn delete(&self, key: &Path) -> CondResult<()> {
             self.map.lock().await.remove(&key.to_string());
             Ok(())
+        }
+        async fn list(&self, _prefix: &Path) -> CondResult<Vec<Path>> {
+            Ok(self
+                .map
+                .lock()
+                .await
+                .keys()
+                .map(|k| Path::from(k.as_str()))
+                .collect())
         }
     }
 
