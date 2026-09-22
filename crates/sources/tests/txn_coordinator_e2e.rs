@@ -146,9 +146,14 @@ impl CheckpointStore for CommittedCheckpointProxy {
 // ============================================================================
 
 struct RunningPipeline {
+    // Held for the pipeline's lifetime: if this sender is dropped, the
+    // coordinator's `pause_rx.changed()` returns Err and its accumulation loop
+    // exits, dropping the source receiver. Keeping it alive keeps the pipeline
+    // running until we explicitly shut the source down.
+    _pause_tx: tokio::sync::watch::Sender<bool>,
     sink: Arc<RecordingSink>,
     src_handle: SourceHandle,
-    coord_task: JoinHandle<Result<()>>,
+    coord_task: Option<JoinHandle<Result<()>>>,
 }
 
 impl RunningPipeline {
@@ -192,36 +197,67 @@ impl RunningPipeline {
         let src_handle = source.run(tx, proxy).await;
 
         let cancel = CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (pause_tx, pause_rx) = tokio::sync::watch::channel(false);
         let coord_task = tokio::spawn(coord.run(rx, cancel, pause_rx));
 
         RunningPipeline {
+            _pause_tx: pause_tx,
             sink,
             src_handle,
-            coord_task,
+            coord_task: Some(coord_task),
         }
     }
 
-    /// Poll until the sink has delivered at least `n` rows, or time out.
-    async fn wait_for_rows(&self, n: usize, timeout: Duration) -> bool {
+    /// Poll until the sink has delivered at least `n` rows. If the coordinator
+    /// task exits early (it should run until the source stops), surface its
+    /// error immediately rather than waiting out the timeout.
+    async fn wait_for_rows(
+        &mut self,
+        n: usize,
+        timeout: Duration,
+    ) -> Result<()> {
         let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
+        loop {
             if self.sink.total() >= n {
-                return true;
+                return Ok(());
+            }
+            if self.coord_task.as_ref().is_some_and(|t| t.is_finished()) {
+                let task = self.coord_task.take().unwrap();
+                return match task.await {
+                    Ok(Ok(())) => Err(anyhow::anyhow!(
+                        "coordinator exited early after {} of {n} rows",
+                        self.sink.total()
+                    )),
+                    Ok(Err(e)) => {
+                        Err(e.context("coordinator failed while streaming"))
+                    }
+                    Err(e) => {
+                        Err(anyhow::anyhow!("coordinator task panicked: {e}"))
+                    }
+                };
+            }
+            if Instant::now() >= deadline {
+                return Err(anyhow::anyhow!(
+                    "timed out waiting for {n} rows (delivered {})",
+                    self.sink.total()
+                ));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        self.sink.total() >= n
     }
 
     /// Stop the source; the coordinator drains whole transactions, commits the
-    /// boundary checkpoint, then exits.
-    async fn shutdown(self) -> Result<Vec<Vec<i64>>> {
+    /// boundary checkpoint, then exits. `_pause_tx` stays alive on `self` until
+    /// this returns, so the coordinator never sees a spurious pause-channel
+    /// close before it finishes.
+    async fn shutdown(mut self) -> Result<Vec<Vec<i64>>> {
         let batches = self.sink.batches();
         self.src_handle.stop();
         let _ = self.src_handle.join().await;
         // The source dropped its sender; the coordinator finishes and returns.
-        self.coord_task.await??;
+        if let Some(task) = self.coord_task.take() {
+            task.await??;
+        }
         Ok(batches)
     }
 }
@@ -266,7 +302,7 @@ async fn mysql_tx_intact_and_resume_from_commit() -> Result<()> {
 
     // ── Phase 1: a single 3-row transaction must arrive as one intact batch. ──
     let batches = {
-        let pipe = RunningPipeline::start(
+        let mut pipe = RunningPipeline::start(
             mysql_source("txc", &dsn, &db).await,
             store.clone(),
             "txc",
@@ -280,10 +316,7 @@ async fn mysql_tx_intact_and_resume_from_commit() -> Result<()> {
             .await?;
         conn.query_drop("COMMIT").await?;
 
-        assert!(
-            pipe.wait_for_rows(3, Duration::from_secs(15)).await,
-            "phase 1 should deliver all 3 rows"
-        );
+        pipe.wait_for_rows(3, Duration::from_secs(15)).await?;
         pipe.shutdown().await?
     };
 
@@ -300,16 +333,13 @@ async fn mysql_tx_intact_and_resume_from_commit() -> Result<()> {
     conn.query_drop("COMMIT").await?;
 
     // ── Phase 2: restart resumes from the committed checkpoint. ──
-    let pipe = RunningPipeline::start(
+    let mut pipe = RunningPipeline::start(
         mysql_source("txc", &dsn, &db).await,
         store.clone(),
         "txc",
     )
     .await;
-    assert!(
-        pipe.wait_for_rows(3, Duration::from_secs(20)).await,
-        "phase 2 should deliver the second transaction"
-    );
+    pipe.wait_for_rows(3, Duration::from_secs(20)).await?;
     let batches2 = pipe.shutdown().await?;
 
     let ids2: Vec<i64> = batches2.iter().flatten().copied().collect();
@@ -381,7 +411,7 @@ async fn postgres_tx_intact_and_resume_from_commit() -> Result<()> {
 
     // ── Phase 1: a single 3-row transaction must arrive as one intact batch. ──
     let batches = {
-        let pipe = RunningPipeline::start(
+        let mut pipe = RunningPipeline::start(
             pg_source("txc", &db, "slot_txc", "pub_txc").await,
             store.clone(),
             "txc",
@@ -397,10 +427,7 @@ async fn postgres_tx_intact_and_resume_from_commit() -> Result<()> {
             )
             .await?;
 
-        assert!(
-            pipe.wait_for_rows(3, Duration::from_secs(15)).await,
-            "phase 1 should deliver all 3 rows"
-        );
+        pipe.wait_for_rows(3, Duration::from_secs(15)).await?;
         pipe.shutdown().await?
     };
 
@@ -419,16 +446,13 @@ async fn postgres_tx_intact_and_resume_from_commit() -> Result<()> {
         .await?;
 
     // ── Phase 2: restart resumes from the committed checkpoint. ──
-    let pipe = RunningPipeline::start(
+    let mut pipe = RunningPipeline::start(
         pg_source("txc", &db, "slot_txc", "pub_txc").await,
         store.clone(),
         "txc",
     )
     .await;
-    assert!(
-        pipe.wait_for_rows(3, Duration::from_secs(20)).await,
-        "phase 2 should deliver the second transaction"
-    );
+    pipe.wait_for_rows(3, Duration::from_secs(20)).await?;
     let batches2 = pipe.shutdown().await?;
 
     let ids2: Vec<i64> = batches2.iter().flatten().copied().collect();
