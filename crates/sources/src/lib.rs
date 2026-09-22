@@ -8,6 +8,7 @@
 //! Each source captures row-level changes and emits them as `Event`s
 //! to be processed by the pipeline coordinator.
 
+pub mod durable_checkpoint;
 pub mod failover;
 pub mod identity_resolution;
 pub mod mysql;
