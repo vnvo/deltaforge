@@ -868,6 +868,25 @@ pub trait Processor: Send + Sync {
     fn identity_digest(&self) -> &str;
 }
 
+/// Authoritative per-batch delivery context, constructed by the coordinator /
+/// runner from **pre-processing** source state. It carries the batch's commit
+/// checkpoint and durable watermark so a sink never has to infer them from the
+/// surviving (post-processor) events - which is unreliable, because a processor
+/// can drop the event that carried the checkpoint and a fully-filtered
+/// transaction can leave an empty batch whose checkpoint must still advance.
+#[derive(Debug, Clone)]
+pub struct SinkBatchContext {
+    /// The batch's commit checkpoint (the source position it covers), captured
+    /// before any processor ran.
+    pub checkpoint: CheckpointMeta,
+    /// Serialized, source-aware durable watermark (carrying source lineage) for
+    /// HEAD ordering. Opaque here; the sink's injected [`CheckpointComparator`]
+    /// interprets it. `None` when durable ordering is not in use.
+    pub durable_watermark: Option<Vec<u8>>,
+    /// Optional stable batch identity for diagnostics/logging.
+    pub batch_id: Option<String>,
+}
+
 #[async_trait]
 pub trait Sink: Send + Sync {
     fn id(&self) -> &str;
@@ -889,6 +908,18 @@ pub trait Sink: Send + Sync {
             self.send(event).await?;
         }
         Ok(BatchResult::ok())
+    }
+
+    /// Send a batch with its authoritative [`SinkBatchContext`]. The default
+    /// delegates to [`Sink::send_batch`], so existing sinks are unaffected; the
+    /// durable S3 sink overrides this to derive its watermark from the context
+    /// (never from the events) and requires it to be present.
+    async fn send_batch_with_context(
+        &self,
+        events: &[Event],
+        _ctx: &SinkBatchContext,
+    ) -> SinkResult<BatchResult> {
+        self.send_batch(events).await
     }
 }
 
