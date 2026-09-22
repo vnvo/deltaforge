@@ -14,6 +14,7 @@ mod encoder;
 mod file_format;
 mod jsonl_writer;
 mod keys;
+mod manifest;
 mod object_writer;
 mod parquet_writer;
 mod rolling;
