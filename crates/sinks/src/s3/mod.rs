@@ -8,6 +8,7 @@
 //! Phase 1a/1b status: file format plumbing only (Parquet + JSON Lines). Sink
 //! trait wire-up and full feature set follow in later phases.
 
+mod batch_upload;
 mod durable_encode;
 mod encoder;
 mod file_format;
