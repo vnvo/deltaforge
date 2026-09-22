@@ -20,7 +20,6 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -61,8 +60,11 @@ pub type CondResult<T> = Result<T, CondError>;
 /// fencing primitive for durable S3 acknowledgements.
 #[async_trait]
 pub trait ConditionalStore: Send + Sync {
-    /// Create `key` only if absent (`If-None-Match: *`). `AlreadyExists` means it
-    /// is already present (a harmless idempotent retry of identical content).
+    /// Create `key` only if absent (`If-None-Match: *`). `AlreadyExists` proves
+    /// only that the key is present - **not** that its content matches. Callers
+    /// treating a retry as idempotent success MUST read the existing object and
+    /// validate its hash/content first; otherwise a hash collision or a
+    /// conflicting object could be silently accepted.
     async fn put_if_absent(
         &self,
         key: &Path,
@@ -175,67 +177,89 @@ impl ConditionalStore for ObjectStoreConditional {
     }
 }
 
-/// Process-unique-ish suffix for the throwaway probe key (no extra deps).
-fn probe_suffix() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{nanos:x}-{n:x}")
-}
-
 /// Non-destructive capability probe. Verifies the backend honors create-only and
-/// CAS conditions by exercising them **only under a unique throwaway key** under
-/// `prefix/_probe/`, which it deletes afterward - it never touches real data.
+/// CAS conditions by exercising them **only under a key this probe creates** under
+/// `prefix/_probe/`, then deleting exactly that key. It never issues an
+/// unconditional delete and never touches a key it did not create, so it cannot
+/// disturb a concurrent probe on another host.
 ///
-/// Returns `Err(CondError::Unsupported)` if the backend silently ignores a
-/// condition (create overwrites, stale CAS accepted, or no ETag returned).
-/// Durable mode must treat that as a fatal, fail-closed startup error.
+/// Returns `Err` if the backend silently ignores a condition
+/// (`CondError::Unsupported`), or if the probe created an object but could not
+/// clean it up (`CondError::Store`) - a successful probe must leave no trace, so
+/// cleanup failure is surfaced rather than silently reported as success. Durable
+/// mode must treat any `Err` as a fatal, fail-closed startup error.
 pub async fn probe_conditional_writes<S: ConditionalStore + ?Sized>(
     store: &S,
     prefix: &str,
 ) -> CondResult<()> {
-    let key = Path::from(format!("{}/_probe/{}", prefix, probe_suffix()));
-    // Best-effort clean of any stale probe object first.
-    let _ = store.delete(&key).await;
-
-    let result = probe_steps(store, &key).await;
-    // Always clean up the throwaway probe object, whatever the outcome.
-    let _ = store.delete(&key).await;
-    result
+    // A UUIDv4 collision is astronomically unlikely; retry a few times only to be
+    // safe, and never delete a colliding key - it may belong to another process.
+    const MAX_ATTEMPTS: usize = 5;
+    for _ in 0..MAX_ATTEMPTS {
+        let key =
+            Path::from(format!("{prefix}/_probe/{}", uuid::Uuid::new_v4()));
+        let created = store
+            .put_if_absent(&key, Bytes::from_static(b"probe-1"))
+            .await?;
+        match created {
+            PutOutcome::Written { .. } => {
+                // We own this key. Run the checks, then delete exactly it.
+                let checks = probe_steps(store, &key).await;
+                let cleanup = store.delete(&key).await;
+                checks?;
+                cleanup.map_err(|e| {
+                    CondError::Store(format!(
+                        "probe checks passed but cleanup of {key} failed: {e}"
+                    ))
+                })?;
+                return Ok(());
+            }
+            PutOutcome::AlreadyExists => {
+                // Collision with another probe's key: try a fresh key; do NOT
+                // delete it - it is not ours.
+                continue;
+            }
+            other => {
+                return Err(CondError::Unsupported(format!(
+                    "create-only on a fresh probe key returned {other:?}"
+                )));
+            }
+        }
+    }
+    Err(CondError::Store(format!(
+        "probe could not acquire a fresh key after {MAX_ATTEMPTS} attempts"
+    )))
 }
 
-/// The probe's conditional-write checks (cleanup is handled by the caller).
+/// The probe's conditional-write checks on a key this probe already created with
+/// `b"probe-1"`. Cleanup of the key is the caller's responsibility.
 async fn probe_steps<S: ConditionalStore + ?Sized>(
     store: &S,
     key: &Path,
 ) -> CondResult<()> {
-    // 1. create-only must succeed on an absent key.
-    match store
-        .put_if_absent(key, Bytes::from_static(b"probe-1"))
-        .await?
-    {
-        PutOutcome::Written { .. } => {}
-        other => {
-            return Err(CondError::Unsupported(format!(
-                "create-only on absent key returned {other:?}"
-            )));
-        }
-    }
-
-    // Capture the ETag - durable mode requires the backend to return one.
+    // Capture the create's ETag and verify the create stored what we wrote.
     let etag = match store.get_with_etag(key).await? {
-        Some((_, Some(etag))) => etag,
-        _ => {
+        Some((bytes, Some(etag))) => {
+            if bytes.as_ref() != b"probe-1" {
+                return Err(CondError::Unsupported(
+                    "create-only did not store the expected bytes".into(),
+                ));
+            }
+            etag
+        }
+        Some((_, None)) => {
             return Err(CondError::Unsupported(
                 "backend did not return an ETag".into(),
             ));
         }
+        None => {
+            return Err(CondError::Unsupported(
+                "created object not found on read-back".into(),
+            ));
+        }
     };
 
-    // 2. a second create-only MUST be rejected (not overwrite).
+    // A second create-only MUST be rejected (not overwrite).
     match store
         .put_if_absent(key, Bytes::from_static(b"probe-2"))
         .await?
@@ -248,7 +272,7 @@ async fn probe_steps<S: ConditionalStore + ?Sized>(
         }
     }
 
-    // 3. CAS with a wrong ETag MUST conflict.
+    // CAS with a wrong ETag MUST conflict.
     match store
         .cas_put(key, Bytes::from_static(b"probe-3"), "\"definitely-wrong\"")
         .await?
@@ -261,15 +285,59 @@ async fn probe_steps<S: ConditionalStore + ?Sized>(
         }
     }
 
-    // 4. CAS with the correct ETag MUST succeed.
-    match store
+    // CAS with the correct ETag MUST succeed and yield a fresh ETag.
+    let new_etag = match store
         .cas_put(key, Bytes::from_static(b"probe-4"), &etag)
         .await?
     {
-        PutOutcome::Written { .. } => {}
+        PutOutcome::Written { etag: Some(e) } => e,
+        PutOutcome::Written { etag: None } => {
+            return Err(CondError::Unsupported(
+                "CAS succeeded but returned no ETag".into(),
+            ));
+        }
         other => {
             return Err(CondError::Unsupported(format!(
                 "If-Match rejected a matching CAS: {other:?}"
+            )));
+        }
+    };
+    if new_etag == etag {
+        return Err(CondError::Unsupported(
+            "CAS did not advance the ETag".into(),
+        ));
+    }
+
+    // Re-read and verify the CAS actually took effect and a usable ETag exists.
+    match store.get_with_etag(key).await? {
+        Some((bytes, Some(cur))) => {
+            if bytes.as_ref() != b"probe-4" {
+                return Err(CondError::Unsupported(
+                    "CAS reported success but content did not change".into(),
+                ));
+            }
+            if cur.is_empty() {
+                return Err(CondError::Unsupported(
+                    "no usable current ETag after CAS".into(),
+                ));
+            }
+        }
+        _ => {
+            return Err(CondError::Unsupported(
+                "object missing or ETag-less after CAS".into(),
+            ));
+        }
+    }
+
+    // The stale pre-CAS ETag MUST no longer be accepted.
+    match store
+        .cas_put(key, Bytes::from_static(b"probe-5"), &etag)
+        .await?
+    {
+        PutOutcome::Conflict => {}
+        other => {
+            return Err(CondError::Unsupported(format!(
+                "stale ETag accepted after CAS: {other:?}"
             )));
         }
     }
@@ -281,6 +349,7 @@ async fn probe_steps<S: ConditionalStore + ?Sized>(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::Mutex;
 
     /// In-memory store with correct conditional semantics + monotonic ETags.
@@ -289,6 +358,7 @@ mod tests {
         // key -> (bytes, etag)
         map: Mutex<HashMap<String, (Bytes, String)>>,
         etag_seq: AtomicU64,
+        fail_delete: std::sync::atomic::AtomicBool,
     }
 
     impl MockCond {
@@ -342,6 +412,9 @@ mod tests {
         }
 
         async fn delete(&self, key: &Path) -> CondResult<()> {
+            if self.fail_delete.load(Ordering::Relaxed) {
+                return Err(CondError::Store("injected delete failure".into()));
+            }
             self.map.lock().await.remove(&key.to_string());
             Ok(())
         }
@@ -456,5 +529,21 @@ mod tests {
         let s = IgnoresConditions::default();
         let err = probe_conditional_writes(&s, "pfx").await.unwrap_err();
         assert!(matches!(err, CondError::Unsupported(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn probe_surfaces_cleanup_failure_instead_of_claiming_success() {
+        // Conditional semantics are correct, but the probe object cannot be
+        // removed. A successful probe must leave no trace, so this is an error,
+        // not a silent success.
+        let s = MockCond {
+            fail_delete: std::sync::atomic::AtomicBool::new(true),
+            ..Default::default()
+        };
+        let err = probe_conditional_writes(&s, "pfx").await.unwrap_err();
+        assert!(
+            matches!(err, CondError::Store(_)),
+            "cleanup failure must surface as an error, got {err:?}"
+        );
     }
 }
