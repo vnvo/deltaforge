@@ -5789,6 +5789,7 @@ dependencies = [
  "pgwire-replication",
  "processors",
  "rand 0.9.4",
+ "runner",
  "schema-registry",
  "scopeguard",
  "serde",

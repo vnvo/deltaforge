@@ -754,6 +754,13 @@ async fn postgres_cdc_pause_resume() -> Result<()> {
     .await;
     assert!(events.iter().any(|e| has_id(e, 1)));
 
+    // `collect_until` stops at the row event, leaving the transaction's
+    // TxBegin/TxCommit markers queued. Consume through the transaction boundary
+    // so a trailing marker is not mistaken for data emitted while paused.
+    while let Ok(Some(_)) = timeout(Duration::from_millis(500), rx.recv()).await
+    {
+    }
+
     handle.pause();
     sleep(Duration::from_secs(1)).await;
 
