@@ -285,6 +285,7 @@ where
                     break;
                 }
             }
+            Ok(Some(SourceItem::TxBegin { .. })) => continue,
             Ok(Some(SourceItem::TxCommit { .. })) => continue,
             _ => break,
         }

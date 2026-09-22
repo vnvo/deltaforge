@@ -102,7 +102,7 @@ pub(super) async fn dispatch_event(
         EventData::DeleteRows(dr) => handle_delete_rows(ctx, header, dr).await,
         EventData::Query(q) => handle_query(ctx, header, q).await,
         EventData::Gtid(gt) => {
-            handle_gtid(ctx, gt);
+            handle_gtid(ctx, gt).await;
             Ok(())
         }
         EventData::Rotate(rot) => {
@@ -214,7 +214,7 @@ async fn handle_write_rows(
         let event_len = header.event_length as usize;
         let checkpoint =
             make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid);
-        let transaction = ctx.last_gtid.as_ref().map(|gtid| Transaction {
+        let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
             id: gtid.clone(),
             total_order: None,
             data_collection_order: None,
@@ -302,7 +302,7 @@ async fn handle_update_rows(
         let event_len = header.event_length as usize;
         let checkpoint =
             make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid);
-        let transaction = ctx.last_gtid.as_ref().map(|gtid| Transaction {
+        let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
             id: gtid.clone(),
             total_order: None,
             data_collection_order: None,
@@ -392,7 +392,7 @@ async fn handle_delete_rows(
         let event_len = header.event_length as usize;
         let checkpoint =
             make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid);
-        let transaction = ctx.last_gtid.as_ref().map(|gtid| Transaction {
+        let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
             id: gtid.clone(),
             total_order: None,
             data_collection_order: None,
@@ -471,7 +471,7 @@ fn source_error_kind(e: &SourceError) -> &'static str {
     }
 }
 
-fn handle_gtid(
+async fn handle_gtid(
     ctx: &mut RunCtx,
     gt: mysql_binlog_connector_rust::event::gtid_event::GtidEvent,
 ) {
@@ -491,6 +491,10 @@ fn handle_gtid(
         None => gtid_str,
         Some(existing) => merge_gtid(existing, &gtid_str),
     });
+
+    // The GTID event is the unambiguous start of every transaction (row, DDL,
+    // or empty) — open it on the coordinator's stream.
+    emit_tx_begin(ctx).await;
 }
 
 /// Merge a single GTID (e.g. "uuid:21") into an existing set (e.g. "uuid:1-20").
@@ -555,21 +559,34 @@ async fn handle_xid(ctx: &mut RunCtx) {
     emit_tx_commit(ctx).await;
 }
 
-/// Emit a `TxCommit` boundary marker for the current transaction. `tx_id` is the
-/// exact per-transaction GTID (falling back to the binlog position when GTIDs
-/// are off); the checkpoint is the commit record's position. Best-effort send
-/// (a closed channel means shutdown).
+/// Open the current transaction on the coordinator's stream. `tx_id` is the
+/// exact per-transaction GTID — the same identity stamped on this transaction's
+/// events and its closing `TxCommit`. Only emitted in GTID mode; without a GTID
+/// there is no stable per-transaction identity, so events flow as standalone
+/// boundaries and no markers are sent. Best-effort (a closed channel = shutdown).
+async fn emit_tx_begin(ctx: &RunCtx) {
+    if let Some(tx_id) = ctx.current_gtid.clone() {
+        let _ = ctx.tx.send(SourceItem::TxBegin { tx_id }).await;
+    }
+}
+
+/// Emit a `TxCommit` boundary marker closing the current transaction and clear
+/// the per-transaction GTID. `tx_id` is the exact per-transaction GTID and the
+/// checkpoint is the commit record's position (the accumulated GTID set for
+/// resume). A no-op without a GTID, so it never emits a marker for a transaction
+/// that had no `TxBegin`. Best-effort send (a closed channel means shutdown).
 async fn emit_tx_commit(ctx: &mut RunCtx) {
-    let tx_id = ctx
-        .current_gtid
-        .clone()
-        .unwrap_or_else(|| format!("{}:{}", ctx.last_file, ctx.last_pos));
+    let Some(tx_id) = ctx.current_gtid.clone() else {
+        return;
+    };
     let checkpoint =
         make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid);
     let _ = ctx
         .tx
         .send(SourceItem::TxCommit { tx_id, checkpoint })
         .await;
+    // Transaction closed — the next transaction opens with its own GTID event.
+    ctx.current_gtid = None;
 }
 
 /// Extract table name from DDL statement.
@@ -701,9 +718,16 @@ async fn handle_query(
 ) -> SourceResult<()> {
     let sql_upper = q.query.to_uppercase();
 
-    // Skip transaction markers
-    if sql_upper == "BEGIN" || sql_upper == "COMMIT" || sql_upper == "ROLLBACK"
-    {
+    // BEGIN is a no-op: the transaction was already opened by its GTID event.
+    if sql_upper == "BEGIN" {
+        return Ok(());
+    }
+    // COMMIT / ROLLBACK close the transaction. Both are commit boundaries here:
+    // the binlog only contains durable changes (a mixed-engine rollback still
+    // persisted its non-transactional writes), and emitting the marker cleanly
+    // closes the transaction opened at BEGIN — including an empty one.
+    if sql_upper == "COMMIT" || sql_upper == "ROLLBACK" {
+        emit_tx_commit(ctx).await;
         return Ok(());
     }
 
@@ -759,7 +783,7 @@ async fn handle_query(
             "database": q.schema,
         });
 
-        let ev = Event::new_ddl(
+        let mut ev = Event::new_ddl(
             ddl_id,
             source_info,
             ddl_payload,
@@ -772,6 +796,13 @@ async fn handle_query(
             ctx.last_pos,
             &ctx.last_gtid,
         ));
+        // DDL is its own GTID transaction — stamp its identity so it belongs to
+        // the transaction opened at the GTID event and closed just below.
+        ev.transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
+            id: gtid.clone(),
+            total_order: None,
+            data_collection_order: None,
+        });
 
         if (ctx.tx.send(SourceItem::Event(ev)).await).is_err() {
             error!(source_id=%ctx.source_id, "channel send failed (op=ddl)");
@@ -884,7 +915,12 @@ mod tests {
             last_file: "mysql-bin.000001".to_string(),
             last_pos: 1234,
             last_gtid: Some("GTID-UNIT".to_string()),
-            current_gtid: None,
+            // A row event only occurs inside a GTID transaction; the per-tx
+            // GTID (a real `uuid:gno`) is the identity stamped on events, the
+            // TxBegin, and the TxCommit alike.
+            current_gtid: Some(
+                "3e11fa47-71ca-11e1-9e33-c80aa9429562:5".to_string(),
+            ),
             message_ordinal: 0,
             checkpoint_gtid: Some("GTID-UNIT".to_string()),
             checkpoint_file: "mysql-bin.000001".to_string(),
@@ -948,7 +984,10 @@ mod tests {
         assert_eq!(produced.source.table, "orders");
         assert_eq!(produced.tenant_id, Some("test-tenant".to_string()));
         assert!(produced.transaction.is_some());
-        assert_eq!(produced.transaction.as_ref().unwrap().id, "GTID-UNIT");
+        assert_eq!(
+            produced.transaction.as_ref().unwrap().id,
+            "3e11fa47-71ca-11e1-9e33-c80aa9429562:5"
+        );
     }
 
     #[tokio::test]
@@ -1497,8 +1536,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn handle_gtid_accumulates_executed_set() {
+    #[tokio::test]
+    async fn handle_gtid_accumulates_executed_set() {
         // handle_gtid must extend the resume GTID set; a no-op body would
         // lose progress and cause re-delivery on reconnect.
         let (tx, _rx) = mpsc::channel::<SourceItem>(1);
@@ -1510,7 +1549,8 @@ mod tests {
                 flags: 0,
                 gtid: "uuid-a:11".into(),
             },
-        );
+        )
+        .await;
         assert_eq!(ctx.last_gtid.as_deref(), Some("uuid-a:1-11"));
     }
 

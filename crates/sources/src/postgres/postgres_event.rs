@@ -123,6 +123,14 @@ pub(super) async fn dispatch_event(
             ctx.current_final_lsn = Some(final_lsn.to_string());
             ctx.change_ordinal = 0;
             ctx.message_ordinal = 0;
+            // Open the transaction on the coordinator's stream. tx_id matches the
+            // xid stamped on this transaction's events and its TxCommit marker.
+            let _ = ctx
+                .tx
+                .send(SourceItem::TxBegin {
+                    tx_id: xid.to_string(),
+                })
+                .await;
         }
         ReplicationEvent::Commit { lsn, end_lsn, .. } => {
             debug!(commit_lsn = %lsn, end_lsn = %end_lsn, "transaction commit");

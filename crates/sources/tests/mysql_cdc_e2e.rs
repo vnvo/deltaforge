@@ -66,6 +66,7 @@ where
                     break;
                 }
             }
+            Ok(Some(SourceItem::TxBegin { .. })) => continue,
             Ok(Some(SourceItem::TxCommit { .. })) => continue,
             Ok(None) | Err(_) => break,
         }

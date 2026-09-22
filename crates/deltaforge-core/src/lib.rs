@@ -723,6 +723,12 @@ impl BatchResult {
 pub enum SourceItem {
     /// A change event.
     Event(Event),
+    /// The start of a source transaction. `tx_id` matches the `transaction.id`
+    /// stamped on that transaction's events and the `tx_id` of its closing
+    /// [`SourceItem::TxCommit`]. Emitted exactly once per real transaction, so
+    /// the coordinator can tell a valid **empty** transaction (a begin followed
+    /// immediately by a commit) from a commit for an unknown transaction.
+    TxBegin { tx_id: String },
     /// A committed-transaction boundary. `checkpoint` is the COMMIT/XID
     /// **record's** position (not the last data event's), generated once by the
     /// source and passed through unchanged; `tx_id` matches the `transaction.id`

@@ -124,6 +124,7 @@ async fn next_event(
         let remaining = deadline.saturating_duration_since(Instant::now());
         match timeout(remaining, rx.recv()).await {
             Ok(Some(SourceItem::Event(e))) => return Some(e),
+            Ok(Some(SourceItem::TxBegin { .. })) => continue,
             Ok(Some(SourceItem::TxCommit { .. })) => continue,
             _ => return None,
         }

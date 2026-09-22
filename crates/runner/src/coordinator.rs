@@ -891,6 +891,10 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                         for item in drain_buf.drain(..) {
                             if respect_source_tx {
                                 match item {
+                                    // Transaction protocol validation lands in a
+                                    // follow-up commit; the marker only opens a
+                                    // transaction, it carries no batch data.
+                                    SourceItem::TxBegin { .. } => {}
                                     SourceItem::Event(ev) => {
                                         if ev.transaction.is_some() {
                                             // In-transaction event: buffer without
