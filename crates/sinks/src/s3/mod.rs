@@ -16,6 +16,7 @@ mod parquet_writer;
 mod rolling;
 mod router;
 mod sink;
+mod store_cond;
 mod writer_pool;
 
 pub use encoder::events_to_record_batch;
