@@ -42,18 +42,30 @@ pub enum WmPos {
     },
     /// MySQL GTID set (raw string; compared by set inclusion, not lexically).
     MysqlGtid { gtid_set: String },
-    /// MySQL non-GTID binlog coordinate: numeric file index + position.
-    MysqlBinlog { file_index: u64, pos: u64 },
+    /// MySQL non-GTID binlog coordinate. `file_base` is the filename prefix
+    /// (e.g. `"mysql-bin"`); it must match for two coordinates to be comparable,
+    /// so a differently-named binlog on a reused server id is Incomparable. The
+    /// numeric index (never the lexical filename) plus position gives the order.
+    MysqlBinlog {
+        file_base: String,
+        file_index: u64,
+        pos: u64,
+    },
     /// Snapshot progress: a per-table cursor vector (a partial order), a
-    /// generation, and whether the generation has completed.
+    /// generation, and `completed` - the explicit, durable completion marker that
+    /// is the ONLY thing permitting a snapshot->CDC transition (see [`order`]).
     Snapshot {
         generation: u64,
         completed: bool,
         table_cursors: BTreeMap<String, u64>,
     },
-    /// A standalone source with an opaque monotonic sequence.
-    Standalone { seq: u64 },
 }
+// NOTE: there is deliberately no "standalone sequence" variant. DDL, logical
+// messages and synthetic events inherit their real source/parent CDC coordinate
+// (PgLsn/MysqlGtid/MysqlBinlog); order is never manufactured from a sink- or
+// process-local counter that would reset on restart. An event with no durable
+// source ordering has no DurableWatermark and cannot be published to the durable
+// sink (fail closed at construction), rather than being given a fake order.
 
 impl DurableWatermark {
     pub fn new(lineage: PersistedLineage, pos: WmPos) -> Self {
@@ -89,11 +101,16 @@ pub fn parse_lsn(s: &str) -> Option<u64> {
     Some((hi << 32) | lo)
 }
 
-/// Extract the numeric file index from a binlog filename (`"mysql-bin.000009"`
-/// -> 9). Never assumes filenames sort lexically.
-pub fn binlog_file_index(file: &str) -> Option<u64> {
-    let suffix = file.rsplit_once('.').map(|(_, s)| s).unwrap_or(file);
-    suffix.parse::<u64>().ok()
+/// Split a binlog filename (`"mysql-bin.000009"`) into its base prefix
+/// (`"mysql-bin"`) and numeric index (`9`). Requires a `<base>.<digits>` shape;
+/// never assumes filenames sort lexically. Returns `None` on any other shape.
+pub fn binlog_file_parts(file: &str) -> Option<(String, u64)> {
+    let (base, suffix) = file.rsplit_once('.')?;
+    if base.is_empty() {
+        return None;
+    }
+    let index = suffix.parse::<u64>().ok()?;
+    Some((base.to_string(), index))
 }
 
 // ── GTID set parsing + inclusion ────────────────────────────────────────────
@@ -247,15 +264,22 @@ pub fn order(a: &DurableWatermark, b: &DurableWatermark) -> CheckpointOrder {
         },
         (
             WmPos::MysqlBinlog {
+                file_base: ba,
                 file_index: fa,
                 pos: pa,
             },
             WmPos::MysqlBinlog {
+                file_base: bb,
                 file_index: fb,
                 pos: pb,
             },
         ) => {
-            // Same lineage already checked; compare (file_index, pos) numerically.
+            // Same lineage already checked; also require the same filename base
+            // (a differently-named binlog on a reused server id is not the same
+            // coordinate space). Then compare (index, pos) numerically.
+            if ba != bb {
+                return CheckpointOrder::Incomparable;
+            }
             match fa.cmp(fb) {
                 std::cmp::Ordering::Equal => cmp_scalar(*pa, *pb),
                 std::cmp::Ordering::Less => CheckpointOrder::Before,
@@ -274,12 +298,11 @@ pub fn order(a: &DurableWatermark, b: &DurableWatermark) -> CheckpointOrder {
                 table_cursors: tb,
             },
         ) => snapshot_order(*ga, *ca, ta, *gb, *cb, tb),
-        (WmPos::Standalone { seq: sa }, WmPos::Standalone { seq: sb }) => {
-            cmp_scalar(*sa, *sb)
-        }
-        // Snapshot -> CDC lifecycle: a COMPLETED snapshot precedes the CDC that
-        // resumes after it (same lineage). An incomplete snapshot is not ordered
-        // against CDC.
+        // The ONLY permitted cross-variant transition: a COMPLETED snapshot of
+        // lineage L precedes CDC of lineage L. The `completed` flag is the
+        // explicit durable completion marker; an incomplete snapshot or a
+        // row-cursor snapshot is never ordered against CDC. (Lineage was already
+        // checked above.)
         (WmPos::Snapshot { completed, .. }, cdc) if is_cdc(cdc) => {
             if *completed {
                 CheckpointOrder::Before
@@ -336,19 +359,25 @@ fn snapshot_order(
     }
 }
 
-/// Component-wise partial order over table cursors.
+/// Component-wise dominance over table cursors.
+///
+/// The two vectors MUST describe the same table set. A missing component is
+/// **not** treated as zero: a `SnapshotVector` is always built over the full
+/// target table set (absent tables are explicit zeros), so differing key sets
+/// mean a lifecycle change (tables added/removed) and are Incomparable rather
+/// than risking a false Before that would let the sink skip a write.
 fn vector_order(
     a: &BTreeMap<String, u64>,
     b: &BTreeMap<String, u64>,
 ) -> CheckpointOrder {
+    if a.len() != b.len() || !a.keys().eq(b.keys()) {
+        return CheckpointOrder::Incomparable;
+    }
     let mut any_less = false;
     let mut any_greater = false;
-    let keys: std::collections::BTreeSet<&String> =
-        a.keys().chain(b.keys()).collect();
-    for k in keys {
-        let va = a.get(k).copied().unwrap_or(0);
-        let vb = b.get(k).copied().unwrap_or(0);
-        match va.cmp(&vb) {
+    for (k, va) in a {
+        let vb = b.get(k).expect("key sets equal");
+        match va.cmp(vb) {
             std::cmp::Ordering::Less => any_less = true,
             std::cmp::Ordering::Greater => any_greater = true,
             std::cmp::Ordering::Equal => {}
@@ -359,6 +388,81 @@ fn vector_order(
         (true, false) => CheckpointOrder::Before,
         (false, true) => CheckpointOrder::After,
         (true, true) => CheckpointOrder::Incomparable,
+    }
+}
+
+/// Owns and advances a snapshot's per-table cursor vector.
+///
+/// Ownership: the durable sink holds one `SnapshotVector` per active snapshot
+/// generation. It is initialized with the **full target table set** (all cursors
+/// at 0) so there are never "missing" components; per-table progress is merged
+/// monotonically (max), so parallel-table updates join into a single monotonic
+/// vector. Each emitted batch takes the **complete** current vector as its
+/// proposed watermark (never inferred from just the last event), which therefore
+/// dominates every position the batch delivered. On restart the vector is rebuilt
+/// from HEAD's watermark via [`SnapshotVector::from_watermark`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotVector {
+    generation: u64,
+    completed: bool,
+    cursors: BTreeMap<String, u64>,
+}
+
+impl SnapshotVector {
+    /// Start a generation over `tables`, all cursors at 0.
+    pub fn new(generation: u64, tables: &[String]) -> Self {
+        Self {
+            generation,
+            completed: false,
+            cursors: tables.iter().map(|t| (t.clone(), 0)).collect(),
+        }
+    }
+
+    /// Merge per-table progress monotonically. A cursor never moves backward;
+    /// an unknown table is ignored (the target set is fixed at construction).
+    pub fn observe(&mut self, table: &str, cursor: u64) {
+        if let Some(c) = self.cursors.get_mut(table) {
+            *c = (*c).max(cursor);
+        }
+    }
+
+    /// Mark the generation durably complete (permits the snapshot->CDC order).
+    pub fn mark_completed(&mut self) {
+        self.completed = true;
+    }
+
+    pub fn completed(&self) -> bool {
+        self.completed
+    }
+
+    /// The complete current position, for use as a batch's proposed watermark.
+    pub fn to_pos(&self) -> WmPos {
+        WmPos::Snapshot {
+            generation: self.generation,
+            completed: self.completed,
+            table_cursors: self.cursors.clone(),
+        }
+    }
+
+    /// The full watermark (position + lineage) for a batch.
+    pub fn watermark(&self, lineage: PersistedLineage) -> DurableWatermark {
+        DurableWatermark::new(lineage, self.to_pos())
+    }
+
+    /// Rebuild from a stored watermark (restart survival).
+    pub fn from_watermark(w: &DurableWatermark) -> Option<Self> {
+        match &w.pos {
+            WmPos::Snapshot {
+                generation,
+                completed,
+                table_cursors,
+            } => Some(Self {
+                generation: *generation,
+                completed: *completed,
+                cursors: table_cursors.clone(),
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -521,10 +625,12 @@ mod tests {
     // ── MySQL non-GTID binlog ───────────────────────────────────────────────
 
     fn binlog_wm(server: u32, file: &str, pos: u64) -> DurableWatermark {
+        let (base, index) = binlog_file_parts(file).unwrap();
         DurableWatermark::new(
             server_lineage(server),
             WmPos::MysqlBinlog {
-                file_index: binlog_file_index(file).unwrap(),
+                file_base: base,
+                file_index: index,
                 pos,
             },
         )
@@ -657,11 +763,10 @@ mod tests {
     }
 
     #[test]
-    fn cross_variant_cdc_types_are_incomparable() {
-        // Same PG lineage cannot suddenly be a GTID position; force a mismatch by
-        // pairing a PG position with a MySQL-binlog position under one lineage
-        // (an impossible-but-defensive case).
-        let a = DurableWatermark::new(
+    fn cross_variant_pg_vs_incomplete_snapshot_is_incomparable() {
+        // A CDC position and an INCOMPLETE snapshot of the same lineage are not
+        // ordered (only a completed snapshot precedes CDC).
+        let cdc = DurableWatermark::new(
             pg_lineage(1),
             WmPos::PgLsn {
                 lsn: 10,
@@ -669,17 +774,119 @@ mod tests {
                 tx_id: None,
             },
         );
-        let b =
-            DurableWatermark::new(pg_lineage(1), WmPos::Standalone { seq: 3 });
-        assert_eq!(ord(&a, &b), CheckpointOrder::Incomparable);
+        let partial = snap(1, false, &[("orders", 10)]);
+        assert_eq!(ord(&cdc, &partial), CheckpointOrder::Incomparable);
+        assert_eq!(ord(&partial, &cdc), CheckpointOrder::Incomparable);
     }
 
     #[test]
-    fn standalone_orders_by_seq() {
-        let a =
-            DurableWatermark::new(pg_lineage(1), WmPos::Standalone { seq: 1 });
-        let b =
-            DurableWatermark::new(pg_lineage(1), WmPos::Standalone { seq: 2 });
-        assert_eq!(ord(&a, &b), CheckpointOrder::Before);
+    fn binlog_different_file_base_is_incomparable() {
+        // Same server id, same index, but a differently-named binlog: not the
+        // same coordinate space.
+        let (b1, i1) = binlog_file_parts("mysql-bin.000009").unwrap();
+        let (b2, i2) = binlog_file_parts("binlog.000009").unwrap();
+        let a = DurableWatermark::new(
+            server_lineage(1),
+            WmPos::MysqlBinlog {
+                file_base: b1,
+                file_index: i1,
+                pos: 4,
+            },
+        );
+        let b = DurableWatermark::new(
+            server_lineage(1),
+            WmPos::MysqlBinlog {
+                file_base: b2,
+                file_index: i2,
+                pos: 4,
+            },
+        );
+        assert_eq!(ord(&a, &b), CheckpointOrder::Incomparable);
+    }
+
+    // ── SnapshotVector construction / restart / dominance ───────────────────
+
+    #[test]
+    fn snapshot_vector_merges_progress_monotonically() {
+        let tables = vec!["orders".to_string(), "users".to_string()];
+        let mut v = SnapshotVector::new(1, &tables);
+        v.observe("orders", 100);
+        v.observe("users", 50);
+        // A late/out-of-order lower cursor must NOT move it backward.
+        v.observe("orders", 30);
+        v.observe("orders", 150);
+        // Unknown table is ignored (fixed target set).
+        v.observe("audit", 999);
+        match v.to_pos() {
+            WmPos::Snapshot { table_cursors, .. } => {
+                assert_eq!(table_cursors.get("orders"), Some(&150));
+                assert_eq!(table_cursors.get("users"), Some(&50));
+                assert!(!table_cursors.contains_key("audit"));
+            }
+            _ => panic!("expected snapshot"),
+        }
+    }
+
+    #[test]
+    fn snapshot_vector_batches_are_ordered_and_dominate() {
+        let tables = vec!["orders".to_string(), "users".to_string()];
+        let mut v = SnapshotVector::new(1, &tables);
+        v.observe("orders", 100);
+        v.observe("users", 40);
+        let earlier = v.watermark(pg_lineage(1));
+        // Parallel-table updates join into one monotonic vector.
+        v.observe("users", 90);
+        v.observe("orders", 250);
+        let later = v.watermark(pg_lineage(1));
+
+        assert_eq!(ord(&earlier, &later), CheckpointOrder::Before);
+        assert_eq!(ord(&later, &earlier), CheckpointOrder::After);
+        // A dominated (earlier) batch's components are all <= the later vector.
+        if let (
+            WmPos::Snapshot {
+                table_cursors: e, ..
+            },
+            WmPos::Snapshot {
+                table_cursors: l, ..
+            },
+        ) = (earlier.pos, later.pos)
+        {
+            for (t, ec) in &e {
+                assert!(ec <= l.get(t).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_vector_survives_restart_via_head() {
+        let tables = vec!["orders".to_string(), "users".to_string()];
+        let mut v = SnapshotVector::new(3, &tables);
+        v.observe("orders", 100);
+        v.observe("users", 200);
+        v.mark_completed();
+        let stored = v.watermark(pg_lineage(1)).to_bytes();
+
+        // Restart: rebuild from the stored watermark bytes.
+        let parsed = DurableWatermark::parse(&stored).unwrap();
+        let restored = SnapshotVector::from_watermark(&parsed).unwrap();
+        assert_eq!(restored, v);
+        assert!(restored.completed());
+        // Same position compares Equal to the original.
+        assert_eq!(
+            ord(
+                &restored.watermark(pg_lineage(1)),
+                &v.watermark(pg_lineage(1))
+            ),
+            CheckpointOrder::Equal
+        );
+    }
+
+    #[test]
+    fn snapshot_vectors_over_different_table_sets_are_incomparable() {
+        // A lifecycle change (table set differs) must not be forced into an
+        // order by defaulting missing components to zero.
+        let a = snap(1, false, &[("orders", 100)]);
+        let b = snap(1, false, &[("orders", 100), ("users", 0)]);
+        assert_eq!(ord(&a, &b), CheckpointOrder::Incomparable);
     }
 }
