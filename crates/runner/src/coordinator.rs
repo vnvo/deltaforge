@@ -146,10 +146,20 @@ fn close_tx(
     had_events
 }
 
-/// Record that a standalone (non-transactional) event is its own boundary.
+/// Record that a standalone (non-transactional) event is its own boundary. The
+/// event's durable watermark (paired atomically with its checkpoint at the
+/// source via `Event::set_boundary`) becomes the batch's boundary watermark, so
+/// a non-GTID CDC row or snapshot row carries a watermark exactly like a commit
+/// marker does. The latest standalone boundary wins, matching the checkpoint the
+/// batch resumes from.
 fn commit_standalone(b: &mut BuildingBatch) {
     b.committed_len = b.raw.len();
     b.committed_bytes = b.bytes;
+    if let Some(last) = b.raw.last() {
+        if let Some(wm) = last.durable_watermark.clone() {
+            b.boundary_watermark = Some(wm);
+        }
+    }
 }
 
 /// A flush is due when the whole-transaction prefix has reached the soft size
@@ -3697,6 +3707,63 @@ mod tests {
             d[0].2.as_deref(),
             Some(&b"WATERMARK"[..]),
             "boundary watermark reaches the context despite full filtering"
+        );
+    }
+
+    /// A standalone (non-transactional) CDC event - e.g. a non-GTID MySQL row,
+    /// which has no TxCommit - carries its durable watermark atomically via
+    /// `Event::set_boundary`; that watermark reaches the sink context and
+    /// survives a processor that filters the event away.
+    #[tokio::test]
+    async fn standalone_event_boundary_watermark_reaches_context() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = CtxSink::new();
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        let cp_fn = build_commit_fn(store, "src::sink::ctx".to_string());
+        // Filter the event away to prove the watermark is carried on the batch,
+        // not on the surviving events.
+        let procs: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![Arc::new(DropAllProcessor) as _]);
+        let batch_processor = build_batch_processor(procs, "test".to_string());
+        let coord = Coordinator::builder("test-standalone-wm")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(1000),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_fn("ctx", cp_fn)
+            .process_fn(batch_processor)
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        // A standalone event (no `transaction`, no TxBegin/TxCommit) carrying an
+        // atomic boundary: checkpoint + binlog file/pos watermark.
+        let mut ev = tx_event(1, "unused", b"unused");
+        ev.transaction = None;
+        ev.set_boundary(deltaforge_core::SourceBoundary {
+            checkpoint: CheckpointMeta::from_vec(b"binlog-cp".to_vec()),
+            durable_watermark: Some(std::sync::Arc::from(
+                b"BINLOG-WM".to_vec(),
+            )),
+        });
+        tx.send(SourceItem::Event(ev)).await.unwrap();
+        drop(tx);
+        coord.run(rx, cancel, pause_rx).await.unwrap();
+
+        let d = sink.deliveries();
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].0, 0, "standalone event filtered -> empty batch");
+        assert_eq!(
+            d[0].2.as_deref(),
+            Some(&b"BINLOG-WM"[..]),
+            "standalone event's carried watermark reaches the context"
         );
     }
 }

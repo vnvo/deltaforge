@@ -219,6 +219,9 @@ async fn handle_write_rows(
             total_order: None,
             data_collection_order: None,
         });
+        // Standalone (non-GTID) rows carry their binlog watermark atomically
+        // with their checkpoint; shared across every row in this binlog event.
+        let standalone_wm = standalone_row_watermark(ctx, &transaction);
         let fingerprint_str = loaded.fingerprint.to_string();
         let is_outbox = !ctx.outbox_tables.is_empty()
             && ctx.outbox_tables.matches(&tm.database_name, &tm.table_name);
@@ -253,6 +256,12 @@ async fn handle_write_rows(
             .with_checkpoint(checkpoint.clone());
 
             ev.transaction = transaction.clone();
+            if let Some(wm) = &standalone_wm {
+                ev.set_boundary(deltaforge_core::SourceBoundary {
+                    checkpoint: checkpoint.clone(),
+                    durable_watermark: Some(wm.clone()),
+                });
+            }
             if is_outbox {
                 ev.source.schema = Some(OUTBOX_SCHEMA_SENTINEL.into());
             }
@@ -307,6 +316,9 @@ async fn handle_update_rows(
             total_order: None,
             data_collection_order: None,
         });
+        // Standalone (non-GTID) rows carry their binlog watermark atomically
+        // with their checkpoint; shared across every row in this binlog event.
+        let standalone_wm = standalone_row_watermark(ctx, &transaction);
         let fingerprint_str = loaded.fingerprint.to_string();
         let sequence = ctx.schema.current_sequence();
 
@@ -347,6 +359,12 @@ async fn handle_update_rows(
             .with_checkpoint(checkpoint.clone());
 
             ev.transaction = transaction.clone();
+            if let Some(wm) = &standalone_wm {
+                ev.set_boundary(deltaforge_core::SourceBoundary {
+                    checkpoint: checkpoint.clone(),
+                    durable_watermark: Some(wm.clone()),
+                });
+            }
             ev.schema_version = Some(fingerprint_str.clone());
             ev.schema_sequence = Some(sequence);
 
@@ -397,6 +415,9 @@ async fn handle_delete_rows(
             total_order: None,
             data_collection_order: None,
         });
+        // Standalone (non-GTID) rows carry their binlog watermark atomically
+        // with their checkpoint; shared across every row in this binlog event.
+        let standalone_wm = standalone_row_watermark(ctx, &transaction);
         let fingerprint_str = loaded.fingerprint.to_string();
         let sequence = ctx.schema.current_sequence();
 
@@ -428,6 +449,12 @@ async fn handle_delete_rows(
             .with_checkpoint(checkpoint.clone());
 
             ev.transaction = transaction.clone();
+            if let Some(wm) = &standalone_wm {
+                ev.set_boundary(deltaforge_core::SourceBoundary {
+                    checkpoint: checkpoint.clone(),
+                    durable_watermark: Some(wm.clone()),
+                });
+            }
             ev.schema_version = Some(fingerprint_str.clone());
             ev.schema_sequence = Some(sequence);
 
@@ -589,6 +616,21 @@ async fn emit_tx_commit(ctx: &mut RunCtx) {
     let _ = ctx.tx.send(SourceItem::TxCommit { tx_id, boundary }).await;
     // Transaction closed - the next transaction opens with its own GTID event.
     ctx.current_gtid = None;
+}
+
+/// A standalone CDC row (non-GTID mode: no enclosing transaction, hence no
+/// `TxCommit`) carries its own durable boundary. Returns the binlog file/pos
+/// watermark to pair atomically with the row's checkpoint, or `None` in GTID
+/// mode (the watermark flows via the commit marker) or when lineage is
+/// unavailable (durable mode fails closed at the sink; never synthesized).
+fn standalone_row_watermark(
+    ctx: &RunCtx,
+    transaction: &Option<Transaction>,
+) -> Option<std::sync::Arc<[u8]>> {
+    if transaction.is_some() {
+        return None;
+    }
+    build_cdc_watermark(ctx)
 }
 
 /// Build the source-aware CDC watermark for the current commit boundary from the
@@ -1162,6 +1204,98 @@ mod tests {
             "position.gtid must be the exact per-tx GTID, not the merged set"
         );
         assert_eq!(produced.source.position.row, Some(0));
+    }
+
+    #[tokio::test]
+    async fn non_gtid_standalone_row_carries_atomic_binlog_boundary() {
+        use crate::durable_checkpoint::{DurableWatermark, WmPos};
+        use crate::snapshot_generation::PersistedLineage;
+
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        // Non-GTID mode: no per-transaction GTID, frozen server lineage.
+        ctx.current_gtid = None;
+        ctx.last_gtid = None;
+        ctx.last_file = "mysql-bin.000009".to_string();
+        ctx.last_pos = 6789;
+        ctx.durable_lineage = Some(PersistedLineage::MysqlServer {
+            server_id: 1,
+            file: "mysql-bin.000009".to_string(),
+        });
+
+        let ev = WriteRowsEvent {
+            table_id: TABLE_ID,
+            included_columns: vec![true, true],
+            rows: vec![RowEvent {
+                column_values: vec![
+                    ColumnValue::LongLong(1),
+                    ColumnValue::String(b"sku-1".to_vec()),
+                ],
+            }],
+        };
+        handle_write_rows(&mut ctx, &make_header(), ev)
+            .await
+            .expect("write rows should succeed");
+
+        let produced = recv_event(&mut rx).await.expect("expected one event");
+        // Standalone: no enclosing transaction, no TxCommit will follow.
+        assert!(
+            produced.transaction.is_none(),
+            "non-GTID row must be standalone"
+        );
+        // The row carries a durable watermark atomically with its checkpoint.
+        let wm_bytes = produced
+            .durable_watermark
+            .expect("standalone row has watermark");
+        let wm = DurableWatermark::parse(&wm_bytes).expect("valid watermark");
+        match wm.pos {
+            WmPos::MysqlBinlog {
+                file_base,
+                file_index,
+                pos,
+            } => {
+                assert_eq!(file_base, "mysql-bin");
+                assert_eq!(file_index, 9);
+                assert_eq!(pos, 6789, "watermark pos == checkpoint pos");
+            }
+            other => panic!("expected binlog watermark, got {other:?}"),
+        }
+        // The paired checkpoint describes the same file/pos.
+        let cp: MySqlCheckpoint = serde_json::from_slice(
+            produced.checkpoint.as_ref().unwrap().as_bytes(),
+        )
+        .expect("checkpoint deserializes");
+        assert_eq!(cp.file, "mysql-bin.000009");
+        assert_eq!(cp.pos, 6789);
+    }
+
+    #[tokio::test]
+    async fn gtid_row_has_no_standalone_watermark() {
+        // In GTID mode the row is transactional; its watermark flows via the
+        // TxCommit marker, so the row itself carries none.
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx); // current_gtid = Some(..) by default
+
+        let ev = WriteRowsEvent {
+            table_id: TABLE_ID,
+            included_columns: vec![true, true],
+            rows: vec![RowEvent {
+                column_values: vec![
+                    ColumnValue::LongLong(1),
+                    ColumnValue::String(b"sku-1".to_vec()),
+                ],
+            }],
+        };
+        handle_write_rows(&mut ctx, &make_header(), ev)
+            .await
+            .expect("write rows should succeed");
+
+        let produced = recv_event(&mut rx).await.expect("expected one event");
+        assert!(produced.transaction.is_some(), "GTID row is transactional");
+        assert!(
+            produced.durable_watermark.is_none(),
+            "GTID row watermark flows via TxCommit, not on the row"
+        );
     }
 
     #[tokio::test]

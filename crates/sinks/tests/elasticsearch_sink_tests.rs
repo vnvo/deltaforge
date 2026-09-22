@@ -136,6 +136,7 @@ fn mk_event(op: Op, after: Value, before: Value, ts: i64) -> Event {
         tx_end: false,
         checkpoint: None,
         size_bytes: 0,
+        durable_watermark: None,
         received_at_ms: 0,
     }
 }

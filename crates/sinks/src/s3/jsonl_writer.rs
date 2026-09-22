@@ -400,6 +400,7 @@ mod tests {
             tx_end: false,
             checkpoint: None,
             size_bytes: 0,
+            durable_watermark: None,
             received_at_ms: i,
         };
 
@@ -468,6 +469,7 @@ mod tests {
             tx_end: false,
             checkpoint: None,
             size_bytes: 0,
+            durable_watermark: None,
             received_at_ms: i,
         };
 
@@ -545,6 +547,7 @@ mod tests {
             tx_end: false,
             checkpoint: None,
             size_bytes: 0,
+            durable_watermark: None,
             received_at_ms: 0,
         };
 

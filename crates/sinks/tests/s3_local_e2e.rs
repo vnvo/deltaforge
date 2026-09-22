@@ -75,6 +75,7 @@ fn event_on(day: u32, table: &str, id: i64, email: &str) -> Event {
         tx_end: false,
         checkpoint: None,
         size_bytes: 0,
+        durable_watermark: None,
         received_at_ms: ts_ms,
     }
 }

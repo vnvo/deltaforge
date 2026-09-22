@@ -430,6 +430,16 @@ pub struct Event {
     #[serde(skip)]
     pub checkpoint: Option<CheckpointMeta>,
 
+    /// Durable source watermark for this event's boundary, paired atomically
+    /// with `checkpoint` for standalone (non-transactional) events that have no
+    /// [`SourceItem::TxCommit`] - e.g. non-GTID MySQL CDC rows and snapshot
+    /// rows. Set only via [`Event::set_boundary`]/[`Event::with_boundary`] so it
+    /// can never describe a different state than `checkpoint`. `None` for events
+    /// with no durable boundary; the durable sink fails closed when it is
+    /// required and absent. Internal - never serialized to the wire.
+    #[serde(skip)]
+    pub durable_watermark: Option<Arc<[u8]>>,
+
     /// Estimated event size in bytes for batching
     #[serde(skip)]
     pub size_bytes: usize,
@@ -449,6 +459,21 @@ fn now_ms() -> i64 {
 }
 
 impl Event {
+    /// Stamp this event's durable boundary: its resume `checkpoint` and the
+    /// durable watermark for the SAME source state, set together from one
+    /// [`SourceBoundary`] so the two can never drift. Used by sources for
+    /// standalone (non-transactional) events that carry their own boundary.
+    pub fn set_boundary(&mut self, boundary: SourceBoundary) {
+        self.checkpoint = Some(boundary.checkpoint);
+        self.durable_watermark = boundary.durable_watermark;
+    }
+
+    /// Builder form of [`Event::set_boundary`].
+    pub fn with_boundary(mut self, boundary: SourceBoundary) -> Self {
+        self.set_boundary(boundary);
+        self
+    }
+
     /// Create a new row-change event. The stable `event_id` is required -
     /// sources must derive it before emission.
     #[allow(clippy::too_many_arguments)]
@@ -480,6 +505,7 @@ impl Event {
             tx_end: true,
             checkpoint: None,
             size_bytes,
+            durable_watermark: None,
             received_at_ms: now_ms(),
         }
     }
@@ -511,6 +537,7 @@ impl Event {
             tx_end: true,
             checkpoint: None,
             size_bytes,
+            durable_watermark: None,
             received_at_ms: now_ms(),
         }
     }
@@ -542,6 +569,7 @@ impl Event {
             tx_end: true,
             checkpoint: None,
             size_bytes,
+            durable_watermark: None,
             received_at_ms: now_ms(),
         }
     }
