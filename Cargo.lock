@@ -5687,6 +5687,7 @@ dependencies = [
  "redis",
  "reqwest",
  "serde_json",
+ "sha2 0.10.9",
  "shellexpand",
  "tempfile",
  "testcontainers",

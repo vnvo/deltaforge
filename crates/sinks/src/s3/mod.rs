@@ -8,9 +8,11 @@
 //! Phase 1a/1b status: file format plumbing only (Parquet + JSON Lines). Sink
 //! trait wire-up and full feature set follow in later phases.
 
+mod durable_encode;
 mod encoder;
 mod file_format;
 mod jsonl_writer;
+mod keys;
 mod object_writer;
 mod parquet_writer;
 mod rolling;
