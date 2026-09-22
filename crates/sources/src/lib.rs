@@ -15,6 +15,7 @@ pub mod mysql;
 pub mod postgres;
 pub mod schema_loader;
 pub mod snapshot_event_id;
+pub mod snapshot_frontier;
 pub mod snapshot_generation;
 
 use anyhow::Result;
