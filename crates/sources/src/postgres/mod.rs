@@ -17,7 +17,9 @@ use tracing::{debug, error, info, warn};
 
 use checkpoints::{CheckpointStore, CheckpointStoreExt};
 use common::{AllowList, RetryPolicy, pause_until_resumed};
-use deltaforge_core::{Event, Source, SourceError, SourceHandle, SourceResult};
+use deltaforge_core::{
+    Source, SourceError, SourceHandle, SourceItem, SourceResult,
+};
 use storage::BackendCheckpointStore;
 
 use crate::snapshot_generation::PersistedLineage;
@@ -116,7 +118,7 @@ pub(crate) struct RunCtx {
     pub default_schema: String,
     pub dsn: String,
     pub slot: String,
-    pub tx: mpsc::Sender<Event>,
+    pub tx: mpsc::Sender<SourceItem>,
     #[allow(dead_code)]
     pub chkpt: Arc<dyn CheckpointStore>,
     pub cancel: CancellationToken,
@@ -315,7 +317,7 @@ impl PostgresSource {
 
     async fn run_inner(
         &self,
-        tx: mpsc::Sender<Event>,
+        tx: mpsc::Sender<SourceItem>,
         chkpt_store: Arc<dyn CheckpointStore>,
         cancel: CancellationToken,
         paused: Arc<AtomicBool>,
@@ -686,7 +688,7 @@ impl PostgresSource {
 impl Source for PostgresSource {
     async fn run(
         &self,
-        tx: mpsc::Sender<Event>,
+        tx: mpsc::Sender<SourceItem>,
         chkpt_store: Arc<dyn CheckpointStore>,
     ) -> SourceHandle {
         let cancel = CancellationToken::new();

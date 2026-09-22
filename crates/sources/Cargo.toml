@@ -49,6 +49,10 @@ tracing-subscriber = { version = "0.3", features = [
 ] }
 tempfile = "3"
 processors ={ path = "../processors"}
+# Dev-only: source→coordinator acceptance tests exercise the real coordinator.
+# This is a dev-dependency cycle (runner depends on sources), which Cargo allows
+# because dev-dependencies are excluded from the normal build graph.
+runner = { path = "../runner" }
 
 [lints]
 workspace = true

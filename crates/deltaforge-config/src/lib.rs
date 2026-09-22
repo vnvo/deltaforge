@@ -293,6 +293,20 @@ pub struct ConnectionLimits {
     pub max_dedicated_per_source: Option<u32>,
 }
 
+/// What to do when a single source transaction exceeds the accumulation limits
+/// (`max_tx_events` / `max_tx_bytes`) while `respect_source_tx` is in effect.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OversizedTxPolicy {
+    /// Stop the pipeline with a typed fatal error rather than split or drop the
+    /// transaction. The transaction is replayed whole from the last checkpoint
+    /// on restart. This is the only supported policy in the first cut.
+    #[default]
+    Fail,
+}
+
 /// The pipeline-level batch (the **commit unit**). Coordinator will build batches
 /// using these thresholds and checkpoint after a batch is accepted by sinks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,6 +322,15 @@ pub struct BatchConfig {
     pub respect_source_tx: Option<bool>,
     /// How many batches may be in-flight concurrently (keep 1 until we add WAL).
     pub max_inflight: Option<usize>,
+    /// Hard cap on events buffered for one source transaction before the
+    /// `oversized_tx` policy fires. Only consulted when `respect_source_tx`.
+    pub max_tx_events: Option<usize>,
+    /// Hard cap on accumulated serialized bytes for one source transaction
+    /// before the `oversized_tx` policy fires. Only consulted when
+    /// `respect_source_tx`.
+    pub max_tx_bytes: Option<usize>,
+    /// What to do when a transaction exceeds `max_tx_events`/`max_tx_bytes`.
+    pub oversized_tx: Option<OversizedTxPolicy>,
 }
 
 impl Default for BatchConfig {
@@ -318,6 +341,9 @@ impl Default for BatchConfig {
             max_ms: Some(50),
             respect_source_tx: Some(true),
             max_inflight: Some(1),
+            max_tx_events: Some(1_000_000),
+            max_tx_bytes: Some(512 * 1024 * 1024),
+            oversized_tx: Some(OversizedTxPolicy::Fail),
         }
     }
 }

@@ -2,7 +2,8 @@ use anyhow::Result;
 use async_trait::async_trait;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
 use deltaforge_core::{
-    Event, Op, Source, SourceHandle, SourceInfo, SourcePosition, SourceResult,
+    Event, Op, Source, SourceHandle, SourceInfo, SourceItem, SourcePosition,
+    SourceResult,
 };
 use std::sync::{
     Arc,
@@ -30,7 +31,7 @@ struct FakeSource {
 impl Source for FakeSource {
     async fn run(
         &self,
-        tx: mpsc::Sender<Event>,
+        tx: mpsc::Sender<SourceItem>,
         _ckpt: Arc<dyn CheckpointStore>,
     ) -> SourceHandle {
         let cancel = CancellationToken::new();
@@ -89,7 +90,7 @@ impl Source for FakeSource {
                 .with_tenant(tenant.clone());
 
                 // If the receiver is dropped, end the task.
-                if tx.send(ev).await.is_err() {
+                if tx.send(SourceItem::Event(ev)).await.is_err() {
                     break;
                 }
                 n += 1;
@@ -125,7 +126,7 @@ async fn source_handle_pause_resume_stop_join() -> Result<()> {
         period: Duration::from_millis(50),
     };
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-    let (tx, mut rx) = mpsc::channel::<Event>(128);
+    let (tx, mut rx) = mpsc::channel::<SourceItem>(128);
 
     // start and keep handle
     let handle = src.run(tx, ckpt).await;

@@ -21,7 +21,9 @@ use common::{AllowList, RetryPolicy, pause_until_resumed};
 use storage::BackendCheckpointStore;
 
 use crate::snapshot_generation::PersistedLineage;
-use deltaforge_core::{Event, Source, SourceError, SourceHandle, SourceResult};
+use deltaforge_core::{
+    Source, SourceError, SourceHandle, SourceItem, SourceResult,
+};
 mod mysql_errors;
 pub use mysql_errors::{LoopControl, MySqlSourceError, MySqlSourceResult};
 
@@ -100,7 +102,7 @@ struct RunCtx {
     host: String,
     default_db: String,
     server_id: u64,
-    tx: mpsc::Sender<Event>,
+    tx: mpsc::Sender<SourceItem>,
     chkpt: Arc<dyn CheckpointStore>,
     cancel: CancellationToken,
     paused: Arc<AtomicBool>,
@@ -269,7 +271,7 @@ impl MySqlSource {
 
     async fn run_inner(
         &self,
-        tx: mpsc::Sender<Event>,
+        tx: mpsc::Sender<SourceItem>,
         chkpt_store: Arc<dyn CheckpointStore>,
         cancel: CancellationToken,
         paused: Arc<AtomicBool>,
@@ -554,7 +556,7 @@ impl MySqlSource {
 impl Source for MySqlSource {
     async fn run(
         &self,
-        tx: mpsc::Sender<Event>,
+        tx: mpsc::Sender<SourceItem>,
         chkpt_store: Arc<dyn CheckpointStore>,
     ) -> SourceHandle {
         let cancel = CancellationToken::new();
