@@ -631,6 +631,63 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         }
     }
 
+    /// Verify a HEAD adopted during same-epoch reconciliation. A single new entry
+    /// is trusted only when it is exactly one step past our current verified head
+    /// (its `prev` references our head entry and its seq is ours + 1); its entry
+    /// hash, referenced data objects and strict watermark advance are then
+    /// checked. If it jumped farther, the entire intervening tail is re-verified.
+    async fn verify_adopted_head(
+        &self,
+        our: &Head,
+        cur: &Head,
+    ) -> Result<(), HeadError> {
+        let cur_entry_key = cur.head_entry_key.as_ref().ok_or_else(|| {
+            HeadError::Integrity("adopted HEAD has no entry".into())
+        })?;
+        let cur_entry = load_entry(self.store.as_ref(), cur_entry_key).await?;
+
+        let one_step = cur.seq == our.seq.saturating_add(1)
+            && matches!(
+                (&cur_entry.prev, &our.head_entry_key, &our.head_entry_hash),
+                (Some(p), Some(ok), Some(oh)) if p.key == *ok && p.hash == *oh
+            );
+
+        if one_step {
+            // Light verification of the single new entry.
+            verify_head_entry(self.store.as_ref(), cur).await?;
+            for mobj in &cur_entry.objects {
+                verify_data_object(self.store.as_ref(), mobj).await?;
+            }
+            // Its watermark must strictly follow ours.
+            if let Some(ourw) = &our.watermark_hex {
+                let ow = unhex(ourw).ok_or_else(|| {
+                    HeadError::Integrity("our watermark not hex".into())
+                })?;
+                let cw = unhex(&cur_entry.watermark_hex).ok_or_else(|| {
+                    HeadError::Integrity("adopted watermark not hex".into())
+                })?;
+                if self.comparator.order(&cw, &ow) != CheckpointOrder::After {
+                    return Err(HeadError::Integrity(
+                        "adopted HEAD watermark does not advance".into(),
+                    ));
+                }
+            }
+            Ok(())
+        } else {
+            // Jumped farther: re-verify the whole chain the adopted HEAD selects.
+            verify_chain(
+                self.store.as_ref(),
+                &self.prefix,
+                &self.pipeline,
+                &self.source_id,
+                &self.sink_id,
+                cur,
+                self.comparator.as_ref(),
+            )
+            .await
+        }
+    }
+
     /// Publish one batch and acknowledge only on success.
     ///
     /// Source-aware ordering against the current HEAD watermark decides the path:
@@ -818,12 +875,12 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                             cur.epoch, st.verified.epoch
                         )));
                     }
-                    // Same epoch, different head: verify the adopted HEAD's
-                    // referenced entry before trusting its watermark for a later
-                    // Before/Equal skip, then retry with a fresh seq + prev. (Our
-                    // already-written entry becomes an unreferenced reconciliation
-                    // candidate.)
-                    verify_head_entry(self.store.as_ref(), &cur).await?;
+                    // Same epoch, different head: verify the adopted HEAD before
+                    // trusting its watermark for a later Before/Equal skip, then
+                    // retry with a fresh seq + prev. (Our already-written entry
+                    // becomes an unreferenced reconciliation candidate.)
+                    let our = st.verified.head.clone();
+                    self.verify_adopted_head(&our, &cur).await?;
                     st.verified.head = cur;
                     st.verified.etag = etag;
                     continue;
@@ -1499,5 +1556,108 @@ mod tests {
             .unwrap();
         let err = expect_err(recover(cs).await);
         assert!(matches!(err, HeadError::Integrity(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_truncated_tail() {
+        // Delete the genesis (seq 1) entry so the chain cannot terminate at a
+        // valid genesis: the walk hits a missing prev and fails closed.
+        let (inner, cs) = build_chain().await;
+        let head = head_of(&cs).await;
+        let head_entry =
+            load_entry(cs.as_ref(), head.head_entry_key.as_ref().unwrap())
+                .await
+                .unwrap();
+        let genesis_key = head_entry.prev.unwrap().key; // seq 1
+        inner
+            .delete(&Path::from(genesis_key.as_str()))
+            .await
+            .unwrap();
+        let err = expect_err(recover(cs).await);
+        assert!(matches!(err, HeadError::Integrity(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn same_epoch_jump_reverifies_tail_and_publishes() {
+        // Out-of-band advance HEAD by TWO valid entries at the same epoch, so the
+        // adopted HEAD is not one step past ours: the writer must re-verify the
+        // whole intervening tail, then publish on top.
+        let (_inner, cs) = build_chain().await; // seq 1..=2, epoch 1 (genesis writer)
+        let w = DurableWriter::acquire(
+            Arc::clone(&cs),
+            "pfx",
+            "pipe",
+            "src",
+            "sink",
+            cmp(),
+        )
+        .await
+        .unwrap(); // epoch 2
+        // Publish one batch so our verified head is at some seq S.
+        w.publish(&wm(0, 3), vec![tobj("orders", b"c")], 1)
+            .await
+            .unwrap();
+        let our = head_of(&cs).await;
+
+        // Build two further valid entries out-of-band at the SAME epoch (2),
+        // chained onto `our`, then point HEAD at the second one.
+        let mk = |seq: u64, wmv: u64, prev: PrevRef| ManifestEntry {
+            version: super::super::manifest::MANIFEST_ENTRY_VERSION,
+            pipeline: "pipe".into(),
+            source_id: "src".into(),
+            sink_id: "sink".into(),
+            epoch: 2,
+            seq,
+            watermark_hex: wm_hex(0, wmv),
+            event_count: 0,
+            objects: vec![],
+            prev: Some(prev),
+        };
+        let e_next = mk(
+            our.seq + 1,
+            4,
+            PrevRef {
+                key: our.head_entry_key.clone().unwrap(),
+                hash: our.head_entry_hash.clone().unwrap(),
+            },
+        );
+        let w_next = write_entry(cs.as_ref(), "pfx", &e_next).await.unwrap();
+        let e_last = mk(
+            our.seq + 2,
+            5,
+            PrevRef {
+                key: w_next.key.clone(),
+                hash: w_next.hash.clone(),
+            },
+        );
+        let w_last = write_entry(cs.as_ref(), "pfx", &e_last).await.unwrap();
+
+        let hkey = head_key("pfx", "pipe");
+        let (_raw, etag) = cs.get_with_etag(&hkey).await.unwrap().unwrap();
+        let jumped = Head {
+            version: HEAD_VERSION,
+            epoch: 2,
+            seq: our.seq + 2,
+            head_entry_key: Some(w_last.key),
+            head_entry_hash: Some(w_last.hash),
+            rollup_key: None,
+            rollup_hash: None,
+            watermark_hex: Some(wm_hex(0, 5)),
+        };
+        cs.cas_put(&hkey, jumped.canonical_bytes(), etag.as_deref().unwrap())
+            .await
+            .unwrap();
+
+        // Publishing now reconciles: the adopted HEAD jumped two steps, so the
+        // tail is fully re-verified (it is valid), then we publish seq+3.
+        w.publish(&wm(0, 6), vec![tobj("orders", b"d")], 1)
+            .await
+            .unwrap();
+        let st = w.state.lock().await;
+        assert_eq!(st.verified.head.seq, our.seq + 3);
+        assert_eq!(
+            st.verified.head.watermark_hex.as_deref(),
+            Some(wm_hex(0, 6).as_str())
+        );
     }
 }
