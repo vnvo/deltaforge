@@ -263,6 +263,103 @@ fn maybe_warn_approaching(
     }
 }
 
+/// A violation of the source→coordinator transaction protocol. Any of these is
+/// fatal: a wrong or stale marker must never close a transaction or advance a
+/// checkpoint, so the coordinator fails closed and the source replays from the
+/// last committed boundary.
+#[derive(Debug, thiserror::Error)]
+pub enum TxProtocolError {
+    #[error(
+        "transaction {new} began while transaction {active} was still open"
+    )]
+    NestedBegin { active: String, new: String },
+    #[error(
+        "event for transaction {event_tx} arrived with no open transaction"
+    )]
+    EventWithoutBegin { event_tx: String },
+    #[error(
+        "event for transaction {event_tx} arrived while transaction {active} \
+         was open"
+    )]
+    EventTxMismatch { active: String, event_tx: String },
+    #[error(
+        "commit marker for transaction {marker} does not match the open \
+         transaction {active}"
+    )]
+    CommitMismatch { active: String, marker: String },
+    #[error(
+        "commit marker for transaction {marker} with no open transaction \
+         (duplicate or unknown commit)"
+    )]
+    CommitWithoutBegin { marker: String },
+}
+
+/// Enforces the source transaction protocol on the marker/event stream: a single
+/// transaction is open at a time, its events carry its id, and only its own
+/// commit marker (exactly once) closes it. This is the locked invariant that a
+/// wrong or stale marker cannot advance a checkpoint.
+#[derive(Default)]
+struct TxTracker {
+    active: Option<String>,
+}
+
+impl TxTracker {
+    /// A `TxBegin` opens a transaction. Only one may be open at a time.
+    fn begin(&mut self, tx_id: &str) -> Result<(), TxProtocolError> {
+        if let Some(active) = &self.active {
+            return Err(TxProtocolError::NestedBegin {
+                active: active.clone(),
+                new: tx_id.to_string(),
+            });
+        }
+        self.active = Some(tx_id.to_string());
+        Ok(())
+    }
+
+    /// A transactional event must belong to the open transaction. Standalone
+    /// (non-transactional, e.g. snapshot) events are not tracked.
+    fn observe_event(&self, ev: &Event) -> Result<(), TxProtocolError> {
+        if let Some(txn) = &ev.transaction {
+            match &self.active {
+                None => {
+                    return Err(TxProtocolError::EventWithoutBegin {
+                        event_tx: txn.id.clone(),
+                    });
+                }
+                Some(active) if *active != txn.id => {
+                    return Err(TxProtocolError::EventTxMismatch {
+                        active: active.clone(),
+                        event_tx: txn.id.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// A `TxCommit` closes the open transaction and must match it. A commit with
+    /// no open transaction is a duplicate or unknown commit — rejected so it
+    /// cannot advance the checkpoint twice.
+    fn commit(&mut self, tx_id: &str) -> Result<(), TxProtocolError> {
+        match &self.active {
+            None => Err(TxProtocolError::CommitWithoutBegin {
+                marker: tx_id.to_string(),
+            }),
+            Some(active) if active != tx_id => {
+                Err(TxProtocolError::CommitMismatch {
+                    active: active.clone(),
+                    marker: tx_id.to_string(),
+                })
+            }
+            _ => {
+                self.active = None;
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Send a completed batch to the delivery task. Returns Err if the delivery
 /// task has stopped (e.g. due to a sink error).
 async fn send_to_delivery(
@@ -810,6 +907,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut building: Option<BuildingBatch> = None;
         let mut drain_buf: Vec<SourceItem> = Vec::with_capacity(256);
+        let mut tx_tracker = TxTracker::default();
 
         let accum_result: Result<()> = async {
             loop {
@@ -891,11 +989,15 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                         for item in drain_buf.drain(..) {
                             if respect_source_tx {
                                 match item {
-                                    // Transaction protocol validation lands in a
-                                    // follow-up commit; the marker only opens a
-                                    // transaction, it carries no batch data.
-                                    SourceItem::TxBegin { .. } => {}
+                                    SourceItem::TxBegin { tx_id } => {
+                                        // Open the transaction; a second open
+                                        // before a commit is a protocol error.
+                                        tx_tracker.begin(&tx_id)?;
+                                    }
                                     SourceItem::Event(ev) => {
+                                        // Every transactional event must belong
+                                        // to the open transaction.
+                                        tx_tracker.observe_event(&ev)?;
                                         if ev.transaction.is_some() {
                                             // In-transaction event: buffer without
                                             // splitting; enforce the hard caps.
@@ -933,7 +1035,11 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                             }
                                         }
                                     }
-                                    SourceItem::TxCommit { checkpoint, .. } => {
+                                    SourceItem::TxCommit { tx_id, checkpoint } => {
+                                        // The marker must match the open tx and
+                                        // may close it exactly once — a stale or
+                                        // duplicate marker cannot advance twice.
+                                        tx_tracker.commit(&tx_id)?;
                                         // Commit boundary: close the open tx and
                                         // flush only if soft limits are reached.
                                         close_tx(&mut b, checkpoint);
@@ -1653,6 +1759,11 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
 
+        tx.send(SourceItem::TxBegin {
+            tx_id: "gtid:1".into(),
+        })
+        .await
+        .unwrap();
         for i in 0..10 {
             tx.send(SourceItem::Event(tx_event(
                 i,
@@ -1709,6 +1820,9 @@ mod tests {
         let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
 
         for (txn, cp) in [("gtid:1", "cp-1"), ("gtid:2", "cp-2")] {
+            tx.send(SourceItem::TxBegin { tx_id: txn.into() })
+                .await
+                .unwrap();
             for i in 0..2 {
                 tx.send(SourceItem::Event(tx_event(i, txn, b"row")))
                     .await
@@ -1757,6 +1871,11 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
 
+        tx.send(SourceItem::TxBegin {
+            tx_id: "gtid:1".into(),
+        })
+        .await
+        .unwrap();
         for i in 0..4 {
             tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
                 .await
@@ -1801,6 +1920,11 @@ mod tests {
         let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
 
         // One whole tx (2 events + marker) ...
+        tx.send(SourceItem::TxBegin {
+            tx_id: "gtid:1".into(),
+        })
+        .await
+        .unwrap();
         for i in 0..2 {
             tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
                 .await
@@ -1812,7 +1936,12 @@ mod tests {
         })
         .await
         .unwrap();
-        // ... then a partial tx (no marker) that must be discarded.
+        // ... then a partial tx (begin + one event, no marker) to discard.
+        tx.send(SourceItem::TxBegin {
+            tx_id: "gtid:2".into(),
+        })
+        .await
+        .unwrap();
         tx.send(SourceItem::Event(tx_event(99, "gtid:2", b"row")))
             .await
             .unwrap();
@@ -1852,7 +1981,12 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
 
-        // Empty transaction: a marker with no preceding events.
+        // Empty transaction: begin immediately followed by commit, no events.
+        tx.send(SourceItem::TxBegin {
+            tx_id: "gtid:1".into(),
+        })
+        .await
+        .unwrap();
         tx.send(SourceItem::TxCommit {
             tx_id: "gtid:1".into(),
             checkpoint: CheckpointMeta::from_vec(b"empty".to_vec()),
@@ -1860,6 +1994,11 @@ mod tests {
         .await
         .unwrap();
         // A real transaction follows.
+        tx.send(SourceItem::TxBegin {
+            tx_id: "gtid:2".into(),
+        })
+        .await
+        .unwrap();
         tx.send(SourceItem::Event(tx_event(1, "gtid:2", b"row")))
             .await
             .unwrap();
@@ -1876,6 +2015,137 @@ mod tests {
         assert_eq!(sink.batch_sizes(), vec![1]);
         let cp = store.get_raw("src::sink::kafka").await.unwrap();
         assert_eq!(cp.as_deref(), Some(&b"real"[..]));
+    }
+
+    /// Run a coordinator over a fixed item stream and return its result. The
+    /// channel is closed after the items, so `run` returns once they are drained.
+    async fn run_items(
+        items: Vec<SourceItem>,
+    ) -> (Result<()>, Arc<checkpoints::MemCheckpointStore>) {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let coord = tx_coord(
+            store.clone(),
+            sink,
+            BatchConfig {
+                max_events: Some(1000),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            },
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        for item in items {
+            tx.send(item).await.unwrap();
+        }
+        drop(tx);
+        (coord.run(rx, cancel, pause_rx).await, store)
+    }
+
+    fn begin(tx_id: &str) -> SourceItem {
+        SourceItem::TxBegin {
+            tx_id: tx_id.into(),
+        }
+    }
+    fn commit(tx_id: &str, cp: &[u8]) -> SourceItem {
+        SourceItem::TxCommit {
+            tx_id: tx_id.into(),
+            checkpoint: CheckpointMeta::from_vec(cp.to_vec()),
+        }
+    }
+
+    /// A commit marker with no matching begin (an unknown or duplicate commit)
+    /// is a fatal protocol error — it must not advance any checkpoint.
+    #[tokio::test]
+    async fn commit_without_begin_is_rejected() {
+        let (res, store) = run_items(vec![commit("gtid:1", b"cp")]).await;
+        let err = res.expect_err("lone commit must be rejected");
+        assert!(
+            err.to_string().contains("no open transaction"),
+            "unexpected error: {err}"
+        );
+        assert!(store.get_raw("src::sink::kafka").await.unwrap().is_none());
+    }
+
+    /// A duplicate commit marker cannot advance the checkpoint twice.
+    #[tokio::test]
+    async fn duplicate_commit_is_rejected() {
+        let (res, _) = run_items(vec![
+            begin("gtid:1"),
+            SourceItem::Event(tx_event(1, "gtid:1", b"row")),
+            commit("gtid:1", b"cp-1"),
+            commit("gtid:1", b"cp-1"), // duplicate
+        ])
+        .await;
+        let err = res.expect_err("duplicate commit must be rejected");
+        assert!(err.to_string().contains("no open transaction"));
+    }
+
+    /// A second transaction cannot begin before the first commits.
+    #[tokio::test]
+    async fn nested_begin_is_rejected() {
+        let (res, _) = run_items(vec![begin("gtid:1"), begin("gtid:2")]).await;
+        let err = res.expect_err("nested begin must be rejected");
+        assert!(
+            err.to_string().contains("still open"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A commit whose id does not match the open transaction is rejected.
+    #[tokio::test]
+    async fn commit_id_mismatch_is_rejected() {
+        let (res, _) = run_items(vec![
+            begin("gtid:1"),
+            SourceItem::Event(tx_event(1, "gtid:1", b"row")),
+            commit("gtid:2", b"cp"), // wrong id
+        ])
+        .await;
+        let err = res.expect_err("mismatched commit must be rejected");
+        assert!(err.to_string().contains("does not match"));
+    }
+
+    /// An in-transaction event whose id does not match the open transaction is
+    /// rejected.
+    #[tokio::test]
+    async fn event_tx_mismatch_is_rejected() {
+        let (res, _) = run_items(vec![
+            begin("gtid:1"),
+            SourceItem::Event(tx_event(1, "gtid:2", b"row")),
+        ])
+        .await;
+        let err = res.expect_err("mismatched event must be rejected");
+        assert!(err.to_string().contains("was open"));
+    }
+
+    /// A transactional event with no open transaction is rejected.
+    #[tokio::test]
+    async fn event_without_begin_is_rejected() {
+        let (res, _) =
+            run_items(vec![SourceItem::Event(tx_event(1, "gtid:1", b"row"))])
+                .await;
+        let err = res.expect_err("event without begin must be rejected");
+        assert!(err.to_string().contains("no open transaction"));
+    }
+
+    /// A well-formed begin→event→commit stream is accepted and checkpoints.
+    #[tokio::test]
+    async fn well_formed_transaction_is_accepted() {
+        let (res, store) = run_items(vec![
+            begin("gtid:1"),
+            SourceItem::Event(tx_event(1, "gtid:1", b"row")),
+            commit("gtid:1", b"cp-1"),
+        ])
+        .await;
+        res.expect("well-formed transaction must succeed");
+        assert_eq!(
+            store.get_raw("src::sink::kafka").await.unwrap().as_deref(),
+            Some(&b"cp-1"[..])
+        );
     }
 
     /// Drops every event — models a transaction whose rows are all filtered by a
@@ -1929,6 +2199,11 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
 
+        tx.send(SourceItem::TxBegin {
+            tx_id: "gtid:1".into(),
+        })
+        .await
+        .unwrap();
         for i in 0..3 {
             tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
                 .await
@@ -1977,6 +2252,11 @@ mod tests {
         let cancel = tokio_util::sync::CancellationToken::new();
         let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
 
+        tx.send(SourceItem::TxBegin {
+            tx_id: "gtid:1".into(),
+        })
+        .await
+        .unwrap();
         for i in 0..2 {
             tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
                 .await
@@ -2044,6 +2324,9 @@ mod tests {
         for (txn, cp) in
             [("gtid:1", "cp-1"), ("gtid:2", "cp-2"), ("gtid:3", "cp-3")]
         {
+            tx.send(SourceItem::TxBegin { tx_id: txn.into() })
+                .await
+                .unwrap();
             for i in 0..2 {
                 tx.send(SourceItem::Event(tx_event(i, txn, b"row")))
                     .await
