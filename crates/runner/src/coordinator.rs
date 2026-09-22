@@ -63,6 +63,10 @@ struct BuildingBatch {
     bytes: usize,
     committed_len: usize,
     committed_bytes: usize,
+    /// Durable watermark of the batch's last committed boundary (from the source
+    /// `SourceBoundary`), carried atomically with that boundary's checkpoint into
+    /// the delivery context. `None` for non-durable / no-boundary batches.
+    boundary_watermark: Option<Arc<[u8]>>,
 }
 
 impl BuildingBatch {
@@ -73,6 +77,7 @@ impl BuildingBatch {
             bytes: 0,
             committed_len: 0,
             committed_bytes: 0,
+            boundary_watermark: None,
         }
     }
 
@@ -126,13 +131,18 @@ fn push_tx_event(
 /// boundary) the checkpoint is advanced onto the prior boundary event when one
 /// exists; otherwise the next transaction covers it. Returns whether the
 /// transaction contributed events.
-fn close_tx(b: &mut BuildingBatch, checkpoint: CheckpointMeta) -> bool {
+fn close_tx(
+    b: &mut BuildingBatch,
+    boundary: deltaforge_core::SourceBoundary,
+) -> bool {
     let had_events = b.mid_tx();
     if let Some(last) = b.raw.last_mut() {
-        last.checkpoint = Some(checkpoint);
+        last.checkpoint = Some(boundary.checkpoint);
     }
     b.committed_len = b.raw.len();
     b.committed_bytes = b.bytes;
+    // The watermark travels with the checkpoint from the same boundary.
+    b.boundary_watermark = boundary.durable_watermark;
     had_events
 }
 
@@ -1061,11 +1071,10 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                         // duplicate marker cannot advance twice.
                                         tx_tracker.commit(&tx_id)?;
                                         // Commit boundary: close the open tx with
-                                        // the boundary's checkpoint, flush only if
-                                        // soft limits are reached. (Threading the
-                                        // boundary watermark into the context
-                                        // lands with source-side population.)
-                                        close_tx(&mut b, boundary.checkpoint);
+                                        // the boundary's checkpoint + watermark
+                                        // (atomic), flush only if soft limits are
+                                        // reached.
+                                        close_tx(&mut b, boundary);
                                         if soft_limit_reached(&b, max_events, max_bytes) {
                                             let full = std::mem::replace(
                                                 &mut b,
@@ -1307,6 +1316,14 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                 },
                 _ => (None, None),
             };
+        // The source boundary's watermark (carried atomically with its commit
+        // checkpoint through the marker) is authoritative when present; the
+        // fn-derived watermark is a fallback for boundary-less paths.
+        let ctx_watermark = b
+            .boundary_watermark
+            .as_ref()
+            .map(|w| w.to_vec())
+            .or(ctx_watermark);
         let ctx = Arc::new(deltaforge_core::SinkBatchContext {
             checkpoint: ctx_checkpoint
                 .unwrap_or_else(|| CheckpointMeta::from_vec(Vec::new())),
@@ -3620,5 +3637,66 @@ mod tests {
         assert_eq!(d[0].0, 6, "3 events fanned out to 6");
         assert_eq!(d[0].1, b"authoritative");
         assert_eq!(d[0].2.as_deref(), Some(&b"authoritative"[..]));
+    }
+
+    /// The commit marker's boundary watermark reaches the sink context even when
+    /// a processor filters the whole transaction away.
+    #[tokio::test]
+    async fn context_boundary_watermark_survives_full_filtering() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = CtxSink::new();
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        let cp_fn = build_commit_fn(store, "src::sink::ctx".to_string());
+        let procs: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![Arc::new(DropAllProcessor) as _]);
+        let batch_processor = build_batch_processor(procs, "test".to_string());
+        let coord = Coordinator::builder("test-ctx-wm")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(1000),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_fn("ctx", cp_fn)
+            .process_fn(batch_processor)
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        tx.send(SourceItem::TxBegin {
+            tx_id: "gtid:1".into(),
+        })
+        .await
+        .unwrap();
+        tx.send(SourceItem::Event(tx_event(1, "gtid:1", b"row")))
+            .await
+            .unwrap();
+        tx.send(SourceItem::TxCommit {
+            tx_id: "gtid:1".into(),
+            boundary: deltaforge_core::SourceBoundary {
+                checkpoint: CheckpointMeta::from_vec(b"cp-1".to_vec()),
+                durable_watermark: Some(std::sync::Arc::from(
+                    b"WATERMARK".to_vec(),
+                )),
+            },
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        coord.run(rx, cancel, pause_rx).await.unwrap();
+
+        let d = sink.deliveries();
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].0, 0, "fully filtered -> empty batch delivered");
+        assert_eq!(
+            d[0].2.as_deref(),
+            Some(&b"WATERMARK"[..]),
+            "boundary watermark reaches the context despite full filtering"
+        );
     }
 }

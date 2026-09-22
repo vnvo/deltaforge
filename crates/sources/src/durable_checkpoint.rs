@@ -76,6 +76,55 @@ impl DurableWatermark {
         }
     }
 
+    /// PostgreSQL CDC commit watermark: the frozen cluster `system_identifier`
+    /// and the COMMIT record's `end_lsn` (never a row/message LSN).
+    pub fn pg_commit(
+        system_identifier: u64,
+        end_lsn: u64,
+        tx_id: Option<u32>,
+    ) -> Self {
+        Self::new(
+            PersistedLineage::Postgres { system_identifier },
+            WmPos::PgLsn {
+                lsn: end_lsn,
+                commit_boundary: true,
+                tx_id,
+            },
+        )
+    }
+
+    /// MySQL GTID CDC commit watermark: the frozen source lineage and the exact
+    /// normalized accumulated GTID set represented by the commit checkpoint.
+    pub fn mysql_gtid_commit(
+        lineage: PersistedLineage,
+        accumulated_gtid_set: String,
+    ) -> Self {
+        Self::new(
+            lineage,
+            WmPos::MysqlGtid {
+                gtid_set: accumulated_gtid_set,
+            },
+        )
+    }
+
+    /// MySQL non-GTID CDC commit watermark: frozen server lineage plus the
+    /// commit-record binlog file base + numeric index + position.
+    pub fn mysql_binlog_commit(
+        lineage: PersistedLineage,
+        file: &str,
+        pos: u64,
+    ) -> Option<Self> {
+        let (file_base, file_index) = binlog_file_parts(file)?;
+        Some(Self::new(
+            lineage,
+            WmPos::MysqlBinlog {
+                file_base,
+                file_index,
+                pos,
+            },
+        ))
+    }
+
     /// Serialize for storage in HEAD.
     pub fn to_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).expect("watermark serializes")
@@ -888,5 +937,73 @@ mod tests {
         let a = snap(1, false, &[("orders", 100)]);
         let b = snap(1, false, &[("orders", 100), ("users", 0)]);
         assert_eq!(ord(&a, &b), CheckpointOrder::Incomparable);
+    }
+
+    // ── CDC commit-watermark constructors ───────────────────────────────────
+
+    #[test]
+    fn pg_commit_watermark_uses_end_lsn_and_orders() {
+        let earlier = DurableWatermark::pg_commit(42, 0x100, Some(5));
+        let later = DurableWatermark::pg_commit(42, 0x200, Some(6));
+        // Both are commit-boundary; earlier end_lsn precedes later.
+        assert_eq!(ord(&earlier, &later), CheckpointOrder::Before);
+        match earlier.pos {
+            WmPos::PgLsn {
+                lsn,
+                commit_boundary,
+                tx_id,
+            } => {
+                assert_eq!(lsn, 0x100);
+                assert!(commit_boundary);
+                assert_eq!(tx_id, Some(5));
+            }
+            _ => panic!("expected PgLsn"),
+        }
+    }
+
+    #[test]
+    fn mysql_gtid_commit_watermark_uses_accumulated_set() {
+        let uuid = "3E11FA47-71CA-11E1-9E33-C80AA9429562";
+        let small = DurableWatermark::mysql_gtid_commit(
+            gtid_lineage([1; 16]),
+            format!("{uuid}:1-5"),
+        );
+        let big = DurableWatermark::mysql_gtid_commit(
+            gtid_lineage([1; 16]),
+            format!("{uuid}:1-9"),
+        );
+        assert_eq!(ord(&small, &big), CheckpointOrder::Before);
+        match small.pos {
+            WmPos::MysqlGtid { gtid_set } => {
+                assert_eq!(gtid_set, format!("{uuid}:1-5"));
+            }
+            _ => panic!("expected MysqlGtid"),
+        }
+    }
+
+    #[test]
+    fn mysql_binlog_commit_watermark_rotation_orders_numerically() {
+        let f9 = DurableWatermark::mysql_binlog_commit(
+            server_lineage(1),
+            "mysql-bin.000009",
+            900,
+        )
+        .unwrap();
+        let f10 = DurableWatermark::mysql_binlog_commit(
+            server_lineage(1),
+            "mysql-bin.000010",
+            4,
+        )
+        .unwrap();
+        assert_eq!(ord(&f9, &f10), CheckpointOrder::Before);
+        // A malformed filename yields no watermark (fail closed upstream).
+        assert!(
+            DurableWatermark::mysql_binlog_commit(
+                server_lineage(1),
+                "nodot",
+                1
+            )
+            .is_none()
+        );
     }
 }

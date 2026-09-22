@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use deltaforge_core::{
-    Event, Op, SourceError, SourceInfo, SourceItem, SourcePosition,
-    SourceResult, Transaction,
+    CheckpointMeta, Event, Op, SourceBoundary, SourceError, SourceInfo,
+    SourceItem, SourcePosition, SourceResult, Transaction,
 };
 use metrics::counter;
 use pgwire_replication::{Lsn, client::ReplicationEvent};
@@ -35,6 +35,33 @@ pub struct RelationInfo {
     pub columns: Arc<Vec<RelationColumn>>,
     /// Replica identity: d=default, n=nothing, f=full, i=index
     pub replica_identity: char,
+}
+
+/// Build the commit boundary: the resume checkpoint plus, atomically, the
+/// durable watermark for the SAME COMMIT (frozen `system_identifier` + end_lsn).
+/// The watermark is `None` when lineage is unavailable (`system_identifier == 0`)
+/// - durable mode then fails closed at the sink; we never synthesize a lineage.
+fn boundary_for_pg_commit(
+    system_identifier: u64,
+    end_lsn: &Lsn,
+    tx_id: Option<u32>,
+    checkpoint: CheckpointMeta,
+) -> SourceBoundary {
+    use crate::durable_checkpoint::{DurableWatermark, parse_lsn};
+    let durable_watermark = if system_identifier != 0 {
+        parse_lsn(&end_lsn.to_string()).map(|lsn| {
+            Arc::from(
+                DurableWatermark::pg_commit(system_identifier, lsn, tx_id)
+                    .to_bytes(),
+            )
+        })
+    } else {
+        None
+    };
+    SourceBoundary {
+        checkpoint,
+        durable_watermark,
+    }
 }
 
 /// Read next replication event with watchdog timeout.
@@ -140,11 +167,15 @@ pub(super) async fn dispatch_event(
             // xid stamped on this transaction's row events. (pgoutput never
             // decodes aborted transactions, so a rollback emits nothing here.)
             if let Some(tx_id) = ctx.current_tx_id {
+                // Checkpoint and watermark BOTH describe this COMMIT boundary:
+                // the COMMIT record's end_lsn (never the last row/message LSN)
+                // and the frozen startup system_identifier lineage.
                 let checkpoint =
                     make_checkpoint_meta(&end_lsn, ctx.current_tx_id);
-                // TODO(P0.4): populate boundary.durable_watermark with the
-                // source-aware CDC watermark (LSN + system_identifier lineage).
-                let boundary = deltaforge_core::SourceBoundary::checkpoint_only(
+                let boundary = boundary_for_pg_commit(
+                    ctx.system_identifier,
+                    &end_lsn,
+                    ctx.current_tx_id,
                     checkpoint,
                 );
                 let _ = ctx

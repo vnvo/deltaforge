@@ -581,12 +581,40 @@ async fn emit_tx_commit(ctx: &mut RunCtx) {
     };
     let checkpoint =
         make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid);
-    // TODO(P0.4): populate boundary.durable_watermark with the source-aware CDC
-    // watermark (GTID set + lineage) once lineage is threaded to RunCtx.
-    let boundary = deltaforge_core::SourceBoundary::checkpoint_only(checkpoint);
+    // Watermark and checkpoint describe the SAME commit boundary.
+    let boundary = deltaforge_core::SourceBoundary {
+        checkpoint,
+        durable_watermark: build_cdc_watermark(ctx),
+    };
     let _ = ctx.tx.send(SourceItem::TxCommit { tx_id, boundary }).await;
     // Transaction closed - the next transaction opens with its own GTID event.
     ctx.current_gtid = None;
+}
+
+/// Build the source-aware CDC watermark for the current commit boundary from the
+/// frozen startup lineage. GTID mode uses the accumulated executed set (the same
+/// set the checkpoint records); non-GTID uses the commit-record binlog file +
+/// position. `None` if lineage is unavailable - durable mode fails closed at the
+/// sink; we never synthesize a lineage.
+fn build_cdc_watermark(ctx: &RunCtx) -> Option<std::sync::Arc<[u8]>> {
+    use crate::durable_checkpoint::DurableWatermark;
+    use crate::snapshot_generation::PersistedLineage;
+    let lineage = ctx.durable_lineage.clone()?;
+    let wm = match &lineage {
+        PersistedLineage::MysqlGtid { .. } => {
+            DurableWatermark::mysql_gtid_commit(lineage, ctx.last_gtid.clone()?)
+        }
+        PersistedLineage::MysqlServer { .. } => {
+            DurableWatermark::mysql_binlog_commit(
+                lineage,
+                &ctx.last_file,
+                ctx.last_pos,
+            )?
+        }
+        // Not a MySQL lineage - should never happen for this source.
+        PersistedLineage::Postgres { .. } => return None,
+    };
+    Some(std::sync::Arc::from(wm.to_bytes()))
 }
 
 /// Extract table name from DDL statement.
@@ -935,6 +963,7 @@ mod tests {
                 "test-tenant",
             ),
             on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
+            durable_lineage: None,
         }
     }
 
@@ -1552,6 +1581,66 @@ mod tests {
         )
         .await;
         assert_eq!(ctx.last_gtid.as_deref(), Some("uuid-a:1-11"));
+    }
+
+    #[tokio::test]
+    async fn emit_tx_commit_boundary_atomic_checkpoint_and_gtid_watermark() {
+        use crate::durable_checkpoint::{DurableWatermark, WmPos};
+        use crate::snapshot_generation::PersistedLineage;
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        ctx.durable_lineage = Some(PersistedLineage::MysqlGtid {
+            source_uuid: [7u8; 16],
+        });
+        ctx.current_gtid =
+            Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:5".to_string());
+        ctx.last_gtid =
+            Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5".to_string());
+        ctx.last_file = "mysql-bin.000003".to_string();
+        ctx.last_pos = 900;
+
+        // No row events buffered: also exercises the empty/fully-filtered case.
+        emit_tx_commit(&mut ctx).await;
+
+        let SourceItem::TxCommit { boundary, .. } =
+            rx.recv().await.expect("marker")
+        else {
+            panic!("expected TxCommit");
+        };
+        // Checkpoint bytes are unchanged from the existing resume format.
+        let expected = make_checkpoint_meta(
+            "mysql-bin.000003",
+            900,
+            &Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5".to_string()),
+        );
+        assert_eq!(boundary.checkpoint.as_bytes(), expected.as_bytes());
+        // Watermark is present (even for an empty tx) and represents the SAME
+        // accumulated GTID set the checkpoint records.
+        let wm = boundary.durable_watermark.expect("durable watermark");
+        let dw = DurableWatermark::parse(&wm).expect("parse");
+        match dw.pos {
+            WmPos::MysqlGtid { gtid_set } => {
+                assert_eq!(gtid_set, "3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5")
+            }
+            other => panic!("expected MysqlGtid, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_tx_commit_without_lineage_has_no_watermark() {
+        // Missing lineage -> no watermark (durable mode fails closed at the
+        // sink; we never synthesize a lineage).
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        ctx.durable_lineage = None;
+        ctx.current_gtid = Some("uuid:5".to_string());
+        emit_tx_commit(&mut ctx).await;
+        let SourceItem::TxCommit { boundary, .. } =
+            rx.recv().await.expect("marker")
+        else {
+            panic!("expected TxCommit");
+        };
+        assert!(boundary.durable_watermark.is_none());
     }
 
     #[test]
