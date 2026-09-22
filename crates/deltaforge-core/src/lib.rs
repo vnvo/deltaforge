@@ -221,7 +221,7 @@ pub struct SourcePosition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub xmin: Option<i64>,
 
-    /// The transaction's final LSN (from the `BEGIN` message) — the stable
+    /// The transaction's final LSN (from the `BEGIN` message) - the stable
     /// identity coordinate, distinct from the per-message `lsn`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_final_lsn: Option<String>,
@@ -230,14 +230,14 @@ pub struct SourcePosition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relation_oid: Option<u32>,
 
-    /// Per-transaction change ordinal — reset at `BEGIN`, incremented for every
+    /// Per-transaction change ordinal - reset at `BEGIN`, incremented for every
     /// identity-bearing change before filtering.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub change_ordinal: Option<u32>,
 
     // Snapshot-specific fields
     /// Durable snapshot generation for stable snapshot-row identity. Serialized
-    /// (optional) — has lasting operational value.
+    /// (optional) - has lasting operational value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_generation: Option<u64>,
 
@@ -373,7 +373,7 @@ pub struct Event {
     /// Stable, deterministic event identity (`dfid:v1:…`) for deduplication and
     /// tracing. The single authoritative identity location: every event that
     /// leaves a source or processor carries one. `Option` only so the JS bridge
-    /// can build a transient event before assigning the resolved id — such an
+    /// can build a transient event before assigning the resolved id - such an
     /// event must never escape without it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_id: Option<EventId>,
@@ -449,7 +449,7 @@ fn now_ms() -> i64 {
 }
 
 impl Event {
-    /// Create a new row-change event. The stable `event_id` is required —
+    /// Create a new row-change event. The stable `event_id` is required -
     /// sources must derive it before emission.
     #[allow(clippy::too_many_arguments)]
     pub fn new_row(
@@ -710,11 +710,11 @@ impl BatchResult {
 // ============================================================================
 
 /// An item on the source→coordinator stream. `TxCommit` is an **internal**
-/// transaction-boundary marker — never a public wire event and never delivered
+/// transaction-boundary marker - never a public wire event and never delivered
 /// to sinks. It lets the coordinator form transaction-aligned batches and
 /// checkpoint only at commit boundaries (even for empty or fully-filtered
 /// transactions).
-// `Event` is the hot-path variant — one per row — and was already moved by
+// `Event` is the hot-path variant - one per row - and was already moved by
 // value through the old `Sender<Event>`. Boxing it to shrink the enum would add
 // a heap allocation per event that the previous channel never paid; `TxCommit`
 // is rare (once per transaction), so the size difference is intentional.
@@ -732,7 +732,7 @@ pub enum SourceItem {
     /// A committed-transaction boundary. `checkpoint` is the COMMIT/XID
     /// **record's** position (not the last data event's), generated once by the
     /// source and passed through unchanged; `tx_id` matches the `transaction.id`
-    /// carried by that transaction's events. Only an actual commit emits this —
+    /// carried by that transaction's events. Only an actual commit emits this -
     /// never a rollback, and never a transactional logical message (those are
     /// transaction *contents*).
     TxCommit {
@@ -792,6 +792,42 @@ impl SourceHandle {
 }
 
 // ============================================================================
+// Checkpoint ordering (source-aware)
+// ============================================================================
+
+/// Structured ordering of two source checkpoints. Unlike `std::cmp::Ordering`
+/// this has an `Incomparable` case for checkpoints from different lineages or
+/// generations (e.g. a MySQL failover to a new server, or a snapshot-generation
+/// change) that must not be ordered against each other.
+///
+/// Ordering MUST use structured source semantics (PostgreSQL LSN + transaction
+/// boundary, MySQL GTID/binlog coordinates, snapshot generation, etc.), never a
+/// lexical comparison of serialized bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointOrder {
+    /// `proposed` precedes `reference`.
+    Before,
+    /// `proposed` is the same position as `reference`.
+    Equal,
+    /// `proposed` follows `reference`.
+    After,
+    /// The two checkpoints belong to different lineages/generations and cannot
+    /// be ordered; callers must fail closed.
+    Incomparable,
+}
+
+/// Compares source checkpoints with [`CheckpointOrder`] semantics. Used by the
+/// durable S3 sink to enforce that a published watermark only ever advances,
+/// even when a valid new-epoch writer receives replayed older batches after a
+/// crash between the durable HEAD CAS and the coordinator checkpoint.
+pub trait CheckpointComparator: Send + Sync {
+    /// Order `proposed` relative to `reference` using structured source
+    /// semantics. Returns [`CheckpointOrder::Incomparable`] when the two cannot
+    /// be meaningfully ordered.
+    fn order(&self, proposed: &[u8], reference: &[u8]) -> CheckpointOrder;
+}
+
+// ============================================================================
 // Traits
 // ============================================================================
 
@@ -824,7 +860,7 @@ pub trait Processor: Send + Sync {
         ctx: &BatchContext,
     ) -> Result<Vec<Event>>;
 
-    /// Stable identity digest for this processor — the `processor_digest`
+    /// Stable identity digest for this processor - the `processor_digest`
     /// component of a synthetic [`EventId`]. Sensitive to anything that changes
     /// the processor's output (source bytes and/or canonical config). Computed
     /// once at construction and returned by reference; never recomputed per

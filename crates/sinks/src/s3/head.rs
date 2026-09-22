@@ -21,6 +21,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
+use deltaforge_core::{CheckpointComparator, CheckpointOrder};
+
 use super::batch_upload::{DurableError, TableObject, upload_batch};
 use super::manifest::{
     ManifestEntry, ManifestObject, PrevRef, WrittenEntry, propose_seq,
@@ -169,6 +171,16 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+fn unhex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
 /// Per-instance mutable state, guarded so concurrent `send_batch` calls on one
 /// sink instance serialize their HEAD publication and cannot race.
 struct WriterState {
@@ -187,6 +199,10 @@ pub struct DurableWriter<S: ConditionalStore + ?Sized> {
     pipeline: String,
     source_id: String,
     sink_id: String,
+    /// Source-aware checkpoint ordering. Enforces that HEAD only ever advances,
+    /// even when this (valid, current-epoch) writer receives replayed older
+    /// batches after a crash between the HEAD CAS and the coordinator checkpoint.
+    comparator: Arc<dyn CheckpointComparator>,
     state: Mutex<WriterState>,
 }
 
@@ -203,6 +219,7 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         pipeline: &str,
         source_id: &str,
         sink_id: &str,
+        comparator: Arc<dyn CheckpointComparator>,
     ) -> Result<Self, HeadError> {
         let hkey = head_key(prefix, pipeline);
         let (head, etag) = match store
@@ -295,6 +312,7 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
             pipeline: pipeline.to_string(),
             source_id: source_id.to_string(),
             sink_id: sink_id.to_string(),
+            comparator,
             state: Mutex::new(WriterState {
                 epoch,
                 head,
@@ -346,12 +364,40 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         self.state.lock().await.epoch
     }
 
+    /// Order a proposed watermark against the current HEAD watermark.
+    /// `Ok(None)` means HEAD has no watermark yet (genesis) so any proposal is
+    /// the first and proceeds.
+    fn order_vs_head(
+        &self,
+        head: &Head,
+        proposed: &[u8],
+    ) -> Result<Option<CheckpointOrder>, HeadError> {
+        match &head.watermark_hex {
+            None => Ok(None),
+            Some(h) => {
+                let head_wm = unhex(h).ok_or_else(|| {
+                    HeadError::Integrity(
+                        "HEAD watermark is not valid hex".into(),
+                    )
+                })?;
+                Ok(Some(self.comparator.order(proposed, &head_wm)))
+            }
+        }
+    }
+
     /// Publish one batch and acknowledge only on success.
     ///
-    /// Returns `Ok(())` **only** after a HEAD CAS that references this batch's
-    /// entry succeeds, or after reconciliation proves HEAD already references our
-    /// exact entry (idempotent). Any other outcome is an error and must not be
-    /// treated as an acknowledgement.
+    /// Source-aware ordering against the current HEAD watermark decides the path:
+    /// - **After**: publish normally (HEAD advances).
+    /// - **Equal / Before**: an already-durable (replayed) batch - acknowledge
+    ///   without uploading a new entry or moving HEAD. Safe because the manifest
+    ///   chain asserts every position through HEAD's watermark is durable.
+    /// - **Incomparable**: different lineage/generation - fail closed.
+    ///
+    /// So HEAD never transitions Before or Incomparable. `Ok(())` is returned
+    /// only after a HEAD CAS referencing this batch's entry succeeds, after
+    /// reconciliation proves HEAD already references our exact entry, or for an
+    /// already-durable replay (Equal/Before).
     pub async fn publish(
         &self,
         watermark: &[u8],
@@ -364,6 +410,23 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                 our: st.epoch,
                 observed,
             });
+        }
+
+        // Ordering gate: only an After (or genesis) proposal does any work.
+        match self.order_vs_head(&st.head, watermark)? {
+            None | Some(CheckpointOrder::After) => {}
+            // Already durable at or beyond this position (a valid replay under a
+            // possibly-newer epoch): acknowledge without moving HEAD.
+            Some(CheckpointOrder::Equal) | Some(CheckpointOrder::Before) => {
+                return Ok(());
+            }
+            Some(CheckpointOrder::Incomparable) => {
+                return Err(HeadError::Integrity(format!(
+                    "proposed checkpoint is incomparable to HEAD watermark for \
+                     pipeline {} (lineage/generation mismatch)",
+                    self.pipeline
+                )));
+            }
         }
 
         // 1. Make the data objects durable (idempotent; integrity is fatal).
@@ -386,6 +449,25 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
 
         // 2. Bounded propose -> write-entry -> HEAD-CAS reconcile loop.
         for _ in 0..MAX_PUBLISH_ATTEMPTS {
+            // HEAD may have advanced (same-epoch race, or catch-up reaching an
+            // already-published position). Re-order before proposing again.
+            match self.order_vs_head(&st.head, watermark)? {
+                None | Some(CheckpointOrder::After) => {}
+                Some(CheckpointOrder::Equal)
+                | Some(CheckpointOrder::Before) => {
+                    // The batch is already covered by the current HEAD; the
+                    // objects uploaded above are harmless reconciliation
+                    // candidates. Acknowledge without moving HEAD.
+                    return Ok(());
+                }
+                Some(CheckpointOrder::Incomparable) => {
+                    return Err(HeadError::Integrity(format!(
+                        "proposed checkpoint became incomparable to HEAD for \
+                         pipeline {}",
+                        self.pipeline
+                    )));
+                }
+            }
             let seq = propose_seq(st.head.seq);
             let prev = match (&st.head.head_entry_key, &st.head.head_entry_hash)
             {
@@ -540,6 +622,54 @@ mod tests {
         Arc::new(ObjectStoreConditional::new(Arc::new(InMemory::new())))
     }
 
+    /// Test comparator modelling structured source semantics: a watermark is
+    /// `[lineage_byte, 8-byte BE position]`. Different lineage -> Incomparable
+    /// (like a MySQL failover / snapshot-generation change); otherwise the
+    /// position orders. Unparseable input is Incomparable (fail closed).
+    struct MonoCmp;
+    impl CheckpointComparator for MonoCmp {
+        fn order(&self, a: &[u8], b: &[u8]) -> CheckpointOrder {
+            fn parse(x: &[u8]) -> Option<(u8, u64)> {
+                if x.len() != 9 {
+                    return None;
+                }
+                let mut p = [0u8; 8];
+                p.copy_from_slice(&x[1..9]);
+                Some((x[0], u64::from_be_bytes(p)))
+            }
+            match (parse(a), parse(b)) {
+                (Some((la, xa)), Some((lb, xb))) => {
+                    if la != lb {
+                        CheckpointOrder::Incomparable
+                    } else {
+                        use std::cmp::Ordering::*;
+                        match xa.cmp(&xb) {
+                            Less => CheckpointOrder::Before,
+                            Equal => CheckpointOrder::Equal,
+                            Greater => CheckpointOrder::After,
+                        }
+                    }
+                }
+                _ => CheckpointOrder::Incomparable,
+            }
+        }
+    }
+
+    fn cmp() -> Arc<dyn CheckpointComparator> {
+        Arc::new(MonoCmp)
+    }
+
+    /// Build a structured watermark: lineage + position.
+    fn wm(lineage: u8, pos: u64) -> Vec<u8> {
+        let mut v = vec![lineage];
+        v.extend_from_slice(&pos.to_be_bytes());
+        v
+    }
+
+    fn wm_hex(lineage: u8, pos: u64) -> String {
+        super::hex(&wm(lineage, pos))
+    }
+
     /// Extract the error without requiring the Ok type to be `Debug`.
     fn expect_err<T>(r: Result<T, HeadError>) -> HeadError {
         match r {
@@ -551,7 +681,7 @@ mod tests {
     async fn writer(
         store: Arc<ObjectStoreConditional>,
     ) -> DurableWriter<ObjectStoreConditional> {
-        DurableWriter::acquire(store, "pfx", "pipe", "src", "sink")
+        DurableWriter::acquire(store, "pfx", "pipe", "src", "sink", cmp())
             .await
             .unwrap()
     }
@@ -561,23 +691,26 @@ mod tests {
         let s = cond();
         let w = writer(Arc::clone(&s)).await;
         assert_eq!(w.epoch().await, 1);
-        w.publish(b"wm1", vec![tobj("orders", b"a")], 1)
+        w.publish(&wm(0, 1), vec![tobj("orders", b"a")], 1)
             .await
             .unwrap();
         let st = w.state.lock().await;
         assert_eq!(st.head.seq, 1);
         assert!(st.head.head_entry_key.is_some());
-        assert_eq!(st.head.watermark_hex.as_deref(), Some("776d31")); // "wm1"
+        assert_eq!(
+            st.head.watermark_hex.as_deref(),
+            Some(wm_hex(0, 1).as_str())
+        );
     }
 
     #[tokio::test]
     async fn second_publish_advances_seq_and_chains() {
         let s = cond();
         let w = writer(Arc::clone(&s)).await;
-        w.publish(b"wm1", vec![tobj("orders", b"a")], 1)
+        w.publish(&wm(0, 1), vec![tobj("orders", b"a")], 1)
             .await
             .unwrap();
-        w.publish(b"wm2", vec![tobj("orders", b"b")], 1)
+        w.publish(&wm(0, 2), vec![tobj("orders", b"b")], 1)
             .await
             .unwrap();
         let st = w.state.lock().await;
@@ -596,7 +729,7 @@ mod tests {
 
         // Stale writer a is fenced and stays fenced (no auto-reacquire).
         let e1 = a
-            .publish(b"wmX", vec![tobj("orders", b"x")], 1)
+            .publish(&wm(0, 10), vec![tobj("orders", b"x")], 1)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -608,13 +741,13 @@ mod tests {
         ));
         assert!(e1.is_fatal());
         let e2 = a
-            .publish(b"wmY", vec![tobj("orders", b"y")], 1)
+            .publish(&wm(0, 11), vec![tobj("orders", b"y")], 1)
             .await
             .unwrap_err();
         assert!(matches!(e2, HeadError::Fenced { .. }));
 
         // The newer epoch publishes fine.
-        b.publish(b"wm2", vec![tobj("orders", b"z")], 1)
+        b.publish(&wm(0, 2), vec![tobj("orders", b"z")], 1)
             .await
             .unwrap();
     }
@@ -636,6 +769,7 @@ mod tests {
                 "pipe",
                 "src",
                 "sink",
+                cmp(),
             )
             .await,
         );
@@ -657,6 +791,7 @@ mod tests {
                 "pipe",
                 "src",
                 "sink",
+                cmp(),
             )
             .await,
         );
@@ -685,6 +820,7 @@ mod tests {
                 "pipe",
                 "src",
                 "sink",
+                cmp(),
             )
             .await,
         );
@@ -701,7 +837,7 @@ mod tests {
         // The next publish must reconcile from the new HEAD and still commit.
         let s = cond();
         let w = writer(Arc::clone(&s)).await; // epoch 1, seq 0 -> after publish seq 1
-        w.publish(b"wm1", vec![tobj("orders", b"a")], 1)
+        w.publish(&wm(0, 1), vec![tobj("orders", b"a")], 1)
             .await
             .unwrap();
 
@@ -718,14 +854,14 @@ mod tests {
         cur.seq = 2;
         cur.head_entry_key = Some(fake_entry_key.to_string());
         cur.head_entry_hash = Some("face".into());
-        cur.watermark_hex = Some("aa".into());
+        cur.watermark_hex = Some(wm_hex(0, 2));
         s.cas_put(&hkey, cur.canonical_bytes(), etag.as_deref().unwrap())
             .await
             .unwrap();
 
         // Writer's cached ETag is now stale; publish reconciles (same epoch,
         // different head) and commits at seq 3.
-        w.publish(b"wm3", vec![tobj("orders", b"c")], 1)
+        w.publish(&wm(0, 3), vec![tobj("orders", b"c")], 1)
             .await
             .unwrap();
         let st = w.state.lock().await;
@@ -789,15 +925,147 @@ mod tests {
             fail_on: AtomicUsize::new(0),
             seen: AtomicUsize::new(0),
         });
-        let w = DurableWriter::acquire(lossy, "pfx", "pipe", "src", "sink")
-            .await
-            .unwrap();
+        let w =
+            DurableWriter::acquire(lossy, "pfx", "pipe", "src", "sink", cmp())
+                .await
+                .unwrap();
         // The publish's HEAD CAS applies but the response is lost; publish must
         // reread, see HEAD referencing its entry, and acknowledge.
-        w.publish(b"wm1", vec![tobj("orders", b"a")], 1)
+        w.publish(&wm(0, 1), vec![tobj("orders", b"a")], 1)
             .await
             .expect("lost response but write succeeded -> ack");
         let st = w.state.lock().await;
         assert_eq!(st.head.seq, 1);
+    }
+
+    async fn entry_count(s: &ObjectStoreConditional) -> usize {
+        s.list(&Path::from("pfx/pipe/_manifest/entries"))
+            .await
+            .unwrap()
+            .len()
+    }
+
+    /// Crash after the HEAD CAS but before the coordinator checkpoint: a new
+    /// epoch is acquired and the source resumes from an OLDER checkpoint. The
+    /// replayed older batch must be acknowledged without moving HEAD backward.
+    #[tokio::test]
+    async fn replay_older_batch_under_newer_epoch_does_not_move_head() {
+        let s = cond();
+        let w1 = writer(Arc::clone(&s)).await; // epoch 1
+        w1.publish(&wm(0, 5), vec![tobj("orders", b"a")], 1)
+            .await
+            .unwrap(); // HEAD at pos 5, seq 1
+        let entries_before = entry_count(&s).await;
+
+        // "Crash": drop w1, acquire a newer epoch. HEAD still at pos 5.
+        drop(w1);
+        let w2 = DurableWriter::acquire(
+            Arc::clone(&s),
+            "pfx",
+            "pipe",
+            "src",
+            "sink",
+            cmp(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(w2.epoch().await, 2);
+
+        // Source resumes from an older checkpoint (pos 3) -> Before -> ack, no
+        // new entry, HEAD unchanged (no backward transition).
+        w2.publish(&wm(0, 3), vec![tobj("orders", b"replay")], 1)
+            .await
+            .unwrap();
+        let st = w2.state.lock().await;
+        assert_eq!(st.head.seq, 1, "HEAD must not advance on replay");
+        assert_eq!(
+            st.head.watermark_hex.as_deref(),
+            Some(wm_hex(0, 5).as_str()),
+            "HEAD watermark must not move backward"
+        );
+        drop(st);
+        assert_eq!(
+            entry_count(&s).await,
+            entries_before,
+            "a Before replay must not write a new manifest entry"
+        );
+    }
+
+    /// An exactly-equal watermark retry is acknowledged without moving HEAD.
+    #[tokio::test]
+    async fn equal_watermark_retry_acknowledges_without_moving_head() {
+        let s = cond();
+        let w = writer(Arc::clone(&s)).await;
+        w.publish(&wm(0, 4), vec![tobj("orders", b"a")], 1)
+            .await
+            .unwrap();
+        let entries = entry_count(&s).await;
+        w.publish(&wm(0, 4), vec![tobj("orders", b"a")], 1)
+            .await
+            .unwrap(); // Equal -> ack, no move
+        let st = w.state.lock().await;
+        assert_eq!(st.head.seq, 1);
+        drop(st);
+        assert_eq!(entry_count(&s).await, entries);
+    }
+
+    /// A proposal from a different lineage/generation fails closed and never
+    /// moves HEAD.
+    #[tokio::test]
+    async fn incomparable_lineage_fails_closed() {
+        let s = cond();
+        let w = writer(Arc::clone(&s)).await;
+        w.publish(&wm(0, 2), vec![tobj("orders", b"a")], 1)
+            .await
+            .unwrap();
+        // lineage 1 != lineage 0 -> Incomparable.
+        let err = expect_err(
+            w.publish(&wm(1, 9), vec![tobj("orders", b"b")], 1).await,
+        );
+        assert!(matches!(err, HeadError::Integrity(_)));
+        assert!(err.is_fatal());
+        let st = w.state.lock().await;
+        assert_eq!(
+            st.head.watermark_hex.as_deref(),
+            Some(wm_hex(0, 2).as_str())
+        );
+    }
+
+    /// After catching up (Before then Equal), a strictly newer watermark
+    /// publishes and advances HEAD.
+    #[tokio::test]
+    async fn catch_up_then_newer_watermark_publishes() {
+        let s = cond();
+        let w1 = writer(Arc::clone(&s)).await;
+        w1.publish(&wm(0, 5), vec![tobj("orders", b"a")], 1)
+            .await
+            .unwrap();
+        drop(w1);
+        let w2 = DurableWriter::acquire(
+            Arc::clone(&s),
+            "pfx",
+            "pipe",
+            "src",
+            "sink",
+            cmp(),
+        )
+        .await
+        .unwrap();
+        // Replay below head, then reach head, then surpass it.
+        w2.publish(&wm(0, 3), vec![tobj("orders", b"x")], 1)
+            .await
+            .unwrap(); // Before
+        w2.publish(&wm(0, 5), vec![tobj("orders", b"y")], 1)
+            .await
+            .unwrap(); // Equal
+        w2.publish(&wm(0, 6), vec![tobj("orders", b"z")], 1)
+            .await
+            .unwrap(); // After -> advances
+        let st = w2.state.lock().await;
+        assert_eq!(st.head.seq, 2, "the newer watermark advanced HEAD");
+        assert_eq!(
+            st.head.watermark_hex.as_deref(),
+            Some(wm_hex(0, 6).as_str())
+        );
     }
 }
