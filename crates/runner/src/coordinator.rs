@@ -29,14 +29,6 @@ use crate::schema_provider::{ArcSchemaProvider, TableSchemaInfo};
 pub type CommitCpFn<Tok> =
     Box<dyn Fn(Tok) -> BoxFuture<'static, Result<()>> + Send + Sync + 'static>;
 
-/// Maps a batch's authoritative (pre-processing) checkpoint token to the
-/// `(CheckpointMeta, durable_watermark_bytes)` the durable sink context needs.
-/// Injected by the runner for durable mode (it owns source lineage/state); the
-/// coordinator stays source- and token-agnostic. `None` = no durable watermark.
-pub type DurableWatermarkFn<Tok> = Arc<
-    dyn Fn(&Tok) -> Option<(CheckpointMeta, Vec<u8>)> + Send + Sync + 'static,
->;
-
 pub struct ProcessedBatch<Tok> {
     pub events: Vec<Event>,
     pub last_checkpoint: Option<Tok>,
@@ -63,10 +55,11 @@ struct BuildingBatch {
     bytes: usize,
     committed_len: usize,
     committed_bytes: usize,
-    /// Durable watermark of the batch's last committed boundary (from the source
-    /// `SourceBoundary`), carried atomically with that boundary's checkpoint into
-    /// the delivery context. `None` for non-durable / no-boundary batches.
-    boundary_watermark: Option<Arc<[u8]>>,
+    /// The batch's last committed source boundary: its resume checkpoint and the
+    /// durable watermark for the SAME source state, carried together (never
+    /// re-derived) into the delivery context. It is the single watermark
+    /// authority. `None` for non-durable / no-boundary batches.
+    boundary: Option<deltaforge_core::SourceBoundary>,
 }
 
 impl BuildingBatch {
@@ -77,7 +70,7 @@ impl BuildingBatch {
             bytes: 0,
             committed_len: 0,
             committed_bytes: 0,
-            boundary_watermark: None,
+            boundary: None,
         }
     }
 
@@ -136,8 +129,9 @@ fn close_tx(
     boundary: deltaforge_core::SourceBoundary,
 ) -> bool {
     let had_events = b.mid_tx();
-    // The watermark travels with the checkpoint from the same boundary.
-    b.boundary_watermark = boundary.durable_watermark.clone();
+    // The whole boundary (checkpoint + watermark, from one source state) becomes
+    // the batch boundary and is stamped on the last event for resume.
+    b.boundary = Some(boundary.clone());
     if let Some(last) = b.raw.last_mut() {
         last.set_boundary(boundary);
     }
@@ -146,19 +140,16 @@ fn close_tx(
     had_events
 }
 
-/// Record that a standalone (non-transactional) event is its own boundary. The
-/// event's durable watermark (paired atomically with its checkpoint at the
-/// source via `Event::set_boundary`) becomes the batch's boundary watermark, so
-/// a non-GTID CDC row or snapshot row carries a watermark exactly like a commit
-/// marker does. The latest standalone boundary wins, matching the checkpoint the
-/// batch resumes from.
+/// Record that a standalone (non-transactional) event is its own boundary. Its
+/// source boundary (checkpoint + watermark, set atomically at the source via
+/// `Event::set_boundary`) becomes the batch boundary, so a non-GTID CDC row or
+/// snapshot row carries a boundary exactly like a commit marker does. The latest
+/// boundary wins; an event without one leaves the current boundary untouched.
 fn commit_standalone(b: &mut BuildingBatch) {
     b.committed_len = b.raw.len();
     b.committed_bytes = b.bytes;
-    if let Some(last) = b.raw.last() {
-        if let Some(wm) = last.durable_watermark().cloned() {
-            b.boundary_watermark = Some(wm);
-        }
+    if let Some(bd) = b.raw.last().and_then(|e| e.boundary.clone()) {
+        b.boundary = Some(bd);
     }
 }
 
@@ -686,9 +677,6 @@ pub struct Coordinator<Tok> {
     db_schema_cache: Mutex<HashMap<String, TableSchemaInfo>>,
     /// Optional DLQ writer for routing per-event failures.
     dlq_writer: Option<Arc<crate::dlq::DlqWriter>>,
-    /// Optional builder for the durable watermark passed to sinks in the batch
-    /// context (durable S3 mode).
-    durable_watermark_fn: Option<DurableWatermarkFn<Tok>>,
 }
 
 pub struct CoordinatorBuilder<Tok> {
@@ -702,7 +690,6 @@ pub struct CoordinatorBuilder<Tok> {
     schema_sensor: Option<Arc<SchemaSensorState>>,
     schema_provider: Option<ArcSchemaProvider>,
     dlq_writer: Option<Arc<crate::dlq::DlqWriter>>,
-    durable_watermark_fn: Option<DurableWatermarkFn<Tok>>,
 }
 
 impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
@@ -718,14 +705,7 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             schema_sensor: None,
             schema_provider: None,
             dlq_writer: None,
-            durable_watermark_fn: None,
         }
-    }
-
-    /// Inject the durable-watermark builder (durable S3 mode).
-    pub fn durable_watermark_fn(mut self, f: DurableWatermarkFn<Tok>) -> Self {
-        self.durable_watermark_fn = Some(f);
-        self
     }
 
     pub fn sinks(mut self, sinks: Vec<ArcDynSink>) -> Self {
@@ -803,7 +783,6 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             schema_provider: self.schema_provider,
             db_schema_cache: Mutex::new(HashMap::new()),
             dlq_writer: self.dlq_writer,
-            durable_watermark_fn: self.durable_watermark_fn,
         }
     }
 }
@@ -1315,29 +1294,21 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         let deadline = self.sink_batch_deadline;
         let pipeline_name_str: String = self.pipeline_name.to_string();
 
-        // Build the authoritative delivery context from the PRE-processing
-        // checkpoint (never inferred from surviving events) plus the durable
-        // watermark. Shared read-only across all sinks.
-        let (ctx_checkpoint, ctx_watermark) =
-            match (&self.durable_watermark_fn, &last_cp) {
-                (Some(f), Some(tok)) => match f(tok) {
-                    Some((cp, wm)) => (Some(cp), Some(wm)),
-                    None => (None, None),
-                },
-                _ => (None, None),
-            };
-        // The source boundary's watermark (carried atomically with its commit
-        // checkpoint through the marker) is authoritative when present; the
-        // fn-derived watermark is a fallback for boundary-less paths.
-        let ctx_watermark = b
-            .boundary_watermark
-            .as_ref()
-            .map(|w| w.to_vec())
-            .or(ctx_watermark);
+        // The delivery context comes entirely from the batch's source boundary
+        // (captured at the commit marker, before processing, so it survives
+        // filtering). Checkpoint and watermark are the SAME source state - the
+        // single watermark authority; nothing re-derives a watermark here.
         let ctx = Arc::new(deltaforge_core::SinkBatchContext {
-            checkpoint: ctx_checkpoint
+            checkpoint: b
+                .boundary
+                .as_ref()
+                .map(|bd| bd.checkpoint.clone())
                 .unwrap_or_else(|| CheckpointMeta::from_vec(Vec::new())),
-            durable_watermark: ctx_watermark,
+            durable_watermark: b
+                .boundary
+                .as_ref()
+                .and_then(|bd| bd.durable_watermark.as_ref())
+                .map(|w| w.to_vec()),
             batch_id: None,
         });
 
@@ -3546,9 +3517,10 @@ mod tests {
         }
     }
 
-    /// Run a batch of events (last carrying `authoritative` checkpoint) through a
-    /// coordinator with `proc` and a durable_watermark_fn, returning the sink's
-    /// recorded contexts.
+    /// Run 3 standalone events (the last carrying an `authoritative` source
+    /// boundary: checkpoint + watermark) through a coordinator with `proc`,
+    /// returning the sink's recorded contexts. The context is built solely from
+    /// the batch's source boundary - there is no independent watermark builder.
     async fn deliver_with_processor(
         proc: deltaforge_core::ArcDynProcessor,
     ) -> Vec<CtxDelivery> {
@@ -3560,23 +3532,17 @@ mod tests {
         let procs: Arc<[deltaforge_core::ArcDynProcessor]> =
             Arc::from(vec![proc]);
         let batch_processor = build_batch_processor(procs, "test".to_string());
-        // Durable watermark = the checkpoint bytes (test builder).
-        let wm_fn: super::DurableWatermarkFn<CheckpointMeta> =
-            Arc::new(|cp: &CheckpointMeta| {
-                Some((cp.clone(), cp.as_bytes().to_vec()))
-            });
         let coord = Coordinator::builder("test-ctx")
             .sinks(sinks)
             .batch_config(Some(BatchConfig {
                 max_events: Some(10),
                 max_ms: Some(50),
-                respect_source_tx: Some(false), // legacy path: simpler for this test
+                respect_source_tx: Some(true),
                 max_inflight: Some(1),
                 ..BatchConfig::default()
             }))
             .commit_fn("ctx", cp_fn)
             .process_fn(batch_processor)
-            .durable_watermark_fn(wm_fn)
             .build();
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
@@ -3604,11 +3570,17 @@ mod tests {
                 0,
                 0,
             );
-            // Only the LAST event carries the authoritative checkpoint.
+            ev.transaction = None; // standalone
+            // Only the LAST event carries the authoritative source boundary.
             if i == 2 {
-                ev.set_checkpoint(CheckpointMeta::from_vec(
-                    b"authoritative".to_vec(),
-                ));
+                ev.set_boundary(deltaforge_core::SourceBoundary {
+                    checkpoint: CheckpointMeta::from_vec(
+                        b"authoritative".to_vec(),
+                    ),
+                    durable_watermark: Some(std::sync::Arc::from(
+                        b"authoritative".to_vec(),
+                    )),
+                });
             }
             tx.send(SourceItem::Event(ev)).await.unwrap();
         }
