@@ -540,6 +540,49 @@ mod tests {
         (std::sync::Arc::new(p), rx)
     }
 
+    /// Publisher over tables of a given cursor kind (PG: Signed or CtidBlock).
+    fn publisher_kind(
+        tables: &[&str],
+        cap: usize,
+        kind: CursorKind,
+    ) -> (
+        std::sync::Arc<SnapshotPublisher>,
+        tokio::sync::mpsc::Receiver<SourceItem>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(cap);
+        let t: Vec<(String, CursorKind)> =
+            tables.iter().map(|s| (s.to_string(), kind)).collect();
+        let a = SnapshotAggregator::new(
+            1,
+            lineage(),
+            CheckpointMeta::from_vec(b"0/1A2B3C".to_vec()),
+            &t,
+        );
+        (std::sync::Arc::new(SnapshotPublisher::new(a, tx)), rx)
+    }
+
+    /// The last boundary drained, as its typed cursor for `table`.
+    fn drain_last_typed(
+        rx: &mut tokio::sync::mpsc::Receiver<SourceItem>,
+        table: &str,
+    ) -> Option<SnapshotCursor> {
+        let mut last = None;
+        while let Ok(item) = rx.try_recv() {
+            if let SourceItem::Event(e) = item {
+                if let Some(b) = e.boundary.as_ref() {
+                    let wm = DurableWatermark::parse(
+                        b.durable_watermark.as_ref().unwrap(),
+                    )
+                    .unwrap();
+                    if let WmPos::Snapshot { table_cursors, .. } = wm.pos {
+                        last = table_cursors.get(table).copied();
+                    }
+                }
+            }
+        }
+        last
+    }
+
     /// Drain currently-available items without blocking, returning the boundary
     /// cursor of the last event that carried one (if any).
     fn drain_last_cursor(
@@ -699,5 +742,105 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ── PostgreSQL-flavoured coverage: signed integer-PK intra-table parallelism
+    //    (negative min) and the ctid page-block frontier. Both drive the same
+    //    SnapshotPublisher. ──────────────────────────────────────────────────────
+
+    use SnapshotCursor::{CtidBlock, Signed};
+
+    /// PG integer-PK intra-table parallelism: sub-ranges of a signed-PK table
+    /// (min_pk negative) publish out of order. A vacuous prefix chunk abuts the
+    /// frontier at min_pk; the frontier then advances only through contiguous
+    /// ranges - a later sub-range never counts before an earlier one is durable.
+    #[tokio::test]
+    async fn publisher_pg_signed_intra_table_out_of_order() {
+        let (p, mut rx) = publisher_kind(&["pg.t"], 64, CursorKind::Signed);
+
+        // Vacuous prefix [i64::MIN, -50): advances the frontier to -50, no rows.
+        p.publish_chunk("pg.t", Signed(i64::MIN), Signed(-50), vec![])
+            .await
+            .unwrap();
+
+        // Sub-range B = [25, 100) completes before sub-range A: buffered (a gap
+        // [-50, 25) remains), so no boundary is emitted.
+        p.publish_chunk("pg.t", Signed(25), Signed(100), vec![snap_event(1)])
+            .await
+            .unwrap();
+        assert_eq!(
+            drain_last_typed(&mut rx, "pg.t"),
+            None,
+            "sub-range B before A must not advance past the gap"
+        );
+
+        // Sub-range A = [-50, 25) fills the gap and cascades into buffered B.
+        p.publish_chunk("pg.t", Signed(-50), Signed(25), vec![snap_event(2)])
+            .await
+            .unwrap();
+        assert_eq!(
+            drain_last_typed(&mut rx, "pg.t"),
+            Some(Signed(100)),
+            "frontier cascades to 100 once [-50,25) lands"
+        );
+    }
+
+    /// PG ctid page-block frontier: a blocked channel holds the publisher lock, so
+    /// a second table's boundary cannot appear before the first chunk drains.
+    #[tokio::test]
+    async fn publisher_pg_ctid_blocked_channel() {
+        let (p, mut rx) =
+            publisher_kind(&["pg.a", "pg.b"], 1, CursorKind::CtidBlock);
+
+        let p1 = std::sync::Arc::clone(&p);
+        let w1 = tokio::spawn(async move {
+            p1.publish_chunk(
+                "pg.a",
+                CtidBlock(0),
+                CtidBlock(4),
+                vec![snap_event(1), snap_event(2)],
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let p2 = std::sync::Arc::clone(&p);
+        let w2 = tokio::spawn(async move {
+            p2.publish_chunk(
+                "pg.b",
+                CtidBlock(0),
+                CtidBlock(4),
+                vec![snap_event(3)],
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!w2.is_finished(), "w2 blocked by the held publisher lock");
+
+        let mut seen = Vec::new();
+        while seen.len() < 3 {
+            if let Some(SourceItem::Event(e)) = rx.recv().await {
+                seen.push(e);
+            }
+        }
+        w1.await.unwrap().unwrap();
+        w2.await.unwrap().unwrap();
+
+        // pg.b's boundary rides its last event, produced only after pg.a drained.
+        let last = seen.last().unwrap();
+        let b = last.boundary.as_ref().expect("pg.b boundary");
+        let wm = DurableWatermark::parse(b.durable_watermark.as_ref().unwrap())
+            .unwrap();
+        match wm.pos {
+            WmPos::Snapshot { table_cursors, .. } => {
+                assert_eq!(table_cursors["pg.b"], CtidBlock(4));
+                assert_eq!(
+                    table_cursors["pg.a"],
+                    CtidBlock(4),
+                    "pg.a durable before pg.b's boundary"
+                );
+            }
+            _ => panic!(),
+        }
     }
 }
