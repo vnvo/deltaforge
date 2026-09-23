@@ -1076,6 +1076,9 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
             format: domain.format.clone(),
             format_version: domain.format_version,
             schema_id: domain.schema_id.clone(),
+            compression: domain.compression.clone(),
+            partition_spec: domain.partition_spec.clone(),
+            partition_version: domain.partition_version,
         };
 
         // Everything from here mutates HEAD, so take the same lock batch
@@ -1232,7 +1235,7 @@ mod tests {
         TableObject {
             table: table.to_string(),
             bytes: Bytes::from_static(bytes),
-            domain: EncodingDomain::new("jsonl", 1, "s1"),
+            domain: EncodingDomain::new("jsonl", 1, "s1", "none", "table", 1),
             ext: "jsonl",
         }
     }

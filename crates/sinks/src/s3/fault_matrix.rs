@@ -249,7 +249,7 @@ fn tobj(table: &str, bytes: &'static [u8]) -> TableObject {
     TableObject {
         table: table.to_string(),
         bytes: Bytes::from_static(bytes),
-        domain: EncodingDomain::new("jsonl", 1, "s1"),
+        domain: EncodingDomain::new("jsonl", 1, "s1", "none", "table", 1),
         ext: "jsonl",
     }
 }

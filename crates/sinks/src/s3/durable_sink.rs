@@ -43,6 +43,21 @@ pub enum DurableFormat {
     Jsonl,
 }
 
+/// Partition-spec identity for durable v2. Currently only table partitioning;
+/// carried explicitly in the encoding domain so a future scheme cannot be mixed.
+const PARTITION_SPEC: &str = "table";
+const PARTITION_VERSION: u16 = 1;
+
+/// Stable codec label for the encoding domain (part of object identity).
+fn compression_label(c: Compression) -> &'static str {
+    match c {
+        Compression::None => "none",
+        Compression::Snappy => "snappy",
+        Compression::Gzip => "gzip",
+        Compression::Zstd => "zstd",
+    }
+}
+
 /// Constructor inputs for the durable S3 sink.
 pub struct DurableS3Args {
     pub id: String,
@@ -136,6 +151,7 @@ impl DurableS3Sink {
         events: &[&Event],
     ) -> SinkResult<TableObject> {
         let owned: Vec<Event> = events.iter().map(|e| (*e).clone()).collect();
+        let compression = compression_label(self.inner.compression);
         match self.inner.format {
             DurableFormat::Jsonl => {
                 let bytes = encode_jsonl(&owned).map_err(|e| {
@@ -148,6 +164,9 @@ impl DurableS3Sink {
                         "jsonl",
                         JSONL_ENCODER_VERSION,
                         "jsonl",
+                        compression,
+                        PARTITION_SPEC,
+                        PARTITION_VERSION,
                     ),
                     ext: "jsonl",
                 })
@@ -167,6 +186,9 @@ impl DurableS3Sink {
                         "parquet",
                         PARQUET_ENCODER_VERSION,
                         schema_fingerprint(&schema),
+                        compression,
+                        PARTITION_SPEC,
+                        PARTITION_VERSION,
                     ),
                     ext: "parquet",
                 })

@@ -24,7 +24,10 @@ use super::batch_upload::UploadedObject;
 use super::store_cond::{CondError, ConditionalStore, PutOutcome};
 
 /// Canonical manifest entry version. Bump if the canonical byte layout changes.
-pub const MANIFEST_ENTRY_VERSION: u16 = 1;
+// v2: ManifestObject records the full encoding domain (adds compression codec
+// and partition spec/version). durable v2 has not shipped, so this is a clean
+// format bump, not a back-compatible default.
+pub const MANIFEST_ENTRY_VERSION: u16 = 2;
 
 /// Domain-separation tag folded into the entry hash so a manifest-entry digest
 /// can never collide with a data-object or any other SHA-256 in the system.
@@ -42,6 +45,9 @@ pub struct ManifestObject {
     pub format: String,
     pub format_version: u16,
     pub schema_id: String,
+    pub compression: String,
+    pub partition_spec: String,
+    pub partition_version: u16,
 }
 
 impl ManifestObject {
@@ -55,6 +61,9 @@ impl ManifestObject {
             format: o.encoding_domain.format.to_string(),
             format_version: o.encoding_domain.format_version,
             schema_id: o.encoding_domain.schema_id.clone(),
+            compression: o.encoding_domain.compression.clone(),
+            partition_spec: o.encoding_domain.partition_spec.clone(),
+            partition_version: o.encoding_domain.partition_version,
         }
     }
 
@@ -70,6 +79,9 @@ impl ManifestObject {
             self.format.clone(),
             self.format_version,
             self.schema_id.clone(),
+            self.compression.clone(),
+            self.partition_spec.clone(),
+            self.partition_version,
         )
     }
 }
@@ -251,6 +263,9 @@ mod tests {
             format: "parquet".into(),
             format_version: 1,
             schema_id: "s1".into(),
+            compression: "none".into(),
+            partition_spec: "table".into(),
+            partition_version: 1,
         }
     }
 
@@ -403,7 +418,9 @@ mod tests {
             table: "orders".into(),
             content_hash: "ch".into(),
             byte_len: 10,
-            encoding_domain: EncodingDomain::new("parquet", 1, "s1"),
+            encoding_domain: EncodingDomain::new(
+                "parquet", 1, "s1", "none", "table", 1,
+            ),
             etag: Some("\"etag-should-not-appear\"".into()),
         };
         let mo = ManifestObject::from_uploaded(&up);

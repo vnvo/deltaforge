@@ -22,7 +22,9 @@ use super::keys::EncodingDomain;
 use super::manifest::{ManifestObject, PrevRef};
 use super::store_cond::{ConditionalStore, PutOutcome};
 
-pub const COMPACTION_RECORD_VERSION: u16 = 1;
+// v2: embedded ManifestObjects now carry the full encoding domain (compression
+// codec + partition spec/version). Clean bump; durable v2 has not shipped.
+pub const COMPACTION_RECORD_VERSION: u16 = 2;
 const RECORD_HASH_DOMAIN: &[u8] = b"deltaforge/s3/compaction-record/v1";
 
 /// An immutable record mapping the original object keys/hashes for one table to
@@ -132,10 +134,11 @@ impl From<super::store_cond::CondError> for CompactionError {
 }
 
 /// Compatibility gate: every original must share `table` and the exact encoding
-/// domain (format, encoder version, schema fingerprint) of the replacement.
-/// Partition and compression semantics are captured by the domain + format
-/// version, so identical domains guarantee identical partition/compression.
-/// Never compact across an incompatible schema or encoding domain.
+/// domain of the replacement. The domain now includes the compression codec and
+/// the partition spec/version as explicit fields, so Snappy vs Zstd, or a
+/// different partition scheme, are rejected here - not silently accepted. Never
+/// compact across an incompatible schema, encoding, compression or partition
+/// domain.
 pub fn check_compatible(
     table: &str,
     replacement_domain: &EncodingDomain,
@@ -290,12 +293,15 @@ mod tests {
             format: "jsonl".to_string(),
             format_version: 1,
             schema_id: "s1".to_string(),
+            compression: "none".to_string(),
+            partition_spec: "table".to_string(),
+            partition_version: 1,
         }
     }
 
     #[test]
     fn check_compatible_rejects_mixed_table_or_domain() {
-        let dom = EncodingDomain::new("jsonl", 1, "s1");
+        let dom = EncodingDomain::new("jsonl", 1, "s1", "none", "table", 1);
         // Empty is rejected.
         assert!(check_compatible("shop.orders", &dom, &[]).is_err());
         // Mixed table.
@@ -312,8 +318,48 @@ mod tests {
     }
 
     #[test]
+    fn check_compatible_rejects_mixed_compression() {
+        // A Snappy replacement can never absorb a Zstd original with the same
+        // schema (and vice versa): compression is part of the domain identity.
+        let snappy =
+            EncodingDomain::new("parquet", 1, "s1", "snappy", "table", 1);
+        let mut zstd_obj = obj("shop.orders", "b");
+        zstd_obj.format = "parquet".into();
+        zstd_obj.compression = "zstd".into();
+        let mut snappy_obj = obj("shop.orders", "a");
+        snappy_obj.format = "parquet".into();
+        snappy_obj.compression = "snappy".into();
+        let mixed = vec![snappy_obj.clone(), zstd_obj];
+        assert!(check_compatible("shop.orders", &snappy, &mixed).is_err());
+        // All-snappy is fine.
+        assert!(
+            check_compatible("shop.orders", &snappy, &[snappy_obj]).is_ok()
+        );
+    }
+
+    #[test]
+    fn check_compatible_rejects_mixed_partition() {
+        // Different partition spec or version is incompatible even with identical
+        // format/schema/compression.
+        let dom = EncodingDomain::new("jsonl", 1, "s1", "none", "table", 1);
+        let mut other_ver = obj("shop.orders", "b");
+        other_ver.partition_version = 2;
+        assert!(
+            check_compatible(
+                "shop.orders",
+                &dom,
+                &[obj("shop.orders", "a"), other_ver]
+            )
+            .is_err()
+        );
+        let mut other_spec = obj("shop.orders", "c");
+        other_spec.partition_spec = "table/date".into();
+        assert!(check_compatible("shop.orders", &dom, &[other_spec]).is_err());
+    }
+
+    #[test]
     fn record_hash_is_stable_regardless_of_original_order() {
-        let dom = EncodingDomain::new("jsonl", 1, "s1");
+        let dom = EncodingDomain::new("jsonl", 1, "s1", "none", "table", 1);
         let mk = |order: Vec<ManifestObject>| CompactionRecord {
             version: COMPACTION_RECORD_VERSION,
             pipeline: "p".into(),

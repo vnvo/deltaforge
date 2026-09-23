@@ -202,7 +202,7 @@ mod tests {
     use std::sync::Arc;
 
     fn dom() -> EncodingDomain {
-        EncodingDomain::new("jsonl", 1, "schema-1")
+        EncodingDomain::new("jsonl", 1, "schema-1", "none", "table", 1)
     }
 
     fn obj(table: &str, bytes: &'static [u8]) -> TableObject {
