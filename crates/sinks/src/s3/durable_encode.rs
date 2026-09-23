@@ -6,13 +6,21 @@
 //! bytes on every retry. That rules out any encoder entropy: wall-clock
 //! metadata, random file/metadata ids, or ordering that varies run to run.
 //!
+//! Reproducibility must hold across *differently built binaries*, not just
+//! across retries in one process: Cargo feature unification is additive, so a
+//! dependency elsewhere in the final binary can flip a shared library's
+//! behavior. This module never relies on such build-dependent behavior.
+//!
 //! - **Parquet**: written with a fixed `created_by` so bytes do not depend on the
 //!   parquet crate version (the version is carried in the `EncodingDomain`
-//!   instead), and a pinned compression codec. parquet-rs embeds no write
-//!   timestamps, and statistics are data-derived, so output is reproducible.
-//! - **JSON Lines**: `serde_json` serializes object keys in sorted (BTreeMap)
-//!   order here (no `preserve_order` feature in the tree), so identical events
-//!   serialize identically.
+//!   instead). parquet-rs embeds no write timestamps and statistics are
+//!   data-derived, so output is reproducible - *except* Gzip, whose `flate2`
+//!   backend is chosen by feature unification; `map_compression` therefore
+//!   rejects Gzip and permits only None, Snappy and Zstd.
+//! - **JSON Lines**: keys are written in recursively sorted order by
+//!   `write_canonical_json`, so the bytes never depend on `serde_json`'s map
+//!   implementation or the `preserve_order` feature (which unification can
+//!   enable). Array order is preserved.
 //!
 //! Staged scaffolding: consumed by the durable sink in a later P0.4 commit.
 #![allow(dead_code)]
@@ -41,12 +49,24 @@ pub const PARQUET_ENCODER_VERSION: u16 = 1;
 /// Encoder version for JSON Lines output.
 pub const JSONL_ENCODER_VERSION: u16 = 1;
 
-fn map_compression(c: Compression) -> PqCompression {
+/// Map a durable-path compression codec to parquet's, rejecting any codec whose
+/// compressed bytes are not stable across build configurations. `Gzip` is
+/// rejected: parquet-rs compresses it with `flate2`, whose backend (pure-Rust
+/// miniz_oxide vs C zlib) is selected by Cargo feature unification and is
+/// additive - a single dependency anywhere in the final binary's graph enabling
+/// `any_zlib` silently changes the gzip byte stream. That would content-address
+/// identical events to different keys across differently built binaries. `None`,
+/// `Snappy` and `Zstd` produce byte-identical output regardless of unification.
+fn map_compression(c: Compression) -> Result<PqCompression> {
     match c {
-        Compression::None => PqCompression::UNCOMPRESSED,
-        Compression::Snappy => PqCompression::SNAPPY,
-        Compression::Gzip => PqCompression::GZIP(Default::default()),
-        Compression::Zstd => PqCompression::ZSTD(Default::default()),
+        Compression::None => Ok(PqCompression::UNCOMPRESSED),
+        Compression::Snappy => Ok(PqCompression::SNAPPY),
+        Compression::Zstd => Ok(PqCompression::ZSTD(Default::default())),
+        Compression::Gzip => Err(anyhow::anyhow!(
+            "Gzip is not permitted on the durable S3 path: its flate2 backend \
+             is chosen by Cargo feature unification, so its bytes are not \
+             reproducible across binaries; use None, Snappy or Zstd"
+        )),
     }
 }
 
@@ -59,7 +79,7 @@ pub fn encode_parquet(
     let batch = events_to_record_batch(schema, events)?;
     let props = WriterProperties::builder()
         .set_created_by(PARQUET_CREATED_BY.to_string())
-        .set_compression(map_compression(compression))
+        .set_compression(map_compression(compression)?)
         .build();
     let mut buf: Vec<u8> = Vec::new();
     let mut writer =
@@ -70,15 +90,59 @@ pub fn encode_parquet(
 }
 
 /// Encode `events` to a byte-reproducible JSON Lines object (one JSON object per
-/// line). Compression, when added, must itself be deterministic; callers pass
-/// pre-agreed settings.
+/// line). Every object is emitted with its keys in sorted order, recursively, so
+/// the bytes never depend on `serde_json`'s map implementation or the
+/// `preserve_order` feature (which Cargo feature unification can silently enable
+/// in some builds but not others). Array order is preserved. Without this, the
+/// same encoder version would content-address identical events to different keys
+/// across differently built binaries.
 pub fn encode_jsonl(events: &[Event]) -> Result<Bytes> {
     let mut buf: Vec<u8> = Vec::new();
     for e in events {
-        serde_json::to_writer(&mut buf, e)?;
+        let v = serde_json::to_value(e)?;
+        write_canonical_json(&mut buf, &v);
         buf.push(b'\n');
     }
     Ok(Bytes::from(buf))
+}
+
+/// Write `v` as compact JSON with object keys sorted lexicographically at every
+/// level (arrays keep their order). Matches `serde_json`'s compact spacing, so
+/// the only difference from `to_writer` is the guaranteed key order.
+fn write_canonical_json(buf: &mut Vec<u8>, v: &serde_json::Value) {
+    use serde_json::Value;
+    match v {
+        Value::Object(map) => {
+            buf.push(b'{');
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    buf.push(b',');
+                }
+                // Encode the key string with correct quoting/escaping.
+                serde_json::to_writer(&mut *buf, k)
+                    .expect("string key serializes");
+                buf.push(b':');
+                write_canonical_json(buf, &map[*k]);
+            }
+            buf.push(b'}');
+        }
+        Value::Array(arr) => {
+            buf.push(b'[');
+            for (i, item) in arr.iter().enumerate() {
+                if i > 0 {
+                    buf.push(b',');
+                }
+                write_canonical_json(buf, item);
+            }
+            buf.push(b']');
+        }
+        // Scalars (null/bool/number/string) have a single canonical compact form.
+        other => {
+            serde_json::to_writer(&mut *buf, other).expect("scalar serializes")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -236,11 +300,9 @@ mod tests {
                 2223,
                 "ce9023b7584c4f25ec929b5d574b68ca83b205fea95737b7ed2ef3f21db0c7ec",
             ),
-            (
-                Compression::Gzip,
-                2440,
-                "ae0fb649215faf56697046c192ffcd0fc780c9bc4312b7976e5667a987a0e7d3",
-            ),
+            // Gzip is intentionally absent: it is rejected on the durable path
+            // (see map_compression) because its flate2 backend, and thus its
+            // bytes, depend on Cargo feature unification.
             (
                 Compression::Zstd,
                 2317,
@@ -260,11 +322,13 @@ mod tests {
                 "Parquet {c:?} bytes drifted; see the change protocol"
             );
         }
+        // Canonical (recursively sorted keys): identical under isolated sinks
+        // tests and the unified workspace graph (serde_json/preserve_order on).
         let j = encode_jsonl(&evs).unwrap();
         assert_eq!(j.len(), 1200, "JSONL byte length drifted");
         assert_eq!(
             sha256_hex(&j),
-            "d767ad745904a312600043cac8210a3c5a8ecad4be00f2807f51ca88f31fb627",
+            "803f679b0fa3061165a83a28374a40b794a1d6713a4917b2bb77f231377e48de",
             "JSONL bytes drifted; see the change protocol"
         );
     }
@@ -275,12 +339,7 @@ mod tests {
     fn print_golden_vectors() {
         let s = golden_schema();
         let evs = golden_events();
-        for c in [
-            Compression::None,
-            Compression::Snappy,
-            Compression::Gzip,
-            Compression::Zstd,
-        ] {
+        for c in [Compression::None, Compression::Snappy, Compression::Zstd] {
             let bytes = encode_parquet(&s, &evs, c).unwrap();
             println!("PARQUET {c:?} {} {}", bytes.len(), sha256_hex(&bytes));
         }
@@ -352,19 +411,25 @@ mod tests {
     }
 
     #[test]
-    fn parquet_reproducible_across_all_compressions() {
+    fn parquet_reproducible_across_permitted_compressions() {
         let s = schema();
         let evs = events();
-        for c in [
-            Compression::None,
-            Compression::Snappy,
-            Compression::Gzip,
-            Compression::Zstd,
-        ] {
+        for c in [Compression::None, Compression::Snappy, Compression::Zstd] {
             let a = encode_parquet(&s, &evs, c).unwrap();
             let b = encode_parquet(&s, &evs, c).unwrap();
             assert_eq!(a, b, "Parquet not reproducible for {c:?}");
         }
+    }
+
+    #[test]
+    fn durable_parquet_rejects_gzip() {
+        // Gzip's bytes are not stable across feature unification, so the durable
+        // path must refuse it rather than write a non-reproducible object.
+        let s = schema();
+        let evs = events();
+        let err = encode_parquet(&s, &evs, Compression::Gzip)
+            .expect_err("Gzip must be rejected on the durable path");
+        assert!(err.to_string().contains("Gzip is not permitted"));
     }
 
     #[test]
@@ -382,6 +447,44 @@ mod tests {
             encode_jsonl(&evs).unwrap(),
             encode_jsonl(&evs).unwrap(),
             "identical events must encode to identical JSONL"
+        );
+    }
+
+    #[test]
+    fn canonical_json_sorts_nested_keys_regardless_of_insertion_order() {
+        // Build the SAME nested object with keys inserted in two different
+        // orders, using serde_json::Map directly so the test exercises whatever
+        // map backing is active (BTreeMap or, under preserve_order, IndexMap).
+        // Canonicalization must collapse both to identical, sorted bytes.
+        use serde_json::{Map, Value};
+        let mut a = Map::new();
+        a.insert("zebra".into(), Value::from(1));
+        a.insert("alpha".into(), Value::from(2));
+        let mut a_inner = Map::new();
+        a_inner.insert("y".into(), Value::from("yy"));
+        a_inner.insert("x".into(), Value::from("xx"));
+        a.insert("nested".into(), Value::Object(a_inner));
+        a.insert("list".into(), Value::from(vec![3, 2, 1]));
+
+        let mut b = Map::new();
+        b.insert("list".into(), Value::from(vec![3, 2, 1]));
+        let mut b_inner = Map::new();
+        b_inner.insert("x".into(), Value::from("xx"));
+        b_inner.insert("y".into(), Value::from("yy"));
+        b.insert("nested".into(), Value::Object(b_inner));
+        b.insert("alpha".into(), Value::from(2));
+        b.insert("zebra".into(), Value::from(1));
+
+        let mut ba = Vec::new();
+        write_canonical_json(&mut ba, &Value::Object(a));
+        let mut bb = Vec::new();
+        write_canonical_json(&mut bb, &Value::Object(b));
+
+        assert_eq!(ba, bb, "insertion order must not affect canonical bytes");
+        // Keys sorted at every level; array order preserved (3,2,1 not sorted).
+        assert_eq!(
+            String::from_utf8(ba).unwrap(),
+            r#"{"alpha":2,"list":[3,2,1],"nested":{"x":"xx","y":"yy"},"zebra":1}"#
         );
     }
 }
