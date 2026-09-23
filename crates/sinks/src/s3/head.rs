@@ -170,6 +170,16 @@ fn head_key(prefix: &str, pipeline: &str) -> object_store::path::Path {
     )
 }
 
+/// Test-only accessor for the HEAD key, so crash-boundary tests can read the
+/// authoritative HEAD directly from the store (with no live writer).
+#[cfg(test)]
+pub(crate) fn head_key_for(
+    prefix: &str,
+    pipeline: &str,
+) -> object_store::path::Path {
+    head_key(prefix, pipeline)
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -874,6 +884,14 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                             "HEAD epoch regressed: {} < our {}",
                             cur.epoch, st.verified.epoch
                         )));
+                    }
+                    // HEAD did not move (same ETag): our CAS failed transiently
+                    // (a rejected or lost-then-not-applied response), not a race.
+                    // Retry the CAS against the same HEAD - there is nothing new
+                    // to adopt or verify (this also covers the genesis case where
+                    // `cur` has no entry to verify).
+                    if etag == st.verified.etag {
+                        continue;
                     }
                     // Same epoch, different head: verify the adopted HEAD before
                     // trusting its watermark for a later Before/Equal skip, then

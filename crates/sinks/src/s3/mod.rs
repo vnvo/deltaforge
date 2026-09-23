@@ -12,6 +12,8 @@ mod batch_upload;
 mod durable_encode;
 mod durable_sink;
 mod encoder;
+#[cfg(test)]
+mod fault_matrix;
 mod file_format;
 mod head;
 mod jsonl_writer;
