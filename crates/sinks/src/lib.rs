@@ -116,17 +116,75 @@ pub fn build_sinks_with_schemas(
     clickhouse_resolver: Option<clickhouse::ClickHouseSchemaResolver>,
     es_resolver: Option<elasticsearch::EsSchemaResolver>,
 ) -> anyhow::Result<Vec<ArcDynSink>> {
+    // Public API: NEVER silently omit a configured sink. A durable_v2 S3 sink
+    // cannot be built here (it needs async probe/recovery + an injected
+    // comparator), so this fails closed rather than returning a list missing it.
+    build_sinks_impl(
+        ps,
+        cancel,
+        pipeline,
+        source_schemas,
+        arrow_schema_resolver,
+        clickhouse_resolver,
+        es_resolver,
+        /* defer_durable_s3 */ false,
+    )
+}
+
+/// Runner-only builder that DEFERS durable_v2 S3 sinks (the runner constructs
+/// them async with an injected comparator after the durable-startup guard). All
+/// other sinks are built here. Callers MUST then build the deferred durable
+/// sinks and validate the final sink set against configuration.
+pub fn build_sinks_deferring_durable_s3(
+    ps: &PipelineSpec,
+    cancel: CancellationToken,
+    pipeline: &str,
+    source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
+    arrow_schema_resolver: Option<s3::SchemaResolver>,
+    clickhouse_resolver: Option<clickhouse::ClickHouseSchemaResolver>,
+    es_resolver: Option<elasticsearch::EsSchemaResolver>,
+) -> anyhow::Result<Vec<ArcDynSink>> {
+    build_sinks_impl(
+        ps,
+        cancel,
+        pipeline,
+        source_schemas,
+        arrow_schema_resolver,
+        clickhouse_resolver,
+        es_resolver,
+        /* defer_durable_s3 */ true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_sinks_impl(
+    ps: &PipelineSpec,
+    cancel: CancellationToken,
+    pipeline: &str,
+    source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
+    arrow_schema_resolver: Option<s3::SchemaResolver>,
+    clickhouse_resolver: Option<clickhouse::ClickHouseSchemaResolver>,
+    es_resolver: Option<elasticsearch::EsSchemaResolver>,
+    defer_durable_s3: bool,
+) -> anyhow::Result<Vec<ArcDynSink>> {
     ps.spec
         .sinks
         .iter()
         .filter_map(|s| {
-            // A durable_v2 S3 sink is built by the runner (async: probe +
-            // verified recovery, with an injected source-aware comparator), so
-            // skip it here rather than build a legacy sink for it.
+            // A durable_v2 S3 sink needs the runner's async durable path. Defer
+            // it (skip) only when the caller will build it; otherwise fail
+            // closed - never silently drop a configured sink.
             if let SinkCfg::S3(cfg) = s {
                 if cfg.durability == deltaforge_config::S3Durability::DurableV2
                 {
-                    return None;
+                    if defer_durable_s3 {
+                        return None;
+                    }
+                    return Some(Err(anyhow::anyhow!(
+                        "S3 sink '{}' selects durable_v2; it must be built via \
+                         the runner's durable path, not build_sinks*",
+                        cfg.id
+                    )));
                 }
             }
             Some((|| -> anyhow::Result<ArcDynSink> {

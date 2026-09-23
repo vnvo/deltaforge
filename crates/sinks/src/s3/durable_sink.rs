@@ -358,8 +358,8 @@ mod tests {
     use super::*;
     use deltaforge_core::{CheckpointMeta, CheckpointOrder, Op, SourceInfo};
     use futures::StreamExt;
-    use object_store::ObjectStore;
     use object_store::memory::InMemory;
+    use object_store::{ObjectStore, ObjectStoreExt};
 
     /// Test comparator: watermarks are ASCII decimal; unparseable = Incomparable
     /// (stands in for a lineage/generation mismatch).
@@ -594,6 +594,67 @@ mod tests {
         );
         assert!(ra.is_ok(), "clone A: {ra:?}");
         assert!(rb.is_ok(), "clone B: {rb:?}");
+    }
+
+    async fn manifest_event_counts(store: &Arc<dyn ObjectStore>) -> Vec<u64> {
+        let mut out = Vec::new();
+        for k in keys(store).await {
+            if k.contains("_manifest/entries") {
+                let path = object_store::path::Path::from(k);
+                let bytes = store
+                    .as_ref()
+                    .get(&path)
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap();
+                let v: serde_json::Value =
+                    serde_json::from_slice(&bytes).unwrap();
+                out.push(v["event_count"].as_u64().unwrap());
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn filtered_durable_sink_manifest_event_count_matches_survivors() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let sink: deltaforge_core::ArcDynSink =
+            Arc::new(sink_over(Arc::clone(&store), "s").await.unwrap());
+        // Wrap the durable sink in a filter that drops synthetic events, exactly
+        // as the runner does for a configured cfg.filter.
+        let filter = deltaforge_config::SinkFilter {
+            exclude_synthetic: true,
+            ..Default::default()
+        };
+        let wrapped = crate::FilteredSink::wrap(sink, filter);
+
+        // Partial: 2 source rows survive, 1 synthetic filtered -> event_count 2.
+        let batch = vec![
+            row(None, "db", "t", 1),
+            row(None, "db", "t", 2).mark_synthetic("proc"),
+            row(None, "db", "t", 3),
+        ];
+        wrapped
+            .send_batch_with_context(&batch, &ctx("100"))
+            .await
+            .unwrap();
+        assert_eq!(manifest_event_counts(&store).await, vec![2]);
+
+        // Fully filtered: still forwards, publishing a zero-object entry (HEAD
+        // advances). A later watermark proves HEAD moved (After 100).
+        let all_synth = vec![row(None, "db", "t", 4).mark_synthetic("proc")];
+        wrapped
+            .send_batch_with_context(&all_synth, &ctx("200"))
+            .await
+            .unwrap();
+        let counts = manifest_event_counts(&store).await;
+        assert_eq!(
+            counts,
+            vec![2, 0],
+            "partial=2 then fully-filtered=0 entries"
+        );
     }
 
     #[tokio::test]
