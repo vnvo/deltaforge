@@ -23,7 +23,7 @@ use anyhow::{Context, Result, anyhow};
 use checkpoints::CheckpointStore;
 use deltaforge_config::SnapshotCfg;
 use deltaforge_core::{
-    Event, EventId, Op, SourceInfo, SourceItem, SourcePosition,
+    CheckpointMeta, Event, EventId, Op, SourceInfo, SourceItem, SourcePosition,
 };
 use metrics::counter;
 use mysql_async::{Pool, Row, Value, prelude::Queryable};
@@ -31,6 +31,7 @@ use std::collections::HashMap;
 
 use super::mysql_identity::mysql_identity_cell;
 use crate::snapshot_event_id::{OwnedIdentityValue, snapshot_row_event_id};
+use crate::snapshot_frontier::{SnapshotAggregator, SnapshotPublisher};
 use crate::snapshot_generation::PersistedLineage;
 use scopeguard;
 use serde::{Deserialize, Serialize};
@@ -242,6 +243,29 @@ pub async fn run_snapshot(
         "mysql snapshot started"
     );
 
+    // Build the ordered-aggregation owner over the tables actually scanned this
+    // run. Every snapshot row is published through it, so its durable boundary
+    // (frozen snapshot checkpoint + advancing per-table contiguous vector) is
+    // produced atomically and travels with the rows.
+    let scan_tables: Vec<String> = tables
+        .iter()
+        .filter(|(db, table)| !progress.table_done(db, table))
+        .map(|(db, table)| fqn(db, table))
+        .collect();
+    let snapshot_checkpoint = CheckpointMeta::from_vec(
+        serde_json::to_vec(&position)
+            .context("serialize snapshot checkpoint")?,
+    );
+    let publisher = Arc::new(SnapshotPublisher::new(
+        SnapshotAggregator::new(
+            ctx.generation,
+            ctx.lineage.clone(),
+            snapshot_checkpoint,
+            &scan_tables,
+        ),
+        ctx.tx.clone(),
+    ));
+
     // step 2: fan out parallel table workers (unchanged)
     let max_parallel = ctx.cfg.max_parallel_tables.min(tables.len()).max(1);
     let semaphore = Arc::new(Semaphore::new(max_parallel));
@@ -269,7 +293,8 @@ pub async fn run_snapshot(
             pipeline: ctx.pipeline.to_string(),
             tenant: ctx.tenant.to_string(),
             cfg: ctx.cfg.clone(),
-            tx: ctx.tx.clone(),
+            table_key: fqn(db, table),
+            publisher: Arc::clone(&publisher),
             schema_loader: ctx.schema_loader.clone(),
             cancel: ctx.cancel.clone(),
             generation: ctx.generation,
@@ -296,6 +321,17 @@ pub async fn run_snapshot(
                     progress.mark_done(parts[0], parts[1]);
                     save_progress(&ctx.chkpt_store, ctx.source_id, &progress)
                         .await;
+                }
+                // Explicit table completion in the aggregator (all its ranges
+                // are incorporated). The final boundary (completed = true) is
+                // returned once every scanned table completes.
+                if let Some(done) = publisher.complete_table(&name).await {
+                    debug!(
+                        table = %name,
+                        "snapshot fully complete; completion boundary ready \
+                         (durable recording lands with the S3 sink)"
+                    );
+                    let _ = done;
                 }
                 info!(table = %name, rows, "table snapshot complete");
             }
@@ -360,11 +396,11 @@ async fn capture_binlog_position(
             Err(_) => conn
                 .query_first("SHOW MASTER STATUS")
                 .await
-                .context("SHOW MASTER STATUS — is binary logging enabled?")?,
+                .context("SHOW MASTER STATUS - is binary logging enabled?")?,
         };
 
     let mut row = row
-        .context("no binlog position returned — is binary logging enabled?")?;
+        .context("no binlog position returned - is binary logging enabled?")?;
 
     let file: String = row.take(0).context("binlog file")?;
     let pos: u32 = row.take(1).context("binlog pos")?;
@@ -408,7 +444,10 @@ struct TableWorker {
     pipeline: String,
     tenant: String,
     cfg: SnapshotCfg,
-    tx: mpsc::Sender<SourceItem>,
+    /// Fully-qualified `db.table`, the aggregator's key for this table.
+    table_key: String,
+    /// Shared aggregation owner: serializes boundary-advance + channel send.
+    publisher: Arc<SnapshotPublisher>,
     schema_loader: MySqlSchemaLoader,
     cancel: CancellationToken,
     /// Durable snapshot generation for stable-id derivation.
@@ -499,6 +538,11 @@ impl TableWorker {
         let chunk = self.cfg.chunk_size as i64;
         let mut cursor = min_pk;
         let mut total_sent = 0u64;
+        // Half-open frontier cursor reported to the aggregator, starting at 0 so
+        // the first chunk covers everything up to its exclusive upper bound
+        // (rows below min_pk do not exist and are vacuously durable). Chunks abut,
+        // so the contiguous frontier advances by one publish each.
+        let mut published_end: u64 = 0;
 
         while cursor <= max_pk {
             if self.cancel.is_cancelled() {
@@ -518,20 +562,29 @@ impl TableWorker {
                 })?;
 
             let n = rows.len() as u64;
+            let mut events = Vec::with_capacity(rows.len());
             for row in rows {
                 // Derive identity from NATIVE values before the lossy JSON
                 // conversion, then build the event.
                 let id = self.provisional_id(&row)?;
                 let json = row_to_json(row)?;
-                if self
-                    .tx
-                    .send(SourceItem::Event(self.make_event(json, id)))
-                    .await
-                    .is_err()
-                {
-                    anyhow::bail!("event channel closed");
-                }
+                events.push(self.make_event(json, id));
             }
+
+            // Publish the chunk as the half-open range [published_end, chunk_end):
+            // the aggregator advances this table's contiguous frontier and stamps
+            // the boundary on the chunk's last event, all under one lock.
+            let chunk_end = (end.max(0) as u64).max(published_end);
+            self.publisher
+                .publish_chunk(
+                    &self.table_key,
+                    published_end,
+                    chunk_end,
+                    events,
+                )
+                .await
+                .map_err(|_| anyhow!("event channel closed"))?;
+            published_end = chunk_end;
 
             total_sent += n;
             cursor = end;
@@ -556,18 +609,20 @@ impl TableWorker {
             .with_context(|| format!("full scan of {table_fqn}"))?;
 
         let n = rows.len() as u64;
+        let mut events = Vec::with_capacity(rows.len());
         for row in rows {
             let id = self.provisional_id(&row)?;
             let json = row_to_json(row)?;
-            if self
-                .tx
-                .send(SourceItem::Event(self.make_event(json, id)))
-                .await
-                .is_err()
-            {
-                anyhow::bail!("event channel closed");
-            }
+            events.push(self.make_event(json, id));
         }
+
+        // No PK cursor: the whole table is one chunk [0, n). The frontier advances
+        // to n and the boundary lands on the last row; resume for a full-scan
+        // table is table-level (rescan), matching the durable progress model.
+        self.publisher
+            .publish_chunk(&self.table_key, 0, n.max(1), events)
+            .await
+            .map_err(|_| anyhow!("event channel closed"))?;
 
         Ok(n)
     }
