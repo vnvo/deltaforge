@@ -22,24 +22,27 @@ use std::collections::BTreeMap;
 
 use deltaforge_core::{CheckpointMeta, SourceBoundary};
 
-use crate::durable_checkpoint::{DurableWatermark, WmPos};
+use crate::durable_checkpoint::{
+    CursorKind, DurableWatermark, SnapshotCursor, WmPos,
+};
 use crate::snapshot_generation::PersistedLineage;
 
 /// A single table's contiguous durable frontier, built from possibly-out-of-order
-/// completed chunks.
+/// completed chunks. All cursors are one [`SnapshotCursor`] kind (fixed at
+/// construction); the derived `Ord` gives correct within-kind ordering.
 #[derive(Debug, Clone)]
 pub struct TableFrontier {
     /// Exclusive upper bound of the contiguous durable prefix: every row with
     /// cursor `< frontier` is durable. Also the resume cursor.
-    frontier: u64,
+    frontier: SnapshotCursor,
     /// Completed chunks not yet contiguous with the frontier, keyed by `start`
     /// (value = `end`, half-open).
-    pending: BTreeMap<u64, u64>,
+    pending: BTreeMap<SnapshotCursor, SnapshotCursor>,
     completed: bool,
 }
 
 impl TableFrontier {
-    pub fn new(start: u64) -> Self {
+    pub fn new(start: SnapshotCursor) -> Self {
         Self {
             frontier: start,
             pending: BTreeMap::new(),
@@ -47,7 +50,7 @@ impl TableFrontier {
         }
     }
 
-    pub fn frontier(&self) -> u64 {
+    pub fn frontier(&self) -> SnapshotCursor {
         self.frontier
     }
 
@@ -57,10 +60,18 @@ impl TableFrontier {
 
     /// Record a completed half-open chunk `[start, end)`. The frontier advances
     /// only through chunks that abut it (one starting exactly at `frontier`);
-    /// non-contiguous chunks are buffered until the gap fills. Returns `true` if
-    /// the frontier advanced.
-    pub fn complete_chunk(&mut self, start: u64, end: u64) -> bool {
-        if end <= start {
+    /// non-contiguous chunks are buffered until the gap fills. A chunk of a
+    /// different cursor kind than the frontier is rejected (never mixed). Returns
+    /// `true` if the frontier advanced.
+    pub fn complete_chunk(
+        &mut self,
+        start: SnapshotCursor,
+        end: SnapshotCursor,
+    ) -> bool {
+        if start.kind() != self.frontier.kind()
+            || end.kind() != self.frontier.kind()
+            || end <= start
+        {
             return false;
         }
         // Buffer (keep the widest range for a given start).
@@ -104,12 +115,14 @@ pub struct SnapshotAggregator {
 }
 
 impl SnapshotAggregator {
-    /// Start a generation over `tables` (all frontiers at 0).
+    /// Start a generation over `tables`, each `(name, cursor kind)`; every
+    /// frontier begins at its kind's minimum so the vector's key set and cursor
+    /// kinds are fixed from the first batch.
     pub fn new(
         generation: u64,
         lineage: PersistedLineage,
         snapshot_checkpoint: CheckpointMeta,
-        tables: &[String],
+        tables: &[(String, CursorKind)],
     ) -> Self {
         Self {
             generation,
@@ -117,7 +130,7 @@ impl SnapshotAggregator {
             snapshot_checkpoint,
             tables: tables
                 .iter()
-                .map(|t| (t.clone(), TableFrontier::new(0)))
+                .map(|(t, k)| (t.clone(), TableFrontier::new(k.min())))
                 .collect(),
         }
     }
@@ -159,7 +172,7 @@ impl SnapshotAggregator {
 
     /// Snapshot the complete current vector into a boundary.
     fn boundary(&self) -> SourceBoundary {
-        let table_cursors: BTreeMap<String, u64> = self
+        let table_cursors: BTreeMap<String, SnapshotCursor> = self
             .tables
             .iter()
             .map(|(t, f)| (t.clone(), f.frontier()))
@@ -185,8 +198,8 @@ impl SnapshotAggregator {
     pub fn complete_chunk(
         &mut self,
         table: &str,
-        start: u64,
-        end: u64,
+        start: SnapshotCursor,
+        end: SnapshotCursor,
     ) -> Option<SourceBoundary> {
         let f = self.tables.get_mut(table)?;
         if f.complete_chunk(start, end) {
@@ -260,8 +273,8 @@ impl SnapshotPublisher {
     pub async fn publish_chunk(
         &self,
         table: &str,
-        start: u64,
-        end: u64,
+        start: SnapshotCursor,
+        end: SnapshotCursor,
         mut events: Vec<deltaforge_core::Event>,
     ) -> Result<(), SnapshotClosed> {
         let mut g = self.inner.lock().await;
@@ -303,7 +316,10 @@ mod tests {
     }
 
     fn agg(tables: &[&str]) -> SnapshotAggregator {
-        let t: Vec<String> = tables.iter().map(|s| s.to_string()).collect();
+        let t: Vec<(String, CursorKind)> = tables
+            .iter()
+            .map(|s| (s.to_string(), CursorKind::Unsigned))
+            .collect();
         SnapshotAggregator::new(
             1,
             lineage(),
@@ -312,26 +328,39 @@ mod tests {
         )
     }
 
+    /// Test cursor constructor (all frontier tests use the unsigned domain; the
+    /// signed domain is covered by durable_checkpoint's comparator tests).
+    fn u(v: u64) -> SnapshotCursor {
+        SnapshotCursor::Unsigned(v)
+    }
+
+    /// Extract table -> unsigned cursor value from a boundary's watermark.
     fn cursors(b: &SourceBoundary) -> BTreeMap<String, u64> {
         let wm = DurableWatermark::parse(b.durable_watermark.as_ref().unwrap())
             .unwrap();
         match wm.pos {
-            WmPos::Snapshot { table_cursors, .. } => table_cursors,
+            WmPos::Snapshot { table_cursors, .. } => table_cursors
+                .into_iter()
+                .map(|(t, c)| match c {
+                    SnapshotCursor::Unsigned(v) => (t, v),
+                    other => panic!("expected unsigned cursor, got {other:?}"),
+                })
+                .collect(),
             _ => panic!("expected snapshot"),
         }
     }
 
     #[test]
     fn frontier_advances_only_through_contiguous_ranges() {
-        let mut f = TableFrontier::new(0);
-        assert!(f.complete_chunk(0, 10));
-        assert_eq!(f.frontier(), 10);
+        let mut f = TableFrontier::new(u(0));
+        assert!(f.complete_chunk(u(0), u(10)));
+        assert_eq!(f.frontier(), u(10));
         // A gap: chunk [20,30) is buffered, frontier does not move.
-        assert!(!f.complete_chunk(20, 30));
-        assert_eq!(f.frontier(), 10);
+        assert!(!f.complete_chunk(u(20), u(30)));
+        assert_eq!(f.frontier(), u(10));
         // Filling the gap cascades through both buffered ranges.
-        assert!(f.complete_chunk(10, 20));
-        assert_eq!(f.frontier(), 30);
+        assert!(f.complete_chunk(u(10), u(20)));
+        assert_eq!(f.frontier(), u(30));
     }
 
     #[test]
@@ -343,16 +372,20 @@ mod tests {
 
         // Chunk 3 first: NO boundary (frontier cannot advance past the gap).
         assert!(
-            a.complete_chunk("orders", 20, 30).is_none(),
+            a.complete_chunk("orders", u(20), u(30)).is_none(),
             "chunk 3 out of order must not advance the frontier"
         );
 
         // Chunk 1: frontier -> 10.
-        let b1 = a.complete_chunk("orders", 0, 10).expect("advance to 10");
+        let b1 = a
+            .complete_chunk("orders", u(0), u(10))
+            .expect("advance to 10");
         assert_eq!(cursors(&b1)["orders"], 10);
 
         // Chunk 2: cascades [10,20) then the buffered [20,30) -> 30.
-        let b2 = a.complete_chunk("orders", 10, 20).expect("advance to 30");
+        let b2 = a
+            .complete_chunk("orders", u(10), u(20))
+            .expect("advance to 30");
         assert_eq!(cursors(&b2)["orders"], 30);
 
         // At no point did a boundary report a cursor of 30 before chunks 1+2.
@@ -364,9 +397,9 @@ mod tests {
         // A boundary's cursor is always the contiguous frontier, so every row it
         // implies covered (< cursor) is genuinely durable.
         let mut a = agg(&["orders"]);
-        a.complete_chunk("orders", 50, 60); // buffered, no boundary
-        a.complete_chunk("orders", 30, 40); // buffered, no boundary
-        let b = a.complete_chunk("orders", 0, 30); // frontier -> 40 ([0,30),[30,40))
+        a.complete_chunk("orders", u(50), u(60)); // buffered, no boundary
+        a.complete_chunk("orders", u(30), u(40)); // buffered, no boundary
+        let b = a.complete_chunk("orders", u(0), u(30)); // frontier -> 40 ([0,30),[30,40))
         let c = cursors(&b.unwrap());
         assert_eq!(
             c["orders"], 40,
@@ -377,10 +410,10 @@ mod tests {
     #[test]
     fn parallel_tables_have_independent_frontiers() {
         let mut a = agg(&["orders", "users"]);
-        let b1 = a.complete_chunk("orders", 0, 10).unwrap();
+        let b1 = a.complete_chunk("orders", u(0), u(10)).unwrap();
         assert_eq!(cursors(&b1)["orders"], 10);
         assert_eq!(cursors(&b1)["users"], 0);
-        let b2 = a.complete_chunk("users", 0, 5).unwrap();
+        let b2 = a.complete_chunk("users", u(0), u(5)).unwrap();
         assert_eq!(cursors(&b2)["orders"], 10);
         assert_eq!(cursors(&b2)["users"], 5);
     }
@@ -388,11 +421,11 @@ mod tests {
     #[test]
     fn completion_is_explicit_and_gated_on_no_gaps() {
         let mut a = agg(&["orders"]);
-        a.complete_chunk("orders", 20, 30); // gap remains
+        a.complete_chunk("orders", u(20), u(30)); // gap remains
         // Cannot complete while a gap is buffered.
         assert!(a.complete_table("orders").is_none());
         assert!(!a.is_complete());
-        a.complete_chunk("orders", 0, 20); // fills the gap -> frontier 30
+        a.complete_chunk("orders", u(0), u(20)); // fills the gap -> frontier 30
         let done = a.complete_table("orders").expect("snapshot complete");
         assert!(a.is_complete());
         // The completed boundary's watermark is marked completed.
@@ -408,8 +441,8 @@ mod tests {
     #[test]
     fn full_completion_requires_all_tables() {
         let mut a = agg(&["orders", "users"]);
-        a.complete_chunk("orders", 0, 10);
-        a.complete_chunk("users", 0, 10);
+        a.complete_chunk("orders", u(0), u(10));
+        a.complete_chunk("users", u(0), u(10));
         // Completing one table does not complete the snapshot.
         assert!(a.complete_table("orders").is_none());
         assert!(!a.is_complete());
@@ -431,8 +464,8 @@ mod tests {
     fn restart_resumes_from_head_vector_and_continues_monotonically() {
         // Simulate a prior run that reached orders=100, users=50.
         let mut prior = agg(&["orders", "users"]);
-        prior.complete_chunk("orders", 0, 100);
-        let head_b = prior.complete_chunk("users", 0, 50).unwrap();
+        prior.complete_chunk("orders", u(0), u(100));
+        let head_b = prior.complete_chunk("users", u(0), u(50)).unwrap();
         let head =
             DurableWatermark::parse(head_b.durable_watermark.as_ref().unwrap())
                 .unwrap();
@@ -446,7 +479,7 @@ mod tests {
         )
         .unwrap();
         // A next contiguous chunk continues from the restored frontier (100).
-        let b = resumed.complete_chunk("orders", 100, 200).unwrap();
+        let b = resumed.complete_chunk("orders", u(100), u(200)).unwrap();
         assert_eq!(cursors(&b)["orders"], 200);
         assert_eq!(cursors(&b)["users"], 50);
     }
@@ -454,7 +487,7 @@ mod tests {
     #[test]
     fn boundary_checkpoint_is_the_frozen_snapshot_checkpoint() {
         let mut a = agg(&["orders"]);
-        let b = a.complete_chunk("orders", 0, 10).unwrap();
+        let b = a.complete_chunk("orders", u(0), u(10)).unwrap();
         assert_eq!(b.checkpoint.as_bytes(), b"snap-start");
     }
 
@@ -504,13 +537,7 @@ mod tests {
         while let Ok(item) = rx.try_recv() {
             if let SourceItem::Event(e) = item {
                 if let Some(b) = e.boundary.as_ref() {
-                    let wm = DurableWatermark::parse(
-                        b.durable_watermark.as_ref().unwrap(),
-                    )
-                    .unwrap();
-                    if let WmPos::Snapshot { table_cursors, .. } = wm.pos {
-                        last = Some(table_cursors);
-                    }
+                    last = Some(cursors(b));
                 }
             }
         }
@@ -525,7 +552,7 @@ mod tests {
         let (p, mut rx) = publisher(&["shop.orders"], 64);
 
         // Chunk 3 out of order: events flow but carry no boundary.
-        p.publish_chunk("shop.orders", 20, 30, vec![snap_event(20)])
+        p.publish_chunk("shop.orders", u(20), u(30), vec![snap_event(20)])
             .await
             .unwrap();
         assert!(
@@ -534,13 +561,13 @@ mod tests {
         );
 
         // Chunk 1: boundary advances to 10.
-        p.publish_chunk("shop.orders", 0, 10, vec![snap_event(0)])
+        p.publish_chunk("shop.orders", u(0), u(10), vec![snap_event(0)])
             .await
             .unwrap();
         assert_eq!(drain_last_cursor(&mut rx).unwrap()["shop.orders"], 10);
 
         // Chunk 2: cascades through the buffered chunk 3 -> 30.
-        p.publish_chunk("shop.orders", 10, 20, vec![snap_event(10)])
+        p.publish_chunk("shop.orders", u(10), u(20), vec![snap_event(10)])
             .await
             .unwrap();
         assert_eq!(drain_last_cursor(&mut rx).unwrap()["shop.orders"], 30);
@@ -561,8 +588,8 @@ mod tests {
             // consumer frees a slot, all while holding the publisher lock.
             p1.publish_chunk(
                 "shop.orders",
-                0,
-                10,
+                u(0),
+                u(10),
                 vec![snap_event(1), snap_event(2)],
             )
             .await
@@ -574,7 +601,7 @@ mod tests {
 
         let p2 = std::sync::Arc::clone(&p);
         let worker2 = tokio::spawn(async move {
-            p2.publish_chunk("shop.users", 0, 5, vec![snap_event(3)])
+            p2.publish_chunk("shop.users", u(0), u(5), vec![snap_event(3)])
                 .await
         });
 
@@ -600,27 +627,21 @@ mod tests {
         // orders chunk was fully enqueued: the users event is the LAST of the 3.
         let users_last = seen.last().unwrap();
         let b = users_last.boundary.as_ref().expect("users boundary");
-        let wm = DurableWatermark::parse(b.durable_watermark.as_ref().unwrap())
-            .unwrap();
-        match wm.pos {
-            WmPos::Snapshot { table_cursors, .. } => {
-                assert_eq!(table_cursors["shop.users"], 5);
-                assert_eq!(
-                    table_cursors["shop.orders"], 10,
-                    "orders progress was durable before the users boundary"
-                );
-            }
-            _ => panic!(),
-        }
+        let c = cursors(b);
+        assert_eq!(c["shop.users"], 5);
+        assert_eq!(
+            c["shop.orders"], 10,
+            "orders progress was durable before the users boundary"
+        );
     }
 
     #[tokio::test]
     async fn publisher_parallel_tables_reach_completion() {
         let (p, mut rx) = publisher(&["shop.orders", "shop.users"], 64);
-        p.publish_chunk("shop.orders", 0, 10, vec![snap_event(1)])
+        p.publish_chunk("shop.orders", u(0), u(10), vec![snap_event(1)])
             .await
             .unwrap();
-        p.publish_chunk("shop.users", 0, 10, vec![snap_event(2)])
+        p.publish_chunk("shop.users", u(0), u(10), vec![snap_event(2)])
             .await
             .unwrap();
         assert!(p.complete_table("shop.orders").await.is_none());

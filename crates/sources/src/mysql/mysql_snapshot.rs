@@ -30,6 +30,7 @@ use mysql_async::{Pool, Row, Value, prelude::Queryable};
 use std::collections::HashMap;
 
 use super::mysql_identity::mysql_identity_cell;
+use crate::durable_checkpoint::{CursorKind, SnapshotCursor};
 use crate::snapshot_event_id::{OwnedIdentityValue, snapshot_row_event_id};
 use crate::snapshot_frontier::{SnapshotAggregator, SnapshotPublisher};
 use crate::snapshot_generation::PersistedLineage;
@@ -247,11 +248,25 @@ pub async fn run_snapshot(
     // run. Every snapshot row is published through it, so its durable boundary
     // (frozen snapshot checkpoint + advancing per-table contiguous vector) is
     // produced atomically and travels with the rows.
-    let scan_tables: Vec<String> = tables
-        .iter()
-        .filter(|(db, table)| !progress.table_done(db, table))
-        .map(|(db, table)| fqn(db, table))
-        .collect();
+    // Resolve each scanned table's cursor kind up front so the aggregator's
+    // vector has a fixed key set and a fixed cursor kind per table from the
+    // first batch (never a signed/unsigned domain switch mid-run).
+    let mut kinds: HashMap<String, CursorKind> = HashMap::new();
+    for (db, table) in tables {
+        if progress.table_done(db, table) {
+            continue;
+        }
+        let loaded = ctx
+            .schema_loader
+            .load_schema(db, table)
+            .await
+            .with_context(|| {
+                format!("load schema (cursor kind) for {}", fqn(db, table))
+            })?;
+        kinds.insert(fqn(db, table), mysql_cursor_kind(&loaded.schema));
+    }
+    let scan_tables: Vec<(String, CursorKind)> =
+        kinds.iter().map(|(t, k)| (t.clone(), *k)).collect();
     let snapshot_checkpoint = CheckpointMeta::from_vec(
         serde_json::to_vec(&position)
             .context("serialize snapshot checkpoint")?,
@@ -294,6 +309,10 @@ pub async fn run_snapshot(
             tenant: ctx.tenant.to_string(),
             cfg: ctx.cfg.clone(),
             table_key: fqn(db, table),
+            cursor_kind: kinds
+                .get(&fqn(db, table))
+                .copied()
+                .unwrap_or(CursorKind::Unsigned),
             publisher: Arc::clone(&publisher),
             schema_loader: ctx.schema_loader.clone(),
             cancel: ctx.cancel.clone(),
@@ -446,6 +465,8 @@ struct TableWorker {
     cfg: SnapshotCfg,
     /// Fully-qualified `db.table`, the aggregator's key for this table.
     table_key: String,
+    /// Cursor kind for this table (matches the aggregator's frontier kind).
+    cursor_kind: CursorKind,
     /// Shared aggregation owner: serializes boundary-advance + channel send.
     publisher: Arc<SnapshotPublisher>,
     schema_loader: MySqlSchemaLoader,
@@ -538,11 +559,13 @@ impl TableWorker {
         let chunk = self.cfg.chunk_size as i64;
         let mut cursor = min_pk;
         let mut total_sent = 0u64;
-        // Half-open frontier cursor reported to the aggregator, starting at 0 so
-        // the first chunk covers everything up to its exclusive upper bound
-        // (rows below min_pk do not exist and are vacuously durable). Chunks abut,
-        // so the contiguous frontier advances by one publish each.
-        let mut published_end: u64 = 0;
+        // Half-open frontier cursor reported to the aggregator, starting at the
+        // cursor kind's minimum so the first chunk covers everything up to its
+        // exclusive upper bound (rows below min_pk do not exist and are vacuously
+        // durable). Chunks abut, so the frontier advances one publish at a time.
+        // Signed PKs keep their true (possibly negative) order via the typed
+        // cursor - never a u64 cast.
+        let mut published_end: SnapshotCursor = self.cursor_kind.min();
 
         while cursor <= max_pk {
             if self.cancel.is_cancelled() {
@@ -573,8 +596,9 @@ impl TableWorker {
 
             // Publish the chunk as the half-open range [published_end, chunk_end):
             // the aggregator advances this table's contiguous frontier and stamps
-            // the boundary on the chunk's last event, all under one lock.
-            let chunk_end = (end.max(0) as u64).max(published_end);
+            // the boundary on the chunk's last event, all under one lock. `end` is
+            // the exclusive PK upper bound of this range (typed to the kind).
+            let chunk_end = mysql_cursor(self.cursor_kind, end);
             self.publisher
                 .publish_chunk(
                     &self.table_key,
@@ -616,11 +640,14 @@ impl TableWorker {
             events.push(self.make_event(json, id));
         }
 
-        // No PK cursor: the whole table is one chunk [0, n). The frontier advances
-        // to n and the boundary lands on the last row; resume for a full-scan
-        // table is table-level (rescan), matching the durable progress model.
+        // No PK cursor: the whole table is one chunk [min, n) over an unsigned
+        // row-count cursor. The frontier advances to n and the boundary lands on
+        // the last row; resume for a full-scan table is table-level (rescan),
+        // matching the durable progress model.
+        let start = self.cursor_kind.min();
+        let end = SnapshotCursor::Unsigned(n.max(1));
         self.publisher
-            .publish_chunk(&self.table_key, 0, n.max(1), events)
+            .publish_chunk(&self.table_key, start, end, events)
             .await
             .map_err(|_| anyhow!("event channel closed"))?;
 
@@ -710,6 +737,37 @@ fn is_integer_pk(col: Option<&super::MySqlColumn>) -> bool {
             "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint"
         ),
         None => false,
+    }
+}
+
+/// The snapshot cursor kind for a table: signed vs unsigned integer PK-range
+/// scan, or an unsigned row-count cursor for the full-scan fallback. Must match
+/// the worker's scan decision so the aggregator's kind agrees with the cursors it
+/// receives.
+fn mysql_cursor_kind(schema: &super::MySqlTableSchema) -> CursorKind {
+    let pk = &schema.primary_key;
+    if pk.len() == 1 {
+        if let Some(col) = schema.column(&pk[0]) {
+            if is_integer_pk(Some(col)) {
+                return if col.is_unsigned() {
+                    CursorKind::Unsigned
+                } else {
+                    CursorKind::Signed
+                };
+            }
+        }
+    }
+    // Full scan: a monotone row-count cursor.
+    CursorKind::Unsigned
+}
+
+/// Build a cursor of `kind` from a scan value. MySQL uses only Signed/Unsigned;
+/// negative values only occur (and are preserved) for the signed kind.
+fn mysql_cursor(kind: CursorKind, v: i64) -> SnapshotCursor {
+    match kind {
+        CursorKind::Signed => SnapshotCursor::Signed(v),
+        CursorKind::Unsigned => SnapshotCursor::Unsigned(v.max(0) as u64),
+        CursorKind::CtidBlock => SnapshotCursor::CtidBlock(v.max(0) as u64),
     }
 }
 

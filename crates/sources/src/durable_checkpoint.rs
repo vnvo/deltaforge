@@ -19,6 +19,60 @@ use serde::{Deserialize, Serialize};
 
 use crate::snapshot_generation::PersistedLineage;
 
+/// A typed, order-preserving snapshot scan cursor. The kind is carried so two
+/// watermarks whose cursor domains differ (a schema/PK-type change) are
+/// `Incomparable` rather than silently mis-ordered. Never mix kinds within a
+/// table.
+///
+/// Ordering: the derived `Ord` sorts by variant, then by the inner value. Within
+/// one kind that is the correct numeric order (including negative signed PKs);
+/// across kinds it is deterministic but meaningless, and callers must treat a
+/// kind mismatch as `Incomparable` (see [`vector_order`]) rather than trusting
+/// the cross-variant order. `u64`->`i64` casts are never used for ordering.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+)]
+pub enum SnapshotCursor {
+    /// Signed integer PK (e.g. MySQL `BIGINT`, PG `bigint`): ordered as `i64`,
+    /// so negative keys sort correctly.
+    Signed(i64),
+    /// Unsigned integer PK (e.g. MySQL `BIGINT UNSIGNED`) or a row-count cursor.
+    Unsigned(u64),
+    /// PostgreSQL `ctid` block number: a SCAN frontier only, never row identity.
+    CtidBlock(u64),
+}
+
+/// The domain of a [`SnapshotCursor`], independent of its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorKind {
+    Signed,
+    Unsigned,
+    CtidBlock,
+}
+
+impl CursorKind {
+    /// The lowest cursor of this kind - a fresh frontier starts here, and the
+    /// first chunk of a table abuts it (everything below the first scanned key is
+    /// vacuously durable).
+    pub fn min(self) -> SnapshotCursor {
+        match self {
+            CursorKind::Signed => SnapshotCursor::Signed(i64::MIN),
+            CursorKind::Unsigned => SnapshotCursor::Unsigned(0),
+            CursorKind::CtidBlock => SnapshotCursor::CtidBlock(0),
+        }
+    }
+}
+
+impl SnapshotCursor {
+    pub fn kind(&self) -> CursorKind {
+        match self {
+            SnapshotCursor::Signed(_) => CursorKind::Signed,
+            SnapshotCursor::Unsigned(_) => CursorKind::Unsigned,
+            SnapshotCursor::CtidBlock(_) => CursorKind::CtidBlock,
+        }
+    }
+}
+
 /// Canonical durable-watermark version. Unknown versions are `Incomparable`.
 pub const WATERMARK_VERSION: u16 = 1;
 
@@ -57,7 +111,7 @@ pub enum WmPos {
     Snapshot {
         generation: u64,
         completed: bool,
-        table_cursors: BTreeMap<String, u64>,
+        table_cursors: BTreeMap<String, SnapshotCursor>,
     },
 }
 // NOTE: there is deliberately no "standalone sequence" variant. DDL, logical
@@ -387,10 +441,10 @@ fn is_cdc(p: &WmPos) -> bool {
 fn snapshot_order(
     ga: u64,
     ca: bool,
-    ta: &BTreeMap<String, u64>,
+    ta: &BTreeMap<String, SnapshotCursor>,
     gb: u64,
     cb: bool,
-    tb: &BTreeMap<String, u64>,
+    tb: &BTreeMap<String, SnapshotCursor>,
 ) -> CheckpointOrder {
     if ga == gb {
         return vector_order(ta, tb);
@@ -416,8 +470,8 @@ fn snapshot_order(
 /// mean a lifecycle change (tables added/removed) and are Incomparable rather
 /// than risking a false Before that would let the sink skip a write.
 fn vector_order(
-    a: &BTreeMap<String, u64>,
-    b: &BTreeMap<String, u64>,
+    a: &BTreeMap<String, SnapshotCursor>,
+    b: &BTreeMap<String, SnapshotCursor>,
 ) -> CheckpointOrder {
     if a.len() != b.len() || !a.keys().eq(b.keys()) {
         return CheckpointOrder::Incomparable;
@@ -426,6 +480,11 @@ fn vector_order(
     let mut any_greater = false;
     for (k, va) in a {
         let vb = b.get(k).expect("key sets equal");
+        // A cursor-kind change for a table (schema/PK-type change) makes the two
+        // vectors incomparable - never order across cursor domains.
+        if va.kind() != vb.kind() {
+            return CheckpointOrder::Incomparable;
+        }
         match va.cmp(vb) {
             std::cmp::Ordering::Less => any_less = true,
             std::cmp::Ordering::Greater => any_greater = true,
@@ -454,24 +513,28 @@ fn vector_order(
 pub struct SnapshotVector {
     generation: u64,
     completed: bool,
-    cursors: BTreeMap<String, u64>,
+    cursors: BTreeMap<String, SnapshotCursor>,
 }
 
 impl SnapshotVector {
-    /// Start a generation over `tables`, all cursors at 0.
-    pub fn new(generation: u64, tables: &[String]) -> Self {
+    /// Start a generation over `tables`, each cursor at its kind's minimum, so the
+    /// key set (and every cursor kind) is fixed from the first batch.
+    pub fn new(generation: u64, tables: &[(String, CursorKind)]) -> Self {
         Self {
             generation,
             completed: false,
-            cursors: tables.iter().map(|t| (t.clone(), 0)).collect(),
+            cursors: tables.iter().map(|(t, k)| (t.clone(), k.min())).collect(),
         }
     }
 
     /// Merge per-table progress monotonically. A cursor never moves backward;
-    /// an unknown table is ignored (the target set is fixed at construction).
-    pub fn observe(&mut self, table: &str, cursor: u64) {
+    /// an unknown table, or one whose cursor kind changed, is ignored (the target
+    /// set and each kind are fixed at construction).
+    pub fn observe(&mut self, table: &str, cursor: SnapshotCursor) {
         if let Some(c) = self.cursors.get_mut(table) {
-            *c = (*c).max(cursor);
+            if c.kind() == cursor.kind() && cursor > *c {
+                *c = cursor;
+            }
         }
     }
 
@@ -716,6 +779,21 @@ mod tests {
         completed: bool,
         cursors: &[(&str, u64)],
     ) -> DurableWatermark {
+        snap_typed(
+            generation,
+            completed,
+            &cursors
+                .iter()
+                .map(|(t, c)| (*t, SnapshotCursor::Unsigned(*c)))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn snap_typed(
+        generation: u64,
+        completed: bool,
+        cursors: &[(&str, SnapshotCursor)],
+    ) -> DurableWatermark {
         DurableWatermark::new(
             pg_lineage(1),
             WmPos::Snapshot {
@@ -855,21 +933,30 @@ mod tests {
 
     // ── SnapshotVector construction / restart / dominance ───────────────────
 
+    fn ucursor(v: u64) -> SnapshotCursor {
+        SnapshotCursor::Unsigned(v)
+    }
+    fn utables(names: &[&str]) -> Vec<(String, CursorKind)> {
+        names
+            .iter()
+            .map(|t| (t.to_string(), CursorKind::Unsigned))
+            .collect()
+    }
+
     #[test]
     fn snapshot_vector_merges_progress_monotonically() {
-        let tables = vec!["orders".to_string(), "users".to_string()];
-        let mut v = SnapshotVector::new(1, &tables);
-        v.observe("orders", 100);
-        v.observe("users", 50);
+        let mut v = SnapshotVector::new(1, &utables(&["orders", "users"]));
+        v.observe("orders", ucursor(100));
+        v.observe("users", ucursor(50));
         // A late/out-of-order lower cursor must NOT move it backward.
-        v.observe("orders", 30);
-        v.observe("orders", 150);
+        v.observe("orders", ucursor(30));
+        v.observe("orders", ucursor(150));
         // Unknown table is ignored (fixed target set).
-        v.observe("audit", 999);
+        v.observe("audit", ucursor(999));
         match v.to_pos() {
             WmPos::Snapshot { table_cursors, .. } => {
-                assert_eq!(table_cursors.get("orders"), Some(&150));
-                assert_eq!(table_cursors.get("users"), Some(&50));
+                assert_eq!(table_cursors.get("orders"), Some(&ucursor(150)));
+                assert_eq!(table_cursors.get("users"), Some(&ucursor(50)));
                 assert!(!table_cursors.contains_key("audit"));
             }
             _ => panic!("expected snapshot"),
@@ -877,15 +964,39 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_vector_merges_signed_cursors_including_negatives() {
+        // Signed PK cursors: a negative value is below a positive one, and the
+        // monotonic merge keeps the greater (never a u64-cast reordering).
+        let mut v = SnapshotVector::new(
+            1,
+            &[("orders".to_string(), CursorKind::Signed)],
+        );
+        v.observe("orders", SnapshotCursor::Signed(-100));
+        v.observe("orders", SnapshotCursor::Signed(-5));
+        // A lower (more negative) cursor must not move it backward.
+        v.observe("orders", SnapshotCursor::Signed(-50));
+        // A different-kind observation for the table is ignored (no domain mix).
+        v.observe("orders", SnapshotCursor::Unsigned(1_000_000));
+        match v.to_pos() {
+            WmPos::Snapshot { table_cursors, .. } => {
+                assert_eq!(
+                    table_cursors.get("orders"),
+                    Some(&SnapshotCursor::Signed(-5))
+                );
+            }
+            _ => panic!("expected snapshot"),
+        }
+    }
+
+    #[test]
     fn snapshot_vector_batches_are_ordered_and_dominate() {
-        let tables = vec!["orders".to_string(), "users".to_string()];
-        let mut v = SnapshotVector::new(1, &tables);
-        v.observe("orders", 100);
-        v.observe("users", 40);
+        let mut v = SnapshotVector::new(1, &utables(&["orders", "users"]));
+        v.observe("orders", ucursor(100));
+        v.observe("users", ucursor(40));
         let earlier = v.watermark(pg_lineage(1));
         // Parallel-table updates join into one monotonic vector.
-        v.observe("users", 90);
-        v.observe("orders", 250);
+        v.observe("users", ucursor(90));
+        v.observe("orders", ucursor(250));
         let later = v.watermark(pg_lineage(1));
 
         assert_eq!(ord(&earlier, &later), CheckpointOrder::Before);
@@ -908,10 +1019,9 @@ mod tests {
 
     #[test]
     fn snapshot_vector_survives_restart_via_head() {
-        let tables = vec!["orders".to_string(), "users".to_string()];
-        let mut v = SnapshotVector::new(3, &tables);
-        v.observe("orders", 100);
-        v.observe("users", 200);
+        let mut v = SnapshotVector::new(3, &utables(&["orders", "users"]));
+        v.observe("orders", ucursor(100));
+        v.observe("users", ucursor(200));
         v.mark_completed();
         let stored = v.watermark(pg_lineage(1)).to_bytes();
 
@@ -937,6 +1047,33 @@ mod tests {
         let a = snap(1, false, &[("orders", 100)]);
         let b = snap(1, false, &[("orders", 100), ("users", 0)]);
         assert_eq!(ord(&a, &b), CheckpointOrder::Incomparable);
+    }
+
+    #[test]
+    fn snapshot_signed_cursors_order_negatives_correctly() {
+        use SnapshotCursor::Signed;
+        // -100 precedes -5 precedes 10: signed order, never a u64 cast.
+        let a = snap_typed(1, false, &[("orders", Signed(-100))]);
+        let b = snap_typed(1, false, &[("orders", Signed(-5))]);
+        let c = snap_typed(1, false, &[("orders", Signed(10))]);
+        assert_eq!(ord(&a, &b), CheckpointOrder::Before);
+        assert_eq!(ord(&b, &c), CheckpointOrder::Before);
+        assert_eq!(ord(&c, &a), CheckpointOrder::After);
+        assert_eq!(ord(&a, &a), CheckpointOrder::Equal);
+    }
+
+    #[test]
+    fn snapshot_cursor_kind_mismatch_is_incomparable() {
+        // Same table, same numeric value, different cursor domain (a schema /
+        // PK-type change) must never be ordered.
+        let signed =
+            snap_typed(1, false, &[("orders", SnapshotCursor::Signed(5))]);
+        let unsigned =
+            snap_typed(1, false, &[("orders", SnapshotCursor::Unsigned(5))]);
+        assert_eq!(ord(&signed, &unsigned), CheckpointOrder::Incomparable);
+        let ctid =
+            snap_typed(1, false, &[("orders", SnapshotCursor::CtidBlock(5))]);
+        assert_eq!(ord(&unsigned, &ctid), CheckpointOrder::Incomparable);
     }
 
     // ── CDC commit-watermark constructors ───────────────────────────────────
