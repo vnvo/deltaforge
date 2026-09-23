@@ -487,6 +487,29 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_frontier_crosses_i64_max_to_u64_max() {
+        // Unsigned cursors above i64::MAX order and advance correctly (they never
+        // pass through a signed cast).
+        let mut a = agg(&["t"]);
+        let mid = i64::MAX as u64; // 2^63 - 1
+        let b1 = a.complete_chunk("t", u(0), u(mid + 1)).unwrap();
+        assert_eq!(cursors(&b1)["t"], mid + 1);
+        let b2 = a.complete_chunk("t", u(mid + 1), u(u64::MAX)).unwrap();
+        assert_eq!(cursors(&b2)["t"], u64::MAX);
+    }
+
+    #[test]
+    fn unsigned_out_of_order_preserves_frontier_above_i64_max() {
+        // The high chunk (above i64::MAX) completes first: buffered until the low
+        // chunk fills the gap, then the frontier cascades to u64::MAX.
+        let mut a = agg(&["t"]);
+        let mid = i64::MAX as u64;
+        assert!(a.complete_chunk("t", u(mid + 1), u(u64::MAX)).is_none());
+        let b = a.complete_chunk("t", u(0), u(mid + 1)).unwrap();
+        assert_eq!(cursors(&b)["t"], u64::MAX);
+    }
+
+    #[test]
     fn parallel_tables_have_independent_frontiers() {
         let mut a = agg(&["orders", "users"]);
         let b1 = a.complete_chunk("orders", u(0), u(10)).unwrap();

@@ -550,6 +550,29 @@ impl TableWorker {
     // ── PK-range chunking ─────────────────────────────────────────────────────
 
     async fn by_pk(&mut self, pk_col: &str) -> Result<u64> {
+        // Signed and unsigned integer PKs use disjoint cursor domains and must
+        // never be mixed: an unsigned PK above i64::MAX would corrupt a signed
+        // (i64) scan. The kind was resolved from the column type up front.
+        match self.cursor_kind {
+            CursorKind::Unsigned => self.by_pk_unsigned(pk_col).await,
+            _ => self.by_pk_signed(pk_col).await,
+        }
+    }
+
+    /// Build snapshot events for a scanned chunk's rows.
+    fn rows_to_events(&self, rows: Vec<Row>) -> Result<Vec<Event>> {
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            // Derive identity from NATIVE values before the lossy JSON
+            // conversion, then build the event.
+            let id = self.provisional_id(&row)?;
+            let json = row_to_json(row)?;
+            events.push(self.make_event(json, id));
+        }
+        Ok(events)
+    }
+
+    async fn by_pk_signed(&mut self, pk_col: &str) -> Result<u64> {
         let table_fqn = fqn(&self.db, &self.table);
 
         let bounds_row: Option<Row> = self
@@ -578,12 +601,9 @@ impl TableWorker {
         let chunk = self.cfg.chunk_size as i64;
         let mut cursor = min_pk;
         let mut total_sent = 0u64;
-        // Half-open frontier cursor reported to the aggregator, starting at the
-        // cursor kind's minimum so the first chunk covers everything up to its
-        // exclusive upper bound (rows below min_pk do not exist and are vacuously
-        // durable). Chunks abut, so the frontier advances one publish at a time.
-        // Signed PKs keep their true (possibly negative) order via the typed
-        // cursor - never a u64 cast.
+        // Half-open frontier cursor, starting at the kind's minimum so the first
+        // chunk covers everything below min_pk (vacuously durable). Signed PKs
+        // keep their true (possibly negative) order via the typed cursor.
         let mut published_end: SnapshotCursor = self.cursor_kind.min();
 
         while cursor <= max_pk {
@@ -603,21 +623,80 @@ impl TableWorker {
                     format!("PK range [{cursor},{end}) for {table_fqn}")
                 })?;
 
-            let n = rows.len() as u64;
-            let mut events = Vec::with_capacity(rows.len());
-            for row in rows {
-                // Derive identity from NATIVE values before the lossy JSON
-                // conversion, then build the event.
-                let id = self.provisional_id(&row)?;
-                let json = row_to_json(row)?;
-                events.push(self.make_event(json, id));
+            total_sent += rows.len() as u64;
+            let events = self.rows_to_events(rows)?;
+            let chunk_end = mysql_signed_cursor(end);
+            self.publisher
+                .publish_chunk(
+                    &self.table_key,
+                    published_end,
+                    chunk_end,
+                    events,
+                )
+                .await
+                .map_err(|_| anyhow!("event channel closed"))?;
+            published_end = chunk_end;
+            cursor = end;
+        }
+
+        Ok(total_sent)
+    }
+
+    /// Unsigned integer PK scan. Bounds are read and interpolated as full-range
+    /// `u64` (never cast through `i64`), and chunk arithmetic is overflow-safe so
+    /// a range crossing `i64::MAX` and ending at `u64::MAX` scans correctly.
+    async fn by_pk_unsigned(&mut self, pk_col: &str) -> Result<u64> {
+        let table_fqn = fqn(&self.db, &self.table);
+
+        let bounds_row: Option<Row> = self
+            .conn
+            .query_first(format!(
+                "SELECT MIN(`{pk_col}`), MAX(`{pk_col}`) FROM `{}`.`{}`",
+                self.db, self.table
+            ))
+            .await
+            .with_context(|| format!("PK bounds for {table_fqn}"))?;
+
+        let (min_pk, max_pk) = match bounds_row {
+            None => return Ok(0),
+            Some(mut r) => {
+                match (r.take::<Option<u64>, _>(0), r.take::<Option<u64>, _>(1))
+                {
+                    (Some(Some(a)), Some(Some(b))) => (a, b),
+                    _ => {
+                        debug!(table = %table_fqn, "empty table");
+                        return Ok(0);
+                    }
+                }
+            }
+        };
+
+        let chunk = self.cfg.chunk_size as u64;
+        let mut cursor = min_pk;
+        let mut total_sent = 0u64;
+        let mut published_end: SnapshotCursor = self.cursor_kind.min();
+
+        loop {
+            if self.cancel.is_cancelled() {
+                anyhow::bail!("snapshot cancelled");
             }
 
-            // Publish the chunk as the half-open range [published_end, chunk_end):
-            // the aggregator advances this table's contiguous frontier and stamps
-            // the boundary on the chunk's last event, all under one lock. `end` is
-            // the exclusive PK upper bound of this range (typed to the kind).
-            let chunk_end = mysql_cursor(self.cursor_kind, end);
+            let cb = unsigned_chunk_bounds(cursor, chunk, max_pk);
+            let op = if cb.inclusive { "<=" } else { "<" };
+            let rows: Vec<Row> = self
+                .conn
+                .query(format!(
+                    "SELECT * FROM `{}`.`{}` WHERE `{pk_col}` >= {cursor} AND `{pk_col}` {op} {}",
+                    self.db, self.table, cb.upper
+                ))
+                .await
+                .with_context(|| {
+                    format!("PK range [{cursor},{}] for {table_fqn}", cb.upper)
+                })?;
+
+            total_sent += rows.len() as u64;
+            let events = self.rows_to_events(rows)?;
+            let chunk_end = SnapshotCursor::Unsigned(cb.frontier_end);
             self.publisher
                 .publish_chunk(
                     &self.table_key,
@@ -629,8 +708,10 @@ impl TableWorker {
                 .map_err(|_| anyhow!("event channel closed"))?;
             published_end = chunk_end;
 
-            total_sent += n;
-            cursor = end;
+            if cb.inclusive {
+                break;
+            }
+            cursor = cb.next;
         }
 
         Ok(total_sent)
@@ -780,13 +861,44 @@ fn mysql_cursor_kind(schema: &super::MySqlTableSchema) -> CursorKind {
     CursorKind::Unsigned
 }
 
-/// Build a cursor of `kind` from a scan value. MySQL uses only Signed/Unsigned;
-/// negative values only occur (and are preserved) for the signed kind.
-fn mysql_cursor(kind: CursorKind, v: i64) -> SnapshotCursor {
-    match kind {
-        CursorKind::Signed => SnapshotCursor::Signed(v),
-        CursorKind::Unsigned => SnapshotCursor::Unsigned(v.max(0) as u64),
-        CursorKind::CtidBlock => SnapshotCursor::CtidBlock(v.max(0) as u64),
+/// Build a signed cursor from a scan value (MySQL signed PK path).
+fn mysql_signed_cursor(v: i64) -> SnapshotCursor {
+    SnapshotCursor::Signed(v)
+}
+
+/// One unsigned PK chunk's bounds, overflow-safe near `u64::MAX`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnsignedChunk {
+    /// SQL predicate upper bound for this chunk.
+    upper: u64,
+    /// Whether the upper bound is inclusive (the final chunk, so the row at
+    /// `max` - possibly `u64::MAX` - is not dropped by an exclusive `<`).
+    inclusive: bool,
+    /// Half-open frontier end reported to the aggregator. `max + 1`, saturating
+    /// at `u64::MAX` (where completion, not the cursor, marks the max row done).
+    frontier_end: u64,
+    /// The next cursor to scan from (only meaningful when not the final chunk).
+    next: u64,
+}
+
+/// Compute the next unsigned PK chunk `[cursor, ..)` given `chunk` size and the
+/// table `max`. Uses checked arithmetic so a cursor near `u64::MAX` never
+/// overflows; the final chunk is inclusive of `max`.
+fn unsigned_chunk_bounds(cursor: u64, chunk: u64, max: u64) -> UnsignedChunk {
+    match cursor.checked_add(chunk) {
+        Some(end) if end <= max => UnsignedChunk {
+            upper: end,
+            inclusive: false,
+            frontier_end: end,
+            next: end,
+        },
+        // Final chunk: covers [cursor, max] inclusively.
+        _ => UnsignedChunk {
+            upper: max,
+            inclusive: true,
+            frontier_end: max.saturating_add(1),
+            next: max,
+        },
     }
 }
 
@@ -848,4 +960,70 @@ fn base64_encode(bytes: &[u8]) -> String {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    #[test]
+    fn unsigned_chunk_bounds_normal_range() {
+        let c = unsigned_chunk_bounds(0, 100, 1000);
+        assert_eq!(
+            c,
+            UnsignedChunk {
+                upper: 100,
+                inclusive: false,
+                frontier_end: 100,
+                next: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn unsigned_chunk_bounds_final_chunk_is_inclusive() {
+        // cursor + chunk overshoots max: final inclusive chunk covers [900, 950].
+        let c = unsigned_chunk_bounds(900, 100, 950);
+        assert!(c.inclusive);
+        assert_eq!(c.upper, 950);
+        assert_eq!(c.frontier_end, 951);
+    }
+
+    #[test]
+    fn unsigned_chunk_bounds_crossing_i64_max() {
+        // A cursor just below i64::MAX with a chunk that crosses it stays correct
+        // (no i64 overflow / sign flip).
+        let below = i64::MAX as u64 - 10;
+        let c = unsigned_chunk_bounds(below, 100, u64::MAX);
+        // below + 100 > u64... no: below+100 < u64::MAX, and <= max -> normal.
+        assert!(!c.inclusive);
+        assert_eq!(c.upper, below + 100);
+        assert_eq!(c.frontier_end, below + 100);
+        // The crossed value is above i64::MAX.
+        assert!(c.upper > i64::MAX as u64);
+    }
+
+    #[test]
+    fn unsigned_chunk_bounds_ending_at_u64_max_no_overflow() {
+        // cursor near u64::MAX: checked_add overflows -> final inclusive chunk to
+        // u64::MAX, frontier_end saturates (no panic, no wraparound).
+        let cursor = u64::MAX - 5;
+        let c = unsigned_chunk_bounds(cursor, 1000, u64::MAX);
+        assert!(c.inclusive);
+        assert_eq!(c.upper, u64::MAX);
+        assert_eq!(c.frontier_end, u64::MAX, "saturates, never wraps to 0");
+    }
+
+    #[test]
+    fn unsigned_chunk_bounds_exact_max_boundary() {
+        // cursor + chunk == max exactly: normal exclusive chunk to max, then a
+        // later call from max produces the final inclusive [max, max].
+        let c = unsigned_chunk_bounds(0, 500, 500);
+        assert!(!c.inclusive);
+        assert_eq!(c.upper, 500);
+        let last = unsigned_chunk_bounds(500, 500, 500);
+        assert!(last.inclusive);
+        assert_eq!(last.upper, 500);
+        assert_eq!(last.frontier_end, 501);
+    }
 }
