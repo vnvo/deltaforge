@@ -32,7 +32,9 @@ use std::collections::HashMap;
 use super::mysql_identity::mysql_identity_cell;
 use crate::durable_checkpoint::{CursorKind, SnapshotCursor};
 use crate::snapshot_event_id::{OwnedIdentityValue, snapshot_row_event_id};
-use crate::snapshot_frontier::{SnapshotAggregator, SnapshotPublisher};
+use crate::snapshot_frontier::{
+    SnapshotAggregator, SnapshotPublisher, TableResume,
+};
 use crate::snapshot_generation::PersistedLineage;
 use scopeguard;
 use serde::{Deserialize, Serialize};
@@ -244,18 +246,14 @@ pub async fn run_snapshot(
         "mysql snapshot started"
     );
 
-    // Build the ordered-aggregation owner over the tables actually scanned this
-    // run. Every snapshot row is published through it, so its durable boundary
-    // (frozen snapshot checkpoint + advancing per-table contiguous vector) is
-    // produced atomically and travels with the rows.
-    // Resolve each scanned table's cursor kind up front so the aggregator's
-    // vector has a fixed key set and a fixed cursor kind per table from the
-    // first batch (never a signed/unsigned domain switch mid-run).
+    // Build the ordered-aggregation owner. Its source vector is restored from
+    // the source's own progress (done_tables + finished) - NEVER from any sink's
+    // HEAD, so the source is not fast-forwarded by how far one sink is durable.
+    // Resolve every table's cursor kind up front (including already-done tables,
+    // which enter the vector complete at their kind's max) so the vector's key
+    // set and cursor kinds are fixed from the first batch.
     let mut kinds: HashMap<String, CursorKind> = HashMap::new();
     for (db, table) in tables {
-        if progress.table_done(db, table) {
-            continue;
-        }
         let loaded = ctx
             .schema_loader
             .load_schema(db, table)
@@ -265,18 +263,31 @@ pub async fn run_snapshot(
             })?;
         kinds.insert(fqn(db, table), mysql_cursor_kind(&loaded.schema));
     }
-    let scan_tables: Vec<(String, CursorKind)> =
-        kinds.iter().map(|(t, k)| (t.clone(), *k)).collect();
+    let all_tables: Vec<(String, CursorKind)> = tables
+        .iter()
+        .map(|(db, table)| {
+            let k = fqn(db, table);
+            let kind = kinds.get(&k).copied().unwrap_or(CursorKind::Unsigned);
+            (k, kind)
+        })
+        .collect();
+    let resume: Vec<(String, TableResume)> = all_tables
+        .iter()
+        .map(|(t, kind)| {
+            let done = progress.finished || progress.done_tables.contains(t);
+            (t.clone(), TableResume { kind: *kind, done })
+        })
+        .collect();
     let snapshot_checkpoint = CheckpointMeta::from_vec(
         serde_json::to_vec(&position)
             .context("serialize snapshot checkpoint")?,
     );
     let publisher = Arc::new(SnapshotPublisher::new(
-        SnapshotAggregator::new(
+        SnapshotAggregator::from_source_progress(
             ctx.generation,
             ctx.lineage.clone(),
             snapshot_checkpoint,
-            &scan_tables,
+            &resume,
         ),
         ctx.tx.clone(),
     ));

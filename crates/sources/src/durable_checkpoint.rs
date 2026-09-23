@@ -61,6 +61,17 @@ impl CursorKind {
             CursorKind::CtidBlock => SnapshotCursor::CtidBlock(0),
         }
     }
+
+    /// The highest cursor of this kind - a fully-scanned (done) table's frontier
+    /// when restoring from a table-level source checkpoint that records only
+    /// completion, not a per-table cursor.
+    pub fn max(self) -> SnapshotCursor {
+        match self {
+            CursorKind::Signed => SnapshotCursor::Signed(i64::MAX),
+            CursorKind::Unsigned => SnapshotCursor::Unsigned(u64::MAX),
+            CursorKind::CtidBlock => SnapshotCursor::CtidBlock(u64::MAX),
+        }
+    }
 }
 
 impl SnapshotCursor {
@@ -1047,6 +1058,24 @@ mod tests {
         let a = snap(1, false, &[("orders", 100)]);
         let b = snap(1, false, &[("orders", 100), ("users", 0)]);
         assert_eq!(ord(&a, &b), CheckpointOrder::Incomparable);
+    }
+
+    #[test]
+    fn s3_head_ahead_source_replay_is_skippable_per_sink() {
+        // Ownership boundary: the source replays from its OWN progress (re-emitting
+        // a lower cursor); each sink recovers its own HEAD independently and its
+        // comparator decides skip-vs-apply. The SAME source replay is Before one
+        // sink's ahead HEAD (that sink skips - no regression, no duplicate durable
+        // write) and After a behind sink's HEAD (that sink applies it). The source
+        // is never fast-forwarded to any sink's HEAD.
+        let replay = snap(1, false, &[("orders", 100)]);
+        let s3_ahead = snap(1, false, &[("orders", 500)]);
+        let other_behind = snap(1, false, &[("orders", 50)]);
+        assert_eq!(ord(&replay, &s3_ahead), CheckpointOrder::Before);
+        assert_eq!(ord(&replay, &other_behind), CheckpointOrder::After);
+        // Equal HEAD is also skippable (Before/Equal both let the sink skip).
+        let s3_equal = snap(1, false, &[("orders", 100)]);
+        assert_eq!(ord(&replay, &s3_equal), CheckpointOrder::Equal);
     }
 
     #[test]

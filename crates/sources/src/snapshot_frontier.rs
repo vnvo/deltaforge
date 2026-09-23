@@ -99,6 +99,73 @@ impl TableFrontier {
             false
         }
     }
+
+    /// An already-durable (done) table restored from the source checkpoint: its
+    /// frontier is the kind's maximum and it is complete. The source checkpoint
+    /// records only table-level completion, not a per-table cursor.
+    fn completed_at_max(kind: CursorKind) -> Self {
+        Self {
+            frontier: kind.max(),
+            pending: BTreeMap::new(),
+            completed: true,
+        }
+    }
+}
+
+/// One table's state when restoring the source snapshot vector from the
+/// authoritative source/coordinator checkpoint (never from any sink's HEAD).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableResume {
+    pub kind: CursorKind,
+    /// The source checkpoint records this table as fully snapshotted.
+    pub done: bool,
+}
+
+/// Converting a table-level source checkpoint to the per-table vector failed
+/// because it is an interrupted legacy snapshot: some tables are done and some
+/// are not, but the legacy format kept no per-table cursor for the unfinished
+/// ones. Such a snapshot cannot be adopted by durable mode without possibly
+/// claiming durability the sink never received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbiguousLegacySnapshot;
+
+impl std::fmt::Display for AmbiguousLegacySnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "in-progress legacy snapshot cannot be converted to a durable \
+             source vector without ambiguity; finish it under legacy mode or \
+             start a new snapshot generation",
+        )
+    }
+}
+impl std::error::Error for AmbiguousLegacySnapshot {}
+
+/// Convert a legacy table-level source checkpoint (`done_tables` + `finished`)
+/// into the per-table resume states for the source vector. This reads the
+/// SOURCE's own progress - never any sink's HEAD, so the source is never
+/// fast-forwarded by how far one sink happens to be durable.
+///
+/// - `finished` (all tables done) or a clean start (nothing done) converts
+///   unambiguously.
+/// - An interrupted legacy snapshot (some done, some pending, not finished) is
+///   [`AmbiguousLegacySnapshot`]: the caller (durable startup) must fail closed.
+pub fn convert_legacy_progress(
+    tables: &[(String, CursorKind)],
+    done_tables: &[String],
+    finished: bool,
+) -> Result<Vec<(String, TableResume)>, AmbiguousLegacySnapshot> {
+    let any_done = tables.iter().any(|(t, _)| done_tables.contains(t));
+    let any_pending = tables.iter().any(|(t, _)| !done_tables.contains(t));
+    if !finished && any_done && any_pending {
+        return Err(AmbiguousLegacySnapshot);
+    }
+    Ok(tables
+        .iter()
+        .map(|(t, kind)| {
+            let done = finished || done_tables.contains(t);
+            (t.clone(), TableResume { kind: *kind, done })
+        })
+        .collect())
 }
 
 /// Owns the per-table frontiers and the full snapshot vector, and emits a
@@ -135,34 +202,34 @@ impl SnapshotAggregator {
         }
     }
 
-    /// Rebuild from a stored snapshot watermark (restart init) BEFORE any worker
-    /// emits, so progress resumes from the verified HEAD vector.
-    pub fn restore_from(
+    /// Build the source vector from the authoritative source/coordinator
+    /// checkpoint (via [`convert_legacy_progress`]). A table the source records as
+    /// done starts complete at its kind's maximum; a pending table starts at the
+    /// minimum for a fresh scan. This NEVER reads a sink's HEAD, so the source is
+    /// not fast-forwarded by how far one sink is durable - each sink recovers its
+    /// own cursor independently and its comparator skips already-durable replay.
+    pub fn from_source_progress(
         generation: u64,
         lineage: PersistedLineage,
         snapshot_checkpoint: CheckpointMeta,
-        head: &DurableWatermark,
-    ) -> Option<Self> {
-        let WmPos::Snapshot {
-            generation: g,
-            table_cursors,
-            ..
-        } = &head.pos
-        else {
-            return None;
-        };
-        if *g != generation {
-            return None;
-        }
-        Some(Self {
+        resume: &[(String, TableResume)],
+    ) -> Self {
+        Self {
             generation,
             lineage,
             snapshot_checkpoint,
-            tables: table_cursors
+            tables: resume
                 .iter()
-                .map(|(t, c)| (t.clone(), TableFrontier::new(*c)))
+                .map(|(t, r)| {
+                    let f = if r.done {
+                        TableFrontier::completed_at_max(r.kind)
+                    } else {
+                        TableFrontier::new(r.kind.min())
+                    };
+                    (t.clone(), f)
+                })
                 .collect(),
-        })
+        }
     }
 
     fn fully_completed(&self) -> bool {
@@ -473,27 +540,77 @@ mod tests {
     }
 
     #[test]
-    fn restart_resumes_from_head_vector_and_continues_monotonically() {
-        // Simulate a prior run that reached orders=100, users=50.
-        let mut prior = agg(&["orders", "users"]);
-        prior.complete_chunk("orders", u(0), u(100));
-        let head_b = prior.complete_chunk("users", u(0), u(50)).unwrap();
-        let head =
-            DurableWatermark::parse(head_b.durable_watermark.as_ref().unwrap())
-                .unwrap();
-
-        // Restart: rebuild from the verified HEAD vector before emitting.
-        let mut resumed = SnapshotAggregator::restore_from(
+    fn from_source_progress_done_tables_complete_pending_fresh() {
+        // Per-table resume states known unambiguously (e.g. a durable resume):
+        // `orders` done, `users` pending. `orders` starts complete at its kind's
+        // max; `users` starts fresh at min and is scanned this run. NOTHING here
+        // reads a sink HEAD.
+        let resume = vec![
+            (
+                "orders".to_string(),
+                TableResume {
+                    kind: CursorKind::Unsigned,
+                    done: true,
+                },
+            ),
+            (
+                "users".to_string(),
+                TableResume {
+                    kind: CursorKind::Unsigned,
+                    done: false,
+                },
+            ),
+        ];
+        let mut a = SnapshotAggregator::from_source_progress(
             1,
             lineage(),
             CheckpointMeta::from_vec(b"snap-start".to_vec()),
-            &head,
+            &resume,
+        );
+        // orders is already complete; users completes after its scan.
+        assert!(!a.is_complete());
+        let b = a.complete_chunk("users", u(0), u(50)).unwrap();
+        assert_eq!(cursors(&b)["users"], 50);
+        assert_eq!(
+            cursors(&b)["orders"],
+            u64::MAX,
+            "done table sits at the kind's max"
+        );
+        assert!(a.complete_table("users").is_some());
+        assert!(a.is_complete(), "all tables complete");
+    }
+
+    #[test]
+    fn convert_legacy_progress_rejects_interrupted_snapshot() {
+        // finished = false with one done and one pending = interrupted legacy
+        // snapshot: unconvertible for durable mode (fail closed).
+        let err = convert_legacy_progress(
+            &[
+                ("orders".to_string(), CursorKind::Signed),
+                ("users".to_string(), CursorKind::Signed),
+            ],
+            &["orders".to_string()],
+            false,
+        );
+        assert_eq!(err, Err(AmbiguousLegacySnapshot));
+
+        // finished = true (all done) converts to an all-complete vector.
+        let ok = convert_legacy_progress(
+            &[("orders".to_string(), CursorKind::Signed)],
+            &["orders".to_string()],
+            true,
         )
         .unwrap();
-        // A next contiguous chunk continues from the restored frontier (100).
-        let b = resumed.complete_chunk("orders", u(100), u(200)).unwrap();
-        assert_eq!(cursors(&b)["orders"], 200);
-        assert_eq!(cursors(&b)["users"], 50);
+        assert!(ok[0].1.done);
+
+        // Clean start (nothing done) converts to all-pending.
+        let fresh = convert_legacy_progress(
+            &[("orders".to_string(), CursorKind::Signed)],
+            &[],
+            false,
+        )
+        .unwrap();
+        assert!(!fresh[0].1.done);
     }
 
     #[test]

@@ -29,7 +29,9 @@ use std::collections::HashMap;
 use super::postgres_identity::{PgIdentityRaw, pg_identity_cell, quote_ident};
 use crate::durable_checkpoint::{CursorKind, SnapshotCursor};
 use crate::snapshot_event_id::{OwnedIdentityValue, snapshot_row_event_id};
-use crate::snapshot_frontier::{SnapshotAggregator, SnapshotPublisher};
+use crate::snapshot_frontier::{
+    SnapshotAggregator, SnapshotPublisher, TableResume,
+};
 use crate::snapshot_generation::PersistedLineage;
 use metrics::counter;
 use pgwire_replication::Lsn;
@@ -262,14 +264,13 @@ pub async fn run_snapshot(
         "snapshot started"
     );
 
-    // Resolve each scanned table's cursor kind up front (signed integer-PK range
-    // or ctid page-block) so the aggregator's vector has a fixed key set and a
-    // fixed cursor kind per table from the first batch.
+    // Build the aggregation owner. Its source vector is restored from the
+    // source's own progress (done_tables + finished) - NEVER from any sink's
+    // HEAD. Resolve every table's cursor kind up front (integer-PK signed range
+    // or ctid page-block); already-done tables enter the vector complete at their
+    // kind's max, so the key set and cursor kinds are fixed from the first batch.
     let mut kinds: HashMap<String, CursorKind> = HashMap::new();
     for (schema, table) in tables {
-        if progress.table_done(schema, table) {
-            continue;
-        }
         let loaded = ctx
             .schema_loader
             .load_schema(schema, table)
@@ -279,16 +280,24 @@ pub async fn run_snapshot(
             })?;
         kinds.insert(fqn(schema, table), pg_cursor_kind(&loaded.schema));
     }
-    let scan_tables: Vec<(String, CursorKind)> =
-        kinds.iter().map(|(t, k)| (t.clone(), *k)).collect();
+    let resume: Vec<(String, TableResume)> = tables
+        .iter()
+        .map(|(schema, table)| {
+            let key = fqn(schema, table);
+            let kind =
+                kinds.get(&key).copied().unwrap_or(CursorKind::CtidBlock);
+            let done = progress.finished || progress.table_done(schema, table);
+            (key, TableResume { kind, done })
+        })
+        .collect();
     let snapshot_checkpoint =
         CheckpointMeta::from_vec(lsn_str.clone().into_bytes());
     let publisher = Arc::new(SnapshotPublisher::new(
-        SnapshotAggregator::new(
+        SnapshotAggregator::from_source_progress(
             ctx.generation,
             ctx.lineage.clone(),
             snapshot_checkpoint,
-            &scan_tables,
+            &resume,
         ),
         ctx.tx.clone(),
     ));
