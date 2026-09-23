@@ -783,6 +783,13 @@ pub enum SourceItem {
         tx_id: String,
         boundary: SourceBoundary,
     },
+    /// A boundary carrying no data event: snapshot table-complete and
+    /// snapshot-complete markers (and any future progress marker that must
+    /// advance the durable watermark without a row). The coordinator applies it
+    /// to the pending batch, or - if prior data already flushed - delivers an
+    /// empty batch carrying it, so the boundary (e.g. the `completed = true`
+    /// snapshot watermark) is durably acknowledged before it takes effect.
+    Boundary { boundary: SourceBoundary },
 }
 
 /// A legal checkpoint boundary emitted by a source: the resume `checkpoint`

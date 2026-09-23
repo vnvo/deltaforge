@@ -341,16 +341,24 @@ pub async fn run_snapshot(
                     save_progress(&ctx.chkpt_store, ctx.source_id, &progress)
                         .await;
                 }
-                // Explicit table completion in the aggregator (all its ranges
-                // are incorporated). The final boundary (completed = true) is
-                // returned once every scanned table completes.
-                if let Some(done) = publisher.complete_table(&name).await {
-                    debug!(
-                        table = %name,
-                        "snapshot fully complete; completion boundary ready \
-                         (durable recording lands with the S3 sink)"
-                    );
-                    let _ = done;
+                // Explicit table completion: emits a table-complete boundary
+                // through the publisher, and the `completed = true` snapshot
+                // boundary once every scanned table is done. The coordinator
+                // delivers those boundaries (and durably acks them) even with no
+                // trailing data rows.
+                match publisher.complete_table(&name).await {
+                    Ok(all_done) => {
+                        if all_done {
+                            debug!(
+                                "snapshot fully complete; completed boundary emitted"
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        anyhow::bail!(
+                            "event channel closed at table completion"
+                        );
+                    }
                 }
                 info!(table = %name, rows, "table snapshot complete");
             }

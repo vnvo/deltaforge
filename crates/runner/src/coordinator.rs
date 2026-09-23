@@ -140,6 +140,19 @@ fn close_tx(
     had_events
 }
 
+/// Apply a data-less boundary (a [`SourceItem::Boundary`], e.g. snapshot
+/// completion) to the batch: it becomes the batch boundary and the whole batch is
+/// a committed prefix. Boundaries only arrive between transactions/standalone
+/// rows, never mid-transaction.
+fn close_boundary(
+    b: &mut BuildingBatch,
+    boundary: deltaforge_core::SourceBoundary,
+) {
+    b.boundary = Some(boundary);
+    b.committed_len = b.raw.len();
+    b.committed_bytes = b.bytes;
+}
+
 /// Record that a standalone (non-transactional) event is its own boundary. Its
 /// source boundary (checkpoint + watermark, set atomically at the source via
 /// `Event::set_boundary`) becomes the batch boundary, so a non-GTID CDC row or
@@ -1071,6 +1084,21 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                             );
                                             send_to_delivery(&deliver_tx, full, "tx_commit").await?;
                                         }
+                                    }
+                                    SourceItem::Boundary { boundary } => {
+                                        // A data-less boundary (snapshot table /
+                                        // full completion). Apply it to the pending
+                                        // batch and flush now so it is delivered -
+                                        // and durably acked - promptly, even when
+                                        // the batch is empty because prior data
+                                        // already flushed (the sink then publishes a
+                                        // zero-object entry + HEAD CAS for it).
+                                        close_boundary(&mut b, boundary);
+                                        let full = std::mem::replace(
+                                            &mut b,
+                                            BuildingBatch::with_capacity(max_events),
+                                        );
+                                        send_to_delivery(&deliver_tx, full, "boundary").await?;
                                     }
                                 }
                             } else {
@@ -3737,5 +3765,100 @@ mod tests {
             Some(&b"BINLOG-WM"[..]),
             "standalone event's carried watermark reaches the context"
         );
+    }
+
+    /// Build a coordinator + CtxSink for the boundary-item tests. `max_events`
+    /// controls whether the standalone rows flush before the boundary arrives.
+    fn boundary_coord(
+        max_events: usize,
+    ) -> (Coordinator<CheckpointMeta>, Arc<CtxSink>) {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = CtxSink::new();
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        let cp_fn = build_commit_fn(store, "src::sink::ctx".to_string());
+        let batch_processor =
+            build_batch_processor(Arc::from(vec![]), "test".to_string());
+        let coord = Coordinator::builder("test-boundary")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(max_events),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_fn("ctx", cp_fn)
+            .process_fn(batch_processor)
+            .build();
+        (coord, sink)
+    }
+
+    fn snapshot_completion_boundary() -> SourceItem {
+        SourceItem::Boundary {
+            boundary: deltaforge_core::SourceBoundary {
+                checkpoint: CheckpointMeta::from_vec(b"snap-done".to_vec()),
+                durable_watermark: Some(std::sync::Arc::from(
+                    b"COMPLETED".to_vec(),
+                )),
+            },
+        }
+    }
+
+    fn standalone_row(id: i64) -> SourceItem {
+        let mut ev = tx_event(id, "unused", b"unused");
+        ev.transaction = None;
+        SourceItem::Event(ev)
+    }
+
+    /// A boundary item applies to a pending snapshot batch: the buffered rows and
+    /// the completion boundary are delivered together in one batch.
+    #[tokio::test]
+    async fn boundary_item_applies_to_pending_batch() {
+        let (coord, sink) = boundary_coord(1000); // rows stay buffered
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_p, pause_rx) = tokio::sync::watch::channel(false);
+
+        tx.send(standalone_row(1)).await.unwrap();
+        tx.send(standalone_row(2)).await.unwrap();
+        tx.send(snapshot_completion_boundary()).await.unwrap();
+        drop(tx);
+        coord.run(rx, cancel, pause_rx).await.unwrap();
+
+        let d = sink.deliveries();
+        assert_eq!(d.len(), 1, "buffered rows + boundary deliver as one batch");
+        assert_eq!(d[0].0, 2, "both rows present");
+        assert_eq!(
+            d[0].1, b"snap-done",
+            "context checkpoint is the boundary's"
+        );
+        assert_eq!(d[0].2.as_deref(), Some(&b"COMPLETED"[..]));
+    }
+
+    /// When prior data already flushed, a boundary item still delivers - as an
+    /// empty batch carrying the completion boundary (the sink can then write a
+    /// zero-object entry + HEAD CAS for it).
+    #[tokio::test]
+    async fn boundary_item_delivers_empty_batch_when_data_already_flushed() {
+        let (coord, sink) = boundary_coord(1); // each row flushes immediately
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_p, pause_rx) = tokio::sync::watch::channel(false);
+
+        tx.send(standalone_row(1)).await.unwrap();
+        tx.send(snapshot_completion_boundary()).await.unwrap();
+        drop(tx);
+        coord.run(rx, cancel, pause_rx).await.unwrap();
+
+        let d = sink.deliveries();
+        assert_eq!(d.len(), 2, "row batch, then the boundary's empty batch");
+        assert_eq!(d[0].0, 1, "first batch carried the row");
+        assert_eq!(
+            d[1].0, 0,
+            "completion boundary delivered as an empty batch"
+        );
+        assert_eq!(d[1].1, b"snap-done");
+        assert_eq!(d[1].2.as_deref(), Some(&b"COMPLETED"[..]));
     }
 }

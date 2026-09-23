@@ -68,6 +68,7 @@ where
             }
             Ok(Some(SourceItem::TxBegin { .. })) => continue,
             Ok(Some(SourceItem::TxCommit { .. })) => continue,
+            Ok(Some(SourceItem::Boundary { .. })) => continue,
             Ok(None) | Err(_) => break,
         }
     }
@@ -209,7 +210,7 @@ async fn mysql_schema_loader() -> Result<()> {
         assert_eq!(sku_col.char_max_length, Some(64));
 
         // DECIMAL(12,2): the loader reads NUMERIC_PRECISION/NUMERIC_SCALE from
-        // INFORMATION_SCHEMA on demand — no snapshot required. Downstream sinks
+        // INFORMATION_SCHEMA on demand - no snapshot required. Downstream sinks
         // (e.g. ClickHouse) rely on these being populated so they map to an
         // exact Decimal(p,s) rather than falling back to a default scale.
         let amount_col = schema.column("amount").expect("amount column");
@@ -1341,7 +1342,7 @@ async fn replay_derived_ids(
         .collect())
 }
 
-/// Pipeline composition: a derived event's id must be identical across replay —
+/// Pipeline composition: a derived event's id must be identical across replay -
 /// stable parent id ∘ constant processor digest ∘ deterministic ordinal.
 #[tokio::test]
 #[ignore = "requires docker"]

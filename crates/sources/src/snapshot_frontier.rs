@@ -170,8 +170,9 @@ impl SnapshotAggregator {
             && self.tables.values().all(TableFrontier::completed)
     }
 
-    /// Snapshot the complete current vector into a boundary.
-    fn boundary(&self) -> SourceBoundary {
+    /// Snapshot the complete current vector into a boundary (its `completed` flag
+    /// reflects whether every table is done).
+    pub fn current_boundary(&self) -> SourceBoundary {
         let table_cursors: BTreeMap<String, SnapshotCursor> = self
             .tables
             .iter()
@@ -203,7 +204,7 @@ impl SnapshotAggregator {
     ) -> Option<SourceBoundary> {
         let f = self.tables.get_mut(table)?;
         if f.complete_chunk(start, end) {
-            Some(self.boundary())
+            Some(self.current_boundary())
         } else {
             None
         }
@@ -216,7 +217,7 @@ impl SnapshotAggregator {
         if !f.try_complete() {
             return None;
         }
-        self.fully_completed().then(|| self.boundary())
+        self.fully_completed().then(|| self.current_boundary())
     }
 
     pub fn is_complete(&self) -> bool {
@@ -291,12 +292,23 @@ impl SnapshotPublisher {
         Ok(())
     }
 
-    /// Mark `table`'s scan complete (all its ranges incorporated). Returns the
-    /// completed-snapshot boundary once every table is complete, for the caller to
-    /// record before the snapshot->CDC transition. Serialized with publication.
-    pub async fn complete_table(&self, table: &str) -> Option<SourceBoundary> {
+    /// Mark `table`'s scan complete (all its ranges incorporated) and emit an
+    /// explicit table-complete [`deltaforge_core::SourceItem::Boundary`] carrying
+    /// the current full vector; when this completes the whole snapshot the
+    /// boundary's watermark is `completed = true`, gating snapshot->CDC once it is
+    /// durably acknowledged. The send is under the lock (ordered with
+    /// publication). Returns whether the whole snapshot is now complete.
+    pub async fn complete_table(
+        &self,
+        table: &str,
+    ) -> Result<bool, SnapshotClosed> {
         let mut g = self.inner.lock().await;
-        g.agg.complete_table(table)
+        g.agg.complete_table(table);
+        let boundary = g.agg.current_boundary();
+        g.tx.send(deltaforge_core::SourceItem::Boundary { boundary })
+            .await
+            .map_err(|_| SnapshotClosed)?;
+        Ok(g.agg.is_complete())
     }
 
     /// Whether the whole snapshot is complete.
@@ -635,6 +647,19 @@ mod tests {
         );
     }
 
+    /// Extract the boundary carried by the last `SourceItem::Boundary` drained.
+    fn drain_last_boundary(
+        rx: &mut tokio::sync::mpsc::Receiver<SourceItem>,
+    ) -> Option<SourceBoundary> {
+        let mut last = None;
+        while let Ok(item) = rx.try_recv() {
+            if let SourceItem::Boundary { boundary } = item {
+                last = Some(boundary);
+            }
+        }
+        last
+    }
+
     #[tokio::test]
     async fn publisher_parallel_tables_reach_completion() {
         let (p, mut rx) = publisher(&["shop.orders", "shop.users"], 64);
@@ -644,9 +669,26 @@ mod tests {
         p.publish_chunk("shop.users", u(0), u(10), vec![snap_event(2)])
             .await
             .unwrap();
-        assert!(p.complete_table("shop.orders").await.is_none());
-        let done = p.complete_table("shop.users").await.expect("all done");
+        // Completing one table emits a table-complete boundary but not `completed`.
+        assert!(!p.complete_table("shop.orders").await.unwrap());
+        let mid =
+            drain_last_boundary(&mut rx).expect("table-complete boundary");
+        let wm =
+            DurableWatermark::parse(mid.durable_watermark.as_ref().unwrap())
+                .unwrap();
+        assert!(matches!(
+            wm.pos,
+            WmPos::Snapshot {
+                completed: false,
+                ..
+            }
+        ));
+
+        // Completing the last table emits the `completed = true` boundary.
+        assert!(p.complete_table("shop.users").await.unwrap());
         assert!(p.is_complete().await);
+        let done =
+            drain_last_boundary(&mut rx).expect("snapshot-complete boundary");
         let wm =
             DurableWatermark::parse(done.durable_watermark.as_ref().unwrap())
                 .unwrap();
@@ -657,7 +699,5 @@ mod tests {
                 ..
             }
         ));
-        // Drain so the channel does not report closed early.
-        while rx.try_recv().is_ok() {}
     }
 }
