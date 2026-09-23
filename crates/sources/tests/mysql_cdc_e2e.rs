@@ -412,7 +412,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
         assert_eq!(e.source.db, db_name);
         assert!(e.schema_version.is_some(), "missing schema_version");
         assert!(e.schema_sequence.is_some(), "missing schema_sequence");
-        assert!(e.checkpoint.is_some(), "missing checkpoint");
+        assert!(e.checkpoint().is_some(), "missing checkpoint");
     }
     info!("✓ event metadata correct");
 

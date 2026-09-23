@@ -136,13 +136,13 @@ fn close_tx(
     boundary: deltaforge_core::SourceBoundary,
 ) -> bool {
     let had_events = b.mid_tx();
+    // The watermark travels with the checkpoint from the same boundary.
+    b.boundary_watermark = boundary.durable_watermark.clone();
     if let Some(last) = b.raw.last_mut() {
-        last.checkpoint = Some(boundary.checkpoint);
+        last.set_boundary(boundary);
     }
     b.committed_len = b.raw.len();
     b.committed_bytes = b.bytes;
-    // The watermark travels with the checkpoint from the same boundary.
-    b.boundary_watermark = boundary.durable_watermark;
     had_events
 }
 
@@ -156,7 +156,7 @@ fn commit_standalone(b: &mut BuildingBatch) {
     b.committed_len = b.raw.len();
     b.committed_bytes = b.bytes;
     if let Some(last) = b.raw.last() {
-        if let Some(wm) = last.durable_watermark.clone() {
+        if let Some(wm) = last.durable_watermark().cloned() {
             b.boundary_watermark = Some(wm);
         }
     }
@@ -1628,11 +1628,8 @@ pub fn build_batch_processor(
         let pipeline = Arc::clone(&pipeline_name);
 
         async move {
-            let last_cp = events
-                .iter()
-                .rev()
-                .find_map(|e| e.checkpoint.as_ref())
-                .cloned();
+            let last_cp =
+                events.iter().rev().find_map(|e| e.checkpoint()).cloned();
 
             if procs.is_empty() {
                 return Ok(ProcessedBatch {
@@ -1784,7 +1781,7 @@ mod tests {
             total_order: None,
             data_collection_order: None,
         });
-        e.checkpoint = Some(CheckpointMeta::from_vec(checkpoint.to_vec()));
+        e.set_checkpoint(CheckpointMeta::from_vec(checkpoint.to_vec()));
         e
     }
 
@@ -2749,8 +2746,8 @@ mod tests {
             0,
             0,
         );
-        event.checkpoint =
-            Some(CheckpointMeta::from_vec(b"{\"pos\":42}".to_vec()));
+        event
+            .set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":42}".to_vec()));
         event.tx_end = true;
         tx.send(SourceItem::Event(event)).await.unwrap();
         drop(tx); // Close channel so coordinator exits after processing.
@@ -2839,8 +2836,9 @@ mod tests {
                 0,
             );
             if i == 2 {
-                ev.checkpoint =
-                    Some(CheckpointMeta::from_vec(b"{\"pos\":99}".to_vec()));
+                ev.set_checkpoint(CheckpointMeta::from_vec(
+                    b"{\"pos\":99}".to_vec(),
+                ));
                 ev.tx_end = true;
             }
             tx.send(SourceItem::Event(ev)).await.unwrap();
@@ -3027,8 +3025,9 @@ mod tests {
                 0,
             );
             if i == 4 {
-                ev.checkpoint =
-                    Some(CheckpointMeta::from_vec(b"{\"pos\":100}".to_vec()));
+                ev.set_checkpoint(CheckpointMeta::from_vec(
+                    b"{\"pos\":100}".to_vec(),
+                ));
                 ev.tx_end = true;
             }
             tx.send(SourceItem::Event(ev)).await.unwrap();
@@ -3145,8 +3144,9 @@ mod tests {
                 0,
             );
             if i == 2 {
-                ev.checkpoint =
-                    Some(CheckpointMeta::from_vec(b"{\"pos\":50}".to_vec()));
+                ev.set_checkpoint(CheckpointMeta::from_vec(
+                    b"{\"pos\":50}".to_vec(),
+                ));
                 ev.tx_end = true;
             }
             tx.send(SourceItem::Event(ev)).await.unwrap();
@@ -3226,8 +3226,7 @@ mod tests {
             0,
             0,
         );
-        ev.checkpoint =
-            Some(CheckpointMeta::from_vec(b"{\"pos\":10}".to_vec()));
+        ev.set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":10}".to_vec()));
         ev.tx_end = true;
         tx.send(SourceItem::Event(ev)).await.unwrap();
         drop(tx);
@@ -3337,7 +3336,7 @@ mod tests {
             0,
             0,
         );
-        ev.checkpoint = Some(CheckpointMeta::from_vec(b"{\"pos\":1}".to_vec()));
+        ev.set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":1}".to_vec()));
         ev.tx_end = true;
         tx.send(SourceItem::Event(ev)).await.unwrap();
         drop(tx);
@@ -3433,7 +3432,7 @@ mod tests {
             0,
             0,
         );
-        ev.checkpoint = Some(CheckpointMeta::from_vec(b"{\"pos\":1}".to_vec()));
+        ev.set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":1}".to_vec()));
         ev.tx_end = true;
         tx.send(SourceItem::Event(ev)).await.unwrap();
         drop(tx);
@@ -3607,8 +3606,9 @@ mod tests {
             );
             // Only the LAST event carries the authoritative checkpoint.
             if i == 2 {
-                ev.checkpoint =
-                    Some(CheckpointMeta::from_vec(b"authoritative".to_vec()));
+                ev.set_checkpoint(CheckpointMeta::from_vec(
+                    b"authoritative".to_vec(),
+                ));
             }
             tx.send(SourceItem::Event(ev)).await.unwrap();
         }

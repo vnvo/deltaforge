@@ -1179,7 +1179,8 @@ mod tests {
         );
 
         // Verify checkpoint is attached
-        let cp_meta = produced.checkpoint.expect("event must have checkpoint");
+        let cp_meta =
+            produced.checkpoint().expect("event must have checkpoint");
 
         // Deserialize and verify
         let cp: MySqlCheckpoint = serde_json::from_slice(cp_meta.as_bytes())
@@ -1245,9 +1246,9 @@ mod tests {
         );
         // The row carries a durable watermark atomically with its checkpoint.
         let wm_bytes = produced
-            .durable_watermark
+            .durable_watermark()
             .expect("standalone row has watermark");
-        let wm = DurableWatermark::parse(&wm_bytes).expect("valid watermark");
+        let wm = DurableWatermark::parse(wm_bytes).expect("valid watermark");
         match wm.pos {
             WmPos::MysqlBinlog {
                 file_base,
@@ -1261,10 +1262,9 @@ mod tests {
             other => panic!("expected binlog watermark, got {other:?}"),
         }
         // The paired checkpoint describes the same file/pos.
-        let cp: MySqlCheckpoint = serde_json::from_slice(
-            produced.checkpoint.as_ref().unwrap().as_bytes(),
-        )
-        .expect("checkpoint deserializes");
+        let cp: MySqlCheckpoint =
+            serde_json::from_slice(produced.checkpoint().unwrap().as_bytes())
+                .expect("checkpoint deserializes");
         assert_eq!(cp.file, "mysql-bin.000009");
         assert_eq!(cp.pos, 6789);
     }
@@ -1293,7 +1293,7 @@ mod tests {
         let produced = recv_event(&mut rx).await.expect("expected one event");
         assert!(produced.transaction.is_some(), "GTID row is transactional");
         assert!(
-            produced.durable_watermark.is_none(),
+            produced.durable_watermark().is_none(),
             "GTID row watermark flows via TxCommit, not on the row"
         );
     }
@@ -1327,7 +1327,8 @@ mod tests {
         let produced = recv_event(&mut rx).await.expect("expected one event");
 
         // Verify checkpoint
-        let cp_meta = produced.checkpoint.expect("event must have checkpoint");
+        let cp_meta =
+            produced.checkpoint().expect("event must have checkpoint");
         let cp: MySqlCheckpoint = serde_json::from_slice(cp_meta.as_bytes())
             .expect("checkpoint must deserialize");
         assert_eq!(cp.file, "mysql-bin.000005");

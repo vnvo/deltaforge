@@ -302,9 +302,9 @@ fn make_event(id: i64, name: &str, amount: &str, paid: bool) -> Event {
         synthetic: None,
         routing: None,
         tx_end: false,
-        checkpoint: None,
+        boundary: None,
         size_bytes: 0,
-        durable_watermark: None,
+
         received_at_ms: ts_ms,
     }
 }

@@ -285,7 +285,7 @@ fn make_events(count: usize) -> Vec<Event> {
                 1_700_000_000_000,
                 256,
             );
-            ev.checkpoint = Some(CheckpointMeta::from_vec(
+            ev.set_checkpoint(CheckpointMeta::from_vec(
                 format!("pos-{}", i).into_bytes(),
             ));
             ev
@@ -325,7 +325,7 @@ fn make_events_with_json(count: usize) -> Vec<Event> {
                 1_700_000_000_000,
                 512,
             );
-            ev.checkpoint = Some(CheckpointMeta::from_vec(
+            ev.set_checkpoint(CheckpointMeta::from_vec(
                 format!("pos-{}", i).into_bytes(),
             ));
             ev
@@ -368,7 +368,7 @@ fn make_events_heterogeneous(count: usize) -> Vec<Event> {
                 1_700_000_000_000,
                 256,
             );
-            ev.checkpoint = Some(CheckpointMeta::from_vec(
+            ev.set_checkpoint(CheckpointMeta::from_vec(
                 format!("pos-{}", i).into_bytes(),
             ));
             ev
@@ -441,11 +441,8 @@ fn noop_commit_fn() -> CommitCpFn<CheckpointMeta> {
 fn noop_process_fn() -> ProcessBatchFn<CheckpointMeta> {
     Arc::new(|events: Vec<Event>| {
         async move {
-            let last_cp = events
-                .iter()
-                .rev()
-                .find_map(|e| e.checkpoint.as_ref())
-                .cloned();
+            let last_cp =
+                events.iter().rev().find_map(|e| e.checkpoint()).cloned();
             Ok(ProcessedBatch {
                 events,
                 last_checkpoint: last_cp,

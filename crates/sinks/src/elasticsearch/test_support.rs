@@ -46,9 +46,9 @@ pub(crate) fn mk_event(
         synthetic: None,
         routing: None,
         tx_end: false,
-        checkpoint: None,
+        boundary: None,
         size_bytes: 0,
-        durable_watermark: None,
+
         received_at_ms: 0,
     }
 }

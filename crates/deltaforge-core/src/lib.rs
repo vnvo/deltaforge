@@ -426,19 +426,16 @@ pub struct Event {
     // ========================================================================
     // Internal fields (never serialized to wire)
     // ========================================================================
-    /// Checkpoint data for resumption (internal use only)
+    /// This event's durable boundary: its resume checkpoint and, atomically, the
+    /// durable watermark for the SAME source state. One composite field (not two
+    /// independent ones) so a caller cannot set a checkpoint without its matching
+    /// watermark or vice versa - the pairing is type-enforced. Read via
+    /// [`Event::checkpoint`]/[`Event::durable_watermark`], set via
+    /// [`Event::set_boundary`]/[`Event::with_boundary`]/[`Event::with_checkpoint`].
+    /// `None` for events with no durable boundary; the durable sink fails closed
+    /// when a boundary is required and absent. Internal - never serialized.
     #[serde(skip)]
-    pub checkpoint: Option<CheckpointMeta>,
-
-    /// Durable source watermark for this event's boundary, paired atomically
-    /// with `checkpoint` for standalone (non-transactional) events that have no
-    /// [`SourceItem::TxCommit`] - e.g. non-GTID MySQL CDC rows and snapshot
-    /// rows. Set only via [`Event::set_boundary`]/[`Event::with_boundary`] so it
-    /// can never describe a different state than `checkpoint`. `None` for events
-    /// with no durable boundary; the durable sink fails closed when it is
-    /// required and absent. Internal - never serialized to the wire.
-    #[serde(skip)]
-    pub durable_watermark: Option<Arc<[u8]>>,
+    pub boundary: Option<SourceBoundary>,
 
     /// Estimated event size in bytes for batching
     #[serde(skip)]
@@ -459,19 +456,30 @@ fn now_ms() -> i64 {
 }
 
 impl Event {
-    /// Stamp this event's durable boundary: its resume `checkpoint` and the
-    /// durable watermark for the SAME source state, set together from one
-    /// [`SourceBoundary`] so the two can never drift. Used by sources for
-    /// standalone (non-transactional) events that carry their own boundary.
+    /// Stamp this event's durable boundary: its resume checkpoint and the durable
+    /// watermark for the SAME source state, carried together as one
+    /// [`SourceBoundary`] so the two can never drift.
     pub fn set_boundary(&mut self, boundary: SourceBoundary) {
-        self.checkpoint = Some(boundary.checkpoint);
-        self.durable_watermark = boundary.durable_watermark;
+        self.boundary = Some(boundary);
     }
 
     /// Builder form of [`Event::set_boundary`].
     pub fn with_boundary(mut self, boundary: SourceBoundary) -> Self {
         self.set_boundary(boundary);
         self
+    }
+
+    /// The resume checkpoint for this event's boundary, if any.
+    pub fn checkpoint(&self) -> Option<&CheckpointMeta> {
+        self.boundary.as_ref().map(|b| &b.checkpoint)
+    }
+
+    /// The durable watermark for this event's boundary, if any. Present only when
+    /// the boundary carries one (a checkpoint-only boundary has none).
+    pub fn durable_watermark(&self) -> Option<&Arc<[u8]>> {
+        self.boundary
+            .as_ref()
+            .and_then(|b| b.durable_watermark.as_ref())
     }
 
     /// Create a new row-change event. The stable `event_id` is required -
@@ -503,9 +511,9 @@ impl Event {
             synthetic: None,
             routing: None,
             tx_end: true,
-            checkpoint: None,
+            boundary: None,
             size_bytes,
-            durable_watermark: None,
+
             received_at_ms: now_ms(),
         }
     }
@@ -535,9 +543,9 @@ impl Event {
             synthetic: None,
             routing: None,
             tx_end: true,
-            checkpoint: None,
+            boundary: None,
             size_bytes,
-            durable_watermark: None,
+
             received_at_ms: now_ms(),
         }
     }
@@ -567,9 +575,9 @@ impl Event {
             synthetic: None,
             routing: None,
             tx_end: true,
-            checkpoint: None,
+            boundary: None,
             size_bytes,
-            durable_watermark: None,
+
             received_at_ms: now_ms(),
         }
     }
@@ -591,9 +599,16 @@ impl Event {
         self
     }
 
-    /// Set checkpoint metadata (internal use).
+    /// Set a checkpoint-only boundary (no durable watermark). Convenience for
+    /// sources that resume from a checkpoint but do not (yet) carry a durable
+    /// watermark; equivalent to `set_boundary(SourceBoundary::checkpoint_only(..))`.
+    pub fn set_checkpoint(&mut self, checkpoint: CheckpointMeta) {
+        self.boundary = Some(SourceBoundary::checkpoint_only(checkpoint));
+    }
+
+    /// Builder form of [`Event::set_checkpoint`].
     pub fn with_checkpoint(mut self, checkpoint: CheckpointMeta) -> Self {
-        self.checkpoint = Some(checkpoint);
+        self.set_checkpoint(checkpoint);
         self
     }
 
