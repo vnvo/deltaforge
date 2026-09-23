@@ -25,6 +25,7 @@ use deltaforge_core::{CheckpointComparator, CheckpointOrder};
 use super::batch_upload::TableObject;
 use super::head::{DurableWriter, Head, HeadError, head_key_for};
 use super::keys::EncodingDomain;
+use super::manifest::{ManifestEntry, ManifestObject};
 use super::store_cond::{
     CondError, CondResult, ConditionalStore, ObjectStoreConditional, PutOutcome,
 };
@@ -44,6 +45,12 @@ enum Op {
     HeadPut,
     /// Compare-and-swap of HEAD.
     HeadCas,
+    /// Create-only write of a compacted data object.
+    CompactedPut,
+    /// Create-only write of a compaction record.
+    CompactionRecordPut,
+    /// Read of an original data object (compaction "read originals" step).
+    GetData,
 }
 
 fn classify_put(key: &Path) -> Op {
@@ -52,8 +59,22 @@ fn classify_put(key: &Path) -> Op {
         Op::HeadPut
     } else if k.contains("_manifest/entries") {
         Op::ManifestPut
+    } else if k.contains("_manifest/compactions") {
+        Op::CompactionRecordPut
+    } else if k.contains("/compacted/") {
+        Op::CompactedPut
     } else {
         Op::DataPut
+    }
+}
+
+/// A data-object read is the compaction "read originals" step; other reads pass.
+fn classify_get(key: &Path) -> Option<Op> {
+    let k = key.to_string();
+    if k.contains("/wm-") && !k.contains("/compacted/") {
+        Some(Op::GetData)
+    } else {
+        None
     }
 }
 
@@ -169,6 +190,13 @@ impl ConditionalStore for FaultStore {
         &self,
         key: &Path,
     ) -> CondResult<Option<(Bytes, Option<String>)>> {
+        if let Some(op) = classify_get(key) {
+            if let Some(Action::ErrBefore) = self.fire(op).await {
+                return Err(CondError::Store(format!(
+                    "injected err reading {op:?}"
+                )));
+            }
+        }
         self.inner.get_with_etag(key).await
     }
     async fn delete(&self, key: &Path) -> CondResult<()> {
@@ -681,4 +709,306 @@ async fn fenced_after_object_creation_before_head_cas() {
 
 fn tr(op: Op, nth: usize, action: Action) -> Trigger {
     Trigger { op, nth, action }
+}
+
+// ── Compaction crash matrix ─────────────────────────────────────────────────
+//
+// Setup publishes two batches for one table (consuming DataPut 0/1, ManifestPut
+// 0/1, HeadCas 0/1), then compacts them. Compaction-only ops (CompactedPut,
+// CompactionRecordPut, GetData) start at nth 0 during compact; the compact HEAD
+// CAS is HeadCas nth 2 (after the two publishes).
+
+async fn all_manifest_objects(
+    inner: &ObjectStoreConditional,
+) -> Vec<ManifestObject> {
+    let mut out = Vec::new();
+    for k in inner
+        .list(&Path::from(format!("{PFX}/{PIPE}/_manifest/entries")))
+        .await
+        .unwrap()
+    {
+        let (raw, _) = inner.get_with_etag(&k).await.unwrap().unwrap();
+        let e: ManifestEntry = serde_json::from_slice(&raw).unwrap();
+        out.extend(e.objects);
+    }
+    out
+}
+
+async fn compaction_record_count(inner: &ObjectStoreConditional) -> usize {
+    inner
+        .list(&Path::from(format!("{PFX}/{PIPE}/_manifest/compactions")))
+        .await
+        .unwrap()
+        .len()
+}
+
+async fn compacted_object_count(inner: &ObjectStoreConditional) -> usize {
+    inner
+        .list(&Path::from(format!("{PFX}/{PIPE}")))
+        .await
+        .unwrap()
+        .iter()
+        .filter(|p| p.to_string().contains("/compacted/"))
+        .count()
+}
+
+/// Genesis writer + two published batches for table "orders" (objects a, b),
+/// returning the writer, the shared fault store, and the two originals.
+async fn setup_two_batches(
+    inner: &Arc<ObjectStoreConditional>,
+    triggers: Vec<Trigger>,
+) -> (
+    Arc<FaultStore>,
+    DurableWriter<FaultStore>,
+    Vec<ManifestObject>,
+) {
+    let (fs, w) = genesis(inner, triggers).await;
+    w.publish(&wm(1), vec![tobj("orders", b"a")], 1)
+        .await
+        .unwrap();
+    w.publish(&wm(2), vec![tobj("orders", b"b")], 1)
+        .await
+        .unwrap();
+    let originals = all_manifest_objects(inner).await;
+    assert_eq!(originals.len(), 2);
+    (fs, w, originals)
+}
+
+fn replacement() -> TableObject {
+    tobj("orders", b"compacted-ab")
+}
+
+#[tokio::test]
+async fn compaction_preserves_ack_state_and_sets_reference() {
+    let inner = inmem();
+    let (_fs, w, originals) = setup_two_batches(&inner, vec![]).await;
+    let before = read_head(&inner).await.unwrap();
+    assert_eq!(before.seq, 2);
+    let wm2_hex = before.watermark_hex.clone();
+
+    w.compact(replacement(), originals).await.unwrap();
+
+    let h = read_head(&inner).await.unwrap();
+    // Ack state is untouched; only the compaction reference is set.
+    assert_eq!(h.seq, 2, "seq preserved");
+    assert_eq!(h.watermark_hex, wm2_hex, "watermark preserved");
+    assert_eq!(
+        h.head_entry_key, before.head_entry_key,
+        "entry ref preserved"
+    );
+    assert!(h.compaction_key.is_some(), "compaction reference set");
+    assert_eq!(compaction_record_count(&inner).await, 1);
+    assert_eq!(compacted_object_count(&inner).await, 1);
+    assert_eq!(data_count(&inner).await, 2, "originals NOT deleted");
+
+    // A later ordinary publish preserves the compaction reference.
+    w.publish(&wm(3), vec![tobj("orders", b"c")], 1)
+        .await
+        .unwrap();
+    let h2 = read_head(&inner).await.unwrap();
+    assert_eq!(h2.seq, 3);
+    assert_eq!(h2.compaction_key, h.compaction_key, "compaction ref kept");
+}
+
+#[tokio::test]
+async fn compaction_read_originals_failure_no_record_ack_intact() {
+    let inner = inmem();
+    let (_fs, w, originals) =
+        setup_two_batches(&inner, vec![tr(Op::GetData, 0, Action::ErrBefore)])
+            .await;
+    let before = read_head(&inner).await.unwrap();
+
+    assert!(w.compact(replacement(), originals.clone()).await.is_err());
+    assert_eq!(compaction_record_count(&inner).await, 0);
+    assert_eq!(compacted_object_count(&inner).await, 0);
+    assert_eq!(read_head(&inner).await.unwrap(), before, "HEAD unchanged");
+
+    // Ack path independent: normal publication still works after the failure.
+    w.publish(&wm(3), vec![tobj("orders", b"c")], 1)
+        .await
+        .unwrap();
+    assert_eq!(read_head(&inner).await.unwrap().seq, 3);
+    // And a retry of the compaction now succeeds (one-shot fault cleared).
+    w.compact(replacement(), originals).await.unwrap();
+    assert!(read_head(&inner).await.unwrap().compaction_key.is_some());
+}
+
+#[tokio::test]
+async fn compaction_replacement_upload_failure_no_record() {
+    let inner = inmem();
+    let (_fs, w, originals) = setup_two_batches(
+        &inner,
+        vec![tr(Op::CompactedPut, 0, Action::ErrBefore)],
+    )
+    .await;
+    let before = read_head(&inner).await.unwrap();
+    assert!(w.compact(replacement(), originals).await.is_err());
+    assert_eq!(compacted_object_count(&inner).await, 0);
+    assert_eq!(compaction_record_count(&inner).await, 0);
+    assert_eq!(read_head(&inner).await.unwrap(), before);
+}
+
+#[tokio::test]
+async fn crash_after_replacement_before_record_leaves_orphan() {
+    let inner = inmem();
+    let (fs, w, originals) = setup_two_batches(
+        &inner,
+        vec![tr(Op::CompactionRecordPut, 0, Action::HangBefore)],
+    )
+    .await;
+    let before = read_head(&inner).await.unwrap();
+    cancel_at_hang(&fs, w.compact(replacement(), originals)).await;
+    drop(w);
+    assert_eq!(
+        compacted_object_count(&inner).await,
+        1,
+        "orphan compacted obj"
+    );
+    assert_eq!(compaction_record_count(&inner).await, 0);
+    assert_eq!(read_head(&inner).await.unwrap(), before, "HEAD unchanged");
+
+    // Restart ignores the orphan (HEAD has no compaction ref) and works.
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let w2 = acquire(Arc::clone(&clean)).await.unwrap();
+    w2.publish(&wm(3), vec![tobj("orders", b"c")], 1)
+        .await
+        .unwrap();
+    assert_eq!(read_head(&inner).await.unwrap().seq, 3);
+}
+
+#[tokio::test]
+async fn crash_after_record_before_head_cas_leaves_orphans() {
+    let inner = inmem();
+    // The compact HEAD CAS is HeadCas nth 2 (after the two publish CASes).
+    let (fs, w, originals) =
+        setup_two_batches(&inner, vec![tr(Op::HeadCas, 2, Action::HangBefore)])
+            .await;
+    let before = read_head(&inner).await.unwrap();
+    cancel_at_hang(&fs, w.compact(replacement(), originals)).await;
+    drop(w);
+    assert_eq!(compaction_record_count(&inner).await, 1, "orphan record");
+    assert_eq!(compacted_object_count(&inner).await, 1, "orphan object");
+    assert_eq!(
+        read_head(&inner).await.unwrap(),
+        before,
+        "HEAD never referenced the orphan record"
+    );
+
+    // Restart: verify_compaction_chain sees HEAD has no compaction ref, so the
+    // orphan record is ignored; recovery succeeds.
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let w2 = acquire(Arc::clone(&clean)).await.unwrap();
+    assert_eq!(w2.epoch().await, 2);
+}
+
+#[tokio::test]
+async fn compaction_head_cas_rejected_then_lost_response() {
+    // Rejected-before-apply: reconcile retries and succeeds.
+    let inner = inmem();
+    let (_fs, w, originals) =
+        setup_two_batches(&inner, vec![tr(Op::HeadCas, 2, Action::ErrBefore)])
+            .await;
+    w.compact(replacement(), originals).await.unwrap();
+    assert!(read_head(&inner).await.unwrap().compaction_key.is_some());
+
+    // Applied-then-lost: reconcile sees HEAD already references the record.
+    let inner2 = inmem();
+    let (_fs2, w2, orig2) = setup_two_batches(
+        &inner2,
+        vec![tr(Op::HeadCas, 2, Action::ApplyThenErr)],
+    )
+    .await;
+    w2.compact(replacement(), orig2).await.unwrap();
+    assert!(read_head(&inner2).await.unwrap().compaction_key.is_some());
+    assert_eq!(compaction_record_count(&inner2).await, 1);
+}
+
+#[tokio::test]
+async fn fencing_during_compaction_denies_and_leaves_orphans() {
+    let inner = inmem();
+    let (_fs, a, originals) = setup_two_batches(&inner, vec![]).await; // epoch 1
+    // B acquires, fencing A.
+    let b = acquire(Arc::new(FaultStore::new(Arc::clone(&inner), vec![])))
+        .await
+        .unwrap();
+    assert_eq!(b.epoch().await, 2);
+
+    // A's compaction uploads object + record, but its HEAD CAS is fenced.
+    let err = expect_err(a.compact(replacement(), originals).await);
+    assert!(matches!(err, HeadError::Fenced { .. }));
+    let h = read_head(&inner).await.unwrap();
+    assert_eq!(h.epoch, 2, "B's HEAD stands");
+    assert!(h.compaction_key.is_none(), "A never set the compaction ref");
+    // Orphan object + record are harmless; B recovers fine on restart.
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let _ = acquire(clean).await.unwrap();
+}
+
+#[tokio::test]
+async fn restart_with_published_compaction_verifies_and_continues() {
+    let inner = inmem();
+    let (_fs, w, originals) = setup_two_batches(&inner, vec![]).await;
+    w.compact(replacement(), originals).await.unwrap();
+    drop(w);
+
+    // Restart: acquire verifies the compaction chain and bumps the epoch.
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let w2 = acquire(Arc::clone(&clean)).await.unwrap();
+    assert_eq!(w2.epoch().await, 2);
+    let h = read_head(&inner).await.unwrap();
+    assert!(h.compaction_key.is_some());
+    // Publishing still works and keeps the compaction reference.
+    w2.publish(&wm(3), vec![tobj("orders", b"c")], 1)
+        .await
+        .unwrap();
+    assert_eq!(read_head(&inner).await.unwrap().seq, 3);
+    assert!(read_head(&inner).await.unwrap().compaction_key.is_some());
+}
+
+#[tokio::test]
+async fn recovery_with_corrupt_replacement_fails_closed() {
+    let inner = inmem();
+    let (_fs, w, originals) = setup_two_batches(&inner, vec![]).await;
+    w.compact(replacement(), originals).await.unwrap();
+    drop(w);
+
+    // Corrupt (delete) the compacted replacement object.
+    let compacted: Vec<Path> = inner
+        .list(&Path::from(format!("{PFX}/{PIPE}")))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.to_string().contains("/compacted/"))
+        .collect();
+    inner.delete(&compacted[0]).await.unwrap();
+
+    // Recovery must fail closed: the referenced replacement is missing.
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let err = expect_err(acquire(clean).await);
+    assert!(
+        err.is_fatal(),
+        "corrupt compaction replacement is fatal: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn recompaction_of_superseded_original_detected_at_recovery() {
+    let inner = inmem();
+    let (_fs, w, originals) = setup_two_batches(&inner, vec![]).await;
+    // First compaction supersedes both originals.
+    w.compact(replacement(), originals.clone()).await.unwrap();
+    // A buggy second compaction re-lists one already-superseded original.
+    let dup = vec![originals[0].clone()];
+    w.compact(tobj("orders", b"compacted-again"), dup)
+        .await
+        .unwrap();
+    drop(w);
+
+    // Recovery detects the same original in two active compactions.
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let err = expect_err(acquire(clean).await);
+    assert!(
+        matches!(err, HeadError::Integrity(ref m) if m.contains("conflicting")),
+        "expected conflicting-compaction integrity error, got {err:?}"
+    );
 }

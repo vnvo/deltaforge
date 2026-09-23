@@ -9,6 +9,7 @@
 //! trait wire-up and full feature set follow in later phases.
 
 mod batch_upload;
+mod compaction;
 mod durable_encode;
 mod durable_sink;
 mod encoder;

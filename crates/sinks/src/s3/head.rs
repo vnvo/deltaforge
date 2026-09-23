@@ -24,6 +24,10 @@ use tokio::sync::Mutex;
 use deltaforge_core::{CheckpointComparator, CheckpointOrder};
 
 use super::batch_upload::{DurableError, TableObject, upload_batch};
+use super::compaction::{
+    CompactionError, CompactionRecord, check_compatible, compacted_object_key,
+    load_record, verify_originals_present, write_record,
+};
 use super::keys::content_hash;
 use super::manifest::{
     ManifestEntry, ManifestObject, PrevRef, WrittenEntry, propose_seq,
@@ -56,6 +60,14 @@ pub struct Head {
     pub rollup_key: Option<String>,
     pub rollup_hash: Option<String>,
     pub watermark_hex: Option<String>,
+    /// Reference to the latest compaction record (the head of the immutable
+    /// compaction history). Independent of the acknowledgement chain: compaction
+    /// only ever sets these two fields via a HEAD CAS that preserves epoch, seq,
+    /// entry reference, watermark and rollup references. `None` = no compactions.
+    #[serde(default)]
+    pub compaction_key: Option<String>,
+    #[serde(default)]
+    pub compaction_hash: Option<String>,
 }
 
 impl Head {
@@ -69,6 +81,8 @@ impl Head {
             rollup_key: None,
             rollup_hash: None,
             watermark_hex: None,
+            compaction_key: None,
+            compaction_hash: None,
         }
     }
 
@@ -112,6 +126,11 @@ impl Head {
         if self.rollup_key.is_some() != self.rollup_hash.is_some() {
             return Err(HeadError::Integrity(
                 "HEAD rollup key/hash not both-set-or-both-unset".into(),
+            ));
+        }
+        if self.compaction_key.is_some() != self.compaction_hash.is_some() {
+            return Err(HeadError::Integrity(
+                "HEAD compaction key/hash not both-set-or-both-unset".into(),
             ));
         }
         Ok(())
@@ -229,6 +248,11 @@ async fn verify_chain<S: ConditionalStore + ?Sized>(
     head: &Head,
     comparator: &dyn CheckpointComparator,
 ) -> Result<(), HeadError> {
+    // Understand the authoritative compaction mapping before trusting HEAD (and
+    // before any later GC deletes originals). This never depends on, or alters,
+    // the acknowledgement chain below.
+    verify_compaction_chain(store, pipeline, source_id, sink_id, head).await?;
+
     // Genesis HEAD (no entry) has nothing to walk; structure was checked by
     // Head::parse.
     let Some(head_entry_key) = head.head_entry_key.clone() else {
@@ -354,6 +378,74 @@ async fn verify_chain<S: ConditionalStore + ?Sized>(
     Err(HeadError::Integrity(
         "manifest chain exceeded the maximum walk length (cycle or runaway)"
             .into(),
+    ))
+}
+
+/// Verify the compaction history reachable from HEAD's compaction reference:
+/// each record parses and matches its referenced hash, has matching identity, is
+/// domain-consistent (every original shares the replacement's table + encoding
+/// domain), and its replacement object is present with the recorded content hash
+/// and size. The `prev` chain is walked bounded and cycle-checked (immutable,
+/// non-cyclic history). This is independent of the acknowledgement chain and
+/// never inspects the source watermark. (Cross-referencing originals against the
+/// ack chain and row-exactness are the pre-deletion gate that lands with GC;
+/// this commit deletes nothing.)
+async fn verify_compaction_chain<S: ConditionalStore + ?Sized>(
+    store: &S,
+    pipeline: &str,
+    source_id: &str,
+    sink_id: &str,
+    head: &Head,
+) -> Result<(), HeadError> {
+    let (Some(mut cur_key), Some(mut expected_hash)) =
+        (head.compaction_key.clone(), head.compaction_hash.clone())
+    else {
+        return Ok(());
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut claimed_originals = std::collections::HashSet::new();
+    for _ in 0..MAX_CHAIN_WALK {
+        if !seen.insert(cur_key.clone()) {
+            return Err(HeadError::Integrity(
+                "compaction history contains a cycle".into(),
+            ));
+        }
+        let rec = load_record(store, &cur_key, &expected_hash)
+            .await
+            .map_err(map_compaction)?;
+        if rec.pipeline != pipeline
+            || rec.source_id != source_id
+            || rec.sink_id != sink_id
+        {
+            return Err(HeadError::Integrity(format!(
+                "compaction record {cur_key} identity mismatch"
+            )));
+        }
+        // Domain consistency: never a cross-table / cross-domain compaction.
+        check_compatible(&rec.table, &rec.domain(), &rec.originals)
+            .map_err(map_compaction)?;
+        // No original may appear in two records (a recompaction of an
+        // already-superseded object is a conflicting active compaction).
+        for o in &rec.originals {
+            if !claimed_originals.insert(o.key.clone()) {
+                return Err(HeadError::Integrity(format!(
+                    "original {} appears in conflicting compactions",
+                    o.key
+                )));
+            }
+        }
+        // The replacement must be durably present with its recorded hash + size.
+        verify_data_object(store, &rec.replacement).await?;
+        match &rec.prev {
+            None => return Ok(()),
+            Some(PrevRef { key, hash }) => {
+                expected_hash = hash.clone();
+                cur_key = key.clone();
+            }
+        }
+    }
+    Err(HeadError::Integrity(
+        "compaction history exceeded the maximum walk length".into(),
     ))
 }
 
@@ -820,6 +912,9 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                 rollup_key: st.verified.head.rollup_key.clone(),
                 rollup_hash: st.verified.head.rollup_hash.clone(),
                 watermark_hex: Some(watermark_hex.clone()),
+                // Ordinary publication preserves the current compaction reference.
+                compaction_key: st.verified.head.compaction_key.clone(),
+                compaction_hash: st.verified.head.compaction_hash.clone(),
             };
 
             let cas = self
@@ -906,6 +1001,204 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
             }
         }
         Err(HeadError::RetriesExhausted(MAX_PUBLISH_ATTEMPTS))
+    }
+
+    /// Publish a compaction: replace `originals` (already-durable objects for one
+    /// table) with the immutable `replacement`, WITHOUT touching the source
+    /// watermark, seq, or the acknowledgement chain. Steps: compatibility gate ->
+    /// read/verify originals -> upload the replacement (immutable, create-only) ->
+    /// write the compaction record -> CAS HEAD to set ONLY the compaction
+    /// reference, preserving epoch/seq/entry/watermark/rollup. Serialized through
+    /// the same writer mutex as batch publication. Originals are NOT deleted (the
+    /// record marks them eligible for later GC).
+    pub async fn compact(
+        &self,
+        replacement: TableObject,
+        originals: Vec<ManifestObject>,
+    ) -> Result<(), HeadError> {
+        let domain = replacement.domain.clone();
+        let table = replacement.table.clone();
+
+        // 1. Never compact across tables or incompatible encoding domains.
+        check_compatible(&table, &domain, &originals)
+            .map_err(map_compaction)?;
+
+        // 2. Read the originals: each must be present with its recorded hash/size.
+        verify_originals_present(self.store.as_ref(), &originals)
+            .await
+            .map_err(map_compaction)?;
+
+        // 3. Upload the immutable replacement, content-addressed (idempotent).
+        let ch = content_hash(&replacement.bytes, &domain);
+        let key = compacted_object_key(
+            &self.prefix,
+            &self.pipeline,
+            &table,
+            &ch,
+            replacement.ext,
+        );
+        let byte_len = replacement.bytes.len() as u64;
+        match self
+            .store
+            .put_if_absent(&key, replacement.bytes.clone())
+            .await
+            .map_err(|e| HeadError::Store(e.to_string()))?
+        {
+            PutOutcome::Written { .. } => {}
+            PutOutcome::AlreadyExists => {
+                // Idempotent: the existing object must be byte-identical.
+                match self
+                    .store
+                    .get_with_etag(&key)
+                    .await
+                    .map_err(|e| HeadError::Store(e.to_string()))?
+                {
+                    Some((existing, _))
+                        if content_hash(&existing, &domain) == ch => {}
+                    _ => {
+                        return Err(HeadError::Integrity(format!(
+                            "compacted object at {key} does not match its hash"
+                        )));
+                    }
+                }
+            }
+            PutOutcome::Conflict => {
+                return Err(HeadError::Store(format!(
+                    "unexpected CAS conflict on create-only object at {key}"
+                )));
+            }
+        }
+        let replacement_obj = ManifestObject {
+            key: key.to_string(),
+            table: table.clone(),
+            content_hash: ch,
+            byte_len,
+            format: domain.format.clone(),
+            format_version: domain.format_version,
+            schema_id: domain.schema_id.clone(),
+        };
+
+        // Everything from here mutates HEAD, so take the same lock batch
+        // publication uses (compaction HEAD updates serialize with it).
+        let mut st = self.state.lock().await;
+        if let Some(observed) = st.fenced {
+            return Err(HeadError::Fenced {
+                our: st.verified.epoch,
+                observed,
+            });
+        }
+
+        // 4. Write the immutable compaction record, chained to the current one.
+        let prev = match (
+            &st.verified.head.compaction_key,
+            &st.verified.head.compaction_hash,
+        ) {
+            (Some(k), Some(h)) => Some(PrevRef {
+                key: k.clone(),
+                hash: h.clone(),
+            }),
+            _ => None,
+        };
+        let record = CompactionRecord {
+            version: super::compaction::COMPACTION_RECORD_VERSION,
+            pipeline: self.pipeline.clone(),
+            source_id: self.source_id.clone(),
+            sink_id: self.sink_id.clone(),
+            table,
+            replacement: replacement_obj,
+            originals,
+            prev,
+        };
+        let written = write_record(self.store.as_ref(), &self.prefix, &record)
+            .await
+            .map_err(map_compaction)?;
+
+        // 5. CAS HEAD to set ONLY the compaction reference; everything else is
+        // preserved. On conflict/lost response, reconcile.
+        let hkey = head_key(&self.prefix, &self.pipeline);
+        for _ in 0..MAX_PUBLISH_ATTEMPTS {
+            let next = Head {
+                compaction_key: Some(written.key.clone()),
+                compaction_hash: Some(written.hash.clone()),
+                ..st.verified.head.clone()
+            };
+            let cas = self
+                .store
+                .cas_put(&hkey, next.canonical_bytes(), &st.verified.etag)
+                .await;
+            match cas {
+                Ok(PutOutcome::Written {
+                    etag: Some(new_etag),
+                }) => {
+                    st.verified.head = next;
+                    st.verified.etag = new_etag;
+                    return Ok(());
+                }
+                Ok(PutOutcome::Written { etag: None }) => {
+                    return Err(HeadError::Store(
+                        "HEAD CAS returned no ETag".into(),
+                    ));
+                }
+                Ok(PutOutcome::AlreadyExists) => unreachable!("cas_put"),
+                Ok(PutOutcome::Conflict) | Err(_) => {
+                    let (raw, etag) = match self
+                        .store
+                        .get_with_etag(&hkey)
+                        .await
+                        .map_err(|e| HeadError::Store(e.to_string()))?
+                    {
+                        Some((raw, Some(etag))) => (raw, etag),
+                        _ => {
+                            return Err(HeadError::Integrity(
+                                "HEAD missing/eTagless during compaction"
+                                    .into(),
+                            ));
+                        }
+                    };
+                    let cur = Head::parse(&raw)?;
+                    // Lost response that succeeded: HEAD already references our
+                    // record -> idempotent success.
+                    if cur.compaction_hash.as_deref()
+                        == Some(written.hash.as_str())
+                    {
+                        st.verified.head = cur;
+                        st.verified.etag = etag;
+                        return Ok(());
+                    }
+                    // A higher epoch fenced us: compaction is abandoned; the
+                    // uploaded object + record are harmless orphans.
+                    if cur.epoch > st.verified.epoch {
+                        st.fenced = Some(cur.epoch);
+                        return Err(HeadError::Fenced {
+                            our: st.verified.epoch,
+                            observed: cur.epoch,
+                        });
+                    }
+                    if cur.epoch < st.verified.epoch {
+                        return Err(HeadError::Integrity(format!(
+                            "HEAD epoch regressed during compaction: {} < {}",
+                            cur.epoch, st.verified.epoch
+                        )));
+                    }
+                    // Same epoch (a transient error, or our own earlier batch
+                    // advanced HEAD): adopt the current HEAD and re-apply the
+                    // compaction reference on top, preserving its ack state.
+                    st.verified.head = cur;
+                    st.verified.etag = etag;
+                    continue;
+                }
+            }
+        }
+        Err(HeadError::RetriesExhausted(MAX_PUBLISH_ATTEMPTS))
+    }
+}
+
+fn map_compaction(e: CompactionError) -> HeadError {
+    match e {
+        CompactionError::Integrity(_) | CompactionError::Incompatible(_) => {
+            HeadError::Integrity(e.to_string())
+        }
+        CompactionError::Store(s) => HeadError::Store(s),
     }
 }
 
@@ -1140,6 +1433,8 @@ mod tests {
             rollup_key: None,
             rollup_hash: None,
             watermark_hex: Some("00".into()),
+            compaction_key: None,
+            compaction_hash: None,
         };
         s.put_if_absent(&hkey, bad.canonical_bytes()).await.unwrap();
         let err = expect_err(
@@ -1661,6 +1956,8 @@ mod tests {
             rollup_key: None,
             rollup_hash: None,
             watermark_hex: Some(wm_hex(0, 5)),
+            compaction_key: None,
+            compaction_hash: None,
         };
         cs.cas_put(&hkey, jumped.canonical_bytes(), etag.as_deref().unwrap())
             .await
