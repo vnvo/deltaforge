@@ -624,6 +624,32 @@ impl Source for MySqlSource {
         };
         a.file.cmp(&b.file).then(a.pos.cmp(&b.pos))
     }
+
+    async fn check_durable_snapshot_startup(
+        &self,
+        checkpoint_store: &dyn CheckpointStore,
+    ) -> Result<(), SourceError> {
+        let progress: mysql_snapshot::MysqlSnapshotProgress = checkpoint_store
+            .get_raw(&mysql_snapshot::progress_key(&self.id))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        if crate::snapshot_frontier::is_ambiguous_legacy_progress(
+            &self.tables,
+            &progress.done_tables,
+            progress.finished,
+        ) {
+            return Err(SourceError::Other(anyhow::anyhow!(
+                "durable_v2: interrupted legacy snapshot progress for source \
+                 {} cannot be adopted (some tables done, some pending); finish \
+                 it under legacy mode or start a new snapshot generation",
+                self.id
+            )));
+        }
+        Ok(())
+    }
 }
 
 // ============================================================================

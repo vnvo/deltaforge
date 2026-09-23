@@ -923,6 +923,18 @@ pub trait Source: Send + Sync {
     /// Returning `Equal` on parse failure is safe (no replay regression) but
     /// may cause unnecessary replay.
     fn compare_checkpoints(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering;
+
+    /// Called at startup when a durable sink is active, BEFORE any source
+    /// emission. The source inspects its own snapshot progress and returns an
+    /// error if it cannot be adopted by durable mode without ambiguity (e.g. an
+    /// interrupted legacy snapshot: some tables done, some pending, not
+    /// finished). Default: `Ok` (non-durable sources, or nothing to reconcile).
+    async fn check_durable_snapshot_startup(
+        &self,
+        _checkpoint_store: &dyn CheckpointStore,
+    ) -> Result<(), SourceError> {
+        Ok(())
+    }
 }
 
 #[async_trait]

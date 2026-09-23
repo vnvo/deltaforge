@@ -140,23 +140,37 @@ impl std::fmt::Display for AmbiguousLegacySnapshot {
 }
 impl std::error::Error for AmbiguousLegacySnapshot {}
 
+/// Whether a table-level source checkpoint is an interrupted legacy snapshot
+/// (some tables done, some pending, not finished) - the ambiguous case durable
+/// startup must reject. Names-only, so a source can check it without resolving
+/// cursor kinds. See [`convert_legacy_progress`] for the full conversion.
+pub fn is_ambiguous_legacy_progress(
+    all_tables: &[String],
+    done_tables: &[String],
+    finished: bool,
+) -> bool {
+    if finished {
+        return false;
+    }
+    let any_done = all_tables.iter().any(|t| done_tables.contains(t));
+    let any_pending = all_tables.iter().any(|t| !done_tables.contains(t));
+    any_done && any_pending
+}
+
 /// Convert a legacy table-level source checkpoint (`done_tables` + `finished`)
 /// into the per-table resume states for the source vector. This reads the
 /// SOURCE's own progress - never any sink's HEAD, so the source is never
-/// fast-forwarded by how far one sink happens to be durable.
-///
-/// - `finished` (all tables done) or a clean start (nothing done) converts
-///   unambiguously.
-/// - An interrupted legacy snapshot (some done, some pending, not finished) is
-///   [`AmbiguousLegacySnapshot`]: the caller (durable startup) must fail closed.
+/// fast-forwarded by how far one sink happens to be durable. `finished` (all
+/// tables done) or a clean start (nothing done) converts unambiguously; an
+/// interrupted legacy snapshot is [`AmbiguousLegacySnapshot`] and the caller
+/// (durable startup) must fail closed.
 pub fn convert_legacy_progress(
     tables: &[(String, CursorKind)],
     done_tables: &[String],
     finished: bool,
 ) -> Result<Vec<(String, TableResume)>, AmbiguousLegacySnapshot> {
-    let any_done = tables.iter().any(|(t, _)| done_tables.contains(t));
-    let any_pending = tables.iter().any(|(t, _)| !done_tables.contains(t));
-    if !finished && any_done && any_pending {
+    let names: Vec<String> = tables.iter().map(|(t, _)| t.clone()).collect();
+    if is_ambiguous_legacy_progress(&names, done_tables, finished) {
         return Err(AmbiguousLegacySnapshot);
     }
     Ok(tables
@@ -601,6 +615,31 @@ mod tests {
         );
         assert!(a.complete_table("users").is_some());
         assert!(a.is_complete(), "all tables complete");
+    }
+
+    #[test]
+    fn is_ambiguous_legacy_progress_only_for_interrupted() {
+        let all = vec!["a".to_string(), "b".to_string()];
+        // Interrupted: one done, one pending, not finished.
+        assert!(is_ambiguous_legacy_progress(
+            &all,
+            &["a".to_string()],
+            false
+        ));
+        // Finished: never ambiguous.
+        assert!(!is_ambiguous_legacy_progress(
+            &all,
+            &["a".to_string()],
+            true
+        ));
+        // Clean start: nothing done.
+        assert!(!is_ambiguous_legacy_progress(&all, &[], false));
+        // All done but not marked finished: not ambiguous (no pending).
+        assert!(!is_ambiguous_legacy_progress(
+            &all,
+            &["a".to_string(), "b".to_string()],
+            false
+        ));
     }
 
     #[test]

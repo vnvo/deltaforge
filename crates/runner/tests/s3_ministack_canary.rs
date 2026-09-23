@@ -334,6 +334,7 @@ async fn ministack_canary_parquet_roundtrip() -> Result<()> {
         },
         send_timeout_secs: 60,
         required: Some(true),
+        durability: Default::default(),
         filter: None,
     });
 

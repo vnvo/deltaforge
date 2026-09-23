@@ -1,4 +1,4 @@
-//! `S3Sink` — the `deltaforge_core::Sink` implementation that plugs the
+//! `S3Sink` - the `deltaforge_core::Sink` implementation that plugs the
 //! S3/Parquet writer pool into the DeltaForge runtime.
 //!
 //! Architecture:
@@ -43,7 +43,7 @@ use anyhow::Context as _;
 /// Time-based rolling (`max_age` / `idle_age`) is only evaluated inside
 /// `append_batch`, which the coordinator calls only when events are flowing.
 /// Without this timer, once the source goes idle the last open writers are
-/// never rolled — their buffers (and uncommitted tail data) linger until the
+/// never rolled - their buffers (and uncommitted tail data) linger until the
 /// pipeline stops. This background sweep makes idle/age rolling actually fire.
 const IDLE_SWEEP_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(5);
@@ -120,8 +120,8 @@ impl S3Sink {
 
     /// Spawn the background task that periodically rolls aged/idle writers.
     ///
-    /// It calls `WriterPool::idle_sweep` on a fixed interval — independent of
-    /// `send_batch` — so `max_age` / `idle_age` rolling fires even when the
+    /// It calls `WriterPool::idle_sweep` on a fixed interval - independent of
+    /// `send_batch` - so `max_age` / `idle_age` rolling fires even when the
     /// source is idle. Stops when the pipeline `cancel` token fires or the
     /// task is aborted on drop. The first tick is delayed by one interval so a
     /// freshly-opened writer isn't swept immediately.
@@ -269,7 +269,7 @@ impl Sink for S3Sink {
         // Wrap the entire append in a per-batch timeout. If a writer's
         // multipart upload (or any pool-internal close) is stuck, this
         // bounds the worst-case wait the coordinator sees. On timeout we
-        // surface SinkError::Backpressure — the coordinator routes per
+        // surface SinkError::Backpressure - the coordinator routes per
         // `required` (block or log+continue).
         let append =
             tokio::time::timeout(self.send_timeout, pool.append_batch(events))
@@ -288,7 +288,7 @@ impl Sink for S3Sink {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(e)) => {
                 // Batch-level failure (object store unreachable, auth,
-                // etc.) — the pool returns a top-level error for these
+                // etc.) - the pool returns a top-level error for these
                 // (per-row encoder errors are isolated into `outcome.failed`
                 // and don't reach this arm).
                 let msg = format!("{e:#}");
@@ -337,7 +337,7 @@ impl Drop for S3Sink {
                     sink = %self.id,
                     pipeline = %self.pipeline,
                     abandoned = n,
-                    "s3 sink dropped without flush — abandoning open writers"
+                    "s3 sink dropped without flush - abandoning open writers"
                 );
             }
         }
@@ -345,14 +345,14 @@ impl Drop for S3Sink {
 }
 
 // =============================================================================
-// Builder — wire up an S3Sink from a config struct
+// Builder - wire up an S3Sink from a config struct
 // =============================================================================
 
 /// Build an `S3Sink` from an `S3SinkCfg` plus an optional schema resolver.
 ///
 /// If `schema_resolver` is `None`, a fallback "envelope-only" resolver is
 /// used (only meta columns; no user data preserved). Production deployments
-/// must supply a resolver derived from source DDL — see the runner's
+/// must supply a resolver derived from source DDL - see the runner's
 /// `build_arrow_schema_resolver` for the canonical adapter.
 pub fn build_s3_sink(
     cfg: &deltaforge_config::S3SinkCfg,
@@ -361,6 +361,17 @@ pub fn build_s3_sink(
     schema_resolver: Option<SchemaResolver>,
 ) -> anyhow::Result<S3Sink> {
     use deltaforge_config::{S3Compression as C, S3FileFormat as F};
+
+    // Fail closed: the legacy rolling builder never silently serves a durable_v2
+    // config. Durable sinks are constructed via `build_durable_s3_sink` (async,
+    // with an injected comparator) from the runner.
+    if cfg.durability == deltaforge_config::S3Durability::DurableV2 {
+        anyhow::bail!(
+            "S3 sink '{}' selects durable_v2; it must be built via the durable \
+             path (build_durable_s3_sink), not the legacy rolling builder",
+            cfg.id
+        );
+    }
 
     // Build object store.
     let access_key = cfg
@@ -437,14 +448,14 @@ pub fn build_s3_sink(
 /// Fallback schema resolver used when no DDL-derived resolver is supplied.
 /// Produces a schema containing only the envelope meta columns; user data
 /// is *not* preserved. Logged as a warning so operators notice.
-fn fallback_envelope_resolver() -> SchemaResolver {
+pub(crate) fn fallback_envelope_resolver() -> SchemaResolver {
     use deltaforge_core::encoding::arrow_schema::{
         Connector, build_envelope_arrow_schema_arc,
     };
     use deltaforge_core::encoding::avro_types::TypeConversionOpts;
 
     warn!(
-        "S3 sink starting without a schema resolver — only envelope-meta \
+        "S3 sink starting without a schema resolver - only envelope-meta \
          columns will be written; user data will be dropped. Wire a \
          DDL-derived resolver from the runner for production use."
     );
@@ -681,7 +692,7 @@ mod tests {
             .unwrap();
 
         // Wait for the background sweeper to see the writer go idle and roll it
-        // — with NO further send_batch call.
+        // - with NO further send_batch call.
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
         // The writer must already be closed by the sweep, so flush finds
@@ -782,7 +793,7 @@ mod tests {
         let committed = sink.flush_on_shutdown().await;
         // Either 0 (writer was never opened because all events failed before
         // any good row) or 1 (writer opened but zero rows written). Both
-        // are atomicity-safe — readers see no bad data.
+        // are atomicity-safe - readers see no bad data.
         for c in &committed {
             assert_eq!(
                 c.result.rows_written, 0,

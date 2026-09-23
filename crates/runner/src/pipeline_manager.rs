@@ -25,7 +25,7 @@ type CheckpointCmpFn =
 /// the smallest (earliest) checkpoint so the source replays from the position
 /// that the slowest sink needs.
 ///
-/// Uses the source-provided comparison function for correctness — different
+/// Uses the source-provided comparison function for correctness - different
 /// sources have different checkpoint formats (MySQL file:pos, Postgres LSN)
 /// that cannot be compared lexicographically.
 struct PerSinkCheckpointProxy {
@@ -42,7 +42,7 @@ impl CheckpointStore for PerSinkCheckpointProxy {
             let keys = self.inner.list_with_prefix(&prefix).await?;
             if keys.is_empty() {
                 // Fallback: check legacy checkpoint key (pre per-sink format).
-                // This allows seamless migration — old pipelines that saved
+                // This allows seamless migration - old pipelines that saved
                 // checkpoints under the plain source_id key still work.
                 return self.inner.get_raw(key).await;
             }
@@ -105,7 +105,7 @@ use deltaforge_core::encoding::avro_types::TypeConversionOpts;
 
 /// Build an Avro source schema provider if any sink uses Avro encoding.
 ///
-/// Returns `None` if no sinks use Avro — zero overhead in that case.
+/// Returns `None` if no sinks use Avro - zero overhead in that case.
 fn build_avro_provider(
     spec: &PipelineSpec,
     schema_loader: &Option<ArcSchemaLoader>,
@@ -471,16 +471,45 @@ impl PipelineManager {
         // Build Elasticsearch column resolver if any sink is an ES sink
         let es_resolver = build_elasticsearch_resolver(&spec, &schema_loader);
 
-        let sinks = sinks::build_sinks_with_schemas(
+        let mut sinks = sinks::build_sinks_with_schemas(
             &spec,
             cancel.clone(),
             &pipeline_name,
             avro_source_schemas,
-            arrow_schema_resolver,
+            arrow_schema_resolver.clone(),
             clickhouse_resolver,
             es_resolver,
         )
         .context("build sinks")?;
+
+        // Durable_v2 S3 sinks are constructed here (not in build_sinks): they are
+        // async (conditional-write probe + verified recovery) and need the
+        // source-aware comparator injected. This runs the probe and completes
+        // recovery before the sink can accept any batch.
+        let durable_source_id = spec.spec.source.source_id().to_string();
+        for s in &spec.spec.sinks {
+            if let deltaforge_config::SinkCfg::S3(cfg) = s {
+                if cfg.durability == deltaforge_config::S3Durability::DurableV2
+                {
+                    let comparator: Arc<
+                        dyn deltaforge_core::CheckpointComparator,
+                    > = Arc::new(
+                        sources::durable_checkpoint::SourceCheckpointComparator,
+                    );
+                    let durable = sinks::s3::build_durable_s3_sink(
+                        cfg,
+                        &pipeline_name,
+                        &durable_source_id,
+                        comparator,
+                        arrow_schema_resolver.clone(),
+                    )
+                    .await
+                    .context("build durable_v2 S3 sink")?;
+                    sinks
+                        .push(Arc::new(durable) as deltaforge_core::ArcDynSink);
+                }
+            }
+        }
 
         let table_patterns = match &spec.spec.source {
             SourceCfg::Mysql(c) => c.tables.clone(),
@@ -491,7 +520,7 @@ impl PipelineManager {
 
         let (event_tx, event_rx) = mpsc::channel::<SourceItem>(32_768);
         // Wrap checkpoint store so the source reads the minimum per-sink
-        // checkpoint — it replays from the position the slowest sink needs.
+        // checkpoint - it replays from the position the slowest sink needs.
         // Capture the source's checkpoint comparison function for the proxy.
         let source_ref = Arc::clone(&source);
         let cmp_fn: CheckpointCmpFn =
@@ -502,6 +531,25 @@ impl PipelineManager {
                 source_id: spec.spec.source.source_id().to_string(),
                 cmp_fn,
             });
+
+        // Durable startup guard: when a durable_v2 sink is active, verify the
+        // source's snapshot progress can be adopted (fail closed on an
+        // interrupted legacy snapshot) BEFORE the source emits anything.
+        let has_durable_s3 = spec.spec.sinks.iter().any(|s| {
+            matches!(
+                s,
+                deltaforge_config::SinkCfg::S3(cfg)
+                    if cfg.durability
+                        == deltaforge_config::S3Durability::DurableV2
+            )
+        });
+        if has_durable_s3 {
+            source
+                .check_durable_snapshot_startup(self.ckpt_store.as_ref())
+                .await
+                .context("durable_v2 snapshot startup check")?;
+        }
+
         let src_handle = source.run(event_tx, source_ckpt).await;
 
         // Wrap the source JoinHandle so alive=false is set immediately when
@@ -579,7 +627,7 @@ impl PipelineManager {
             builder = builder.schema_provider(provider);
         }
 
-        // DLQ writer — opt-in via journal config.
+        // DLQ writer - opt-in via journal config.
         let dlq_writer = if spec
             .spec
             .journal
@@ -618,7 +666,7 @@ impl PipelineManager {
         let join = tokio::spawn(async move {
             let result = coord.run(event_rx, cancel_for_task, pause_rx).await;
             if !cancel_check.is_cancelled() {
-                // Coordinator exited without an explicit stop — also mark
+                // Coordinator exited without an explicit stop - also mark
                 // failed (covers errors that originate inside the coordinator
                 // itself rather than in the source task).
                 alive_for_task.store(false, Ordering::Release);
@@ -642,7 +690,7 @@ impl PipelineManager {
         for (k, v) in &spec.metadata.labels {
             info_labels.push((k.clone(), v.clone()));
         }
-        // Build gauge with dynamic labels — use the pipeline + tenant as fixed,
+        // Build gauge with dynamic labels - use the pipeline + tenant as fixed,
         // and emit user labels as part of the metric name context.
         gauge!(
             "deltaforge_pipeline_info",
@@ -899,7 +947,7 @@ impl PipelineController for PipelineManager {
         for src in &sources {
             src.cancel.cancel();
         }
-        // Update the gauge immediately — the status is already Stopped in the
+        // Update the gauge immediately - the status is already Stopped in the
         // registry. Don't wait for the join handles; the source task may be
         // stuck in a TCP read that is slow to notice cancellation.
         gauge!("deltaforge_pipeline_status", "pipeline" => name.to_string())
@@ -1170,7 +1218,7 @@ mod tests {
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
         };
-        // No per-sink checkpoints and no legacy key — fresh start.
+        // No per-sink checkpoints and no legacy key - fresh start.
         let result = proxy.get_raw("mysql").await.unwrap();
         assert!(result.is_none());
     }
@@ -1195,7 +1243,7 @@ mod tests {
         let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
 
         // Write per-sink checkpoints with different positions.
-        // Using simple JSON strings — lexicographic comparison works for these.
+        // Using simple JSON strings - lexicographic comparison works for these.
         store
             .put_raw("mysql::sink::kafka", b"{\"pos\":200}")
             .await

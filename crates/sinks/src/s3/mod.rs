@@ -10,6 +10,7 @@
 
 mod batch_upload;
 mod durable_encode;
+mod durable_sink;
 mod encoder;
 mod file_format;
 mod head;
@@ -24,6 +25,9 @@ mod sink;
 mod store_cond;
 mod writer_pool;
 
+pub use durable_sink::{
+    DurableFormat, DurableS3Args, DurableS3Sink, build_durable_s3_sink,
+};
 pub use encoder::events_to_record_batch;
 pub use file_format::{Compression, FileFormat, FileWriter, WriteResult};
 pub use jsonl_writer::JsonLinesFormat;
