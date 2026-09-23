@@ -49,6 +49,8 @@ enum Op {
     CompactedPut,
     /// Create-only write of a compaction record.
     CompactionRecordPut,
+    /// Create-only write of a rollup record.
+    RollupRecordPut,
     /// Read of an original data object (compaction "read originals" step).
     GetData,
 }
@@ -61,6 +63,8 @@ fn classify_put(key: &Path) -> Op {
         Op::ManifestPut
     } else if k.contains("_manifest/compactions") {
         Op::CompactionRecordPut
+    } else if k.contains("_manifest/rollups") {
+        Op::RollupRecordPut
     } else if k.contains("/compacted/") {
         Op::CompactedPut
     } else {
@@ -786,7 +790,9 @@ async fn compaction_preserves_ack_state_and_sets_reference() {
     assert_eq!(before.seq, 2);
     let wm2_hex = before.watermark_hex.clone();
 
-    w.compact(replacement(), originals).await.unwrap();
+    w.compact_with_replacement(replacement(), originals)
+        .await
+        .unwrap();
 
     let h = read_head(&inner).await.unwrap();
     // Ack state is untouched; only the compaction reference is set.
@@ -818,7 +824,11 @@ async fn compaction_read_originals_failure_no_record_ack_intact() {
             .await;
     let before = read_head(&inner).await.unwrap();
 
-    assert!(w.compact(replacement(), originals.clone()).await.is_err());
+    assert!(
+        w.compact_with_replacement(replacement(), originals.clone())
+            .await
+            .is_err()
+    );
     assert_eq!(compaction_record_count(&inner).await, 0);
     assert_eq!(compacted_object_count(&inner).await, 0);
     assert_eq!(read_head(&inner).await.unwrap(), before, "HEAD unchanged");
@@ -829,7 +839,9 @@ async fn compaction_read_originals_failure_no_record_ack_intact() {
         .unwrap();
     assert_eq!(read_head(&inner).await.unwrap().seq, 3);
     // And a retry of the compaction now succeeds (one-shot fault cleared).
-    w.compact(replacement(), originals).await.unwrap();
+    w.compact_with_replacement(replacement(), originals)
+        .await
+        .unwrap();
     assert!(read_head(&inner).await.unwrap().compaction_key.is_some());
 }
 
@@ -842,7 +854,11 @@ async fn compaction_replacement_upload_failure_no_record() {
     )
     .await;
     let before = read_head(&inner).await.unwrap();
-    assert!(w.compact(replacement(), originals).await.is_err());
+    assert!(
+        w.compact_with_replacement(replacement(), originals)
+            .await
+            .is_err()
+    );
     assert_eq!(compacted_object_count(&inner).await, 0);
     assert_eq!(compaction_record_count(&inner).await, 0);
     assert_eq!(read_head(&inner).await.unwrap(), before);
@@ -857,7 +873,8 @@ async fn crash_after_replacement_before_record_leaves_orphan() {
     )
     .await;
     let before = read_head(&inner).await.unwrap();
-    cancel_at_hang(&fs, w.compact(replacement(), originals)).await;
+    cancel_at_hang(&fs, w.compact_with_replacement(replacement(), originals))
+        .await;
     drop(w);
     assert_eq!(
         compacted_object_count(&inner).await,
@@ -884,7 +901,8 @@ async fn crash_after_record_before_head_cas_leaves_orphans() {
         setup_two_batches(&inner, vec![tr(Op::HeadCas, 2, Action::HangBefore)])
             .await;
     let before = read_head(&inner).await.unwrap();
-    cancel_at_hang(&fs, w.compact(replacement(), originals)).await;
+    cancel_at_hang(&fs, w.compact_with_replacement(replacement(), originals))
+        .await;
     drop(w);
     assert_eq!(compaction_record_count(&inner).await, 1, "orphan record");
     assert_eq!(compacted_object_count(&inner).await, 1, "orphan object");
@@ -908,7 +926,9 @@ async fn compaction_head_cas_rejected_then_lost_response() {
     let (_fs, w, originals) =
         setup_two_batches(&inner, vec![tr(Op::HeadCas, 2, Action::ErrBefore)])
             .await;
-    w.compact(replacement(), originals).await.unwrap();
+    w.compact_with_replacement(replacement(), originals)
+        .await
+        .unwrap();
     assert!(read_head(&inner).await.unwrap().compaction_key.is_some());
 
     // Applied-then-lost: reconcile sees HEAD already references the record.
@@ -918,7 +938,9 @@ async fn compaction_head_cas_rejected_then_lost_response() {
         vec![tr(Op::HeadCas, 2, Action::ApplyThenErr)],
     )
     .await;
-    w2.compact(replacement(), orig2).await.unwrap();
+    w2.compact_with_replacement(replacement(), orig2)
+        .await
+        .unwrap();
     assert!(read_head(&inner2).await.unwrap().compaction_key.is_some());
     assert_eq!(compaction_record_count(&inner2).await, 1);
 }
@@ -934,7 +956,8 @@ async fn fencing_during_compaction_denies_and_leaves_orphans() {
     assert_eq!(b.epoch().await, 2);
 
     // A's compaction uploads object + record, but its HEAD CAS is fenced.
-    let err = expect_err(a.compact(replacement(), originals).await);
+    let err =
+        expect_err(a.compact_with_replacement(replacement(), originals).await);
     assert!(matches!(err, HeadError::Fenced { .. }));
     let h = read_head(&inner).await.unwrap();
     assert_eq!(h.epoch, 2, "B's HEAD stands");
@@ -948,7 +971,9 @@ async fn fencing_during_compaction_denies_and_leaves_orphans() {
 async fn restart_with_published_compaction_verifies_and_continues() {
     let inner = inmem();
     let (_fs, w, originals) = setup_two_batches(&inner, vec![]).await;
-    w.compact(replacement(), originals).await.unwrap();
+    w.compact_with_replacement(replacement(), originals)
+        .await
+        .unwrap();
     drop(w);
 
     // Restart: acquire verifies the compaction chain and bumps the epoch.
@@ -969,7 +994,9 @@ async fn restart_with_published_compaction_verifies_and_continues() {
 async fn recovery_with_corrupt_replacement_fails_closed() {
     let inner = inmem();
     let (_fs, w, originals) = setup_two_batches(&inner, vec![]).await;
-    w.compact(replacement(), originals).await.unwrap();
+    w.compact_with_replacement(replacement(), originals)
+        .await
+        .unwrap();
     drop(w);
 
     // Corrupt (delete) the compacted replacement object.
@@ -996,10 +1023,12 @@ async fn recompaction_of_superseded_original_detected_at_recovery() {
     let inner = inmem();
     let (_fs, w, originals) = setup_two_batches(&inner, vec![]).await;
     // First compaction supersedes both originals.
-    w.compact(replacement(), originals.clone()).await.unwrap();
+    w.compact_with_replacement(replacement(), originals.clone())
+        .await
+        .unwrap();
     // A buggy second compaction re-lists one already-superseded original.
     let dup = vec![originals[0].clone()];
-    w.compact(tobj("orders", b"compacted-again"), dup)
+    w.compact_with_replacement(tobj("orders", b"compacted-again"), dup)
         .await
         .unwrap();
     drop(w);
@@ -1011,4 +1040,329 @@ async fn recompaction_of_superseded_original_detected_at_recovery() {
         matches!(err, HeadError::Integrity(ref m) if m.contains("conflicting")),
         "expected conflicting-compaction integrity error, got {err:?}"
     );
+}
+
+// ── Production compaction API (replacement built from verified originals) ────
+
+/// Read the single compacted replacement object's bytes.
+async fn compacted_bytes(inner: &ObjectStoreConditional) -> Bytes {
+    let key = inner
+        .list(&Path::from(format!("{PFX}/{PIPE}")))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|p| p.to_string().contains("/compacted/"))
+        .expect("a compacted object");
+    inner.get_with_etag(&key).await.unwrap().unwrap().0
+}
+
+#[tokio::test]
+async fn production_compact_builds_replacement_from_verified_originals() {
+    let inner = inmem();
+    let (_fs, w, originals) = setup_two_batches(&inner, vec![]).await;
+    let before = read_head(&inner).await.unwrap();
+
+    // Production API: no caller bytes, just the authoritative originals.
+    w.compact(originals).await.unwrap();
+
+    let h = read_head(&inner).await.unwrap();
+    assert_eq!(h.seq, before.seq, "ack state preserved");
+    assert_eq!(h.watermark_hex, before.watermark_hex);
+    assert!(h.compaction_key.is_some(), "compaction reference set");
+    assert_eq!(compaction_record_count(&inner).await, 1);
+    assert_eq!(data_count(&inner).await, 2, "originals NOT deleted");
+    // The replacement is the originals' exact bytes, concatenated in ack order.
+    assert_eq!(compacted_bytes(&inner).await.as_ref(), b"ab");
+}
+
+#[tokio::test]
+async fn production_compact_orders_originals_by_ack_sequence() {
+    let inner = inmem();
+    let (_fs, w, mut originals) = setup_two_batches(&inner, vec![]).await;
+    // Hand the API the originals in the WRONG order; it must re-order by ack seq.
+    originals.reverse();
+    w.compact(originals).await.unwrap();
+    assert_eq!(
+        compacted_bytes(&inner).await.as_ref(),
+        b"ab",
+        "replacement respects ack order, not caller order"
+    );
+}
+
+#[tokio::test]
+async fn production_compact_rejects_non_authoritative_original() {
+    let inner = inmem();
+    let (_fs, w, _originals) = setup_two_batches(&inner, vec![]).await;
+    // A fabricated original that is not in the acknowledgement chain.
+    let fake = ManifestObject {
+        key: format!("{PFX}/{PIPE}/orders/wm-fake/x.jsonl"),
+        table: "orders".into(),
+        content_hash: "h-fake".into(),
+        byte_len: 1,
+        format: "jsonl".into(),
+        format_version: 1,
+        schema_id: "s1".into(),
+        compression: "none".into(),
+        partition_spec: "table".into(),
+        partition_version: 1,
+    };
+    let err = expect_err(w.compact(vec![fake]).await);
+    assert!(
+        matches!(err, HeadError::Integrity(ref m) if m.contains("authoritative")),
+        "expected non-authoritative rejection, got {err:?}"
+    );
+    assert_eq!(compaction_record_count(&inner).await, 0);
+    assert_eq!(compacted_object_count(&inner).await, 0);
+}
+
+#[tokio::test]
+async fn production_compact_rejects_tampered_original_hash() {
+    let inner = inmem();
+    let (_fs, w, mut originals) = setup_two_batches(&inner, vec![]).await;
+    // Same key as a real original, but a content hash that no longer matches.
+    originals[0].content_hash = "h-tampered".into();
+    let err = expect_err(w.compact(originals).await);
+    assert!(
+        matches!(err, HeadError::Integrity(ref m) if m.contains("hash")),
+        "expected content-hash mismatch, got {err:?}"
+    );
+    assert_eq!(compaction_record_count(&inner).await, 0);
+}
+
+// ── Rollup publication + recovery ────────────────────────────────────────────
+
+async fn rollup_record_count(inner: &ObjectStoreConditional) -> usize {
+    inner
+        .list(&Path::from(format!("{PFX}/{PIPE}/_manifest/rollups")))
+        .await
+        .unwrap()
+        .len()
+}
+
+/// Delete the rollup record a HEAD field currently references.
+async fn delete_rollup(inner: &ObjectStoreConditional, key: &str) {
+    inner.delete(&Path::from(key.to_string())).await.unwrap();
+}
+
+#[tokio::test]
+async fn rollup_happy_path_sets_refs_and_preserves_ack_state() {
+    let inner = inmem();
+    let (_fs, w, _o) = setup_two_batches(&inner, vec![]).await;
+    let before = read_head(&inner).await.unwrap();
+
+    w.rollup().await.unwrap();
+
+    let h = read_head(&inner).await.unwrap();
+    assert_eq!(h.seq, before.seq, "ack state untouched");
+    assert_eq!(h.watermark_hex, before.watermark_hex);
+    assert_eq!(h.head_entry_key, before.head_entry_key);
+    assert!(h.rollup_key.is_some(), "current rollup reference set");
+    assert!(h.prev_rollup_key.is_none(), "no previous rollup yet");
+    assert_eq!(rollup_record_count(&inner).await, 1);
+}
+
+#[tokio::test]
+async fn second_rollup_retains_current_and_previous_refs_and_recovers() {
+    let inner = inmem();
+    let (_fs, w, _o) = setup_two_batches(&inner, vec![]).await;
+    w.rollup().await.unwrap(); // rollup 1 covers seq 1..=2
+    let r1 = read_head(&inner).await.unwrap().rollup_key.unwrap();
+
+    // Publish a third batch, then roll up again: rollup 2 covers seq 3.
+    w.publish(&wm(3), vec![tobj("orders", b"c")], 1)
+        .await
+        .unwrap();
+    w.rollup().await.unwrap();
+
+    let h = read_head(&inner).await.unwrap();
+    assert!(h.rollup_key.is_some());
+    assert_eq!(
+        h.prev_rollup_key.as_deref(),
+        Some(r1.as_str()),
+        "previous rollup reference retained"
+    );
+    assert_ne!(h.rollup_key, h.prev_rollup_key, "two distinct rollups");
+    assert_eq!(rollup_record_count(&inner).await, 2);
+
+    // Recovery verifies the rollup chain and continues.
+    drop(w);
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let w2 = acquire(Arc::clone(&clean)).await.unwrap();
+    assert_eq!(w2.epoch().await, 2);
+}
+
+#[tokio::test]
+async fn ordinary_publish_and_compaction_preserve_both_rollup_refs() {
+    let inner = inmem();
+    let (_fs, w, _o) = setup_two_batches(&inner, vec![]).await;
+    w.rollup().await.unwrap();
+    w.publish(&wm(3), vec![tobj("orders", b"c")], 1)
+        .await
+        .unwrap();
+    w.rollup().await.unwrap();
+    let h = read_head(&inner).await.unwrap();
+    let (cur, prev) = (h.rollup_key.clone(), h.prev_rollup_key.clone());
+    assert!(cur.is_some() && prev.is_some());
+
+    // An ordinary publish keeps both rollup references.
+    w.publish(&wm(4), vec![tobj("orders", b"d")], 1)
+        .await
+        .unwrap();
+    let h2 = read_head(&inner).await.unwrap();
+    assert_eq!(h2.rollup_key, cur, "publish keeps current rollup ref");
+    assert_eq!(
+        h2.prev_rollup_key, prev,
+        "publish keeps previous rollup ref"
+    );
+
+    // A compaction also keeps both rollup references.
+    let originals = all_manifest_objects(&inner).await;
+    w.compact(originals).await.unwrap();
+    let h3 = read_head(&inner).await.unwrap();
+    assert_eq!(h3.rollup_key, cur, "compaction keeps current rollup ref");
+    assert_eq!(
+        h3.prev_rollup_key, prev,
+        "compaction keeps previous rollup ref"
+    );
+    assert!(h3.compaction_key.is_some());
+}
+
+#[tokio::test]
+async fn rollup_record_upload_failure_leaves_head_unchanged() {
+    let inner = inmem();
+    let (_fs, w, _o) = setup_two_batches(
+        &inner,
+        vec![tr(Op::RollupRecordPut, 0, Action::ErrBefore)],
+    )
+    .await;
+    let before = read_head(&inner).await.unwrap();
+    assert!(w.rollup().await.is_err());
+    assert_eq!(rollup_record_count(&inner).await, 0);
+    assert_eq!(read_head(&inner).await.unwrap(), before, "HEAD unchanged");
+    // Retry (one-shot fault cleared) succeeds.
+    w.rollup().await.unwrap();
+    assert!(read_head(&inner).await.unwrap().rollup_key.is_some());
+}
+
+#[tokio::test]
+async fn rollup_head_cas_rejected_reconciles() {
+    let inner = inmem();
+    // The rollup HEAD CAS is HeadCas nth 2 (after the two publish CASes).
+    let (_fs, w, _o) =
+        setup_two_batches(&inner, vec![tr(Op::HeadCas, 2, Action::ErrBefore)])
+            .await;
+    w.rollup().await.unwrap();
+    assert!(read_head(&inner).await.unwrap().rollup_key.is_some());
+    assert_eq!(rollup_record_count(&inner).await, 1);
+}
+
+#[tokio::test]
+async fn rollup_head_cas_lost_response_acks_because_head_references_rollup() {
+    let inner = inmem();
+    let (_fs, w, _o) = setup_two_batches(
+        &inner,
+        vec![tr(Op::HeadCas, 2, Action::ApplyThenErr)],
+    )
+    .await;
+    w.rollup().await.unwrap();
+    assert!(read_head(&inner).await.unwrap().rollup_key.is_some());
+    assert_eq!(rollup_record_count(&inner).await, 1);
+}
+
+#[tokio::test]
+async fn crash_after_rollup_record_before_head_cas_leaves_orphan() {
+    let inner = inmem();
+    let (fs, w, _o) =
+        setup_two_batches(&inner, vec![tr(Op::HeadCas, 2, Action::HangBefore)])
+            .await;
+    let before = read_head(&inner).await.unwrap();
+    cancel_at_hang(&fs, w.rollup()).await;
+    drop(w);
+    assert_eq!(rollup_record_count(&inner).await, 1, "orphan rollup record");
+    assert_eq!(
+        read_head(&inner).await.unwrap(),
+        before,
+        "HEAD never referenced the orphan rollup"
+    );
+
+    // Restart: HEAD has no rollup ref, so the orphan is ignored; recovery works.
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let w2 = acquire(Arc::clone(&clean)).await.unwrap();
+    assert_eq!(w2.epoch().await, 2);
+    assert!(read_head(&inner).await.unwrap().rollup_key.is_none());
+}
+
+#[tokio::test]
+async fn fencing_during_rollup_denies_and_leaves_orphan() {
+    let inner = inmem();
+    let (_fs, a, _o) = setup_two_batches(&inner, vec![]).await; // epoch 1
+    let b = acquire(Arc::new(FaultStore::new(Arc::clone(&inner), vec![])))
+        .await
+        .unwrap();
+    assert_eq!(b.epoch().await, 2);
+
+    // A's rollup writes its record, but the HEAD CAS finds B's higher epoch.
+    let err = expect_err(a.rollup().await);
+    assert!(matches!(err, HeadError::Fenced { .. }));
+    let h = read_head(&inner).await.unwrap();
+    assert_eq!(h.epoch, 2, "B's HEAD stands");
+    assert!(h.rollup_key.is_none(), "A never set the rollup ref");
+    // Orphan rollup record is harmless; B recovers on restart.
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let _ = acquire(clean).await.unwrap();
+}
+
+#[tokio::test]
+async fn corrupt_current_rollup_falls_back_and_recovers() {
+    // A damaged CURRENT rollup is an alarm, not a failure: recovery falls back to
+    // the previous rollup / retained entries (ground truth) and succeeds.
+    let inner = inmem();
+    let (_fs, w, _o) = setup_two_batches(&inner, vec![]).await;
+    w.rollup().await.unwrap();
+    w.publish(&wm(3), vec![tobj("orders", b"c")], 1)
+        .await
+        .unwrap();
+    w.rollup().await.unwrap();
+    drop(w);
+    let cur = read_head(&inner).await.unwrap().rollup_key.unwrap();
+    delete_rollup(&inner, &cur).await;
+
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let w2 = acquire(Arc::clone(&clean)).await.unwrap();
+    assert_eq!(w2.epoch().await, 2, "recovery succeeded via fallback");
+    // Publishing still works after fall-back recovery.
+    w2.publish(&wm(4), vec![tobj("orders", b"d")], 1)
+        .await
+        .unwrap();
+    assert_eq!(read_head(&inner).await.unwrap().seq, 4);
+}
+
+#[tokio::test]
+async fn corrupt_previous_rollup_falls_back_to_entries_and_recovers() {
+    let inner = inmem();
+    let (_fs, w, _o) = setup_two_batches(&inner, vec![]).await;
+    w.rollup().await.unwrap();
+    w.publish(&wm(3), vec![tobj("orders", b"c")], 1)
+        .await
+        .unwrap();
+    w.rollup().await.unwrap();
+    drop(w);
+    // Corrupt the PREVIOUS rollup: the current one still verifies its own range,
+    // but its prev chain is broken; recovery falls back to the entry chain.
+    let prev = read_head(&inner).await.unwrap().prev_rollup_key.unwrap();
+    delete_rollup(&inner, &prev).await;
+
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let w2 = acquire(Arc::clone(&clean)).await.unwrap();
+    assert_eq!(w2.epoch().await, 2, "recovery succeeded via entry chain");
+}
+
+#[tokio::test]
+async fn rollup_before_any_publish_is_rejected() {
+    let inner = inmem();
+    let (_fs, w) = genesis(&inner, vec![]).await;
+    // Genesis HEAD (seq 0) has nothing to summarize.
+    let err = expect_err(w.rollup().await);
+    assert!(matches!(err, HeadError::Integrity(_)), "got {err:?}");
+    assert_eq!(rollup_record_count(&inner).await, 0);
 }

@@ -25,13 +25,17 @@ use deltaforge_core::{CheckpointComparator, CheckpointOrder};
 
 use super::batch_upload::{DurableError, TableObject, upload_batch};
 use super::compaction::{
-    CompactionError, CompactionRecord, check_compatible, compacted_object_key,
-    load_record, verify_originals_present, write_record,
+    CompactionError, CompactionIndex, CompactionRecord, check_compatible,
+    compacted_object_key, load_record, verify_originals_present, write_record,
 };
 use super::keys::content_hash;
 use super::manifest::{
     ManifestEntry, ManifestObject, PrevRef, WrittenEntry, propose_seq,
     write_entry,
+};
+use super::rollup::{
+    RollupError, RollupRecord, load_record as rollup_load,
+    object_digest as rollup_object_digest, write_record as rollup_write,
 };
 use super::store_cond::{ConditionalStore, PutOutcome};
 
@@ -59,6 +63,13 @@ pub struct Head {
     pub head_entry_hash: Option<String>,
     pub rollup_key: Option<String>,
     pub rollup_hash: Option<String>,
+    /// The previous rollup reference, retained so a corrupt/missing current
+    /// rollup can fall back without a full chain walk. Set together with
+    /// `rollup_key/hash` when a new rollup is published.
+    #[serde(default)]
+    pub prev_rollup_key: Option<String>,
+    #[serde(default)]
+    pub prev_rollup_hash: Option<String>,
     pub watermark_hex: Option<String>,
     /// Reference to the latest compaction record (the head of the immutable
     /// compaction history). Independent of the acknowledgement chain: compaction
@@ -80,6 +91,8 @@ impl Head {
             head_entry_hash: None,
             rollup_key: None,
             rollup_hash: None,
+            prev_rollup_key: None,
+            prev_rollup_hash: None,
             watermark_hex: None,
             compaction_key: None,
             compaction_hash: None,
@@ -126,6 +139,11 @@ impl Head {
         if self.rollup_key.is_some() != self.rollup_hash.is_some() {
             return Err(HeadError::Integrity(
                 "HEAD rollup key/hash not both-set-or-both-unset".into(),
+            ));
+        }
+        if self.prev_rollup_key.is_some() != self.prev_rollup_hash.is_some() {
+            return Err(HeadError::Integrity(
+                "HEAD prev-rollup key/hash not both-set-or-both-unset".into(),
             ));
         }
         if self.compaction_key.is_some() != self.compaction_hash.is_some() {
@@ -234,10 +252,20 @@ async fn load_entry<S: ConditionalStore + ?Sized>(
     }
 }
 
-/// Verify HEAD's authoritative chain and all referenced data objects. Walks from
-/// the head entry back to genesis (rollup-aware walking lands with the rollup
-/// commit; a HEAD that references a rollup fails closed here rather than trusting
-/// an unvalidated one). Every failure is fatal - no `Before`/`Equal` skipping is
+/// Per-seq summary collected while walking the authoritative chain, used to
+/// verify rollups (boundary hashes, watermark, object digest) against retained
+/// entries and to build the ack-chain object inventory.
+struct EntrySummary {
+    entry_hash: String,
+    watermark_hex: String,
+    objects: Vec<ManifestObject>,
+}
+
+/// Verify HEAD's authoritative chain and all referenced data objects, then verify
+/// the rollup chain against the retained entries (advisory in 9A: alarm + fall
+/// back, never trust a damaged rollup) and build+verify the authoritative
+/// compaction index. Returns that index so recovery can hand it to GC. Every
+/// entry-chain or compaction failure is fatal - no `Before`/`Equal` skipping is
 /// enabled unless this returns `Ok`.
 async fn verify_chain<S: ConditionalStore + ?Sized>(
     store: &S,
@@ -247,163 +275,186 @@ async fn verify_chain<S: ConditionalStore + ?Sized>(
     sink_id: &str,
     head: &Head,
     comparator: &dyn CheckpointComparator,
-) -> Result<(), HeadError> {
-    // Understand the authoritative compaction mapping before trusting HEAD (and
-    // before any later GC deletes originals). This never depends on, or alters,
-    // the acknowledgement chain below.
-    verify_compaction_chain(store, pipeline, source_id, sink_id, head).await?;
+) -> Result<CompactionIndex, HeadError> {
+    // The authoritative object inventory (every object key referenced by an
+    // entry) and per-seq summaries, collected during the walk.
+    let mut inventory: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut entries: std::collections::BTreeMap<u64, EntrySummary> =
+        std::collections::BTreeMap::new();
 
-    // Genesis HEAD (no entry) has nothing to walk; structure was checked by
-    // Head::parse.
-    let Some(head_entry_key) = head.head_entry_key.clone() else {
-        return Ok(());
-    };
-    let head_entry_hash = head
-        .head_entry_hash
-        .clone()
-        .ok_or_else(|| HeadError::Integrity("HEAD hash missing".into()))?;
+    if let Some(head_entry_key) = head.head_entry_key.clone() {
+        let head_entry_hash = head
+            .head_entry_hash
+            .clone()
+            .ok_or_else(|| HeadError::Integrity("HEAD hash missing".into()))?;
 
-    // Rollups are not produced yet; a HEAD claiming one is unexpected and cannot
-    // be validated, so fail closed rather than trust it.
-    if head.rollup_key.is_some() {
-        return Err(HeadError::Integrity(
-            "HEAD references a rollup, but rollup verification is not yet \
-             supported"
-                .into(),
-        ));
-    }
+        let mut cur_key = head_entry_key;
+        let mut expected_hash = head_entry_hash;
+        let mut expected_seq: Option<u64> = None;
+        let mut later_epoch: Option<u64> = None;
+        let mut later_wm: Option<Vec<u8>> = None;
+        let mut is_head_entry = true;
+        let mut done = false;
 
-    let mut cur_key = head_entry_key;
-    let mut expected_hash = head_entry_hash;
-    let mut expected_seq: Option<u64> = None;
-    let mut later_epoch: Option<u64> = None;
-    let mut later_wm: Option<Vec<u8>> = None;
-    let mut is_head_entry = true;
+        for _ in 0..MAX_CHAIN_WALK {
+            let entry = load_entry(store, &cur_key).await?;
 
-    for _ in 0..MAX_CHAIN_WALK {
-        let entry = load_entry(store, &cur_key).await?;
-
-        // 1. Bytes match the referenced hash (and thus the key hash).
-        if entry.entry_hash() != expected_hash {
-            return Err(HeadError::Integrity(format!(
-                "entry {cur_key} hash mismatch"
-            )));
-        }
-        // 2. Identity.
-        if entry.pipeline != pipeline
-            || entry.source_id != source_id
-            || entry.sink_id != sink_id
-        {
-            return Err(HeadError::Integrity(format!(
-                "entry {cur_key} identity mismatch"
-            )));
-        }
-        // 3. Sequence continuity.
-        if let Some(es) = expected_seq {
-            if entry.seq != es {
+            // 1. Bytes match the referenced hash (and thus the key hash).
+            if entry.entry_hash() != expected_hash {
                 return Err(HeadError::Integrity(format!(
-                    "sequence discontinuity at {cur_key}: expected {es}, got {}",
-                    entry.seq
+                    "entry {cur_key} hash mismatch"
                 )));
             }
-        }
-        // 4. Epoch never regresses toward HEAD (earlier entry <= later entry;
-        //    jumps are allowed).
-        if let Some(le) = later_epoch {
-            if entry.epoch > le {
+            // 2. Identity.
+            if entry.pipeline != pipeline
+                || entry.source_id != source_id
+                || entry.sink_id != sink_id
+            {
                 return Err(HeadError::Integrity(format!(
-                    "epoch regression at {cur_key}: {} > later {le}",
-                    entry.epoch
+                    "entry {cur_key} identity mismatch"
                 )));
             }
-        }
-        // 5. Watermark strictly advances toward HEAD (later After earlier).
-        let cur_wm = unhex(&entry.watermark_hex).ok_or_else(|| {
-            HeadError::Integrity(format!("entry {cur_key} watermark not hex"))
-        })?;
-        if let Some(lw) = &later_wm {
-            match comparator.order(lw, &cur_wm) {
-                CheckpointOrder::After => {}
-                other => {
+            // 3. Sequence continuity.
+            if let Some(es) = expected_seq {
+                if entry.seq != es {
                     return Err(HeadError::Integrity(format!(
-                        "non-monotonic watermark at {cur_key}: later is {other:?} \
-                         relative to it"
-                    )));
-                }
-            }
-        }
-        // HEAD watermark exactly matches its selected (head) entry.
-        if is_head_entry
-            && head.watermark_hex.as_deref()
-                != Some(entry.watermark_hex.as_str())
-        {
-            return Err(HeadError::Integrity(
-                "HEAD watermark does not match its selected entry".into(),
-            ));
-        }
-        // 6. Every referenced data object exists and matches.
-        for mobj in &entry.objects {
-            verify_data_object(store, mobj).await?;
-        }
-
-        // Advance to the previous entry, or stop at genesis.
-        match &entry.prev {
-            None => {
-                if entry.seq != 1 {
-                    return Err(HeadError::Integrity(format!(
-                        "genesis entry {cur_key} has seq {} (expected 1)",
+                        "sequence discontinuity at {cur_key}: expected {es}, got {}",
                         entry.seq
                     )));
                 }
-                return Ok(());
             }
-            Some(PrevRef { key, hash }) => {
-                let next_seq = entry.seq.checked_sub(1).ok_or_else(|| {
-                    HeadError::Integrity("sequence underflow".into())
-                })?;
-                if next_seq == 0 {
+            // 4. Epoch never regresses toward HEAD.
+            if let Some(le) = later_epoch {
+                if entry.epoch > le {
                     return Err(HeadError::Integrity(format!(
-                        "entry {cur_key} has a prev link but seq would reach 0"
+                        "epoch regression at {cur_key}: {} > later {le}",
+                        entry.epoch
                     )));
                 }
-                later_epoch = Some(entry.epoch);
-                later_wm = Some(cur_wm);
-                expected_seq = Some(next_seq);
-                expected_hash = hash.clone();
-                cur_key = key.clone();
-                is_head_entry = false;
+            }
+            // 5. Watermark strictly advances toward HEAD.
+            let cur_wm = unhex(&entry.watermark_hex).ok_or_else(|| {
+                HeadError::Integrity(format!(
+                    "entry {cur_key} watermark not hex"
+                ))
+            })?;
+            if let Some(lw) = &later_wm {
+                match comparator.order(lw, &cur_wm) {
+                    CheckpointOrder::After => {}
+                    other => {
+                        return Err(HeadError::Integrity(format!(
+                            "non-monotonic watermark at {cur_key}: later is \
+                             {other:?} relative to it"
+                        )));
+                    }
+                }
+            }
+            // HEAD watermark exactly matches its selected (head) entry.
+            if is_head_entry
+                && head.watermark_hex.as_deref()
+                    != Some(entry.watermark_hex.as_str())
+            {
+                return Err(HeadError::Integrity(
+                    "HEAD watermark does not match its selected entry".into(),
+                ));
+            }
+            // 6. Every referenced data object exists and matches; collect it.
+            for mobj in &entry.objects {
+                verify_data_object(store, mobj).await?;
+                inventory.insert(mobj.key.clone());
+            }
+            entries.insert(
+                entry.seq,
+                EntrySummary {
+                    entry_hash: entry.entry_hash(),
+                    watermark_hex: entry.watermark_hex.clone(),
+                    objects: entry.objects.clone(),
+                },
+            );
+
+            match &entry.prev {
+                None => {
+                    if entry.seq != 1 {
+                        return Err(HeadError::Integrity(format!(
+                            "genesis entry {cur_key} has seq {} (expected 1)",
+                            entry.seq
+                        )));
+                    }
+                    done = true;
+                    break;
+                }
+                Some(PrevRef { key, hash }) => {
+                    let next_seq =
+                        entry.seq.checked_sub(1).ok_or_else(|| {
+                            HeadError::Integrity("sequence underflow".into())
+                        })?;
+                    if next_seq == 0 {
+                        return Err(HeadError::Integrity(format!(
+                            "entry {cur_key} has a prev link but seq reaches 0"
+                        )));
+                    }
+                    later_epoch = Some(entry.epoch);
+                    later_wm = Some(cur_wm);
+                    expected_seq = Some(next_seq);
+                    expected_hash = hash.clone();
+                    cur_key = key.clone();
+                    is_head_entry = false;
+                }
             }
         }
+        if !done {
+            return Err(HeadError::Integrity(
+                "manifest chain exceeded the maximum walk length (cycle or \
+                 runaway)"
+                    .into(),
+            ));
+        }
     }
-    Err(HeadError::Integrity(
-        "manifest chain exceeded the maximum walk length (cycle or runaway)"
-            .into(),
-    ))
+
+    // Rollups are advisory in 9A: verify against retained entries; a damaged
+    // rollup alarms and falls back but is never trusted (entries are ground
+    // truth). This never affects the fatal outcome of recovery.
+    let _ = verify_rollup_chain(
+        store, pipeline, source_id, sink_id, head, &entries,
+    )
+    .await;
+
+    // Build + verify the authoritative compaction index (originals must be in
+    // the ack inventory; conflicts/cycles are fatal).
+    build_compaction_index(
+        store, pipeline, source_id, sink_id, head, &inventory,
+    )
+    .await
 }
 
-/// Verify the compaction history reachable from HEAD's compaction reference:
-/// each record parses and matches its referenced hash, has matching identity, is
-/// domain-consistent (every original shares the replacement's table + encoding
-/// domain), and its replacement object is present with the recorded content hash
-/// and size. The `prev` chain is walked bounded and cycle-checked (immutable,
-/// non-cyclic history). This is independent of the acknowledgement chain and
-/// never inspects the source watermark. (Cross-referencing originals against the
-/// ack chain and row-exactness are the pre-deletion gate that lands with GC;
-/// this commit deletes nothing.)
-async fn verify_compaction_chain<S: ConditionalStore + ?Sized>(
+/// Build the AUTHORITATIVE compaction index from the records reachable from
+/// HEAD's compaction reference, verifying as it goes: each record parses + hash
+/// matches, identity matches, is domain-consistent (every original shares the
+/// replacement's table + full encoding domain), its replacement is present with
+/// the recorded hash + size, every original is referenced by the acknowledgement
+/// chain (`ack_inventory`), and no original appears in two records (conflicting
+/// active compaction). Because an original must be an ack-chain object and a
+/// replacement is never one, a transitive compaction (an original that is itself
+/// a prior replacement) is rejected here - transitive semantics are not
+/// implemented. The `prev` chain is bounded and cycle-checked. The returned
+/// index maps each original key to its single active replacement; GC (9B)
+/// consumes it rather than rescanning arbitrary objects.
+async fn build_compaction_index<S: ConditionalStore + ?Sized>(
     store: &S,
     pipeline: &str,
     source_id: &str,
     sink_id: &str,
     head: &Head,
-) -> Result<(), HeadError> {
+    ack_inventory: &std::collections::HashSet<String>,
+) -> Result<CompactionIndex, HeadError> {
+    let mut index = CompactionIndex::default();
     let (Some(mut cur_key), Some(mut expected_hash)) =
         (head.compaction_key.clone(), head.compaction_hash.clone())
     else {
-        return Ok(());
+        return Ok(index);
     };
     let mut seen = std::collections::HashSet::new();
-    let mut claimed_originals = std::collections::HashSet::new();
     for _ in 0..MAX_CHAIN_WALK {
         if !seen.insert(cur_key.clone()) {
             return Err(HeadError::Integrity(
@@ -424,20 +475,33 @@ async fn verify_compaction_chain<S: ConditionalStore + ?Sized>(
         // Domain consistency: never a cross-table / cross-domain compaction.
         check_compatible(&rec.table, &rec.domain(), &rec.originals)
             .map_err(map_compaction)?;
-        // No original may appear in two records (a recompaction of an
-        // already-superseded object is a conflicting active compaction).
+        // The replacement must be durably present with its recorded hash + size.
+        verify_data_object(store, &rec.replacement).await?;
         for o in &rec.originals {
-            if !claimed_originals.insert(o.key.clone()) {
+            // Every original must be an authoritative ack-chain object. This also
+            // rejects transitive compaction (a replacement is never in the ack
+            // inventory).
+            if !ack_inventory.contains(&o.key) {
+                return Err(HeadError::Integrity(format!(
+                    "compaction original {} is not referenced by the \
+                     acknowledgement chain (missing or transitive)",
+                    o.key
+                )));
+            }
+            // No original may appear in two records (conflicting active
+            // compaction).
+            if index
+                .insert(o.key.clone(), rec.replacement.clone())
+                .is_some()
+            {
                 return Err(HeadError::Integrity(format!(
                     "original {} appears in conflicting compactions",
                     o.key
                 )));
             }
         }
-        // The replacement must be durably present with its recorded hash + size.
-        verify_data_object(store, &rec.replacement).await?;
         match &rec.prev {
-            None => return Ok(()),
+            None => return Ok(index),
             Some(PrevRef { key, hash }) => {
                 expected_hash = hash.clone();
                 cur_key = key.clone();
@@ -446,6 +510,185 @@ async fn verify_compaction_chain<S: ConditionalStore + ?Sized>(
     }
     Err(HeadError::Integrity(
         "compaction history exceeded the maximum walk length".into(),
+    ))
+}
+
+/// Result of verifying the rollup chain against retained entries. In 9A entries
+/// are the ground truth, so a damaged rollup never fails recovery - it alarms and
+/// falls back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RollupCheck {
+    /// No rollup, or the current rollup fully verified.
+    Healthy,
+    /// The current rollup was damaged; fell back (alarm raised).
+    DamagedFellBack,
+}
+
+/// Verify the rollup chain reachable from HEAD against the retained `entries`
+/// (seq -> summary). A rollup must match its referenced hash + identity, have a
+/// valid contiguous range with correct boundary entry hashes and end watermark,
+/// and an object digest matching the summarized entries. On any discrepancy the
+/// current rollup is NOT trusted: an alarm is logged and we fall back to the
+/// previous rollup, then to the (already fully verified) entry chain. Bounded and
+/// cycle-checked. Never fails recovery in 9A.
+async fn verify_rollup_chain<S: ConditionalStore + ?Sized>(
+    store: &S,
+    pipeline: &str,
+    source_id: &str,
+    sink_id: &str,
+    head: &Head,
+    entries: &std::collections::BTreeMap<u64, EntrySummary>,
+) -> RollupCheck {
+    let Some((key, hash)) =
+        head.rollup_key.clone().zip(head.rollup_hash.clone())
+    else {
+        return RollupCheck::Healthy; // no rollup
+    };
+
+    match verify_rollup_from(
+        store, pipeline, source_id, sink_id, &key, &hash, entries,
+    )
+    .await
+    {
+        Ok(()) => RollupCheck::Healthy,
+        Err(e) => {
+            tracing::warn!(
+                pipeline = %pipeline,
+                error = %e,
+                "durable S3 current rollup failed verification; falling back \
+                 (entries retained) - this is an alarm, not silent trust"
+            );
+            // Fall back to the previous rollup, if any.
+            if let Some((pk, ph)) = head
+                .prev_rollup_key
+                .clone()
+                .zip(head.prev_rollup_hash.clone())
+            {
+                if let Err(e2) = verify_rollup_from(
+                    store, pipeline, source_id, sink_id, &pk, &ph, entries,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        pipeline = %pipeline,
+                        error = %e2,
+                        "durable S3 previous rollup also failed; falling back \
+                         to the full verified entry chain"
+                    );
+                }
+            }
+            RollupCheck::DamagedFellBack
+        }
+    }
+}
+
+/// Verify a single rollup chain starting at `(key, hash)` against `entries`.
+#[allow(clippy::too_many_arguments)]
+async fn verify_rollup_from<S: ConditionalStore + ?Sized>(
+    store: &S,
+    pipeline: &str,
+    source_id: &str,
+    sink_id: &str,
+    key: &str,
+    hash: &str,
+    entries: &std::collections::BTreeMap<u64, EntrySummary>,
+) -> Result<(), HeadError> {
+    let mut cur_key = key.to_string();
+    let mut expected_hash = hash.to_string();
+    let mut seen = std::collections::HashSet::new();
+    let mut expected_end: Option<u64> = None;
+    for _ in 0..MAX_CHAIN_WALK {
+        if !seen.insert(cur_key.clone()) {
+            return Err(HeadError::Integrity(
+                "rollup history contains a cycle".into(),
+            ));
+        }
+        let rec = rollup_load(store, &cur_key, &expected_hash)
+            .await
+            .map_err(map_rollup)?;
+        if rec.pipeline != pipeline
+            || rec.source_id != source_id
+            || rec.sink_id != sink_id
+        {
+            return Err(HeadError::Integrity(format!(
+                "rollup {cur_key} identity mismatch"
+            )));
+        }
+        if rec.end_seq < rec.start_seq || rec.start_seq == 0 {
+            return Err(HeadError::Integrity(format!(
+                "rollup {cur_key} has an invalid range [{}, {}]",
+                rec.start_seq, rec.end_seq
+            )));
+        }
+        // Contiguity with the later rollup (this one ends just before it starts).
+        if let Some(end) = expected_end {
+            if rec.end_seq + 1 != end {
+                return Err(HeadError::Integrity(format!(
+                    "rollup {cur_key} end {} not contiguous with later start {}",
+                    rec.end_seq, end
+                )));
+            }
+        }
+        // Boundary entry hashes + end watermark match the retained entries.
+        let start = entries.get(&rec.start_seq).ok_or_else(|| {
+            HeadError::Integrity(format!(
+                "rollup {cur_key} start_seq {} not in retained entries",
+                rec.start_seq
+            ))
+        })?;
+        let end = entries.get(&rec.end_seq).ok_or_else(|| {
+            HeadError::Integrity(format!(
+                "rollup {cur_key} end_seq {} not in retained entries",
+                rec.end_seq
+            ))
+        })?;
+        if start.entry_hash != rec.start_entry_hash
+            || end.entry_hash != rec.end_entry_hash
+        {
+            return Err(HeadError::Integrity(format!(
+                "rollup {cur_key} boundary entry hash mismatch"
+            )));
+        }
+        if end.watermark_hex != rec.watermark_hex {
+            return Err(HeadError::Integrity(format!(
+                "rollup {cur_key} watermark does not match its end entry"
+            )));
+        }
+        // Object digest matches the summarized range's inventory.
+        let mut objs = Vec::new();
+        for seq in rec.start_seq..=rec.end_seq {
+            let e = entries.get(&seq).ok_or_else(|| {
+                HeadError::Integrity(format!(
+                    "rollup {cur_key} range gap at seq {seq}"
+                ))
+            })?;
+            objs.extend(e.objects.iter().cloned());
+        }
+        if rollup_object_digest(&objs) != rec.object_digest
+            || objs.len() as u64 != rec.object_count
+        {
+            return Err(HeadError::Integrity(format!(
+                "rollup {cur_key} object digest/count mismatch"
+            )));
+        }
+        match &rec.prev {
+            None => {
+                if rec.start_seq != 1 {
+                    return Err(HeadError::Integrity(format!(
+                        "first rollup {cur_key} does not start at seq 1"
+                    )));
+                }
+                return Ok(());
+            }
+            Some(PrevRef { key, hash }) => {
+                expected_end = Some(rec.start_seq);
+                expected_hash = hash.clone();
+                cur_key = key.clone();
+            }
+        }
+    }
+    Err(HeadError::Integrity(
+        "rollup history exceeded the maximum walk length".into(),
     ))
 }
 
@@ -541,6 +784,10 @@ pub struct DurableWriter<S: ConditionalStore + ?Sized> {
     /// batches after a crash between the HEAD CAS and the coordinator checkpoint.
     comparator: Arc<dyn CheckpointComparator>,
     state: Mutex<WriterState>,
+    /// The authoritative compaction index built and verified at acquire. GC
+    /// consumes this rather than rescanning objects. (A live writer's own
+    /// compactions after acquire are not reflected here; GC re-acquires.)
+    compaction_index: CompactionIndex,
 }
 
 impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
@@ -570,8 +817,9 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                     let head = Head::parse(&raw)?;
                     // Verify HEAD + the authoritative chain + referenced data
                     // objects BEFORE acquiring, using the same ETag we will CAS
-                    // against (steps 2-3).
-                    verify_chain(
+                    // against (steps 2-3). Also builds the authoritative
+                    // compaction index and verifies the rollup chain.
+                    let compaction_index = verify_chain(
                         store.as_ref(),
                         prefix,
                         pipeline,
@@ -610,6 +858,7 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                                     head: next,
                                     etag: new_etag,
                                 },
+                                compaction_index,
                             ));
                         }
                         PutOutcome::Written { etag: None } => {
@@ -666,6 +915,7 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                                     head: genesis,
                                     etag,
                                 },
+                                CompactionIndex::default(),
                             ));
                         }
                         PutOutcome::Written { etag: None } => {
@@ -692,6 +942,7 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         sink_id: &str,
         comparator: Arc<dyn CheckpointComparator>,
         verified: VerifiedHead,
+        compaction_index: CompactionIndex,
     ) -> Self {
         Self {
             store,
@@ -704,12 +955,18 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                 verified,
                 fenced: None,
             }),
+            compaction_index,
         }
     }
 
     /// Current epoch (test/observability).
     pub async fn epoch(&self) -> u64 {
         self.state.lock().await.verified.epoch
+    }
+
+    /// The authoritative compaction index built at acquire (for GC in 9B).
+    pub fn compaction_index(&self) -> &CompactionIndex {
+        &self.compaction_index
     }
 
     /// Order a proposed watermark against the current HEAD watermark.
@@ -777,6 +1034,8 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
             Ok(())
         } else {
             // Jumped farther: re-verify the whole chain the adopted HEAD selects.
+            // (The rebuilt compaction index is not needed on this mid-publish
+            // path; it is captured at acquire.)
             verify_chain(
                 self.store.as_ref(),
                 &self.prefix,
@@ -787,6 +1046,7 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                 self.comparator.as_ref(),
             )
             .await
+            .map(|_| ())
         }
     }
 
@@ -909,10 +1169,13 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                 head_entry_hash: Some(written.hash.clone()),
                 // Rollup references are preserved unchanged during ordinary
                 // batch publication.
+                // Ordinary publication preserves BOTH rollup references and the
+                // compaction reference untouched.
                 rollup_key: st.verified.head.rollup_key.clone(),
                 rollup_hash: st.verified.head.rollup_hash.clone(),
+                prev_rollup_key: st.verified.head.prev_rollup_key.clone(),
+                prev_rollup_hash: st.verified.head.prev_rollup_hash.clone(),
                 watermark_hex: Some(watermark_hex.clone()),
-                // Ordinary publication preserves the current compaction reference.
                 compaction_key: st.verified.head.compaction_key.clone(),
                 compaction_hash: st.verified.head.compaction_hash.clone(),
             };
@@ -1003,15 +1266,175 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         Err(HeadError::RetriesExhausted(MAX_PUBLISH_ATTEMPTS))
     }
 
-    /// Publish a compaction: replace `originals` (already-durable objects for one
-    /// table) with the immutable `replacement`, WITHOUT touching the source
-    /// watermark, seq, or the acknowledgement chain. Steps: compatibility gate ->
-    /// read/verify originals -> upload the replacement (immutable, create-only) ->
-    /// write the compaction record -> CAS HEAD to set ONLY the compaction
-    /// reference, preserving epoch/seq/entry/watermark/rollup. Serialized through
-    /// the same writer mutex as batch publication. Originals are NOT deleted (the
-    /// record marks them eligible for later GC).
+    /// Production compaction: replace a selection of authoritative `originals`
+    /// (already-durable ack-chain objects for ONE table) with a replacement built
+    /// INTERNALLY from their exact verified bytes by trusted code - callers never
+    /// supply replacement bytes. Verifies every original is authoritative, orders
+    /// them by acknowledgement sequence + per-entry object order, decodes and
+    /// deterministically re-encodes the replacement, then publishes it (immutable
+    /// object + compaction record + HEAD CAS setting only the compaction
+    /// reference). Deletes nothing; marks nothing deletion-eligible (that is 9B).
     pub async fn compact(
+        &self,
+        originals: Vec<ManifestObject>,
+    ) -> Result<(), HeadError> {
+        let first = originals.first().ok_or_else(|| {
+            HeadError::Integrity("no originals to compact".into())
+        })?;
+        let table = first.table.clone();
+        let domain = first.encoding_domain();
+        check_compatible(&table, &domain, &originals)
+            .map_err(map_compaction)?;
+
+        // Order by acknowledgement sequence (and per-entry object order), and
+        // verify every original is an authoritative ack-chain object.
+        let ordered = self.order_originals_by_ack(originals).await?;
+        // Build the replacement from the originals' exact verified bytes.
+        let replacement =
+            self.build_replacement(&table, &domain, &ordered).await?;
+        self.publish_compaction(replacement, ordered).await
+    }
+
+    /// Order `originals` by their position in the authoritative acknowledgement
+    /// chain (sequence, then per-entry object index) and confirm each is an
+    /// ack-chain object with matching content hash. Rejects any original not
+    /// found in the chain (not authoritative / already superseded to a
+    /// non-ack-chain object).
+    async fn order_originals_by_ack(
+        &self,
+        originals: Vec<ManifestObject>,
+    ) -> Result<Vec<ManifestObject>, HeadError> {
+        // Snapshot the current head entry to walk from (brief lock).
+        let (mut cur_key, mut cur_hash) = {
+            let st = self.state.lock().await;
+            match (
+                st.verified.head.head_entry_key.clone(),
+                st.verified.head.head_entry_hash.clone(),
+            ) {
+                (Some(k), Some(h)) => (k, h),
+                _ => {
+                    return Err(HeadError::Integrity(
+                        "cannot compact: HEAD has no entries".into(),
+                    ));
+                }
+            }
+        };
+        // object key -> (seq, index-in-entry, authoritative content_hash).
+        let mut pos: std::collections::HashMap<String, (u64, usize, String)> =
+            std::collections::HashMap::new();
+        for _ in 0..MAX_CHAIN_WALK {
+            let entry = load_entry(self.store.as_ref(), &cur_key).await?;
+            if entry.entry_hash() != cur_hash {
+                return Err(HeadError::Integrity(format!(
+                    "compaction walk: entry {cur_key} hash mismatch"
+                )));
+            }
+            for (idx, o) in entry.objects.iter().enumerate() {
+                pos.entry(o.key.clone()).or_insert((
+                    entry.seq,
+                    idx,
+                    o.content_hash.clone(),
+                ));
+            }
+            match &entry.prev {
+                Some(PrevRef { key, hash }) => {
+                    cur_key = key.clone();
+                    cur_hash = hash.clone();
+                }
+                None => break,
+            }
+        }
+
+        let mut keyed: Vec<((u64, usize), ManifestObject)> =
+            Vec::with_capacity(originals.len());
+        for o in originals {
+            match pos.get(&o.key) {
+                Some((seq, idx, chash)) => {
+                    if *chash != o.content_hash {
+                        return Err(HeadError::Integrity(format!(
+                            "compaction original {} content hash does not match \
+                             the acknowledgement chain",
+                            o.key
+                        )));
+                    }
+                    keyed.push(((*seq, *idx), o));
+                }
+                None => {
+                    return Err(HeadError::Integrity(format!(
+                        "compaction original {} is not an authoritative \
+                         acknowledgement-chain object",
+                        o.key
+                    )));
+                }
+            }
+        }
+        keyed.sort_by_key(|(pos, _)| *pos);
+        Ok(keyed.into_iter().map(|(_, o)| o).collect())
+    }
+
+    /// Build the replacement object from the originals' exact verified bytes,
+    /// deterministically. 9A supports JSONL (canonical lines concatenated in ack
+    /// order - a deterministic re-encode); Parquet internal compaction needs the
+    /// Arrow schema and lands later.
+    async fn build_replacement(
+        &self,
+        table: &str,
+        domain: &super::keys::EncodingDomain,
+        ordered: &[ManifestObject],
+    ) -> Result<TableObject, HeadError> {
+        if domain.format != "jsonl" {
+            return Err(HeadError::Integrity(format!(
+                "internal compaction supports only jsonl in 9A, not {}",
+                domain.format
+            )));
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        for o in ordered {
+            let (raw, _) = self
+                .store
+                .get_with_etag(&object_store::path::Path::from(o.key.clone()))
+                .await
+                .map_err(|e| HeadError::Store(e.to_string()))?
+                .ok_or_else(|| {
+                    HeadError::Integrity(format!(
+                        "original {} missing while building replacement",
+                        o.key
+                    ))
+                })?;
+            if content_hash(&raw, domain) != o.content_hash {
+                return Err(HeadError::Integrity(format!(
+                    "original {} content changed while building replacement",
+                    o.key
+                )));
+            }
+            bytes.extend_from_slice(&raw);
+        }
+        Ok(TableObject {
+            table: table.to_string(),
+            bytes: bytes::Bytes::from(bytes),
+            domain: domain.clone(),
+            ext: "jsonl",
+        })
+    }
+
+    /// Test-only: publish a compaction with a caller-supplied replacement. NOT
+    /// available in production (GC never trusts an arbitrarily-supplied
+    /// replacement); production uses [`DurableWriter::compact`].
+    #[cfg(test)]
+    pub async fn compact_with_replacement(
+        &self,
+        replacement: TableObject,
+        originals: Vec<ManifestObject>,
+    ) -> Result<(), HeadError> {
+        self.publish_compaction(replacement, originals).await
+    }
+
+    /// Shared compaction publication protocol: compatibility gate -> read/verify
+    /// originals -> upload the replacement (immutable, create-only) -> write the
+    /// compaction record -> CAS HEAD to set ONLY the compaction reference,
+    /// preserving epoch/seq/entry/watermark/rollup. Serialized through the writer
+    /// mutex. Originals are NOT deleted.
+    async fn publish_compaction(
         &self,
         replacement: TableObject,
         originals: Vec<ManifestObject>,
@@ -1194,6 +1617,192 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         }
         Err(HeadError::RetriesExhausted(MAX_PUBLISH_ATTEMPTS))
     }
+
+    /// Publish a rollup summarizing the contiguous manifest range `(prev rollup
+    /// end .. current HEAD seq]` of the already-verified chain. Writes an
+    /// immutable rollup record chained to the current rollup, then CASes HEAD to
+    /// set the rollup + previous-rollup references, preserving epoch, seq, entry,
+    /// watermark and compaction references. Serialized through the writer mutex;
+    /// reversible (summarizes retained entries, deletes nothing).
+    pub async fn rollup(&self) -> Result<(), HeadError> {
+        let mut st = self.state.lock().await;
+        if let Some(observed) = st.fenced {
+            return Err(HeadError::Fenced {
+                our: st.verified.epoch,
+                observed,
+            });
+        }
+        let end_seq = st.verified.head.seq;
+        if end_seq == 0 {
+            return Err(HeadError::Integrity(
+                "nothing to roll up (genesis HEAD)".into(),
+            ));
+        }
+        let end_entry_hash =
+            st.verified.head.head_entry_hash.clone().ok_or_else(|| {
+                HeadError::Integrity("HEAD has no entry to roll up".into())
+            })?;
+        let watermark_hex =
+            st.verified.head.watermark_hex.clone().ok_or_else(|| {
+                HeadError::Integrity("HEAD has no watermark".into())
+            })?;
+
+        // Start just after the current rollup's end (or at genesis seq 1).
+        let start_seq =
+            match (&st.verified.head.rollup_key, &st.verified.head.rollup_hash)
+            {
+                (Some(k), Some(h)) => {
+                    let cur = rollup_load(self.store.as_ref(), k, h)
+                        .await
+                        .map_err(map_rollup)?;
+                    cur.end_seq + 1
+                }
+                _ => 1,
+            };
+        if start_seq > end_seq {
+            return Err(HeadError::Integrity(
+                "rollup range is empty (already summarized to HEAD)".into(),
+            ));
+        }
+
+        // Walk the verified chain from HEAD back to start_seq, collecting the
+        // authoritative object inventory and the start boundary hash.
+        let mut cur_key =
+            st.verified.head.head_entry_key.clone().ok_or_else(|| {
+                HeadError::Integrity("HEAD has no entry key".into())
+            })?;
+        let mut cur_hash = end_entry_hash.clone();
+        let mut objects: Vec<ManifestObject> = Vec::new();
+        let mut start_entry_hash: Option<String> = None;
+        for _ in 0..MAX_CHAIN_WALK {
+            let entry = load_entry(self.store.as_ref(), &cur_key).await?;
+            if entry.entry_hash() != cur_hash {
+                return Err(HeadError::Integrity(format!(
+                    "rollup walk: entry {cur_key} hash mismatch"
+                )));
+            }
+            objects.extend(entry.objects.iter().cloned());
+            if entry.seq == start_seq {
+                start_entry_hash = Some(entry.entry_hash());
+                break;
+            }
+            match &entry.prev {
+                Some(PrevRef { key, hash }) => {
+                    cur_key = key.clone();
+                    cur_hash = hash.clone();
+                }
+                None => {
+                    return Err(HeadError::Integrity(
+                        "rollup walk reached genesis before start_seq".into(),
+                    ));
+                }
+            }
+        }
+        let start_entry_hash = start_entry_hash.ok_or_else(|| {
+            HeadError::Integrity(
+                "rollup walk exceeded max length before start_seq".into(),
+            )
+        })?;
+
+        let prev =
+            match (&st.verified.head.rollup_key, &st.verified.head.rollup_hash)
+            {
+                (Some(k), Some(h)) => Some(PrevRef {
+                    key: k.clone(),
+                    hash: h.clone(),
+                }),
+                _ => None,
+            };
+        let record = RollupRecord {
+            version: super::rollup::ROLLUP_RECORD_VERSION,
+            pipeline: self.pipeline.clone(),
+            source_id: self.source_id.clone(),
+            sink_id: self.sink_id.clone(),
+            start_seq,
+            end_seq,
+            start_entry_hash,
+            end_entry_hash,
+            watermark_hex,
+            object_count: objects.len() as u64,
+            object_digest: rollup_object_digest(&objects),
+            prev,
+        };
+        let written = rollup_write(self.store.as_ref(), &self.prefix, &record)
+            .await
+            .map_err(map_rollup)?;
+
+        // CAS HEAD: set the rollup + previous-rollup references, preserving
+        // everything else. Reconcile a lost response only if HEAD references our
+        // exact rollup.
+        let hkey = head_key(&self.prefix, &self.pipeline);
+        for _ in 0..MAX_PUBLISH_ATTEMPTS {
+            let next = Head {
+                rollup_key: Some(written.key.clone()),
+                rollup_hash: Some(written.hash.clone()),
+                prev_rollup_key: st.verified.head.rollup_key.clone(),
+                prev_rollup_hash: st.verified.head.rollup_hash.clone(),
+                ..st.verified.head.clone()
+            };
+            match self
+                .store
+                .cas_put(&hkey, next.canonical_bytes(), &st.verified.etag)
+                .await
+            {
+                Ok(PutOutcome::Written {
+                    etag: Some(new_etag),
+                }) => {
+                    st.verified.head = next;
+                    st.verified.etag = new_etag;
+                    return Ok(());
+                }
+                Ok(PutOutcome::Written { etag: None }) => {
+                    return Err(HeadError::Store(
+                        "HEAD CAS returned no ETag".into(),
+                    ));
+                }
+                Ok(PutOutcome::AlreadyExists) => unreachable!("cas_put"),
+                Ok(PutOutcome::Conflict) | Err(_) => {
+                    let (raw, etag) = match self
+                        .store
+                        .get_with_etag(&hkey)
+                        .await
+                        .map_err(|e| HeadError::Store(e.to_string()))?
+                    {
+                        Some((raw, Some(etag))) => (raw, etag),
+                        _ => {
+                            return Err(HeadError::Integrity(
+                                "HEAD missing/eTagless during rollup".into(),
+                            ));
+                        }
+                    };
+                    let cur = Head::parse(&raw)?;
+                    if cur.rollup_hash.as_deref() == Some(written.hash.as_str())
+                    {
+                        st.verified.head = cur;
+                        st.verified.etag = etag;
+                        return Ok(());
+                    }
+                    if cur.epoch > st.verified.epoch {
+                        st.fenced = Some(cur.epoch);
+                        return Err(HeadError::Fenced {
+                            our: st.verified.epoch,
+                            observed: cur.epoch,
+                        });
+                    }
+                    if cur.epoch < st.verified.epoch {
+                        return Err(HeadError::Integrity(format!(
+                            "HEAD epoch regressed during rollup: {} < {}",
+                            cur.epoch, st.verified.epoch
+                        )));
+                    }
+                    st.verified.head = cur;
+                    st.verified.etag = etag;
+                    continue;
+                }
+            }
+        }
+        Err(HeadError::RetriesExhausted(MAX_PUBLISH_ATTEMPTS))
+    }
 }
 
 fn map_compaction(e: CompactionError) -> HeadError {
@@ -1202,6 +1811,13 @@ fn map_compaction(e: CompactionError) -> HeadError {
             HeadError::Integrity(e.to_string())
         }
         CompactionError::Store(s) => HeadError::Store(s),
+    }
+}
+
+fn map_rollup(e: RollupError) -> HeadError {
+    match e {
+        RollupError::Integrity(_) => HeadError::Integrity(e.to_string()),
+        RollupError::Store(s) => HeadError::Store(s),
     }
 }
 
@@ -1435,6 +2051,8 @@ mod tests {
             head_entry_hash: Some("abc".into()),
             rollup_key: None,
             rollup_hash: None,
+            prev_rollup_key: None,
+            prev_rollup_hash: None,
             watermark_hex: Some("00".into()),
             compaction_key: None,
             compaction_hash: None,
@@ -1841,10 +2459,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_rejects_head_referencing_rollup() {
+    async fn recovery_falls_back_when_current_rollup_damaged() {
+        // A HEAD referencing a rollup we cannot validate is an alarm, not a
+        // failure: rollups are advisory in 9A, so recovery falls back to the
+        // retained entry chain (ground truth) and succeeds.
         let (inner, cs) = build_chain().await;
         let mut head = head_of(&cs).await;
-        // Claim a rollup that we cannot validate.
         head.rollup_key = Some("pfx/pipe/_manifest/rollups/x.json".into());
         head.rollup_hash = Some("deadbeef".into());
         inner
@@ -1854,8 +2474,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let err = expect_err(recover(cs).await);
-        assert!(matches!(err, HeadError::Integrity(_)), "got {err:?}");
+        recover(cs)
+            .await
+            .expect("recovery falls back to entry chain");
     }
 
     #[tokio::test]
@@ -1958,6 +2579,8 @@ mod tests {
             head_entry_hash: Some(w_last.hash),
             rollup_key: None,
             rollup_hash: None,
+            prev_rollup_key: None,
+            prev_rollup_hash: None,
             watermark_hex: Some(wm_hex(0, 5)),
             compaction_key: None,
             compaction_hash: None,
@@ -1977,5 +2600,231 @@ mod tests {
             st.verified.head.watermark_hex.as_deref(),
             Some(wm_hex(0, 6).as_str())
         );
+    }
+
+    // ── Rollup chain verification (verify_rollup_from) ──────────────────────
+    //
+    // These exercise the pure detection logic directly against a synthetic
+    // `entries` map + hand-written rollup records, so each rejection path
+    // (identity, range, contiguity, boundary hash, watermark, object digest,
+    // first-starts-at-1, cycle) is asserted in isolation.
+
+    use super::super::rollup::{
+        ROLLUP_RECORD_VERSION, RollupRecord as RR, WrittenRollup,
+    };
+    use std::collections::BTreeMap;
+
+    fn mobj(key: &str) -> ManifestObject {
+        ManifestObject {
+            key: key.to_string(),
+            table: "orders".into(),
+            content_hash: format!("h-{key}"),
+            byte_len: 1,
+            format: "jsonl".into(),
+            format_version: 1,
+            schema_id: "s1".into(),
+            compression: "none".into(),
+            partition_spec: "table".into(),
+            partition_version: 1,
+        }
+    }
+
+    /// Three retained entries, seq 1..=3, one object each.
+    fn synthetic_entries() -> BTreeMap<u64, EntrySummary> {
+        let mut m = BTreeMap::new();
+        for seq in 1u64..=3 {
+            m.insert(
+                seq,
+                EntrySummary {
+                    entry_hash: format!("eh-{seq}"),
+                    watermark_hex: wm_hex(0, seq),
+                    objects: vec![mobj(&format!("o{seq}"))],
+                },
+            );
+        }
+        m
+    }
+
+    /// Build a rollup record matching `entries` over [start, end], with `prev`.
+    fn valid_rollup(
+        entries: &BTreeMap<u64, EntrySummary>,
+        start: u64,
+        end: u64,
+        prev: Option<PrevRef>,
+    ) -> RR {
+        let mut objs = Vec::new();
+        for seq in start..=end {
+            objs.extend(entries[&seq].objects.iter().cloned());
+        }
+        RR {
+            version: ROLLUP_RECORD_VERSION,
+            pipeline: "pipe".into(),
+            source_id: "src".into(),
+            sink_id: "sink".into(),
+            start_seq: start,
+            end_seq: end,
+            start_entry_hash: entries[&start].entry_hash.clone(),
+            end_entry_hash: entries[&end].entry_hash.clone(),
+            watermark_hex: entries[&end].watermark_hex.clone(),
+            object_count: objs.len() as u64,
+            object_digest: rollup_object_digest(&objs),
+            prev,
+        }
+    }
+
+    async fn put_rollup(
+        cs: &ObjectStoreConditional,
+        rec: &RR,
+    ) -> WrittenRollup {
+        rollup_write(cs, "pfx", rec).await.unwrap()
+    }
+
+    async fn check_rollup(
+        cs: &ObjectStoreConditional,
+        w: &WrittenRollup,
+        entries: &BTreeMap<u64, EntrySummary>,
+    ) -> Result<(), HeadError> {
+        verify_rollup_from(cs, "pipe", "src", "sink", &w.key, &w.hash, entries)
+            .await
+    }
+
+    #[tokio::test]
+    async fn rollup_verifies_valid_single() {
+        let (_i, cs) = cond_with_inner();
+        let e = synthetic_entries();
+        let w = put_rollup(&cs, &valid_rollup(&e, 1, 3, None)).await;
+        check_rollup(&cs, &w, &e)
+            .await
+            .expect("valid rollup verifies");
+    }
+
+    #[tokio::test]
+    async fn rollup_verifies_valid_chain_of_two() {
+        let (_i, cs) = cond_with_inner();
+        let e = synthetic_entries();
+        let first = put_rollup(&cs, &valid_rollup(&e, 1, 1, None)).await;
+        let second = put_rollup(
+            &cs,
+            &valid_rollup(
+                &e,
+                2,
+                3,
+                Some(PrevRef {
+                    key: first.key.clone(),
+                    hash: first.hash.clone(),
+                }),
+            ),
+        )
+        .await;
+        check_rollup(&cs, &second, &e)
+            .await
+            .expect("chain verifies");
+    }
+
+    #[tokio::test]
+    async fn rollup_rejected_wrong_object_digest() {
+        let (_i, cs) = cond_with_inner();
+        let e = synthetic_entries();
+        let mut rec = valid_rollup(&e, 1, 3, None);
+        rec.object_digest = "deadbeef".into();
+        let w = put_rollup(&cs, &rec).await;
+        assert!(check_rollup(&cs, &w, &e).await.is_err(), "bad digest");
+    }
+
+    #[tokio::test]
+    async fn rollup_rejected_boundary_hash_mismatch() {
+        let (_i, cs) = cond_with_inner();
+        let e = synthetic_entries();
+        let mut rec = valid_rollup(&e, 1, 3, None);
+        rec.end_entry_hash = "eh-wrong".into();
+        let w = put_rollup(&cs, &rec).await;
+        assert!(check_rollup(&cs, &w, &e).await.is_err(), "bad boundary");
+    }
+
+    #[tokio::test]
+    async fn rollup_rejected_watermark_mismatch() {
+        let (_i, cs) = cond_with_inner();
+        let e = synthetic_entries();
+        let mut rec = valid_rollup(&e, 1, 3, None);
+        rec.watermark_hex = wm_hex(0, 99);
+        let w = put_rollup(&cs, &rec).await;
+        assert!(check_rollup(&cs, &w, &e).await.is_err(), "bad watermark");
+    }
+
+    #[tokio::test]
+    async fn rollup_rejected_non_contiguous_chain_gap() {
+        // A gap: first rollup ends at seq 1, second starts at seq 3 (skips 2).
+        let (_i, cs) = cond_with_inner();
+        let e = synthetic_entries();
+        let first = put_rollup(&cs, &valid_rollup(&e, 1, 1, None)).await;
+        let second = put_rollup(
+            &cs,
+            &valid_rollup(
+                &e,
+                3,
+                3,
+                Some(PrevRef {
+                    key: first.key.clone(),
+                    hash: first.hash.clone(),
+                }),
+            ),
+        )
+        .await;
+        let err = check_rollup(&cs, &second, &e).await.unwrap_err();
+        assert!(
+            matches!(err, HeadError::Integrity(ref m) if m.contains("contiguous")),
+            "expected contiguity error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollup_rejected_overlapping_chain() {
+        // An overlap: first ends at seq 2, second starts at seq 2 (double count).
+        let (_i, cs) = cond_with_inner();
+        let e = synthetic_entries();
+        let first = put_rollup(&cs, &valid_rollup(&e, 1, 2, None)).await;
+        let second = put_rollup(
+            &cs,
+            &valid_rollup(
+                &e,
+                2,
+                3,
+                Some(PrevRef {
+                    key: first.key.clone(),
+                    hash: first.hash.clone(),
+                }),
+            ),
+        )
+        .await;
+        let err = check_rollup(&cs, &second, &e).await.unwrap_err();
+        assert!(
+            matches!(err, HeadError::Integrity(ref m) if m.contains("contiguous")),
+            "expected contiguity error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollup_rejected_first_not_starting_at_one() {
+        let (_i, cs) = cond_with_inner();
+        let e = synthetic_entries();
+        // A lone rollup with no prev must start at seq 1.
+        let w = put_rollup(&cs, &valid_rollup(&e, 2, 3, None)).await;
+        let err = check_rollup(&cs, &w, &e).await.unwrap_err();
+        assert!(
+            matches!(err, HeadError::Integrity(ref m) if m.contains("start at seq 1")),
+            "expected first-starts-at-1 error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollup_rejected_missing_start_entry() {
+        // A rollup whose start_seq is not among the retained entries (e.g. the
+        // chain the rollup claims to summarize does not match reality).
+        let (_i, cs) = cond_with_inner();
+        let mut e = synthetic_entries();
+        let w = put_rollup(&cs, &valid_rollup(&e, 1, 3, None)).await;
+        e.remove(&2); // range now has a gap the rollup claims to cover
+        let err = check_rollup(&cs, &w, &e).await.unwrap_err();
+        assert!(matches!(err, HeadError::Integrity(_)), "got {err:?}");
     }
 }

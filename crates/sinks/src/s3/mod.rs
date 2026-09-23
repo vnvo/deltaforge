@@ -23,6 +23,7 @@ mod manifest;
 mod object_writer;
 mod parquet_writer;
 mod rolling;
+mod rollup;
 mod router;
 mod sink;
 mod store_cond;

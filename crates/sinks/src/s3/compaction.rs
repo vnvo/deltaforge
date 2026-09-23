@@ -47,6 +47,43 @@ pub struct CompactionRecord {
     pub prev: Option<PrevRef>,
 }
 
+/// The authoritative compaction index, built at recovery from the records
+/// reachable from HEAD and verified against the acknowledgement chain. Maps each
+/// superseded original object key to its single active replacement. GC (9B)
+/// consumes this verified index rather than rescanning arbitrary objects.
+#[derive(Debug, Clone, Default)]
+pub struct CompactionIndex {
+    by_original: std::collections::HashMap<String, ManifestObject>,
+}
+
+impl CompactionIndex {
+    /// Record that `original_key` is superseded by `replacement`. Returns the
+    /// previous mapping if the original was already claimed (a conflict).
+    pub(crate) fn insert(
+        &mut self,
+        original_key: String,
+        replacement: ManifestObject,
+    ) -> Option<ManifestObject> {
+        self.by_original.insert(original_key, replacement)
+    }
+
+    /// The active replacement for an original object key, if it was compacted.
+    pub fn active_replacement(
+        &self,
+        original_key: &str,
+    ) -> Option<&ManifestObject> {
+        self.by_original.get(original_key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_original.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_original.is_empty()
+    }
+}
+
 impl CompactionRecord {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut c = self.clone();
