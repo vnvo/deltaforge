@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Crash-durable S3 acknowledgements (`durability: durable_v2`)** — the S3 sink now makes the acknowledgement point the durability point. A batch is acknowledged to the source only after its immutable, content-addressed objects and its append-only, hash-chained manifest entry are written and a `_manifest/HEAD` compare-and-swap (CAS) commits; the successful CAS is both the acknowledgement and the writer fence. A crash at any point leaves either a fully committed batch or an uncommitted orphan that reconciliation removes, so acknowledged data is never lost across a crash (the previous rolling-file path could lose acknowledged data before a roll). Includes verified recovery from HEAD + the rollup chain + the retained entry tail (halts past the fallback horizon rather than advancing silently); epoch fencing with source-aware checkpoint ordering that keeps HEAD monotonic and fails closed on incomparable checkpoints; cumulative hash-linked rollups with a bound inventory index; asynchronous compaction decoupled from the ack path with an independent row-level equivalence proof bound into a HEAD-published record; two owner-fenced, staged GC actors (manifest-entry expiry via durable marks, compacted-original deletion authorized only by a HEAD-reachable equivalence-true record) plus reachability-driven orphan reconciliation with a grace period; a startup capability probe that fails closed when the provider does not honor conditional writes; and byte-reproducible Parquet/JSON Lines encoders. Validated with a crash-boundary fault-injection matrix and a live MinIO/S3 integration suite. Operations guide at [docs/src/sinks/s3-durable-acks.md](docs/src/sinks/s3-durable-acks.md).
+
+### Changed
+
+- **S3 durability now defaults to `durable_v2`** — an unspecified `durability` on an S3 sink now resolves to the crash-durable path instead of the legacy rolling-file path. **Deployments that do not set `durability` switch to durable acknowledgements on upgrade.** To keep the previous (non-durable) behavior, set `durability: legacy_rolling` explicitly; that mode logs a prominent startup warning and emits the metric `deltaforge_sink_s3_non_durable_ack_mode = 1` (durable sinks report `0`), so a sink acknowledging non-durably can be alerted on. See [docs/src/sinks/s3-durable-acks.md](docs/src/sinks/s3-durable-acks.md) for rollout and rollback.
+
 ## [v0.1.0-beta.10] - 2026-09-21
 
 ### Added
