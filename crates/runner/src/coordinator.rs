@@ -60,6 +60,11 @@ struct BuildingBatch {
     /// re-derived) into the delivery context. It is the single watermark
     /// authority. `None` for non-durable / no-boundary batches.
     boundary: Option<deltaforge_core::SourceBoundary>,
+    /// Whether the approaching-cap warning has already fired for the currently-open
+    /// transaction (per dimension), so it is emitted at most once per transaction.
+    /// Reset when the open region closes at a boundary.
+    approaching_events_warned: bool,
+    approaching_bytes_warned: bool,
 }
 
 impl BuildingBatch {
@@ -71,7 +76,16 @@ impl BuildingBatch {
             committed_len: 0,
             committed_bytes: 0,
             boundary: None,
+            approaching_events_warned: false,
+            approaching_bytes_warned: false,
         }
+    }
+
+    /// Reset the per-open-transaction approaching-cap warning flags. Called when the
+    /// open region closes at a boundary, so the next transaction warns afresh.
+    fn reset_approaching_warnings(&mut self) {
+        self.approaching_events_warned = false;
+        self.approaching_bytes_warned = false;
     }
 
     /// Number of events in the currently-open (uncommitted) transaction.
@@ -90,11 +104,54 @@ impl BuildingBatch {
     }
 }
 
-/// A single source transaction exceeded the configured accumulation caps.
+/// Which per-transaction cap a source transaction breached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OversizedLimit {
+    Events,
+    Bytes,
+    Both,
+}
+
+impl std::fmt::Display for OversizedLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            OversizedLimit::Events => "events",
+            OversizedLimit::Bytes => "bytes",
+            OversizedLimit::Both => "events+bytes",
+        })
+    }
+}
+
+/// A single source transaction exceeded a configured accumulation cap. Internal
+/// (no tx id); the run loop turns this into an [`OversizedTxError`] with full
+/// context.
 #[derive(Debug, Clone, Copy)]
 struct OversizedTx {
     events: usize,
     bytes: usize,
+    exceeded: OversizedLimit,
+}
+
+/// Fatal, typed error for `oversized_tx: Fail`: a source transaction exceeded its
+/// configured per-transaction cap. Carries structured context - the transaction id,
+/// observed events/bytes, the configured event/byte limits, and which limit was
+/// exceeded - so callers match on fields instead of parsing the message. The
+/// transaction is replayed whole on restart.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error(
+    "source transaction {tx_id} exceeds its size cap ({exceeded}): observed \
+     {observed_events} events / {observed_bytes} bytes against limits \
+     {max_tx_events} events / {max_tx_bytes} bytes; oversized_tx policy is Fail - \
+     reduce the transaction at the source or raise max_tx_events/max_tx_bytes, then \
+     restart to replay the whole transaction"
+)]
+pub struct OversizedTxError {
+    pub tx_id: String,
+    pub observed_events: usize,
+    pub observed_bytes: usize,
+    pub max_tx_events: usize,
+    pub max_tx_bytes: usize,
+    pub exceeded: OversizedLimit,
 }
 
 /// Append one transactional event to the open transaction, enforcing the hard
@@ -111,8 +168,20 @@ fn push_tx_event(
     b.raw.push(ev);
     let events = b.open_events();
     let bytes = b.open_bytes();
-    if events > max_tx_events || bytes > max_tx_bytes {
-        return Err(OversizedTx { events, bytes });
+    let over_events = events > max_tx_events;
+    let over_bytes = bytes > max_tx_bytes;
+    if over_events || over_bytes {
+        let exceeded = match (over_events, over_bytes) {
+            (true, true) => OversizedLimit::Both,
+            (true, false) => OversizedLimit::Events,
+            (false, true) => OversizedLimit::Bytes,
+            (false, false) => unreachable!(),
+        };
+        return Err(OversizedTx {
+            events,
+            bytes,
+            exceeded,
+        });
     }
     Ok(())
 }
@@ -137,6 +206,7 @@ fn close_tx(
     }
     b.committed_len = b.raw.len();
     b.committed_bytes = b.bytes;
+    b.reset_approaching_warnings();
     had_events
 }
 
@@ -151,6 +221,7 @@ fn close_boundary(
     b.boundary = Some(boundary);
     b.committed_len = b.raw.len();
     b.committed_bytes = b.bytes;
+    b.reset_approaching_warnings();
 }
 
 /// Record that a standalone (non-transactional) event is its own boundary. Its
@@ -161,6 +232,7 @@ fn close_boundary(
 fn commit_standalone(b: &mut BuildingBatch) {
     b.committed_len = b.raw.len();
     b.committed_bytes = b.bytes;
+    b.reset_approaching_warnings();
     if let Some(bd) = b.raw.last().and_then(|e| e.boundary.clone()) {
         b.boundary = Some(bd);
     }
@@ -275,12 +347,16 @@ fn check_and_split(
 /// crosses 80% of the event cap. Fires on the exact count so it logs once per
 /// oversized-approaching transaction rather than on every subsequent event.
 fn maybe_warn_approaching(
-    b: &BuildingBatch,
+    b: &mut BuildingBatch,
     max_tx_events: usize,
+    max_tx_bytes: usize,
     pipeline: &str,
 ) {
-    let threshold = (max_tx_events.saturating_mul(8) / 10).max(1);
-    if b.open_events() == threshold {
+    // Warn (once per open transaction, per dimension) when the open transaction
+    // reaches 80% of a cap, so operators see it coming before the fail-closed cut.
+    let events_threshold = (max_tx_events.saturating_mul(8) / 10).max(1);
+    if !b.approaching_events_warned && b.open_events() >= events_threshold {
+        b.approaching_events_warned = true;
         warn!(
             pipeline = %pipeline,
             open_events = b.open_events(),
@@ -290,6 +366,24 @@ fn maybe_warn_approaching(
         counter!(
             "deltaforge_tx_approaching_limit_total",
             "pipeline" => pipeline.to_string(),
+            "limit" => "events",
+        )
+        .increment(1);
+    }
+
+    let bytes_threshold = (max_tx_bytes.saturating_mul(8) / 10).max(1);
+    if !b.approaching_bytes_warned && b.open_bytes() >= bytes_threshold {
+        b.approaching_bytes_warned = true;
+        warn!(
+            pipeline = %pipeline,
+            open_bytes = b.open_bytes(),
+            max_tx_bytes,
+            "source transaction approaching the byte cap"
+        );
+        counter!(
+            "deltaforge_tx_approaching_limit_total",
+            "pipeline" => pipeline.to_string(),
+            "limit" => "bytes",
         )
         .increment(1);
     }
@@ -341,6 +435,11 @@ struct TxTracker {
 }
 
 impl TxTracker {
+    /// The currently open transaction id, if any.
+    fn active(&self) -> Option<&str> {
+        self.active.as_deref()
+    }
+
     /// A `TxBegin` opens a transaction. Only one may be open at a time.
     fn begin(&mut self, tx_id: &str) -> Result<(), TxProtocolError> {
         if let Some(active) = &self.active {
@@ -1052,16 +1151,24 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                                     "pipeline" => coord.pipeline_name.to_string(),
                                                 )
                                                 .increment(1);
-                                                return Err(anyhow::anyhow!(
-                                                    "source transaction exceeds limits \
-                                                     ({} events, {} bytes); oversized_tx \
-                                                     policy is Fail - the transaction is \
-                                                     replayed whole on restart",
-                                                    o.events, o.bytes,
-                                                ));
+                                                return Err(OversizedTxError {
+                                                    tx_id: tx_tracker
+                                                        .active()
+                                                        .unwrap_or("<unknown>")
+                                                        .to_string(),
+                                                    observed_events: o.events,
+                                                    observed_bytes: o.bytes,
+                                                    max_tx_events,
+                                                    max_tx_bytes,
+                                                    exceeded: o.exceeded,
+                                                }
+                                                .into());
                                             }
                                             maybe_warn_approaching(
-                                                &b, max_tx_events, &coord.pipeline_name,
+                                                &mut b,
+                                                max_tx_events,
+                                                max_tx_bytes,
+                                                &coord.pipeline_name,
                                             );
                                         } else {
                                             // Standalone/snapshot event: its own
@@ -1972,12 +2079,39 @@ mod tests {
             .run(rx, cancel, pause_rx)
             .await
             .expect_err("oversized transaction must fail the pipeline");
-        assert!(
-            err.to_string().contains("exceeds limits"),
-            "unexpected error: {err}"
-        );
+        // Assert on the concrete typed error and its structured fields, not a
+        // formatted string.
+        let oversized = err
+            .downcast_ref::<OversizedTxError>()
+            .unwrap_or_else(|| panic!("expected OversizedTxError, got: {err}"));
+        assert_eq!(oversized.tx_id, "gtid:1");
+        assert_eq!(oversized.observed_events, 4);
+        assert_eq!(oversized.max_tx_events, 3);
+        assert_eq!(oversized.exceeded, OversizedLimit::Events);
         let cp = store.get_raw("src::sink::kafka").await.unwrap();
         assert!(cp.is_none(), "oversized tx must not advance the checkpoint");
+    }
+
+    /// The approaching-cap warning fires once per dimension per open transaction:
+    /// the byte-cap warning (G3) mirrors the event-cap one, and neither re-fires.
+    #[test]
+    fn approaching_warning_fires_once_per_dimension() {
+        let mut b = BuildingBatch::with_capacity(4);
+        // Simulate an open transaction at 90% of a 1000-byte cap, well under the
+        // event cap. open_bytes = bytes - committed_bytes (both start committed=0).
+        b.bytes = 900;
+        maybe_warn_approaching(&mut b, 1_000_000, 1000, "p");
+        assert!(b.approaching_bytes_warned, "byte-cap warning should fire");
+        assert!(
+            !b.approaching_events_warned,
+            "event-cap warning should not fire below its threshold"
+        );
+        // Idempotent: a second call does not reset or re-fire.
+        maybe_warn_approaching(&mut b, 1_000_000, 1000, "p");
+        assert!(b.approaching_bytes_warned);
+        // Closing the open region rearms the warnings for the next transaction.
+        b.reset_approaching_warnings();
+        assert!(!b.approaching_bytes_warned);
     }
 
     /// Shutdown mid-transaction discards the uncommitted suffix: only whole
