@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::head::Head;
-use super::manifest::ManifestObject;
 
 /// Retained rollup generations behind HEAD. Ships as 1 (current + previous
 /// fallback); structurally configurable but only the one-generation case is
@@ -193,14 +192,8 @@ pub struct GcRun {
 }
 
 pub const GC_MARK_VERSION: u16 = 1;
-pub const DATA_GC_AUTH_VERSION: u16 = 1;
-/// Identifies the equivalence proof recorded in a data-GC authorization, so a later
-/// owner knows exactly what was proven and how.
-pub const EQUIVALENCE_ALGO: &str = "jsonl-rowwise";
-pub const EQUIVALENCE_VERSION: u16 = 1;
 
 const MARK_DOMAIN: &[u8] = b"deltaforge/s3/gc-entry-mark/v1";
-const DATA_AUTH_DOMAIN: &[u8] = b"deltaforge/s3/gc-data-auth/v1";
 
 fn hash_domain(domain: &[u8], canonical: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -217,6 +210,10 @@ fn hash_domain(domain: &[u8], canonical: &[u8]) -> String {
 /// over the complete canonical contents; the expiry actor re-reads, re-parses, and
 /// re-verifies it, and derives the canonical entry key itself - it never trusts a
 /// caller-supplied path.
+///
+/// Data-GC needs no analogous object: the equivalence proof is bound into the
+/// compaction record and made authoritative by that record's HEAD CAS, so a
+/// HEAD-reachable compaction record is itself the durable data-deletion authorization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GcMark {
     pub version: u16,
@@ -225,16 +222,11 @@ pub struct GcMark {
     pub sink_id: String,
     pub seq: u64,
     /// The canonical manifest-entry key, derived internally at authorization from
-    /// (prefix, pipeline, seq, entry_hash). Re-derived + checked at expiry.
+    /// (prefix, pipeline, seq, entry_hash). Re-derived + checked at expiry. Coverage
+    /// is re-proven at expiry against the LIVE rollups (monotonic), so the mark records
+    /// only the entry identity, not transient rollup/inventory references.
     pub entry_key: String,
     pub entry_hash: String,
-    pub rollup_key: String,
-    pub rollup_hash: String,
-    pub prev_rollup_key: String,
-    pub prev_rollup_hash: String,
-    pub inventory_record_hash: String,
-    pub prev_inventory_record_hash: String,
-    pub horizon: u64,
 }
 
 impl GcMark {
@@ -243,37 +235,6 @@ impl GcMark {
     }
     pub fn auth_hash(&self) -> String {
         hash_domain(MARK_DOMAIN, &self.canonical_bytes())
-    }
-}
-
-/// An IMMUTABLE, self-authenticating authorization to delete the compacted originals
-/// of ONE compaction record (9B.2, data-side). Persisted BEFORE any deletion so the
-/// authorization survives a real process crash: after restart a new owner verifies
-/// it, re-proves HEAD reachability + the surviving replacement, and resumes - without
-/// re-running equivalence (which is impossible once originals start disappearing).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DataGcAuth {
-    pub version: u16,
-    pub pipeline: String,
-    pub source_id: String,
-    pub sink_id: String,
-    pub compaction_record_hash: String,
-    pub replacement: ManifestObject,
-    /// The exact ordered original inventory this authorization covers.
-    pub originals: Vec<ManifestObject>,
-    pub equivalence_algo: String,
-    pub equivalence_version: u16,
-    pub equivalence_result: bool,
-    /// HEAD's compaction-chain root under which equivalence + membership were proven.
-    pub compaction_root: String,
-}
-
-impl DataGcAuth {
-    pub fn canonical_bytes(&self) -> Vec<u8> {
-        serde_json::to_vec(self).expect("data gc auth serializes")
-    }
-    pub fn auth_hash(&self) -> String {
-        hash_domain(DATA_AUTH_DOMAIN, &self.canonical_bytes())
     }
 }
 
@@ -294,43 +255,13 @@ pub fn mark_key(
     )
 }
 
-/// Key for a data-GC authorization: content-addressed by its `auth_hash` under
-/// `.../_manifest/gc/data/<auth_hash>.json`.
-pub fn data_auth_key(
-    prefix: &str,
-    pipeline: &str,
-    auth_hash: &str,
-) -> object_store::path::Path {
-    object_store::path::Path::from_iter(
-        prefix
-            .split('/')
-            .filter(|p| !p.is_empty())
-            .chain([pipeline, "_manifest", "gc", "data"])
-            .map(str::to_string)
-            .chain([format!("{auth_hash}.json")]),
-    )
-}
-
-/// Directory prefixes for listing durable GC authorizations during execution.
+/// Directory prefix for listing durable entry-expiry marks during execution.
 pub fn marks_prefix(prefix: &str, pipeline: &str) -> object_store::path::Path {
     object_store::path::Path::from_iter(
         prefix
             .split('/')
             .filter(|p| !p.is_empty())
             .chain([pipeline, "_manifest", "gc", "marks"])
-            .map(str::to_string),
-    )
-}
-
-pub fn data_auth_prefix(
-    prefix: &str,
-    pipeline: &str,
-) -> object_store::path::Path {
-    object_store::path::Path::from_iter(
-        prefix
-            .split('/')
-            .filter(|p| !p.is_empty())
-            .chain([pipeline, "_manifest", "gc", "data"])
             .map(str::to_string),
     )
 }

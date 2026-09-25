@@ -24,12 +24,11 @@ use deltaforge_core::{CheckpointComparator, CheckpointOrder};
 
 use super::batch_upload::TableObject;
 use super::compaction::{
-    CompactionRecord, write_record as write_compaction_record,
+    CompactionRecord, EQUIVALENCE_ALGO, EQUIVALENCE_VERSION,
+    write_record as write_compaction_record,
 };
 use super::gc::{
-    DATA_GC_AUTH_VERSION, DataGcAuth, EQUIVALENCE_ALGO, EQUIVALENCE_VERSION,
-    GC_MARK_VERSION, GcConfig, GcMark, data_auth_key, entry_seq_from_key,
-    mark_key,
+    GC_MARK_VERSION, GcConfig, GcMark, entry_seq_from_key, mark_key,
 };
 use super::head::{DurableWriter, Head, HeadError, head_key_for};
 use super::keys::EncodingDomain;
@@ -2219,12 +2218,24 @@ async fn mark_count(inner: &ObjectStoreConditional) -> usize {
         .len()
 }
 
-async fn data_auth_count(inner: &ObjectStoreConditional) -> usize {
-    inner
-        .list(&Path::from(format!("{PFX}/{PIPE}/_manifest/gc/data")))
+/// Publish 3 JSONL batches + 2 rollups but NO compaction (so there is nothing data-
+/// GC-eligible unless a compaction is added).
+async fn setup_no_compaction(
+    inner: &Arc<ObjectStoreConditional>,
+) -> (Arc<FaultStore>, DurableWriter<FaultStore>) {
+    let (fs, w) = genesis(inner, vec![]).await;
+    w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)
         .await
-        .unwrap()
-        .len()
+        .unwrap();
+    w.publish(&wm(2), vec![tobj_jsonl("orders", &[2])], 1)
+        .await
+        .unwrap();
+    w.rollup().await.unwrap();
+    w.publish(&wm(3), vec![tobj_jsonl("orders", &[3])], 1)
+        .await
+        .unwrap();
+    w.rollup().await.unwrap();
+    (fs, w)
 }
 
 /// Two cumulative generations over real JSONL objects (gen1 [1,2], gen2 [1,3]) plus a
@@ -2251,21 +2262,15 @@ async fn setup_gc_ready(
     (fs, w)
 }
 
-// ── Data-side (authorize + delete) ────────────────────────────────────────────
+// ── Data-side: the HEAD-reachable equivalence-proven compaction record is the
+//    authorization (no separate object). ───────────────────────────────────────
 
 #[tokio::test]
-async fn data_gc_authorize_then_delete_preserves_replacement_and_recovers() {
+async fn data_gc_deletes_originals_preserves_replacement_and_recovers() {
     let inner = inmem();
     let (_fs, w) = setup_gc_ready(&inner, vec![]).await;
     let plan = w.plan_gc(far_future(), no_window()).await.unwrap();
     assert_eq!(plan.data_originals_eligible().len(), 3);
-
-    let a = w.gc_authorize_data().await.unwrap();
-    assert_eq!(
-        a.marked, 1,
-        "one authorization for the one compaction record"
-    );
-    assert_eq!(data_auth_count(&inner).await, 1);
 
     let run = w.gc_delete_originals().await.unwrap();
     assert_eq!(run.deleted, 3);
@@ -2284,8 +2289,6 @@ async fn data_gc_authorize_then_delete_preserves_replacement_and_recovers() {
 async fn data_gc_keeps_original_when_replacement_missing() {
     let inner = inmem();
     let (_fs, w) = setup_gc_ready(&inner, vec![]).await;
-    w.gc_authorize_data().await.unwrap();
-    // Out-of-band removal of the surviving replacement.
     let compacted: Vec<Path> = inner
         .list(&Path::from(format!("{PFX}/{PIPE}")))
         .await
@@ -2295,12 +2298,10 @@ async fn data_gc_keeps_original_when_replacement_missing() {
         .collect();
     inner.delete(&compacted[0]).await.unwrap();
 
-    let run = w.gc_delete_originals().await.unwrap();
-    assert!(
-        run.stopped.is_some(),
-        "must stop when the replacement is gone"
-    );
-    assert_eq!(run.deleted, 0);
+    // With the replacement (surviving copy) gone, verification fails closed and NO
+    // original is deleted - the last durable copy is never lost.
+    let err = expect_err(w.gc_delete_originals().await);
+    assert!(err.is_fatal(), "missing replacement fails closed: {err:?}");
     assert_eq!(data_count(&inner).await, 3, "no original deleted");
 }
 
@@ -2312,7 +2313,6 @@ async fn data_gc_crash_before_delete_then_resume() {
         vec![tr(Op::OriginalDelete, 0, Action::HangBefore)],
     )
     .await;
-    w.gc_authorize_data().await.unwrap();
     cancel_at_hang(&fs, async { w.gc_delete_originals().await.map(|_| ()) })
         .await;
     assert_eq!(
@@ -2333,20 +2333,18 @@ async fn data_gc_crash_before_delete_then_resume() {
 
 #[tokio::test]
 async fn data_gc_survives_process_restart_after_partial_deletion() {
-    // Blocker 3: a real crash loses the in-memory plan. The durable authorization,
-    // re-verified by a NEW owner after an epoch bump, lets deletion resume.
+    // A real crash loses any in-memory state. The HEAD-reachable, equivalence-proven
+    // compaction record IS the durable authorization, so a new owner (higher epoch)
+    // resumes from it - no re-run of equivalence.
     let inner = inmem();
     let (_fs, w) = setup_gc_ready(
         &inner,
         vec![tr(Op::OriginalDelete, 0, Action::ApplyThenErr)],
     )
     .await;
-    w.gc_authorize_data().await.unwrap();
     let run = w.gc_delete_originals().await.unwrap();
     assert!(run.stopped.is_some(), "lost response stops the first pass");
 
-    // "Process restart": drop the writer (and any in-memory plan), reacquire a new
-    // epoch, and resume from the durable authorization alone.
     drop(w);
     let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
     let w2 = acquire(Arc::clone(&clean)).await.unwrap();
@@ -2370,7 +2368,6 @@ async fn data_gc_survives_process_restart_after_partial_deletion() {
 async fn data_gc_fenced_before_deleting() {
     let inner = inmem();
     let (_fs, a) = setup_gc_ready(&inner, vec![]).await;
-    a.gc_authorize_data().await.unwrap();
     let _b = acquire(Arc::new(FaultStore::new(Arc::clone(&inner), vec![])))
         .await
         .unwrap(); // epoch 2 fences A
@@ -2384,53 +2381,65 @@ async fn data_gc_fenced_before_deleting() {
 }
 
 #[tokio::test]
-async fn data_gc_forged_authorization_is_rejected() {
-    // A forged data-GC authorization that names a real record but swaps in a
-    // non-original target (HEAD, a rollup, the replacement) must be rejected by the
-    // live record-content match; nothing is deleted.
+async fn non_equivalent_compaction_originals_are_retained() {
+    // A compaction whose replacement is NOT row-equivalent to its originals is
+    // published with equivalence_result == false (the proof is bound at publication),
+    // so its originals are never GC-eligible.
     let inner = inmem();
-    let (_fs, w) = setup_gc_ready(&inner, vec![]).await;
-    let head = read_head(&inner).await.unwrap();
-    // Take the real compaction record, then forge originals to include HEAD's key.
-    let (craw, _) = inner
-        .get_with_etag(&Path::from(head.compaction_key.clone().unwrap()))
+    let (_fs, w) = genesis(&inner, vec![]).await;
+    w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)
         .await
-        .unwrap()
         .unwrap();
-    let rec: CompactionRecord = serde_json::from_slice(&craw).unwrap();
-    let forged_target = ManifestObject {
-        key: head.head_entry_key.clone().unwrap(),
-        ..rec.originals[0].clone()
-    };
-    let forged = DataGcAuth {
-        version: DATA_GC_AUTH_VERSION,
+    w.publish(&wm(2), vec![tobj_jsonl("orders", &[2])], 1)
+        .await
+        .unwrap();
+    w.publish(&wm(3), vec![tobj_jsonl("orders", &[3])], 1)
+        .await
+        .unwrap();
+    let originals = all_manifest_objects(&inner).await;
+    // Replacement drops a row -> not equivalent.
+    w.compact_with_replacement(tobj_jsonl("orders", &[1, 2]), originals)
+        .await
+        .unwrap();
+
+    let plan = w.plan_gc(far_future(), no_window()).await.unwrap();
+    assert!(
+        plan.data_originals_eligible().is_empty(),
+        "non-equivalent compaction yields no eligible originals"
+    );
+    let run = w.gc_delete_originals().await.unwrap();
+    assert_eq!(run.deleted, 0);
+    assert_eq!(data_count(&inner).await, 3, "originals retained");
+}
+
+#[tokio::test]
+async fn forged_compaction_record_not_head_reachable_is_ignored() {
+    // A canonical, correctly content-addressed compaction record (equivalence_result
+    // true) that is NOT referenced from HEAD is a harmless orphan: data GC only ever
+    // consumes HEAD-reachable records, so nothing is deleted.
+    let inner = inmem();
+    let (_fs, w) = setup_no_compaction(&inner).await;
+    let originals = all_manifest_objects(&inner).await;
+    let forged = CompactionRecord {
+        version: super::compaction::COMPACTION_RECORD_VERSION,
         pipeline: PIPE.into(),
         source_id: "src".into(),
         sink_id: "sink".into(),
-        compaction_record_hash: head.compaction_hash.clone().unwrap(),
-        replacement: rec.replacement.clone(),
-        originals: vec![forged_target],
+        table: "orders".into(),
+        replacement: originals[0].clone(),
+        originals: originals.clone(),
         equivalence_algo: EQUIVALENCE_ALGO.into(),
         equivalence_version: EQUIVALENCE_VERSION,
         equivalence_result: true,
-        compaction_root: head.compaction_hash.clone().unwrap(),
+        prev: None,
     };
-    let key = data_auth_key(PFX, PIPE, &forged.auth_hash());
-    inner
-        .put_if_absent(&key, Bytes::from(forged.canonical_bytes()))
+    // Write it durably but NEVER reference it from HEAD.
+    write_compaction_record(&*inner, PFX, &forged)
         .await
         .unwrap();
 
     let run = w.gc_delete_originals().await.unwrap();
-    assert!(run.stopped.is_some(), "forged authorization must halt");
-    // HEAD entry object still present (never deleted).
-    assert!(
-        inner
-            .get_with_etag(&Path::from(head.head_entry_key.unwrap()))
-            .await
-            .unwrap()
-            .is_some()
-    );
+    assert_eq!(run.deleted, 0, "unreferenced forged record is ignored");
     assert_eq!(data_count(&inner).await, 3, "no original deleted");
 }
 
@@ -2572,13 +2581,6 @@ async fn manifest_gc_forged_mark_with_non_canonical_key_halts() {
         seq: 1,
         entry_key: head.rollup_key.clone().unwrap(), // NOT the canonical entry key
         entry_hash: "eh".into(),
-        rollup_key: head.rollup_key.clone().unwrap(),
-        rollup_hash: head.rollup_hash.clone().unwrap(),
-        prev_rollup_key: head.prev_rollup_key.clone().unwrap(),
-        prev_rollup_hash: head.prev_rollup_hash.clone().unwrap(),
-        inventory_record_hash: "i".into(),
-        prev_inventory_record_hash: "p".into(),
-        horizon: 2,
     };
     let key = mark_key(PFX, PIPE, &forged.entry_hash);
     inner
@@ -2627,6 +2629,9 @@ async fn compaction_original_metadata_mismatch_fails_recovery() {
         table: "orders".into(),
         replacement: originals[0].clone(),
         originals: tampered,
+        equivalence_algo: EQUIVALENCE_ALGO.into(),
+        equivalence_version: EQUIVALENCE_VERSION,
+        equivalence_result: true,
         prev: None,
     };
     let wr = write_compaction_record(&*inner, PFX, &rec).await.unwrap();
@@ -2658,7 +2663,6 @@ async fn compaction_original_metadata_mismatch_fails_recovery() {
 async fn combined_data_and_entry_gc_then_recovery_preserves_events() {
     let inner = inmem();
     let (_fs, w) = setup_gc_ready(&inner, vec![]).await;
-    w.gc_authorize_data().await.unwrap();
     let d = w.gc_delete_originals().await.unwrap();
     assert_eq!(d.deleted, 3);
     w.gc_mark_entries(far_future(), no_window()).await.unwrap();

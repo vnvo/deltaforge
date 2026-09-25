@@ -30,10 +30,9 @@ use super::compaction::{
 };
 use super::equivalence::verify_jsonl;
 use super::gc::{
-    Alarm, DATA_GC_AUTH_VERSION, DataGcAuth, EQUIVALENCE_ALGO,
-    EQUIVALENCE_VERSION, EntryRef, GC_MARK_VERSION, GcConfig, GcMark, GcPlan,
-    GcRun, HeadBinding, InventoryRef, OriginalRef, SkipReason, data_auth_key,
-    data_auth_prefix, horizon_seq, mark_key, marks_prefix,
+    Alarm, EntryRef, GC_MARK_VERSION, GcConfig, GcMark, GcPlan, GcRun,
+    HeadBinding, InventoryRef, OriginalRef, SkipReason, horizon_seq, mark_key,
+    marks_prefix,
 };
 use super::keys::content_hash;
 use super::manifest::{
@@ -705,6 +704,9 @@ struct VerifiedCompaction {
     record_hash: String,
     replacement: ManifestObject,
     originals: Vec<ManifestObject>,
+    /// The equivalence proof bound into the (HEAD-reachable) record at publication.
+    /// Only `true` records authorize deleting their originals.
+    equivalence_result: bool,
 }
 
 /// The authoritative compaction result: the original -> replacement index (for
@@ -795,6 +797,7 @@ async fn build_verified_compactions<S: ConditionalStore + ?Sized>(
             record_hash: expected_hash.clone(),
             replacement: rec.replacement.clone(),
             originals: rec.originals.clone(),
+            equivalence_result: rec.equivalence_result,
         });
         match &rec.prev {
             None => return Ok(out),
@@ -1969,6 +1972,16 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
             }),
             _ => None,
         };
+        // Bind the independent equivalence proof into the record BEFORE publication:
+        // the row-wise validator decodes both sides from stored bytes and compares. A
+        // non-equivalent (or non-JSONL/unsupported) replacement records `false` and
+        // its originals never become GC-eligible. Because the record is then published
+        // through the HEAD CAS below, a HEAD-reachable `true` record is authoritative
+        // provenance for data GC - a forged standalone authorization cannot exist.
+        let equivalence_result =
+            verify_jsonl(self.store.as_ref(), &originals, &replacement_obj)
+                .await
+                .is_ok();
         let record = CompactionRecord {
             version: super::compaction::COMPACTION_RECORD_VERSION,
             pipeline: self.pipeline.clone(),
@@ -1977,6 +1990,9 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
             table,
             replacement: replacement_obj,
             originals,
+            equivalence_algo: super::compaction::EQUIVALENCE_ALGO.to_string(),
+            equivalence_version: super::compaction::EQUIVALENCE_VERSION,
+            equivalence_result,
             prev,
         };
         let written = write_record(self.store.as_ref(), &self.prefix, &record)
@@ -2525,39 +2541,33 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         }
 
         // ---- Data-side eligibility (from the SHARED verified compaction result) ----
+        // The equivalence proof was bound into the HEAD-published record at
+        // compaction; here we only read its authoritative result.
         for rec in &state.compactions.records {
-            match verify_jsonl(
-                self.store.as_ref(),
-                &rec.originals,
-                &rec.replacement,
-            )
-            .await
-            {
-                Ok(()) => {
-                    for o in &rec.originals {
-                        data_originals_eligible.push(OriginalRef {
-                            key: o.key.clone(),
-                            content_hash: o.content_hash.clone(),
-                            replacement_key: rec.replacement.key.clone(),
-                            compaction_record_hash: rec.record_hash.clone(),
-                        });
-                    }
-                }
-                Err(e) => {
-                    for o in &rec.originals {
-                        skipped.push(SkipReason {
-                            key: o.key.clone(),
-                            reason: format!("equivalence not proven: {e}"),
-                        });
-                    }
-                    alarms.push(Alarm {
-                        message: format!(
-                            "compaction record {} replacement not \
-                             equivalence-proven: {e}",
-                            rec.record_hash
-                        ),
+            if rec.equivalence_result {
+                for o in &rec.originals {
+                    data_originals_eligible.push(OriginalRef {
+                        key: o.key.clone(),
+                        content_hash: o.content_hash.clone(),
+                        replacement_key: rec.replacement.key.clone(),
+                        compaction_record_hash: rec.record_hash.clone(),
                     });
                 }
+            } else {
+                for o in &rec.originals {
+                    skipped.push(SkipReason {
+                        key: o.key.clone(),
+                        reason: "compaction record not equivalence-proven"
+                            .into(),
+                    });
+                }
+                alarms.push(Alarm {
+                    message: format!(
+                        "compaction record {} is not equivalence-proven; its \
+                         originals are not GC-eligible",
+                        rec.record_hash
+                    ),
+                });
             }
         }
 
@@ -2755,33 +2765,22 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                     seq: *seq,
                     entry_key,
                     entry_hash: summ.entry_hash.clone(),
-                    rollup_key: rk.clone(),
-                    rollup_hash: rh.clone(),
-                    prev_rollup_key: pk.clone(),
-                    prev_rollup_hash: ph.clone(),
-                    inventory_record_hash: cur.inventory_record_hash.clone(),
-                    prev_inventory_record_hash: prev
-                        .inventory_record_hash
-                        .clone(),
-                    horizon,
                 });
             }
         }
         Ok(marks)
     }
 
-    /// Recompute, from live authoritative state, the data-GC authorizations currently
-    /// justified: each HEAD-reachable, verified compaction record whose replacement is
-    /// equivalence-proven to its exact ordered originals. Equivalence is proven HERE
-    /// (all originals still present) and recorded durably, because it cannot be re-run
-    /// once deletion begins.
-    async fn authoritative_data_auths(
+    /// Recompute, from LIVE authoritative state, the compaction records whose
+    /// originals are deletable: HEAD-reachable, fully verified (identity, domain,
+    /// exact ack-inventory metadata, no conflicts), and carrying a bound
+    /// `equivalence_result == true` proof. Because the proof rides in the record that
+    /// was published through the HEAD CAS, a HEAD-reachable `true` record is
+    /// authoritative provenance - a forged standalone authorization cannot exist.
+    async fn authoritative_deletable_records(
         &self,
         head: &Head,
-    ) -> Result<Vec<DataGcAuth>, HeadError> {
-        let Some(root) = head.compaction_hash.clone() else {
-            return Ok(vec![]);
-        };
+    ) -> Result<Vec<VerifiedCompaction>, HeadError> {
         let state = verify_state(
             self.store.as_ref(),
             &self.pipeline,
@@ -2791,77 +2790,12 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
             self.comparator.as_ref(),
         )
         .await?;
-        let mut auths = Vec::new();
-        for rec in &state.compactions.records {
-            verify_jsonl(self.store.as_ref(), &rec.originals, &rec.replacement)
-                .await
-                .map_err(|e| HeadError::Integrity(e.to_string()))?;
-            auths.push(DataGcAuth {
-                version: DATA_GC_AUTH_VERSION,
-                pipeline: self.pipeline.clone(),
-                source_id: self.source_id.clone(),
-                sink_id: self.sink_id.clone(),
-                compaction_record_hash: rec.record_hash.clone(),
-                replacement: rec.replacement.clone(),
-                originals: rec.originals.clone(),
-                equivalence_algo: EQUIVALENCE_ALGO.to_string(),
-                equivalence_version: EQUIVALENCE_VERSION,
-                equivalence_result: true,
-                compaction_root: root.clone(),
-            });
-        }
-        Ok(auths)
-    }
-
-    /// Confirm the compaction record named by a data authorization is reachable from
-    /// the LIVE HEAD compaction chain and that the live record's replacement + exact
-    /// ordered originals equal the authorization's. Returns `Ok(false)` when the record
-    /// is not reachable (stale authorization); an integrity error (caller stops) when
-    /// it is reachable but its contents diverge (a tampered authorization).
-    async fn reachable_compaction_record(
-        &self,
-        head: &Head,
-        auth: &DataGcAuth,
-    ) -> Result<bool, HeadError> {
-        let (Some(mut ck), Some(mut chash)) =
-            (head.compaction_key.clone(), head.compaction_hash.clone())
-        else {
-            return Ok(false);
-        };
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..MAX_CHAIN_WALK {
-            if !seen.insert(ck.clone()) {
-                return Err(HeadError::Integrity(
-                    "compaction history cycle during GC".into(),
-                ));
-            }
-            let rec = load_record(self.store.as_ref(), &ck, &chash)
-                .await
-                .map_err(map_compaction)?;
-            if chash == auth.compaction_record_hash {
-                if rec.replacement != auth.replacement
-                    || rec.originals != auth.originals
-                {
-                    return Err(HeadError::Integrity(
-                        "data-GC authorization does not match the live \
-                         compaction record"
-                            .into(),
-                    ));
-                }
-                return Ok(true);
-            }
-            match &rec.prev {
-                None => return Ok(false),
-                Some(PrevRef { key, hash }) => {
-                    ck = key.clone();
-                    chash = hash.clone();
-                }
-            }
-        }
-        Err(HeadError::Integrity(
-            "compaction history exceeded the maximum walk length during GC"
-                .into(),
-        ))
+        Ok(state
+            .compactions
+            .records
+            .into_iter()
+            .filter(|r| r.equivalence_result)
+            .collect())
     }
 
     /// GC actor A (manifest-side, step 1 of 2): AUTHORIZE entry expiry by writing
@@ -3034,84 +2968,16 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         Ok(run)
     }
 
-    /// GC actor B (data-side, step 1 of 2): AUTHORIZE original deletion by writing an
-    /// immutable, content-addressed [`DataGcAuth`] for every HEAD-reachable compaction
-    /// record whose replacement is equivalence-proven to its exact originals. Persisted
-    /// BEFORE any deletion so a later owner can resume without re-running equivalence.
-    /// Owner-fenced; create-only + byte-identical on `AlreadyExists`.
-    pub async fn gc_authorize_data(&self) -> Result<GcRun, HeadError> {
-        let mut st = self.state.lock().await;
-        if let Some(observed) = st.fenced {
-            return Err(HeadError::Fenced {
-                our: st.verified.epoch,
-                observed,
-            });
-        }
-        let our_epoch = st.verified.epoch;
-        let head = match self.gc_live_head(our_epoch).await {
-            Ok(h) => h,
-            Err(e) => {
-                if let HeadError::Fenced { observed, .. } = &e {
-                    st.fenced = Some(*observed);
-                }
-                return Err(e);
-            }
-        };
-        let auths = self.authoritative_data_auths(&head).await?;
-        let mut run = GcRun::default();
-        for a in auths {
-            let key =
-                data_auth_key(&self.prefix, &self.pipeline, &a.auth_hash());
-            let body = bytes::Bytes::from(a.canonical_bytes());
-            match self
-                .store
-                .put_if_absent(&key, body.clone())
-                .await
-                .map_err(|e| HeadError::Store(e.to_string()))?
-            {
-                PutOutcome::Written { .. } => run.marked += 1,
-                PutOutcome::AlreadyExists => {
-                    match self
-                        .store
-                        .get_with_etag(&key)
-                        .await
-                        .map_err(|e| HeadError::Store(e.to_string()))?
-                    {
-                        Some((existing, _))
-                            if existing.as_ref() == body.as_ref() =>
-                        {
-                            run.marked += 1
-                        }
-                        _ => {
-                            run.stopped = Some(
-                                "existing data-GC authorization is not \
-                                 byte-identical"
-                                    .into(),
-                            );
-                            break;
-                        }
-                    }
-                }
-                PutOutcome::Conflict => {
-                    run.stopped = Some(
-                        "unexpected conflict writing data-GC authorization"
-                            .into(),
-                    );
-                    break;
-                }
-            }
-        }
-        Ok(run)
-    }
-
-    /// GC actor B (data-side, step 2 of 2): DELETE compacted originals authorized by a
-    /// durable [`DataGcAuth`]. Consumes the durable authorizations (not an in-memory
-    /// plan), so it resumes after a crash / re-acquisition. Owner-fenced; per
-    /// authorization it re-reads HEAD (fencing first), re-reads + byte-verifies + parses
-    /// the authorization, proves the compaction record is HEAD-reachable with matching
-    /// contents, re-verifies the surviving REPLACEMENT is durable + content-verified,
-    /// then deletes the originals. Deletes originals only; delete is idempotent; stops
-    /// on any stale/fenced/integrity/ambiguous condition so the last copy is never lost.
+    /// GC actor B (data-side): DELETE compacted originals superseded by a HEAD-reachable,
+    /// equivalence-proven compaction record. The authorization is the record itself,
+    /// made authoritative by its HEAD CAS at publication - there is no separate
+    /// authorization object to forge, and an unreferenced compaction record is a
+    /// harmless orphan (never HEAD-reachable, so never consumed). Owner-fenced; consumes
+    /// only durable HEAD-reachable records, so it resumes after a crash / re-acquisition.
+    /// Per record it re-reads HEAD (fencing first) and re-verifies the surviving
+    /// REPLACEMENT is durable + content-verified before deleting, so the last copy is
+    /// never lost. Deletes originals only; delete is idempotent; stops on any
+    /// stale/fenced/integrity/ambiguous condition.
     pub async fn gc_delete_originals(&self) -> Result<GcRun, HeadError> {
         let mut st = self.state.lock().await;
         if let Some(observed) = st.fenced {
@@ -3121,77 +2987,41 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
             });
         }
         let our_epoch = st.verified.epoch;
-        let keys = self
-            .store
-            .list(&data_auth_prefix(&self.prefix, &self.pipeline))
-            .await
-            .map_err(|e| HeadError::Store(e.to_string()))?;
+        let head0 = match self.gc_live_head(our_epoch).await {
+            Ok(h) => h,
+            Err(e) => {
+                if let HeadError::Fenced { observed, .. } = &e {
+                    st.fenced = Some(*observed);
+                }
+                return Err(e);
+            }
+        };
+        let records = self.authoritative_deletable_records(&head0).await?;
         let mut run = GcRun::default();
-        for akey in keys {
-            let head = match self.gc_live_head(our_epoch).await {
-                Ok(h) => h,
+        for rec in &records {
+            // Per-unit fencing: a higher epoch that appeared mid-run stops us. GC
+            // eligibility is monotonic, so a record deletable at head0 stays deletable
+            // at the same epoch; a bump fences.
+            match self.gc_live_head(our_epoch).await {
+                Ok(_) => {}
                 Err(e) => {
                     if let HeadError::Fenced { observed, .. } = &e {
                         st.fenced = Some(*observed);
                     }
                     return Err(e);
                 }
-            };
-            let raw = match self
-                .store
-                .get_with_etag(&akey)
-                .await
-                .map_err(|e| HeadError::Store(e.to_string()))?
-            {
-                Some((raw, _)) => raw,
-                None => continue,
-            };
-            let auth: DataGcAuth = match serde_json::from_slice(&raw) {
-                Ok(a) => a,
-                Err(_) => {
-                    run.stopped =
-                        Some(format!("malformed data-GC auth at {akey}"));
-                    break;
-                }
-            };
-            if auth.canonical_bytes() != raw.as_ref()
-                || auth.version != DATA_GC_AUTH_VERSION
-                || auth.pipeline != self.pipeline
-                || auth.source_id != self.source_id
-                || auth.sink_id != self.sink_id
-                || !auth.equivalence_result
-                || auth.equivalence_algo != EQUIVALENCE_ALGO
-                || auth.equivalence_version != EQUIVALENCE_VERSION
-            {
-                run.stopped =
-                    Some(format!("data-GC auth at {akey} failed verification"));
-                break;
-            }
-            match self.reachable_compaction_record(&head, &auth).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    run.skipped.push(SkipReason {
-                        key: akey.to_string(),
-                        reason: "compaction record not HEAD-reachable".into(),
-                    });
-                    continue;
-                }
-                Err(err) => {
-                    run.stopped = Some(format!("integrity: {err}"));
-                    break;
-                }
             }
             // The surviving replacement must be durable + content-verified before any
-            // original is removed.
+            // original is removed (never remove the last durable copy).
             if let Err(err) =
-                verify_data_object(self.store.as_ref(), &auth.replacement).await
+                verify_data_object(self.store.as_ref(), &rec.replacement).await
             {
                 run.stopped =
                     Some(format!("replacement not durable, refusing: {err}"));
                 break;
             }
             let mut ambiguous = None;
-            for o in &auth.originals {
+            for o in &rec.originals {
                 match self
                     .store
                     .delete(&object_store::path::Path::from(o.key.clone()))

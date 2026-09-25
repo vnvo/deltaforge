@@ -24,8 +24,15 @@ use super::store_cond::{ConditionalStore, PutOutcome};
 
 // v2: embedded ManifestObjects now carry the full encoding domain (compression
 // codec + partition spec/version). Clean bump; durable v2 has not shipped.
-pub const COMPACTION_RECORD_VERSION: u16 = 2;
+/// Bumped to 3: the independent equivalence proof is now bound INTO the record and
+/// published through HEAD, so a HEAD-reachable record is the authoritative data-GC
+/// authorization (content addressing alone proves integrity, not provenance).
+pub const COMPACTION_RECORD_VERSION: u16 = 3;
 const RECORD_HASH_DOMAIN: &[u8] = b"deltaforge/s3/compaction-record/v1";
+
+/// Identifies the independent equivalence proof recorded on a compaction record.
+pub const EQUIVALENCE_ALGO: &str = "jsonl-rowwise";
+pub const EQUIVALENCE_VERSION: u16 = 1;
 
 /// An immutable record mapping the original object keys/hashes for one table to
 /// the replacement object. `prev` chains the compaction history (absent for the
@@ -41,8 +48,16 @@ pub struct CompactionRecord {
     /// The compacted object that supersedes `originals`.
     pub replacement: ManifestObject,
     /// The superseded objects (canonically sorted). Eligible for later GC once
-    /// the replacement is proven authoritative.
+    /// the replacement is proven authoritative AND equivalence-proven here.
     pub originals: Vec<ManifestObject>,
+    /// The independent equivalence proof, computed at publication (before the HEAD
+    /// CAS) by the row-wise validator that decodes both sides and compares. Only a
+    /// HEAD-reachable record with `equivalence_result == true` authorizes deleting
+    /// its originals; a non-equivalent replacement is published with `false` and its
+    /// originals are never GC-eligible.
+    pub equivalence_algo: String,
+    pub equivalence_version: u16,
+    pub equivalence_result: bool,
     /// Previous compaction record in the history (None = first).
     pub prev: Option<PrevRef>,
 }
@@ -409,6 +424,9 @@ mod tests {
                 r
             },
             originals: order,
+            equivalence_algo: EQUIVALENCE_ALGO.into(),
+            equivalence_version: EQUIVALENCE_VERSION,
+            equivalence_result: true,
             prev: None,
         };
         let _ = &dom;
