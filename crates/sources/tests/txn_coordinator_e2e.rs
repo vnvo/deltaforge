@@ -2,7 +2,7 @@
 //!
 //! These run the *real* coordinator over a *real* CDC source (MySQL / Postgres)
 //! and prove the two end-to-end invariants that coordinator unit tests cannot:
-//!   1. A multi-row source transaction is delivered to the sink intact — as a
+//!   1. A multi-row source transaction is delivered to the sink intact - as a
 //!      single batch, never split.
 //!   2. After a restart the source resumes from the coordinator's *committed*
 //!      checkpoint (the commit boundary), so already-committed rows are not
@@ -164,6 +164,27 @@ impl RunningPipeline {
         store: Arc<dyn CheckpointStore>,
         source_id: &str,
     ) -> Self {
+        // Large soft limits so a small multi-row tx is never split by size; a short
+        // timer flushes it once the source goes idle.
+        let cfg = BatchConfig {
+            max_events: Some(100_000),
+            max_bytes: Some(1 << 30),
+            max_ms: Some(100),
+            respect_source_tx: Some(true),
+            max_inflight: Some(1),
+            ..BatchConfig::default()
+        };
+        Self::start_with_batch_config(source, store, source_id, cfg).await
+    }
+
+    /// Like [`start`], but with an explicit [`BatchConfig`] - used to drive small
+    /// soft limits that make a mid-transaction split deterministic if one occurs.
+    async fn start_with_batch_config<S: Source>(
+        source: S,
+        store: Arc<dyn CheckpointStore>,
+        source_id: &str,
+        cfg: BatchConfig,
+    ) -> Self {
         let sink = RecordingSink::new("rec");
         let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
         let cp_key = format!("{source_id}::sink::rec");
@@ -173,16 +194,7 @@ impl RunningPipeline {
 
         let coord = Coordinator::builder("acc")
             .sinks(sinks)
-            .batch_config(Some(BatchConfig {
-                // Large soft limits so a small multi-row tx is never split by
-                // size; a short timer flushes it once the source goes idle.
-                max_events: Some(100_000),
-                max_bytes: Some(1 << 30),
-                max_ms: Some(100),
-                respect_source_tx: Some(true),
-                max_inflight: Some(1),
-                ..BatchConfig::default()
-            }))
+            .batch_config(Some(cfg))
             .commit_fn("rec", commit)
             .process_fn(batch_processor)
             .build();
@@ -466,6 +478,86 @@ async fn postgres_tx_intact_and_resume_from_commit() -> Result<()> {
     );
 
     test_common::pg_cleanup_repl(&client, "pub_txc", "slot_txc").await;
+    test_common::pg_drop_db(&db).await;
+    Ok(())
+}
+
+/// A PostgreSQL transactional logical message emitted *inside* a transaction must
+/// not split it: the surrounding rows are delivered as one intact batch. With a
+/// small soft limit, an unstamped (standalone) message would deterministically
+/// flush mid-transaction and split it - provider-level proof for the fix that
+/// stamps transactional logical messages with the active xid.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn postgres_transactional_message_does_not_split_tx() -> Result<()> {
+    let (db, client) = test_common::pg_setup("txcmsg").await?;
+    client
+        .execute("CREATE TABLE orders (id INT PRIMARY KEY, sku TEXT)", &[])
+        .await?;
+    client
+        .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
+        .await?;
+    client
+        .execute(
+            &format!("GRANT SELECT ON orders TO {}", test_common::PG_CDC_USER),
+            &[],
+        )
+        .await?;
+    test_common::pg_create_pub_slot(
+        &client,
+        "pub_txcm",
+        "slot_txcm",
+        &["orders"],
+    )
+    .await?;
+
+    let store: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+
+    // Small soft limit: were the message treated as a standalone boundary, it would
+    // flush mid-transaction (a deterministic split); with the fix the whole tx is
+    // one batch regardless.
+    let cfg = BatchConfig {
+        max_events: Some(2),
+        max_bytes: Some(1 << 30),
+        max_ms: Some(100),
+        respect_source_tx: Some(true),
+        max_inflight: Some(1),
+        ..BatchConfig::default()
+    };
+
+    let batches = {
+        let mut pipe = RunningPipeline::start_with_batch_config(
+            pg_source("txcm", &db, "slot_txcm", "pub_txcm").await,
+            store.clone(),
+            "txcm",
+            cfg,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Row 1, then a TRANSACTIONAL logical message, then rows 2 and 3 - all in one
+        // transaction. pgoutput streams the message (the client sends messages 'true').
+        client
+            .batch_execute(
+                "BEGIN; \
+                 INSERT INTO orders VALUES (1,'a'); \
+                 SELECT pg_logical_emit_message(true, 'audit', '{\"note\":\"m\"}'); \
+                 INSERT INTO orders VALUES (2,'b'),(3,'c'); \
+                 COMMIT;",
+            )
+            .await?;
+
+        pipe.wait_for_rows(3, Duration::from_secs(15)).await?;
+        pipe.shutdown().await?
+    };
+
+    assert!(
+        batches.iter().any(|b| b == &vec![1, 2, 3]),
+        "the transaction (with an interleaved transactional message) must be one \
+         intact batch, got {batches:?}"
+    );
+
+    test_common::pg_cleanup_repl(&client, "pub_txcm", "slot_txcm").await;
     test_common::pg_drop_db(&db).await;
     Ok(())
 }
