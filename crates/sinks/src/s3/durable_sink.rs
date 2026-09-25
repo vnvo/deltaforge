@@ -131,6 +131,17 @@ impl DurableS3Sink {
         .await
         .map_err(|e| fatal(format!("durable HEAD acquire/recovery: {e}")))?;
 
+        // 0 = this sink acknowledges durably. Reported so the non-durable alerting
+        // series (`deltaforge_sink_s3_non_durable_ack_mode`) has a healthy baseline
+        // and durable mode never leaves the metric unset/stale at 1 after a rollback
+        // and roll-forward.
+        metrics::gauge!(
+            "deltaforge_sink_s3_non_durable_ack_mode",
+            "pipeline" => args.pipeline.clone(),
+            "sink" => args.id.clone(),
+        )
+        .set(0.0);
+
         Ok(Self {
             inner: Arc::new(DurableInner {
                 id: args.id,
@@ -703,5 +714,46 @@ mod tests {
         sink.send_batch_with_context(&[row(None, "db", "t", 1)], &ctx("50"))
             .await
             .unwrap();
+    }
+
+    // Durable mode MUST report the non-durable-ack metric as 0 (a healthy
+    // baseline for the alerting series), never leaving it unset or stale at 1.
+    #[test]
+    fn durable_mode_reports_non_durable_ack_metric_zero() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+                sink_over(store, "durable-s3")
+                    .await
+                    .expect("durable sink creates");
+            });
+        });
+
+        let value =
+            snap.snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(ck, _, _, v)| match v {
+                    DebugValue::Gauge(g)
+                        if ck.key().name()
+                            == "deltaforge_sink_s3_non_durable_ack_mode" =>
+                    {
+                        Some(g.into_inner())
+                    }
+                    _ => None,
+                });
+        assert_eq!(
+            value,
+            Some(0.0),
+            "durable mode must report non-durable ack mode = 0"
+        );
     }
 }

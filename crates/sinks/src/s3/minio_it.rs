@@ -1,9 +1,14 @@
 //! Live MinIO / S3 integration tests for the durable S3 path (P0.4, Commit 11).
 //!
-//! These are `#[ignore]`d and env-gated: they run only against a real S3-compatible
-//! backend (MinIO in CI/dev via docker) and are skipped when the environment is not
-//! configured. They exercise ACTUAL provider behavior - conditional writes, ETag CAS,
-//! listing timestamps, deletes - which the in-memory `FaultStore` suite cannot prove:
+//! These are `#[ignore]`d, so they never run in a normal `cargo test`. When run
+//! EXPLICITLY (the command below), they REQUIRE a real S3-compatible backend and
+//! fail loudly if it is not configured: a missing env var or a store that will not
+//! construct panics rather than passing vacuously. A selected live test therefore
+//! either exercises the provider or fails - it can never report a green run while
+//! testing nothing, and it cannot hide invalid credentials or a malformed endpoint.
+//!
+//! They exercise ACTUAL provider behavior - conditional writes, ETag CAS, listing
+//! timestamps, deletes - which the in-memory `FaultStore` suite cannot prove:
 //! capability probing, publish/ack + restart recovery, concurrent-writer fencing, CAS
 //! conflicts, cumulative rollups + fallback, compaction, both GC domains, orphan
 //! reconciliation, and end-to-end recoverability after combined compaction + entry
@@ -92,23 +97,40 @@ fn tobj_jsonl(table: &str, rows: &[u32]) -> TableObject {
     }
 }
 
-/// Build a `ConditionalStore` over the configured MinIO/S3 backend, or `None` when the
-/// environment is not set (the test then skips).
-fn it_store() -> Option<Arc<ObjectStoreConditional>> {
-    let bucket = std::env::var("DELTAFORGE_IT_S3_BUCKET").ok()?;
+/// A required env var, or a loud panic naming it. Because these tests are
+/// `#[ignore]`d, reaching here means the operator asked to run them explicitly, so a
+/// missing variable is a configuration error, never a reason to pass vacuously.
+fn require_env(name: &str) -> String {
+    match std::env::var(name) {
+        Ok(v) if !v.is_empty() => v,
+        _ => panic!(
+            "live MinIO/S3 test requires env var {name} to be set to a non-empty \
+             value. These tests are #[ignore]d; running them explicitly must \
+             exercise a real backend. See this module's docs for the full set."
+        ),
+    }
+}
+
+/// Build a `ConditionalStore` over the configured MinIO/S3 backend. Panics loudly if
+/// any required variable is missing or the store cannot be constructed - a selected
+/// live test must exercise the provider or fail, never pass without testing anything.
+fn it_store() -> Arc<ObjectStoreConditional> {
     let params = ObjectStoreParams {
-        bucket,
-        endpoint: std::env::var("DELTAFORGE_IT_S3_ENDPOINT").ok(),
-        region: std::env::var("DELTAFORGE_IT_S3_REGION")
-            .ok()
-            .or_else(|| Some("us-east-1".into())),
-        access_key_id: std::env::var("DELTAFORGE_IT_S3_ACCESS_KEY").ok(),
-        secret_access_key: std::env::var("DELTAFORGE_IT_S3_SECRET_KEY").ok(),
+        bucket: require_env("DELTAFORGE_IT_S3_BUCKET"),
+        endpoint: Some(require_env("DELTAFORGE_IT_S3_ENDPOINT")),
+        region: Some(
+            std::env::var("DELTAFORGE_IT_S3_REGION")
+                .unwrap_or_else(|_| "us-east-1".into()),
+        ),
+        access_key_id: Some(require_env("DELTAFORGE_IT_S3_ACCESS_KEY")),
+        secret_access_key: Some(require_env("DELTAFORGE_IT_S3_SECRET_KEY")),
         virtual_hosted_style: false,
         local: false,
     };
-    let store = build_object_store(&params).ok()?;
-    Some(Arc::new(ObjectStoreConditional::new(store)))
+    let store = build_object_store(&params).expect(
+        "construct live S3/MinIO object store from DELTAFORGE_IT_S3_* env vars",
+    );
+    Arc::new(ObjectStoreConditional::new(store))
 }
 
 /// A fresh unique prefix per test, so runs never collide on a shared bucket.
@@ -165,7 +187,7 @@ fn now_ms() -> u64 {
 #[tokio::test]
 #[ignore = "requires a live MinIO/S3 backend (DELTAFORGE_IT_S3_*)"]
 async fn minio_conditional_write_probe_passes() {
-    let Some(store) = it_store() else { return };
+    let store = it_store();
     let prefix = unique_prefix();
     // Real conditional-write + ETag capability parity on the live backend.
     probe_conditional_writes(store.as_ref(), &prefix)
@@ -176,7 +198,7 @@ async fn minio_conditional_write_probe_passes() {
 #[tokio::test]
 #[ignore = "requires a live MinIO/S3 backend (DELTAFORGE_IT_S3_*)"]
 async fn minio_publish_ack_and_recover() {
-    let Some(store) = it_store() else { return };
+    let store = it_store();
     let prefix = unique_prefix();
     let w = acquire(Arc::clone(&store), &prefix).await.unwrap();
     w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)
@@ -199,7 +221,7 @@ async fn minio_publish_ack_and_recover() {
 #[tokio::test]
 #[ignore = "requires a live MinIO/S3 backend (DELTAFORGE_IT_S3_*)"]
 async fn minio_concurrent_writers_fence() {
-    let Some(store) = it_store() else { return };
+    let store = it_store();
     let prefix = unique_prefix();
     let a = acquire(Arc::clone(&store), &prefix).await.unwrap();
     let b = acquire(Arc::clone(&store), &prefix).await.unwrap();
@@ -218,7 +240,7 @@ async fn minio_concurrent_writers_fence() {
 #[tokio::test]
 #[ignore = "requires a live MinIO/S3 backend (DELTAFORGE_IT_S3_*)"]
 async fn minio_rollup_fallback_after_gc() {
-    let Some(store) = it_store() else { return };
+    let store = it_store();
     let prefix = unique_prefix();
     let w = acquire(Arc::clone(&store), &prefix).await.unwrap();
     w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)
@@ -253,7 +275,7 @@ async fn minio_rollup_fallback_after_gc() {
 #[tokio::test]
 #[ignore = "requires a live MinIO/S3 backend (DELTAFORGE_IT_S3_*)"]
 async fn minio_full_lifecycle_recoverable_after_combined_gc() {
-    let Some(store) = it_store() else { return };
+    let store = it_store();
     let prefix = unique_prefix();
     let w = acquire(Arc::clone(&store), &prefix).await.unwrap();
     w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)
@@ -293,7 +315,7 @@ async fn minio_full_lifecycle_recoverable_after_combined_gc() {
 #[tokio::test]
 #[ignore = "requires a live MinIO/S3 backend (DELTAFORGE_IT_S3_*)"]
 async fn minio_reconcile_deletes_orphan_after_grace() {
-    let Some(store) = it_store() else { return };
+    let store = it_store();
     let prefix = unique_prefix();
     let w = acquire(Arc::clone(&store), &prefix).await.unwrap();
     w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)

@@ -376,7 +376,7 @@ pub fn build_s3_sink(
     // Reaching here means `durability: legacy_rolling` was chosen EXPLICITLY (the
     // default is durable_v2). It is a non-durable, acknowledged rollback/compat mode:
     // acknowledged data can be lost before a size/age roll. Emit a prominent startup
-    // warning carrying the machine-readable `s3_non_durable_ack_mode` signal so
+    // warning AND the machine-readable `s3_non_durable_ack_mode` metric (set to 1) so
     // operators/tooling can alert on it, and note it is excluded from the durability
     // guarantees.
     tracing::warn!(
@@ -389,6 +389,15 @@ pub fn build_s3_sink(
          default) for crash-durable acknowledgements.",
         cfg.id
     );
+    // 1 = this sink acknowledges non-durably. Durable sinks report 0 (see
+    // `build_durable_s3_sink`), so `deltaforge_sink_s3_non_durable_ack_mode == 1`
+    // is a direct alerting condition.
+    gauge!(
+        "deltaforge_sink_s3_non_durable_ack_mode",
+        "pipeline" => pipeline.to_string(),
+        "sink" => cfg.id.clone(),
+    )
+    .set(1.0);
 
     // Build object store.
     let access_key = cfg
@@ -902,5 +911,78 @@ mod tests {
             other => panic!("expected Backpressure, got {other:?}"),
         }
         Ok(())
+    }
+
+    fn legacy_cfg(id: &str, local_path: &str) -> deltaforge_config::S3SinkCfg {
+        deltaforge_config::S3SinkCfg {
+            id: id.into(),
+            bucket: local_path.into(),
+            prefix: "out".into(),
+            region: None,
+            endpoint: None,
+            access_key_id: None,
+            secret_access_key: None,
+            virtual_hosted_style: false,
+            local: true,
+            format: deltaforge_config::S3FileFormat::Jsonl,
+            compression: deltaforge_config::S3Compression::None,
+            file_roll: Default::default(),
+            send_timeout_secs: 60,
+            required: Some(true),
+            durability: deltaforge_config::S3Durability::LegacyRolling,
+            filter: None,
+        }
+    }
+
+    fn gauge_value(
+        snap: &metrics_util::debugging::Snapshotter,
+        name: &str,
+    ) -> Option<f64> {
+        use metrics_util::debugging::DebugValue;
+        snap.snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| match v {
+                DebugValue::Gauge(g) if ck.key().name() == name => {
+                    Some(g.into_inner())
+                }
+                _ => None,
+            })
+    }
+
+    // Explicit legacy_rolling MUST emit the operational metric
+    // `deltaforge_sink_s3_non_durable_ack_mode == 1` (not only a log field), so
+    // operators can alert on a sink acknowledging non-durably.
+    #[test]
+    fn legacy_rolling_reports_non_durable_ack_metric() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = legacy_cfg("legacy-s3", &tmp.path().to_string_lossy());
+
+        // build_s3_sink spawns an idle-sweep task, so a runtime must be in scope;
+        // the metric itself is emitted synchronously on this thread, where the
+        // local recorder is installed.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            build_s3_sink(
+                &cfg,
+                CancellationToken::new(),
+                "test-pipeline",
+                None,
+            )
+            .expect("legacy S3 sink builds");
+        });
+
+        assert_eq!(
+            gauge_value(&snap, "deltaforge_sink_s3_non_durable_ack_mode"),
+            Some(1.0),
+            "legacy_rolling must report non-durable ack mode = 1"
+        );
     }
 }

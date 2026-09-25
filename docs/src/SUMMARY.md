@@ -16,6 +16,7 @@
     - [NATS](sinks/nats.md)
     - [HTTP/Webhook](sinks/http.md)
     - [S3 (Parquet / JSON Lines)](sinks/s3.md)
+        - [Durable acknowledgements](sinks/s3-durable-acks.md)
     - [ClickHouse](sinks/clickhouse.md)
     - [Elasticsearch](sinks/elasticsearch.md)
 - [Envelopes and Encodings](envelopes.md)
