@@ -118,6 +118,14 @@ async fn read_verified<S: ConditionalStore + ?Sized>(
         .ok_or_else(|| {
             EquivalenceError::Integrity(format!("object {} missing", o.key))
         })?;
+    if raw.len() as u64 != o.byte_len {
+        return Err(EquivalenceError::Integrity(format!(
+            "object {} byte length {} does not match its record {}",
+            o.key,
+            raw.len(),
+            o.byte_len
+        )));
+    }
     if content_hash(&raw, &o.encoding_domain()) != o.content_hash {
         return Err(EquivalenceError::Integrity(format!(
             "object {} content hash does not match its record",
@@ -128,17 +136,24 @@ async fn read_verified<S: ConditionalStore + ?Sized>(
 }
 
 /// Decode JSONL bytes into canonical rows, requiring a valid top-level `event_id`
-/// on each. A trailing newline yields no empty row; a blank interior line is an
-/// error (durable JSONL never writes one).
+/// on each. `split('\n')` yields one trailing empty segment for the final newline,
+/// which is allowed; ANY OTHER empty segment (a blank interior line) is rejected -
+/// durable JSONL never writes one, and silently skipping it could mask a row.
 fn decode_rows(key: &str, bytes: &[u8]) -> Result<Vec<Row>, EquivalenceError> {
     let text = std::str::from_utf8(bytes).map_err(|_| {
         EquivalenceError::Integrity(format!("object {key} is not valid UTF-8"))
     })?;
+    let segments: Vec<&str> = text.split('\n').collect();
+    let last = segments.len().saturating_sub(1);
     let mut rows = Vec::new();
-    for (lineno, line) in text.split('\n').enumerate() {
+    for (lineno, line) in segments.iter().enumerate() {
         if line.is_empty() {
-            // Only the final newline may produce an empty trailing segment.
-            continue;
+            if lineno == last {
+                continue; // the single trailing segment from a final newline
+            }
+            return Err(EquivalenceError::Integrity(format!(
+                "object {key} line {lineno} is an unexpected blank line"
+            )));
         }
         let value: serde_json::Value =
             serde_json::from_str(line).map_err(|e| {
@@ -393,6 +408,42 @@ mod tests {
         let mut o1 = orig(&s, "orders/wm-1/a.jsonl", &[(eid(1), 1)]).await;
         o1.content_hash = "deadbeef".into(); // no longer matches stored bytes
         let repl = orig(&s, "orders/compacted/r.jsonl", &[(eid(1), 1)]).await;
+        assert!(matches!(
+            verify_jsonl(s.as_ref(), &[o1], &repl).await,
+            Err(EquivalenceError::Integrity(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn wrong_byte_len_fails_closed() {
+        let s = store();
+        let mut o1 = orig(&s, "orders/wm-1/a.jsonl", &[(eid(1), 1)]).await;
+        o1.byte_len += 1; // no longer matches the stored object
+        let repl = orig(&s, "orders/compacted/r.jsonl", &[(eid(1), 1)]).await;
+        assert!(matches!(
+            verify_jsonl(s.as_ref(), &[o1], &repl).await,
+            Err(EquivalenceError::Integrity(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn interior_blank_line_fails_closed() {
+        // A blank line between two rows must be rejected, not silently skipped.
+        let s = store();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&canonical_json_bytes(
+            &serde_json::json!({"event_id": eid(1), "v": 1}),
+        ));
+        bytes.push(b'\n');
+        bytes.push(b'\n'); // blank interior line
+        bytes.extend_from_slice(&canonical_json_bytes(
+            &serde_json::json!({"event_id": eid(2), "v": 2}),
+        ));
+        bytes.push(b'\n');
+        let o1 = put_obj(&s, "orders/wm-1/a.jsonl", bytes).await;
+        let repl =
+            orig(&s, "orders/compacted/r.jsonl", &[(eid(1), 1), (eid(2), 2)])
+                .await;
         assert!(matches!(
             verify_jsonl(s.as_ref(), &[o1], &repl).await,
             Err(EquivalenceError::Integrity(_))

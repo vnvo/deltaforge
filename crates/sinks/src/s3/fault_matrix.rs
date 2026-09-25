@@ -1845,3 +1845,126 @@ fn now_ms_test() -> u64 {
         .unwrap()
         .as_millis() as u64
 }
+
+// ── 9B.1 follow-up: deletion-gate regression tests ───────────────────────────
+
+#[tokio::test]
+async fn cumulative_rollup_can_be_created_after_entry_gc() {
+    // Blocker 1: a later cumulative rollup must be buildable from the current
+    // cumulative inventory + retained tail, without walking to a GC'd genesis.
+    let inner = inmem();
+    let (_fs, w) = setup_generations(&inner).await; // gen2 [1,3], prev gen1 [1,2]
+    drop(w);
+    delete_entries_le(&inner, 2).await; // authorized GC through the horizon
+
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let w2 = acquire(Arc::clone(&clean)).await.unwrap(); // recovered-current
+    w2.publish(&wm(4), vec![tobj("orders", b"d")], 1)
+        .await
+        .unwrap();
+    w2.publish(&wm(5), vec![tobj("orders", b"e")], 1)
+        .await
+        .unwrap();
+    // The new rollup builds on gen2's inventory ([1,3]) + the retained tail (4,5].
+    w2.rollup().await.unwrap();
+    let gen3 = current_rollup(&inner).await;
+    assert_eq!(gen3.start_seq, 1, "still cumulative from genesis");
+    assert_eq!(gen3.end_seq, 5);
+    assert_eq!(gen3.inventory_count, 5, "covers all five objects");
+    drop(w2);
+
+    // And recovery from the new generation still works.
+    let clean2 = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let w3 = acquire(Arc::clone(&clean2)).await.unwrap();
+    w3.publish(&wm(6), vec![tobj("orders", b"f")], 1)
+        .await
+        .unwrap();
+    assert_eq!(read_head(&inner).await.unwrap().seq, 6);
+}
+
+#[tokio::test]
+async fn missing_entry_at_horizon_plus_one_halts() {
+    // Blocker 2: a gap ABOVE the fallback horizon is not authorized GC.
+    let inner = inmem();
+    let (_fs, w) = setup_generations(&inner).await; // horizon = prev.end = 2
+    w.publish(&wm(4), vec![tobj("orders", b"d")], 1)
+        .await
+        .unwrap(); // HEAD seq 4
+    drop(w);
+    // Delete seq 3 (= horizon + 1), which must remain in the retained tail.
+    delete_entries_le_range(&inner, 3, 3).await;
+
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let err = expect_err(acquire(clean).await);
+    assert!(err.is_fatal(), "gap above the horizon must halt: {err:?}");
+}
+
+#[tokio::test]
+async fn missing_entry_elsewhere_in_retained_tail_halts() {
+    // Blocker 2: a gap further up the retained tail (still above horizon) halts.
+    let inner = inmem();
+    let (_fs, w) = setup_generations(&inner).await; // horizon 2
+    w.publish(&wm(4), vec![tobj("orders", b"d")], 1)
+        .await
+        .unwrap();
+    w.publish(&wm(5), vec![tobj("orders", b"e")], 1)
+        .await
+        .unwrap(); // HEAD seq 5
+    drop(w);
+    delete_entries_le_range(&inner, 4, 4).await; // interior tail entry, above horizon
+
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let err = expect_err(acquire(clean).await);
+    assert!(
+        err.is_fatal(),
+        "tail gap above the horizon must halt: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn rollup_lost_response_does_not_adopt_higher_epoch_rollup() {
+    // Blocker 4: a stale writer whose rollup CAS conflicts must be fenced, even if a
+    // higher-epoch writer published the byte-identical (content-addressed) rollup.
+    let inner = inmem();
+    let (_fsa, a) = genesis(&inner, vec![]).await; // epoch 1
+    a.publish(&wm(1), vec![tobj("orders", b"a")], 1)
+        .await
+        .unwrap();
+    a.publish(&wm(2), vec![tobj("orders", b"b")], 1)
+        .await
+        .unwrap();
+    // B acquires (epoch 2, fences A) and rolls up the same [1,2] range.
+    let b = acquire(Arc::new(FaultStore::new(Arc::clone(&inner), vec![])))
+        .await
+        .unwrap();
+    assert_eq!(b.epoch().await, 2);
+    b.rollup().await.unwrap();
+
+    // A rolls up the identical range; its HEAD CAS conflicts with B's higher epoch.
+    // A must be fenced, NOT treat B's identical rollup as its own lost response.
+    let err = expect_err(a.rollup().await);
+    assert!(matches!(err, HeadError::Fenced { .. }), "got {err:?}");
+    let h = read_head(&inner).await.unwrap();
+    assert_eq!(h.epoch, 2, "B's HEAD stands");
+    assert!(h.rollup_key.is_some());
+}
+
+/// Delete every manifest entry with `lo <= seq <= hi`.
+async fn delete_entries_le_range(
+    inner: &ObjectStoreConditional,
+    lo: u64,
+    hi: u64,
+) {
+    for k in inner
+        .list(&Path::from(format!("{PFX}/{PIPE}/_manifest/entries")))
+        .await
+        .unwrap()
+    {
+        let ks = k.to_string();
+        if let Some(seq) = entry_seq_from_key(&ks) {
+            if seq >= lo && seq <= hi {
+                inner.delete(&k).await.unwrap();
+            }
+        }
+    }
+}
