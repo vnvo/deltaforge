@@ -302,8 +302,9 @@ fn make_event(id: i64, name: &str, amount: &str, paid: bool) -> Event {
         synthetic: None,
         routing: None,
         tx_end: false,
-        checkpoint: None,
+        boundary: None,
         size_bytes: 0,
+
         received_at_ms: ts_ms,
     }
 }
@@ -333,6 +334,7 @@ async fn ministack_canary_parquet_roundtrip() -> Result<()> {
         },
         send_timeout_secs: 60,
         required: Some(true),
+        durability: Default::default(),
         filter: None,
     });
 

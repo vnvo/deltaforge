@@ -310,8 +310,9 @@ async fn phase1e_abandoned_writer_produces_no_visible_object() -> Result<()> {
             synthetic: None,
             routing: None,
             tx_end: false,
-            checkpoint: None,
+            boundary: None,
             size_bytes: 0,
+
             received_at_ms: ts_ms,
         })
         .collect();

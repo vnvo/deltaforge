@@ -8,16 +8,35 @@
 //! Phase 1a/1b status: file format plumbing only (Parquet + JSON Lines). Sink
 //! trait wire-up and full feature set follow in later phases.
 
+mod batch_upload;
+mod compaction;
+mod durable_encode;
+mod durable_sink;
 mod encoder;
+mod equivalence;
+#[cfg(test)]
+mod fault_matrix;
 mod file_format;
+mod gc;
+mod head;
 mod jsonl_writer;
+mod keys;
+mod manifest;
+#[cfg(test)]
+mod minio_it;
 mod object_writer;
 mod parquet_writer;
+mod reconcile;
 mod rolling;
+mod rollup;
 mod router;
 mod sink;
+mod store_cond;
 mod writer_pool;
 
+pub use durable_sink::{
+    DurableFormat, DurableS3Args, DurableS3Sink, build_durable_s3_sink,
+};
 pub use encoder::events_to_record_batch;
 pub use file_format::{Compression, FileFormat, FileWriter, WriteResult};
 pub use jsonl_writer::JsonLinesFormat;

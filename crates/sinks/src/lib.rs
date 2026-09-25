@@ -116,83 +116,152 @@ pub fn build_sinks_with_schemas(
     clickhouse_resolver: Option<clickhouse::ClickHouseSchemaResolver>,
     es_resolver: Option<elasticsearch::EsSchemaResolver>,
 ) -> anyhow::Result<Vec<ArcDynSink>> {
+    // Public API: NEVER silently omit a configured sink. A durable_v2 S3 sink
+    // cannot be built here (it needs async probe/recovery + an injected
+    // comparator), so this fails closed rather than returning a list missing it.
+    build_sinks_impl(
+        ps,
+        cancel,
+        pipeline,
+        source_schemas,
+        arrow_schema_resolver,
+        clickhouse_resolver,
+        es_resolver,
+        /* defer_durable_s3 */ false,
+    )
+}
+
+/// Runner-only builder that DEFERS durable_v2 S3 sinks (the runner constructs
+/// them async with an injected comparator after the durable-startup guard). All
+/// other sinks are built here. Callers MUST then build the deferred durable
+/// sinks and validate the final sink set against configuration.
+pub fn build_sinks_deferring_durable_s3(
+    ps: &PipelineSpec,
+    cancel: CancellationToken,
+    pipeline: &str,
+    source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
+    arrow_schema_resolver: Option<s3::SchemaResolver>,
+    clickhouse_resolver: Option<clickhouse::ClickHouseSchemaResolver>,
+    es_resolver: Option<elasticsearch::EsSchemaResolver>,
+) -> anyhow::Result<Vec<ArcDynSink>> {
+    build_sinks_impl(
+        ps,
+        cancel,
+        pipeline,
+        source_schemas,
+        arrow_schema_resolver,
+        clickhouse_resolver,
+        es_resolver,
+        /* defer_durable_s3 */ true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_sinks_impl(
+    ps: &PipelineSpec,
+    cancel: CancellationToken,
+    pipeline: &str,
+    source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
+    arrow_schema_resolver: Option<s3::SchemaResolver>,
+    clickhouse_resolver: Option<clickhouse::ClickHouseSchemaResolver>,
+    es_resolver: Option<elasticsearch::EsSchemaResolver>,
+    defer_durable_s3: bool,
+) -> anyhow::Result<Vec<ArcDynSink>> {
     ps.spec
         .sinks
         .iter()
-        .map(|s| {
-            let (sink, filter): (ArcDynSink, Option<SinkFilter>) = match s {
-                SinkCfg::Kafka(cfg) => (
-                    Arc::new(KafkaSink::new(
-                        cfg,
-                        cancel.clone(),
-                        pipeline,
-                        source_schemas.clone(),
-                    )?) as ArcDynSink,
-                    cfg.filter.clone(),
-                ),
-                SinkCfg::Redis(cfg) => (
-                    Arc::new(RedisSink::new(
-                        cfg,
-                        cancel.clone(),
-                        pipeline,
-                        source_schemas.clone(),
-                    )?) as ArcDynSink,
-                    cfg.filter.clone(),
-                ),
-                SinkCfg::Nats(cfg) => (
-                    Arc::new(NatsSink::new(
-                        cfg,
-                        cancel.clone(),
-                        pipeline,
-                        source_schemas.clone(),
-                    )?) as ArcDynSink,
-                    cfg.filter.clone(),
-                ),
-                SinkCfg::Http(cfg) => (
-                    Arc::new(HttpSink::new(
-                        cfg,
-                        cancel.clone(),
-                        pipeline,
-                        source_schemas.clone(),
-                    )?) as ArcDynSink,
-                    cfg.filter.clone(),
-                ),
-                SinkCfg::S3(cfg) => (
-                    Arc::new(build_s3_sink(
-                        cfg,
-                        cancel.clone(),
-                        pipeline,
-                        arrow_schema_resolver.clone(),
-                    )?) as ArcDynSink,
-                    cfg.filter.clone(),
-                ),
-                SinkCfg::ClickHouse(cfg) => (
-                    Arc::new(clickhouse::build_clickhouse_sink(
-                        cfg,
-                        cancel.clone(),
-                        pipeline,
-                        clickhouse_resolver.clone(),
-                    )?) as ArcDynSink,
-                    // v1: ClickHouse sink does not support sink-level filters.
-                    None,
-                ),
-                SinkCfg::Elasticsearch(cfg) => (
-                    Arc::new(elasticsearch::build_elasticsearch_sink(
-                        cfg,
-                        cancel.clone(),
-                        pipeline,
-                        es_resolver.clone(),
-                    )?) as ArcDynSink,
-                    // v1: Elasticsearch sink does not support sink-level filters.
-                    None,
-                ),
-            };
-            // Only wrap when filter has actual conditions — zero overhead otherwise
-            let sink = match filter {
-                Some(f) if f.is_active() => FilteredSink::wrap(sink, f),
-                _ => sink,
-            };
-            Ok(sink)
+        .filter_map(|s| {
+            // A durable_v2 S3 sink needs the runner's async durable path. Defer
+            // it (skip) only when the caller will build it; otherwise fail
+            // closed - never silently drop a configured sink.
+            if let SinkCfg::S3(cfg) = s {
+                if cfg.durability == deltaforge_config::S3Durability::DurableV2
+                {
+                    if defer_durable_s3 {
+                        return None;
+                    }
+                    return Some(Err(anyhow::anyhow!(
+                        "S3 sink '{}' selects durable_v2; it must be built via \
+                         the runner's durable path, not build_sinks*",
+                        cfg.id
+                    )));
+                }
+            }
+            Some((|| -> anyhow::Result<ArcDynSink> {
+                let (sink, filter): (ArcDynSink, Option<SinkFilter>) = match s {
+                    SinkCfg::Kafka(cfg) => (
+                        Arc::new(KafkaSink::new(
+                            cfg,
+                            cancel.clone(),
+                            pipeline,
+                            source_schemas.clone(),
+                        )?) as ArcDynSink,
+                        cfg.filter.clone(),
+                    ),
+                    SinkCfg::Redis(cfg) => (
+                        Arc::new(RedisSink::new(
+                            cfg,
+                            cancel.clone(),
+                            pipeline,
+                            source_schemas.clone(),
+                        )?) as ArcDynSink,
+                        cfg.filter.clone(),
+                    ),
+                    SinkCfg::Nats(cfg) => (
+                        Arc::new(NatsSink::new(
+                            cfg,
+                            cancel.clone(),
+                            pipeline,
+                            source_schemas.clone(),
+                        )?) as ArcDynSink,
+                        cfg.filter.clone(),
+                    ),
+                    SinkCfg::Http(cfg) => (
+                        Arc::new(HttpSink::new(
+                            cfg,
+                            cancel.clone(),
+                            pipeline,
+                            source_schemas.clone(),
+                        )?) as ArcDynSink,
+                        cfg.filter.clone(),
+                    ),
+                    SinkCfg::S3(cfg) => (
+                        Arc::new(build_s3_sink(
+                            cfg,
+                            cancel.clone(),
+                            pipeline,
+                            arrow_schema_resolver.clone(),
+                        )?) as ArcDynSink,
+                        cfg.filter.clone(),
+                    ),
+                    SinkCfg::ClickHouse(cfg) => (
+                        Arc::new(clickhouse::build_clickhouse_sink(
+                            cfg,
+                            cancel.clone(),
+                            pipeline,
+                            clickhouse_resolver.clone(),
+                        )?) as ArcDynSink,
+                        // v1: ClickHouse sink does not support sink-level filters.
+                        None,
+                    ),
+                    SinkCfg::Elasticsearch(cfg) => (
+                        Arc::new(elasticsearch::build_elasticsearch_sink(
+                            cfg,
+                            cancel.clone(),
+                            pipeline,
+                            es_resolver.clone(),
+                        )?) as ArcDynSink,
+                        // v1: Elasticsearch sink does not support sink-level filters.
+                        None,
+                    ),
+                };
+                // Only wrap when filter has actual conditions - zero overhead otherwise
+                let sink = match filter {
+                    Some(f) if f.is_active() => FilteredSink::wrap(sink, f),
+                    _ => sink,
+                };
+                Ok(sink)
+            })())
         })
         .collect()
 }

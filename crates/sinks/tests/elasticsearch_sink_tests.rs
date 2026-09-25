@@ -134,8 +134,9 @@ fn mk_event(op: Op, after: Value, before: Value, ts: i64) -> Event {
         synthetic: None,
         routing: None,
         tx_end: false,
-        checkpoint: None,
+        boundary: None,
         size_bytes: 0,
+
         received_at_ms: 0,
     }
 }

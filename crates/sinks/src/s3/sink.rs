@@ -1,4 +1,4 @@
-//! `S3Sink` — the `deltaforge_core::Sink` implementation that plugs the
+//! `S3Sink` - the `deltaforge_core::Sink` implementation that plugs the
 //! S3/Parquet writer pool into the DeltaForge runtime.
 //!
 //! Architecture:
@@ -43,7 +43,7 @@ use anyhow::Context as _;
 /// Time-based rolling (`max_age` / `idle_age`) is only evaluated inside
 /// `append_batch`, which the coordinator calls only when events are flowing.
 /// Without this timer, once the source goes idle the last open writers are
-/// never rolled — their buffers (and uncommitted tail data) linger until the
+/// never rolled - their buffers (and uncommitted tail data) linger until the
 /// pipeline stops. This background sweep makes idle/age rolling actually fire.
 const IDLE_SWEEP_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(5);
@@ -120,8 +120,8 @@ impl S3Sink {
 
     /// Spawn the background task that periodically rolls aged/idle writers.
     ///
-    /// It calls `WriterPool::idle_sweep` on a fixed interval — independent of
-    /// `send_batch` — so `max_age` / `idle_age` rolling fires even when the
+    /// It calls `WriterPool::idle_sweep` on a fixed interval - independent of
+    /// `send_batch` - so `max_age` / `idle_age` rolling fires even when the
     /// source is idle. Stops when the pipeline `cancel` token fires or the
     /// task is aborted on drop. The first tick is delayed by one interval so a
     /// freshly-opened writer isn't swept immediately.
@@ -269,7 +269,7 @@ impl Sink for S3Sink {
         // Wrap the entire append in a per-batch timeout. If a writer's
         // multipart upload (or any pool-internal close) is stuck, this
         // bounds the worst-case wait the coordinator sees. On timeout we
-        // surface SinkError::Backpressure — the coordinator routes per
+        // surface SinkError::Backpressure - the coordinator routes per
         // `required` (block or log+continue).
         let append =
             tokio::time::timeout(self.send_timeout, pool.append_batch(events))
@@ -288,7 +288,7 @@ impl Sink for S3Sink {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(e)) => {
                 // Batch-level failure (object store unreachable, auth,
-                // etc.) — the pool returns a top-level error for these
+                // etc.) - the pool returns a top-level error for these
                 // (per-row encoder errors are isolated into `outcome.failed`
                 // and don't reach this arm).
                 let msg = format!("{e:#}");
@@ -337,7 +337,7 @@ impl Drop for S3Sink {
                     sink = %self.id,
                     pipeline = %self.pipeline,
                     abandoned = n,
-                    "s3 sink dropped without flush — abandoning open writers"
+                    "s3 sink dropped without flush - abandoning open writers"
                 );
             }
         }
@@ -345,14 +345,14 @@ impl Drop for S3Sink {
 }
 
 // =============================================================================
-// Builder — wire up an S3Sink from a config struct
+// Builder - wire up an S3Sink from a config struct
 // =============================================================================
 
 /// Build an `S3Sink` from an `S3SinkCfg` plus an optional schema resolver.
 ///
 /// If `schema_resolver` is `None`, a fallback "envelope-only" resolver is
 /// used (only meta columns; no user data preserved). Production deployments
-/// must supply a resolver derived from source DDL — see the runner's
+/// must supply a resolver derived from source DDL - see the runner's
 /// `build_arrow_schema_resolver` for the canonical adapter.
 pub fn build_s3_sink(
     cfg: &deltaforge_config::S3SinkCfg,
@@ -361,6 +361,43 @@ pub fn build_s3_sink(
     schema_resolver: Option<SchemaResolver>,
 ) -> anyhow::Result<S3Sink> {
     use deltaforge_config::{S3Compression as C, S3FileFormat as F};
+
+    // Fail closed: the legacy rolling builder never silently serves a durable_v2
+    // config. Durable sinks are constructed via `build_durable_s3_sink` (async,
+    // with an injected comparator) from the runner.
+    if cfg.durability == deltaforge_config::S3Durability::DurableV2 {
+        anyhow::bail!(
+            "S3 sink '{}' selects durable_v2; it must be built via the durable \
+             path (build_durable_s3_sink), not the legacy rolling builder",
+            cfg.id
+        );
+    }
+
+    // Reaching here means `durability: legacy_rolling` was chosen EXPLICITLY (the
+    // default is durable_v2). It is a non-durable, acknowledged rollback/compat mode:
+    // acknowledged data can be lost before a size/age roll. Emit a prominent startup
+    // warning AND the machine-readable `s3_non_durable_ack_mode` metric (set to 1) so
+    // operators/tooling can alert on it, and note it is excluded from the durability
+    // guarantees.
+    tracing::warn!(
+        sink_id = %cfg.id,
+        pipeline = %pipeline,
+        s3_non_durable_ack_mode = true,
+        "S3 sink '{}' is running in legacy_rolling (NON-DURABLE) mode: acknowledged \
+         data can be lost before a roll. This is an explicit rollback/compat mode \
+         excluded from the durability guarantees; set durability: durable_v2 (the \
+         default) for crash-durable acknowledgements.",
+        cfg.id
+    );
+    // 1 = this sink acknowledges non-durably. Durable sinks report 0 (see
+    // `build_durable_s3_sink`), so `deltaforge_sink_s3_non_durable_ack_mode == 1`
+    // is a direct alerting condition.
+    gauge!(
+        "deltaforge_sink_s3_non_durable_ack_mode",
+        "pipeline" => pipeline.to_string(),
+        "sink" => cfg.id.clone(),
+    )
+    .set(1.0);
 
     // Build object store.
     let access_key = cfg
@@ -437,14 +474,14 @@ pub fn build_s3_sink(
 /// Fallback schema resolver used when no DDL-derived resolver is supplied.
 /// Produces a schema containing only the envelope meta columns; user data
 /// is *not* preserved. Logged as a warning so operators notice.
-fn fallback_envelope_resolver() -> SchemaResolver {
+pub(crate) fn fallback_envelope_resolver() -> SchemaResolver {
     use deltaforge_core::encoding::arrow_schema::{
         Connector, build_envelope_arrow_schema_arc,
     };
     use deltaforge_core::encoding::avro_types::TypeConversionOpts;
 
     warn!(
-        "S3 sink starting without a schema resolver — only envelope-meta \
+        "S3 sink starting without a schema resolver - only envelope-meta \
          columns will be written; user data will be dropped. Wire a \
          DDL-derived resolver from the runner for production use."
     );
@@ -526,8 +563,9 @@ mod tests {
             synthetic: None,
             routing: None,
             tx_end: false,
-            checkpoint: None,
+            boundary: None,
             size_bytes: 0,
+
             received_at_ms: ts_ms,
         }
     }
@@ -680,7 +718,7 @@ mod tests {
             .unwrap();
 
         // Wait for the background sweeper to see the writer go idle and roll it
-        // — with NO further send_batch call.
+        // - with NO further send_batch call.
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
         // The writer must already be closed by the sweep, so flush finds
@@ -781,7 +819,7 @@ mod tests {
         let committed = sink.flush_on_shutdown().await;
         // Either 0 (writer was never opened because all events failed before
         // any good row) or 1 (writer opened but zero rows written). Both
-        // are atomicity-safe — readers see no bad data.
+        // are atomicity-safe - readers see no bad data.
         for c in &committed {
             assert_eq!(
                 c.result.rows_written, 0,
@@ -873,5 +911,78 @@ mod tests {
             other => panic!("expected Backpressure, got {other:?}"),
         }
         Ok(())
+    }
+
+    fn legacy_cfg(id: &str, local_path: &str) -> deltaforge_config::S3SinkCfg {
+        deltaforge_config::S3SinkCfg {
+            id: id.into(),
+            bucket: local_path.into(),
+            prefix: "out".into(),
+            region: None,
+            endpoint: None,
+            access_key_id: None,
+            secret_access_key: None,
+            virtual_hosted_style: false,
+            local: true,
+            format: deltaforge_config::S3FileFormat::Jsonl,
+            compression: deltaforge_config::S3Compression::None,
+            file_roll: Default::default(),
+            send_timeout_secs: 60,
+            required: Some(true),
+            durability: deltaforge_config::S3Durability::LegacyRolling,
+            filter: None,
+        }
+    }
+
+    fn gauge_value(
+        snap: &metrics_util::debugging::Snapshotter,
+        name: &str,
+    ) -> Option<f64> {
+        use metrics_util::debugging::DebugValue;
+        snap.snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| match v {
+                DebugValue::Gauge(g) if ck.key().name() == name => {
+                    Some(g.into_inner())
+                }
+                _ => None,
+            })
+    }
+
+    // Explicit legacy_rolling MUST emit the operational metric
+    // `deltaforge_sink_s3_non_durable_ack_mode == 1` (not only a log field), so
+    // operators can alert on a sink acknowledging non-durably.
+    #[test]
+    fn legacy_rolling_reports_non_durable_ack_metric() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = legacy_cfg("legacy-s3", &tmp.path().to_string_lossy());
+
+        // build_s3_sink spawns an idle-sweep task, so a runtime must be in scope;
+        // the metric itself is emitted synchronously on this thread, where the
+        // local recorder is installed.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            build_s3_sink(
+                &cfg,
+                CancellationToken::new(),
+                "test-pipeline",
+                None,
+            )
+            .expect("legacy S3 sink builds");
+        });
+
+        assert_eq!(
+            gauge_value(&snap, "deltaforge_sink_s3_non_durable_ack_mode"),
+            Some(1.0),
+            "legacy_rolling must report non-durable ack mode = 1"
+        );
     }
 }

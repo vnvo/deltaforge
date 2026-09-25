@@ -133,6 +133,10 @@ struct RunCtx {
     identity_store: IdentityStore,
     reconciler: SchemaReconciler,
     on_schema_drift: deltaforge_config::OnSchemaDrift,
+    /// Frozen source lineage captured once at startup, for durable CDC
+    /// watermarks. `None` if lineage could not be resolved (durable mode then
+    /// fails closed at the sink; non-durable pipelines are unaffected).
+    durable_lineage: Option<PersistedLineage>,
 }
 
 /// Outcome of the pre-snapshot validate/allocate flow: the frozen generation,
@@ -147,7 +151,7 @@ struct SnapshotPlan {
 impl MySqlSource {
     /// Validate every selected table's identity, freeze source lineage, compute
     /// the config fingerprint, and atomically allocate (or resume) the snapshot
-    /// generation — all **before** any row is emitted. Keyless tables or
+    /// generation - all **before** any row is emitted. Keyless tables or
     /// unsupported identity types fail here, before allocation.
     async fn prepare_snapshot_generation(
         &self,
@@ -167,7 +171,7 @@ impl MySqlSource {
         let mut identity_map: HashMap<String, Vec<String>> = HashMap::new();
 
         // Steps 2-4: schema, identity resolution, and type validation for
-        // EVERY table — so an invalid table fails before a generation is
+        // EVERY table - so an invalid table fails before a generation is
         // allocated or any row emitted.
         for (db, table) in tracked {
             let loaded = loader.load_schema(db, table).await?;
@@ -349,7 +353,7 @@ impl MySqlSource {
             info!(source_id = %self.id, "snapshot complete, starting binlog streaming");
         }
 
-        // binlog streaming — retry prepare_client on transient connection errors
+        // binlog streaming - retry prepare_client on transient connection errors
         // (MySQL or toxiproxy may not be ready yet during startup).
         let (host, default_db, server_id, mut client) = {
             let mut retry = common::retry::RetryPolicy::default();
@@ -486,6 +490,10 @@ impl MySqlSource {
             tables: self.tables.clone(),
             outbox_tables: self.outbox_tables.clone(),
             on_schema_drift: self.on_schema_drift.clone(),
+            // Freeze lineage once at startup for durable CDC watermarks. Same
+            // authority as snapshot lineage; best-effort (None -> durable sink
+            // fails closed, never a synthetic fallback).
+            durable_lineage: self.capture_snapshot_lineage().await.ok(),
         };
 
         info!(source_id=%self.id, "connecting for binlog stream ..");
@@ -594,7 +602,7 @@ impl Source for MySqlSource {
 
     fn compare_checkpoints(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
         // MySqlCheckpoint: { file: String, pos: u64, gtid_set: Option<String> }
-        // Compare by (file, pos) — the binlog position.
+        // Compare by (file, pos) - the binlog position.
         #[derive(serde::Deserialize)]
         struct Cp {
             file: String,
@@ -615,6 +623,32 @@ impl Source for MySqlSource {
             }
         };
         a.file.cmp(&b.file).then(a.pos.cmp(&b.pos))
+    }
+
+    async fn check_durable_snapshot_startup(
+        &self,
+        checkpoint_store: &dyn CheckpointStore,
+    ) -> Result<(), SourceError> {
+        let progress: mysql_snapshot::MysqlSnapshotProgress = checkpoint_store
+            .get_raw(&mysql_snapshot::progress_key(&self.id))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        if crate::snapshot_frontier::is_ambiguous_legacy_progress(
+            &self.tables,
+            &progress.done_tables,
+            progress.finished,
+        ) {
+            return Err(SourceError::Other(anyhow::anyhow!(
+                "durable_v2: interrupted legacy snapshot progress for source \
+                 {} cannot be adopted (some tables done, some pending); finish \
+                 it under legacy mode or start a new snapshot generation",
+                self.id
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -733,7 +767,7 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
 ///
 /// Returns:
 /// - `Ok(Some(stream))` - reconnected, caller assigns the new stream.
-/// - `Ok(None)` — cancelled during sleep or transient connect error;
+/// - `Ok(None)` - cancelled during sleep or transient connect error;
 ///   caller should `continue` the loop (next iteration will either break
 ///   on cancel or retry with fresh backoff).
 /// - `Err(e)`           - fatal error, caller propagates.
@@ -819,7 +853,7 @@ async fn check_identity_post_reconnect(ctx: &mut RunCtx) -> SourceResult<()> {
                 source_id = %ctx.source_id,
                 prev = ?previous,
                 new = ?current,
-                "server identity changed — failover detected, reconciling"
+                "server identity changed - failover detected, reconciling"
             );
             run_failover_reconciliation(ctx, previous, current).await?;
         }
@@ -841,7 +875,7 @@ async fn run_failover_reconciliation(
         .unwrap_or(None);
 
     if existing.is_none() {
-        // Position reachability — use the original checkpoint position, not the
+        // Position reachability - use the original checkpoint position, not the
         // (potentially adjusted) streaming position in last_gtid/last_file.
         match check_position_reachability(
             &ctx.dsn,
@@ -857,7 +891,7 @@ async fn run_failover_reconciliation(
                 warn!(
                     source_id = %ctx.source_id,
                     %reason,
-                    "could not verify position reachability after failover — resuming anyway"
+                    "could not verify position reachability after failover - resuming anyway"
                 );
             }
             PositionReachability::Lost { reason } => {

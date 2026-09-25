@@ -8,12 +8,14 @@
 //! Each source captures row-level changes and emits them as `Event`s
 //! to be processed by the pipeline coordinator.
 
+pub mod durable_checkpoint;
 pub mod failover;
 pub mod identity_resolution;
 pub mod mysql;
 pub mod postgres;
 pub mod schema_loader;
 pub mod snapshot_event_id;
+pub mod snapshot_frontier;
 pub mod snapshot_generation;
 
 use anyhow::Result;

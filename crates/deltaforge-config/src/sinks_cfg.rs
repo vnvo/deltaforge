@@ -229,14 +229,14 @@ impl<'de> Deserialize<'de> for EncodingCfg {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SubjectStrategy {
-    /// `{topic}-value` — one schema per Kafka topic (default, most common).
+    /// `{topic}-value` - one schema per Kafka topic (default, most common).
     #[default]
     TopicName,
 
-    /// `{record_name}` — one schema per record type (requires `record_name` in event).
+    /// `{record_name}` - one schema per record type (requires `record_name` in event).
     RecordName,
 
-    /// `{topic}-{record_name}` — per-topic, per-record schema.
+    /// `{topic}-{record_name}` - per-topic, per-record schema.
     TopicRecordName,
 }
 
@@ -289,9 +289,9 @@ fn default_send_timeout_secs() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ChMode {
-    /// `ReplacingMergeTree` target — current-state / mirror.
+    /// `ReplacingMergeTree` target - current-state / mirror.
     Upsert,
-    /// `MergeTree` target — retain every change (default).
+    /// `MergeTree` target - retain every change (default).
     #[default]
     Changelog,
 }
@@ -303,7 +303,7 @@ pub enum ChVersionSource {
     /// Source LSN / binlog position (monotonic). Default.
     #[default]
     SourcePosition,
-    /// Event `ts_ms` — weaker (ms ties per key are undefined).
+    /// Event `ts_ms` - weaker (ms ties per key are undefined).
     TsMs,
 }
 
@@ -329,7 +329,7 @@ pub struct ClickHouseSinkCfg {
     pub database: String,
     /// Target table (must be pre-created by the operator in v1).
     pub table: String,
-    /// Write shape — see [`ChMode`]. Defaults to `changelog`.
+    /// Write shape - see [`ChMode`]. Defaults to `changelog`.
     #[serde(default)]
     pub mode: ChMode,
     /// ClickHouse user. Values support `${ENV_VAR}` expansion.
@@ -371,7 +371,7 @@ pub enum EsVersionSource {
     /// Source LSN / binlog position (monotonic). Default.
     #[default]
     SourcePosition,
-    /// Event `ts_ms` — weaker (ms ties per key are undefined).
+    /// Event `ts_ms` - weaker (ms ties per key are undefined).
     TsMs,
 }
 
@@ -850,10 +850,35 @@ pub struct S3SinkCfg {
     #[serde(default)]
     pub required: Option<bool>,
 
+    /// Durability mode. Defaults to `durable_v2` (crash-durable, content-addressed,
+    /// HEAD-CAS acknowledged): an absent or unspecified value ALWAYS resolves to the
+    /// safe path, never legacy. `legacy_rolling` (the time/size-rolled path, which can
+    /// lose acknowledged data before a roll) must be selected EXPLICITLY as an
+    /// acknowledged rollback/compat mode and emits a prominent startup warning.
+    #[serde(default)]
+    pub durability: S3Durability,
+
     /// Optional filter applied before delivery. Events not matching the filter
     /// are silently ignored by this sink.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<SinkFilter>,
+}
+
+/// Durability mode for the S3 sink. Explicit and fail-closed: unknown values are
+/// a parse error, and `durable_v2` never falls back to legacy behavior.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum S3Durability {
+    /// Time/size-rolled files. Acknowledged data can be lost before a roll, so this is
+    /// an explicit, acknowledged rollback/compat mode only (never the default) and is
+    /// excluded from the durability guarantees.
+    LegacyRolling,
+    /// Crash-durable, content-addressed objects acknowledged only after a HEAD
+    /// compare-and-swap. The DEFAULT: an unspecified `durability` resolves here.
+    #[default]
+    DurableV2,
 }
 
 #[derive(
@@ -1471,5 +1496,33 @@ mod tests {
         assert_eq!(c.send_timeout_secs, 30);
         assert!(c.auth.is_none());
         assert!(c.tls.is_none());
+    }
+
+    #[test]
+    fn s3_durability_defaults_to_durable_and_legacy_is_explicit() {
+        // An unspecified durability ALWAYS resolves to the safe path (durable_v2),
+        // never legacy.
+        let base = r#"
+            id: s
+            bucket: b
+            prefix: p
+        "#;
+        let c: S3SinkCfg = serde_yaml::from_str(base).unwrap();
+        assert_eq!(c.durability, S3Durability::DurableV2);
+
+        // durable_v2 can be named explicitly too.
+        let durable = format!("{base}\n            durability: durable_v2\n");
+        let c: S3SinkCfg = serde_yaml::from_str(&durable).unwrap();
+        assert_eq!(c.durability, S3Durability::DurableV2);
+
+        // legacy_rolling is an explicit, acknowledged rollback/compat mode.
+        let legacy =
+            format!("{base}\n            durability: legacy_rolling\n");
+        let c: S3SinkCfg = serde_yaml::from_str(&legacy).unwrap();
+        assert_eq!(c.durability, S3Durability::LegacyRolling);
+
+        // An unknown value is a parse error (fail closed, no silent fallback).
+        let bad = format!("{base}\n            durability: durable\n");
+        assert!(serde_yaml::from_str::<S3SinkCfg>(&bad).is_err());
     }
 }

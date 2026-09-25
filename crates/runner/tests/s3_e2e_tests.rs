@@ -259,8 +259,9 @@ fn make_order(
         synthetic: None,
         routing: None,
         tx_end: false,
-        checkpoint: None,
+        boundary: None,
         size_bytes: 0,
+
         received_at_ms: ts_ms,
     }
 }
@@ -293,6 +294,7 @@ fn s3_cfg(format: S3FileFormat, prefix: &str, max_events: u64) -> S3SinkCfg {
         },
         send_timeout_secs: 60,
         required: Some(true),
+        durability: Default::default(),
         filter: None,
     }
 }

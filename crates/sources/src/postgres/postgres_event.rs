@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use deltaforge_core::{
-    Event, Op, SourceError, SourceInfo, SourceItem, SourcePosition,
-    SourceResult, Transaction,
+    CheckpointMeta, Event, Op, SourceBoundary, SourceError, SourceInfo,
+    SourceItem, SourcePosition, SourceResult, Transaction,
 };
 use metrics::counter;
 use pgwire_replication::{Lsn, client::ReplicationEvent};
@@ -35,6 +35,33 @@ pub struct RelationInfo {
     pub columns: Arc<Vec<RelationColumn>>,
     /// Replica identity: d=default, n=nothing, f=full, i=index
     pub replica_identity: char,
+}
+
+/// Build the commit boundary: the resume checkpoint plus, atomically, the
+/// durable watermark for the SAME COMMIT (frozen `system_identifier` + end_lsn).
+/// The watermark is `None` when lineage is unavailable (`system_identifier == 0`)
+/// - durable mode then fails closed at the sink; we never synthesize a lineage.
+fn boundary_for_pg_commit(
+    system_identifier: u64,
+    end_lsn: &Lsn,
+    tx_id: Option<u32>,
+    checkpoint: CheckpointMeta,
+) -> SourceBoundary {
+    use crate::durable_checkpoint::{DurableWatermark, parse_lsn};
+    let durable_watermark = if system_identifier != 0 {
+        parse_lsn(&end_lsn.to_string()).map(|lsn| {
+            Arc::from(
+                DurableWatermark::pg_commit(system_identifier, lsn, tx_id)
+                    .to_bytes(),
+            )
+        })
+    } else {
+        None
+    };
+    SourceBoundary {
+        checkpoint,
+        durable_watermark,
+    }
 }
 
 /// Read next replication event with watchdog timeout.
@@ -140,13 +167,22 @@ pub(super) async fn dispatch_event(
             // xid stamped on this transaction's row events. (pgoutput never
             // decodes aborted transactions, so a rollback emits nothing here.)
             if let Some(tx_id) = ctx.current_tx_id {
+                // Checkpoint and watermark BOTH describe this COMMIT boundary:
+                // the COMMIT record's end_lsn (never the last row/message LSN)
+                // and the frozen startup system_identifier lineage.
                 let checkpoint =
                     make_checkpoint_meta(&end_lsn, ctx.current_tx_id);
+                let boundary = boundary_for_pg_commit(
+                    ctx.system_identifier,
+                    &end_lsn,
+                    ctx.current_tx_id,
+                    checkpoint,
+                );
                 let _ = ctx
                     .tx
                     .send(SourceItem::TxCommit {
                         tx_id: tx_id.to_string(),
-                        checkpoint,
+                        boundary,
                     })
                     .await;
             }
@@ -173,7 +209,7 @@ pub(super) async fn dispatch_event(
             // A transactional message is an identity-bearing change: it consumes
             // a change-ordinal slot so subsequent rows in the transaction do not
             // collide. (Non-transactional messages occur outside BEGIN/COMMIT
-            // and have their own identity — they do not consume a tx ordinal.)
+            // and have their own identity - they do not consume a tx ordinal.)
             if transactional {
                 ctx.change_ordinal += 1;
             }
@@ -182,7 +218,7 @@ pub(super) async fn dispatch_event(
             let message_ordinal = ctx.message_ordinal;
             ctx.message_ordinal += 1;
 
-            // The stable `msg` id is required — fail closed without lineage.
+            // The stable `msg` id is required - fail closed without lineage.
             if ctx.system_identifier == 0 {
                 return Err(LoopControl::Fail(SourceError::Other(
                     anyhow::anyhow!(
@@ -425,7 +461,7 @@ fn columns_differ(old: &[RelationColumn], new: &[RelationColumn]) -> bool {
     false
 }
 
-/// Static version string — allocated once, not per event.
+/// Static version string - allocated once, not per event.
 static PG_VERSION: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| {
         concat!("deltaforge-", env!("CARGO_PKG_VERSION")).to_string()
@@ -445,7 +481,7 @@ fn build_source_info(
     relation_oid: u32,
     change_ordinal: u32,
 ) -> SourceResult<(SourceInfo, deltaforge_core::EventId)> {
-    // Cache the LSN string — only reformat when it changes.
+    // Cache the LSN string - only reformat when it changes.
     let lsn_str = match &ctx.cached_lsn {
         Some((cached, s)) if cached == wal_lsn => s.clone(),
         _ => {
@@ -477,7 +513,7 @@ fn build_source_info(
             p
         },
     };
-    // The stable id is required at the source boundary — fail closed if the
+    // The stable id is required at the source boundary - fail closed if the
     // system_identifier is missing or the row has no active transaction.
     if ctx.system_identifier == 0 {
         return Err(SourceError::Other(anyhow::anyhow!(
@@ -834,7 +870,7 @@ async fn handle_truncate(
         };
 
         // Truncate carries row-like identity coordinates (relation OID +
-        // per-tx change ordinal), so its id is a `pgrow`. Required — fail closed.
+        // per-tx change ordinal), so its id is a `pgrow`. Required - fail closed.
         if ctx.system_identifier == 0 {
             return Err(SourceError::Other(anyhow::anyhow!(
                 "truncate identity: system_identifier unavailable"

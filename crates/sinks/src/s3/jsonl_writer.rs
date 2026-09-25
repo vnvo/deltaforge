@@ -398,8 +398,9 @@ mod tests {
             synthetic: None,
             routing: None,
             tx_end: false,
-            checkpoint: None,
+            boundary: None,
             size_bytes: 0,
+
             received_at_ms: i,
         };
 
@@ -466,8 +467,9 @@ mod tests {
             synthetic: None,
             routing: None,
             tx_end: false,
-            checkpoint: None,
+            boundary: None,
             size_bytes: 0,
+
             received_at_ms: i,
         };
 
@@ -543,8 +545,9 @@ mod tests {
             synthetic: None,
             routing: None,
             tx_end: false,
-            checkpoint: None,
+            boundary: None,
             size_bytes: 0,
+
             received_at_ms: 0,
         };
 

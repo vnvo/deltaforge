@@ -132,7 +132,7 @@ pub(crate) struct RunCtx {
     pub last_lsn: Lsn,
     pub current_tx_id: Option<u32>,
     pub current_tx_commit_time: Option<i64>,
-    /// The current transaction's final LSN (from `BEGIN`) — the stable identity
+    /// The current transaction's final LSN (from `BEGIN`) - the stable identity
     /// coordinate for row/message changes in this transaction. `None` outside a
     /// transaction.
     pub current_final_lsn: Option<String>,
@@ -140,7 +140,7 @@ pub(crate) struct RunCtx {
     /// identity-bearing change (insert/update/delete/truncate/transactional
     /// message) before filtering.
     pub change_ordinal: u32,
-    /// Cluster `system_identifier` (per-connection lineage) — captured once at
+    /// Cluster `system_identifier` (per-connection lineage) - captured once at
     /// startup and mixed into provisional row/DDL/message ids. `0` if the
     /// catalog function was unavailable (provisional ids are then skipped).
     pub system_identifier: u64,
@@ -177,7 +177,7 @@ struct SnapshotPlan {
 impl PostgresSource {
     /// Validate every selected table's identity (resolution + catalog type
     /// support), freeze the cluster lineage, compute the config fingerprint, and
-    /// atomically allocate (or resume) the snapshot generation — all **before**
+    /// atomically allocate (or resume) the snapshot generation - all **before**
     /// any row is emitted. Keyless tables or unsupported identity types fail
     /// here, before allocation.
     async fn prepare_snapshot_generation(
@@ -286,7 +286,7 @@ impl PostgresSource {
         })
     }
 
-    /// Freeze the PostgreSQL cluster lineage from `system_identifier` — the same
+    /// Freeze the PostgreSQL cluster lineage from `system_identifier` - the same
     /// authority used by the failover identity path (`pg_control_system()`, no
     /// superuser). Fails with an actionable error if it is unavailable.
     async fn capture_snapshot_lineage(
@@ -382,14 +382,14 @@ impl PostgresSource {
         } else {
             // Resuming from a checkpoint: verify the replication slot still exists
             // before trusting the saved LSN. A dropped slot means the WAL position
-            // is permanently lost — halt rather than silently reconnecting.
+            // is permanently lost - halt rather than silently reconnecting.
             match check_position_reachability(&self.dsn, &self.slot).await {
                 Ok(PositionReachability::Lost { reason }) => {
                     error!(
                         source_id = %self.id,
                         slot = %self.slot,
                         %reason,
-                        "replication slot lost — checkpoint position is unreachable, halting"
+                        "replication slot lost - checkpoint position is unreachable, halting"
                     );
                     return Err(SourceError::Checkpoint {
                         details: format!(
@@ -570,7 +570,7 @@ impl PostgresSource {
         check_identity_post_reconnect(&mut ctx).await?;
 
         // If failover was detected, ctx.last_lsn was reset to B's slot position.
-        // The existing stream was opened from A's stale LSN — reconnect from the correct point.
+        // The existing stream was opened from A's stale LSN - reconnect from the correct point.
         if ctx.last_lsn != start_lsn {
             let reconnect_config = config.clone().with_start_lsn(ctx.last_lsn);
             let new_client = connect_replication_with_retries(
@@ -755,6 +755,32 @@ impl Source for PostgresSource {
         };
         parse_lsn(&a.lsn).cmp(&parse_lsn(&b.lsn))
     }
+
+    async fn check_durable_snapshot_startup(
+        &self,
+        checkpoint_store: &dyn CheckpointStore,
+    ) -> Result<(), SourceError> {
+        let progress: postgres_snapshot::SnapshotProgress = checkpoint_store
+            .get_raw(&postgres_snapshot::progress_key(&self.id))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        if crate::snapshot_frontier::is_ambiguous_legacy_progress(
+            &self.tables,
+            &progress.done_tables,
+            progress.finished,
+        ) {
+            return Err(SourceError::Other(anyhow::anyhow!(
+                "durable_v2: interrupted legacy snapshot progress for source \
+                 {} cannot be adopted (some tables done, some pending); finish \
+                 it under legacy mode or start a new snapshot generation",
+                self.id
+            )));
+        }
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -766,7 +792,7 @@ impl Source for PostgresSource {
 /// `START_REPLICATION` immediately advances the slot's `confirmed_flush_lsn` to
 /// `max(start_lsn, slot.confirmed_flush_lsn)`.  If we start with A's stale checkpoint
 /// LSN on a fresh B whose slot is behind that checkpoint, PostgreSQL will skip any
-/// changes B committed between its slot creation LSN and A's checkpoint — even if we
+/// changes B committed between its slot creation LSN and A's checkpoint - even if we
 /// reconnect from the correct LSN afterwards.
 ///
 /// By fetching the correct start LSN before the first replication connection, we avoid
@@ -843,7 +869,7 @@ async fn check_identity_post_reconnect(ctx: &mut RunCtx) -> SourceResult<()> {
                 source_id = %ctx.source_id,
                 prev = ?previous,
                 new = ?current,
-                "server identity changed — failover detected, reconciling"
+                "server identity changed - failover detected, reconciling"
             );
             run_failover_reconciliation(ctx, previous, current).await?;
         }
@@ -875,7 +901,7 @@ async fn run_failover_reconciliation(
                 warn!(
                     source_id = %ctx.source_id,
                     %reason,
-                    "could not verify position reachability after failover — resuming anyway"
+                    "could not verify position reachability after failover - resuming anyway"
                 );
             }
             PositionReachability::Lost { reason } => {

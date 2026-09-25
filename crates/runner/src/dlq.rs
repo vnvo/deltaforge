@@ -1,4 +1,4 @@
-//! Dead Letter Queue writer — routes per-event failures to a durable queue
+//! Dead Letter Queue writer - routes per-event failures to a durable queue
 //! backed by the StorageBackend.
 //!
 //! The DLQ is a bounded FIFO queue with configurable overflow policy.
@@ -19,7 +19,7 @@ use tracing::{debug, error, warn};
 /// Namespace used for all journal queue entries in the StorageBackend.
 const JOURNAL_NS: &str = "journal";
 
-/// DLQ writer — thin wrapper over StorageBackend.queue_* primitives.
+/// DLQ writer - thin wrapper over StorageBackend.queue_* primitives.
 pub struct DlqWriter {
     backend: ArcStorageBackend,
     pipeline: String,
@@ -51,7 +51,7 @@ impl DlqWriter {
     /// Write a failed event to the DLQ.
     ///
     /// Handles payload truncation, overflow policy, and metrics.
-    /// Errors from the DLQ write itself are logged but do not propagate —
+    /// Errors from the DLQ write itself are logged but do not propagate -
     /// a broken DLQ should not stop the pipeline.
     pub async fn write(&self, event: &Event, sink_id: &str, error: &SinkError) {
         let error_kind = error.kind().to_string();
@@ -66,7 +66,7 @@ impl DlqWriter {
                 .event_id
                 .map(|id| id.to_string())
                 .unwrap_or_default(),
-            source_cursor: event.checkpoint.as_ref().map(|cp| {
+            source_cursor: event.checkpoint().map(|cp| {
                 serde_json::from_slice(cp.as_bytes())
                     .unwrap_or(serde_json::Value::Null)
             }),
@@ -278,7 +278,7 @@ impl DlqWriter {
             if entry.timestamp <= cutoff {
                 last_expired_seq = Some(entry.seq);
             } else {
-                break; // FIFO order — all remaining are newer
+                break; // FIFO order - all remaining are newer
             }
         }
         if let Some(seq) = last_expired_seq {
@@ -529,7 +529,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!write_handle.is_finished(), "write should be blocked");
 
-        // Ack one entry — this should unblock the writer.
+        // Ack one entry - this should unblock the writer.
         let entries = dlq.peek(1).await.unwrap();
         dlq.ack(entries[0].seq).await.unwrap();
 
@@ -590,7 +590,7 @@ mod tests {
         }
         assert_eq!(dlq.len().await.unwrap(), 3);
 
-        // Cleanup immediately — nothing should expire (entries are <2s old).
+        // Cleanup immediately - nothing should expire (entries are <2s old).
         let removed = dlq.cleanup_expired().await.unwrap();
         assert_eq!(removed, 0);
         assert_eq!(dlq.len().await.unwrap(), 3);

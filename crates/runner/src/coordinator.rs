@@ -55,6 +55,11 @@ struct BuildingBatch {
     bytes: usize,
     committed_len: usize,
     committed_bytes: usize,
+    /// The batch's last committed source boundary: its resume checkpoint and the
+    /// durable watermark for the SAME source state, carried together (never
+    /// re-derived) into the delivery context. It is the single watermark
+    /// authority. `None` for non-durable / no-boundary batches.
+    boundary: Option<deltaforge_core::SourceBoundary>,
 }
 
 impl BuildingBatch {
@@ -65,6 +70,7 @@ impl BuildingBatch {
             bytes: 0,
             committed_len: 0,
             committed_bytes: 0,
+            boundary: None,
         }
     }
 
@@ -118,20 +124,46 @@ fn push_tx_event(
 /// boundary) the checkpoint is advanced onto the prior boundary event when one
 /// exists; otherwise the next transaction covers it. Returns whether the
 /// transaction contributed events.
-fn close_tx(b: &mut BuildingBatch, checkpoint: CheckpointMeta) -> bool {
+fn close_tx(
+    b: &mut BuildingBatch,
+    boundary: deltaforge_core::SourceBoundary,
+) -> bool {
     let had_events = b.mid_tx();
+    // The whole boundary (checkpoint + watermark, from one source state) becomes
+    // the batch boundary and is stamped on the last event for resume.
+    b.boundary = Some(boundary.clone());
     if let Some(last) = b.raw.last_mut() {
-        last.checkpoint = Some(checkpoint);
+        last.set_boundary(boundary);
     }
     b.committed_len = b.raw.len();
     b.committed_bytes = b.bytes;
     had_events
 }
 
-/// Record that a standalone (non-transactional) event is its own boundary.
+/// Apply a data-less boundary (a [`SourceItem::Boundary`], e.g. snapshot
+/// completion) to the batch: it becomes the batch boundary and the whole batch is
+/// a committed prefix. Boundaries only arrive between transactions/standalone
+/// rows, never mid-transaction.
+fn close_boundary(
+    b: &mut BuildingBatch,
+    boundary: deltaforge_core::SourceBoundary,
+) {
+    b.boundary = Some(boundary);
+    b.committed_len = b.raw.len();
+    b.committed_bytes = b.bytes;
+}
+
+/// Record that a standalone (non-transactional) event is its own boundary. Its
+/// source boundary (checkpoint + watermark, set atomically at the source via
+/// `Event::set_boundary`) becomes the batch boundary, so a non-GTID CDC row or
+/// snapshot row carries a boundary exactly like a commit marker does. The latest
+/// boundary wins; an event without one leaves the current boundary untouched.
 fn commit_standalone(b: &mut BuildingBatch) {
     b.committed_len = b.raw.len();
     b.committed_bytes = b.bytes;
+    if let Some(bd) = b.raw.last().and_then(|e| e.boundary.clone()) {
+        b.boundary = Some(bd);
+    }
 }
 
 /// A flush is due when the whole-transaction prefix has reached the soft size
@@ -156,13 +188,13 @@ fn keep_whole_txs(mut b: BuildingBatch) -> Option<BuildingBatch> {
 
 /// Prepare the in-flight batch for a terminal flush (cancel / source-closed /
 /// disconnect). In tx-aligned mode any uncommitted partial transaction is
-/// discarded — it was never durable at the source, so its checkpoint must not
+/// discarded - it was never durable at the source, so its checkpoint must not
 /// advance and it replays whole on restart. The discard is recorded so an
 /// operator can see it happened. Returns the remainder to flush, if any.
 ///
 /// A rolled-back transaction needs no special handling here: MySQL binlog and
 /// PostgreSQL logical replication only stream committed transactions, so the
-/// coordinator never sees aborted events — an in-progress suffix at shutdown is
+/// coordinator never sees aborted events - an in-progress suffix at shutdown is
 /// simply a transaction whose commit had not yet been read.
 fn finalize_batch(
     b: BuildingBatch,
@@ -339,7 +371,7 @@ impl TxTracker {
     }
 
     /// A `TxCommit` closes the open transaction and must match it. A commit with
-    /// no open transaction is a duplicate or unknown commit — rejected so it
+    /// no open transaction is a duplicate or unknown commit - rejected so it
     /// cannot advance the checkpoint twice.
     fn commit(&mut self, tx_id: &str) -> Result<(), TxProtocolError> {
         match &self.active {
@@ -380,7 +412,7 @@ fn policy_satisfied(
     total_acks: usize,
 ) -> bool {
     match policy.as_ref().unwrap_or(&CommitPolicy::Required) {
-        // `All` means *every* sink acked — required and optional alike. It must
+        // `All` means *every* sink acked - required and optional alike. It must
         // compare against the total sink count, not the required count (else a
         // pipeline with any optional sink could never satisfy `All`, and a
         // *failed* optional sink would spuriously satisfy it).
@@ -866,7 +898,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
 
         let coord = Arc::new(self);
 
-        // Bounded channel for pipelined delivery — capacity = max_inflight.
+        // Bounded channel for pipelined delivery - capacity = max_inflight.
         // When max_inflight=1 this degrades gracefully to back-pressure after
         // every batch (same throughput as the old sequential path).
         let (deliver_tx, mut deliver_rx) =
@@ -876,7 +908,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         let delivery_error: Arc<Mutex<Option<anyhow::Error>>> =
             Arc::new(Mutex::new(None));
 
-        // Spawn delivery task — processes batches in FIFO order so checkpoints
+        // Spawn delivery task - processes batches in FIFO order so checkpoints
         // are committed in sequence.
         let d_coord = Arc::clone(&coord);
         let d_cancel = cancel.clone();
@@ -938,7 +970,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                             let elapsed = b.started_at.elapsed()
                                 >= Duration::from_millis(tick_ms);
                             // In tx-aligned mode only whole transactions may
-                            // flush — never mid-transaction.
+                            // flush - never mid-transaction.
                             let flushable = if respect_source_tx {
                                 b.committed_len > 0 && !b.mid_tx()
                             } else {
@@ -1012,7 +1044,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                                 return Err(anyhow::anyhow!(
                                                     "source transaction exceeds limits \
                                                      ({} events, {} bytes); oversized_tx \
-                                                     policy is Fail — the transaction is \
+                                                     policy is Fail - the transaction is \
                                                      replayed whole on restart",
                                                     o.events, o.bytes,
                                                 ));
@@ -1035,14 +1067,16 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                             }
                                         }
                                     }
-                                    SourceItem::TxCommit { tx_id, checkpoint } => {
+                                    SourceItem::TxCommit { tx_id, boundary } => {
                                         // The marker must match the open tx and
-                                        // may close it exactly once — a stale or
+                                        // may close it exactly once - a stale or
                                         // duplicate marker cannot advance twice.
                                         tx_tracker.commit(&tx_id)?;
-                                        // Commit boundary: close the open tx and
-                                        // flush only if soft limits are reached.
-                                        close_tx(&mut b, checkpoint);
+                                        // Commit boundary: close the open tx with
+                                        // the boundary's checkpoint + watermark
+                                        // (atomic), flush only if soft limits are
+                                        // reached.
+                                        close_tx(&mut b, boundary);
                                         if soft_limit_reached(&b, max_events, max_bytes) {
                                             let full = std::mem::replace(
                                                 &mut b,
@@ -1050,6 +1084,21 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                             );
                                             send_to_delivery(&deliver_tx, full, "tx_commit").await?;
                                         }
+                                    }
+                                    SourceItem::Boundary { boundary } => {
+                                        // A data-less boundary (snapshot table /
+                                        // full completion). Apply it to the pending
+                                        // batch and flush now so it is delivered -
+                                        // and durably acked - promptly, even when
+                                        // the batch is empty because prior data
+                                        // already flushed (the sink then publishes a
+                                        // zero-object entry + HEAD CAS for it).
+                                        close_boundary(&mut b, boundary);
+                                        let full = std::mem::replace(
+                                            &mut b,
+                                            BuildingBatch::with_capacity(max_events),
+                                        );
+                                        send_to_delivery(&deliver_tx, full, "boundary").await?;
                                     }
                                 }
                             } else {
@@ -1252,7 +1301,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
 
         // 4) DELIVER to all sinks concurrently
         //
-        // Each sink gets the same Arc<[Event]> — no cloning of event data.
+        // Each sink gets the same Arc<[Event]> - no cloning of event data.
         // We drive all futures simultaneously and collect per-sink outcomes,
         // then fold the results into ack counters
         let required_total =
@@ -1272,18 +1321,41 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         // `SinkError::Backpressure` for that sink, routed per `required`.
         let deadline = self.sink_batch_deadline;
         let pipeline_name_str: String = self.pipeline_name.to_string();
+
+        // The delivery context comes entirely from the batch's source boundary
+        // (captured at the commit marker, before processing, so it survives
+        // filtering). Checkpoint and watermark are the SAME source state - the
+        // single watermark authority; nothing re-derives a watermark here.
+        let ctx = Arc::new(deltaforge_core::SinkBatchContext {
+            checkpoint: b
+                .boundary
+                .as_ref()
+                .map(|bd| bd.checkpoint.clone())
+                .unwrap_or_else(|| CheckpointMeta::from_vec(Vec::new())),
+            durable_watermark: b
+                .boundary
+                .as_ref()
+                .and_then(|bd| bd.durable_watermark.as_ref())
+                .map(|w| w.to_vec()),
+            batch_id: None,
+        });
+
         let sink_futs = self.sinks.iter().map(|sink| {
             let start = Instant::now();
             let events = Arc::clone(&frozen.events);
             let required = is_sink_required(sink);
             let sink_id = sink.id().to_string();
             let pipeline = pipeline_name_str.clone();
+            let ctx = Arc::clone(&ctx);
 
             async move {
                 let result = match deadline {
                     Some(d) => {
-                        match tokio::time::timeout(d, sink.send_batch(&events))
-                            .await
+                        match tokio::time::timeout(
+                            d,
+                            sink.send_batch_with_context(&events, &ctx),
+                        )
+                        .await
                         {
                             Ok(r) => r,
                             Err(_elapsed) => {
@@ -1309,7 +1381,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                             }
                         }
                     }
-                    None => sink.send_batch(&events).await,
+                    None => sink.send_batch_with_context(&events, &ctx).await,
                 };
                 (sink_id, required, start.elapsed(), result)
             }
@@ -1405,7 +1477,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             .set(if *succeeded { 1.0 } else { 0.0 });
         }
 
-        // Policy gate — check BEFORE committing any checkpoints so that a
+        // Policy gate - check BEFORE committing any checkpoints so that a
         // failed required sink never leaves optional sinks with advanced
         // checkpoints while the required sink is behind.
         if !policy_satisfied(
@@ -1422,7 +1494,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         }
 
         //
-        // Per-sink checkpoint commit — only reached when the commit policy is
+        // Per-sink checkpoint commit - only reached when the commit policy is
         // satisfied. Each sink that successfully delivered the batch gets its
         // own checkpoint committed independently. Failed sinks do not advance.
         // Commits run concurrently to avoid serializing latency across sinks.
@@ -1555,11 +1627,8 @@ pub fn build_batch_processor(
         let pipeline = Arc::clone(&pipeline_name);
 
         async move {
-            let last_cp = events
-                .iter()
-                .rev()
-                .find_map(|e| e.checkpoint.as_ref())
-                .cloned();
+            let last_cp =
+                events.iter().rev().find_map(|e| e.checkpoint()).cloned();
 
             if procs.is_empty() {
                 return Ok(ProcessedBatch {
@@ -1711,7 +1780,7 @@ mod tests {
             total_order: None,
             data_collection_order: None,
         });
-        e.checkpoint = Some(CheckpointMeta::from_vec(checkpoint.to_vec()));
+        e.set_checkpoint(CheckpointMeta::from_vec(checkpoint.to_vec()));
         e
     }
 
@@ -1737,7 +1806,7 @@ mod tests {
 
     /// A transaction larger than the soft `max_events` limit is delivered whole
     /// (one batch, never split), and the committed checkpoint is the commit
-    /// marker's position — not any data event's.
+    /// marker's position - not any data event's.
     #[tokio::test]
     async fn tx_not_split_at_soft_limit_and_checkpoints_at_marker() {
         use checkpoints::MemCheckpointStore;
@@ -1775,7 +1844,9 @@ mod tests {
         }
         tx.send(SourceItem::TxCommit {
             tx_id: "gtid:1".into(),
-            checkpoint: CheckpointMeta::from_vec(b"commit-1".to_vec()),
+            boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                CheckpointMeta::from_vec(b"commit-1".to_vec()),
+            ),
         })
         .await
         .unwrap();
@@ -1830,7 +1901,9 @@ mod tests {
             }
             tx.send(SourceItem::TxCommit {
                 tx_id: txn.into(),
-                checkpoint: CheckpointMeta::from_vec(cp.as_bytes().to_vec()),
+                boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                    CheckpointMeta::from_vec(cp.as_bytes().to_vec()),
+                ),
             })
             .await
             .unwrap();
@@ -1932,7 +2005,9 @@ mod tests {
         }
         tx.send(SourceItem::TxCommit {
             tx_id: "gtid:1".into(),
-            checkpoint: CheckpointMeta::from_vec(b"cp-1".to_vec()),
+            boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                CheckpointMeta::from_vec(b"cp-1".to_vec()),
+            ),
         })
         .await
         .unwrap();
@@ -1989,7 +2064,9 @@ mod tests {
         .unwrap();
         tx.send(SourceItem::TxCommit {
             tx_id: "gtid:1".into(),
-            checkpoint: CheckpointMeta::from_vec(b"empty".to_vec()),
+            boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                CheckpointMeta::from_vec(b"empty".to_vec()),
+            ),
         })
         .await
         .unwrap();
@@ -2004,7 +2081,9 @@ mod tests {
             .unwrap();
         tx.send(SourceItem::TxCommit {
             tx_id: "gtid:2".into(),
-            checkpoint: CheckpointMeta::from_vec(b"real".to_vec()),
+            boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                CheckpointMeta::from_vec(b"real".to_vec()),
+            ),
         })
         .await
         .unwrap();
@@ -2054,12 +2133,14 @@ mod tests {
     fn commit(tx_id: &str, cp: &[u8]) -> SourceItem {
         SourceItem::TxCommit {
             tx_id: tx_id.into(),
-            checkpoint: CheckpointMeta::from_vec(cp.to_vec()),
+            boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                CheckpointMeta::from_vec(cp.to_vec()),
+            ),
         }
     }
 
     /// A commit marker with no matching begin (an unknown or duplicate commit)
-    /// is a fatal protocol error — it must not advance any checkpoint.
+    /// is a fatal protocol error - it must not advance any checkpoint.
     #[tokio::test]
     async fn commit_without_begin_is_rejected() {
         let (res, store) = run_items(vec![commit("gtid:1", b"cp")]).await;
@@ -2148,7 +2229,7 @@ mod tests {
         );
     }
 
-    /// Drops every event — models a transaction whose rows are all filtered by a
+    /// Drops every event - models a transaction whose rows are all filtered by a
     /// processor.
     struct DropAllProcessor;
     #[async_trait::async_trait]
@@ -2211,7 +2292,9 @@ mod tests {
         }
         tx.send(SourceItem::TxCommit {
             tx_id: "gtid:1".into(),
-            checkpoint: CheckpointMeta::from_vec(b"cp-1".to_vec()),
+            boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                CheckpointMeta::from_vec(b"cp-1".to_vec()),
+            ),
         })
         .await
         .unwrap();
@@ -2229,7 +2312,7 @@ mod tests {
     }
 
     /// A completed transaction that never reaches the soft size limit is flushed
-    /// by the timer once the source goes idle — while it stays open (no marker)
+    /// by the timer once the source goes idle - while it stays open (no marker)
     /// the timer must not flush it.
     #[tokio::test]
     async fn timer_flushes_whole_tx_when_idle() {
@@ -2264,7 +2347,9 @@ mod tests {
         }
         tx.send(SourceItem::TxCommit {
             tx_id: "gtid:1".into(),
-            checkpoint: CheckpointMeta::from_vec(b"cp-1".to_vec()),
+            boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                CheckpointMeta::from_vec(b"cp-1".to_vec()),
+            ),
         })
         .await
         .unwrap();
@@ -2334,7 +2419,9 @@ mod tests {
             }
             tx.send(SourceItem::TxCommit {
                 tx_id: txn.into(),
-                checkpoint: CheckpointMeta::from_vec(cp.as_bytes().to_vec()),
+                boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                    CheckpointMeta::from_vec(cp.as_bytes().to_vec()),
+                ),
             })
             .await
             .unwrap();
@@ -2353,7 +2440,7 @@ mod tests {
     // ── Pure batch-accumulation helpers (check_and_split / policy) ───────
 
     /// Build a minimal row event with a controllable size hint and tx-end
-    /// flag — the only two fields `check_and_split` reads.
+    /// flag - the only two fields `check_and_split` reads.
     fn sized_event(size_bytes: usize, tx_end: bool) -> Event {
         let source = deltaforge_core::SourceInfo {
             version: "test".into(),
@@ -2492,7 +2579,7 @@ mod tests {
         // Both ack → satisfied.
         assert!(policy_satisfied(&Some(CommitPolicy::All), 2, 1, 1, 2));
         // Optional sink fails (total_acks=1): must NOT be satisfied. Regression
-        // guard — the old code compared total_acks to required_total (1) and
+        // guard - the old code compared total_acks to required_total (1) and
         // spuriously passed here.
         assert!(!policy_satisfied(&Some(CommitPolicy::All), 2, 1, 1, 1));
     }
@@ -2658,15 +2745,15 @@ mod tests {
             0,
             0,
         );
-        event.checkpoint =
-            Some(CheckpointMeta::from_vec(b"{\"pos\":42}".to_vec()));
+        event
+            .set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":42}".to_vec()));
         event.tx_end = true;
         tx.send(SourceItem::Event(event)).await.unwrap();
         drop(tx); // Close channel so coordinator exits after processing.
 
         let _ = coord.run(rx, cancel, pause_rx).await;
 
-        // Kafka succeeded — checkpoint should be written.
+        // Kafka succeeded - checkpoint should be written.
         let kafka_cp = store.get_raw("mysql::sink::kafka").await.unwrap();
         assert!(
             kafka_cp.is_some(),
@@ -2674,7 +2761,7 @@ mod tests {
         );
         assert_eq!(kafka_cp.unwrap(), b"{\"pos\":42}");
 
-        // Redis failed — checkpoint should NOT be written.
+        // Redis failed - checkpoint should NOT be written.
         let redis_cp = store.get_raw("mysql::sink::redis").await.unwrap();
         assert!(
             redis_cp.is_none(),
@@ -2688,7 +2775,7 @@ mod tests {
     }
 
     /// Regression test: a partial batch (fewer events than max_events) must be
-    /// flushed by the timer when the source goes idle — not stuck waiting for
+    /// flushed by the timer when the source goes idle - not stuck waiting for
     /// more events to fill the batch.
     #[tokio::test]
     async fn test_partial_batch_flushed_by_timer() {
@@ -2748,14 +2835,15 @@ mod tests {
                 0,
             );
             if i == 2 {
-                ev.checkpoint =
-                    Some(CheckpointMeta::from_vec(b"{\"pos\":99}".to_vec()));
+                ev.set_checkpoint(CheckpointMeta::from_vec(
+                    b"{\"pos\":99}".to_vec(),
+                ));
                 ev.tx_end = true;
             }
             tx.send(SourceItem::Event(ev)).await.unwrap();
         }
 
-        // Don't close the channel — simulate source idle at WAL tail.
+        // Don't close the channel - simulate source idle at WAL tail.
         // The timer should flush the partial batch within max_ms.
         // Wait up to 2 seconds for the sink to receive the events.
         let cancel_clone = cancel.clone();
@@ -2764,7 +2852,7 @@ mod tests {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
             loop {
                 if sink_clone.delivery_count() >= 3 {
-                    // Events delivered — cancel coordinator to stop the test.
+                    // Events delivered - cancel coordinator to stop the test.
                     cancel_clone.cancel();
                     return true;
                 }
@@ -2936,8 +3024,9 @@ mod tests {
                 0,
             );
             if i == 4 {
-                ev.checkpoint =
-                    Some(CheckpointMeta::from_vec(b"{\"pos\":100}".to_vec()));
+                ev.set_checkpoint(CheckpointMeta::from_vec(
+                    b"{\"pos\":100}".to_vec(),
+                ));
                 ev.tx_end = true;
             }
             tx.send(SourceItem::Event(ev)).await.unwrap();
@@ -3054,8 +3143,9 @@ mod tests {
                 0,
             );
             if i == 2 {
-                ev.checkpoint =
-                    Some(CheckpointMeta::from_vec(b"{\"pos\":50}".to_vec()));
+                ev.set_checkpoint(CheckpointMeta::from_vec(
+                    b"{\"pos\":50}".to_vec(),
+                ));
                 ev.tx_end = true;
             }
             tx.send(SourceItem::Event(ev)).await.unwrap();
@@ -3071,7 +3161,7 @@ mod tests {
         assert_eq!(dlq_writer.len().await.unwrap(), 3);
 
         // Checkpoint should still be committed (batch "succeeded" with all
-        // events routed to DLQ — the sink returned Ok(BatchResult) not Err).
+        // events routed to DLQ - the sink returned Ok(BatchResult) not Err).
         let cp = ckpt_store.get_raw("src::sink::kafka").await.unwrap();
         assert!(cp.is_some(), "checkpoint should be committed");
     }
@@ -3095,7 +3185,7 @@ mod tests {
         let batch_processor =
             build_batch_processor(processors, "test".to_string());
 
-        // No DLQ writer — default (None).
+        // No DLQ writer - default (None).
         let coord = Coordinator::builder("test-no-dlq")
             .sinks(sinks)
             .batch_config(Some(BatchConfig {
@@ -3135,8 +3225,7 @@ mod tests {
             0,
             0,
         );
-        ev.checkpoint =
-            Some(CheckpointMeta::from_vec(b"{\"pos\":10}".to_vec()));
+        ev.set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":10}".to_vec()));
         ev.tx_end = true;
         tx.send(SourceItem::Event(ev)).await.unwrap();
         drop(tx);
@@ -3246,7 +3335,7 @@ mod tests {
             0,
             0,
         );
-        ev.checkpoint = Some(CheckpointMeta::from_vec(b"{\"pos\":1}".to_vec()));
+        ev.set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":1}".to_vec()));
         ev.tx_end = true;
         tx.send(SourceItem::Event(ev)).await.unwrap();
         drop(tx);
@@ -3342,7 +3431,7 @@ mod tests {
             0,
             0,
         );
-        ev.checkpoint = Some(CheckpointMeta::from_vec(b"{\"pos\":1}".to_vec()));
+        ev.set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":1}".to_vec()));
         ev.tx_end = true;
         tx.send(SourceItem::Event(ev)).await.unwrap();
         drop(tx);
@@ -3372,5 +3461,404 @@ mod tests {
             cp_slow.is_none(),
             "slow optional sink's checkpoint stays behind on coordinator timeout"
         );
+    }
+
+    // ── Delivery context: the authoritative checkpoint reaches sinks ─────────
+
+    /// One recorded delivery: (event count, checkpoint bytes, watermark bytes).
+    type CtxDelivery = (usize, Vec<u8>, Option<Vec<u8>>);
+
+    /// Records the SinkBatchContext each delivery carried.
+    struct CtxSink {
+        id: String,
+        seen: std::sync::Mutex<Vec<CtxDelivery>>,
+    }
+    impl CtxSink {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                id: "ctx".into(),
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn deliveries(&self) -> Vec<CtxDelivery> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+    #[async_trait::async_trait]
+    impl deltaforge_core::Sink for CtxSink {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        async fn send(&self, _e: &Event) -> SinkResult<()> {
+            Ok(())
+        }
+        async fn send_batch_with_context(
+            &self,
+            events: &[Event],
+            ctx: &deltaforge_core::SinkBatchContext,
+        ) -> SinkResult<deltaforge_core::BatchResult> {
+            self.seen.lock().unwrap().push((
+                events.len(),
+                ctx.checkpoint.as_bytes().to_vec(),
+                ctx.durable_watermark.clone(),
+            ));
+            Ok(deltaforge_core::BatchResult::ok())
+        }
+    }
+
+    struct DropLastProcessor;
+    #[async_trait::async_trait]
+    impl deltaforge_core::Processor for DropLastProcessor {
+        fn id(&self) -> &str {
+            "drop-last"
+        }
+        async fn process(
+            &self,
+            mut events: Vec<Event>,
+            _ctx: &BatchContext,
+        ) -> anyhow::Result<Vec<Event>> {
+            events.pop();
+            Ok(events)
+        }
+        fn identity_digest(&self) -> &str {
+            "drop-last-v1"
+        }
+    }
+
+    struct FanOutProcessor;
+    #[async_trait::async_trait]
+    impl deltaforge_core::Processor for FanOutProcessor {
+        fn id(&self) -> &str {
+            "fan-out"
+        }
+        async fn process(
+            &self,
+            events: Vec<Event>,
+            _ctx: &BatchContext,
+        ) -> anyhow::Result<Vec<Event>> {
+            let mut out = events.clone();
+            out.extend(events);
+            Ok(out)
+        }
+        fn identity_digest(&self) -> &str {
+            "fan-out-v1"
+        }
+    }
+
+    /// Run 3 standalone events (the last carrying an `authoritative` source
+    /// boundary: checkpoint + watermark) through a coordinator with `proc`,
+    /// returning the sink's recorded contexts. The context is built solely from
+    /// the batch's source boundary - there is no independent watermark builder.
+    async fn deliver_with_processor(
+        proc: deltaforge_core::ArcDynProcessor,
+    ) -> Vec<CtxDelivery> {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = CtxSink::new();
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        let cp_fn = build_commit_fn(store, "src::sink::ctx".to_string());
+        let procs: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![proc]);
+        let batch_processor = build_batch_processor(procs, "test".to_string());
+        let coord = Coordinator::builder("test-ctx")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(10),
+                max_ms: Some(50),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_fn("ctx", cp_fn)
+            .process_fn(batch_processor)
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        let source = deltaforge_core::SourceInfo {
+            version: "t".into(),
+            connector: "mysql".into(),
+            name: "t".into(),
+            db: "db".into(),
+            schema: None,
+            table: "t".into(),
+            ts_ms: 0,
+            snapshot: None,
+            position: deltaforge_core::SourcePosition::default(),
+        };
+        for i in 0..3 {
+            let mut ev = Event::new_row(
+                deltaforge_core::EventId::mysql_row_server(1, "t", 1, i),
+                source.clone(),
+                deltaforge_core::Op::Create,
+                None,
+                Some(serde_json::json!({ "id": i })),
+                0,
+                0,
+            );
+            ev.transaction = None; // standalone
+            // Only the LAST event carries the authoritative source boundary.
+            if i == 2 {
+                ev.set_boundary(deltaforge_core::SourceBoundary {
+                    checkpoint: CheckpointMeta::from_vec(
+                        b"authoritative".to_vec(),
+                    ),
+                    durable_watermark: Some(std::sync::Arc::from(
+                        b"authoritative".to_vec(),
+                    )),
+                });
+            }
+            tx.send(SourceItem::Event(ev)).await.unwrap();
+        }
+        drop(tx);
+        coord.run(rx, cancel, pause_rx).await.unwrap();
+        sink.deliveries()
+    }
+
+    #[tokio::test]
+    async fn context_checkpoint_survives_filtered_last_event() {
+        // The processor drops the last event (which carried the checkpoint); the
+        // context checkpoint must still be the authoritative pre-processing one.
+        let d = deliver_with_processor(Arc::new(DropLastProcessor)).await;
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].0, 2, "two events survived");
+        assert_eq!(d[0].1, b"authoritative");
+        assert_eq!(d[0].2.as_deref(), Some(&b"authoritative"[..]));
+    }
+
+    #[tokio::test]
+    async fn context_present_for_fully_filtered_batch() {
+        // All events dropped: the sink still receives an empty batch with the
+        // authoritative context so it can publish a zero-object entry.
+        let d = deliver_with_processor(Arc::new(DropAllProcessor)).await;
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].0, 0, "empty batch delivered");
+        assert_eq!(d[0].1, b"authoritative");
+        assert_eq!(d[0].2.as_deref(), Some(&b"authoritative"[..]));
+    }
+
+    #[tokio::test]
+    async fn context_watermark_unchanged_by_fan_out() {
+        // Fan-out doubles the events but must not change the source watermark.
+        let d = deliver_with_processor(Arc::new(FanOutProcessor)).await;
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].0, 6, "3 events fanned out to 6");
+        assert_eq!(d[0].1, b"authoritative");
+        assert_eq!(d[0].2.as_deref(), Some(&b"authoritative"[..]));
+    }
+
+    /// The commit marker's boundary watermark reaches the sink context even when
+    /// a processor filters the whole transaction away.
+    #[tokio::test]
+    async fn context_boundary_watermark_survives_full_filtering() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = CtxSink::new();
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        let cp_fn = build_commit_fn(store, "src::sink::ctx".to_string());
+        let procs: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![Arc::new(DropAllProcessor) as _]);
+        let batch_processor = build_batch_processor(procs, "test".to_string());
+        let coord = Coordinator::builder("test-ctx-wm")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(1000),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_fn("ctx", cp_fn)
+            .process_fn(batch_processor)
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        tx.send(SourceItem::TxBegin {
+            tx_id: "gtid:1".into(),
+        })
+        .await
+        .unwrap();
+        tx.send(SourceItem::Event(tx_event(1, "gtid:1", b"row")))
+            .await
+            .unwrap();
+        tx.send(SourceItem::TxCommit {
+            tx_id: "gtid:1".into(),
+            boundary: deltaforge_core::SourceBoundary {
+                checkpoint: CheckpointMeta::from_vec(b"cp-1".to_vec()),
+                durable_watermark: Some(std::sync::Arc::from(
+                    b"WATERMARK".to_vec(),
+                )),
+            },
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        coord.run(rx, cancel, pause_rx).await.unwrap();
+
+        let d = sink.deliveries();
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].0, 0, "fully filtered -> empty batch delivered");
+        assert_eq!(
+            d[0].2.as_deref(),
+            Some(&b"WATERMARK"[..]),
+            "boundary watermark reaches the context despite full filtering"
+        );
+    }
+
+    /// A standalone (non-transactional) CDC event - e.g. a non-GTID MySQL row,
+    /// which has no TxCommit - carries its durable watermark atomically via
+    /// `Event::set_boundary`; that watermark reaches the sink context and
+    /// survives a processor that filters the event away.
+    #[tokio::test]
+    async fn standalone_event_boundary_watermark_reaches_context() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = CtxSink::new();
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        let cp_fn = build_commit_fn(store, "src::sink::ctx".to_string());
+        // Filter the event away to prove the watermark is carried on the batch,
+        // not on the surviving events.
+        let procs: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![Arc::new(DropAllProcessor) as _]);
+        let batch_processor = build_batch_processor(procs, "test".to_string());
+        let coord = Coordinator::builder("test-standalone-wm")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(1000),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_fn("ctx", cp_fn)
+            .process_fn(batch_processor)
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        // A standalone event (no `transaction`, no TxBegin/TxCommit) carrying an
+        // atomic boundary: checkpoint + binlog file/pos watermark.
+        let mut ev = tx_event(1, "unused", b"unused");
+        ev.transaction = None;
+        ev.set_boundary(deltaforge_core::SourceBoundary {
+            checkpoint: CheckpointMeta::from_vec(b"binlog-cp".to_vec()),
+            durable_watermark: Some(std::sync::Arc::from(
+                b"BINLOG-WM".to_vec(),
+            )),
+        });
+        tx.send(SourceItem::Event(ev)).await.unwrap();
+        drop(tx);
+        coord.run(rx, cancel, pause_rx).await.unwrap();
+
+        let d = sink.deliveries();
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].0, 0, "standalone event filtered -> empty batch");
+        assert_eq!(
+            d[0].2.as_deref(),
+            Some(&b"BINLOG-WM"[..]),
+            "standalone event's carried watermark reaches the context"
+        );
+    }
+
+    /// Build a coordinator + CtxSink for the boundary-item tests. `max_events`
+    /// controls whether the standalone rows flush before the boundary arrives.
+    fn boundary_coord(
+        max_events: usize,
+    ) -> (Coordinator<CheckpointMeta>, Arc<CtxSink>) {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = CtxSink::new();
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        let cp_fn = build_commit_fn(store, "src::sink::ctx".to_string());
+        let batch_processor =
+            build_batch_processor(Arc::from(vec![]), "test".to_string());
+        let coord = Coordinator::builder("test-boundary")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(max_events),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_fn("ctx", cp_fn)
+            .process_fn(batch_processor)
+            .build();
+        (coord, sink)
+    }
+
+    fn snapshot_completion_boundary() -> SourceItem {
+        SourceItem::Boundary {
+            boundary: deltaforge_core::SourceBoundary {
+                checkpoint: CheckpointMeta::from_vec(b"snap-done".to_vec()),
+                durable_watermark: Some(std::sync::Arc::from(
+                    b"COMPLETED".to_vec(),
+                )),
+            },
+        }
+    }
+
+    fn standalone_row(id: i64) -> SourceItem {
+        let mut ev = tx_event(id, "unused", b"unused");
+        ev.transaction = None;
+        SourceItem::Event(ev)
+    }
+
+    /// A boundary item applies to a pending snapshot batch: the buffered rows and
+    /// the completion boundary are delivered together in one batch.
+    #[tokio::test]
+    async fn boundary_item_applies_to_pending_batch() {
+        let (coord, sink) = boundary_coord(1000); // rows stay buffered
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_p, pause_rx) = tokio::sync::watch::channel(false);
+
+        tx.send(standalone_row(1)).await.unwrap();
+        tx.send(standalone_row(2)).await.unwrap();
+        tx.send(snapshot_completion_boundary()).await.unwrap();
+        drop(tx);
+        coord.run(rx, cancel, pause_rx).await.unwrap();
+
+        let d = sink.deliveries();
+        assert_eq!(d.len(), 1, "buffered rows + boundary deliver as one batch");
+        assert_eq!(d[0].0, 2, "both rows present");
+        assert_eq!(
+            d[0].1, b"snap-done",
+            "context checkpoint is the boundary's"
+        );
+        assert_eq!(d[0].2.as_deref(), Some(&b"COMPLETED"[..]));
+    }
+
+    /// When prior data already flushed, a boundary item still delivers - as an
+    /// empty batch carrying the completion boundary (the sink can then write a
+    /// zero-object entry + HEAD CAS for it).
+    #[tokio::test]
+    async fn boundary_item_delivers_empty_batch_when_data_already_flushed() {
+        let (coord, sink) = boundary_coord(1); // each row flushes immediately
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_p, pause_rx) = tokio::sync::watch::channel(false);
+
+        tx.send(standalone_row(1)).await.unwrap();
+        tx.send(snapshot_completion_boundary()).await.unwrap();
+        drop(tx);
+        coord.run(rx, cancel, pause_rx).await.unwrap();
+
+        let d = sink.deliveries();
+        assert_eq!(d.len(), 2, "row batch, then the boundary's empty batch");
+        assert_eq!(d[0].0, 1, "first batch carried the row");
+        assert_eq!(
+            d[1].0, 0,
+            "completion boundary delivered as an empty batch"
+        );
+        assert_eq!(d[1].1, b"snap-done");
+        assert_eq!(d[1].2.as_deref(), Some(&b"COMPLETED"[..]));
     }
 }

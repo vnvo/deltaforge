@@ -25,7 +25,7 @@ type CheckpointCmpFn =
 /// the smallest (earliest) checkpoint so the source replays from the position
 /// that the slowest sink needs.
 ///
-/// Uses the source-provided comparison function for correctness — different
+/// Uses the source-provided comparison function for correctness - different
 /// sources have different checkpoint formats (MySQL file:pos, Postgres LSN)
 /// that cannot be compared lexicographically.
 struct PerSinkCheckpointProxy {
@@ -42,7 +42,7 @@ impl CheckpointStore for PerSinkCheckpointProxy {
             let keys = self.inner.list_with_prefix(&prefix).await?;
             if keys.is_empty() {
                 // Fallback: check legacy checkpoint key (pre per-sink format).
-                // This allows seamless migration — old pipelines that saved
+                // This allows seamless migration - old pipelines that saved
                 // checkpoints under the plain source_id key still work.
                 return self.inner.get_raw(key).await;
             }
@@ -105,7 +105,7 @@ use deltaforge_core::encoding::avro_types::TypeConversionOpts;
 
 /// Build an Avro source schema provider if any sink uses Avro encoding.
 ///
-/// Returns `None` if no sinks use Avro — zero overhead in that case.
+/// Returns `None` if no sinks use Avro - zero overhead in that case.
 fn build_avro_provider(
     spec: &PipelineSpec,
     schema_loader: &Option<ArcSchemaLoader>,
@@ -255,6 +255,98 @@ fn build_elasticsearch_resolver(
     Some(crate::schema_provider::build_elasticsearch_schema_resolver(
         schema_provider,
     ))
+}
+
+/// Build the durable_v2 S3 sinks in the correct startup order: FIRST validate
+/// the source's snapshot migration (fail closed on an interrupted legacy
+/// snapshot) so a config that cannot start never probes/creates HEAD or fences a
+/// healthy prior writer, THEN probe/recover/acquire each durable sink and apply
+/// its configured filter. Returns an empty vec when no durable_v2 S3 sink is
+/// configured. The comparator is a core trait, injected here.
+async fn build_durable_s3_sinks(
+    spec: &PipelineSpec,
+    source: &dyn deltaforge_core::Source,
+    ckpt_store: &dyn CheckpointStore,
+    pipeline: &str,
+    arrow_resolver: Option<sinks::s3::SchemaResolver>,
+) -> Result<Vec<deltaforge_core::ArcDynSink>> {
+    use deltaforge_config::{S3Durability, SinkCfg};
+
+    let durable: Vec<&deltaforge_config::S3SinkCfg> = spec
+        .spec
+        .sinks
+        .iter()
+        .filter_map(|s| match s {
+            SinkCfg::S3(c) if c.durability == S3Durability::DurableV2 => {
+                Some(c)
+            }
+            _ => None,
+        })
+        .collect();
+    if durable.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // (2) Validate durable snapshot migration BEFORE any HEAD mutation.
+    source
+        .check_durable_snapshot_startup(ckpt_store)
+        .await
+        .context("durable_v2 snapshot startup check")?;
+
+    // (3) Probe/recover/acquire each durable sink; apply the configured filter.
+    let source_id = spec.spec.source.source_id().to_string();
+    let mut out: Vec<deltaforge_core::ArcDynSink> =
+        Vec::with_capacity(durable.len());
+    for cfg in durable {
+        let comparator: Arc<dyn deltaforge_core::CheckpointComparator> =
+            Arc::new(sources::durable_checkpoint::SourceCheckpointComparator);
+        let sink: deltaforge_core::ArcDynSink = Arc::new(
+            sinks::s3::build_durable_s3_sink(
+                cfg,
+                pipeline,
+                &source_id,
+                comparator,
+                arrow_resolver.clone(),
+            )
+            .await
+            .context("build durable_v2 S3 sink")?,
+        );
+        // Apply the configured filter exactly as legacy S3 does (the filter
+        // wrapper forwards the delivery context, even for a fully-filtered batch).
+        let sink = match &cfg.filter {
+            Some(f) if f.is_active() => {
+                sinks::FilteredSink::wrap(sink, f.clone())
+            }
+            _ => sink,
+        };
+        out.push(sink);
+    }
+    Ok(out)
+}
+
+/// Fail closed if the constructed sink set does not exactly match the configured
+/// sink IDs - guards against silently dropping or duplicating a sink.
+fn validate_sink_ids(
+    spec: &PipelineSpec,
+    sinks: &[deltaforge_core::ArcDynSink],
+) -> Result<()> {
+    use std::collections::BTreeMap;
+    let mut want: BTreeMap<&str, usize> = BTreeMap::new();
+    for s in &spec.spec.sinks {
+        *want.entry(s.sink_id()).or_default() += 1;
+    }
+    let mut got: BTreeMap<&str, usize> = BTreeMap::new();
+    for s in sinks {
+        *got.entry(s.id()).or_default() += 1;
+    }
+    if want != got {
+        anyhow::bail!(
+            "constructed sinks {:?} do not match configured sink ids {:?}",
+            got.keys().collect::<Vec<_>>(),
+            want.keys().collect::<Vec<_>>()
+        );
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -471,16 +563,35 @@ impl PipelineManager {
         // Build Elasticsearch column resolver if any sink is an ES sink
         let es_resolver = build_elasticsearch_resolver(&spec, &schema_loader);
 
-        let sinks = sinks::build_sinks_with_schemas(
+        // Build every non-durable sink. Durable_v2 S3 sinks are deferred (the
+        // builder fails closed on them via the public API): they are built below,
+        // in order, only after the durable-startup guard.
+        let mut sinks = sinks::build_sinks_deferring_durable_s3(
             &spec,
             cancel.clone(),
             &pipeline_name,
             avro_source_schemas,
-            arrow_schema_resolver,
+            arrow_schema_resolver.clone(),
             clickhouse_resolver,
             es_resolver,
         )
         .context("build sinks")?;
+
+        // Durable startup order: (2) validate the source snapshot migration
+        // BEFORE (3) probing/recovering/acquiring durable S3 - so a config that
+        // cannot start never creates HEAD or fences a healthy prior writer - then
+        // (4) confirm the constructed sink set matches configuration.
+        let durable = build_durable_s3_sinks(
+            &spec,
+            source.as_ref(),
+            self.ckpt_store.as_ref(),
+            &pipeline_name,
+            arrow_schema_resolver.clone(),
+        )
+        .await?;
+        sinks.extend(durable);
+        validate_sink_ids(&spec, &sinks)
+            .context("sink construction does not match configuration")?;
 
         let table_patterns = match &spec.spec.source {
             SourceCfg::Mysql(c) => c.tables.clone(),
@@ -491,7 +602,7 @@ impl PipelineManager {
 
         let (event_tx, event_rx) = mpsc::channel::<SourceItem>(32_768);
         // Wrap checkpoint store so the source reads the minimum per-sink
-        // checkpoint — it replays from the position the slowest sink needs.
+        // checkpoint - it replays from the position the slowest sink needs.
         // Capture the source's checkpoint comparison function for the proxy.
         let source_ref = Arc::clone(&source);
         let cmp_fn: CheckpointCmpFn =
@@ -502,6 +613,7 @@ impl PipelineManager {
                 source_id: spec.spec.source.source_id().to_string(),
                 cmp_fn,
             });
+
         let src_handle = source.run(event_tx, source_ckpt).await;
 
         // Wrap the source JoinHandle so alive=false is set immediately when
@@ -579,7 +691,7 @@ impl PipelineManager {
             builder = builder.schema_provider(provider);
         }
 
-        // DLQ writer — opt-in via journal config.
+        // DLQ writer - opt-in via journal config.
         let dlq_writer = if spec
             .spec
             .journal
@@ -618,7 +730,7 @@ impl PipelineManager {
         let join = tokio::spawn(async move {
             let result = coord.run(event_rx, cancel_for_task, pause_rx).await;
             if !cancel_check.is_cancelled() {
-                // Coordinator exited without an explicit stop — also mark
+                // Coordinator exited without an explicit stop - also mark
                 // failed (covers errors that originate inside the coordinator
                 // itself rather than in the source task).
                 alive_for_task.store(false, Ordering::Release);
@@ -642,7 +754,7 @@ impl PipelineManager {
         for (k, v) in &spec.metadata.labels {
             info_labels.push((k.clone(), v.clone()));
         }
-        // Build gauge with dynamic labels — use the pipeline + tenant as fixed,
+        // Build gauge with dynamic labels - use the pipeline + tenant as fixed,
         // and emit user labels as part of the metric name context.
         gauge!(
             "deltaforge_pipeline_info",
@@ -899,7 +1011,7 @@ impl PipelineController for PipelineManager {
         for src in &sources {
             src.cancel.cancel();
         }
-        // Update the gauge immediately — the status is already Stopped in the
+        // Update the gauge immediately - the status is already Stopped in the
         // registry. Don't wait for the join handles; the source task may be
         // stuck in a TCP read that is slow to notice cancellation.
         gauge!("deltaforge_pipeline_status", "pipeline" => name.to_string())
@@ -1147,6 +1259,174 @@ mod tests {
         }
     }
 
+    // ── Durable_v2 wiring: fail-closed builders, ID validation, startup order ──
+
+    use deltaforge_config::{S3Durability, S3SinkCfg};
+
+    fn durable_s3_cfg(id: &str, bucket: &str) -> S3SinkCfg {
+        S3SinkCfg {
+            id: id.into(),
+            bucket: bucket.into(),
+            prefix: "root".into(),
+            region: None,
+            endpoint: None,
+            access_key_id: None,
+            secret_access_key: None,
+            virtual_hosted_style: false,
+            local: true,
+            format: deltaforge_config::S3FileFormat::Jsonl,
+            compression: deltaforge_config::S3Compression::None,
+            file_roll: Default::default(),
+            send_timeout_secs: 60,
+            required: Some(true),
+            durability: S3Durability::DurableV2,
+            filter: None,
+        }
+    }
+
+    fn spec_with_sinks(sinks: Vec<SinkCfg>) -> PipelineSpec {
+        let mut s = sample_spec("p");
+        s.spec.sinks = sinks;
+        s
+    }
+
+    /// Public build_sinks* must fail closed on a durable_v2 config - never
+    /// return a sink list silently missing the configured S3 sink.
+    #[test]
+    fn public_build_sinks_fails_closed_on_durable_v2() {
+        let spec = spec_with_sinks(vec![SinkCfg::S3(durable_s3_cfg(
+            "s3",
+            "/tmp/df-none",
+        ))]);
+        let err = sinks::build_sinks_with_schemas(
+            &spec,
+            CancellationToken::new(),
+            "p",
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(err.is_err(), "durable_v2 must not build via the public API");
+
+        // The deferring builder omits it (the runner builds it), so the list is
+        // shorter - which is exactly why the runner then validates IDs.
+        let deferred = sinks::build_sinks_deferring_durable_s3(
+            &spec,
+            CancellationToken::new(),
+            "p",
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(deferred.is_empty(), "durable S3 deferred, not built here");
+    }
+
+    /// A recording sink for ID validation.
+    struct NamedSink(String);
+    #[async_trait]
+    impl deltaforge_core::Sink for NamedSink {
+        fn id(&self) -> &str {
+            &self.0
+        }
+        async fn send(
+            &self,
+            _e: &deltaforge_core::Event,
+        ) -> deltaforge_core::SinkResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn validate_sink_ids_rejects_missing_sink() {
+        let spec = spec_with_sinks(vec![
+            SinkCfg::S3(durable_s3_cfg("s3", "/tmp/df-none")),
+            SinkCfg::Redis(RedisSinkCfg {
+                id: "redis".into(),
+                uri: "redis://x".into(),
+                stream: "e".into(),
+                key: None,
+                required: Some(true),
+                send_timeout_secs: None,
+                batch_timeout_secs: None,
+                connect_timeout_secs: None,
+                envelope: deltaforge_config::EnvelopeCfg::Debezium,
+                encoding: deltaforge_config::EncodingCfg::Json,
+                filter: None,
+            }),
+        ]);
+        // Only one of the two configured sinks constructed -> fail closed.
+        let built: Vec<deltaforge_core::ArcDynSink> =
+            vec![Arc::new(NamedSink("redis".into()))];
+        assert!(validate_sink_ids(&spec, &built).is_err());
+        // Both present -> ok.
+        let both: Vec<deltaforge_core::ArcDynSink> = vec![
+            Arc::new(NamedSink("redis".into())),
+            Arc::new(NamedSink("s3".into())),
+        ];
+        assert!(validate_sink_ids(&spec, &both).is_ok());
+    }
+
+    /// A source whose durable startup check fails.
+    struct FailCheckSource;
+    #[async_trait]
+    impl deltaforge_core::Source for FailCheckSource {
+        async fn run(
+            &self,
+            _tx: mpsc::Sender<SourceItem>,
+            _ckpt: Arc<dyn CheckpointStore>,
+        ) -> SourceHandle {
+            unimplemented!("not started in this test")
+        }
+        fn compare_checkpoints(
+            &self,
+            _a: &[u8],
+            _b: &[u8],
+        ) -> std::cmp::Ordering {
+            std::cmp::Ordering::Equal
+        }
+        async fn check_durable_snapshot_startup(
+            &self,
+            _ckpt: &dyn CheckpointStore,
+        ) -> Result<(), SourceError> {
+            Err(SourceError::Other(anyhow::anyhow!("ambiguous legacy")))
+        }
+    }
+
+    /// A failed snapshot-startup check must abort BEFORE the durable sink is
+    /// built, so no probe/recovery/HEAD creation or epoch acquisition happens.
+    #[tokio::test]
+    async fn failed_startup_check_creates_no_head() {
+        let dir = std::env::temp_dir()
+            .join(format!("df-durable-guard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bucket = dir.to_string_lossy().to_string();
+        let spec =
+            spec_with_sinks(vec![SinkCfg::S3(durable_s3_cfg("s3", &bucket))]);
+        let store: Arc<dyn CheckpointStore> =
+            Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+
+        let err = build_durable_s3_sinks(
+            &spec,
+            &FailCheckSource,
+            store.as_ref(),
+            "p",
+            None,
+        )
+        .await;
+        assert!(err.is_err(), "startup check must abort construction");
+
+        // Nothing was written: the bucket dir (and its _manifest) never appeared.
+        let manifest = dir.join("root").join("p").join("_manifest");
+        assert!(
+            !manifest.exists(),
+            "no HEAD/manifest created when the startup check fails"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── Per-sink checkpoint proxy tests ─────────────────────────────────
 
     /// Test comparison function: parses `{"pos": N}` and compares numerically.
@@ -1170,7 +1450,7 @@ mod tests {
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
         };
-        // No per-sink checkpoints and no legacy key — fresh start.
+        // No per-sink checkpoints and no legacy key - fresh start.
         let result = proxy.get_raw("mysql").await.unwrap();
         assert!(result.is_none());
     }
@@ -1195,7 +1475,7 @@ mod tests {
         let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
 
         // Write per-sink checkpoints with different positions.
-        // Using simple JSON strings — lexicographic comparison works for these.
+        // Using simple JSON strings - lexicographic comparison works for these.
         store
             .put_raw("mysql::sink::kafka", b"{\"pos\":200}")
             .await

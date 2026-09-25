@@ -21,12 +21,17 @@ use checkpoints::CheckpointStore;
 use common::redact_url_password;
 use deltaforge_config::SnapshotCfg;
 use deltaforge_core::{
-    Event, EventId, IdentityKind, Op, SourceInfo, SourceItem, SourcePosition,
+    CheckpointMeta, Event, EventId, IdentityKind, Op, SourceInfo, SourceItem,
+    SourcePosition,
 };
 use std::collections::HashMap;
 
 use super::postgres_identity::{PgIdentityRaw, pg_identity_cell, quote_ident};
+use crate::durable_checkpoint::{CursorKind, SnapshotCursor};
 use crate::snapshot_event_id::{OwnedIdentityValue, snapshot_row_event_id};
+use crate::snapshot_frontier::{
+    SnapshotAggregator, SnapshotPublisher, TableResume,
+};
 use crate::snapshot_generation::PersistedLineage;
 use metrics::counter;
 use pgwire_replication::Lsn;
@@ -163,7 +168,7 @@ pub struct PgSnapshotCtx<'a> {
 
 /// Run a consistent snapshot of `tables`.
 ///
-/// Returns the WAL LSN captured before any rows were read — pass this to the
+/// Returns the WAL LSN captured before any rows were read - pass this to the
 /// replication client as `start_lsn` so streaming picks up exactly where the
 /// snapshot left off with no gaps and no duplicate events.
 pub async fn run_snapshot(
@@ -195,7 +200,7 @@ pub async fn run_snapshot(
     let preflight = health::run_preflight(
         ctx.dsn,
         ctx.slot_name,
-        // publication name not on ctx — pass empty string; publication check
+        // publication name not on ctx - pass empty string; publication check
         // is already done in ensure_slot_and_publication before we get here.
         // Pass slot_name here only for slot health checks.
         "",
@@ -259,6 +264,44 @@ pub async fn run_snapshot(
         "snapshot started"
     );
 
+    // Build the aggregation owner. Its source vector is restored from the
+    // source's own progress (done_tables + finished) - NEVER from any sink's
+    // HEAD. Resolve every table's cursor kind up front (integer-PK signed range
+    // or ctid page-block); already-done tables enter the vector complete at their
+    // kind's max, so the key set and cursor kinds are fixed from the first batch.
+    let mut kinds: HashMap<String, CursorKind> = HashMap::new();
+    for (schema, table) in tables {
+        let loaded = ctx
+            .schema_loader
+            .load_schema(schema, table)
+            .await
+            .with_context(|| {
+                format!("load schema (cursor kind) for {}", fqn(schema, table))
+            })?;
+        kinds.insert(fqn(schema, table), pg_cursor_kind(&loaded.schema));
+    }
+    let resume: Vec<(String, TableResume)> = tables
+        .iter()
+        .map(|(schema, table)| {
+            let key = fqn(schema, table);
+            let kind =
+                kinds.get(&key).copied().unwrap_or(CursorKind::CtidBlock);
+            let done = progress.finished || progress.table_done(schema, table);
+            (key, TableResume { kind, done })
+        })
+        .collect();
+    let snapshot_checkpoint =
+        CheckpointMeta::from_vec(lsn_str.clone().into_bytes());
+    let publisher = Arc::new(SnapshotPublisher::new(
+        SnapshotAggregator::from_source_progress(
+            ctx.generation,
+            ctx.lineage.clone(),
+            snapshot_checkpoint,
+            &resume,
+        ),
+        ctx.tx.clone(),
+    ));
+
     // step 2: fan out parallel table workers
     let max_parallel = ctx.cfg.max_parallel_tables.min(tables.len()).max(1);
     let semaphore = Arc::new(Semaphore::new(max_parallel));
@@ -286,13 +329,18 @@ pub async fn run_snapshot(
             pipeline: ctx.pipeline.to_string(),
             tenant: ctx.tenant.to_string(),
             cfg: ctx.cfg.clone(),
-            tx: ctx.tx.clone(),
             schema_loader: ctx.schema_loader.clone(),
             chkpt_store: ctx.chkpt_store.clone(),
             cancel: ctx.cancel.clone(),
             generation: ctx.generation,
             lineage: ctx.lineage.clone(),
             identity,
+            table_key: fqn(schema, table),
+            cursor_kind: kinds
+                .get(&fqn(schema, table))
+                .copied()
+                .unwrap_or(CursorKind::CtidBlock),
+            publisher: Arc::clone(&publisher),
         };
 
         let handle = tokio::spawn(async move {
@@ -315,6 +363,13 @@ pub async fn run_snapshot(
                     progress.mark_done(parts[0], parts[1]);
                     save_progress(&ctx.chkpt_store, ctx.source_id, &progress)
                         .await;
+                }
+                // Explicit table completion: emits a table-complete boundary, and
+                // the `completed = true` snapshot boundary once every scanned
+                // table is done (delivered and durably acked with no trailing
+                // data rows).
+                if publisher.complete_table(&name).await.is_err() {
+                    bail!("event channel closed at table completion");
                 }
                 info!(table = %name, "snapshot complete");
             }
@@ -358,7 +413,7 @@ pub async fn run_snapshot(
         source_id = %ctx.source_id,
         elapsed_secs = t0.elapsed().as_secs(),
         start_lsn = %start_lsn,
-        "snapshot finished — streaming will start from this LSN"
+        "snapshot finished - streaming will start from this LSN"
     );
 
     guard_cancel.cancel();
@@ -388,7 +443,6 @@ struct TableWorker {
     pipeline: String,
     tenant: String,
     cfg: SnapshotCfg,
-    tx: mpsc::Sender<SourceItem>,
     schema_loader: PostgresSchemaLoader,
     #[allow(unused)]
     chkpt_store: Arc<dyn CheckpointStore>,
@@ -399,6 +453,12 @@ struct TableWorker {
     lineage: PersistedLineage,
     /// Resolved identity columns (name + kind, identity order).
     identity: Vec<IdentitySpec>,
+    /// Fully-qualified `schema.table`, the aggregator's key for this table.
+    table_key: String,
+    /// Cursor kind for this table (matches the aggregator's frontier kind).
+    cursor_kind: CursorKind,
+    /// Shared aggregation owner: serializes boundary-advance + channel send.
+    publisher: Arc<SnapshotPublisher>,
 }
 
 impl TableWorker {
@@ -417,7 +477,7 @@ impl TableWorker {
             }
         });
 
-        // Import the shared snapshot — all workers see the same DB state.
+        // Import the shared snapshot - all workers see the same DB state.
         client
             .batch_execute(&format!(
                 "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ; \
@@ -447,7 +507,7 @@ impl TableWorker {
             if pk.len() != 1 {
                 debug!(
                     table = %fqn,
-                    "composite or missing PK — using ctid chunking"
+                    "composite or missing PK - using ctid chunking"
                 );
             }
             self.by_ctid(&client).await?
@@ -527,16 +587,26 @@ impl TableWorker {
         let chunk = self.cfg.chunk_size as i64;
         let mut cursor = min_pk;
         let mut total_sent = 0u64;
+        // Half-open frontier cursor reported to the aggregator, starting at the
+        // signed minimum so the first chunk abuts the frontier (rows below min_pk
+        // do not exist and are vacuously durable). PG integer PKs are signed.
+        let mut published: SnapshotCursor = self.cursor_kind.min();
 
         while cursor <= max_pk {
             if self.cancel.is_cancelled() {
                 anyhow::bail!("snapshot cancelled");
             }
             let next = cursor + chunk;
-            let n = self
-                .read_pk_range(client, pk_col, cursor, next, &fqn)
+            let events = self
+                .read_pk_events(client, pk_col, cursor, next, &fqn)
                 .await?;
-            total_sent += n;
+            total_sent += events.len() as u64;
+            let end = SnapshotCursor::Signed(next);
+            self.publisher
+                .publish_chunk(&self.table_key, published, end, events)
+                .await
+                .map_err(|_| anyhow!("event channel closed"))?;
+            published = end;
             cursor = next;
         }
         Ok(total_sent)
@@ -554,6 +624,19 @@ impl TableWorker {
         let n_chunks = self.cfg.max_parallel_chunks;
         let range = max_pk - min_pk + 1;
         let per_chunk = (range / n_chunks as i64).max(1);
+
+        // Cover the vacuous prefix below min_pk once, so every real chunk (from
+        // any concurrent sub-range) abuts the contiguous frontier at min_pk.
+        // Empty events: this only advances the frontier, emitting no boundary.
+        self.publisher
+            .publish_chunk(
+                &self.table_key,
+                self.cursor_kind.min(),
+                SnapshotCursor::Signed(min_pk),
+                Vec::new(),
+            )
+            .await
+            .map_err(|_| anyhow!("event channel closed"))?;
 
         let semaphore = Arc::new(Semaphore::new(n_chunks));
         let mut handles = Vec::new();
@@ -589,7 +672,6 @@ impl TableWorker {
             let pk = pk_col.to_string();
             let fqn = fqn(&self.schema, &self.table);
             let step = self.cfg.chunk_size as i64;
-            let tx = self.tx.clone();
             let cancel = self.cancel.clone();
 
             let handle = tokio::spawn(async move {
@@ -600,10 +682,13 @@ impl TableWorker {
                         return Err(anyhow::anyhow!("cancelled"));
                     }
                     let next = (cursor + step).min(chunk_end);
+                    // Concurrent sub-ranges publish their real chunks
+                    // [Signed(cursor), Signed(next)); the aggregator buffers
+                    // out-of-order arrivals and advances the frontier only through
+                    // contiguous ranges.
                     sent += worker_self
-                        .read_pk_range_with_tx(
+                        .read_and_publish_pk_range(
                             &sub_client,
-                            &tx,
                             &pk,
                             cursor,
                             next,
@@ -631,27 +716,16 @@ impl TableWorker {
         Ok(total)
     }
 
-    async fn read_pk_range(
+    /// Read one PK range `[from, to)` and build its snapshot events (no send);
+    /// the caller publishes the chunk through the aggregation owner.
+    async fn read_pk_events(
         &self,
         client: &tokio_postgres::Client,
         pk_col: &str,
         from: i64,
         to: i64,
         fqn: &str,
-    ) -> Result<u64> {
-        self.read_pk_range_with_tx(client, &self.tx, pk_col, from, to, fqn)
-            .await
-    }
-
-    async fn read_pk_range_with_tx(
-        &self,
-        client: &tokio_postgres::Client,
-        tx: &mpsc::Sender<SourceItem>,
-        pk_col: &str,
-        from: i64,
-        to: i64,
-        fqn: &str,
-    ) -> Result<u64> {
+    ) -> Result<Vec<Event>> {
         // row_to_json (column 0) is the payload; native identity columns follow
         // and are the ONLY identity input (schema-directed, never the JSON).
         let sql = format!(
@@ -669,29 +743,20 @@ impl TableWorker {
             .await
             .with_context(|| format!("read chunk [{from},{to}) from {fqn}"))?;
 
-        let n = rows.len() as u64;
+        let mut events = Vec::with_capacity(rows.len());
         for row in rows {
-            let id = provisional_snapshot_id(
+            events.push(build_pg_snapshot_event(
                 &row,
                 &self.identity,
                 &self.lineage,
                 self.generation,
                 &self.schema,
                 &self.table,
-            )?;
-            let json_str: &str = row.get(0);
-            let after: serde_json::Value = serde_json::from_str(json_str)
-                .with_context(|| {
-                    format!("parse row_to_json output for {fqn}")
-                })?;
-            let size = json_str.len();
-            let event = self.make_event(after, size, id);
-            if tx.send(SourceItem::Event(event)).await.is_err() {
-                anyhow::bail!("event channel closed");
-            }
+                &self.pipeline,
+                &self.tenant,
+            )?);
         }
-
-        Ok(n)
+        Ok(events)
     }
 
     // ctid-range chunking (fallback for non-integer-PK tables)
@@ -699,7 +764,7 @@ impl TableWorker {
         let fqn = fqn(&self.schema, &self.table);
 
         // Page count from the REAL on-disk size (`pg_relation_size`), never from
-        // `pg_class.relpages` — relpages is a planner statistic that is 0/stale
+        // `pg_class.relpages` - relpages is a planner statistic that is 0/stale
         // until an ANALYZE the CDC role may not be permitted to run, and a stale
         // 0 must never be mistaken for an empty table. `pg_relation_size` reads
         // the actual file size, so 0 here means genuinely empty.
@@ -724,6 +789,8 @@ impl TableWorker {
         let pages_per_chunk = ((self.cfg.chunk_size / 100) as i32).max(1);
         let mut page = 0i32;
         let mut total_sent = 0u64;
+        // ctid page-block frontier, starting at block 0 (the kind's minimum).
+        let mut published: SnapshotCursor = self.cursor_kind.min();
 
         while page < total_pages {
             if self.cancel.is_cancelled() {
@@ -746,67 +813,31 @@ impl TableWorker {
                 format!("read ctid [{page},{end_page}) from {fqn}")
             })?;
 
-            let n = rows.len() as u64;
+            let mut events = Vec::with_capacity(rows.len());
             for row in rows {
-                let id = provisional_snapshot_id(
+                events.push(build_pg_snapshot_event(
                     &row,
                     &self.identity,
                     &self.lineage,
                     self.generation,
                     &self.schema,
                     &self.table,
-                )?;
-                let json_str: &str = row.get(0);
-                let after: serde_json::Value =
-                    serde_json::from_str(json_str).context("parse ctid row")?;
-                let size = json_str.len();
-                let event = self.make_event(after, size, id);
-                if self.tx.send(SourceItem::Event(event)).await.is_err() {
-                    anyhow::bail!("event channel closed");
-                }
+                    &self.pipeline,
+                    &self.tenant,
+                )?);
             }
 
-            total_sent += n;
+            total_sent += events.len() as u64;
+            let end = SnapshotCursor::CtidBlock(end_page as u64);
+            self.publisher
+                .publish_chunk(&self.table_key, published, end, events)
+                .await
+                .map_err(|_| anyhow!("event channel closed"))?;
+            published = end;
             page = end_page;
         }
 
         Ok(total_sent)
-    }
-
-    //Helpers
-    fn make_event(
-        &self,
-        after: serde_json::Value,
-        size_bytes: usize,
-        provisional_id: EventId,
-    ) -> Event {
-        let ts_ms = chrono::Utc::now().timestamp_millis();
-        let source = SourceInfo {
-            version: concat!("deltaforge-", env!("CARGO_PKG_VERSION"))
-                .to_string(),
-            connector: "postgresql".into(),
-            name: self.pipeline.clone(),
-            ts_ms,
-            db: self.schema.clone(),
-            schema: Some(self.schema.clone()),
-            table: self.table.clone(),
-            snapshot: Some("true".into()),
-            position: SourcePosition {
-                snapshot_generation: Some(self.generation),
-                ..Default::default()
-            },
-        };
-
-        Event::new_row(
-            provisional_id,
-            source,
-            Op::Read,
-            None,
-            Some(after),
-            ts_ms,
-            size_bytes,
-        )
-        .with_tenant(self.tenant.clone())
     }
 
     /// Shallow clone for intra-table parallel workers.
@@ -822,6 +853,8 @@ impl TableWorker {
             generation: self.generation,
             lineage: self.lineage.clone(),
             identity: self.identity.clone(),
+            table_key: self.table_key.clone(),
+            publisher: Arc::clone(&self.publisher),
         }
     }
 }
@@ -838,13 +871,18 @@ struct ChunkWorkerCtx {
     generation: u64,
     lineage: PersistedLineage,
     identity: Vec<IdentitySpec>,
+    table_key: String,
+    publisher: Arc<SnapshotPublisher>,
 }
 
 impl ChunkWorkerCtx {
-    async fn read_pk_range_with_tx(
+    /// Read one PK sub-range `[from, to)` and publish it as the half-open chunk
+    /// `[Signed(from), Signed(to))` through the shared aggregation owner.
+    /// Concurrent sub-ranges publish out of order; the aggregator buffers them and
+    /// advances the contiguous frontier only through abutting ranges.
+    async fn read_and_publish_pk_range(
         &self,
         client: &tokio_postgres::Client,
-        tx: &mpsc::Sender<SourceItem>,
         pk_col: &str,
         from: i64,
         to: i64,
@@ -873,56 +911,91 @@ impl ChunkWorkerCtx {
             .await
             .with_context(|| format!("read chunk [{from},{to}) from {fqn}"))?;
 
-        let n = rows.len() as u64;
+        let mut events = Vec::with_capacity(rows.len());
         for row in rows {
-            let id = provisional_snapshot_id(
+            events.push(build_pg_snapshot_event(
                 &row,
                 &self.identity,
                 &self.lineage,
                 self.generation,
                 &self.schema,
                 &self.table,
-            )?;
-            let json_str: &str = row.get(0);
-            let after: serde_json::Value =
-                serde_json::from_str(json_str).context("parse row")?;
-            let size = json_str.len();
-            let ts_ms = chrono::Utc::now().timestamp_millis();
-            let source = SourceInfo {
-                version: concat!("deltaforge-", env!("CARGO_PKG_VERSION"))
-                    .to_string(),
-                connector: "postgresql".into(),
-                name: self.pipeline.clone(),
-                ts_ms,
-                db: self.schema.clone(),
-                schema: Some(self.schema.clone()),
-                table: self.table.clone(),
-                snapshot: Some("true".into()),
-                position: SourcePosition {
-                    snapshot_generation: Some(self.generation),
-                    ..Default::default()
-                },
-            };
-            let event = Event::new_row(
-                id,
-                source,
-                Op::Read,
-                None,
-                Some(after),
-                ts_ms,
-                size,
-            )
-            .with_tenant(self.tenant.clone());
-            if tx.send(SourceItem::Event(event)).await.is_err() {
-                anyhow::bail!("event channel closed");
-            }
+                &self.pipeline,
+                &self.tenant,
+            )?);
         }
-
+        let n = events.len() as u64;
+        self.publisher
+            .publish_chunk(
+                &self.table_key,
+                SnapshotCursor::Signed(from),
+                SnapshotCursor::Signed(to),
+                events,
+            )
+            .await
+            .map_err(|_| anyhow!("event channel closed"))?;
         Ok(n)
     }
 }
 
 // Utility functions
+
+/// Build one snapshot event from a scanned row. Identity comes only from the
+/// explicit native identity columns (never ctid); column 0 is the row_to_json
+/// payload. Shared by the table worker and its intra-table chunk tasks.
+#[allow(clippy::too_many_arguments)]
+fn build_pg_snapshot_event(
+    row: &tokio_postgres::Row,
+    identity: &[IdentitySpec],
+    lineage: &PersistedLineage,
+    generation: u64,
+    schema: &str,
+    table: &str,
+    pipeline: &str,
+    tenant: &str,
+) -> Result<Event> {
+    let id = provisional_snapshot_id(
+        row, identity, lineage, generation, schema, table,
+    )?;
+    let json_str: &str = row.get(0);
+    let after: serde_json::Value =
+        serde_json::from_str(json_str).context("parse row_to_json output")?;
+    let size = json_str.len();
+    let ts_ms = chrono::Utc::now().timestamp_millis();
+    let source = SourceInfo {
+        version: concat!("deltaforge-", env!("CARGO_PKG_VERSION")).to_string(),
+        connector: "postgresql".into(),
+        name: pipeline.to_string(),
+        ts_ms,
+        db: schema.to_string(),
+        schema: Some(schema.to_string()),
+        table: table.to_string(),
+        snapshot: Some("true".into()),
+        position: SourcePosition {
+            snapshot_generation: Some(generation),
+            ..Default::default()
+        },
+    };
+    Ok(
+        Event::new_row(id, source, Op::Read, None, Some(after), ts_ms, size)
+            .with_tenant(tenant.to_string()),
+    )
+}
+
+/// The snapshot cursor kind for a table: a signed integer-PK range scan (PG
+/// integer types are all signed) or a ctid page-block frontier for
+/// composite/non-integer/no-PK tables. ctid is a SCAN frontier only, never row
+/// identity (identity comes from the explicit native identity columns).
+fn pg_cursor_kind(
+    schema: &crate::postgres::postgres_table_schema::PostgresTableSchema,
+) -> CursorKind {
+    let pk = &schema.primary_key;
+    if pk.len() == 1 && is_integer_type(schema.column(pk[0].as_str())) {
+        CursorKind::Signed
+    } else {
+        CursorKind::CtidBlock
+    }
+}
 
 fn is_integer_type(
     col: Option<&crate::postgres::postgres_table_schema::PostgresColumn>,

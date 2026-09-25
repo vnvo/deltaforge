@@ -221,7 +221,7 @@ pub struct SourcePosition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub xmin: Option<i64>,
 
-    /// The transaction's final LSN (from the `BEGIN` message) — the stable
+    /// The transaction's final LSN (from the `BEGIN` message) - the stable
     /// identity coordinate, distinct from the per-message `lsn`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_final_lsn: Option<String>,
@@ -230,14 +230,14 @@ pub struct SourcePosition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relation_oid: Option<u32>,
 
-    /// Per-transaction change ordinal — reset at `BEGIN`, incremented for every
+    /// Per-transaction change ordinal - reset at `BEGIN`, incremented for every
     /// identity-bearing change before filtering.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub change_ordinal: Option<u32>,
 
     // Snapshot-specific fields
     /// Durable snapshot generation for stable snapshot-row identity. Serialized
-    /// (optional) — has lasting operational value.
+    /// (optional) - has lasting operational value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_generation: Option<u64>,
 
@@ -373,7 +373,7 @@ pub struct Event {
     /// Stable, deterministic event identity (`dfid:v1:…`) for deduplication and
     /// tracing. The single authoritative identity location: every event that
     /// leaves a source or processor carries one. `Option` only so the JS bridge
-    /// can build a transient event before assigning the resolved id — such an
+    /// can build a transient event before assigning the resolved id - such an
     /// event must never escape without it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub event_id: Option<EventId>,
@@ -426,9 +426,16 @@ pub struct Event {
     // ========================================================================
     // Internal fields (never serialized to wire)
     // ========================================================================
-    /// Checkpoint data for resumption (internal use only)
+    /// This event's durable boundary: its resume checkpoint and, atomically, the
+    /// durable watermark for the SAME source state. One composite field (not two
+    /// independent ones) so a caller cannot set a checkpoint without its matching
+    /// watermark or vice versa - the pairing is type-enforced. Read via
+    /// [`Event::checkpoint`]/[`Event::durable_watermark`], set via
+    /// [`Event::set_boundary`]/[`Event::with_boundary`]/[`Event::with_checkpoint`].
+    /// `None` for events with no durable boundary; the durable sink fails closed
+    /// when a boundary is required and absent. Internal - never serialized.
     #[serde(skip)]
-    pub checkpoint: Option<CheckpointMeta>,
+    pub boundary: Option<SourceBoundary>,
 
     /// Estimated event size in bytes for batching
     #[serde(skip)]
@@ -449,7 +456,33 @@ fn now_ms() -> i64 {
 }
 
 impl Event {
-    /// Create a new row-change event. The stable `event_id` is required —
+    /// Stamp this event's durable boundary: its resume checkpoint and the durable
+    /// watermark for the SAME source state, carried together as one
+    /// [`SourceBoundary`] so the two can never drift.
+    pub fn set_boundary(&mut self, boundary: SourceBoundary) {
+        self.boundary = Some(boundary);
+    }
+
+    /// Builder form of [`Event::set_boundary`].
+    pub fn with_boundary(mut self, boundary: SourceBoundary) -> Self {
+        self.set_boundary(boundary);
+        self
+    }
+
+    /// The resume checkpoint for this event's boundary, if any.
+    pub fn checkpoint(&self) -> Option<&CheckpointMeta> {
+        self.boundary.as_ref().map(|b| &b.checkpoint)
+    }
+
+    /// The durable watermark for this event's boundary, if any. Present only when
+    /// the boundary carries one (a checkpoint-only boundary has none).
+    pub fn durable_watermark(&self) -> Option<&Arc<[u8]>> {
+        self.boundary
+            .as_ref()
+            .and_then(|b| b.durable_watermark.as_ref())
+    }
+
+    /// Create a new row-change event. The stable `event_id` is required -
     /// sources must derive it before emission.
     #[allow(clippy::too_many_arguments)]
     pub fn new_row(
@@ -478,8 +511,9 @@ impl Event {
             synthetic: None,
             routing: None,
             tx_end: true,
-            checkpoint: None,
+            boundary: None,
             size_bytes,
+
             received_at_ms: now_ms(),
         }
     }
@@ -509,8 +543,9 @@ impl Event {
             synthetic: None,
             routing: None,
             tx_end: true,
-            checkpoint: None,
+            boundary: None,
             size_bytes,
+
             received_at_ms: now_ms(),
         }
     }
@@ -540,8 +575,9 @@ impl Event {
             synthetic: None,
             routing: None,
             tx_end: true,
-            checkpoint: None,
+            boundary: None,
             size_bytes,
+
             received_at_ms: now_ms(),
         }
     }
@@ -563,9 +599,16 @@ impl Event {
         self
     }
 
-    /// Set checkpoint metadata (internal use).
+    /// Set a checkpoint-only boundary (no durable watermark). Convenience for
+    /// sources that resume from a checkpoint but do not (yet) carry a durable
+    /// watermark; equivalent to `set_boundary(SourceBoundary::checkpoint_only(..))`.
+    pub fn set_checkpoint(&mut self, checkpoint: CheckpointMeta) {
+        self.boundary = Some(SourceBoundary::checkpoint_only(checkpoint));
+    }
+
+    /// Builder form of [`Event::set_checkpoint`].
     pub fn with_checkpoint(mut self, checkpoint: CheckpointMeta) -> Self {
-        self.checkpoint = Some(checkpoint);
+        self.set_checkpoint(checkpoint);
         self
     }
 
@@ -710,11 +753,11 @@ impl BatchResult {
 // ============================================================================
 
 /// An item on the source→coordinator stream. `TxCommit` is an **internal**
-/// transaction-boundary marker — never a public wire event and never delivered
+/// transaction-boundary marker - never a public wire event and never delivered
 /// to sinks. It lets the coordinator form transaction-aligned batches and
 /// checkpoint only at commit boundaries (even for empty or fully-filtered
 /// transactions).
-// `Event` is the hot-path variant — one per row — and was already moved by
+// `Event` is the hot-path variant - one per row - and was already moved by
 // value through the old `Sender<Event>`. Boxing it to shrink the enum would add
 // a heap allocation per event that the previous channel never paid; `TxCommit`
 // is rare (once per transaction), so the size difference is intentional.
@@ -729,16 +772,47 @@ pub enum SourceItem {
     /// the coordinator can tell a valid **empty** transaction (a begin followed
     /// immediately by a commit) from a commit for an unknown transaction.
     TxBegin { tx_id: String },
-    /// A committed-transaction boundary. `checkpoint` is the COMMIT/XID
-    /// **record's** position (not the last data event's), generated once by the
-    /// source and passed through unchanged; `tx_id` matches the `transaction.id`
-    /// carried by that transaction's events. Only an actual commit emits this —
+    /// A committed-transaction boundary. `boundary` carries the COMMIT/XID
+    /// **record's** checkpoint (not the last data event's) and, atomically, the
+    /// durable watermark for that same boundary - both generated together by the
+    /// source and passed through unchanged. `tx_id` matches the `transaction.id`
+    /// carried by that transaction's events. Only an actual commit emits this -
     /// never a rollback, and never a transactional logical message (those are
     /// transaction *contents*).
     TxCommit {
         tx_id: String,
-        checkpoint: CheckpointMeta,
+        boundary: SourceBoundary,
     },
+    /// A boundary carrying no data event: snapshot table-complete and
+    /// snapshot-complete markers (and any future progress marker that must
+    /// advance the durable watermark without a row). The coordinator applies it
+    /// to the pending batch, or - if prior data already flushed - delivers an
+    /// empty batch carrying it, so the boundary (e.g. the `completed = true`
+    /// snapshot watermark) is durably acknowledged before it takes effect.
+    Boundary { boundary: SourceBoundary },
+}
+
+/// A legal checkpoint boundary emitted by a source: the resume `checkpoint`
+/// (the source's own persisted/deserialized format) plus, atomically, the
+/// `durable_watermark` for the *same* boundary state. The two are always
+/// produced together so a sink can never pair a checkpoint with a watermark
+/// from a different snapshot state. The watermark is opaque here (a serialized,
+/// source-aware watermark); the durable S3 sink's injected comparator interprets
+/// it, and legacy sinks ignore it.
+#[derive(Debug, Clone)]
+pub struct SourceBoundary {
+    pub checkpoint: CheckpointMeta,
+    pub durable_watermark: Option<Arc<[u8]>>,
+}
+
+impl SourceBoundary {
+    /// A boundary carrying only a resume checkpoint (no durable watermark).
+    pub fn checkpoint_only(checkpoint: CheckpointMeta) -> Self {
+        Self {
+            checkpoint,
+            durable_watermark: None,
+        }
+    }
 }
 
 impl SourceItem {
@@ -792,6 +866,42 @@ impl SourceHandle {
 }
 
 // ============================================================================
+// Checkpoint ordering (source-aware)
+// ============================================================================
+
+/// Structured ordering of two source checkpoints. Unlike `std::cmp::Ordering`
+/// this has an `Incomparable` case for checkpoints from different lineages or
+/// generations (e.g. a MySQL failover to a new server, or a snapshot-generation
+/// change) that must not be ordered against each other.
+///
+/// Ordering MUST use structured source semantics (PostgreSQL LSN + transaction
+/// boundary, MySQL GTID/binlog coordinates, snapshot generation, etc.), never a
+/// lexical comparison of serialized bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointOrder {
+    /// `proposed` precedes `reference`.
+    Before,
+    /// `proposed` is the same position as `reference`.
+    Equal,
+    /// `proposed` follows `reference`.
+    After,
+    /// The two checkpoints belong to different lineages/generations and cannot
+    /// be ordered; callers must fail closed.
+    Incomparable,
+}
+
+/// Compares source checkpoints with [`CheckpointOrder`] semantics. Used by the
+/// durable S3 sink to enforce that a published watermark only ever advances,
+/// even when a valid new-epoch writer receives replayed older batches after a
+/// crash between the durable HEAD CAS and the coordinator checkpoint.
+pub trait CheckpointComparator: Send + Sync {
+    /// Order `proposed` relative to `reference` using structured source
+    /// semantics. Returns [`CheckpointOrder::Incomparable`] when the two cannot
+    /// be meaningfully ordered.
+    fn order(&self, proposed: &[u8], reference: &[u8]) -> CheckpointOrder;
+}
+
+// ============================================================================
 // Traits
 // ============================================================================
 
@@ -813,6 +923,18 @@ pub trait Source: Send + Sync {
     /// Returning `Equal` on parse failure is safe (no replay regression) but
     /// may cause unnecessary replay.
     fn compare_checkpoints(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering;
+
+    /// Called at startup when a durable sink is active, BEFORE any source
+    /// emission. The source inspects its own snapshot progress and returns an
+    /// error if it cannot be adopted by durable mode without ambiguity (e.g. an
+    /// interrupted legacy snapshot: some tables done, some pending, not
+    /// finished). Default: `Ok` (non-durable sources, or nothing to reconcile).
+    async fn check_durable_snapshot_startup(
+        &self,
+        _checkpoint_store: &dyn CheckpointStore,
+    ) -> Result<(), SourceError> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -824,12 +946,31 @@ pub trait Processor: Send + Sync {
         ctx: &BatchContext,
     ) -> Result<Vec<Event>>;
 
-    /// Stable identity digest for this processor — the `processor_digest`
+    /// Stable identity digest for this processor - the `processor_digest`
     /// component of a synthetic [`EventId`]. Sensitive to anything that changes
     /// the processor's output (source bytes and/or canonical config). Computed
     /// once at construction and returned by reference; never recomputed per
     /// event.
     fn identity_digest(&self) -> &str;
+}
+
+/// Authoritative per-batch delivery context, constructed by the coordinator /
+/// runner from **pre-processing** source state. It carries the batch's commit
+/// checkpoint and durable watermark so a sink never has to infer them from the
+/// surviving (post-processor) events - which is unreliable, because a processor
+/// can drop the event that carried the checkpoint and a fully-filtered
+/// transaction can leave an empty batch whose checkpoint must still advance.
+#[derive(Debug, Clone)]
+pub struct SinkBatchContext {
+    /// The batch's commit checkpoint (the source position it covers), captured
+    /// before any processor ran.
+    pub checkpoint: CheckpointMeta,
+    /// Serialized, source-aware durable watermark (carrying source lineage) for
+    /// HEAD ordering. Opaque here; the sink's injected [`CheckpointComparator`]
+    /// interprets it. `None` when durable ordering is not in use.
+    pub durable_watermark: Option<Vec<u8>>,
+    /// Optional stable batch identity for diagnostics/logging.
+    pub batch_id: Option<String>,
 }
 
 #[async_trait]
@@ -853,6 +994,18 @@ pub trait Sink: Send + Sync {
             self.send(event).await?;
         }
         Ok(BatchResult::ok())
+    }
+
+    /// Send a batch with its authoritative [`SinkBatchContext`]. The default
+    /// delegates to [`Sink::send_batch`], so existing sinks are unaffected; the
+    /// durable S3 sink overrides this to derive its watermark from the context
+    /// (never from the events) and requires it to be present.
+    async fn send_batch_with_context(
+        &self,
+        events: &[Event],
+        _ctx: &SinkBatchContext,
+    ) -> SinkResult<BatchResult> {
+        self.send_batch(events).await
     }
 }
 

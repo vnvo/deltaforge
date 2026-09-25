@@ -23,14 +23,18 @@ use anyhow::{Context, Result, anyhow};
 use checkpoints::CheckpointStore;
 use deltaforge_config::SnapshotCfg;
 use deltaforge_core::{
-    Event, EventId, Op, SourceInfo, SourceItem, SourcePosition,
+    CheckpointMeta, Event, EventId, Op, SourceInfo, SourceItem, SourcePosition,
 };
 use metrics::counter;
 use mysql_async::{Pool, Row, Value, prelude::Queryable};
 use std::collections::HashMap;
 
 use super::mysql_identity::mysql_identity_cell;
+use crate::durable_checkpoint::{CursorKind, SnapshotCursor};
 use crate::snapshot_event_id::{OwnedIdentityValue, snapshot_row_event_id};
+use crate::snapshot_frontier::{
+    SnapshotAggregator, SnapshotPublisher, TableResume,
+};
 use crate::snapshot_generation::PersistedLineage;
 use scopeguard;
 use serde::{Deserialize, Serialize};
@@ -242,6 +246,52 @@ pub async fn run_snapshot(
         "mysql snapshot started"
     );
 
+    // Build the ordered-aggregation owner. Its source vector is restored from
+    // the source's own progress (done_tables + finished) - NEVER from any sink's
+    // HEAD, so the source is not fast-forwarded by how far one sink is durable.
+    // Resolve every table's cursor kind up front (including already-done tables,
+    // which enter the vector complete at their kind's max) so the vector's key
+    // set and cursor kinds are fixed from the first batch.
+    let mut kinds: HashMap<String, CursorKind> = HashMap::new();
+    for (db, table) in tables {
+        let loaded = ctx
+            .schema_loader
+            .load_schema(db, table)
+            .await
+            .with_context(|| {
+                format!("load schema (cursor kind) for {}", fqn(db, table))
+            })?;
+        kinds.insert(fqn(db, table), mysql_cursor_kind(&loaded.schema));
+    }
+    let all_tables: Vec<(String, CursorKind)> = tables
+        .iter()
+        .map(|(db, table)| {
+            let k = fqn(db, table);
+            let kind = kinds.get(&k).copied().unwrap_or(CursorKind::Unsigned);
+            (k, kind)
+        })
+        .collect();
+    let resume: Vec<(String, TableResume)> = all_tables
+        .iter()
+        .map(|(t, kind)| {
+            let done = progress.finished || progress.done_tables.contains(t);
+            (t.clone(), TableResume { kind: *kind, done })
+        })
+        .collect();
+    let snapshot_checkpoint = CheckpointMeta::from_vec(
+        serde_json::to_vec(&position)
+            .context("serialize snapshot checkpoint")?,
+    );
+    let publisher = Arc::new(SnapshotPublisher::new(
+        SnapshotAggregator::from_source_progress(
+            ctx.generation,
+            ctx.lineage.clone(),
+            snapshot_checkpoint,
+            &resume,
+        ),
+        ctx.tx.clone(),
+    ));
+
     // step 2: fan out parallel table workers (unchanged)
     let max_parallel = ctx.cfg.max_parallel_tables.min(tables.len()).max(1);
     let semaphore = Arc::new(Semaphore::new(max_parallel));
@@ -269,7 +319,12 @@ pub async fn run_snapshot(
             pipeline: ctx.pipeline.to_string(),
             tenant: ctx.tenant.to_string(),
             cfg: ctx.cfg.clone(),
-            tx: ctx.tx.clone(),
+            table_key: fqn(db, table),
+            cursor_kind: kinds
+                .get(&fqn(db, table))
+                .copied()
+                .unwrap_or(CursorKind::Unsigned),
+            publisher: Arc::clone(&publisher),
             schema_loader: ctx.schema_loader.clone(),
             cancel: ctx.cancel.clone(),
             generation: ctx.generation,
@@ -296,6 +351,25 @@ pub async fn run_snapshot(
                     progress.mark_done(parts[0], parts[1]);
                     save_progress(&ctx.chkpt_store, ctx.source_id, &progress)
                         .await;
+                }
+                // Explicit table completion: emits a table-complete boundary
+                // through the publisher, and the `completed = true` snapshot
+                // boundary once every scanned table is done. The coordinator
+                // delivers those boundaries (and durably acks them) even with no
+                // trailing data rows.
+                match publisher.complete_table(&name).await {
+                    Ok(all_done) => {
+                        if all_done {
+                            debug!(
+                                "snapshot fully complete; completed boundary emitted"
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        anyhow::bail!(
+                            "event channel closed at table completion"
+                        );
+                    }
                 }
                 info!(table = %name, rows, "table snapshot complete");
             }
@@ -360,11 +434,11 @@ async fn capture_binlog_position(
             Err(_) => conn
                 .query_first("SHOW MASTER STATUS")
                 .await
-                .context("SHOW MASTER STATUS — is binary logging enabled?")?,
+                .context("SHOW MASTER STATUS - is binary logging enabled?")?,
         };
 
     let mut row = row
-        .context("no binlog position returned — is binary logging enabled?")?;
+        .context("no binlog position returned - is binary logging enabled?")?;
 
     let file: String = row.take(0).context("binlog file")?;
     let pos: u32 = row.take(1).context("binlog pos")?;
@@ -408,7 +482,12 @@ struct TableWorker {
     pipeline: String,
     tenant: String,
     cfg: SnapshotCfg,
-    tx: mpsc::Sender<SourceItem>,
+    /// Fully-qualified `db.table`, the aggregator's key for this table.
+    table_key: String,
+    /// Cursor kind for this table (matches the aggregator's frontier kind).
+    cursor_kind: CursorKind,
+    /// Shared aggregation owner: serializes boundary-advance + channel send.
+    publisher: Arc<SnapshotPublisher>,
     schema_loader: MySqlSchemaLoader,
     cancel: CancellationToken,
     /// Durable snapshot generation for stable-id derivation.
@@ -471,6 +550,29 @@ impl TableWorker {
     // ── PK-range chunking ─────────────────────────────────────────────────────
 
     async fn by_pk(&mut self, pk_col: &str) -> Result<u64> {
+        // Signed and unsigned integer PKs use disjoint cursor domains and must
+        // never be mixed: an unsigned PK above i64::MAX would corrupt a signed
+        // (i64) scan. The kind was resolved from the column type up front.
+        match self.cursor_kind {
+            CursorKind::Unsigned => self.by_pk_unsigned(pk_col).await,
+            _ => self.by_pk_signed(pk_col).await,
+        }
+    }
+
+    /// Build snapshot events for a scanned chunk's rows.
+    fn rows_to_events(&self, rows: Vec<Row>) -> Result<Vec<Event>> {
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            // Derive identity from NATIVE values before the lossy JSON
+            // conversion, then build the event.
+            let id = self.provisional_id(&row)?;
+            let json = row_to_json(row)?;
+            events.push(self.make_event(json, id));
+        }
+        Ok(events)
+    }
+
+    async fn by_pk_signed(&mut self, pk_col: &str) -> Result<u64> {
         let table_fqn = fqn(&self.db, &self.table);
 
         let bounds_row: Option<Row> = self
@@ -499,6 +601,10 @@ impl TableWorker {
         let chunk = self.cfg.chunk_size as i64;
         let mut cursor = min_pk;
         let mut total_sent = 0u64;
+        // Half-open frontier cursor, starting at the kind's minimum so the first
+        // chunk covers everything below min_pk (vacuously durable). Signed PKs
+        // keep their true (possibly negative) order via the typed cursor.
+        let mut published_end: SnapshotCursor = self.cursor_kind.min();
 
         while cursor <= max_pk {
             if self.cancel.is_cancelled() {
@@ -517,24 +623,95 @@ impl TableWorker {
                     format!("PK range [{cursor},{end}) for {table_fqn}")
                 })?;
 
-            let n = rows.len() as u64;
-            for row in rows {
-                // Derive identity from NATIVE values before the lossy JSON
-                // conversion, then build the event.
-                let id = self.provisional_id(&row)?;
-                let json = row_to_json(row)?;
-                if self
-                    .tx
-                    .send(SourceItem::Event(self.make_event(json, id)))
-                    .await
-                    .is_err()
+            total_sent += rows.len() as u64;
+            let events = self.rows_to_events(rows)?;
+            let chunk_end = mysql_signed_cursor(end);
+            self.publisher
+                .publish_chunk(
+                    &self.table_key,
+                    published_end,
+                    chunk_end,
+                    events,
+                )
+                .await
+                .map_err(|_| anyhow!("event channel closed"))?;
+            published_end = chunk_end;
+            cursor = end;
+        }
+
+        Ok(total_sent)
+    }
+
+    /// Unsigned integer PK scan. Bounds are read and interpolated as full-range
+    /// `u64` (never cast through `i64`), and chunk arithmetic is overflow-safe so
+    /// a range crossing `i64::MAX` and ending at `u64::MAX` scans correctly.
+    async fn by_pk_unsigned(&mut self, pk_col: &str) -> Result<u64> {
+        let table_fqn = fqn(&self.db, &self.table);
+
+        let bounds_row: Option<Row> = self
+            .conn
+            .query_first(format!(
+                "SELECT MIN(`{pk_col}`), MAX(`{pk_col}`) FROM `{}`.`{}`",
+                self.db, self.table
+            ))
+            .await
+            .with_context(|| format!("PK bounds for {table_fqn}"))?;
+
+        let (min_pk, max_pk) = match bounds_row {
+            None => return Ok(0),
+            Some(mut r) => {
+                match (r.take::<Option<u64>, _>(0), r.take::<Option<u64>, _>(1))
                 {
-                    anyhow::bail!("event channel closed");
+                    (Some(Some(a)), Some(Some(b))) => (a, b),
+                    _ => {
+                        debug!(table = %table_fqn, "empty table");
+                        return Ok(0);
+                    }
                 }
             }
+        };
 
-            total_sent += n;
-            cursor = end;
+        let chunk = self.cfg.chunk_size as u64;
+        let mut cursor = min_pk;
+        let mut total_sent = 0u64;
+        let mut published_end: SnapshotCursor = self.cursor_kind.min();
+
+        loop {
+            if self.cancel.is_cancelled() {
+                anyhow::bail!("snapshot cancelled");
+            }
+
+            let cb = unsigned_chunk_bounds(cursor, chunk, max_pk);
+            let op = if cb.inclusive { "<=" } else { "<" };
+            let rows: Vec<Row> = self
+                .conn
+                .query(format!(
+                    "SELECT * FROM `{}`.`{}` WHERE `{pk_col}` >= {cursor} AND `{pk_col}` {op} {}",
+                    self.db, self.table, cb.upper
+                ))
+                .await
+                .with_context(|| {
+                    format!("PK range [{cursor},{}] for {table_fqn}", cb.upper)
+                })?;
+
+            total_sent += rows.len() as u64;
+            let events = self.rows_to_events(rows)?;
+            let chunk_end = SnapshotCursor::Unsigned(cb.frontier_end);
+            self.publisher
+                .publish_chunk(
+                    &self.table_key,
+                    published_end,
+                    chunk_end,
+                    events,
+                )
+                .await
+                .map_err(|_| anyhow!("event channel closed"))?;
+            published_end = chunk_end;
+
+            if cb.inclusive {
+                break;
+            }
+            cursor = cb.next;
         }
 
         Ok(total_sent)
@@ -556,18 +733,23 @@ impl TableWorker {
             .with_context(|| format!("full scan of {table_fqn}"))?;
 
         let n = rows.len() as u64;
+        let mut events = Vec::with_capacity(rows.len());
         for row in rows {
             let id = self.provisional_id(&row)?;
             let json = row_to_json(row)?;
-            if self
-                .tx
-                .send(SourceItem::Event(self.make_event(json, id)))
-                .await
-                .is_err()
-            {
-                anyhow::bail!("event channel closed");
-            }
+            events.push(self.make_event(json, id));
         }
+
+        // No PK cursor: the whole table is one chunk [min, n) over an unsigned
+        // row-count cursor. The frontier advances to n and the boundary lands on
+        // the last row; resume for a full-scan table is table-level (rescan),
+        // matching the durable progress model.
+        let start = self.cursor_kind.min();
+        let end = SnapshotCursor::Unsigned(n.max(1));
+        self.publisher
+            .publish_chunk(&self.table_key, start, end, events)
+            .await
+            .map_err(|_| anyhow!("event channel closed"))?;
 
         Ok(n)
     }
@@ -658,6 +840,68 @@ fn is_integer_pk(col: Option<&super::MySqlColumn>) -> bool {
     }
 }
 
+/// The snapshot cursor kind for a table: signed vs unsigned integer PK-range
+/// scan, or an unsigned row-count cursor for the full-scan fallback. Must match
+/// the worker's scan decision so the aggregator's kind agrees with the cursors it
+/// receives.
+fn mysql_cursor_kind(schema: &super::MySqlTableSchema) -> CursorKind {
+    let pk = &schema.primary_key;
+    if pk.len() == 1 {
+        if let Some(col) = schema.column(&pk[0]) {
+            if is_integer_pk(Some(col)) {
+                return if col.is_unsigned() {
+                    CursorKind::Unsigned
+                } else {
+                    CursorKind::Signed
+                };
+            }
+        }
+    }
+    // Full scan: a monotone row-count cursor.
+    CursorKind::Unsigned
+}
+
+/// Build a signed cursor from a scan value (MySQL signed PK path).
+fn mysql_signed_cursor(v: i64) -> SnapshotCursor {
+    SnapshotCursor::Signed(v)
+}
+
+/// One unsigned PK chunk's bounds, overflow-safe near `u64::MAX`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnsignedChunk {
+    /// SQL predicate upper bound for this chunk.
+    upper: u64,
+    /// Whether the upper bound is inclusive (the final chunk, so the row at
+    /// `max` - possibly `u64::MAX` - is not dropped by an exclusive `<`).
+    inclusive: bool,
+    /// Half-open frontier end reported to the aggregator. `max + 1`, saturating
+    /// at `u64::MAX` (where completion, not the cursor, marks the max row done).
+    frontier_end: u64,
+    /// The next cursor to scan from (only meaningful when not the final chunk).
+    next: u64,
+}
+
+/// Compute the next unsigned PK chunk `[cursor, ..)` given `chunk` size and the
+/// table `max`. Uses checked arithmetic so a cursor near `u64::MAX` never
+/// overflows; the final chunk is inclusive of `max`.
+fn unsigned_chunk_bounds(cursor: u64, chunk: u64, max: u64) -> UnsignedChunk {
+    match cursor.checked_add(chunk) {
+        Some(end) if end <= max => UnsignedChunk {
+            upper: end,
+            inclusive: false,
+            frontier_end: end,
+            next: end,
+        },
+        // Final chunk: covers [cursor, max] inclusively.
+        _ => UnsignedChunk {
+            upper: max,
+            inclusive: true,
+            frontier_end: max.saturating_add(1),
+            next: max,
+        },
+    }
+}
+
 fn row_to_json(mut row: Row) -> Result<serde_json::Value> {
     let columns = row.columns_ref().to_vec();
     let mut map = serde_json::Map::with_capacity(columns.len());
@@ -716,4 +960,70 @@ fn base64_encode(bytes: &[u8]) -> String {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    #[test]
+    fn unsigned_chunk_bounds_normal_range() {
+        let c = unsigned_chunk_bounds(0, 100, 1000);
+        assert_eq!(
+            c,
+            UnsignedChunk {
+                upper: 100,
+                inclusive: false,
+                frontier_end: 100,
+                next: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn unsigned_chunk_bounds_final_chunk_is_inclusive() {
+        // cursor + chunk overshoots max: final inclusive chunk covers [900, 950].
+        let c = unsigned_chunk_bounds(900, 100, 950);
+        assert!(c.inclusive);
+        assert_eq!(c.upper, 950);
+        assert_eq!(c.frontier_end, 951);
+    }
+
+    #[test]
+    fn unsigned_chunk_bounds_crossing_i64_max() {
+        // A cursor just below i64::MAX with a chunk that crosses it stays correct
+        // (no i64 overflow / sign flip).
+        let below = i64::MAX as u64 - 10;
+        let c = unsigned_chunk_bounds(below, 100, u64::MAX);
+        // below + 100 > u64... no: below+100 < u64::MAX, and <= max -> normal.
+        assert!(!c.inclusive);
+        assert_eq!(c.upper, below + 100);
+        assert_eq!(c.frontier_end, below + 100);
+        // The crossed value is above i64::MAX.
+        assert!(c.upper > i64::MAX as u64);
+    }
+
+    #[test]
+    fn unsigned_chunk_bounds_ending_at_u64_max_no_overflow() {
+        // cursor near u64::MAX: checked_add overflows -> final inclusive chunk to
+        // u64::MAX, frontier_end saturates (no panic, no wraparound).
+        let cursor = u64::MAX - 5;
+        let c = unsigned_chunk_bounds(cursor, 1000, u64::MAX);
+        assert!(c.inclusive);
+        assert_eq!(c.upper, u64::MAX);
+        assert_eq!(c.frontier_end, u64::MAX, "saturates, never wraps to 0");
+    }
+
+    #[test]
+    fn unsigned_chunk_bounds_exact_max_boundary() {
+        // cursor + chunk == max exactly: normal exclusive chunk to max, then a
+        // later call from max produces the final inclusive [max, max].
+        let c = unsigned_chunk_bounds(0, 500, 500);
+        assert!(!c.inclusive);
+        assert_eq!(c.upper, 500);
+        let last = unsigned_chunk_bounds(500, 500, 500);
+        assert!(last.inclusive);
+        assert_eq!(last.upper, 500);
+        assert_eq!(last.frontier_end, 501);
+    }
 }
