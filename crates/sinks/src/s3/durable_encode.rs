@@ -106,6 +106,15 @@ pub fn encode_jsonl(events: &[Event]) -> Result<Bytes> {
     Ok(Bytes::from(buf))
 }
 
+/// Canonical bytes for a single JSON value (compact, keys sorted at every level).
+/// Used by the independent equivalence validator to compare records regardless of
+/// key order.
+pub(crate) fn canonical_json_bytes(v: &serde_json::Value) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_canonical_json(&mut buf, v);
+    buf
+}
+
 /// Write `v` as compact JSON with object keys sorted lexicographically at every
 /// level (arrays keep their order). Matches `serde_json`'s compact spacing, so
 /// the only difference from `to_writer` is the guaranteed key order.

@@ -23,9 +23,14 @@ use tokio::sync::{Mutex, Notify};
 use deltaforge_core::{CheckpointComparator, CheckpointOrder};
 
 use super::batch_upload::TableObject;
+use super::gc::{GcConfig, entry_seq_from_key};
 use super::head::{DurableWriter, Head, HeadError, head_key_for};
 use super::keys::EncodingDomain;
 use super::manifest::{ManifestEntry, ManifestObject};
+use super::rollup::{
+    InventoryIndex, RollupRecord, load_inventory,
+    load_record as load_rollup_rec,
+};
 use super::store_cond::{
     CondError, CondResult, ConditionalStore, ObjectStoreConditional, PutOutcome,
 };
@@ -51,6 +56,8 @@ enum Op {
     CompactionRecordPut,
     /// Create-only write of a rollup record.
     RollupRecordPut,
+    /// Create-only write of a rollup inventory index object.
+    InventoryPut,
     /// Read of an original data object (compaction "read originals" step).
     GetData,
 }
@@ -63,6 +70,8 @@ fn classify_put(key: &Path) -> Op {
         Op::ManifestPut
     } else if k.contains("_manifest/compactions") {
         Op::CompactionRecordPut
+    } else if k.contains("_manifest/rollups/inventory") {
+        Op::InventoryPut
     } else if k.contains("_manifest/rollups") {
         Op::RollupRecordPut
     } else if k.contains("/compacted/") {
@@ -276,10 +285,11 @@ fn expect_err<T>(r: Result<T, HeadError>) -> HeadError {
 
 /// Read the authoritative HEAD straight from the store (no live writer).
 async fn read_head(inner: &ObjectStoreConditional) -> Option<Head> {
-    match inner.get_with_etag(&head_key_for(PFX, PIPE)).await.unwrap() {
-        Some((raw, _)) => Some(serde_json::from_slice(&raw).unwrap()),
-        None => None,
-    }
+    inner
+        .get_with_etag(&head_key_for(PFX, PIPE))
+        .await
+        .unwrap()
+        .map(|(raw, _)| serde_json::from_slice(&raw).unwrap())
 }
 
 async fn entry_count(inner: &ObjectStoreConditional) -> usize {
@@ -1136,6 +1146,18 @@ async fn rollup_record_count(inner: &ObjectStoreConditional) -> usize {
         .list(&Path::from(format!("{PFX}/{PIPE}/_manifest/rollups")))
         .await
         .unwrap()
+        .iter()
+        .filter(|p| !p.to_string().contains("/inventory/"))
+        .count()
+}
+
+async fn inventory_count(inner: &ObjectStoreConditional) -> usize {
+    inner
+        .list(&Path::from(format!(
+            "{PFX}/{PIPE}/_manifest/rollups/inventory"
+        )))
+        .await
+        .unwrap()
         .len()
 }
 
@@ -1365,4 +1387,461 @@ async fn rollup_before_any_publish_is_rejected() {
     let err = expect_err(w.rollup().await);
     assert!(matches!(err, HeadError::Integrity(_)), "got {err:?}");
     assert_eq!(rollup_record_count(&inner).await, 0);
+}
+
+// ── 9B.1: cumulative rollups, recovery-from-rollup + inventory, dry-run GC ────
+
+/// Read HEAD and its ETag straight from the store.
+async fn head_and_etag(inner: &ObjectStoreConditional) -> (Head, String) {
+    let (raw, etag) = inner
+        .get_with_etag(&head_key_for(PFX, PIPE))
+        .await
+        .unwrap()
+        .unwrap();
+    (serde_json::from_slice(&raw).unwrap(), etag.unwrap())
+}
+
+/// Load the rollup record HEAD currently references.
+async fn current_rollup(inner: &ObjectStoreConditional) -> RollupRecord {
+    let h = read_head(inner).await.unwrap();
+    load_rollup_rec(inner, &h.rollup_key.unwrap(), &h.rollup_hash.unwrap())
+        .await
+        .unwrap()
+}
+
+/// Load the inventory index bound by a rollup record.
+async fn inventory_of(
+    inner: &ObjectStoreConditional,
+    rec: &RollupRecord,
+) -> InventoryIndex {
+    load_inventory(inner, &rec.inventory_key, &rec.inventory_record_hash)
+        .await
+        .unwrap()
+}
+
+/// Delete every manifest entry with seq <= `seq_max` (simulate authorized GC).
+async fn delete_entries_le(inner: &ObjectStoreConditional, seq_max: u64) {
+    for k in inner
+        .list(&Path::from(format!("{PFX}/{PIPE}/_manifest/entries")))
+        .await
+        .unwrap()
+    {
+        let ks = k.to_string();
+        if let Some(seq) = entry_seq_from_key(&ks) {
+            if seq <= seq_max {
+                inner.delete(&k).await.unwrap();
+            }
+        }
+    }
+}
+
+/// Delete the rollup record + its bound inventory index (simulate damage).
+async fn delete_rollup_and_inventory(
+    inner: &ObjectStoreConditional,
+    key: &str,
+    hash: &str,
+) {
+    let rec = load_rollup_rec(inner, key, hash).await.unwrap();
+    inner.delete(&Path::from(rec.inventory_key)).await.unwrap();
+    inner.delete(&Path::from(key.to_string())).await.unwrap();
+}
+
+/// Publish `n` single-object batches ("orders", value per seq) and roll up,
+/// producing one cumulative generation. Returns the writer + shared fault store.
+async fn setup_generations(
+    inner: &Arc<ObjectStoreConditional>,
+) -> (Arc<FaultStore>, DurableWriter<FaultStore>) {
+    // gen1 over [1,2]; publish seq 3 then gen2 over [1,3]. HEAD: current=gen2
+    // (end 3), prev=gen1 (end 2), horizon = 2.
+    let (fs, w) = genesis(inner, vec![]).await;
+    w.publish(&wm(1), vec![tobj("orders", b"a")], 1)
+        .await
+        .unwrap();
+    w.publish(&wm(2), vec![tobj("orders", b"b")], 1)
+        .await
+        .unwrap();
+    w.rollup().await.unwrap(); // gen1 [1,2]
+    w.publish(&wm(3), vec![tobj("orders", b"c")], 1)
+        .await
+        .unwrap();
+    w.rollup().await.unwrap(); // gen2 [1,3]
+    (fs, w)
+}
+
+#[tokio::test]
+async fn cumulative_rollups_are_nested_from_genesis() {
+    let inner = inmem();
+    let (_fs, w) = setup_generations(&inner).await;
+    let cur = current_rollup(&inner).await;
+    assert_eq!(
+        cur.start_seq, 1,
+        "current rollup is cumulative from genesis"
+    );
+    assert_eq!(cur.end_seq, 3);
+    let h = read_head(&inner).await.unwrap();
+    let prev = load_rollup_rec(
+        inner.as_ref(),
+        &h.prev_rollup_key.unwrap(),
+        &h.prev_rollup_hash.unwrap(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(prev.start_seq, 1, "previous rollup also cumulative");
+    assert_eq!(prev.end_seq, 2);
+    assert!(
+        prev.end_seq < cur.end_seq,
+        "generations strictly increasing"
+    );
+    // Each generation wrote its own inventory index.
+    assert_eq!(inventory_count(&inner).await, 2);
+    assert_eq!(cur.inventory_count, 3, "current inventory covers [1,3]");
+    drop(w);
+    // Intact recovery still works.
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    acquire(clean).await.unwrap();
+}
+
+#[tokio::test]
+async fn remove_entries_through_horizon_recovers_via_current_rollup() {
+    let inner = inmem();
+    let (_fs, w) = setup_generations(&inner).await;
+    drop(w);
+    // Authorized GC removes entries at/below the horizon (prev.end = 2).
+    delete_entries_le(&inner, 2).await;
+
+    // Recovery reconstructs [1,3] from the current cumulative rollup + inventory
+    // plus the retained tail (seq 3), and continues.
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let w2 = acquire(Arc::clone(&clean)).await.unwrap();
+    assert_eq!(w2.epoch().await, 2, "recovered-current");
+    w2.publish(&wm(4), vec![tobj("orders", b"d")], 1)
+        .await
+        .unwrap();
+    assert_eq!(read_head(&inner).await.unwrap().seq, 4);
+}
+
+#[tokio::test]
+async fn damaged_current_falls_back_to_previous_generation() {
+    let inner = inmem();
+    let (_fs, w) = setup_generations(&inner).await;
+    let h = read_head(&inner).await.unwrap();
+    drop(w);
+    delete_entries_le(&inner, 2).await;
+    // Damage the current generation entirely.
+    delete_rollup_and_inventory(
+        &inner,
+        h.rollup_key.as_ref().unwrap(),
+        h.rollup_hash.as_ref().unwrap(),
+    )
+    .await;
+
+    // Recovery falls back to the previous rollup [1,2] + the retained tail (seq 3).
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let w2 = acquire(Arc::clone(&clean)).await.unwrap();
+    assert_eq!(w2.epoch().await, 2, "recovered-previous");
+}
+
+#[tokio::test]
+async fn removing_older_than_previous_generation_does_not_break_recovery() {
+    let inner = inmem();
+    let (fs, w) = genesis(&inner, vec![]).await;
+    w.publish(&wm(1), vec![tobj("orders", b"a")], 1)
+        .await
+        .unwrap();
+    w.publish(&wm(2), vec![tobj("orders", b"b")], 1)
+        .await
+        .unwrap();
+    w.rollup().await.unwrap(); // gen1 [1,2]
+    let gen1 = read_head(&inner).await.unwrap();
+    w.publish(&wm(3), vec![tobj("orders", b"c")], 1)
+        .await
+        .unwrap();
+    w.rollup().await.unwrap(); // gen2 [1,3]
+    w.publish(&wm(4), vec![tobj("orders", b"d")], 1)
+        .await
+        .unwrap();
+    w.rollup().await.unwrap(); // gen3 [1,4]; HEAD current=gen3, prev=gen2
+    drop((fs, w));
+
+    // Remove entries through the horizon (prev = gen2, end 3) and delete the
+    // older-than-previous generation (gen1): a dangling prev.prev is expected.
+    delete_entries_le(&inner, 3).await;
+    delete_rollup_and_inventory(
+        &inner,
+        gen1.rollup_key.as_ref().unwrap(),
+        gen1.rollup_hash.as_ref().unwrap(),
+    )
+    .await;
+
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    acquire(clean)
+        .await
+        .expect("recovery ignores the removed older generation");
+}
+
+#[tokio::test]
+async fn losing_previous_generation_with_damaged_current_halts() {
+    let inner = inmem();
+    let (_fs, w) = setup_generations(&inner).await;
+    let h = read_head(&inner).await.unwrap();
+    drop(w);
+    delete_entries_le(&inner, 2).await;
+    // Damage BOTH retained generations: beyond the one-generation horizon.
+    delete_rollup_and_inventory(
+        &inner,
+        h.rollup_key.as_ref().unwrap(),
+        h.rollup_hash.as_ref().unwrap(),
+    )
+    .await;
+    delete_rollup_and_inventory(
+        &inner,
+        h.prev_rollup_key.as_ref().unwrap(),
+        h.prev_rollup_hash.as_ref().unwrap(),
+    )
+    .await;
+
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let err = expect_err(acquire(clean).await);
+    assert!(
+        err.is_fatal(),
+        "corruption beyond the horizon halts: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn publish_and_compaction_preserve_cumulative_refs_and_times() {
+    let inner = inmem();
+    let (_fs, w) = setup_generations(&inner).await;
+    let before = read_head(&inner).await.unwrap();
+    assert!(before.rollup_published_at_ms.is_some());
+    assert!(before.prev_rollup_published_at_ms.is_some());
+
+    // Ordinary publish preserves both generations' refs + publication times.
+    w.publish(&wm(4), vec![tobj("orders", b"d")], 1)
+        .await
+        .unwrap();
+    let h = read_head(&inner).await.unwrap();
+    assert_eq!(h.rollup_key, before.rollup_key);
+    assert_eq!(h.prev_rollup_key, before.prev_rollup_key);
+    assert_eq!(h.rollup_published_at_ms, before.rollup_published_at_ms);
+    assert_eq!(
+        h.prev_rollup_published_at_ms,
+        before.prev_rollup_published_at_ms
+    );
+
+    // Compaction also preserves them.
+    let originals = all_manifest_objects(&inner).await;
+    w.compact(originals).await.unwrap();
+    let h2 = read_head(&inner).await.unwrap();
+    assert_eq!(h2.rollup_key, before.rollup_key);
+    assert_eq!(h2.prev_rollup_key, before.prev_rollup_key);
+    assert_eq!(h2.rollup_published_at_ms, before.rollup_published_at_ms);
+}
+
+#[tokio::test]
+async fn cumulative_inventory_is_unchanged_by_compaction() {
+    let inner = inmem();
+    let (_fs, w) = setup_generations(&inner).await;
+    let inv_before = inventory_of(&inner, &current_rollup(&inner).await).await;
+
+    // Compact the originals; the rollup + its inventory are untouched.
+    let originals = all_manifest_objects(&inner).await;
+    w.compact(originals).await.unwrap();
+
+    let inv_after = inventory_of(&inner, &current_rollup(&inner).await).await;
+    assert_eq!(
+        inv_before, inv_after,
+        "the rollup inventory still lists the original acknowledged objects"
+    );
+    // None of the inventory objects is the compacted replacement.
+    assert!(
+        inv_after
+            .objects
+            .iter()
+            .all(|o| !o.key.contains("/compacted/")),
+        "inventory holds originals, not replacements"
+    );
+}
+
+// ── Dry-run GcPlan ───────────────────────────────────────────────────────────
+
+const NO_WINDOW: GcConfig = GcConfig {
+    safety_window_ms: 0,
+};
+
+/// A `TableObject` of real canonical JSONL rows, each with a valid `event_id`, so
+/// the internal compactor + equivalence validator can round-trip it.
+fn tobj_jsonl(table: &str, rows: &[u32]) -> TableObject {
+    let mut buf = Vec::new();
+    for r in rows {
+        let id = deltaforge_core::EventId::mysql_row_server(
+            1, "orders", *r as u64, 0,
+        )
+        .to_string();
+        buf.extend_from_slice(
+            format!("{{\"event_id\":\"{id}\",\"v\":{r}}}").as_bytes(),
+        );
+        buf.push(b'\n');
+    }
+    TableObject {
+        table: table.to_string(),
+        bytes: Bytes::from(buf),
+        domain: EncodingDomain::new("jsonl", 1, "s1", "none", "table", 1),
+        ext: "jsonl",
+    }
+}
+
+#[tokio::test]
+async fn plan_gc_lists_eligible_entries_and_data_originals() {
+    let inner = inmem();
+    // Two cumulative generations over real JSONL objects (so compaction produces an
+    // equivalence-provable replacement).
+    let (_fs, w) = genesis(&inner, vec![]).await;
+    w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)
+        .await
+        .unwrap();
+    w.publish(&wm(2), vec![tobj_jsonl("orders", &[2])], 1)
+        .await
+        .unwrap();
+    w.rollup().await.unwrap(); // gen1 [1,2]
+    w.publish(&wm(3), vec![tobj_jsonl("orders", &[3])], 1)
+        .await
+        .unwrap();
+    w.rollup().await.unwrap(); // gen2 [1,3]
+    let originals = all_manifest_objects(&inner).await;
+    w.compact(originals).await.unwrap();
+
+    let now = now_ms_test() + 1_000_000;
+    let plan = w.plan_gc(now, NO_WINDOW).await.unwrap();
+
+    // Horizon = prev.end = 2; entries seq 1,2 are eligible (seq 3 is the tail).
+    assert_eq!(plan.horizon_seq, 2);
+    let seqs: Vec<u64> = plan
+        .manifest_entries_eligible
+        .iter()
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(seqs, vec![1, 2], "only entries at/below the horizon");
+    // All three originals were compacted -> data-eligible, each with a replacement.
+    assert_eq!(plan.data_originals_eligible.len(), 3);
+    assert!(
+        plan.data_originals_eligible
+            .iter()
+            .all(|o| o.replacement_key.contains("/compacted/"))
+    );
+    assert!(
+        plan.alarms.is_empty(),
+        "no alarms on a clean plan: {:?}",
+        plan.alarms
+    );
+}
+
+#[tokio::test]
+async fn plan_gc_premature_window_lists_no_entries() {
+    let inner = inmem();
+    let (_fs, w) = setup_generations(&inner).await;
+    let pub_at = read_head(&inner)
+        .await
+        .unwrap()
+        .rollup_published_at_ms
+        .unwrap();
+    // now == publish time => age 0; a large window => not yet eligible.
+    let plan = w
+        .plan_gc(
+            pub_at,
+            GcConfig {
+                safety_window_ms: u64::MAX,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        plan.manifest_entries_eligible.is_empty(),
+        "window not elapsed => no manifest entries"
+    );
+}
+
+#[tokio::test]
+async fn plan_gc_future_timestamp_alarms_and_lists_no_entries() {
+    let inner = inmem();
+    let (_fs, w) = setup_generations(&inner).await;
+    let pub_at = read_head(&inner)
+        .await
+        .unwrap()
+        .rollup_published_at_ms
+        .unwrap();
+    // now strictly before the publication time => suspicious clock.
+    let plan = w.plan_gc(pub_at - 1, NO_WINDOW).await.unwrap();
+    assert!(plan.manifest_entries_eligible.is_empty());
+    assert!(
+        plan.alarms.iter().any(|a| a.message.contains("future")),
+        "future-timestamp alarm expected: {:?}",
+        plan.alarms
+    );
+}
+
+#[tokio::test]
+async fn plan_gc_still_valid_until_head_changes() {
+    let inner = inmem();
+    let (_fs, w) = setup_generations(&inner).await;
+    let now = now_ms_test() + 1_000_000;
+    let plan = w.plan_gc(now, NO_WINDOW).await.unwrap();
+    let (h1, e1) = head_and_etag(&inner).await;
+    assert!(
+        plan.still_valid(&h1, &e1),
+        "valid against the HEAD it was built on"
+    );
+
+    // Any HEAD write invalidates the plan.
+    w.publish(&wm(4), vec![tobj("orders", b"d")], 1)
+        .await
+        .unwrap();
+    let (h2, e2) = head_and_etag(&inner).await;
+    assert!(!plan.still_valid(&h2, &e2), "stale after a new batch");
+}
+
+#[tokio::test]
+async fn plan_gc_fenced_writer_returns_fenced() {
+    let inner = inmem();
+    let (_fs, a) = setup_generations(&inner).await; // epoch 1
+    let _b = acquire(Arc::new(FaultStore::new(Arc::clone(&inner), vec![])))
+        .await
+        .unwrap(); // epoch 2 fences A
+    let now = now_ms_test() + 1_000_000;
+    let err = expect_err(a.plan_gc(now, NO_WINDOW).await);
+    assert!(matches!(err, HeadError::Fenced { .. }), "got {err:?}");
+}
+
+#[tokio::test]
+async fn plan_gc_skips_non_equivalent_compaction() {
+    let inner = inmem();
+    let (_fs, w) = setup_generations(&inner).await;
+    // A test-only compaction whose replacement is NOT the concatenation of its
+    // originals: equivalence must fail, so its originals are not data-eligible.
+    let originals = all_manifest_objects(&inner).await;
+    w.compact_with_replacement(tobj("orders", b"not-equivalent"), originals)
+        .await
+        .unwrap();
+
+    let now = now_ms_test() + 1_000_000;
+    let plan = w.plan_gc(now, NO_WINDOW).await.unwrap();
+    assert!(
+        plan.data_originals_eligible.is_empty(),
+        "non-equivalent replacement makes no original eligible"
+    );
+    assert!(!plan.skipped.is_empty(), "skips recorded");
+    assert!(
+        plan.alarms
+            .iter()
+            .any(|a| a.message.contains("equivalence")),
+        "equivalence alarm expected: {:?}",
+        plan.alarms
+    );
+}
+
+fn now_ms_test() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }

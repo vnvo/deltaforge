@@ -13,9 +13,11 @@ mod compaction;
 mod durable_encode;
 mod durable_sink;
 mod encoder;
+mod equivalence;
 #[cfg(test)]
 mod fault_matrix;
 mod file_format;
+mod gc;
 mod head;
 mod jsonl_writer;
 mod keys;

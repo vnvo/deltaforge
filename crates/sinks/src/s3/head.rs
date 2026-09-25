@@ -28,14 +28,21 @@ use super::compaction::{
     CompactionError, CompactionIndex, CompactionRecord, check_compatible,
     compacted_object_key, load_record, verify_originals_present, write_record,
 };
+use super::equivalence::verify_jsonl;
+use super::gc::{
+    Alarm, EntryRef, GcConfig, GcPlan, HeadBinding, InventoryRef, OriginalRef,
+    SkipReason, horizon_seq,
+};
 use super::keys::content_hash;
 use super::manifest::{
-    ManifestEntry, ManifestObject, PrevRef, WrittenEntry, propose_seq,
-    write_entry,
+    ManifestEntry, ManifestObject, PrevRef, WrittenEntry, entry_key,
+    propose_seq, write_entry,
 };
 use super::rollup::{
-    RollupError, RollupRecord, load_record as rollup_load,
-    object_digest as rollup_object_digest, write_record as rollup_write,
+    InventoryIndex, RollupError, RollupRecord,
+    load_inventory as rollup_load_inventory, load_record as rollup_load,
+    object_digest as rollup_object_digest,
+    write_inventory as rollup_write_inventory, write_record as rollup_write,
 };
 use super::store_cond::{ConditionalStore, PutOutcome};
 
@@ -51,6 +58,16 @@ const MAX_ACQUIRE_ATTEMPTS: usize = 8;
 /// Hard cap on manifest-chain length walked during recovery (cycle / runaway
 /// guard). Chains longer than this fail closed rather than walk forever.
 const MAX_CHAIN_WALK: usize = 5_000_000;
+
+/// Wall-clock milliseconds since the Unix epoch. Used only to stamp the rollup
+/// publication time into HEAD; GC compares it against an injected `now` and fails
+/// closed on rollback/future skew, so this is not a correctness-critical clock.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// The authoritative HEAD state. Genesis is `epoch >= 1, seq == 0` with no entry
 /// or watermark; after the first publish `seq >= 1` with entry + watermark set.
@@ -70,6 +87,17 @@ pub struct Head {
     pub prev_rollup_key: Option<String>,
     #[serde(default)]
     pub prev_rollup_hash: Option<String>,
+    /// Wall-clock time (ms since epoch) at which the current rollup became
+    /// HEAD-published. This is the authoritative-age source for the GC safety
+    /// window: it begins when the rollup becomes HEAD-published, NOT when its
+    /// immutable object was uploaded. Stamped at the rollup CAS, preserved across
+    /// ordinary batch/compaction publications, moved to `prev_rollup_published_at_ms`
+    /// when a new rollup supersedes it, reconciled to the same value on a lost CAS
+    /// response. Set together with `rollup_key/hash`.
+    #[serde(default)]
+    pub rollup_published_at_ms: Option<u64>,
+    #[serde(default)]
+    pub prev_rollup_published_at_ms: Option<u64>,
     pub watermark_hex: Option<String>,
     /// Reference to the latest compaction record (the head of the immutable
     /// compaction history). Independent of the acknowledgement chain: compaction
@@ -93,6 +121,8 @@ impl Head {
             rollup_hash: None,
             prev_rollup_key: None,
             prev_rollup_hash: None,
+            rollup_published_at_ms: None,
+            prev_rollup_published_at_ms: None,
             watermark_hex: None,
             compaction_key: None,
             compaction_hash: None,
@@ -144,6 +174,21 @@ impl Head {
         if self.prev_rollup_key.is_some() != self.prev_rollup_hash.is_some() {
             return Err(HeadError::Integrity(
                 "HEAD prev-rollup key/hash not both-set-or-both-unset".into(),
+            ));
+        }
+        // The publication time travels with its rollup ref (present iff the ref is).
+        if self.rollup_key.is_some() != self.rollup_published_at_ms.is_some() {
+            return Err(HeadError::Integrity(
+                "HEAD rollup ref/publication-time not both-set-or-both-unset"
+                    .into(),
+            ));
+        }
+        if self.prev_rollup_key.is_some()
+            != self.prev_rollup_published_at_ms.is_some()
+        {
+            return Err(HeadError::Integrity(
+                "HEAD prev-rollup ref/publication-time not both-set-or-both-unset"
+                    .into(),
             ));
         }
         if self.compaction_key.is_some() != self.compaction_hash.is_some() {
@@ -240,15 +285,28 @@ async fn load_entry<S: ConditionalStore + ?Sized>(
     store: &S,
     key: &str,
 ) -> Result<ManifestEntry, HeadError> {
+    load_entry_opt(store, key)
+        .await?
+        .ok_or_else(|| HeadError::Integrity(format!("missing entry {key}")))
+}
+
+/// Like [`load_entry`] but distinguishes a genuinely absent object (`Ok(None)`,
+/// e.g. an entry authorized-GC'd below the recovery horizon) from a store/parse
+/// error (`Err`). Recovery uses `None` on a `prev` link as a truncation boundary,
+/// never as corruption.
+async fn load_entry_opt<S: ConditionalStore + ?Sized>(
+    store: &S,
+    key: &str,
+) -> Result<Option<ManifestEntry>, HeadError> {
     match store
         .get_with_etag(&object_store::path::Path::from(key))
         .await
         .map_err(|e| HeadError::Store(e.to_string()))?
     {
-        Some((raw, _)) => serde_json::from_slice(&raw).map_err(|e| {
+        Some((raw, _)) => serde_json::from_slice(&raw).map(Some).map_err(|e| {
             HeadError::Integrity(format!("entry {key} unparseable: {e}"))
         }),
-        None => Err(HeadError::Integrity(format!("missing entry {key}"))),
+        None => Ok(None),
     }
 }
 
@@ -257,31 +315,48 @@ async fn load_entry<S: ConditionalStore + ?Sized>(
 /// entries and to build the ack-chain object inventory.
 struct EntrySummary {
     entry_hash: String,
+    /// The hash of the entry immediately before this one (`prev.hash`), or `None`
+    /// at genesis. Used to verify a rollup's end boundary against the first
+    /// retained tail entry after covered entries are gone.
+    prev_hash: Option<String>,
     watermark_hex: String,
     objects: Vec<ManifestObject>,
 }
 
-/// Verify HEAD's authoritative chain and all referenced data objects, then verify
-/// the rollup chain against the retained entries (advisory in 9A: alarm + fall
-/// back, never trust a damaged rollup) and build+verify the authoritative
-/// compaction index. Returns that index so recovery can hand it to GC. Every
-/// entry-chain or compaction failure is fatal - no `Before`/`Equal` skipping is
-/// enabled unless this returns `Ok`.
-async fn verify_chain<S: ConditionalStore + ?Sized>(
+/// The result of fully verifying the retained manifest entries reachable from HEAD.
+struct RetainedWalk {
+    /// seq -> summary for every retained entry.
+    entries: std::collections::BTreeMap<u64, EntrySummary>,
+    /// Every object key referenced by a retained entry.
+    inventory: std::collections::HashSet<String>,
+    /// The walk terminated at a valid genesis (intact chain).
+    reached_genesis: bool,
+    /// The walk stopped at a truncation boundary (authorized GC below the horizon):
+    /// the highest seq whose entry is gone. A rollup selected for recovery must
+    /// cover at least `[1 .. covered_end]`.
+    truncated_covered_end: Option<u64>,
+}
+
+/// Walk HEAD -> genesis, fully verifying each retained entry (bytes/hash, identity,
+/// seq continuity, epoch non-regression, strictly-advancing watermark, HEAD
+/// watermark match, and every referenced data object) and collecting the per-seq
+/// summaries + object inventory. A missing `prev` object is a truncation boundary
+/// (authorized GC), not corruption; a missing HEAD entry, or any verification
+/// failure on a present entry, is fatal.
+async fn walk_retained_entries<S: ConditionalStore + ?Sized>(
     store: &S,
-    _prefix: &str,
     pipeline: &str,
     source_id: &str,
     sink_id: &str,
     head: &Head,
     comparator: &dyn CheckpointComparator,
-) -> Result<CompactionIndex, HeadError> {
-    // The authoritative object inventory (every object key referenced by an
-    // entry) and per-seq summaries, collected during the walk.
+) -> Result<RetainedWalk, HeadError> {
     let mut inventory: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let mut entries: std::collections::BTreeMap<u64, EntrySummary> =
         std::collections::BTreeMap::new();
+    let mut reached_genesis = false;
+    let mut truncated_covered_end: Option<u64> = None;
 
     if let Some(head_entry_key) = head.head_entry_key.clone() {
         let head_entry_hash = head
@@ -295,10 +370,28 @@ async fn verify_chain<S: ConditionalStore + ?Sized>(
         let mut later_epoch: Option<u64> = None;
         let mut later_wm: Option<Vec<u8>> = None;
         let mut is_head_entry = true;
-        let mut done = false;
+        let mut resolved = false;
 
         for _ in 0..MAX_CHAIN_WALK {
-            let entry = load_entry(store, &cur_key).await?;
+            let entry = match load_entry_opt(store, &cur_key).await? {
+                Some(e) => e,
+                None => {
+                    // The HEAD entry itself must always exist.
+                    if is_head_entry {
+                        return Err(HeadError::Integrity(format!(
+                            "HEAD references a missing entry {cur_key}"
+                        )));
+                    }
+                    // A missing `prev` is a truncation boundary: entries at and
+                    // below `expected_seq` were authorized-GC'd.
+                    truncated_covered_end = Some(
+                        expected_seq
+                            .expect("expected_seq set for any non-head entry"),
+                    );
+                    resolved = true;
+                    break;
+                }
+            };
 
             // 1. Bytes match the referenced hash (and thus the key hash).
             if entry.entry_hash() != expected_hash {
@@ -368,6 +461,7 @@ async fn verify_chain<S: ConditionalStore + ?Sized>(
                 entry.seq,
                 EntrySummary {
                     entry_hash: entry.entry_hash(),
+                    prev_hash: entry.prev.as_ref().map(|p| p.hash.clone()),
                     watermark_hex: entry.watermark_hex.clone(),
                     objects: entry.objects.clone(),
                 },
@@ -381,7 +475,8 @@ async fn verify_chain<S: ConditionalStore + ?Sized>(
                             entry.seq
                         )));
                     }
-                    done = true;
+                    reached_genesis = true;
+                    resolved = true;
                     break;
                 }
                 Some(PrevRef { key, hash }) => {
@@ -403,7 +498,7 @@ async fn verify_chain<S: ConditionalStore + ?Sized>(
                 }
             }
         }
-        if !done {
+        if !resolved {
             return Err(HeadError::Integrity(
                 "manifest chain exceeded the maximum walk length (cycle or \
                  runaway)"
@@ -412,13 +507,66 @@ async fn verify_chain<S: ConditionalStore + ?Sized>(
         }
     }
 
-    // Rollups are advisory in 9A: verify against retained entries; a damaged
-    // rollup alarms and falls back but is never trusted (entries are ground
-    // truth). This never affects the fatal outcome of recovery.
-    let _ = verify_rollup_chain(
-        store, pipeline, source_id, sink_id, head, &entries,
+    Ok(RetainedWalk {
+        entries,
+        inventory,
+        reached_genesis,
+        truncated_covered_end,
+    })
+}
+
+/// Verify HEAD's authoritative chain and all referenced data objects, then verify
+/// the rollup chain against the retained entries (advisory when the chain is intact;
+/// authoritative recovery from rollup + inventory when covered entries are gone) and
+/// build+verify the authoritative compaction index. Returns that index so recovery
+/// can hand it to GC. Every entry-chain or compaction failure is fatal - no
+/// `Before`/`Equal` skipping is enabled unless this returns `Ok`.
+async fn verify_chain<S: ConditionalStore + ?Sized>(
+    store: &S,
+    _prefix: &str,
+    pipeline: &str,
+    source_id: &str,
+    sink_id: &str,
+    head: &Head,
+    comparator: &dyn CheckpointComparator,
+) -> Result<CompactionIndex, HeadError> {
+    let RetainedWalk {
+        entries,
+        mut inventory,
+        reached_genesis,
+        truncated_covered_end,
+    } = walk_retained_entries(
+        store, pipeline, source_id, sink_id, head, comparator,
     )
-    .await;
+    .await?;
+
+    // Covered-range recovery. If the entry walk was truncated by authorized GC,
+    // reconstruct the covered inventory from a verified cumulative rollup +
+    // inventory index (current, else the previous fallback generation, else a hard
+    // halt), and fold its keys into the ack inventory so compaction-index
+    // membership can be proven for the covered range. If the chain is intact, the
+    // rollup is only advisory (entries are ground truth): verify + alarm on damage,
+    // never fatal.
+    if let Some(covered_end) = truncated_covered_end {
+        let covered = recover_covered_inventory(
+            store,
+            pipeline,
+            source_id,
+            sink_id,
+            head,
+            covered_end,
+            &entries,
+        )
+        .await?;
+        for o in &covered {
+            inventory.insert(o.key.clone());
+        }
+    } else if reached_genesis {
+        let _ = verify_rollup_chain(
+            store, pipeline, source_id, sink_id, head, &entries,
+        )
+        .await;
+    }
 
     // Build + verify the authoritative compaction index (originals must be in
     // the ack inventory; conflicts/cycles are fatal).
@@ -524,13 +672,9 @@ pub(crate) enum RollupCheck {
     DamagedFellBack,
 }
 
-/// Verify the rollup chain reachable from HEAD against the retained `entries`
-/// (seq -> summary). A rollup must match its referenced hash + identity, have a
-/// valid contiguous range with correct boundary entry hashes and end watermark,
-/// and an object digest matching the summarized entries. On any discrepancy the
-/// current rollup is NOT trusted: an alarm is logged and we fall back to the
-/// previous rollup, then to the (already fully verified) entry chain. Bounded and
-/// cycle-checked. Never fails recovery in 9A.
+/// Advisory rollup verification for the INTACT chain (entries are ground truth):
+/// verify the current cumulative rollup + its inventory index; on damage, warn and
+/// try the previous generation; never fatal. Discards the recovered inventory.
 async fn verify_rollup_chain<S: ConditionalStore + ?Sized>(
     store: &S,
     pipeline: &str,
@@ -545,12 +689,12 @@ async fn verify_rollup_chain<S: ConditionalStore + ?Sized>(
         return RollupCheck::Healthy; // no rollup
     };
 
-    match verify_rollup_from(
-        store, pipeline, source_id, sink_id, &key, &hash, entries,
+    match verify_cumulative_rollup(
+        store, pipeline, source_id, sink_id, head, &key, &hash, 0, entries,
     )
     .await
     {
-        Ok(()) => RollupCheck::Healthy,
+        Ok(_) => RollupCheck::Healthy,
         Err(e) => {
             tracing::warn!(
                 pipeline = %pipeline,
@@ -558,14 +702,14 @@ async fn verify_rollup_chain<S: ConditionalStore + ?Sized>(
                 "durable S3 current rollup failed verification; falling back \
                  (entries retained) - this is an alarm, not silent trust"
             );
-            // Fall back to the previous rollup, if any.
             if let Some((pk, ph)) = head
                 .prev_rollup_key
                 .clone()
                 .zip(head.prev_rollup_hash.clone())
             {
-                if let Err(e2) = verify_rollup_from(
-                    store, pipeline, source_id, sink_id, &pk, &ph, entries,
+                if let Err(e2) = verify_cumulative_rollup(
+                    store, pipeline, source_id, sink_id, head, &pk, &ph, 0,
+                    entries,
                 )
                 .await
                 {
@@ -582,114 +726,235 @@ async fn verify_rollup_chain<S: ConditionalStore + ?Sized>(
     }
 }
 
-/// Verify a single rollup chain starting at `(key, hash)` against `entries`.
-#[allow(clippy::too_many_arguments)]
-async fn verify_rollup_from<S: ConditionalStore + ?Sized>(
+/// Recover the authoritative covered-range inventory after authorized GC truncated
+/// the entry chain: verify the current cumulative rollup (must cover at least
+/// `[1 .. covered_end]`), else fall back to the previous retained generation, else
+/// HALT (hard reconciliation alarm - both retained generations unusable). Returns
+/// the adopted covered inventory objects. Never walks beyond the previous
+/// generation (a dangling `prev.prev` after authorized GC is expected).
+async fn recover_covered_inventory<S: ConditionalStore + ?Sized>(
     store: &S,
     pipeline: &str,
     source_id: &str,
     sink_id: &str,
+    head: &Head,
+    covered_end: u64,
+    entries: &std::collections::BTreeMap<u64, EntrySummary>,
+) -> Result<Vec<ManifestObject>, HeadError> {
+    let (ck, chash) = head
+        .rollup_key
+        .clone()
+        .zip(head.rollup_hash.clone())
+        .ok_or_else(|| {
+            HeadError::Integrity(
+                "covered entries were removed but HEAD has no rollup to recover \
+                 from (hard halt)"
+                    .into(),
+            )
+        })?;
+    match verify_cumulative_rollup(
+        store,
+        pipeline,
+        source_id,
+        sink_id,
+        head,
+        &ck,
+        &chash,
+        covered_end,
+        entries,
+    )
+    .await
+    {
+        Ok(objs) => Ok(objs),
+        Err(e) => {
+            tracing::warn!(
+                pipeline = %pipeline,
+                error = %e,
+                "durable S3 current rollup unusable for covered-range recovery; \
+                 falling back to the previous retained generation - alarm"
+            );
+            let (pk, ph) = head
+                .prev_rollup_key
+                .clone()
+                .zip(head.prev_rollup_hash.clone())
+                .ok_or_else(|| {
+                    HeadError::Integrity(format!(
+                        "current rollup unusable and no previous generation \
+                         retained: cannot recover covered range (hard halt): {e}"
+                    ))
+                })?;
+            verify_cumulative_rollup(
+                store, pipeline, source_id, sink_id, head, &pk, &ph,
+                covered_end, entries,
+            )
+            .await
+            .map_err(|e2| {
+                HeadError::Integrity(format!(
+                    "both retained rollup generations unusable; cannot recover \
+                     the covered range (hard halt): current: {e}; previous: {e2}"
+                ))
+            })
+        }
+    }
+}
+
+/// Verify a single CUMULATIVE rollup `(key, hash)` and its bound inventory index
+/// against the retained `entries`, returning the covered inventory objects. Checks:
+/// hash/identity; cumulative invariants (`start_seq == 1`, covers at least
+/// `[1 .. min_covered_end]`); the inventory index binds (record hash, declared
+/// range == rollup range, count == object_count, object digest == rollup digest);
+/// the end boundary + watermark against HEAD (if it ends at HEAD) or against the
+/// first retained tail entry's `prev` (and the end entry itself when retained); and,
+/// when the full covered range is still retained (intact chain), exact equality
+/// between the inventory and the reconstructed-from-entries inventory. Verifies ONE
+/// generation only - never walks `prev`.
+#[allow(clippy::too_many_arguments)]
+async fn verify_cumulative_rollup<S: ConditionalStore + ?Sized>(
+    store: &S,
+    pipeline: &str,
+    source_id: &str,
+    sink_id: &str,
+    head: &Head,
     key: &str,
     hash: &str,
+    min_covered_end: u64,
     entries: &std::collections::BTreeMap<u64, EntrySummary>,
-) -> Result<(), HeadError> {
-    let mut cur_key = key.to_string();
-    let mut expected_hash = hash.to_string();
-    let mut seen = std::collections::HashSet::new();
-    let mut expected_end: Option<u64> = None;
-    for _ in 0..MAX_CHAIN_WALK {
-        if !seen.insert(cur_key.clone()) {
-            return Err(HeadError::Integrity(
-                "rollup history contains a cycle".into(),
-            ));
-        }
-        let rec = rollup_load(store, &cur_key, &expected_hash)
-            .await
-            .map_err(map_rollup)?;
-        if rec.pipeline != pipeline
-            || rec.source_id != source_id
-            || rec.sink_id != sink_id
+) -> Result<Vec<ManifestObject>, HeadError> {
+    let rec = rollup_load(store, key, hash).await.map_err(map_rollup)?;
+    if rec.pipeline != pipeline
+        || rec.source_id != source_id
+        || rec.sink_id != sink_id
+    {
+        return Err(HeadError::Integrity(format!(
+            "rollup {key} identity mismatch"
+        )));
+    }
+    // Cumulative invariants.
+    if rec.start_seq != 1 {
+        return Err(HeadError::Integrity(format!(
+            "rollup {key} is not cumulative: start_seq {} != 1",
+            rec.start_seq
+        )));
+    }
+    if rec.end_seq < 1 {
+        return Err(HeadError::Integrity(format!(
+            "rollup {key} has invalid end_seq {}",
+            rec.end_seq
+        )));
+    }
+    if rec.end_seq < min_covered_end {
+        return Err(HeadError::Integrity(format!(
+            "rollup {key} end_seq {} does not cover the removed range down to \
+             {min_covered_end}",
+            rec.end_seq
+        )));
+    }
+    // Load + verify the bound inventory index.
+    let inv = rollup_load_inventory(
+        store,
+        &rec.inventory_key,
+        &rec.inventory_record_hash,
+    )
+    .await
+    .map_err(map_rollup)?;
+    if inv.pipeline != pipeline
+        || inv.source_id != source_id
+        || inv.sink_id != sink_id
+    {
+        return Err(HeadError::Integrity(format!(
+            "inventory index {} identity mismatch",
+            rec.inventory_key
+        )));
+    }
+    if inv.start_seq != rec.start_seq || inv.end_seq != rec.end_seq {
+        return Err(HeadError::Integrity(format!(
+            "inventory index {} range [{}, {}] differs from rollup [{}, {}]",
+            rec.inventory_key,
+            inv.start_seq,
+            inv.end_seq,
+            rec.start_seq,
+            rec.end_seq
+        )));
+    }
+    if inv.objects.len() as u64 != rec.object_count
+        || rec.inventory_count != rec.object_count
+    {
+        return Err(HeadError::Integrity(format!(
+            "inventory index {} count mismatch (inventory {}, rollup object \
+             {}, rollup inventory {})",
+            rec.inventory_key,
+            inv.objects.len(),
+            rec.object_count,
+            rec.inventory_count
+        )));
+    }
+    if rollup_object_digest(&inv.objects) != rec.object_digest {
+        return Err(HeadError::Integrity(format!(
+            "inventory index {} object digest does not match the rollup",
+            rec.inventory_key
+        )));
+    }
+    // End boundary + watermark.
+    if rec.end_seq == head.seq {
+        if head.head_entry_hash.as_deref() != Some(rec.end_entry_hash.as_str())
         {
             return Err(HeadError::Integrity(format!(
-                "rollup {cur_key} identity mismatch"
+                "rollup {key} end hash does not match the HEAD entry"
             )));
         }
-        if rec.end_seq < rec.start_seq || rec.start_seq == 0 {
+        if head.watermark_hex.as_deref() != Some(rec.watermark_hex.as_str()) {
             return Err(HeadError::Integrity(format!(
-                "rollup {cur_key} has an invalid range [{}, {}]",
-                rec.start_seq, rec.end_seq
+                "rollup {key} watermark does not match HEAD"
             )));
         }
-        // Contiguity with the later rollup (this one ends just before it starts).
-        if let Some(end) = expected_end {
-            if rec.end_seq + 1 != end {
-                return Err(HeadError::Integrity(format!(
-                    "rollup {cur_key} end {} not contiguous with later start {}",
-                    rec.end_seq, end
-                )));
-            }
-        }
-        // Boundary entry hashes + end watermark match the retained entries.
-        let start = entries.get(&rec.start_seq).ok_or_else(|| {
+    } else {
+        // Ends below HEAD: the entry just after the rollup must be retained and
+        // link back to the rollup's end hash (this is the post-GC boundary check).
+        let tail = entries.get(&(rec.end_seq + 1)).ok_or_else(|| {
             HeadError::Integrity(format!(
-                "rollup {cur_key} start_seq {} not in retained entries",
-                rec.start_seq
-            ))
-        })?;
-        let end = entries.get(&rec.end_seq).ok_or_else(|| {
-            HeadError::Integrity(format!(
-                "rollup {cur_key} end_seq {} not in retained entries",
+                "rollup {key} end_seq {} + 1 is not retained: cannot verify the \
+                 boundary (gap)",
                 rec.end_seq
             ))
         })?;
-        if start.entry_hash != rec.start_entry_hash
-            || end.entry_hash != rec.end_entry_hash
-        {
+        if tail.prev_hash.as_deref() != Some(rec.end_entry_hash.as_str()) {
             return Err(HeadError::Integrity(format!(
-                "rollup {cur_key} boundary entry hash mismatch"
+                "rollup {key} end hash does not match the first retained tail \
+                 entry's prev"
             )));
         }
-        if end.watermark_hex != rec.watermark_hex {
-            return Err(HeadError::Integrity(format!(
-                "rollup {cur_key} watermark does not match its end entry"
-            )));
-        }
-        // Object digest matches the summarized range's inventory.
-        let mut objs = Vec::new();
-        for seq in rec.start_seq..=rec.end_seq {
-            let e = entries.get(&seq).ok_or_else(|| {
-                HeadError::Integrity(format!(
-                    "rollup {cur_key} range gap at seq {seq}"
-                ))
-            })?;
-            objs.extend(e.objects.iter().cloned());
-        }
-        if rollup_object_digest(&objs) != rec.object_digest
-            || objs.len() as u64 != rec.object_count
-        {
-            return Err(HeadError::Integrity(format!(
-                "rollup {cur_key} object digest/count mismatch"
-            )));
-        }
-        match &rec.prev {
-            None => {
-                if rec.start_seq != 1 {
-                    return Err(HeadError::Integrity(format!(
-                        "first rollup {cur_key} does not start at seq 1"
-                    )));
-                }
-                return Ok(());
+        // If the end entry itself is retained (intact chain), cross-check it.
+        if let Some(end_entry) = entries.get(&rec.end_seq) {
+            if end_entry.entry_hash != rec.end_entry_hash {
+                return Err(HeadError::Integrity(format!(
+                    "rollup {key} end entry hash mismatch"
+                )));
             }
-            Some(PrevRef { key, hash }) => {
-                expected_end = Some(rec.start_seq);
-                expected_hash = hash.clone();
-                cur_key = key.clone();
+            if end_entry.watermark_hex != rec.watermark_hex {
+                return Err(HeadError::Integrity(format!(
+                    "rollup {key} watermark does not match its end entry"
+                )));
             }
         }
     }
-    Err(HeadError::Integrity(
-        "rollup history exceeded the maximum walk length".into(),
-    ))
+    // Equality proof when the whole covered range is still retained (intact chain):
+    // the inventory index must EXACTLY equal the reconstructed-from-entries
+    // inventory (same objects, same canonical order).
+    let full_present = (1..=rec.end_seq).all(|s| entries.contains_key(&s));
+    if full_present {
+        let mut recon: Vec<ManifestObject> = Vec::new();
+        for s in 1..=rec.end_seq {
+            recon.extend(entries[&s].objects.iter().cloned());
+        }
+        if recon != inv.objects {
+            return Err(HeadError::Integrity(format!(
+                "inventory index {} does not equal the reconstructed-from-entries \
+                 inventory",
+                rec.inventory_key
+            )));
+        }
+    }
+    Ok(inv.objects)
 }
 
 /// Verify only HEAD's directly-referenced entry (exists, hash matches, and its
@@ -1175,6 +1440,11 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                 rollup_hash: st.verified.head.rollup_hash.clone(),
                 prev_rollup_key: st.verified.head.prev_rollup_key.clone(),
                 prev_rollup_hash: st.verified.head.prev_rollup_hash.clone(),
+                rollup_published_at_ms: st.verified.head.rollup_published_at_ms,
+                prev_rollup_published_at_ms: st
+                    .verified
+                    .head
+                    .prev_rollup_published_at_ms,
                 watermark_hex: Some(watermark_hex.clone()),
                 compaction_key: st.verified.head.compaction_key.clone(),
                 compaction_hash: st.verified.head.compaction_hash.clone(),
@@ -1618,12 +1888,13 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         Err(HeadError::RetriesExhausted(MAX_PUBLISH_ATTEMPTS))
     }
 
-    /// Publish a rollup summarizing the contiguous manifest range `(prev rollup
-    /// end .. current HEAD seq]` of the already-verified chain. Writes an
-    /// immutable rollup record chained to the current rollup, then CASes HEAD to
-    /// set the rollup + previous-rollup references, preserving epoch, seq, entry,
-    /// watermark and compaction references. Serialized through the writer mutex;
-    /// reversible (summarizes retained entries, deletes nothing).
+    /// Publish a CUMULATIVE rollup snapshot of `[1 .. current HEAD seq]` of the
+    /// already-verified chain, with a retained inventory index. Writes the
+    /// inventory index + an immutable rollup record chained to the current rollup
+    /// (nested: same start seq 1, strictly greater end seq), then CASes HEAD to set
+    /// the rollup + previous-rollup references and publication times, preserving
+    /// epoch, seq, entry, watermark and compaction references. Serialized through
+    /// the writer mutex; reversible (summarizes retained entries, deletes nothing).
     pub async fn rollup(&self) -> Result<(), HeadError> {
         let mut st = self.state.lock().await;
         if let Some(observed) = st.fenced {
@@ -1647,18 +1918,22 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                 HeadError::Integrity("HEAD has no watermark".into())
             })?;
 
-        // Start just after the current rollup's end (or at genesis seq 1).
-        let start_seq =
-            match (&st.verified.head.rollup_key, &st.verified.head.rollup_hash)
-            {
-                (Some(k), Some(h)) => {
-                    let cur = rollup_load(self.store.as_ref(), k, h)
-                        .await
-                        .map_err(map_rollup)?;
-                    cur.end_seq + 1
-                }
-                _ => 1,
-            };
+        // Cumulative snapshots always start at genesis; successive generations are
+        // nested (strictly greater end_seq). Load the current rollup only to
+        // enforce strict advance.
+        let start_seq: u64 = 1;
+        if let (Some(k), Some(h)) =
+            (&st.verified.head.rollup_key, &st.verified.head.rollup_hash)
+        {
+            let cur = rollup_load(self.store.as_ref(), k, h)
+                .await
+                .map_err(map_rollup)?;
+            if cur.end_seq >= end_seq {
+                return Err(HeadError::Integrity(
+                    "rollup range is empty (already summarized to HEAD)".into(),
+                ));
+            }
+        }
         if start_seq > end_seq {
             return Err(HeadError::Integrity(
                 "rollup range is empty (already summarized to HEAD)".into(),
@@ -1666,13 +1941,15 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         }
 
         // Walk the verified chain from HEAD back to start_seq, collecting the
-        // authoritative object inventory and the start boundary hash.
+        // authoritative object inventory (with seq + per-entry index, so it can be
+        // sorted into a canonical order independent of walk direction) and the
+        // start boundary hash.
         let mut cur_key =
             st.verified.head.head_entry_key.clone().ok_or_else(|| {
                 HeadError::Integrity("HEAD has no entry key".into())
             })?;
         let mut cur_hash = end_entry_hash.clone();
-        let mut objects: Vec<ManifestObject> = Vec::new();
+        let mut keyed: Vec<((u64, usize), ManifestObject)> = Vec::new();
         let mut start_entry_hash: Option<String> = None;
         for _ in 0..MAX_CHAIN_WALK {
             let entry = load_entry(self.store.as_ref(), &cur_key).await?;
@@ -1681,7 +1958,9 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                     "rollup walk: entry {cur_key} hash mismatch"
                 )));
             }
-            objects.extend(entry.objects.iter().cloned());
+            for (idx, o) in entry.objects.iter().enumerate() {
+                keyed.push(((entry.seq, idx), o.clone()));
+            }
             if entry.seq == start_seq {
                 start_entry_hash = Some(entry.entry_hash());
                 break;
@@ -1703,6 +1982,28 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                 "rollup walk exceeded max length before start_seq".into(),
             )
         })?;
+        // Canonical order: ack sequence, then per-entry object order.
+        keyed.sort_by_key(|(pos, _)| *pos);
+        let objects: Vec<ManifestObject> =
+            keyed.into_iter().map(|(_, o)| o).collect();
+
+        // Build + write the retained inventory index, then bind it into the record.
+        let inventory = InventoryIndex {
+            version: super::rollup::INVENTORY_INDEX_VERSION,
+            pipeline: self.pipeline.clone(),
+            source_id: self.source_id.clone(),
+            sink_id: self.sink_id.clone(),
+            start_seq,
+            end_seq,
+            objects: objects.clone(),
+        };
+        let written_inv = rollup_write_inventory(
+            self.store.as_ref(),
+            &self.prefix,
+            &inventory,
+        )
+        .await
+        .map_err(map_rollup)?;
 
         let prev =
             match (&st.verified.head.rollup_key, &st.verified.head.rollup_hash)
@@ -1725,15 +2026,23 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
             watermark_hex,
             object_count: objects.len() as u64,
             object_digest: rollup_object_digest(&objects),
+            inventory_key: written_inv.key.clone(),
+            inventory_record_hash: written_inv.record_hash.clone(),
+            inventory_count: written_inv.count,
             prev,
         };
         let written = rollup_write(self.store.as_ref(), &self.prefix, &record)
             .await
             .map_err(map_rollup)?;
 
-        // CAS HEAD: set the rollup + previous-rollup references, preserving
-        // everything else. Reconcile a lost response only if HEAD references our
-        // exact rollup.
+        // The current generation's authoritative age begins now, at HEAD
+        // publication (not at object upload). Computed once so a lost-response
+        // retry reconciles to the value that actually landed.
+        let published_now = now_ms();
+
+        // CAS HEAD: set the rollup + previous-rollup references (and publication
+        // times), preserving everything else. Reconcile a lost response only if
+        // HEAD references our exact rollup.
         let hkey = head_key(&self.prefix, &self.pipeline);
         for _ in 0..MAX_PUBLISH_ATTEMPTS {
             let next = Head {
@@ -1741,6 +2050,11 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                 rollup_hash: Some(written.hash.clone()),
                 prev_rollup_key: st.verified.head.rollup_key.clone(),
                 prev_rollup_hash: st.verified.head.rollup_hash.clone(),
+                rollup_published_at_ms: Some(published_now),
+                prev_rollup_published_at_ms: st
+                    .verified
+                    .head
+                    .rollup_published_at_ms,
                 ..st.verified.head.clone()
             };
             match self
@@ -1802,6 +2116,294 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
             }
         }
         Err(HeadError::RetriesExhausted(MAX_PUBLISH_ATTEMPTS))
+    }
+
+    /// Compute a DRY-RUN GC plan against the current verified HEAD (P0.4, 9B.1).
+    /// Read-only, owner-fenced, and bound to the exact HEAD identity: it computes
+    /// what WOULD be deleted and DELETES/MARKS NOTHING. Manifest-side eligibility
+    /// requires the current cumulative rollup + its inventory to verify (as a
+    /// subsequent generation over the retained entries), the previous fallback
+    /// generation to verify, the safety window to have elapsed with a sane clock,
+    /// and entries at `seq <= horizon`. Data-side eligibility requires an original
+    /// to be superseded by a durable, equivalence-proven, HEAD-reachable compaction
+    /// record. Serialized through the writer mutex; a fenced writer or any HEAD
+    /// drift produces no plan.
+    pub async fn plan_gc(
+        &self,
+        now_ms: u64,
+        cfg: GcConfig,
+    ) -> Result<GcPlan, HeadError> {
+        let st = self.state.lock().await;
+        if let Some(observed) = st.fenced {
+            return Err(HeadError::Fenced {
+                our: st.verified.epoch,
+                observed,
+            });
+        }
+        let head = st.verified.head.clone();
+        let etag = st.verified.etag.clone();
+
+        // Re-read HEAD immediately before planning: any drift from our verified view
+        // means concurrent activity - refuse rather than plan against stale state.
+        let hkey = head_key(&self.prefix, &self.pipeline);
+        let (raw, cur_etag) = match self
+            .store
+            .get_with_etag(&hkey)
+            .await
+            .map_err(|e| HeadError::Store(e.to_string()))?
+        {
+            Some((raw, Some(e))) => (raw, e),
+            _ => {
+                return Err(HeadError::Integrity(
+                    "HEAD missing/eTagless during GC planning".into(),
+                ));
+            }
+        };
+        if cur_etag != etag {
+            let cur = Head::parse(&raw)?;
+            if cur.epoch > head.epoch {
+                return Err(HeadError::Fenced {
+                    our: head.epoch,
+                    observed: cur.epoch,
+                });
+            }
+            return Err(HeadError::Store(
+                "HEAD changed during GC planning; recompute".into(),
+            ));
+        }
+
+        let mut alarms: Vec<Alarm> = Vec::new();
+        let mut skipped: Vec<SkipReason> = Vec::new();
+        let mut manifest_entries_eligible: Vec<EntryRef> = Vec::new();
+        // Out-of-horizon inventory-index GC is not tracked under one-generation
+        // retention in 9B.1 (only current + previous inventories exist and both are
+        // retained); it becomes relevant when older generations accumulate.
+        let inventory_indexes_eligible: Vec<InventoryRef> = Vec::new();
+        let mut data_originals_eligible: Vec<OriginalRef> = Vec::new();
+
+        // Fully verify the retained entries (intact in 9B.1; deletion is 9B.2).
+        let walk = walk_retained_entries(
+            self.store.as_ref(),
+            &self.pipeline,
+            &self.source_id,
+            &self.sink_id,
+            &head,
+            self.comparator.as_ref(),
+        )
+        .await?;
+
+        // ---- Manifest-side eligibility ----
+        let mut horizon = 0u64;
+        let mut cur_inv_hash: Option<String> = None;
+        let mut prev_inv_hash: Option<String> = None;
+        if let (Some(rk), Some(rh)) =
+            (head.rollup_key.clone(), head.rollup_hash.clone())
+        {
+            let cur_rec = rollup_load(self.store.as_ref(), &rk, &rh)
+                .await
+                .map_err(map_rollup)?;
+            cur_inv_hash = Some(cur_rec.inventory_record_hash.clone());
+            let cur_ok = verify_cumulative_rollup(
+                self.store.as_ref(),
+                &self.pipeline,
+                &self.source_id,
+                &self.sink_id,
+                &head,
+                &rk,
+                &rh,
+                0,
+                &walk.entries,
+            )
+            .await;
+
+            // The previous generation is the retained fallback and must also verify
+            // before entries it covers may be removed.
+            let prev_end: Option<u64> = match (
+                head.prev_rollup_key.clone(),
+                head.prev_rollup_hash.clone(),
+            ) {
+                (Some(pk), Some(ph)) => {
+                    let prev_rec = rollup_load(self.store.as_ref(), &pk, &ph)
+                        .await
+                        .map_err(map_rollup)?;
+                    prev_inv_hash =
+                        Some(prev_rec.inventory_record_hash.clone());
+                    match verify_cumulative_rollup(
+                        self.store.as_ref(),
+                        &self.pipeline,
+                        &self.source_id,
+                        &self.sink_id,
+                        &head,
+                        &pk,
+                        &ph,
+                        0,
+                        &walk.entries,
+                    )
+                    .await
+                    {
+                        Ok(_) => Some(prev_rec.end_seq),
+                        Err(e) => {
+                            alarms.push(Alarm {
+                                message: format!(
+                                    "previous rollup unusable; no manifest GC: {e}"
+                                ),
+                            });
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+
+            let window_ok = safety_window_ok(&head, now_ms, cfg, &mut alarms);
+
+            match (&cur_ok, prev_end, window_ok) {
+                (Ok(_), Some(prev_e), true) => {
+                    horizon = horizon_seq(Some(prev_e));
+                    for (seq, summ) in walk.entries.iter() {
+                        if *seq <= horizon {
+                            let key = entry_key(
+                                &self.prefix,
+                                &self.pipeline,
+                                *seq,
+                                &summ.entry_hash,
+                            )
+                            .to_string();
+                            manifest_entries_eligible.push(EntryRef {
+                                key,
+                                seq: *seq,
+                                entry_hash: summ.entry_hash.clone(),
+                            });
+                        }
+                    }
+                }
+                (Err(e), _, _) => {
+                    alarms.push(Alarm {
+                        message: format!(
+                            "current rollup unusable; no manifest GC: {e}"
+                        ),
+                    });
+                }
+                // No previous generation, or window not elapsed / skew: nothing
+                // manifest-eligible (any skew alarm already recorded).
+                _ => {}
+            }
+        }
+
+        // ---- Data-side eligibility (compaction records reachable from HEAD) ----
+        if let (Some(mut ck), Some(mut chash)) =
+            (head.compaction_key.clone(), head.compaction_hash.clone())
+        {
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..MAX_CHAIN_WALK {
+                if !seen.insert(ck.clone()) {
+                    return Err(HeadError::Integrity(
+                        "compaction history cycle during GC planning".into(),
+                    ));
+                }
+                let rec = load_record(self.store.as_ref(), &ck, &chash)
+                    .await
+                    .map_err(map_compaction)?;
+                // The replacement must be durable + content-verified.
+                verify_data_object(self.store.as_ref(), &rec.replacement)
+                    .await?;
+                // Prove the replacement represents exactly the originals in order.
+                match verify_jsonl(
+                    self.store.as_ref(),
+                    &rec.originals,
+                    &rec.replacement,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        for o in &rec.originals {
+                            data_originals_eligible.push(OriginalRef {
+                                key: o.key.clone(),
+                                content_hash: o.content_hash.clone(),
+                                replacement_key: rec.replacement.key.clone(),
+                                compaction_record_hash: chash.clone(),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        for o in &rec.originals {
+                            skipped.push(SkipReason {
+                                key: o.key.clone(),
+                                reason: format!("equivalence not proven: {e}"),
+                            });
+                        }
+                        alarms.push(Alarm {
+                            message: format!(
+                                "compaction record {ck} replacement not \
+                                 equivalence-proven: {e}"
+                            ),
+                        });
+                    }
+                }
+                match &rec.prev {
+                    None => break,
+                    Some(PrevRef { key, hash }) => {
+                        ck = key.clone();
+                        chash = hash.clone();
+                    }
+                }
+            }
+        }
+
+        let bound =
+            HeadBinding::capture(&head, &etag, cur_inv_hash, prev_inv_hash);
+        Ok(GcPlan {
+            bound,
+            horizon_seq: horizon,
+            manifest_entries_eligible,
+            inventory_indexes_eligible,
+            data_originals_eligible,
+            skipped,
+            alarms,
+        })
+    }
+}
+
+/// The safety window measures how long the CURRENT rollup generation has been
+/// HEAD-published (`rollup_published_at_ms`). Fail conservatively on a missing,
+/// future, or rolled-back timestamp (alarm + not-ok); otherwise require the age to
+/// meet `cfg.safety_window_ms`.
+fn safety_window_ok(
+    head: &Head,
+    now_ms: u64,
+    cfg: GcConfig,
+    alarms: &mut Vec<Alarm>,
+) -> bool {
+    match head.rollup_published_at_ms {
+        None => {
+            alarms.push(Alarm {
+                message: "rollup ref present without a publication time; no \
+                          manifest GC"
+                    .into(),
+            });
+            false
+        }
+        Some(pub_at) => {
+            if now_ms < pub_at {
+                alarms.push(Alarm {
+                    message:
+                        "future rollup publication timestamp; no manifest GC"
+                            .into(),
+                });
+                return false;
+            }
+            if let Some(prev_pub) = head.prev_rollup_published_at_ms {
+                if prev_pub > pub_at {
+                    alarms.push(Alarm {
+                        message:
+                            "rollup publication time rollback; no manifest GC"
+                                .into(),
+                    });
+                    return false;
+                }
+            }
+            now_ms - pub_at >= cfg.safety_window_ms
+        }
     }
 }
 
@@ -2053,6 +2655,8 @@ mod tests {
             rollup_hash: None,
             prev_rollup_key: None,
             prev_rollup_hash: None,
+            rollup_published_at_ms: None,
+            prev_rollup_published_at_ms: None,
             watermark_hex: Some("00".into()),
             compaction_key: None,
             compaction_hash: None,
@@ -2467,6 +3071,7 @@ mod tests {
         let mut head = head_of(&cs).await;
         head.rollup_key = Some("pfx/pipe/_manifest/rollups/x.json".into());
         head.rollup_hash = Some("deadbeef".into());
+        head.rollup_published_at_ms = Some(1);
         inner
             .put(
                 &head_key("pfx", "pipe"),
@@ -2581,6 +3186,8 @@ mod tests {
             rollup_hash: None,
             prev_rollup_key: None,
             prev_rollup_hash: None,
+            rollup_published_at_ms: None,
+            prev_rollup_published_at_ms: None,
             watermark_hex: Some(wm_hex(0, 5)),
             compaction_key: None,
             compaction_hash: None,
@@ -2602,15 +3209,17 @@ mod tests {
         );
     }
 
-    // ── Rollup chain verification (verify_rollup_from) ──────────────────────
+    // ── Cumulative rollup + inventory verification (verify_cumulative_rollup) ──
     //
-    // These exercise the pure detection logic directly against a synthetic
-    // `entries` map + hand-written rollup records, so each rejection path
-    // (identity, range, contiguity, boundary hash, watermark, object digest,
-    // first-starts-at-1, cycle) is asserted in isolation.
+    // These exercise the single-generation detection logic directly against a
+    // synthetic entries map, a written inventory index, and a rollup record that
+    // binds it, so each rejection path (cumulative start, digest, inventory range,
+    // count, boundary hash/watermark vs HEAD or tail prev, and the exact
+    // inventory-equals-reconstructed proof) is asserted in isolation.
 
     use super::super::rollup::{
-        ROLLUP_RECORD_VERSION, RollupRecord as RR, WrittenRollup,
+        INVENTORY_INDEX_VERSION, InventoryIndex, ROLLUP_RECORD_VERSION,
+        RollupRecord as RR,
     };
     use std::collections::BTreeMap;
 
@@ -2629,14 +3238,16 @@ mod tests {
         }
     }
 
-    /// Three retained entries, seq 1..=3, one object each.
-    fn synthetic_entries() -> BTreeMap<u64, EntrySummary> {
+    /// `n` retained, chained entries seq 1..=n, one object each. Each entry's
+    /// `prev_hash` links to the entry before it (genesis has None).
+    fn synth_entries(n: u64) -> BTreeMap<u64, EntrySummary> {
         let mut m = BTreeMap::new();
-        for seq in 1u64..=3 {
+        for seq in 1u64..=n {
             m.insert(
                 seq,
                 EntrySummary {
                     entry_hash: format!("eh-{seq}"),
+                    prev_hash: (seq > 1).then(|| format!("eh-{}", seq - 1)),
                     watermark_hex: wm_hex(0, seq),
                     objects: vec![mobj(&format!("o{seq}"))],
                 },
@@ -2645,186 +3256,260 @@ mod tests {
         m
     }
 
-    /// Build a rollup record matching `entries` over [start, end], with `prev`.
-    fn valid_rollup(
-        entries: &BTreeMap<u64, EntrySummary>,
-        start: u64,
-        end: u64,
-        prev: Option<PrevRef>,
-    ) -> RR {
-        let mut objs = Vec::new();
-        for seq in start..=end {
-            objs.extend(entries[&seq].objects.iter().cloned());
+    /// A HEAD whose selected entry is `entries[seq]`.
+    fn head_at(entries: &BTreeMap<u64, EntrySummary>, seq: u64) -> Head {
+        Head {
+            version: HEAD_VERSION,
+            epoch: 1,
+            seq,
+            head_entry_key: Some(format!("k-{seq}")),
+            head_entry_hash: Some(entries[&seq].entry_hash.clone()),
+            rollup_key: None,
+            rollup_hash: None,
+            prev_rollup_key: None,
+            prev_rollup_hash: None,
+            rollup_published_at_ms: None,
+            prev_rollup_published_at_ms: None,
+            watermark_hex: Some(entries[&seq].watermark_hex.clone()),
+            compaction_key: None,
+            compaction_hash: None,
         }
+    }
+
+    /// Objects for the cumulative range [1, end], in canonical order.
+    fn range_objects(
+        entries: &BTreeMap<u64, EntrySummary>,
+        end: u64,
+    ) -> Vec<ManifestObject> {
+        let mut v = Vec::new();
+        for s in 1..=end {
+            v.extend(entries[&s].objects.iter().cloned());
+        }
+        v
+    }
+
+    /// Write an inventory index for `[1, end]` holding `inv_objects`, returning its
+    /// bound (key, record_hash, count).
+    async fn put_inv(
+        cs: &ObjectStoreConditional,
+        end: u64,
+        inv_objects: Vec<ManifestObject>,
+    ) -> (String, String, u64) {
+        let inv = InventoryIndex {
+            version: INVENTORY_INDEX_VERSION,
+            pipeline: "pipe".into(),
+            source_id: "src".into(),
+            sink_id: "sink".into(),
+            start_seq: 1,
+            end_seq: end,
+            objects: inv_objects,
+        };
+        let w = rollup_write_inventory(cs, "pfx", &inv).await.unwrap();
+        (w.key, w.record_hash, w.count)
+    }
+
+    /// Build a cumulative rollup record over `[1, end]` binding `(inv_key,
+    /// inv_hash, inv_count)`, with digest/count taken from `digest_objects`.
+    #[allow(clippy::too_many_arguments)]
+    fn cumulative_record(
+        entries: &BTreeMap<u64, EntrySummary>,
+        end: u64,
+        inv_key: String,
+        inv_hash: String,
+        inv_count: u64,
+        digest_objects: &[ManifestObject],
+    ) -> RR {
         RR {
             version: ROLLUP_RECORD_VERSION,
             pipeline: "pipe".into(),
             source_id: "src".into(),
             sink_id: "sink".into(),
-            start_seq: start,
+            start_seq: 1,
             end_seq: end,
-            start_entry_hash: entries[&start].entry_hash.clone(),
+            start_entry_hash: entries[&1].entry_hash.clone(),
             end_entry_hash: entries[&end].entry_hash.clone(),
             watermark_hex: entries[&end].watermark_hex.clone(),
-            object_count: objs.len() as u64,
-            object_digest: rollup_object_digest(&objs),
-            prev,
+            object_count: digest_objects.len() as u64,
+            object_digest: rollup_object_digest(digest_objects),
+            inventory_key: inv_key,
+            inventory_record_hash: inv_hash,
+            inventory_count: inv_count,
+            prev: None,
         }
     }
 
-    async fn put_rollup(
+    async fn verify(
         cs: &ObjectStoreConditional,
+        head: &Head,
         rec: &RR,
-    ) -> WrittenRollup {
-        rollup_write(cs, "pfx", rec).await.unwrap()
-    }
-
-    async fn check_rollup(
-        cs: &ObjectStoreConditional,
-        w: &WrittenRollup,
+        min_covered_end: u64,
         entries: &BTreeMap<u64, EntrySummary>,
-    ) -> Result<(), HeadError> {
-        verify_rollup_from(cs, "pipe", "src", "sink", &w.key, &w.hash, entries)
-            .await
-    }
-
-    #[tokio::test]
-    async fn rollup_verifies_valid_single() {
-        let (_i, cs) = cond_with_inner();
-        let e = synthetic_entries();
-        let w = put_rollup(&cs, &valid_rollup(&e, 1, 3, None)).await;
-        check_rollup(&cs, &w, &e)
-            .await
-            .expect("valid rollup verifies");
-    }
-
-    #[tokio::test]
-    async fn rollup_verifies_valid_chain_of_two() {
-        let (_i, cs) = cond_with_inner();
-        let e = synthetic_entries();
-        let first = put_rollup(&cs, &valid_rollup(&e, 1, 1, None)).await;
-        let second = put_rollup(
-            &cs,
-            &valid_rollup(
-                &e,
-                2,
-                3,
-                Some(PrevRef {
-                    key: first.key.clone(),
-                    hash: first.hash.clone(),
-                }),
-            ),
+    ) -> Result<Vec<ManifestObject>, HeadError> {
+        let w = rollup_write(cs, "pfx", rec).await.unwrap();
+        verify_cumulative_rollup(
+            cs,
+            "pipe",
+            "src",
+            "sink",
+            head,
+            &w.key,
+            &w.hash,
+            min_covered_end,
+            entries,
         )
-        .await;
-        check_rollup(&cs, &second, &e)
-            .await
-            .expect("chain verifies");
+        .await
     }
 
     #[tokio::test]
-    async fn rollup_rejected_wrong_object_digest() {
+    async fn cumulative_rollup_verifies_at_head() {
         let (_i, cs) = cond_with_inner();
-        let e = synthetic_entries();
-        let mut rec = valid_rollup(&e, 1, 3, None);
+        let e = synth_entries(3);
+        let head = head_at(&e, 3);
+        let objs = range_objects(&e, 3);
+        let (ik, ih, ic) = put_inv(&cs, 3, objs.clone()).await;
+        let rec = cumulative_record(&e, 3, ik, ih, ic, &objs);
+        let got = verify(&cs, &head, &rec, 0, &e)
+            .await
+            .expect("valid cumulative rollup verifies");
+        assert_eq!(got, objs, "returns the covered inventory");
+    }
+
+    #[tokio::test]
+    async fn cumulative_rollup_rejects_non_genesis_start() {
+        let (_i, cs) = cond_with_inner();
+        let e = synth_entries(3);
+        let head = head_at(&e, 3);
+        let objs = range_objects(&e, 3);
+        let (ik, ih, ic) = put_inv(&cs, 3, objs.clone()).await;
+        let mut rec = cumulative_record(&e, 3, ik, ih, ic, &objs);
+        rec.start_seq = 2; // not cumulative
+        let err = verify(&cs, &head, &rec, 0, &e).await.unwrap_err();
+        assert!(
+            matches!(err, HeadError::Integrity(ref m) if m.contains("cumulative")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cumulative_rollup_rejects_wrong_object_digest() {
+        let (_i, cs) = cond_with_inner();
+        let e = synth_entries(3);
+        let head = head_at(&e, 3);
+        let objs = range_objects(&e, 3);
+        let (ik, ih, ic) = put_inv(&cs, 3, objs.clone()).await;
+        let mut rec = cumulative_record(&e, 3, ik, ih, ic, &objs);
         rec.object_digest = "deadbeef".into();
-        let w = put_rollup(&cs, &rec).await;
-        assert!(check_rollup(&cs, &w, &e).await.is_err(), "bad digest");
+        assert!(verify(&cs, &head, &rec, 0, &e).await.is_err());
     }
 
     #[tokio::test]
-    async fn rollup_rejected_boundary_hash_mismatch() {
+    async fn cumulative_rollup_rejects_inventory_range_mismatch() {
         let (_i, cs) = cond_with_inner();
-        let e = synthetic_entries();
-        let mut rec = valid_rollup(&e, 1, 3, None);
+        let e = synth_entries(3);
+        let head = head_at(&e, 3);
+        let objs = range_objects(&e, 3);
+        // Inventory declares end 2 but the rollup declares end 3.
+        let (ik, ih, ic) = put_inv(&cs, 2, objs.clone()).await;
+        let rec = cumulative_record(&e, 3, ik, ih, ic, &objs);
+        let err = verify(&cs, &head, &rec, 0, &e).await.unwrap_err();
+        assert!(
+            matches!(err, HeadError::Integrity(ref m) if m.contains("range")),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cumulative_rollup_rejects_end_hash_vs_head() {
+        let (_i, cs) = cond_with_inner();
+        let e = synth_entries(3);
+        let head = head_at(&e, 3);
+        let objs = range_objects(&e, 3);
+        let (ik, ih, ic) = put_inv(&cs, 3, objs.clone()).await;
+        let mut rec = cumulative_record(&e, 3, ik, ih, ic, &objs);
         rec.end_entry_hash = "eh-wrong".into();
-        let w = put_rollup(&cs, &rec).await;
-        assert!(check_rollup(&cs, &w, &e).await.is_err(), "bad boundary");
+        let err = verify(&cs, &head, &rec, 0, &e).await.unwrap_err();
+        assert!(
+            matches!(err, HeadError::Integrity(ref m) if m.contains("HEAD")),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]
-    async fn rollup_rejected_watermark_mismatch() {
+    async fn cumulative_rollup_rejects_watermark_vs_head() {
         let (_i, cs) = cond_with_inner();
-        let e = synthetic_entries();
-        let mut rec = valid_rollup(&e, 1, 3, None);
+        let e = synth_entries(3);
+        let head = head_at(&e, 3);
+        let objs = range_objects(&e, 3);
+        let (ik, ih, ic) = put_inv(&cs, 3, objs.clone()).await;
+        let mut rec = cumulative_record(&e, 3, ik, ih, ic, &objs);
         rec.watermark_hex = wm_hex(0, 99);
-        let w = put_rollup(&cs, &rec).await;
-        assert!(check_rollup(&cs, &w, &e).await.is_err(), "bad watermark");
+        assert!(verify(&cs, &head, &rec, 0, &e).await.is_err());
     }
 
     #[tokio::test]
-    async fn rollup_rejected_non_contiguous_chain_gap() {
-        // A gap: first rollup ends at seq 1, second starts at seq 3 (skips 2).
+    async fn cumulative_rollup_rejects_inventory_not_equal_reconstructed() {
         let (_i, cs) = cond_with_inner();
-        let e = synthetic_entries();
-        let first = put_rollup(&cs, &valid_rollup(&e, 1, 1, None)).await;
-        let second = put_rollup(
-            &cs,
-            &valid_rollup(
-                &e,
-                3,
-                3,
-                Some(PrevRef {
-                    key: first.key.clone(),
-                    hash: first.hash.clone(),
-                }),
-            ),
-        )
-        .await;
-        let err = check_rollup(&cs, &second, &e).await.unwrap_err();
+        let e = synth_entries(3);
+        let head = head_at(&e, 3);
+        // Tamper the inventory (swap an object), but make the rollup's digest match
+        // the tampered inventory so the digest check passes and the equality proof
+        // (inventory vs reconstructed-from-entries) is what fails.
+        let mut tampered = range_objects(&e, 3);
+        tampered[1] = mobj("intruder");
+        let (ik, ih, ic) = put_inv(&cs, 3, tampered.clone()).await;
+        let rec = cumulative_record(&e, 3, ik, ih, ic, &tampered);
+        let err = verify(&cs, &head, &rec, 0, &e).await.unwrap_err();
         assert!(
-            matches!(err, HeadError::Integrity(ref m) if m.contains("contiguous")),
-            "expected contiguity error, got {err:?}"
+            matches!(err, HeadError::Integrity(ref m) if m.contains("reconstructed")),
+            "got {err:?}"
         );
     }
 
     #[tokio::test]
-    async fn rollup_rejected_overlapping_chain() {
-        // An overlap: first ends at seq 2, second starts at seq 2 (double count).
+    async fn cumulative_rollup_ends_below_head_verifies_via_tail_prev() {
+        // Rollup covers [1, 2]; HEAD is at 3; the boundary is verified against the
+        // first retained tail entry (seq 3)'s prev_hash == rollup end hash.
         let (_i, cs) = cond_with_inner();
-        let e = synthetic_entries();
-        let first = put_rollup(&cs, &valid_rollup(&e, 1, 2, None)).await;
-        let second = put_rollup(
-            &cs,
-            &valid_rollup(
-                &e,
-                2,
-                3,
-                Some(PrevRef {
-                    key: first.key.clone(),
-                    hash: first.hash.clone(),
-                }),
-            ),
-        )
-        .await;
-        let err = check_rollup(&cs, &second, &e).await.unwrap_err();
+        let e = synth_entries(3);
+        let head = head_at(&e, 3);
+        let objs = range_objects(&e, 2);
+        let (ik, ih, ic) = put_inv(&cs, 2, objs.clone()).await;
+        let rec = cumulative_record(&e, 2, ik, ih, ic, &objs);
+        verify(&cs, &head, &rec, 2, &e)
+            .await
+            .expect("verifies via retained tail prev");
+    }
+
+    #[tokio::test]
+    async fn cumulative_rollup_rejects_tail_prev_mismatch() {
+        let (_i, cs) = cond_with_inner();
+        let mut e = synth_entries(3);
+        let head = head_at(&e, 3);
+        let objs = range_objects(&e, 2);
+        let (ik, ih, ic) = put_inv(&cs, 2, objs.clone()).await;
+        let rec = cumulative_record(&e, 2, ik, ih, ic, &objs);
+        // Corrupt the tail entry's prev link so it no longer abuts the rollup.
+        e.get_mut(&3).unwrap().prev_hash = Some("eh-bogus".into());
+        let err = verify(&cs, &head, &rec, 2, &e).await.unwrap_err();
         assert!(
-            matches!(err, HeadError::Integrity(ref m) if m.contains("contiguous")),
-            "expected contiguity error, got {err:?}"
+            matches!(err, HeadError::Integrity(ref m) if m.contains("tail")),
+            "got {err:?}"
         );
     }
 
     #[tokio::test]
-    async fn rollup_rejected_first_not_starting_at_one() {
+    async fn cumulative_rollup_rejects_min_covered_not_met() {
+        // The rollup only reaches seq 2 but recovery needs coverage down to 3.
         let (_i, cs) = cond_with_inner();
-        let e = synthetic_entries();
-        // A lone rollup with no prev must start at seq 1.
-        let w = put_rollup(&cs, &valid_rollup(&e, 2, 3, None)).await;
-        let err = check_rollup(&cs, &w, &e).await.unwrap_err();
+        let e = synth_entries(3);
+        let head = head_at(&e, 3);
+        let objs = range_objects(&e, 2);
+        let (ik, ih, ic) = put_inv(&cs, 2, objs.clone()).await;
+        let rec = cumulative_record(&e, 2, ik, ih, ic, &objs);
+        let err = verify(&cs, &head, &rec, 3, &e).await.unwrap_err();
         assert!(
-            matches!(err, HeadError::Integrity(ref m) if m.contains("start at seq 1")),
-            "expected first-starts-at-1 error, got {err:?}"
+            matches!(err, HeadError::Integrity(ref m) if m.contains("cover")),
+            "got {err:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn rollup_rejected_missing_start_entry() {
-        // A rollup whose start_seq is not among the retained entries (e.g. the
-        // chain the rollup claims to summarize does not match reality).
-        let (_i, cs) = cond_with_inner();
-        let mut e = synthetic_entries();
-        let w = put_rollup(&cs, &valid_rollup(&e, 1, 3, None)).await;
-        e.remove(&2); // range now has a gap the rollup claims to cover
-        let err = check_rollup(&cs, &w, &e).await.unwrap_err();
-        assert!(matches!(err, HeadError::Integrity(_)), "got {err:?}");
     }
 }
