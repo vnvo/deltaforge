@@ -244,9 +244,18 @@ pub async fn load_inventory<S: ConditionalStore + ?Sized>(
             "inventory index {key} hash mismatch"
         )));
     }
-    serde_json::from_slice(&raw).map_err(|e| {
+    let inv: InventoryIndex = serde_json::from_slice(&raw).map_err(|e| {
         RollupError::Integrity(format!("inventory {key} not parseable: {e}"))
-    })
+    })?;
+    // Fail closed on any unsupported version (older or newer) before using its
+    // range/objects: durable_v2 is unshipped, so there is no migration path.
+    if inv.version != INVENTORY_INDEX_VERSION {
+        return Err(RollupError::Integrity(format!(
+            "inventory index {key} version {} is not the supported {}",
+            inv.version, INVENTORY_INDEX_VERSION
+        )));
+    }
+    Ok(inv)
 }
 
 /// Write the rollup record create-only; idempotent on byte-identical retry.
@@ -306,9 +315,18 @@ pub async fn load_record<S: ConditionalStore + ?Sized>(
             "rollup record {key} hash mismatch"
         )));
     }
-    serde_json::from_slice(&raw).map_err(|e| {
+    let rec: RollupRecord = serde_json::from_slice(&raw).map_err(|e| {
         RollupError::Integrity(format!("rollup {key} not parseable: {e}"))
-    })
+    })?;
+    // Fail closed on any unsupported version (older v1 incremental rollups OR a
+    // future version) before using its ranges/hashes/fallback semantics.
+    if rec.version != ROLLUP_RECORD_VERSION {
+        return Err(RollupError::Integrity(format!(
+            "rollup record {key} version {} is not the supported {}",
+            rec.version, ROLLUP_RECORD_VERSION
+        )));
+    }
+    Ok(rec)
 }
 
 #[cfg(test)]
@@ -338,5 +356,82 @@ mod tests {
         // A different inventory differs.
         let c = object_digest(&[obj("a"), obj("b")]);
         assert_ne!(a, c);
+    }
+
+    fn store()
+    -> std::sync::Arc<super::super::store_cond::ObjectStoreConditional> {
+        std::sync::Arc::new(
+            super::super::store_cond::ObjectStoreConditional::new(
+                std::sync::Arc::new(object_store::memory::InMemory::new()),
+            ),
+        )
+    }
+
+    fn sample_record(version: u16) -> RollupRecord {
+        RollupRecord {
+            version,
+            pipeline: "p".into(),
+            source_id: "s".into(),
+            sink_id: "k".into(),
+            start_seq: 1,
+            end_seq: 3,
+            start_entry_hash: "e1".into(),
+            end_entry_hash: "e3".into(),
+            watermark_hex: "00".into(),
+            object_count: 1,
+            object_digest: object_digest(&[obj("a")]),
+            inventory_key: "ik".into(),
+            inventory_record_hash: "ih".into(),
+            inventory_count: 1,
+            prev: None,
+        }
+    }
+
+    fn sample_inventory(version: u16) -> InventoryIndex {
+        InventoryIndex {
+            version,
+            pipeline: "p".into(),
+            source_id: "s".into(),
+            sink_id: "k".into(),
+            start_seq: 1,
+            end_seq: 3,
+            objects: vec![obj("a")],
+        }
+    }
+
+    #[tokio::test]
+    async fn load_record_rejects_unsupported_versions() {
+        let s = store();
+        // A future version is rejected.
+        let fut = sample_record(ROLLUP_RECORD_VERSION + 1);
+        let wf = write_record(s.as_ref(), "pfx", &fut).await.unwrap();
+        assert!(load_record(s.as_ref(), &wf.key, &wf.hash).await.is_err());
+        // An older v1 (incremental) rollup is rejected - no migration path.
+        let old = sample_record(1);
+        let wo = write_record(s.as_ref(), "pfx", &old).await.unwrap();
+        assert!(load_record(s.as_ref(), &wo.key, &wo.hash).await.is_err());
+        // The supported version loads.
+        let ok = sample_record(ROLLUP_RECORD_VERSION);
+        let wok = write_record(s.as_ref(), "pfx", &ok).await.unwrap();
+        assert!(load_record(s.as_ref(), &wok.key, &wok.hash).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn load_inventory_rejects_unsupported_versions() {
+        let s = store();
+        let fut = sample_inventory(INVENTORY_INDEX_VERSION + 1);
+        let wf = write_inventory(s.as_ref(), "pfx", &fut).await.unwrap();
+        assert!(
+            load_inventory(s.as_ref(), &wf.key, &wf.record_hash)
+                .await
+                .is_err()
+        );
+        let ok = sample_inventory(INVENTORY_INDEX_VERSION);
+        let wok = write_inventory(s.as_ref(), "pfx", &ok).await.unwrap();
+        assert!(
+            load_inventory(s.as_ref(), &wok.key, &wok.record_hash)
+                .await
+                .is_ok()
+        );
     }
 }

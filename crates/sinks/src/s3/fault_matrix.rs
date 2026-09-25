@@ -28,8 +28,9 @@ use super::head::{DurableWriter, Head, HeadError, head_key_for};
 use super::keys::EncodingDomain;
 use super::manifest::{ManifestEntry, ManifestObject};
 use super::rollup::{
-    InventoryIndex, RollupRecord, load_inventory,
-    load_record as load_rollup_rec,
+    INVENTORY_INDEX_VERSION, InventoryIndex, ROLLUP_RECORD_VERSION,
+    RollupRecord, load_inventory, load_record as load_rollup_rec,
+    object_digest, write_inventory, write_record,
 };
 use super::store_cond::{
     CondError, CondResult, ConditionalStore, ObjectStoreConditional, PutOutcome,
@@ -1967,4 +1968,177 @@ async fn delete_entries_le_range(
             }
         }
     }
+}
+
+// ── 9B.1 review round 2: cross-epoch reconciliation + version validation ──────
+
+#[tokio::test]
+async fn higher_epoch_preserving_entry_ref_fences_stale_publisher() {
+    // A's publish CAS applies (HEAD -> entry E1 at epoch 1), then the process dies
+    // before returning. B acquires (epoch 2), whose epoch bump PRESERVES E1 as the
+    // head entry. A retries the identical publish: its CAS conflicts and the re-read
+    // HEAD references its exact entry E1 - but under epoch 2. A must be fenced, not
+    // report idempotent success.
+    let inner = inmem();
+    let (fs, a) =
+        genesis(&inner, vec![tr(Op::HeadCas, 0, Action::HangAfterApply)]).await;
+    cancel_at_hang(&fs, a.publish(&wm(5), vec![tobj("orders", b"a")], 1)).await;
+    assert_eq!(read_head(&inner).await.unwrap().seq, 1, "E1 applied");
+
+    let b = acquire(Arc::new(FaultStore::new(Arc::clone(&inner), vec![])))
+        .await
+        .unwrap();
+    assert_eq!(b.epoch().await, 2);
+    let h = read_head(&inner).await.unwrap();
+    assert_eq!(h.epoch, 2, "epoch bumped, entry ref preserved");
+
+    let err =
+        expect_err(a.publish(&wm(5), vec![tobj("orders", b"a")], 1).await);
+    assert!(matches!(err, HeadError::Fenced { .. }), "got {err:?}");
+}
+
+#[tokio::test]
+async fn higher_epoch_preserving_compaction_hash_fences_stale_compactor() {
+    // A's compaction CAS applies (HEAD gains the compaction ref at epoch 1), then
+    // dies. B acquires (epoch 2), preserving the same compaction ref. A retries the
+    // identical (content-addressed) compaction: its CAS conflicts and HEAD carries
+    // the same compaction hash under epoch 2. A must be fenced, not ack.
+    let inner = inmem();
+    let (fs, a, originals) = setup_two_batches(
+        &inner,
+        vec![tr(Op::HeadCas, 2, Action::HangAfterApply)],
+    )
+    .await;
+    cancel_at_hang(
+        &fs,
+        a.compact_with_replacement(replacement(), originals.clone()),
+    )
+    .await;
+    assert_eq!(compaction_record_count(&inner).await, 1, "record applied");
+
+    let b = acquire(Arc::new(FaultStore::new(Arc::clone(&inner), vec![])))
+        .await
+        .unwrap();
+    assert_eq!(b.epoch().await, 2);
+    assert!(read_head(&inner).await.unwrap().compaction_key.is_some());
+
+    let err =
+        expect_err(a.compact_with_replacement(replacement(), originals).await);
+    assert!(matches!(err, HeadError::Fenced { .. }), "got {err:?}");
+}
+
+/// Replace HEAD's current rollup reference with a freshly-planted rollup + inventory
+/// carrying the given versions (keeping the previous generation + publication times),
+/// to exercise version rejection. The rollup covers the same range as the current one.
+async fn plant_current_rollup(
+    inner: &ObjectStoreConditional,
+    rollup_version: u16,
+    inv_version: u16,
+) {
+    let head = read_head(inner).await.unwrap();
+    let cur = current_rollup(inner).await; // valid v2 rollup (gen2)
+    let inv = inventory_of(inner, &cur).await;
+    let inventory = InventoryIndex {
+        version: inv_version,
+        pipeline: PIPE.into(),
+        source_id: "src".into(),
+        sink_id: "sink".into(),
+        start_seq: 1,
+        end_seq: cur.end_seq,
+        objects: inv.objects.clone(),
+    };
+    let wi = write_inventory(inner, PFX, &inventory).await.unwrap();
+    let rec = RollupRecord {
+        version: rollup_version,
+        pipeline: PIPE.into(),
+        source_id: "src".into(),
+        sink_id: "sink".into(),
+        start_seq: 1,
+        end_seq: cur.end_seq,
+        start_entry_hash: cur.start_entry_hash.clone(),
+        end_entry_hash: cur.end_entry_hash.clone(),
+        watermark_hex: cur.watermark_hex.clone(),
+        object_count: inv.objects.len() as u64,
+        object_digest: object_digest(&inv.objects),
+        inventory_key: wi.key.clone(),
+        inventory_record_hash: wi.record_hash.clone(),
+        inventory_count: wi.count,
+        prev: cur.prev.clone(),
+    };
+    let wr = write_record(inner, PFX, &rec).await.unwrap();
+
+    let hkey = head_key_for(PFX, PIPE);
+    let (_raw, etag) = inner.get_with_etag(&hkey).await.unwrap().unwrap();
+    let mut h2 = head;
+    h2.rollup_key = Some(wr.key);
+    h2.rollup_hash = Some(wr.hash);
+    inner
+        .cas_put(
+            &hkey,
+            Bytes::from(serde_json::to_vec(&h2).unwrap()),
+            etag.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn unsupported_version_rollup_intact_chain_recovers_via_entries() {
+    // A HEAD referencing an unsupported-version current rollup on an INTACT chain:
+    // rollup verification is advisory, so the bad-version rollup is not trusted and
+    // recovery falls back to the retained entries and succeeds.
+    let inner = inmem();
+    let (_fs, w) = setup_generations(&inner).await;
+    drop(w);
+    plant_current_rollup(
+        &inner,
+        ROLLUP_RECORD_VERSION + 7,
+        INVENTORY_INDEX_VERSION,
+    )
+    .await;
+
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    acquire(clean)
+        .await
+        .expect("intact recovery tolerates a bad-version rollup");
+}
+
+#[tokio::test]
+async fn unsupported_version_rollup_post_gc_falls_back_to_previous() {
+    // Post-GC authoritative recovery: an unsupported-version current rollup is
+    // rejected at load, so recovery falls back to the valid previous generation.
+    let inner = inmem();
+    let (_fs, w) = setup_generations(&inner).await;
+    drop(w);
+    plant_current_rollup(
+        &inner,
+        ROLLUP_RECORD_VERSION + 7,
+        INVENTORY_INDEX_VERSION,
+    )
+    .await;
+    delete_entries_le(&inner, 2).await; // GC through the horizon (prev.end = 2)
+
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let w2 = acquire(Arc::clone(&clean)).await.unwrap();
+    assert_eq!(w2.epoch().await, 2, "recovered via the previous generation");
+}
+
+#[tokio::test]
+async fn unsupported_version_inventory_post_gc_falls_back_to_previous() {
+    // The current rollup record is a supported version but its inventory index is a
+    // future version: rejected at load, driving the fallback.
+    let inner = inmem();
+    let (_fs, w) = setup_generations(&inner).await;
+    drop(w);
+    plant_current_rollup(
+        &inner,
+        ROLLUP_RECORD_VERSION,
+        INVENTORY_INDEX_VERSION + 7,
+    )
+    .await;
+    delete_entries_le(&inner, 2).await;
+
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let w2 = acquire(Arc::clone(&clean)).await.unwrap();
+    assert_eq!(w2.epoch().await, 2, "recovered via the previous generation");
 }

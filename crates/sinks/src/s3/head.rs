@@ -1607,14 +1607,9 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                     };
                     let cur = Head::parse(&raw)?;
 
-                    // Lost/ambiguous response that actually succeeded: HEAD
-                    // references our exact entry -> idempotent success.
-                    if cur.references(&written) {
-                        st.verified.head = cur;
-                        st.verified.etag = etag;
-                        return Ok(()); // ACKNOWLEDGE (idempotent)
-                    }
-                    // A higher epoch published: fenced, permanently.
+                    // Fencing is decided FIRST, before any reference match: a higher
+                    // epoch may preserve our exact entry reference, and a stale writer
+                    // must never mistake that for its own lost response.
                     if cur.epoch > st.verified.epoch {
                         st.fenced = Some(cur.epoch);
                         return Err(HeadError::Fenced {
@@ -1628,6 +1623,14 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                             "HEAD epoch regressed: {} < our {}",
                             cur.epoch, st.verified.epoch
                         )));
+                    }
+                    // Same epoch only: a lost/ambiguous response that actually
+                    // succeeded leaves HEAD referencing our exact entry -> idempotent
+                    // success.
+                    if cur.references(&written) {
+                        st.verified.head = cur;
+                        st.verified.etag = etag;
+                        return Ok(()); // ACKNOWLEDGE (idempotent)
                     }
                     // HEAD did not move (same ETag): our CAS failed transiently
                     // (a rejected or lost-then-not-applied response), not a race.
@@ -1968,17 +1971,10 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                         }
                     };
                     let cur = Head::parse(&raw)?;
-                    // Lost response that succeeded: HEAD already references our
-                    // record -> idempotent success.
-                    if cur.compaction_hash.as_deref()
-                        == Some(written.hash.as_str())
-                    {
-                        st.verified.head = cur;
-                        st.verified.etag = etag;
-                        return Ok(());
-                    }
-                    // A higher epoch fenced us: compaction is abandoned; the
-                    // uploaded object + record are harmless orphans.
+                    // Fencing FIRST: a higher epoch may have published the same
+                    // content-addressed compaction record, so a matching hash must
+                    // never be mistaken for our own lost response. The uploaded
+                    // object + record are harmless orphans.
                     if cur.epoch > st.verified.epoch {
                         st.fenced = Some(cur.epoch);
                         return Err(HeadError::Fenced {
@@ -1992,8 +1988,16 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                             cur.epoch, st.verified.epoch
                         )));
                     }
-                    // Same epoch (a transient error, or our own earlier batch
-                    // advanced HEAD): adopt the current HEAD and re-apply the
+                    // Same epoch only: a lost response that actually succeeded leaves
+                    // HEAD at the EXACT proposed transition (not merely a matching
+                    // compaction hash) -> idempotent success.
+                    if cur == next {
+                        st.verified.head = cur;
+                        st.verified.etag = etag;
+                        return Ok(());
+                    }
+                    // Same epoch, different head (a transient error, or our own
+                    // earlier batch advanced HEAD): adopt it and re-apply the
                     // compaction reference on top, preserving its ack state.
                     st.verified.head = cur;
                     st.verified.etag = etag;
@@ -2330,8 +2334,10 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         // Out-of-horizon inventory-index / older-generation rollup GC is
         // deliberately OUT OF SCOPE for 9B.1 and 9B.2: those objects stay ineligible
         // (never listed) until a later milestone implements older-generation
-        // planning. Under one-generation retention only the current + previous
-        // generations exist and both are retained, so nothing is missed here now.
+        // planning. NOTE: older immutable rollup + inventory objects (generations
+        // before `previous`) DO exist once several rollups have been published; they
+        // are simply retained indefinitely and excluded from GC here, NOT absent.
+        // Later reconciliation must not misclassify them as sweepable orphans.
         let inventory_indexes_eligible: Vec<InventoryRef> = Vec::new();
         let mut data_originals_eligible: Vec<OriginalRef> = Vec::new();
 
