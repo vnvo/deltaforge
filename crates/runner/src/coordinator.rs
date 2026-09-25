@@ -2604,6 +2604,214 @@ mod tests {
         assert_eq!(cp.as_deref(), Some(&b"cp-3"[..]));
     }
 
+    /// G4: the stream ends immediately BEFORE a COMMIT. The open transaction is
+    /// discarded and no checkpoint advances - on restart the source replays it whole.
+    #[tokio::test]
+    async fn disconnect_before_commit_discards_and_no_checkpoint() {
+        let (res, store) = run_items(vec![
+            begin("gtid:1"),
+            SourceItem::Event(tx_event(1, "gtid:1", b"r1")),
+            SourceItem::Event(tx_event(2, "gtid:1", b"r2")),
+            // stream ends here: no commit marker
+        ])
+        .await;
+        res.expect("clean stream end");
+        assert!(
+            store.get_raw("src::sink::kafka").await.unwrap().is_none(),
+            "a partial tx (disconnect before COMMIT) must not checkpoint"
+        );
+    }
+
+    /// G4: the stream ends immediately AFTER a COMMIT. The whole transaction is
+    /// flushed and the checkpoint is the commit marker's position.
+    #[tokio::test]
+    async fn disconnect_after_commit_flushes_and_checkpoints() {
+        let (res, store) = run_items(vec![
+            begin("gtid:1"),
+            SourceItem::Event(tx_event(1, "gtid:1", b"r1")),
+            commit("gtid:1", b"cp-1"),
+            // stream ends right after the commit marker
+        ])
+        .await;
+        res.expect("clean stream end");
+        assert_eq!(
+            store.get_raw("src::sink::kafka").await.unwrap().as_deref(),
+            Some(&b"cp-1"[..]),
+            "a committed tx (disconnect after COMMIT) checkpoints at the marker"
+        );
+    }
+
+    /// G5: the flush timer must never flush an open (uncommitted) transaction, no
+    /// matter how long the source sits mid-transaction.
+    #[tokio::test]
+    async fn timer_does_not_flush_partial_transaction() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let coord = tx_coord(
+            store.clone(),
+            Arc::clone(&sink),
+            BatchConfig {
+                max_events: Some(1000),
+                max_ms: Some(50), // short timer, many chances to fire
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            },
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        tx.send(begin("gtid:1")).await.unwrap();
+        for i in 0..2 {
+            tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
+                .await
+                .unwrap();
+        }
+        // No commit marker; keep the channel open so the timer can fire repeatedly.
+
+        let cancel_c = cancel.clone();
+        let sink_c = Arc::clone(&sink);
+        let waiter = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let delivered = sink_c.delivery_count();
+            cancel_c.cancel();
+            delivered
+        });
+
+        coord.run(rx, cancel, pause_rx).await.unwrap();
+        assert_eq!(
+            waiter.await.unwrap(),
+            0,
+            "timer must not flush an open partial transaction"
+        );
+        assert_eq!(
+            sink.delivery_count(),
+            0,
+            "the partial tx is discarded on cancel, never delivered"
+        );
+        assert!(store.get_raw("src::sink::kafka").await.unwrap().is_none());
+    }
+
+    /// G6: an oversized transaction fails without advancing the checkpoint; on
+    /// restart the ENTIRE transaction replays and, under a larger cap, commits as
+    /// one whole batch.
+    #[tokio::test]
+    async fn oversized_tx_restart_replays_whole_transaction() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+
+        // Phase 1: cap too small -> fail closed, no checkpoint, nothing delivered.
+        {
+            let sink = MockSink::new("kafka", true);
+            let coord = tx_coord(
+                store.clone(),
+                Arc::clone(&sink),
+                BatchConfig {
+                    max_ms: Some(60_000),
+                    respect_source_tx: Some(true),
+                    max_inflight: Some(1),
+                    max_tx_events: Some(3),
+                    ..BatchConfig::default()
+                },
+            );
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+            tx.send(begin("gtid:1")).await.unwrap();
+            for i in 0..4 {
+                tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
+                    .await
+                    .unwrap();
+            }
+            drop(tx);
+            coord
+                .run(rx, cancel, pause_rx)
+                .await
+                .expect_err("oversized tx must fail");
+            assert_eq!(sink.delivery_count(), 0);
+            assert!(store.get_raw("src::sink::kafka").await.unwrap().is_none());
+        }
+
+        // Phase 2: restart with a larger cap. The same whole transaction replays
+        // (all 4 events + its commit) and now delivers as one batch and checkpoints.
+        {
+            let sink = MockSink::new("kafka", true);
+            let coord = tx_coord(
+                store.clone(),
+                Arc::clone(&sink),
+                BatchConfig {
+                    max_ms: Some(60_000),
+                    respect_source_tx: Some(true),
+                    max_inflight: Some(1),
+                    max_tx_events: Some(10),
+                    ..BatchConfig::default()
+                },
+            );
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+            tx.send(begin("gtid:1")).await.unwrap();
+            for i in 0..4 {
+                tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
+                    .await
+                    .unwrap();
+            }
+            tx.send(commit("gtid:1", b"cp-1")).await.unwrap();
+            drop(tx);
+            coord.run(rx, cancel, pause_rx).await.unwrap();
+            assert_eq!(
+                sink.batch_sizes(),
+                vec![4],
+                "the whole transaction replays as one batch"
+            );
+            assert_eq!(
+                store.get_raw("src::sink::kafka").await.unwrap().as_deref(),
+                Some(&b"cp-1"[..])
+            );
+        }
+    }
+
+    /// G7: with `respect_source_tx = false`, the legacy path ignores tx markers and
+    /// the hard event limit splits by count (it may split a transaction - by design).
+    #[tokio::test]
+    async fn legacy_path_ignores_markers_and_splits_by_count() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let coord = tx_coord(
+            store.clone(),
+            Arc::clone(&sink),
+            BatchConfig {
+                max_events: Some(2),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(false),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            },
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+
+        // A 3-event transaction with markers; the legacy path drops the markers and
+        // splits the events by count into [2, 1].
+        tx.send(begin("gtid:1")).await.unwrap();
+        for i in 0..3 {
+            tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
+                .await
+                .unwrap();
+        }
+        tx.send(commit("gtid:1", b"cp-1")).await.unwrap();
+        drop(tx);
+
+        coord.run(rx, cancel, pause_rx).await.unwrap();
+        assert_eq!(sink.batch_sizes(), vec![2, 1]);
+    }
+
     // ── Pure batch-accumulation helpers (check_and_split / policy) ───────
 
     /// Build a minimal row event with a controllable size hint and tx-end
