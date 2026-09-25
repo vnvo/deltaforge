@@ -73,6 +73,8 @@ enum Op {
     EntryDelete,
     /// Delete of a compacted original data object (9B.2 data GC).
     OriginalDelete,
+    /// A `list_meta` call during reconciliation (Commit 10).
+    ListObjects,
 }
 
 fn classify_put(key: &Path) -> Op {
@@ -266,6 +268,18 @@ impl ConditionalStore for FaultStore {
     }
     async fn list(&self, prefix: &Path) -> CondResult<Vec<Path>> {
         self.inner.list(prefix).await
+    }
+    async fn list_meta(
+        &self,
+        prefix: &Path,
+    ) -> CondResult<Vec<super::store_cond::ObjectListing>> {
+        // A listing failpoint models provider "listing uncertainty".
+        if let Some(Action::ErrBefore) = self.fire(Op::ListObjects).await {
+            return Err(CondError::Store(
+                "injected listing uncertainty".into(),
+            ));
+        }
+        self.inner.list_meta(prefix).await
     }
 }
 
@@ -2831,4 +2845,248 @@ async fn combined_data_and_entry_gc_then_recovery_preserves_events() {
         .await
         .unwrap();
     assert_eq!(read_head(&inner).await.unwrap().seq, 4);
+}
+
+// ── Commit 10: orphan reconciliation + metrics ────────────────────────────────
+
+use super::reconcile::ReconcileConfig;
+
+/// Write an unreferenced object under the pipeline (an orphan candidate).
+async fn plant_orphan(inner: &ObjectStoreConditional, key: &str) {
+    inner
+        .put_if_absent(
+            &Path::from(key.to_string()),
+            Bytes::from_static(b"orphan"),
+        )
+        .await
+        .unwrap();
+}
+
+fn recon(now_ms: u64, grace_period_ms: u64) -> ReconcileConfig {
+    ReconcileConfig {
+        now_ms,
+        grace_period_ms,
+    }
+}
+
+#[tokio::test]
+async fn reconcile_deletes_orphan_past_grace_keeps_referenced() {
+    let inner = inmem();
+    let (_fs, w) = setup_generations(&inner).await;
+    let entries_before = entry_count(&inner).await;
+    let data_before = data_count(&inner).await;
+    plant_orphan(&inner, &format!("{PFX}/{PIPE}/orders/wm-9999/orphan.jsonl"))
+        .await;
+
+    // now far in the future, grace 0 -> the orphan is past grace.
+    let report = w
+        .reconcile(recon(now_ms_test() + 1_000_000, 0))
+        .await
+        .unwrap();
+    assert!(report.stopped.is_none(), "{:?}", report.stopped);
+    assert_eq!(report.orphans_deleted, 1);
+    assert!(report.missing_referenced.is_empty());
+    assert_eq!(report.mpu_aborts, 0, "single-PUT path has no MPUs");
+    // Referenced state is untouched.
+    assert_eq!(entry_count(&inner).await, entries_before);
+    assert_eq!(
+        data_count(&inner).await,
+        data_before,
+        "referenced data kept"
+    );
+    assert_eq!(rollup_record_count(&inner).await, 2);
+    assert_eq!(inventory_count(&inner).await, 2);
+}
+
+#[tokio::test]
+async fn reconcile_keeps_orphan_within_grace() {
+    let inner = inmem();
+    let (_fs, w) = setup_generations(&inner).await;
+    let okey = format!("{PFX}/{PIPE}/orders/wm-9999/orphan.jsonl");
+    plant_orphan(&inner, &okey).await;
+
+    // A huge grace window: a freshly-created object is never mistaken for an orphan
+    // (the orphan-vs-referenced race is closed by grace).
+    let report = w.reconcile(recon(now_ms_test(), u64::MAX)).await.unwrap();
+    assert_eq!(report.orphans_deleted, 0);
+    assert!(report.orphans_within_grace >= 1);
+    assert!(
+        inner
+            .get_with_etag(&Path::from(okey))
+            .await
+            .unwrap()
+            .is_some(),
+        "orphan within grace is kept"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_never_deletes_gc_marks() {
+    let inner = inmem();
+    let (_fs, w) = setup_gc_ready(&inner, vec![]).await;
+    w.gc_mark_entries(far_future(), no_window()).await.unwrap();
+    let marks_before = mark_count(&inner).await;
+    assert!(marks_before > 0);
+    plant_orphan(&inner, &format!("{PFX}/{PIPE}/orders/wm-9999/orphan.jsonl"))
+        .await;
+
+    let report = w
+        .reconcile(recon(now_ms_test() + 1_000_000, 0))
+        .await
+        .unwrap();
+    assert_eq!(report.orphans_deleted, 1, "only the orphan is deleted");
+    assert_eq!(mark_count(&inner).await, marks_before, "GC marks kept");
+}
+
+#[tokio::test]
+async fn reconcile_missing_referenced_object_is_a_hard_alarm() {
+    let inner = inmem();
+    let (_fs, w) = setup_generations(&inner).await;
+    plant_orphan(&inner, &format!("{PFX}/{PIPE}/orders/wm-9999/orphan.jsonl"))
+        .await;
+    // Delete a REFERENCED (non-superseded) data object out of band.
+    let referenced_obj = inner
+        .list(&Path::from(format!("{PFX}/{PIPE}/orders")))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|p| {
+            p.to_string().contains("/wm-") && !p.to_string().contains("9999")
+        })
+        .unwrap();
+    inner.delete(&referenced_obj).await.unwrap();
+
+    // Reconciliation fails closed (verify_state) and deletes nothing.
+    let err =
+        expect_err(w.reconcile(recon(now_ms_test() + 1_000_000, 0)).await);
+    assert!(err.is_fatal(), "missing referenced object halts: {err:?}");
+    assert!(
+        inner
+            .get_with_etag(&Path::from(format!(
+                "{PFX}/{PIPE}/orders/wm-9999/orphan.jsonl"
+            )))
+            .await
+            .unwrap()
+            .is_some(),
+        "no cleanup on a missing-referenced alarm"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_fenced_stops() {
+    let inner = inmem();
+    let (_fs, a) = setup_generations(&inner).await;
+    plant_orphan(&inner, &format!("{PFX}/{PIPE}/orders/wm-9999/orphan.jsonl"))
+        .await;
+    let _b = acquire(Arc::new(FaultStore::new(Arc::clone(&inner), vec![])))
+        .await
+        .unwrap(); // epoch 2 fences A
+    let err =
+        expect_err(a.reconcile(recon(now_ms_test() + 1_000_000, 0)).await);
+    assert!(matches!(err, HeadError::Fenced { .. }), "got {err:?}");
+}
+
+#[tokio::test]
+async fn reconcile_listing_uncertainty_stops() {
+    let inner = inmem();
+    let (fs, w) =
+        genesis(&inner, vec![tr(Op::ListObjects, 0, Action::ErrBefore)]).await;
+    // Build a couple of generations on the same fault store.
+    w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)
+        .await
+        .unwrap();
+    w.publish(&wm(2), vec![tobj_jsonl("orders", &[2])], 1)
+        .await
+        .unwrap();
+    w.rollup().await.unwrap();
+    drop(fs);
+    plant_orphan(&inner, &format!("{PFX}/{PIPE}/orders/wm-9999/orphan.jsonl"))
+        .await;
+
+    // The listing failpoint makes reconciliation stop rather than act on an uncertain
+    // listing.
+    let err =
+        expect_err(w.reconcile(recon(now_ms_test() + 1_000_000, 0)).await);
+    assert!(matches!(err, HeadError::Store(_)), "got {err:?}");
+    assert!(
+        inner
+            .get_with_etag(&Path::from(format!(
+                "{PFX}/{PIPE}/orders/wm-9999/orphan.jsonl"
+            )))
+            .await
+            .unwrap()
+            .is_some(),
+        "no deletion under listing uncertainty"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_lost_delete_response_is_resumable() {
+    let inner = inmem();
+    let (_fs, w) = setup_generations(&inner).await;
+    let okey = format!("{PFX}/{PIPE}/orders/wm-9999/orphan.jsonl");
+    plant_orphan(&inner, &okey).await;
+    // A lost delete response (the delete applied) stops the pass.
+    let (fs2, w2) = {
+        let fs = Arc::new(FaultStore::new(
+            Arc::clone(&inner),
+            vec![tr(Op::OriginalDelete, 0, Action::ApplyThenErr)],
+        ));
+        let w = acquire(Arc::clone(&fs)).await.unwrap();
+        (fs, w)
+    };
+    let _ = fs2;
+    let report = w2
+        .reconcile(recon(now_ms_test() + 1_000_000, 0))
+        .await
+        .unwrap();
+    assert!(
+        report.stopped.is_some(),
+        "lost delete response stops the pass"
+    );
+    // The orphan was actually removed; a resumed pass is clean + idempotent.
+    let report2 = w2
+        .reconcile(recon(now_ms_test() + 1_000_000, 0))
+        .await
+        .unwrap();
+    assert!(report2.stopped.is_none());
+    assert_eq!(report2.orphans_deleted, 0, "already gone");
+    assert!(
+        inner
+            .get_with_etag(&Path::from(okey))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let _ = w; // original writer is now fenced by w2
+}
+
+#[tokio::test]
+async fn metrics_snapshot_reports_durable_state() {
+    let inner = inmem();
+    let (_fs, w) = setup_gc_ready(&inner, vec![]).await; // 3 batches, 2 rollups, 1 compaction
+    let m = w.metrics().await.unwrap();
+    assert_eq!(m.seq, 3);
+    assert_eq!(m.rollup_end_seq, Some(3));
+    assert_eq!(m.prev_rollup_end_seq, Some(2));
+    assert_eq!(m.horizon_seq, 2);
+    assert_eq!(m.compaction_records, 1);
+    assert_eq!(m.compaction_lag, 0, "all originals superseded");
+}
+
+#[tokio::test]
+async fn metrics_counts_cas_conflicts() {
+    let inner = inmem();
+    // A rejected HEAD CAS on the first publish forces a reconcile retry (one conflict).
+    let (_fs, w) =
+        genesis(&inner, vec![tr(Op::HeadCas, 0, Action::ErrBefore)]).await;
+    w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)
+        .await
+        .unwrap();
+    let m = w.metrics().await.unwrap();
+    assert!(
+        m.cas_conflicts >= 1,
+        "cas conflict counted: {}",
+        m.cas_conflicts
+    );
 }

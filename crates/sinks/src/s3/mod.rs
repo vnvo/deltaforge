@@ -24,6 +24,7 @@ mod keys;
 mod manifest;
 mod object_writer;
 mod parquet_writer;
+mod reconcile;
 mod rolling;
 mod rollup;
 mod router;

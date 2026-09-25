@@ -93,6 +93,31 @@ pub trait ConditionalStore: Send + Sync {
     /// List keys under `prefix` (recursively). Used by recovery/reconciliation to
     /// detect existing state, never on the hot ack path.
     async fn list(&self, prefix: &Path) -> CondResult<Vec<Path>>;
+
+    /// List objects under `prefix` with their creation/modification time and size,
+    /// for grace-period orphan reconciliation. The default returns entries with a zero
+    /// timestamp (unknown age); backends that expose listing metadata override it.
+    async fn list_meta(&self, prefix: &Path) -> CondResult<Vec<ObjectListing>> {
+        Ok(self
+            .list(prefix)
+            .await?
+            .into_iter()
+            .map(|key| ObjectListing {
+                key,
+                last_modified_ms: 0,
+                size: 0,
+            })
+            .collect())
+    }
+}
+
+/// One listed object with the metadata reconciliation needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectListing {
+    pub key: Path,
+    /// Milliseconds since the Unix epoch; `0` means the backend did not report a time.
+    pub last_modified_ms: u64,
+    pub size: u64,
 }
 
 /// [`ConditionalStore`] backed by an `object_store` client.
@@ -187,6 +212,22 @@ impl ConditionalStore for ObjectStoreConditional {
         while let Some(item) = stream.next().await {
             let meta = item.map_err(|e| CondError::Store(format!("{e}")))?;
             out.push(meta.location);
+        }
+        Ok(out)
+    }
+
+    async fn list_meta(&self, prefix: &Path) -> CondResult<Vec<ObjectListing>> {
+        use futures::StreamExt;
+        let mut stream = self.store.list(Some(prefix));
+        let mut out = Vec::new();
+        while let Some(item) = stream.next().await {
+            let meta = item.map_err(|e| CondError::Store(format!("{e}")))?;
+            let ms = meta.last_modified.timestamp_millis();
+            out.push(ObjectListing {
+                key: meta.location,
+                last_modified_ms: ms.max(0) as u64,
+                size: meta.size,
+            });
         }
         Ok(out)
     }

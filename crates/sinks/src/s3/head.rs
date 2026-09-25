@@ -26,7 +26,8 @@ use deltaforge_core::{CheckpointComparator, CheckpointOrder};
 use super::batch_upload::{DurableError, TableObject, upload_batch};
 use super::compaction::{
     CompactionError, CompactionIndex, CompactionRecord, check_compatible,
-    compacted_object_key, load_record, verify_originals_present, write_record,
+    compacted_object_key, load_record, record_key as compaction_record_key,
+    verify_originals_present, write_record,
 };
 use super::equivalence::verify_jsonl;
 use super::gc::{
@@ -39,6 +40,7 @@ use super::manifest::{
     ManifestEntry, ManifestObject, PrevRef, WrittenEntry, entry_key,
     propose_seq, write_entry,
 };
+use super::reconcile::{DurableMetrics, ReconcileConfig, ReconcileReport};
 use super::rollup::{
     InventoryIndex, RollupError, RollupRecord,
     load_inventory as rollup_load_inventory, load_record as rollup_load,
@@ -1227,6 +1229,9 @@ pub struct DurableWriter<S: ConditionalStore + ?Sized> {
     /// consumes this rather than rescanning objects. (A live writer's own
     /// compactions after acquire are not reflected here; GC re-acquires.)
     compaction_index: CompactionIndex,
+    /// Cumulative count of HEAD CAS conflicts/retries observed by this writer, for
+    /// operational metrics.
+    cas_conflicts: std::sync::atomic::AtomicU64,
 }
 
 impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
@@ -1395,6 +1400,7 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                 fenced: None,
             }),
             compaction_index,
+            cas_conflicts: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1645,6 +1651,8 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                 Ok(PutOutcome::AlreadyExists) => unreachable!("cas_put"),
                 // Conflict or a lost/ambiguous response: reread and disambiguate.
                 Ok(PutOutcome::Conflict) | Err(_) => {
+                    self.cas_conflicts
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let (raw, etag) = match self
                         .store
                         .get_with_etag(&hkey)
@@ -1982,11 +1990,7 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         // `false` is treated as corruption at recovery.
         verify_jsonl(self.store.as_ref(), &originals, &replacement_obj)
             .await
-            .map_err(|e| {
-                HeadError::Integrity(format!(
-                    "compaction replacement failed equivalence; not published: {e}"
-                ))
-            })?;
+            .map_err(map_equivalence)?;
         let record = CompactionRecord {
             version: super::compaction::COMPACTION_RECORD_VERSION,
             pipeline: self.pipeline.clone(),
@@ -2032,6 +2036,8 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                 }
                 Ok(PutOutcome::AlreadyExists) => unreachable!("cas_put"),
                 Ok(PutOutcome::Conflict) | Err(_) => {
+                    self.cas_conflicts
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let (raw, etag) = match self
                         .store
                         .get_with_etag(&hkey)
@@ -2301,6 +2307,8 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                 }
                 Ok(PutOutcome::AlreadyExists) => unreachable!("cas_put"),
                 Ok(PutOutcome::Conflict) | Err(_) => {
+                    self.cas_conflicts
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let (raw, etag) = match self
                         .store
                         .get_with_etag(&hkey)
@@ -3046,6 +3054,245 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         }
         Ok(run)
     }
+
+    /// Build the set of object keys reachable from authoritative HEAD state - the
+    /// objects reconciliation must NEVER delete. Also returns the committed-data-object
+    /// count and the compaction lag (acknowledged originals not yet superseded). Fails
+    /// closed (via `verify_state`) if any referenced non-superseded object is missing,
+    /// so a missing referenced object is a hard error, never a cleanup.
+    async fn reconcile_referenced(
+        &self,
+        head: &Head,
+    ) -> Result<(std::collections::HashSet<String>, usize, usize), HeadError>
+    {
+        // verify_state verifies + returns the authoritative entries, ack inventory,
+        // and compaction records; it fails closed if a referenced object is missing.
+        let state = verify_state(
+            self.store.as_ref(),
+            &self.pipeline,
+            &self.source_id,
+            &self.sink_id,
+            head,
+            self.comparator.as_ref(),
+        )
+        .await?;
+        let mut referenced: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        referenced.insert(head_key(&self.prefix, &self.pipeline).to_string());
+        for (seq, summ) in &state.entries {
+            referenced.insert(
+                entry_key(&self.prefix, &self.pipeline, *seq, &summ.entry_hash)
+                    .to_string(),
+            );
+        }
+        // Every authoritative object (retained-tail + adopted covered range).
+        for k in state.ack_inventory.keys() {
+            referenced.insert(k.clone());
+        }
+        // Compaction records + their replacements + originals.
+        let mut lag = state.ack_inventory.len();
+        for rec in &state.compactions.records {
+            referenced.insert(
+                compaction_record_key(
+                    &self.prefix,
+                    &self.pipeline,
+                    &rec.record_hash,
+                )
+                .to_string(),
+            );
+            referenced.insert(rec.replacement.key.clone());
+            for o in &rec.originals {
+                referenced.insert(o.key.clone());
+            }
+        }
+        // Compaction lag = acknowledged originals not yet superseded.
+        lag = lag.saturating_sub(state.compactions.index.len());
+        // The FULL rollup chain (all retained generations) + their inventories. A
+        // rollup that cannot load makes reachability uncertain - the caller stops.
+        let mut cur = head.rollup_key.clone().zip(head.rollup_hash.clone());
+        let mut seen = std::collections::HashSet::new();
+        while let Some((k, h)) = cur {
+            if !seen.insert(k.clone()) || seen.len() > MAX_CHAIN_WALK {
+                return Err(HeadError::Integrity(
+                    "rollup history cycle/runaway during reconcile".into(),
+                ));
+            }
+            referenced.insert(k.clone());
+            let rec = rollup_load(self.store.as_ref(), &k, &h)
+                .await
+                .map_err(map_rollup)?;
+            referenced.insert(rec.inventory_key.clone());
+            cur = rec.prev.map(|p| (p.key, p.hash));
+        }
+        // GC marks are authorization records, never orphans.
+        for k in self
+            .store
+            .list(&marks_prefix(&self.prefix, &self.pipeline))
+            .await
+            .map_err(|e| HeadError::Store(e.to_string()))?
+        {
+            referenced.insert(k.to_string());
+        }
+        let committed = referenced
+            .iter()
+            .filter(|k| k.contains("/wm-") || k.contains("/compacted/"))
+            .count();
+        Ok((referenced, committed, lag))
+    }
+
+    /// Reconcile orphan objects (Commit 10): delete objects that are NOT reachable from
+    /// authoritative HEAD state and have outlived the grace period. Owner-fenced;
+    /// reachability-driven (never naming patterns alone); re-reads HEAD + revalidates
+    /// ownership before every deletion; stops on epoch change, listing uncertainty, an
+    /// ambiguous provider response, or any integrity failure. A missing REFERENCED
+    /// object is a hard error from `verify_state` (never a cleanup). durable_v2 uses
+    /// single create-only PUTs, so there are no MPUs to abort (`mpu_aborts == 0`).
+    pub async fn reconcile(
+        &self,
+        cfg: ReconcileConfig,
+    ) -> Result<ReconcileReport, HeadError> {
+        let mut st = self.state.lock().await;
+        if let Some(observed) = st.fenced {
+            return Err(HeadError::Fenced {
+                our: st.verified.epoch,
+                observed,
+            });
+        }
+        let our_epoch = st.verified.epoch;
+        let head = match self.gc_live_head(our_epoch).await {
+            Ok(h) => h,
+            Err(e) => {
+                if let HeadError::Fenced { observed, .. } = &e {
+                    st.fenced = Some(*observed);
+                }
+                return Err(e);
+            }
+        };
+
+        let (referenced, committed, compaction_lag) =
+            self.reconcile_referenced(&head).await?;
+
+        let listed = self
+            .store
+            .list_meta(&object_store::path::Path::from_iter(
+                self.prefix
+                    .split('/')
+                    .filter(|p| !p.is_empty())
+                    .chain([self.pipeline.as_str()]),
+            ))
+            .await
+            .map_err(|e| HeadError::Store(e.to_string()))?;
+
+        let mut report = ReconcileReport {
+            referenced: referenced.len(),
+            listed: listed.len(),
+            committed_objects: committed,
+            compaction_lag,
+            ..Default::default()
+        };
+
+        for obj in &listed {
+            let key = obj.key.to_string();
+            if referenced.contains(&key) {
+                continue; // reachable - never an orphan
+            }
+            // Unreferenced. Respect the grace period: never delete an object younger
+            // than the window (it may be about to be referenced), and never one whose
+            // age the backend could not report (0).
+            if obj.last_modified_ms == 0
+                || obj.last_modified_ms.saturating_add(cfg.grace_period_ms)
+                    > cfg.now_ms
+            {
+                report.orphans_within_grace += 1;
+                continue;
+            }
+            // Re-read HEAD + revalidate ownership immediately before deleting.
+            match self.gc_live_head(our_epoch).await {
+                Ok(_) => {}
+                Err(e) => {
+                    if let HeadError::Fenced { observed, .. } = &e {
+                        st.fenced = Some(*observed);
+                    }
+                    return Err(e);
+                }
+            }
+            match self.store.delete(&obj.key).await {
+                Ok(()) => report.orphans_deleted += 1,
+                Err(err) => {
+                    report.stopped = Some(format!("ambiguous delete: {err}"));
+                    break;
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// A cheap operational snapshot for dashboards/tooling.
+    pub async fn metrics(&self) -> Result<DurableMetrics, HeadError> {
+        let st = self.state.lock().await;
+        let head = st.verified.head.clone();
+        drop(st);
+        let load_end =
+            |k: &Option<String>, h: &Option<String>| k.clone().zip(h.clone());
+        let mut rollup_end_seq = None;
+        if let Some((k, h)) = load_end(&head.rollup_key, &head.rollup_hash) {
+            rollup_end_seq = Some(
+                rollup_load(self.store.as_ref(), &k, &h)
+                    .await
+                    .map_err(map_rollup)?
+                    .end_seq,
+            );
+        }
+        let mut prev_rollup_end_seq = None;
+        if let Some((k, h)) =
+            load_end(&head.prev_rollup_key, &head.prev_rollup_hash)
+        {
+            prev_rollup_end_seq = Some(
+                rollup_load(self.store.as_ref(), &k, &h)
+                    .await
+                    .map_err(map_rollup)?
+                    .end_seq,
+            );
+        }
+        let (compaction_records, compaction_lag) = match self
+            .reconcile_referenced(&head)
+            .await
+        {
+            Ok((_, _, lag)) => {
+                // records count via a quick compaction walk.
+                let mut n = 0usize;
+                let (mut ck, mut chash) =
+                    (head.compaction_key.clone(), head.compaction_hash.clone());
+                let mut seen = std::collections::HashSet::new();
+                while let (Some(k), Some(h)) = (ck.clone(), chash.clone()) {
+                    if !seen.insert(k.clone()) || seen.len() > MAX_CHAIN_WALK {
+                        break;
+                    }
+                    let rec = load_record(self.store.as_ref(), &k, &h)
+                        .await
+                        .map_err(map_compaction)?;
+                    n += 1;
+                    ck = rec.prev.as_ref().map(|p| p.key.clone());
+                    chash = rec.prev.as_ref().map(|p| p.hash.clone());
+                }
+                (n, lag)
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(DurableMetrics {
+            epoch: head.epoch,
+            seq: head.seq,
+            watermark_hex: head.watermark_hex.clone(),
+            rollup_end_seq,
+            prev_rollup_end_seq,
+            horizon_seq: horizon_seq(prev_rollup_end_seq),
+            compaction_records,
+            compaction_lag,
+            cas_conflicts: self
+                .cas_conflicts
+                .load(std::sync::atomic::Ordering::Relaxed),
+        })
+    }
 }
 
 /// The safety window measures how long the CURRENT rollup generation has been
@@ -3104,6 +3351,19 @@ fn map_rollup(e: RollupError) -> HeadError {
     match e {
         RollupError::Integrity(_) => HeadError::Integrity(e.to_string()),
         RollupError::Store(s) => HeadError::Store(s),
+    }
+}
+
+/// Map an equivalence-validation failure to a compaction publish outcome. A transient
+/// store error stays RETRYABLE (`Store`); an actual non-equivalence, unsupported
+/// format, or integrity problem is fatal (`Integrity`) - the compaction is refused.
+fn map_equivalence(e: super::equivalence::EquivalenceError) -> HeadError {
+    use super::equivalence::EquivalenceError as E;
+    match e {
+        E::Store(s) => HeadError::Store(s),
+        other => HeadError::Integrity(format!(
+            "compaction replacement failed equivalence; not published: {other}"
+        )),
     }
 }
 
