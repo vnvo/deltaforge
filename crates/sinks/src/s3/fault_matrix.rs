@@ -23,7 +23,14 @@ use tokio::sync::{Mutex, Notify};
 use deltaforge_core::{CheckpointComparator, CheckpointOrder};
 
 use super::batch_upload::TableObject;
-use super::gc::{GcConfig, entry_seq_from_key};
+use super::compaction::{
+    CompactionRecord, write_record as write_compaction_record,
+};
+use super::gc::{
+    DATA_GC_AUTH_VERSION, DataGcAuth, EQUIVALENCE_ALGO, EQUIVALENCE_VERSION,
+    GC_MARK_VERSION, GcConfig, GcMark, data_auth_key, entry_seq_from_key,
+    mark_key,
+};
 use super::head::{DurableWriter, Head, HeadError, head_key_for};
 use super::keys::EncodingDomain;
 use super::manifest::{ManifestEntry, ManifestObject};
@@ -73,7 +80,7 @@ fn classify_put(key: &Path) -> Op {
     let k = key.to_string();
     if k.contains("_manifest/HEAD") {
         Op::HeadPut
-    } else if k.contains("_manifest/gc/marks") {
+    } else if k.contains("_manifest/gc") {
         Op::MarkPut
     } else if k.contains("_manifest/entries") {
         Op::ManifestPut
@@ -2186,6 +2193,13 @@ async fn unsupported_version_inventory_post_gc_falls_back_to_previous() {
 }
 
 // ── 9B.2: destructive GC actors (deletion) fault matrix ───────────────────────
+//
+// Authorization is durable: manifest entries get immutable self-authenticating
+// marks; compacted originals get an immutable content-addressed data-GC
+// authorization written BEFORE any deletion. The destructive actors consume those
+// durable authorizations (never an in-memory plan), re-read HEAD and fence per unit,
+// re-verify the live objects, and stop on any unsafe condition. Every failure case
+// proves recovery within the fallback horizon and no lost last durable copy.
 
 fn no_window() -> GcConfig {
     GcConfig {
@@ -2205,9 +2219,17 @@ async fn mark_count(inner: &ObjectStoreConditional) -> usize {
         .len()
 }
 
-/// Two cumulative generations over real JSONL objects (gen1 [1,2], gen2 [1,3]) plus
-/// a compaction of all three originals, so both manifest entries (seq 1,2 <= horizon
-/// 2) and data originals (all 3) are GC-eligible.
+async fn data_auth_count(inner: &ObjectStoreConditional) -> usize {
+    inner
+        .list(&Path::from(format!("{PFX}/{PIPE}/_manifest/gc/data")))
+        .await
+        .unwrap()
+        .len()
+}
+
+/// Two cumulative generations over real JSONL objects (gen1 [1,2], gen2 [1,3]) plus a
+/// compaction of all three originals, so both manifest entries (seq 1,2 <= horizon 2)
+/// and data originals (all 3) are GC-eligible.
 async fn setup_gc_ready(
     inner: &Arc<ObjectStoreConditional>,
     triggers: Vec<Trigger>,
@@ -2229,22 +2251,27 @@ async fn setup_gc_ready(
     (fs, w)
 }
 
+// ── Data-side (authorize + delete) ────────────────────────────────────────────
+
 #[tokio::test]
-async fn data_gc_deletes_originals_preserves_replacement_and_recovers() {
+async fn data_gc_authorize_then_delete_preserves_replacement_and_recovers() {
     let inner = inmem();
     let (_fs, w) = setup_gc_ready(&inner, vec![]).await;
     let plan = w.plan_gc(far_future(), no_window()).await.unwrap();
-    assert_eq!(plan.data_originals_eligible.len(), 3);
+    assert_eq!(plan.data_originals_eligible().len(), 3);
 
-    let run = w.gc_delete_originals(&plan).await.unwrap();
+    let a = w.gc_authorize_data().await.unwrap();
+    assert_eq!(
+        a.marked, 1,
+        "one authorization for the one compaction record"
+    );
+    assert_eq!(data_auth_count(&inner).await, 1);
+
+    let run = w.gc_delete_originals().await.unwrap();
     assert_eq!(run.deleted, 3);
     assert!(run.stopped.is_none(), "{:?}", run.stopped);
     assert_eq!(data_count(&inner).await, 0, "originals removed");
-    assert_eq!(
-        compacted_object_count(&inner).await,
-        1,
-        "the replacement (last durable copy) is preserved"
-    );
+    assert_eq!(compacted_object_count(&inner).await, 1, "replacement kept");
 
     drop(w);
     let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
@@ -2255,12 +2282,10 @@ async fn data_gc_deletes_originals_preserves_replacement_and_recovers() {
 
 #[tokio::test]
 async fn data_gc_keeps_original_when_replacement_missing() {
-    // The critical safety invariant: if the surviving replacement is gone, the
-    // original is NOT deleted (its last durable copy must not be lost).
     let inner = inmem();
     let (_fs, w) = setup_gc_ready(&inner, vec![]).await;
-    let plan = w.plan_gc(far_future(), no_window()).await.unwrap();
-    // Out-of-band removal of the replacement.
+    w.gc_authorize_data().await.unwrap();
+    // Out-of-band removal of the surviving replacement.
     let compacted: Vec<Path> = inner
         .list(&Path::from(format!("{PFX}/{PIPE}")))
         .await
@@ -2270,7 +2295,7 @@ async fn data_gc_keeps_original_when_replacement_missing() {
         .collect();
     inner.delete(&compacted[0]).await.unwrap();
 
-    let run = w.gc_delete_originals(&plan).await.unwrap();
+    let run = w.gc_delete_originals().await.unwrap();
     assert!(
         run.stopped.is_some(),
         "must stop when the replacement is gone"
@@ -2287,66 +2312,69 @@ async fn data_gc_crash_before_delete_then_resume() {
         vec![tr(Op::OriginalDelete, 0, Action::HangBefore)],
     )
     .await;
-    let plan = w.plan_gc(far_future(), no_window()).await.unwrap();
-    cancel_at_hang(&fs, async {
-        w.gc_delete_originals(&plan).await.map(|_| ())
-    })
-    .await;
+    w.gc_authorize_data().await.unwrap();
+    cancel_at_hang(&fs, async { w.gc_delete_originals().await.map(|_| ()) })
+        .await;
     assert_eq!(
         data_count(&inner).await,
         3,
         "nothing deleted before the crash"
     );
 
-    // Resume: the plan is still valid (GC never moves HEAD); the one-shot fault is
-    // cleared, so the run completes idempotently.
-    let plan2 = w.plan_gc(far_future(), no_window()).await.unwrap();
-    let run = w.gc_delete_originals(&plan2).await.unwrap();
+    let run = w.gc_delete_originals().await.unwrap();
     assert_eq!(run.deleted, 3);
     assert_eq!(data_count(&inner).await, 0);
     drop(w);
     let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
     acquire(clean)
         .await
-        .expect("recovery succeeds after resumed data GC");
+        .expect("recovery after resumed data GC");
 }
 
 #[tokio::test]
-async fn data_gc_lost_delete_response_resumes_idempotently() {
+async fn data_gc_survives_process_restart_after_partial_deletion() {
+    // Blocker 3: a real crash loses the in-memory plan. The durable authorization,
+    // re-verified by a NEW owner after an epoch bump, lets deletion resume.
     let inner = inmem();
     let (_fs, w) = setup_gc_ready(
         &inner,
         vec![tr(Op::OriginalDelete, 0, Action::ApplyThenErr)],
     )
     .await;
-    let plan = w.plan_gc(far_future(), no_window()).await.unwrap();
-    // The first delete applies but the response is lost -> the actor stops.
-    let run = w.gc_delete_originals(&plan).await.unwrap();
-    assert!(run.stopped.is_some());
+    w.gc_authorize_data().await.unwrap();
+    let run = w.gc_delete_originals().await.unwrap();
+    assert!(run.stopped.is_some(), "lost response stops the first pass");
 
-    // Resume with the SAME plan (its equivalence proof - which needs all originals
-    // present - was established before any deletion; the plan is the durable
-    // authorization for the pass). The already-deleted original is absent (idempotent
-    // success under the proving plan); the rest are removed.
-    let run2 = w.gc_delete_originals(&plan).await.unwrap();
+    // "Process restart": drop the writer (and any in-memory plan), reacquire a new
+    // epoch, and resume from the durable authorization alone.
+    drop(w);
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let w2 = acquire(Arc::clone(&clean)).await.unwrap();
+    assert!(w2.epoch().await >= 2, "new owner bumped the epoch");
+    let run2 = w2.gc_delete_originals().await.unwrap();
     assert!(run2.stopped.is_none());
     assert_eq!(
         data_count(&inner).await,
         0,
-        "all originals gone after resume"
+        "resumed to completion after restart"
     );
     assert_eq!(compacted_object_count(&inner).await, 1);
+    drop(w2);
+    let clean2 = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    acquire(clean2)
+        .await
+        .expect("recovery after restart-resumed data GC");
 }
 
 #[tokio::test]
 async fn data_gc_fenced_before_deleting() {
     let inner = inmem();
     let (_fs, a) = setup_gc_ready(&inner, vec![]).await;
-    let plan = a.plan_gc(far_future(), no_window()).await.unwrap();
+    a.gc_authorize_data().await.unwrap();
     let _b = acquire(Arc::new(FaultStore::new(Arc::clone(&inner), vec![])))
         .await
         .unwrap(); // epoch 2 fences A
-    let err = expect_err(a.gc_delete_originals(&plan).await);
+    let err = expect_err(a.gc_delete_originals().await);
     assert!(matches!(err, HeadError::Fenced { .. }), "got {err:?}");
     assert_eq!(
         data_count(&inner).await,
@@ -2356,18 +2384,57 @@ async fn data_gc_fenced_before_deleting() {
 }
 
 #[tokio::test]
-async fn data_gc_stale_plan_stops() {
+async fn data_gc_forged_authorization_is_rejected() {
+    // A forged data-GC authorization that names a real record but swaps in a
+    // non-original target (HEAD, a rollup, the replacement) must be rejected by the
+    // live record-content match; nothing is deleted.
     let inner = inmem();
     let (_fs, w) = setup_gc_ready(&inner, vec![]).await;
-    let plan = w.plan_gc(far_future(), no_window()).await.unwrap();
-    // A new batch moves HEAD, invalidating the plan.
-    w.publish(&wm(4), vec![tobj_jsonl("orders", &[4])], 1)
+    let head = read_head(&inner).await.unwrap();
+    // Take the real compaction record, then forge originals to include HEAD's key.
+    let (craw, _) = inner
+        .get_with_etag(&Path::from(head.compaction_key.clone().unwrap()))
+        .await
+        .unwrap()
+        .unwrap();
+    let rec: CompactionRecord = serde_json::from_slice(&craw).unwrap();
+    let forged_target = ManifestObject {
+        key: head.head_entry_key.clone().unwrap(),
+        ..rec.originals[0].clone()
+    };
+    let forged = DataGcAuth {
+        version: DATA_GC_AUTH_VERSION,
+        pipeline: PIPE.into(),
+        source_id: "src".into(),
+        sink_id: "sink".into(),
+        compaction_record_hash: head.compaction_hash.clone().unwrap(),
+        replacement: rec.replacement.clone(),
+        originals: vec![forged_target],
+        equivalence_algo: EQUIVALENCE_ALGO.into(),
+        equivalence_version: EQUIVALENCE_VERSION,
+        equivalence_result: true,
+        compaction_root: head.compaction_hash.clone().unwrap(),
+    };
+    let key = data_auth_key(PFX, PIPE, &forged.auth_hash());
+    inner
+        .put_if_absent(&key, Bytes::from(forged.canonical_bytes()))
         .await
         .unwrap();
-    let run = w.gc_delete_originals(&plan).await.unwrap();
-    assert!(run.stopped.is_some(), "stale plan must stop");
-    assert_eq!(run.deleted, 0);
+
+    let run = w.gc_delete_originals().await.unwrap();
+    assert!(run.stopped.is_some(), "forged authorization must halt");
+    // HEAD entry object still present (never deleted).
+    assert!(
+        inner
+            .get_with_etag(&Path::from(head.head_entry_key.unwrap()))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(data_count(&inner).await, 3, "no original deleted");
 }
+
+// ── Manifest-side (mark + expire) ─────────────────────────────────────────────
 
 #[tokio::test]
 async fn manifest_gc_mark_then_expire_deletes_entries_and_recovers() {
@@ -2375,24 +2442,19 @@ async fn manifest_gc_mark_then_expire_deletes_entries_and_recovers() {
     let (_fs, w) = setup_gc_ready(&inner, vec![]).await;
     let plan = w.plan_gc(far_future(), no_window()).await.unwrap();
     let seqs: Vec<u64> = plan
-        .manifest_entries_eligible
+        .manifest_entries_eligible()
         .iter()
         .map(|e| e.seq)
         .collect();
     assert_eq!(seqs, vec![1, 2]);
 
-    let m = w.gc_mark_entries(&plan).await.unwrap();
+    let m = w.gc_mark_entries(far_future(), no_window()).await.unwrap();
     assert_eq!(m.marked, 2);
     assert_eq!(mark_count(&inner).await, 2);
 
-    let e = w.gc_expire_entries(&plan).await.unwrap();
+    let e = w.gc_expire_entries().await.unwrap();
     assert_eq!(e.deleted, 2);
-    assert_eq!(
-        entry_count(&inner).await,
-        1,
-        "only the tail entry (seq 3) remains"
-    );
-    // Retained rollups + inventories are never touched.
+    assert_eq!(entry_count(&inner).await, 1, "only the tail entry remains");
     assert_eq!(rollup_record_count(&inner).await, 2);
     assert_eq!(inventory_count(&inner).await, 2);
 
@@ -2407,14 +2469,11 @@ async fn manifest_gc_mark_then_expire_deletes_entries_and_recovers() {
 }
 
 #[tokio::test]
-async fn manifest_gc_expire_requires_a_mark() {
+async fn manifest_gc_expire_without_marks_deletes_nothing() {
     let inner = inmem();
     let (_fs, w) = setup_gc_ready(&inner, vec![]).await;
-    let plan = w.plan_gc(far_future(), no_window()).await.unwrap();
-    // Expire without marking first: nothing is deleted.
-    let e = w.gc_expire_entries(&plan).await.unwrap();
+    let e = w.gc_expire_entries().await.unwrap();
     assert_eq!(e.deleted, 0);
-    assert_eq!(e.skipped.len(), 2);
     assert_eq!(entry_count(&inner).await, 3);
 }
 
@@ -2426,9 +2485,8 @@ async fn manifest_gc_crash_before_expire_then_resume() {
         vec![tr(Op::EntryDelete, 0, Action::HangBefore)],
     )
     .await;
-    let plan = w.plan_gc(far_future(), no_window()).await.unwrap();
-    w.gc_mark_entries(&plan).await.unwrap();
-    cancel_at_hang(&fs, async { w.gc_expire_entries(&plan).await.map(|_| ()) })
+    w.gc_mark_entries(far_future(), no_window()).await.unwrap();
+    cancel_at_hang(&fs, async { w.gc_expire_entries().await.map(|_| ()) })
         .await;
     assert_eq!(
         entry_count(&inner).await,
@@ -2436,9 +2494,7 @@ async fn manifest_gc_crash_before_expire_then_resume() {
         "no entry expired before the crash"
     );
 
-    // Resume: marks persist, the plan is still valid, expiry completes.
-    let plan2 = w.plan_gc(far_future(), no_window()).await.unwrap();
-    let e = w.gc_expire_entries(&plan2).await.unwrap();
+    let e = w.gc_expire_entries().await.unwrap();
     assert_eq!(e.deleted, 2);
     assert_eq!(entry_count(&inner).await, 1);
     drop(w);
@@ -2449,15 +2505,29 @@ async fn manifest_gc_crash_before_expire_then_resume() {
 }
 
 #[tokio::test]
+async fn manifest_gc_expiry_survives_restart_and_epoch_bump() {
+    // Marks are durable authorizations; a new owner (higher epoch) expires from them.
+    let inner = inmem();
+    let (_fs, w) = setup_gc_ready(&inner, vec![]).await;
+    w.gc_mark_entries(far_future(), no_window()).await.unwrap();
+    drop(w);
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let w2 = acquire(Arc::clone(&clean)).await.unwrap();
+    assert!(w2.epoch().await >= 2);
+    let e = w2.gc_expire_entries().await.unwrap();
+    assert_eq!(e.deleted, 2, "monotonic eligibility across the epoch bump");
+    assert_eq!(entry_count(&inner).await, 1);
+}
+
+#[tokio::test]
 async fn manifest_gc_fenced_between_marking_and_expiry() {
     let inner = inmem();
     let (_fs, a) = setup_gc_ready(&inner, vec![]).await;
-    let plan = a.plan_gc(far_future(), no_window()).await.unwrap();
-    a.gc_mark_entries(&plan).await.unwrap();
+    a.gc_mark_entries(far_future(), no_window()).await.unwrap();
     let _b = acquire(Arc::new(FaultStore::new(Arc::clone(&inner), vec![])))
         .await
         .unwrap(); // epoch 2 fences A
-    let err = expect_err(a.gc_expire_entries(&plan).await);
+    let err = expect_err(a.gc_expire_entries().await);
     assert!(matches!(err, HeadError::Fenced { .. }), "got {err:?}");
     assert_eq!(
         entry_count(&inner).await,
@@ -2467,18 +2537,132 @@ async fn manifest_gc_fenced_between_marking_and_expiry() {
 }
 
 #[tokio::test]
-async fn combined_data_and_entry_gc_then_recovery_preserves_events() {
-    // Run BOTH actors, then prove recovery within the fallback horizon with no event
-    // losing its last durable copy (the replacement survives; entries below the
-    // horizon are recovered from the rollup + inventory).
+async fn manifest_gc_malformed_mark_halts() {
+    // Blocker 4: a tampered/garbage mark object must halt expiry without deleting.
     let inner = inmem();
     let (_fs, w) = setup_gc_ready(&inner, vec![]).await;
-    let plan = w.plan_gc(far_future(), no_window()).await.unwrap();
+    w.gc_mark_entries(far_future(), no_window()).await.unwrap();
+    // Overwrite one mark with garbage.
+    let mkeys = inner
+        .list(&Path::from(format!("{PFX}/{PIPE}/_manifest/gc/marks")))
+        .await
+        .unwrap();
+    inner.delete(&mkeys[0]).await.unwrap();
+    inner
+        .put_if_absent(&mkeys[0], Bytes::from_static(b"not json"))
+        .await
+        .unwrap();
 
-    let d = w.gc_delete_originals(&plan).await.unwrap();
+    let e = w.gc_expire_entries().await.unwrap();
+    assert!(e.stopped.is_some(), "malformed mark halts");
+}
+
+#[tokio::test]
+async fn manifest_gc_forged_mark_with_non_canonical_key_halts() {
+    // A forged mark whose entry_key does not equal the canonical key derived from
+    // (seq, entry_hash) - e.g. pointing at a rollup - must halt; nothing deleted.
+    let inner = inmem();
+    let (_fs, w) = setup_gc_ready(&inner, vec![]).await;
+    let head = read_head(&inner).await.unwrap();
+    let forged = GcMark {
+        version: GC_MARK_VERSION,
+        pipeline: PIPE.into(),
+        source_id: "src".into(),
+        sink_id: "sink".into(),
+        seq: 1,
+        entry_key: head.rollup_key.clone().unwrap(), // NOT the canonical entry key
+        entry_hash: "eh".into(),
+        rollup_key: head.rollup_key.clone().unwrap(),
+        rollup_hash: head.rollup_hash.clone().unwrap(),
+        prev_rollup_key: head.prev_rollup_key.clone().unwrap(),
+        prev_rollup_hash: head.prev_rollup_hash.clone().unwrap(),
+        inventory_record_hash: "i".into(),
+        prev_inventory_record_hash: "p".into(),
+        horizon: 2,
+    };
+    let key = mark_key(PFX, PIPE, &forged.entry_hash);
+    inner
+        .put_if_absent(&key, Bytes::from(forged.canonical_bytes()))
+        .await
+        .unwrap();
+
+    let e = w.gc_expire_entries().await.unwrap();
+    assert!(e.stopped.is_some(), "non-canonical mark halts");
+    // The rollup the forged key pointed at is untouched.
+    assert!(
+        inner
+            .get_with_etag(&Path::from(head.rollup_key.unwrap()))
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+// ── Blocker 1: exact compaction-original metadata ─────────────────────────────
+
+#[tokio::test]
+async fn compaction_original_metadata_mismatch_fails_recovery() {
+    // A compaction record naming an authoritative key but a substituted content hash
+    // must fail closed at recovery (and thus never authorize GC of the real object).
+    let inner = inmem();
+    let (_fs, w) = genesis(&inner, vec![]).await;
+    w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)
+        .await
+        .unwrap();
+    w.publish(&wm(2), vec![tobj_jsonl("orders", &[2])], 1)
+        .await
+        .unwrap();
+    let originals = all_manifest_objects(&inner).await;
+    let head = read_head(&inner).await.unwrap();
+    drop(w);
+
+    // Forge a compaction record: same authoritative key, tampered content hash.
+    let mut tampered = originals.clone();
+    tampered[0].content_hash = "tampered".into();
+    let rec = CompactionRecord {
+        version: super::compaction::COMPACTION_RECORD_VERSION,
+        pipeline: PIPE.into(),
+        source_id: "src".into(),
+        sink_id: "sink".into(),
+        table: "orders".into(),
+        replacement: originals[0].clone(),
+        originals: tampered,
+        prev: None,
+    };
+    let wr = write_compaction_record(&*inner, PFX, &rec).await.unwrap();
+    let hkey = head_key_for(PFX, PIPE);
+    let (_raw, etag) = inner.get_with_etag(&hkey).await.unwrap().unwrap();
+    let mut h2 = head;
+    h2.compaction_key = Some(wr.key);
+    h2.compaction_hash = Some(wr.hash);
+    inner
+        .cas_put(
+            &hkey,
+            Bytes::from(serde_json::to_vec(&h2).unwrap()),
+            etag.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let err = expect_err(acquire(clean).await);
+    assert!(
+        err.is_fatal(),
+        "tampered original metadata is fatal: {err:?}"
+    );
+}
+
+// ── Combined ──────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn combined_data_and_entry_gc_then_recovery_preserves_events() {
+    let inner = inmem();
+    let (_fs, w) = setup_gc_ready(&inner, vec![]).await;
+    w.gc_authorize_data().await.unwrap();
+    let d = w.gc_delete_originals().await.unwrap();
     assert_eq!(d.deleted, 3);
-    w.gc_mark_entries(&plan).await.unwrap();
-    let e = w.gc_expire_entries(&plan).await.unwrap();
+    w.gc_mark_entries(far_future(), no_window()).await.unwrap();
+    let e = w.gc_expire_entries().await.unwrap();
     assert_eq!(e.deleted, 2);
 
     assert_eq!(data_count(&inner).await, 0, "originals gone");
@@ -2488,7 +2672,6 @@ async fn combined_data_and_entry_gc_then_recovery_preserves_events() {
     drop(w);
     let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
     let w2 = acquire(Arc::clone(&clean)).await.unwrap();
-    // The pipeline still works after both GC domains ran.
     w2.publish(&wm(5), vec![tobj_jsonl("orders", &[5])], 1)
         .await
         .unwrap();

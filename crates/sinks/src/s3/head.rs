@@ -26,13 +26,14 @@ use deltaforge_core::{CheckpointComparator, CheckpointOrder};
 use super::batch_upload::{DurableError, TableObject, upload_batch};
 use super::compaction::{
     CompactionError, CompactionIndex, CompactionRecord, check_compatible,
-    compacted_object_key, load_record, record_key as compaction_record_key,
-    verify_originals_present, write_record,
+    compacted_object_key, load_record, verify_originals_present, write_record,
 };
 use super::equivalence::verify_jsonl;
 use super::gc::{
-    Alarm, EntryRef, GcConfig, GcMark, GcPlan, GcRun, HeadBinding,
-    InventoryRef, OriginalRef, SkipReason, horizon_seq, mark_key,
+    Alarm, DATA_GC_AUTH_VERSION, DataGcAuth, EQUIVALENCE_ALGO,
+    EQUIVALENCE_VERSION, EntryRef, GC_MARK_VERSION, GcConfig, GcMark, GcPlan,
+    GcRun, HeadBinding, InventoryRef, OriginalRef, SkipReason, data_auth_key,
+    data_auth_prefix, horizon_seq, mark_key, marks_prefix,
 };
 use super::keys::content_hash;
 use super::manifest::{
@@ -329,7 +330,7 @@ struct RetainedWalk {
     /// seq -> summary for every retained entry.
     entries: std::collections::BTreeMap<u64, EntrySummary>,
     /// Every object key referenced by a retained entry.
-    inventory: std::collections::HashSet<String>,
+    inventory: std::collections::BTreeMap<String, ManifestObject>,
     /// The walk terminated at a valid genesis (intact chain).
     reached_genesis: bool,
     /// The walk stopped at a truncation boundary (authorized GC below the horizon):
@@ -352,8 +353,8 @@ async fn walk_retained_entries<S: ConditionalStore + ?Sized>(
     head: &Head,
     comparator: &dyn CheckpointComparator,
 ) -> Result<RetainedWalk, HeadError> {
-    let mut inventory: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut inventory: std::collections::BTreeMap<String, ManifestObject> =
+        std::collections::BTreeMap::new();
     let mut entries: std::collections::BTreeMap<u64, EntrySummary> =
         std::collections::BTreeMap::new();
     let mut reached_genesis = false;
@@ -453,13 +454,25 @@ async fn walk_retained_entries<S: ConditionalStore + ?Sized>(
                     "HEAD watermark does not match its selected entry".into(),
                 ));
             }
-            // 6. Collect every referenced data object into the ack inventory.
-            // Object EXISTENCE is verified later (in `verify_state`, after the
-            // compaction index is known), because a compacted original may have been
-            // GC-deleted while its live entry still references it - such an original
-            // is verified via its replacement, not directly.
+            // 6. Collect every referenced data object into the ack inventory as its
+            // COMPLETE authoritative ManifestObject. The same key appearing twice
+            // with different metadata is corruption. Object EXISTENCE is verified
+            // later (in `verify_state`, after the compaction index is known), because
+            // a compacted original may have been GC-deleted while its live entry
+            // still references it - such an original is verified via its replacement.
             for mobj in &entry.objects {
-                inventory.insert(mobj.key.clone());
+                match inventory.get(&mobj.key) {
+                    Some(existing) if existing != mobj => {
+                        return Err(HeadError::Integrity(format!(
+                            "object {} appears with conflicting metadata across \
+                             entries",
+                            mobj.key
+                        )));
+                    }
+                    _ => {
+                        inventory.insert(mobj.key.clone(), mobj.clone());
+                    }
+                }
             }
             entries.insert(
                 entry.seq,
@@ -526,7 +539,7 @@ async fn walk_retained_entries<S: ConditionalStore + ?Sized>(
 /// in both paths.
 struct VerifiedState {
     entries: std::collections::BTreeMap<u64, EntrySummary>,
-    ack_inventory: std::collections::HashSet<String>,
+    ack_inventory: std::collections::BTreeMap<String, ManifestObject>,
     compactions: VerifiedCompactions,
     truncated_covered_end: Option<u64>,
 }
@@ -569,7 +582,18 @@ async fn verify_state<S: ConditionalStore + ?Sized>(
         )
         .await?;
         for o in &covered {
-            inventory.insert(o.key.clone());
+            match inventory.get(&o.key) {
+                Some(existing) if existing != o => {
+                    return Err(HeadError::Integrity(format!(
+                        "covered-range object {} conflicts with a retained-tail \
+                         object of the same key",
+                        o.key
+                    )));
+                }
+                _ => {
+                    inventory.insert(o.key.clone(), o.clone());
+                }
+            }
         }
     } else if reached_genesis {
         // Intact chain: entries are ground truth, so the rollup is advisory
@@ -698,7 +722,7 @@ async fn build_verified_compactions<S: ConditionalStore + ?Sized>(
     source_id: &str,
     sink_id: &str,
     head: &Head,
-    ack_inventory: &std::collections::HashSet<String>,
+    ack_inventory: &std::collections::BTreeMap<String, ManifestObject>,
 ) -> Result<VerifiedCompactions, HeadError> {
     let mut out = VerifiedCompactions::default();
     let (Some(mut cur_key), Some(mut expected_hash)) =
@@ -730,15 +754,29 @@ async fn build_verified_compactions<S: ConditionalStore + ?Sized>(
         // The replacement must be durably present with its recorded hash + size.
         verify_data_object(store, &rec.replacement).await?;
         for o in &rec.originals {
-            // Every original must be an authoritative ack-chain object. This also
+            // Every original must be an authoritative ack-chain object with EXACTLY
+            // the acknowledged metadata (key + content_hash + byte_len + table +
+            // full encoding domain). A record naming an authoritative key but
+            // substituting any other field is rejected, so GC can never delete a
+            // real acknowledged object under a mismatched replacement. This also
             // rejects transitive compaction (a replacement is never in the ack
             // inventory).
-            if !ack_inventory.contains(&o.key) {
-                return Err(HeadError::Integrity(format!(
-                    "compaction original {} is not referenced by the \
-                     acknowledgement chain (missing or transitive)",
-                    o.key
-                )));
+            match ack_inventory.get(&o.key) {
+                Some(authoritative) if authoritative == o => {}
+                Some(_) => {
+                    return Err(HeadError::Integrity(format!(
+                        "compaction original {} metadata does not match the \
+                         acknowledged object",
+                        o.key
+                    )));
+                }
+                None => {
+                    return Err(HeadError::Integrity(format!(
+                        "compaction original {} is not referenced by the \
+                         acknowledgement chain (missing or transitive)",
+                        o.key
+                    )));
+                }
             }
             // No original may appear in two records (conflicting active
             // compaction).
@@ -2556,14 +2594,19 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
     /// a higher epoch fences us; a lower epoch is an integrity failure; a HEAD that
     /// no longer matches the plan binding is stale (stop); otherwise proceed against
     /// the freshly-read HEAD.
-    async fn gc_recheck(
-        &self,
-        our_epoch: u64,
-        plan: &GcPlan,
-    ) -> Result<GcRecheck, HeadError> {
-        let (head, etag) = self.read_head_etag().await?;
+    /// Read live HEAD for a GC step and apply fencing: a higher epoch fences us; a
+    /// lower epoch is an integrity failure; otherwise the live HEAD is returned. GC
+    /// eligibility is MONOTONIC (compaction chains only grow, the horizon only
+    /// advances, replacements are immutable), so an authorization proven earlier
+    /// remains valid across an epoch bump - the durable authorization plus this live
+    /// re-verification, not fencing alone, is what closes the recheck/delete race.
+    async fn gc_live_head(&self, our_epoch: u64) -> Result<Head, HeadError> {
+        let (head, _etag) = self.read_head_etag().await?;
         if head.epoch > our_epoch {
-            return Ok(GcRecheck::Fenced(head.epoch));
+            return Err(HeadError::Fenced {
+                our: our_epoch,
+                observed: head.epoch,
+            });
         }
         if head.epoch < our_epoch {
             return Err(HeadError::Integrity(format!(
@@ -2571,17 +2614,13 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                 head.epoch, our_epoch
             )));
         }
-        if !plan.still_valid(&head, &etag) {
-            return Ok(GcRecheck::Stale);
-        }
-        Ok(GcRecheck::Ok(Box::new(head)))
+        Ok(head)
     }
 
-    /// Re-verify (against live objects, not the cached plan) that a manifest entry at
-    /// `seq` is still covered by BOTH retained generations forming a valid nested
-    /// pair with intact, bound inventories, and lies at/below the horizon. Any
-    /// integrity problem is an error (the caller stops); `Ok(false)` means simply not
-    /// eligible now.
+    /// Re-verify (against live objects) that a manifest entry at `seq` is still covered
+    /// by BOTH retained generations forming a valid nested pair with intact, bound
+    /// inventories, and lies at/below the horizon. Any integrity problem is an error
+    /// (the caller stops); `Ok(false)` means simply not eligible now.
     async fn revalidate_entry_coverage(
         &self,
         head: &Head,
@@ -2604,8 +2643,6 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
             .await
             .map_err(map_rollup)?;
         verify_rollup_pair(&cur, &prev, head)?;
-        // Both inventories must load (version + hash verified) and match their
-        // rollup's declared range - so a deleted entry stays independently covered.
         let cinv = rollup_load_inventory(
             self.store.as_ref(),
             &cur.inventory_key,
@@ -2633,68 +2670,210 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         Ok(seq <= prev.end_seq)
     }
 
-    /// Re-verify (against live objects) that a compacted original is still safe to
-    /// delete: its compaction record loads + is domain-consistent, the target is one
-    /// of the record's originals, and the REPLACEMENT (the surviving copy) is durable
-    /// and content-verified. Any integrity problem is an error (the caller stops) so
-    /// the last durable copy is never removed; `Ok(false)` means not eligible now.
-    ///
-    /// Equivalence (replacement == all originals) is a PLAN-TIME proof; `still_valid`
-    /// has confirmed HEAD's compaction ref is unchanged and records + replacements are
-    /// immutable, so that proof still holds. It is deliberately NOT re-run here: once
-    /// this actor deletes the first original, the originals are no longer all present,
-    /// so re-reading them would spuriously fail. The surviving-copy guarantee is the
-    /// replacement's continued durability + content hash, which IS re-checked.
-    async fn revalidate_original(
+    /// Recompute, from live authoritative state, the set of entry-expiry authorizations
+    /// (marks) that are currently justified: both retained generations verify as a
+    /// nested pair, the safety window has elapsed with a sane clock, and each entry is
+    /// at/below the horizon. Callers never supply the eligible set - this is derived
+    /// here, so a forged plan cannot widen it.
+    async fn authoritative_marks(
         &self,
         head: &Head,
-        target: &OriginalRef,
-    ) -> Result<bool, HeadError> {
-        // still_valid has confirmed HEAD's compaction ref is unchanged; records are
-        // immutable + prev-linked, so a record loadable by its hash is reachable.
-        if head.compaction_key.is_none() {
-            return Ok(false);
-        }
-        let rec_key = compaction_record_key(
-            &self.prefix,
-            &self.pipeline,
-            &target.compaction_record_hash,
-        )
-        .to_string();
-        let rec = load_record(
+        now_ms: u64,
+        cfg: GcConfig,
+    ) -> Result<Vec<GcMark>, HeadError> {
+        let (Some(rk), Some(rh)) =
+            (head.rollup_key.clone(), head.rollup_hash.clone())
+        else {
+            return Ok(vec![]);
+        };
+        let (Some(pk), Some(ph)) =
+            (head.prev_rollup_key.clone(), head.prev_rollup_hash.clone())
+        else {
+            return Ok(vec![]);
+        };
+        let state = verify_state(
             self.store.as_ref(),
-            &rec_key,
-            &target.compaction_record_hash,
+            &self.pipeline,
+            &self.source_id,
+            &self.sink_id,
+            head,
+            self.comparator.as_ref(),
         )
-        .await
-        .map_err(map_compaction)?;
-        if rec.pipeline != self.pipeline
-            || rec.source_id != self.source_id
-            || rec.sink_id != self.sink_id
-        {
-            return Err(HeadError::Integrity(
-                "compaction record identity mismatch during GC".into(),
-            ));
+        .await?;
+        let cur = rollup_load(self.store.as_ref(), &rk, &rh)
+            .await
+            .map_err(map_rollup)?;
+        let prev = rollup_load(self.store.as_ref(), &pk, &ph)
+            .await
+            .map_err(map_rollup)?;
+        verify_rollup_pair(&cur, &prev, head)?;
+        // Both generations must verify against the retained entries.
+        verify_cumulative_rollup(
+            self.store.as_ref(),
+            &self.pipeline,
+            &self.source_id,
+            &self.sink_id,
+            head,
+            &rk,
+            &rh,
+            0,
+            &state.entries,
+        )
+        .await?;
+        verify_cumulative_rollup(
+            self.store.as_ref(),
+            &self.pipeline,
+            &self.source_id,
+            &self.sink_id,
+            head,
+            &pk,
+            &ph,
+            0,
+            &state.entries,
+        )
+        .await?;
+        let mut alarms = Vec::new();
+        if !safety_window_ok(head, now_ms, cfg, &mut alarms) {
+            return Ok(vec![]);
         }
-        check_compatible(&rec.table, &rec.domain(), &rec.originals)
-            .map_err(map_compaction)?;
-        // The replacement (the surviving copy) must be durable + content-verified
-        // BEFORE the original goes.
-        verify_data_object(self.store.as_ref(), &rec.replacement).await?;
-        let present = rec.originals.iter().any(|o| {
-            o.key == target.key && o.content_hash == target.content_hash
-        });
-        Ok(present)
+        let horizon = horizon_seq(Some(prev.end_seq));
+        let mut marks = Vec::new();
+        for (seq, summ) in state.entries.iter() {
+            if *seq <= horizon {
+                let entry_key = entry_key(
+                    &self.prefix,
+                    &self.pipeline,
+                    *seq,
+                    &summ.entry_hash,
+                )
+                .to_string();
+                marks.push(GcMark {
+                    version: GC_MARK_VERSION,
+                    pipeline: self.pipeline.clone(),
+                    source_id: self.source_id.clone(),
+                    sink_id: self.sink_id.clone(),
+                    seq: *seq,
+                    entry_key,
+                    entry_hash: summ.entry_hash.clone(),
+                    rollup_key: rk.clone(),
+                    rollup_hash: rh.clone(),
+                    prev_rollup_key: pk.clone(),
+                    prev_rollup_hash: ph.clone(),
+                    inventory_record_hash: cur.inventory_record_hash.clone(),
+                    prev_inventory_record_hash: prev
+                        .inventory_record_hash
+                        .clone(),
+                    horizon,
+                });
+            }
+        }
+        Ok(marks)
     }
 
-    /// GC actor A (manifest-side, step 1 of 2): MARK eligible manifest entries as
-    /// lifecycle-eligible (preferred, reversible). Owner-fenced; re-reads HEAD and
-    /// revalidates coverage before each mark; stops on any stale/fenced/integrity
-    /// condition. Marks nothing but manifest entries; never touches rollups or
-    /// inventories. Marking is create-only + idempotent.
+    /// Recompute, from live authoritative state, the data-GC authorizations currently
+    /// justified: each HEAD-reachable, verified compaction record whose replacement is
+    /// equivalence-proven to its exact ordered originals. Equivalence is proven HERE
+    /// (all originals still present) and recorded durably, because it cannot be re-run
+    /// once deletion begins.
+    async fn authoritative_data_auths(
+        &self,
+        head: &Head,
+    ) -> Result<Vec<DataGcAuth>, HeadError> {
+        let Some(root) = head.compaction_hash.clone() else {
+            return Ok(vec![]);
+        };
+        let state = verify_state(
+            self.store.as_ref(),
+            &self.pipeline,
+            &self.source_id,
+            &self.sink_id,
+            head,
+            self.comparator.as_ref(),
+        )
+        .await?;
+        let mut auths = Vec::new();
+        for rec in &state.compactions.records {
+            verify_jsonl(self.store.as_ref(), &rec.originals, &rec.replacement)
+                .await
+                .map_err(|e| HeadError::Integrity(e.to_string()))?;
+            auths.push(DataGcAuth {
+                version: DATA_GC_AUTH_VERSION,
+                pipeline: self.pipeline.clone(),
+                source_id: self.source_id.clone(),
+                sink_id: self.sink_id.clone(),
+                compaction_record_hash: rec.record_hash.clone(),
+                replacement: rec.replacement.clone(),
+                originals: rec.originals.clone(),
+                equivalence_algo: EQUIVALENCE_ALGO.to_string(),
+                equivalence_version: EQUIVALENCE_VERSION,
+                equivalence_result: true,
+                compaction_root: root.clone(),
+            });
+        }
+        Ok(auths)
+    }
+
+    /// Confirm the compaction record named by a data authorization is reachable from
+    /// the LIVE HEAD compaction chain and that the live record's replacement + exact
+    /// ordered originals equal the authorization's. Returns `Ok(false)` when the record
+    /// is not reachable (stale authorization); an integrity error (caller stops) when
+    /// it is reachable but its contents diverge (a tampered authorization).
+    async fn reachable_compaction_record(
+        &self,
+        head: &Head,
+        auth: &DataGcAuth,
+    ) -> Result<bool, HeadError> {
+        let (Some(mut ck), Some(mut chash)) =
+            (head.compaction_key.clone(), head.compaction_hash.clone())
+        else {
+            return Ok(false);
+        };
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..MAX_CHAIN_WALK {
+            if !seen.insert(ck.clone()) {
+                return Err(HeadError::Integrity(
+                    "compaction history cycle during GC".into(),
+                ));
+            }
+            let rec = load_record(self.store.as_ref(), &ck, &chash)
+                .await
+                .map_err(map_compaction)?;
+            if chash == auth.compaction_record_hash {
+                if rec.replacement != auth.replacement
+                    || rec.originals != auth.originals
+                {
+                    return Err(HeadError::Integrity(
+                        "data-GC authorization does not match the live \
+                         compaction record"
+                            .into(),
+                    ));
+                }
+                return Ok(true);
+            }
+            match &rec.prev {
+                None => return Ok(false),
+                Some(PrevRef { key, hash }) => {
+                    ck = key.clone();
+                    chash = hash.clone();
+                }
+            }
+        }
+        Err(HeadError::Integrity(
+            "compaction history exceeded the maximum walk length during GC"
+                .into(),
+        ))
+    }
+
+    /// GC actor A (manifest-side, step 1 of 2): AUTHORIZE entry expiry by writing
+    /// immutable, self-authenticating [`GcMark`] records for every entry the LIVE
+    /// authoritative state proves eligible. Owner-fenced; the eligible set is derived
+    /// here (a caller cannot supply it); marks are create-only and, on `AlreadyExists`,
+    /// re-read byte-for-byte (a non-identical existing mark halts). Marks nothing but
+    /// manifest-entry authorizations; touches no rollup, inventory, or data object.
     pub async fn gc_mark_entries(
         &self,
-        plan: &GcPlan,
+        now_ms: u64,
+        cfg: GcConfig,
     ) -> Result<GcRun, HeadError> {
         let mut st = self.state.lock().await;
         if let Some(observed) = st.fenced {
@@ -2704,59 +2883,52 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
             });
         }
         let our_epoch = st.verified.epoch;
+        let head = match self.gc_live_head(our_epoch).await {
+            Ok(h) => h,
+            Err(e) => {
+                if let HeadError::Fenced { observed, .. } = &e {
+                    st.fenced = Some(*observed);
+                }
+                return Err(e);
+            }
+        };
+        let marks = self.authoritative_marks(&head, now_ms, cfg).await?;
         let mut run = GcRun::default();
-        for e in &plan.manifest_entries_eligible {
-            let head = match self.gc_recheck(our_epoch, plan).await? {
-                GcRecheck::Fenced(observed) => {
-                    st.fenced = Some(observed);
-                    return Err(HeadError::Fenced {
-                        our: our_epoch,
-                        observed,
-                    });
-                }
-                GcRecheck::Stale => {
-                    run.stopped =
-                        Some("plan no longer valid (HEAD changed)".into());
-                    break;
-                }
-                GcRecheck::Ok(head) => *head,
-            };
-            match self.revalidate_entry_coverage(&head, e.seq).await {
-                Ok(true) => {
-                    let mk = GcMark {
-                        kind: "entry".into(),
-                        target_key: e.key.clone(),
-                        target_hash: e.entry_hash.clone(),
-                        marked_by_epoch: our_epoch,
-                    };
-                    let key =
-                        mark_key(&self.prefix, &self.pipeline, &e.entry_hash);
-                    let body = bytes::Bytes::from(
-                        serde_json::to_vec(&mk).expect("mark serializes"),
-                    );
+        for mk in marks {
+            let key = mark_key(&self.prefix, &self.pipeline, &mk.entry_hash);
+            let body = bytes::Bytes::from(mk.canonical_bytes());
+            match self
+                .store
+                .put_if_absent(&key, body.clone())
+                .await
+                .map_err(|e| HeadError::Store(e.to_string()))?
+            {
+                PutOutcome::Written { .. } => run.marked += 1,
+                PutOutcome::AlreadyExists => {
                     match self
                         .store
-                        .put_if_absent(&key, body)
+                        .get_with_etag(&key)
                         .await
                         .map_err(|e| HeadError::Store(e.to_string()))?
                     {
-                        PutOutcome::Written { .. }
-                        | PutOutcome::AlreadyExists => run.marked += 1,
-                        PutOutcome::Conflict => {
+                        Some((existing, _))
+                            if existing.as_ref() == body.as_ref() =>
+                        {
+                            run.marked += 1
+                        }
+                        _ => {
                             run.stopped = Some(
-                                "unexpected conflict writing GC mark".into(),
+                                "existing GC mark is not byte-identical \
+                                 (tampered)"
+                                    .into(),
                             );
                             break;
                         }
                     }
                 }
-                Ok(false) => run.skipped.push(SkipReason {
-                    key: e.key.clone(),
-                    reason: "entry no longer covered/eligible".into(),
-                }),
-                Err(err) => {
+                PutOutcome::Conflict => {
                     run.stopped =
-                        Some(format!("integrity during revalidation: {err}"));
+                        Some("unexpected conflict writing GC mark".into());
                     break;
                 }
             }
@@ -2765,15 +2937,13 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
     }
 
     /// GC actor A (manifest-side, step 2 of 2): EXPIRE (delete) manifest entries that
-    /// were marked eligible and still pass revalidation. Models the lifecycle
-    /// expiration of a marked object. Owner-fenced; re-reads HEAD + revalidates before
-    /// each delete; only expires entries that carry a mark; delete is idempotent
-    /// (absence is success under the proving plan). Deletes entries only - never a
-    /// rollup, inventory, or data object.
-    pub async fn gc_expire_entries(
-        &self,
-        plan: &GcPlan,
-    ) -> Result<GcRun, HeadError> {
+    /// carry a valid, self-authenticating mark and still pass live coverage
+    /// revalidation. Consumes the DURABLE marks (not an in-memory plan), so it resumes
+    /// after a crash. Owner-fenced; per entry it re-reads HEAD (fencing first), then
+    /// re-reads, byte-verifies, and parses the mark, re-derives the canonical entry key
+    /// internally (never a caller path), and re-verifies coverage against the live
+    /// rollups. Deletes entries only; delete is idempotent.
+    pub async fn gc_expire_entries(&self) -> Result<GcRun, HeadError> {
         let mut st = self.state.lock().await;
         if let Some(observed) = st.fenced {
             return Err(HeadError::Fenced {
@@ -2782,43 +2952,64 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
             });
         }
         let our_epoch = st.verified.epoch;
+        let keys = self
+            .store
+            .list(&marks_prefix(&self.prefix, &self.pipeline))
+            .await
+            .map_err(|e| HeadError::Store(e.to_string()))?;
         let mut run = GcRun::default();
-        for e in &plan.manifest_entries_eligible {
-            let head = match self.gc_recheck(our_epoch, plan).await? {
-                GcRecheck::Fenced(observed) => {
-                    st.fenced = Some(observed);
-                    return Err(HeadError::Fenced {
-                        our: our_epoch,
-                        observed,
-                    });
+        for mkey in keys {
+            let head = match self.gc_live_head(our_epoch).await {
+                Ok(h) => h,
+                Err(e) => {
+                    if let HeadError::Fenced { observed, .. } = &e {
+                        st.fenced = Some(*observed);
+                    }
+                    return Err(e);
                 }
-                GcRecheck::Stale => {
-                    run.stopped =
-                        Some("plan no longer valid (HEAD changed)".into());
-                    break;
-                }
-                GcRecheck::Ok(head) => *head,
             };
-            // Only expire what was marked eligible first.
-            let mkey = mark_key(&self.prefix, &self.pipeline, &e.entry_hash);
-            let marked = self
+            let raw = match self
                 .store
                 .get_with_etag(&mkey)
                 .await
                 .map_err(|e| HeadError::Store(e.to_string()))?
-                .is_some();
-            if !marked {
-                run.skipped.push(SkipReason {
-                    key: e.key.clone(),
-                    reason: "entry not marked eligible".into(),
-                });
-                continue;
+            {
+                Some((raw, _)) => raw,
+                None => continue, // vanished concurrently; nothing to expire
+            };
+            let mk: GcMark = match serde_json::from_slice(&raw) {
+                Ok(m) => m,
+                Err(_) => {
+                    run.stopped = Some(format!("malformed GC mark at {mkey}"));
+                    break;
+                }
+            };
+            // Immutable + self-authenticating: bytes must be canonical, version and
+            // identity must match, and the entry key must be the canonical one.
+            if mk.canonical_bytes() != raw.as_ref()
+                || mk.version != GC_MARK_VERSION
+                || mk.pipeline != self.pipeline
+                || mk.source_id != self.source_id
+                || mk.sink_id != self.sink_id
+            {
+                run.stopped =
+                    Some(format!("GC mark at {mkey} failed verification"));
+                break;
             }
-            match self.revalidate_entry_coverage(&head, e.seq).await {
+            let canonical =
+                entry_key(&self.prefix, &self.pipeline, mk.seq, &mk.entry_hash)
+                    .to_string();
+            if canonical != mk.entry_key {
+                run.stopped = Some(format!(
+                    "GC mark at {mkey} entry_key is not canonical"
+                ));
+                break;
+            }
+            match self.revalidate_entry_coverage(&head, mk.seq).await {
                 Ok(true) => {
                     match self
                         .store
-                        .delete(&object_store::path::Path::from(e.key.clone()))
+                        .delete(&object_store::path::Path::from(canonical))
                         .await
                     {
                         Ok(()) => run.deleted += 1,
@@ -2830,7 +3021,7 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                     }
                 }
                 Ok(false) => run.skipped.push(SkipReason {
-                    key: e.key.clone(),
+                    key: mk.entry_key.clone(),
                     reason: "entry no longer covered/eligible".into(),
                 }),
                 Err(err) => {
@@ -2843,16 +3034,12 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         Ok(run)
     }
 
-    /// GC actor B (data-side): DELETE compacted originals superseded by a verified,
-    /// equivalence-proven replacement. A SEPARATE actor/policy from manifest-entry
-    /// GC. Owner-fenced; re-reads HEAD + re-verifies the record/replacement/equivalence
-    /// before each delete, so the last durable copy is never removed; stops on any
-    /// stale/fenced/integrity/ambiguous condition. Deletes originals only - never a
-    /// replacement, an uncompacted object, a rollup, or an inventory.
-    pub async fn gc_delete_originals(
-        &self,
-        plan: &GcPlan,
-    ) -> Result<GcRun, HeadError> {
+    /// GC actor B (data-side, step 1 of 2): AUTHORIZE original deletion by writing an
+    /// immutable, content-addressed [`DataGcAuth`] for every HEAD-reachable compaction
+    /// record whose replacement is equivalence-proven to its exact originals. Persisted
+    /// BEFORE any deletion so a later owner can resume without re-running equivalence.
+    /// Owner-fenced; create-only + byte-identical on `AlreadyExists`.
+    pub async fn gc_authorize_data(&self) -> Result<GcRun, HeadError> {
         let mut st = self.state.lock().await;
         if let Some(observed) = st.fenced {
             return Err(HeadError::Fenced {
@@ -2861,60 +3048,169 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
             });
         }
         let our_epoch = st.verified.epoch;
+        let head = match self.gc_live_head(our_epoch).await {
+            Ok(h) => h,
+            Err(e) => {
+                if let HeadError::Fenced { observed, .. } = &e {
+                    st.fenced = Some(*observed);
+                }
+                return Err(e);
+            }
+        };
+        let auths = self.authoritative_data_auths(&head).await?;
         let mut run = GcRun::default();
-        for target in &plan.data_originals_eligible {
-            let head = match self.gc_recheck(our_epoch, plan).await? {
-                GcRecheck::Fenced(observed) => {
-                    st.fenced = Some(observed);
-                    return Err(HeadError::Fenced {
-                        our: our_epoch,
-                        observed,
-                    });
-                }
-                GcRecheck::Stale => {
-                    run.stopped =
-                        Some("plan no longer valid (HEAD changed)".into());
-                    break;
-                }
-                GcRecheck::Ok(head) => *head,
-            };
-            match self.revalidate_original(&head, target).await {
-                Ok(true) => {
+        for a in auths {
+            let key =
+                data_auth_key(&self.prefix, &self.pipeline, &a.auth_hash());
+            let body = bytes::Bytes::from(a.canonical_bytes());
+            match self
+                .store
+                .put_if_absent(&key, body.clone())
+                .await
+                .map_err(|e| HeadError::Store(e.to_string()))?
+            {
+                PutOutcome::Written { .. } => run.marked += 1,
+                PutOutcome::AlreadyExists => {
                     match self
                         .store
-                        .delete(&object_store::path::Path::from(
-                            target.key.clone(),
-                        ))
+                        .get_with_etag(&key)
                         .await
+                        .map_err(|e| HeadError::Store(e.to_string()))?
                     {
-                        Ok(()) => run.deleted += 1,
-                        Err(err) => {
-                            run.stopped =
-                                Some(format!("ambiguous delete: {err}"));
+                        Some((existing, _))
+                            if existing.as_ref() == body.as_ref() =>
+                        {
+                            run.marked += 1
+                        }
+                        _ => {
+                            run.stopped = Some(
+                                "existing data-GC authorization is not \
+                                 byte-identical"
+                                    .into(),
+                            );
                             break;
                         }
                     }
                 }
-                Ok(false) => run.skipped.push(SkipReason {
-                    key: target.key.clone(),
-                    reason: "original no longer eligible".into(),
-                }),
-                Err(err) => {
-                    run.stopped =
-                        Some(format!("integrity during revalidation: {err}"));
+                PutOutcome::Conflict => {
+                    run.stopped = Some(
+                        "unexpected conflict writing data-GC authorization"
+                            .into(),
+                    );
                     break;
                 }
             }
         }
         Ok(run)
     }
-}
 
-/// Classification of a pre-destructive HEAD recheck (9B.2).
-enum GcRecheck {
-    Ok(Box<Head>),
-    Stale,
-    Fenced(u64),
+    /// GC actor B (data-side, step 2 of 2): DELETE compacted originals authorized by a
+    /// durable [`DataGcAuth`]. Consumes the durable authorizations (not an in-memory
+    /// plan), so it resumes after a crash / re-acquisition. Owner-fenced; per
+    /// authorization it re-reads HEAD (fencing first), re-reads + byte-verifies + parses
+    /// the authorization, proves the compaction record is HEAD-reachable with matching
+    /// contents, re-verifies the surviving REPLACEMENT is durable + content-verified,
+    /// then deletes the originals. Deletes originals only; delete is idempotent; stops
+    /// on any stale/fenced/integrity/ambiguous condition so the last copy is never lost.
+    pub async fn gc_delete_originals(&self) -> Result<GcRun, HeadError> {
+        let mut st = self.state.lock().await;
+        if let Some(observed) = st.fenced {
+            return Err(HeadError::Fenced {
+                our: st.verified.epoch,
+                observed,
+            });
+        }
+        let our_epoch = st.verified.epoch;
+        let keys = self
+            .store
+            .list(&data_auth_prefix(&self.prefix, &self.pipeline))
+            .await
+            .map_err(|e| HeadError::Store(e.to_string()))?;
+        let mut run = GcRun::default();
+        for akey in keys {
+            let head = match self.gc_live_head(our_epoch).await {
+                Ok(h) => h,
+                Err(e) => {
+                    if let HeadError::Fenced { observed, .. } = &e {
+                        st.fenced = Some(*observed);
+                    }
+                    return Err(e);
+                }
+            };
+            let raw = match self
+                .store
+                .get_with_etag(&akey)
+                .await
+                .map_err(|e| HeadError::Store(e.to_string()))?
+            {
+                Some((raw, _)) => raw,
+                None => continue,
+            };
+            let auth: DataGcAuth = match serde_json::from_slice(&raw) {
+                Ok(a) => a,
+                Err(_) => {
+                    run.stopped =
+                        Some(format!("malformed data-GC auth at {akey}"));
+                    break;
+                }
+            };
+            if auth.canonical_bytes() != raw.as_ref()
+                || auth.version != DATA_GC_AUTH_VERSION
+                || auth.pipeline != self.pipeline
+                || auth.source_id != self.source_id
+                || auth.sink_id != self.sink_id
+                || !auth.equivalence_result
+                || auth.equivalence_algo != EQUIVALENCE_ALGO
+                || auth.equivalence_version != EQUIVALENCE_VERSION
+            {
+                run.stopped =
+                    Some(format!("data-GC auth at {akey} failed verification"));
+                break;
+            }
+            match self.reachable_compaction_record(&head, &auth).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    run.skipped.push(SkipReason {
+                        key: akey.to_string(),
+                        reason: "compaction record not HEAD-reachable".into(),
+                    });
+                    continue;
+                }
+                Err(err) => {
+                    run.stopped = Some(format!("integrity: {err}"));
+                    break;
+                }
+            }
+            // The surviving replacement must be durable + content-verified before any
+            // original is removed.
+            if let Err(err) =
+                verify_data_object(self.store.as_ref(), &auth.replacement).await
+            {
+                run.stopped =
+                    Some(format!("replacement not durable, refusing: {err}"));
+                break;
+            }
+            let mut ambiguous = None;
+            for o in &auth.originals {
+                match self
+                    .store
+                    .delete(&object_store::path::Path::from(o.key.clone()))
+                    .await
+                {
+                    Ok(()) => run.deleted += 1,
+                    Err(err) => {
+                        ambiguous = Some(format!("ambiguous delete: {err}"));
+                        break;
+                    }
+                }
+            }
+            if let Some(reason) = ambiguous {
+                run.stopped = Some(reason);
+                break;
+            }
+        }
+        Ok(run)
+    }
 }
 
 /// The safety window measures how long the CURRENT rollup generation has been
