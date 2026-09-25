@@ -2885,7 +2885,6 @@ async fn reconcile_deletes_orphan_past_grace_keeps_referenced() {
         .unwrap();
     assert!(report.stopped.is_none(), "{:?}", report.stopped);
     assert_eq!(report.orphans_deleted, 1);
-    assert!(report.missing_referenced.is_empty());
     assert_eq!(report.mpu_aborts, 0, "single-PUT path has no MPUs");
     // Referenced state is untouched.
     assert_eq!(entry_count(&inner).await, entries_before);
@@ -2956,10 +2955,14 @@ async fn reconcile_missing_referenced_object_is_a_hard_alarm() {
         .unwrap();
     inner.delete(&referenced_obj).await.unwrap();
 
-    // Reconciliation fails closed (verify_state) and deletes nothing.
+    // Reconciliation fails closed with a MACHINE-READABLE hard alarm, deletes nothing.
     let err =
         expect_err(w.reconcile(recon(now_ms_test() + 1_000_000, 0)).await);
-    assert!(err.is_fatal(), "missing referenced object halts: {err:?}");
+    assert!(
+        matches!(err, HeadError::MissingReferenced { .. }),
+        "structured missing-referenced alarm: {err:?}"
+    );
+    assert!(err.is_fatal());
     assert!(
         inner
             .get_with_etag(&Path::from(format!(
@@ -2969,6 +2972,109 @@ async fn reconcile_missing_referenced_object_is_a_hard_alarm() {
             .unwrap()
             .is_some(),
         "no cleanup on a missing-referenced alarm"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_missing_historical_inventory_is_a_hard_alarm() {
+    // Three cumulative generations, so gen1 is an OLDER-than-previous, retained
+    // generation whose inventory reconciliation must still verify.
+    let inner = inmem();
+    let (fs, w) = genesis(&inner, vec![]).await;
+    w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)
+        .await
+        .unwrap();
+    w.publish(&wm(2), vec![tobj_jsonl("orders", &[2])], 1)
+        .await
+        .unwrap();
+    w.rollup().await.unwrap(); // gen1 [1,2]
+    let gen1 = current_rollup(&inner).await;
+    w.publish(&wm(3), vec![tobj_jsonl("orders", &[3])], 1)
+        .await
+        .unwrap();
+    w.rollup().await.unwrap(); // gen2 [1,3]
+    w.publish(&wm(4), vec![tobj_jsonl("orders", &[4])], 1)
+        .await
+        .unwrap();
+    w.rollup().await.unwrap(); // gen3 [1,4]; gen1 is older-than-previous
+    drop(fs);
+    plant_orphan(&inner, &format!("{PFX}/{PIPE}/orders/wm-9999/orphan.jsonl"))
+        .await;
+    // Delete gen1's (older-than-previous, retained) inventory out of band.
+    inner
+        .delete(&Path::from(gen1.inventory_key.clone()))
+        .await
+        .unwrap();
+
+    let err =
+        expect_err(w.reconcile(recon(now_ms_test() + 1_000_000, 0)).await);
+    assert!(
+        matches!(err, HeadError::MissingReferenced { .. }),
+        "missing historical inventory is a hard alarm: {err:?}"
+    );
+    assert!(
+        inner
+            .get_with_etag(&Path::from(format!(
+                "{PFX}/{PIPE}/orders/wm-9999/orphan.jsonl"
+            )))
+            .await
+            .unwrap()
+            .is_some(),
+        "no cleanup when a historical inventory is missing"
+    );
+}
+
+#[tokio::test]
+async fn reconcile_corrupt_historical_inventory_stops() {
+    let inner = inmem();
+    let (fs, w) = genesis(&inner, vec![]).await;
+    w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)
+        .await
+        .unwrap();
+    w.publish(&wm(2), vec![tobj_jsonl("orders", &[2])], 1)
+        .await
+        .unwrap();
+    w.rollup().await.unwrap();
+    let gen1 = current_rollup(&inner).await;
+    w.publish(&wm(3), vec![tobj_jsonl("orders", &[3])], 1)
+        .await
+        .unwrap();
+    w.rollup().await.unwrap();
+    w.publish(&wm(4), vec![tobj_jsonl("orders", &[4])], 1)
+        .await
+        .unwrap();
+    w.rollup().await.unwrap();
+    drop(fs);
+    plant_orphan(&inner, &format!("{PFX}/{PIPE}/orders/wm-9999/orphan.jsonl"))
+        .await;
+    // Corrupt gen1's inventory (present but bytes no longer match its bound hash).
+    inner
+        .delete(&Path::from(gen1.inventory_key.clone()))
+        .await
+        .unwrap();
+    inner
+        .put_if_absent(
+            &Path::from(gen1.inventory_key.clone()),
+            Bytes::from_static(b"{\"corrupt\":true}"),
+        )
+        .await
+        .unwrap();
+
+    let err =
+        expect_err(w.reconcile(recon(now_ms_test() + 1_000_000, 0)).await);
+    assert!(
+        err.is_fatal(),
+        "corrupt historical inventory halts: {err:?}"
+    );
+    assert!(
+        inner
+            .get_with_etag(&Path::from(format!(
+                "{PFX}/{PIPE}/orders/wm-9999/orphan.jsonl"
+            )))
+            .await
+            .unwrap()
+            .is_some(),
+        "no cleanup when a historical inventory is corrupt"
     );
 }
 

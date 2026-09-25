@@ -217,6 +217,12 @@ pub enum HeadError {
     /// epoch overflow. Never silently repaired.
     #[error("integrity: {0}")]
     Integrity(String),
+    /// A referenced object (data object, entry, rollup, inventory, or replacement)
+    /// that MUST exist is absent. A machine-readable hard alarm carrying the affected
+    /// key: recovery halts and reconciliation deletes nothing. Distinct from a corrupt
+    /// object (`Integrity`), which is present but fails verification.
+    #[error("missing referenced object: {key}")]
+    MissingReferenced { key: String },
     /// A higher epoch has published: this writer is permanently fenced and must
     /// not reacquire or continue.
     #[error("fenced: our epoch {our} superseded by epoch {observed}")]
@@ -239,6 +245,7 @@ impl HeadError {
         matches!(
             self,
             HeadError::Integrity(_)
+                | HeadError::MissingReferenced { .. }
                 | HeadError::Fenced { .. }
                 | HeadError::RecoveryRequired(_)
         )
@@ -1185,10 +1192,9 @@ async fn verify_data_object<S: ConditionalStore + ?Sized>(
             }
             Ok(())
         }
-        None => Err(HeadError::Integrity(format!(
-            "referenced data object {} is missing",
-            mobj.key
-        ))),
+        None => Err(HeadError::MissingReferenced {
+            key: mobj.key.clone(),
+        }),
     }
 }
 
@@ -3107,8 +3113,11 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         }
         // Compaction lag = acknowledged originals not yet superseded.
         lag = lag.saturating_sub(state.compactions.index.len());
-        // The FULL rollup chain (all retained generations) + their inventories. A
-        // rollup that cannot load makes reachability uncertain - the caller stops.
+        // The FULL rollup chain (all retained generations) + their inventories. Each
+        // rollup record AND its bound inventory are verified: a MISSING one is a hard
+        // alarm (`MissingReferenced`), a corrupt/unsupported one is `Integrity`, and
+        // either stops reconciliation before any listing or deletion - so an uncertain
+        // historical reachability never lets an orphan be swept.
         let mut cur = head.rollup_key.clone().zip(head.rollup_hash.clone());
         let mut seen = std::collections::HashSet::new();
         while let Some((k, h)) = cur {
@@ -3118,10 +3127,51 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                 ));
             }
             referenced.insert(k.clone());
+            if self
+                .store
+                .get_with_etag(&object_store::path::Path::from(k.clone()))
+                .await
+                .map_err(|e| HeadError::Store(e.to_string()))?
+                .is_none()
+            {
+                return Err(HeadError::MissingReferenced { key: k });
+            }
             let rec = rollup_load(self.store.as_ref(), &k, &h)
                 .await
                 .map_err(map_rollup)?;
+            // The bound inventory must exist and be a valid, in-range copy.
             referenced.insert(rec.inventory_key.clone());
+            if self
+                .store
+                .get_with_etag(&object_store::path::Path::from(
+                    rec.inventory_key.clone(),
+                ))
+                .await
+                .map_err(|e| HeadError::Store(e.to_string()))?
+                .is_none()
+            {
+                return Err(HeadError::MissingReferenced {
+                    key: rec.inventory_key.clone(),
+                });
+            }
+            let inv = rollup_load_inventory(
+                self.store.as_ref(),
+                &rec.inventory_key,
+                &rec.inventory_record_hash,
+            )
+            .await
+            .map_err(map_rollup)?;
+            if inv.pipeline != self.pipeline
+                || inv.source_id != self.source_id
+                || inv.sink_id != self.sink_id
+                || inv.start_seq != 1
+                || inv.end_seq != rec.end_seq
+            {
+                return Err(HeadError::Integrity(format!(
+                    "historical inventory {} identity/range mismatch",
+                    rec.inventory_key
+                )));
+            }
             cur = rec.prev.map(|p| (p.key, p.hash));
         }
         // GC marks are authorization records, never orphans.
@@ -4003,7 +4053,10 @@ mod tests {
             .await
             .unwrap();
         let err = expect_err(recover(cs).await);
-        assert!(matches!(err, HeadError::Integrity(_)), "got {err:?}");
+        assert!(
+            matches!(err, HeadError::MissingReferenced { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]

@@ -44,9 +44,6 @@ pub struct ReconcileReport {
     pub orphans_within_grace: usize,
     /// Aborted multipart uploads. Always 0 on the single-PUT durable_v2 path.
     pub mpu_aborts: usize,
-    /// Referenced objects that were expected but ABSENT. Non-empty is a hard alarm;
-    /// reconciliation stops and deletes nothing further.
-    pub missing_referenced: Vec<String>,
     /// Acknowledged original objects not yet superseded by a compaction (GC backlog).
     pub compaction_lag: usize,
     /// Set when the pass stopped early (epoch change, listing uncertainty, ambiguous
