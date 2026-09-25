@@ -324,6 +324,11 @@ pub enum TxProtocolError {
          (duplicate or unknown commit)"
     )]
     CommitWithoutBegin { marker: String },
+    #[error(
+        "standalone (non-transactional) event arrived while transaction {active} \
+         was still open"
+    )]
+    StandaloneEventInTx { active: String },
 }
 
 /// Enforces the source transaction protocol on the marker/event stream: a single
@@ -351,23 +356,29 @@ impl TxTracker {
     /// A transactional event must belong to the open transaction. Standalone
     /// (non-transactional, e.g. snapshot) events are not tracked.
     fn observe_event(&self, ev: &Event) -> Result<(), TxProtocolError> {
-        if let Some(txn) = &ev.transaction {
-            match &self.active {
-                None => {
-                    return Err(TxProtocolError::EventWithoutBegin {
-                        event_tx: txn.id.clone(),
-                    });
-                }
+        match &ev.transaction {
+            Some(txn) => match &self.active {
+                None => Err(TxProtocolError::EventWithoutBegin {
+                    event_tx: txn.id.clone(),
+                }),
                 Some(active) if *active != txn.id => {
-                    return Err(TxProtocolError::EventTxMismatch {
+                    Err(TxProtocolError::EventTxMismatch {
                         active: active.clone(),
                         event_tx: txn.id.clone(),
-                    });
+                    })
                 }
-                _ => {}
-            }
+                _ => Ok(()),
+            },
+            // A non-transactional event while a transaction is open would be
+            // committed as a standalone boundary and could split the open
+            // transaction. Fail closed instead.
+            None => match &self.active {
+                Some(active) => Err(TxProtocolError::StandaloneEventInTx {
+                    active: active.clone(),
+                }),
+                None => Ok(()),
+            },
         }
-        Ok(())
     }
 
     /// A `TxCommit` closes the open transaction and must match it. A commit with
@@ -2164,6 +2175,28 @@ mod tests {
         .await;
         let err = res.expect_err("duplicate commit must be rejected");
         assert!(err.to_string().contains("no open transaction"));
+    }
+
+    /// A non-transactional (transaction=None) event arriving while a transaction is
+    /// open must be rejected. Otherwise it is treated as a standalone boundary and
+    /// can flush/checkpoint mid-transaction, splitting the open transaction - the
+    /// failure mode of an unstamped PG transactional logical message. Defense in
+    /// depth: even if a source forgets to stamp such an event, the coordinator fails
+    /// closed rather than splitting.
+    #[tokio::test]
+    async fn standalone_event_inside_open_tx_is_rejected() {
+        let mut standalone = tx_event(1, "gtid:1", b"row");
+        standalone.transaction = None; // simulate an unstamped in-tx event
+        let (res, store) =
+            run_items(vec![begin("gtid:1"), SourceItem::Event(standalone)])
+                .await;
+        let err = res
+            .expect_err("standalone event inside an open tx must be rejected");
+        assert!(
+            err.to_string().contains("standalone"),
+            "unexpected error: {err}"
+        );
+        assert!(store.get_raw("src::sink::kafka").await.unwrap().is_none());
     }
 
     /// A second transaction cannot begin before the first commits.

@@ -241,7 +241,14 @@ pub(super) async fn dispatch_event(
                 lsn,
                 &ctx.pipeline,       // pipeline name
                 &ctx.default_schema, // database name
-                ctx.current_tx_id,
+                // Only a transactional message belongs to the open transaction; a
+                // non-transactional message is its own boundary and must stay
+                // unstamped so the coordinator keeps treating it as standalone.
+                if transactional {
+                    ctx.current_tx_id
+                } else {
+                    None
+                },
                 ctx.current_tx_commit_time,
                 &ctx.outbox_prefixes,
             ) {
