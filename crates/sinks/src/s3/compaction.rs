@@ -101,12 +101,11 @@ impl CompactionIndex {
 
 impl CompactionRecord {
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut c = self.clone();
-        c.originals.sort_by(|a, b| {
-            (a.table.as_str(), a.key.as_str())
-                .cmp(&(b.table.as_str(), b.key.as_str()))
-        });
-        serde_json::to_vec(&c).expect("compaction record serializes")
+        // `originals` are preserved in the EXACT canonical acknowledgement order the
+        // equivalence proof was computed over - never re-sorted. Determinism comes
+        // from the production ordering step (`order_originals_by_ack`); reordering the
+        // originals is a different record with a different hash and a different proof.
+        serde_json::to_vec(self).expect("compaction record serializes")
     }
 
     pub fn record_hash(&self) -> String {
@@ -326,9 +325,34 @@ pub async fn load_record<S: ConditionalStore + ?Sized>(
             "compaction record {key} hash mismatch"
         )));
     }
-    serde_json::from_slice(&raw).map_err(|e| {
+    let rec: CompactionRecord = serde_json::from_slice(&raw).map_err(|e| {
         CompactionError::Integrity(format!("record {key} not parseable: {e}"))
-    })
+    })?;
+    // Fail closed on any unsupported schema or proof: a HEAD-reachable record is a
+    // deletion authorization, so it MUST be the supported version, carry the known
+    // equivalence proof, and be proven equivalent. An older/future layout, an unknown
+    // proof algorithm/version, or a `false` result is integrity corruption.
+    if rec.version != COMPACTION_RECORD_VERSION {
+        return Err(CompactionError::Integrity(format!(
+            "compaction record {key} version {} is not the supported {}",
+            rec.version, COMPACTION_RECORD_VERSION
+        )));
+    }
+    if rec.equivalence_algo != EQUIVALENCE_ALGO
+        || rec.equivalence_version != EQUIVALENCE_VERSION
+    {
+        return Err(CompactionError::Integrity(format!(
+            "compaction record {key} uses an unknown equivalence proof {}/{}",
+            rec.equivalence_algo, rec.equivalence_version
+        )));
+    }
+    if !rec.equivalence_result {
+        return Err(CompactionError::Integrity(format!(
+            "compaction record {key} is not equivalence-proven \
+             (equivalence_result = false); refusing to treat it as authoritative"
+        )));
+    }
+    Ok(rec)
 }
 
 #[cfg(test)]
@@ -410,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn record_hash_is_stable_regardless_of_original_order() {
+    fn record_hash_changes_with_original_order() {
         let dom = EncodingDomain::new("jsonl", 1, "s1", "none", "table", 1);
         let mk = |order: Vec<ManifestObject>| CompactionRecord {
             version: COMPACTION_RECORD_VERSION,
@@ -430,8 +454,10 @@ mod tests {
             prev: None,
         };
         let _ = &dom;
+        // The equivalence proof is order-sensitive, so the record preserves the exact
+        // original order: reordering the originals is a DIFFERENT record + hash.
         let a = mk(vec![obj("shop.orders", "a"), obj("shop.orders", "b")]);
         let b = mk(vec![obj("shop.orders", "b"), obj("shop.orders", "a")]);
-        assert_eq!(a.record_hash(), b.record_hash());
+        assert_ne!(a.record_hash(), b.record_hash());
     }
 }

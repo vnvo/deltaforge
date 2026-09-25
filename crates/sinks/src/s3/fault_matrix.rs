@@ -826,10 +826,10 @@ async fn setup_two_batches(
     Vec<ManifestObject>,
 ) {
     let (fs, w) = genesis(inner, triggers).await;
-    w.publish(&wm(1), vec![tobj("orders", b"a")], 1)
+    w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)
         .await
         .unwrap();
-    w.publish(&wm(2), vec![tobj("orders", b"b")], 1)
+    w.publish(&wm(2), vec![tobj_jsonl("orders", &[2])], 1)
         .await
         .unwrap();
     let originals = all_manifest_objects(inner).await;
@@ -837,8 +837,10 @@ async fn setup_two_batches(
     (fs, w, originals)
 }
 
+/// The equivalence-preserving replacement for the two `setup_two_batches` originals
+/// (rows 1 and 2 concatenated in ack order).
 fn replacement() -> TableObject {
-    tobj("orders", b"compacted-ab")
+    tobj_jsonl("orders", &[1, 2])
 }
 
 #[tokio::test]
@@ -1085,9 +1087,10 @@ async fn recompaction_of_superseded_original_detected_at_recovery() {
     w.compact_with_replacement(replacement(), originals.clone())
         .await
         .unwrap();
-    // A buggy second compaction re-lists one already-superseded original.
+    // A buggy second compaction re-lists one already-superseded original, with an
+    // equivalence-preserving replacement (row 1) so it publishes.
     let dup = vec![originals[0].clone()];
-    w.compact_with_replacement(tobj("orders", b"compacted-again"), dup)
+    w.compact_with_replacement(tobj_jsonl("orders", &[1]), dup)
         .await
         .unwrap();
     drop(w);
@@ -1130,8 +1133,12 @@ async fn production_compact_builds_replacement_from_verified_originals() {
     assert!(h.compaction_key.is_some(), "compaction reference set");
     assert_eq!(compaction_record_count(&inner).await, 1);
     assert_eq!(data_count(&inner).await, 2, "originals NOT deleted");
-    // The replacement is the originals' exact bytes, concatenated in ack order.
-    assert_eq!(compacted_bytes(&inner).await.as_ref(), b"ab");
+    // The replacement is the originals' exact bytes concatenated in ack order (the
+    // two JSONL rows), which is exactly the equivalent [1,2] object.
+    assert_eq!(
+        compacted_bytes(&inner).await,
+        tobj_jsonl("orders", &[1, 2]).bytes
+    );
 }
 
 #[tokio::test]
@@ -1142,8 +1149,8 @@ async fn production_compact_orders_originals_by_ack_sequence() {
     originals.reverse();
     w.compact(originals).await.unwrap();
     assert_eq!(
-        compacted_bytes(&inner).await.as_ref(),
-        b"ab",
+        compacted_bytes(&inner).await,
+        tobj_jsonl("orders", &[1, 2]).bytes,
         "replacement respects ack order, not caller order"
     );
 }
@@ -1267,7 +1274,7 @@ async fn ordinary_publish_and_compaction_preserve_both_rollup_refs() {
     let inner = inmem();
     let (_fs, w, _o) = setup_two_batches(&inner, vec![]).await;
     w.rollup().await.unwrap();
-    w.publish(&wm(3), vec![tobj("orders", b"c")], 1)
+    w.publish(&wm(3), vec![tobj_jsonl("orders", &[3])], 1)
         .await
         .unwrap();
     w.rollup().await.unwrap();
@@ -1276,7 +1283,7 @@ async fn ordinary_publish_and_compaction_preserve_both_rollup_refs() {
     assert!(cur.is_some() && prev.is_some());
 
     // An ordinary publish keeps both rollup references.
-    w.publish(&wm(4), vec![tobj("orders", b"d")], 1)
+    w.publish(&wm(4), vec![tobj_jsonl("orders", &[4])], 1)
         .await
         .unwrap();
     let h2 = read_head(&inner).await.unwrap();
@@ -1503,14 +1510,14 @@ async fn setup_generations(
     // gen1 over [1,2]; publish seq 3 then gen2 over [1,3]. HEAD: current=gen2
     // (end 3), prev=gen1 (end 2), horizon = 2.
     let (fs, w) = genesis(inner, vec![]).await;
-    w.publish(&wm(1), vec![tobj("orders", b"a")], 1)
+    w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)
         .await
         .unwrap();
-    w.publish(&wm(2), vec![tobj("orders", b"b")], 1)
+    w.publish(&wm(2), vec![tobj_jsonl("orders", &[2])], 1)
         .await
         .unwrap();
     w.rollup().await.unwrap(); // gen1 [1,2]
-    w.publish(&wm(3), vec![tobj("orders", b"c")], 1)
+    w.publish(&wm(3), vec![tobj_jsonl("orders", &[3])], 1)
         .await
         .unwrap();
     w.rollup().await.unwrap(); // gen2 [1,3]
@@ -1666,7 +1673,7 @@ async fn publish_and_compaction_preserve_cumulative_refs_and_times() {
     assert!(before.prev_rollup_published_at_ms.is_some());
 
     // Ordinary publish preserves both generations' refs + publication times.
-    w.publish(&wm(4), vec![tobj("orders", b"d")], 1)
+    w.publish(&wm(4), vec![tobj_jsonl("orders", &[4])], 1)
         .await
         .unwrap();
     let h = read_head(&inner).await.unwrap();
@@ -1862,29 +1869,32 @@ async fn plan_gc_fenced_writer_returns_fenced() {
 }
 
 #[tokio::test]
-async fn plan_gc_skips_non_equivalent_compaction() {
+async fn non_equivalent_compaction_is_not_published() {
     let inner = inmem();
     let (_fs, w) = setup_generations(&inner).await;
-    // A test-only compaction whose replacement is NOT the concatenation of its
-    // originals: equivalence must fail, so its originals are not data-eligible.
+    let before = read_head(&inner).await.unwrap();
+    // A compaction whose replacement is NOT equivalent to its originals is refused at
+    // publication: HEAD is unchanged, no compaction reference, and the uploaded
+    // replacement is a harmless orphan.
     let originals = all_manifest_objects(&inner).await;
-    w.compact_with_replacement(tobj("orders", b"not-equivalent"), originals)
-        .await
-        .unwrap();
-
-    let now = now_ms_test() + 1_000_000;
-    let plan = w.plan_gc(now, NO_WINDOW).await.unwrap();
-    assert!(
-        plan.data_originals_eligible.is_empty(),
-        "non-equivalent replacement makes no original eligible"
+    let err = expect_err(
+        w.compact_with_replacement(
+            tobj("orders", b"not-equivalent"),
+            originals,
+        )
+        .await,
     );
-    assert!(!plan.skipped.is_empty(), "skips recorded");
+    assert!(matches!(err, HeadError::Integrity(_)), "got {err:?}");
+    let after = read_head(&inner).await.unwrap();
+    assert_eq!(after, before, "HEAD unchanged");
     assert!(
-        plan.alarms
-            .iter()
-            .any(|a| a.message.contains("equivalence")),
-        "equivalence alarm expected: {:?}",
-        plan.alarms
+        after.compaction_key.is_none(),
+        "no compaction reference set"
+    );
+    assert_eq!(
+        compaction_record_count(&inner).await,
+        0,
+        "no compaction record published"
     );
 }
 
@@ -2381,10 +2391,10 @@ async fn data_gc_fenced_before_deleting() {
 }
 
 #[tokio::test]
-async fn non_equivalent_compaction_originals_are_retained() {
-    // A compaction whose replacement is NOT row-equivalent to its originals is
-    // published with equivalence_result == false (the proof is bound at publication),
-    // so its originals are never GC-eligible.
+async fn non_equivalent_compaction_is_refused_and_originals_retained() {
+    // A compaction whose replacement is NOT row-equivalent to its originals is refused
+    // at publication (never recorded as active), so its originals stay and are never
+    // GC-eligible.
     let inner = inmem();
     let (_fs, w) = genesis(&inner, vec![]).await;
     w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)
@@ -2397,16 +2407,17 @@ async fn non_equivalent_compaction_originals_are_retained() {
         .await
         .unwrap();
     let originals = all_manifest_objects(&inner).await;
-    // Replacement drops a row -> not equivalent.
-    w.compact_with_replacement(tobj_jsonl("orders", &[1, 2]), originals)
-        .await
-        .unwrap();
+    // Replacement drops a row -> not equivalent -> refused.
+    let err = expect_err(
+        w.compact_with_replacement(tobj_jsonl("orders", &[1, 2]), originals)
+            .await,
+    );
+    assert!(matches!(err, HeadError::Integrity(_)), "got {err:?}");
+    assert!(read_head(&inner).await.unwrap().compaction_key.is_none());
+    assert_eq!(compaction_record_count(&inner).await, 0);
 
     let plan = w.plan_gc(far_future(), no_window()).await.unwrap();
-    assert!(
-        plan.data_originals_eligible().is_empty(),
-        "non-equivalent compaction yields no eligible originals"
-    );
+    assert!(plan.data_originals_eligible().is_empty());
     let run = w.gc_delete_originals().await.unwrap();
     assert_eq!(run.deleted, 0);
     assert_eq!(data_count(&inner).await, 3, "originals retained");
@@ -2654,6 +2665,146 @@ async fn compaction_original_metadata_mismatch_fails_recovery() {
     assert!(
         err.is_fatal(),
         "tampered original metadata is fatal: {err:?}"
+    );
+}
+
+/// Publish two JSONL batches (no compaction) and return the writer + the two
+/// originals - a base for planting a crafted compaction record at HEAD.
+async fn two_batches_for_compaction(
+    inner: &Arc<ObjectStoreConditional>,
+) -> (
+    Arc<FaultStore>,
+    DurableWriter<FaultStore>,
+    Vec<ManifestObject>,
+) {
+    let (fs, w) = genesis(inner, vec![]).await;
+    w.publish(&wm(1), vec![tobj_jsonl("orders", &[1])], 1)
+        .await
+        .unwrap();
+    w.publish(&wm(2), vec![tobj_jsonl("orders", &[2])], 1)
+        .await
+        .unwrap();
+    let originals = all_manifest_objects(inner).await;
+    (fs, w, originals)
+}
+
+/// Write `rec` and point HEAD's compaction reference at it (bypassing publication),
+/// to plant a crafted compaction record for recovery tests.
+async fn plant_compaction_at_head(
+    inner: &ObjectStoreConditional,
+    rec: &CompactionRecord,
+) {
+    let wr = write_compaction_record(inner, PFX, rec).await.unwrap();
+    let hkey = head_key_for(PFX, PIPE);
+    let (raw, etag) = inner.get_with_etag(&hkey).await.unwrap().unwrap();
+    let mut h: Head = serde_json::from_slice(&raw).unwrap();
+    h.compaction_key = Some(wr.key);
+    h.compaction_hash = Some(wr.hash);
+    inner
+        .cas_put(
+            &hkey,
+            Bytes::from(serde_json::to_vec(&h).unwrap()),
+            etag.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+fn crafted_record(
+    originals: &[ManifestObject],
+    version: u16,
+    algo: &str,
+    equiv_version: u16,
+    result: bool,
+) -> CompactionRecord {
+    CompactionRecord {
+        version,
+        pipeline: PIPE.into(),
+        source_id: "src".into(),
+        sink_id: "sink".into(),
+        table: "orders".into(),
+        replacement: originals[0].clone(),
+        originals: originals.to_vec(),
+        equivalence_algo: algo.into(),
+        equivalence_version: equiv_version,
+        equivalence_result: result,
+        prev: None,
+    }
+}
+
+#[tokio::test]
+async fn compaction_publish_fails_on_store_error_during_validation() {
+    // A transient read failure DURING equivalence validation aborts publication with
+    // HEAD unchanged and only an orphan replacement. (GetData 0,1 are the read-originals
+    // step; GetData 2 is the first re-read inside the equivalence validator.)
+    let inner = inmem();
+    let (_fs, w, originals) =
+        setup_two_batches(&inner, vec![tr(Op::GetData, 2, Action::ErrBefore)])
+            .await;
+    let before = read_head(&inner).await.unwrap();
+    let err =
+        expect_err(w.compact_with_replacement(replacement(), originals).await);
+    assert!(matches!(err, HeadError::Store(_) | HeadError::Integrity(_)));
+    assert_eq!(read_head(&inner).await.unwrap(), before, "HEAD unchanged");
+    assert_eq!(compaction_record_count(&inner).await, 0);
+}
+
+#[tokio::test]
+async fn head_reachable_non_equivalent_record_halts_recovery() {
+    let inner = inmem();
+    let (_fs, w, originals) = two_batches_for_compaction(&inner).await;
+    drop(w);
+    // A HEAD-reachable v3 record with equivalence_result = false is corruption.
+    let rec = crafted_record(
+        &originals,
+        super::compaction::COMPACTION_RECORD_VERSION,
+        EQUIVALENCE_ALGO,
+        EQUIVALENCE_VERSION,
+        false,
+    );
+    plant_compaction_at_head(&inner, &rec).await;
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let err = expect_err(acquire(clean).await);
+    assert!(err.is_fatal(), "non-equivalent HEAD record halts: {err:?}");
+}
+
+#[tokio::test]
+async fn unsupported_compaction_version_halts_recovery() {
+    let inner = inmem();
+    let (_fs, w, originals) = two_batches_for_compaction(&inner).await;
+    drop(w);
+    // A future record version is rejected fail-closed.
+    let rec = crafted_record(
+        &originals,
+        super::compaction::COMPACTION_RECORD_VERSION + 5,
+        EQUIVALENCE_ALGO,
+        EQUIVALENCE_VERSION,
+        true,
+    );
+    plant_compaction_at_head(&inner, &rec).await;
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let err = expect_err(acquire(clean).await);
+    assert!(err.is_fatal(), "unsupported version halts: {err:?}");
+}
+
+#[tokio::test]
+async fn unknown_equivalence_algorithm_halts_recovery() {
+    let inner = inmem();
+    let (_fs, w, originals) = two_batches_for_compaction(&inner).await;
+    drop(w);
+    let rec = crafted_record(
+        &originals,
+        super::compaction::COMPACTION_RECORD_VERSION,
+        "bogus-algo",
+        EQUIVALENCE_VERSION,
+        true,
+    );
+    plant_compaction_at_head(&inner, &rec).await;
+    let clean = Arc::new(FaultStore::new(Arc::clone(&inner), vec![]));
+    let err = expect_err(acquire(clean).await);
+    assert!(
+        err.is_fatal(),
+        "unknown equivalence algorithm halts: {err:?}"
     );
 }
 

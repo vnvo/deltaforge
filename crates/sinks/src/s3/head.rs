@@ -1972,16 +1972,21 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
             }),
             _ => None,
         };
-        // Bind the independent equivalence proof into the record BEFORE publication:
-        // the row-wise validator decodes both sides from stored bytes and compares. A
-        // non-equivalent (or non-JSONL/unsupported) replacement records `false` and
-        // its originals never become GC-eligible. Because the record is then published
-        // through the HEAD CAS below, a HEAD-reachable `true` record is authoritative
-        // provenance for data GC - a forged standalone authorization cannot exist.
-        let equivalence_result =
-            verify_jsonl(self.store.as_ref(), &originals, &replacement_obj)
-                .await
-                .is_ok();
+        // Prove equivalence BEFORE publication: the independent row-wise validator
+        // decodes both sides from stored bytes and compares. A compaction is published
+        // ONLY if equivalence holds - a validator failure (non-equivalent,
+        // non-JSONL/unsupported, or a transient read error) propagates here WITHOUT
+        // writing the record or advancing HEAD, leaving the uploaded replacement as a
+        // harmless orphan. Every published v3 record therefore carries a successful
+        // proof (`equivalence_result == true`), and a HEAD-reachable record with
+        // `false` is treated as corruption at recovery.
+        verify_jsonl(self.store.as_ref(), &originals, &replacement_obj)
+            .await
+            .map_err(|e| {
+                HeadError::Integrity(format!(
+                    "compaction replacement failed equivalence; not published: {e}"
+                ))
+            })?;
         let record = CompactionRecord {
             version: super::compaction::COMPACTION_RECORD_VERSION,
             pipeline: self.pipeline.clone(),
@@ -1992,7 +1997,7 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
             originals,
             equivalence_algo: super::compaction::EQUIVALENCE_ALGO.to_string(),
             equivalence_version: super::compaction::EQUIVALENCE_VERSION,
-            equivalence_result,
+            equivalence_result: true,
             prev,
         };
         let written = write_record(self.store.as_ref(), &self.prefix, &record)
