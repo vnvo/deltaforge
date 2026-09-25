@@ -26,12 +26,13 @@ use deltaforge_core::{CheckpointComparator, CheckpointOrder};
 use super::batch_upload::{DurableError, TableObject, upload_batch};
 use super::compaction::{
     CompactionError, CompactionIndex, CompactionRecord, check_compatible,
-    compacted_object_key, load_record, verify_originals_present, write_record,
+    compacted_object_key, load_record, record_key as compaction_record_key,
+    verify_originals_present, write_record,
 };
 use super::equivalence::verify_jsonl;
 use super::gc::{
-    Alarm, EntryRef, GcConfig, GcPlan, HeadBinding, InventoryRef, OriginalRef,
-    SkipReason, horizon_seq,
+    Alarm, EntryRef, GcConfig, GcMark, GcPlan, GcRun, HeadBinding,
+    InventoryRef, OriginalRef, SkipReason, horizon_seq, mark_key,
 };
 use super::keys::content_hash;
 use super::manifest::{
@@ -452,9 +453,12 @@ async fn walk_retained_entries<S: ConditionalStore + ?Sized>(
                     "HEAD watermark does not match its selected entry".into(),
                 ));
             }
-            // 6. Every referenced data object exists and matches; collect it.
+            // 6. Collect every referenced data object into the ack inventory.
+            // Object EXISTENCE is verified later (in `verify_state`, after the
+            // compaction index is known), because a compacted original may have been
+            // GC-deleted while its live entry still references it - such an original
+            // is verified via its replacement, not directly.
             for mobj in &entry.objects {
-                verify_data_object(store, mobj).await?;
                 inventory.insert(mobj.key.clone());
             }
             entries.insert(
@@ -580,6 +584,19 @@ async fn verify_state<S: ConditionalStore + ?Sized>(
         store, pipeline, source_id, sink_id, head, &inventory,
     )
     .await?;
+
+    // Verify existence of every retained-tail data object EXCEPT originals superseded
+    // by a verified compaction: a superseded original may have been GC-deleted while
+    // its live entry still references it, and its durable copy is the replacement
+    // (already verified by build_verified_compactions). Covered-range objects (below a
+    // truncation boundary) are attested by the adopted rollup inventory, not re-read.
+    for summ in entries.values() {
+        for o in &summ.objects {
+            if compactions.index.active_replacement(&o.key).is_none() {
+                verify_data_object(store, o).await?;
+            }
+        }
+    }
 
     Ok(VerifiedState {
         entries,
@@ -2518,6 +2535,386 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
             alarms,
         })
     }
+
+    /// Read HEAD + ETag for a GC recheck.
+    async fn read_head_etag(&self) -> Result<(Head, String), HeadError> {
+        let hkey = head_key(&self.prefix, &self.pipeline);
+        match self
+            .store
+            .get_with_etag(&hkey)
+            .await
+            .map_err(|e| HeadError::Store(e.to_string()))?
+        {
+            Some((raw, Some(etag))) => Ok((Head::parse(&raw)?, etag)),
+            _ => Err(HeadError::Integrity(
+                "HEAD missing/eTagless during GC".into(),
+            )),
+        }
+    }
+
+    /// Re-read HEAD immediately before a destructive unit of work and classify:
+    /// a higher epoch fences us; a lower epoch is an integrity failure; a HEAD that
+    /// no longer matches the plan binding is stale (stop); otherwise proceed against
+    /// the freshly-read HEAD.
+    async fn gc_recheck(
+        &self,
+        our_epoch: u64,
+        plan: &GcPlan,
+    ) -> Result<GcRecheck, HeadError> {
+        let (head, etag) = self.read_head_etag().await?;
+        if head.epoch > our_epoch {
+            return Ok(GcRecheck::Fenced(head.epoch));
+        }
+        if head.epoch < our_epoch {
+            return Err(HeadError::Integrity(format!(
+                "HEAD epoch regressed during GC: {} < {}",
+                head.epoch, our_epoch
+            )));
+        }
+        if !plan.still_valid(&head, &etag) {
+            return Ok(GcRecheck::Stale);
+        }
+        Ok(GcRecheck::Ok(Box::new(head)))
+    }
+
+    /// Re-verify (against live objects, not the cached plan) that a manifest entry at
+    /// `seq` is still covered by BOTH retained generations forming a valid nested
+    /// pair with intact, bound inventories, and lies at/below the horizon. Any
+    /// integrity problem is an error (the caller stops); `Ok(false)` means simply not
+    /// eligible now.
+    async fn revalidate_entry_coverage(
+        &self,
+        head: &Head,
+        seq: u64,
+    ) -> Result<bool, HeadError> {
+        let (Some(rk), Some(rh)) =
+            (head.rollup_key.clone(), head.rollup_hash.clone())
+        else {
+            return Ok(false);
+        };
+        let (Some(pk), Some(ph)) =
+            (head.prev_rollup_key.clone(), head.prev_rollup_hash.clone())
+        else {
+            return Ok(false);
+        };
+        let cur = rollup_load(self.store.as_ref(), &rk, &rh)
+            .await
+            .map_err(map_rollup)?;
+        let prev = rollup_load(self.store.as_ref(), &pk, &ph)
+            .await
+            .map_err(map_rollup)?;
+        verify_rollup_pair(&cur, &prev, head)?;
+        // Both inventories must load (version + hash verified) and match their
+        // rollup's declared range - so a deleted entry stays independently covered.
+        let cinv = rollup_load_inventory(
+            self.store.as_ref(),
+            &cur.inventory_key,
+            &cur.inventory_record_hash,
+        )
+        .await
+        .map_err(map_rollup)?;
+        if cinv.start_seq != 1 || cinv.end_seq != cur.end_seq {
+            return Err(HeadError::Integrity(
+                "current inventory range mismatch during GC".into(),
+            ));
+        }
+        let pinv = rollup_load_inventory(
+            self.store.as_ref(),
+            &prev.inventory_key,
+            &prev.inventory_record_hash,
+        )
+        .await
+        .map_err(map_rollup)?;
+        if pinv.start_seq != 1 || pinv.end_seq != prev.end_seq {
+            return Err(HeadError::Integrity(
+                "previous inventory range mismatch during GC".into(),
+            ));
+        }
+        Ok(seq <= prev.end_seq)
+    }
+
+    /// Re-verify (against live objects) that a compacted original is still safe to
+    /// delete: its compaction record loads + is domain-consistent, the target is one
+    /// of the record's originals, and the REPLACEMENT (the surviving copy) is durable
+    /// and content-verified. Any integrity problem is an error (the caller stops) so
+    /// the last durable copy is never removed; `Ok(false)` means not eligible now.
+    ///
+    /// Equivalence (replacement == all originals) is a PLAN-TIME proof; `still_valid`
+    /// has confirmed HEAD's compaction ref is unchanged and records + replacements are
+    /// immutable, so that proof still holds. It is deliberately NOT re-run here: once
+    /// this actor deletes the first original, the originals are no longer all present,
+    /// so re-reading them would spuriously fail. The surviving-copy guarantee is the
+    /// replacement's continued durability + content hash, which IS re-checked.
+    async fn revalidate_original(
+        &self,
+        head: &Head,
+        target: &OriginalRef,
+    ) -> Result<bool, HeadError> {
+        // still_valid has confirmed HEAD's compaction ref is unchanged; records are
+        // immutable + prev-linked, so a record loadable by its hash is reachable.
+        if head.compaction_key.is_none() {
+            return Ok(false);
+        }
+        let rec_key = compaction_record_key(
+            &self.prefix,
+            &self.pipeline,
+            &target.compaction_record_hash,
+        )
+        .to_string();
+        let rec = load_record(
+            self.store.as_ref(),
+            &rec_key,
+            &target.compaction_record_hash,
+        )
+        .await
+        .map_err(map_compaction)?;
+        if rec.pipeline != self.pipeline
+            || rec.source_id != self.source_id
+            || rec.sink_id != self.sink_id
+        {
+            return Err(HeadError::Integrity(
+                "compaction record identity mismatch during GC".into(),
+            ));
+        }
+        check_compatible(&rec.table, &rec.domain(), &rec.originals)
+            .map_err(map_compaction)?;
+        // The replacement (the surviving copy) must be durable + content-verified
+        // BEFORE the original goes.
+        verify_data_object(self.store.as_ref(), &rec.replacement).await?;
+        let present = rec.originals.iter().any(|o| {
+            o.key == target.key && o.content_hash == target.content_hash
+        });
+        Ok(present)
+    }
+
+    /// GC actor A (manifest-side, step 1 of 2): MARK eligible manifest entries as
+    /// lifecycle-eligible (preferred, reversible). Owner-fenced; re-reads HEAD and
+    /// revalidates coverage before each mark; stops on any stale/fenced/integrity
+    /// condition. Marks nothing but manifest entries; never touches rollups or
+    /// inventories. Marking is create-only + idempotent.
+    pub async fn gc_mark_entries(
+        &self,
+        plan: &GcPlan,
+    ) -> Result<GcRun, HeadError> {
+        let mut st = self.state.lock().await;
+        if let Some(observed) = st.fenced {
+            return Err(HeadError::Fenced {
+                our: st.verified.epoch,
+                observed,
+            });
+        }
+        let our_epoch = st.verified.epoch;
+        let mut run = GcRun::default();
+        for e in &plan.manifest_entries_eligible {
+            let head = match self.gc_recheck(our_epoch, plan).await? {
+                GcRecheck::Fenced(observed) => {
+                    st.fenced = Some(observed);
+                    return Err(HeadError::Fenced {
+                        our: our_epoch,
+                        observed,
+                    });
+                }
+                GcRecheck::Stale => {
+                    run.stopped =
+                        Some("plan no longer valid (HEAD changed)".into());
+                    break;
+                }
+                GcRecheck::Ok(head) => *head,
+            };
+            match self.revalidate_entry_coverage(&head, e.seq).await {
+                Ok(true) => {
+                    let mk = GcMark {
+                        kind: "entry".into(),
+                        target_key: e.key.clone(),
+                        target_hash: e.entry_hash.clone(),
+                        marked_by_epoch: our_epoch,
+                    };
+                    let key =
+                        mark_key(&self.prefix, &self.pipeline, &e.entry_hash);
+                    let body = bytes::Bytes::from(
+                        serde_json::to_vec(&mk).expect("mark serializes"),
+                    );
+                    match self
+                        .store
+                        .put_if_absent(&key, body)
+                        .await
+                        .map_err(|e| HeadError::Store(e.to_string()))?
+                    {
+                        PutOutcome::Written { .. }
+                        | PutOutcome::AlreadyExists => run.marked += 1,
+                        PutOutcome::Conflict => {
+                            run.stopped = Some(
+                                "unexpected conflict writing GC mark".into(),
+                            );
+                            break;
+                        }
+                    }
+                }
+                Ok(false) => run.skipped.push(SkipReason {
+                    key: e.key.clone(),
+                    reason: "entry no longer covered/eligible".into(),
+                }),
+                Err(err) => {
+                    run.stopped =
+                        Some(format!("integrity during revalidation: {err}"));
+                    break;
+                }
+            }
+        }
+        Ok(run)
+    }
+
+    /// GC actor A (manifest-side, step 2 of 2): EXPIRE (delete) manifest entries that
+    /// were marked eligible and still pass revalidation. Models the lifecycle
+    /// expiration of a marked object. Owner-fenced; re-reads HEAD + revalidates before
+    /// each delete; only expires entries that carry a mark; delete is idempotent
+    /// (absence is success under the proving plan). Deletes entries only - never a
+    /// rollup, inventory, or data object.
+    pub async fn gc_expire_entries(
+        &self,
+        plan: &GcPlan,
+    ) -> Result<GcRun, HeadError> {
+        let mut st = self.state.lock().await;
+        if let Some(observed) = st.fenced {
+            return Err(HeadError::Fenced {
+                our: st.verified.epoch,
+                observed,
+            });
+        }
+        let our_epoch = st.verified.epoch;
+        let mut run = GcRun::default();
+        for e in &plan.manifest_entries_eligible {
+            let head = match self.gc_recheck(our_epoch, plan).await? {
+                GcRecheck::Fenced(observed) => {
+                    st.fenced = Some(observed);
+                    return Err(HeadError::Fenced {
+                        our: our_epoch,
+                        observed,
+                    });
+                }
+                GcRecheck::Stale => {
+                    run.stopped =
+                        Some("plan no longer valid (HEAD changed)".into());
+                    break;
+                }
+                GcRecheck::Ok(head) => *head,
+            };
+            // Only expire what was marked eligible first.
+            let mkey = mark_key(&self.prefix, &self.pipeline, &e.entry_hash);
+            let marked = self
+                .store
+                .get_with_etag(&mkey)
+                .await
+                .map_err(|e| HeadError::Store(e.to_string()))?
+                .is_some();
+            if !marked {
+                run.skipped.push(SkipReason {
+                    key: e.key.clone(),
+                    reason: "entry not marked eligible".into(),
+                });
+                continue;
+            }
+            match self.revalidate_entry_coverage(&head, e.seq).await {
+                Ok(true) => {
+                    match self
+                        .store
+                        .delete(&object_store::path::Path::from(e.key.clone()))
+                        .await
+                    {
+                        Ok(()) => run.deleted += 1,
+                        Err(err) => {
+                            run.stopped =
+                                Some(format!("ambiguous delete: {err}"));
+                            break;
+                        }
+                    }
+                }
+                Ok(false) => run.skipped.push(SkipReason {
+                    key: e.key.clone(),
+                    reason: "entry no longer covered/eligible".into(),
+                }),
+                Err(err) => {
+                    run.stopped =
+                        Some(format!("integrity during revalidation: {err}"));
+                    break;
+                }
+            }
+        }
+        Ok(run)
+    }
+
+    /// GC actor B (data-side): DELETE compacted originals superseded by a verified,
+    /// equivalence-proven replacement. A SEPARATE actor/policy from manifest-entry
+    /// GC. Owner-fenced; re-reads HEAD + re-verifies the record/replacement/equivalence
+    /// before each delete, so the last durable copy is never removed; stops on any
+    /// stale/fenced/integrity/ambiguous condition. Deletes originals only - never a
+    /// replacement, an uncompacted object, a rollup, or an inventory.
+    pub async fn gc_delete_originals(
+        &self,
+        plan: &GcPlan,
+    ) -> Result<GcRun, HeadError> {
+        let mut st = self.state.lock().await;
+        if let Some(observed) = st.fenced {
+            return Err(HeadError::Fenced {
+                our: st.verified.epoch,
+                observed,
+            });
+        }
+        let our_epoch = st.verified.epoch;
+        let mut run = GcRun::default();
+        for target in &plan.data_originals_eligible {
+            let head = match self.gc_recheck(our_epoch, plan).await? {
+                GcRecheck::Fenced(observed) => {
+                    st.fenced = Some(observed);
+                    return Err(HeadError::Fenced {
+                        our: our_epoch,
+                        observed,
+                    });
+                }
+                GcRecheck::Stale => {
+                    run.stopped =
+                        Some("plan no longer valid (HEAD changed)".into());
+                    break;
+                }
+                GcRecheck::Ok(head) => *head,
+            };
+            match self.revalidate_original(&head, target).await {
+                Ok(true) => {
+                    match self
+                        .store
+                        .delete(&object_store::path::Path::from(
+                            target.key.clone(),
+                        ))
+                        .await
+                    {
+                        Ok(()) => run.deleted += 1,
+                        Err(err) => {
+                            run.stopped =
+                                Some(format!("ambiguous delete: {err}"));
+                            break;
+                        }
+                    }
+                }
+                Ok(false) => run.skipped.push(SkipReason {
+                    key: target.key.clone(),
+                    reason: "original no longer eligible".into(),
+                }),
+                Err(err) => {
+                    run.stopped =
+                        Some(format!("integrity during revalidation: {err}"));
+                    break;
+                }
+            }
+        }
+        Ok(run)
+    }
+}
+
+/// Classification of a pre-destructive HEAD recheck (9B.2).
+enum GcRecheck {
+    Ok(Box<Head>),
+    Stale,
+    Fenced(u64),
 }
 
 /// The safety window measures how long the CURRENT rollup generation has been

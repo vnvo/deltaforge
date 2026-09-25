@@ -148,6 +148,53 @@ impl GcPlan {
     }
 }
 
+/// The outcome of one destructive GC actor run (9B.2). Actors stop at the first
+/// unsafe condition (`stopped` set) and never continue past it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GcRun {
+    /// Entries marked GC-eligible (lifecycle marking).
+    pub marked: usize,
+    /// Objects physically removed (or already absent under a proving plan).
+    pub deleted: usize,
+    /// Targets already absent (idempotent success under the same valid plan).
+    pub already_absent: usize,
+    /// Targets considered but not acted on, with why.
+    pub skipped: Vec<SkipReason>,
+    /// Set when the actor stopped early (stale plan, epoch/ETag change, missing
+    /// state, integrity failure, ambiguous provider response). Deletion never
+    /// proceeds past this.
+    pub stopped: Option<String>,
+}
+
+/// A durable, immutable lifecycle-eligibility marker for a manifest entry (9B.2).
+/// Writing it is the PREFERRED, reversible first step before an entry is expired:
+/// it records that this exact entry was proven GC-eligible under a bound HEAD. In a
+/// real deployment this corresponds to an object tag that a provider lifecycle rule
+/// expires; here it is an explicit object and the expiry actor removes the entry.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GcMark {
+    pub kind: String,
+    pub target_key: String,
+    pub target_hash: String,
+    pub marked_by_epoch: u64,
+}
+
+/// Key for an entry's eligibility marker: `.../_manifest/gc/marks/<target_hash>.json`.
+pub fn mark_key(
+    prefix: &str,
+    pipeline: &str,
+    target_hash: &str,
+) -> object_store::path::Path {
+    object_store::path::Path::from_iter(
+        prefix
+            .split('/')
+            .filter(|p| !p.is_empty())
+            .chain([pipeline, "_manifest", "gc", "marks"])
+            .map(str::to_string)
+            .chain([format!("{target_hash}.json")]),
+    )
+}
+
 /// Parse the manifest sequence from an entry key of the form
 /// `.../_manifest/entries/{seq:020}-{hash}.json`. Returns `None` if the shape is
 /// not recognized.
