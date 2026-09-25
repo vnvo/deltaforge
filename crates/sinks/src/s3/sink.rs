@@ -373,6 +373,23 @@ pub fn build_s3_sink(
         );
     }
 
+    // Reaching here means `durability: legacy_rolling` was chosen EXPLICITLY (the
+    // default is durable_v2). It is a non-durable, acknowledged rollback/compat mode:
+    // acknowledged data can be lost before a size/age roll. Emit a prominent startup
+    // warning carrying the machine-readable `s3_non_durable_ack_mode` signal so
+    // operators/tooling can alert on it, and note it is excluded from the durability
+    // guarantees.
+    tracing::warn!(
+        sink_id = %cfg.id,
+        pipeline = %pipeline,
+        s3_non_durable_ack_mode = true,
+        "S3 sink '{}' is running in legacy_rolling (NON-DURABLE) mode: acknowledged \
+         data can be lost before a roll. This is an explicit rollback/compat mode \
+         excluded from the durability guarantees; set durability: durable_v2 (the \
+         default) for crash-durable acknowledgements.",
+        cfg.id
+    );
+
     // Build object store.
     let access_key = cfg
         .access_key_id

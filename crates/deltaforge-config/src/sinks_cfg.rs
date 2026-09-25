@@ -850,10 +850,11 @@ pub struct S3SinkCfg {
     #[serde(default)]
     pub required: Option<bool>,
 
-    /// Durability mode. Defaults to `legacy_rolling` (the time/size-rolled path).
-    /// `durable_v2` (crash-durable, content-addressed, HEAD-CAS acknowledged)
-    /// must be selected explicitly and fails closed if its prerequisites are
-    /// missing. The default is NOT switched here - that is a later commit.
+    /// Durability mode. Defaults to `durable_v2` (crash-durable, content-addressed,
+    /// HEAD-CAS acknowledged): an absent or unspecified value ALWAYS resolves to the
+    /// safe path, never legacy. `legacy_rolling` (the time/size-rolled path, which can
+    /// lose acknowledged data before a roll) must be selected EXPLICITLY as an
+    /// acknowledged rollback/compat mode and emits a prominent startup warning.
     #[serde(default)]
     pub durability: S3Durability,
 
@@ -870,11 +871,13 @@ pub struct S3SinkCfg {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum S3Durability {
-    /// Time/size-rolled files (the current behavior). Temporary default.
-    #[default]
+    /// Time/size-rolled files. Acknowledged data can be lost before a roll, so this is
+    /// an explicit, acknowledged rollback/compat mode only (never the default) and is
+    /// excluded from the durability guarantees.
     LegacyRolling,
     /// Crash-durable, content-addressed objects acknowledged only after a HEAD
-    /// compare-and-swap. Must be selected explicitly.
+    /// compare-and-swap. The DEFAULT: an unspecified `durability` resolves here.
+    #[default]
     DurableV2,
 }
 
@@ -1496,22 +1499,23 @@ mod tests {
     }
 
     #[test]
-    fn s3_durability_defaults_to_legacy_and_is_explicit() {
-        // Default is legacy_rolling (the default is NOT switched here).
+    fn s3_durability_defaults_to_durable_and_legacy_is_explicit() {
+        // An unspecified durability ALWAYS resolves to the safe path (durable_v2),
+        // never legacy.
         let base = r#"
             id: s
             bucket: b
             prefix: p
         "#;
         let c: S3SinkCfg = serde_yaml::from_str(base).unwrap();
-        assert_eq!(c.durability, S3Durability::LegacyRolling);
+        assert_eq!(c.durability, S3Durability::DurableV2);
 
-        // durable_v2 must be selected explicitly.
+        // durable_v2 can be named explicitly too.
         let durable = format!("{base}\n            durability: durable_v2\n");
         let c: S3SinkCfg = serde_yaml::from_str(&durable).unwrap();
         assert_eq!(c.durability, S3Durability::DurableV2);
 
-        // legacy_rolling can be named explicitly too.
+        // legacy_rolling is an explicit, acknowledged rollback/compat mode.
         let legacy =
             format!("{base}\n            durability: legacy_rolling\n");
         let c: S3SinkCfg = serde_yaml::from_str(&legacy).unwrap();
