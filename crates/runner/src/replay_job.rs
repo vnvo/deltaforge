@@ -507,7 +507,9 @@ pub struct StoredReplayJob {
 
 /// Slot-backed persistence for the single per-pipeline-incarnation replay job, and the
 /// authoritative validation boundary: every write is checked against the store's identity
-/// and the current durable record before it is committed.
+/// and the current durable record before it is committed. Cheap to clone (an `Arc` backend
+/// plus a few strings), so the controller and worker can each hold one over the same slot.
+#[derive(Clone)]
 pub struct ReplayJobStore {
     backend: ArcStorageBackend,
     pipeline: String,

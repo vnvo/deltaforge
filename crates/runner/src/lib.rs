@@ -2,6 +2,8 @@ pub mod coordinator;
 pub mod dlq;
 pub mod drift_detector;
 pub mod pipeline_manager;
+pub mod replay_controller;
+pub mod replay_gate;
 pub mod replay_job;
 pub mod replay_journal;
 pub mod replay_worker;

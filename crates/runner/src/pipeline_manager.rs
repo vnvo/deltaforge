@@ -1,10 +1,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use crate::coordinator::{
     Coordinator, SchemaSensorState, build_batch_processor, build_commit_fn,
 };
+use crate::replay_controller::{
+    CoordinatorReplayDelivery, PauseIngestionControl, ReplayController,
+};
+use crate::replay_gate::ReplaySinkGate;
+use crate::replay_job::{
+    EncoderSchemaPolicy, ReplayJob, ReplayJobStore, ReplayPhase,
+};
+use crate::replay_worker::ReplayDelivery;
 use crate::schema_provider::SchemaLoaderAdapter;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -388,6 +397,10 @@ pub(crate) struct PipelineRuntime {
     /// Background replay-retention task, when replay journaling is enabled. Owned here
     /// so it is aborted when the pipeline stops, is deleted, or the runtime is dropped.
     pub(crate) retention_task: Option<JoinHandle<()>>,
+    /// Everything needed to build a replay controller (present when replay is enabled).
+    pub(crate) replay_ctx: Option<ReplayContext>,
+    /// The running replay controller task and its cancel handle, if a job is in progress.
+    pub(crate) replay_controller: Option<(CancellationToken, JoinHandle<()>)>,
     pub(crate) started_at: std::time::Instant,
 }
 
@@ -396,6 +409,55 @@ impl Drop for PipelineRuntime {
         if let Some(task) = self.retention_task.take() {
             task.abort();
         }
+        if let Some((cancel, task)) = self.replay_controller.take() {
+            cancel.cancel();
+            task.abort();
+        }
+    }
+}
+
+/// Everything needed to build a [`ReplayController`] for a replay-enabled pipeline. Held on
+/// the runtime so a start request (Slice 4 REST) or a startup resume can spin one up. Cheap
+/// to clone (Arc handles + a watch sender), so it can be lifted out from under the pipelines
+/// lock before any async work.
+#[derive(Clone)]
+pub(crate) struct ReplayContext {
+    backend: ArcStorageBackend,
+    journal: Arc<dyn crate::replay_journal::JournalLog>,
+    pipeline: String,
+    incarnation: String,
+    gate: Arc<ReplaySinkGate>,
+    pause: watch::Sender<bool>,
+    delivery: Arc<dyn ReplayDelivery>,
+    pin: Arc<AtomicU64>,
+    batch_limit: usize,
+    settle: Duration,
+}
+
+impl ReplayContext {
+    fn store(&self) -> ReplayJobStore {
+        ReplayJobStore::new(
+            self.backend.clone(),
+            &self.pipeline,
+            &self.incarnation,
+        )
+    }
+
+    fn build_controller(&self, cancel: CancellationToken) -> ReplayController {
+        ReplayController::new(
+            self.store(),
+            self.journal.clone(),
+            self.gate.clone(),
+            Arc::new(PauseIngestionControl::new(
+                self.pause.clone(),
+                self.settle,
+            )),
+            self.delivery.clone(),
+            self.pin.clone(),
+            cancel,
+            self.batch_limit,
+            self.pipeline.clone(),
+        )
     }
 }
 
@@ -659,6 +721,14 @@ impl PipelineManager {
             join: monitored_join,
         };
 
+        // Keep a processor handle + a by-id sink map for the replay delivery, which runs
+        // the CURRENT processors and sends to a job's target sinks out of band.
+        let replay_processors = Arc::clone(&processors);
+        let sinks_by_id: HashMap<String, deltaforge_core::ArcDynSink> = sinks
+            .iter()
+            .map(|s| (s.id().to_string(), Arc::clone(s)))
+            .collect();
+
         let batch_processor =
             build_batch_processor(processors, pipeline_name.clone());
 
@@ -734,6 +804,7 @@ impl PipelineManager {
         // Replay journal - opt-in, requires BOTH the journal master switch and the
         // replay sub-switch (replay is a journal feature; the master switch gates it).
         let mut retention_task: Option<tokio::task::JoinHandle<()>> = None;
+        let mut replay_ctx: Option<ReplayContext> = None;
         if let Some(replay_cfg) = spec
             .spec
             .journal
@@ -781,6 +852,13 @@ impl PipelineManager {
             let journal: Arc<dyn JournalLog> = Arc::new(
                 BackendJournalLog::new(self.backend.clone(), identity.clone()),
             );
+            // Per-sink gate + retention pin, shared between the coordinator (which excludes
+            // gated sinks from live delivery and commit policy) and the replay controller
+            // (which flips the gate and reports the pin). The gate is installed from the
+            // durable job below, before any live delivery, so a crash cannot strand a pause.
+            let gate = Arc::new(ReplaySinkGate::new());
+            let pin = Arc::new(AtomicU64::new(u64::MAX));
+            builder = builder.replay_gate(Arc::clone(&gate));
             builder =
                 builder.replay_capture(crate::coordinator::ReplayCapture {
                     journal: Arc::clone(&journal),
@@ -807,14 +885,67 @@ impl PipelineManager {
                     .then_some(replay_cfg.max_bytes),
                 interval_secs: 60,
             };
-            // No replay job pins retention yet (the replay engine lands later). The
-            // task is owned by the PipelineRuntime and aborted on stop/delete/drop.
+            // Retention is pinned to the active replay job (if any) through the shared
+            // `pin`: the controller sets it while a job runs and clears it otherwise, so
+            // retention never truncates envelopes a job still needs. The task is owned by
+            // the PipelineRuntime and aborted on stop/delete/drop.
+            let pin_for_ret = Arc::clone(&pin);
             retention_task = Some(spawn_retention_task(
-                journal,
+                Arc::clone(&journal),
                 pipeline_name.clone(),
                 ret_cfg,
-                Arc::new(|| u64::MAX),
+                Arc::new(move || pin_for_ret.load(Ordering::SeqCst)),
             ));
+
+            // Startup barrier: reinstall the gate from the durable job BEFORE any live
+            // delivery (the coordinator has not started consuming yet), so a job that was
+            // mid-flight before a restart keeps its sinks paused.
+            let store = ReplayJobStore::new(
+                self.backend.clone(),
+                &pipeline_name,
+                &incarnation,
+            );
+            if let Some(stored) = store.get().await? {
+                if stored.job.holds_pause() {
+                    gate.exclude(
+                        stored
+                            .job
+                            .selected_sinks
+                            .iter()
+                            .chain(stored.job.staged_sinks.iter())
+                            .cloned(),
+                    );
+                }
+            }
+
+            let delivery: Arc<dyn ReplayDelivery> =
+                Arc::new(CoordinatorReplayDelivery::new(
+                    build_batch_processor(
+                        replay_processors,
+                        pipeline_name.clone(),
+                    ),
+                    sinks_by_id,
+                    pipeline_name.clone(),
+                ));
+            let batch_limit = spec
+                .spec
+                .batch
+                .as_ref()
+                .and_then(|b| b.max_events)
+                .unwrap_or(500)
+                .max(1);
+            replay_ctx = Some(ReplayContext {
+                backend: self.backend.clone(),
+                journal,
+                pipeline: pipeline_name.clone(),
+                incarnation: incarnation.clone(),
+                gate,
+                pause: pause_tx.clone(),
+                delivery,
+                pin,
+                batch_limit,
+                settle: Duration::from_millis(200),
+            });
             tracing::info!(
                 pipeline = %pipeline_name,
                 incarnation = %incarnation,
@@ -845,6 +976,35 @@ impl PipelineManager {
 
         gauge!("deltaforge_pipeline_status", "pipeline" => pipeline_name.clone())
             .set(1.0);
+
+        // Resume an in-flight replay job across a restart: if the durable job is still
+        // active, spawn a controller to drive it to completion (the startup barrier above
+        // already reinstalled its pauses before the coordinator began delivering).
+        let mut replay_controller: Option<(CancellationToken, JoinHandle<()>)> =
+            None;
+        if let Some(ctx) = &replay_ctx {
+            let has_active_job = ctx
+                .store()
+                .get()
+                .await?
+                .map(|s| s.job.is_active())
+                .unwrap_or(false);
+            if has_active_job {
+                let job_cancel = CancellationToken::new();
+                let controller = ctx.build_controller(job_cancel.clone());
+                let pname = pipeline_name.clone();
+                let task = tokio::spawn(async move {
+                    if let Err(e) = controller.run().await {
+                        tracing::warn!(
+                            pipeline = %pname,
+                            error = %format!("{e:#}"),
+                            "resumed replay job failed"
+                        );
+                    }
+                });
+                replay_controller = Some((job_cancel, task));
+            }
+        }
 
         // Emit pipeline info metric with labels for Grafana joins.
         // This is a constant gauge (always 1) that carries metadata as labels.
@@ -878,6 +1038,8 @@ impl PipelineManager {
             sensor_state: sensor_for_runtime,
             dlq_writer,
             retention_task,
+            replay_ctx,
+            replay_controller,
             started_at: std::time::Instant::now(),
         })
     }
@@ -925,6 +1087,11 @@ impl PipelineManager {
         if let Some(task) = runtime.retention_task.take() {
             task.abort();
         }
+        // Stop any in-flight replay controller (a restart's startup barrier resumes it).
+        if let Some((c, task)) = runtime.replay_controller.take() {
+            c.cancel();
+            task.abort();
+        }
         let sources = std::mem::take(&mut runtime.sources);
         for src in &sources {
             src.cancel.cancel();
@@ -949,6 +1116,136 @@ impl PipelineManager {
     pub fn get_pipeline(&self, name: &str) -> Option<PipeInfo> {
         self.pipelines.read().get(name).map(|r| r.info())
     }
+
+    /// Lift the replay context out from under the pipelines lock (so async work does not
+    /// hold the parking_lot guard).
+    fn replay_ctx_of(
+        &self,
+        name: &str,
+    ) -> Result<ReplayContext, PipelineAPIError> {
+        let guard = self.pipelines.read();
+        let rt = guard
+            .get(name)
+            .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?;
+        rt.replay_ctx.clone().ok_or_else(|| {
+            PipelineAPIError::Failed(anyhow::anyhow!(
+                "replay is not enabled for pipeline '{name}' (set journal.replay.enabled)"
+            ))
+        })
+    }
+
+    /// Start a replay job for a pipeline: create the durable job, then spawn a controller to
+    /// drive it (historical delivery, catch-up, handoff). Returns the new job id. The store
+    /// rejects a second active job, so callers get `AlreadyActive` rather than two runners.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_replay(
+        &self,
+        name: &str,
+        selected_sinks: Vec<String>,
+        staged_sinks: Vec<String>,
+        from_seq: u64,
+        through_seq: Option<u64>,
+        encoder_schema_policy: EncoderSchemaPolicy,
+        dry_run: bool,
+    ) -> Result<String, PipelineAPIError> {
+        let ctx = self.replay_ctx_of(name)?;
+        let job_id = uuid::Uuid::now_v7().to_string();
+        let now = now_ms();
+        let job = ReplayJob::new(
+            job_id.clone(),
+            name,
+            &ctx.incarnation,
+            selected_sinks,
+            staged_sinks,
+            from_seq,
+            through_seq,
+            encoder_schema_policy,
+            dry_run,
+            now,
+        )
+        .map_err(|e| PipelineAPIError::Failed(anyhow::anyhow!(e)))?;
+        ctx.store()
+            .create(&job)
+            .await
+            .map_err(PipelineAPIError::Failed)?;
+
+        let job_cancel = CancellationToken::new();
+        let controller = ctx.build_controller(job_cancel.clone());
+        let pname = name.to_string();
+        let task = tokio::spawn(async move {
+            if let Err(e) = controller.run().await {
+                tracing::warn!(
+                    pipeline = %pname,
+                    error = %format!("{e:#}"),
+                    "replay job failed"
+                );
+            }
+        });
+
+        // Install the controller handle; abort any stale (finished) one it replaces.
+        if let Some(rt) = self.pipelines.write().get_mut(name) {
+            if let Some((c, t)) =
+                rt.replay_controller.replace((job_cancel, task))
+            {
+                c.cancel();
+                t.abort();
+            }
+        }
+        Ok(job_id)
+    }
+
+    /// Cancel the active replay job for a pipeline: stop the controller, mark the job
+    /// cancelled, and return the paused/staged sinks to the live set. Idempotent when no
+    /// active job exists.
+    pub async fn cancel_replay(
+        &self,
+        name: &str,
+    ) -> Result<(), PipelineAPIError> {
+        let ctx = self.replay_ctx_of(name)?;
+
+        // Stop the controller first so it cannot race the cancellation.
+        if let Some(rt) = self.pipelines.write().get_mut(name) {
+            if let Some((c, t)) = rt.replay_controller.take() {
+                c.cancel();
+                t.abort();
+            }
+        }
+
+        // Mark the durable job cancelled (only from a pre-live-restored phase) and restore
+        // live delivery: release the gate and the retention pin, and unpause ingestion in
+        // case the cancel landed during a handoff quiesce.
+        if let Some(stored) =
+            ctx.store().get().await.map_err(PipelineAPIError::Failed)?
+        {
+            if stored.job.is_active() {
+                if let Ok(cancelled) =
+                    stored.job.advance(ReplayPhase::Cancelled, now_ms())
+                {
+                    let _ = ctx
+                        .store()
+                        .compare_and_set(stored.version, &cancelled)
+                        .await;
+                }
+                ctx.gate.include(
+                    stored
+                        .job
+                        .selected_sinks
+                        .iter()
+                        .chain(stored.job.staged_sinks.iter()),
+                );
+                ctx.pin.store(u64::MAX, Ordering::SeqCst);
+                let _ = ctx.pause.send(false);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 // ============================================================================
@@ -1115,6 +1412,11 @@ impl PipelineController for PipelineManager {
             // Stop the replay-retention background task with the coordinator; there is
             // nothing to retain while the pipeline is not capturing.
             if let Some(task) = runtime.retention_task.take() {
+                task.abort();
+            }
+            // Stop any in-flight replay controller (resumed by the barrier on restart).
+            if let Some((c, task)) = runtime.replay_controller.take() {
+                c.cancel();
                 task.abort();
             }
             (cancel, sources, join)

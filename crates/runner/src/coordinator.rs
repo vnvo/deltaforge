@@ -848,6 +848,10 @@ pub struct Coordinator<Tok> {
     dlq_writer: Option<Arc<crate::dlq::DlqWriter>>,
     /// Optional replay capture (enabled by `journal.replay`).
     replay_capture: Option<ReplayCapture>,
+    /// Optional per-sink replay gate. When a replay job pauses a live sink (or holds a
+    /// staged sink out of the live set), that sink is excluded from live delivery and from
+    /// commit-policy evaluation for the job's duration.
+    replay_gate: Option<Arc<crate::replay_gate::ReplaySinkGate>>,
 }
 
 pub struct CoordinatorBuilder<Tok> {
@@ -862,6 +866,7 @@ pub struct CoordinatorBuilder<Tok> {
     schema_provider: Option<ArcSchemaProvider>,
     dlq_writer: Option<Arc<crate::dlq::DlqWriter>>,
     replay_capture: Option<ReplayCapture>,
+    replay_gate: Option<Arc<crate::replay_gate::ReplaySinkGate>>,
 }
 
 impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
@@ -878,6 +883,7 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             schema_provider: None,
             dlq_writer: None,
             replay_capture: None,
+            replay_gate: None,
         }
     }
 
@@ -942,6 +948,14 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
         self
     }
 
+    pub fn replay_gate(
+        mut self,
+        gate: Arc<crate::replay_gate::ReplaySinkGate>,
+    ) -> Self {
+        self.replay_gate = Some(gate);
+        self
+    }
+
     pub fn build(self) -> Coordinator<Tok> {
         let batch_cfg_eff = Coordinator::<Tok>::effective(&self.batch_config);
         assert!(
@@ -962,6 +976,7 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             db_schema_cache: Mutex::new(HashMap::new()),
             dlq_writer: self.dlq_writer,
             replay_capture: self.replay_capture,
+            replay_gate: self.replay_gate,
         }
     }
 }
@@ -1083,6 +1098,13 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
     /// Get access to schema sensor state (for API exposure).
     pub fn schema_sensor(&self) -> Option<&Arc<SchemaSensorState>> {
         self.schema_sensor.as_ref()
+    }
+
+    /// Whether a replay job currently excludes `sink_id` from live delivery.
+    fn is_sink_excluded(&self, sink_id: &str) -> bool {
+        self.replay_gate
+            .as_ref()
+            .is_some_and(|g| g.is_excluded(sink_id))
     }
 
     fn effective(cfg: &Option<BatchConfig>) -> BatchConfig {
@@ -1659,12 +1681,22 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         // Each sink gets the same Arc<[Event]> - no cloning of event data.
         // We drive all futures simultaneously and collect per-sink outcomes,
         // then fold the results into ack counters
+        // Sinks receiving this LIVE batch: all sinks minus any an active replay job
+        // excludes (a paused live sink, or a staged sink not yet promoted). Excluded sinks
+        // are also dropped from commit-policy evaluation for the job's duration, so a paused
+        // required sink does not block the rest of the pipeline.
+        let live_sinks: Vec<ArcDynSink> = self
+            .sinks
+            .iter()
+            .filter(|s| !self.is_sink_excluded(s.id()))
+            .cloned()
+            .collect();
         let required_total =
-            self.sinks.iter().filter(|s| is_sink_required(s)).count();
+            live_sinks.iter().filter(|s| is_sink_required(s)).count();
 
         debug!(
             pipeline=%self.pipeline_name,
-            sink_count=self.sinks.len(),
+            sink_count=live_sinks.len(),
             event_count=frozen.events.len(),
             "sending batch to sink(s) concurrently"
         );
@@ -1695,7 +1727,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             batch_id: None,
         });
 
-        let sink_futs = self.sinks.iter().map(|sink| {
+        let sink_futs = live_sinks.iter().map(|sink| {
             let start = Instant::now();
             let events = Arc::clone(&frozen.events);
             let required = is_sink_required(sink);
@@ -1837,7 +1869,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         // checkpoints while the required sink is behind.
         if !policy_satisfied(
             &self.commit_policy,
-            self.sinks.len(),
+            live_sinks.len(),
             required_total,
             required_acks,
             total_acks,
@@ -3133,6 +3165,68 @@ mod tests {
         assert_eq!(
             store.get_raw("src::sink::kafka").await.unwrap().as_deref(),
             Some(&b"cp-1"[..])
+        );
+    }
+
+    /// A sink excluded by the replay gate receives no live batch and is dropped from
+    /// commit-policy evaluation, so a paused required sink does not block the others.
+    #[tokio::test]
+    async fn replay_gate_excludes_sink_from_delivery_and_commit_policy() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let kafka = MockSink::new("kafka", true);
+        let s3 = MockSink::new("s3", true);
+        let sinks: Vec<ArcDynSink> = vec![
+            Arc::clone(&kafka) as ArcDynSink,
+            Arc::clone(&s3) as ArcDynSink,
+        ];
+        let gate = Arc::new(crate::replay_gate::ReplaySinkGate::new());
+        gate.exclude(["s3".to_string()]);
+        let procs: Arc<[deltaforge_core::ArcDynProcessor]> = Arc::from(vec![]);
+        let batch_processor = build_batch_processor(procs, "test".to_string());
+        let coord = Coordinator::builder("gate-test")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(1000),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_policy(Some(CommitPolicy::Required))
+            .commit_fn(
+                "kafka",
+                build_commit_fn(store.clone(), "src::sink::kafka".to_string()),
+            )
+            .commit_fn(
+                "s3",
+                build_commit_fn(store.clone(), "src::sink::s3".to_string()),
+            )
+            .process_fn(batch_processor)
+            .replay_gate(gate)
+            .build();
+
+        feed_and_run(
+            coord,
+            vec![
+                begin("g1"),
+                SourceItem::Event(tx_event(1, "g1", b"row")),
+                commit("g1", b"cp-1"),
+            ],
+        )
+        .await
+        .expect("live delivery succeeds while a required sink is gated out");
+
+        assert_eq!(kafka.delivery_count(), 1, "live sink received the batch");
+        assert_eq!(s3.delivery_count(), 0, "excluded sink received nothing");
+        assert_eq!(
+            store.get_raw("src::sink::kafka").await.unwrap().as_deref(),
+            Some(&b"cp-1"[..]),
+            "live sink checkpoint advanced (policy satisfied over live sinks)"
+        );
+        assert!(
+            store.get_raw("src::sink::s3").await.unwrap().is_none(),
+            "excluded sink checkpoint did not advance"
         );
     }
 
