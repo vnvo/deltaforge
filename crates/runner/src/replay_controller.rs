@@ -1018,6 +1018,128 @@ mod tests {
         assert!(!gate.any_excluded(), "live restored after failed quiesce");
     }
 
+    struct RecordingSink {
+        id: String,
+        count: AtomicUsize,
+    }
+    #[async_trait]
+    impl deltaforge_core::Sink for RecordingSink {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        async fn send(
+            &self,
+            _e: &deltaforge_core::Event,
+        ) -> deltaforge_core::SinkResult<()> {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn send_batch(
+            &self,
+            events: &[deltaforge_core::Event],
+        ) -> deltaforge_core::SinkResult<deltaforge_core::BatchResult> {
+            self.count.fetch_add(events.len(), Ordering::SeqCst);
+            Ok(deltaforge_core::BatchResult::ok())
+        }
+    }
+
+    /// End-to-end for the real delivery path: reconstruct the stored Event, run it through
+    /// the (current) processors, and send it to the target sink. A non-current encoder
+    /// schema fails closed.
+    #[tokio::test]
+    async fn coordinator_replay_delivery_reconstructs_and_delivers() {
+        let source = deltaforge_core::SourceInfo {
+            version: "t".into(),
+            connector: "mysql".into(),
+            name: "t".into(),
+            db: "db".into(),
+            schema: None,
+            table: "t".into(),
+            ts_ms: 0,
+            snapshot: None,
+            position: Default::default(),
+        };
+        let ev = deltaforge_core::Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 1),
+            source,
+            deltaforge_core::Op::Create,
+            None,
+            Some(serde_json::json!({ "id": 1 })),
+            0,
+            10,
+        );
+        let payload = ReplayEnvelopePayload {
+            version: REPLAY_ENVELOPE_VERSION,
+            pipeline_identity: identity(),
+            boundary: SourceBoundaryRecord::from_boundary(
+                &SourceBoundary::checkpoint_only(CheckpointMeta::from_vec(
+                    b"cp".to_vec(),
+                )),
+            ),
+            events: vec![ReplayEventRecord {
+                offset: 0,
+                event_id: "e1".into(),
+                tx_id: None,
+                event: serde_json::to_value(&ev).unwrap(),
+            }],
+            schema_binding: SchemaBinding {
+                source_tables: vec!["db.t".into()],
+                registry_seq_at_capture: None,
+            },
+        };
+        let stored = StoredReplayEnvelope {
+            seq: 1,
+            stored_at_ms: 0,
+            capture_id: payload.capture_id(),
+            content_hash: "x".into(),
+            payload,
+        };
+
+        let sink = Arc::new(RecordingSink {
+            id: "kafka".into(),
+            count: AtomicUsize::new(0),
+        });
+        let mut sinks: HashMap<String, deltaforge_core::ArcDynSink> =
+            HashMap::new();
+        sinks.insert(
+            "kafka".to_string(),
+            Arc::clone(&sink) as deltaforge_core::ArcDynSink,
+        );
+        let process = crate::coordinator::build_batch_processor(
+            Arc::from(vec![]),
+            "p".to_string(),
+        );
+        let delivery =
+            CoordinatorReplayDelivery::new(process, sinks, None, None, "p");
+
+        let job = ReplayJob::new(
+            "j",
+            "p",
+            "inc-1",
+            vec!["kafka".into()],
+            vec![],
+            0,
+            None,
+            EncoderSchemaPolicy::Current,
+            false,
+            1,
+        )
+        .unwrap();
+
+        delivery
+            .deliver(&job, &stored, ResolvedEncoderSchema::Current)
+            .await
+            .unwrap();
+        assert_eq!(sink.count.load(Ordering::SeqCst), 1);
+
+        // A non-current (pinned) schema is not honorable via the sink API: fail closed.
+        let err = delivery
+            .deliver(&job, &stored, ResolvedEncoderSchema::AtSeq(5))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("schema pinning"));
+    }
+
     #[tokio::test]
     async fn hex_roundtrips_through_ctx() {
         let (_be, jl, _seqs) = journal_with(0).await;
