@@ -241,7 +241,14 @@ pub(super) async fn dispatch_event(
                 lsn,
                 &ctx.pipeline,       // pipeline name
                 &ctx.default_schema, // database name
-                ctx.current_tx_id,
+                // Only a transactional message belongs to the open transaction; a
+                // non-transactional message is its own boundary and must stay
+                // unstamped so the coordinator keeps treating it as standalone.
+                if transactional {
+                    ctx.current_tx_id
+                } else {
+                    None
+                },
                 ctx.current_tx_commit_time,
                 &ctx.outbox_prefixes,
             ) {
@@ -980,6 +987,34 @@ fn read_cstring(data: &[u8], offset: &mut usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The TxCommit marker carries a boundary built from the COMMIT record's
+    /// end_lsn and the frozen system_identifier lineage: the checkpoint passes
+    /// through and a durable watermark is produced when lineage is available.
+    #[test]
+    fn pg_commit_boundary_uses_commit_lsn_and_lineage() {
+        let end_lsn = Lsn::from(0x00AB_CDEFu64);
+        let cp = CheckpointMeta::from_vec(b"cp".to_vec());
+        let boundary = boundary_for_pg_commit(42, &end_lsn, Some(7), cp);
+        assert_eq!(boundary.checkpoint.as_bytes(), b"cp");
+        assert!(
+            boundary.durable_watermark.is_some(),
+            "a known lineage must produce a durable watermark"
+        );
+    }
+
+    /// `system_identifier == 0` means lineage is unavailable: fail closed with no
+    /// synthesized watermark (durable mode then fails at the sink, never guesses).
+    #[test]
+    fn pg_commit_boundary_without_lineage_has_no_watermark() {
+        let end_lsn = Lsn::from(0x00AB_CDEFu64);
+        let cp = CheckpointMeta::from_vec(b"cp".to_vec());
+        let boundary = boundary_for_pg_commit(0, &end_lsn, Some(7), cp);
+        assert!(
+            boundary.durable_watermark.is_none(),
+            "missing lineage must not synthesize a watermark"
+        );
+    }
 
     #[test]
     fn test_read_cstring() {

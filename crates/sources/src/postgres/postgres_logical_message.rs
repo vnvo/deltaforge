@@ -78,7 +78,7 @@ pub fn to_event(
 
     debug!(prefix = %prefix, lsn = %lsn, tx_id = ?tx_id, schema = schema, "emitted WAL message event");
 
-    Some(Event::new_row(
+    let mut event = Event::new_row(
         event_id,
         source,
         Op::Create,
@@ -86,7 +86,20 @@ pub fn to_event(
         Some(after),
         ts_ms,
         content.len(),
-    ))
+    );
+    // A transactional message occurs inside a BEGIN/COMMIT, so stamp it with the
+    // transaction id (like DML/DDL rows). Without this the coordinator treats it as
+    // a standalone boundary and can flush/checkpoint mid-transaction, splitting the
+    // surrounding transaction. Non-transactional messages (`tx_id == None`) are their
+    // own boundary and stay unstamped.
+    if let Some(xid) = tx_id {
+        event.transaction = Some(deltaforge_core::Transaction {
+            id: xid.to_string(),
+            total_order: None,
+            data_collection_order: None,
+        });
+    }
+    Some(event)
 }
 
 #[cfg(test)]
@@ -139,6 +152,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ev.source.schema.as_deref(), Some(OUTBOX_SCHEMA_SENTINEL));
+    }
+
+    #[test]
+    fn transactional_message_is_stamped_with_transaction_id() {
+        // A transactional logical message occurs inside a BEGIN/COMMIT; it MUST
+        // carry the transaction id so the coordinator folds it into the open
+        // transaction instead of treating it as a standalone boundary (which would
+        // split the surrounding transaction).
+        let ev = to_event(
+            msg_id(),
+            "outbox",
+            &Bytes::from(r#"{"id":"1"}"#),
+            Lsn::from(1u64),
+            "p",
+            "db",
+            Some(4242),
+            None,
+            &allow(&["outbox"]),
+        )
+        .unwrap();
+        assert_eq!(
+            ev.transaction.as_ref().map(|t| t.id.as_str()),
+            Some("4242"),
+            "transactional message must be stamped with its tx id"
+        );
+    }
+
+    #[test]
+    fn non_transactional_message_has_no_transaction() {
+        // A non-transactional message occurs outside BEGIN/COMMIT and is its own
+        // boundary - it must NOT be stamped with a transaction id.
+        let ev = to_event(
+            msg_id(),
+            "audit",
+            &Bytes::from(r#"{}"#),
+            Lsn::from(1u64),
+            "p",
+            "db",
+            None,
+            None,
+            &allow(&["outbox"]),
+        )
+        .unwrap();
+        assert!(
+            ev.transaction.is_none(),
+            "non-transactional message must not carry a transaction id"
+        );
     }
 
     #[test]
