@@ -429,6 +429,11 @@ pub(crate) struct ReplayContext {
     journal: Arc<dyn crate::replay_journal::JournalLog>,
     pipeline: String,
     incarnation: String,
+    /// A unique token minted on every `spawn_pipeline`. The incarnation persists across
+    /// stop/restart and config patches, so it alone cannot tell a replaced runtime apart;
+    /// commit requires this generation to match too, so a controller reserved against one
+    /// runtime can never attach to a replacement runtime.
+    generation: String,
     gate: Arc<ReplaySinkGate>,
     pause: watch::Sender<PauseState>,
     /// Receives the coordinator's acknowledged quiesce, used by the handoff barrier.
@@ -964,6 +969,8 @@ impl PipelineManager {
                 journal,
                 pipeline: pipeline_name.clone(),
                 incarnation: incarnation.clone(),
+                // Fresh per spawn so a replaced runtime (same incarnation) is distinguishable.
+                generation: uuid::Uuid::now_v7().to_string(),
                 gate,
                 pause: pause_tx.clone(),
                 quiesced: quiesce_ack_rx.clone(),
@@ -1207,25 +1214,35 @@ impl PipelineManager {
         // Construction invariants (range, targets, sink hygiene) are client errors (400).
         .map_err(|e| PipelineAPIError::BadRequest(e.to_string()))?;
 
-        // Reserve (durably create) the job, then commit it (install ownership + spawn the
-        // controller) only if the pipeline is still the same live generation. This
-        // reserve/commit split means a start invalidated by a concurrent stop/delete never
-        // installs a gate/pin and never spawns a controller - it just rolls the reserved job
-        // back to Cancelled.
-        self.reserve_replay_job(&ctx, &job).await?;
+        // Pre-install a RESERVATION pin (the lowest seq the job needs) before the durable
+        // create, so concurrent retention cannot truncate the requested range during the
+        // reserve window. Remember the prior pin to restore it if the create fails.
+        let prev_pin = ctx.pin.load(Ordering::SeqCst);
+        if let Some(p) = job.pin_seq() {
+            ctx.pin.fetch_min(p, Ordering::SeqCst);
+        }
+        if let Err(e) = self.reserve_replay_job(&ctx, &job).await {
+            // No job was created: restore the pin we speculatively lowered.
+            ctx.pin.store(prev_pin, Ordering::SeqCst);
+            return Err(e);
+        }
+
+        // Commit (promote the pin + install the gate + spawn/attach the controller) only if
+        // the pipeline is still the same live runtime generation. Otherwise roll the reserved
+        // job back, clearing the reservation pin ONLY once cancellation is durably confirmed.
         if self.commit_replay_job(&ctx, &job) {
             Ok(job_id)
         } else {
-            self.rollback_replay_job(&ctx).await;
+            self.rollback_replay_job(&ctx, prev_pin).await?;
             Err(PipelineAPIError::Conflict(format!(
                 "pipeline '{name}' changed during replay start; job cancelled"
             )))
         }
     }
 
-    /// Reserve a replay job by durably creating it. No gate/pin/controller are installed
-    /// here - those happen only on [`Self::commit_replay_job`]. `AlreadyActive` maps to a
-    /// 409 conflict; other store errors to 500.
+    /// Reserve a replay job by durably creating it. No gate/controller are installed here -
+    /// those happen only on [`Self::commit_replay_job`]; the retention pin is pre-installed by
+    /// the caller. `AlreadyActive` maps to a 409 conflict; other store errors to 500.
     async fn reserve_replay_job(
         &self,
         ctx: &ReplayContext,
@@ -1248,19 +1265,19 @@ impl PipelineManager {
     }
 
     /// Commit a reserved job under the pipelines write lock: if the pipeline is still the
-    /// same live generation (incarnation) and in an eligible state, install the retention pin
-    /// and sink exclusions, spawn the controller, and attach it (aborting any stale one).
-    /// Returns whether it committed. ALL side effects (pin, gate, spawn, attach) happen only
-    /// on the committed path, so an invalidated start leaves nothing installed or leaked.
+    /// same live runtime (matching BOTH incarnation and per-spawn generation) and in an
+    /// eligible state, promote the retention pin, install the sink exclusions, spawn the
+    /// controller, and attach it (aborting any stale one). Returns whether it committed. The
+    /// gate/spawn/attach side effects happen only on the committed path.
     fn commit_replay_job(&self, ctx: &ReplayContext, job: &ReplayJob) -> bool {
         let mut guard = self.pipelines.write();
         let Some(rt) = guard.get_mut(&ctx.pipeline) else {
             return false;
         };
-        let eligible = rt
-            .replay_ctx
-            .as_ref()
-            .is_some_and(|c| c.incarnation == ctx.incarnation)
+        let same_runtime = rt.replay_ctx.as_ref().is_some_and(|c| {
+            c.incarnation == ctx.incarnation && c.generation == ctx.generation
+        });
+        let eligible = same_runtime
             && matches!(
                 rt.status,
                 PipelineStatus::Running | PipelineStatus::Paused
@@ -1268,6 +1285,8 @@ impl PipelineManager {
         if !eligible {
             return false;
         }
+        // Promote the reservation pin to the committed job's pin (same value; the controller
+        // maintains it from here).
         if let Some(pin) = job.pin_seq() {
             ctx.pin.store(pin, Ordering::SeqCst);
         }
@@ -1293,21 +1312,34 @@ impl PipelineManager {
         true
     }
 
-    /// Roll back a reserved-but-not-committed job: durably cancel it (best effort). No
-    /// gate/pin were installed (commit did not run), so there is nothing to release.
-    async fn rollback_replay_job(&self, ctx: &ReplayContext) {
-        if let Ok(Some(stored)) = ctx.store().get().await {
+    /// Roll back a reserved-but-not-committed job: durably cancel it, then clear the
+    /// reservation pin (restoring `prev_pin`). Read/CAS failures propagate: the caller must
+    /// NOT report the job cancelled unless this returns `Ok`, and the reservation pin is left
+    /// installed on failure so retention still protects the (still-active) reserved range.
+    async fn rollback_replay_job(
+        &self,
+        ctx: &ReplayContext,
+        prev_pin: u64,
+    ) -> Result<(), PipelineAPIError> {
+        if let Some(stored) =
+            ctx.store().get().await.map_err(PipelineAPIError::Failed)?
+        {
             if stored.job.is_active() {
-                if let Ok(cancelled) =
-                    stored.job.advance(ReplayPhase::Cancelled, now_ms())
-                {
-                    let _ = ctx
-                        .store()
-                        .compare_and_set(stored.version, &cancelled)
-                        .await;
-                }
+                let cancelled = stored
+                    .job
+                    .advance(ReplayPhase::Cancelled, now_ms())
+                    .map_err(|e| {
+                        PipelineAPIError::Failed(anyhow::anyhow!(e))
+                    })?;
+                ctx.store()
+                    .compare_and_set(stored.version, &cancelled)
+                    .await
+                    .map_err(PipelineAPIError::Failed)?;
             }
         }
+        // Cancellation is durably confirmed (or there was no job): release the reservation pin.
+        ctx.pin.store(prev_pin, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Cancel the active replay job for a pipeline: stop the controller, persist the
@@ -2631,6 +2663,7 @@ mod tests {
             journal,
             pipeline: name.clone(),
             incarnation: incarnation.clone(),
+            generation: "gen-1".to_string(),
             gate: gate.clone(),
             pause: pause_tx.clone(),
             quiesced: quiesced_rx,
@@ -2702,7 +2735,10 @@ mod tests {
             !fx.manager.commit_replay_job(&ctx, &job),
             "commit must fail"
         );
-        fx.manager.rollback_replay_job(&ctx).await;
+        fx.manager
+            .rollback_replay_job(&ctx, u64::MAX)
+            .await
+            .unwrap();
 
         let stored = ctx.store().get().await.unwrap().unwrap();
         assert_eq!(stored.job.phase, ReplayPhase::Cancelled);
@@ -2714,27 +2750,36 @@ mod tests {
         );
     }
 
-    /// A start invalidated by a delete+recreate (incarnation changed) rolls back.
+    /// A start invalidated by a stop+restart that keeps the SAME incarnation but mints a new
+    /// runtime generation rolls back (the generation check, not incarnation, catches it).
     #[tokio::test]
-    async fn start_loses_to_incarnation_change_rolls_back() {
+    async fn start_loses_to_runtime_replacement_rolls_back() {
         let fx = replay_fixture(Arc::new(MemoryStorageBackend::new())).await;
         let ctx = fx.manager.replay_ctx_of(&fx.name).unwrap();
         let job = a_job(&fx);
         fx.manager.reserve_replay_job(&ctx, &job).await.unwrap();
 
-        // Recreate wins: the runtime now carries a new incarnation.
-        fx.manager
-            .pipelines
-            .write()
-            .get_mut(&fx.name)
-            .unwrap()
-            .replay_ctx
-            .as_mut()
-            .unwrap()
-            .incarnation = "inc-2".into();
+        // Restart wins: same incarnation, but the runtime now carries a NEW generation, as a
+        // real respawn (spawn_pipeline mints one) would.
+        {
+            let mut guard = fx.manager.pipelines.write();
+            let rt = guard.get_mut(&fx.name).unwrap();
+            let rc = rt.replay_ctx.as_mut().unwrap();
+            assert_eq!(
+                rc.incarnation, ctx.incarnation,
+                "incarnation unchanged"
+            );
+            rc.generation = "gen-2".into();
+        }
 
-        assert!(!fx.manager.commit_replay_job(&ctx, &job));
-        fx.manager.rollback_replay_job(&ctx).await;
+        assert!(
+            !fx.manager.commit_replay_job(&ctx, &job),
+            "generation mismatch must fail commit despite matching incarnation"
+        );
+        fx.manager
+            .rollback_replay_job(&ctx, u64::MAX)
+            .await
+            .unwrap();
         let stored = ctx.store().get().await.unwrap().unwrap();
         assert_eq!(stored.job.phase, ReplayPhase::Cancelled);
         assert!(!fx.gate.any_excluded());
@@ -2756,11 +2801,61 @@ mod tests {
             .status = PipelineStatus::Stopped;
 
         assert!(!fx.manager.commit_replay_job(&ctx, &job));
-        fx.manager.rollback_replay_job(&ctx).await;
+        fx.manager
+            .rollback_replay_job(&ctx, u64::MAX)
+            .await
+            .unwrap();
         let stored = ctx.store().get().await.unwrap().unwrap();
         assert_eq!(stored.job.phase, ReplayPhase::Cancelled);
         assert!(!fx.gate.any_excluded());
         assert_eq!(fx.pin.load(Ordering::SeqCst), u64::MAX);
+    }
+
+    /// If rollback cannot durably persist the cancellation (CAS keeps failing), it returns an
+    /// error and LEAVES the reservation pin installed (so retention still protects the range)
+    /// and the job active - the caller must not claim "cancelled".
+    #[tokio::test]
+    async fn rollback_leaves_pin_when_persistence_fails() {
+        let backend: ArcStorageBackend = Arc::new(FaultBackend::new(
+            Arc::new(MemoryStorageBackend::new()),
+            100,
+        ));
+        let fx = replay_fixture(backend).await;
+        let ctx = fx.manager.replay_ctx_of(&fx.name).unwrap();
+        let job = a_job(&fx);
+        // Pre-install the reservation pin (as start_replay does), then reserve.
+        fx.pin.fetch_min(job.pin_seq().unwrap(), Ordering::SeqCst);
+        assert_eq!(fx.pin.load(Ordering::SeqCst), 1);
+        fx.manager.reserve_replay_job(&ctx, &job).await.unwrap();
+
+        // Runtime replaced -> commit fails.
+        fx.manager
+            .pipelines
+            .write()
+            .get_mut(&fx.name)
+            .unwrap()
+            .replay_ctx
+            .as_mut()
+            .unwrap()
+            .generation = "gen-2".into();
+        assert!(!fx.manager.commit_replay_job(&ctx, &job));
+
+        // Rollback cannot persist the cancellation -> Err, pin left installed, job active.
+        let err = fx
+            .manager
+            .rollback_replay_job(&ctx, u64::MAX)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PipelineAPIError::Failed(_)));
+        assert_eq!(
+            fx.pin.load(Ordering::SeqCst),
+            1,
+            "reservation pin stays installed on rollback failure"
+        );
+        assert!(
+            ctx.store().get().await.unwrap().unwrap().job.is_active(),
+            "job not cancelled when persistence failed"
+        );
     }
 
     /// The eligible path installs ownership and attaches the controller.

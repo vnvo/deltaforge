@@ -1,22 +1,26 @@
-//! Event-replay acceptance tests against a REAL PostgreSQL backend (Slice 5, Option 3).
+//! PostgreSQL-backed engine/store INTEGRATION tests for event replay (Slice 5, Option 3).
 //!
-//! These exercise the replay engine (journal + durable job store + controller + real
-//! coordinator-backed delivery) over a live PostgreSQL `StorageBackend`, so capture-time
-//! durability and replay run against the same storage a production deployment uses.
+//! Scope, precisely: these drive the replay engine (the journal, the durable job store, the
+//! controller, and the real coordinator-backed delivery) over a live PostgreSQL
+//! `StorageBackend`, using HAND-BUILT envelopes and an immediate (test) ingestion control.
+//! They verify the journal/job-store durability and the replay/resume path against real
+//! PostgreSQL; they are NOT a full source-capture test and NOT an acknowledged-coordinator-
+//! handoff test. The real capture path (coordinator commit-unit capture) and the acknowledged
+//! quiesce/handoff are covered by the in-process unit tests in the runner crate.
 //!
-//! They are `#[ignore]`d and gated on `DELTAFORGE_IT_PG_DSN` (matching the storage crate's
-//! PostgreSQL contract test); run them with, e.g.:
+//! `#[ignore]`d and gated on `DELTAFORGE_IT_PG_DSN` (matching the storage crate's PostgreSQL
+//! contract test); an explicitly-invoked case PANICS if the variable is unset (so it cannot
+//! falsely pass). Run with, e.g.:
 //!
 //! ```text
 //! DELTAFORGE_IT_PG_DSN='host=127.0.0.1 port=55432 user=postgres password=postgres dbname=postgres' \
-//!   cargo test -p runner --test replay_pg_e2e -- --ignored
+//!   cargo test -p runner --test replay_pg_integration -- --ignored
 //! ```
 //!
 //! Each test isolates itself under a unique pipeline incarnation so cases can share one
-//! database. Scenarios covered here: deterministic capture/replay, at-least-once
-//! re-delivery, and restart from a durable handoff phase. Operator-pause overlap,
-//! snapshot-chunk/transaction boundary quiescence, and coordinator-loss are covered by the
-//! in-process unit tests in the runner crate.
+//! database. Scenarios: deterministic capture/replay, at-least-once re-delivery after an
+//! interruption at the ack-before-cursor-persist boundary, and restart from a durable handoff
+//! phase.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,13 +49,15 @@ use runner::replay_job::{
     EncoderSchemaPolicy, ReplayJob, ReplayJobStore, ReplayPhase,
 };
 use runner::replay_journal::{BackendJournalLog, JournalLog};
-use runner::replay_worker::ReplayDelivery;
+use runner::replay_worker::{ReplayDelivery, ResolvedEncoderSchema};
 
-/// Skip (returning None) unless a live PostgreSQL DSN is configured.
-async fn pg_backend() -> Option<ArcStorageBackend> {
-    let dsn = std::env::var("DELTAFORGE_IT_PG_DSN").ok()?;
-    Some(PostgresStorageBackend::connect(&dsn).await.unwrap()
-        as ArcStorageBackend)
+/// Connect to the configured PostgreSQL. These are `#[ignore]`d, so they only run when
+/// explicitly invoked - at which point a missing DSN is a hard failure (never a silent pass),
+/// mirroring the fix applied to the MinIO gate.
+async fn pg_backend() -> ArcStorageBackend {
+    let dsn = std::env::var("DELTAFORGE_IT_PG_DSN")
+        .expect("DELTAFORGE_IT_PG_DSN must be set to run this test");
+    PostgresStorageBackend::connect(&dsn).await.unwrap() as ArcStorageBackend
 }
 
 fn identity(incarnation: &str) -> PipelineIdentity {
@@ -218,9 +224,7 @@ async fn append_units(
 #[tokio::test]
 #[ignore = "requires a live PostgreSQL (DELTAFORGE_IT_PG_DSN)"]
 async fn pg_deterministic_capture_replay() {
-    let Some(backend) = pg_backend().await else {
-        return;
-    };
+    let backend = pg_backend().await;
     let incarnation = uuid::Uuid::now_v7().to_string();
     let journal: Arc<dyn JournalLog> = Arc::new(BackendJournalLog::new(
         backend.clone(),
@@ -246,45 +250,63 @@ async fn pg_deterministic_capture_replay() {
     assert_eq!(after.job.phase, ReplayPhase::Completed);
 }
 
-/// At-least-once: replaying the same range again re-delivers every unit (idempotent capture
-/// in the journal, at-least-once delivery to the sink).
+/// At-least-once after interruption at the ack-before-cursor-persist boundary: an envelope
+/// whose sink delivery was acknowledged but whose cursor advance was lost (crash) is delivered
+/// AGAIN when the job resumes from the unchanged durable cursor.
 #[tokio::test]
 #[ignore = "requires a live PostgreSQL (DELTAFORGE_IT_PG_DSN)"]
-async fn pg_at_least_once_redelivery() {
-    let Some(backend) = pg_backend().await else {
-        return;
-    };
+async fn pg_at_least_once_after_interruption() {
+    let backend = pg_backend().await;
     let incarnation = uuid::Uuid::now_v7().to_string();
     let journal: Arc<dyn JournalLog> = Arc::new(BackendJournalLog::new(
         backend.clone(),
         identity(&incarnation),
     ));
-    append_units(&journal, &incarnation, 3).await;
-    // Re-appending identical units is idempotent (capture_id), so the stream still has 3.
-    append_units(&journal, &incarnation, 3).await;
-    assert_eq!(journal.stream_meta().await.unwrap().len, 3);
+    append_units(&journal, &incarnation, 2).await; // env0, env1
 
     let store =
         ReplayJobStore::new(backend.clone(), "replay-e2e", &incarnation);
+    store.create(&new_job(&incarnation)).await.unwrap();
     let sink = Arc::new(RecordingSink::default());
 
-    // First replay.
-    store.create(&new_job(&incarnation)).await.unwrap();
-    controller(&backend, &incarnation, journal.clone(), sink.clone())
-        .run()
+    // Interrupted first delivery: env0 is delivered and ACKNOWLEDGED by the sink, but the
+    // process crashes before the cursor advance is persisted - so the durable cursor is
+    // unchanged. Model that by delivering env0 directly (the real delivery path) WITHOUT
+    // advancing the cursor.
+    let env0 = journal.read_since(0, 1).await.unwrap().remove(0);
+    let mut manual_sinks: HashMap<String, ArcDynSink> = HashMap::new();
+    manual_sinks.insert("kafka".to_string(), sink.clone() as ArcDynSink);
+    let manual_delivery = CoordinatorReplayDelivery::new(
+        build_batch_processor(Arc::from(vec![]), "replay-e2e".to_string()),
+        manual_sinks,
+        None,
+        None,
+        "replay-e2e",
+    );
+    manual_delivery
+        .deliver(
+            &new_job(&incarnation),
+            &env0,
+            ResolvedEncoderSchema::Current,
+        )
         .await
         .unwrap();
-    // Second replay of the same range (the completed job is replaced).
-    store.create(&new_job(&incarnation)).await.unwrap();
-    controller(&backend, &incarnation, journal.clone(), sink.clone())
-        .run()
-        .await
-        .unwrap();
+    assert_eq!(*sink.ids.lock().unwrap(), vec![0], "env0 acknowledged once");
+    assert_eq!(
+        store.get().await.unwrap().unwrap().job.cursor,
+        0,
+        "cursor persist was lost (unchanged)"
+    );
 
+    // Restart from the unchanged durable cursor: env0 is re-delivered (at-least-once), then env1.
+    controller(&backend, &incarnation, journal.clone(), sink.clone())
+        .run()
+        .await
+        .unwrap();
     assert_eq!(
         *sink.ids.lock().unwrap(),
-        vec![0, 1, 2, 0, 1, 2],
-        "each unit delivered at least once per run"
+        vec![0, 0, 1],
+        "the acknowledged env0 is delivered again after restart, then env1"
     );
 }
 
@@ -293,9 +315,7 @@ async fn pg_at_least_once_redelivery() {
 #[tokio::test]
 #[ignore = "requires a live PostgreSQL (DELTAFORGE_IT_PG_DSN)"]
 async fn pg_restart_from_handoff_quiesced() {
-    let Some(backend) = pg_backend().await else {
-        return;
-    };
+    let backend = pg_backend().await;
     let incarnation = uuid::Uuid::now_v7().to_string();
     let journal: Arc<dyn JournalLog> = Arc::new(BackendJournalLog::new(
         backend.clone(),
