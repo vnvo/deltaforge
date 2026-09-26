@@ -1,8 +1,11 @@
-//! In-memory `StorageBackend` — for testing and development only.
+//! In-memory `StorageBackend` - for testing and development only.
 //!
 //! State is lost on drop. Not suitable for production.
 
-use crate::StorageBackend;
+use crate::{
+    AppendStatus, LogAppendOutcome, LogError, LogStreamMeta,
+    LogTruncateOutcome, LogTruncateRequest, StorageBackend, content_digest,
+};
 use anyhow::Result;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -19,6 +22,13 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
 #[derive(Debug, Clone)]
 struct KvEntry {
     value: Vec<u8>,
@@ -32,14 +42,54 @@ impl KvEntry {
 }
 
 type NsKey = (String, String);
-type LogEntry = (u64, Vec<u8>);
 type QueueEntry = (u64, Vec<u8>);
 
 #[derive(Debug, Default)]
 struct KvStore(HashMap<NsKey, KvEntry>);
 
+#[derive(Debug, Clone)]
+struct MemLogEntry {
+    seq: u64,
+    value: Vec<u8>,
+    capture_id: Option<String>,
+    content_hash: Option<String>,
+    ts_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MemLogMeta {
+    min_valid_from_seq: u64,
+    head_seq: u64,
+}
+
+/// Entries are kept per `(ns, key)` in ascending-seq order (append order, since the
+/// global seq is monotonic). `meta` is the durable stream metadata, created lazily.
 #[derive(Debug, Default)]
-struct LogStore(BTreeMap<NsKey, Vec<LogEntry>>);
+struct LogStore {
+    entries: BTreeMap<NsKey, Vec<MemLogEntry>>,
+    meta: HashMap<NsKey, MemLogMeta>,
+}
+
+impl LogStore {
+    /// Lazily initialize the metadata row from current entries (head = highest seq
+    /// present, horizon = 0). Non-destructive; never rewrites entries.
+    fn ensure_meta(&mut self, k: &NsKey) -> MemLogMeta {
+        if let Some(m) = self.meta.get(k) {
+            return *m;
+        }
+        let head_seq = self
+            .entries
+            .get(k)
+            .and_then(|v| v.last())
+            .map_or(0, |e| e.seq);
+        let m = MemLogMeta {
+            min_valid_from_seq: 0,
+            head_seq,
+        };
+        self.meta.insert(k.clone(), m);
+        m
+    }
+}
 
 #[derive(Debug, Default)]
 struct SlotStore(HashMap<NsKey, (u64, Vec<u8>)>);
@@ -154,11 +204,22 @@ impl StorageBackend for MemoryStorageBackend {
     ) -> Result<u64> {
         let seq = self.next_seq();
         let mut store = self.log.write().await;
+        let k = (ns.to_string(), key.to_string());
         store
-            .0
-            .entry((ns.to_string(), key.to_string()))
+            .entries
+            .entry(k.clone())
             .or_default()
-            .push((seq, value.to_vec()));
+            .push(MemLogEntry {
+                seq,
+                value: value.to_vec(),
+                capture_id: None,
+                content_hash: None,
+                ts_ms: now_ms(),
+            });
+        // Maintain head_seq atomically where stream metadata exists.
+        if let Some(m) = store.meta.get_mut(&k) {
+            m.head_seq = m.head_seq.max(seq);
+        }
         Ok(seq)
     }
 
@@ -169,9 +230,9 @@ impl StorageBackend for MemoryStorageBackend {
     ) -> Result<Vec<(u64, Vec<u8>)>> {
         let store = self.log.read().await;
         Ok(store
-            .0
+            .entries
             .get(&(ns.to_string(), key.to_string()))
-            .cloned()
+            .map(|v| v.iter().map(|e| (e.seq, e.value.clone())).collect())
             .unwrap_or_default())
     }
 
@@ -183,13 +244,13 @@ impl StorageBackend for MemoryStorageBackend {
     ) -> Result<Vec<(u64, Vec<u8>)>> {
         let store = self.log.read().await;
         Ok(store
-            .0
+            .entries
             .get(&(ns.to_string(), key.to_string()))
             .map(|entries| {
                 entries
                     .iter()
-                    .filter(|(seq, _)| *seq > since_seq)
-                    .cloned()
+                    .filter(|e| e.seq > since_seq)
+                    .map(|e| (e.seq, e.value.clone()))
                     .collect()
             })
             .unwrap_or_default())
@@ -202,9 +263,179 @@ impl StorageBackend for MemoryStorageBackend {
     ) -> Result<Option<(u64, Vec<u8>)>> {
         let store = self.log.read().await;
         Ok(store
-            .0
+            .entries
             .get(&(ns.to_string(), key.to_string()))
-            .and_then(|entries| entries.last().cloned()))
+            .and_then(|entries| entries.last())
+            .map(|e| (e.seq, e.value.clone())))
+    }
+
+    async fn log_append_if_absent(
+        &self,
+        ns: &str,
+        key: &str,
+        capture_id: &str,
+        value: &[u8],
+    ) -> Result<LogAppendOutcome> {
+        let mut store = self.log.write().await;
+        let k = (ns.to_string(), key.to_string());
+        store.ensure_meta(&k);
+
+        // Idempotent / conflict check: does this capture_id already exist?
+        if let Some(existing) = store.entries.get(&k).and_then(|v| {
+            v.iter()
+                .find(|e| e.capture_id.as_deref() == Some(capture_id))
+        }) {
+            let digest = content_digest(value);
+            // Cheap digest check, then authoritative exact-bytes comparison.
+            if existing.content_hash.as_deref() == Some(digest.as_str())
+                && existing.value == value
+            {
+                return Ok(LogAppendOutcome {
+                    seq: existing.seq,
+                    status: AppendStatus::AlreadyPresent,
+                });
+            }
+            return Err(LogError::CaptureIdentityConflict {
+                capture_id: capture_id.to_string(),
+            }
+            .into());
+        }
+
+        let seq = self.next_seq();
+        let digest = content_digest(value);
+        store
+            .entries
+            .entry(k.clone())
+            .or_default()
+            .push(MemLogEntry {
+                seq,
+                value: value.to_vec(),
+                capture_id: Some(capture_id.to_string()),
+                content_hash: Some(digest),
+                ts_ms: now_ms(),
+            });
+        if let Some(m) = store.meta.get_mut(&k) {
+            m.head_seq = m.head_seq.max(seq);
+        }
+        Ok(LogAppendOutcome {
+            seq,
+            status: AppendStatus::Inserted,
+        })
+    }
+
+    async fn log_truncate(
+        &self,
+        ns: &str,
+        key: &str,
+        req: LogTruncateRequest,
+    ) -> Result<LogTruncateOutcome> {
+        let mut store = self.log.write().await;
+        let k = (ns.to_string(), key.to_string());
+        let mut meta = store.ensure_meta(&k);
+
+        let (
+            removed,
+            removed_bytes,
+            highest_removed_seq,
+            oldest_seq,
+            capacity_pinned,
+        ) = {
+            let entries = store.entries.entry(k.clone()).or_default();
+            let n = entries.len();
+            // Entries are ascending by seq; the removable window is the leading run
+            // with seq < pin_seq.
+            let below_pin =
+                entries.iter().take_while(|e| e.seq < req.pin_seq).count();
+
+            let age_remove = match req.older_than_ms {
+                Some(cutoff) => {
+                    entries.iter().take_while(|e| e.ts_ms < cutoff).count()
+                }
+                None => 0,
+            };
+            let entries_cap_remove = match req.max_entries {
+                Some(max) => n.saturating_sub(max as usize),
+                None => 0,
+            };
+            let bytes_cap_remove = match req.max_bytes {
+                Some(max) => {
+                    let total: u64 =
+                        entries.iter().map(|e| e.value.len() as u64).sum();
+                    let mut over = total.saturating_sub(max);
+                    let mut cnt = 0usize;
+                    for e in entries.iter() {
+                        if over == 0 {
+                            break;
+                        }
+                        over = over.saturating_sub(e.value.len() as u64);
+                        cnt += 1;
+                    }
+                    cnt
+                }
+                None => 0,
+            };
+
+            let desired =
+                age_remove.max(entries_cap_remove).max(bytes_cap_remove);
+            let actual = desired.min(below_pin);
+            // A capacity cap (not age) wanted to remove more than pin_seq allowed.
+            let capacity_pinned =
+                entries_cap_remove.max(bytes_cap_remove) > below_pin;
+
+            let removed_bytes: u64 = entries
+                .iter()
+                .take(actual)
+                .map(|e| e.value.len() as u64)
+                .sum();
+            let highest_removed_seq = if actual > 0 {
+                Some(entries[actual - 1].seq)
+            } else {
+                None
+            };
+            entries.drain(0..actual);
+            let oldest_seq = entries.first().map(|e| e.seq);
+            (
+                actual,
+                removed_bytes,
+                highest_removed_seq,
+                oldest_seq,
+                capacity_pinned,
+            )
+        };
+
+        if let Some(h) = highest_removed_seq {
+            meta.min_valid_from_seq = meta.min_valid_from_seq.max(h);
+        }
+        store.meta.insert(k, meta);
+
+        Ok(LogTruncateOutcome {
+            removed,
+            removed_bytes,
+            oldest_seq,
+            highest_removed_seq,
+            min_valid_from_seq: meta.min_valid_from_seq,
+            head_seq: meta.head_seq,
+            capacity_pinned,
+        })
+    }
+
+    async fn log_stream_meta(
+        &self,
+        ns: &str,
+        key: &str,
+    ) -> Result<LogStreamMeta> {
+        let mut store = self.log.write().await;
+        let k = (ns.to_string(), key.to_string());
+        let meta = store.ensure_meta(&k);
+        let entries = store.entries.get(&k);
+        let oldest_seq = entries.and_then(|v| v.first()).map(|e| e.seq);
+        let len = entries.map_or(0, |v| v.len() as u64);
+        Ok(LogStreamMeta {
+            min_valid_from_seq: meta.min_valid_from_seq,
+            oldest_seq,
+            head_seq: meta.head_seq,
+            len,
+        })
     }
 
     // ── Slot ────────────────────────────────────────────────────────────────
@@ -341,5 +572,40 @@ impl StorageBackend for MemoryStorageBackend {
             q.pop_front();
         }
         Ok(to_drop)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn be() -> Arc<dyn StorageBackend> {
+        Arc::new(MemoryStorageBackend::new())
+    }
+
+    #[tokio::test]
+    async fn idempotency() {
+        crate::log_contract_suite::idempotency(be()).await;
+    }
+    #[tokio::test]
+    async fn conflict_rejected() {
+        crate::log_contract_suite::conflict_rejected(be()).await;
+    }
+    #[tokio::test]
+    async fn horizon_with_global_gaps() {
+        crate::log_contract_suite::horizon_with_global_gaps(be()).await;
+    }
+    #[tokio::test]
+    async fn pin_invariant() {
+        crate::log_contract_suite::pin_invariant(be()).await;
+    }
+    #[tokio::test]
+    async fn empty_vs_truncated() {
+        crate::log_contract_suite::empty_vs_truncated(be()).await;
+    }
+    #[tokio::test]
+    async fn concurrent_appends() {
+        crate::log_contract_suite::concurrent_appends(be()).await;
     }
 }

@@ -17,7 +17,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
-use crate::StorageBackend;
+use crate::{
+    AppendStatus, LogAppendOutcome, LogError, LogStreamMeta,
+    LogTruncateOutcome, LogTruncateRequest, StorageBackend, content_digest,
+};
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -26,9 +29,59 @@ fn now_secs() -> i64 {
         .as_secs() as i64
 }
 
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+/// Additively add the replay columns to a pre-existing `df_log` table. Idempotent:
+/// a column that already exists is skipped. No data is rewritten.
+fn migrate_df_log_columns(conn: &Connection) -> Result<()> {
+    let existing: std::collections::HashSet<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(df_log)")?;
+        let cols = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        cols.collect::<rusqlite::Result<_>>()?
+    };
+    for (col, decl) in [
+        ("ts_ms", "INTEGER"),
+        ("capture_id", "TEXT"),
+        ("content_hash", "TEXT"),
+    ] {
+        if !existing.contains(col) {
+            conn.execute(
+                &format!("ALTER TABLE df_log ADD COLUMN {col} {decl}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Lazily create the metadata row for a stream, initializing `head_seq` from the
+/// current maximum sequence (non-destructive). No-op if it already exists.
+fn ensure_log_meta(
+    conn: &Connection,
+    ns: &str,
+    key: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO df_log_meta(ns, key, min_valid_from_seq, head_seq)
+         VALUES(?1, ?2, 0,
+                COALESCE((SELECT MAX(seq) FROM df_log WHERE ns=?1 AND key=?2), 0))",
+        params![ns, key],
+    )?;
+    Ok(())
+}
+
 pub struct SqliteStorageBackend {
     conn: Arc<Mutex<Connection>>,
     _sweep_handle: JoinHandle<()>,
+    /// Test hook: when set, `log_truncate` returns an error AFTER performing the
+    /// delete + horizon update but BEFORE committing, to prove neither is durable
+    /// unless the transaction commits. Always false in production (one atomic load).
+    fail_truncate_after_delete: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for SqliteStorageBackend {
@@ -55,13 +108,29 @@ CREATE TABLE IF NOT EXISTS df_kv (
 CREATE INDEX IF NOT EXISTS df_kv_expires ON df_kv(expires_at) WHERE expires_at IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS df_log (
-    seq  INTEGER PRIMARY KEY AUTOINCREMENT,
-    ns   TEXT    NOT NULL,
-    key  TEXT    NOT NULL,
-    val  BLOB    NOT NULL,
-    ts   INTEGER NOT NULL DEFAULT (unixepoch())
+    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ns           TEXT    NOT NULL,
+    key          TEXT    NOT NULL,
+    val          BLOB    NOT NULL,
+    ts           INTEGER NOT NULL DEFAULT (unixepoch()),
+    ts_ms        INTEGER,
+    capture_id   TEXT,
+    content_hash TEXT
 );
 CREATE INDEX IF NOT EXISTS df_log_ns_key_seq ON df_log(ns, key, seq);
+-- Idempotent capture: at most one entry per (ns, key, capture_id).
+CREATE UNIQUE INDEX IF NOT EXISTS df_log_capture
+    ON df_log(ns, key, capture_id) WHERE capture_id IS NOT NULL;
+
+-- Durable per-stream metadata: the retention horizon and head sequence, owned by
+-- log_truncate / the append paths (never an independently updated slot).
+CREATE TABLE IF NOT EXISTS df_log_meta (
+    ns                 TEXT    NOT NULL,
+    key                TEXT    NOT NULL,
+    min_valid_from_seq INTEGER NOT NULL DEFAULT 0,
+    head_seq           INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (ns, key)
+);
 
 CREATE TABLE IF NOT EXISTS df_slot (
     ns          TEXT    NOT NULL,
@@ -97,6 +166,8 @@ impl SqliteStorageBackend {
 
     fn init(conn: Connection) -> Result<Arc<Self>> {
         conn.execute_batch(SCHEMA)?;
+        // Additive migration for pre-existing df_log tables (no destructive backfill).
+        migrate_df_log_columns(&conn)?;
 
         let conn = Arc::new(Mutex::new(conn));
 
@@ -126,7 +197,18 @@ impl SqliteStorageBackend {
         Ok(Arc::new(Self {
             conn,
             _sweep_handle: sweep_handle,
+            fail_truncate_after_delete: Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
         }))
+    }
+
+    /// Test hook: force `log_truncate` to fail after the delete + horizon update but
+    /// before commit, so a test can prove the transaction rolls back both together.
+    #[cfg(test)]
+    pub(crate) fn set_fail_truncate_after_delete(&self, v: bool) {
+        self.fail_truncate_after_delete
+            .store(v, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -261,11 +343,19 @@ impl StorageBackend for SqliteStorageBackend {
         let key = key.to_string();
         let value = value.to_vec();
         db!(self, move |conn: &Connection| {
-            conn.execute(
-                "INSERT INTO df_log(ns, key, val, ts) VALUES(?1, ?2, ?3, ?4)",
-                params![ns, key, value, now_secs()],
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "INSERT INTO df_log(ns, key, val, ts, ts_ms) VALUES(?1, ?2, ?3, ?4, ?5)",
+                params![ns, key, value, now_secs(), now_ms()],
             )?;
-            Ok(conn.last_insert_rowid() as u64)
+            let seq = tx.last_insert_rowid() as u64;
+            // Maintain head_seq atomically where stream metadata exists.
+            tx.execute(
+                "UPDATE df_log_meta SET head_seq=MAX(head_seq, ?3) WHERE ns=?1 AND key=?2",
+                params![ns, key, seq as i64],
+            )?;
+            tx.commit()?;
+            Ok(seq)
         })
     }
 
@@ -309,6 +399,207 @@ impl StorageBackend for SqliteStorageBackend {
             )
             .optional()
             .map_err(Into::into)
+        })
+    }
+
+    async fn log_append_if_absent(
+        &self,
+        ns: &str,
+        key: &str,
+        capture_id: &str,
+        value: &[u8],
+    ) -> Result<LogAppendOutcome> {
+        let ns = ns.to_string();
+        let key = key.to_string();
+        let capture_id = capture_id.to_string();
+        let value = value.to_vec();
+        db!(self, move |conn: &Connection| {
+            let digest = content_digest(&value);
+            let tx = conn.unchecked_transaction()?;
+            ensure_log_meta(&tx, &ns, &key)?;
+            let existing: Option<(i64, Vec<u8>, Option<String>)> = tx
+                .query_row(
+                    "SELECT seq, val, content_hash FROM df_log
+                     WHERE ns=?1 AND key=?2 AND capture_id=?3",
+                    params![ns, key, capture_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            if let Some((seq, val, ch)) = existing {
+                // Cheap digest check, then authoritative exact-bytes comparison.
+                if ch.as_deref() == Some(digest.as_str()) && val == value {
+                    tx.commit()?;
+                    return Ok(LogAppendOutcome {
+                        seq: seq as u64,
+                        status: AppendStatus::AlreadyPresent,
+                    });
+                }
+                // Different bytes under an existing identity: never overwrite.
+                return Err(LogError::CaptureIdentityConflict {
+                    capture_id: capture_id.clone(),
+                }
+                .into());
+            }
+            tx.execute(
+                "INSERT INTO df_log(ns, key, val, ts, ts_ms, capture_id, content_hash)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![ns, key, value, now_secs(), now_ms(), capture_id, digest],
+            )?;
+            let seq = tx.last_insert_rowid() as u64;
+            tx.execute(
+                "UPDATE df_log_meta SET head_seq=MAX(head_seq, ?3) WHERE ns=?1 AND key=?2",
+                params![ns, key, seq as i64],
+            )?;
+            tx.commit()?;
+            Ok(LogAppendOutcome {
+                seq,
+                status: AppendStatus::Inserted,
+            })
+        })
+    }
+
+    async fn log_truncate(
+        &self,
+        ns: &str,
+        key: &str,
+        req: LogTruncateRequest,
+    ) -> Result<LogTruncateOutcome> {
+        let ns = ns.to_string();
+        let key = key.to_string();
+        let fail_flag = Arc::clone(&self.fail_truncate_after_delete);
+        db!(self, move |conn: &Connection| {
+            let tx = conn.unchecked_transaction()?;
+            ensure_log_meta(&tx, &ns, &key)?;
+
+            // (seq, byte_len, ts_ms) ascending by seq. ts_ms falls back to ts*1000
+            // for rows predating the ms column.
+            let rows: Vec<(i64, i64, i64)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT seq, LENGTH(val), COALESCE(ts_ms, ts*1000)
+                     FROM df_log WHERE ns=?1 AND key=?2 ORDER BY seq ASC",
+                )?;
+                let mapped = stmt.query_map(params![ns, key], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
+                mapped.collect::<rusqlite::Result<_>>()?
+            };
+            let n = rows.len();
+            let below_pin = rows
+                .iter()
+                .take_while(|(seq, _, _)| (*seq as u64) < req.pin_seq)
+                .count();
+            let age_remove = match req.older_than_ms {
+                Some(cutoff) => {
+                    rows.iter().take_while(|(_, _, tms)| *tms < cutoff).count()
+                }
+                None => 0,
+            };
+            let entries_cap_remove = match req.max_entries {
+                Some(max) => n.saturating_sub(max as usize),
+                None => 0,
+            };
+            let bytes_cap_remove = match req.max_bytes {
+                Some(max) => {
+                    let total: i64 = rows.iter().map(|(_, len, _)| *len).sum();
+                    let mut over = (total as u64).saturating_sub(max);
+                    let mut cnt = 0usize;
+                    for (_, len, _) in &rows {
+                        if over == 0 {
+                            break;
+                        }
+                        over = over.saturating_sub(*len as u64);
+                        cnt += 1;
+                    }
+                    cnt
+                }
+                None => 0,
+            };
+            let desired =
+                age_remove.max(entries_cap_remove).max(bytes_cap_remove);
+            let actual = desired.min(below_pin);
+            let capacity_pinned =
+                entries_cap_remove.max(bytes_cap_remove) > below_pin;
+
+            let (removed_bytes, highest_removed_seq) = if actual > 0 {
+                let rb: i64 =
+                    rows.iter().take(actual).map(|(_, len, _)| *len).sum();
+                (rb as u64, Some(rows[actual - 1].0 as u64))
+            } else {
+                (0, None)
+            };
+            if let Some(h) = highest_removed_seq {
+                tx.execute(
+                    "DELETE FROM df_log WHERE ns=?1 AND key=?2 AND seq<=?3",
+                    params![ns, key, h as i64],
+                )?;
+                tx.execute(
+                    "UPDATE df_log_meta SET min_valid_from_seq=MAX(min_valid_from_seq, ?3)
+                     WHERE ns=?1 AND key=?2",
+                    params![ns, key, h as i64],
+                )?;
+            }
+            let (mvfs, head): (i64, i64) = tx.query_row(
+                "SELECT min_valid_from_seq, head_seq FROM df_log_meta WHERE ns=?1 AND key=?2",
+                params![ns, key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let oldest: Option<i64> = tx.query_row(
+                "SELECT MIN(seq) FROM df_log WHERE ns=?1 AND key=?2",
+                params![ns, key],
+                |r| r.get::<_, Option<i64>>(0),
+            )?;
+            // Test hook: fail after the delete + horizon update, before commit.
+            // Dropping `tx` here rolls back BOTH.
+            if fail_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(anyhow!(
+                    "injected truncate failure after delete, before commit"
+                ));
+            }
+            tx.commit()?;
+            Ok(LogTruncateOutcome {
+                removed: actual,
+                removed_bytes,
+                oldest_seq: oldest.map(|s| s as u64),
+                highest_removed_seq,
+                min_valid_from_seq: mvfs as u64,
+                head_seq: head as u64,
+                capacity_pinned,
+            })
+        })
+    }
+
+    async fn log_stream_meta(
+        &self,
+        ns: &str,
+        key: &str,
+    ) -> Result<LogStreamMeta> {
+        let ns = ns.to_string();
+        let key = key.to_string();
+        db!(self, move |conn: &Connection| {
+            let tx = conn.unchecked_transaction()?;
+            ensure_log_meta(&tx, &ns, &key)?;
+            let (mvfs, head): (i64, i64) = tx.query_row(
+                "SELECT min_valid_from_seq, head_seq FROM df_log_meta WHERE ns=?1 AND key=?2",
+                params![ns, key],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let oldest: Option<i64> = tx.query_row(
+                "SELECT MIN(seq) FROM df_log WHERE ns=?1 AND key=?2",
+                params![ns, key],
+                |r| r.get::<_, Option<i64>>(0),
+            )?;
+            let len: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM df_log WHERE ns=?1 AND key=?2",
+                params![ns, key],
+                |r| r.get(0),
+            )?;
+            tx.commit()?;
+            Ok(LogStreamMeta {
+                min_valid_from_seq: mvfs as u64,
+                oldest_seq: oldest.map(|s| s as u64),
+                head_seq: head as u64,
+                len: len as u64,
+            })
         })
     }
 
@@ -518,4 +809,97 @@ fn query_log(
         .collect::<Result<Vec<_>>>()?
     };
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::LogTruncateRequest;
+
+    fn be() -> Arc<dyn StorageBackend> {
+        SqliteStorageBackend::in_memory().unwrap()
+    }
+
+    #[tokio::test]
+    async fn idempotency() {
+        crate::log_contract_suite::idempotency(be()).await;
+    }
+    #[tokio::test]
+    async fn conflict_rejected() {
+        crate::log_contract_suite::conflict_rejected(be()).await;
+    }
+    #[tokio::test]
+    async fn horizon_with_global_gaps() {
+        crate::log_contract_suite::horizon_with_global_gaps(be()).await;
+    }
+    #[tokio::test]
+    async fn pin_invariant() {
+        crate::log_contract_suite::pin_invariant(be()).await;
+    }
+    #[tokio::test]
+    async fn empty_vs_truncated() {
+        crate::log_contract_suite::empty_vs_truncated(be()).await;
+    }
+    #[tokio::test]
+    async fn concurrent_appends() {
+        crate::log_contract_suite::concurrent_appends(be()).await;
+    }
+
+    /// A failure after the delete + horizon update but before commit rolls BOTH
+    /// back: neither the deletion nor the horizon advancement is durable alone.
+    #[tokio::test]
+    async fn truncate_rollback_is_atomic() {
+        let be = SqliteStorageBackend::in_memory().unwrap();
+        let s1 = be
+            .log_append_if_absent("journal", "s", "c1", b"a")
+            .await
+            .unwrap()
+            .seq;
+        be.log_append_if_absent("journal", "s", "c2", b"b")
+            .await
+            .unwrap();
+        be.log_append_if_absent("journal", "s", "c3", b"c")
+            .await
+            .unwrap();
+
+        be.set_fail_truncate_after_delete(true);
+        let err = be
+            .log_truncate(
+                "journal",
+                "s",
+                LogTruncateRequest {
+                    older_than_ms: Some(i64::MAX),
+                    pin_seq: u64::MAX,
+                    max_entries: Some(0),
+                    max_bytes: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("injected"), "got: {err}");
+        be.set_fail_truncate_after_delete(false);
+
+        // Deletion rolled back.
+        assert_eq!(be.log_since("journal", "s", 0).await.unwrap().len(), 3);
+        // Horizon advancement rolled back.
+        let meta = be.log_stream_meta("journal", "s").await.unwrap();
+        assert_eq!(meta.min_valid_from_seq, 0);
+        assert_eq!(meta.oldest_seq, Some(s1));
+
+        // A subsequent real truncate commits normally.
+        let out = be
+            .log_truncate(
+                "journal",
+                "s",
+                LogTruncateRequest {
+                    older_than_ms: Some(i64::MAX),
+                    pin_seq: u64::MAX,
+                    max_entries: Some(0),
+                    max_bytes: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.removed, 3);
+    }
 }

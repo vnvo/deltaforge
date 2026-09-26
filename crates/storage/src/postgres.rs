@@ -20,7 +20,10 @@ use deadpool_postgres::{Config, Pool, Runtime, tokio_postgres::NoTls};
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
-use crate::StorageBackend;
+use crate::{
+    AppendStatus, LogAppendOutcome, LogError, LogStreamMeta,
+    LogTruncateOutcome, LogTruncateRequest, StorageBackend, content_digest,
+};
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -28,6 +31,18 @@ fn now_secs() -> i64 {
         .unwrap_or_default()
         .as_secs() as i64
 }
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+const ENSURE_LOG_META_SQL: &str = "\
+INSERT INTO df_log_meta(ns, key, min_valid_from_seq, head_seq) \
+VALUES($1, $2, 0, COALESCE((SELECT MAX(seq) FROM df_log WHERE ns=$1 AND key=$2), 0)) \
+ON CONFLICT (ns, key) DO NOTHING";
 
 // ── Schema ────────────────────────────────────────────────────────────────────
 
@@ -51,6 +66,20 @@ CREATE TABLE IF NOT EXISTS df_log (
     ts   BIGINT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS df_log_ns_key_seq ON df_log(ns, key, seq);
+-- Additive replay columns (idempotent; safe on pre-existing tables).
+ALTER TABLE df_log ADD COLUMN IF NOT EXISTS ts_ms BIGINT;
+ALTER TABLE df_log ADD COLUMN IF NOT EXISTS capture_id TEXT;
+ALTER TABLE df_log ADD COLUMN IF NOT EXISTS content_hash TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS df_log_capture
+    ON df_log(ns, key, capture_id) WHERE capture_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS df_log_meta (
+    ns                 TEXT   NOT NULL,
+    key                TEXT   NOT NULL,
+    min_valid_from_seq BIGINT NOT NULL DEFAULT 0,
+    head_seq           BIGINT NOT NULL DEFAULT 0,
+    PRIMARY KEY (ns, key)
+);
 
 CREATE TABLE IF NOT EXISTS df_slot (
     ns          TEXT   NOT NULL,
@@ -249,14 +278,23 @@ impl StorageBackend for PostgresStorageBackend {
         key: &str,
         value: &[u8],
     ) -> Result<u64> {
-        let c = client!(self);
-        let row = c
+        let mut c = client!(self);
+        let tx = c.transaction().await?;
+        let row = tx
             .query_one(
-                "INSERT INTO df_log(ns, key, val, ts) VALUES($1, $2, $3, $4) RETURNING seq",
-                &[&ns, &key, &value, &now_secs()],
+                "INSERT INTO df_log(ns, key, val, ts, ts_ms) VALUES($1, $2, $3, $4, $5) RETURNING seq",
+                &[&ns, &key, &value, &now_secs(), &now_ms()],
             )
             .await?;
-        Ok(row.get::<_, i64>(0) as u64)
+        let seq = row.get::<_, i64>(0);
+        // Maintain head_seq atomically where stream metadata exists.
+        tx.execute(
+            "UPDATE df_log_meta SET head_seq=GREATEST(head_seq, $3) WHERE ns=$1 AND key=$2",
+            &[&ns, &key, &seq],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(seq as u64)
     }
 
     async fn log_list(
@@ -309,6 +347,203 @@ impl StorageBackend for PostgresStorageBackend {
             )
             .await?;
         Ok(row.map(|r| (r.get::<_, i64>(0) as u64, r.get(1))))
+    }
+
+    async fn log_append_if_absent(
+        &self,
+        ns: &str,
+        key: &str,
+        capture_id: &str,
+        value: &[u8],
+    ) -> Result<LogAppendOutcome> {
+        let digest = content_digest(value);
+        let mut c = client!(self);
+        let tx = c.transaction().await?;
+        tx.execute(ENSURE_LOG_META_SQL, &[&ns, &key]).await?;
+        let existing = tx
+            .query_opt(
+                "SELECT seq, val, content_hash FROM df_log
+                 WHERE ns=$1 AND key=$2 AND capture_id=$3",
+                &[&ns, &key, &capture_id],
+            )
+            .await?;
+        if let Some(row) = existing {
+            let seq: i64 = row.get(0);
+            let val: Vec<u8> = row.get(1);
+            let ch: Option<String> = row.get(2);
+            if ch.as_deref() == Some(digest.as_str()) && val.as_slice() == value
+            {
+                tx.commit().await?;
+                return Ok(LogAppendOutcome {
+                    seq: seq as u64,
+                    status: AppendStatus::AlreadyPresent,
+                });
+            }
+            // Different bytes under an existing identity: never overwrite (rollback).
+            return Err(LogError::CaptureIdentityConflict {
+                capture_id: capture_id.to_string(),
+            }
+            .into());
+        }
+        let row = tx
+            .query_one(
+                "INSERT INTO df_log(ns, key, val, ts, ts_ms, capture_id, content_hash)
+                 VALUES($1, $2, $3, $4, $5, $6, $7) RETURNING seq",
+                &[&ns, &key, &value, &now_secs(), &now_ms(), &capture_id, &digest],
+            )
+            .await?;
+        let seq: i64 = row.get(0);
+        tx.execute(
+            "UPDATE df_log_meta SET head_seq=GREATEST(head_seq, $3) WHERE ns=$1 AND key=$2",
+            &[&ns, &key, &seq],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(LogAppendOutcome {
+            seq: seq as u64,
+            status: AppendStatus::Inserted,
+        })
+    }
+
+    async fn log_truncate(
+        &self,
+        ns: &str,
+        key: &str,
+        req: LogTruncateRequest,
+    ) -> Result<LogTruncateOutcome> {
+        let mut c = client!(self);
+        let tx = c.transaction().await?;
+        tx.execute(ENSURE_LOG_META_SQL, &[&ns, &key]).await?;
+        let rows = tx
+            .query(
+                "SELECT seq, LENGTH(val), COALESCE(ts_ms, ts*1000)
+                 FROM df_log WHERE ns=$1 AND key=$2 ORDER BY seq ASC",
+                &[&ns, &key],
+            )
+            .await?;
+        let rows: Vec<(i64, i64, i64)> = rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<_, i64>(0),
+                    r.get::<_, i32>(1) as i64,
+                    r.get::<_, i64>(2),
+                )
+            })
+            .collect();
+        let n = rows.len();
+        let below_pin = rows
+            .iter()
+            .take_while(|(seq, _, _)| (*seq as u64) < req.pin_seq)
+            .count();
+        let age_remove = match req.older_than_ms {
+            Some(cutoff) => {
+                rows.iter().take_while(|(_, _, tms)| *tms < cutoff).count()
+            }
+            None => 0,
+        };
+        let entries_cap_remove = match req.max_entries {
+            Some(max) => n.saturating_sub(max as usize),
+            None => 0,
+        };
+        let bytes_cap_remove = match req.max_bytes {
+            Some(max) => {
+                let total: i64 = rows.iter().map(|(_, len, _)| *len).sum();
+                let mut over = (total as u64).saturating_sub(max);
+                let mut cnt = 0usize;
+                for (_, len, _) in &rows {
+                    if over == 0 {
+                        break;
+                    }
+                    over = over.saturating_sub(*len as u64);
+                    cnt += 1;
+                }
+                cnt
+            }
+            None => 0,
+        };
+        let desired = age_remove.max(entries_cap_remove).max(bytes_cap_remove);
+        let actual = desired.min(below_pin);
+        let capacity_pinned =
+            entries_cap_remove.max(bytes_cap_remove) > below_pin;
+        let (removed_bytes, highest_removed_seq) = if actual > 0 {
+            let rb: i64 =
+                rows.iter().take(actual).map(|(_, len, _)| *len).sum();
+            (rb as u64, Some(rows[actual - 1].0))
+        } else {
+            (0, None)
+        };
+        if let Some(h) = highest_removed_seq {
+            tx.execute(
+                "DELETE FROM df_log WHERE ns=$1 AND key=$2 AND seq<=$3",
+                &[&ns, &key, &h],
+            )
+            .await?;
+            tx.execute(
+                "UPDATE df_log_meta SET min_valid_from_seq=GREATEST(min_valid_from_seq, $3)
+                 WHERE ns=$1 AND key=$2",
+                &[&ns, &key, &h],
+            )
+            .await?;
+        }
+        let meta_row = tx
+            .query_one(
+                "SELECT min_valid_from_seq, head_seq FROM df_log_meta WHERE ns=$1 AND key=$2",
+                &[&ns, &key],
+            )
+            .await?;
+        let mvfs: i64 = meta_row.get(0);
+        let head: i64 = meta_row.get(1);
+        let oldest_row = tx
+            .query_one(
+                "SELECT MIN(seq) FROM df_log WHERE ns=$1 AND key=$2",
+                &[&ns, &key],
+            )
+            .await?;
+        let oldest: Option<i64> = oldest_row.get(0);
+        tx.commit().await?;
+        Ok(LogTruncateOutcome {
+            removed: actual,
+            removed_bytes,
+            oldest_seq: oldest.map(|s| s as u64),
+            highest_removed_seq: highest_removed_seq.map(|s| s as u64),
+            min_valid_from_seq: mvfs as u64,
+            head_seq: head as u64,
+            capacity_pinned,
+        })
+    }
+
+    async fn log_stream_meta(
+        &self,
+        ns: &str,
+        key: &str,
+    ) -> Result<LogStreamMeta> {
+        let mut c = client!(self);
+        let tx = c.transaction().await?;
+        tx.execute(ENSURE_LOG_META_SQL, &[&ns, &key]).await?;
+        let meta_row = tx
+            .query_one(
+                "SELECT min_valid_from_seq, head_seq FROM df_log_meta WHERE ns=$1 AND key=$2",
+                &[&ns, &key],
+            )
+            .await?;
+        let mvfs: i64 = meta_row.get(0);
+        let head: i64 = meta_row.get(1);
+        let stat_row = tx
+            .query_one(
+                "SELECT MIN(seq), COUNT(*) FROM df_log WHERE ns=$1 AND key=$2",
+                &[&ns, &key],
+            )
+            .await?;
+        let oldest: Option<i64> = stat_row.get(0);
+        let len: i64 = stat_row.get(1);
+        tx.commit().await?;
+        Ok(LogStreamMeta {
+            min_valid_from_seq: mvfs as u64,
+            oldest_seq: oldest.map(|s| s as u64),
+            head_seq: head as u64,
+            len: len as u64,
+        })
     }
 
     // ── Slot ────────────────────────────────────────────────────────────────
@@ -476,5 +711,79 @@ impl StorageBackend for PostgresStorageBackend {
             )
             .await?;
         Ok(n as usize)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AppendStatus, LogError, LogTruncateRequest};
+
+    // Live PostgreSQL contract check. #[ignore] + env-gated on DELTAFORGE_IT_PG_DSN;
+    // uses a unique key per run so it is safe against a shared database.
+    #[tokio::test]
+    #[ignore = "requires a live PostgreSQL (DELTAFORGE_IT_PG_DSN)"]
+    async fn pg_log_contracts() {
+        let dsn = std::env::var("DELTAFORGE_IT_PG_DSN")
+            .expect("DELTAFORGE_IT_PG_DSN must be set to run this test");
+        let be = PostgresStorageBackend::connect(&dsn).await.unwrap();
+        let ns = "journal";
+        let uniq = now_ms();
+        let key = format!("s:{uniq}:replay");
+        let other = format!("s:{uniq}:other");
+
+        // Idempotency + conflict.
+        let a = be.log_append_if_absent(ns, &key, "c1", b"a").await.unwrap();
+        assert_eq!(a.status, AppendStatus::Inserted);
+        let a2 = be.log_append_if_absent(ns, &key, "c1", b"a").await.unwrap();
+        assert_eq!(a2.status, AppendStatus::AlreadyPresent);
+        assert_eq!(a.seq, a2.seq);
+        let err = be
+            .log_append_if_absent(ns, &key, "c1", b"different")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<LogError>(),
+            Some(LogError::CaptureIdentityConflict { .. })
+        ));
+
+        // Global-gap horizon: interleave another key, then truncate below the tail.
+        be.log_append(ns, &other, b"x").await.unwrap();
+        let s2 = be
+            .log_append_if_absent(ns, &key, "c2", b"b")
+            .await
+            .unwrap()
+            .seq;
+        be.log_append(ns, &other, b"x").await.unwrap();
+        let s3 = be
+            .log_append_if_absent(ns, &key, "c3", b"c")
+            .await
+            .unwrap()
+            .seq;
+        let out = be
+            .log_truncate(
+                ns,
+                &key,
+                LogTruncateRequest {
+                    older_than_ms: Some(i64::MAX),
+                    pin_seq: s3,
+                    max_entries: Some(1),
+                    max_bytes: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.highest_removed_seq, Some(s2));
+        assert_eq!(
+            out.min_valid_from_seq, s2,
+            "horizon = highest removed, not oldest-1"
+        );
+        assert_eq!(out.oldest_seq, Some(s3));
+        assert!(out.capacity_pinned, "cap blocked by pin");
+        let from_horizon = be
+            .log_since(ns, &key, out.min_valid_from_seq)
+            .await
+            .unwrap();
+        assert_eq!(from_horizon.first().map(|(s, _)| *s), Some(s3));
     }
 }
