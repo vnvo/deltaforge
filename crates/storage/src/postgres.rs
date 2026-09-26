@@ -46,59 +46,41 @@ ON CONFLICT (ns, key) DO NOTHING";
 
 // ── Schema ────────────────────────────────────────────────────────────────────
 
-const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS df_kv (
-    ns          TEXT    NOT NULL,
-    key         TEXT    NOT NULL,
-    val         BYTEA   NOT NULL,
-    updated_at  BIGINT  NOT NULL,
-    expires_at  BIGINT,
-    PRIMARY KEY (ns, key)
-);
-CREATE INDEX IF NOT EXISTS df_kv_expires ON df_kv(expires_at)
-    WHERE expires_at IS NOT NULL;
-
-CREATE TABLE IF NOT EXISTS df_log (
-    seq  BIGSERIAL PRIMARY KEY,
-    ns   TEXT   NOT NULL,
-    key  TEXT   NOT NULL,
-    val  BYTEA  NOT NULL,
-    ts   BIGINT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS df_log_ns_key_seq ON df_log(ns, key, seq);
--- Additive replay columns (idempotent; safe on pre-existing tables).
-ALTER TABLE df_log ADD COLUMN IF NOT EXISTS ts_ms BIGINT;
-ALTER TABLE df_log ADD COLUMN IF NOT EXISTS capture_id TEXT;
-ALTER TABLE df_log ADD COLUMN IF NOT EXISTS content_hash TEXT;
-CREATE UNIQUE INDEX IF NOT EXISTS df_log_capture
-    ON df_log(ns, key, capture_id) WHERE capture_id IS NOT NULL;
-
-CREATE TABLE IF NOT EXISTS df_log_meta (
-    ns                 TEXT   NOT NULL,
-    key                TEXT   NOT NULL,
-    min_valid_from_seq BIGINT NOT NULL DEFAULT 0,
-    head_seq           BIGINT NOT NULL DEFAULT 0,
-    PRIMARY KEY (ns, key)
-);
-
-CREATE TABLE IF NOT EXISTS df_slot (
-    ns          TEXT   NOT NULL,
-    key         TEXT   NOT NULL,
-    version     BIGINT NOT NULL DEFAULT 1,
-    state       BYTEA  NOT NULL,
-    updated_at  BIGINT NOT NULL,
-    PRIMARY KEY (ns, key)
-);
-
-CREATE TABLE IF NOT EXISTS df_queue (
-    id   BIGSERIAL PRIMARY KEY,
-    ns   TEXT   NOT NULL,
-    key  TEXT   NOT NULL,
-    val  BYTEA  NOT NULL,
-    ts   BIGINT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS df_queue_ns_key_id ON df_queue(ns, key, id);
-"#;
+// Schema + additive migrations as a structured list, each element EXACTLY ONE
+// statement with no trailing ';' and no embedded SQL comments. They are executed one
+// at a time (never by splitting a blob on ';'), so a comment or literal containing a
+// semicolon can never break schema execution. Order matters: df_log's replay columns
+// are added before the index that references them, so an upgraded database is safe.
+const MIGRATIONS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS df_kv (
+        ns TEXT NOT NULL, key TEXT NOT NULL, val BYTEA NOT NULL,
+        updated_at BIGINT NOT NULL, expires_at BIGINT,
+        PRIMARY KEY (ns, key))",
+    "CREATE INDEX IF NOT EXISTS df_kv_expires ON df_kv(expires_at)
+        WHERE expires_at IS NOT NULL",
+    "CREATE TABLE IF NOT EXISTS df_log (
+        seq BIGSERIAL PRIMARY KEY, ns TEXT NOT NULL, key TEXT NOT NULL,
+        val BYTEA NOT NULL, ts BIGINT NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS df_log_ns_key_seq ON df_log(ns, key, seq)",
+    "ALTER TABLE df_log ADD COLUMN IF NOT EXISTS ts_ms BIGINT",
+    "ALTER TABLE df_log ADD COLUMN IF NOT EXISTS capture_id TEXT",
+    "ALTER TABLE df_log ADD COLUMN IF NOT EXISTS content_hash TEXT",
+    "CREATE UNIQUE INDEX IF NOT EXISTS df_log_capture
+        ON df_log(ns, key, capture_id) WHERE capture_id IS NOT NULL",
+    "CREATE TABLE IF NOT EXISTS df_log_meta (
+        ns TEXT NOT NULL, key TEXT NOT NULL,
+        min_valid_from_seq BIGINT NOT NULL DEFAULT 0,
+        head_seq BIGINT NOT NULL DEFAULT 0,
+        PRIMARY KEY (ns, key))",
+    "CREATE TABLE IF NOT EXISTS df_slot (
+        ns TEXT NOT NULL, key TEXT NOT NULL, version BIGINT NOT NULL DEFAULT 1,
+        state BYTEA NOT NULL, updated_at BIGINT NOT NULL,
+        PRIMARY KEY (ns, key))",
+    "CREATE TABLE IF NOT EXISTS df_queue (
+        id BIGSERIAL PRIMARY KEY, ns TEXT NOT NULL, key TEXT NOT NULL,
+        val BYTEA NOT NULL, ts BIGINT NOT NULL)",
+    "CREATE INDEX IF NOT EXISTS df_queue_ns_key_id ON df_queue(ns, key, id)",
+];
 
 // ── Backend ───────────────────────────────────────────────────────────────────
 
@@ -126,11 +108,12 @@ impl PostgresStorageBackend {
             .create_pool(Some(Runtime::Tokio1), NoTls)
             .map_err(|e| anyhow!("pool create: {e}"))?;
 
-        // Run schema migrations
+        // Run schema migrations: one complete statement at a time (never split a
+        // multi-statement blob on ';', which a comment/literal semicolon would break).
         let client = pool.get().await.map_err(|e| anyhow!("pool get: {e}"))?;
-        for stmt in SCHEMA.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        for stmt in MIGRATIONS {
             client
-                .execute(stmt, &[])
+                .execute(*stmt, &[])
                 .await
                 .map_err(|e| anyhow!("schema migration: {e}\nSQL: {stmt}"))?;
         }
@@ -727,6 +710,20 @@ impl StorageBackend for PostgresStorageBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: every migration must be exactly one statement with no ';'. This
+    /// prevents reintroducing a multi-statement blob parsed by splitting on ';', which
+    /// a comment or literal containing a semicolon would break. Runs without a DB.
+    #[test]
+    fn migrations_are_single_statements() {
+        assert!(!MIGRATIONS.is_empty());
+        for stmt in MIGRATIONS {
+            assert!(
+                !stmt.contains(';'),
+                "migration must be a single statement with no ';': {stmt}"
+            );
+        }
+    }
 
     /// The full shared contract suite against a live PostgreSQL, including the
     /// concurrent cases (which exercise the ON CONFLICT / re-read race). #[ignore] +
