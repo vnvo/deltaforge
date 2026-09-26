@@ -150,7 +150,7 @@ struct RunningPipeline {
     // coordinator's `pause_rx.changed()` returns Err and its accumulation loop
     // exits, dropping the source receiver. Keeping it alive keeps the pipeline
     // running until we explicitly shut the source down.
-    _pause_tx: tokio::sync::watch::Sender<bool>,
+    _pause_tx: tokio::sync::watch::Sender<runner::coordinator::PauseState>,
     sink: Arc<RecordingSink>,
     src_handle: SourceHandle,
     coord_task: Option<JoinHandle<Result<()>>>,
@@ -209,7 +209,9 @@ impl RunningPipeline {
         let src_handle = source.run(tx, proxy).await;
 
         let cancel = CancellationToken::new();
-        let (pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (pause_tx, pause_rx) = tokio::sync::watch::channel(
+            runner::coordinator::PauseState::default(),
+        );
         let coord_task = tokio::spawn(coord.run(rx, cancel, pause_rx));
 
         RunningPipeline {
