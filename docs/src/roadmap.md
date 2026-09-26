@@ -9,6 +9,7 @@
 - **Avro encoding with Confluent Schema Registry** - DDL-derived Avro schemas, Confluent wire format, all sinks supported, type conversion policies, Schema Registry failure handling with cached fallback
 - **HTTP/Webhook sink** - POST/PUT to any URL, URL templates, batch mode, retry with backoff
 - **Dead Letter Queue** - per-event failure routing, overflow policies, REST API for inspection
+- **Event replay** - re-deliver captured commit units from the durable journal to selected sinks (recover from consumer bugs, catch a sink up after an outage) with a durable, resumable job model, an acknowledged pause/handoff back to live delivery, at-least-once semantics, and a REST API (start/dry-run/status/cancel). See [Event Replay](replay.md).
 - **Transaction-aware batching** - a commit unit contains only whole transactions; the checkpoint only ever lands at a transaction boundary; resume restarts on a clean boundary. Oversized-transaction fail-closed with a typed error. See [Guarantees & Correctness](guarantees.md).
 - **Per-sink independent checkpoints** - each sink advances independently, source replays from minimum
 - **Exactly-once delivery** - Kafka transactional producer with producer fencing detection
@@ -22,7 +23,7 @@
 
 ## Planned
 
-- **Event replay (next)** - re-deliver historical events from the journal log to recover from consumer bugs, backfill new sinks, and re-deliver without resetting the source. Builds on the completed DLQ journal and storage backend; deterministic rebuild (snapshot + replay) follows it.
+- **Deterministic rebuild (snapshot + replay) (next)** - rebuild a sink's full state deterministically from a snapshot plus journal replay. Builds on the completed event-replay journal and job model.
 - **Iceberg / Delta Lake table formats** - exactly-once at event level via atomic snapshot commits; schema evolution and time travel on top of the S3 sink
 - **Kubernetes operator** - PipelineTemplate + PipelinePool for fleet management
 - **OpenAPI spec generation** - auto-generated REST API documentation
