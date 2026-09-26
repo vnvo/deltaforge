@@ -61,9 +61,16 @@ impl SourceBoundaryRecord {
 
 /// Schema provenance for an envelope. `source_tables` is honest, available metadata (the
 /// distinct fully-qualified source tables in the unit). `registry_seq_at_capture` is the
-/// schema-registry sequence at capture time when the registry handle is available,
-/// otherwise `None` (explicitly not captured). Provenance only; not consumed by replay
-/// delivery today.
+/// schema-registry sequence bound to the commit unit when available, otherwise `None`
+/// (explicitly not captured). Provenance only; not consumed by replay delivery today.
+///
+/// Both fields are part of the stored canonical bytes, so both must be DETERMINISTIC and
+/// STABLE for a given commit unit across idempotent retries. A retry that produced a
+/// different value would change the content bytes and fail `log_append_if_absent` with a
+/// CaptureIdentityConflict, even though these fields are excluded from `capture_id`. When
+/// `registry_seq_at_capture` is later bound to a real value it MUST be derived from the
+/// unit's own retry-stable schema state (e.g. the registry sequence pinned to the events'
+/// schema versions), never a mutable global sequence sampled at capture time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchemaBinding {
     pub source_tables: Vec<String>,
@@ -106,8 +113,14 @@ impl ReplayEnvelopePayload {
     /// boundary, and ordered event ids - domain-separated and length-prefixed so no two
     /// distinct inputs can concatenate to the same digest. Stable across process
     /// restarts and source retries; this is the idempotency key for
-    /// `log_append_if_absent`. It deliberately excludes fields that may vary between
-    /// retries (e.g. a registry sequence), so a retry never conflicts on identical bytes.
+    /// `log_append_if_absent`.
+    ///
+    /// It excludes `schema_binding` (source_tables, registry_seq_at_capture) because that
+    /// is provenance, not identity. This exclusion does NOT license those fields to vary
+    /// between retries: the whole payload is hashed into the stored content bytes, and
+    /// `log_append_if_absent` requires byte-identical content for an existing capture_id
+    /// (otherwise it returns CaptureIdentityConflict). Every payload field, schema_binding
+    /// included, must be deterministic and stable for a given commit unit across retries.
     pub fn capture_id(&self) -> String {
         let mut h = Sha256::new();
         h.update(b"deltaforge:replay:capture:v1");

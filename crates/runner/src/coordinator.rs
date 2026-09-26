@@ -789,8 +789,12 @@ pub struct ReplayCapture {
     /// A captured envelope larger than this fails closed (0 = unbounded). A commit unit
     /// is never split to fit.
     pub max_envelope_bytes: usize,
-    /// Schema-registry sequence at capture time, or `None` when the registry handle is
-    /// not available (recorded honestly as unavailable rather than a placeholder).
+    /// Schema-registry sequence bound to the commit unit, or `None` when the registry
+    /// handle is not available (recorded honestly as unavailable rather than a
+    /// placeholder). Must return a DETERMINISTIC, retry-stable value for a given commit
+    /// unit: it lands in the stored canonical bytes, so a differing value on an idempotent
+    /// retry would fail the append with a CaptureIdentityConflict. Bind it from the unit's
+    /// own schema state, never a mutable global sequence sampled during capture.
     pub registry_seq_fn: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
 }
 

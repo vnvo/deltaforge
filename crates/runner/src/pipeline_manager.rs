@@ -788,9 +788,14 @@ impl PipelineManager {
                     max_envelope_bytes: replay_cfg.max_envelope_bytes,
                     // The schema-registry handle is not threaded here yet; the registry
                     // sequence is recorded as absent rather than a placeholder 0. It is
-                    // provenance only and is deliberately excluded from capture_id (it may
-                    // legitimately differ between idempotent retries), so binding it later
-                    // does not change any envelope's identity.
+                    // provenance (excluded from capture_id) but still part of the stored
+                    // canonical bytes, so whatever value it returns must be DETERMINISTIC
+                    // and STABLE for a commit unit across retries - a differing value on
+                    // retry would fail log_append_if_absent with a CaptureIdentityConflict.
+                    // `None` is trivially stable. When bound for real, derive it from the
+                    // unit's own retry-stable schema state (the registry sequence pinned to
+                    // the events' schema versions), NOT a mutable global sequence sampled
+                    // during capture.
                     registry_seq_fn: Arc::new(|| None),
                 });
             let ret_cfg = RetentionConfig {
