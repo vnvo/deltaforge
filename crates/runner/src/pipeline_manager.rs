@@ -720,6 +720,84 @@ impl PipelineManager {
             None
         };
 
+        // Replay journal - opt-in via journal.replay config.
+        if let Some(replay_cfg) = spec
+            .spec
+            .journal
+            .as_ref()
+            .and_then(|j| j.replay.clone())
+            .filter(|r| r.enabled)
+        {
+            use crate::replay_journal::{
+                BackendJournalLog, JournalLog, REPLAY_NS, RetentionConfig,
+                spawn_retention_task,
+            };
+            // Durable, incarnation-scoped identity: minted once and reused across
+            // restarts. (Invalidation on delete/recreate lands with the pipeline
+            // lifecycle work in a later slice.)
+            let inc_key = format!("{pipeline_name}:incarnation");
+            let new_id = uuid::Uuid::now_v7().to_string();
+            let incarnation = match self
+                .backend
+                .slot_create(REPLAY_NS, &inc_key, new_id.as_bytes())
+                .await?
+            {
+                Some(_) => new_id,
+                None => {
+                    let (_, bytes) = self
+                        .backend
+                        .slot_get(REPLAY_NS, &inc_key)
+                        .await?
+                        .expect("incarnation slot exists after slot_create");
+                    String::from_utf8_lossy(&bytes).into_owned()
+                }
+            };
+            let journal: Arc<dyn JournalLog> =
+                Arc::new(BackendJournalLog::new(
+                    self.backend.clone(),
+                    &pipeline_name,
+                    &incarnation,
+                ));
+            let identity = deltaforge_core::replay::PipelineIdentity {
+                pipeline: pipeline_name.clone(),
+                incarnation: incarnation.clone(),
+                // TODO: bind the true source DB lineage (system_identifier /
+                // server-uuid) once the source exposes it; the config source id is
+                // stable per pipeline in the meantime.
+                source_identity: source_id.clone(),
+            };
+            builder =
+                builder.replay_capture(crate::coordinator::ReplayCapture {
+                    journal: Arc::clone(&journal),
+                    identity,
+                    max_envelope_bytes: replay_cfg.max_envelope_bytes,
+                    // TODO: bind the schema-registry current_sequence when the registry
+                    // handle is threaded here (audit + AtCaptureSeq encoder option).
+                    registry_seq_fn: Arc::new(|| 0),
+                });
+            let ret_cfg = RetentionConfig {
+                max_age_ms: (replay_cfg.retention_secs > 0)
+                    .then(|| (replay_cfg.retention_secs * 1000) as i64),
+                max_entries: (replay_cfg.max_entries > 0)
+                    .then_some(replay_cfg.max_entries),
+                max_bytes: (replay_cfg.max_bytes > 0)
+                    .then_some(replay_cfg.max_bytes),
+                interval_secs: 60,
+            };
+            // No replay job pins retention yet (the replay engine lands later).
+            let _retention = spawn_retention_task(
+                journal,
+                pipeline_name.clone(),
+                ret_cfg,
+                Arc::new(|| u64::MAX),
+            );
+            tracing::info!(
+                pipeline = %pipeline_name,
+                incarnation = %incarnation,
+                "replay journaling enabled"
+            );
+        }
+
         let coord = builder.build();
         let cancel_for_task = cancel.clone();
         let cancel_check = cancel.clone();

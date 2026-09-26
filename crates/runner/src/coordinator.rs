@@ -779,6 +779,34 @@ impl SchemaSensorState {
     }
 }
 
+/// Replay-capture wiring, present only when `journal.replay` is enabled. Capture is
+/// orthogonal to batching: it accumulates raw pre-processing events across coordinator
+/// soft-limit flushes and closes one envelope per source commit unit at its boundary.
+#[derive(Clone)]
+pub struct ReplayCapture {
+    pub journal: Arc<dyn crate::replay_journal::JournalLog>,
+    pub identity: deltaforge_core::replay::PipelineIdentity,
+    /// A captured envelope larger than this fails closed (0 = unbounded). A commit unit
+    /// is never split to fit.
+    pub max_envelope_bytes: usize,
+    /// Schema-registry sequence at capture time (audit + the AtCaptureSeq encoder option).
+    pub registry_seq_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
+}
+
+/// A single source commit unit's replay envelope exceeds the configured size cap. The
+/// unit is never split; this is fail-closed (the checkpoint does not advance).
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "replay envelope is {bytes} bytes ({events} events), over the {max}-byte cap; a \
+     source commit unit is never split - raise journal.replay.max_envelope_bytes or \
+     reduce the source transaction/snapshot-chunk size, then restart to replay the unit"
+)]
+pub struct OversizedReplayEnvelopeError {
+    pub bytes: usize,
+    pub max: usize,
+    pub events: usize,
+}
+
 pub struct Coordinator<Tok> {
     pipeline_name: Arc<str>,
     sinks: Vec<ArcDynSink>,
@@ -800,6 +828,8 @@ pub struct Coordinator<Tok> {
     db_schema_cache: Mutex<HashMap<String, TableSchemaInfo>>,
     /// Optional DLQ writer for routing per-event failures.
     dlq_writer: Option<Arc<crate::dlq::DlqWriter>>,
+    /// Optional replay capture (enabled by `journal.replay`).
+    replay_capture: Option<ReplayCapture>,
 }
 
 pub struct CoordinatorBuilder<Tok> {
@@ -813,6 +843,7 @@ pub struct CoordinatorBuilder<Tok> {
     schema_sensor: Option<Arc<SchemaSensorState>>,
     schema_provider: Option<ArcSchemaProvider>,
     dlq_writer: Option<Arc<crate::dlq::DlqWriter>>,
+    replay_capture: Option<ReplayCapture>,
 }
 
 impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
@@ -828,6 +859,7 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             schema_sensor: None,
             schema_provider: None,
             dlq_writer: None,
+            replay_capture: None,
         }
     }
 
@@ -887,6 +919,11 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
         self
     }
 
+    pub fn replay_capture(mut self, capture: ReplayCapture) -> Self {
+        self.replay_capture = Some(capture);
+        self
+    }
+
     pub fn build(self) -> Coordinator<Tok> {
         let batch_cfg_eff = Coordinator::<Tok>::effective(&self.batch_config);
         assert!(
@@ -906,6 +943,7 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             schema_provider: self.schema_provider,
             db_schema_cache: Mutex::new(HashMap::new()),
             dlq_writer: self.dlq_writer,
+            replay_capture: self.replay_capture,
         }
     }
 }
@@ -913,6 +951,90 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
 impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
     pub fn builder(name: impl Into<String>) -> CoordinatorBuilder<Tok> {
         CoordinatorBuilder::new(name)
+    }
+
+    /// Close one captured commit unit: build a replay envelope from the accumulated
+    /// raw (pre-processing) events plus `boundary`, persist it idempotently, then clear
+    /// the accumulator. No-op when replay is disabled or the accumulator is empty (a
+    /// data-less boundary). Fail-closed: an append or size-cap failure returns Err so the
+    /// caller aborts before the unit's checkpoint can commit; the accumulator is left
+    /// intact for the error path (the source replays the unit and re-captures
+    /// idempotently).
+    async fn close_capture_unit(
+        &self,
+        accum: &mut Vec<Event>,
+        boundary: &deltaforge_core::SourceBoundary,
+    ) -> Result<()> {
+        use deltaforge_core::replay::{
+            REPLAY_ENVELOPE_VERSION, ReplayEnvelopePayload, ReplayEventRecord,
+            SchemaBinding, SourceBoundaryRecord,
+        };
+        let Some(cap) = &self.replay_capture else {
+            accum.clear();
+            return Ok(());
+        };
+        if accum.is_empty() {
+            return Ok(());
+        }
+        let events: Vec<ReplayEventRecord> = accum
+            .iter()
+            .enumerate()
+            .map(|(i, ev)| ReplayEventRecord {
+                offset: i as u32,
+                event_id: ev
+                    .event_id
+                    .as_ref()
+                    .map(|e| e.to_string())
+                    .unwrap_or_default(),
+                tx_id: ev.transaction.as_ref().map(|t| t.id.clone()),
+                event: serde_json::to_value(ev)
+                    .unwrap_or(serde_json::Value::Null),
+            })
+            .collect();
+        let payload = ReplayEnvelopePayload {
+            version: REPLAY_ENVELOPE_VERSION,
+            pipeline_identity: cap.identity.clone(),
+            boundary: SourceBoundaryRecord::from_boundary(boundary),
+            events,
+            schema_binding: SchemaBinding {
+                // Provenance-only; not consumed by replay delivery today.
+                source_provenance: Vec::new(),
+                registry_seq_at_capture: (cap.registry_seq_fn)(),
+            },
+        };
+        if cap.max_envelope_bytes > 0 {
+            let bytes = payload.canonical_bytes().len();
+            if bytes > cap.max_envelope_bytes {
+                counter!(
+                    "deltaforge_replay_capture_oversized_total",
+                    "pipeline" => self.pipeline_name.to_string(),
+                )
+                .increment(1);
+                return Err(OversizedReplayEnvelopeError {
+                    bytes,
+                    max: cap.max_envelope_bytes,
+                    events: payload.events.len(),
+                }
+                .into());
+            }
+        }
+        cap.journal.append(&payload).await.map_err(|e| {
+            counter!(
+                "deltaforge_replay_capture_failures_total",
+                "pipeline" => self.pipeline_name.to_string(),
+            )
+            .increment(1);
+            e.context(
+                "replay journal capture failed (fail closed; checkpoint not advanced)",
+            )
+        })?;
+        counter!(
+            "deltaforge_replay_captured_total",
+            "pipeline" => self.pipeline_name.to_string(),
+        )
+        .increment(1);
+        accum.clear();
+        Ok(())
     }
 
     /// Get access to schema sensor state (for API exposure).
@@ -1050,6 +1172,11 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         let mut building: Option<BuildingBatch> = None;
         let mut drain_buf: Vec<SourceItem> = Vec::with_capacity(256);
         let mut tx_tracker = TxTracker::default();
+        // Replay capture accumulator: raw pre-processing events for the currently-open
+        // commit unit. Separate from batching, so it spans soft-limit flushes; closed at
+        // a boundary, discarded (dropped) on cancel/shutdown/error before a boundary.
+        let replay_on = coord.replay_capture.is_some();
+        let mut capture_accum: Vec<Event> = Vec::new();
 
         let accum_result: Result<()> = async {
             loop {
@@ -1141,6 +1268,11 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                         // to the open transaction.
                                         tx_tracker.observe_event(&ev)?;
                                         if ev.transaction.is_some() {
+                                            // Accumulate the raw event for replay before
+                                            // it is moved into the batch.
+                                            if replay_on {
+                                                capture_accum.push(ev.clone());
+                                            }
                                             // In-transaction event: buffer without
                                             // splitting; enforce the hard caps.
                                             if let Err(o) = push_tx_event(
@@ -1172,10 +1304,32 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                             );
                                         } else {
                                             // Standalone/snapshot event: its own
-                                            // boundary; split by soft limits.
+                                            // boundary; split by soft limits. Accumulate
+                                            // the raw event and note whether it carries a
+                                            // boundary (snapshot chunk-final rows do; the
+                                            // rest accumulate across soft-limit flushes).
+                                            let ev_boundary = if replay_on {
+                                                ev.boundary.clone()
+                                            } else {
+                                                None
+                                            };
+                                            if replay_on {
+                                                capture_accum.push(ev.clone());
+                                            }
                                             b.bytes += event_size_hint(&ev);
                                             b.raw.push(ev);
                                             commit_standalone(&mut b);
+                                            // Close the replay unit at the boundary event,
+                                            // before any flush that could commit its
+                                            // checkpoint (fail-closed).
+                                            if let Some(bd) = ev_boundary {
+                                                coord
+                                                    .close_capture_unit(
+                                                        &mut capture_accum,
+                                                        &bd,
+                                                    )
+                                                    .await?;
+                                            }
                                             if soft_limit_reached(&b, max_events, max_bytes) {
                                                 let full = std::mem::replace(
                                                     &mut b,
@@ -1194,7 +1348,13 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                         // the boundary's checkpoint + watermark
                                         // (atomic), flush only if soft limits are
                                         // reached.
-                                        close_tx(&mut b, boundary);
+                                        close_tx(&mut b, boundary.clone());
+                                        // Persist the replay envelope for the whole tx
+                                        // before any flush can commit its checkpoint
+                                        // (fail-closed).
+                                        coord
+                                            .close_capture_unit(&mut capture_accum, &boundary)
+                                            .await?;
                                         if soft_limit_reached(&b, max_events, max_bytes) {
                                             let full = std::mem::replace(
                                                 &mut b,
@@ -1211,6 +1371,13 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                         // the batch is empty because prior data
                                         // already flushed (the sink then publishes a
                                         // zero-object entry + HEAD CAS for it).
+                                        // Close any accumulated commit unit at this
+                                        // data-less boundary before the flush commits its
+                                        // checkpoint (fail-closed). Usually empty (a
+                                        // chunk-final event already closed the unit).
+                                        coord
+                                            .close_capture_unit(&mut capture_accum, &boundary)
+                                            .await?;
                                         close_boundary(&mut b, boundary);
                                         let full = std::mem::replace(
                                             &mut b,
@@ -1920,6 +2087,290 @@ mod tests {
             .commit_fn("kafka", cp_fn)
             .process_fn(batch_processor)
             .build()
+    }
+
+    /// Like `tx_coord` but with replay capture wired to `journal`.
+    fn cap_coord(
+        store: Arc<checkpoints::MemCheckpointStore>,
+        sink: Arc<MockSink>,
+        cfg: BatchConfig,
+        journal: Arc<dyn crate::replay_journal::JournalLog>,
+        max_envelope_bytes: usize,
+    ) -> Coordinator<CheckpointMeta> {
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        let cp_fn = build_commit_fn(store, "src::sink::kafka".to_string());
+        let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![]);
+        let batch_processor =
+            build_batch_processor(processors, "test".to_string());
+        let capture = ReplayCapture {
+            journal,
+            identity: deltaforge_core::replay::PipelineIdentity {
+                pipeline: "p".into(),
+                incarnation: "inc-1".into(),
+                source_identity: "src".into(),
+            },
+            max_envelope_bytes,
+            registry_seq_fn: Arc::new(|| 0),
+        };
+        Coordinator::builder("cap-test")
+            .sinks(sinks)
+            .batch_config(Some(cfg))
+            .commit_fn("kafka", cp_fn)
+            .process_fn(batch_processor)
+            .replay_capture(capture)
+            .build()
+    }
+
+    /// A standalone (non-transactional) event, carrying a boundary only when
+    /// `boundary_cp` is `Some` (snapshot chunk-final rows do; the rest do not).
+    fn snap_event(id: i64, boundary_cp: Option<&[u8]>) -> Event {
+        let mut e = tx_event(id, "ignored", b"");
+        e.transaction = None;
+        e.boundary = boundary_cp.map(|cp| {
+            deltaforge_core::SourceBoundary::checkpoint_only(
+                CheckpointMeta::from_vec(cp.to_vec()),
+            )
+        });
+        e
+    }
+
+    fn cap_cfg(max_events: usize) -> BatchConfig {
+        BatchConfig {
+            max_events: Some(max_events),
+            max_ms: Some(60_000),
+            respect_source_tx: Some(true),
+            max_inflight: Some(1),
+            ..BatchConfig::default()
+        }
+    }
+
+    /// A journal that always fails, to prove fail-closed capture.
+    struct FailingJournal;
+    #[async_trait::async_trait]
+    impl crate::replay_journal::JournalLog for FailingJournal {
+        async fn append(
+            &self,
+            _p: &deltaforge_core::replay::ReplayEnvelopePayload,
+        ) -> Result<storage::LogAppendOutcome> {
+            anyhow::bail!("journal unavailable")
+        }
+        async fn read_since(
+            &self,
+            _f: u64,
+            _l: usize,
+        ) -> Result<Vec<(u64, deltaforge_core::replay::ReplayEnvelopePayload)>>
+        {
+            Ok(vec![])
+        }
+        async fn stream_meta(&self) -> Result<storage::LogStreamMeta> {
+            anyhow::bail!("n/a")
+        }
+        async fn truncate(
+            &self,
+            _r: storage::LogTruncateRequest,
+        ) -> Result<storage::LogTruncateOutcome> {
+            anyhow::bail!("n/a")
+        }
+    }
+
+    async fn feed_and_run(
+        coord: Coordinator<CheckpointMeta>,
+        items: Vec<SourceItem>,
+    ) -> Result<()> {
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        for item in items {
+            tx.send(item).await.unwrap();
+        }
+        drop(tx);
+        coord.run(rx, cancel, pause_rx).await
+    }
+
+    /// A snapshot chunk whose rows flush across several coordinator batches is
+    /// captured as ONE envelope, closed by the chunk-final boundary.
+    #[tokio::test]
+    async fn snapshot_chunk_across_batches_is_one_envelope() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let be: storage::ArcStorageBackend =
+            Arc::new(storage::MemoryStorageBackend::new());
+        let journal = Arc::new(crate::replay_journal::BackendJournalLog::new(
+            be, "p", "inc-1",
+        ));
+        let coord = cap_coord(
+            store,
+            Arc::clone(&sink),
+            cap_cfg(2), // small soft limit forces mid-chunk flushes
+            journal.clone(),
+            0,
+        );
+
+        let mut items = Vec::new();
+        for i in 1..=4 {
+            items.push(SourceItem::Event(snap_event(i, None)));
+        }
+        items.push(SourceItem::Event(snap_event(5, Some(b"chunk-cp"))));
+        feed_and_run(coord, items).await.unwrap();
+
+        let envs =
+            crate::replay_journal::JournalLog::read_since(&*journal, 0, 100)
+                .await
+                .unwrap();
+        assert_eq!(envs.len(), 1, "whole chunk is one envelope");
+        assert_eq!(envs[0].1.events.len(), 5);
+        assert_eq!(
+            envs[0].1.boundary.checkpoint_hex,
+            hex_of(b"chunk-cp"),
+            "envelope boundary is the chunk-final checkpoint"
+        );
+    }
+
+    fn hex_of(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// A journal append failure at a commit boundary fails the pipeline and does not
+    /// advance the checkpoint.
+    #[tokio::test]
+    async fn capture_failure_fails_closed_no_checkpoint() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let coord = cap_coord(
+            store.clone(),
+            sink,
+            cap_cfg(1000),
+            Arc::new(FailingJournal),
+            0,
+        );
+        let res = feed_and_run(
+            coord,
+            vec![
+                begin("g1"),
+                SourceItem::Event(tx_event(1, "g1", b"row")),
+                commit("g1", b"cp-1"),
+            ],
+        )
+        .await;
+        assert!(res.is_err(), "capture failure must fail the pipeline");
+        assert!(
+            store.get_raw("src::sink::kafka").await.unwrap().is_none(),
+            "checkpoint must not advance on capture failure"
+        );
+    }
+
+    /// A partial chunk with no boundary before shutdown captures nothing (the
+    /// accumulator is discarded; the source replays the chunk on restart).
+    #[tokio::test]
+    async fn partial_chunk_without_boundary_captures_nothing() {
+        let be: storage::ArcStorageBackend =
+            Arc::new(storage::MemoryStorageBackend::new());
+        let journal = Arc::new(crate::replay_journal::BackendJournalLog::new(
+            be, "p", "inc-1",
+        ));
+        let coord = cap_coord(
+            Arc::new(checkpoints::MemCheckpointStore::new().unwrap()),
+            MockSink::new("kafka", true),
+            cap_cfg(1000),
+            journal.clone(),
+            0,
+        );
+        feed_and_run(
+            coord,
+            vec![
+                SourceItem::Event(snap_event(1, None)),
+                SourceItem::Event(snap_event(2, None)),
+            ],
+        )
+        .await
+        .unwrap();
+        let envs =
+            crate::replay_journal::JournalLog::read_since(&*journal, 0, 100)
+                .await
+                .unwrap();
+        assert!(envs.is_empty(), "no boundary -> nothing captured");
+    }
+
+    /// Replaying the same chunk (e.g. after a restart before the boundary) produces a
+    /// single idempotent envelope.
+    #[tokio::test]
+    async fn replaying_same_chunk_is_idempotent() {
+        let be: storage::ArcStorageBackend =
+            Arc::new(storage::MemoryStorageBackend::new());
+        let chunk = || {
+            vec![
+                SourceItem::Event(snap_event(1, None)),
+                SourceItem::Event(snap_event(2, None)),
+                SourceItem::Event(snap_event(3, Some(b"chunk-cp"))),
+            ]
+        };
+        for _ in 0..2 {
+            let journal =
+                Arc::new(crate::replay_journal::BackendJournalLog::new(
+                    be.clone(),
+                    "p",
+                    "inc-1",
+                ));
+            let coord = cap_coord(
+                Arc::new(checkpoints::MemCheckpointStore::new().unwrap()),
+                MockSink::new("kafka", true),
+                cap_cfg(1000),
+                journal,
+                0,
+            );
+            feed_and_run(coord, chunk()).await.unwrap();
+        }
+        let journal =
+            crate::replay_journal::BackendJournalLog::new(be, "p", "inc-1");
+        let envs =
+            crate::replay_journal::JournalLog::read_since(&journal, 0, 100)
+                .await
+                .unwrap();
+        assert_eq!(envs.len(), 1, "same chunk captured exactly once");
+    }
+
+    /// An envelope over the size cap fails closed (never split); the checkpoint does
+    /// not advance.
+    #[tokio::test]
+    async fn oversized_envelope_fails_closed() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let be: storage::ArcStorageBackend =
+            Arc::new(storage::MemoryStorageBackend::new());
+        let journal = Arc::new(crate::replay_journal::BackendJournalLog::new(
+            be, "p", "inc-1",
+        ));
+        let coord = cap_coord(
+            store.clone(),
+            MockSink::new("kafka", true),
+            cap_cfg(1000),
+            journal.clone(),
+            10, // tiny cap: any real envelope exceeds it
+        );
+        let res = feed_and_run(
+            coord,
+            vec![
+                begin("g1"),
+                SourceItem::Event(tx_event(1, "g1", b"row")),
+                commit("g1", b"cp-1"),
+            ],
+        )
+        .await;
+        let err = res.expect_err("oversized envelope must fail closed");
+        assert!(
+            err.downcast_ref::<OversizedReplayEnvelopeError>().is_some(),
+            "expected OversizedReplayEnvelopeError: {err}"
+        );
+        assert!(store.get_raw("src::sink::kafka").await.unwrap().is_none());
+        assert!(
+            crate::replay_journal::JournalLog::read_since(&*journal, 0, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A transaction larger than the soft `max_events` limit is delivered whole
