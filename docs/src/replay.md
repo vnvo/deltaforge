@@ -163,3 +163,11 @@ already received.
   supported yet; `staged_sinks` must be empty. Replay targets existing pipeline sinks only.
 - **One job per pipeline.** At most one active replay job exists per pipeline incarnation; a
   second start returns `409`.
+
+## Operational validation (canary)
+
+Before relying on replay in an environment, run the disposable-pipeline canary in
+[`docs/ops/replay-canary/`](https://github.com/deltaforge/deltaforge/tree/main/docs/ops/replay-canary).
+It verifies selected-sink pause/restoration, at-least-once duplicate handling,
+restart-during-replay resume, retention and journal-growth metrics, and the
+network-restriction requirement above.
