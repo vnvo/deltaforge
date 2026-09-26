@@ -26,9 +26,43 @@ pub struct PreflightReport {
     pub estimated_size_bytes: Option<u64>,
     pub estimated_duration_secs: Option<u64>,
     pub retention_secs: Option<u64>,
+    /// True when a hard error is a missing-privilege problem (e.g. RELOAD),
+    /// so callers can surface a typed `Permission` refusal rather than a generic
+    /// incompatibility. Managed MySQL without RELOAD lands here.
+    pub permission_error: bool,
 }
 
 impl PreflightReport {
+    /// Log the report (info summary + warnings) without failing. Callers that
+    /// want typed fail-closed behavior use this then inspect `hard_errors` /
+    /// `permission_error` themselves.
+    pub fn emit(&self, source_id: &str, table_count: usize) {
+        let size_str = self
+            .estimated_size_bytes
+            .map(|b| format!("{:.1} GB", b as f64 / 1_073_741_824.0))
+            .unwrap_or_else(|| "unknown".into());
+        let duration_str = self
+            .estimated_duration_secs
+            .map(format_duration)
+            .unwrap_or_else(|| "unknown".into());
+        let retention_str = self
+            .retention_secs
+            .map(format_duration)
+            .unwrap_or_else(|| "unknown".into());
+
+        info!(
+            source_id,
+            tables = table_count,
+            estimated_size = %size_str,
+            estimated_duration = %duration_str,
+            binlog_retention = %retention_str,
+            "snapshot preflight: mysql"
+        );
+        for w in &self.warnings {
+            warn!(source_id, "{}", w);
+        }
+    }
+
     /// Log the full report at the appropriate level and return Err if there
     /// are any hard errors.
     pub fn emit_and_check(
@@ -92,6 +126,7 @@ pub async fn run_preflight(
         estimated_size_bytes: None,
         estimated_duration_secs: None,
         retention_secs: None,
+        permission_error: false,
     };
 
     // 1. binlog enabled and ROW format
@@ -137,6 +172,19 @@ pub async fn run_preflight(
 
     if let Some(err) = gtid_mode_hard_error(gtid_mode.as_deref()) {
         report.hard_errors.push(err);
+    }
+
+    // 1c. RELOAD privilege - required for FLUSH TABLES WITH READ LOCK, which
+    // brackets the consistent snapshot anchor. Managed MySQL that restricts
+    // RELOAD cannot guarantee a consistent initial snapshot and fails closed
+    // (no silent fallback to an unsafe per-worker-snapshot anchor).
+    let grants: Vec<String> = conn
+        .query("SHOW GRANTS FOR CURRENT_USER()")
+        .await
+        .unwrap_or_default();
+    if let Some(err) = reload_privilege_hard_error(&grants) {
+        report.hard_errors.push(err);
+        report.permission_error = true;
     }
 
     // 2. retention window
@@ -582,6 +630,32 @@ fn gtid_mode_hard_error(gtid_mode: Option<&str>) -> Option<String> {
     }
 }
 
+/// Hard error unless the current user holds `RELOAD` (globally, `ON *.*`) - the
+/// privilege `FLUSH TABLES WITH READ LOCK` requires to bracket the snapshot
+/// anchor. `ALL PRIVILEGES ON *.*` implies RELOAD; a database-scoped `ALL
+/// PRIVILEGES ON db.*` does not (RELOAD is global-only), so both the privilege
+/// and the `ON *.*` scope must appear on the same grant line.
+fn reload_privilege_hard_error(grants: &[String]) -> Option<String> {
+    let has_reload = grants.iter().any(|g| {
+        let up = g.to_uppercase();
+        up.contains("ON *.*")
+            && (up.contains("ALL PRIVILEGES") || up.contains("RELOAD"))
+    });
+    if has_reload {
+        None
+    } else {
+        Some(
+            "current user lacks the global RELOAD privilege required for \
+             FLUSH TABLES WITH READ LOCK, which brackets the consistent snapshot \
+             anchor. On managed MySQL that restricts RELOAD a consistent initial \
+             snapshot cannot be guaranteed; grant RELOAD (GRANT RELOAD ON *.* ...), \
+             or set snapshot mode to 'never' to stream changes only (not a complete \
+             initial load)."
+                .into(),
+        )
+    }
+}
+
 /// Hard error unless the table's storage engine is InnoDB. Only InnoDB provides
 /// the MVCC consistent read the snapshot relies on; non-InnoDB tables are out of
 /// scope for this milestone and must fail closed rather than snapshot inconsistently.
@@ -643,6 +717,31 @@ mod tests {
         assert_eq!(engine_hard_error("db", "t", Some("innodb")), None);
         assert!(engine_hard_error("db", "t", Some("MyISAM")).is_some());
         assert!(engine_hard_error("db", "t", None).is_some());
+    }
+
+    #[test]
+    fn reload_privilege_detected() {
+        let full = vec![
+            "GRANT SELECT, RELOAD, REPLICATION SLAVE ON *.* TO 'df'@'%'".into(),
+        ];
+        assert_eq!(reload_privilege_hard_error(&full), None);
+        let all = vec!["GRANT ALL PRIVILEGES ON *.* TO 'root'@'%'".into()];
+        assert_eq!(reload_privilege_hard_error(&all), None);
+    }
+
+    #[test]
+    fn reload_privilege_missing_fails_closed() {
+        // Managed MySQL: broad db grant but no global RELOAD.
+        let managed = vec![
+            "GRANT SELECT, INSERT ON `app`.* TO 'df'@'%'".into(),
+            "GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'df'@'%'"
+                .into(),
+        ];
+        assert!(reload_privilege_hard_error(&managed).is_some());
+        // ALL PRIVILEGES scoped to a database is NOT global RELOAD.
+        let db_all = vec!["GRANT ALL PRIVILEGES ON `app`.* TO 'df'@'%'".into()];
+        assert!(reload_privilege_hard_error(&db_all).is_some());
+        assert!(reload_privilege_hard_error(&[]).is_some());
     }
 
     #[test]
