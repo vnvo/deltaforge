@@ -1181,6 +1181,7 @@ impl PipelineManager {
             &ctx.commit_policy,
             &selected_sinks,
             &staged_sinks,
+            &encoder_schema_policy,
         )
         .map_err(PipelineAPIError::Failed)?;
 
@@ -1203,6 +1204,18 @@ impl PipelineManager {
             .create(&job)
             .await
             .map_err(PipelineAPIError::Failed)?;
+
+        // Install ownership SYNCHRONOUSLY, immediately after the durable create and before
+        // spawning the controller: set the retention pin and (for a non-dry-run job) the
+        // sink exclusions with no await in between, so neither the retention task nor live
+        // delivery can run against the new active job before its gate/pin exist. If any of
+        // this fails we roll the job back to Cancelled so it does not linger active.
+        if let Some(pin) = job.pin_seq() {
+            ctx.pin.store(pin, Ordering::SeqCst);
+        }
+        if job.holds_pause() {
+            ctx.gate.exclude(job.selected_sinks.iter().cloned());
+        }
 
         let job_cancel = CancellationToken::new();
         let controller = ctx.build_controller(job_cancel.clone());
@@ -1272,11 +1285,20 @@ impl PipelineManager {
                 );
                 break;
             }
-            let cancelled = stored
+            // A job already at LiveRestored cannot be Cancelled (that transition is illegal,
+            // and the pause has effectively been released): finalize it to Completed instead,
+            // so aborting the controller mid-handoff never strands the replay pause.
+            let target =
+                if matches!(stored.job.phase, ReplayPhase::LiveRestored) {
+                    ReplayPhase::Completed
+                } else {
+                    ReplayPhase::Cancelled
+                };
+            let next = stored
                 .job
-                .advance(ReplayPhase::Cancelled, now_ms())
+                .advance(target, now_ms())
                 .map_err(|e| PipelineAPIError::Failed(anyhow::anyhow!(e)))?;
-            match store.compare_and_set(stored.version, &cancelled).await {
+            match store.compare_and_set(stored.version, &next).await {
                 Ok(_) => {
                     targets = Some(
                         stored
@@ -1336,7 +1358,16 @@ fn authorize_replay_start(
     commit_policy: &Option<deltaforge_config::CommitPolicy>,
     selected: &[String],
     staged: &[String],
+    encoder_schema_policy: &EncoderSchemaPolicy,
 ) -> Result<()> {
+    // The current Sink API cannot honor a pinned/at-capture encoder schema, so reject those
+    // policies up front rather than creating a job that would fail on first delivery.
+    if !matches!(encoder_schema_policy, EncoderSchemaPolicy::Current) {
+        anyhow::bail!(
+            "encoder_schema_policy other than 'current' is not supported yet (the sink API \
+             cannot select a schema); use the default 'current' policy"
+        );
+    }
     if !staged.is_empty() {
         anyhow::bail!(
             "staged-sink backfill is not supported yet; staged_sinks must be empty"
@@ -1770,57 +1801,45 @@ mod tests {
     #[test]
     fn authorize_replay_start_validates_targets_and_policy() {
         let sinks = vec!["kafka".to_string(), "s3".to_string()];
+        let current = EncoderSchemaPolicy::Current;
+        let auth = |cp: &Option<CommitPolicy>,
+                    sel: &[String],
+                    staged: &[String],
+                    pol: &EncoderSchemaPolicy| {
+            authorize_replay_start("p", &sinks, cp, sel, staged, pol)
+        };
 
         // Happy path.
-        assert!(
-            authorize_replay_start("p", &sinks, &None, &["kafka".into()], &[])
-                .is_ok()
-        );
+        assert!(auth(&None, &["kafka".into()], &[], &current).is_ok());
 
         // Staged sinks are rejected for this release.
-        let err = authorize_replay_start(
-            "p",
-            &sinks,
-            &None,
-            &["kafka".into()],
-            &["new".into()],
-        )
-        .unwrap_err();
+        let err = auth(&None, &["kafka".into()], &["new".into()], &current)
+            .unwrap_err();
         assert!(err.to_string().contains("staged"));
 
         // Unknown selected sink.
-        let err =
-            authorize_replay_start("p", &sinks, &None, &["ghost".into()], &[])
-                .unwrap_err();
+        let err = auth(&None, &["ghost".into()], &[], &current).unwrap_err();
         assert!(err.to_string().contains("not a sink"));
 
         // Empty selection.
-        assert!(authorize_replay_start("p", &sinks, &None, &[], &[]).is_err());
+        assert!(auth(&None, &[], &[], &current).is_err());
+
+        // Non-current encoder policy is rejected up front.
+        for pol in [
+            EncoderSchemaPolicy::AtCaptureSeq,
+            EncoderSchemaPolicy::Pinned { seq: 7 },
+        ] {
+            let err = auth(&None, &["kafka".into()], &[], &pol).unwrap_err();
+            assert!(err.to_string().contains("encoder_schema_policy"));
+        }
 
         // Quorum must remain satisfiable after excluding the selected sinks.
         let quorum2 = Some(CommitPolicy::Quorum { quorum: 2 });
-        // Excluding one of two leaves 1 live < quorum 2 -> rejected.
-        let err = authorize_replay_start(
-            "p",
-            &sinks,
-            &quorum2,
-            &["kafka".into()],
-            &[],
-        )
-        .unwrap_err();
+        let err = auth(&quorum2, &["kafka".into()], &[], &current).unwrap_err();
         assert!(err.to_string().contains("quorum"));
         // Quorum 1 with one sink excluded leaves 1 live -> ok.
         let quorum1 = Some(CommitPolicy::Quorum { quorum: 1 });
-        assert!(
-            authorize_replay_start(
-                "p",
-                &sinks,
-                &quorum1,
-                &["kafka".into()],
-                &[]
-            )
-            .is_ok()
-        );
+        assert!(auth(&quorum1, &["kafka".into()], &[], &current).is_ok());
     }
 
     fn sample_spec(name: &str) -> PipelineSpec {

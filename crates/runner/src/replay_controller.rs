@@ -332,17 +332,20 @@ impl ReplayController {
         Ok(())
     }
 
-    /// Run the job to completion (or until cancelled). On any error the controller fails
-    /// safe: it resumes ingestion and returns the paused/staged sinks to the live set so a
-    /// failure never strands the pipeline paused.
+    /// Run the job to completion (or until cancelled). On success the retention pin is
+    /// released. On error, ownership (gate/pin/pause) is released ONLY after the durable job
+    /// is recorded `Failed`, so durable and runtime state never disagree.
     pub async fn run(&self) -> Result<()> {
         let outcome = self.run_inner().await;
-        // Whatever happened, the job is no longer advancing: release the retention pin.
-        // A still-active job (cancelled controller) is re-pinned by the startup barrier on
-        // the next run.
-        self.pin.store(u64::MAX, Ordering::SeqCst);
         match outcome {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // The job reached a terminal/handoff-complete state (or there was nothing to
+                // do, or the controller was cancelled and will be resumed by the startup
+                // barrier). Releasing the pin is safe: on the cancel path the retention task
+                // is torn down with the runtime.
+                self.pin.store(u64::MAX, Ordering::SeqCst);
+                Ok(())
+            }
             Err(e) => {
                 self.recover_from_failure(&e).await;
                 Err(e)
@@ -467,12 +470,53 @@ impl ReplayController {
         Ok(())
     }
 
-    /// Fail-safe cleanup: never leave ingestion paused or sinks out of the live set.
+    /// Fail-safe cleanup that keeps durable and runtime state in agreement: record the job
+    /// `Failed` FIRST, and only then release ownership (resume ingestion, return sinks to the
+    /// live set, clear the pin). If the job cannot be persisted `Failed`, leave the
+    /// gate/pin/pause installed so a restart's startup barrier re-syncs from the still-active
+    /// durable job rather than silently restoring live delivery over an active job.
     async fn recover_from_failure(&self, err: &anyhow::Error) {
-        warn!(pipeline = %self.pipeline, error = %format!("{err:#}"), "replay controller failed; restoring live delivery");
+        warn!(pipeline = %self.pipeline, error = %format!("{err:#}"), "replay controller failed");
+        if !self.mark_failed(err).await {
+            warn!(
+                pipeline = %self.pipeline,
+                "could not persist replay failure; leaving pause/gate/pin installed for restart"
+            );
+            return;
+        }
+        // Failure is durable: safe to restore live delivery.
+        let targets = self
+            .store
+            .get()
+            .await
+            .ok()
+            .flatten()
+            .map(|s| job_targets(&s.job))
+            .unwrap_or_default();
+        self.gate.include(targets);
+        self.pin.store(u64::MAX, Ordering::SeqCst);
         self.ingestion.resume().await;
-        if let Ok(Some(stored)) = self.store.get().await {
-            self.gate.include(job_targets(&stored.job));
+    }
+
+    /// Record the job `Failed`. Returns whether the durable state is terminal afterward
+    /// (already terminal, no job, or a successful CAS to `Failed`).
+    async fn mark_failed(&self, err: &anyhow::Error) -> bool {
+        match self.store.get().await {
+            Ok(Some(stored)) => {
+                if !stored.job.is_active() {
+                    return true; // the worker already failed it, or it is otherwise terminal
+                }
+                match stored.job.fail(format!("{err:#}"), now_ms()) {
+                    Ok(failed) => self
+                        .store
+                        .compare_and_set(stored.version, &failed)
+                        .await
+                        .is_ok(),
+                    Err(_) => false,
+                }
+            }
+            Ok(None) => true, // no durable job to fail
+            Err(_) => false,
         }
     }
 }
@@ -545,6 +589,19 @@ mod tests {
         ) -> Result<()> {
             self.delivered.lock().unwrap().push(envelope.seq);
             Ok(())
+        }
+    }
+
+    struct FailingDelivery;
+    #[async_trait]
+    impl ReplayDelivery for FailingDelivery {
+        async fn deliver(
+            &self,
+            _job: &ReplayJob,
+            _envelope: &StoredReplayEnvelope,
+            _schema: ResolvedEncoderSchema,
+        ) -> Result<()> {
+            anyhow::bail!("sink exploded")
         }
     }
 
@@ -841,6 +898,41 @@ mod tests {
             ingestion.quiesced.load(Ordering::SeqCst),
             0,
             "no re-quiesce after live was already restored"
+        );
+    }
+
+    /// On a delivery failure the controller records the job Failed durably, then restores
+    /// live delivery and clears the pin (durable and runtime stay in agreement).
+    #[tokio::test]
+    async fn failure_marks_failed_then_restores_live() {
+        let (be, jl, _seqs) = journal_with(2).await;
+        let store = ReplayJobStore::new(be.clone(), "p", "inc-1");
+        store.create(&job(false)).await.unwrap();
+        let gate = Arc::new(ReplaySinkGate::new());
+        let ingestion = Arc::new(MockIngestion::default());
+        let pin = Arc::new(AtomicU64::new(u64::MAX));
+        let controller = ReplayController::new(
+            store.clone(),
+            jl,
+            gate.clone(),
+            ingestion.clone(),
+            Arc::new(FailingDelivery),
+            pin.clone(),
+            CancellationToken::new(),
+            10,
+            "p",
+        );
+
+        let err = controller.run().await.unwrap_err();
+        assert!(err.to_string().contains("replay delivery failed"));
+        let after = store.get().await.unwrap().unwrap();
+        assert_eq!(after.job.phase, ReplayPhase::Failed);
+        assert!(after.job.error.is_some());
+        assert!(!gate.any_excluded(), "live restored after durable Failed");
+        assert_eq!(
+            pin.load(Ordering::SeqCst),
+            u64::MAX,
+            "retention pin released"
         );
     }
 

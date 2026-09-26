@@ -1315,11 +1315,14 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             loop {
                 let ps = *pause_rx.borrow();
                 if ps.paused() {
-                    // A replay quiesce must land on a COMMIT-UNIT boundary before the tail
-                    // is frozen: if a transaction is open, keep consuming to finish it.
-                    let at_boundary =
-                        building.as_ref().is_none_or(|b| !b.mid_tx());
-                    if ps.replay && at_boundary && !quiesced_acked {
+                    // A replay quiesce may be acknowledged only at a genuine commit-unit
+                    // boundary: no open transaction AND no partially-accumulated snapshot
+                    // chunk still pending capture. Otherwise excluded rows for the open unit
+                    // could enter the journal AFTER the selected sink is restored, losing
+                    // them for that sink.
+                    let unit_open = building.as_ref().is_some_and(|b| b.mid_tx())
+                        || (replay_on && !capture_accum.is_empty());
+                    if ps.replay && !unit_open && !quiesced_acked {
                         // Flush any whole commit units that are ready, then wait for
                         // in-flight delivery to drain. Capture is already durable in-loop,
                         // so once delivery drains the tail is frozen and consistent.
@@ -1353,10 +1356,15 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                         }
                         quiesced_acked = true;
                     }
-                    // Park while paused - unless a replay quiesce is still waiting to reach
-                    // a boundary, in which case fall through to consume the open tx.
-                    let park = ps.operator || (ps.replay && at_boundary);
-                    if park {
+                    // A replay quiesce that has not yet reached a boundary must keep
+                    // consuming to finish the open unit - even under an operator pause, which
+                    // would otherwise park the loop and deadlock the handoff. The operator
+                    // pause is preserved: once the unit closes and the quiesce is
+                    // acknowledged, the loop parks (operator is still set) and stays parked
+                    // after the handoff clears only the replay reason.
+                    let replay_needs_progress =
+                        ps.replay && unit_open && !quiesced_acked;
+                    if !replay_needs_progress {
                         tokio::select! {
                             _ = cancel.cancelled() => break,
                             changed = pause_rx.changed() => {
@@ -2346,6 +2354,192 @@ mod tests {
             max_inflight: Some(1),
             ..BatchConfig::default()
         }
+    }
+
+    /// A tx-aligned config with a short tick so the burst-gather and timer flush promptly
+    /// (used by the quiesce tests, which drive events by hand).
+    fn quiesce_cfg() -> BatchConfig {
+        BatchConfig {
+            max_events: Some(1000),
+            max_ms: Some(50),
+            respect_source_tx: Some(true),
+            max_inflight: Some(1),
+            ..BatchConfig::default()
+        }
+    }
+
+    /// Like `cap_coord` but also wired with a quiesce-ack channel.
+    fn cap_coord_with_ack(
+        store: Arc<checkpoints::MemCheckpointStore>,
+        sink: Arc<MockSink>,
+        cfg: BatchConfig,
+        journal: Arc<dyn crate::replay_journal::JournalLog>,
+        ack: tokio::sync::watch::Sender<bool>,
+    ) -> Coordinator<CheckpointMeta> {
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        let cp_fn = build_commit_fn(store, "src::sink::kafka".to_string());
+        let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![]);
+        let batch_processor =
+            build_batch_processor(processors, "test".to_string());
+        let capture = ReplayCapture {
+            journal,
+            identity: deltaforge_core::replay::PipelineIdentity {
+                pipeline: "p".into(),
+                incarnation: "inc-1".into(),
+                source_lineage: None,
+            },
+            max_envelope_bytes: 0,
+            registry_seq_fn: Arc::new(|| None),
+        };
+        Coordinator::builder("cap-test")
+            .sinks(sinks)
+            .batch_config(Some(cfg))
+            .commit_fn("kafka", cp_fn)
+            .process_fn(batch_processor)
+            .replay_capture(capture)
+            .quiesce_ack(ack)
+            .build()
+    }
+
+    async fn wait_ack(
+        rx: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), tokio::time::error::Elapsed> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if *rx.borrow_and_update() {
+                    break;
+                }
+                rx.changed().await.unwrap();
+            }
+        })
+        .await
+    }
+
+    /// Blocker: a replay quiesce must not acknowledge while a snapshot chunk is still
+    /// accumulating (spanning batches), or excluded rows could enter the journal after the
+    /// sink is restored. Ack only after the chunk-final boundary closes the accumulator.
+    #[tokio::test]
+    async fn quiesce_waits_for_open_snapshot_chunk() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let be: storage::ArcStorageBackend =
+            Arc::new(storage::MemoryStorageBackend::new());
+        let journal = Arc::new(crate::replay_journal::BackendJournalLog::new(
+            be,
+            deltaforge_core::replay::PipelineIdentity {
+                pipeline: "p".into(),
+                incarnation: "inc-1".into(),
+                source_lineage: None,
+            },
+        ));
+        let (ack_tx, mut ack_rx) = tokio::sync::watch::channel(false);
+        let coord = cap_coord_with_ack(
+            store,
+            MockSink::new("kafka", true),
+            quiesce_cfg(),
+            journal,
+            ack_tx,
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
+        let run = tokio::spawn(coord.run(rx, cancel.clone(), pause_rx));
+
+        // Snapshot chunk in progress (rows without a chunk-final boundary).
+        tx.send(SourceItem::Event(snap_event(1, None)))
+            .await
+            .unwrap();
+        tx.send(SourceItem::Event(snap_event(2, None)))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        pause_tx.send_modify(|s| s.replay = true);
+        // Must NOT acknowledge while the chunk accumulator is open.
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            wait_ack(&mut ack_rx),
+        )
+        .await;
+        assert!(early.is_err(), "quiesce acked mid snapshot chunk");
+
+        // Chunk-final boundary closes the unit; now the quiesce can ack.
+        tx.send(SourceItem::Event(snap_event(3, Some(b"chunk-cp"))))
+            .await
+            .unwrap();
+        wait_ack(&mut ack_rx)
+            .await
+            .expect("quiesce did not ack after the chunk boundary");
+
+        pause_tx.send_modify(|s| s.replay = false);
+        drop(tx);
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(5), run).await;
+    }
+
+    /// Blocker: an operator pause must not deadlock a replay quiesce. With a transaction
+    /// open, the coordinator keeps consuming to finish it (despite operator=true), then
+    /// acknowledges; the operator pause remains in effect afterward.
+    #[tokio::test]
+    async fn operator_pause_does_not_deadlock_replay_quiesce() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        let procs: Arc<[deltaforge_core::ArcDynProcessor]> = Arc::from(vec![]);
+        let bp = build_batch_processor(procs, "test".to_string());
+        let (ack_tx, mut ack_rx) = tokio::sync::watch::channel(false);
+        let coord = Coordinator::builder("op-q")
+            .sinks(sinks)
+            .batch_config(Some(quiesce_cfg()))
+            .commit_fn(
+                "kafka",
+                build_commit_fn(store.clone(), "src::sink::kafka".to_string()),
+            )
+            .process_fn(bp)
+            .quiesce_ack(ack_tx)
+            .build();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
+        let run = tokio::spawn(coord.run(rx, cancel.clone(), pause_rx));
+
+        // Open a transaction (no commit yet).
+        tx.send(begin("g1")).await.unwrap();
+        tx.send(SourceItem::Event(tx_event(1, "g1", b"row")))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Operator pause AND replay quiesce, with the transaction still open.
+        pause_tx.send_modify(|s| {
+            s.operator = true;
+            s.replay = true;
+        });
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(400),
+            wait_ack(&mut ack_rx),
+        )
+        .await;
+        assert!(early.is_err(), "acked with an open transaction");
+
+        // The commit lets the coordinator finish the unit despite the operator pause.
+        tx.send(commit("g1", b"cp-1")).await.unwrap();
+        wait_ack(&mut ack_rx)
+            .await
+            .expect("operator pause deadlocked the replay quiesce");
+        assert!(
+            pause_tx.borrow().operator,
+            "operator pause must remain in effect"
+        );
+
+        cancel.cancel();
+        drop(tx);
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(5), run).await;
     }
 
     /// A journal that always fails, to prove fail-closed capture.
