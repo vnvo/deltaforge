@@ -771,9 +771,11 @@ impl PipelineManager {
                 pipeline: pipeline_name.clone(),
                 incarnation: incarnation.clone(),
                 // Real source DB lineage (system_identifier / server-uuid) is not yet
-                // exposed by the source trait; the schema represents it as absent rather
-                // than binding a placeholder. It does not enter capture_id, so binding it
-                // later is a forward-compatible change.
+                // exposed by the source trait; recorded as absent rather than a
+                // placeholder. Lineage IS part of the identity and the capture id, so
+                // changing it (None -> Some, or a different value) requires minting a new
+                // incarnation - existing envelopes stay bound to the incarnation that
+                // captured them and are only readable under that identity.
                 source_lineage: None,
             };
             let journal: Arc<dyn JournalLog> = Arc::new(
@@ -784,10 +786,11 @@ impl PipelineManager {
                     journal: Arc::clone(&journal),
                     identity,
                     max_envelope_bytes: replay_cfg.max_envelope_bytes,
-                    // The schema-registry handle is not threaded here yet; the schema
-                    // represents the registry sequence as absent rather than binding 0.
-                    // It does not enter capture_id, so binding it later is
-                    // forward-compatible.
+                    // The schema-registry handle is not threaded here yet; the registry
+                    // sequence is recorded as absent rather than a placeholder 0. It is
+                    // provenance only and is deliberately excluded from capture_id (it may
+                    // legitimately differ between idempotent retries), so binding it later
+                    // does not change any envelope's identity.
                     registry_seq_fn: Arc::new(|| None),
                 });
             let ret_cfg = RetentionConfig {
@@ -1147,6 +1150,23 @@ impl PipelineController for PipelineManager {
             .get(name)
             .map(|r| r.spec.spec.source.source_id().to_string());
 
+        // Fail-closed incarnation invalidation FIRST, before the pipeline is removed. If
+        // clearing the replay incarnation slot fails, abort the delete: the pipeline
+        // stays registered and deletable on retry, and we never report a successful
+        // deletion that leaves the old incarnation behind for a recreated pipeline to
+        // inherit. slot_delete is idempotent (Ok(false) when nothing was there), so a
+        // non-replay pipeline is a no-op and a retry after a partial delete still works.
+        let inc_key = format!("{name}:incarnation");
+        self.backend
+            .slot_delete(crate::replay_journal::REPLAY_NS, &inc_key)
+            .await
+            .map_err(|e| {
+                PipelineAPIError::Failed(e.context(
+                    "failed to clear replay incarnation slot; delete aborted so the \
+                     pipeline is not recreated with a stale incarnation",
+                ))
+            })?;
+
         self.stop_pipeline(name).await?;
 
         // Clean up all per-sink checkpoints for this pipeline.
@@ -1170,21 +1190,6 @@ impl PipelineController for PipelineManager {
                     );
                 }
             }
-        }
-
-        // Drop the replay incarnation slot so a recreated pipeline mints a fresh
-        // incarnation and never inherits the deleted pipeline's replay stream.
-        let inc_key = format!("{name}:incarnation");
-        if let Err(e) = self
-            .backend
-            .slot_delete(crate::replay_journal::REPLAY_NS, &inc_key)
-            .await
-        {
-            tracing::warn!(
-                pipeline = %name,
-                error = %e,
-                "failed to clear replay incarnation slot on delete"
-            );
         }
 
         Ok(())

@@ -980,7 +980,9 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         &self,
         accum: &mut Vec<Event>,
         boundary: &deltaforge_core::SourceBoundary,
-        last_captured_cp: &mut Option<String>,
+        last_captured_boundary: &mut Option<
+            deltaforge_core::replay::SourceBoundaryRecord,
+        >,
     ) -> Result<()> {
         use deltaforge_core::replay::{
             REPLAY_ENVELOPE_VERSION, ReplayEnvelopePayload, ReplayEventRecord,
@@ -991,12 +993,14 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             return Ok(());
         };
         let boundary_rec = SourceBoundaryRecord::from_boundary(boundary);
-        // Redundant data-less boundary: no new events and the same checkpoint as the
-        // unit just captured (e.g. a snapshot-completion marker after its chunk-final
-        // event). Skip so it does not create a duplicate unit.
+        // Redundant data-less boundary: no new events and the SAME complete boundary
+        // (checkpoint AND durable watermark) as the unit just captured, e.g. a
+        // snapshot-completion marker re-emitted after its chunk-final event. Skip so it
+        // does not create a duplicate unit. Comparing the full boundary record (not just
+        // the checkpoint) avoids collapsing two boundaries that share a checkpoint but
+        // carry different watermarks.
         if accum.is_empty()
-            && last_captured_cp.as_deref()
-                == Some(boundary_rec.checkpoint_hex.as_str())
+            && last_captured_boundary.as_ref() == Some(&boundary_rec)
         {
             return Ok(());
         }
@@ -1067,7 +1071,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             "pipeline" => self.pipeline_name.to_string(),
         )
         .increment(1);
-        *last_captured_cp = Some(boundary_rec.checkpoint_hex);
+        *last_captured_boundary = Some(boundary_rec);
         accum.clear();
         Ok(())
     }
@@ -1224,10 +1228,12 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         // a boundary, discarded (dropped) on cancel/shutdown/error before a boundary.
         let replay_on = coord.replay_capture.is_some();
         let mut capture_accum: Vec<Event> = Vec::new();
-        // Checkpoint of the last commit unit actually captured. Used to distinguish a
-        // genuine data-less boundary (worth capturing) from a redundant snapshot
-        // completion marker that repeats the already-captured checkpoint.
-        let mut last_captured_cp: Option<String> = None;
+        // Full boundary record of the last commit unit actually captured. Used to
+        // distinguish a genuine data-less boundary (worth capturing) from a redundant
+        // snapshot-completion marker that repeats the already-captured boundary.
+        let mut last_captured_boundary: Option<
+            deltaforge_core::replay::SourceBoundaryRecord,
+        > = None;
 
         let accum_result: Result<()> = async {
             loop {
@@ -1378,7 +1384,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                                     .close_capture_unit(
                                                         &mut capture_accum,
                                                         &bd,
-                                                        &mut last_captured_cp,
+                                                        &mut last_captured_boundary,
                                                     )
                                                     .await?;
                                             }
@@ -1408,7 +1414,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                             .close_capture_unit(
                                                 &mut capture_accum,
                                                 &boundary,
-                                                &mut last_captured_cp,
+                                                &mut last_captured_boundary,
                                             )
                                             .await?;
                                         if soft_limit_reached(&b, max_events, max_bytes) {
@@ -1435,7 +1441,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                             .close_capture_unit(
                                                 &mut capture_accum,
                                                 &boundary,
-                                                &mut last_captured_cp,
+                                                &mut last_captured_boundary,
                                             )
                                             .await?;
                                         close_boundary(&mut b, boundary);
@@ -2568,6 +2574,54 @@ mod tests {
             "redundant completion marker is not a new unit"
         );
         assert_eq!(envs[0].payload.events.len(), 1);
+    }
+
+    /// Two data-less boundaries sharing a checkpoint but carrying DIFFERENT durable
+    /// watermarks are distinct commit units and must not be collapsed by dedup.
+    #[tokio::test]
+    async fn dataless_boundaries_differ_by_watermark() {
+        let journal = mem_journal();
+        let coord = cap_coord(
+            Arc::new(checkpoints::MemCheckpointStore::new().unwrap()),
+            MockSink::new("kafka", true),
+            cap_cfg(1000),
+            journal.clone(),
+            0,
+        );
+        let boundary = |wm: &[u8]| deltaforge_core::SourceBoundary {
+            checkpoint: CheckpointMeta::from_vec(b"same-cp".to_vec()),
+            durable_watermark: Some(std::sync::Arc::from(wm)),
+        };
+        feed_and_run(
+            coord,
+            vec![
+                SourceItem::Boundary {
+                    boundary: boundary(b"wm-1"),
+                },
+                SourceItem::Boundary {
+                    boundary: boundary(b"wm-2"),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+        let envs =
+            crate::replay_journal::JournalLog::read_since(&*journal, 0, 100)
+                .await
+                .unwrap();
+        assert_eq!(
+            envs.len(),
+            2,
+            "same checkpoint + different watermark are distinct units"
+        );
+        assert_eq!(
+            envs[0].payload.boundary.watermark_hex,
+            Some(hex_of(b"wm-1"))
+        );
+        assert_eq!(
+            envs[1].payload.boundary.watermark_hex,
+            Some(hex_of(b"wm-2"))
+        );
     }
 
     /// Capture fails closed on a raw event with no event id: never store an envelope

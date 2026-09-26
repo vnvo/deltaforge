@@ -34,9 +34,11 @@ pub struct PipelineIdentity {
     pub incarnation: String,
     /// The stable source database lineage (e.g. PG system_identifier / MySQL
     /// server-uuid). `None` when the source does not yet expose it - explicitly
-    /// unavailable rather than a misleading substitute. It cannot be back-filled into
-    /// already-captured immutable envelopes, so a later version that binds real lineage
-    /// simply produces a distinct identity (a new incarnation scopes the change).
+    /// unavailable rather than a misleading substitute. Lineage is part of this identity:
+    /// it is bound into `capture_id` and into read-time identity equality. Changing it
+    /// (None -> Some, or a different value) therefore requires minting a NEW incarnation;
+    /// reusing the old incarnation with a changed lineage would make already-captured
+    /// envelopes fail identity verification on read.
     pub source_lineage: Option<String>,
 }
 
@@ -294,6 +296,38 @@ mod tests {
             payload(vec![ev("e1", json!({}))]).capture_id(),
             other.capture_id()
         );
+    }
+
+    #[test]
+    fn source_lineage_is_identity_bound() {
+        // Lineage is part of the identity: it changes the capture id and breaks read-time
+        // identity equality, so binding lineage requires a new incarnation rather than
+        // being a transparent change under the same one.
+        let none = payload(vec![ev("e1", json!({}))]);
+        let mut some = payload(vec![ev("e1", json!({}))]);
+        some.pipeline_identity.source_lineage = Some("sys-42".into());
+        assert_ne!(
+            none.capture_id(),
+            some.capture_id(),
+            "lineage must change capture_id"
+        );
+
+        // An envelope captured with no lineage cannot be read back under an identity that
+        // now claims a lineage (same incarnation): identity verification fails closed.
+        let bytes = none.canonical_bytes();
+        let cid = none.capture_id();
+        let ch = content_digest(&bytes);
+        let changed = PipelineIdentity {
+            pipeline: "p".into(),
+            incarnation: "inc-1".into(),
+            source_lineage: Some("sys-42".into()),
+        };
+        assert!(matches!(
+            StoredReplayEnvelope::decode_verified(
+                1, 1, &cid, &ch, &bytes, &changed
+            ),
+            Err(ReplayLoadError::IdentityMismatch)
+        ));
     }
 
     #[test]

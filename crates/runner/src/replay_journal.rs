@@ -83,6 +83,17 @@ impl JournalLog for BackendJournalLog {
         &self,
         payload: &ReplayEnvelopePayload,
     ) -> Result<LogAppendOutcome> {
+        // Defense in depth: never write an envelope whose identity differs from this
+        // log's configured identity. Such an envelope would land under this stream's key
+        // but fail identity verification on read (read_since decodes against
+        // self.identity), poisoning the stream. Reject at write time instead.
+        if payload.pipeline_identity != self.identity {
+            anyhow::bail!(
+                "replay append rejected: envelope pipeline identity does not match this \
+                 journal's identity (stream {})",
+                self.key
+            );
+        }
         let capture_id = payload.capture_id();
         let value = payload.canonical_bytes();
         self.backend
@@ -279,6 +290,24 @@ mod tests {
         assert_eq!(all[0].capture_id, e1.capture_id());
         assert!(all[0].stored_at_ms > 0);
         assert_eq!(jl.stream_meta().await.unwrap().len, 2);
+    }
+
+    /// Appending an envelope whose identity differs from the journal's configured
+    /// identity is rejected at write time (defense in depth): it would otherwise land
+    /// under this stream's key and fail identity verification on read.
+    #[tokio::test]
+    async fn append_rejects_foreign_identity() {
+        let be: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        let jl = BackendJournalLog::new(be, identity());
+        let mut foreign = envelope(b"cp1", &["a"]);
+        foreign.pipeline_identity.incarnation = "inc-2".into();
+        let err = jl.append(&foreign).await.unwrap_err();
+        assert!(
+            err.to_string().contains("identity"),
+            "expected identity rejection, got: {err}"
+        );
+        // Nothing was written.
+        assert_eq!(jl.stream_meta().await.unwrap().len, 0);
     }
 
     /// Reading under a different identity fails closed (cannot read another
