@@ -205,6 +205,13 @@ pub enum ReplayJobError {
         "replay job error/terminal invariant violated (error is set iff phase is failed)"
     )]
     ErrorInvariant,
+    #[error(
+        "a newly created replay job must be fresh (phase running, cursor at from_seq, \
+         created == updated, no error)"
+    )]
+    NotFresh,
+    #[error("replay job is terminal ({phase}) and cannot be updated")]
+    TerminalImmutable { phase: String },
 }
 
 /// The durable record of one replay.
@@ -406,6 +413,20 @@ impl ReplayJob {
         }
         Ok(())
     }
+
+    /// A record is FRESH (as required at creation) when it is in `Running` with the cursor
+    /// still at `from_seq`, its timestamps equal, and no error. This stops a caller from
+    /// creating a job that starts mid-lifecycle.
+    fn check_fresh(&self) -> Result<(), ReplayJobError> {
+        if self.phase != ReplayPhase::Running
+            || self.cursor != self.from_seq
+            || self.created_at_ms != self.updated_at_ms
+            || self.error.is_some()
+        {
+            return Err(ReplayJobError::NotFresh);
+        }
+        Ok(())
+    }
 }
 
 /// Validate a proposed durable update against the current durable record: immutable
@@ -416,6 +437,13 @@ fn validate_durable_update(
     current: &ReplayJob,
     proposed: &ReplayJob,
 ) -> Result<(), ReplayJobError> {
+    // A terminal record is immutable. Reject before the phase-equality shortcut below,
+    // which would otherwise let a same-phase "progress update" mutate a terminal job.
+    if current.phase.is_terminal() {
+        return Err(ReplayJobError::TerminalImmutable {
+            phase: current.phase.name().into(),
+        });
+    }
     macro_rules! immutable {
         ($field:ident) => {
             if current.$field != proposed.$field {
@@ -530,6 +558,7 @@ impl ReplayJobStore {
     pub async fn create(&self, job: &ReplayJob) -> Result<StoredReplayJob> {
         self.check_identity(job)?;
         job.validate()?;
+        job.check_fresh()?;
         let bytes = serde_json::to_vec(job)?;
         if let Some(version) = self
             .backend
@@ -907,6 +936,69 @@ mod tests {
         let replaced = store.create(&fresh).await.unwrap();
         assert_eq!(replaced.job.job_id, "job-2");
         assert_eq!(replaced.job.phase, ReplayPhase::Running);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_a_non_fresh_job() {
+        let be: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        let store = ReplayJobStore::new(be, "p", "inc-1");
+        // Mid-lifecycle phase.
+        let mut phased = job();
+        phased.phase = ReplayPhase::CatchingUp;
+        assert!(matches!(
+            store
+                .create(&phased)
+                .await
+                .unwrap_err()
+                .downcast_ref::<ReplayJobError>(),
+            Some(ReplayJobError::NotFresh)
+        ));
+        // Cursor already ahead of from_seq.
+        let mut advanced = job();
+        advanced.cursor = advanced.from_seq + 1;
+        assert!(matches!(
+            store
+                .create(&advanced)
+                .await
+                .unwrap_err()
+                .downcast_ref::<ReplayJobError>(),
+            Some(ReplayJobError::NotFresh)
+        ));
+        // updated_at diverged from created_at.
+        let mut touched = job();
+        touched.updated_at_ms += 1;
+        assert!(matches!(
+            store
+                .create(&touched)
+                .await
+                .unwrap_err()
+                .downcast_ref::<ReplayJobError>(),
+            Some(ReplayJobError::NotFresh)
+        ));
+    }
+
+    #[tokio::test]
+    async fn compare_and_set_rejects_updates_to_a_terminal_job() {
+        let be: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        let store = ReplayJobStore::new(be, "p", "inc-1");
+        let created = store.create(&job()).await.unwrap();
+        let cancelled =
+            created.job.advance(ReplayPhase::Cancelled, 5_000).unwrap();
+        let stored = store
+            .compare_and_set(created.version, &cancelled)
+            .await
+            .unwrap();
+        // Even a same-phase progress update to a terminal record is rejected.
+        let mut bump = stored.job.clone();
+        bump.cursor += 1;
+        assert!(matches!(
+            store
+                .compare_and_set(stored.version, &bump)
+                .await
+                .unwrap_err()
+                .downcast_ref::<ReplayJobError>(),
+            Some(ReplayJobError::TerminalImmutable { .. })
+        ));
     }
 
     #[tokio::test]
