@@ -295,6 +295,23 @@ The checkpoint commit follows a strict sequence:
 
 Checkpoints are stored in SQLite (default) with WAL mode and `synchronous=NORMAL` for durability. The checkpoint store survives `SIGKILL` — no graceful shutdown required for checkpoint safety.
 
+## Event replay
+
+[Event replay](replay.md) re-delivers captured commit units from the durable journal to
+selected sinks. Its correctness guarantees:
+
+- **At-least-once re-delivery.** The durable cursor is advanced only after a sink
+  acknowledges an envelope. A crash between the acknowledgement and the cursor persist causes
+  the acknowledged envelope to be delivered again on restart, so dedup-capable sinks must
+  absorb duplicates (the same idempotency key applies).
+- **No checkpoint mutation during replay.** A running job never advances or rewinds the source
+  or per-sink checkpoints; only normal live delivery moves checkpoints after the handoff.
+- **Pause and handoff.** Selected sinks are excluded from live delivery and from commit-policy
+  evaluation while a job runs, and rejoin the live set only at an acknowledged handoff to a
+  frozen tail `H`; the first live delivery to a restored sink is strictly after `H`.
+- **Fail-closed capture.** A commit unit that cannot be captured verbatim aborts the pipeline
+  rather than advancing the checkpoint past uncaptured data.
+
 ## Backpressure
 
 DeltaForge implements end-to-end backpressure without dropping events:
