@@ -118,9 +118,25 @@ impl ReplayWorker {
             return Ok(Some(stored.job.phase));
         }
 
-        // Running: deliver the requested historical range [from_seq, end].
+        // Fail closed if the cursor is below the durable horizon: entries in
+        // (cursor, min_valid_from_seq] were truncated and would be silently skipped.
+        // Retention pins active jobs above their cursor, so a single check here is enough.
+        let meta = self.journal.stream_meta().await?;
+        if stored.job.cursor < meta.min_valid_from_seq {
+            let err = ReplayJobError::HorizonViolation {
+                requested: stored.job.cursor,
+                horizon: meta.min_valid_from_seq,
+            };
+            self.fail_job(&mut stored, err.to_string()).await;
+            return Err(err.into());
+        }
+
+        // Running: deliver the requested historical range. `through_seq` bounds only this
+        // phase (capped at the head, so we never wait past available data).
         if matches!(stored.job.phase, ReplayPhase::Running) {
-            let end = self.range_end(&stored.job).await?;
+            let head = meta.head_seq;
+            let end =
+                stored.job.through_seq.map(|t| t.min(head)).unwrap_or(head);
             self.deliver_through(&mut stored, end).await?;
             if self.cancel.is_cancelled() {
                 return Ok(Some(stored.job.phase));
@@ -133,29 +149,23 @@ impl ReplayWorker {
             self.set_phase(&mut stored, ReplayPhase::CatchingUp).await?;
         }
 
-        // CatchingUp: keep delivering toward the (possibly growing) tail until the cursor
-        // catches up. The quiesce/handoff that finalizes from here is checkpoint c.
+        // CatchingUp: chase the current journal head, regardless of `through_seq` (which
+        // bounded only the historical phase), until the cursor is caught up. The
+        // quiesce/handoff that finalizes from here is checkpoint c.
         if matches!(stored.job.phase, ReplayPhase::CatchingUp) {
             loop {
                 if self.cancel.is_cancelled() {
                     break;
                 }
-                let end = self.range_end(&stored.job).await?;
-                if stored.job.cursor >= end {
+                let head = self.journal.stream_meta().await?.head_seq;
+                if stored.job.cursor >= head {
                     break;
                 }
-                self.deliver_through(&mut stored, end).await?;
+                self.deliver_through(&mut stored, head).await?;
             }
         }
 
         Ok(Some(stored.job.phase))
-    }
-
-    /// The upper seq bound to deliver toward: the requested `through_seq` if set, capped at
-    /// the current stream head (so we never wait past available data), else the head.
-    async fn range_end(&self, job: &ReplayJob) -> Result<u64> {
-        let head = self.journal.stream_meta().await?.head_seq;
-        Ok(job.through_seq.map(|t| t.min(head)).unwrap_or(head))
     }
 
     /// Deliver every envelope in `(cursor, up_to_seq]` to the job's targets, advancing the
@@ -176,11 +186,19 @@ impl ReplayWorker {
                 .read_since(stored.job.cursor, self.batch_limit)
                 .await?;
             if batch.is_empty() {
+                // No entries remain up to the head. The range is conclusively scanned;
+                // advance the cursor to the bound so a gap (or an empty tail) between the
+                // last entry and `up_to_seq` does not stall the caller forever.
+                self.advance_cursor(stored, up_to_seq).await?;
                 break;
             }
+            let mut scanned_to_bound = false;
             for env in batch {
                 if env.seq > up_to_seq {
-                    return Ok(());
+                    // Remaining entries are past the bound: nothing more in range. Step
+                    // over the gap between the last delivered seq and the bound.
+                    scanned_to_bound = true;
+                    break;
                 }
                 if self.cancel.is_cancelled() {
                     return Ok(());
@@ -189,6 +207,10 @@ impl ReplayWorker {
                     self.fail_job(stored, format!("{e:#}")).await;
                     return Err(e);
                 }
+            }
+            if scanned_to_bound {
+                self.advance_cursor(stored, up_to_seq).await?;
+                break;
             }
         }
         Ok(())
@@ -201,29 +223,50 @@ impl ReplayWorker {
         stored: &mut StoredReplayJob,
         env: &StoredReplayEnvelope,
     ) -> Result<()> {
-        if !stored.job.dry_run {
-            let schema = resolve_encoder_schema(
-                &stored.job.encoder_schema_policy,
-                &env.payload.schema_binding,
-                env.seq,
-            )?;
-            self.delivery
-                .deliver(&stored.job, env, schema)
-                .await
-                .with_context(|| {
-                    format!("replay delivery failed at seq {}", env.seq)
-                })?;
+        if stored.job.dry_run {
+            // Dry-run scans without delivering; count scanned units, not delivered ones.
+            self.advance_cursor(stored, env.seq).await?;
+            counter!(
+                "deltaforge_replay_scanned_total",
+                "pipeline" => self.pipeline.clone(),
+            )
+            .increment(1);
+            return Ok(());
         }
-        let advanced = stored.job.with_cursor(env.seq, now_ms())?;
-        *stored = self
-            .store
-            .compare_and_set(stored.version, &advanced)
-            .await?;
+        let schema = resolve_encoder_schema(
+            &stored.job.encoder_schema_policy,
+            &env.payload.schema_binding,
+            env.seq,
+        )?;
+        self.delivery
+            .deliver(&stored.job, env, schema)
+            .await
+            .with_context(|| {
+                format!("replay delivery failed at seq {}", env.seq)
+            })?;
+        self.advance_cursor(stored, env.seq).await?;
         counter!(
             "deltaforge_replay_delivered_total",
             "pipeline" => self.pipeline.clone(),
         )
         .increment(1);
+        Ok(())
+    }
+
+    /// Advance the durable cursor to `to` (a no-op when it is not ahead of the current
+    /// cursor). Used both after delivering an envelope and to step over a gap up to a bound.
+    async fn advance_cursor(
+        &self,
+        stored: &mut StoredReplayJob,
+        to: u64,
+    ) -> Result<()> {
+        if to > stored.job.cursor {
+            let advanced = stored.job.with_cursor(to, now_ms())?;
+            *stored = self
+                .store
+                .compare_and_set(stored.version, &advanced)
+                .await?;
+        }
         Ok(())
     }
 
@@ -275,10 +318,12 @@ mod tests {
         PipelineIdentity, REPLAY_ENVELOPE_VERSION, ReplayEnvelopePayload,
         ReplayEventRecord, SourceBoundaryRecord,
     };
-    use storage::{ArcStorageBackend, MemoryStorageBackend};
+    use storage::{
+        ArcStorageBackend, LogTruncateRequest, MemoryStorageBackend,
+    };
 
     use crate::replay_job::ReplayJob;
-    use crate::replay_journal::BackendJournalLog;
+    use crate::replay_journal::{BackendJournalLog, REPLAY_NS};
 
     fn identity() -> PipelineIdentity {
         PipelineIdentity {
@@ -588,5 +633,128 @@ mod tests {
         assert!(err.to_string().contains("at_capture_seq"));
         let after = store_for(&be).get().await.unwrap().unwrap();
         assert_eq!(after.job.phase, ReplayPhase::Failed);
+    }
+
+    #[tokio::test]
+    async fn rejects_cursor_below_the_durable_horizon() {
+        let (be, jl, _seqs) = journal_with(3, None).await;
+        // Truncate the oldest entry so the durable horizon advances above from_seq = 0.
+        let out = jl
+            .truncate(LogTruncateRequest {
+                older_than_ms: None,
+                pin_seq: u64::MAX,
+                max_entries: Some(2),
+                max_bytes: None,
+            })
+            .await
+            .unwrap();
+        assert!(out.min_valid_from_seq > 0, "horizon advanced");
+
+        let store = store_for(&be);
+        store
+            .create(&job(0, false, EncoderSchemaPolicy::Current))
+            .await
+            .unwrap();
+        let delivery = Arc::new(RecordingDelivery::default());
+        let worker = ReplayWorker::new(
+            store_for(&be),
+            jl,
+            delivery.clone(),
+            CancellationToken::new(),
+            10,
+            "p",
+        );
+        let err = worker.run_catch_up().await.unwrap_err();
+        assert!(
+            err.downcast_ref::<ReplayJobError>()
+                .is_some_and(|e| matches!(
+                    e,
+                    ReplayJobError::HorizonViolation { .. }
+                )),
+            "expected HorizonViolation, got: {err}"
+        );
+        assert!(delivery.delivered.lock().unwrap().is_empty());
+        let after = store_for(&be).get().await.unwrap().unwrap();
+        assert_eq!(after.job.phase, ReplayPhase::Failed);
+    }
+
+    #[tokio::test]
+    async fn deliver_through_steps_over_a_gap_to_the_bound() {
+        let be: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        let jl: Arc<dyn JournalLog> =
+            Arc::new(BackendJournalLog::new(be.clone(), identity()));
+        let a = jl.append(&envelope(&[0], None)).await.unwrap().seq;
+        // Bump the global sequence via another key, leaving a gap in our stream.
+        be.log_append_if_absent(REPLAY_NS, "other:stream", "cap-x", b"{}")
+            .await
+            .unwrap();
+        let b = jl.append(&envelope(&[2], None)).await.unwrap().seq;
+        assert!(
+            b > a + 1,
+            "there is a global-seq gap between our two entries"
+        );
+
+        let store = store_for(&be);
+        let mut stored = store
+            .create(&job(0, false, EncoderSchemaPolicy::Current))
+            .await
+            .unwrap();
+        let delivery = Arc::new(RecordingDelivery::default());
+        let worker = ReplayWorker::new(
+            store_for(&be),
+            jl,
+            delivery.clone(),
+            CancellationToken::new(),
+            10,
+            "p",
+        );
+        // Bound the delivery at a gap seq (between a and b): the next entry is above it, so
+        // the worker must advance the cursor to the bound rather than stalling.
+        let bound = a + 1;
+        worker.deliver_through(&mut stored, bound).await.unwrap();
+        assert_eq!(stored.job.cursor, bound);
+        let got: Vec<u64> = delivery
+            .delivered
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|d| d.0)
+            .collect();
+        assert_eq!(
+            got,
+            vec![a],
+            "only the entry within the bound was delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn catch_up_chases_head_past_through_seq() {
+        let (be, jl, seqs) = journal_with(3, None).await;
+        let store = store_for(&be);
+        // through_seq bounds only the historical Running phase to the first entry.
+        let mut j = job(0, false, EncoderSchemaPolicy::Current);
+        j.through_seq = Some(seqs[0]);
+        store.create(&j).await.unwrap();
+        let delivery = Arc::new(RecordingDelivery::default());
+        let worker = ReplayWorker::new(
+            store_for(&be),
+            jl,
+            delivery.clone(),
+            CancellationToken::new(),
+            10,
+            "p",
+        );
+        let phase = worker.run_catch_up().await.unwrap();
+        assert_eq!(phase, Some(ReplayPhase::CatchingUp));
+        let got: Vec<u64> = delivery
+            .delivered
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|d| d.0)
+            .collect();
+        assert_eq!(got, seqs, "catch-up chases the head beyond through_seq");
+        let after = store_for(&be).get().await.unwrap().unwrap();
+        assert_eq!(after.job.cursor, *seqs.last().unwrap());
     }
 }

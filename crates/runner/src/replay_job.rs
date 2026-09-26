@@ -217,6 +217,11 @@ pub enum ReplayJobError {
          but the envelope at seq {seq} has none"
     )]
     EncoderSchemaUnavailable { seq: u64 },
+    #[error(
+        "replay job cursor {requested} is below the journal's durable horizon {horizon}; \
+         history in that range has been truncated and cannot be replayed"
+    )]
+    HorizonViolation { requested: u64, horizon: u64 },
 }
 
 /// The durable record of one replay.
