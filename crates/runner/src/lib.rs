@@ -2,6 +2,7 @@ pub mod coordinator;
 pub mod dlq;
 pub mod drift_detector;
 pub mod pipeline_manager;
+pub mod replay_job;
 pub mod replay_journal;
 mod schema_api;
 mod schema_provider;
