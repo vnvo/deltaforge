@@ -95,8 +95,9 @@ pub fn ownership_proven(
 }
 
 async fn connect(dsn: &str) -> Result<tokio_postgres::Client> {
-    let (client, conn) =
-        tokio_postgres::connect(dsn, NoTls).await.context("connect")?;
+    let (client, conn) = tokio_postgres::connect(dsn, NoTls)
+        .await
+        .context("connect")?;
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             warn!(error = %e, "slot-owner control connection error");
@@ -109,7 +110,10 @@ async fn fetch_identity(
     client: &tokio_postgres::Client,
 ) -> Result<ServerDbIdentity> {
     let sid: String = client
-        .query_one("SELECT system_identifier::text FROM pg_control_system()", &[])
+        .query_one(
+            "SELECT system_identifier::text FROM pg_control_system()",
+            &[],
+        )
         .await
         .context("read system_identifier")?
         .get(0);
@@ -258,23 +262,23 @@ pub async fn prepare_snapshot_slot_anchor(
     source_id: &str,
     chkpt: &Arc<dyn CheckpointStore>,
 ) -> Result<Lsn, SourceError> {
-    let client = connect(dsn)
-        .await
-        .map_err(|e| SourceError::Connect { details: e.to_string().into() })?;
-    let id = fetch_identity(&client)
-        .await
-        .map_err(|e| SourceError::Other(e))?;
+    let client = connect(dsn).await.map_err(|e| SourceError::Connect {
+        details: e.to_string().into(),
+    })?;
+    let id = fetch_identity(&client).await.map_err(SourceError::Other)?;
 
     match slot_status(&client, slot)
         .await
-        .map_err(|e| SourceError::Other(e))?
+        .map_err(SourceError::Other)?
     {
         None => {
             // Fresh: any stale Creating record is overwritten (no slot exists,
             // so nothing is ambiguous).
-            let c = create_owned_slot(&client, chkpt, slot, pipeline, source_id, &id)
-                .await
-                .map_err(|e| SourceError::Other(e))?;
+            let c = create_owned_slot(
+                &client, chkpt, slot, pipeline, source_id, &id,
+            )
+            .await
+            .map_err(SourceError::Other)?;
             info!(source_id, slot, consistent_lsn = %c, "created replication slot at consistent point");
             Ok(c)
         }
@@ -286,14 +290,12 @@ pub async fn prepare_snapshot_slot_anchor(
 
             if owned && !active {
                 // Interrupted owned snapshot (or Always re-snapshot): re-anchor.
-                drop_slot(&client, slot)
-                    .await
-                    .map_err(|e| SourceError::Other(e))?;
+                drop_slot(&client, slot).await.map_err(SourceError::Other)?;
                 let c = create_owned_slot(
                     &client, chkpt, slot, pipeline, source_id, &id,
                 )
                 .await
-                .map_err(|e| SourceError::Other(e))?;
+                .map_err(SourceError::Other)?;
                 // Full re-snapshot: discard table-level progress.
                 reset_snapshot_progress(chkpt, source_id).await;
                 warn!(source_id, slot, consistent_lsn = %c, "re-anchored owned inactive slot; performing a full re-snapshot");
@@ -348,7 +350,12 @@ mod tests {
 
     #[test]
     fn proven_when_all_match_and_created() {
-        assert!(ownership_proven(&created_record(), "src1", "df_slot", &id()));
+        assert!(ownership_proven(
+            &created_record(),
+            "src1",
+            "df_slot",
+            &id()
+        ));
     }
 
     #[test]

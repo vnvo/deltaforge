@@ -659,7 +659,11 @@ fn reload_privilege_hard_error(grants: &[String]) -> Option<String> {
 /// Hard error unless the table's storage engine is InnoDB. Only InnoDB provides
 /// the MVCC consistent read the snapshot relies on; non-InnoDB tables are out of
 /// scope for this milestone and must fail closed rather than snapshot inconsistently.
-fn engine_hard_error(db: &str, table: &str, engine: Option<&str>) -> Option<String> {
+fn engine_hard_error(
+    db: &str,
+    table: &str,
+    engine: Option<&str>,
+) -> Option<String> {
     match engine {
         Some(e) if e.eq_ignore_ascii_case("InnoDB") => None,
         other => Some(format!(

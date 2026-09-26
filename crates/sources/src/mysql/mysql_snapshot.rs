@@ -330,9 +330,7 @@ pub async fn run_snapshot(
     let progress_shared = Arc::new(tokio::sync::Mutex::new(progress));
     let mut handles = Vec::new();
 
-    for (bucket, worker_conn) in
-        buckets.into_iter().zip(worker_conns.into_iter())
-    {
+    for (bucket, worker_conn) in buckets.into_iter().zip(worker_conns) {
         let publisher = Arc::clone(&publisher);
         let progress_shared = Arc::clone(&progress_shared);
         let chkpt_store = ctx.chkpt_store.clone();
@@ -385,13 +383,14 @@ pub async fn run_snapshot(
                         {
                             let mut p = progress_shared.lock().await;
                             p.mark_done(&db, &table);
-                            save_progress(&chkpt_store, &source_id, &*p).await;
+                            save_progress(&chkpt_store, &source_id, &p).await;
                         }
                         // Table-complete boundary (and the completed boundary on
                         // the final table). Delivered and durably acked by the
                         // coordinator even with no trailing data rows.
                         if publisher.complete_table(&table_key).await.is_err() {
-                            failed.push(format!("{table_key} (channel closed)"));
+                            failed
+                                .push(format!("{table_key} (channel closed)"));
                             return failed;
                         }
                         info!(table = %table_key, rows, "table snapshot complete");
@@ -447,7 +446,7 @@ pub async fn run_snapshot(
     {
         let mut p = progress_shared.lock().await;
         p.finished = true;
-        save_progress(&ctx.chkpt_store, ctx.source_id, &*p).await;
+        save_progress(&ctx.chkpt_store, ctx.source_id, &p).await;
     }
 
     info!(
@@ -486,8 +485,9 @@ async fn acquire_locked_anchor(
     let opts = Opts::from_url(dsn).context("parse mysql dsn")?;
 
     // Dedicated, non-pooled lock connection: dropping it releases FTWRL.
-    let mut lock_conn =
-        Conn::new(opts.clone()).await.context("connect lock connection")?;
+    let mut lock_conn = Conn::new(opts.clone())
+        .await
+        .context("connect lock connection")?;
 
     // Bound how long FTWRL may wait on in-flight statements/metadata locks.
     let lock_wait = timeout_dur.as_secs().max(1);
@@ -1204,7 +1204,8 @@ mod live_anchor_tests {
                 .unwrap();
             let mut n: u64 = 0;
             while !stop2.load(Ordering::Relaxed) {
-                let _ = c.query_drop("INSERT INTO anchor_seam(v) VALUES (1)").await;
+                let _ =
+                    c.query_drop("INSERT INTO anchor_seam(v) VALUES (1)").await;
                 n += 1;
             }
             n
@@ -1220,8 +1221,10 @@ mod live_anchor_tests {
         // All worker snapshots must agree - one shared consistent view.
         let mut counts = Vec::new();
         for w in workers.iter_mut() {
-            let c: Option<u64> =
-                w.query_first("SELECT COUNT(*) FROM anchor_seam").await.unwrap();
+            let c: Option<u64> = w
+                .query_first("SELECT COUNT(*) FROM anchor_seam")
+                .await
+                .unwrap();
             counts.push(c.unwrap_or(0));
         }
         assert!(
@@ -1258,7 +1261,10 @@ mod live_anchor_tests {
         for mut w in workers {
             w.query_drop("ROLLBACK").await.ok();
         }
-        admin.query_drop("DROP TABLE IF EXISTS anchor_seam").await.ok();
+        admin
+            .query_drop("DROP TABLE IF EXISTS anchor_seam")
+            .await
+            .ok();
     }
 
     /// Success path releases the global lock: after `acquire_locked_anchor`
@@ -1272,9 +1278,14 @@ mod live_anchor_tests {
         };
         let opts = Opts::from_url(&dsn).unwrap();
         let mut admin = Conn::new(opts.clone()).await.unwrap();
-        admin.query_drop("DROP TABLE IF EXISTS lock_rel").await.unwrap();
         admin
-            .query_drop("CREATE TABLE lock_rel(id INT PRIMARY KEY) ENGINE=InnoDB")
+            .query_drop("DROP TABLE IF EXISTS lock_rel")
+            .await
+            .unwrap();
+        admin
+            .query_drop(
+                "CREATE TABLE lock_rel(id INT PRIMARY KEY) ENGINE=InnoDB",
+            )
             .await
             .unwrap();
 
@@ -1290,7 +1301,10 @@ mod live_anchor_tests {
             admin.query_drop("INSERT INTO lock_rel(id) VALUES (1)"),
         )
         .await;
-        assert!(ins.is_ok(), "write blocked after anchor success - lock leaked");
+        assert!(
+            ins.is_ok(),
+            "write blocked after anchor success - lock leaked"
+        );
         admin.query_drop("DROP TABLE IF EXISTS lock_rel").await.ok();
     }
 
@@ -1332,7 +1346,10 @@ mod live_anchor_tests {
             unblocked.is_ok(),
             "lock not released after dropping the lock connection"
         );
-        writer.query_drop("DROP TABLE IF EXISTS lock_drop_probe").await.ok();
+        writer
+            .query_drop("DROP TABLE IF EXISTS lock_drop_probe")
+            .await
+            .ok();
     }
 
     /// Timeout path releases: when FTWRL cannot be acquired within the budget
@@ -1347,19 +1364,26 @@ mod live_anchor_tests {
         };
         let opts = Opts::from_url(&dsn).unwrap();
         let mut admin = Conn::new(opts.clone()).await.unwrap();
-        admin.query_drop("DROP TABLE IF EXISTS lock_to").await.unwrap();
         admin
-            .query_drop("CREATE TABLE lock_to(id INT PRIMARY KEY) ENGINE=InnoDB")
+            .query_drop("DROP TABLE IF EXISTS lock_to")
+            .await
+            .unwrap();
+        admin
+            .query_drop(
+                "CREATE TABLE lock_to(id INT PRIMARY KEY) ENGINE=InnoDB",
+            )
             .await
             .unwrap();
 
         // Blocker: hold a WRITE table lock so FTWRL must wait.
         let mut blocker = Conn::new(opts.clone()).await.unwrap();
-        blocker.query_drop("LOCK TABLES lock_to WRITE").await.unwrap();
+        blocker
+            .query_drop("LOCK TABLES lock_to WRITE")
+            .await
+            .unwrap();
 
         let started = Instant::now();
-        let res =
-            acquire_locked_anchor(&dsn, 2, Duration::from_secs(2)).await;
+        let res = acquire_locked_anchor(&dsn, 2, Duration::from_secs(2)).await;
         assert!(res.is_err(), "expected timeout while FTWRL was blocked");
         assert!(
             started.elapsed() < Duration::from_secs(15),
@@ -1390,7 +1414,10 @@ mod live_anchor_tests {
         let opts = Opts::from_url(&dsn).unwrap();
         let mut admin = Conn::new(opts.clone()).await.unwrap();
         // Fresh table + a limited user that intentionally lacks RELOAD.
-        admin.query_drop("DROP TABLE IF EXISTS ltd_t").await.unwrap();
+        admin
+            .query_drop("DROP TABLE IF EXISTS ltd_t")
+            .await
+            .unwrap();
         admin
             .query_drop("CREATE TABLE ltd_t(id INT PRIMARY KEY) ENGINE=InnoDB")
             .await

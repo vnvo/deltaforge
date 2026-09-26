@@ -115,7 +115,12 @@ async fn pg_snapshot_captures_all_rows_integer_pk() -> Result<()> {
         identity_map: Default::default(),
     };
 
-    run_snapshot(&snapshot_ctx, &[("public".into(), "orders".into())], Lsn::from(0u64)).await?;
+    run_snapshot(
+        &snapshot_ctx,
+        &[("public".into(), "orders".into())],
+        Lsn::from(0u64),
+    )
+    .await?;
     drop(snapshot_ctx);
     drop(tx);
 
@@ -341,7 +346,12 @@ async fn pg_snapshot_ctid_fallback_for_uuid_pk() -> Result<()> {
         identity_map: Default::default(),
     };
 
-    run_snapshot(&snapshot_ctx, &[("public".into(), "events".into())], Lsn::from(0u64)).await?;
+    run_snapshot(
+        &snapshot_ctx,
+        &[("public".into(), "events".into())],
+        Lsn::from(0u64),
+    )
+    .await?;
     drop(snapshot_ctx);
     drop(tx);
 
@@ -388,9 +398,12 @@ async fn pg_snapshot_persists_lsn_and_marks_finished() -> Result<()> {
         identity_map: Default::default(),
     };
 
-    let returned_lsn =
-        run_snapshot(&snapshot_ctx, &[("public".into(), "items".into())], Lsn::from(0u64))
-            .await?;
+    let returned_lsn = run_snapshot(
+        &snapshot_ctx,
+        &[("public".into(), "items".into())],
+        Lsn::from(0u64),
+    )
+    .await?;
     drop(snapshot_ctx);
     drop(tx);
 
@@ -442,15 +455,23 @@ async fn pg_snapshot_already_finished_returns_saved_lsn() -> Result<()> {
         };
 
     let (tx1, mut rx1) = mpsc::channel(64);
-    let lsn1 =
-        run_snapshot(&make_ctx(tx1), &[("public".into(), "t".into())], Lsn::from(0u64)).await?;
+    let lsn1 = run_snapshot(
+        &make_ctx(tx1),
+        &[("public".into(), "t".into())],
+        Lsn::from(0u64),
+    )
+    .await?;
     let events1 = collect_reads(&mut rx1, Duration::from_secs(5)).await;
     assert_eq!(events1.len(), 10);
 
     // Second call — must return the same LSN, emit zero rows.
     let (tx2, mut rx2) = mpsc::channel(64);
-    let lsn2 =
-        run_snapshot(&make_ctx(tx2), &[("public".into(), "t".into())], Lsn::from(0u64)).await?;
+    let lsn2 = run_snapshot(
+        &make_ctx(tx2),
+        &[("public".into(), "t".into())],
+        Lsn::from(0u64),
+    )
+    .await?;
     let events2 = collect_reads(&mut rx2, Duration::from_secs(2)).await;
 
     assert_eq!(lsn1, lsn2, "second run must return the same saved LSN");
@@ -484,14 +505,18 @@ async fn pg_snapshot_anchor_zero_loss_bounded_overlap() -> Result<()> {
     let slot = "anchor_ovl_slot";
 
     // Real production anchor: creates the slot and returns its consistent point C.
-    let c = prepare_snapshot_slot_anchor(&dsn, slot, "test", "snap-anchor", &chkpt)
-        .await
-        .expect("establish anchor");
+    let c =
+        prepare_snapshot_slot_anchor(&dsn, slot, "test", "snap-anchor", &chkpt)
+            .await
+            .expect("establish anchor");
 
     // "during": committed AFTER C but before the snapshot export.
     for i in 1000..=1049i64 {
         client
-            .execute("INSERT INTO orders (id, tag) VALUES ($1, 'during')", &[&i])
+            .execute(
+                "INSERT INTO orders (id, tag) VALUES ($1, 'during')",
+                &[&i],
+            )
             .await?;
     }
 
@@ -515,13 +540,14 @@ async fn pg_snapshot_anchor_zero_loss_bounded_overlap() -> Result<()> {
         identity_map: Default::default(),
     };
 
-    let returned = run_snapshot(
-        &snapshot_ctx,
-        &[("public".into(), "orders".into())],
-        c,
-    )
-    .await?;
-    assert_eq!(returned.to_string(), c.to_string(), "anchor must be the returned start LSN");
+    let returned =
+        run_snapshot(&snapshot_ctx, &[("public".into(), "orders".into())], c)
+            .await?;
+    assert_eq!(
+        returned.to_string(),
+        c.to_string(),
+        "anchor must be the returned start LSN"
+    );
     drop(snapshot_ctx);
     drop(tx);
 
@@ -530,7 +556,8 @@ async fn pg_snapshot_anchor_zero_loss_bounded_overlap() -> Result<()> {
         .iter()
         .filter_map(|e| {
             let v = e.after.as_ref()?.get("id")?;
-            v.as_i64().or_else(|| v.as_str().and_then(|x| x.parse().ok()))
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|x| x.parse().ok()))
         })
         .collect();
 
