@@ -98,6 +98,13 @@ To avoid ambiguity, here is exactly what DeltaForge guarantees about transaction
 - A single database transaction that exceeds `max_events` or `max_bytes` is still kept in one batch. The limits are exceeded rather than the transaction being split.
 - With `respect_source_tx: false`, batches are split purely by size/time limits regardless of transaction boundaries. Cross-table transaction atomicity is not preserved in this mode.
 
+## Initial-snapshot anchoring
+
+The initial snapshot and the CDC stream meet at a single anchor so that **no committed row is lost** across the boundary. The checks below run only when a snapshot runs; CDC-only pipelines (`snapshot.mode = never`) are unaffected.
+
+- **PostgreSQL** anchors CDC at the replication slot's consistent point `C`. Every row committed at or before `C` is in the snapshot; every row after `C` is in the CDC stream. Rows committed in `(C, snapshot-export]` fall in **both** - a **bounded at-least-once overlap**, not exactly-once. Current-state sinks (with `version_source: source_position`) converge via last-writer-wins; append-only sinks receive the overlap twice. A snapshot completed under the older anchor is flagged by the gauge `deltaforge_snapshot_unsafe_anchor = 1` until a safe re-snapshot.
+- **MySQL** brackets the anchor under a brief `FLUSH TABLES WITH READ LOCK`: all snapshot workers open their consistent-snapshot transactions and the binlog position + GTID set are captured while the lock is held, so every worker shares one view that matches the captured position exactly. This **closes a real initial-snapshot data-loss window** present in earlier versions (independent per-worker snapshots with the position captured afterward). It requires `gtid_mode = ON`, `binlog_format = ROW`, InnoDB tables, and the global `RELOAD` privilege; managed MySQL without `RELOAD` **fails closed** rather than snapshotting unsafely (no silent fallback).
+
 ## Failure Isolation
 
 ### Per-sink independence

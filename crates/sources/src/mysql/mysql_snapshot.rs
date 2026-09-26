@@ -9,7 +9,7 @@
 //!    `REPEATABLE READ`, and capturing the binlog position + GTID set. Because no
 //!    transaction can commit while the lock is held, every worker's read view
 //!    equals the captured position - one shared anchor, no seam loss. The whole
-//!    setup is bounded by `snapshot_lock_timeout_secs`; the lock is guaranteed to
+//!    setup is bounded by `snapshot.lock_timeout_secs`; the lock is guaranteed to
 //!    release by dropping the lock connection on any error/panic/timeout
 //!    (`UNLOCK TABLES` is only the success path).
 //! 2. Each worker reads its bucket of tables sequentially under its single
@@ -241,7 +241,7 @@ pub async fn run_snapshot(
     let (worker_conns, position) = acquire_locked_anchor(
         ctx.dsn,
         num_workers,
-        Duration::from_secs(ctx.cfg.snapshot_lock_timeout_secs.max(1)),
+        Duration::from_secs(ctx.cfg.lock_timeout_secs.max(1)),
     )
     .await
     .context("acquire locked snapshot anchor")?;
@@ -533,7 +533,7 @@ async fn acquire_locked_anchor(
             return Err(anyhow!(
                 "timed out establishing snapshot read lock within {timeout_dur:?}; \
                  the source may be under long-running statements. Increase \
-                 snapshot_lock_timeout_secs or retry when the source is quieter."
+                 snapshot.lock_timeout_secs or retry when the source is quieter."
             ));
         }
     };

@@ -44,8 +44,8 @@ pub struct SnapshotCfg {
     /// cannot complete within this budget the snapshot fails closed rather than
     /// stalling writes on the source. The worker count under the lock is bounded
     /// by `max_parallel_tables` (reused; not a separate knob).
-    #[serde(default = "default_snapshot_lock_timeout_secs")]
-    pub snapshot_lock_timeout_secs: u64,
+    #[serde(default = "default_lock_timeout_secs")]
+    pub lock_timeout_secs: u64,
 }
 
 impl Default for SnapshotCfg {
@@ -56,7 +56,7 @@ impl Default for SnapshotCfg {
             chunk_size: default_chunk_size(),
             intra_table_parallel: false,
             max_parallel_chunks: default_parallel_chunks(),
-            snapshot_lock_timeout_secs: default_snapshot_lock_timeout_secs(),
+            lock_timeout_secs: default_lock_timeout_secs(),
         }
     }
 }
@@ -70,6 +70,6 @@ fn default_chunk_size() -> usize {
 fn default_parallel_chunks() -> usize {
     4
 }
-fn default_snapshot_lock_timeout_secs() -> u64 {
+fn default_lock_timeout_secs() -> u64 {
     10
 }
