@@ -54,9 +54,21 @@ use runner::replay_worker::{ReplayDelivery, ResolvedEncoderSchema};
 /// Connect to the configured PostgreSQL. These are `#[ignore]`d, so they only run when
 /// explicitly invoked - at which point a missing DSN is a hard failure (never a silent pass),
 /// mirroring the fix applied to the MinIO gate.
+///
+/// The connect step (which lazily creates the shared `df_*` schema) is serialized across the
+/// test binary's threads: on a fresh database, concurrent `CREATE TABLE` for the same schema
+/// object races. Serializing only the connect lets the schema be created once while the test
+/// bodies still run in parallel, so the default `-- --ignored` command is safe without
+/// `--test-threads=1`.
 async fn pg_backend() -> ArcStorageBackend {
+    static INIT: std::sync::OnceLock<tokio::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
     let dsn = std::env::var("DELTAFORGE_IT_PG_DSN")
         .expect("DELTAFORGE_IT_PG_DSN must be set to run this test");
+    let _init = INIT
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
     PostgresStorageBackend::connect(&dsn).await.unwrap() as ArcStorageBackend
 }
 
