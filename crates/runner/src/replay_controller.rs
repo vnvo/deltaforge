@@ -39,7 +39,10 @@ use crate::schema_provider::{ArcSchemaProvider, TableSchemaInfo};
 /// lets it continue. Abstracted so the controller can be tested without a live coordinator.
 #[async_trait]
 pub trait IngestionControl: Send + Sync {
-    async fn quiesce(&self);
+    /// Quiesce ingestion and wait for the coordinator's acknowledgement. Returns `Err` if
+    /// the coordinator is gone (its ack channel closed) so the handoff fails closed rather
+    /// than freezing `H` and restoring sinks without ever quiescing.
+    async fn quiesce(&self) -> Result<()>;
     async fn resume(&self);
 }
 
@@ -63,16 +66,20 @@ impl PauseIngestionControl {
 
 #[async_trait]
 impl IngestionControl for PauseIngestionControl {
-    async fn quiesce(&self) {
+    async fn quiesce(&self) -> Result<()> {
         self.pause.send_modify(|s| s.replay = true);
-        // Wait for the coordinator to acknowledge a genuine, boundary-aligned quiesce.
+        // Wait for the coordinator to acknowledge a genuine, boundary-aligned quiesce. A
+        // closed channel means the coordinator exited without acknowledging: fail closed so
+        // the handoff does not proceed to freeze H and restore sinks unquiesced.
         let mut rx = self.quiesced.clone();
         loop {
             if *rx.borrow_and_update() {
-                break;
+                return Ok(());
             }
             if rx.changed().await.is_err() {
-                break;
+                anyhow::bail!(
+                    "coordinator exited before acknowledging the replay quiesce"
+                );
             }
         }
     }
@@ -407,8 +414,9 @@ impl ReplayController {
         })?;
         let h = match &stored.job.phase {
             ReplayPhase::CatchingUp => {
-                // Fresh handoff: quiesce ingestion and freeze the tail.
-                self.ingestion.quiesce().await;
+                // Fresh handoff: quiesce ingestion and freeze the tail. A quiesce failure
+                // (coordinator gone) propagates and fails the job closed.
+                self.ingestion.quiesce().await?;
                 let h = self.journal.stream_meta().await?.head_seq;
                 self.set_phase(ReplayPhase::HandoffQuiesced { handoff_seq: h })
                     .await?;
@@ -419,7 +427,7 @@ impl ReplayController {
                 // Restart mid-handoff: `H` is durable. Re-quiesce (idempotent) and reuse it;
                 // delivery through H may safely repeat.
                 let h = *handoff_seq;
-                self.ingestion.quiesce().await;
+                self.ingestion.quiesce().await?;
                 h
             }
             ReplayPhase::LiveRestored => {
@@ -609,12 +617,18 @@ mod tests {
     struct MockIngestion {
         quiesced: AtomicUsize,
         resumed: AtomicUsize,
+        /// When true, quiesce fails closed (simulating a gone coordinator).
+        fail_quiesce: bool,
     }
 
     #[async_trait]
     impl IngestionControl for MockIngestion {
-        async fn quiesce(&self) {
+        async fn quiesce(&self) -> Result<()> {
             self.quiesced.fetch_add(1, Ordering::SeqCst);
+            if self.fail_quiesce {
+                anyhow::bail!("coordinator gone");
+            }
+            Ok(())
         }
         async fn resume(&self) {
             self.resumed.fetch_add(1, Ordering::SeqCst);
@@ -948,7 +962,7 @@ mod tests {
         let (_ack_tx, ack_rx) = watch::channel(true);
         let ctrl = PauseIngestionControl::new(pause_tx, ack_rx);
 
-        ctrl.quiesce().await;
+        ctrl.quiesce().await.unwrap();
         assert!(pause_rx.borrow().operator && pause_rx.borrow().replay);
 
         ctrl.resume().await;
@@ -956,6 +970,52 @@ mod tests {
         assert!(s.operator, "operator pause preserved");
         assert!(!s.replay, "replay pause cleared");
         assert!(s.paused(), "still paused due to operator");
+    }
+
+    /// A closed acknowledgement channel (the coordinator exited before acking) makes
+    /// quiesce fail closed rather than falsely succeed.
+    #[tokio::test]
+    async fn quiesce_fails_closed_when_coordinator_gone() {
+        use crate::coordinator::PauseState;
+        let (pause_tx, _pause_rx) = watch::channel(PauseState::default());
+        let (ack_tx, ack_rx) = watch::channel(false);
+        let ctrl = PauseIngestionControl::new(pause_tx, ack_rx);
+        // Coordinator gone: drop the ack sender so the channel closes.
+        drop(ack_tx);
+        let err = ctrl.quiesce().await.unwrap_err();
+        assert!(err.to_string().contains("coordinator exited"));
+    }
+
+    /// If the coordinator is gone at handoff, the controller fails the job closed and
+    /// restores live delivery rather than freezing H and restoring sinks unquiesced.
+    #[tokio::test]
+    async fn handoff_quiesce_failure_fails_job_closed() {
+        let (be, jl, _seqs) = journal_with(2).await;
+        let store = ReplayJobStore::new(be.clone(), "p", "inc-1");
+        store.create(&job(false)).await.unwrap();
+        let gate = Arc::new(ReplaySinkGate::new());
+        let ingestion = Arc::new(MockIngestion {
+            fail_quiesce: true,
+            ..Default::default()
+        });
+        let delivery = Arc::new(RecordingDelivery::default());
+        let controller = ReplayController::new(
+            store.clone(),
+            jl,
+            gate.clone(),
+            ingestion.clone(),
+            delivery.clone(),
+            Arc::new(AtomicU64::new(u64::MAX)),
+            CancellationToken::new(),
+            10,
+            "p",
+        );
+
+        let err = controller.run().await.unwrap_err();
+        assert!(err.to_string().contains("coordinator gone"));
+        let after = store.get().await.unwrap().unwrap();
+        assert_eq!(after.job.phase, ReplayPhase::Failed);
+        assert!(!gate.any_excluded(), "live restored after failed quiesce");
     }
 
     #[tokio::test]

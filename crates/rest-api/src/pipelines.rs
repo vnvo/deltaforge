@@ -765,6 +765,8 @@ mod tests {
     struct ReplayMock {
         last_from_seq: Arc<std::sync::Mutex<Option<u64>>>,
         has_job: bool,
+        /// When set, replay_start returns this error instead of succeeding.
+        start_err: Option<&'static str>,
     }
 
     #[async_trait]
@@ -813,9 +815,17 @@ mod tests {
             req: ReplayStartRequest,
         ) -> Result<ReplayStartResponse, PipelineAPIError> {
             *self.last_from_seq.lock().unwrap() = Some(req.from_seq);
-            Ok(ReplayStartResponse {
-                job_id: "job-xyz".to_string(),
-            })
+            match self.start_err {
+                Some("conflict") => Err(PipelineAPIError::Conflict(
+                    "already active".to_string(),
+                )),
+                Some("bad") => Err(PipelineAPIError::BadRequest(
+                    "invalid range".to_string(),
+                )),
+                _ => Ok(ReplayStartResponse {
+                    job_id: "job-xyz".to_string(),
+                }),
+            }
         }
         async fn replay_status(
             &self,
@@ -932,6 +942,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(StatusCode::NO_CONTENT, resp.status());
+    }
+
+    #[tokio::test]
+    async fn replay_start_maps_client_errors_to_status_codes() {
+        for (flag, want) in [
+            ("conflict", StatusCode::CONFLICT),
+            ("bad", StatusCode::BAD_REQUEST),
+        ] {
+            let app = router(AppState {
+                controller: Arc::new(ReplayMock {
+                    start_err: Some(flag),
+                    ..Default::default()
+                }),
+            });
+            let body = serde_json::json!({ "selected_sinks": ["kafka"], "from_seq": 0 });
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/pipelines/demo/journal/replay")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(want, resp.status(), "flag {flag}");
+        }
     }
 
     #[tokio::test]

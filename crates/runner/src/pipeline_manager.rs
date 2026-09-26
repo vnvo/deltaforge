@@ -1177,7 +1177,8 @@ impl PipelineManager {
     ) -> Result<String, PipelineAPIError> {
         let ctx = self.replay_ctx_of(name)?;
 
-        // Authorize the request BEFORE creating the job or pausing anything.
+        // Authorize the request BEFORE creating the job or pausing anything. These are all
+        // client errors (400).
         authorize_replay_start(
             name,
             &ctx.sink_ids,
@@ -1185,8 +1186,9 @@ impl PipelineManager {
             &selected_sinks,
             &staged_sinks,
             &encoder_schema_policy,
+            dry_run,
         )
-        .map_err(PipelineAPIError::Failed)?;
+        .map_err(|e| PipelineAPIError::BadRequest(e.to_string()))?;
 
         let job_id = uuid::Uuid::now_v7().to_string();
         let now = now_ms();
@@ -1202,17 +1204,28 @@ impl PipelineManager {
             dry_run,
             now,
         )
-        .map_err(|e| PipelineAPIError::Failed(anyhow::anyhow!(e)))?;
-        ctx.store()
-            .create(&job)
-            .await
-            .map_err(PipelineAPIError::Failed)?;
+        // Construction invariants (range, targets, sink hygiene) are client errors (400).
+        .map_err(|e| PipelineAPIError::BadRequest(e.to_string()))?;
+        // An already-active job is a conflict (409); everything else is a 500.
+        ctx.store().create(&job).await.map_err(|e| {
+            if e.downcast_ref::<crate::replay_job::ReplayJobError>()
+                .is_some_and(|e| {
+                    matches!(
+                        e,
+                        crate::replay_job::ReplayJobError::AlreadyActive { .. }
+                    )
+                })
+            {
+                PipelineAPIError::Conflict(e.to_string())
+            } else {
+                PipelineAPIError::Failed(e)
+            }
+        })?;
 
         // Install ownership SYNCHRONOUSLY, immediately after the durable create and before
         // spawning the controller: set the retention pin and (for a non-dry-run job) the
         // sink exclusions with no await in between, so neither the retention task nor live
-        // delivery can run against the new active job before its gate/pin exist. If any of
-        // this fails we roll the job back to Cancelled so it does not linger active.
+        // delivery can run against the new active job before its gate/pin exist.
         if let Some(pin) = job.pin_seq() {
             ctx.pin.store(pin, Ordering::SeqCst);
         }
@@ -1233,16 +1246,59 @@ impl PipelineManager {
             }
         });
 
-        // Install the controller handle; abort any stale (finished) one it replaces.
-        if let Some(rt) = self.pipelines.write().get_mut(name) {
-            if let Some((c, t)) =
-                rt.replay_controller.replace((job_cancel, task))
-            {
-                c.cancel();
-                t.abort();
+        // Attach the controller ONLY if the pipeline is still the same live runtime
+        // (generation = incarnation) and eligible. A concurrent stop/delete/reconfigure
+        // between the durable create above and here would otherwise leave an unowned
+        // controller delivering through stale sinks. The attach happens under the write
+        // lock; on the eligible path the handle is moved in and we return. Otherwise we fall
+        // through (below) to tear the controller down and undo the ownership we installed.
+        {
+            let mut guard = self.pipelines.write();
+            if let Some(rt) = guard.get_mut(name) {
+                let eligible = rt
+                    .replay_ctx
+                    .as_ref()
+                    .is_some_and(|c| c.incarnation == ctx.incarnation)
+                    && matches!(
+                        rt.status,
+                        PipelineStatus::Running | PipelineStatus::Paused
+                    );
+                if eligible {
+                    if let Some((c, t)) =
+                        rt.replay_controller.replace((job_cancel, task))
+                    {
+                        c.cancel();
+                        t.abort();
+                    }
+                    return Ok(job_id);
+                }
+            }
+            // Not eligible (removed, reconfigured to a new incarnation, or stopped): fall
+            // through with job_cancel/task still owned. Guard drops at the end of this block.
+        }
+
+        // Invalidated by a concurrent stop/delete/reconfigure: tear down and undo.
+        job_cancel.cancel();
+        task.abort();
+        ctx.gate.include(job.selected_sinks.iter());
+        ctx.pin.store(u64::MAX, Ordering::SeqCst);
+        ctx.pause.send_modify(|s| s.replay = false);
+        // Best-effort durable cancel so the orphaned job does not linger active.
+        if let Ok(Some(stored)) = ctx.store().get().await {
+            if stored.job.is_active() {
+                if let Ok(cancelled) =
+                    stored.job.advance(ReplayPhase::Cancelled, now_ms())
+                {
+                    let _ = ctx
+                        .store()
+                        .compare_and_set(stored.version, &cancelled)
+                        .await;
+                }
             }
         }
-        Ok(job_id)
+        Err(PipelineAPIError::Conflict(format!(
+            "pipeline '{name}' changed during replay start; job cancelled"
+        )))
     }
 
     /// Cancel the active replay job for a pipeline: stop the controller, mark the job
@@ -1362,6 +1418,7 @@ fn authorize_replay_start(
     selected: &[String],
     staged: &[String],
     encoder_schema_policy: &EncoderSchemaPolicy,
+    dry_run: bool,
 ) -> Result<()> {
     // The current Sink API cannot honor a pinned/at-capture encoder schema, so reject those
     // policies up front rather than creating a job that would fail on first delivery.
@@ -1386,16 +1443,20 @@ fn authorize_replay_start(
             );
         }
     }
-    let live_after =
-        sink_ids.iter().filter(|id| !selected.contains(id)).count();
-    if let Some(deltaforge_config::CommitPolicy::Quorum { quorum }) =
-        commit_policy
-    {
-        if *quorum > live_after {
-            anyhow::bail!(
-                "replay would leave commit quorum {quorum} unsatisfiable: only \
-                 {live_after} sink(s) would remain live"
-            );
+    // The commit-quorum satisfiability check applies only to a real (pausing) replay: a
+    // dry-run pauses no sink, so excluding the selected sinks from quorum does not apply.
+    if !dry_run {
+        let live_after =
+            sink_ids.iter().filter(|id| !selected.contains(id)).count();
+        if let Some(deltaforge_config::CommitPolicy::Quorum { quorum }) =
+            commit_policy
+        {
+            if *quorum > live_after {
+                anyhow::bail!(
+                    "replay would leave commit quorum {quorum} unsatisfiable: only \
+                     {live_after} sink(s) would remain live"
+                );
+            }
         }
     }
     Ok(())
@@ -1755,8 +1816,9 @@ impl PipelineController for PipelineManager {
     ) -> Result<ReplayStartResponse, PipelineAPIError> {
         let policy =
             parse_encoder_policy(req.encoder_schema_policy.as_deref())?;
-        // Audit record for a mutating replay request (there is no request-level identity in
-        // the API yet; this is the durable trail for who/what was replayed).
+        // Structured audit event for the replay REQUEST (not a confirmed outcome). It is
+        // only as durable as the configured log collector; there is no request-level
+        // identity in the API yet.
         tracing::info!(
             target: "audit",
             pipeline = %name,
@@ -1777,6 +1839,8 @@ impl PipelineController for PipelineManager {
                 req.dry_run,
             )
             .await?;
+        // Audit the confirmed outcome with the job id.
+        tracing::info!(target: "audit", pipeline = %name, job_id = %job_id, "replay started");
         Ok(ReplayStartResponse { job_id })
     }
 
@@ -1791,14 +1855,18 @@ impl PipelineController for PipelineManager {
     }
 
     async fn replay_cancel(&self, name: &str) -> Result<(), PipelineAPIError> {
-        tracing::info!(target: "audit", pipeline = %name, "replay cancel requested");
-        self.cancel_replay(name).await
+        self.cancel_replay(name).await?;
+        // Audit the confirmed outcome (structured event; durability depends on the log
+        // collector).
+        tracing::info!(target: "audit", pipeline = %name, "replay cancelled");
+        Ok(())
     }
 }
 
 /// Parse the REST `encoder_schema_policy` string into the domain enum. `None`/"current" is
 /// the default; "at_capture_seq" and "pinned:<seq>" are parsed but rejected later by
-/// [`authorize_replay_start`] until the sink API can honor them.
+/// [`authorize_replay_start`] until the sink API can honor them. A malformed value is a
+/// client error (400).
 fn parse_encoder_policy(
     s: Option<&str>,
 ) -> Result<EncoderSchemaPolicy, PipelineAPIError> {
@@ -1807,13 +1875,13 @@ fn parse_encoder_policy(
         Some("at_capture_seq") => Ok(EncoderSchemaPolicy::AtCaptureSeq),
         Some(other) if other.starts_with("pinned:") => {
             let seq = other["pinned:".len()..].parse::<u64>().map_err(|_| {
-                PipelineAPIError::Failed(anyhow::anyhow!(
+                PipelineAPIError::BadRequest(format!(
                     "invalid encoder_schema_policy '{other}' (expected 'pinned:<seq>')"
                 ))
             })?;
             Ok(EncoderSchemaPolicy::Pinned { seq })
         }
-        Some(other) => Err(PipelineAPIError::Failed(anyhow::anyhow!(
+        Some(other) => Err(PipelineAPIError::BadRequest(format!(
             "unknown encoder_schema_policy '{other}'"
         ))),
     }
@@ -1895,7 +1963,7 @@ mod tests {
                     sel: &[String],
                     staged: &[String],
                     pol: &EncoderSchemaPolicy| {
-            authorize_replay_start("p", &sinks, cp, sel, staged, pol)
+            authorize_replay_start("p", &sinks, cp, sel, staged, pol, false)
         };
 
         // Happy path.
@@ -1929,6 +1997,36 @@ mod tests {
         // Quorum 1 with one sink excluded leaves 1 live -> ok.
         let quorum1 = Some(CommitPolicy::Quorum { quorum: 1 });
         assert!(auth(&quorum1, &["kafka".into()], &[], &current).is_ok());
+
+        // A DRY-RUN pauses nothing, so the quorum-exclusion rule does not apply: a job that
+        // would break quorum for a real replay is allowed as a dry-run (targets/policy still
+        // validated).
+        assert!(
+            authorize_replay_start(
+                "p",
+                &sinks,
+                &quorum2,
+                &["kafka".into()],
+                &[],
+                &current,
+                true, // dry_run
+            )
+            .is_ok(),
+            "dry-run skips the pause-induced quorum check"
+        );
+        // But a dry-run still validates targets.
+        assert!(
+            authorize_replay_start(
+                "p",
+                &sinks,
+                &None,
+                &["ghost".into()],
+                &[],
+                &current,
+                true
+            )
+            .is_err()
+        );
     }
 
     fn sample_spec(name: &str) -> PipelineSpec {
