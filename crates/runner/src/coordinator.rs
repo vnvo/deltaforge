@@ -789,8 +789,22 @@ pub struct ReplayCapture {
     /// A captured envelope larger than this fails closed (0 = unbounded). A commit unit
     /// is never split to fit.
     pub max_envelope_bytes: usize,
-    /// Schema-registry sequence at capture time (audit + the AtCaptureSeq encoder option).
-    pub registry_seq_fn: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// Schema-registry sequence at capture time, or `None` when the registry handle is
+    /// not available (recorded honestly as unavailable rather than a placeholder).
+    pub registry_seq_fn: Arc<dyn Fn() -> Option<u64> + Send + Sync>,
+}
+
+/// Fail-closed replay-capture errors for invalid raw events. A commit unit that cannot
+/// be captured verbatim aborts the pipeline rather than storing corrupt identity/content.
+#[derive(Debug, thiserror::Error)]
+pub enum ReplayCaptureError {
+    #[error(
+        "replay capture: event has no stable event_id and cannot be captured; \
+         a replay-enabled pipeline requires stable event ids on every event"
+    )]
+    MissingEventId,
+    #[error("replay capture: event failed to serialize: {0}")]
+    SerializeFailed(String),
 }
 
 /// A single source commit unit's replay envelope exceeds the configured size cap. The
@@ -955,15 +969,18 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
 
     /// Close one captured commit unit: build a replay envelope from the accumulated
     /// raw (pre-processing) events plus `boundary`, persist it idempotently, then clear
-    /// the accumulator. No-op when replay is disabled or the accumulator is empty (a
-    /// data-less boundary). Fail-closed: an append or size-cap failure returns Err so the
-    /// caller aborts before the unit's checkpoint can commit; the accumulator is left
-    /// intact for the error path (the source replays the unit and re-captures
-    /// idempotently).
+    /// the accumulator. A data-less boundary (empty accumulator) is a genuine commit unit
+    /// and is captured as an empty-events envelope, UNLESS it repeats the checkpoint of
+    /// the unit just captured (a redundant snapshot-completion marker), which is skipped
+    /// so it does not create a duplicate unit. Fail-closed: an invalid event, an append,
+    /// or a size-cap failure returns Err so the caller aborts before the unit's checkpoint
+    /// can commit; the accumulator is left intact on the error path (the source replays
+    /// the unit and re-captures idempotently).
     async fn close_capture_unit(
         &self,
         accum: &mut Vec<Event>,
         boundary: &deltaforge_core::SourceBoundary,
+        last_captured_cp: &mut Option<String>,
     ) -> Result<()> {
         use deltaforge_core::replay::{
             REPLAY_ENVELOPE_VERSION, ReplayEnvelopePayload, ReplayEventRecord,
@@ -973,32 +990,49 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             accum.clear();
             return Ok(());
         };
-        if accum.is_empty() {
+        let boundary_rec = SourceBoundaryRecord::from_boundary(boundary);
+        // Redundant data-less boundary: no new events and the same checkpoint as the
+        // unit just captured (e.g. a snapshot-completion marker after its chunk-final
+        // event). Skip so it does not create a duplicate unit.
+        if accum.is_empty()
+            && last_captured_cp.as_deref()
+                == Some(boundary_rec.checkpoint_hex.as_str())
+        {
             return Ok(());
         }
-        let events: Vec<ReplayEventRecord> = accum
-            .iter()
-            .enumerate()
-            .map(|(i, ev)| ReplayEventRecord {
+        // Build records fail-closed: a missing event_id or a serialization failure is a
+        // hard error (never store corrupt identity/content).
+        let mut events: Vec<ReplayEventRecord> =
+            Vec::with_capacity(accum.len());
+        for (i, ev) in accum.iter().enumerate() {
+            let event_id = ev
+                .event_id
+                .as_ref()
+                .ok_or(ReplayCaptureError::MissingEventId)?
+                .to_string();
+            let event = serde_json::to_value(ev).map_err(|e| {
+                ReplayCaptureError::SerializeFailed(e.to_string())
+            })?;
+            events.push(ReplayEventRecord {
                 offset: i as u32,
-                event_id: ev
-                    .event_id
-                    .as_ref()
-                    .map(|e| e.to_string())
-                    .unwrap_or_default(),
+                event_id,
                 tx_id: ev.transaction.as_ref().map(|t| t.id.clone()),
-                event: serde_json::to_value(ev)
-                    .unwrap_or(serde_json::Value::Null),
-            })
-            .collect();
+                event,
+            });
+        }
+        // Honest schema provenance: distinct fully-qualified source tables, sorted for
+        // deterministic bytes (so an idempotent retry produces identical content).
+        let mut source_tables: Vec<String> =
+            accum.iter().map(|ev| ev.source.full_table_name()).collect();
+        source_tables.sort_unstable();
+        source_tables.dedup();
         let payload = ReplayEnvelopePayload {
             version: REPLAY_ENVELOPE_VERSION,
             pipeline_identity: cap.identity.clone(),
-            boundary: SourceBoundaryRecord::from_boundary(boundary),
+            boundary: boundary_rec.clone(),
             events,
             schema_binding: SchemaBinding {
-                // Provenance-only; not consumed by replay delivery today.
-                source_provenance: Vec::new(),
+                source_tables,
                 registry_seq_at_capture: (cap.registry_seq_fn)(),
             },
         };
@@ -1033,6 +1067,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             "pipeline" => self.pipeline_name.to_string(),
         )
         .increment(1);
+        *last_captured_cp = Some(boundary_rec.checkpoint_hex);
         accum.clear();
         Ok(())
     }
@@ -1128,6 +1163,18 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             ));
         }
 
+        // Replay capture derives commit-unit boundaries from transaction markers, so
+        // it requires transaction-aligned batching. With respect_source_tx = false the
+        // legacy path ignores tx markers and would capture nothing; fail fast at
+        // startup rather than run a replay-enabled pipeline that silently journals no
+        // commit units.
+        if self.replay_capture.is_some() && !respect_source_tx {
+            return Err(anyhow::anyhow!(
+                "replay capture requires respect_source_tx = true; a replay-enabled \
+                 pipeline cannot run with transaction-aligned batching disabled"
+            ));
+        }
+
         let coord = Arc::new(self);
 
         // Bounded channel for pipelined delivery - capacity = max_inflight.
@@ -1177,6 +1224,10 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         // a boundary, discarded (dropped) on cancel/shutdown/error before a boundary.
         let replay_on = coord.replay_capture.is_some();
         let mut capture_accum: Vec<Event> = Vec::new();
+        // Checkpoint of the last commit unit actually captured. Used to distinguish a
+        // genuine data-less boundary (worth capturing) from a redundant snapshot
+        // completion marker that repeats the already-captured checkpoint.
+        let mut last_captured_cp: Option<String> = None;
 
         let accum_result: Result<()> = async {
             loop {
@@ -1327,6 +1378,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                                     .close_capture_unit(
                                                         &mut capture_accum,
                                                         &bd,
+                                                        &mut last_captured_cp,
                                                     )
                                                     .await?;
                                             }
@@ -1353,7 +1405,11 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                         // before any flush can commit its checkpoint
                                         // (fail-closed).
                                         coord
-                                            .close_capture_unit(&mut capture_accum, &boundary)
+                                            .close_capture_unit(
+                                                &mut capture_accum,
+                                                &boundary,
+                                                &mut last_captured_cp,
+                                            )
                                             .await?;
                                         if soft_limit_reached(&b, max_events, max_bytes) {
                                             let full = std::mem::replace(
@@ -1376,7 +1432,11 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                         // checkpoint (fail-closed). Usually empty (a
                                         // chunk-final event already closed the unit).
                                         coord
-                                            .close_capture_unit(&mut capture_accum, &boundary)
+                                            .close_capture_unit(
+                                                &mut capture_accum,
+                                                &boundary,
+                                                &mut last_captured_cp,
+                                            )
                                             .await?;
                                         close_boundary(&mut b, boundary);
                                         let full = std::mem::replace(
@@ -2108,10 +2168,10 @@ mod tests {
             identity: deltaforge_core::replay::PipelineIdentity {
                 pipeline: "p".into(),
                 incarnation: "inc-1".into(),
-                source_identity: "src".into(),
+                source_lineage: None,
             },
             max_envelope_bytes,
-            registry_seq_fn: Arc::new(|| 0),
+            registry_seq_fn: Arc::new(|| None),
         };
         Coordinator::builder("cap-test")
             .sinks(sinks)
@@ -2159,7 +2219,7 @@ mod tests {
             &self,
             _f: u64,
             _l: usize,
-        ) -> Result<Vec<(u64, deltaforge_core::replay::ReplayEnvelopePayload)>>
+        ) -> Result<Vec<deltaforge_core::replay::StoredReplayEnvelope>>
         {
             Ok(vec![])
         }
@@ -2198,7 +2258,12 @@ mod tests {
         let be: storage::ArcStorageBackend =
             Arc::new(storage::MemoryStorageBackend::new());
         let journal = Arc::new(crate::replay_journal::BackendJournalLog::new(
-            be, "p", "inc-1",
+            be,
+            deltaforge_core::replay::PipelineIdentity {
+                pipeline: "p".into(),
+                incarnation: "inc-1".into(),
+                source_lineage: None,
+            },
         ));
         let coord = cap_coord(
             store,
@@ -2220,9 +2285,9 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(envs.len(), 1, "whole chunk is one envelope");
-        assert_eq!(envs[0].1.events.len(), 5);
+        assert_eq!(envs[0].payload.events.len(), 5);
         assert_eq!(
-            envs[0].1.boundary.checkpoint_hex,
+            envs[0].payload.boundary.checkpoint_hex,
             hex_of(b"chunk-cp"),
             "envelope boundary is the chunk-final checkpoint"
         );
@@ -2269,7 +2334,12 @@ mod tests {
         let be: storage::ArcStorageBackend =
             Arc::new(storage::MemoryStorageBackend::new());
         let journal = Arc::new(crate::replay_journal::BackendJournalLog::new(
-            be, "p", "inc-1",
+            be,
+            deltaforge_core::replay::PipelineIdentity {
+                pipeline: "p".into(),
+                incarnation: "inc-1".into(),
+                source_lineage: None,
+            },
         ));
         let coord = cap_coord(
             Arc::new(checkpoints::MemCheckpointStore::new().unwrap()),
@@ -2311,8 +2381,11 @@ mod tests {
             let journal =
                 Arc::new(crate::replay_journal::BackendJournalLog::new(
                     be.clone(),
-                    "p",
-                    "inc-1",
+                    deltaforge_core::replay::PipelineIdentity {
+                        pipeline: "p".into(),
+                        incarnation: "inc-1".into(),
+                        source_lineage: None,
+                    },
                 ));
             let coord = cap_coord(
                 Arc::new(checkpoints::MemCheckpointStore::new().unwrap()),
@@ -2323,8 +2396,14 @@ mod tests {
             );
             feed_and_run(coord, chunk()).await.unwrap();
         }
-        let journal =
-            crate::replay_journal::BackendJournalLog::new(be, "p", "inc-1");
+        let journal = crate::replay_journal::BackendJournalLog::new(
+            be,
+            deltaforge_core::replay::PipelineIdentity {
+                pipeline: "p".into(),
+                incarnation: "inc-1".into(),
+                source_lineage: None,
+            },
+        );
         let envs =
             crate::replay_journal::JournalLog::read_since(&journal, 0, 100)
                 .await
@@ -2341,7 +2420,12 @@ mod tests {
         let be: storage::ArcStorageBackend =
             Arc::new(storage::MemoryStorageBackend::new());
         let journal = Arc::new(crate::replay_journal::BackendJournalLog::new(
-            be, "p", "inc-1",
+            be,
+            deltaforge_core::replay::PipelineIdentity {
+                pipeline: "p".into(),
+                incarnation: "inc-1".into(),
+                source_lineage: None,
+            },
         ));
         let coord = cap_coord(
             store.clone(),
@@ -2365,6 +2449,153 @@ mod tests {
             "expected OversizedReplayEnvelopeError: {err}"
         );
         assert!(store.get_raw("src::sink::kafka").await.unwrap().is_none());
+        assert!(
+            crate::replay_journal::JournalLog::read_since(&*journal, 0, 100)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn mem_journal() -> Arc<crate::replay_journal::BackendJournalLog> {
+        let be: storage::ArcStorageBackend =
+            Arc::new(storage::MemoryStorageBackend::new());
+        Arc::new(crate::replay_journal::BackendJournalLog::new(
+            be,
+            deltaforge_core::replay::PipelineIdentity {
+                pipeline: "p".into(),
+                incarnation: "inc-1".into(),
+                source_lineage: None,
+            },
+        ))
+    }
+
+    /// A replay-enabled pipeline must run with transaction-aligned batching; with
+    /// `respect_source_tx = false` the legacy path ignores tx markers and would capture
+    /// nothing, so startup fails fast rather than journaling silently empty.
+    #[tokio::test]
+    async fn replay_requires_respect_source_tx() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let cfg = BatchConfig {
+            max_events: Some(1000),
+            max_ms: Some(60_000),
+            respect_source_tx: Some(false),
+            max_inflight: Some(1),
+            ..BatchConfig::default()
+        };
+        let coord = cap_coord(
+            store,
+            MockSink::new("kafka", true),
+            cfg,
+            mem_journal(),
+            0,
+        );
+        let err = feed_and_run(coord, vec![])
+            .await
+            .expect_err("replay + respect_source_tx=false must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("replay") && msg.contains("respect_source_tx"),
+            "error should explain the constraint, got: {msg}"
+        );
+    }
+
+    /// A genuine data-less boundary (no accumulated events, a new checkpoint) is a real
+    /// commit unit and is captured as an empty envelope.
+    #[tokio::test]
+    async fn genuine_dataless_boundary_is_captured() {
+        let journal = mem_journal();
+        let coord = cap_coord(
+            Arc::new(checkpoints::MemCheckpointStore::new().unwrap()),
+            MockSink::new("kafka", true),
+            cap_cfg(1000),
+            journal.clone(),
+            0,
+        );
+        feed_and_run(
+            coord,
+            vec![SourceItem::Boundary {
+                boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                    CheckpointMeta::from_vec(b"done-cp".to_vec()),
+                ),
+            }],
+        )
+        .await
+        .unwrap();
+        let envs =
+            crate::replay_journal::JournalLog::read_since(&*journal, 0, 100)
+                .await
+                .unwrap();
+        assert_eq!(envs.len(), 1, "data-less boundary is captured");
+        assert!(envs[0].payload.events.is_empty());
+        assert_eq!(envs[0].payload.boundary.checkpoint_hex, hex_of(b"done-cp"));
+    }
+
+    /// A redundant snapshot-completion marker (same checkpoint as the just-captured
+    /// chunk-final unit, no new events) does not create a duplicate unit.
+    #[tokio::test]
+    async fn redundant_snapshot_completion_marker_is_skipped() {
+        let journal = mem_journal();
+        let coord = cap_coord(
+            Arc::new(checkpoints::MemCheckpointStore::new().unwrap()),
+            MockSink::new("kafka", true),
+            cap_cfg(1000),
+            journal.clone(),
+            0,
+        );
+        feed_and_run(
+            coord,
+            vec![
+                SourceItem::Event(snap_event(1, Some(b"chunk-cp"))),
+                // The source re-emits the completion checkpoint as a data-less boundary.
+                SourceItem::Boundary {
+                    boundary: deltaforge_core::SourceBoundary::checkpoint_only(
+                        CheckpointMeta::from_vec(b"chunk-cp".to_vec()),
+                    ),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+        let envs =
+            crate::replay_journal::JournalLog::read_since(&*journal, 0, 100)
+                .await
+                .unwrap();
+        assert_eq!(
+            envs.len(),
+            1,
+            "redundant completion marker is not a new unit"
+        );
+        assert_eq!(envs[0].payload.events.len(), 1);
+    }
+
+    /// Capture fails closed on a raw event with no event id: never store an envelope
+    /// with a corrupt identity, and never advance the checkpoint.
+    #[tokio::test]
+    async fn missing_event_id_fails_closed() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let journal = mem_journal();
+        let coord = cap_coord(
+            store.clone(),
+            MockSink::new("kafka", true),
+            cap_cfg(1000),
+            journal.clone(),
+            0,
+        );
+        let mut ev = snap_event(1, Some(b"chunk-cp"));
+        ev.event_id = None;
+        let res = feed_and_run(coord, vec![SourceItem::Event(ev)]).await;
+        let err = res.expect_err("missing event_id must fail capture");
+        assert!(
+            err.downcast_ref::<ReplayCaptureError>().is_some(),
+            "expected ReplayCaptureError, got: {err}"
+        );
+        assert!(
+            store.get_raw("src::sink::kafka").await.unwrap().is_none(),
+            "checkpoint must not advance"
+        );
         assert!(
             crate::replay_journal::JournalLog::read_since(&*journal, 0, 100)
                 .await

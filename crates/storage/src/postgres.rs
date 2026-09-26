@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, info};
 
 use crate::{
-    AppendStatus, LogAppendOutcome, LogError, LogStreamMeta,
+    AppendStatus, LogAppendOutcome, LogEntryMeta, LogError, LogStreamMeta,
     LogTruncateOutcome, LogTruncateRequest, StorageBackend, content_digest,
 };
 
@@ -537,6 +537,34 @@ impl StorageBackend for PostgresStorageBackend {
             head_seq: head as u64,
             len: len as u64,
         })
+    }
+
+    async fn log_read_meta_since(
+        &self,
+        ns: &str,
+        key: &str,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<LogEntryMeta>> {
+        let c = client!(self);
+        let rows = c
+            .query(
+                "SELECT seq, COALESCE(ts_ms, ts*1000), capture_id, content_hash, val
+                 FROM df_log WHERE ns=$1 AND key=$2 AND seq>$3
+                 ORDER BY seq ASC LIMIT $4",
+                &[&ns, &key, &(since_seq as i64), &(limit as i64)],
+            )
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| LogEntryMeta {
+                seq: r.get::<_, i64>(0) as u64,
+                stored_at_ms: r.get(1),
+                capture_id: r.get(2),
+                content_hash: r.get(3),
+                value: r.get(4),
+            })
+            .collect())
     }
 
     // ── Slot ────────────────────────────────────────────────────────────────

@@ -3,7 +3,7 @@
 //! State is lost on drop. Not suitable for production.
 
 use crate::{
-    AppendStatus, LogAppendOutcome, LogError, LogStreamMeta,
+    AppendStatus, LogAppendOutcome, LogEntryMeta, LogError, LogStreamMeta,
     LogTruncateOutcome, LogTruncateRequest, StorageBackend, content_digest,
 };
 use anyhow::Result;
@@ -436,6 +436,34 @@ impl StorageBackend for MemoryStorageBackend {
             head_seq: meta.head_seq,
             len,
         })
+    }
+
+    async fn log_read_meta_since(
+        &self,
+        ns: &str,
+        key: &str,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<LogEntryMeta>> {
+        let store = self.log.read().await;
+        Ok(store
+            .entries
+            .get(&(ns.to_string(), key.to_string()))
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|e| e.seq > since_seq)
+                    .take(limit)
+                    .map(|e| LogEntryMeta {
+                        seq: e.seq,
+                        stored_at_ms: e.ts_ms,
+                        capture_id: e.capture_id.clone(),
+                        content_hash: e.content_hash.clone(),
+                        value: e.value.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     // ── Slot ────────────────────────────────────────────────────────────────

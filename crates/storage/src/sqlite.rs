@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 use tracing::{error, info};
 
 use crate::{
-    AppendStatus, LogAppendOutcome, LogError, LogStreamMeta,
+    AppendStatus, LogAppendOutcome, LogEntryMeta, LogError, LogStreamMeta,
     LogTruncateOutcome, LogTruncateRequest, StorageBackend, content_digest,
 };
 
@@ -607,6 +607,38 @@ impl StorageBackend for SqliteStorageBackend {
                 head_seq: head as u64,
                 len: len as u64,
             })
+        })
+    }
+
+    async fn log_read_meta_since(
+        &self,
+        ns: &str,
+        key: &str,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<LogEntryMeta>> {
+        let ns = ns.to_string();
+        let key = key.to_string();
+        db!(self, move |conn: &Connection| {
+            let mut stmt = conn.prepare(
+                "SELECT seq, COALESCE(ts_ms, ts*1000), capture_id, content_hash, val
+                 FROM df_log WHERE ns=?1 AND key=?2 AND seq>?3
+                 ORDER BY seq ASC LIMIT ?4",
+            )?;
+            let rows = stmt.query_map(
+                params![ns, key, since_seq as i64, limit as i64],
+                |r| {
+                    Ok(LogEntryMeta {
+                        seq: r.get::<_, i64>(0)? as u64,
+                        stored_at_ms: r.get(1)?,
+                        capture_id: r.get(2)?,
+                        content_hash: r.get(3)?,
+                        value: r.get(4)?,
+                    })
+                },
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
         })
     }
 

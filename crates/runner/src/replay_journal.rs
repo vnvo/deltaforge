@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use deltaforge_core::replay::ReplayEnvelopePayload;
+use deltaforge_core::replay::{
+    PipelineIdentity, ReplayEnvelopePayload, StoredReplayEnvelope,
+};
 use metrics::counter;
 use storage::{
     ArcStorageBackend, LogAppendOutcome, LogStreamMeta, LogTruncateOutcome,
@@ -38,12 +40,13 @@ pub trait JournalLog: Send + Sync {
         payload: &ReplayEnvelopePayload,
     ) -> Result<LogAppendOutcome>;
 
-    /// Read up to `limit` envelopes with `seq > from_seq`, decoded from canonical bytes.
+    /// Read up to `limit` envelopes with `seq > from_seq`, each decoded and verified
+    /// fail-closed (version, pipeline identity, capture id, and content digest).
     async fn read_since(
         &self,
         from_seq: u64,
         limit: usize,
-    ) -> Result<Vec<(u64, ReplayEnvelopePayload)>>;
+    ) -> Result<Vec<StoredReplayEnvelope>>;
 
     /// The stream's durable metadata (horizon, head, oldest, len).
     async fn stream_meta(&self) -> Result<LogStreamMeta>;
@@ -55,21 +58,21 @@ pub trait JournalLog: Send + Sync {
     ) -> Result<LogTruncateOutcome>;
 }
 
-/// `JournalLog` over any `StorageBackend`.
+/// `JournalLog` over any `StorageBackend`. Holds the reading pipeline's identity so
+/// reads can be verified fail-closed against it.
 pub struct BackendJournalLog {
     backend: ArcStorageBackend,
+    identity: PipelineIdentity,
     key: String,
 }
 
 impl BackendJournalLog {
-    pub fn new(
-        backend: ArcStorageBackend,
-        pipeline: &str,
-        incarnation: &str,
-    ) -> Self {
+    pub fn new(backend: ArcStorageBackend, identity: PipelineIdentity) -> Self {
+        let key = replay_stream_key(&identity.pipeline, &identity.incarnation);
         Self {
             backend,
-            key: replay_stream_key(pipeline, incarnation),
+            identity,
+            key,
         }
     }
 }
@@ -91,16 +94,35 @@ impl JournalLog for BackendJournalLog {
         &self,
         from_seq: u64,
         limit: usize,
-    ) -> Result<Vec<(u64, ReplayEnvelopePayload)>> {
-        let raw = self
+    ) -> Result<Vec<StoredReplayEnvelope>> {
+        let metas = self
             .backend
-            .log_since(REPLAY_NS, &self.key, from_seq)
+            .log_read_meta_since(REPLAY_NS, &self.key, from_seq, limit)
             .await?;
-        raw.into_iter()
-            .take(limit)
-            .map(|(seq, bytes)| {
-                let p: ReplayEnvelopePayload = serde_json::from_slice(&bytes)?;
-                Ok((seq, p))
+        metas
+            .into_iter()
+            .map(|m| {
+                let capture_id = m.capture_id.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "replay entry seq {} has no capture_id (not a replay envelope)",
+                        m.seq
+                    )
+                })?;
+                let content_hash = m.content_hash.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "replay entry seq {} has no content_hash",
+                        m.seq
+                    )
+                })?;
+                StoredReplayEnvelope::decode_verified(
+                    m.seq,
+                    m.stored_at_ms,
+                    &capture_id,
+                    &content_hash,
+                    &m.value,
+                    &self.identity,
+                )
+                .map_err(anyhow::Error::from)
             })
             .collect()
     }
@@ -200,14 +222,18 @@ mod tests {
     };
     use storage::{AppendStatus, MemoryStorageBackend};
 
+    fn identity() -> PipelineIdentity {
+        PipelineIdentity {
+            pipeline: "p".into(),
+            incarnation: "inc-1".into(),
+            source_lineage: None,
+        }
+    }
+
     fn envelope(cp: &[u8], ids: &[&str]) -> ReplayEnvelopePayload {
         ReplayEnvelopePayload {
             version: REPLAY_ENVELOPE_VERSION,
-            pipeline_identity: PipelineIdentity {
-                pipeline: "p".into(),
-                incarnation: "inc-1".into(),
-                source_identity: "src".into(),
-            },
+            pipeline_identity: identity(),
             boundary: SourceBoundaryRecord::from_boundary(
                 &SourceBoundary::checkpoint_only(CheckpointMeta::from_vec(
                     cp.to_vec(),
@@ -224,16 +250,16 @@ mod tests {
                 })
                 .collect(),
             schema_binding: SchemaBinding {
-                source_provenance: vec![],
-                registry_seq_at_capture: 0,
+                source_tables: vec!["db.t".into()],
+                registry_seq_at_capture: None,
             },
         }
     }
 
     #[tokio::test]
-    async fn append_is_idempotent_and_reads_back() {
+    async fn append_is_idempotent_and_reads_back_verified() {
         let be: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
-        let jl = BackendJournalLog::new(be, "p", "inc-1");
+        let jl = BackendJournalLog::new(be, identity());
         let e1 = envelope(b"cp1", &["a", "b"]);
         let e2 = envelope(b"cp2", &["c"]);
 
@@ -247,8 +273,38 @@ mod tests {
 
         let all = jl.read_since(0, 100).await.unwrap();
         assert_eq!(all.len(), 2);
-        assert_eq!(all[0].1, e1);
-        assert_eq!(all[1].1, e2);
+        assert_eq!(all[0].payload, e1);
+        assert_eq!(all[1].payload, e2);
+        // Verified metadata is exposed.
+        assert_eq!(all[0].capture_id, e1.capture_id());
+        assert!(all[0].stored_at_ms > 0);
         assert_eq!(jl.stream_meta().await.unwrap().len, 2);
+    }
+
+    /// Reading under a different identity fails closed (cannot read another
+    /// incarnation's stream as your own).
+    #[tokio::test]
+    async fn read_rejects_foreign_identity() {
+        let be: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        let writer = BackendJournalLog::new(be.clone(), identity());
+        writer.append(&envelope(b"cp1", &["a"])).await.unwrap();
+
+        let other = PipelineIdentity {
+            pipeline: "p".into(),
+            incarnation: "inc-2".into(),
+            source_lineage: None,
+        };
+        // Different incarnation => different stream key => reads nothing; but a reader
+        // pointed at the same key with a foreign identity would fail-closed on decode.
+        let foreign_same_key = BackendJournalLog {
+            backend: be,
+            identity: other,
+            key: replay_stream_key("p", "inc-1"),
+        };
+        let err = foreign_same_key.read_since(0, 100).await.unwrap_err();
+        assert!(
+            err.to_string().contains("identity"),
+            "expected identity mismatch, got: {err}"
+        );
     }
 }

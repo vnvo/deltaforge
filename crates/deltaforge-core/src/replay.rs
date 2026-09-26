@@ -13,6 +13,17 @@ use crate::{SourceBoundary, canonical_json};
 
 pub const REPLAY_ENVELOPE_VERSION: u16 = 1;
 
+/// Backend-computed content digest over the exact stored bytes, domain-separated so it
+/// cannot collide with a hash taken for another purpose. Defined here (not in the
+/// storage crate) so both the storage backend that writes it and the replay reader that
+/// verifies it share one implementation.
+pub fn content_digest(value: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(b"deltaforge:replay:content:v1");
+    h.update(value);
+    hex(&h.finalize())
+}
+
 /// Immutable, incarnation-scoped pipeline identity, bound into every envelope and its
 /// capture id so a deleted-and-recreated pipeline can never inherit an old replay
 /// stream.
@@ -21,8 +32,12 @@ pub struct PipelineIdentity {
     pub pipeline: String,
     /// Durable id minted when the pipeline is created; new on recreate.
     pub incarnation: String,
-    /// Stable source lineage (e.g. PG system_identifier / MySQL server-uuid lineage).
-    pub source_identity: String,
+    /// The stable source database lineage (e.g. PG system_identifier / MySQL
+    /// server-uuid). `None` when the source does not yet expose it - explicitly
+    /// unavailable rather than a misleading substitute. It cannot be back-filled into
+    /// already-captured immutable envelopes, so a later version that binds real lineage
+    /// simply produces a distinct identity (a new incarnation scopes the change).
+    pub source_lineage: Option<String>,
 }
 
 /// The commit boundary carried verbatim from ingestion (checkpoint + optional durable
@@ -42,21 +57,15 @@ impl SourceBoundaryRecord {
     }
 }
 
-/// Provenance for the source schema that decoded an event. NOT consumed by replay
-/// delivery today (events are stored already decoded); it is audit metadata and the
-/// input to a future typed-reconstruction feature.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SourceSchemaRef {
-    pub table: String,
-    pub schema_id: String,
-    pub version: u64,
-}
-
+/// Schema provenance for an envelope. `source_tables` is honest, available metadata (the
+/// distinct fully-qualified source tables in the unit). `registry_seq_at_capture` is the
+/// schema-registry sequence at capture time when the registry handle is available,
+/// otherwise `None` (explicitly not captured). Provenance only; not consumed by replay
+/// delivery today.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchemaBinding {
-    pub source_provenance: Vec<SourceSchemaRef>,
-    /// Schema-registry sequence at capture time (audit + the AtCaptureSeq encoder option).
-    pub registry_seq_at_capture: u64,
+    pub source_tables: Vec<String>,
+    pub registry_seq_at_capture: Option<u64>,
 }
 
 /// One raw (pre-processing) event within an envelope. `offset` is a subordinate
@@ -70,7 +79,8 @@ pub struct ReplayEventRecord {
 }
 
 /// The canonical, hashable payload - one captured commit unit. Excludes all
-/// backend-assigned metadata (seq, stored_at_ms), which the storage layer adds.
+/// backend-assigned metadata (seq, stored_at_ms, capture_id, content_hash), which the
+/// storage layer adds and which [`StoredReplayEnvelope`] carries back on read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayEnvelopePayload {
     pub version: u16,
@@ -94,15 +104,23 @@ impl ReplayEnvelopePayload {
     /// boundary, and ordered event ids - domain-separated and length-prefixed so no two
     /// distinct inputs can concatenate to the same digest. Stable across process
     /// restarts and source retries; this is the idempotency key for
-    /// `log_append_if_absent`.
+    /// `log_append_if_absent`. It deliberately excludes fields that may vary between
+    /// retries (e.g. a registry sequence), so a retry never conflicts on identical bytes.
     pub fn capture_id(&self) -> String {
         let mut h = Sha256::new();
         h.update(b"deltaforge:replay:capture:v1");
         feed(&mut h, self.pipeline_identity.pipeline.as_bytes());
         feed(&mut h, self.pipeline_identity.incarnation.as_bytes());
-        feed(&mut h, self.pipeline_identity.source_identity.as_bytes());
+        h.update([self.pipeline_identity.source_lineage.is_some() as u8]);
+        feed(
+            &mut h,
+            self.pipeline_identity
+                .source_lineage
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes(),
+        );
         feed(&mut h, self.boundary.checkpoint_hex.as_bytes());
-        // Watermark presence flag first, so None and Some("") cannot collide.
         h.update([self.boundary.watermark_hex.is_some() as u8]);
         feed(
             &mut h,
@@ -117,6 +135,88 @@ impl ReplayEnvelopePayload {
             feed(&mut h, e.event_id.as_bytes());
         }
         hex(&h.finalize())
+    }
+}
+
+/// A stored envelope as read back from the journal: the backend-assigned metadata plus
+/// the decoded payload. Produced by a fail-closed load that verifies integrity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredReplayEnvelope {
+    pub seq: u64,
+    pub stored_at_ms: i64,
+    pub capture_id: String,
+    pub content_hash: String,
+    pub payload: ReplayEnvelopePayload,
+}
+
+/// Fail-closed load errors: a stored envelope failed an integrity or contract check.
+#[derive(Debug, thiserror::Error)]
+pub enum ReplayLoadError {
+    #[error("unsupported replay envelope version {got} (expected {expected})")]
+    UnsupportedVersion { got: u16, expected: u16 },
+    #[error(
+        "replay envelope pipeline identity does not match the reading pipeline"
+    )]
+    IdentityMismatch,
+    #[error(
+        "replay envelope capture id mismatch (stored {stored}, recomputed {recomputed})"
+    )]
+    CaptureIdMismatch { stored: String, recomputed: String },
+    #[error(
+        "replay envelope content hash mismatch (tampered or corrupt bytes)"
+    )]
+    ContentHashMismatch,
+    #[error("replay envelope is not valid JSON: {0}")]
+    Decode(String),
+}
+
+impl StoredReplayEnvelope {
+    /// Decode and verify one stored entry, fail-closed. Checks: valid JSON, supported
+    /// version, matching pipeline identity, the stored `capture_id` equals the payload's
+    /// recomputed capture id, and the stored `content_hash` equals the digest of the
+    /// re-serialized canonical bytes (so tampering with either the bytes or the metadata
+    /// is caught).
+    pub fn decode_verified(
+        seq: u64,
+        stored_at_ms: i64,
+        capture_id: &str,
+        content_hash: &str,
+        value: &[u8],
+        expected_identity: &PipelineIdentity,
+    ) -> Result<Self, ReplayLoadError> {
+        let payload: ReplayEnvelopePayload = serde_json::from_slice(value)
+            .map_err(|e| ReplayLoadError::Decode(e.to_string()))?;
+        if payload.version != REPLAY_ENVELOPE_VERSION {
+            return Err(ReplayLoadError::UnsupportedVersion {
+                got: payload.version,
+                expected: REPLAY_ENVELOPE_VERSION,
+            });
+        }
+        if &payload.pipeline_identity != expected_identity {
+            return Err(ReplayLoadError::IdentityMismatch);
+        }
+        // Recompute the digest over the canonical bytes we would have stored, and
+        // compare to both the stored content_hash and the raw value's digest.
+        let recomputed_hash = content_digest(&payload.canonical_bytes());
+        if recomputed_hash != content_hash
+            || content_digest(value) != content_hash
+        {
+            return Err(ReplayLoadError::ContentHashMismatch);
+        }
+        let recomputed_id = payload.capture_id();
+        if recomputed_id != capture_id {
+            return Err(ReplayLoadError::CaptureIdMismatch {
+                stored: capture_id.to_string(),
+                recomputed: recomputed_id,
+            });
+        }
+        Ok(Self {
+            seq,
+            stored_at_ms,
+            capture_id: capture_id.to_string(),
+            content_hash: content_hash.to_string(),
+            payload,
+        })
     }
 }
 
@@ -140,14 +240,18 @@ mod tests {
     use crate::CheckpointMeta;
     use serde_json::json;
 
+    fn identity() -> PipelineIdentity {
+        PipelineIdentity {
+            pipeline: "p".into(),
+            incarnation: "inc-1".into(),
+            source_lineage: None,
+        }
+    }
+
     fn payload(events: Vec<ReplayEventRecord>) -> ReplayEnvelopePayload {
         ReplayEnvelopePayload {
             version: REPLAY_ENVELOPE_VERSION,
-            pipeline_identity: PipelineIdentity {
-                pipeline: "p".into(),
-                incarnation: "inc-1".into(),
-                source_identity: "src-1".into(),
-            },
+            pipeline_identity: identity(),
             boundary: SourceBoundaryRecord::from_boundary(
                 &SourceBoundary::checkpoint_only(CheckpointMeta::from_vec(
                     b"cp".to_vec(),
@@ -155,8 +259,8 @@ mod tests {
             ),
             events,
             schema_binding: SchemaBinding {
-                source_provenance: vec![],
-                registry_seq_at_capture: 7,
+                source_tables: vec!["db.t".into()],
+                registry_seq_at_capture: None,
             },
         }
     }
@@ -184,22 +288,69 @@ mod tests {
         let reordered = payload(vec![ev("e2", json!({})), ev("e1", json!({}))]);
         assert_ne!(base.capture_id(), reordered.capture_id());
 
-        let mut other_incarnation = payload(vec![ev("e1", json!({}))]);
-        other_incarnation.pipeline_identity.incarnation = "inc-2".into();
+        let mut other = payload(vec![ev("e1", json!({}))]);
+        other.pipeline_identity.incarnation = "inc-2".into();
         assert_ne!(
             payload(vec![ev("e1", json!({}))]).capture_id(),
-            other_incarnation.capture_id()
+            other.capture_id()
         );
     }
 
     #[test]
-    fn capture_id_is_stable_and_roundtrips() {
+    fn decode_verified_roundtrips_and_catches_tampering() {
         let p = payload(vec![ev("e1", json!({"x": 1}))]);
-        let id1 = p.capture_id();
         let bytes = p.canonical_bytes();
-        let back: ReplayEnvelopePayload =
-            serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(back, p);
-        assert_eq!(back.capture_id(), id1);
+        let cid = p.capture_id();
+        let ch = content_digest(&bytes);
+
+        let ok = StoredReplayEnvelope::decode_verified(
+            5,
+            123,
+            &cid,
+            &ch,
+            &bytes,
+            &identity(),
+        )
+        .unwrap();
+        assert_eq!(ok.seq, 5);
+        assert_eq!(ok.stored_at_ms, 123);
+        assert_eq!(ok.payload, p);
+
+        // Wrong identity.
+        let other = PipelineIdentity {
+            pipeline: "p".into(),
+            incarnation: "inc-2".into(),
+            source_lineage: None,
+        };
+        assert!(matches!(
+            StoredReplayEnvelope::decode_verified(
+                5, 123, &cid, &ch, &bytes, &other
+            ),
+            Err(ReplayLoadError::IdentityMismatch)
+        ));
+        // Tampered content hash.
+        assert!(matches!(
+            StoredReplayEnvelope::decode_verified(
+                5,
+                123,
+                &cid,
+                "deadbeef",
+                &bytes,
+                &identity()
+            ),
+            Err(ReplayLoadError::ContentHashMismatch)
+        ));
+        // Mismatched capture id.
+        assert!(matches!(
+            StoredReplayEnvelope::decode_verified(
+                5,
+                123,
+                "wrong",
+                &ch,
+                &bytes,
+                &identity()
+            ),
+            Err(ReplayLoadError::CaptureIdMismatch { .. })
+        ));
     }
 }

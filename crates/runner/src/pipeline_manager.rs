@@ -385,7 +385,18 @@ pub(crate) struct PipelineRuntime {
     pub(crate) table_patterns: Vec<String>,
     pub(crate) sensor_state: Option<Arc<SchemaSensorState>>,
     pub(crate) dlq_writer: Option<Arc<crate::dlq::DlqWriter>>,
+    /// Background replay-retention task, when replay journaling is enabled. Owned here
+    /// so it is aborted when the pipeline stops, is deleted, or the runtime is dropped.
+    pub(crate) retention_task: Option<JoinHandle<()>>,
     pub(crate) started_at: std::time::Instant,
+}
+
+impl Drop for PipelineRuntime {
+    fn drop(&mut self) {
+        if let Some(task) = self.retention_task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl PipelineRuntime {
@@ -720,11 +731,14 @@ impl PipelineManager {
             None
         };
 
-        // Replay journal - opt-in via journal.replay config.
+        // Replay journal - opt-in, requires BOTH the journal master switch and the
+        // replay sub-switch (replay is a journal feature; the master switch gates it).
+        let mut retention_task: Option<tokio::task::JoinHandle<()>> = None;
         if let Some(replay_cfg) = spec
             .spec
             .journal
             .as_ref()
+            .filter(|j| j.enabled)
             .and_then(|j| j.replay.clone())
             .filter(|r| r.enabled)
         {
@@ -732,9 +746,10 @@ impl PipelineManager {
                 BackendJournalLog, JournalLog, REPLAY_NS, RetentionConfig,
                 spawn_retention_task,
             };
-            // Durable, incarnation-scoped identity: minted once and reused across
-            // restarts. (Invalidation on delete/recreate lands with the pipeline
-            // lifecycle work in a later slice.)
+            // Durable, incarnation-scoped identity: minted once per lifecycle and reused
+            // across restarts (the slot is deleted on pipeline delete, so a recreated
+            // pipeline mints a fresh incarnation and never inherits an old stream). The
+            // read-back is deterministic, so retries bind the same identity.
             let inc_key = format!("{pipeline_name}:incarnation");
             let new_id = uuid::Uuid::now_v7().to_string();
             let incarnation = match self
@@ -752,28 +767,28 @@ impl PipelineManager {
                     String::from_utf8_lossy(&bytes).into_owned()
                 }
             };
-            let journal: Arc<dyn JournalLog> =
-                Arc::new(BackendJournalLog::new(
-                    self.backend.clone(),
-                    &pipeline_name,
-                    &incarnation,
-                ));
             let identity = deltaforge_core::replay::PipelineIdentity {
                 pipeline: pipeline_name.clone(),
                 incarnation: incarnation.clone(),
-                // TODO: bind the true source DB lineage (system_identifier /
-                // server-uuid) once the source exposes it; the config source id is
-                // stable per pipeline in the meantime.
-                source_identity: source_id.clone(),
+                // Real source DB lineage (system_identifier / server-uuid) is not yet
+                // exposed by the source trait; the schema represents it as absent rather
+                // than binding a placeholder. It does not enter capture_id, so binding it
+                // later is a forward-compatible change.
+                source_lineage: None,
             };
+            let journal: Arc<dyn JournalLog> = Arc::new(
+                BackendJournalLog::new(self.backend.clone(), identity.clone()),
+            );
             builder =
                 builder.replay_capture(crate::coordinator::ReplayCapture {
                     journal: Arc::clone(&journal),
                     identity,
                     max_envelope_bytes: replay_cfg.max_envelope_bytes,
-                    // TODO: bind the schema-registry current_sequence when the registry
-                    // handle is threaded here (audit + AtCaptureSeq encoder option).
-                    registry_seq_fn: Arc::new(|| 0),
+                    // The schema-registry handle is not threaded here yet; the schema
+                    // represents the registry sequence as absent rather than binding 0.
+                    // It does not enter capture_id, so binding it later is
+                    // forward-compatible.
+                    registry_seq_fn: Arc::new(|| None),
                 });
             let ret_cfg = RetentionConfig {
                 max_age_ms: (replay_cfg.retention_secs > 0)
@@ -784,13 +799,14 @@ impl PipelineManager {
                     .then_some(replay_cfg.max_bytes),
                 interval_secs: 60,
             };
-            // No replay job pins retention yet (the replay engine lands later).
-            let _retention = spawn_retention_task(
+            // No replay job pins retention yet (the replay engine lands later). The
+            // task is owned by the PipelineRuntime and aborted on stop/delete/drop.
+            retention_task = Some(spawn_retention_task(
                 journal,
                 pipeline_name.clone(),
                 ret_cfg,
                 Arc::new(|| u64::MAX),
-            );
+            ));
             tracing::info!(
                 pipeline = %pipeline_name,
                 incarnation = %incarnation,
@@ -853,6 +869,7 @@ impl PipelineManager {
             table_patterns,
             sensor_state: sensor_for_runtime,
             dlq_writer,
+            retention_task,
             started_at: std::time::Instant::now(),
         })
     }
@@ -896,14 +913,19 @@ impl PipelineManager {
             .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?;
 
         runtime.cancel.cancel();
-        for src in &runtime.sources {
+        // Stop the replay-retention background task with the coordinator.
+        if let Some(task) = runtime.retention_task.take() {
+            task.abort();
+        }
+        let sources = std::mem::take(&mut runtime.sources);
+        for src in &sources {
             src.cancel.cancel();
         }
 
         if let Some(join) = runtime.join.take() {
             let _ = join.await;
         }
-        for src in runtime.sources {
+        for src in sources {
             let _ = src.join.await;
         }
 
@@ -1082,6 +1104,11 @@ impl PipelineController for PipelineManager {
             let cancel = runtime.cancel.clone();
             let sources = std::mem::take(&mut runtime.sources);
             let join = runtime.join.take();
+            // Stop the replay-retention background task with the coordinator; there is
+            // nothing to retain while the pipeline is not capturing.
+            if let Some(task) = runtime.retention_task.take() {
+                task.abort();
+            }
             (cancel, sources, join)
         };
 
@@ -1143,6 +1170,21 @@ impl PipelineController for PipelineManager {
                     );
                 }
             }
+        }
+
+        // Drop the replay incarnation slot so a recreated pipeline mints a fresh
+        // incarnation and never inherits the deleted pipeline's replay stream.
+        let inc_key = format!("{name}:incarnation");
+        if let Err(e) = self
+            .backend
+            .slot_delete(crate::replay_journal::REPLAY_NS, &inc_key)
+            .await
+        {
+            tracing::warn!(
+                pipeline = %name,
+                error = %e,
+                "failed to clear replay incarnation slot on delete"
+            );
         }
 
         Ok(())
