@@ -51,13 +51,22 @@ use super::postgres_schema_loader::PostgresSchemaLoader;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SnapshotProgress {
-    /// WAL LSN captured before any rows were read.
+    /// The anchor LSN: the replication slot's consistent point (PG-A-lite).
     pub start_lsn: String,
     /// Tables that have been fully snapshotted ("schema.table").
     pub done_tables: Vec<String>,
     /// True once every table is complete.
     pub finished: bool,
+    /// Anchor protocol version. 0 (default, for records written before this
+    /// milestone) = legacy `pg_current_wal_lsn` anchor that could lose rows
+    /// committed in the snapshot->CDC seam. `SNAPSHOT_ANCHOR_VERSION` = the
+    /// slot-consistent-point anchor. Used to flag completed legacy snapshots.
+    #[serde(default)]
+    pub anchor_version: u32,
 }
+
+/// Current snapshot-anchor protocol version (slot-consistent-point anchor).
+pub const SNAPSHOT_ANCHOR_VERSION: u32 = 1;
 
 impl SnapshotProgress {
     pub fn table_done(&self, schema: &str, table: &str) -> bool {
@@ -174,6 +183,11 @@ pub struct PgSnapshotCtx<'a> {
 pub async fn run_snapshot(
     ctx: &PgSnapshotCtx<'_>,
     tables: &[(String, String)],
+    // The anchor LSN: the replication slot's consistent point, established by
+    // prepare_snapshot_slot_anchor. CDC resumes from here; rows committed in
+    // (anchor, snapshot-export] are re-delivered by CDC (bounded at-least-once
+    // overlap), never lost. NOT pg_current_wal_lsn.
+    anchor: Lsn,
 ) -> Result<Lsn> {
     let t0 = Instant::now();
 
@@ -227,21 +241,21 @@ pub async fn run_snapshot(
         .await
         .context("begin coordinator transaction")?;
 
+    // Export the MVCC snapshot for worker mutual consistency only. The CDC
+    // start position is the slot's consistent point (`anchor`), NOT
+    // pg_current_wal_lsn - that decoupling is exactly the pre-hardening seam
+    // bug (PG-A-lite).
     let row = coord
-        .query_one(
-            "SELECT pg_export_snapshot(), pg_current_wal_lsn()::text",
-            &[],
-        )
+        .query_one("SELECT pg_export_snapshot()", &[])
         .await
-        .context("export snapshot + capture LSN")?;
+        .context("export snapshot")?;
 
     let snapshot_id: String = row.get(0);
-    let lsn_str: String = row.get(1);
-    let start_lsn = Lsn::parse(&lsn_str).context("parse snapshot LSN")?;
+    let start_lsn = anchor;
 
     // Save start_lsn immediately - if we crash before finishing, we know
     // where to resume streaming from.
-    progress.start_lsn = lsn_str.clone();
+    progress.start_lsn = anchor.to_string();
     save_progress(&ctx.chkpt_store, ctx.source_id, &progress).await;
 
     let abort_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -291,7 +305,7 @@ pub async fn run_snapshot(
         })
         .collect();
     let snapshot_checkpoint =
-        CheckpointMeta::from_vec(lsn_str.clone().into_bytes());
+        CheckpointMeta::from_vec(anchor.to_string().into_bytes());
     let publisher = Arc::new(SnapshotPublisher::new(
         SnapshotAggregator::from_source_progress(
             ctx.generation,
@@ -405,8 +419,9 @@ pub async fn run_snapshot(
     // release the exported snapshot.
     coord.batch_execute("COMMIT").await.ok();
 
-    // mark fully done.
+    // mark fully done, stamped with the current (safe) anchor protocol version.
     progress.finished = true;
+    progress.anchor_version = SNAPSHOT_ANCHOR_VERSION;
     save_progress(&ctx.chkpt_store, ctx.source_id, &progress).await;
 
     info!(

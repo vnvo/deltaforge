@@ -31,9 +31,12 @@ pub use postgres_errors::{PostgresSourceError, PostgresSourceResult};
 
 mod postgres_helpers;
 use postgres_helpers::{
-    connect_replication_with_retries, ensure_slot_and_publication,
-    prepare_replication_client,
+    connect_replication_with_retries, ensure_publication_exists,
+    ensure_slot_and_publication, prepare_replication_client,
 };
+
+pub mod postgres_slot_owner;
+use postgres_slot_owner::prepare_snapshot_slot_anchor;
 
 pub mod postgres_object;
 
@@ -342,14 +345,27 @@ impl PostgresSource {
 
         let start_lsn = if last_checkpoint.is_none() {
             loop {
-                match ensure_slot_and_publication(
-                    &self.dsn,
-                    &self.slot,
-                    &self.publication,
-                    &self.tables,
-                )
-                .await
-                {
+                let ensure_result = if needs_snapshot {
+                    // The slot anchor is established by
+                    // prepare_snapshot_slot_anchor (below) at the slot's
+                    // consistent point; here we only verify the publication.
+                    ensure_publication_exists(
+                        &self.dsn,
+                        &self.publication,
+                        &self.tables,
+                    )
+                    .await
+                    .map(|_| Lsn::from(0u64))
+                } else {
+                    ensure_slot_and_publication(
+                        &self.dsn,
+                        &self.slot,
+                        &self.publication,
+                        &self.tables,
+                    )
+                    .await
+                };
+                match ensure_result {
                     Ok(lsn) => break lsn,
                     Err(LoopControl::Reconnect) => {
                         let delay = startup_retry
@@ -446,6 +462,19 @@ impl PostgresSource {
         let start_lsn = if needs_snapshot {
             info!(source_id = %self.id, "starting initial snapshot");
 
+            // Establish the CDC anchor at the replication slot's consistent point
+            // (PG-A-lite): create the slot, or safely re-anchor an owned inactive
+            // slot (full re-snapshot), or fail closed. This replaces the removed
+            // pg_current_wal_lsn anchor and closes the snapshot->CDC seam.
+            let anchor = prepare_snapshot_slot_anchor(
+                &self.dsn,
+                &self.slot,
+                &self.pipeline,
+                &self.id,
+                &chkpt_store,
+            )
+            .await?;
+
             // An explicit re-snapshot re-scans every table: reset table-level
             // progress so completed tables are not skipped (generation is
             // separately bumped via ForceNew below).
@@ -483,12 +512,45 @@ impl PostgresSource {
                 lineage: plan.lineage,
                 identity_map: plan.identity_map,
             };
-            postgres_snapshot::run_snapshot(&snapshot_ctx, &tracked)
+            postgres_snapshot::run_snapshot(&snapshot_ctx, &tracked, anchor)
                 .await
                 .map_err(SourceError::Other)?
         } else {
             start_lsn
         };
+
+        // Flag a completed snapshot taken under the legacy (pre-hardening) anchor,
+        // which could have lost rows committed during snapshot setup. The gauge is
+        // held at 1 with a structured startup warning until a safe-anchor
+        // re-snapshot records the current anchor version, then it reads 0.
+        {
+            let progress: SnapshotProgress = chkpt_store
+                .get_raw(&postgres_snapshot::progress_key(&self.id))
+                .await
+                .ok()
+                .flatten()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+            let unsafe_legacy = progress.finished
+                && progress.anchor_version
+                    < postgres_snapshot::SNAPSHOT_ANCHOR_VERSION;
+            if unsafe_legacy {
+                warn!(
+                    source_id = %self.id,
+                    pipeline = %self.pipeline,
+                    "initial snapshot was taken under the legacy anchor that could \
+                     lose rows committed during snapshot setup; re-snapshot \
+                     (snapshot mode 'always' once, or drop the checkpoint) to \
+                     record the safe anchor and clear deltaforge_snapshot_unsafe_anchor"
+                );
+            }
+            metrics::gauge!(
+                "deltaforge_snapshot_unsafe_anchor",
+                "pipeline" => self.pipeline.clone(),
+                "source" => self.id.clone(),
+            )
+            .set(if unsafe_legacy { 1.0 } else { 0.0 });
+        }
 
         // Adjust start_lsn BEFORE opening the replication stream.
         // If a failover has occurred, START_REPLICATION with A's stale LSN would

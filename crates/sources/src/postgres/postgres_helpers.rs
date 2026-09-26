@@ -362,6 +362,57 @@ pub(super) async fn ensure_slot_and_publication(
     Ok(start_lsn)
 }
 
+/// Verify the publication exists (never auto-created), without touching the
+/// replication slot. Used on the snapshot path, where slot creation/anchoring is
+/// owned by `postgres_slot_owner::prepare_snapshot_slot_anchor` so the CDC anchor
+/// is the slot's consistent point rather than a sampled WAL position.
+pub(super) async fn ensure_publication_exists(
+    dsn: &str,
+    publication: &str,
+    tables: &[String],
+) -> Result<(), super::postgres_errors::LoopControl> {
+    use super::postgres_errors::LoopControl;
+
+    let (client, conn) =
+        tokio_postgres::connect(dsn, NoTls).await.map_err(|e| {
+            error!(error = %e, "control plane connect failed");
+            LoopControl::from_tokio_postgres_error(&e)
+        })?;
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            warn!("control plane connection error: {}", e);
+        }
+    });
+
+    let pub_exists = client
+        .query_opt(
+            "SELECT 1 FROM pg_publication WHERE pubname = $1",
+            &[&publication],
+        )
+        .await
+        .map_err(|e| {
+            error!(error = %e, "failed to check publication");
+            LoopControl::from_tokio_postgres_error(&e)
+        })?
+        .is_some();
+
+    if !pub_exists {
+        let table_list = if tables.is_empty() {
+            "ALL TABLES".to_string()
+        } else {
+            tables.join(", ")
+        };
+        error!(
+            publication = %publication,
+            tables = %table_list,
+            "Publication does not exist. DeltaForge requires a pre-created publication."
+        );
+        return Err(LoopControl::Reconnect);
+    }
+
+    Ok(())
+}
+
 /// Get current WAL LSN.
 async fn get_current_wal_lsn(
     client: &tokio_postgres::Client,
