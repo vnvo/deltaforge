@@ -127,6 +127,18 @@ pub async fn run_preflight(
         ));
     }
 
+    // 1b. GTID mode must be fully ON (mandatory; no file/position downgrade).
+    let gtid_mode: Option<String> = conn
+        .query_first("SELECT @@GLOBAL.gtid_mode")
+        .await
+        .ok()
+        .flatten()
+        .map(|mut r: Row| r.take(0).unwrap_or_default());
+
+    if let Some(err) = gtid_mode_hard_error(gtid_mode.as_deref()) {
+        report.hard_errors.push(err);
+    }
+
     // 2. retention window
 
     // MySQL 8.0+: binlog_expire_logs_seconds (0 = never expire)
@@ -186,6 +198,26 @@ pub async fn run_preflight(
 
             if let Ok(Some(bytes)) = conn.query_first::<u64, _>(query).await {
                 total_bytes += bytes;
+            }
+
+            // Storage-engine check: only InnoDB gives the MVCC consistent read
+            // the snapshot anchor relies on. Fail closed on anything else.
+            let engine_query = format!(
+                "SELECT table_name, engine \
+                 FROM information_schema.tables \
+                 WHERE table_schema = '{db}' AND table_name IN ({placeholders})"
+            );
+            if let Ok(rows) = conn
+                .query::<(String, Option<String>), _>(engine_query)
+                .await
+            {
+                for (tname, engine) in rows {
+                    if let Some(err) =
+                        engine_hard_error(db, &tname, engine.as_deref())
+                    {
+                        report.hard_errors.push(err);
+                    }
+                }
             }
         }
 
@@ -534,6 +566,38 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
+/// Hard error unless GTID mode is fully `ON`. GTID is mandatory for the
+/// snapshot-anchor hardening milestone: the anchor captures `@@GLOBAL.gtid_executed`
+/// under the read lock and CDC resumes by GTID set, so there is no quiet
+/// file/position downgrade. `ON_PERMISSIVE`/`OFF_PERMISSIVE` are migration
+/// states, not a stable GTID stream, and are rejected.
+fn gtid_mode_hard_error(gtid_mode: Option<&str>) -> Option<String> {
+    match gtid_mode {
+        Some("ON") => None,
+        other => Some(format!(
+            "gtid_mode is {:?}, must be ON for consistent snapshot anchoring. \
+             Enable with --gtid-mode=ON --enforce-gtid-consistency=ON.",
+            other.unwrap_or("unknown")
+        )),
+    }
+}
+
+/// Hard error unless the table's storage engine is InnoDB. Only InnoDB provides
+/// the MVCC consistent read the snapshot relies on; non-InnoDB tables are out of
+/// scope for this milestone and must fail closed rather than snapshot inconsistently.
+fn engine_hard_error(db: &str, table: &str, engine: Option<&str>) -> Option<String> {
+    match engine {
+        Some(e) if e.eq_ignore_ascii_case("InnoDB") => None,
+        other => Some(format!(
+            "table {}.{} uses storage engine {:?}, only InnoDB is supported for \
+             consistent snapshots.",
+            db,
+            table,
+            other.unwrap_or("unknown")
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,6 +624,25 @@ mod tests {
         assert_eq!(format_duration(30), "30s");
         assert_eq!(format_duration(90), "1m30s");
         assert_eq!(format_duration(3661), "1h1m");
+    }
+
+    #[test]
+    fn gtid_mode_must_be_fully_on() {
+        assert_eq!(gtid_mode_hard_error(Some("ON")), None);
+        assert!(gtid_mode_hard_error(Some("OFF")).is_some());
+        assert!(gtid_mode_hard_error(Some("OFF_PERMISSIVE")).is_some());
+        // ON_PERMISSIVE is a migration state, not fully ON - reject.
+        assert!(gtid_mode_hard_error(Some("ON_PERMISSIVE")).is_some());
+        assert!(gtid_mode_hard_error(None).is_some());
+    }
+
+    #[test]
+    fn engine_must_be_innodb() {
+        assert_eq!(engine_hard_error("db", "t", Some("InnoDB")), None);
+        // engine name comparison is case-insensitive
+        assert_eq!(engine_hard_error("db", "t", Some("innodb")), None);
+        assert!(engine_hard_error("db", "t", Some("MyISAM")).is_some());
+        assert!(engine_hard_error("db", "t", None).is_some());
     }
 
     #[test]

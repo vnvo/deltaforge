@@ -37,6 +37,15 @@ pub struct SnapshotCfg {
     /// Max parallel chunks per table (only used when intra_table_parallel = true).
     #[serde(default = "default_parallel_chunks")]
     pub max_parallel_chunks: usize,
+
+    /// Bounded timeout (seconds) for acquiring the snapshot consistency anchor -
+    /// for MySQL, the window holding `FLUSH TABLES WITH READ LOCK` while worker
+    /// snapshots open and the binlog position is captured. If the lock/setup
+    /// cannot complete within this budget the snapshot fails closed rather than
+    /// stalling writes on the source. The worker count under the lock is bounded
+    /// by `max_parallel_tables` (reused; not a separate knob).
+    #[serde(default = "default_snapshot_lock_timeout_secs")]
+    pub snapshot_lock_timeout_secs: u64,
 }
 
 impl Default for SnapshotCfg {
@@ -47,6 +56,7 @@ impl Default for SnapshotCfg {
             chunk_size: default_chunk_size(),
             intra_table_parallel: false,
             max_parallel_chunks: default_parallel_chunks(),
+            snapshot_lock_timeout_secs: default_snapshot_lock_timeout_secs(),
         }
     }
 }
@@ -59,4 +69,7 @@ fn default_chunk_size() -> usize {
 }
 fn default_parallel_chunks() -> usize {
     4
+}
+fn default_snapshot_lock_timeout_secs() -> u64 {
+    10
 }
