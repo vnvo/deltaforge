@@ -94,7 +94,10 @@ use deltaforge_core::{SourceError, SourceHandle, SourceItem};
 use metrics::{counter, gauge};
 use parking_lot::RwLock;
 use processors::build_processors;
-use rest_api::{PipeInfo, PipelineAPIError, PipelineController};
+use rest_api::{
+    PipeInfo, PipelineAPIError, PipelineController, ReplayJobStatus,
+    ReplayStartRequest, ReplayStartResponse,
+};
 use serde_json::Value;
 use sources::{ArcSchemaLoader, build_schema_loader, build_source};
 use storage::{
@@ -1743,6 +1746,92 @@ impl PipelineController for PipelineManager {
         }
 
         Ok(result)
+    }
+
+    async fn replay_start(
+        &self,
+        name: &str,
+        req: ReplayStartRequest,
+    ) -> Result<ReplayStartResponse, PipelineAPIError> {
+        let policy =
+            parse_encoder_policy(req.encoder_schema_policy.as_deref())?;
+        // Audit record for a mutating replay request (there is no request-level identity in
+        // the API yet; this is the durable trail for who/what was replayed).
+        tracing::info!(
+            target: "audit",
+            pipeline = %name,
+            from_seq = req.from_seq,
+            through_seq = ?req.through_seq,
+            selected_sinks = ?req.selected_sinks,
+            dry_run = req.dry_run,
+            "replay start requested"
+        );
+        let job_id = self
+            .start_replay(
+                name,
+                req.selected_sinks,
+                req.staged_sinks,
+                req.from_seq,
+                req.through_seq,
+                policy,
+                req.dry_run,
+            )
+            .await?;
+        Ok(ReplayStartResponse { job_id })
+    }
+
+    async fn replay_status(
+        &self,
+        name: &str,
+    ) -> Result<Option<ReplayJobStatus>, PipelineAPIError> {
+        let ctx = self.replay_ctx_of(name)?;
+        let stored =
+            ctx.store().get().await.map_err(PipelineAPIError::Failed)?;
+        Ok(stored.map(|s| replay_job_status(&s.job)))
+    }
+
+    async fn replay_cancel(&self, name: &str) -> Result<(), PipelineAPIError> {
+        tracing::info!(target: "audit", pipeline = %name, "replay cancel requested");
+        self.cancel_replay(name).await
+    }
+}
+
+/// Parse the REST `encoder_schema_policy` string into the domain enum. `None`/"current" is
+/// the default; "at_capture_seq" and "pinned:<seq>" are parsed but rejected later by
+/// [`authorize_replay_start`] until the sink API can honor them.
+fn parse_encoder_policy(
+    s: Option<&str>,
+) -> Result<EncoderSchemaPolicy, PipelineAPIError> {
+    match s {
+        None | Some("current") => Ok(EncoderSchemaPolicy::Current),
+        Some("at_capture_seq") => Ok(EncoderSchemaPolicy::AtCaptureSeq),
+        Some(other) if other.starts_with("pinned:") => {
+            let seq = other["pinned:".len()..].parse::<u64>().map_err(|_| {
+                PipelineAPIError::Failed(anyhow::anyhow!(
+                    "invalid encoder_schema_policy '{other}' (expected 'pinned:<seq>')"
+                ))
+            })?;
+            Ok(EncoderSchemaPolicy::Pinned { seq })
+        }
+        Some(other) => Err(PipelineAPIError::Failed(anyhow::anyhow!(
+            "unknown encoder_schema_policy '{other}'"
+        ))),
+    }
+}
+
+fn replay_job_status(job: &ReplayJob) -> ReplayJobStatus {
+    ReplayJobStatus {
+        job_id: job.job_id.clone(),
+        phase: job.phase.name().to_string(),
+        cursor: job.cursor,
+        from_seq: job.from_seq,
+        through_seq: job.through_seq,
+        selected_sinks: job.selected_sinks.clone(),
+        staged_sinks: job.staged_sinks.clone(),
+        dry_run: job.dry_run,
+        created_at_ms: job.created_at_ms,
+        updated_at_ms: job.updated_at_ms,
+        error: job.error.clone(),
     }
 }
 
