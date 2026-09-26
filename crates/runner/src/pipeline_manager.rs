@@ -444,6 +444,10 @@ pub(crate) struct ReplayContext {
     delivery: Arc<dyn ReplayDelivery>,
     pin: Arc<AtomicU64>,
     batch_limit: usize,
+    /// Serializes the whole start (reserve/commit/rollback) and cancel operations for this
+    /// runtime, so concurrent starts cannot interleave their shared reservation-pin
+    /// read/lower/restore. Shared across cloned contexts (an `Arc` of one per-runtime mutex).
+    lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ReplayContext {
@@ -979,6 +983,7 @@ impl PipelineManager {
                 delivery,
                 pin,
                 batch_limit,
+                lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             });
             tracing::info!(
                 pipeline = %pipeline_name,
@@ -1183,6 +1188,11 @@ impl PipelineManager {
         dry_run: bool,
     ) -> Result<String, PipelineAPIError> {
         let ctx = self.replay_ctx_of(name)?;
+        // Serialize the entire start against concurrent starts/cancels for this runtime, so
+        // the shared reservation pin cannot be read/lowered/restored by two operations at
+        // once. Cloned contexts share one per-runtime mutex.
+        let _lifecycle = ctx.lifecycle_lock.clone();
+        let _guard = _lifecycle.lock().await;
 
         // Authorize the request BEFORE creating the job or pausing anything. These are all
         // client errors (400).
@@ -1350,6 +1360,10 @@ impl PipelineManager {
         name: &str,
     ) -> Result<(), PipelineAPIError> {
         let ctx = self.replay_ctx_of(name)?;
+        // Serialize against concurrent starts/cancels for this runtime (shares the pin and
+        // ownership with them).
+        let _lifecycle = ctx.lifecycle_lock.clone();
+        let _guard = _lifecycle.lock().await;
 
         // Stop the controller first so it cannot race the cancellation.
         if let Some(rt) = self.pipelines.write().get_mut(name) {
@@ -2672,6 +2686,7 @@ mod tests {
             delivery: Arc::new(NoopDelivery),
             pin: pin.clone(),
             batch_limit: 10,
+            lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         let (pause_tx2, _pr) = watch::channel(PauseState::default());
         let runtime = PipelineRuntime {
@@ -2856,6 +2871,51 @@ mod tests {
             ctx.store().get().await.unwrap().unwrap().job.is_active(),
             "job not cancelled when persistence failed"
         );
+    }
+
+    /// Two concurrent starts serialize on the per-runtime lifecycle lock: exactly one wins,
+    /// the other is a conflict, and the winner's reservation pin is NOT cleared by the loser.
+    #[tokio::test]
+    async fn concurrent_starts_preserve_winner_pin() {
+        let fx = replay_fixture(Arc::new(MemoryStorageBackend::new())).await;
+        let start = || {
+            fx.manager.start_replay(
+                &fx.name,
+                vec!["kafka".into()],
+                vec![],
+                0,
+                None,
+                EncoderSchemaPolicy::Current,
+                false,
+            )
+        };
+        let (a, b) = tokio::join!(start(), start());
+        let results = [a, b];
+        let oks = results.iter().filter(|r| r.is_ok()).count();
+        let conflicts = results
+            .iter()
+            .filter(|r| matches!(r, Err(PipelineAPIError::Conflict(_))))
+            .count();
+        assert_eq!(oks, 1, "exactly one concurrent start wins");
+        assert_eq!(conflicts, 1, "the other start is a conflict");
+        assert_eq!(
+            fx.pin.load(Ordering::SeqCst),
+            1,
+            "the winning job's reservation pin is retained"
+        );
+        // Tear down the winner's spawned controller (blocked at handoff quiesce).
+        if let Some((c, t)) = fx
+            .manager
+            .pipelines
+            .write()
+            .get_mut(&fx.name)
+            .unwrap()
+            .replay_controller
+            .take()
+        {
+            c.cancel();
+            t.abort();
+        }
     }
 
     /// The eligible path installs ownership and attaches the controller.
