@@ -1206,8 +1206,32 @@ impl PipelineManager {
         )
         // Construction invariants (range, targets, sink hygiene) are client errors (400).
         .map_err(|e| PipelineAPIError::BadRequest(e.to_string()))?;
-        // An already-active job is a conflict (409); everything else is a 500.
-        ctx.store().create(&job).await.map_err(|e| {
+
+        // Reserve (durably create) the job, then commit it (install ownership + spawn the
+        // controller) only if the pipeline is still the same live generation. This
+        // reserve/commit split means a start invalidated by a concurrent stop/delete never
+        // installs a gate/pin and never spawns a controller - it just rolls the reserved job
+        // back to Cancelled.
+        self.reserve_replay_job(&ctx, &job).await?;
+        if self.commit_replay_job(&ctx, &job) {
+            Ok(job_id)
+        } else {
+            self.rollback_replay_job(&ctx).await;
+            Err(PipelineAPIError::Conflict(format!(
+                "pipeline '{name}' changed during replay start; job cancelled"
+            )))
+        }
+    }
+
+    /// Reserve a replay job by durably creating it. No gate/pin/controller are installed
+    /// here - those happen only on [`Self::commit_replay_job`]. `AlreadyActive` maps to a
+    /// 409 conflict; other store errors to 500.
+    async fn reserve_replay_job(
+        &self,
+        ctx: &ReplayContext,
+        job: &ReplayJob,
+    ) -> Result<(), PipelineAPIError> {
+        ctx.store().create(job).await.map(|_| ()).map_err(|e| {
             if e.downcast_ref::<crate::replay_job::ReplayJobError>()
                 .is_some_and(|e| {
                     matches!(
@@ -1220,22 +1244,39 @@ impl PipelineManager {
             } else {
                 PipelineAPIError::Failed(e)
             }
-        })?;
+        })
+    }
 
-        // Install ownership SYNCHRONOUSLY, immediately after the durable create and before
-        // spawning the controller: set the retention pin and (for a non-dry-run job) the
-        // sink exclusions with no await in between, so neither the retention task nor live
-        // delivery can run against the new active job before its gate/pin exist.
+    /// Commit a reserved job under the pipelines write lock: if the pipeline is still the
+    /// same live generation (incarnation) and in an eligible state, install the retention pin
+    /// and sink exclusions, spawn the controller, and attach it (aborting any stale one).
+    /// Returns whether it committed. ALL side effects (pin, gate, spawn, attach) happen only
+    /// on the committed path, so an invalidated start leaves nothing installed or leaked.
+    fn commit_replay_job(&self, ctx: &ReplayContext, job: &ReplayJob) -> bool {
+        let mut guard = self.pipelines.write();
+        let Some(rt) = guard.get_mut(&ctx.pipeline) else {
+            return false;
+        };
+        let eligible = rt
+            .replay_ctx
+            .as_ref()
+            .is_some_and(|c| c.incarnation == ctx.incarnation)
+            && matches!(
+                rt.status,
+                PipelineStatus::Running | PipelineStatus::Paused
+            );
+        if !eligible {
+            return false;
+        }
         if let Some(pin) = job.pin_seq() {
             ctx.pin.store(pin, Ordering::SeqCst);
         }
         if job.holds_pause() {
             ctx.gate.exclude(job.selected_sinks.iter().cloned());
         }
-
         let job_cancel = CancellationToken::new();
         let controller = ctx.build_controller(job_cancel.clone());
-        let pname = name.to_string();
+        let pname = ctx.pipeline.clone();
         let task = tokio::spawn(async move {
             if let Err(e) = controller.run().await {
                 tracing::warn!(
@@ -1245,45 +1286,16 @@ impl PipelineManager {
                 );
             }
         });
-
-        // Attach the controller ONLY if the pipeline is still the same live runtime
-        // (generation = incarnation) and eligible. A concurrent stop/delete/reconfigure
-        // between the durable create above and here would otherwise leave an unowned
-        // controller delivering through stale sinks. The attach happens under the write
-        // lock; on the eligible path the handle is moved in and we return. Otherwise we fall
-        // through (below) to tear the controller down and undo the ownership we installed.
-        {
-            let mut guard = self.pipelines.write();
-            if let Some(rt) = guard.get_mut(name) {
-                let eligible = rt
-                    .replay_ctx
-                    .as_ref()
-                    .is_some_and(|c| c.incarnation == ctx.incarnation)
-                    && matches!(
-                        rt.status,
-                        PipelineStatus::Running | PipelineStatus::Paused
-                    );
-                if eligible {
-                    if let Some((c, t)) =
-                        rt.replay_controller.replace((job_cancel, task))
-                    {
-                        c.cancel();
-                        t.abort();
-                    }
-                    return Ok(job_id);
-                }
-            }
-            // Not eligible (removed, reconfigured to a new incarnation, or stopped): fall
-            // through with job_cancel/task still owned. Guard drops at the end of this block.
+        if let Some((c, t)) = rt.replay_controller.replace((job_cancel, task)) {
+            c.cancel();
+            t.abort();
         }
+        true
+    }
 
-        // Invalidated by a concurrent stop/delete/reconfigure: tear down and undo.
-        job_cancel.cancel();
-        task.abort();
-        ctx.gate.include(job.selected_sinks.iter());
-        ctx.pin.store(u64::MAX, Ordering::SeqCst);
-        ctx.pause.send_modify(|s| s.replay = false);
-        // Best-effort durable cancel so the orphaned job does not linger active.
+    /// Roll back a reserved-but-not-committed job: durably cancel it (best effort). No
+    /// gate/pin were installed (commit did not run), so there is nothing to release.
+    async fn rollback_replay_job(&self, ctx: &ReplayContext) {
         if let Ok(Some(stored)) = ctx.store().get().await {
             if stored.job.is_active() {
                 if let Ok(cancelled) =
@@ -1296,14 +1308,11 @@ impl PipelineManager {
                 }
             }
         }
-        Err(PipelineAPIError::Conflict(format!(
-            "pipeline '{name}' changed during replay start; job cancelled"
-        )))
     }
 
-    /// Cancel the active replay job for a pipeline: stop the controller, mark the job
-    /// cancelled, and return the paused/staged sinks to the live set. Idempotent when no
-    /// active job exists.
+    /// Cancel the active replay job for a pipeline: stop the controller, persist the
+    /// cancellation, and only then return the paused/staged sinks to the live set. Idempotent
+    /// when no active job exists.
     pub async fn cancel_replay(
         &self,
         name: &str,
@@ -1318,35 +1327,48 @@ impl PipelineManager {
             }
         }
 
-        // Persist the cancellation FIRST, and only release ownership (gate, pin, quiesce)
-        // once it is durable. Otherwise a failed CAS could leave an active durable job while
-        // live delivery is restored. A concurrent writer (a racing controller step) can bump
-        // the version, so retry a few times on conflict; a job already terminal is done.
-        let store = ctx.store();
-        let mut targets: Option<Vec<String>> = None;
+        // Persist the cancellation BEFORE releasing ownership. If it cannot be persisted
+        // (persistent CAS conflict), return an error and leave the gate/pin/pause installed
+        // so durable and runtime state never disagree.
+        let targets =
+            match self.persist_replay_cancellation(&ctx.store()).await? {
+                Some(t) => t,
+                None => return Ok(()), // no job to cancel
+            };
+
+        // Cancellation is durable: now restore live delivery.
+        ctx.gate.include(targets.iter());
+        ctx.pin.store(u64::MAX, Ordering::SeqCst);
+        ctx.pause.send_modify(|s| s.replay = false);
+        Ok(())
+    }
+
+    /// Persist the active job's cancellation, retrying on version conflict, and return the
+    /// job's target sinks to release (or `None` when no job exists). A job already at
+    /// `LiveRestored` is finalized to `Completed` (cancel is illegal there). A persistent
+    /// conflict returns `Err` - the caller must NOT release ownership.
+    async fn persist_replay_cancellation(
+        &self,
+        store: &ReplayJobStore,
+    ) -> Result<Option<Vec<String>>, PipelineAPIError> {
         for _ in 0..5 {
             let stored =
                 match store.get().await.map_err(PipelineAPIError::Failed)? {
                     Some(s) => s,
-                    None => return Ok(()),
+                    None => return Ok(None),
                 };
+            let targets: Vec<String> = stored
+                .job
+                .selected_sinks
+                .iter()
+                .chain(stored.job.staged_sinks.iter())
+                .cloned()
+                .collect();
             if !stored.job.is_active() {
-                // Already terminal (completed/cancelled/failed): nothing to cancel, but make
-                // sure ownership is released below in case a crash left it installed.
-                targets = Some(
-                    stored
-                        .job
-                        .selected_sinks
-                        .iter()
-                        .chain(stored.job.staged_sinks.iter())
-                        .cloned()
-                        .collect(),
-                );
-                break;
+                // Already terminal: nothing to persist, but release ownership below in case a
+                // crash left it installed.
+                return Ok(Some(targets));
             }
-            // A job already at LiveRestored cannot be Cancelled (that transition is illegal,
-            // and the pause has effectively been released): finalize it to Completed instead,
-            // so aborting the controller mid-handoff never strands the replay pause.
             let target =
                 if matches!(stored.job.phase, ReplayPhase::LiveRestored) {
                     ReplayPhase::Completed
@@ -1358,20 +1380,8 @@ impl PipelineManager {
                 .advance(target, now_ms())
                 .map_err(|e| PipelineAPIError::Failed(anyhow::anyhow!(e)))?;
             match store.compare_and_set(stored.version, &next).await {
-                Ok(_) => {
-                    targets = Some(
-                        stored
-                            .job
-                            .selected_sinks
-                            .iter()
-                            .chain(stored.job.staged_sinks.iter())
-                            .cloned()
-                            .collect(),
-                    );
-                    break;
-                }
+                Ok(_) => return Ok(Some(targets)),
                 Err(e) => {
-                    // Retry only on a version conflict (someone advanced it concurrently).
                     if e.downcast_ref::<crate::replay_job::ReplayJobError>()
                         .is_some_and(|e| {
                             matches!(
@@ -1386,17 +1396,9 @@ impl PipelineManager {
                 }
             }
         }
-        let Some(targets) = targets else {
-            return Err(PipelineAPIError::Failed(anyhow::anyhow!(
-                "could not persist replay cancellation after repeated version conflicts"
-            )));
-        };
-
-        // Cancellation is durable: now restore live delivery.
-        ctx.gate.include(targets.iter());
-        ctx.pin.store(u64::MAX, Ordering::SeqCst);
-        ctx.pause.send_modify(|s| s.replay = false);
-        Ok(())
+        Err(PipelineAPIError::Failed(anyhow::anyhow!(
+            "could not persist replay cancellation after repeated version conflicts"
+        )))
     }
 }
 
@@ -2376,6 +2378,464 @@ mod tests {
             serde_json::json!({"spec": {"batch": {"max_events": 2000}}});
         let merged = merge_spec(base, patch).unwrap();
         assert_eq!(merged.spec.batch.as_ref().unwrap().max_events, Some(2000));
+    }
+
+    // ── Replay lifecycle: reservation/commit + cancellation-CAS ─────────
+
+    use crate::replay_journal::BackendJournalLog;
+    use std::sync::atomic::AtomicUsize;
+    use storage::{
+        ArcStorageBackend, LogAppendOutcome, LogEntryMeta, LogStreamMeta,
+        LogTruncateOutcome, LogTruncateRequest, MemoryStorageBackend,
+        StorageBackend,
+    };
+
+    /// A StorageBackend that fails the next `fail_cas` `slot_cas` calls (returning a version
+    /// conflict) and delegates everything else, to exercise persistent/transient CAS conflicts.
+    #[derive(Debug)]
+    struct FaultBackend {
+        inner: ArcStorageBackend,
+        fail_cas: AtomicUsize,
+    }
+    impl FaultBackend {
+        fn new(inner: ArcStorageBackend, fail_cas: usize) -> Self {
+            Self {
+                inner,
+                fail_cas: AtomicUsize::new(fail_cas),
+            }
+        }
+    }
+    #[async_trait]
+    impl StorageBackend for FaultBackend {
+        async fn kv_get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.kv_get(ns, key).await
+        }
+        async fn kv_put(
+            &self,
+            ns: &str,
+            key: &str,
+            value: &[u8],
+        ) -> Result<()> {
+            self.inner.kv_put(ns, key, value).await
+        }
+        async fn kv_put_with_ttl(
+            &self,
+            ns: &str,
+            key: &str,
+            value: &[u8],
+            ttl_secs: u64,
+        ) -> Result<()> {
+            self.inner.kv_put_with_ttl(ns, key, value, ttl_secs).await
+        }
+        async fn kv_delete(&self, ns: &str, key: &str) -> Result<bool> {
+            self.inner.kv_delete(ns, key).await
+        }
+        async fn kv_list(
+            &self,
+            ns: &str,
+            prefix: Option<&str>,
+        ) -> Result<Vec<String>> {
+            self.inner.kv_list(ns, prefix).await
+        }
+        async fn log_append(
+            &self,
+            ns: &str,
+            key: &str,
+            value: &[u8],
+        ) -> Result<u64> {
+            self.inner.log_append(ns, key, value).await
+        }
+        async fn log_list(
+            &self,
+            ns: &str,
+            key: &str,
+        ) -> Result<Vec<(u64, Vec<u8>)>> {
+            self.inner.log_list(ns, key).await
+        }
+        async fn log_since(
+            &self,
+            ns: &str,
+            key: &str,
+            since_seq: u64,
+        ) -> Result<Vec<(u64, Vec<u8>)>> {
+            self.inner.log_since(ns, key, since_seq).await
+        }
+        async fn log_latest(
+            &self,
+            ns: &str,
+            key: &str,
+        ) -> Result<Option<(u64, Vec<u8>)>> {
+            self.inner.log_latest(ns, key).await
+        }
+        async fn log_append_if_absent(
+            &self,
+            ns: &str,
+            key: &str,
+            capture_id: &str,
+            value: &[u8],
+        ) -> Result<LogAppendOutcome> {
+            self.inner
+                .log_append_if_absent(ns, key, capture_id, value)
+                .await
+        }
+        async fn log_truncate(
+            &self,
+            ns: &str,
+            key: &str,
+            req: LogTruncateRequest,
+        ) -> Result<LogTruncateOutcome> {
+            self.inner.log_truncate(ns, key, req).await
+        }
+        async fn log_stream_meta(
+            &self,
+            ns: &str,
+            key: &str,
+        ) -> Result<LogStreamMeta> {
+            self.inner.log_stream_meta(ns, key).await
+        }
+        async fn log_read_meta_since(
+            &self,
+            ns: &str,
+            key: &str,
+            since_seq: u64,
+            limit: usize,
+        ) -> Result<Vec<LogEntryMeta>> {
+            self.inner
+                .log_read_meta_since(ns, key, since_seq, limit)
+                .await
+        }
+        async fn slot_upsert(
+            &self,
+            ns: &str,
+            key: &str,
+            state: &[u8],
+        ) -> Result<u64> {
+            self.inner.slot_upsert(ns, key, state).await
+        }
+        async fn slot_get(
+            &self,
+            ns: &str,
+            key: &str,
+        ) -> Result<Option<(u64, Vec<u8>)>> {
+            self.inner.slot_get(ns, key).await
+        }
+        async fn slot_cas(
+            &self,
+            ns: &str,
+            key: &str,
+            expected_version: u64,
+            state: &[u8],
+        ) -> Result<bool> {
+            if self.fail_cas.load(Ordering::SeqCst) > 0 {
+                self.fail_cas.fetch_sub(1, Ordering::SeqCst);
+                return Ok(false); // simulate a version conflict
+            }
+            self.inner.slot_cas(ns, key, expected_version, state).await
+        }
+        async fn slot_create(
+            &self,
+            ns: &str,
+            key: &str,
+            state: &[u8],
+        ) -> Result<Option<u64>> {
+            self.inner.slot_create(ns, key, state).await
+        }
+        async fn slot_delete(&self, ns: &str, key: &str) -> Result<bool> {
+            self.inner.slot_delete(ns, key).await
+        }
+        async fn queue_push(
+            &self,
+            ns: &str,
+            key: &str,
+            value: &[u8],
+        ) -> Result<u64> {
+            self.inner.queue_push(ns, key, value).await
+        }
+        async fn queue_peek(
+            &self,
+            ns: &str,
+            key: &str,
+            limit: usize,
+        ) -> Result<Vec<(u64, Vec<u8>)>> {
+            self.inner.queue_peek(ns, key, limit).await
+        }
+        async fn queue_ack(
+            &self,
+            ns: &str,
+            key: &str,
+            up_to_id: u64,
+        ) -> Result<usize> {
+            self.inner.queue_ack(ns, key, up_to_id).await
+        }
+        async fn queue_len(&self, ns: &str, key: &str) -> Result<u64> {
+            self.inner.queue_len(ns, key).await
+        }
+        async fn queue_drop_oldest(
+            &self,
+            ns: &str,
+            key: &str,
+            count: usize,
+        ) -> Result<usize> {
+            self.inner.queue_drop_oldest(ns, key, count).await
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoopDelivery;
+    #[async_trait]
+    impl ReplayDelivery for NoopDelivery {
+        async fn deliver(
+            &self,
+            _j: &ReplayJob,
+            _e: &deltaforge_core::replay::StoredReplayEnvelope,
+            _s: crate::replay_worker::ResolvedEncoderSchema,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A PipelineManager over `backend` with one replay-enabled runtime inserted directly
+    /// (no real source), exposing the same gate/pin/pause the production code installs so
+    /// tests can drive the real reserve/commit/cancel primitives and assert ownership.
+    struct ReplayFixture {
+        manager: PipelineManager,
+        gate: Arc<ReplaySinkGate>,
+        pin: Arc<AtomicU64>,
+        pause_tx: watch::Sender<PauseState>,
+        _quiesced_tx: watch::Sender<bool>,
+        name: String,
+        incarnation: String,
+    }
+
+    async fn replay_fixture(backend: ArcStorageBackend) -> ReplayFixture {
+        let manager = PipelineManager::with_backend(backend.clone())
+            .await
+            .unwrap();
+        let name = "p".to_string();
+        let incarnation = "inc-1".to_string();
+        let gate = Arc::new(ReplaySinkGate::new());
+        let pin = Arc::new(AtomicU64::new(u64::MAX));
+        let (pause_tx, _pause_rx) = watch::channel(PauseState::default());
+        // Keep the quiesced sender alive so a spawned controller blocks at handoff quiesce
+        // rather than failing closed.
+        let (quiesced_tx, quiesced_rx) = watch::channel(false);
+        let identity = deltaforge_core::replay::PipelineIdentity {
+            pipeline: name.clone(),
+            incarnation: incarnation.clone(),
+            source_lineage: None,
+        };
+        let journal: Arc<dyn crate::replay_journal::JournalLog> =
+            Arc::new(BackendJournalLog::new(backend.clone(), identity));
+        let ctx = ReplayContext {
+            backend: backend.clone(),
+            journal,
+            pipeline: name.clone(),
+            incarnation: incarnation.clone(),
+            gate: gate.clone(),
+            pause: pause_tx.clone(),
+            quiesced: quiesced_rx,
+            sink_ids: Arc::new(vec!["kafka".to_string()]),
+            commit_policy: None,
+            delivery: Arc::new(NoopDelivery),
+            pin: pin.clone(),
+            batch_limit: 10,
+        };
+        let (pause_tx2, _pr) = watch::channel(PauseState::default());
+        let runtime = PipelineRuntime {
+            spec: sample_spec(&name),
+            status: PipelineStatus::Running,
+            alive: Arc::new(AtomicBool::new(true)),
+            cancel: CancellationToken::new(),
+            pause: pause_tx2,
+            sources: vec![],
+            join: None,
+            schema_loader: None,
+            table_patterns: vec![],
+            sensor_state: None,
+            dlq_writer: None,
+            retention_task: None,
+            replay_ctx: Some(ctx),
+            replay_controller: None,
+            started_at: std::time::Instant::now(),
+        };
+        manager.pipelines.write().insert(name.clone(), runtime);
+        ReplayFixture {
+            manager,
+            gate,
+            pin,
+            pause_tx,
+            _quiesced_tx: quiesced_tx,
+            name,
+            incarnation,
+        }
+    }
+
+    fn a_job(fx: &ReplayFixture) -> ReplayJob {
+        ReplayJob::new(
+            "j",
+            &fx.name,
+            &fx.incarnation,
+            vec!["kafka".into()],
+            vec![],
+            0,
+            None,
+            EncoderSchemaPolicy::Current,
+            false,
+            now_ms(),
+        )
+        .unwrap()
+    }
+
+    /// A start invalidated by a concurrent delete (runtime gone before commit) installs no
+    /// gate/pin and durably cancels the reserved job.
+    #[tokio::test]
+    async fn start_loses_to_delete_rolls_back() {
+        let fx = replay_fixture(Arc::new(MemoryStorageBackend::new())).await;
+        let ctx = fx.manager.replay_ctx_of(&fx.name).unwrap();
+        let job = a_job(&fx);
+        fx.manager.reserve_replay_job(&ctx, &job).await.unwrap();
+
+        // Delete wins after create, before attachment.
+        fx.manager.pipelines.write().remove(&fx.name);
+
+        assert!(
+            !fx.manager.commit_replay_job(&ctx, &job),
+            "commit must fail"
+        );
+        fx.manager.rollback_replay_job(&ctx).await;
+
+        let stored = ctx.store().get().await.unwrap().unwrap();
+        assert_eq!(stored.job.phase, ReplayPhase::Cancelled);
+        assert!(!fx.gate.any_excluded(), "loser installs no gate");
+        assert_eq!(
+            fx.pin.load(Ordering::SeqCst),
+            u64::MAX,
+            "loser installs no pin"
+        );
+    }
+
+    /// A start invalidated by a delete+recreate (incarnation changed) rolls back.
+    #[tokio::test]
+    async fn start_loses_to_incarnation_change_rolls_back() {
+        let fx = replay_fixture(Arc::new(MemoryStorageBackend::new())).await;
+        let ctx = fx.manager.replay_ctx_of(&fx.name).unwrap();
+        let job = a_job(&fx);
+        fx.manager.reserve_replay_job(&ctx, &job).await.unwrap();
+
+        // Recreate wins: the runtime now carries a new incarnation.
+        fx.manager
+            .pipelines
+            .write()
+            .get_mut(&fx.name)
+            .unwrap()
+            .replay_ctx
+            .as_mut()
+            .unwrap()
+            .incarnation = "inc-2".into();
+
+        assert!(!fx.manager.commit_replay_job(&ctx, &job));
+        fx.manager.rollback_replay_job(&ctx).await;
+        let stored = ctx.store().get().await.unwrap().unwrap();
+        assert_eq!(stored.job.phase, ReplayPhase::Cancelled);
+        assert!(!fx.gate.any_excluded());
+    }
+
+    /// A start invalidated by a stop (runtime not Running/Paused) rolls back.
+    #[tokio::test]
+    async fn start_loses_to_stop_rolls_back() {
+        let fx = replay_fixture(Arc::new(MemoryStorageBackend::new())).await;
+        let ctx = fx.manager.replay_ctx_of(&fx.name).unwrap();
+        let job = a_job(&fx);
+        fx.manager.reserve_replay_job(&ctx, &job).await.unwrap();
+
+        fx.manager
+            .pipelines
+            .write()
+            .get_mut(&fx.name)
+            .unwrap()
+            .status = PipelineStatus::Stopped;
+
+        assert!(!fx.manager.commit_replay_job(&ctx, &job));
+        fx.manager.rollback_replay_job(&ctx).await;
+        let stored = ctx.store().get().await.unwrap().unwrap();
+        assert_eq!(stored.job.phase, ReplayPhase::Cancelled);
+        assert!(!fx.gate.any_excluded());
+        assert_eq!(fx.pin.load(Ordering::SeqCst), u64::MAX);
+    }
+
+    /// The eligible path installs ownership and attaches the controller.
+    #[tokio::test]
+    async fn start_commits_when_eligible() {
+        let fx = replay_fixture(Arc::new(MemoryStorageBackend::new())).await;
+        let ctx = fx.manager.replay_ctx_of(&fx.name).unwrap();
+        let job = a_job(&fx);
+        fx.manager.reserve_replay_job(&ctx, &job).await.unwrap();
+
+        assert!(fx.manager.commit_replay_job(&ctx, &job));
+        assert!(fx.gate.is_excluded("kafka"), "gate installed on commit");
+        assert_eq!(fx.pin.load(Ordering::SeqCst), 1, "pin installed on commit");
+        {
+            let mut guard = fx.manager.pipelines.write();
+            let rt = guard.get_mut(&fx.name).unwrap();
+            assert!(rt.replay_controller.is_some(), "controller attached");
+            // Tear the spawned controller down (it is blocked at handoff quiesce).
+            if let Some((c, t)) = rt.replay_controller.take() {
+                c.cancel();
+                t.abort();
+            }
+        }
+    }
+
+    /// Set up an active job with ownership installed, to drive cancellation tests.
+    async fn active_job_with_ownership(fx: &ReplayFixture) {
+        let ctx = fx.manager.replay_ctx_of(&fx.name).unwrap();
+        ctx.store().create(&a_job(fx)).await.unwrap();
+        fx.gate.exclude(["kafka".to_string()]);
+        fx.pin.store(5, Ordering::SeqCst);
+        fx.pause_tx.send_modify(|s| s.replay = true);
+    }
+
+    /// A persistent CAS conflict makes cancel return an error and leaves gate, pin, and the
+    /// replay pause installed (durable and runtime state stay in agreement).
+    #[tokio::test]
+    async fn cancel_fails_closed_on_persistent_cas_conflict() {
+        let backend: ArcStorageBackend = Arc::new(FaultBackend::new(
+            Arc::new(MemoryStorageBackend::new()),
+            100, // fail every cas
+        ));
+        let fx = replay_fixture(backend).await;
+        active_job_with_ownership(&fx).await;
+
+        let err = fx.manager.cancel_replay(&fx.name).await.unwrap_err();
+        assert!(err.to_string().contains("could not persist"));
+        // Ownership NOT released.
+        assert!(fx.gate.is_excluded("kafka"));
+        assert_eq!(fx.pin.load(Ordering::SeqCst), 5);
+        assert!(fx.pause_tx.borrow().replay);
+    }
+
+    /// A transient CAS conflict (one failure then success) still cancels durably and releases
+    /// ownership.
+    #[tokio::test]
+    async fn cancel_recovers_from_transient_cas_conflict() {
+        let backend: ArcStorageBackend = Arc::new(FaultBackend::new(
+            Arc::new(MemoryStorageBackend::new()),
+            1, // fail the first cas, then succeed
+        ));
+        let fx = replay_fixture(backend).await;
+        active_job_with_ownership(&fx).await;
+
+        fx.manager.cancel_replay(&fx.name).await.unwrap();
+
+        let ctx = fx.manager.replay_ctx_of(&fx.name).unwrap();
+        let stored = ctx.store().get().await.unwrap().unwrap();
+        assert_eq!(stored.job.phase, ReplayPhase::Cancelled);
+        assert!(
+            !fx.gate.any_excluded(),
+            "ownership released after durable cancel"
+        );
+        assert_eq!(fx.pin.load(Ordering::SeqCst), u64::MAX);
+        assert!(!fx.pause_tx.borrow().replay);
     }
 
     #[test]
