@@ -1,0 +1,78 @@
+# Replay canary pipeline.
+#
+# Two REQUIRED redis-stream sinks on the same redis so both are trivially
+# observable with XLEN / XRANGE:
+#   - sink "replay_target" (stream df.canary.replay) -> SELECTED for replay
+#   - sink "live_only"      (stream df.canary.live)   -> stays in the live set
+#
+# Both required + commit_policy.mode=required means excluding replay_target at
+# start still leaves one required sink, so the commit quorum stays satisfiable
+# (the start-authorization check passes). That lets us watch live_only keep
+# advancing while replay_target is paused.
+#
+# Pre-create the pg slot/publication before starting (see dev.postgres.yaml header):
+#   CREATE PUBLICATION deltaforge_pub FOR TABLE public.orders;
+#   SELECT pg_create_logical_replication_slot('deltaforge_slot', 'pgoutput');
+
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: replay-canary
+  tenant: canary
+
+spec:
+  source:
+    type: postgres
+    config:
+      id: canary-pg
+      dsn: "${POSTGRES_DSN}"
+      slot: deltaforge_slot
+      publication: deltaforge_pub
+      tables:
+        - public.orders
+
+  processors: []
+
+  sinks:
+    - type: redis
+      config:
+        id: replay_target
+        uri: ${REDIS_URI}
+        stream: df.canary.replay
+        envelope:
+          type: native
+        encoding: json
+        required: true
+
+    - type: redis
+      config:
+        id: live_only
+        uri: ${REDIS_URI}
+        stream: df.canary.live
+        envelope:
+          type: native
+        encoding: json
+        required: true
+
+  batch:
+    max_events: 100
+    max_bytes: 8388608
+    max_ms: 200
+    respect_source_tx: true   # replay capture REQUIRES transaction-aligned batching
+    max_inflight: 1
+
+  commit_policy:
+    mode: required
+
+  journal:
+    enabled: true             # master switch (also gates the DLQ)
+    max_event_bytes: 262144
+    replay:
+      enabled: true
+      retention_secs: 86400
+      max_entries: 0
+      max_bytes: 0
+      max_envelope_bytes: 8388608
+
+  schema_sensing:
+    enabled: true
