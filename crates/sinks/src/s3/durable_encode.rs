@@ -106,53 +106,11 @@ pub fn encode_jsonl(events: &[Event]) -> Result<Bytes> {
     Ok(Bytes::from(buf))
 }
 
-/// Canonical bytes for a single JSON value (compact, keys sorted at every level).
-/// Used by the independent equivalence validator to compare records regardless of
-/// key order.
-pub(crate) fn canonical_json_bytes(v: &serde_json::Value) -> Vec<u8> {
-    let mut buf = Vec::new();
-    write_canonical_json(&mut buf, v);
-    buf
-}
-
-/// Write `v` as compact JSON with object keys sorted lexicographically at every
-/// level (arrays keep their order). Matches `serde_json`'s compact spacing, so
-/// the only difference from `to_writer` is the guaranteed key order.
-fn write_canonical_json(buf: &mut Vec<u8>, v: &serde_json::Value) {
-    use serde_json::Value;
-    match v {
-        Value::Object(map) => {
-            buf.push(b'{');
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort_unstable();
-            for (i, k) in keys.iter().enumerate() {
-                if i > 0 {
-                    buf.push(b',');
-                }
-                // Encode the key string with correct quoting/escaping.
-                serde_json::to_writer(&mut *buf, k)
-                    .expect("string key serializes");
-                buf.push(b':');
-                write_canonical_json(buf, &map[*k]);
-            }
-            buf.push(b'}');
-        }
-        Value::Array(arr) => {
-            buf.push(b'[');
-            for (i, item) in arr.iter().enumerate() {
-                if i > 0 {
-                    buf.push(b',');
-                }
-                write_canonical_json(buf, item);
-            }
-            buf.push(b']');
-        }
-        // Scalars (null/bool/number/string) have a single canonical compact form.
-        other => {
-            serde_json::to_writer(&mut *buf, other).expect("scalar serializes")
-        }
-    }
-}
+// Canonical JSON now lives in `deltaforge-core` so the replay envelope and this
+// durable encoder share one implementation without a cross-crate dependency inversion.
+pub(crate) use deltaforge_core::canonical_json::{
+    canonical_json_bytes, write_canonical_json,
+};
 
 #[cfg(test)]
 mod tests {
