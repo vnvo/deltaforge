@@ -506,12 +506,18 @@ impl TxTracker {
 /// task has stopped (e.g. due to a sink error).
 async fn send_to_delivery(
     tx: &tokio::sync::mpsc::Sender<DeliveryItem>,
+    inflight: &std::sync::atomic::AtomicUsize,
     batch: BuildingBatch,
     reason: &'static str,
 ) -> Result<()> {
-    tx.send(DeliveryItem { batch, reason })
-        .await
-        .map_err(|_| anyhow::anyhow!("delivery task stopped unexpectedly"))
+    // Count the item as in-flight before it enters the channel; the delivery task
+    // decrements once it has processed it. The quiesce barrier waits for this to reach 0.
+    inflight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if tx.send(DeliveryItem { batch, reason }).await.is_err() {
+        inflight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        return Err(anyhow::anyhow!("delivery task stopped unexpectedly"));
+    }
+    Ok(())
 }
 
 fn policy_satisfied(
@@ -825,6 +831,22 @@ pub struct OversizedReplayEnvelopeError {
     pub events: usize,
 }
 
+/// Ingestion pause reasons, tracked independently so a replay handoff quiesce and an
+/// operator pause never override each other. Ingestion runs only when neither is set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PauseState {
+    /// Set by the operator (pause/resume API).
+    pub operator: bool,
+    /// Set by a replay handoff while it quiesces ingestion.
+    pub replay: bool,
+}
+
+impl PauseState {
+    pub fn paused(&self) -> bool {
+        self.operator || self.replay
+    }
+}
+
 pub struct Coordinator<Tok> {
     pipeline_name: Arc<str>,
     sinks: Vec<ArcDynSink>,
@@ -848,6 +870,15 @@ pub struct Coordinator<Tok> {
     dlq_writer: Option<Arc<crate::dlq::DlqWriter>>,
     /// Optional replay capture (enabled by `journal.replay`).
     replay_capture: Option<ReplayCapture>,
+    /// Optional per-sink replay gate. When a replay job pauses a live sink (or holds a
+    /// staged sink out of the live set), that sink is excluded from live delivery and from
+    /// commit-policy evaluation for the job's duration.
+    replay_gate: Option<Arc<crate::replay_gate::ReplaySinkGate>>,
+    /// Optional replay-quiesce acknowledgement. The coordinator sets it `true` once it has
+    /// reached a commit-unit boundary, drained in-flight delivery, and made capture durable
+    /// in response to a replay pause, and `false` when it resumes. The handoff waits on it
+    /// so `H` is read against a genuinely frozen tail.
+    quiesce_ack: Option<watch::Sender<bool>>,
 }
 
 pub struct CoordinatorBuilder<Tok> {
@@ -862,6 +893,8 @@ pub struct CoordinatorBuilder<Tok> {
     schema_provider: Option<ArcSchemaProvider>,
     dlq_writer: Option<Arc<crate::dlq::DlqWriter>>,
     replay_capture: Option<ReplayCapture>,
+    replay_gate: Option<Arc<crate::replay_gate::ReplaySinkGate>>,
+    quiesce_ack: Option<watch::Sender<bool>>,
 }
 
 impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
@@ -878,6 +911,8 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             schema_provider: None,
             dlq_writer: None,
             replay_capture: None,
+            replay_gate: None,
+            quiesce_ack: None,
         }
     }
 
@@ -942,6 +977,19 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
         self
     }
 
+    pub fn replay_gate(
+        mut self,
+        gate: Arc<crate::replay_gate::ReplaySinkGate>,
+    ) -> Self {
+        self.replay_gate = Some(gate);
+        self
+    }
+
+    pub fn quiesce_ack(mut self, ack: watch::Sender<bool>) -> Self {
+        self.quiesce_ack = Some(ack);
+        self
+    }
+
     pub fn build(self) -> Coordinator<Tok> {
         let batch_cfg_eff = Coordinator::<Tok>::effective(&self.batch_config);
         assert!(
@@ -962,6 +1010,8 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             db_schema_cache: Mutex::new(HashMap::new()),
             dlq_writer: self.dlq_writer,
             replay_capture: self.replay_capture,
+            replay_gate: self.replay_gate,
+            quiesce_ack: self.quiesce_ack,
         }
     }
 }
@@ -1085,6 +1135,13 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         self.schema_sensor.as_ref()
     }
 
+    /// Whether a replay job currently excludes `sink_id` from live delivery.
+    fn is_sink_excluded(&self, sink_id: &str) -> bool {
+        self.replay_gate
+            .as_ref()
+            .is_some_and(|g| g.is_excluded(sink_id))
+    }
+
     fn effective(cfg: &Option<BatchConfig>) -> BatchConfig {
         let defaults = BatchConfig::default();
         match cfg {
@@ -1146,7 +1203,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         self,
         mut event_rx: tokio::sync::mpsc::Receiver<SourceItem>,
         cancel: CancellationToken,
-        mut pause_rx: watch::Receiver<bool>,
+        mut pause_rx: watch::Receiver<PauseState>,
     ) -> Result<()> {
         let tick_ms = self.batch_cfg_eff.max_ms.unwrap_or(200);
         let max_events = self.batch_cfg_eff.max_events.unwrap_or(usize::MAX);
@@ -1195,17 +1252,28 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         let delivery_error: Arc<Mutex<Option<anyhow::Error>>> =
             Arc::new(Mutex::new(None));
 
+        // In-flight delivery accounting for the quiesce barrier: incremented when a batch
+        // enters the delivery channel, decremented once the delivery task has processed it.
+        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drained = Arc::new(tokio::sync::Notify::new());
+
         // Spawn delivery task - processes batches in FIFO order so checkpoints
         // are committed in sequence.
         let d_coord = Arc::clone(&coord);
         let d_cancel = cancel.clone();
         let d_error = Arc::clone(&delivery_error);
+        let d_inflight = Arc::clone(&inflight);
+        let d_drained = Arc::clone(&drained);
         let delivery_handle = tokio::spawn(async move {
             while let Some(item) = deliver_rx.recv().await {
-                if let Err(e) = d_coord
+                let outcome = d_coord
                     .process_deliver_and_maybe_commit(item.batch, item.reason)
-                    .await
-                {
+                    .await;
+                // Decrement + notify AFTER processing (success or failure) so the quiesce
+                // barrier only observes drain once the batch is truly done.
+                d_inflight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                d_drained.notify_waiters();
+                if let Err(e) = outcome {
                     *d_error.lock() = Some(e);
                     d_cancel.cancel();
                     break;
@@ -1239,16 +1307,78 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             deltaforge_core::replay::SourceBoundaryRecord,
         > = None;
 
+        // Mirrors the quiesce-ack this receiver last published, so we ack/clear only on
+        // edges rather than every loop turn.
+        let mut quiesced_acked = false;
+
         let accum_result: Result<()> = async {
             loop {
-                if *pause_rx.borrow() {
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        changed = pause_rx.changed() => {
-                            if changed.is_err() { break; }
-                            continue;
+                let ps = *pause_rx.borrow();
+                if ps.paused() {
+                    // A replay quiesce may be acknowledged only at a genuine commit-unit
+                    // boundary: no open transaction AND no partially-accumulated snapshot
+                    // chunk still pending capture. Otherwise excluded rows for the open unit
+                    // could enter the journal AFTER the selected sink is restored, losing
+                    // them for that sink.
+                    let unit_open = building.as_ref().is_some_and(|b| b.mid_tx())
+                        || (replay_on && !capture_accum.is_empty());
+                    if ps.replay && !unit_open && !quiesced_acked {
+                        // Flush any whole commit units that are ready, then wait for
+                        // in-flight delivery to drain. Capture is already durable in-loop,
+                        // so once delivery drains the tail is frozen and consistent.
+                        if let Some(b) = building.take() {
+                            if let Some(b) = finalize_batch(
+                                b,
+                                respect_source_tx,
+                                &coord.pipeline_name,
+                            ) {
+                                send_to_delivery(
+                                    &deliver_tx,
+                                    &inflight,
+                                    b,
+                                    "quiesce",
+                                )
+                                .await?;
+                            }
+                        }
+                        loop {
+                            let waiter = drained.notified();
+                            if inflight
+                                .load(std::sync::atomic::Ordering::SeqCst)
+                                == 0
+                            {
+                                break;
+                            }
+                            waiter.await;
+                        }
+                        if let Some(ack) = &coord.quiesce_ack {
+                            let _ = ack.send(true);
+                        }
+                        quiesced_acked = true;
+                    }
+                    // A replay quiesce that has not yet reached a boundary must keep
+                    // consuming to finish the open unit - even under an operator pause, which
+                    // would otherwise park the loop and deadlock the handoff. The operator
+                    // pause is preserved: once the unit closes and the quiesce is
+                    // acknowledged, the loop parks (operator is still set) and stays parked
+                    // after the handoff clears only the replay reason.
+                    let replay_needs_progress =
+                        ps.replay && unit_open && !quiesced_acked;
+                    if !replay_needs_progress {
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            changed = pause_rx.changed() => {
+                                if changed.is_err() { break; }
+                                continue;
+                            }
                         }
                     }
+                } else if quiesced_acked {
+                    // Resumed: clear the ack so the next quiesce request re-arms.
+                    if let Some(ack) = &coord.quiesce_ack {
+                        let _ = ack.send(false);
+                    }
+                    quiesced_acked = false;
                 }
 
                 tokio::select! {
@@ -1257,7 +1387,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                             if let Some(b) = finalize_batch(
                                 b, respect_source_tx, &coord.pipeline_name,
                             ) {
-                                send_to_delivery(&deliver_tx, b, "cancelled").await?;
+                                send_to_delivery(&deliver_tx, &inflight, b, "cancelled").await?;
                             }
                         }
                         break;
@@ -1275,7 +1405,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                 !b.raw.is_empty()
                             };
                             if flushable && elapsed {
-                                send_to_delivery(&deliver_tx, b, "timer").await?;
+                                send_to_delivery(&deliver_tx, &inflight, b, "timer").await?;
                             } else {
                                 building = Some(b);
                             }
@@ -1293,7 +1423,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                 if let Some(b) = finalize_batch(
                                     b, respect_source_tx, &coord.pipeline_name,
                                 ) {
-                                    send_to_delivery(&deliver_tx, b, "shutdown").await?;
+                                    send_to_delivery(&deliver_tx, &inflight, b, "shutdown").await?;
                                 }
                             }
                             break;
@@ -1397,7 +1527,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                                     &mut b,
                                                     BuildingBatch::with_capacity(max_events),
                                                 );
-                                                send_to_delivery(&deliver_tx, full, "limits").await?;
+                                                send_to_delivery(&deliver_tx, &inflight, full, "limits").await?;
                                             }
                                         }
                                     }
@@ -1426,7 +1556,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                                 &mut b,
                                                 BuildingBatch::with_capacity(max_events),
                                             );
-                                            send_to_delivery(&deliver_tx, full, "tx_commit").await?;
+                                            send_to_delivery(&deliver_tx, &inflight, full, "tx_commit").await?;
                                         }
                                     }
                                     SourceItem::Boundary { boundary } => {
@@ -1453,14 +1583,14 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                             &mut b,
                                             BuildingBatch::with_capacity(max_events),
                                         );
-                                        send_to_delivery(&deliver_tx, full, "boundary").await?;
+                                        send_to_delivery(&deliver_tx, &inflight, full, "boundary").await?;
                                     }
                                 }
                             } else {
                                 // Legacy path: soft-limit splitting; markers ignored.
                                 let SourceItem::Event(ev) = item else { continue; };
                                 if let Some(full) = check_and_split(&mut b, ev, max_events, max_bytes) {
-                                    send_to_delivery(&deliver_tx, full, "limits").await?;
+                                    send_to_delivery(&deliver_tx, &inflight, full, "limits").await?;
                                 }
                             }
                         }
@@ -1659,12 +1789,22 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         // Each sink gets the same Arc<[Event]> - no cloning of event data.
         // We drive all futures simultaneously and collect per-sink outcomes,
         // then fold the results into ack counters
+        // Sinks receiving this LIVE batch: all sinks minus any an active replay job
+        // excludes (a paused live sink, or a staged sink not yet promoted). Excluded sinks
+        // are also dropped from commit-policy evaluation for the job's duration, so a paused
+        // required sink does not block the rest of the pipeline.
+        let live_sinks: Vec<ArcDynSink> = self
+            .sinks
+            .iter()
+            .filter(|s| !self.is_sink_excluded(s.id()))
+            .cloned()
+            .collect();
         let required_total =
-            self.sinks.iter().filter(|s| is_sink_required(s)).count();
+            live_sinks.iter().filter(|s| is_sink_required(s)).count();
 
         debug!(
             pipeline=%self.pipeline_name,
-            sink_count=self.sinks.len(),
+            sink_count=live_sinks.len(),
             event_count=frozen.events.len(),
             "sending batch to sink(s) concurrently"
         );
@@ -1695,7 +1835,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             batch_id: None,
         });
 
-        let sink_futs = self.sinks.iter().map(|sink| {
+        let sink_futs = live_sinks.iter().map(|sink| {
             let start = Instant::now();
             let events = Arc::clone(&frozen.events);
             let required = is_sink_required(sink);
@@ -1837,7 +1977,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         // checkpoints while the required sink is behind.
         if !policy_satisfied(
             &self.commit_policy,
-            self.sinks.len(),
+            live_sinks.len(),
             required_total,
             required_acks,
             total_acks,
@@ -2093,7 +2233,8 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         drop(tx); // Closed channel: without validation, run() would exit Ok(()).
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         let err = coord
             .run(rx, cancel, pause_rx)
@@ -2215,6 +2356,192 @@ mod tests {
         }
     }
 
+    /// A tx-aligned config with a short tick so the burst-gather and timer flush promptly
+    /// (used by the quiesce tests, which drive events by hand).
+    fn quiesce_cfg() -> BatchConfig {
+        BatchConfig {
+            max_events: Some(1000),
+            max_ms: Some(50),
+            respect_source_tx: Some(true),
+            max_inflight: Some(1),
+            ..BatchConfig::default()
+        }
+    }
+
+    /// Like `cap_coord` but also wired with a quiesce-ack channel.
+    fn cap_coord_with_ack(
+        store: Arc<checkpoints::MemCheckpointStore>,
+        sink: Arc<MockSink>,
+        cfg: BatchConfig,
+        journal: Arc<dyn crate::replay_journal::JournalLog>,
+        ack: tokio::sync::watch::Sender<bool>,
+    ) -> Coordinator<CheckpointMeta> {
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        let cp_fn = build_commit_fn(store, "src::sink::kafka".to_string());
+        let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![]);
+        let batch_processor =
+            build_batch_processor(processors, "test".to_string());
+        let capture = ReplayCapture {
+            journal,
+            identity: deltaforge_core::replay::PipelineIdentity {
+                pipeline: "p".into(),
+                incarnation: "inc-1".into(),
+                source_lineage: None,
+            },
+            max_envelope_bytes: 0,
+            registry_seq_fn: Arc::new(|| None),
+        };
+        Coordinator::builder("cap-test")
+            .sinks(sinks)
+            .batch_config(Some(cfg))
+            .commit_fn("kafka", cp_fn)
+            .process_fn(batch_processor)
+            .replay_capture(capture)
+            .quiesce_ack(ack)
+            .build()
+    }
+
+    async fn wait_ack(
+        rx: &mut tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), tokio::time::error::Elapsed> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if *rx.borrow_and_update() {
+                    break;
+                }
+                rx.changed().await.unwrap();
+            }
+        })
+        .await
+    }
+
+    /// Blocker: a replay quiesce must not acknowledge while a snapshot chunk is still
+    /// accumulating (spanning batches), or excluded rows could enter the journal after the
+    /// sink is restored. Ack only after the chunk-final boundary closes the accumulator.
+    #[tokio::test]
+    async fn quiesce_waits_for_open_snapshot_chunk() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let be: storage::ArcStorageBackend =
+            Arc::new(storage::MemoryStorageBackend::new());
+        let journal = Arc::new(crate::replay_journal::BackendJournalLog::new(
+            be,
+            deltaforge_core::replay::PipelineIdentity {
+                pipeline: "p".into(),
+                incarnation: "inc-1".into(),
+                source_lineage: None,
+            },
+        ));
+        let (ack_tx, mut ack_rx) = tokio::sync::watch::channel(false);
+        let coord = cap_coord_with_ack(
+            store,
+            MockSink::new("kafka", true),
+            quiesce_cfg(),
+            journal,
+            ack_tx,
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
+        let run = tokio::spawn(coord.run(rx, cancel.clone(), pause_rx));
+
+        // Snapshot chunk in progress (rows without a chunk-final boundary).
+        tx.send(SourceItem::Event(snap_event(1, None)))
+            .await
+            .unwrap();
+        tx.send(SourceItem::Event(snap_event(2, None)))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        pause_tx.send_modify(|s| s.replay = true);
+        // Must NOT acknowledge while the chunk accumulator is open.
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            wait_ack(&mut ack_rx),
+        )
+        .await;
+        assert!(early.is_err(), "quiesce acked mid snapshot chunk");
+
+        // Chunk-final boundary closes the unit; now the quiesce can ack.
+        tx.send(SourceItem::Event(snap_event(3, Some(b"chunk-cp"))))
+            .await
+            .unwrap();
+        wait_ack(&mut ack_rx)
+            .await
+            .expect("quiesce did not ack after the chunk boundary");
+
+        pause_tx.send_modify(|s| s.replay = false);
+        drop(tx);
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(5), run).await;
+    }
+
+    /// Blocker: an operator pause must not deadlock a replay quiesce. With a transaction
+    /// open, the coordinator keeps consuming to finish it (despite operator=true), then
+    /// acknowledges; the operator pause remains in effect afterward.
+    #[tokio::test]
+    async fn operator_pause_does_not_deadlock_replay_quiesce() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        let procs: Arc<[deltaforge_core::ArcDynProcessor]> = Arc::from(vec![]);
+        let bp = build_batch_processor(procs, "test".to_string());
+        let (ack_tx, mut ack_rx) = tokio::sync::watch::channel(false);
+        let coord = Coordinator::builder("op-q")
+            .sinks(sinks)
+            .batch_config(Some(quiesce_cfg()))
+            .commit_fn(
+                "kafka",
+                build_commit_fn(store.clone(), "src::sink::kafka".to_string()),
+            )
+            .process_fn(bp)
+            .quiesce_ack(ack_tx)
+            .build();
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
+        let run = tokio::spawn(coord.run(rx, cancel.clone(), pause_rx));
+
+        // Open a transaction (no commit yet).
+        tx.send(begin("g1")).await.unwrap();
+        tx.send(SourceItem::Event(tx_event(1, "g1", b"row")))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Operator pause AND replay quiesce, with the transaction still open.
+        pause_tx.send_modify(|s| {
+            s.operator = true;
+            s.replay = true;
+        });
+        let early = tokio::time::timeout(
+            std::time::Duration::from_millis(400),
+            wait_ack(&mut ack_rx),
+        )
+        .await;
+        assert!(early.is_err(), "acked with an open transaction");
+
+        // The commit lets the coordinator finish the unit despite the operator pause.
+        tx.send(commit("g1", b"cp-1")).await.unwrap();
+        wait_ack(&mut ack_rx)
+            .await
+            .expect("operator pause deadlocked the replay quiesce");
+        assert!(
+            pause_tx.borrow().operator,
+            "operator pause must remain in effect"
+        );
+
+        cancel.cancel();
+        drop(tx);
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(5), run).await;
+    }
+
     /// A journal that always fails, to prove fail-closed capture.
     struct FailingJournal;
     #[async_trait::async_trait]
@@ -2250,7 +2577,8 @@ mod tests {
     ) -> Result<()> {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
         for item in items {
             tx.send(item).await.unwrap();
         }
@@ -2684,7 +3012,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         tx.send(SourceItem::TxBegin {
             tx_id: "gtid:1".into(),
@@ -2746,7 +3075,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         for (txn, cp) in [("gtid:1", "cp-1"), ("gtid:2", "cp-2")] {
             tx.send(SourceItem::TxBegin { tx_id: txn.into() })
@@ -2800,7 +3130,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         tx.send(SourceItem::TxBegin {
             tx_id: "gtid:1".into(),
@@ -2875,7 +3206,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         // One whole tx (2 events + marker) ...
         tx.send(SourceItem::TxBegin {
@@ -2939,7 +3271,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         // Empty transaction: begin immediately followed by commit, no events.
         tx.send(SourceItem::TxBegin {
@@ -3002,7 +3335,8 @@ mod tests {
         );
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
         for item in items {
             tx.send(item).await.unwrap();
         }
@@ -3136,6 +3470,134 @@ mod tests {
         );
     }
 
+    /// A sink excluded by the replay gate receives no live batch and is dropped from
+    /// commit-policy evaluation, so a paused required sink does not block the others.
+    #[tokio::test]
+    async fn replay_gate_excludes_sink_from_delivery_and_commit_policy() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let kafka = MockSink::new("kafka", true);
+        let s3 = MockSink::new("s3", true);
+        let sinks: Vec<ArcDynSink> = vec![
+            Arc::clone(&kafka) as ArcDynSink,
+            Arc::clone(&s3) as ArcDynSink,
+        ];
+        let gate = Arc::new(crate::replay_gate::ReplaySinkGate::new());
+        gate.exclude(["s3".to_string()]);
+        let procs: Arc<[deltaforge_core::ArcDynProcessor]> = Arc::from(vec![]);
+        let batch_processor = build_batch_processor(procs, "test".to_string());
+        let coord = Coordinator::builder("gate-test")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(1000),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_policy(Some(CommitPolicy::Required))
+            .commit_fn(
+                "kafka",
+                build_commit_fn(store.clone(), "src::sink::kafka".to_string()),
+            )
+            .commit_fn(
+                "s3",
+                build_commit_fn(store.clone(), "src::sink::s3".to_string()),
+            )
+            .process_fn(batch_processor)
+            .replay_gate(gate)
+            .build();
+
+        feed_and_run(
+            coord,
+            vec![
+                begin("g1"),
+                SourceItem::Event(tx_event(1, "g1", b"row")),
+                commit("g1", b"cp-1"),
+            ],
+        )
+        .await
+        .expect("live delivery succeeds while a required sink is gated out");
+
+        assert_eq!(kafka.delivery_count(), 1, "live sink received the batch");
+        assert_eq!(s3.delivery_count(), 0, "excluded sink received nothing");
+        assert_eq!(
+            store.get_raw("src::sink::kafka").await.unwrap().as_deref(),
+            Some(&b"cp-1"[..]),
+            "live sink checkpoint advanced (policy satisfied over live sinks)"
+        );
+        assert!(
+            store.get_raw("src::sink::s3").await.unwrap().is_none(),
+            "excluded sink checkpoint did not advance"
+        );
+    }
+
+    /// A replay quiesce is acknowledged only after the coordinator reaches a commit-unit
+    /// boundary and drains in-flight delivery: the pending transaction is flushed and
+    /// delivered before the ack, proving the barrier is real (not a fixed sleep).
+    #[tokio::test]
+    async fn quiesce_acknowledges_after_boundary_and_drain() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        let procs: Arc<[deltaforge_core::ArcDynProcessor]> = Arc::from(vec![]);
+        let bp = build_batch_processor(procs, "test".to_string());
+        let (ack_tx, mut ack_rx) = tokio::sync::watch::channel(false);
+        let coord = Coordinator::builder("q-test")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(1000),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_fn(
+                "kafka",
+                build_commit_fn(store.clone(), "src::sink::kafka".to_string()),
+            )
+            .process_fn(bp)
+            .quiesce_ack(ack_tx)
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
+        let run = tokio::spawn(coord.run(rx, cancel.clone(), pause_rx));
+
+        // Feed one whole transaction; with a long timer it stays in `building`.
+        tx.send(begin("g1")).await.unwrap();
+        tx.send(SourceItem::Event(tx_event(1, "g1", b"row")))
+            .await
+            .unwrap();
+        tx.send(commit("g1", b"cp-1")).await.unwrap();
+        // Let the coordinator consume + build the transaction before quiescing.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Request a replay quiesce and wait for the acknowledgement.
+        pause_tx.send_modify(|s| s.replay = true);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if *ack_rx.borrow_and_update() {
+                    break;
+                }
+                ack_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("quiesce was not acknowledged in time");
+
+        // Acknowledged means the pending unit was flushed and delivered (drained).
+        assert_eq!(sink.delivery_count(), 1);
+
+        pause_tx.send_modify(|s| s.replay = false);
+        drop(tx);
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(5), run).await;
+    }
+
     /// Drops every event - models a transaction whose rows are all filtered by a
     /// processor.
     struct DropAllProcessor;
@@ -3185,7 +3647,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         tx.send(SourceItem::TxBegin {
             tx_id: "gtid:1".into(),
@@ -3240,7 +3703,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         tx.send(SourceItem::TxBegin {
             tx_id: "gtid:1".into(),
@@ -3311,7 +3775,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         for (txn, cp) in
             [("gtid:1", "cp-1"), ("gtid:2", "cp-2"), ("gtid:3", "cp-3")]
@@ -3402,7 +3867,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         tx.send(begin("gtid:1")).await.unwrap();
         for i in 0..2 {
@@ -3459,7 +3925,8 @@ mod tests {
             );
             let (tx, rx) = tokio::sync::mpsc::channel(64);
             let cancel = tokio_util::sync::CancellationToken::new();
-            let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+            let (_pause_tx, pause_rx) =
+                tokio::sync::watch::channel(PauseState::default());
             tx.send(begin("gtid:1")).await.unwrap();
             for i in 0..4 {
                 tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
@@ -3492,7 +3959,8 @@ mod tests {
             );
             let (tx, rx) = tokio::sync::mpsc::channel(64);
             let cancel = tokio_util::sync::CancellationToken::new();
-            let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+            let (_pause_tx, pause_rx) =
+                tokio::sync::watch::channel(PauseState::default());
             tx.send(begin("gtid:1")).await.unwrap();
             for i in 0..4 {
                 tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
@@ -3535,7 +4003,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         // A 3-event transaction with markers; the legacy path drops the markers and
         // splits the events by count into [2, 1].
@@ -3836,7 +4305,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         // Send one event with a checkpoint, then drop the sender
         // so the coordinator sees channel-closed and exits.
@@ -3924,7 +4394,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         let source = deltaforge_core::SourceInfo {
             version: "test".into(),
@@ -4113,7 +4584,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         let source = deltaforge_core::SourceInfo {
             version: "test".into(),
@@ -4233,7 +4705,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         let source = deltaforge_core::SourceInfo {
             version: "test".into(),
@@ -4317,7 +4790,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         let source = deltaforge_core::SourceInfo {
             version: "test".into(),
@@ -4428,7 +4902,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         let source = deltaforge_core::SourceInfo {
             version: "test".into(),
@@ -4524,7 +4999,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         let source = deltaforge_core::SourceInfo {
             version: "t".into(),
@@ -4690,7 +5166,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         let source = deltaforge_core::SourceInfo {
             version: "t".into(),
@@ -4791,7 +5268,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         tx.send(SourceItem::TxBegin {
             tx_id: "gtid:1".into(),
@@ -4856,7 +5334,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         // A standalone event (no `transaction`, no TxBegin/TxCommit) carrying an
         // atomic boundary: checkpoint + binlog file/pos watermark.
@@ -4933,7 +5412,7 @@ mod tests {
         let (coord, sink) = boundary_coord(1000); // rows stay buffered
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_p, pause_rx) = tokio::sync::watch::channel(false);
+        let (_p, pause_rx) = tokio::sync::watch::channel(PauseState::default());
 
         tx.send(standalone_row(1)).await.unwrap();
         tx.send(standalone_row(2)).await.unwrap();
@@ -4959,7 +5438,7 @@ mod tests {
         let (coord, sink) = boundary_coord(1); // each row flushes immediately
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_p, pause_rx) = tokio::sync::watch::channel(false);
+        let (_p, pause_rx) = tokio::sync::watch::channel(PauseState::default());
 
         tx.send(standalone_row(1)).await.unwrap();
         tx.send(snapshot_completion_boundary()).await.unwrap();

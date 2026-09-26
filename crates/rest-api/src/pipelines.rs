@@ -22,12 +22,12 @@ pub struct PipeInfo {
     pub name: String,
     pub status: String,
     pub spec: PipelineSpec,
-    /// Operational status — populated by the controller, optional for backward compat.
+    /// Operational status - populated by the controller, optional for backward compat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ops: Option<PipelineOpsStatus>,
 }
 
-/// Operational status fields — everything an operator needs in one response.
+/// Operational status fields - everything an operator needs in one response.
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct PipelineOpsStatus {
     /// Replication lag in seconds (source event time vs wall clock).
@@ -117,6 +117,39 @@ pub trait PipelineController: Send + Sync {
         )))
     }
 
+    // ── Event replay endpoints ─────────────────────────────────────────
+
+    /// Start (or dry-run) a replay job for a pipeline. Returns the new job id.
+    async fn replay_start(
+        &self,
+        name: &str,
+        req: ReplayStartRequest,
+    ) -> Result<ReplayStartResponse, PipelineAPIError> {
+        let _ = (name, req);
+        Err(PipelineAPIError::Failed(anyhow::anyhow!(
+            "replay is not enabled for this pipeline"
+        )))
+    }
+
+    /// The current (or most recent) replay job for a pipeline, if any.
+    async fn replay_status(
+        &self,
+        name: &str,
+    ) -> Result<Option<ReplayJobStatus>, PipelineAPIError> {
+        let _ = name;
+        Err(PipelineAPIError::Failed(anyhow::anyhow!(
+            "replay is not enabled for this pipeline"
+        )))
+    }
+
+    /// Cancel the active replay job for a pipeline (idempotent when none is active).
+    async fn replay_cancel(&self, name: &str) -> Result<(), PipelineAPIError> {
+        let _ = name;
+        Err(PipelineAPIError::Failed(anyhow::anyhow!(
+            "replay is not enabled for this pipeline"
+        )))
+    }
+
     // ── Checkpoint inspection ──────────────────────────────────────────
 
     /// Get per-sink checkpoint positions for a pipeline.
@@ -127,6 +160,49 @@ pub trait PipelineController: Send + Sync {
         let _ = name;
         Ok(vec![])
     }
+}
+
+/// Request body for `POST /pipelines/{name}/journal/replay`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReplayStartRequest {
+    /// Existing live sinks to pause and replay the range to.
+    pub selected_sinks: Vec<String>,
+    /// New sinks to backfill (not supported yet; must be empty).
+    #[serde(default)]
+    pub staged_sinks: Vec<String>,
+    /// Lower bound of the range (log_since semantics: envelopes with seq > from_seq).
+    pub from_seq: u64,
+    /// Optional inclusive upper bound of the historical range.
+    #[serde(default)]
+    pub through_seq: Option<u64>,
+    /// Encoder schema policy: "current" (default), "at_capture_seq", or "pinned:<seq>".
+    #[serde(default)]
+    pub encoder_schema_policy: Option<String>,
+    /// Dry-run delivers nothing; reports the range/targets only.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// Response body for a started replay job.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReplayStartResponse {
+    pub job_id: String,
+}
+
+/// A replay job's durable status.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReplayJobStatus {
+    pub job_id: String,
+    pub phase: String,
+    pub cursor: u64,
+    pub from_seq: u64,
+    pub through_seq: Option<u64>,
+    pub selected_sinks: Vec<String>,
+    pub staged_sinks: Vec<String>,
+    pub dry_run: bool,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub error: Option<String>,
 }
 
 /// Per-sink checkpoint position returned by the inspection API.
@@ -156,6 +232,15 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/pipelines/{name}/journal/dlq/count", get(handle_dlq_count))
         .route("/pipelines/{name}/journal/dlq/ack", post(handle_dlq_ack))
+        // Replay endpoints
+        .route(
+            "/pipelines/{name}/journal/replay",
+            post(handle_replay_start).get(handle_replay_status),
+        )
+        .route(
+            "/pipelines/{name}/journal/replay/cancel",
+            post(handle_replay_cancel),
+        )
         // Checkpoint inspection
         .route("/pipelines/{name}/checkpoints", get(handle_checkpoints))
         .with_state(state)
@@ -177,7 +262,7 @@ async fn list_pipelines(
 ) -> Json<Vec<PipeInfo>> {
     let mut pipelines = st.controller.list().await;
 
-    // Filter by labels (AND logic — all specified labels must match).
+    // Filter by labels (AND logic - all specified labels must match).
     if !params.label.is_empty() {
         pipelines.retain(|p| {
             let meta_labels = &p.spec.metadata.labels;
@@ -392,6 +477,42 @@ async fn handle_checkpoints(
         .checkpoints(&name)
         .await
         .map(Json)
+        .map_err(pipeline_error)
+}
+
+// ── Replay handlers ────────────────────────────────────────────────────────────
+
+async fn handle_replay_start(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<ReplayStartRequest>,
+) -> ApiResult<ReplayStartResponse> {
+    st.controller
+        .replay_start(&name, body)
+        .await
+        .map(Json)
+        .map_err(pipeline_error)
+}
+
+async fn handle_replay_status(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<Option<ReplayJobStatus>> {
+    st.controller
+        .replay_status(&name)
+        .await
+        .map(Json)
+        .map_err(pipeline_error)
+}
+
+async fn handle_replay_cancel(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<crate::errors::ApiError>)> {
+    st.controller
+        .replay_cancel(&name)
+        .await
+        .map(|_| StatusCode::NO_CONTENT)
         .map_err(pipeline_error)
 }
 
@@ -637,5 +758,241 @@ mod tests {
             .unwrap();
 
         assert_eq!(StatusCode::NOT_FOUND, resp.status());
+    }
+
+    /// A controller with working replay endpoints, recording the last start request.
+    #[derive(Clone, Default)]
+    struct ReplayMock {
+        last_from_seq: Arc<std::sync::Mutex<Option<u64>>>,
+        has_job: bool,
+        /// When set, replay_start returns this error instead of succeeding.
+        start_err: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl PipelineController for ReplayMock {
+        async fn list(&self) -> Vec<PipeInfo> {
+            vec![]
+        }
+        async fn get(&self, name: &str) -> Result<PipeInfo, PipelineAPIError> {
+            Err(PipelineAPIError::NotFound(name.to_string()))
+        }
+        async fn create(
+            &self,
+            _spec: deltaforge_config::PipelineSpec,
+        ) -> Result<PipeInfo, PipelineAPIError> {
+            Err(PipelineAPIError::Failed(anyhow::anyhow!("no")))
+        }
+        async fn patch(
+            &self,
+            name: &str,
+            _p: Value,
+        ) -> Result<PipeInfo, PipelineAPIError> {
+            Err(PipelineAPIError::NotFound(name.to_string()))
+        }
+        async fn pause(
+            &self,
+            name: &str,
+        ) -> Result<PipeInfo, PipelineAPIError> {
+            Err(PipelineAPIError::NotFound(name.to_string()))
+        }
+        async fn resume(
+            &self,
+            name: &str,
+        ) -> Result<PipeInfo, PipelineAPIError> {
+            Err(PipelineAPIError::NotFound(name.to_string()))
+        }
+        async fn stop(&self, name: &str) -> Result<PipeInfo, PipelineAPIError> {
+            Err(PipelineAPIError::NotFound(name.to_string()))
+        }
+        async fn delete(&self, _name: &str) -> Result<(), PipelineAPIError> {
+            Ok(())
+        }
+
+        async fn replay_start(
+            &self,
+            _name: &str,
+            req: ReplayStartRequest,
+        ) -> Result<ReplayStartResponse, PipelineAPIError> {
+            *self.last_from_seq.lock().unwrap() = Some(req.from_seq);
+            match self.start_err {
+                Some("conflict") => Err(PipelineAPIError::Conflict(
+                    "already active".to_string(),
+                )),
+                Some("bad") => Err(PipelineAPIError::BadRequest(
+                    "invalid range".to_string(),
+                )),
+                _ => Ok(ReplayStartResponse {
+                    job_id: "job-xyz".to_string(),
+                }),
+            }
+        }
+        async fn replay_status(
+            &self,
+            _name: &str,
+        ) -> Result<Option<ReplayJobStatus>, PipelineAPIError> {
+            Ok(self.has_job.then(|| ReplayJobStatus {
+                job_id: "job-xyz".into(),
+                phase: "running".into(),
+                cursor: 5,
+                from_seq: 0,
+                through_seq: None,
+                selected_sinks: vec!["kafka".into()],
+                staged_sinks: vec![],
+                dry_run: false,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+                error: None,
+            }))
+        }
+        async fn replay_cancel(
+            &self,
+            _name: &str,
+        ) -> Result<(), PipelineAPIError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_start_returns_job_id() {
+        let mock = ReplayMock::default();
+        let app = router(AppState {
+            controller: Arc::new(mock.clone()),
+        });
+        let body = serde_json::json!({
+            "selected_sinks": ["kafka"],
+            "from_seq": 42
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/pipelines/demo/journal/replay")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, resp.status());
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let out: ReplayStartResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(out.job_id, "job-xyz");
+        assert_eq!(*mock.last_from_seq.lock().unwrap(), Some(42));
+    }
+
+    #[tokio::test]
+    async fn replay_status_reports_job_or_null() {
+        // No active job -> null.
+        let app = router(AppState {
+            controller: Arc::new(ReplayMock::default()),
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/pipelines/demo/journal/replay")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, resp.status());
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let out: Option<ReplayJobStatus> =
+            serde_json::from_slice(&bytes).unwrap();
+        assert!(out.is_none());
+
+        // Active job -> populated status.
+        let app = router(AppState {
+            controller: Arc::new(ReplayMock {
+                has_job: true,
+                ..Default::default()
+            }),
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/pipelines/demo/journal/replay")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let out: Option<ReplayJobStatus> =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(out.unwrap().phase, "running");
+    }
+
+    #[tokio::test]
+    async fn replay_cancel_returns_no_content() {
+        let app = router(AppState {
+            controller: Arc::new(ReplayMock::default()),
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/pipelines/demo/journal/replay/cancel")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::NO_CONTENT, resp.status());
+    }
+
+    #[tokio::test]
+    async fn replay_start_maps_client_errors_to_status_codes() {
+        for (flag, want) in [
+            ("conflict", StatusCode::CONFLICT),
+            ("bad", StatusCode::BAD_REQUEST),
+        ] {
+            let app = router(AppState {
+                controller: Arc::new(ReplayMock {
+                    start_err: Some(flag),
+                    ..Default::default()
+                }),
+            });
+            let body = serde_json::json!({ "selected_sinks": ["kafka"], "from_seq": 0 });
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/pipelines/demo/journal/replay")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(want, resp.status(), "flag {flag}");
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_start_defaults_to_error_without_impl() {
+        // MockController does not override replay_start -> trait default errors -> 500.
+        let app = router(AppState {
+            controller: Arc::new(MockController {
+                info: sample_pipe_info(),
+            }),
+        });
+        let body =
+            serde_json::json!({ "selected_sinks": ["kafka"], "from_seq": 0 });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/pipelines/demo/journal/replay")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::INTERNAL_SERVER_ERROR, resp.status());
     }
 }

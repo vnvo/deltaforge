@@ -7,11 +7,18 @@ use tracing::error;
 pub enum PipelineAPIError {
     NotFound(String),
     AlreadyExists(String),
-    NameMismatch { expected: String, found: String },
+    NameMismatch {
+        expected: String,
+        found: String,
+    },
+    /// A malformed or invalid client request (maps to 400).
+    BadRequest(String),
+    /// A conflict with current state, e.g. an already-active replay job (maps to 409).
+    Conflict(String),
     Failed(anyhow::Error),
 }
 
-/// Structured error response — parseable by automation and CLIs.
+/// Structured error response - parseable by automation and CLIs.
 #[derive(Serialize)]
 pub struct ApiError {
     pub code: &'static str,
@@ -36,6 +43,8 @@ impl std::fmt::Display for PipelineAPIError {
                     "pipeline name mismatch: expected {expected}, got {found}"
                 )
             }
+            PipelineAPIError::BadRequest(msg) => write!(f, "{msg}"),
+            PipelineAPIError::Conflict(msg) => write!(f, "{msg}"),
             PipelineAPIError::Failed(e) => std::fmt::Display::fmt(e, f),
         }
     }
@@ -68,6 +77,10 @@ pub fn pipeline_error(err: PipelineAPIError) -> (StatusCode, Json<ApiError>) {
         PipelineAPIError::NameMismatch { .. } => {
             (StatusCode::BAD_REQUEST, "PIPELINE_NAME_MISMATCH")
         }
+        PipelineAPIError::BadRequest(_) => {
+            (StatusCode::BAD_REQUEST, "BAD_REQUEST")
+        }
+        PipelineAPIError::Conflict(_) => (StatusCode::CONFLICT, "CONFLICT"),
         PipelineAPIError::Failed(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")
         }

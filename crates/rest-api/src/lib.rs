@@ -6,7 +6,10 @@ mod schemas;
 mod sensing;
 
 pub use errors::{PipelineAPIError, pipeline_error};
-pub use pipelines::{AppState, PipeInfo, PipelineController};
+pub use pipelines::{
+    AppState, PipeInfo, PipelineController, ReplayJobStatus,
+    ReplayStartRequest, ReplayStartResponse,
+};
 pub use schemas::{
     ColumnInfo, ReloadResult, SchemaController, SchemaDetail, SchemaInfo,
     SchemaState, SchemaVersionInfo, TableReloadStatus,
