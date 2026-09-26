@@ -4,6 +4,7 @@ pub mod drift_detector;
 pub mod pipeline_manager;
 pub mod replay_job;
 pub mod replay_journal;
+pub mod replay_worker;
 mod schema_api;
 mod schema_provider;
 mod sensing_api;

@@ -212,6 +212,11 @@ pub enum ReplayJobError {
     NotFresh,
     #[error("replay job is terminal ({phase}) and cannot be updated")]
     TerminalImmutable { phase: String },
+    #[error(
+        "encoder schema policy 'at_capture_seq' requires a captured registry sequence, \
+         but the envelope at seq {seq} has none"
+    )]
+    EncoderSchemaUnavailable { seq: u64 },
 }
 
 /// The durable record of one replay.
