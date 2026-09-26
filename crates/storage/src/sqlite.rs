@@ -118,9 +118,8 @@ CREATE TABLE IF NOT EXISTS df_log (
     content_hash TEXT
 );
 CREATE INDEX IF NOT EXISTS df_log_ns_key_seq ON df_log(ns, key, seq);
--- Idempotent capture: at most one entry per (ns, key, capture_id).
-CREATE UNIQUE INDEX IF NOT EXISTS df_log_capture
-    ON df_log(ns, key, capture_id) WHERE capture_id IS NOT NULL;
+-- NOTE: the unique capture index is created in init() AFTER the additive column
+-- migration, because an upgraded database does not yet have capture_id here.
 
 -- Durable per-stream metadata: the retention horizon and head sequence, owned by
 -- log_truncate / the append paths (never an independently updated slot).
@@ -168,6 +167,14 @@ impl SqliteStorageBackend {
         conn.execute_batch(SCHEMA)?;
         // Additive migration for pre-existing df_log tables (no destructive backfill).
         migrate_df_log_columns(&conn)?;
+        // Only now that capture_id is guaranteed to exist (fresh CREATE TABLE or the
+        // migration above) can the partial unique index be built - on an upgraded
+        // database the column did not exist when SCHEMA ran.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS df_log_capture
+             ON df_log(ns, key, capture_id) WHERE capture_id IS NOT NULL",
+            [],
+        )?;
 
         let conn = Arc::new(Mutex::new(conn));
 
@@ -822,27 +829,28 @@ mod tests {
 
     #[tokio::test]
     async fn idempotency() {
-        crate::log_contract_suite::idempotency(be()).await;
+        crate::log_contract_suite::idempotency(be(), "journal").await;
     }
     #[tokio::test]
     async fn conflict_rejected() {
-        crate::log_contract_suite::conflict_rejected(be()).await;
+        crate::log_contract_suite::conflict_rejected(be(), "journal").await;
     }
     #[tokio::test]
     async fn horizon_with_global_gaps() {
-        crate::log_contract_suite::horizon_with_global_gaps(be()).await;
+        crate::log_contract_suite::horizon_with_global_gaps(be(), "journal")
+            .await;
     }
     #[tokio::test]
     async fn pin_invariant() {
-        crate::log_contract_suite::pin_invariant(be()).await;
+        crate::log_contract_suite::pin_invariant(be(), "journal").await;
     }
     #[tokio::test]
     async fn empty_vs_truncated() {
-        crate::log_contract_suite::empty_vs_truncated(be()).await;
+        crate::log_contract_suite::empty_vs_truncated(be(), "journal").await;
     }
     #[tokio::test]
     async fn concurrent_appends() {
-        crate::log_contract_suite::concurrent_appends(be()).await;
+        crate::log_contract_suite::concurrent_appends(be(), "journal").await;
     }
 
     /// A failure after the delete + horizon update but before commit rolls BOTH
@@ -901,5 +909,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.removed, 3);
+    }
+
+    /// An old-format df_log (no replay columns, no metadata, no capture index) with
+    /// existing data opens through the new backend: startup succeeds, data is
+    /// preserved, and the new APIs work.
+    #[tokio::test]
+    async fn migrates_old_schema_and_preserves_data() {
+        let path = std::env::temp_dir().join(format!(
+            "df_migrate_{}_{}.db",
+            now_ms(),
+            std::process::id()
+        ));
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE df_log (
+                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                     ns  TEXT NOT NULL, key TEXT NOT NULL, val BLOB NOT NULL,
+                     ts  INTEGER NOT NULL DEFAULT (unixepoch()));
+                 CREATE INDEX df_log_ns_key_seq ON df_log(ns, key, seq);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO df_log(ns, key, val) VALUES('journal', 's', ?1)",
+                params![b"old-1".to_vec()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO df_log(ns, key, val) VALUES('journal', 's', ?1)",
+                params![b"old-2".to_vec()],
+            )
+            .unwrap();
+        }
+
+        // Opening runs the additive migration; startup must not fail.
+        let be = SqliteStorageBackend::open(&path).unwrap();
+
+        // Old data preserved.
+        let entries = be.log_since("journal", "s", 0).await.unwrap();
+        assert_eq!(
+            entries.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>(),
+            vec![b"old-1".to_vec(), b"old-2".to_vec()],
+        );
+        // Metadata lazily initialized from the existing max sequence.
+        let meta = be.log_stream_meta("journal", "s").await.unwrap();
+        assert_eq!(meta.head_seq, entries.last().unwrap().0);
+        assert_eq!(meta.min_valid_from_seq, 0);
+        assert_eq!(meta.len, 2);
+        // New APIs work post-migration.
+        let ins = be
+            .log_append_if_absent("journal", "s", "cap-new", b"new")
+            .await
+            .unwrap();
+        assert_eq!(ins.status, AppendStatus::Inserted);
+        let again = be
+            .log_append_if_absent("journal", "s", "cap-new", b"new")
+            .await
+            .unwrap();
+        assert_eq!(again.status, AppendStatus::AlreadyPresent);
+        assert_eq!(ins.seq, again.seq);
+
+        drop(be);
+        let _ = std::fs::remove_file(&path);
     }
 }

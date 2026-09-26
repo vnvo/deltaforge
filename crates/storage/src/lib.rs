@@ -280,8 +280,6 @@ pub(crate) fn content_digest(value: &[u8]) -> String {
 pub(crate) mod log_contract_suite {
     use super::*;
 
-    const NS: &str = "journal";
-
     fn is_conflict(err: &anyhow::Error) -> bool {
         matches!(
             err.downcast_ref::<LogError>(),
@@ -290,55 +288,58 @@ pub(crate) mod log_contract_suite {
     }
 
     /// Identical (capture_id, value) is idempotent: one entry, stable seq.
-    pub async fn idempotency(be: Arc<dyn StorageBackend>) {
+    pub async fn idempotency(be: Arc<dyn StorageBackend>, ns: &str) {
         let a = be
-            .log_append_if_absent(NS, "s:replay", "cap-1", b"payload-1")
+            .log_append_if_absent(ns, "s:replay", "cap-1", b"payload-1")
             .await
             .unwrap();
         assert_eq!(a.status, AppendStatus::Inserted);
         let b = be
-            .log_append_if_absent(NS, "s:replay", "cap-1", b"payload-1")
+            .log_append_if_absent(ns, "s:replay", "cap-1", b"payload-1")
             .await
             .unwrap();
         assert_eq!(b.status, AppendStatus::AlreadyPresent);
         assert_eq!(a.seq, b.seq, "identical retry must return the same seq");
-        assert_eq!(be.log_since(NS, "s:replay", 0).await.unwrap().len(), 1);
+        assert_eq!(be.log_since(ns, "s:replay", 0).await.unwrap().len(), 1);
     }
 
     /// Same capture_id with different bytes is rejected; the original is untouched.
-    pub async fn conflict_rejected(be: Arc<dyn StorageBackend>) {
+    pub async fn conflict_rejected(be: Arc<dyn StorageBackend>, ns: &str) {
         let a = be
-            .log_append_if_absent(NS, "s:replay", "cap-1", b"original")
+            .log_append_if_absent(ns, "s:replay", "cap-1", b"original")
             .await
             .unwrap();
         let err = be
-            .log_append_if_absent(NS, "s:replay", "cap-1", b"tampered")
+            .log_append_if_absent(ns, "s:replay", "cap-1", b"tampered")
             .await
             .unwrap_err();
         assert!(is_conflict(&err), "expected CaptureIdentityConflict: {err}");
-        let entries = be.log_since(NS, "s:replay", 0).await.unwrap();
+        let entries = be.log_since(ns, "s:replay", 0).await.unwrap();
         assert_eq!(entries, vec![(a.seq, b"original".to_vec())]);
     }
 
     /// The horizon is the highest seq actually removed from THIS stream, not
     /// `oldest_retained - 1` - global sequence gaps belong to other keys.
-    pub async fn horizon_with_global_gaps(be: Arc<dyn StorageBackend>) {
+    pub async fn horizon_with_global_gaps(
+        be: Arc<dyn StorageBackend>,
+        ns: &str,
+    ) {
         // Interleave appends to another key so the target stream has global gaps.
-        be.log_append(NS, "other", b"x").await.unwrap();
+        be.log_append(ns, "other", b"x").await.unwrap();
         let s1 = be
-            .log_append_if_absent(NS, "s:replay", "c1", b"a")
+            .log_append_if_absent(ns, "s:replay", "c1", b"a")
             .await
             .unwrap()
             .seq;
-        be.log_append(NS, "other", b"x").await.unwrap();
+        be.log_append(ns, "other", b"x").await.unwrap();
         let s2 = be
-            .log_append_if_absent(NS, "s:replay", "c2", b"b")
+            .log_append_if_absent(ns, "s:replay", "c2", b"b")
             .await
             .unwrap()
             .seq;
-        be.log_append(NS, "other", b"x").await.unwrap();
+        be.log_append(ns, "other", b"x").await.unwrap();
         let s3 = be
-            .log_append_if_absent(NS, "s:replay", "c3", b"c")
+            .log_append_if_absent(ns, "s:replay", "c3", b"c")
             .await
             .unwrap()
             .seq;
@@ -346,7 +347,7 @@ pub(crate) mod log_contract_suite {
         // Remove everything below s3 (pin protects s3), by age (cutoff in the future).
         let out = be
             .log_truncate(
-                NS,
+                ns,
                 "s:replay",
                 LogTruncateRequest {
                     older_than_ms: Some(i64::MAX),
@@ -366,7 +367,7 @@ pub(crate) mod log_contract_suite {
         assert_eq!(out.oldest_seq, Some(s3));
         // Exclusive cursor: from_seq == min_valid_from_seq returns the oldest retained.
         let from_horizon = be
-            .log_since(NS, "s:replay", out.min_valid_from_seq)
+            .log_since(ns, "s:replay", out.min_valid_from_seq)
             .await
             .unwrap();
         assert_eq!(from_horizon, vec![(s3, b"c".to_vec())]);
@@ -374,11 +375,11 @@ pub(crate) mod log_contract_suite {
 
     /// Retention never removes an entry with seq >= pin_seq; a capacity cap that
     /// cannot be honored sets `capacity_pinned`.
-    pub async fn pin_invariant(be: Arc<dyn StorageBackend>) {
+    pub async fn pin_invariant(be: Arc<dyn StorageBackend>, ns: &str) {
         let mut seqs = Vec::new();
         for i in 0..5u8 {
             seqs.push(
-                be.log_append_if_absent(NS, "s:replay", &format!("c{i}"), &[i])
+                be.log_append_if_absent(ns, "s:replay", &format!("c{i}"), &[i])
                     .await
                     .unwrap()
                     .seq,
@@ -387,7 +388,7 @@ pub(crate) mod log_contract_suite {
         // Pin at the 3rd entry: only the first two are removable.
         let out = be
             .log_truncate(
-                NS,
+                ns,
                 "s:replay",
                 LogTruncateRequest {
                     older_than_ms: None,
@@ -404,7 +405,7 @@ pub(crate) mod log_contract_suite {
             "cap could not be honored under the pin"
         );
         let remaining: Vec<u64> = be
-            .log_since(NS, "s:replay", 0)
+            .log_since(ns, "s:replay", 0)
             .await
             .unwrap()
             .into_iter()
@@ -415,27 +416,27 @@ pub(crate) mod log_contract_suite {
 
     /// A truncated-empty stream keeps its horizon, distinguishing it from a stream
     /// that never held data.
-    pub async fn empty_vs_truncated(be: Arc<dyn StorageBackend>) {
+    pub async fn empty_vs_truncated(be: Arc<dyn StorageBackend>, ns: &str) {
         // Never-had-data.
-        let fresh = be.log_stream_meta(NS, "s:fresh").await.unwrap();
+        let fresh = be.log_stream_meta(ns, "s:fresh").await.unwrap();
         assert_eq!(fresh.min_valid_from_seq, 0);
         assert_eq!(fresh.head_seq, 0);
         assert_eq!(fresh.oldest_seq, None);
         assert_eq!(fresh.len, 0);
 
         let s1 = be
-            .log_append_if_absent(NS, "s:t", "c1", b"a")
+            .log_append_if_absent(ns, "s:t", "c1", b"a")
             .await
             .unwrap()
             .seq;
         let s2 = be
-            .log_append_if_absent(NS, "s:t", "c2", b"b")
+            .log_append_if_absent(ns, "s:t", "c2", b"b")
             .await
             .unwrap()
             .seq;
         let out = be
             .log_truncate(
-                NS,
+                ns,
                 "s:t",
                 LogTruncateRequest {
                     older_than_ms: None,
@@ -448,7 +449,7 @@ pub(crate) mod log_contract_suite {
             .unwrap();
         assert_eq!(out.removed, 2);
         assert_eq!(out.oldest_seq, None);
-        let meta = be.log_stream_meta(NS, "s:t").await.unwrap();
+        let meta = be.log_stream_meta(ns, "s:t").await.unwrap();
         assert_eq!(meta.oldest_seq, None);
         assert_eq!(meta.len, 0);
         assert_eq!(meta.min_valid_from_seq, s2, "horizon preserved when empty");
@@ -458,16 +459,18 @@ pub(crate) mod log_contract_suite {
 
     /// Concurrent identical appends collapse to one entry; concurrent same-id
     /// different-value appends yield exactly one insert and one conflict.
-    pub async fn concurrent_appends(be: Arc<dyn StorageBackend>) {
+    pub async fn concurrent_appends(be: Arc<dyn StorageBackend>, ns: &str) {
+        // Owned copies so the spawned ('static) tasks capture no borrows.
+        let ns = ns.to_string();
         // Identical.
-        let b1 = Arc::clone(&be);
-        let b2 = Arc::clone(&be);
+        let (b1, b2) = (Arc::clone(&be), Arc::clone(&be));
+        let (n1, n2) = (ns.clone(), ns.clone());
         let (r1, r2) = tokio::join!(
             tokio::spawn(async move {
-                b1.log_append_if_absent(NS, "s:c", "cap", b"same").await
+                b1.log_append_if_absent(&n1, "s:c", "cap", b"same").await
             }),
             tokio::spawn(async move {
-                b2.log_append_if_absent(NS, "s:c", "cap", b"same").await
+                b2.log_append_if_absent(&n2, "s:c", "cap", b"same").await
             }),
         );
         let (o1, o2) = (r1.unwrap().unwrap(), r2.unwrap().unwrap());
@@ -480,17 +483,17 @@ pub(crate) mod log_contract_suite {
             inserts, 1,
             "exactly one insert for identical concurrent appends"
         );
-        assert_eq!(be.log_since(NS, "s:c", 0).await.unwrap().len(), 1);
+        assert_eq!(be.log_since(&ns, "s:c", 0).await.unwrap().len(), 1);
 
         // Same id, different value.
-        let b3 = Arc::clone(&be);
-        let b4 = Arc::clone(&be);
+        let (b3, b4) = (Arc::clone(&be), Arc::clone(&be));
+        let (n3, n4) = (ns.clone(), ns.clone());
         let (r3, r4) = tokio::join!(
             tokio::spawn(async move {
-                b3.log_append_if_absent(NS, "s:d", "cap", b"one").await
+                b3.log_append_if_absent(&n3, "s:d", "cap", b"one").await
             }),
             tokio::spawn(async move {
-                b4.log_append_if_absent(NS, "s:d", "cap", b"two").await
+                b4.log_append_if_absent(&n4, "s:d", "cap", b"two").await
             }),
         );
         let results = [r3.unwrap(), r4.unwrap()];
@@ -501,6 +504,6 @@ pub(crate) mod log_contract_suite {
             .count();
         assert_eq!(oks, 1, "exactly one insert wins");
         assert_eq!(conflicts, 1, "the other is a conflict");
-        assert_eq!(be.log_since(NS, "s:d", 0).await.unwrap().len(), 1);
+        assert_eq!(be.log_since(&ns, "s:d", 0).await.unwrap().len(), 1);
     }
 }

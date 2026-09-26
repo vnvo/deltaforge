@@ -360,49 +360,59 @@ impl StorageBackend for PostgresStorageBackend {
         let mut c = client!(self);
         let tx = c.transaction().await?;
         tx.execute(ENSURE_LOG_META_SQL, &[&ns, &key]).await?;
-        let existing = tx
+        // Race-safe insert: attempt it directly and let the partial unique index
+        // arbitrate. A concurrent inserter with the same capture_id makes this a
+        // no-op - the second transaction blocks on the conflicting tuple, then (once
+        // the first commits) DO NOTHING returns no row and we re-read below. This
+        // avoids the check-then-insert race that would surface a raw unique-constraint
+        // error to the loser.
+        let inserted = tx
             .query_opt(
+                "INSERT INTO df_log(ns, key, val, ts, ts_ms, capture_id, content_hash)
+                 VALUES($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (ns, key, capture_id) WHERE capture_id IS NOT NULL
+                 DO NOTHING
+                 RETURNING seq",
+                &[&ns, &key, &value, &now_secs(), &now_ms(), &capture_id, &digest],
+            )
+            .await?;
+        if let Some(row) = inserted {
+            let seq: i64 = row.get(0);
+            tx.execute(
+                "UPDATE df_log_meta SET head_seq=GREATEST(head_seq, $3) WHERE ns=$1 AND key=$2",
+                &[&ns, &key, &seq],
+            )
+            .await?;
+            tx.commit().await?;
+            return Ok(LogAppendOutcome {
+                seq: seq as u64,
+                status: AppendStatus::Inserted,
+            });
+        }
+        // The identity already exists (committed by a concurrent or prior writer).
+        // Re-read and confirm by exact bytes.
+        let row = tx
+            .query_one(
                 "SELECT seq, val, content_hash FROM df_log
                  WHERE ns=$1 AND key=$2 AND capture_id=$3",
                 &[&ns, &key, &capture_id],
             )
             .await?;
-        if let Some(row) = existing {
-            let seq: i64 = row.get(0);
-            let val: Vec<u8> = row.get(1);
-            let ch: Option<String> = row.get(2);
-            if ch.as_deref() == Some(digest.as_str()) && val.as_slice() == value
-            {
-                tx.commit().await?;
-                return Ok(LogAppendOutcome {
-                    seq: seq as u64,
-                    status: AppendStatus::AlreadyPresent,
-                });
-            }
-            // Different bytes under an existing identity: never overwrite (rollback).
-            return Err(LogError::CaptureIdentityConflict {
-                capture_id: capture_id.to_string(),
-            }
-            .into());
-        }
-        let row = tx
-            .query_one(
-                "INSERT INTO df_log(ns, key, val, ts, ts_ms, capture_id, content_hash)
-                 VALUES($1, $2, $3, $4, $5, $6, $7) RETURNING seq",
-                &[&ns, &key, &value, &now_secs(), &now_ms(), &capture_id, &digest],
-            )
-            .await?;
         let seq: i64 = row.get(0);
-        tx.execute(
-            "UPDATE df_log_meta SET head_seq=GREATEST(head_seq, $3) WHERE ns=$1 AND key=$2",
-            &[&ns, &key, &seq],
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(LogAppendOutcome {
-            seq: seq as u64,
-            status: AppendStatus::Inserted,
-        })
+        let val: Vec<u8> = row.get(1);
+        let ch: Option<String> = row.get(2);
+        if ch.as_deref() == Some(digest.as_str()) && val.as_slice() == value {
+            tx.commit().await?;
+            return Ok(LogAppendOutcome {
+                seq: seq as u64,
+                status: AppendStatus::AlreadyPresent,
+            });
+        }
+        // Different bytes under an existing identity: never overwrite (rollback).
+        Err(LogError::CaptureIdentityConflict {
+            capture_id: capture_id.to_string(),
+        }
+        .into())
     }
 
     async fn log_truncate(
@@ -717,73 +727,29 @@ impl StorageBackend for PostgresStorageBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AppendStatus, LogError, LogTruncateRequest};
 
-    // Live PostgreSQL contract check. #[ignore] + env-gated on DELTAFORGE_IT_PG_DSN;
-    // uses a unique key per run so it is safe against a shared database.
+    /// The full shared contract suite against a live PostgreSQL, including the
+    /// concurrent cases (which exercise the ON CONFLICT / re-read race). #[ignore] +
+    /// env-gated on DELTAFORGE_IT_PG_DSN; each case runs under a unique namespace so
+    /// it is safe against a shared database and repeated runs.
     #[tokio::test]
     #[ignore = "requires a live PostgreSQL (DELTAFORGE_IT_PG_DSN)"]
     async fn pg_log_contracts() {
         let dsn = std::env::var("DELTAFORGE_IT_PG_DSN")
             .expect("DELTAFORGE_IT_PG_DSN must be set to run this test");
-        let be = PostgresStorageBackend::connect(&dsn).await.unwrap();
-        let ns = "journal";
-        let uniq = now_ms();
-        let key = format!("s:{uniq}:replay");
-        let other = format!("s:{uniq}:other");
-
-        // Idempotency + conflict.
-        let a = be.log_append_if_absent(ns, &key, "c1", b"a").await.unwrap();
-        assert_eq!(a.status, AppendStatus::Inserted);
-        let a2 = be.log_append_if_absent(ns, &key, "c1", b"a").await.unwrap();
-        assert_eq!(a2.status, AppendStatus::AlreadyPresent);
-        assert_eq!(a.seq, a2.seq);
-        let err = be
-            .log_append_if_absent(ns, &key, "c1", b"different")
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err.downcast_ref::<LogError>(),
-            Some(LogError::CaptureIdentityConflict { .. })
-        ));
-
-        // Global-gap horizon: interleave another key, then truncate below the tail.
-        be.log_append(ns, &other, b"x").await.unwrap();
-        let s2 = be
-            .log_append_if_absent(ns, &key, "c2", b"b")
-            .await
-            .unwrap()
-            .seq;
-        be.log_append(ns, &other, b"x").await.unwrap();
-        let s3 = be
-            .log_append_if_absent(ns, &key, "c3", b"c")
-            .await
-            .unwrap()
-            .seq;
-        let out = be
-            .log_truncate(
-                ns,
-                &key,
-                LogTruncateRequest {
-                    older_than_ms: Some(i64::MAX),
-                    pin_seq: s3,
-                    max_entries: Some(1),
-                    max_bytes: None,
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(out.highest_removed_seq, Some(s2));
-        assert_eq!(
-            out.min_valid_from_seq, s2,
-            "horizon = highest removed, not oldest-1"
-        );
-        assert_eq!(out.oldest_seq, Some(s3));
-        assert!(out.capacity_pinned, "cap blocked by pin");
-        let from_horizon = be
-            .log_since(ns, &key, out.min_valid_from_seq)
-            .await
-            .unwrap();
-        assert_eq!(from_horizon.first().map(|(s, _)| *s), Some(s3));
+        use crate::log_contract_suite as suite;
+        let be: Arc<dyn StorageBackend> =
+            PostgresStorageBackend::connect(&dsn).await.unwrap();
+        let base = now_ms();
+        suite::idempotency(be.clone(), &format!("it{base}_idem")).await;
+        suite::conflict_rejected(be.clone(), &format!("it{base}_conf")).await;
+        suite::horizon_with_global_gaps(
+            be.clone(),
+            &format!("it{base}_horizon"),
+        )
+        .await;
+        suite::pin_invariant(be.clone(), &format!("it{base}_pin")).await;
+        suite::empty_vs_truncated(be.clone(), &format!("it{base}_empty")).await;
+        suite::concurrent_appends(be.clone(), &format!("it{base}_conc")).await;
     }
 }

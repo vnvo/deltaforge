@@ -586,26 +586,27 @@ mod tests {
 
     #[tokio::test]
     async fn idempotency() {
-        crate::log_contract_suite::idempotency(be()).await;
+        crate::log_contract_suite::idempotency(be(), "journal").await;
     }
     #[tokio::test]
     async fn conflict_rejected() {
-        crate::log_contract_suite::conflict_rejected(be()).await;
+        crate::log_contract_suite::conflict_rejected(be(), "journal").await;
     }
     #[tokio::test]
     async fn horizon_with_global_gaps() {
-        crate::log_contract_suite::horizon_with_global_gaps(be()).await;
+        crate::log_contract_suite::horizon_with_global_gaps(be(), "journal")
+            .await;
     }
     #[tokio::test]
     async fn pin_invariant() {
-        crate::log_contract_suite::pin_invariant(be()).await;
+        crate::log_contract_suite::pin_invariant(be(), "journal").await;
     }
     #[tokio::test]
     async fn empty_vs_truncated() {
-        crate::log_contract_suite::empty_vs_truncated(be()).await;
+        crate::log_contract_suite::empty_vs_truncated(be(), "journal").await;
     }
     #[tokio::test]
     async fn concurrent_appends() {
-        crate::log_contract_suite::concurrent_appends(be()).await;
+        crate::log_contract_suite::concurrent_appends(be(), "journal").await;
     }
 }
