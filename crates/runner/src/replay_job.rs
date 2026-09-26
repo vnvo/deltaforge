@@ -5,16 +5,25 @@
 //! progress cursor and phase. At most one ACTIVE (non-terminal) job may exist per pipeline
 //! incarnation.
 //!
-//! This module owns only the model, its legal phase transitions, and slot-backed
-//! persistence. Wiring a job into the coordinator (pause derivation, handoff barrier) and
-//! the replay worker that reads the journal and delivers to sinks arrives in later
-//! checkpoints; the fields and phases here are the contract those pieces build on.
+//! The model owns its legal phase transitions and construction invariants; the store is
+//! the authoritative persistence boundary and re-validates every write against the current
+//! durable record (immutable identity/config, legal phase step or same-phase progress,
+//! monotonic cursor, error/terminal invariants) so a caller cannot persist an illegal
+//! record by hand-building one and calling CAS. Wiring a job into the coordinator (pause
+//! derivation, handoff barrier) and the replay worker arrives in later checkpoints.
+
+use std::collections::HashSet;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use storage::ArcStorageBackend;
 
 use crate::replay_journal::REPLAY_NS;
+
+/// Durable schema version of a persisted [`ReplayJob`] record. Distinct from the slot's
+/// CAS version (which counts writes); this versions the record's shape so a load can fail
+/// closed on an unsupported record rather than mis-deserializing.
+pub const REPLAY_JOB_RECORD_VERSION: u16 = 1;
 
 /// The replay-job slot key, incarnation-scoped so a recreated pipeline never inherits an
 /// old pipeline's job (mirrors the replay stream key).
@@ -49,9 +58,10 @@ pub enum EncoderSchemaPolicy {
 ///         -> Completed
 /// ```
 ///
-/// `Cancelled` and `Failed` are terminal off-ramps. The handoff sequence `H` is carried in
-/// the phase itself so it is durable and cannot drift between the quiesced and delivered
-/// phases.
+/// A dry-run job (which never pauses or delivers) instead completes directly from
+/// `Running`, bypassing the quiesce/handoff phases. `Cancelled` and `Failed` are terminal
+/// off-ramps. The handoff sequence `H` is carried in the phase itself so it is durable and
+/// cannot drift between the quiesced and delivered phases.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub enum ReplayPhase {
@@ -99,9 +109,8 @@ impl ReplayPhase {
         )
     }
 
-    /// While in a pre-`LiveRestored` phase the job holds its selected sinks paused (out of
-    /// the live delivery set). The startup barrier and pause derivation (later checkpoints)
-    /// use this to reinstall pauses before the source starts.
+    /// Whether this phase (ignoring dry-run) keeps the selected sinks paused. Callers
+    /// should prefer [`ReplayJob::holds_pause`], which also accounts for dry-run.
     pub fn holds_pause(&self) -> bool {
         matches!(
             self,
@@ -119,7 +128,7 @@ impl std::fmt::Display for ReplayPhase {
     }
 }
 
-/// Whether `from -> to` is a legal phase transition.
+/// Whether `from -> to` is a legal phase transition for a NON-dry-run job.
 ///
 /// - No transition leaves a terminal phase.
 /// - `Failed` is reachable from any non-terminal phase (any step may error out).
@@ -128,6 +137,9 @@ impl std::fmt::Display for ReplayPhase {
 /// - The forward path is strictly `Running -> CatchingUp -> HandoffQuiesced(H) ->
 ///   DeliveredThrough(H) -> LiveRestored -> Completed`, and `H` must match across the
 ///   quiesced and delivered phases.
+///
+/// Dry-run jobs use [`ReplayJob::is_legal_next_phase`], which completes directly from
+/// `Running`.
 pub fn is_legal_transition(from: &ReplayPhase, to: &ReplayPhase) -> bool {
     use ReplayPhase::*;
     if from.is_terminal() {
@@ -164,11 +176,42 @@ pub enum ReplayJobError {
     VersionConflict { expected: u64 },
     #[error("replay job cursor cannot move backward (from {from} to {to})")]
     CursorRegression { from: u64, to: u64 },
+    #[error("replay job immutable field changed: {field}")]
+    ImmutableFieldChanged { field: &'static str },
+    #[error(
+        "replay job identity mismatch (record is {got}, store is for {expected})"
+    )]
+    IdentityMismatch { expected: String, got: String },
+    #[error(
+        "unsupported replay job record version {got} (expected {expected})"
+    )]
+    UnsupportedRecordVersion { got: u16, expected: u16 },
+    #[error(
+        "replay job has no target sinks (selected and staged are both empty)"
+    )]
+    NoTargets,
+    #[error(
+        "replay job sink sets are invalid: duplicate within, or overlap between, \
+         selected and staged"
+    )]
+    OverlappingOrDuplicateSinks,
+    #[error(
+        "replay job range is invalid: through_seq {through} < from_seq {from}"
+    )]
+    InvalidRange { from: u64, through: u64 },
+    #[error("a dry-run replay job cannot stage sinks for backfill")]
+    DryRunWithStaged,
+    #[error(
+        "replay job error/terminal invariant violated (error is set iff phase is failed)"
+    )]
+    ErrorInvariant,
 }
 
 /// The durable record of one replay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplayJob {
+    /// Record schema version; see [`REPLAY_JOB_RECORD_VERSION`].
+    pub record_version: u16,
     pub job_id: String,
     pub pipeline: String,
     /// The pipeline incarnation whose replay stream this job reads. Ties the job to one
@@ -186,21 +229,21 @@ pub struct ReplayJob {
     pub through_seq: Option<u64>,
     pub encoder_schema_policy: EncoderSchemaPolicy,
     /// Dry-run jobs deliver nothing (report count/range/targets only) and therefore never
-    /// pause a live sink.
+    /// pause a live sink or run a handoff.
     pub dry_run: bool,
     pub phase: ReplayPhase,
-    /// Highest journal seq durably delivered so far. Resume re-reads from here
-    /// (at-least-once); retention is pinned so entries beyond it are never truncated.
+    /// Highest journal seq durably delivered so far. Resume re-reads from seq > `cursor`
+    /// (at-least-once).
     pub cursor: u64,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
-    /// Set when `phase` is `Failed`.
+    /// Set when, and only when, `phase` is `Failed`.
     pub error: Option<String>,
 }
 
 impl ReplayJob {
-    /// Create a fresh job in `Running` with the cursor at `from_seq` (nothing delivered
-    /// beyond the lower bound yet).
+    /// Construct a fresh job in `Running` with the cursor at `from_seq`, validating the
+    /// construction invariants (targets, sink-set hygiene, range, dry-run/staged rules).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         job_id: impl Into<String>,
@@ -213,8 +256,9 @@ impl ReplayJob {
         encoder_schema_policy: EncoderSchemaPolicy,
         dry_run: bool,
         now_ms: i64,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ReplayJobError> {
+        let job = Self {
+            record_version: REPLAY_JOB_RECORD_VERSION,
             job_id: job_id.into(),
             pipeline: pipeline.into(),
             incarnation: incarnation.into(),
@@ -229,7 +273,45 @@ impl ReplayJob {
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             error: None,
+        };
+        job.validate()?;
+        Ok(job)
+    }
+
+    /// Validate the record's construction invariants. Called by [`ReplayJob::new`] and,
+    /// authoritatively, by [`ReplayJobStore::create`] (so a hand-built job is checked too).
+    pub fn validate(&self) -> Result<(), ReplayJobError> {
+        if self.record_version != REPLAY_JOB_RECORD_VERSION {
+            return Err(ReplayJobError::UnsupportedRecordVersion {
+                got: self.record_version,
+                expected: REPLAY_JOB_RECORD_VERSION,
+            });
         }
+        if self.selected_sinks.is_empty() && self.staged_sinks.is_empty() {
+            return Err(ReplayJobError::NoTargets);
+        }
+        if has_duplicates(&self.selected_sinks)
+            || has_duplicates(&self.staged_sinks)
+            || self
+                .selected_sinks
+                .iter()
+                .any(|s| self.staged_sinks.contains(s))
+        {
+            return Err(ReplayJobError::OverlappingOrDuplicateSinks);
+        }
+        if let Some(through) = self.through_seq {
+            if through < self.from_seq {
+                return Err(ReplayJobError::InvalidRange {
+                    from: self.from_seq,
+                    through,
+                });
+            }
+        }
+        if self.dry_run && !self.staged_sinks.is_empty() {
+            return Err(ReplayJobError::DryRunWithStaged);
+        }
+        self.check_error_invariant()?;
+        Ok(())
     }
 
     /// A job is active while its phase is non-terminal.
@@ -237,10 +319,35 @@ impl ReplayJob {
         !self.phase.is_terminal()
     }
 
+    /// Whether this job keeps its selected sinks paused: a non-dry-run job in a
+    /// pre-`LiveRestored` phase. Dry-run jobs never pause.
+    pub fn holds_pause(&self) -> bool {
+        !self.dry_run && self.phase.holds_pause()
+    }
+
     /// The lowest journal seq this job still needs retained, or `None` when the job is
-    /// terminal (it then pins nothing). Retention must never remove `seq >= pin_seq`.
+    /// terminal (it then pins nothing). Resume reads seq > `cursor`, so the next needed seq
+    /// is `cursor + 1`; retention must never remove `seq >= pin_seq` (C3).
     pub fn pin_seq(&self) -> Option<u64> {
-        self.is_active().then_some(self.cursor)
+        self.is_active().then(|| self.cursor.saturating_add(1))
+    }
+
+    /// Whether `to` is a legal next phase for THIS job, accounting for dry-run (which
+    /// completes directly from `Running`, never through quiesce/handoff).
+    pub fn is_legal_next_phase(&self, to: &ReplayPhase) -> bool {
+        if self.phase.is_terminal() {
+            return false;
+        }
+        if self.dry_run {
+            matches!(
+                to,
+                ReplayPhase::Completed
+                    | ReplayPhase::Cancelled
+                    | ReplayPhase::Failed
+            )
+        } else {
+            is_legal_transition(&self.phase, to)
+        }
     }
 
     /// Return a copy transitioned to `to`, or an error if the transition is illegal.
@@ -249,7 +356,7 @@ impl ReplayJob {
         to: ReplayPhase,
         now_ms: i64,
     ) -> Result<Self, ReplayJobError> {
-        if !is_legal_transition(&self.phase, &to) {
+        if !self.is_legal_next_phase(&to) {
             return Err(ReplayJobError::IllegalTransition {
                 from: self.phase.name().into(),
                 to: to.name().into(),
@@ -257,6 +364,7 @@ impl ReplayJob {
         }
         let mut next = self.clone();
         next.phase = to;
+        next.error = None;
         next.updated_at_ms = now_ms;
         Ok(next)
     }
@@ -289,6 +397,67 @@ impl ReplayJob {
         next.updated_at_ms = now_ms;
         Ok(next)
     }
+
+    /// `error` must be set exactly when the phase is `Failed`.
+    fn check_error_invariant(&self) -> Result<(), ReplayJobError> {
+        let is_failed = matches!(self.phase, ReplayPhase::Failed);
+        if is_failed != self.error.is_some() {
+            return Err(ReplayJobError::ErrorInvariant);
+        }
+        Ok(())
+    }
+}
+
+/// Validate a proposed durable update against the current durable record: immutable
+/// identity and configuration must be unchanged, the phase must be the same (a progress
+/// update) or a legal transition, the cursor must not regress, and the error/terminal
+/// invariant must hold. This is the persistence boundary's guard against illegal writes.
+fn validate_durable_update(
+    current: &ReplayJob,
+    proposed: &ReplayJob,
+) -> Result<(), ReplayJobError> {
+    macro_rules! immutable {
+        ($field:ident) => {
+            if current.$field != proposed.$field {
+                return Err(ReplayJobError::ImmutableFieldChanged {
+                    field: stringify!($field),
+                });
+            }
+        };
+    }
+    immutable!(record_version);
+    immutable!(job_id);
+    immutable!(pipeline);
+    immutable!(incarnation);
+    immutable!(selected_sinks);
+    immutable!(staged_sinks);
+    immutable!(from_seq);
+    immutable!(through_seq);
+    immutable!(encoder_schema_policy);
+    immutable!(dry_run);
+    immutable!(created_at_ms);
+
+    if proposed.phase != current.phase
+        && !current.is_legal_next_phase(&proposed.phase)
+    {
+        return Err(ReplayJobError::IllegalTransition {
+            from: current.phase.name().into(),
+            to: proposed.phase.name().into(),
+        });
+    }
+    if proposed.cursor < current.cursor {
+        return Err(ReplayJobError::CursorRegression {
+            from: current.cursor,
+            to: proposed.cursor,
+        });
+    }
+    proposed.check_error_invariant()?;
+    Ok(())
+}
+
+fn has_duplicates(v: &[String]) -> bool {
+    let mut seen = HashSet::with_capacity(v.len());
+    !v.iter().all(|s| seen.insert(s))
 }
 
 /// A job as read back from its slot, with the slot's CAS version.
@@ -298,9 +467,13 @@ pub struct StoredReplayJob {
     pub job: ReplayJob,
 }
 
-/// Slot-backed persistence for the single per-pipeline-incarnation replay job.
+/// Slot-backed persistence for the single per-pipeline-incarnation replay job, and the
+/// authoritative validation boundary: every write is checked against the store's identity
+/// and the current durable record before it is committed.
 pub struct ReplayJobStore {
     backend: ArcStorageBackend,
+    pipeline: String,
+    incarnation: String,
     key: String,
 }
 
@@ -312,15 +485,38 @@ impl ReplayJobStore {
     ) -> Self {
         Self {
             backend,
+            pipeline: pipeline.to_string(),
+            incarnation: incarnation.to_string(),
             key: replay_job_key(pipeline, incarnation),
         }
     }
 
-    /// Load the current job and its CAS version, or `None` when no job exists.
+    /// The record's version and identity must match the store; used on every load and
+    /// write so a corrupt or foreign record fails closed rather than being trusted.
+    fn check_identity(&self, job: &ReplayJob) -> Result<(), ReplayJobError> {
+        if job.record_version != REPLAY_JOB_RECORD_VERSION {
+            return Err(ReplayJobError::UnsupportedRecordVersion {
+                got: job.record_version,
+                expected: REPLAY_JOB_RECORD_VERSION,
+            });
+        }
+        if job.pipeline != self.pipeline || job.incarnation != self.incarnation
+        {
+            return Err(ReplayJobError::IdentityMismatch {
+                expected: format!("{}:{}", self.pipeline, self.incarnation),
+                got: format!("{}:{}", job.pipeline, job.incarnation),
+            });
+        }
+        Ok(())
+    }
+
+    /// Load the current job and its CAS version, or `None` when no job exists. Fails closed
+    /// on an unsupported record version or an identity that does not match the store key.
     pub async fn get(&self) -> Result<Option<StoredReplayJob>> {
         match self.backend.slot_get(REPLAY_NS, &self.key).await? {
             Some((version, bytes)) => {
-                let job = serde_json::from_slice(&bytes)?;
+                let job: ReplayJob = serde_json::from_slice(&bytes)?;
+                self.check_identity(&job)?;
                 Ok(Some(StoredReplayJob { version, job }))
             }
             None => Ok(None),
@@ -329,8 +525,11 @@ impl ReplayJobStore {
 
     /// Create a new job. Fails with [`ReplayJobError::AlreadyActive`] when a non-terminal
     /// job already exists; a terminal record (completed/cancelled/failed) is replaced so a
-    /// pipeline can start a fresh replay after the previous one finished.
+    /// pipeline can start a fresh replay after the previous one finished. Validates the
+    /// job's identity and construction invariants first.
     pub async fn create(&self, job: &ReplayJob) -> Result<StoredReplayJob> {
+        self.check_identity(job)?;
+        job.validate()?;
         let bytes = serde_json::to_vec(job)?;
         if let Some(version) = self
             .backend
@@ -369,14 +568,27 @@ impl ReplayJobStore {
             .ok_or_else(|| anyhow::anyhow!("replay job vanished after replace"))
     }
 
-    /// Persist `job` if the slot is still at `expected_version`. Returns the new stored
-    /// job (with its bumped version) or [`ReplayJobError::VersionConflict`] on a stale
-    /// version (a concurrent writer moved the job first).
+    /// Persist `job` if the slot is still at `expected_version`, after validating the write
+    /// against the current durable record (immutable identity/config, legal phase step or
+    /// same-phase progress, monotonic cursor, error/terminal invariant). Returns the new
+    /// stored job or an error: [`ReplayJobError::VersionConflict`] on a stale version, or a
+    /// specific invariant error on an illegal write.
     pub async fn compare_and_set(
         &self,
         expected_version: u64,
         job: &ReplayJob,
     ) -> Result<StoredReplayJob> {
+        self.check_identity(job)?;
+        let current = self.get().await?.ok_or_else(|| {
+            anyhow::anyhow!("no replay job to update (slot is empty)")
+        })?;
+        if current.version != expected_version {
+            return Err(ReplayJobError::VersionConflict {
+                expected: expected_version,
+            }
+            .into());
+        }
+        validate_durable_update(&current.job, job)?;
         let bytes = serde_json::to_vec(job)?;
         if !self
             .backend
@@ -418,6 +630,7 @@ mod tests {
             false,
             1_000,
         )
+        .unwrap()
     }
 
     #[test]
@@ -438,7 +651,6 @@ mod tests {
                 pair[1]
             );
         }
-        // Skipping a phase is illegal.
         assert!(!is_legal_transition(
             &ReplayPhase::Running,
             &ReplayPhase::HandoffQuiesced { handoff_seq: 1 }
@@ -447,7 +659,6 @@ mod tests {
             &ReplayPhase::CatchingUp,
             &ReplayPhase::LiveRestored
         ));
-        // No going backward.
         assert!(!is_legal_transition(
             &ReplayPhase::LiveRestored,
             &ReplayPhase::Running
@@ -517,6 +728,83 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_completes_directly_and_never_pauses() {
+        let dry = ReplayJob::new(
+            "job-dry",
+            "p",
+            "inc-1",
+            vec!["kafka".into()],
+            vec![],
+            0,
+            None,
+            EncoderSchemaPolicy::Current,
+            true,
+            1_000,
+        )
+        .unwrap();
+        assert!(!dry.holds_pause(), "dry-run never pauses live sinks");
+        // Completes directly from Running, bypassing quiesce/handoff.
+        assert!(dry.is_legal_next_phase(&ReplayPhase::Completed));
+        assert!(!dry.is_legal_next_phase(&ReplayPhase::CatchingUp));
+        assert!(!dry.is_legal_next_phase(&ReplayPhase::HandoffQuiesced {
+            handoff_seq: 1
+        }));
+        let done = dry.advance(ReplayPhase::Completed, 2_000).unwrap();
+        assert_eq!(done.phase, ReplayPhase::Completed);
+    }
+
+    #[test]
+    fn non_dry_run_running_holds_pause() {
+        assert!(job().holds_pause());
+    }
+
+    #[test]
+    fn construction_rejects_invalid_jobs() {
+        let mk = |selected: Vec<String>,
+                  staged: Vec<String>,
+                  through: Option<u64>,
+                  dry: bool| {
+            ReplayJob::new(
+                "j",
+                "p",
+                "inc-1",
+                selected,
+                staged,
+                10,
+                through,
+                EncoderSchemaPolicy::Current,
+                dry,
+                1_000,
+            )
+        };
+        assert!(matches!(
+            mk(vec![], vec![], None, false),
+            Err(ReplayJobError::NoTargets)
+        ));
+        assert!(matches!(
+            mk(vec!["a".into(), "a".into()], vec![], None, false),
+            Err(ReplayJobError::OverlappingOrDuplicateSinks)
+        ));
+        assert!(matches!(
+            mk(vec!["a".into()], vec!["a".into()], None, false),
+            Err(ReplayJobError::OverlappingOrDuplicateSinks)
+        ));
+        assert!(matches!(
+            mk(vec!["a".into()], vec![], Some(5), false),
+            Err(ReplayJobError::InvalidRange {
+                from: 10,
+                through: 5
+            })
+        ));
+        assert!(matches!(
+            mk(vec!["a".into()], vec!["b".into()], None, true),
+            Err(ReplayJobError::DryRunWithStaged)
+        ));
+        // through == from is valid.
+        assert!(mk(vec!["a".into()], vec![], Some(10), false).is_ok());
+    }
+
+    #[test]
     fn advance_and_fail_set_phase_and_error() {
         let j = job();
         let caught = j.advance(ReplayPhase::CatchingUp, 2_000).unwrap();
@@ -527,27 +815,27 @@ mod tests {
         let failed = caught.fail("sink exploded", 3_000).unwrap();
         assert_eq!(failed.phase, ReplayPhase::Failed);
         assert_eq!(failed.error.as_deref(), Some("sink exploded"));
+        failed.check_error_invariant().unwrap();
     }
 
     #[test]
     fn cursor_advances_forward_only() {
-        let j = job(); // cursor starts at from_seq = 10
+        let j = job();
         let moved = j.with_cursor(15, 2_000).unwrap();
         assert_eq!(moved.cursor, 15);
         assert!(matches!(
             moved.with_cursor(14, 2_000),
             Err(ReplayJobError::CursorRegression { from: 15, to: 14 })
         ));
-        // Same position is allowed (idempotent re-record).
         assert_eq!(moved.with_cursor(15, 2_500).unwrap().cursor, 15);
     }
 
     #[test]
-    fn pin_seq_tracks_cursor_while_active_and_is_none_when_terminal() {
-        let j = job();
-        assert_eq!(j.pin_seq(), Some(10));
+    fn pin_seq_is_next_needed_seq_while_active_and_none_when_terminal() {
+        let j = job(); // cursor starts at from_seq = 10
+        assert_eq!(j.pin_seq(), Some(11));
         let moved = j.with_cursor(20, 2_000).unwrap();
-        assert_eq!(moved.pin_seq(), Some(20));
+        assert_eq!(moved.pin_seq(), Some(21));
         let done = moved
             .advance(ReplayPhase::CatchingUp, 2_100)
             .unwrap()
@@ -608,14 +896,12 @@ mod tests {
         let be: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
         let store = ReplayJobStore::new(be, "p", "inc-1");
         let created = store.create(&job()).await.unwrap();
-        // Drive the first job to a terminal phase and persist it.
         let cancelled =
             created.job.advance(ReplayPhase::Cancelled, 5_000).unwrap();
         store
             .compare_and_set(created.version, &cancelled)
             .await
             .unwrap();
-        // A fresh job may now take the slot.
         let mut fresh = job();
         fresh.job_id = "job-2".into();
         let replaced = store.create(&fresh).await.unwrap();
@@ -634,7 +920,6 @@ mod tests {
             .await
             .unwrap();
         assert!(after.version > created.version);
-        // The stale version no longer wins.
         let err = store
             .compare_and_set(created.version, &moved)
             .await
@@ -647,5 +932,117 @@ mod tests {
                 )),
             "expected VersionConflict, got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn compare_and_set_enforces_the_state_machine() {
+        let be: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        let store = ReplayJobStore::new(be, "p", "inc-1");
+        let created = store.create(&job()).await.unwrap();
+        let v = created.version;
+
+        // Illegal phase skip (Running -> LiveRestored).
+        let mut skip = created.job.clone();
+        skip.phase = ReplayPhase::LiveRestored;
+        assert!(matches!(
+            store
+                .compare_and_set(v, &skip)
+                .await
+                .unwrap_err()
+                .downcast_ref::<ReplayJobError>(),
+            Some(ReplayJobError::IllegalTransition { .. })
+        ));
+
+        // Immutable range change.
+        let mut range = created.job.clone();
+        range.from_seq = 0;
+        range.cursor = 0;
+        assert!(matches!(
+            store
+                .compare_and_set(v, &range)
+                .await
+                .unwrap_err()
+                .downcast_ref::<ReplayJobError>(),
+            Some(ReplayJobError::ImmutableFieldChanged { .. })
+        ));
+
+        // Immutable identity change (job_id).
+        let mut ident = created.job.clone();
+        ident.job_id = "other".into();
+        assert!(matches!(
+            store
+                .compare_and_set(v, &ident)
+                .await
+                .unwrap_err()
+                .downcast_ref::<ReplayJobError>(),
+            Some(ReplayJobError::ImmutableFieldChanged { .. })
+        ));
+
+        // Cursor regression bypassing with_cursor (from_seq and cursor both start at 10).
+        let mut back = created.job.clone();
+        back.cursor = 9;
+        assert!(matches!(
+            store
+                .compare_and_set(v, &back)
+                .await
+                .unwrap_err()
+                .downcast_ref::<ReplayJobError>(),
+            Some(ReplayJobError::CursorRegression { .. })
+        ));
+
+        // A legal progress update still works.
+        let ok = created.job.with_cursor(12, 2_000).unwrap();
+        assert!(store.compare_and_set(v, &ok).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn get_and_create_fail_closed_on_foreign_identity() {
+        let be: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        let store = ReplayJobStore::new(be.clone(), "p", "inc-1");
+        // A job built for a different incarnation cannot be created here.
+        let mut foreign = job();
+        foreign.incarnation = "inc-2".into();
+        assert!(matches!(
+            store
+                .create(&foreign)
+                .await
+                .unwrap_err()
+                .downcast_ref::<ReplayJobError>(),
+            Some(ReplayJobError::IdentityMismatch { .. })
+        ));
+
+        // A record written directly under the key with a foreign identity fails the load.
+        let bytes = serde_json::to_vec(&foreign).unwrap();
+        be.slot_upsert(REPLAY_NS, &replay_job_key("p", "inc-1"), &bytes)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .get()
+                .await
+                .unwrap_err()
+                .downcast_ref::<ReplayJobError>(),
+            Some(ReplayJobError::IdentityMismatch { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_fails_closed_on_unsupported_record_version() {
+        let be: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        let store = ReplayJobStore::new(be.clone(), "p", "inc-1");
+        let mut future = job();
+        future.record_version = REPLAY_JOB_RECORD_VERSION + 1;
+        let bytes = serde_json::to_vec(&future).unwrap();
+        be.slot_upsert(REPLAY_NS, &replay_job_key("p", "inc-1"), &bytes)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .get()
+                .await
+                .unwrap_err()
+                .downcast_ref::<ReplayJobError>(),
+            Some(ReplayJobError::UnsupportedRecordVersion { .. })
+        ));
     }
 }
