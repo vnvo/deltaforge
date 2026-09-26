@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
 
 use crate::coordinator::{
-    Coordinator, SchemaSensorState, build_batch_processor, build_commit_fn,
+    Coordinator, PauseState, SchemaSensorState, build_batch_processor,
+    build_commit_fn,
 };
 use crate::replay_controller::{
     CoordinatorReplayDelivery, PauseIngestionControl, ReplayController,
@@ -387,7 +387,7 @@ pub(crate) struct PipelineRuntime {
     /// (i.e. the source died unexpectedly). Used to drive /health.
     pub(crate) alive: Arc<AtomicBool>,
     pub(crate) cancel: CancellationToken,
-    pub(crate) pause: watch::Sender<bool>,
+    pub(crate) pause: watch::Sender<PauseState>,
     pub(crate) sources: Vec<SourceHandle>,
     pub(crate) join: Option<JoinHandle<Result<()>>>,
     pub(crate) schema_loader: Option<ArcSchemaLoader>,
@@ -427,11 +427,15 @@ pub(crate) struct ReplayContext {
     pipeline: String,
     incarnation: String,
     gate: Arc<ReplaySinkGate>,
-    pause: watch::Sender<bool>,
+    pause: watch::Sender<PauseState>,
+    /// Receives the coordinator's acknowledged quiesce, used by the handoff barrier.
+    quiesced: watch::Receiver<bool>,
+    /// Commit-policy and the full sink id set, for start-authorization validation.
+    sink_ids: Arc<Vec<String>>,
+    commit_policy: Option<deltaforge_config::CommitPolicy>,
     delivery: Arc<dyn ReplayDelivery>,
     pin: Arc<AtomicU64>,
     batch_limit: usize,
-    settle: Duration,
 }
 
 impl ReplayContext {
@@ -450,7 +454,7 @@ impl ReplayContext {
             self.gate.clone(),
             Arc::new(PauseIngestionControl::new(
                 self.pause.clone(),
-                self.settle,
+                self.quiesced.clone(),
             )),
             self.delivery.clone(),
             self.pin.clone(),
@@ -464,7 +468,7 @@ impl ReplayContext {
 impl PipelineRuntime {
     pub(crate) fn pause(&mut self) {
         self.sources.iter().for_each(|s| s.pause());
-        let _ = self.pause.send(true);
+        self.pause.send_modify(|s| s.operator = true);
         self.status = PipelineStatus::Paused;
         counter!(
             "deltaforge_pipeline_pauses_total",
@@ -475,7 +479,7 @@ impl PipelineRuntime {
 
     pub(crate) fn resume(&mut self) {
         self.sources.iter().for_each(|s| s.resume());
-        let _ = self.pause.send(false);
+        self.pause.send_modify(|s| s.operator = false);
         self.status = PipelineStatus::Running;
         counter!(
             "deltaforge_pipeline_resumes_total",
@@ -736,7 +740,9 @@ impl PipelineManager {
         // Each sink gets its own checkpoint key: "{source_id}::sink::{sink_id}".
         let source_id = spec.spec.source.source_id().to_string();
 
-        let (pause_tx, pause_rx) = watch::channel(false);
+        let (pause_tx, pause_rx) = watch::channel(PauseState::default());
+        // Coordinator -> replay handoff acknowledged-quiesce channel.
+        let (quiesce_ack_tx, quiesce_ack_rx) = watch::channel(false);
 
         // Schema sensing
         let sensing_cfg = spec.spec.schema_sensing.clone();
@@ -767,9 +773,15 @@ impl PipelineManager {
             builder = builder.schema_sensor(s);
         }
 
-        if let Some(loader) = &schema_loader {
-            let provider = Arc::new(SchemaLoaderAdapter::new(loader.clone()));
-            builder = builder.schema_provider(provider);
+        // Build the schema provider once and share it between live delivery (coordinator)
+        // and replay delivery, so replay runs the same guided sensing.
+        let replay_provider: Option<crate::schema_provider::ArcSchemaProvider> =
+            schema_loader.as_ref().map(|loader| {
+                Arc::new(SchemaLoaderAdapter::new(loader.clone()))
+                    as crate::schema_provider::ArcSchemaProvider
+            });
+        if let Some(provider) = &replay_provider {
+            builder = builder.schema_provider(provider.clone());
         }
 
         // DLQ writer - opt-in via journal config.
@@ -859,6 +871,7 @@ impl PipelineManager {
             let gate = Arc::new(ReplaySinkGate::new());
             let pin = Arc::new(AtomicU64::new(u64::MAX));
             builder = builder.replay_gate(Arc::clone(&gate));
+            builder = builder.quiesce_ack(quiesce_ack_tx.clone());
             builder =
                 builder.replay_capture(crate::coordinator::ReplayCapture {
                     journal: Arc::clone(&journal),
@@ -885,27 +898,20 @@ impl PipelineManager {
                     .then_some(replay_cfg.max_bytes),
                 interval_secs: 60,
             };
-            // Retention is pinned to the active replay job (if any) through the shared
-            // `pin`: the controller sets it while a job runs and clears it otherwise, so
-            // retention never truncates envelopes a job still needs. The task is owned by
-            // the PipelineRuntime and aborted on stop/delete/drop.
-            let pin_for_ret = Arc::clone(&pin);
-            retention_task = Some(spawn_retention_task(
-                Arc::clone(&journal),
-                pipeline_name.clone(),
-                ret_cfg,
-                Arc::new(move || pin_for_ret.load(Ordering::SeqCst)),
-            ));
-
-            // Startup barrier: reinstall the gate from the durable job BEFORE any live
-            // delivery (the coordinator has not started consuming yet), so a job that was
-            // mid-flight before a restart keeps its sinks paused.
+            // Startup barrier + retention pin, installed synchronously from the durable job
+            // BEFORE retention starts (its first tick fires immediately) and before the
+            // coordinator consumes any event. This closes two races: retention truncating
+            // below the job's needed seq on restart, and live delivery reaching a sink the
+            // job means to keep paused.
             let store = ReplayJobStore::new(
                 self.backend.clone(),
                 &pipeline_name,
                 &incarnation,
             );
             if let Some(stored) = store.get().await? {
+                if let Some(p) = stored.job.pin_seq() {
+                    pin.store(p, Ordering::SeqCst);
+                }
                 if stored.job.holds_pause() {
                     gate.exclude(
                         stored
@@ -918,6 +924,18 @@ impl PipelineManager {
                 }
             }
 
+            // Retention is pinned to the active replay job through the shared `pin`: the
+            // controller keeps it current while a job runs and clears it otherwise, so
+            // retention never truncates envelopes a job still needs. The task is owned by
+            // the PipelineRuntime and aborted on stop/delete/drop.
+            let pin_for_ret = Arc::clone(&pin);
+            retention_task = Some(spawn_retention_task(
+                Arc::clone(&journal),
+                pipeline_name.clone(),
+                ret_cfg,
+                Arc::new(move || pin_for_ret.load(Ordering::SeqCst)),
+            ));
+
             let delivery: Arc<dyn ReplayDelivery> =
                 Arc::new(CoordinatorReplayDelivery::new(
                     build_batch_processor(
@@ -925,6 +943,8 @@ impl PipelineManager {
                         pipeline_name.clone(),
                     ),
                     sinks_by_id,
+                    sensor_for_runtime.clone(),
+                    replay_provider.clone(),
                     pipeline_name.clone(),
                 ));
             let batch_limit = spec
@@ -934,6 +954,8 @@ impl PipelineManager {
                 .and_then(|b| b.max_events)
                 .unwrap_or(500)
                 .max(1);
+            let sink_ids: Arc<Vec<String>> =
+                Arc::new(sinks.iter().map(|s| s.id().to_string()).collect());
             replay_ctx = Some(ReplayContext {
                 backend: self.backend.clone(),
                 journal,
@@ -941,10 +963,12 @@ impl PipelineManager {
                 incarnation: incarnation.clone(),
                 gate,
                 pause: pause_tx.clone(),
+                quiesced: quiesce_ack_rx.clone(),
+                sink_ids,
+                commit_policy: spec.spec.commit_policy.clone(),
                 delivery,
                 pin,
                 batch_limit,
-                settle: Duration::from_millis(200),
             });
             tracing::info!(
                 pipeline = %pipeline_name,
@@ -1149,6 +1173,17 @@ impl PipelineManager {
         dry_run: bool,
     ) -> Result<String, PipelineAPIError> {
         let ctx = self.replay_ctx_of(name)?;
+
+        // Authorize the request BEFORE creating the job or pausing anything.
+        authorize_replay_start(
+            name,
+            &ctx.sink_ids,
+            &ctx.commit_policy,
+            &selected_sinks,
+            &staged_sinks,
+        )
+        .map_err(PipelineAPIError::Failed)?;
+
         let job_id = uuid::Uuid::now_v7().to_string();
         let now = now_ms();
         let job = ReplayJob::new(
@@ -1211,32 +1246,75 @@ impl PipelineManager {
             }
         }
 
-        // Mark the durable job cancelled (only from a pre-live-restored phase) and restore
-        // live delivery: release the gate and the retention pin, and unpause ingestion in
-        // case the cancel landed during a handoff quiesce.
-        if let Some(stored) =
-            ctx.store().get().await.map_err(PipelineAPIError::Failed)?
-        {
-            if stored.job.is_active() {
-                if let Ok(cancelled) =
-                    stored.job.advance(ReplayPhase::Cancelled, now_ms())
-                {
-                    let _ = ctx
-                        .store()
-                        .compare_and_set(stored.version, &cancelled)
-                        .await;
-                }
-                ctx.gate.include(
+        // Persist the cancellation FIRST, and only release ownership (gate, pin, quiesce)
+        // once it is durable. Otherwise a failed CAS could leave an active durable job while
+        // live delivery is restored. A concurrent writer (a racing controller step) can bump
+        // the version, so retry a few times on conflict; a job already terminal is done.
+        let store = ctx.store();
+        let mut targets: Option<Vec<String>> = None;
+        for _ in 0..5 {
+            let stored =
+                match store.get().await.map_err(PipelineAPIError::Failed)? {
+                    Some(s) => s,
+                    None => return Ok(()),
+                };
+            if !stored.job.is_active() {
+                // Already terminal (completed/cancelled/failed): nothing to cancel, but make
+                // sure ownership is released below in case a crash left it installed.
+                targets = Some(
                     stored
                         .job
                         .selected_sinks
                         .iter()
-                        .chain(stored.job.staged_sinks.iter()),
+                        .chain(stored.job.staged_sinks.iter())
+                        .cloned()
+                        .collect(),
                 );
-                ctx.pin.store(u64::MAX, Ordering::SeqCst);
-                let _ = ctx.pause.send(false);
+                break;
+            }
+            let cancelled = stored
+                .job
+                .advance(ReplayPhase::Cancelled, now_ms())
+                .map_err(|e| PipelineAPIError::Failed(anyhow::anyhow!(e)))?;
+            match store.compare_and_set(stored.version, &cancelled).await {
+                Ok(_) => {
+                    targets = Some(
+                        stored
+                            .job
+                            .selected_sinks
+                            .iter()
+                            .chain(stored.job.staged_sinks.iter())
+                            .cloned()
+                            .collect(),
+                    );
+                    break;
+                }
+                Err(e) => {
+                    // Retry only on a version conflict (someone advanced it concurrently).
+                    if e.downcast_ref::<crate::replay_job::ReplayJobError>()
+                        .is_some_and(|e| {
+                            matches!(
+                                e,
+                                crate::replay_job::ReplayJobError::VersionConflict { .. }
+                            )
+                        })
+                    {
+                        continue;
+                    }
+                    return Err(PipelineAPIError::Failed(e));
+                }
             }
         }
+        let Some(targets) = targets else {
+            return Err(PipelineAPIError::Failed(anyhow::anyhow!(
+                "could not persist replay cancellation after repeated version conflicts"
+            )));
+        };
+
+        // Cancellation is durable: now restore live delivery.
+        ctx.gate.include(targets.iter());
+        ctx.pin.store(u64::MAX, Ordering::SeqCst);
+        ctx.pause.send_modify(|s| s.replay = false);
         Ok(())
     }
 }
@@ -1246,6 +1324,47 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+/// Authorize a replay start against the pipeline's sinks and commit policy, before any job
+/// is created or any sink is paused: staged-sink backfill is not supported yet, every
+/// selected sink must exist, and excluding the selected sinks must leave the commit policy
+/// satisfiable (so the live pipeline cannot stall while sinks are held out).
+fn authorize_replay_start(
+    pipeline: &str,
+    sink_ids: &[String],
+    commit_policy: &Option<deltaforge_config::CommitPolicy>,
+    selected: &[String],
+    staged: &[String],
+) -> Result<()> {
+    if !staged.is_empty() {
+        anyhow::bail!(
+            "staged-sink backfill is not supported yet; staged_sinks must be empty"
+        );
+    }
+    if selected.is_empty() {
+        anyhow::bail!("replay requires at least one selected sink");
+    }
+    for id in selected {
+        if !sink_ids.iter().any(|s| s == id) {
+            anyhow::bail!(
+                "replay target sink '{id}' is not a sink of pipeline '{pipeline}'"
+            );
+        }
+    }
+    let live_after =
+        sink_ids.iter().filter(|id| !selected.contains(id)).count();
+    if let Some(deltaforge_config::CommitPolicy::Quorum { quorum }) =
+        commit_policy
+    {
+        if *quorum > live_after {
+            anyhow::bail!(
+                "replay would leave commit quorum {quorum} unsatisfiable: only \
+                 {live_after} sink(s) would remain live"
+            );
+        }
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -1644,9 +1763,65 @@ fn merge_values(base: &mut Value, patch: Value) {
 mod tests {
     use super::*;
     use deltaforge_config::{
-        BatchConfig, Metadata, MysqlSrcCfg, RedisSinkCfg, SinkCfg, SnapshotCfg,
-        SourceCfg, Spec,
+        BatchConfig, CommitPolicy, Metadata, MysqlSrcCfg, RedisSinkCfg,
+        SinkCfg, SnapshotCfg, SourceCfg, Spec,
     };
+
+    #[test]
+    fn authorize_replay_start_validates_targets_and_policy() {
+        let sinks = vec!["kafka".to_string(), "s3".to_string()];
+
+        // Happy path.
+        assert!(
+            authorize_replay_start("p", &sinks, &None, &["kafka".into()], &[])
+                .is_ok()
+        );
+
+        // Staged sinks are rejected for this release.
+        let err = authorize_replay_start(
+            "p",
+            &sinks,
+            &None,
+            &["kafka".into()],
+            &["new".into()],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("staged"));
+
+        // Unknown selected sink.
+        let err =
+            authorize_replay_start("p", &sinks, &None, &["ghost".into()], &[])
+                .unwrap_err();
+        assert!(err.to_string().contains("not a sink"));
+
+        // Empty selection.
+        assert!(authorize_replay_start("p", &sinks, &None, &[], &[]).is_err());
+
+        // Quorum must remain satisfiable after excluding the selected sinks.
+        let quorum2 = Some(CommitPolicy::Quorum { quorum: 2 });
+        // Excluding one of two leaves 1 live < quorum 2 -> rejected.
+        let err = authorize_replay_start(
+            "p",
+            &sinks,
+            &quorum2,
+            &["kafka".into()],
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("quorum"));
+        // Quorum 1 with one sink excluded leaves 1 live -> ok.
+        let quorum1 = Some(CommitPolicy::Quorum { quorum: 1 });
+        assert!(
+            authorize_replay_start(
+                "p",
+                &sinks,
+                &quorum1,
+                &["kafka".into()],
+                &[]
+            )
+            .is_ok()
+        );
+    }
 
     fn sample_spec(name: &str) -> PipelineSpec {
         PipelineSpec {

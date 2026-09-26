@@ -12,26 +12,27 @@
 //! [`CoordinatorReplayDelivery`] is the real delivery: it reconstructs each envelope's
 //! events, runs the pipeline's CURRENT processors, and sends to the job's target sinks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use deltaforge_core::replay::StoredReplayEnvelope;
 use deltaforge_core::{ArcDynSink, CheckpointMeta, Event, SinkBatchContext};
+use parking_lot::Mutex;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::coordinator::ProcessBatchFn;
+use crate::coordinator::{ProcessBatchFn, SchemaSensorState};
 use crate::replay_gate::ReplaySinkGate;
 use crate::replay_job::{ReplayJob, ReplayJobStore, ReplayPhase};
 use crate::replay_journal::JournalLog;
 use crate::replay_worker::{
     ReplayDelivery, ReplayWorker, ResolvedEncoderSchema,
 };
+use crate::schema_provider::{ArcSchemaProvider, TableSchemaInfo};
 
 /// Controls pipeline ingestion during the handoff: `quiesce` stops the coordinator from
 /// capturing or delivering new commit units (so the journal tail is stable) and `resume`
@@ -42,28 +43,41 @@ pub trait IngestionControl: Send + Sync {
     async fn resume(&self);
 }
 
-/// Real ingestion control over the coordinator's pause channel. Quiesce pauses the
-/// coordinator and waits a short settle so any in-flight capture completes before the tail
-/// is read; resume unpauses.
+/// Real ingestion control over the coordinator's reason-tracked pause channel. Quiesce sets
+/// the replay pause reason and waits for the coordinator's acknowledged quiesce (reached a
+/// commit-unit boundary, drained in-flight delivery, capture durable); resume clears only
+/// the replay reason, so a concurrent operator pause is preserved.
 pub struct PauseIngestionControl {
-    pause: watch::Sender<bool>,
-    settle: Duration,
+    pause: watch::Sender<crate::coordinator::PauseState>,
+    quiesced: watch::Receiver<bool>,
 }
 
 impl PauseIngestionControl {
-    pub fn new(pause: watch::Sender<bool>, settle: Duration) -> Self {
-        Self { pause, settle }
+    pub fn new(
+        pause: watch::Sender<crate::coordinator::PauseState>,
+        quiesced: watch::Receiver<bool>,
+    ) -> Self {
+        Self { pause, quiesced }
     }
 }
 
 #[async_trait]
 impl IngestionControl for PauseIngestionControl {
     async fn quiesce(&self) {
-        let _ = self.pause.send(true);
-        tokio::time::sleep(self.settle).await;
+        self.pause.send_modify(|s| s.replay = true);
+        // Wait for the coordinator to acknowledge a genuine, boundary-aligned quiesce.
+        let mut rx = self.quiesced.clone();
+        loop {
+            if *rx.borrow_and_update() {
+                break;
+            }
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
     }
     async fn resume(&self) {
-        let _ = self.pause.send(false);
+        self.pause.send_modify(|s| s.replay = false);
     }
 }
 
@@ -83,6 +97,11 @@ fn job_targets(job: &ReplayJob) -> Vec<String> {
 pub struct CoordinatorReplayDelivery {
     process: ProcessBatchFn<CheckpointMeta>,
     sinks_by_id: HashMap<String, ArcDynSink>,
+    /// The pipeline's live schema sensor (shared instance) and provider, so replay runs the
+    /// SAME process -> sense -> deliver path as live delivery.
+    sensor: Option<Arc<SchemaSensorState>>,
+    provider: Option<ArcSchemaProvider>,
+    schema_cache: Mutex<HashMap<String, TableSchemaInfo>>,
     pipeline: String,
 }
 
@@ -90,13 +109,59 @@ impl CoordinatorReplayDelivery {
     pub fn new(
         process: ProcessBatchFn<CheckpointMeta>,
         sinks_by_id: HashMap<String, ArcDynSink>,
+        sensor: Option<Arc<SchemaSensorState>>,
+        provider: Option<ArcSchemaProvider>,
         pipeline: impl Into<String>,
     ) -> Self {
         Self {
             process,
             sinks_by_id,
+            sensor,
+            provider,
+            schema_cache: Mutex::new(HashMap::new()),
             pipeline: pipeline.into(),
         }
+    }
+
+    /// Run events through the current processors and then the schema-sensing/enrichment
+    /// stage - the same path live delivery uses (process -> sense) - without touching any
+    /// checkpoint.
+    async fn process_and_sense(
+        &self,
+        events: Vec<Event>,
+    ) -> Result<Vec<Event>> {
+        let mut events = (self.process)(events).await?.events;
+        if let Some(sensor) = &self.sensor {
+            let db_schemas = if self.provider.is_some() {
+                let tables: HashSet<String> =
+                    events.iter().map(|e| e.source.table.clone()).collect();
+                let mut map = HashMap::new();
+                for t in tables {
+                    if let Some(s) = self.fetch_schema(&t).await {
+                        map.insert(t, s);
+                    }
+                }
+                (!map.is_empty()).then_some(map)
+            } else {
+                None
+            };
+            sensor.observe_and_enrich(&mut events, db_schemas.as_ref());
+        }
+        Ok(events)
+    }
+
+    async fn fetch_schema(&self, table: &str) -> Option<TableSchemaInfo> {
+        if let Some(s) = self.schema_cache.lock().get(table) {
+            return Some(s.clone());
+        }
+        let schema = self.provider.as_ref()?.get_table_schema(table).await?;
+        if let Some(sensor) = &self.sensor {
+            sensor.register_table_schema(schema.clone());
+        }
+        self.schema_cache
+            .lock()
+            .insert(table.to_string(), schema.clone());
+        Some(schema)
     }
 }
 
@@ -132,13 +197,11 @@ impl ReplayDelivery for CoordinatorReplayDelivery {
             events.push(ev);
         }
 
-        // Run the CURRENT processors (this is how replay repairs consumer/processor bugs).
-        let processed = (self.process)(events)
-            .await
-            .with_context(|| {
+        // Run the CURRENT processors then the schema-sensing stage (same path as live).
+        let processed =
+            self.process_and_sense(events).await.with_context(|| {
                 format!("replay processing failed at seq {}", envelope.seq)
-            })?
-            .events;
+            })?;
         if processed.is_empty() {
             // Everything was filtered by the current processors: nothing to deliver.
             return Ok(());
@@ -302,45 +365,80 @@ impl ReplayController {
             self.gate.exclude(job_targets(&stored.job));
         }
 
-        // Historical + catch-up delivery.
-        let phase = match self.worker.run_catch_up().await? {
-            Some(p) => p,
-            None => return Ok(()),
-        };
+        // Historical + catch-up delivery, only when starting/resuming in those phases. A
+        // job resumed mid-handoff skips straight to the handoff recovery below.
+        if matches!(
+            stored.job.phase,
+            ReplayPhase::Running | ReplayPhase::CatchingUp
+        ) {
+            let phase = match self.worker.run_catch_up().await? {
+                Some(p) => p,
+                None => return Ok(()),
+            };
+            if self.cancel.is_cancelled() {
+                return Ok(());
+            }
+            match phase {
+                // Dry-run finished (delivered nothing); no handoff, nothing to restore.
+                ReplayPhase::Completed => return Ok(()),
+                // Caught up: fall through to the handoff.
+                ReplayPhase::CatchingUp => {}
+                // Failed/cancelled/other: nothing more to do here.
+                _ => return Ok(()),
+            }
+        }
         if self.cancel.is_cancelled() {
             return Ok(());
         }
-        match phase {
-            // Dry-run finished (delivered nothing); no handoff, nothing to restore.
-            ReplayPhase::Completed => Ok(()),
-            // Caught up to the tail: perform the handoff.
-            ReplayPhase::CatchingUp => self.handoff().await,
-            // Failed/cancelled/other: nothing more to do here.
-            _ => Ok(()),
-        }
+        self.handoff().await
     }
 
-    /// Quiesce ingestion, deliver through the frozen tail `H`, then restore the sinks to
-    /// the live set and resume ingestion. Ordered so the first live delivery to a restored
-    /// sink is strictly after `H` (new captures get seq > H once ingestion resumes).
+    /// Drive the handoff to completion from whatever phase the durable job is in, so a
+    /// restart mid-handoff recovers correctly (C4). All steps up to `LiveRestored` run while
+    /// ingestion is quiesced; ingestion resumes only after the sinks have rejoined the live
+    /// set and the phase is durably `LiveRestored`, so the first live delivery to a restored
+    /// sink is strictly after `H`.
     async fn handoff(&self) -> Result<()> {
-        self.ingestion.quiesce().await;
-        // With ingestion quiesced, no new commit units are captured, so the head is a
-        // stable frozen tail `H`.
-        let h = self.journal.stream_meta().await?.head_seq;
-        self.set_phase(ReplayPhase::HandoffQuiesced { handoff_seq: h })
-            .await?;
-
-        // Deliver anything captured between catch-up and quiesce, through H.
-        let mut stored = self.store.get().await?.ok_or_else(|| {
+        let stored = self.store.get().await?.ok_or_else(|| {
             anyhow::anyhow!("replay job vanished during handoff")
+        })?;
+        let h = match &stored.job.phase {
+            ReplayPhase::CatchingUp => {
+                // Fresh handoff: quiesce ingestion and freeze the tail.
+                self.ingestion.quiesce().await;
+                let h = self.journal.stream_meta().await?.head_seq;
+                self.set_phase(ReplayPhase::HandoffQuiesced { handoff_seq: h })
+                    .await?;
+                h
+            }
+            ReplayPhase::HandoffQuiesced { handoff_seq }
+            | ReplayPhase::DeliveredThrough { handoff_seq } => {
+                // Restart mid-handoff: `H` is durable. Re-quiesce (idempotent) and reuse it;
+                // delivery through H may safely repeat.
+                let h = *handoff_seq;
+                self.ingestion.quiesce().await;
+                h
+            }
+            ReplayPhase::LiveRestored => {
+                // Restart after restoration: the pause is already released; just finalize.
+                self.set_phase(ReplayPhase::Completed).await?;
+                return Ok(());
+            }
+            // Running (shouldn't reach here) or terminal: nothing to do.
+            _ => return Ok(()),
+        };
+
+        // Deliver everything through the frozen tail H (idempotent: a re-run past the cursor
+        // is a no-op).
+        let mut stored = self.store.get().await?.ok_or_else(|| {
+            anyhow::anyhow!("replay job vanished during handoff delivery")
         })?;
         self.worker.deliver_through(&mut stored, h).await?;
         self.set_phase(ReplayPhase::DeliveredThrough { handoff_seq: h })
             .await?;
 
-        // Restore: the sinks rejoin the live set, then ingestion resumes, so their first
-        // live delivery is strictly after H.
+        // Restore under the quiesced window: sinks rejoin the live set and the phase becomes
+        // durably LiveRestored BEFORE ingestion resumes.
         let targets = self
             .store
             .get()
@@ -355,10 +453,15 @@ impl ReplayController {
         Ok(())
     }
 
+    /// Transition to `to`, idempotently: a job already in the target phase is left as-is (so
+    /// a restart that re-drives the handoff does not attempt an illegal self-transition).
     async fn set_phase(&self, to: ReplayPhase) -> Result<()> {
         let stored = self.store.get().await?.ok_or_else(|| {
             anyhow::anyhow!("replay job vanished before phase change")
         })?;
+        if stored.job.phase == to {
+            return Ok(());
+        }
         let next = stored.job.advance(to, now_ms())?;
         self.store.compare_and_set(stored.version, &next).await?;
         Ok(())
@@ -583,6 +686,184 @@ mod tests {
         assert_eq!(ingestion.quiesced.load(Ordering::SeqCst), 0, "no handoff");
         let after = store.get().await.unwrap().unwrap();
         assert_eq!(after.job.phase, ReplayPhase::Completed);
+    }
+
+    async fn advance(
+        store: &ReplayJobStore,
+        s: crate::replay_job::StoredReplayJob,
+        to: ReplayPhase,
+    ) -> crate::replay_job::StoredReplayJob {
+        let next = s.job.advance(to, 2_000).unwrap();
+        store.compare_and_set(s.version, &next).await.unwrap()
+    }
+
+    fn controller_for(
+        be: &ArcStorageBackend,
+        jl: Arc<dyn JournalLog>,
+        gate: Arc<ReplaySinkGate>,
+        ingestion: Arc<MockIngestion>,
+        delivery: Arc<RecordingDelivery>,
+    ) -> ReplayController {
+        ReplayController::new(
+            ReplayJobStore::new(be.clone(), "p", "inc-1"),
+            jl,
+            gate,
+            ingestion,
+            delivery,
+            Arc::new(AtomicU64::new(u64::MAX)),
+            CancellationToken::new(),
+            10,
+            "p",
+        )
+    }
+
+    /// Crash recovery: a job resumed in HandoffQuiesced(H) re-quiesces, delivers through H,
+    /// restores live, and completes.
+    #[tokio::test]
+    async fn restart_in_handoff_quiesced_recovers() {
+        let (be, jl, seqs) = journal_with(3).await;
+        let store = ReplayJobStore::new(be.clone(), "p", "inc-1");
+        let h = *seqs.last().unwrap();
+        let s = store.create(&job(false)).await.unwrap();
+        let s = advance(&store, s, ReplayPhase::CatchingUp).await;
+        advance(&store, s, ReplayPhase::HandoffQuiesced { handoff_seq: h })
+            .await;
+
+        let gate = Arc::new(ReplaySinkGate::new());
+        let ingestion = Arc::new(MockIngestion::default());
+        let delivery = Arc::new(RecordingDelivery::default());
+        controller_for(
+            &be,
+            jl,
+            gate.clone(),
+            ingestion.clone(),
+            delivery.clone(),
+        )
+        .run()
+        .await
+        .unwrap();
+
+        assert_eq!(*delivery.delivered.lock().unwrap(), seqs);
+        let after = store.get().await.unwrap().unwrap();
+        assert_eq!(after.job.phase, ReplayPhase::Completed);
+        assert!(!gate.any_excluded());
+        assert!(ingestion.quiesced.load(Ordering::SeqCst) >= 1);
+        assert!(ingestion.resumed.load(Ordering::SeqCst) >= 1);
+    }
+
+    /// Crash recovery: a job resumed in DeliveredThrough(H) with the cursor already at H
+    /// re-delivers nothing (idempotent), restores live, and completes.
+    #[tokio::test]
+    async fn restart_in_delivered_through_restores_without_redelivery() {
+        let (be, jl, seqs) = journal_with(3).await;
+        let store = ReplayJobStore::new(be.clone(), "p", "inc-1");
+        let h = *seqs.last().unwrap();
+        let created = store.create(&job(false)).await.unwrap();
+        // Cursor already advanced through H (delivered).
+        let moved = created.job.with_cursor(h, 2_000).unwrap();
+        let s = store
+            .compare_and_set(created.version, &moved)
+            .await
+            .unwrap();
+        let s = advance(&store, s, ReplayPhase::CatchingUp).await;
+        let s =
+            advance(&store, s, ReplayPhase::HandoffQuiesced { handoff_seq: h })
+                .await;
+        advance(&store, s, ReplayPhase::DeliveredThrough { handoff_seq: h })
+            .await;
+
+        let gate = Arc::new(ReplaySinkGate::new());
+        let ingestion = Arc::new(MockIngestion::default());
+        let delivery = Arc::new(RecordingDelivery::default());
+        controller_for(
+            &be,
+            jl,
+            gate.clone(),
+            ingestion.clone(),
+            delivery.clone(),
+        )
+        .run()
+        .await
+        .unwrap();
+
+        assert!(
+            delivery.delivered.lock().unwrap().is_empty(),
+            "cursor was already at H; nothing re-delivered"
+        );
+        let after = store.get().await.unwrap().unwrap();
+        assert_eq!(after.job.phase, ReplayPhase::Completed);
+        assert!(!gate.any_excluded());
+        assert!(ingestion.resumed.load(Ordering::SeqCst) >= 1);
+    }
+
+    /// Crash recovery: a job resumed in LiveRestored simply finalizes to Completed without
+    /// re-quiescing (the pause was already released).
+    #[tokio::test]
+    async fn restart_in_live_restored_finalizes() {
+        let (be, jl, seqs) = journal_with(3).await;
+        let store = ReplayJobStore::new(be.clone(), "p", "inc-1");
+        let h = *seqs.last().unwrap();
+        let created = store.create(&job(false)).await.unwrap();
+        let moved = created.job.with_cursor(h, 2_000).unwrap();
+        let s = store
+            .compare_and_set(created.version, &moved)
+            .await
+            .unwrap();
+        let s = advance(&store, s, ReplayPhase::CatchingUp).await;
+        let s =
+            advance(&store, s, ReplayPhase::HandoffQuiesced { handoff_seq: h })
+                .await;
+        let s = advance(
+            &store,
+            s,
+            ReplayPhase::DeliveredThrough { handoff_seq: h },
+        )
+        .await;
+        advance(&store, s, ReplayPhase::LiveRestored).await;
+
+        let gate = Arc::new(ReplaySinkGate::new());
+        let ingestion = Arc::new(MockIngestion::default());
+        let delivery = Arc::new(RecordingDelivery::default());
+        controller_for(
+            &be,
+            jl,
+            gate.clone(),
+            ingestion.clone(),
+            delivery.clone(),
+        )
+        .run()
+        .await
+        .unwrap();
+
+        let after = store.get().await.unwrap().unwrap();
+        assert_eq!(after.job.phase, ReplayPhase::Completed);
+        assert_eq!(
+            ingestion.quiesced.load(Ordering::SeqCst),
+            0,
+            "no re-quiesce after live was already restored"
+        );
+    }
+
+    /// A replay quiesce/resume must not clear a concurrent operator pause.
+    #[tokio::test]
+    async fn replay_resume_preserves_operator_pause() {
+        use crate::coordinator::PauseState;
+        let (pause_tx, pause_rx) = watch::channel(PauseState {
+            operator: true,
+            replay: false,
+        });
+        // Pretend the coordinator has already acknowledged the quiesce.
+        let (_ack_tx, ack_rx) = watch::channel(true);
+        let ctrl = PauseIngestionControl::new(pause_tx, ack_rx);
+
+        ctrl.quiesce().await;
+        assert!(pause_rx.borrow().operator && pause_rx.borrow().replay);
+
+        ctrl.resume().await;
+        let s = *pause_rx.borrow();
+        assert!(s.operator, "operator pause preserved");
+        assert!(!s.replay, "replay pause cleared");
+        assert!(s.paused(), "still paused due to operator");
     }
 
     #[tokio::test]

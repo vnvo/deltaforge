@@ -506,12 +506,18 @@ impl TxTracker {
 /// task has stopped (e.g. due to a sink error).
 async fn send_to_delivery(
     tx: &tokio::sync::mpsc::Sender<DeliveryItem>,
+    inflight: &std::sync::atomic::AtomicUsize,
     batch: BuildingBatch,
     reason: &'static str,
 ) -> Result<()> {
-    tx.send(DeliveryItem { batch, reason })
-        .await
-        .map_err(|_| anyhow::anyhow!("delivery task stopped unexpectedly"))
+    // Count the item as in-flight before it enters the channel; the delivery task
+    // decrements once it has processed it. The quiesce barrier waits for this to reach 0.
+    inflight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if tx.send(DeliveryItem { batch, reason }).await.is_err() {
+        inflight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        return Err(anyhow::anyhow!("delivery task stopped unexpectedly"));
+    }
+    Ok(())
 }
 
 fn policy_satisfied(
@@ -825,6 +831,22 @@ pub struct OversizedReplayEnvelopeError {
     pub events: usize,
 }
 
+/// Ingestion pause reasons, tracked independently so a replay handoff quiesce and an
+/// operator pause never override each other. Ingestion runs only when neither is set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PauseState {
+    /// Set by the operator (pause/resume API).
+    pub operator: bool,
+    /// Set by a replay handoff while it quiesces ingestion.
+    pub replay: bool,
+}
+
+impl PauseState {
+    pub fn paused(&self) -> bool {
+        self.operator || self.replay
+    }
+}
+
 pub struct Coordinator<Tok> {
     pipeline_name: Arc<str>,
     sinks: Vec<ArcDynSink>,
@@ -852,6 +874,11 @@ pub struct Coordinator<Tok> {
     /// staged sink out of the live set), that sink is excluded from live delivery and from
     /// commit-policy evaluation for the job's duration.
     replay_gate: Option<Arc<crate::replay_gate::ReplaySinkGate>>,
+    /// Optional replay-quiesce acknowledgement. The coordinator sets it `true` once it has
+    /// reached a commit-unit boundary, drained in-flight delivery, and made capture durable
+    /// in response to a replay pause, and `false` when it resumes. The handoff waits on it
+    /// so `H` is read against a genuinely frozen tail.
+    quiesce_ack: Option<watch::Sender<bool>>,
 }
 
 pub struct CoordinatorBuilder<Tok> {
@@ -867,6 +894,7 @@ pub struct CoordinatorBuilder<Tok> {
     dlq_writer: Option<Arc<crate::dlq::DlqWriter>>,
     replay_capture: Option<ReplayCapture>,
     replay_gate: Option<Arc<crate::replay_gate::ReplaySinkGate>>,
+    quiesce_ack: Option<watch::Sender<bool>>,
 }
 
 impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
@@ -884,6 +912,7 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             dlq_writer: None,
             replay_capture: None,
             replay_gate: None,
+            quiesce_ack: None,
         }
     }
 
@@ -956,6 +985,11 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
         self
     }
 
+    pub fn quiesce_ack(mut self, ack: watch::Sender<bool>) -> Self {
+        self.quiesce_ack = Some(ack);
+        self
+    }
+
     pub fn build(self) -> Coordinator<Tok> {
         let batch_cfg_eff = Coordinator::<Tok>::effective(&self.batch_config);
         assert!(
@@ -977,6 +1011,7 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             dlq_writer: self.dlq_writer,
             replay_capture: self.replay_capture,
             replay_gate: self.replay_gate,
+            quiesce_ack: self.quiesce_ack,
         }
     }
 }
@@ -1168,7 +1203,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         self,
         mut event_rx: tokio::sync::mpsc::Receiver<SourceItem>,
         cancel: CancellationToken,
-        mut pause_rx: watch::Receiver<bool>,
+        mut pause_rx: watch::Receiver<PauseState>,
     ) -> Result<()> {
         let tick_ms = self.batch_cfg_eff.max_ms.unwrap_or(200);
         let max_events = self.batch_cfg_eff.max_events.unwrap_or(usize::MAX);
@@ -1217,17 +1252,28 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         let delivery_error: Arc<Mutex<Option<anyhow::Error>>> =
             Arc::new(Mutex::new(None));
 
+        // In-flight delivery accounting for the quiesce barrier: incremented when a batch
+        // enters the delivery channel, decremented once the delivery task has processed it.
+        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drained = Arc::new(tokio::sync::Notify::new());
+
         // Spawn delivery task - processes batches in FIFO order so checkpoints
         // are committed in sequence.
         let d_coord = Arc::clone(&coord);
         let d_cancel = cancel.clone();
         let d_error = Arc::clone(&delivery_error);
+        let d_inflight = Arc::clone(&inflight);
+        let d_drained = Arc::clone(&drained);
         let delivery_handle = tokio::spawn(async move {
             while let Some(item) = deliver_rx.recv().await {
-                if let Err(e) = d_coord
+                let outcome = d_coord
                     .process_deliver_and_maybe_commit(item.batch, item.reason)
-                    .await
-                {
+                    .await;
+                // Decrement + notify AFTER processing (success or failure) so the quiesce
+                // barrier only observes drain once the batch is truly done.
+                d_inflight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                d_drained.notify_waiters();
+                if let Err(e) = outcome {
                     *d_error.lock() = Some(e);
                     d_cancel.cancel();
                     break;
@@ -1261,16 +1307,70 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             deltaforge_core::replay::SourceBoundaryRecord,
         > = None;
 
+        // Mirrors the quiesce-ack this receiver last published, so we ack/clear only on
+        // edges rather than every loop turn.
+        let mut quiesced_acked = false;
+
         let accum_result: Result<()> = async {
             loop {
-                if *pause_rx.borrow() {
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        changed = pause_rx.changed() => {
-                            if changed.is_err() { break; }
-                            continue;
+                let ps = *pause_rx.borrow();
+                if ps.paused() {
+                    // A replay quiesce must land on a COMMIT-UNIT boundary before the tail
+                    // is frozen: if a transaction is open, keep consuming to finish it.
+                    let at_boundary =
+                        building.as_ref().is_none_or(|b| !b.mid_tx());
+                    if ps.replay && at_boundary && !quiesced_acked {
+                        // Flush any whole commit units that are ready, then wait for
+                        // in-flight delivery to drain. Capture is already durable in-loop,
+                        // so once delivery drains the tail is frozen and consistent.
+                        if let Some(b) = building.take() {
+                            if let Some(b) = finalize_batch(
+                                b,
+                                respect_source_tx,
+                                &coord.pipeline_name,
+                            ) {
+                                send_to_delivery(
+                                    &deliver_tx,
+                                    &inflight,
+                                    b,
+                                    "quiesce",
+                                )
+                                .await?;
+                            }
+                        }
+                        loop {
+                            let waiter = drained.notified();
+                            if inflight
+                                .load(std::sync::atomic::Ordering::SeqCst)
+                                == 0
+                            {
+                                break;
+                            }
+                            waiter.await;
+                        }
+                        if let Some(ack) = &coord.quiesce_ack {
+                            let _ = ack.send(true);
+                        }
+                        quiesced_acked = true;
+                    }
+                    // Park while paused - unless a replay quiesce is still waiting to reach
+                    // a boundary, in which case fall through to consume the open tx.
+                    let park = ps.operator || (ps.replay && at_boundary);
+                    if park {
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            changed = pause_rx.changed() => {
+                                if changed.is_err() { break; }
+                                continue;
+                            }
                         }
                     }
+                } else if quiesced_acked {
+                    // Resumed: clear the ack so the next quiesce request re-arms.
+                    if let Some(ack) = &coord.quiesce_ack {
+                        let _ = ack.send(false);
+                    }
+                    quiesced_acked = false;
                 }
 
                 tokio::select! {
@@ -1279,7 +1379,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                             if let Some(b) = finalize_batch(
                                 b, respect_source_tx, &coord.pipeline_name,
                             ) {
-                                send_to_delivery(&deliver_tx, b, "cancelled").await?;
+                                send_to_delivery(&deliver_tx, &inflight, b, "cancelled").await?;
                             }
                         }
                         break;
@@ -1297,7 +1397,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                 !b.raw.is_empty()
                             };
                             if flushable && elapsed {
-                                send_to_delivery(&deliver_tx, b, "timer").await?;
+                                send_to_delivery(&deliver_tx, &inflight, b, "timer").await?;
                             } else {
                                 building = Some(b);
                             }
@@ -1315,7 +1415,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                 if let Some(b) = finalize_batch(
                                     b, respect_source_tx, &coord.pipeline_name,
                                 ) {
-                                    send_to_delivery(&deliver_tx, b, "shutdown").await?;
+                                    send_to_delivery(&deliver_tx, &inflight, b, "shutdown").await?;
                                 }
                             }
                             break;
@@ -1419,7 +1519,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                                     &mut b,
                                                     BuildingBatch::with_capacity(max_events),
                                                 );
-                                                send_to_delivery(&deliver_tx, full, "limits").await?;
+                                                send_to_delivery(&deliver_tx, &inflight, full, "limits").await?;
                                             }
                                         }
                                     }
@@ -1448,7 +1548,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                                 &mut b,
                                                 BuildingBatch::with_capacity(max_events),
                                             );
-                                            send_to_delivery(&deliver_tx, full, "tx_commit").await?;
+                                            send_to_delivery(&deliver_tx, &inflight, full, "tx_commit").await?;
                                         }
                                     }
                                     SourceItem::Boundary { boundary } => {
@@ -1475,14 +1575,14 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                             &mut b,
                                             BuildingBatch::with_capacity(max_events),
                                         );
-                                        send_to_delivery(&deliver_tx, full, "boundary").await?;
+                                        send_to_delivery(&deliver_tx, &inflight, full, "boundary").await?;
                                     }
                                 }
                             } else {
                                 // Legacy path: soft-limit splitting; markers ignored.
                                 let SourceItem::Event(ev) = item else { continue; };
                                 if let Some(full) = check_and_split(&mut b, ev, max_events, max_bytes) {
-                                    send_to_delivery(&deliver_tx, full, "limits").await?;
+                                    send_to_delivery(&deliver_tx, &inflight, full, "limits").await?;
                                 }
                             }
                         }
@@ -2125,7 +2225,8 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         drop(tx); // Closed channel: without validation, run() would exit Ok(()).
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         let err = coord
             .run(rx, cancel, pause_rx)
@@ -2282,7 +2383,8 @@ mod tests {
     ) -> Result<()> {
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
         for item in items {
             tx.send(item).await.unwrap();
         }
@@ -2716,7 +2818,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         tx.send(SourceItem::TxBegin {
             tx_id: "gtid:1".into(),
@@ -2778,7 +2881,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         for (txn, cp) in [("gtid:1", "cp-1"), ("gtid:2", "cp-2")] {
             tx.send(SourceItem::TxBegin { tx_id: txn.into() })
@@ -2832,7 +2936,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         tx.send(SourceItem::TxBegin {
             tx_id: "gtid:1".into(),
@@ -2907,7 +3012,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         // One whole tx (2 events + marker) ...
         tx.send(SourceItem::TxBegin {
@@ -2971,7 +3077,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         // Empty transaction: begin immediately followed by commit, no events.
         tx.send(SourceItem::TxBegin {
@@ -3034,7 +3141,8 @@ mod tests {
         );
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
         for item in items {
             tx.send(item).await.unwrap();
         }
@@ -3230,6 +3338,72 @@ mod tests {
         );
     }
 
+    /// A replay quiesce is acknowledged only after the coordinator reaches a commit-unit
+    /// boundary and drains in-flight delivery: the pending transaction is flushed and
+    /// delivered before the ack, proving the barrier is real (not a fixed sleep).
+    #[tokio::test]
+    async fn quiesce_acknowledges_after_boundary_and_drain() {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        let procs: Arc<[deltaforge_core::ArcDynProcessor]> = Arc::from(vec![]);
+        let bp = build_batch_processor(procs, "test".to_string());
+        let (ack_tx, mut ack_rx) = tokio::sync::watch::channel(false);
+        let coord = Coordinator::builder("q-test")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(1000),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_fn(
+                "kafka",
+                build_commit_fn(store.clone(), "src::sink::kafka".to_string()),
+            )
+            .process_fn(bp)
+            .quiesce_ack(ack_tx)
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
+        let run = tokio::spawn(coord.run(rx, cancel.clone(), pause_rx));
+
+        // Feed one whole transaction; with a long timer it stays in `building`.
+        tx.send(begin("g1")).await.unwrap();
+        tx.send(SourceItem::Event(tx_event(1, "g1", b"row")))
+            .await
+            .unwrap();
+        tx.send(commit("g1", b"cp-1")).await.unwrap();
+        // Let the coordinator consume + build the transaction before quiescing.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Request a replay quiesce and wait for the acknowledgement.
+        pause_tx.send_modify(|s| s.replay = true);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if *ack_rx.borrow_and_update() {
+                    break;
+                }
+                ack_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("quiesce was not acknowledged in time");
+
+        // Acknowledged means the pending unit was flushed and delivered (drained).
+        assert_eq!(sink.delivery_count(), 1);
+
+        pause_tx.send_modify(|s| s.replay = false);
+        drop(tx);
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(5), run).await;
+    }
+
     /// Drops every event - models a transaction whose rows are all filtered by a
     /// processor.
     struct DropAllProcessor;
@@ -3279,7 +3453,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         tx.send(SourceItem::TxBegin {
             tx_id: "gtid:1".into(),
@@ -3334,7 +3509,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         tx.send(SourceItem::TxBegin {
             tx_id: "gtid:1".into(),
@@ -3405,7 +3581,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         for (txn, cp) in
             [("gtid:1", "cp-1"), ("gtid:2", "cp-2"), ("gtid:3", "cp-3")]
@@ -3496,7 +3673,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         tx.send(begin("gtid:1")).await.unwrap();
         for i in 0..2 {
@@ -3553,7 +3731,8 @@ mod tests {
             );
             let (tx, rx) = tokio::sync::mpsc::channel(64);
             let cancel = tokio_util::sync::CancellationToken::new();
-            let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+            let (_pause_tx, pause_rx) =
+                tokio::sync::watch::channel(PauseState::default());
             tx.send(begin("gtid:1")).await.unwrap();
             for i in 0..4 {
                 tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
@@ -3586,7 +3765,8 @@ mod tests {
             );
             let (tx, rx) = tokio::sync::mpsc::channel(64);
             let cancel = tokio_util::sync::CancellationToken::new();
-            let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+            let (_pause_tx, pause_rx) =
+                tokio::sync::watch::channel(PauseState::default());
             tx.send(begin("gtid:1")).await.unwrap();
             for i in 0..4 {
                 tx.send(SourceItem::Event(tx_event(i, "gtid:1", b"row")))
@@ -3629,7 +3809,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         // A 3-event transaction with markers; the legacy path drops the markers and
         // splits the events by count into [2, 1].
@@ -3930,7 +4111,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         // Send one event with a checkpoint, then drop the sender
         // so the coordinator sees channel-closed and exits.
@@ -4018,7 +4200,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         let source = deltaforge_core::SourceInfo {
             version: "test".into(),
@@ -4207,7 +4390,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         let source = deltaforge_core::SourceInfo {
             version: "test".into(),
@@ -4327,7 +4511,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         let source = deltaforge_core::SourceInfo {
             version: "test".into(),
@@ -4411,7 +4596,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         let source = deltaforge_core::SourceInfo {
             version: "test".into(),
@@ -4522,7 +4708,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         let source = deltaforge_core::SourceInfo {
             version: "test".into(),
@@ -4618,7 +4805,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         let source = deltaforge_core::SourceInfo {
             version: "t".into(),
@@ -4784,7 +4972,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         let source = deltaforge_core::SourceInfo {
             version: "t".into(),
@@ -4885,7 +5074,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         tx.send(SourceItem::TxBegin {
             tx_id: "gtid:1".into(),
@@ -4950,7 +5140,8 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_pause_tx, pause_rx) = tokio::sync::watch::channel(false);
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
 
         // A standalone event (no `transaction`, no TxBegin/TxCommit) carrying an
         // atomic boundary: checkpoint + binlog file/pos watermark.
@@ -5027,7 +5218,7 @@ mod tests {
         let (coord, sink) = boundary_coord(1000); // rows stay buffered
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_p, pause_rx) = tokio::sync::watch::channel(false);
+        let (_p, pause_rx) = tokio::sync::watch::channel(PauseState::default());
 
         tx.send(standalone_row(1)).await.unwrap();
         tx.send(standalone_row(2)).await.unwrap();
@@ -5053,7 +5244,7 @@ mod tests {
         let (coord, sink) = boundary_coord(1); // each row flushes immediately
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (_p, pause_rx) = tokio::sync::watch::channel(false);
+        let (_p, pause_rx) = tokio::sync::watch::channel(PauseState::default());
 
         tx.send(standalone_row(1)).await.unwrap();
         tx.send(snapshot_completion_boundary()).await.unwrap();
