@@ -121,6 +121,16 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
         key: &str,
     ) -> Result<LogStreamMeta>;
 
+    /// Read up to `limit` entries with `seq > since_seq`, each with the metadata the
+    /// replay reader verifies on load: append time, `capture_id`, and `content_hash`.
+    async fn log_read_meta_since(
+        &self,
+        ns: &str,
+        key: &str,
+        since_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<LogEntryMeta>>;
+
     /// Upsert a slot; returns the new version number.
     async fn slot_upsert(
         &self,
@@ -263,16 +273,23 @@ pub struct LogStreamMeta {
     pub len: u64,
 }
 
-/// The backend-computed content digest over the exact stored bytes. Domain-separated
-/// so it can never collide with a hash taken for another purpose. Used for a cheap
-/// inequality check before the authoritative exact-bytes comparison; the backend
-/// derives it from the bytes it stores and never trusts a caller-supplied digest.
+/// The backend-computed content digest over the exact stored bytes. Delegates to
+/// `deltaforge_core::replay::content_digest` so the backend that writes it and the
+/// replay reader that verifies it share one implementation. The backend derives it from
+/// the bytes it stores and never trusts a caller-supplied digest.
 pub(crate) fn content_digest(value: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(b"deltaforge:replay:content:v1");
-    h.update(value);
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    deltaforge_core::replay::content_digest(value)
+}
+
+/// One log entry with the metadata the replay reader needs for fail-closed loads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogEntryMeta {
+    pub seq: u64,
+    /// Append time in unix milliseconds (falls back to `ts * 1000` for pre-ms rows).
+    pub stored_at_ms: i64,
+    pub capture_id: Option<String>,
+    pub content_hash: Option<String>,
+    pub value: Vec<u8>,
 }
 
 /// Shared contract suite for the replay log primitives, run against every backend.

@@ -119,7 +119,7 @@ pub struct Spec {
     /// is treated as `SinkError::Backpressure` for that sink (then routed
     /// per `required`).
     ///
-    /// This is the outer bound — *in addition to* each sink's own internal
+    /// This is the outer bound - *in addition to* each sink's own internal
     /// timeout (e.g. `send_timeout_secs` on the S3/Kafka/Redis/NATS/HTTP
     /// sinks). The internal timeout catches sink-specific library/protocol
     /// misbehavior; this outer timeout catches the sink itself misbehaving
@@ -384,6 +384,9 @@ pub struct JournalConfig {
     pub max_event_bytes: usize,
     /// DLQ stream configuration.
     pub dlq: DlqStreamConfig,
+    /// Replay stream configuration. `None` = replay journaling disabled.
+    #[serde(default)]
+    pub replay: Option<ReplayStreamConfig>,
 }
 
 impl Default for JournalConfig {
@@ -392,6 +395,38 @@ impl Default for JournalConfig {
             enabled: false,
             max_event_bytes: 256 * 1024, // 256KB
             dlq: DlqStreamConfig::default(),
+            replay: None,
+        }
+    }
+}
+
+/// Replay stream configuration. Present and `enabled` turns on pre-processing capture
+/// of every committed source commit unit for later re-delivery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReplayStreamConfig {
+    /// Turns capture on. When false the stream is configured but inert.
+    pub enabled: bool,
+    /// Retention: drop envelopes older than this many seconds (0 = no age limit),
+    /// never past the pin of an active replay job.
+    pub retention_secs: u64,
+    /// Optional capacity caps enforced oldest-first (never past an active-job pin).
+    /// 0 = unbounded.
+    pub max_entries: u64,
+    pub max_bytes: u64,
+    /// A captured envelope larger than this fails closed (never truncated - replay
+    /// source data must be lossless). 0 = unbounded.
+    pub max_envelope_bytes: usize,
+}
+
+impl Default for ReplayStreamConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            retention_secs: 24 * 3600, // 24h
+            max_entries: 0,
+            max_bytes: 0,
+            max_envelope_bytes: 8 * 1024 * 1024, // 8 MiB
         }
     }
 }
@@ -444,7 +479,7 @@ pub fn load_from_path(file_path: &str) -> ConfigResult<PipelineSpec> {
         match std::env::var(var_name) {
             Ok(val) => Ok(Some(val)),
             Err(_) => {
-                // Unknown variable — pass through as-is.
+                // Unknown variable - pass through as-is.
                 // This allows routing templates like ${source.table}
                 // to coexist with env vars like ${KAFKA_BROKERS}.
                 warn!(
