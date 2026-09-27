@@ -477,18 +477,16 @@ impl PostgresSource {
 
             // An explicit re-snapshot re-scans every table: reset table-level
             // progress so completed tables are not skipped (generation is
-            // separately bumped via ForceNew below).
+            // separately bumped via ForceNew below). Fail closed if the reset
+            // does not persist - snapshotting on stale completed-table progress
+            // would skip tables and reintroduce loss.
             if self.snapshot_cfg.mode == SnapshotMode::Always {
-                if let Ok(bytes) =
-                    serde_json::to_vec(&SnapshotProgress::default())
-                {
-                    let _ = chkpt_store
-                        .put_raw(
-                            &postgres_snapshot::progress_key(&self.id),
-                            &bytes,
-                        )
-                        .await;
-                }
+                postgres_slot_owner::reset_snapshot_progress(
+                    &chkpt_store,
+                    &self.id,
+                )
+                .await
+                .map_err(SourceError::Other)?;
             }
 
             // Validate every table + freeze lineage + allocate the generation

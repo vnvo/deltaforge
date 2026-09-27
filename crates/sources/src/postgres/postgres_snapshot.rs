@@ -177,9 +177,12 @@ pub struct PgSnapshotCtx<'a> {
 
 /// Run a consistent snapshot of `tables`.
 ///
-/// Returns the WAL LSN captured before any rows were read - pass this to the
-/// replication client as `start_lsn` so streaming picks up exactly where the
-/// snapshot left off with no gaps and no duplicate events.
+/// Returns the anchor LSN (the slot's consistent point) - pass this to the
+/// replication client as `start_lsn` so streaming resumes from the anchor with
+/// **no gaps** (no committed row is lost). Note this is at-least-once at the
+/// boundary: rows committed in `(anchor, snapshot-export]` are delivered by both
+/// the snapshot and CDC (a bounded overlap), so **duplicate events are possible**
+/// and expected - it is not exactly-once (PG-A-lite).
 pub async fn run_snapshot(
     ctx: &PgSnapshotCtx<'_>,
     tables: &[(String, String)],

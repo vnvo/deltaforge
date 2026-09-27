@@ -73,20 +73,22 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Pure ownership check: does `rec` prove `source_id` owns `slot` on `id`?
+/// Pure ownership check: does `rec` prove `source_id`/`pipeline` owns `slot` on `id`?
 ///
 /// Requires a finalized (`Created`) record of the current schema version whose
-/// source, server identity, database identity, slot, and plugin all match. A
-/// `Creating` (partial/ambiguous) record never proves ownership.
+/// source, pipeline, server identity, database identity, slot, and plugin all
+/// match. A `Creating` (partial/ambiguous) record never proves ownership.
 pub fn ownership_proven(
     rec: &SlotOwnership,
     source_id: &str,
+    pipeline: &str,
     slot: &str,
     id: &ServerDbIdentity,
 ) -> bool {
     rec.record_version == SLOT_OWNER_RECORD_VERSION
         && rec.lifecycle == SlotLifecycle::Created
         && rec.source_id == source_id
+        && rec.pipeline == pipeline
         && rec.slot == slot
         && rec.plugin == PLUGIN
         && rec.system_identifier == id.system_identifier
@@ -231,13 +233,21 @@ async fn create_owned_slot(
     Ok(c)
 }
 
-async fn reset_snapshot_progress(
+/// Reset snapshot progress to empty. Fallible and must be awaited with `?`: if the
+/// reset does not persist, `run_snapshot` could reload stale completed-table state
+/// and skip tables under the new anchor, reintroducing loss - so the caller fails
+/// closed rather than snapshotting on unreset progress.
+pub(super) async fn reset_snapshot_progress(
     chkpt: &Arc<dyn CheckpointStore>,
     source_id: &str,
-) {
-    if let Ok(bytes) = serde_json::to_vec(&SnapshotProgress::default()) {
-        let _ = chkpt.put_raw(&progress_key(source_id), &bytes).await;
-    }
+) -> Result<()> {
+    let bytes = serde_json::to_vec(&SnapshotProgress::default())
+        .context("serialize reset snapshot progress")?;
+    chkpt
+        .put_raw(&progress_key(source_id), &bytes)
+        .await
+        .context("persist reset snapshot progress")?;
+    Ok(())
 }
 
 fn fail_closed(msg: String) -> SourceError {
@@ -285,7 +295,9 @@ pub async fn prepare_snapshot_slot_anchor(
         Some(active) => {
             let owned = load_owner(chkpt, source_id)
                 .await
-                .map(|rec| ownership_proven(&rec, source_id, slot, &id))
+                .map(|rec| {
+                    ownership_proven(&rec, source_id, pipeline, slot, &id)
+                })
                 .unwrap_or(false);
 
             if owned && !active {
@@ -296,8 +308,12 @@ pub async fn prepare_snapshot_slot_anchor(
                 )
                 .await
                 .map_err(SourceError::Other)?;
-                // Full re-snapshot: discard table-level progress.
-                reset_snapshot_progress(chkpt, source_id).await;
+                // Full re-snapshot: discard table-level progress. Fail closed if
+                // this does not persist - snapshotting on stale progress would
+                // skip tables under the new anchor and reintroduce loss.
+                reset_snapshot_progress(chkpt, source_id)
+                    .await
+                    .map_err(SourceError::Other)?;
                 warn!(source_id, slot, consistent_lsn = %c, "re-anchored owned inactive slot; performing a full re-snapshot");
                 Ok(c)
             } else {
@@ -323,6 +339,46 @@ pub async fn prepare_snapshot_slot_anchor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use checkpoints::{CheckpointError, CheckpointResult};
+
+    /// A checkpoint store whose `put_raw` always fails - to prove the snapshot
+    /// progress reset propagates persistence failures (fail closed).
+    struct FailingPutStore;
+
+    #[async_trait]
+    impl CheckpointStore for FailingPutStore {
+        async fn get_raw(
+            &self,
+            _source_id: &str,
+        ) -> CheckpointResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn put_raw(
+            &self,
+            _source_id: &str,
+            _bytes: &[u8],
+        ) -> CheckpointResult<()> {
+            Err(CheckpointError::Database("injected put_raw failure".into()))
+        }
+        async fn delete(&self, _source_id: &str) -> CheckpointResult<bool> {
+            Ok(false)
+        }
+        async fn list(&self) -> CheckpointResult<Vec<String>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_snapshot_progress_fails_closed_on_persist_error() {
+        let store: Arc<dyn CheckpointStore> = Arc::new(FailingPutStore);
+        let res = reset_snapshot_progress(&store, "src1").await;
+        assert!(
+            res.is_err(),
+            "reset must propagate a persistence failure so the caller fails \
+             closed instead of snapshotting on stale progress"
+        );
+    }
 
     fn id() -> ServerDbIdentity {
         ServerDbIdentity {
@@ -353,6 +409,7 @@ mod tests {
         assert!(ownership_proven(
             &created_record(),
             "src1",
+            "p",
             "df_slot",
             &id()
         ));
@@ -362,27 +419,47 @@ mod tests {
     fn not_proven_when_creating() {
         let mut r = created_record();
         r.lifecycle = SlotLifecycle::Creating;
-        assert!(!ownership_proven(&r, "src1", "df_slot", &id()));
+        assert!(!ownership_proven(&r, "src1", "p", "df_slot", &id()));
+    }
+
+    #[test]
+    fn not_proven_on_pipeline_mismatch() {
+        // Same source and slot on the same server/db, but a different pipeline
+        // must not be treated as the owner.
+        let base = created_record();
+        assert!(!ownership_proven(
+            &base,
+            "src1",
+            "other-pipeline",
+            "df_slot",
+            &id()
+        ));
     }
 
     #[test]
     fn not_proven_on_identity_or_lineage_mismatch() {
         let base = created_record();
         // different source
-        assert!(!ownership_proven(&base, "other", "df_slot", &id()));
+        assert!(!ownership_proven(&base, "other", "p", "df_slot", &id()));
         // different slot
-        assert!(!ownership_proven(&base, "src1", "other_slot", &id()));
+        assert!(!ownership_proven(&base, "src1", "p", "other_slot", &id()));
         // different server
         let mut other_server = id();
         other_server.system_identifier = "9999999999999999999".into();
-        assert!(!ownership_proven(&base, "src1", "df_slot", &other_server));
+        assert!(!ownership_proven(
+            &base,
+            "src1",
+            "p",
+            "df_slot",
+            &other_server
+        ));
         // different database
         let mut other_db = id();
         other_db.database_oid = 99999;
-        assert!(!ownership_proven(&base, "src1", "df_slot", &other_db));
+        assert!(!ownership_proven(&base, "src1", "p", "df_slot", &other_db));
         // wrong record version
         let mut old_ver = created_record();
         old_ver.record_version = 0;
-        assert!(!ownership_proven(&old_ver, "src1", "df_slot", &id()));
+        assert!(!ownership_proven(&old_ver, "src1", "p", "df_slot", &id()));
     }
 }
