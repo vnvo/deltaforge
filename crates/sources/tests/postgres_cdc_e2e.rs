@@ -241,6 +241,67 @@ async fn start_source(
     Ok((rx, handle))
 }
 
+/// Build a CDC-only source (no snapshot) with an explicit drift policy, sharing a
+/// registry + backend across runs so the persisted schema survives restarts (as a
+/// durable registry does in production - the basis for startup drift detection).
+async fn configured_source(
+    id: &str,
+    db: &str,
+    slot: &str,
+    publication: &str,
+    drift: deltaforge_config::OnSchemaDrift,
+    registry: Arc<storage::DurableSchemaRegistry>,
+    backend: storage::ArcStorageBackend,
+) -> PostgresSource {
+    let mut src = make_source(
+        id,
+        db,
+        slot,
+        publication,
+        vec!["public.orders".into()],
+        AllowList::default(),
+    )
+    .await;
+    src.on_schema_drift = drift;
+    src.snapshot_cfg = deltaforge_config::SnapshotCfg {
+        mode: deltaforge_config::SnapshotMode::Never,
+        ..Default::default()
+    };
+    src.registry = registry;
+    src.backend = backend;
+    src
+}
+
+/// A registry + its backing store, shared across a test's runs.
+async fn shared_registry() -> (
+    Arc<storage::DurableSchemaRegistry>,
+    storage::ArcStorageBackend,
+) {
+    let backend = make_storage_backend().await;
+    let registry = storage::DurableSchemaRegistry::new(backend.clone())
+        .await
+        .expect("registry");
+    (registry, backend)
+}
+
+/// Drain every `SourceItem` available within `dur` (stops early when the channel
+/// closes, e.g. after the source task ends).
+async fn drain_items(
+    rx: &mut mpsc::Receiver<SourceItem>,
+    dur: Duration,
+) -> Vec<SourceItem> {
+    let mut items = Vec::new();
+    let deadline = Instant::now() + dur;
+    while Instant::now() < deadline {
+        match timeout(Duration::from_millis(100), rx.recv()).await {
+            Ok(Some(item)) => items.push(item),
+            Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    items
+}
+
 // =============================================================================
 // TESTS
 // =============================================================================
@@ -447,6 +508,353 @@ async fn postgres_cdc_schema_evolution() -> Result<()> {
     handle.stop();
     handle.join().await.ok();
     cleanup_repl(&client, "pub_evo", "slot_evo").await;
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+/// on_schema_drift = Adapt: an in-stream Relation change is absorbed - the schema
+/// reloads, the first event under the changed relation is delivered correctly,
+/// and the checkpoint advances past the drift as normal.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_schema_drift_adapt_delivers_post_drift_and_advances_checkpoint()
+-> Result<()> {
+    use deltaforge_config::OnSchemaDrift;
+
+    let (db, client) = pg_setup("adapt").await?;
+    client
+        .execute(
+            "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64))",
+            &[],
+        )
+        .await?;
+    client
+        .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
+        .await?;
+    create_pub_slot(&client, "pub_adapt", "slot_adapt", &["orders"]).await?;
+
+    let (registry, backend) = shared_registry().await;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+
+    // Run 1: deliver a pre-drift row, then stop so a committed boundary persists.
+    {
+        let src = configured_source(
+            "adapt",
+            &db,
+            "slot_adapt",
+            "pub_adapt",
+            OnSchemaDrift::Adapt,
+            registry.clone(),
+            backend.clone(),
+        )
+        .await;
+        let (tx, mut rx) = mpsc::channel(128);
+        let h = src.run(tx, ckpt.clone()).await;
+        wait_ready(&h, Duration::from_secs(3)).await?;
+        client
+            .execute("INSERT INTO orders VALUES (200, 'pre')", &[])
+            .await?;
+        let ev = collect_until(&mut rx, Duration::from_secs(10), |e| {
+            e.iter().any(|x| has_id(x, 200))
+        })
+        .await;
+        assert!(ev.iter().any(|e| has_id(e, 200)), "pre-drift row delivered");
+        h.stop();
+        h.join().await.ok();
+    }
+    let cp0 = ckpt.get_raw("adapt").await?.expect("pre-drift checkpoint");
+
+    // Drift + a row under the changed schema.
+    client
+        .execute("ALTER TABLE orders ADD COLUMN status VARCHAR(32)", &[])
+        .await?;
+    client
+        .execute("INSERT INTO orders VALUES (201, 'post', 'active')", &[])
+        .await?;
+
+    // Run 2: Adapt resumes, reloads, delivers 201 under the new schema, advances.
+    {
+        let src = configured_source(
+            "adapt",
+            &db,
+            "slot_adapt",
+            "pub_adapt",
+            OnSchemaDrift::Adapt,
+            registry.clone(),
+            backend.clone(),
+        )
+        .await;
+        let (tx, mut rx) = mpsc::channel(128);
+        let h = src.run(tx, ckpt.clone()).await;
+        wait_ready(&h, Duration::from_secs(3)).await?;
+        let ev = collect_until(&mut rx, Duration::from_secs(15), |e| {
+            e.iter().any(|x| has_id(x, 201))
+        })
+        .await;
+        let post = ev
+            .iter()
+            .find(|e| has_id(e, 201))
+            .expect("post-drift row delivered under adapt");
+        assert!(
+            post.after.as_ref().unwrap().get("status").is_some(),
+            "post-drift row decoded under the changed schema (new column present)"
+        );
+        h.stop();
+        h.join().await.ok();
+    }
+    let cp1 = ckpt.get_raw("adapt").await?.expect("post-drift checkpoint");
+    assert_ne!(cp0, cp1, "checkpoint advanced past the drift under adapt");
+    info!("✓ adapt: post-drift row delivered and checkpoint advanced");
+
+    cleanup_repl(&client, "pub_adapt", "slot_adapt").await;
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+/// on_schema_drift = Halt: an in-stream Relation change fails the source closed
+/// before any row under the changed schema is emitted, does not deliver the open
+/// transaction, does not advance the checkpoint, and fails AGAIN on unchanged
+/// restart (never silently skips the drift).
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_schema_drift_halt_fails_closed_and_does_not_skip() -> Result<()> {
+    use deltaforge_config::OnSchemaDrift;
+
+    let (db, client) = pg_setup("halt").await?;
+    client
+        .execute(
+            "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64))",
+            &[],
+        )
+        .await?;
+    client
+        .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
+        .await?;
+    create_pub_slot(&client, "pub_halt", "slot_halt", &["orders"]).await?;
+
+    let (registry, backend) = shared_registry().await;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+
+    // Run 1: deliver a pre-drift row, then stop -> committed pre-drift boundary.
+    {
+        let src = configured_source(
+            "halt",
+            &db,
+            "slot_halt",
+            "pub_halt",
+            OnSchemaDrift::Halt,
+            registry.clone(),
+            backend.clone(),
+        )
+        .await;
+        let (tx, mut rx) = mpsc::channel(128);
+        let h = src.run(tx, ckpt.clone()).await;
+        wait_ready(&h, Duration::from_secs(3)).await?;
+        client
+            .execute("INSERT INTO orders VALUES (300, 'pre')", &[])
+            .await?;
+        let ev = collect_until(&mut rx, Duration::from_secs(10), |e| {
+            e.iter().any(|x| has_id(x, 300))
+        })
+        .await;
+        assert!(ev.iter().any(|e| has_id(e, 300)), "pre-drift row delivered");
+        h.stop();
+        h.join().await.ok();
+    }
+    let cp0 = ckpt.get_raw("halt").await?.expect("pre-drift checkpoint");
+
+    // Drift + a row under the changed schema (committed while streaming is down).
+    client
+        .execute("ALTER TABLE orders ADD COLUMN status VARCHAR(32)", &[])
+        .await?;
+    client
+        .execute("INSERT INTO orders VALUES (301, 'post', 'active')", &[])
+        .await?;
+
+    // One Halt restart attempt: resumes from cp0, the startup drift check detects
+    // the change against the persisted schema and fails closed before streaming.
+    let attempt = || async {
+        let src = configured_source(
+            "halt",
+            &db,
+            "slot_halt",
+            "pub_halt",
+            OnSchemaDrift::Halt,
+            registry.clone(),
+            backend.clone(),
+        )
+        .await;
+        let (tx, mut rx) = mpsc::channel(128);
+        let h = src.run(tx, ckpt.clone()).await;
+        // The source must die (never become ready) once it hits the drift.
+        let ready = wait_ready(&h, Duration::from_secs(10)).await;
+        let items = drain_items(&mut rx, Duration::from_secs(2)).await;
+        // stop() is a no-op on the already-failed task; it only guards the test
+        // from hanging on join() if a regression left the source alive.
+        h.stop();
+        let joined = h.join().await;
+        (ready, items, joined)
+    };
+
+    // Run 2: fails closed.
+    let (ready, items, joined) = attempt().await;
+    assert!(
+        ready.is_err(),
+        "source must not become ready when it hits a Halt drift"
+    );
+    let err = format!("{:?}", joined.expect_err("run must fail closed"));
+    assert!(
+        err.contains("orders") && err.contains("on_schema_drift=adapt"),
+        "typed, actionable error names the table and remediation: {err}"
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|i| matches!(i, SourceItem::Event(e) if has_id(e, 301))),
+        "no post-drift event delivered"
+    );
+    assert!(
+        !items.iter().any(|i| matches!(i, SourceItem::Event(_))),
+        "no row event delivered from the drift transaction"
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|i| matches!(i, SourceItem::TxCommit { .. })),
+        "no partial transaction delivered (no commit)"
+    );
+    assert_eq!(
+        ckpt.get_raw("halt").await?.as_deref(),
+        Some(cp0.as_slice()),
+        "checkpoint remains at the prior committed boundary"
+    );
+    info!("✓ halt: failed closed, no post-drift delivery, checkpoint held");
+
+    // Run 3: unchanged restart fails AGAIN (does not skip the drift).
+    let (ready3, items3, joined3) = attempt().await;
+    assert!(ready3.is_err(), "second Halt restart must also fail closed");
+    assert!(
+        joined3.is_err(),
+        "unchanged restart under Halt fails again rather than skipping the drift"
+    );
+    assert!(
+        !items3.iter().any(|i| matches!(i, SourceItem::Event(_))),
+        "still no event delivered on the second attempt"
+    );
+    assert_eq!(
+        ckpt.get_raw("halt").await?.as_deref(),
+        Some(cp0.as_slice()),
+        "checkpoint still held at the prior committed boundary"
+    );
+    info!("✓ halt: unchanged restart fails again without skipping");
+
+    cleanup_repl(&client, "pub_halt", "slot_halt").await;
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+/// on_schema_drift = Halt, drift detected in-stream (an ALTER while the source is
+/// actively streaming): the source fails closed at the Relation message, before
+/// any row under the changed schema is emitted, and advances no checkpoint.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_schema_drift_halt_instream_fails_before_post_drift_row()
+-> Result<()> {
+    use deltaforge_config::OnSchemaDrift;
+
+    let (db, client) = pg_setup("haltis").await?;
+    client
+        .execute(
+            "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64))",
+            &[],
+        )
+        .await?;
+    client
+        .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
+        .await?;
+    create_pub_slot(&client, "pub_haltis", "slot_haltis", &["orders"]).await?;
+
+    let (registry, backend) = shared_registry().await;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let src = configured_source(
+        "haltis",
+        &db,
+        "slot_haltis",
+        "pub_haltis",
+        OnSchemaDrift::Halt,
+        registry.clone(),
+        backend.clone(),
+    )
+    .await;
+    let (tx, mut rx) = mpsc::channel(128);
+    let h = src.run(tx, ckpt.clone()).await;
+    wait_ready(&h, Duration::from_secs(3)).await?;
+
+    // Map the table with its original schema by streaming one pre-drift row.
+    client
+        .execute("INSERT INTO orders VALUES (400, 'pre')", &[])
+        .await?;
+    let pre = collect_until(&mut rx, Duration::from_secs(10), |e| {
+        e.iter().any(|x| has_id(x, 400))
+    })
+    .await;
+    assert!(pre.iter().any(|e| has_id(e, 400)), "pre-drift row streamed");
+
+    // ALTER while streaming, then a row under the new schema: the next Relation
+    // message carries the changed definition -> in-stream drift -> Halt.
+    client
+        .execute("ALTER TABLE orders ADD COLUMN status VARCHAR(32)", &[])
+        .await?;
+    client
+        .execute("INSERT INTO orders VALUES (401, 'post', 'active')", &[])
+        .await?;
+
+    let ready_after = wait_ready(&h, Duration::from_secs(10)).await;
+    assert!(
+        ready_after.is_err(),
+        "source must fail closed on the in-stream drift"
+    );
+    let items = drain_items(&mut rx, Duration::from_secs(2)).await;
+    h.stop();
+    let joined = h.join().await;
+
+    let err = format!("{:?}", joined.expect_err("run must fail closed"));
+    assert!(
+        err.contains("orders") && err.contains("on_schema_drift=adapt"),
+        "typed, actionable error names the table and remediation: {err}"
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|i| matches!(i, SourceItem::Event(e) if has_id(e, 401))),
+        "no post-drift row (401) delivered"
+    );
+    assert!(
+        !items.iter().any(|i| matches!(
+            i,
+            SourceItem::Event(e)
+                if e.after.as_ref().map(|a| a.get("status").is_some()).unwrap_or(false)
+        )),
+        "no row decoded under the changed schema was delivered"
+    );
+    assert!(
+        ckpt.get_raw("haltis").await?.is_none(),
+        "no checkpoint advanced past the last committed pre-drift transaction"
+    );
+    info!(
+        "✓ halt (in-stream): failed before any post-drift row, no checkpoint advance"
+    );
+
+    cleanup_repl(&client, "pub_haltis", "slot_haltis").await;
     pg_drop_db(&db).await;
     Ok(())
 }

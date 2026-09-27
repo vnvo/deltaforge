@@ -394,6 +394,9 @@ impl PostgresSource {
                         return Err(e);
                     }
                     Err(LoopControl::ReloadSchema { .. }) => continue,
+                    // The ensure/startup path does not decode Relation messages,
+                    // so drift cannot originate here; reload-and-retry defensively.
+                    Err(LoopControl::SchemaDrift(_)) => continue,
                 }
             }
         } else {
@@ -673,6 +676,20 @@ impl PostgresSource {
                         info!("reloading all schemas");
                         let _ = ctx.schema.reload_all(&self.tables).await;
                     }
+                }
+                Err(LoopControl::SchemaDrift(drift)) => {
+                    // Apply the policy, failing closed on a reload error under
+                    // Adapt or on Halt. The drift Relation precedes the
+                    // transaction's rows, so failing here leaves the open
+                    // transaction uncommitted (the coordinator discards it, no
+                    // sink checkpoint advances past the last committed pre-drift
+                    // transaction) and skips the graceful-stop checkpoint put.
+                    apply_schema_drift(
+                        &ctx.schema,
+                        &self.on_schema_drift,
+                        &drift,
+                    )
+                    .await?;
                 }
                 Err(LoopControl::Reconnect) => {
                     let delay = ctx.retry.next_backoff();
@@ -967,6 +984,55 @@ async fn check_identity_post_reconnect(ctx: &mut RunCtx) -> SourceResult<()> {
     Ok(())
 }
 
+/// Apply the configured `on_schema_drift` policy to a detected drift, failing
+/// closed. Under Adapt, reload the table's schema and continue only if the reload
+/// succeeds - a reload failure fails closed rather than proceeding to the first
+/// changed row with an unverified schema. Under Halt, return a typed, actionable
+/// error naming the table, the change, and the remediation. In both error cases
+/// the caller returns before emitting any post-drift row or advancing the
+/// checkpoint.
+pub(crate) async fn apply_schema_drift(
+    loader: &PostgresSchemaLoader,
+    policy: &OnSchemaDrift,
+    drift: &postgres_errors::SchemaDrift,
+) -> SourceResult<()> {
+    match policy {
+        OnSchemaDrift::Adapt => {
+            info!(
+                schema = %drift.schema, table = %drift.table, change = %drift.detail,
+                "schema drift; reloading (on_schema_drift=adapt)"
+            );
+            loader
+                .reload_schema(&drift.schema, &drift.table)
+                .await
+                .map_err(|e| {
+                    error!(
+                        schema = %drift.schema, table = %drift.table, error = %e,
+                        "schema reload failed under on_schema_drift=adapt; failing closed"
+                    );
+                    e
+                })?;
+            Ok(())
+        }
+        OnSchemaDrift::Halt => {
+            error!(
+                schema = %drift.schema, table = %drift.table, change = %drift.detail,
+                "schema drift and on_schema_drift=halt; failing closed"
+            );
+            Err(SourceError::Schema {
+                details: format!(
+                    "schema drift on table \"{}.{}\" ({}) and on_schema_drift=halt. \
+                     No events under the changed schema were emitted and the \
+                     checkpoint was not advanced. Review the schema change; to \
+                     continue past it, restart with on_schema_drift=adapt.",
+                    drift.schema, drift.table, drift.detail
+                )
+                .into(),
+            })
+        }
+    }
+}
+
 async fn run_failover_reconciliation(
     ctx: &mut RunCtx,
     previous: ServerIdentity,
@@ -1173,5 +1239,57 @@ mod compare_checkpoints_tests {
                 "out-of-range LSN {bad_lsn} (b) must be Incomparable"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod schema_drift_policy_tests {
+    use super::apply_schema_drift;
+    use super::postgres_errors::SchemaDrift;
+    use super::{OnSchemaDrift, PostgresSchemaLoader};
+    use std::sync::Arc;
+    use storage::{DurableSchemaRegistry, MemoryStorageBackend};
+
+    async fn loader(dsn: &str) -> PostgresSchemaLoader {
+        let backend = Arc::new(MemoryStorageBackend::new());
+        let registry =
+            DurableSchemaRegistry::new(backend).await.expect("registry");
+        PostgresSchemaLoader::new(dsn, registry, "acme")
+    }
+
+    fn drift() -> SchemaDrift {
+        SchemaDrift {
+            schema: "public".into(),
+            table: "orders".into(),
+            detail: "columns [id] -> [id, status]".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn halt_fails_closed_with_typed_actionable_error() {
+        // DSN is unused on the Halt path (no reload).
+        let l = loader("host=127.0.0.1 port=1 dbname=x").await;
+        let err = apply_schema_drift(&l, &OnSchemaDrift::Halt, &drift())
+            .await
+            .expect_err("halt must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("public.orders")
+                && msg.contains("on_schema_drift=adapt"),
+            "error names the table and remediation: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn adapt_fails_closed_when_reload_fails() {
+        // Unreachable DSN: reload_schema -> load_schema -> connect fails, so Adapt
+        // must NOT continue - it fails closed instead of proceeding with an
+        // unverified schema.
+        let l = loader("host=127.0.0.1 port=1 dbname=x").await;
+        let r = apply_schema_drift(&l, &OnSchemaDrift::Adapt, &drift()).await;
+        assert!(
+            r.is_err(),
+            "adapt must fail closed when the schema reload fails"
+        );
     }
 }

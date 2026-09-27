@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 use common::watchdog;
 
 use super::RunCtx;
-use super::postgres_errors::LoopControl;
+use super::postgres_errors::{LoopControl, SchemaDrift};
 use super::postgres_helpers::{
     make_checkpoint_meta, make_checkpoint_meta_str, pg_timestamp_to_unix_ms,
 };
@@ -333,7 +333,17 @@ async fn handle_pgoutput_message(
 }
 
 /// Handle relation (table metadata) message.
-/// Returns LoopControl::ReloadSchema if schema changed and needs reload.
+///
+/// Two drift paths, both signalling `LoopControl::SchemaDrift` before any row
+/// under the changed schema is decoded:
+/// - **In-stream**: the table was already mapped this run and its definition
+///   changed (an ALTER while streaming) - compared against the in-memory map, no
+///   catalog fetch.
+/// - **First resolution (lazy restart detection)**: the first Relation for a
+///   table this run is verified against the durably persisted schema, catching a
+///   change made while the source was down (and re-detecting a previously
+///   Halt-failed drift). A catalog fetch happens only for this active table, and
+///   only when the Relation payload cannot settle the comparison on its own.
 fn handle_relation(
     ctx: &mut RunCtx,
     payload: &[u8],
@@ -408,15 +418,33 @@ fn handle_relation(
         });
     }
 
-    // Check if this relation already exists and if schema changed
+    // Check if this relation already exists and if schema changed. Capture the
+    // prior columns before the map is updated so a drift can be described.
     let existing = ctx.relation_map.get(&relation_id);
     let is_new = existing.is_none();
-    let schema_changed = existing
-        .map(|r| {
-            r.columns.len() != columns.len()
-                || columns_differ(&r.columns, &columns)
-        })
+    let old_columns: Option<Vec<RelationColumn>> =
+        existing.map(|r| r.columns.to_vec());
+    let schema_changed = old_columns
+        .as_ref()
+        .map(|old| old.len() != columns.len() || columns_differ(old, &columns))
         .unwrap_or(false);
+    // Describe the change before `columns` is moved into the relation map.
+    let drift_detail = if schema_changed {
+        Some(describe_schema_change(
+            old_columns.as_deref().unwrap_or(&[]),
+            &columns,
+        ))
+    } else {
+        None
+    };
+
+    // The (name, type_oid) signature in pgoutput order, captured before `columns`
+    // is moved into the relation map (used for the first-resolution comparison
+    // below - same fields the in-stream path compares).
+    let relation_signature: Vec<(String, u32)> = columns
+        .iter()
+        .map(|c| (c.name.clone(), c.type_oid))
+        .collect();
 
     // Update relation map with new column info
     let qualified_name: Arc<str> = format!("{schema}.{table}").into();
@@ -432,27 +460,151 @@ fn handle_relation(
         },
     );
 
-    if ctx.allow.matches(&schema, &table) {
-        if is_new {
-            info!(relation_id, schema = %schema, table = %table, "relation mapped");
-        } else {
-            debug!(relation_id, schema = %schema, table = %table, "relation re-mapped");
+    if !ctx.allow.matches(&schema, &table) {
+        return Ok(());
+    }
+    if is_new {
+        info!(relation_id, schema = %schema, table = %table, "relation mapped");
+    } else {
+        debug!(relation_id, schema = %schema, table = %table, "relation re-mapped");
+    }
+
+    // In-stream drift: the table was already mapped this run and changed.
+    if schema_changed {
+        let detail = drift_detail.unwrap_or_default();
+        info!(
+            relation_id, schema = %schema, table = %table, change = %detail,
+            "in-stream schema drift detected"
+        );
+        return Err(LoopControl::SchemaDrift(SchemaDrift {
+            schema,
+            table,
+            detail,
+        }));
+    }
+
+    // First resolution this run: verify the Relation against the durably persisted
+    // schema so a change made while the source was down (or a previously
+    // Halt-failed drift) is caught here, before this table's rows are decoded.
+    // Deterministic and synchronous from the cached/durable schema - no catalog
+    // query.
+    if is_new {
+        if let Some(persisted) = ctx.schema.get_cached(&schema, &table) {
+            let persisted_signature: Vec<(String, Option<u32>)> = persisted
+                .schema
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), c.type_oid))
+                .collect();
+            if let FirstResolution::Drift(detail) = verify_first_resolution(
+                &persisted_signature,
+                &relation_signature,
+            ) {
+                info!(
+                    relation_id, schema = %schema, table = %table, change = %detail,
+                    "restart schema drift detected on first resolution"
+                );
+                return Err(LoopControl::SchemaDrift(SchemaDrift {
+                    schema,
+                    table,
+                    detail,
+                }));
+            }
         }
     }
 
-    // If schema changed, signal main loop to reload (like MySQL does)
-    if schema_changed && ctx.allow.matches(&schema, &table) {
-        info!(
-            relation_id, schema = %schema, table = %table,
-            "schema changed, requesting reload"
-        );
-        return Err(LoopControl::ReloadSchema {
-            schema: Some(schema),
-            table: Some(table),
-        });
-    }
-
     Ok(())
+}
+
+/// Result of verifying a table's first Relation this run against the persisted
+/// baseline.
+#[derive(Debug, PartialEq, Eq)]
+enum FirstResolution {
+    NoDrift,
+    Drift(String),
+}
+
+/// Compare the first Relation for a table against its durably persisted schema,
+/// deterministically and without any catalog query.
+///
+/// The persisted schema already carries each column's `type_oid` (populated at
+/// load time), so the comparison is a direct match of the ordered
+/// `(name, type_oid)` signature the pgoutput Relation message sends - the same
+/// fields the in-stream path compares (name/order/count/type-OID).
+///
+/// Fails closed: a persisted column whose `type_oid` is unavailable (e.g. a schema
+/// persisted before type OIDs were recorded) is **unverifiable** and reported as
+/// drift, never silently accepted as unchanged. Under Halt the caller stops; under
+/// Adapt it reloads, which re-persists the type OID so later restarts verify
+/// cleanly.
+///
+/// Note on scope: this guards replication-visible structural changes
+/// (name/order/count/type-OID), matching the in-stream contract. Catalog-only
+/// changes not present in the Relation payload (nullability, defaults, identity
+/// metadata) are out of scope and would require a durable relation/catalog
+/// signature plus batched reconciliation rather than per-table point queries.
+fn verify_first_resolution(
+    persisted_signature: &[(String, Option<u32>)],
+    relation_signature: &[(String, u32)],
+) -> FirstResolution {
+    let describe = || {
+        let persisted = persisted_signature
+            .iter()
+            .map(|(n, o)| match o {
+                Some(o) => format!("{n}:{o}"),
+                None => format!("{n}:?"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let relation = relation_signature
+            .iter()
+            .map(|(n, o)| format!("{n}:{o}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("columns [{persisted}] -> [{relation}]")
+    };
+
+    if persisted_signature.len() != relation_signature.len() {
+        return FirstResolution::Drift(describe());
+    }
+    for ((p_name, p_oid), (r_name, r_oid)) in
+        persisted_signature.iter().zip(relation_signature.iter())
+    {
+        if p_name != r_name {
+            return FirstResolution::Drift(describe());
+        }
+        match p_oid {
+            // Persisted type OID unavailable: cannot verify -> fail closed as
+            // drift (unverifiable), never treated as unchanged.
+            None => {
+                return FirstResolution::Drift(format!(
+                    "persisted type OID unavailable for column \"{p_name}\"; \
+                     cannot verify schema ({})",
+                    describe()
+                ));
+            }
+            Some(o) if o != r_oid => {
+                return FirstResolution::Drift(describe());
+            }
+            _ => {}
+        }
+    }
+    FirstResolution::NoDrift
+}
+
+/// Describe a relation-definition change as `old cols -> new cols`, for the
+/// drift log line and the Halt error message.
+fn describe_schema_change(
+    old: &[RelationColumn],
+    new: &[RelationColumn],
+) -> String {
+    fn cols(c: &[RelationColumn]) -> String {
+        c.iter()
+            .map(|c| format!("{}:{}", c.name, c.type_oid))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+    format!("columns [{}] -> [{}]", cols(old), cols(new))
 }
 
 /// Check if columns differ (by name or type).
@@ -987,6 +1139,92 @@ fn read_cstring(data: &[u8], offset: &mut usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod verify_first_resolution_tests {
+        use super::super::{FirstResolution, verify_first_resolution};
+
+        // (name, type_oid) persisted signature helper.
+        fn persisted(cols: &[(&str, u32)]) -> Vec<(String, Option<u32>)> {
+            cols.iter()
+                .map(|(n, o)| (n.to_string(), Some(*o)))
+                .collect()
+        }
+        // pgoutput Relation signature helper.
+        fn relation(cols: &[(&str, u32)]) -> Vec<(String, u32)> {
+            cols.iter().map(|(n, o)| (n.to_string(), *o)).collect()
+        }
+
+        // Same names/order but a changed type OID is drift - detected purely from
+        // cached state, with no catalog query (the function takes no connection).
+        #[test]
+        fn same_names_changed_type_oid_is_drift() {
+            let out = verify_first_resolution(
+                &persisted(&[("id", 23), ("sku", 1043)]),
+                &relation(&[("id", 23), ("sku", 25)]), // varchar -> text
+            );
+            assert!(matches!(out, FirstResolution::Drift(_)));
+        }
+
+        // Added / removed / reordered columns are drift.
+        #[test]
+        fn structural_changes_are_drift() {
+            // added
+            assert!(matches!(
+                verify_first_resolution(
+                    &persisted(&[("id", 23), ("sku", 1043)]),
+                    &relation(&[("id", 23), ("sku", 1043), ("status", 1043)]),
+                ),
+                FirstResolution::Drift(_)
+            ));
+            // removed
+            assert!(matches!(
+                verify_first_resolution(
+                    &persisted(&[("id", 23), ("sku", 1043)]),
+                    &relation(&[("id", 23)]),
+                ),
+                FirstResolution::Drift(_)
+            ));
+            // reordered
+            assert!(matches!(
+                verify_first_resolution(
+                    &persisted(&[("id", 23), ("sku", 1043)]),
+                    &relation(&[("sku", 1043), ("id", 23)]),
+                ),
+                FirstResolution::Drift(_)
+            ));
+        }
+
+        // Identical persisted and relation signatures are not drift.
+        #[test]
+        fn identical_signatures_no_drift() {
+            let out = verify_first_resolution(
+                &persisted(&[("id", 23), ("sku", 1043)]),
+                &relation(&[("id", 23), ("sku", 1043)]),
+            );
+            assert_eq!(out, FirstResolution::NoDrift);
+        }
+
+        // A persisted column without a type OID is unverifiable: it must fail
+        // closed as drift, never be treated as "unchanged".
+        #[test]
+        fn missing_persisted_type_oid_fails_closed_unverifiable() {
+            let out = verify_first_resolution(
+                &[("id".into(), Some(23)), ("sku".into(), None)],
+                &relation(&[("id", 23), ("sku", 1043)]),
+            );
+            match out {
+                FirstResolution::Drift(detail) => {
+                    assert!(
+                        detail.contains("unavailable"),
+                        "unverifiable reason surfaced: {detail}"
+                    );
+                }
+                FirstResolution::NoDrift => {
+                    panic!("missing type OID must not read as unchanged")
+                }
+            }
+        }
+    }
 
     /// The TxCommit marker carries a boundary built from the COMMIT record's
     /// end_lsn and the frozen system_identifier lineage: the checkpoint passes

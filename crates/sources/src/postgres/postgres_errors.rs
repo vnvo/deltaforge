@@ -87,13 +87,31 @@ impl From<tokio_postgres::Error> for PostgresSourceError {
 // LoopControl - for event loop control flow
 // =============================================================================
 
+/// An in-stream pgoutput Relation message changed a tracked table's definition
+/// (column added/removed/renamed or a type change). Carried by
+/// [`LoopControl::SchemaDrift`] and handled per `on_schema_drift`: Adapt reloads
+/// the schema and continues; Halt fails closed before any row decoded under the
+/// changed schema is emitted.
+#[derive(Debug, Clone)]
+pub struct SchemaDrift {
+    pub schema: String,
+    pub table: String,
+    /// Human-readable description of the detected change (old vs new columns).
+    pub detail: String,
+}
+
 #[derive(Debug)]
 pub enum LoopControl {
     Reconnect,
+    /// Recovery reload (schema-not-loaded / transient catalog error). Always
+    /// reloads regardless of `on_schema_drift`; distinct from [`Self::SchemaDrift`].
     ReloadSchema {
         schema: Option<String>,
         table: Option<String>,
     },
+    /// A tracked table's definition changed mid-stream. Handled per the
+    /// configured `on_schema_drift` policy.
+    SchemaDrift(SchemaDrift),
     Stop,
     Fail(SourceError),
 }
