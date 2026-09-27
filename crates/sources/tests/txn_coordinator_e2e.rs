@@ -287,7 +287,7 @@ async fn mysql_source(
 ) -> sources::mysql::MySqlSource {
     sources::mysql::MySqlSource {
         id: id.into(),
-        dsn: dsn.to_string(),
+        dsn: dsn.to_string().into(),
         tables: vec![format!("{db}.orders")],
         tenant: "acme".into(),
         pipeline: "acc".into(),
@@ -382,7 +382,7 @@ async fn pg_source(
 ) -> sources::postgres::PostgresSource {
     sources::postgres::PostgresSource {
         id: id.into(),
-        dsn: test_common::pg_cdc_dsn(db).await,
+        dsn: test_common::pg_cdc_dsn(db).await.into(),
         slot: slot.into(),
         publication: publication.into(),
         tables: vec!["public.orders".into()],

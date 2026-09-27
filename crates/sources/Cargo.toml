@@ -15,6 +15,10 @@ tokio.workspace = true
 tokio-util.workspace = true
 deltaforge-config = { path = "../deltaforge-config" }
 deltaforge-core = { path = "../deltaforge-core" }
+# Static credential resolution (env/file references) at source startup.
+secrets = { path = "../secrets" }
+# Best-effort zeroization of the reconstructed protected DSN string.
+zeroize = "1"
 checkpoints = { path = "../checkpoints" }
 schema-registry = { path = "../schema-registry" }
 storage ={ path = "../storage"}

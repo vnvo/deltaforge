@@ -65,7 +65,10 @@ spec:
 
     match &spec.spec.source {
         SourceCfg::Postgres(pc) => {
-            assert_eq!(pc.dsn, "postgres://pgu:pgpass@localhost:5432/orders");
+            assert_eq!(
+                pc.dsn.as_deref(),
+                Some("postgres://pgu:pgpass@localhost:5432/orders")
+            );
             assert!(matches!(
                 pc.start_position,
                 deltaforge_config::PostgresStartPosition::Latest
@@ -921,4 +924,141 @@ spec:
         }
         _ => panic!("expected redis"),
     }
+}
+
+// ============================================================================
+// Credential redaction (status serialization + Debug)
+// ============================================================================
+
+fn postgres_cfg_with_inline_dsn(
+    dsn: &str,
+) -> deltaforge_config::PostgresSrcCfg {
+    deltaforge_config::PostgresSrcCfg {
+        id: "pg".to_string(),
+        dsn: Some(dsn.to_string()),
+        dsn_secret: None,
+        credentials: None,
+        publication: "pub".to_string(),
+        slot: "slot".to_string(),
+        tables: vec![],
+        table_options: Default::default(),
+        start_position: Default::default(),
+        outbox: None,
+        snapshot: Default::default(),
+        on_schema_drift: Default::default(),
+    }
+}
+
+fn sanitized_spec_json(spec: &deltaforge_config::PipelineSpec) -> String {
+    let mut buf = Vec::new();
+    let mut ser = serde_json::Serializer::new(&mut buf);
+    deltaforge_config::serialize_sanitized_spec(spec, &mut ser).unwrap();
+    String::from_utf8(buf).unwrap()
+}
+
+#[test]
+fn status_serialization_redacts_inline_dsn_password() {
+    let yaml = r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata: { name: redact, tenant: t }
+spec:
+  source:
+    type: postgres
+    config:
+      id: pg
+      dsn: postgres://user:supersecret@db.internal:5432/orders
+      publication: pub
+      slot: slot
+      tables: [public.t1]
+  processors: []
+  sinks: []
+"#;
+    let spec = load_from_path(write_temp(yaml).to_str().unwrap()).unwrap();
+
+    // Lossless persistence/round-trip still contains the password.
+    let raw = serde_json::to_string(&spec).unwrap();
+    assert!(raw.contains("supersecret"), "persistence must be lossless");
+
+    // The sanitized status/API serialization must never expose it.
+    let shown = sanitized_spec_json(&spec);
+    assert!(
+        !shown.contains("supersecret"),
+        "status serialization leaked password: {shown}"
+    );
+    assert!(shown.contains("db.internal"), "host must survive: {shown}");
+}
+
+#[test]
+fn sanitized_and_normal_json_match_except_source_dsn() {
+    // Credential-less libpq key=value DSN: redaction is identity, so the sanitized
+    // JSON must be structurally identical to the normal JSON. A Spec (or source
+    // config) field dropped from the sanitized serializer would break this - the
+    // regression guard for the borrowed sanitizer, which the type system does not
+    // enforce (SanitizedSpec is a separate struct from Spec).
+    let yaml = r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata: { name: shape, tenant: t }
+spec:
+  source:
+    type: postgres
+    config:
+      id: pg
+      dsn: host=db.internal dbname=orders
+      publication: pub
+      slot: slot
+      tables: [public.t1]
+  processors: []
+  sinks: []
+"#;
+    let spec = load_from_path(write_temp(yaml).to_str().unwrap()).unwrap();
+    let normal: serde_json::Value = serde_json::to_value(&spec).unwrap();
+    let sanitized: serde_json::Value =
+        serde_json::from_str(&sanitized_spec_json(&spec)).unwrap();
+    assert_eq!(
+        normal, sanitized,
+        "sanitized JSON shape diverged from normal (a field may be missing from \
+         the sanitized serializer)"
+    );
+}
+
+#[test]
+fn sanitized_serialization_preserves_secret_references() {
+    let yaml = r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata: { name: refs, tenant: t }
+spec:
+  source:
+    type: postgres
+    config:
+      id: pg
+      dsn: postgres://db.internal/orders
+      credentials:
+        username: { provider: env, location: DF_PG_USER }
+        password: { provider: file, location: /run/secrets/pg/password }
+      publication: pub
+      slot: slot
+      tables: [public.t1]
+  processors: []
+  sinks: []
+"#;
+    let spec = load_from_path(write_temp(yaml).to_str().unwrap()).unwrap();
+    let shown = sanitized_spec_json(&spec);
+    // References remain visible and usable in sanitized output.
+    assert!(shown.contains("DF_PG_USER"), "{shown}");
+    assert!(shown.contains("/run/secrets/pg/password"), "{shown}");
+}
+
+#[test]
+fn config_debug_does_not_reveal_dsn_password() {
+    let src = postgres_cfg_with_inline_dsn(
+        "postgres://user:supersecret@db.internal/orders",
+    );
+    let shown = format!("{src:?}");
+    assert!(
+        !shown.contains("supersecret"),
+        "config Debug leaked password: {shown}"
+    );
 }

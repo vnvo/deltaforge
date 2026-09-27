@@ -76,7 +76,9 @@ pub struct MySqlCheckpoint {
 #[derive(Debug, Clone)]
 pub struct MySqlSource {
     pub id: String,
-    pub dsn: String,
+    /// Protected connection DSN (redacted `Debug`, no serialization). Built at
+    /// startup from inline config or resolved secret references.
+    pub dsn: crate::credentials::ProtectedDsn,
     pub tables: Vec<String>,
     pub tenant: String,
     pub pipeline: String,
@@ -98,7 +100,7 @@ struct RunCtx {
     source_id: String,
     pipeline: String,
     tenant: String,
-    dsn: String,
+    dsn: crate::credentials::ProtectedDsn,
     #[allow(dead_code)]
     host: String,
     default_db: String,
@@ -245,7 +247,7 @@ impl MySqlSource {
     /// `server_id` + the current binlog file.
     async fn capture_snapshot_lineage(&self) -> SourceResult<PersistedLineage> {
         use mysql_async::{Pool, Row, prelude::Queryable};
-        let pool = Pool::new(self.dsn.as_str());
+        let pool = Pool::new(self.dsn.expose());
         let mut conn = pool
             .get_conn()
             .await
@@ -315,7 +317,7 @@ impl MySqlSource {
             info!(source_id = %self.id, "starting mysql snapshot");
 
             let snap_schema_loader = MySqlSchemaLoader::new(
-                &self.dsn,
+                self.dsn.clone(),
                 self.registry.clone(),
                 &self.tenant,
             );
@@ -328,7 +330,7 @@ impl MySqlSource {
                 .await?;
 
             let snapshot_ctx = mysql_snapshot::SnapshotCtx {
-                dsn: &self.dsn,
+                dsn: self.dsn.expose(),
                 source_id: &self.id,
                 pipeline: &self.pipeline,
                 tenant: &self.tenant,
@@ -364,7 +366,9 @@ impl MySqlSource {
         let (host, default_db, server_id, mut client) = {
             let mut retry = common::retry::RetryPolicy::default();
             loop {
-                match prepare_client(&self.dsn, &self.id, &chkpt_store).await {
+                match prepare_client(self.dsn.expose(), &self.id, &chkpt_store)
+                    .await
+                {
                     Ok(result) => break result,
                     Err(e) => {
                         let source_err: SourceError = e.into();
@@ -414,13 +418,15 @@ impl MySqlSource {
         // so the in-loop pre-connect check always sees Same).
         if client.gtid_enabled {
             let id_store = IdentityStore::new(Arc::clone(&self.backend));
-            if let Ok(Some(live_id)) = fetch_server_identity(&self.dsn).await {
+            if let Ok(Some(live_id)) =
+                fetch_server_identity(self.dsn.expose()).await
+            {
                 let live = ServerIdentity::from(live_id);
                 if matches!(
                     id_store.compare(&self.id, &live).await,
                     Ok(IdentityComparison::Changed { .. })
                 ) {
-                    match resolve_binlog_tail(&self.dsn).await {
+                    match resolve_binlog_tail(self.dsn.expose()).await {
                         Ok((fname, fpos)) => {
                             warn!(
                                 source_id = %self.id,
@@ -446,7 +452,7 @@ impl MySqlSource {
 
         info!(source_id=%self.id, "prepare_client finished, loading schemas");
         let schema_loader = MySqlSchemaLoader::new(
-            &self.dsn,
+            self.dsn.clone(),
             self.registry.clone(),
             &self.tenant,
         );
@@ -694,7 +700,7 @@ async fn connect_first_stream(
     let sid = ctx.server_id;
     let make_client = move || {
         let mut c = BinlogClient {
-            url: dsn.clone(),
+            url: dsn.expose().to_string(),
             server_id: sid,
             heartbeat_interval_secs: HEARTBEAT_INTERVAL_SECS,
             timeout_secs: READ_TIMEOUT,
@@ -732,7 +738,7 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     } else if !ctx.last_file.is_empty() && ctx.last_pos > 0 {
         (None, Some(ctx.last_file.clone()), Some(ctx.last_pos as u32))
     } else {
-        match resolve_binlog_tail(&ctx.dsn).await {
+        match resolve_binlog_tail(ctx.dsn.expose()).await {
             Ok((f, p)) => (None, Some(f), Some(p as u32)),
             Err(_) => {
                 return Err(SourceError::Connect {
@@ -747,7 +753,7 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     let sid = ctx.server_id;
     let make_client = move || {
         let mut c = BinlogClient {
-            url: dsn.clone(),
+            url: dsn.expose().to_string(),
             server_id: sid,
             heartbeat_interval_secs: HEARTBEAT_INTERVAL_SECS,
             timeout_secs: READ_TIMEOUT,
@@ -819,7 +825,7 @@ async fn do_reconnect(ctx: &mut RunCtx) -> SourceResult<Option<BinlogStream>> {
 /// - `Same`: normal reconnect, nothing to do.
 /// - `Changed`: run full failover reconciliation before returning.
 async fn check_identity_post_reconnect(ctx: &mut RunCtx) -> SourceResult<()> {
-    let live_mysql = match fetch_server_identity(&ctx.dsn).await {
+    let live_mysql = match fetch_server_identity(ctx.dsn.expose()).await {
         Ok(Some(id)) => id,
         Ok(None) => return Ok(()), // MySQL < 5.6 or unavailable - skip silently
         Err(e) => {
@@ -846,7 +852,7 @@ async fn check_identity_post_reconnect(ctx: &mut RunCtx) -> SourceResult<()> {
             // start) to avoid false positives from the file-presence fallback.
             if ctx.checkpoint_gtid.is_some() {
                 match check_position_reachability(
-                    &ctx.dsn,
+                    ctx.dsn.expose(),
                     &ctx.checkpoint_file,
                     ctx.checkpoint_gtid.as_deref(),
                 )
@@ -896,7 +902,7 @@ async fn run_failover_reconciliation(
         // Position reachability - use the original checkpoint position, not the
         // (potentially adjusted) streaming position in last_gtid/last_file.
         match check_position_reachability(
-            &ctx.dsn,
+            ctx.dsn.expose(),
             &ctx.checkpoint_file,
             ctx.checkpoint_gtid.as_deref(),
         )
@@ -930,7 +936,7 @@ async fn run_failover_reconciliation(
             let (db, table) = (parts[0].to_owned(), parts[1].to_owned());
             let live_cols: Option<
                 Vec<crate::failover::reconciler::ColumnSnapshot>,
-            > = mysql_health::fetch_live_columns(&ctx.dsn, &db, &table)
+            > = mysql_health::fetch_live_columns(ctx.dsn.expose(), &db, &table)
                 .await
                 .ok()
                 .flatten()

@@ -116,7 +116,7 @@ pub struct SnapshotCtx<'a> {
 /// On confirmed purge: sets abort_reason and fires the CancellationToken.
 /// Transient errors (connect failures, empty results) are retried - never abort.
 fn spawn_binlog_position_guard(
-    dsn: String,
+    dsn: crate::credentials::ProtectedDsn,
     captured_file: String,
     cancel: CancellationToken,
     abort_reason: Arc<Mutex<Option<String>>>,
@@ -131,7 +131,7 @@ fn spawn_binlog_position_guard(
                 _ = interval.tick() => {}
             }
 
-            let mut conn = match Pool::new(dsn.as_str()).get_conn().await {
+            let mut conn = match Pool::new(dsn.expose()).get_conn().await {
                 Ok(c) => c,
                 Err(e) => {
                     warn!(error = %e, "binlog guard: connect error, retrying");
@@ -255,7 +255,7 @@ pub async fn run_snapshot(
     let guard_cancel = ctx.cancel.child_token();
     let _guard_stop = scopeguard::guard((), |_| guard_cancel.cancel());
     let _position_guard = spawn_binlog_position_guard(
-        ctx.dsn.to_string(),
+        crate::credentials::ProtectedDsn::from(ctx.dsn),
         position.file.clone(),
         guard_cancel.clone(),
         abort_reason.clone(),

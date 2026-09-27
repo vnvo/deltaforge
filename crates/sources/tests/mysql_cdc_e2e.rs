@@ -126,7 +126,7 @@ async fn make_source(
 ) -> MySqlSource {
     MySqlSource {
         id: id.into(),
-        dsn: dsn.to_string(),
+        dsn: dsn.to_string().into(),
         tables,
         tenant: "acme".into(),
         pipeline: "test".to_string(),
@@ -322,7 +322,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
     let backend = make_storage_backend().await;
     let src = MySqlSource {
         id: "cdc-basic".into(),
-        dsn: dsn.clone(),
+        dsn: dsn.clone().into(),
         tables: vec![format!("{}.orders", db_name)],
         tenant: "acme".into(),
         pipeline: "test".to_string(),
@@ -442,7 +442,7 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
     let registry = make_registry().await;
     let src = MySqlSource {
         id: "schema-ddl".into(),
-        dsn: dsn.clone(),
+        dsn: dsn.clone().into(),
         tables: vec![format!("{}.orders", db_name)],
         tenant: "acme".into(),
         pipeline: "test".to_string(),

@@ -364,7 +364,7 @@ const GUARD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 /// On `unreserved` status: warns but continues (WAL not guaranteed but not gone).
 /// On `lost` status or invalidation: sets abort_reason and cancels.
 pub fn spawn_wal_slot_guard(
-    dsn: String,
+    dsn: crate::credentials::ProtectedDsn,
     slot_name: String,
     cancel: CancellationToken,
     abort_reason: Arc<Mutex<Option<String>>>,
@@ -379,7 +379,9 @@ pub fn spawn_wal_slot_guard(
                 _ = interval.tick() => {}
             }
 
-            let client = match tokio_postgres::connect(&dsn, NoTls).await {
+            let client = match tokio_postgres::connect(dsn.expose(), NoTls)
+                .await
+            {
                 Ok((c, conn)) => {
                     tokio::spawn(async move {
                         let _ = conn.await;

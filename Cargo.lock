@@ -1611,6 +1611,7 @@ dependencies = [
  "common",
  "deltaforge-core",
  "pretty_assertions",
+ "secrets",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -5862,6 +5863,7 @@ dependencies = [
  "runner",
  "schema-registry",
  "scopeguard",
+ "secrets",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5875,6 +5877,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "zeroize",
 ]
 
 [[package]]

@@ -48,7 +48,7 @@ async fn make_source(
     let dsn = mysql_cdc_dsn(db).await;
     MySqlSource {
         id: id.into(),
-        dsn,
+        dsn: dsn.into(),
         tables,
         tenant: "acme".into(),
         pipeline: "test".into(),
@@ -486,7 +486,7 @@ async fn make_source_on(
     let dsn = mysql_cdc_dsn(db).await;
     MySqlSource {
         id: id.into(),
-        dsn,
+        dsn: dsn.into(),
         tables,
         tenant: "acme".into(),
         pipeline: "test".into(),

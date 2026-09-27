@@ -968,7 +968,7 @@ mod tests {
             source_id: "unit-test".to_string(),
             pipeline: "test-pipeline".to_string(),
             tenant: "test-tenant".to_string(),
-            dsn: "mysql://fake".to_string(),
+            dsn: "mysql://fake".to_string().into(),
             host: "localhost".to_string(),
             default_db: "test".to_string(),
             server_id: 1,

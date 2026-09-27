@@ -39,7 +39,7 @@ type ArcSchemaCache = Arc<RwLock<HashMap<(String, String), Arc<LoadedSchema>>>>;
 #[derive(Clone)]
 pub struct MySqlSchemaLoader {
     pool: Pool,
-    dsn: String,
+    dsn: crate::credentials::ProtectedDsn,
     /// Cache: (db, table) -> Arc<LoadedSchema>
     cache: ArcSchemaCache,
     /// Schema registry for versioning
@@ -47,17 +47,32 @@ pub struct MySqlSchemaLoader {
     tenant: String,
 }
 
+impl std::fmt::Debug for MySqlSchemaLoader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MySqlSchemaLoader")
+            .field("dsn", &self.dsn)
+            .field("tenant", &self.tenant)
+            .finish_non_exhaustive()
+    }
+}
+
 impl MySqlSchemaLoader {
-    /// Create a new schema loader.
+    /// Create a new schema loader. Accepts a protected DSN (or anything convertible
+    /// into one); the loader shares the protected wrapper rather than a plaintext
+    /// copy.
     pub fn new(
-        dsn: &str,
+        dsn: impl Into<crate::credentials::ProtectedDsn>,
         registry: Arc<DurableSchemaRegistry>,
         tenant: &str,
     ) -> Self {
-        info!("creating mysql schema loader for {}", redact_password(dsn));
+        let dsn = dsn.into();
+        info!(
+            "creating mysql schema loader for {}",
+            redact_password(dsn.expose())
+        );
         Self {
-            pool: Pool::new(dsn),
-            dsn: dsn.to_string(),
+            pool: Pool::new(dsn.expose()),
+            dsn,
             cache: Arc::new(RwLock::new(HashMap::new())),
             registry,
             tenant: tenant.to_string(),
@@ -89,7 +104,7 @@ impl MySqlSchemaLoader {
         let tables = self.expand_patterns(patterns).await?;
 
         info!(
-            dns=redact_password(&self.dsn),
+            dns=redact_password(self.dsn.expose()),
             patterns = ?patterns,
             matched_tables = tables.len(),
             "expanded table patterns"
@@ -169,7 +184,7 @@ impl MySqlSchemaLoader {
 
         if row_image.to_lowercase() != "full" {
             warn!(
-                dns=redact_password(&self.dsn),
+                dns=redact_password(self.dsn.expose()),
                 binlog_row_image = %row_image,
                 "binlog_row_image is not FULL - before images may be incomplete. \
                 Consider: SET GLOBAL binlog_row_image = 'FULL'"
@@ -548,7 +563,7 @@ impl MySqlSchemaLoader {
 
         Self {
             pool: Pool::new("mysql://localhost/ignored"),
-            dsn: "mysql://localhost/ignored".to_string(),
+            dsn: "mysql://localhost/ignored".into(),
             cache: Arc::new(RwLock::new(cache)),
             registry: storage::DurableSchemaRegistry::for_testing(),
             tenant: "test".to_string(),

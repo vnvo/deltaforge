@@ -510,7 +510,7 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
     {
         let src = MySqlSource {
             id: "fo_drift".into(),
-            dsn: mysql_cdc_dsn(port_a, DB),
+            dsn: mysql_cdc_dsn(port_a, DB).into(),
             tables: vec![format!("{DB}.orders")],
             tenant: "acme".into(),
             pipeline: "test".into(),
@@ -559,7 +559,7 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
     {
         let src = MySqlSource {
             id: "fo_drift".into(),
-            dsn: mysql_cdc_dsn(port_b, DB),
+            dsn: mysql_cdc_dsn(port_b, DB).into(),
             tables: vec![format!("{DB}.orders")],
             tenant: "acme".into(),
             pipeline: "test".into(),
@@ -652,7 +652,7 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
     {
         let src = MySqlSource {
             id: "fo_halt".into(),
-            dsn: mysql_cdc_dsn(port_a, DB),
+            dsn: mysql_cdc_dsn(port_a, DB).into(),
             tables: vec![format!("{DB}.orders")],
             tenant: "acme".into(),
             pipeline: "test".into(),
@@ -700,7 +700,7 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
     {
         let src = MySqlSource {
             id: "fo_halt".into(),
-            dsn: mysql_cdc_dsn(port_b, DB),
+            dsn: mysql_cdc_dsn(port_b, DB).into(),
             tables: vec![format!("{DB}.orders")],
             tenant: "acme".into(),
             pipeline: "test".into(),
@@ -791,7 +791,7 @@ async fn mysql_failover_schema_drift_halt_no_drift_continues() -> Result<()> {
     {
         let src = MySqlSource {
             id: "fo_halt_nodrift".into(),
-            dsn: mysql_cdc_dsn(port_b, DB),
+            dsn: mysql_cdc_dsn(port_b, DB).into(),
             tables: vec![format!("{DB}.orders")],
             tenant: "acme".into(),
             pipeline: "test".into(),

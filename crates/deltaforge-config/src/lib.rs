@@ -8,6 +8,9 @@ use walkdir::WalkDir;
 mod storage;
 pub use storage::*;
 
+mod sanitize;
+pub use sanitize::serialize_sanitized_spec;
+
 mod snapshot_cfg;
 pub use snapshot_cfg::*;
 
@@ -173,10 +176,31 @@ pub struct TableOptions {
     pub assume_unique: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Referenced credential fields that augment a non-secret base DSN. Each field is
+/// a [`SecretReference`] (never a value); resolution happens at source startup.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SourceCredentialsCfg {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<secrets::SecretReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<secrets::SecretReference>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PostgresSrcCfg {
     pub id: String,
-    pub dsn: String,
+    /// Inline connection string (may embed credentials). Exactly one of `dsn` or
+    /// `dsn_secret` must be set. Kept for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsn: Option<String>,
+    /// Reference to a secret holding the entire DSN (resolved as UTF-8 at startup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsn_secret: Option<secrets::SecretReference>,
+    /// Referenced username/password that augment a non-secret `dsn` lacking
+    /// credentials. Not permitted alongside `dsn_secret` or an inline DSN that
+    /// already carries credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<SourceCredentialsCfg>,
     pub publication: String,
     pub slot: String,
     pub tables: Vec<String>,
@@ -208,10 +232,21 @@ pub enum PostgresStartPosition {
     Lsn(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MysqlSrcCfg {
     pub id: String,
-    pub dsn: String,
+    /// Inline connection string (may embed credentials). Exactly one of `dsn` or
+    /// `dsn_secret` must be set. Kept for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsn: Option<String>,
+    /// Reference to a secret holding the entire DSN (resolved as UTF-8 at startup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsn_secret: Option<secrets::SecretReference>,
+    /// Referenced username/password that augment a non-secret `dsn` lacking
+    /// credentials. Not permitted alongside `dsn_secret` or an inline DSN that
+    /// already carries credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<SourceCredentialsCfg>,
     pub tables: Vec<String>,
     /// Options for concrete (fully-qualified) tables selected by `tables`.
     #[serde(default)]
@@ -223,6 +258,50 @@ pub struct MysqlSrcCfg {
     /// What to do when schema drift is detected after failover.
     #[serde(default)]
     pub on_schema_drift: OnSchemaDrift,
+}
+
+/// Redacted rendering of an optional inline DSN for `Debug`. `Some` values have
+/// their password stripped; the value itself is never printed in the clear.
+fn debug_dsn(dsn: &Option<String>) -> String {
+    match dsn {
+        Some(d) => common::dsn::redact_dsn(d),
+        None => "None".to_string(),
+    }
+}
+
+impl std::fmt::Debug for PostgresSrcCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresSrcCfg")
+            .field("id", &self.id)
+            .field("dsn", &debug_dsn(&self.dsn))
+            .field("dsn_secret", &self.dsn_secret)
+            .field("credentials", &self.credentials)
+            .field("publication", &self.publication)
+            .field("slot", &self.slot)
+            .field("tables", &self.tables)
+            .field("table_options", &self.table_options)
+            .field("start_position", &self.start_position)
+            .field("outbox", &self.outbox)
+            .field("snapshot", &self.snapshot)
+            .field("on_schema_drift", &self.on_schema_drift)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for MysqlSrcCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MysqlSrcCfg")
+            .field("id", &self.id)
+            .field("dsn", &debug_dsn(&self.dsn))
+            .field("dsn_secret", &self.dsn_secret)
+            .field("credentials", &self.credentials)
+            .field("tables", &self.tables)
+            .field("table_options", &self.table_options)
+            .field("outbox", &self.outbox)
+            .field("snapshot", &self.snapshot)
+            .field("on_schema_drift", &self.on_schema_drift)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
