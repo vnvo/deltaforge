@@ -154,7 +154,9 @@ impl Drop for ZeroizingStringMap {
     }
 }
 
-/// Resolves `SecretProvider::File` references.
+/// Resolves `SecretProvider::File` references. `Clone` is cheap (the policy only)
+/// and lets the rotation watcher move a resolver into one `spawn_blocking` pass.
+#[derive(Clone)]
 pub struct FileResolver {
     policy: FilePolicy,
 }
@@ -169,6 +171,7 @@ impl FileResolver {
         &self,
         reference: &SecretReference,
     ) -> Result<FileIdentity, SecretError> {
+        maybe_identity_delay(reference);
         let target = resolve_target(&self.policy, reference)?;
         let meta = fs::metadata(&target).map_err(|e| map_io(&e, reference))?;
         if !meta.is_file() {
@@ -527,7 +530,19 @@ fn trim_trailing_newline(mut bytes: Vec<u8>) -> Vec<u8> {
 /// Test-only slowness seam: a resolution whose path contains this marker sleeps in
 /// the blocking task, so a concurrency test can prove the blocking work does not
 /// stall the async runtime. Compiled out entirely in non-test builds.
+// Test-only slowness seams (compiled out of non-test builds). `__slow__` slows both
+// identity and read; `__slowread__` slows only the read (so a test can keep
+// fingerprinting fast while widening the resolve window).
 fn maybe_test_delay(_reference: &SecretReference) {
+    #[cfg(test)]
+    if _reference.location.contains("__slow__")
+        || _reference.location.contains("__slowread__")
+    {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
+fn maybe_identity_delay(_reference: &SecretReference) {
     #[cfg(test)]
     if _reference.location.contains("__slow__") {
         std::thread::sleep(std::time::Duration::from_millis(500));

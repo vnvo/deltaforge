@@ -35,6 +35,7 @@ mod registry;
 mod resolved;
 mod resolver;
 mod structured;
+mod watch;
 
 pub use credential_set::CredentialSet;
 pub use error::{
@@ -53,3 +54,4 @@ pub use resolver::{
     CredentialFieldRequest, SecretResolver, check_no_duplicate_fields,
 };
 pub use structured::{StructuredSecret, credential_set_from_record};
+pub use watch::{FileWatcher, RotationOutcome};
