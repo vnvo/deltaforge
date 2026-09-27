@@ -58,6 +58,14 @@ impl CredentialSet {
         self.fields.is_empty()
     }
 
+    /// Consume the set into its owned fields. Crate-internal: used by the composite
+    /// resolver to merge per-provider sets while preserving each field's
+    /// provenance. Not public, so external callers cannot disassemble a set and
+    /// re-tag its provenance.
+    pub(crate) fn into_fields(self) -> BTreeMap<String, ResolvedSecret> {
+        self.fields
+    }
+
     /// Provider versions for every field (opaque, non-secret). Diagnostic only:
     /// version equality is **not** proof of a single provider read (two
     /// independent reads can carry equal or absent versions). Use

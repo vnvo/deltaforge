@@ -62,6 +62,25 @@ impl std::fmt::Display for InconsistencyKind {
     }
 }
 
+/// A reference option a given provider does not honor. Naming the option in a typed
+/// way prevents a caller from believing an unenforced constraint is enforced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceOption {
+    /// A structured-field selector.
+    Selector,
+    /// An immutable version pin.
+    Version,
+}
+
+impl std::fmt::Display for ReferenceOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ReferenceOption::Selector => "selector",
+            ReferenceOption::Version => "version",
+        })
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SecretError {
     /// No secret found at the reference.
@@ -105,5 +124,52 @@ pub enum SecretError {
     Inconsistent {
         kind: InconsistencyKind,
         field: Option<String>,
+    },
+
+    /// A present-but-empty value (e.g. an empty env var or empty file) where a
+    /// non-empty secret is required. Fails closed.
+    #[error("secret {0} is present but empty")]
+    Empty(SafeRef),
+
+    /// The reference names a provider that no installed provider handles (e.g. a
+    /// Vault reference before the Vault provider feature is installed).
+    #[error("no provider installed for {0}")]
+    UnsupportedProvider(SafeRef),
+
+    /// A file reference resolved to something other than a regular file
+    /// (directory, device, socket, ...).
+    #[error("file secret {0} is not a regular file")]
+    NotRegularFile(SafeRef),
+
+    /// A file reference used a relative path; only absolute paths are accepted.
+    #[error("file secret {0} must be an absolute path")]
+    PathNotAbsolute(SafeRef),
+
+    /// A symlink was encountered under a policy that forbids following it.
+    #[error("file secret {0} is a symlink (rejected by policy)")]
+    SymlinkRejected(SafeRef),
+
+    /// A file reference resolved outside its configured trusted root.
+    #[error("file secret {0} resolves outside the trusted root")]
+    OutsideTrustedRoot(SafeRef),
+
+    /// The file changed underneath the read (size/mtime moved between stat and
+    /// the completed read). Fails closed for this resolution.
+    #[error("file secret {0} was replaced during read")]
+    ReplacedDuringRead(SafeRef),
+
+    /// A structured-record file could not be parsed as the expected bounded
+    /// object. The underlying parser message is deliberately **not** included, as
+    /// it can echo file content.
+    #[error("structured secret {0} is malformed")]
+    MalformedRecord(SafeRef),
+
+    /// The reference carries an option the resolving provider does not enforce
+    /// (e.g. a selector or version on an environment reference). Fails closed so a
+    /// caller never believes an unenforced constraint is applied.
+    #[error("reference {reference} does not support option: {option}")]
+    UnsupportedReferenceOption {
+        reference: SafeRef,
+        option: ReferenceOption,
     },
 }

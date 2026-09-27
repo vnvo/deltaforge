@@ -25,6 +25,7 @@ use crate::resolved::ResolvedSecret;
 /// One requested connector credential field: the connector's field name (e.g.
 /// "username", "tls_key") paired with the reference that locates it. Field names
 /// are free-form connector strings, so a plain `String` rather than a fixed enum.
+#[derive(Clone)]
 pub struct CredentialFieldRequest {
     pub field: String,
     pub reference: SecretReference,
