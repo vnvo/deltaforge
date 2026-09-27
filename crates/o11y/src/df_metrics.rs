@@ -236,6 +236,13 @@ pub fn describe_metrics() {
         Unit::Count,
         "Total rows emitted during initial snapshot, per pipeline and table"
     );
+    describe_gauge!(
+        "deltaforge_snapshot_unsafe_anchor",
+        Unit::Count,
+        "1 while a pipeline's completed initial snapshot used the legacy \
+         (pre-hardening) anchor that could lose seam rows; 0 once re-snapshotted \
+         with the safe slot-consistent-point anchor"
+    );
 
     describe_histogram!(
         "deltaforge_e2e_latency_seconds",

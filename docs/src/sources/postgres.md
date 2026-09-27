@@ -53,7 +53,10 @@ host    your_database   deltaforge      0.0.0.0/0               scram-sha-256
 
 ### Replication Slot and Publication
 
-DeltaForge automatically creates the replication **slot** on first run. The **publication** is not auto-created — you must create it yourself. Create both manually if you prefer:
+DeltaForge automatically creates the replication **slot** on first run and records
+durable **ownership** of it (bound to the server's `system_identifier`, the
+database, the slot name, and the plugin). The **publication** is not auto-created —
+you must create it yourself. Create both manually if you prefer:
 
 ```sql
 -- Create publication for specific tables
@@ -172,13 +175,25 @@ snapshot mechanism before starting logical replication.
 
 ### How it works
 
-A coordinator connection exports a snapshot and captures the current WAL LSN
-in a single round trip. Worker connections each import the shared snapshot into
-their own `REPEATABLE READ` transaction - all workers see the same consistent
-DB state with no locks held on the source.
+DeltaForge anchors CDC at the replication slot's **consistent point** `C` - the
+LSN `pg_create_logical_replication_slot` returns when the slot is created - rather
+than a separately sampled `pg_current_wal_lsn()`. A coordinator connection then
+exports an MVCC snapshot for worker mutual consistency; worker connections import
+it into their own `REPEATABLE READ` transactions, so all workers see one
+consistent DB state with no locks held on the source. Tables with a single
+integer primary key use PK-range chunking; others fall back to ctid page-range
+chunking.
 
-Tables with a single integer primary key use PK-range chunking. All others
-fall back to ctid page-range chunking.
+Anchoring at `C` (which precedes the snapshot read) closes the snapshot-to-CDC
+seam: **no committed row is lost**. The trade-off is a **bounded at-least-once
+overlap** - a change committed between `C` and the snapshot export is present in
+both the snapshot and the CDC stream from `C`, so it is delivered more than once.
+This is at-least-once, **not** exactly-once (see [Snapshot events](#snapshot-events)).
+
+> **Correctness note.** Earlier versions sampled `pg_current_wal_lsn()` decoupled
+> from the exported snapshot, which admitted a (small) window where a row could be
+> absent from both the snapshot and the CDC stream. The slot-consistent-point
+> anchor removes that window, trading the loss risk for the bounded overlap above.
 
 ### Configuration
 ```yaml
@@ -206,13 +221,40 @@ source:
 ### Snapshot events
 
 Snapshot rows are emitted as `Op::Read` events (Debezium `op: "r"`),
-distinguishable from live CDC `Op::Create` events. The WAL LSN captured at
-snapshot time becomes the CDC resume point - no rows are missed or duplicated.
+distinguishable from live CDC `Op::Create` events. The slot's consistent point
+`C` is the CDC resume position, so **no rows are missed**. Rows committed in
+`(C, snapshot-export]` are delivered by both the snapshot (as `Op::Read`) and the
+CDC stream (as their change op) - the **bounded at-least-once overlap**. The two
+copies carry distinct event identities:
+
+- **Current-state / idempotent sinks** (Elasticsearch, ClickHouse `upsert`, with
+  `version_source: source_position`) converge to the correct current state - the
+  duplicate is absorbed by last-writer-wins.
+- **Append-only sinks** (Kafka, Redis, HTTP, ClickHouse `changelog`, legacy S3)
+  receive the overlapping rows twice, by design.
+
+This is at-least-once delivery; DeltaForge does not claim exactly-once for the
+snapshot-to-CDC boundary.
+
+### Legacy-anchor warning and metric
+
+A pipeline whose initial snapshot was completed under the older (pre-hardening)
+anchor is flagged so you can decide to re-snapshot:
+
+- a structured `WARN` at startup, and
+- the gauge `deltaforge_snapshot_unsafe_anchor{pipeline,source}` held at `1`.
+
+Re-snapshotting under this version records the safe anchor and resets the gauge to
+`0`. See [Upgrade guidance](#upgrade-guidance).
 
 ### Resume after interruption
 
-If the snapshot is interrupted, DeltaForge resumes at table granularity on
-the next restart - already-completed tables are skipped.
+If a snapshot is interrupted, DeltaForge resumes at table granularity on the next
+restart when there is a durable checkpoint - already-completed tables are skipped.
+If the snapshot was interrupted before any checkpoint (slot created, no rows yet
+committed to a checkpoint) and DeltaForge can prove it owns the now-inactive slot,
+it **re-anchors** (drops and recreates its slot for a fresh `C`) and performs a
+**full re-snapshot**, rather than reusing a stale anchor.
 
 ### WAL slot retention safety
 
@@ -242,6 +284,32 @@ If you see WAL retention risk warnings:
 ALTER SYSTEM SET max_slot_wal_keep_size = '10GB';
 SELECT pg_reload_conf();
 ```
+
+## Upgrade guidance
+
+The slot-consistent-point anchor and durable slot ownership change how existing
+slots are handled when a snapshot runs. **Steady-state CDC resume from a
+checkpoint is unaffected** - the notes below apply only when a snapshot runs.
+
+- **Existing slots created before this version** have no ownership record. A
+  re-snapshot on such a slot (`mode: always`, or `mode: initial` after clearing
+  the checkpoint) cannot prove ownership and **fails closed** with remediation:
+  drop the slot manually (`SELECT pg_drop_replication_slot('<slot>')`) so
+  DeltaForge recreates it with ownership, then restart. New pipelines and
+  first-run snapshots are unaffected.
+- **Ownership ambiguity / foreign slots.** If the slot exists but DeltaForge
+  cannot prove exclusive ownership (missing, partial, or mismatched record - e.g.
+  a different server `system_identifier` after a restore/failover) or the slot is
+  **active**, it **fails closed** and never drops the slot. Remediation: confirm
+  no other consumer uses it, drop it, and restart; or set `snapshot.mode = never`
+  to stream from the current position without an initial load.
+- **Interrupted snapshots.** An owned, inactive slot left by a snapshot that was
+  interrupted before its first checkpoint is re-anchored (dropped and recreated
+  for a fresh consistent point) and fully re-snapshotted automatically.
+- **Safe re-snapshotting.** To take a fresh, correctly-anchored snapshot: stop the
+  pipeline; clear the checkpoint (or set `mode: always`); ensure the slot is either
+  owned and inactive or dropped so DeltaForge recreates it; restart. A completed,
+  safely-anchored snapshot resets `deltaforge_snapshot_unsafe_anchor` to `0`.
 
 ## Type Handling
 

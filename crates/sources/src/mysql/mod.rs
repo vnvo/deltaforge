@@ -343,7 +343,12 @@ impl MySqlSource {
             let snapshot_position =
                 mysql_snapshot::run_snapshot(&snapshot_ctx, &tracked)
                     .await
-                    .map_err(SourceError::Other)?;
+                    // Preserve a typed preflight refusal (Permission/Incompatible)
+                    // if run_snapshot produced one; otherwise wrap as Other.
+                    .map_err(|e| {
+                        e.downcast::<SourceError>()
+                            .unwrap_or_else(SourceError::Other)
+                    })?;
 
             chkpt_store
                 .put(&self.id, snapshot_position)
