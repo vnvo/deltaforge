@@ -17,6 +17,9 @@ shellexpand.workspace = true
 tracing.workspace = true
 deltaforge-core = { path = "../deltaforge-core" }
 common = { path = "../common" }
+# SecretReference is the only serializable secret type; the config schema carries
+# references (never resolved values). No provider runtime is pulled in here.
+secrets = { path = "../secrets" }
 
 [dev-dependencies]
 tempfile = "3"

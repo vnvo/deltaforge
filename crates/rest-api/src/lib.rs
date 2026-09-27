@@ -206,7 +206,9 @@ mod tests {
                     sharding: None,
                     source: SourceCfg::Mysql(MysqlSrcCfg {
                         id: "mysql".to_string(),
-                        dsn: "mysql://root:root@localhost/db".to_string(),
+                        dsn: Some("mysql://root:root@localhost/db".to_string()),
+                        dsn_secret: None,
+                        credentials: None,
                         tables: vec![],
                         table_options: Default::default(),
                         outbox: None,
@@ -243,6 +245,20 @@ mod tests {
     fn sample_spec_json() -> Body {
         let spec = sample_pipe_info().spec;
         Body::from(serde_json::to_vec(&spec).expect("spec serialization"))
+    }
+
+    #[test]
+    fn pipe_info_serialization_redacts_inline_source_password() {
+        // Every public pipeline response is a PipeInfo, whose `spec` serializes
+        // through the sanitized view; so no response can expose an inline password.
+        let mut info = sample_pipe_info();
+        if let SourceCfg::Mysql(c) = &mut info.spec.spec.source {
+            c.dsn =
+                Some("mysql://root:S3NT1NEL-restpw@localhost/db".to_string());
+        }
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("S3NT1NEL-restpw"), "leaked: {json}");
+        assert!(json.contains("localhost"), "host must survive: {json}");
     }
 
     #[tokio::test]

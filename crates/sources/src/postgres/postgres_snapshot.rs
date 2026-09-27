@@ -266,7 +266,7 @@ pub async fn run_snapshot(
     let _guard_stop = scopeguard::guard((), |_| guard_cancel.cancel());
     let _slot_guard = ctx.slot_name.map(|slot| {
         health::spawn_wal_slot_guard(
-            ctx.dsn.to_string(),
+            crate::credentials::ProtectedDsn::from(ctx.dsn),
             slot.to_string(),
             guard_cancel.clone(),
             abort_reason.clone(),
@@ -338,7 +338,7 @@ pub async fn run_snapshot(
             .cloned()
             .unwrap_or_default();
         let worker = TableWorker {
-            dsn: ctx.dsn.to_string(),
+            dsn: crate::credentials::ProtectedDsn::from(ctx.dsn),
             schema: schema.clone(),
             table: table.clone(),
             snapshot_id: snapshot_id.clone(),
@@ -453,7 +453,7 @@ async fn save_progress(
 // ============================================================================
 
 struct TableWorker {
-    dsn: String,
+    dsn: crate::credentials::ProtectedDsn,
     schema: String,
     table: String,
     snapshot_id: String,
@@ -485,7 +485,7 @@ impl TableWorker {
         let fqn = fqn(&self.schema, &self.table);
         let t0 = Instant::now();
 
-        let (client, conn) = tokio_postgres::connect(&self.dsn, NoTls)
+        let (client, conn) = tokio_postgres::connect(self.dsn.expose(), NoTls)
             .await
             .with_context(|| format!("connect for {fqn}"))?;
 
@@ -667,7 +667,7 @@ impl TableWorker {
             // Each intra-table chunk needs its own connection with the
             // snapshot imported.
             let (sub_client, sub_conn) =
-                tokio_postgres::connect(&self.dsn, NoTls)
+                tokio_postgres::connect(self.dsn.expose(), NoTls)
                     .await
                     .context("intra-table chunk connect")?;
 
@@ -883,7 +883,7 @@ struct ChunkWorkerCtx {
     table: String,
     pipeline: String,
     tenant: String,
-    dsn: String,
+    dsn: crate::credentials::ProtectedDsn,
     snapshot_id: String,
     chunk_size: usize,
     generation: u64,
@@ -908,7 +908,7 @@ impl ChunkWorkerCtx {
     ) -> Result<u64> {
         debug!(
             pipeline=%self.pipeline,
-            dsn=%redact_url_password(&self.dsn),
+            dsn=%redact_url_password(self.dsn.expose()),
             snapshot_id=%self.snapshot_id,
             chunk_size=%self.chunk_size,
             "reading PK range"

@@ -573,6 +573,9 @@ impl PipelineRuntime {
         PipeInfo {
             name: self.spec.metadata.name.clone(),
             status: status.to_string(),
+            // PipeInfo holds the real spec; its serialization is sanitized at the
+            // boundary (see PipeInfo's serialize_with), so status/API output never
+            // exposes an inline DSN password.
             spec: self.spec.clone(),
             ops: None, // populated async by controller.get()
         }
@@ -693,15 +696,24 @@ impl PipelineManager {
         // Create cancellation token early so it can be shared with sinks
         let cancel = CancellationToken::new();
 
+        // Resolve source credentials (inline DSN, whole-DSN secret, or referenced
+        // username/password) up front, before the source takes long-lived
+        // ownership. A missing/invalid secret fails startup here, cleanly.
+        let resolver = sources::default_secret_resolver();
+        let source_dsn = sources::resolve_source_dsn(&spec, &resolver)
+            .await
+            .context("resolve source credentials")?;
         let source = build_source(
             &spec,
+            source_dsn.clone(),
             self.registry.clone(),
             Arc::clone(&self.backend),
         )
         .context("build source")?;
         let processors = build_processors(&spec, &pipeline_name)
             .context("build processors")?;
-        let schema_loader = build_schema_loader(&spec, self.registry.clone());
+        let schema_loader =
+            build_schema_loader(&spec, &source_dsn, self.registry.clone());
 
         // Build Avro schema provider if any sink uses Avro encoding
         let avro_source_schemas = build_avro_provider(&spec, &schema_loader);
@@ -2149,7 +2161,9 @@ mod tests {
                 sharding: None,
                 source: SourceCfg::Mysql(MysqlSrcCfg {
                     id: "mysql".to_string(),
-                    dsn: "mysql://root:root@localhost/db".to_string(),
+                    dsn: Some("mysql://root:root@localhost/db".to_string()),
+                    dsn_secret: None,
+                    credentials: None,
                     tables: vec![],
                     table_options: Default::default(),
                     outbox: None,

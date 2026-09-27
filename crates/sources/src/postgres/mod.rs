@@ -92,7 +92,9 @@ pub struct PostgresCheckpoint {
 #[derive(Debug, Clone)]
 pub struct PostgresSource {
     pub id: String,
-    pub dsn: String,
+    /// Protected connection DSN (redacted `Debug`, no serialization). Built at
+    /// startup from inline config or resolved secret references.
+    pub dsn: crate::credentials::ProtectedDsn,
     pub slot: String,
     pub publication: String,
     pub tables: Vec<String>,
@@ -120,7 +122,7 @@ pub(crate) struct RunCtx {
     #[allow(dead_code)]
     pub host: String,
     pub default_schema: String,
-    pub dsn: String,
+    pub dsn: crate::credentials::ProtectedDsn,
     pub slot: String,
     pub tx: mpsc::Sender<SourceItem>,
     #[allow(dead_code)]
@@ -199,7 +201,7 @@ impl PostgresSource {
         use tokio_postgres::NoTls;
 
         // One catalog connection for identity-kind resolution + lineage.
-        let (client, conn) = tokio_postgres::connect(&self.dsn, NoTls)
+        let (client, conn) = tokio_postgres::connect(self.dsn.expose(), NoTls)
             .await
             .map_err(|e| SourceError::Other(e.into()))?;
         let conn_task = tokio::spawn(async move {
@@ -328,7 +330,7 @@ impl PostgresSource {
         pause_notify: Arc<Notify>,
     ) -> SourceResult<()> {
         let (components, config, last_checkpoint) = prepare_replication_client(
-            &self.dsn,
+            self.dsn.expose(),
             &self.id,
             &self.slot,
             &self.publication,
@@ -351,7 +353,7 @@ impl PostgresSource {
                     // prepare_snapshot_slot_anchor (below) at the slot's
                     // consistent point; here we only verify the publication.
                     ensure_publication_exists(
-                        &self.dsn,
+                        self.dsn.expose(),
                         &self.publication,
                         &self.tables,
                     )
@@ -359,7 +361,7 @@ impl PostgresSource {
                     .map(|_| Lsn::from(0u64))
                 } else {
                     ensure_slot_and_publication(
-                        &self.dsn,
+                        self.dsn.expose(),
                         &self.slot,
                         &self.publication,
                         &self.tables,
@@ -403,7 +405,9 @@ impl PostgresSource {
             // Resuming from a checkpoint: verify the replication slot still exists
             // before trusting the saved LSN. A dropped slot means the WAL position
             // is permanently lost - halt rather than silently reconnecting.
-            match check_position_reachability(&self.dsn, &self.slot).await {
+            match check_position_reachability(self.dsn.expose(), &self.slot)
+                .await
+            {
                 Ok(PositionReachability::Lost { reason }) => {
                     error!(
                         source_id = %self.id,
@@ -442,7 +446,7 @@ impl PostgresSource {
         };
 
         let schema_loader = PostgresSchemaLoader::new(
-            &self.dsn,
+            self.dsn.clone(),
             self.registry.clone(),
             &self.tenant,
         );
@@ -471,7 +475,7 @@ impl PostgresSource {
             // slot (full re-snapshot), or fail closed. This replaces the removed
             // pg_current_wal_lsn anchor and closes the snapshot->CDC seam.
             let anchor = prepare_snapshot_slot_anchor(
-                &self.dsn,
+                self.dsn.expose(),
                 &self.slot,
                 &self.pipeline,
                 &self.id,
@@ -500,7 +504,7 @@ impl PostgresSource {
                 .await?;
 
             let snapshot_ctx = postgres_snapshot::PgSnapshotCtx {
-                dsn: &self.dsn,
+                dsn: self.dsn.expose(),
                 source_id: &self.id,
                 pipeline: &self.pipeline,
                 tenant: &self.tenant,
@@ -561,7 +565,11 @@ impl PostgresSource {
         let start_lsn = {
             let id_store = IdentityStore::new(Arc::clone(&self.backend));
             pre_connect_lsn_adjust(
-                &self.dsn, &self.slot, start_lsn, &id_store, &self.id,
+                self.dsn.expose(),
+                &self.slot,
+                start_lsn,
+                &id_store,
+                &self.id,
             )
             .await
         };
@@ -586,7 +594,7 @@ impl PostgresSource {
         let cancel_ref = cancel.clone();
         // Capture the cluster lineage once for provisional row/DDL/message ids
         // (the same authority used by snapshot + failover identity).
-        let system_identifier = fetch_server_identity(&self.dsn)
+        let system_identifier = fetch_server_identity(self.dsn.expose())
             .await
             .ok()
             .flatten()
@@ -947,7 +955,7 @@ async fn pre_connect_lsn_adjust(
 }
 
 async fn check_identity_post_reconnect(ctx: &mut RunCtx) -> SourceResult<()> {
-    let live_pg = match fetch_server_identity(&ctx.dsn).await {
+    let live_pg = match fetch_server_identity(ctx.dsn.expose()).await {
         Ok(Some(id)) => id,
         Ok(None) => return Ok(()),
         Err(e) => {
@@ -1046,7 +1054,7 @@ async fn run_failover_reconciliation(
 
     if existing.is_none() {
         // Position reachability via slot state.
-        match check_position_reachability(&ctx.dsn, &ctx.slot)
+        match check_position_reachability(ctx.dsn.expose(), &ctx.slot)
             .await
             .unwrap_or(PositionReachability::Unknown {
                 reason: "reachability check failed".into(),
@@ -1067,7 +1075,7 @@ async fn run_failover_reconciliation(
         }
 
         if let Ok(slot_lsn) =
-            fetch_slot_confirmed_lsn(&ctx.dsn, &ctx.slot).await
+            fetch_slot_confirmed_lsn(ctx.dsn.expose(), &ctx.slot).await
         {
             ctx.last_lsn = slot_lsn;
         }
@@ -1078,11 +1086,15 @@ async fn run_failover_reconciliation(
         for (schema, table) in &tracked {
             let live_cols: Option<
                 Vec<crate::failover::reconciler::ColumnSnapshot>,
-            > = postgres_health::fetch_live_columns(&ctx.dsn, schema, table)
-                .await
-                .ok()
-                .flatten()
-                .map(|cols| cols.into_iter().map(Into::into).collect());
+            > = postgres_health::fetch_live_columns(
+                ctx.dsn.expose(),
+                schema,
+                table,
+            )
+            .await
+            .ok()
+            .flatten()
+            .map(|cols| cols.into_iter().map(Into::into).collect());
             inputs.push(ReconcileInput {
                 db: schema.clone(),
                 table: table.clone(),

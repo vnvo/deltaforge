@@ -213,7 +213,7 @@ async fn make_source(
 ) -> PostgresSource {
     PostgresSource {
         id: id.into(),
-        dsn: pg_cdc_dsn(db).await,
+        dsn: pg_cdc_dsn(db).await.into(),
         slot: slot.into(),
         publication: publication.into(),
         tables,
@@ -1387,7 +1387,7 @@ async fn postgres_cdc_auth_failure() -> Result<()> {
         AllowList::default(),
     )
     .await;
-    src.dsn = bad_dsn;
+    src.dsn = bad_dsn.into();
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     let (tx, _rx) = mpsc::channel(128);
     let handle = src.run(tx, ckpt).await;
@@ -1635,7 +1635,7 @@ async fn postgres_cdc_connection_refused() -> Result<()> {
         AllowList::default(),
     )
     .await;
-    src.dsn = bad_dsn;
+    src.dsn = bad_dsn.into();
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     let (tx, _rx) = mpsc::channel(128);
     let handle = src.run(tx, ckpt).await;
@@ -2545,7 +2545,7 @@ async fn make_snap_source(
 ) -> PostgresSource {
     PostgresSource {
         id: id.into(),
-        dsn: pg_cdc_dsn(db).await,
+        dsn: pg_cdc_dsn(db).await.into(),
         slot: slot.into(),
         publication: publication.into(),
         tables,

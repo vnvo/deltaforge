@@ -40,25 +40,37 @@ pub struct LoadedSchema {
 /// Schema loader with caching and registry integration.
 #[derive(Clone)]
 pub struct PostgresSchemaLoader {
-    dsn: String,
+    dsn: crate::credentials::ProtectedDsn,
     cache: Arc<RwLock<HashMap<(String, String), LoadedSchema>>>,
     registry: Arc<DurableSchemaRegistry>,
     tenant: String,
 }
 
+impl std::fmt::Debug for PostgresSchemaLoader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresSchemaLoader")
+            .field("dsn", &self.dsn)
+            .field("tenant", &self.tenant)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PostgresSchemaLoader {
-    /// Create a new schema loader.
+    /// Create a new schema loader. Accepts a protected DSN (or anything convertible
+    /// into one); the loader shares the protected wrapper rather than a plaintext
+    /// copy.
     pub fn new(
-        dsn: &str,
+        dsn: impl Into<crate::credentials::ProtectedDsn>,
         registry: Arc<DurableSchemaRegistry>,
         tenant: &str,
     ) -> Self {
+        let dsn = dsn.into();
         info!(
             "creating postgres schema loader for {}",
-            redact_password(dsn)
+            redact_password(dsn.expose())
         );
         Self {
-            dsn: dsn.to_string(),
+            dsn,
             cache: Arc::new(RwLock::new(HashMap::new())),
             registry,
             tenant: tenant.to_string(),
@@ -67,7 +79,7 @@ impl PostgresSchemaLoader {
 
     /// Get a database connection.
     async fn connect(&self) -> SourceResult<tokio_postgres::Client> {
-        let (client, conn) = tokio_postgres::connect(&self.dsn, NoTls)
+        let (client, conn) = tokio_postgres::connect(self.dsn.expose(), NoTls)
             .await
             .map_err(|e| SourceError::Connect {
                 details: format!("postgres connect: {}", e).into(),
@@ -100,7 +112,7 @@ impl PostgresSchemaLoader {
         let tables = self.expand_patterns(patterns).await?;
 
         info!(
-            dsn = redact_password(&self.dsn),
+            dsn = redact_password(self.dsn.expose()),
             patterns = ?patterns,
             matched_tables = tables.len(),
             "expanded table patterns"
@@ -468,7 +480,7 @@ impl PostgresSchemaLoader {
             .collect();
 
         Self {
-            dsn: "host=localhost".to_string(),
+            dsn: "host=localhost".into(),
             cache: Arc::new(RwLock::new(cache)),
             registry: tokio::runtime::Builder::new_current_thread()
                 .build()

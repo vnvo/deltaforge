@@ -21,6 +21,10 @@ pub struct AppState {
 pub struct PipeInfo {
     pub name: String,
     pub status: String,
+    /// Serialized through the sanitized view so no public response exposes an inline
+    /// DSN password; secret references are preserved. Deserialization (rarely used;
+    /// input uses `PipelineSpec` directly) reads the field normally.
+    #[serde(serialize_with = "deltaforge_config::serialize_sanitized_spec")]
     pub spec: PipelineSpec,
     /// Operational status - populated by the controller, optional for backward compat.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -544,7 +548,9 @@ mod tests {
                     sharding: None,
                     source: SourceCfg::Mysql(MysqlSrcCfg {
                         id: "mysql".to_string(),
-                        dsn: "mysql://root:root@localhost/db".to_string(),
+                        dsn: Some("mysql://root:root@localhost/db".to_string()),
+                        dsn_secret: None,
+                        credentials: None,
                         tables: vec![],
                         table_options: Default::default(),
                         outbox: None,
