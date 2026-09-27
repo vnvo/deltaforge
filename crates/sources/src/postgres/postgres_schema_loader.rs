@@ -321,15 +321,26 @@ impl PostgresSchemaLoader {
     ) -> SourceResult<PostgresTableSchema> {
         let client = self.connect().await?;
 
+        // `a.atttypid` is the column's pgoutput type OID; it is joined in so the
+        // persisted schema carries the same (name, type_oid) signature the
+        // logical-replication Relation message sends, enabling drift detection at
+        // first resolution with no extra catalog query.
         let col_rows = client
             .query(
                 r#"
-                SELECT 
+                SELECT
                     c.column_name, c.data_type, c.udt_name, c.is_nullable,
                     c.ordinal_position, c.column_default, c.character_maximum_length,
                     c.numeric_precision, c.numeric_scale, c.is_identity,
-                    c.identity_generation, c.is_generated
+                    c.identity_generation, c.is_generated, a.atttypid
                 FROM information_schema.columns c
+                JOIN pg_catalog.pg_namespace nsp
+                    ON nsp.nspname = c.table_schema
+                JOIN pg_catalog.pg_class cl
+                    ON cl.relname = c.table_name AND cl.relnamespace = nsp.oid
+                JOIN pg_catalog.pg_attribute a
+                    ON a.attrelid = cl.oid AND a.attname = c.column_name
+                    AND a.attnum > 0 AND NOT a.attisdropped
                 WHERE c.table_schema = $1 AND c.table_name = $2
                 ORDER BY c.ordinal_position
                 "#,
@@ -485,6 +496,7 @@ fn build_column(row: &tokio_postgres::Row) -> PostgresColumn {
     let is_identity: String = row.get(9);
     let identity_gen: Option<String> = row.get(10);
     let is_generated: String = row.get(11);
+    let type_oid: u32 = row.get(12);
 
     let is_array = data_type == "ARRAY";
     let effective_type = if is_array {
@@ -519,6 +531,7 @@ fn build_column(row: &tokio_postgres::Row) -> PostgresColumn {
         col = col.as_array(udt_name.trim_start_matches('_'));
     }
     col.udt_name = Some(udt_name);
+    col.type_oid = Some(type_oid);
 
     col
 }
