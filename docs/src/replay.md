@@ -11,7 +11,10 @@ journal.
 > (this applies to every mutating endpoint, not just replay). Until platform-wide
 > authN/authZ exists, you MUST restrict the API at the network layer (private network,
 > firewall, service mesh, or an authenticating reverse proxy). Do not expose it to
-> untrusted callers.
+> untrusted callers. The Prometheus metrics endpoint (`--metrics-addr`, default
+> `0.0.0.0:9000`, and also merged onto the API port) is likewise unauthenticated; bind it to
+> loopback or restrict it at the network layer as well. See
+> [Observability](observability.md#metrics-endpoint-address-and-exposure).
 
 ## How it works
 

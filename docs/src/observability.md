@@ -4,7 +4,15 @@ DeltaForge already ships a Prometheus exporter, structured logging, and a panic 
 
 ## What exists today
 
-- Prometheus endpoint served at `/metrics` (default `0.0.0.0:9000`) with descriptors for pipeline counts, source/sink counters, and a stage latency histogram. The recorder is installed automatically when metrics are enabled.
+- Prometheus endpoint served at `/metrics` with descriptors for pipeline counts, source/sink counters, and a stage latency histogram. The recorder is installed automatically when metrics are enabled.
+
+### Metrics endpoint address and exposure
+
+The metrics listener honors `--metrics-addr` (`host:port`). It defaults to `0.0.0.0:9000` (all interfaces), which is what the Helm `ServiceMonitor` and typical cross-pod Prometheus scraping expect.
+
+> **Exposure.** The `/metrics` endpoint has **no authentication**. Binding to `0.0.0.0` exposes it on every interface. Where the scraper is local, restrict it to loopback (`--metrics-addr 127.0.0.1:9000`); otherwise confine it with a firewall, Kubernetes NetworkPolicy, or a private interface. (The `/metrics` path is also merged onto the REST API port, so the same network restrictions that protect the API apply there too.)
+
+An invalid `--metrics-addr` (not `host:port`) or an unavailable one (port already in use) **fails startup** with a clear error rather than leaving the process running without a metrics endpoint.
 - Structured logging via `tracing_subscriber` with JSON output by default, optional targets, and support for `RUST_LOG` overrides.
 - Panic hook increments a `deltaforge_panics_total` counter and logs captured panics before delegating to the default hook.
 
