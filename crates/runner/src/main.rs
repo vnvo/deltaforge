@@ -31,7 +31,12 @@ struct Args {
     config: Option<String>,
     #[arg(long, default_value = "0.0.0.0:8080")]
     api_addr: String,
-    #[arg(long, default_value = "0.0.0.0:9095")]
+    /// Prometheus metrics listen address (host:port). Defaults to all interfaces
+    /// on port 9000. The endpoint has NO authentication - restrict it to loopback
+    /// or a private interface (e.g. 127.0.0.1:9000) when the scraper is local, or
+    /// firewall / network-policy it otherwise. An invalid or unavailable address
+    /// fails startup.
+    #[arg(long, default_value = "0.0.0.0:9000")]
     metrics_addr: String,
     /// Storage backend: sqlite (default), memory, or postgres
     #[arg(long, default_value = "sqlite")]
@@ -49,6 +54,9 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     eprintln!("{}", version::startup_banner());
 
+    // Parse listen addresses up front so an invalid value fails startup clearly.
+    let metrics_addr = parse_listen_addr("metrics-addr", &args.metrics_addr)?;
+
     let cfg = o11y::O11yConfig {
         logging: o11y::logging::Config {
             level: std::env::var("RUST_LOG").ok(),
@@ -57,11 +65,13 @@ async fn main() -> Result<()> {
         },
         metrics: o11y::df_metrics::Config {
             enable: true,
-            http_listener: Some(([0, 0, 0, 0], 9000).into()),
+            http_listener: Some(metrics_addr),
         },
         install_panic_hook: true,
     };
-    let _ = o11y::init_all(&cfg);
+    // Fail startup if observability init fails (e.g. the metrics port is taken).
+    o11y::init_all(&cfg)
+        .map_err(|e| anyhow::anyhow!("initialize observability: {e}"))?;
     o11y::df_metrics::set_build_info(
         version::GIT_VERSION,
         version::GIT_HASH,
@@ -140,14 +150,24 @@ async fn main() -> Result<()> {
     );
     let app = app.merge(o11y::df_metrics::router_with_metrics());
 
-    let addr: SocketAddr =
-        args.api_addr.parse().expect("api_addr must be host:port");
+    let addr = parse_listen_addr("api-addr", &args.api_addr)?;
     info!(%addr, "api listening");
 
-    let listener = TcpListener::bind(addr).await?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind --api-addr {addr}"))?;
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// Parse a `host:port` listen address, failing with a clear message on bad input.
+fn parse_listen_addr(flag: &str, value: &str) -> Result<SocketAddr> {
+    value.parse().with_context(|| {
+        format!(
+            "invalid --{flag} '{value}' (expected host:port, e.g. 127.0.0.1:9000)"
+        )
+    })
 }
 
 async fn build_storage_backend(
@@ -242,4 +262,22 @@ fn format_pipeline_summary(ps: &deltaforge_config::PipelineSpec) -> String {
         "  [{name}]  {source_type}:{source_id} -> [{procs_str}] -> {sinks}",
         sinks = sinks.join(", "),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_listen_addr_accepts_valid_and_rejects_invalid() {
+        assert!(parse_listen_addr("metrics-addr", "127.0.0.1:9000").is_ok());
+        assert!(parse_listen_addr("metrics-addr", "0.0.0.0:9000").is_ok());
+        assert!(parse_listen_addr("metrics-addr", "[::1]:9000").is_ok());
+        // missing port
+        assert!(parse_listen_addr("metrics-addr", "127.0.0.1").is_err());
+        // not an address
+        assert!(parse_listen_addr("metrics-addr", "nonsense").is_err());
+        // empty
+        assert!(parse_listen_addr("metrics-addr", "").is_err());
+    }
 }

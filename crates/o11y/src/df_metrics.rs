@@ -6,7 +6,7 @@ use metrics_exporter_prometheus::{
     Matcher, PrometheusBuilder, PrometheusHandle,
 };
 use once_cell::sync::OnceCell;
-use std::{net::SocketAddr, time::Duration};
+use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
 static HANDLE: OnceCell<PrometheusHandle> = OnceCell::new();
@@ -64,26 +64,27 @@ pub fn init(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(addr) = cfg.http_listener {
+        // Bind synchronously so an invalid or unavailable metrics address fails
+        // startup immediately with a clear error, rather than silently retrying
+        // and giving up (which left the process running with no metrics endpoint).
+        let std_listener = bind_metrics_listener(addr).map_err(|e| {
+            format!(
+                "metrics listener cannot bind to {addr}: {e}. \
+                 Check the configured metrics address and that the port is free."
+            )
+        })?;
+        tracing::info!(%addr, "metrics listener bound");
         tokio::spawn(async move {
-            let router = Router::new().route("/metrics", get(metrics_handler));
-            // Retry binding a few times in case of startup races (tests)
-            let mut tries = 0;
-            loop {
-                match TcpListener::bind(addr).await {
-                    Ok(l) => {
-                        axum::serve(l, router).await.ok();
-                        break;
-                    }
-                    Err(e) if tries < 5 => {
-                        tries += 1;
-                        tracing::warn!(error=%e, tries, "metrics listener bind failed; retrying");
-                        tokio::time::sleep(Duration::from_millis(150)).await;
-                    }
-                    Err(e) => {
-                        tracing::error!(error=%e, "metrics listener failed; giving up");
-                        break;
-                    }
+            let listener = match TcpListener::from_std(std_listener) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!(error=%e, "metrics listener conversion failed");
+                    return;
                 }
+            };
+            let router = Router::new().route("/metrics", get(metrics_handler));
+            if let Err(e) = axum::serve(listener, router).await {
+                tracing::error!(error=%e, "metrics server exited");
             }
         });
     }
@@ -91,6 +92,19 @@ pub fn init(cfg: &Config) -> Result<(), Box<dyn std::error::Error>> {
     describe_metrics();
 
     Ok(())
+}
+
+/// Bind the metrics HTTP listener synchronously.
+///
+/// Binding here (rather than inside a spawned task) makes an invalid or
+/// unavailable address a fast, fatal startup error. The listener is returned in
+/// non-blocking mode so it can be handed to tokio via `TcpListener::from_std`.
+pub fn bind_metrics_listener(
+    addr: SocketAddr,
+) -> std::io::Result<std::net::TcpListener> {
+    let listener = std::net::TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
 }
 
 /// Axum handler that renders the current metrics snapshot.
@@ -335,4 +349,24 @@ pub fn set_build_info(
         "build_date" => build_date,
     )
     .set(1.0);
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+
+    #[test]
+    fn binds_configured_loopback_address() {
+        // An ephemeral loopback address binds successfully...
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let listener =
+            bind_metrics_listener(addr).expect("bind ephemeral loopback");
+        let bound = listener.local_addr().unwrap();
+        assert_eq!(bound.ip().to_string(), "127.0.0.1");
+
+        // ...and re-binding the now-in-use concrete address fails (fatal at
+        // startup rather than a silent give-up).
+        let err = bind_metrics_listener(bound);
+        assert!(err.is_err(), "second bind to {bound} must fail (in use)");
+    }
 }
