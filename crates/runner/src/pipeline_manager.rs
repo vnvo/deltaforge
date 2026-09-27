@@ -17,14 +17,30 @@ use crate::replay_worker::ReplayDelivery;
 use crate::schema_provider::SchemaLoaderAdapter;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use checkpoints::{CheckpointResult, CheckpointStore};
+use checkpoints::{CheckpointError, CheckpointResult, CheckpointStore};
+use deltaforge_core::CheckpointOrder;
 
 // ── Per-sink checkpoint proxy ────────────────────────────────────────────────
 
 /// Comparison function for opaque checkpoint bytes.
 /// Each source provides its own implementation via `Source::compare_checkpoints`.
 type CheckpointCmpFn =
-    Arc<dyn Fn(&[u8], &[u8]) -> std::cmp::Ordering + Send + Sync>;
+    Arc<dyn Fn(&[u8], &[u8]) -> CheckpointOrder + Send + Sync>;
+
+/// Startup/recovery error for two per-sink checkpoints the source cannot order.
+/// Carries the affected checkpoint keys so an operator can locate the corrupt or
+/// incompatible entries.
+fn incomparable_checkpoint_error(
+    source_id: &str,
+    key_a: &str,
+    key_b: &str,
+) -> CheckpointError {
+    CheckpointError::Data(format!(
+        "cannot determine resume position for source '{source_id}': per-sink \
+         checkpoints '{key_a}' and '{key_b}' are incomparable (malformed or \
+         from different lineages); refusing to choose a checkpoint"
+    ))
+}
 
 /// Wraps a [`CheckpointStore`] to present the **minimum** per-sink checkpoint
 /// when the source calls `get_raw(source_id)`.
@@ -37,10 +53,29 @@ type CheckpointCmpFn =
 /// Uses the source-provided comparison function for correctness - different
 /// sources have different checkpoint formats (MySQL file:pos, Postgres LSN)
 /// that cannot be compared lexicographically.
-struct PerSinkCheckpointProxy {
+pub struct PerSinkCheckpointProxy {
     inner: Arc<dyn CheckpointStore>,
     source_id: String,
     cmp_fn: CheckpointCmpFn,
+}
+
+impl PerSinkCheckpointProxy {
+    /// Build the proxy for a source, wiring the fold to the source's own
+    /// `compare_checkpoints`. This is the exact production wiring used by the
+    /// pipeline build path, exposed so integration tests can exercise the real
+    /// resume-position computation.
+    pub fn for_source(
+        inner: Arc<dyn CheckpointStore>,
+        source_id: String,
+        source: &Arc<dyn deltaforge_core::Source>,
+    ) -> Self {
+        let source = Arc::clone(source);
+        Self {
+            inner,
+            source_id,
+            cmp_fn: Arc::new(move |a, b| source.compare_checkpoints(a, b)),
+        }
+    }
 }
 
 #[async_trait]
@@ -55,24 +90,53 @@ impl CheckpointStore for PerSinkCheckpointProxy {
                 // checkpoints under the plain source_id key still work.
                 return self.inner.get_raw(key).await;
             }
-            let mut min_cp: Option<Vec<u8>> = None;
+            // Fold to the minimum (earliest) per-sink checkpoint. Fails closed:
+            // any pair the source cannot order (malformed bytes, or - once
+            // lineage tokens exist - cross-lineage positions) returns an error
+            // naming the affected keys, rather than silently skipping one and
+            // resuming ahead of the sink that needs it.
+            let mut min_data: Option<Vec<u8>> = None;
+            let mut min_key: Option<String> = None;
             for k in &keys {
-                if let Some(data) = self.inner.get_raw(k).await? {
-                    min_cp = Some(match min_cp {
-                        None => data,
-                        Some(prev) => {
-                            if (self.cmp_fn)(&data, &prev)
-                                == std::cmp::Ordering::Less
-                            {
-                                data
-                            } else {
-                                prev
-                            }
+                let Some(data) = self.inner.get_raw(k).await? else {
+                    continue;
+                };
+                match min_data {
+                    None => {
+                        // Validate a lone checkpoint via self-comparison: a
+                        // well-formed checkpoint is reflexively Equal, a
+                        // malformed one is Incomparable. This catches a single
+                        // corrupt per-sink checkpoint that never reaches a
+                        // pairwise comparison below.
+                        if (self.cmp_fn)(&data, &data)
+                            == CheckpointOrder::Incomparable
+                        {
+                            return Err(incomparable_checkpoint_error(
+                                &self.source_id,
+                                k,
+                                k,
+                            ));
                         }
-                    });
+                        min_data = Some(data);
+                        min_key = Some(k.clone());
+                    }
+                    Some(ref prev) => match (self.cmp_fn)(&data, prev) {
+                        CheckpointOrder::Before => {
+                            min_data = Some(data);
+                            min_key = Some(k.clone());
+                        }
+                        CheckpointOrder::Equal | CheckpointOrder::After => {}
+                        CheckpointOrder::Incomparable => {
+                            return Err(incomparable_checkpoint_error(
+                                &self.source_id,
+                                min_key.as_deref().unwrap_or("?"),
+                                k,
+                            ));
+                        }
+                    },
                 }
             }
-            return Ok(min_cp);
+            return Ok(min_data);
         }
         self.inner.get_raw(key).await
     }
@@ -692,16 +756,12 @@ impl PipelineManager {
         let (event_tx, event_rx) = mpsc::channel::<SourceItem>(32_768);
         // Wrap checkpoint store so the source reads the minimum per-sink
         // checkpoint - it replays from the position the slowest sink needs.
-        // Capture the source's checkpoint comparison function for the proxy.
-        let source_ref = Arc::clone(&source);
-        let cmp_fn: CheckpointCmpFn =
-            Arc::new(move |a, b| source_ref.compare_checkpoints(a, b));
         let source_ckpt: Arc<dyn CheckpointStore> =
-            Arc::new(PerSinkCheckpointProxy {
-                inner: self.ckpt_store.clone(),
-                source_id: spec.spec.source.source_id().to_string(),
-                cmp_fn,
-            });
+            Arc::new(PerSinkCheckpointProxy::for_source(
+                self.ckpt_store.clone(),
+                spec.spec.source.source_id().to_string(),
+                &source,
+            ));
 
         let src_handle = source.run(event_tx, source_ckpt).await;
 
@@ -2241,12 +2301,8 @@ mod tests {
         ) -> SourceHandle {
             unimplemented!("not started in this test")
         }
-        fn compare_checkpoints(
-            &self,
-            _a: &[u8],
-            _b: &[u8],
-        ) -> std::cmp::Ordering {
-            std::cmp::Ordering::Equal
+        fn compare_checkpoints(&self, _a: &[u8], _b: &[u8]) -> CheckpointOrder {
+            CheckpointOrder::Equal
         }
         async fn check_durable_snapshot_startup(
             &self,
@@ -2291,15 +2347,24 @@ mod tests {
     // ── Per-sink checkpoint proxy tests ─────────────────────────────────
 
     /// Test comparison function: parses `{"pos": N}` and compares numerically.
+    /// Fails closed - an unparseable checkpoint is `Incomparable`.
     fn test_cmp_fn() -> CheckpointCmpFn {
         Arc::new(|a: &[u8], b: &[u8]| {
             #[derive(serde::Deserialize)]
             struct Cp {
                 pos: u64,
             }
-            let a: Cp = serde_json::from_slice(a).unwrap_or(Cp { pos: 0 });
-            let b: Cp = serde_json::from_slice(b).unwrap_or(Cp { pos: 0 });
-            a.pos.cmp(&b.pos)
+            let (Ok(a), Ok(b)) = (
+                serde_json::from_slice::<Cp>(a),
+                serde_json::from_slice::<Cp>(b),
+            ) else {
+                return CheckpointOrder::Incomparable;
+            };
+            match a.pos.cmp(&b.pos) {
+                std::cmp::Ordering::Less => CheckpointOrder::Before,
+                std::cmp::Ordering::Equal => CheckpointOrder::Equal,
+                std::cmp::Ordering::Greater => CheckpointOrder::After,
+            }
         })
     }
 
@@ -2393,6 +2458,202 @@ mod tests {
 
         let result = proxy.get_raw("mysql").await.unwrap().unwrap();
         assert_eq!(result, b"{\"pos\":500}");
+    }
+
+    // ── Per-sink fold fail-closed tests ─────────────────────────────────
+
+    /// A checkpoint store that returns keys in a fixed insertion order, so a
+    /// malformed entry can be placed at a known position in the fold. (The
+    /// production Mem store is HashMap-backed and unordered.)
+    #[derive(Default)]
+    struct OrderedTestStore {
+        entries: std::sync::Mutex<Vec<(String, Vec<u8>)>>,
+    }
+    impl OrderedTestStore {
+        fn with(entries: &[(&str, &[u8])]) -> Arc<Self> {
+            let s = Self::default();
+            *s.entries.lock().unwrap() = entries
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_vec()))
+                .collect();
+            Arc::new(s)
+        }
+    }
+    #[async_trait]
+    impl CheckpointStore for OrderedTestStore {
+        async fn get_raw(
+            &self,
+            key: &str,
+        ) -> CheckpointResult<Option<Vec<u8>>> {
+            Ok(self
+                .entries
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone()))
+        }
+        async fn put_raw(
+            &self,
+            key: &str,
+            bytes: &[u8],
+        ) -> CheckpointResult<()> {
+            self.entries
+                .lock()
+                .unwrap()
+                .push((key.to_string(), bytes.to_vec()));
+            Ok(())
+        }
+        async fn delete(&self, key: &str) -> CheckpointResult<bool> {
+            let mut e = self.entries.lock().unwrap();
+            let before = e.len();
+            e.retain(|(k, _)| k != key);
+            Ok(e.len() != before)
+        }
+        async fn list(&self) -> CheckpointResult<Vec<String>> {
+            Ok(self
+                .entries
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(k, _)| k.clone())
+                .collect())
+        }
+    }
+
+    const VALID_A: &[u8] = b"{\"pos\":100}";
+    const VALID_B: &[u8] = b"{\"pos\":200}";
+    const MALFORMED: &[u8] = b"not json";
+
+    async fn fold_err(entries: &[(&str, &[u8])]) -> CheckpointError {
+        let proxy = PerSinkCheckpointProxy {
+            inner: OrderedTestStore::with(entries),
+            source_id: "src".to_string(),
+            cmp_fn: test_cmp_fn(),
+        };
+        proxy
+            .get_raw("src")
+            .await
+            .expect_err("malformed per-sink checkpoint must fail closed")
+    }
+
+    #[tokio::test]
+    async fn fold_fails_closed_malformed_first() {
+        let err = fold_err(&[
+            ("src::sink::a", MALFORMED),
+            ("src::sink::b", VALID_A),
+            ("src::sink::c", VALID_B),
+        ])
+        .await;
+        assert!(
+            err.to_string().contains("src::sink::a"),
+            "error must name the malformed key: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fold_fails_closed_malformed_middle() {
+        let err = fold_err(&[
+            ("src::sink::a", VALID_A),
+            ("src::sink::b", MALFORMED),
+            ("src::sink::c", VALID_B),
+        ])
+        .await;
+        assert!(
+            err.to_string().contains("src::sink::b"),
+            "error must name the malformed key: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fold_fails_closed_malformed_last() {
+        let err = fold_err(&[
+            ("src::sink::a", VALID_A),
+            ("src::sink::b", VALID_B),
+            ("src::sink::c", MALFORMED),
+        ])
+        .await;
+        assert!(
+            err.to_string().contains("src::sink::c"),
+            "error must name the malformed key: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fold_fails_closed_single_malformed() {
+        // A lone corrupt per-sink checkpoint never reaches a pairwise compare;
+        // self-comparison in the fold must still fail it closed.
+        let err = fold_err(&[("src::sink::a", MALFORMED)]).await;
+        assert!(
+            err.to_string().contains("src::sink::a"),
+            "error must name the malformed key: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fold_returns_min_when_all_valid() {
+        // Regression: divergent but well-formed checkpoints still fold to the
+        // earliest (slowest sink) position without error.
+        let proxy = PerSinkCheckpointProxy {
+            inner: OrderedTestStore::with(&[
+                ("src::sink::a", VALID_B),
+                ("src::sink::b", VALID_A),
+            ]),
+            source_id: "src".to_string(),
+            cmp_fn: test_cmp_fn(),
+        };
+        let got = proxy.get_raw("src").await.unwrap().unwrap();
+        assert_eq!(got, VALID_A, "must return the earliest checkpoint");
+    }
+
+    /// Divergent two-sink PostgreSQL fold: with the real PostgreSQL comparator
+    /// driving the real per-sink fold, `get_raw` selects the slower sink's LSN
+    /// (the resume position), never the faster one's. This is a fold-level unit
+    /// test; the end-to-end restart behavior is covered by the live integration
+    /// test `pg_two_sink_restart_resumes_from_slowest_sink` in the sources
+    /// crate's postgres_cdc_e2e suite.
+    #[tokio::test]
+    async fn pg_two_sink_divergent_fold_selects_slowest() {
+        let slow = br#"{"lsn":"0/1000","tx_id":null}"#.to_vec();
+        let fast = br#"{"lsn":"0/2000","tx_id":null}"#.to_vec();
+        let proxy = PerSinkCheckpointProxy {
+            inner: OrderedTestStore::with(&[
+                ("pg::sink::fast", fast.as_slice()),
+                ("pg::sink::slow", slow.as_slice()),
+            ]),
+            source_id: "pg".to_string(),
+            cmp_fn: Arc::new(|a: &[u8], b: &[u8]| {
+                sources::postgres::compare_pg_checkpoints(a, b)
+            }),
+        };
+        let got = proxy.get_raw("pg").await.unwrap().unwrap();
+        assert_eq!(got, slow, "must rewind to the slower sink's LSN");
+    }
+
+    /// A corrupt PostgreSQL per-sink checkpoint must fail the restart closed
+    /// through the real comparator, not silently pick the other sink.
+    #[tokio::test]
+    async fn pg_corrupt_per_sink_checkpoint_fails_closed() {
+        let good = br#"{"lsn":"0/1000","tx_id":null}"#.to_vec();
+        let corrupt = b"{not-json".to_vec();
+        let proxy = PerSinkCheckpointProxy {
+            inner: OrderedTestStore::with(&[
+                ("pg::sink::a", good.as_slice()),
+                ("pg::sink::b", corrupt.as_slice()),
+            ]),
+            source_id: "pg".to_string(),
+            cmp_fn: Arc::new(|a: &[u8], b: &[u8]| {
+                sources::postgres::compare_pg_checkpoints(a, b)
+            }),
+        };
+        let err = proxy
+            .get_raw("pg")
+            .await
+            .expect_err("corrupt checkpoint must fail closed");
+        assert!(
+            err.to_string().contains("pg::sink::b"),
+            "error must name the corrupt key: {err}"
+        );
     }
 
     // ── SinkCfg::sink_id tests ──────────────────────────────────────────

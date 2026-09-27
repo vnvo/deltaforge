@@ -918,16 +918,21 @@ pub trait Source: Send + Sync {
         checkpoint_store: Arc<dyn CheckpointStore>,
     ) -> SourceHandle;
 
-    /// Compare two checkpoint byte slices, returning their ordering.
+    /// Compare two checkpoint byte slices using structured source semantics.
     ///
     /// Used by the per-sink checkpoint system to find the minimum (earliest)
     /// checkpoint across all sinks so the source replays from the position
     /// the slowest sink needs.
     ///
-    /// Each source MUST implement this correctly for its checkpoint format.
-    /// Returning `Equal` on parse failure is safe (no replay regression) but
-    /// may cause unnecessary replay.
-    fn compare_checkpoints(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering;
+    /// Each source MUST implement this correctly for its checkpoint format and
+    /// MUST fail closed: return [`CheckpointOrder::Incomparable`] for malformed,
+    /// unsupported, or structurally incompatible checkpoints (e.g. two positions
+    /// from different lineages/generations). Returning any orderable value for
+    /// inputs that cannot be meaningfully ordered risks selecting a resume
+    /// position ahead of a sink and silently dropping that sink's events, so the
+    /// consumer treats `Incomparable` as a hard startup/recovery error rather
+    /// than choosing a checkpoint.
+    fn compare_checkpoints(&self, a: &[u8], b: &[u8]) -> CheckpointOrder;
 
     /// Called at startup when a durable sink is active, BEFORE any source
     /// emission. The source inspects its own snapshot progress and returns an

@@ -112,8 +112,12 @@ impl Source for FakeSource {
         }
     }
 
-    fn compare_checkpoints(&self, _a: &[u8], _b: &[u8]) -> std::cmp::Ordering {
-        std::cmp::Ordering::Equal
+    fn compare_checkpoints(
+        &self,
+        _a: &[u8],
+        _b: &[u8],
+    ) -> deltaforge_core::CheckpointOrder {
+        deltaforge_core::CheckpointOrder::Equal
     }
 }
 

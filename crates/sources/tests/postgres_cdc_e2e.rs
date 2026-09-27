@@ -537,6 +537,163 @@ async fn postgres_cdc_checkpoint_resume() -> Result<()> {
     Ok(())
 }
 
+/// Live two-sink restart through the PRODUCTION `PerSinkCheckpointProxy`: with two
+/// per-sink checkpoints at divergent LSNs, the source resumes from the SLOWER
+/// sink's LSN and re-delivers the events the faster sink already saw. The second
+/// case proves a corrupt per-sink checkpoint fails the restart closed - the
+/// source never begins replication.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_two_sink_restart_resumes_from_slowest_sink() -> Result<()> {
+    use deltaforge_config::{SnapshotCfg, SnapshotMode};
+    use runner::pipeline_manager::PerSinkCheckpointProxy;
+
+    let (db, client) = pg_setup("twosink").await?;
+    client
+        .execute(
+            "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64))",
+            &[],
+        )
+        .await?;
+    client
+        .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
+        .await?;
+    create_pub_slot(&client, "pub_twosink", "slot_twosink", &["orders"])
+        .await?;
+
+    // Insert rows WITHOUT running the source, so the freshly-created slot retains
+    // all WAL from its creation point and never advances past our anchors.
+    // Capture the exact WAL LSN after each commit as the per-sink positions.
+    async fn wal_lsn(client: &tokio_postgres::Client) -> Result<String> {
+        let row = client
+            .query_one("SELECT pg_current_wal_lsn()::text", &[])
+            .await?;
+        Ok(row.get::<_, String>(0))
+    }
+    client
+        .execute("INSERT INTO orders VALUES (700, 'a')", &[])
+        .await?;
+    let cp_slow = wal_lsn(&client).await?; // after 700, before 701
+    client
+        .execute("INSERT INTO orders VALUES (701, 'b')", &[])
+        .await?;
+    let cp_fast = wal_lsn(&client).await?; // after 701, before 702
+    client
+        .execute("INSERT INTO orders VALUES (702, 'c')", &[])
+        .await?;
+
+    let sid = "twosink";
+    let cp_bytes = |lsn: &str| {
+        serde_json::to_vec(&sources::postgres::PostgresCheckpoint {
+            lsn: lsn.to_string(),
+            tx_id: None,
+        })
+        .unwrap()
+    };
+    let build_src = || async {
+        let mut src = make_source(
+            sid,
+            &db,
+            "slot_twosink",
+            "pub_twosink",
+            vec!["public.orders".into()],
+            AllowList::default(),
+        )
+        .await;
+        // CDC-only: with an initial snapshot the pre-existing rows would arrive
+        // via the snapshot regardless of checkpoint, defeating the test.
+        src.snapshot_cfg = SnapshotCfg {
+            mode: SnapshotMode::Never,
+            ..Default::default()
+        };
+        Arc::new(src) as Arc<dyn Source>
+    };
+
+    // --- Divergent two-sink resume: min(slow, fast) = slow, so 701 and 702 replay.
+    {
+        let store: Arc<dyn CheckpointStore> =
+            Arc::new(MemCheckpointStore::new()?);
+        store
+            .put_raw(&format!("{sid}::sink::slow"), &cp_bytes(&cp_slow))
+            .await?;
+        store
+            .put_raw(&format!("{sid}::sink::fast"), &cp_bytes(&cp_fast))
+            .await?;
+
+        let src = build_src().await;
+        let proxy: Arc<dyn CheckpointStore> = Arc::new(
+            PerSinkCheckpointProxy::for_source(store, sid.to_string(), &src),
+        );
+        let (tx, mut rx) = mpsc::channel(128);
+        let handle = src.run(tx, proxy).await;
+        wait_ready(&handle, Duration::from_secs(5)).await?;
+
+        let events = collect_until(&mut rx, Duration::from_secs(15), |e| {
+            e.iter().any(|x| has_id(x, 702))
+        })
+        .await;
+        assert!(
+            events.iter().any(|e| has_id(e, 701)),
+            "resumed from the SLOWER sink: 701 (already seen by the fast sink) must replay"
+        );
+        assert!(
+            events.iter().any(|e| has_id(e, 702)),
+            "new row 702 must be delivered"
+        );
+        assert!(
+            !events.iter().any(|e| has_id(e, 700)),
+            "700 precedes both checkpoints and must not replay"
+        );
+        handle.stop();
+        handle.join().await.ok();
+        info!("✓ two-sink restart rewinds to the slowest sink");
+    }
+
+    // --- Corrupt per-sink checkpoint: the restart must fail closed.
+    {
+        let store: Arc<dyn CheckpointStore> =
+            Arc::new(MemCheckpointStore::new()?);
+        store
+            .put_raw(&format!("{sid}::sink::good"), &cp_bytes(&cp_slow))
+            .await?;
+        store
+            .put_raw(&format!("{sid}::sink::bad"), b"{corrupt")
+            .await?;
+
+        let src = build_src().await;
+        let proxy: Arc<dyn CheckpointStore> = Arc::new(
+            PerSinkCheckpointProxy::for_source(store, sid.to_string(), &src),
+        );
+        let (tx, mut rx) = mpsc::channel(128);
+        let handle = src.run(tx, proxy).await;
+
+        // The source must fail closed reading its resume position: it dies before
+        // becoming ready, its task returns an error, and it delivers nothing.
+        assert!(
+            wait_ready(&handle, Duration::from_secs(5)).await.is_err(),
+            "source must not become ready with a corrupt per-sink checkpoint"
+        );
+        assert!(
+            handle.join().await.is_err(),
+            "source run must fail closed on the incomparable checkpoint"
+        );
+        assert!(
+            collect_until(&mut rx, Duration::from_secs(1), |_| false)
+                .await
+                .is_empty(),
+            "no events delivered when the resume position cannot be computed"
+        );
+        info!("✓ corrupt per-sink checkpoint fails the restart closed");
+    }
+
+    cleanup_repl(&client, "pub_twosink", "slot_twosink").await;
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_cdc_table_filtering() -> Result<()> {

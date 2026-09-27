@@ -22,7 +22,8 @@ use storage::BackendCheckpointStore;
 
 use crate::snapshot_generation::PersistedLineage;
 use deltaforge_core::{
-    Source, SourceError, SourceHandle, SourceItem, SourceResult,
+    CheckpointOrder, Source, SourceError, SourceHandle, SourceItem,
+    SourceResult,
 };
 mod mysql_errors;
 pub use mysql_errors::{LoopControl, MySqlSourceError, MySqlSourceResult};
@@ -565,6 +566,39 @@ impl MySqlSource {
     }
 }
 
+/// Order two MySQL checkpoints by binlog `(file, pos)`, failing closed.
+///
+/// `MySqlCheckpoint` is `{ file: String, pos: u64, gtid_set: Option<String> }`.
+/// An unparseable checkpoint is [`CheckpointOrder::Incomparable`] rather than
+/// silently treated as an orderable position (which could select a resume point
+/// ahead of a sink and drop its events).
+pub fn compare_mysql_checkpoints(a: &[u8], b: &[u8]) -> CheckpointOrder {
+    #[derive(serde::Deserialize)]
+    struct Cp {
+        file: String,
+        pos: u64,
+    }
+    let a: Cp = match serde_json::from_slice(a) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "incomparable checkpoint a: parse failed");
+            return CheckpointOrder::Incomparable;
+        }
+    };
+    let b: Cp = match serde_json::from_slice(b) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "incomparable checkpoint b: parse failed");
+            return CheckpointOrder::Incomparable;
+        }
+    };
+    match a.file.cmp(&b.file).then(a.pos.cmp(&b.pos)) {
+        std::cmp::Ordering::Less => CheckpointOrder::Before,
+        std::cmp::Ordering::Equal => CheckpointOrder::Equal,
+        std::cmp::Ordering::Greater => CheckpointOrder::After,
+    }
+}
+
 #[async_trait]
 impl Source for MySqlSource {
     async fn run(
@@ -605,29 +639,8 @@ impl Source for MySqlSource {
         }
     }
 
-    fn compare_checkpoints(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
-        // MySqlCheckpoint: { file: String, pos: u64, gtid_set: Option<String> }
-        // Compare by (file, pos) - the binlog position.
-        #[derive(serde::Deserialize)]
-        struct Cp {
-            file: String,
-            pos: u64,
-        }
-        let a: Cp = match serde_json::from_slice(a) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!(error = %e, "failed to parse checkpoint a in compare_checkpoints");
-                return std::cmp::Ordering::Equal;
-            }
-        };
-        let b: Cp = match serde_json::from_slice(b) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!(error = %e, "failed to parse checkpoint b in compare_checkpoints");
-                return std::cmp::Ordering::Equal;
-            }
-        };
-        a.file.cmp(&b.file).then(a.pos.cmp(&b.pos))
+    fn compare_checkpoints(&self, a: &[u8], b: &[u8]) -> CheckpointOrder {
+        compare_mysql_checkpoints(a, b)
     }
 
     async fn check_durable_snapshot_startup(
@@ -971,4 +984,83 @@ async fn run_failover_reconciliation(
 
     info!(source_id = %ctx.source_id, "failover reconciliation complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod compare_checkpoints_tests {
+    use super::compare_mysql_checkpoints;
+    use deltaforge_core::CheckpointOrder;
+
+    fn cp(file: &str, pos: u64) -> Vec<u8> {
+        format!(r#"{{"file":"{file}","pos":{pos},"gtid_set":null}}"#)
+            .into_bytes()
+    }
+
+    // Regression: the (file, pos) ordering must be preserved exactly through the
+    // CheckpointOrder conversion.
+    #[test]
+    fn orders_by_pos_within_same_file() {
+        assert_eq!(
+            compare_mysql_checkpoints(
+                &cp("bin.000001", 100),
+                &cp("bin.000001", 200)
+            ),
+            CheckpointOrder::Before
+        );
+        assert_eq!(
+            compare_mysql_checkpoints(
+                &cp("bin.000001", 200),
+                &cp("bin.000001", 100)
+            ),
+            CheckpointOrder::After
+        );
+        assert_eq!(
+            compare_mysql_checkpoints(
+                &cp("bin.000001", 100),
+                &cp("bin.000001", 100)
+            ),
+            CheckpointOrder::Equal
+        );
+    }
+
+    #[test]
+    fn file_dominates_pos() {
+        // A later file with a smaller pos is still After.
+        assert_eq!(
+            compare_mysql_checkpoints(
+                &cp("bin.000002", 1),
+                &cp("bin.000001", 999)
+            ),
+            CheckpointOrder::After
+        );
+    }
+
+    #[test]
+    fn malformed_is_incomparable_never_equal() {
+        for bad in [&b"not json"[..], &b"{}"[..], br#"{"file":"x"}"#] {
+            assert_eq!(
+                compare_mysql_checkpoints(bad, &cp("bin.000001", 1)),
+                CheckpointOrder::Incomparable
+            );
+            assert_eq!(
+                compare_mysql_checkpoints(&cp("bin.000001", 1), bad),
+                CheckpointOrder::Incomparable
+            );
+            assert_ne!(
+                compare_mysql_checkpoints(bad, &cp("bin.000001", 1)),
+                CheckpointOrder::Equal
+            );
+        }
+    }
+
+    #[test]
+    fn well_formed_is_reflexively_equal() {
+        assert_eq!(
+            compare_mysql_checkpoints(
+                &cp("bin.000001", 42),
+                &cp("bin.000001", 42)
+            ),
+            CheckpointOrder::Equal
+        );
+    }
 }
