@@ -18,7 +18,8 @@ use tracing::{debug, error, info, warn};
 use checkpoints::{CheckpointStore, CheckpointStoreExt};
 use common::{AllowList, RetryPolicy, pause_until_resumed};
 use deltaforge_core::{
-    Source, SourceError, SourceHandle, SourceItem, SourceResult,
+    CheckpointOrder, Source, SourceError, SourceHandle, SourceItem,
+    SourceResult,
 };
 use storage::BackendCheckpointStore;
 
@@ -744,6 +745,62 @@ impl PostgresSource {
     }
 }
 
+/// Order two PostgreSQL checkpoints by LSN, failing closed.
+///
+/// `PostgresCheckpoint` is `{ lsn: "X/Y" (hex), tx_id: Option<u32> }`. A
+/// checkpoint that does not parse, or whose LSN is not a valid `hi/lo` hex pair,
+/// is [`CheckpointOrder::Incomparable`] rather than silently treated as an
+/// orderable position - the per-sink fold turns that into a hard error instead
+/// of resuming ahead of a sink.
+///
+/// Cross-lineage comparison (two LSNs from different PostgreSQL systems) is a
+/// known gap: v1 checkpoints carry no lineage token, so same-lineage is assumed
+/// here. See `docs/specs/postgres-checkpoint-comparison-lineage-design.md`.
+pub fn compare_pg_checkpoints(a: &[u8], b: &[u8]) -> CheckpointOrder {
+    #[derive(serde::Deserialize)]
+    struct Cp {
+        lsn: String,
+    }
+
+    fn parse_lsn(s: &str) -> Option<u64> {
+        let (hi, lo) = s.split_once('/')?;
+        // Each half is a 32-bit word. Parse as u32 so an out-of-range or
+        // over-long hex component (e.g. "100000000") is rejected rather than
+        // silently truncated or aliased into the combined u64.
+        let hi = u32::from_str_radix(hi, 16).ok()?;
+        let lo = u32::from_str_radix(lo, 16).ok()?;
+        Some(((hi as u64) << 32) | (lo as u64))
+    }
+
+    let a: Cp = match serde_json::from_slice(a) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "incomparable checkpoint a: parse failed");
+            return CheckpointOrder::Incomparable;
+        }
+    };
+    let b: Cp = match serde_json::from_slice(b) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "incomparable checkpoint b: parse failed");
+            return CheckpointOrder::Incomparable;
+        }
+    };
+    let (Some(la), Some(lb)) = (parse_lsn(&a.lsn), parse_lsn(&b.lsn)) else {
+        tracing::warn!(
+            lsn_a = %a.lsn,
+            lsn_b = %b.lsn,
+            "incomparable checkpoint: malformed LSN"
+        );
+        return CheckpointOrder::Incomparable;
+    };
+    match la.cmp(&lb) {
+        std::cmp::Ordering::Less => CheckpointOrder::Before,
+        std::cmp::Ordering::Equal => CheckpointOrder::Equal,
+        std::cmp::Ordering::Greater => CheckpointOrder::After,
+    }
+}
+
 #[async_trait]
 impl Source for PostgresSource {
     async fn run(
@@ -784,36 +841,8 @@ impl Source for PostgresSource {
         }
     }
 
-    fn compare_checkpoints(&self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
-        // PostgresCheckpoint: { lsn: String, tx_id: Option<u32> }
-        // LSN format: "X/YYYYYYYY" where X and Y are hex.
-        #[derive(serde::Deserialize)]
-        struct Cp {
-            lsn: String,
-        }
-
-        fn parse_lsn(s: &str) -> u64 {
-            let (hi, lo) = s.split_once('/').unwrap_or(("0", s));
-            let hi = u64::from_str_radix(hi, 16).unwrap_or(0);
-            let lo = u64::from_str_radix(lo, 16).unwrap_or(0);
-            (hi << 32) | lo
-        }
-
-        let a: Cp = match serde_json::from_slice(a) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!(error = %e, "failed to parse checkpoint a in compare_checkpoints");
-                return std::cmp::Ordering::Equal;
-            }
-        };
-        let b: Cp = match serde_json::from_slice(b) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!(error = %e, "failed to parse checkpoint b in compare_checkpoints");
-                return std::cmp::Ordering::Equal;
-            }
-        };
-        parse_lsn(&a.lsn).cmp(&parse_lsn(&b.lsn))
+    fn compare_checkpoints(&self, a: &[u8], b: &[u8]) -> CheckpointOrder {
+        compare_pg_checkpoints(a, b)
     }
 
     async fn check_durable_snapshot_startup(
@@ -1045,4 +1074,104 @@ async fn fetch_slot_confirmed_lsn(
         .await?;
     let s: &str = row.get(0);
     s.parse::<Lsn>().map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+#[cfg(test)]
+mod compare_checkpoints_tests {
+    use super::compare_pg_checkpoints;
+    use deltaforge_core::CheckpointOrder;
+
+    fn cp(lsn: &str) -> Vec<u8> {
+        format!(r#"{{"lsn":"{lsn}","tx_id":null}}"#).into_bytes()
+    }
+
+    #[test]
+    fn orders_valid_lsns() {
+        assert_eq!(
+            compare_pg_checkpoints(&cp("0/100"), &cp("0/200")),
+            CheckpointOrder::Before
+        );
+        assert_eq!(
+            compare_pg_checkpoints(&cp("0/200"), &cp("0/100")),
+            CheckpointOrder::After
+        );
+        assert_eq!(
+            compare_pg_checkpoints(&cp("0/100"), &cp("0/100")),
+            CheckpointOrder::Equal
+        );
+    }
+
+    #[test]
+    fn high_word_dominates_low_word_boundary() {
+        // 0/FFFFFFFF must be strictly before 1/0 (the hi word carries).
+        assert_eq!(
+            compare_pg_checkpoints(&cp("0/FFFFFFFF"), &cp("1/0")),
+            CheckpointOrder::Before
+        );
+        assert_eq!(
+            compare_pg_checkpoints(&cp("1/0"), &cp("0/FFFFFFFF")),
+            CheckpointOrder::After
+        );
+    }
+
+    #[test]
+    fn malformed_is_incomparable_never_equal() {
+        // Non-JSON, missing field, non-hex LSN, missing '/' separator all fail
+        // closed - and specifically must NOT read as Equal (the old bug).
+        for bad in [
+            &b"not json"[..],
+            &b"{}"[..],
+            br#"{"lsn":"zz/yy","tx_id":null}"#,
+            br#"{"lsn":"12345","tx_id":null}"#,
+        ] {
+            assert_eq!(
+                compare_pg_checkpoints(bad, &cp("0/100")),
+                CheckpointOrder::Incomparable,
+                "malformed a must be Incomparable"
+            );
+            assert_eq!(
+                compare_pg_checkpoints(&cp("0/100"), bad),
+                CheckpointOrder::Incomparable,
+                "malformed b must be Incomparable"
+            );
+            assert_ne!(
+                compare_pg_checkpoints(bad, &cp("0/100")),
+                CheckpointOrder::Equal
+            );
+        }
+    }
+
+    #[test]
+    fn well_formed_is_reflexively_equal() {
+        // The per-sink fold relies on self-comparison to validate a lone
+        // checkpoint: a well-formed one must be Equal to itself.
+        assert_eq!(
+            compare_pg_checkpoints(&cp("A/B"), &cp("A/B")),
+            CheckpointOrder::Equal
+        );
+    }
+
+    #[test]
+    fn out_of_range_lsn_components_are_incomparable() {
+        // Each PostgreSQL LSN half is a 32-bit word; a component that does not
+        // fit u32 (0x100000000), or an excessively long hex run, must be
+        // rejected rather than truncated/aliased into the combined u64.
+        for bad_lsn in [
+            "100000000/0",        // high half = 2^32, one past u32::MAX
+            "0/100000000",        // low half = 2^32
+            "FFFFFFFFF/0",        // 9 hex digits, overflows u32
+            "0/FFFFFFFFFFFFFFFF", // 16 hex digits, overflows u32
+        ] {
+            assert_eq!(
+                compare_pg_checkpoints(&cp(bad_lsn), &cp("0/100")),
+                CheckpointOrder::Incomparable,
+                "out-of-range LSN {bad_lsn} (a) must be Incomparable"
+            );
+            assert_eq!(
+                compare_pg_checkpoints(&cp("0/100"), &cp(bad_lsn)),
+                CheckpointOrder::Incomparable,
+                "out-of-range LSN {bad_lsn} (b) must be Incomparable"
+            );
+        }
+    }
 }
