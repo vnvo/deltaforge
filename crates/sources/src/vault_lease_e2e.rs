@@ -33,6 +33,8 @@ use secrets::{
 };
 use storage::{ArcStorageBackend, MemoryStorageBackend};
 
+use crate::rotation::ApplyOutcome;
+use crate::vault_lease::LeaseRevokeDecision;
 use crate::vault_lease_manager::{
     LeaseIdentity, LeaseManager, LeaseScheduleConfig, VaultLeaseProvider,
 };
@@ -291,14 +293,27 @@ async fn pg_lease_lifecycle_e2e() -> Result<()> {
         "renewed credentials must still authenticate"
     );
 
-    // Reissue: a fresh credential is adopted, the old lease is revoked. The new creds
-    // work; the old ones are rejected once Vault revokes the old role.
+    // Reissue (two-handle): mint a pending replacement while the old lease keeps
+    // serving. Both credentials work until an apply outcome resolves the swap.
     let leased2 = m.reissue(SystemTime::now()).await?;
     let (u2, p2) = creds(&leased2);
     assert_ne!(u1, u2, "reissue yields a distinct dynamic user");
     assert!(
         pg_can_connect(&env, &u2, &p2).await?,
-        "reissued credentials must authenticate"
+        "the pending replacement's credentials authenticate"
+    );
+    assert!(
+        pg_can_connect(&env, &u1, &p1).await?,
+        "the old lease keeps serving until apply"
+    );
+
+    // Resolve the reissue as Applied (Phase 3 supplies the real reconnect result):
+    // promote the new lease, revoke the old. The old credentials are then rejected.
+    let decision = m.resolve_reissue(ApplyOutcome::Applied, false).await?;
+    assert_eq!(decision, LeaseRevokeDecision::PromoteNewRevokeOld);
+    assert!(
+        pg_can_connect(&env, &u2, &p2).await?,
+        "promoted credentials must authenticate"
     );
     assert!(
         wait_until_rejected(&env, &u1, &p1).await,
@@ -343,15 +358,24 @@ async fn pg_crash_recovery_and_orphan_e2e() -> Result<()> {
     };
     assert!(pg_can_connect(&env, &u1, &p1).await?);
 
-    // Restart with the same incarnation: recover adopts the live lease.
+    // Restart with the same incarnation: recovery RECLAIMS the pre-crash lease (its
+    // password cannot be reconstructed from metadata, so it is revoked, not adopted).
     let mut m2 =
         manager(provider.clone(), backend.clone(), "inc-1", mount, &role);
     let summary = m2.recover().await?;
-    assert_eq!(summary.adopted, 1, "the live lease is re-adopted");
-    assert_eq!(m2.status().await?.state, "active");
+    assert_eq!(summary.reclaimed, 1, "the pre-crash lease is reclaimed");
+    assert!(m2.status().await?.state == "none", "nothing adopted");
     assert!(
-        pg_can_connect(&env, &u1, &p1).await?,
-        "the recovered lease's credentials still work"
+        wait_until_rejected(&env, &u1, &p1).await,
+        "the reclaimed lease's credentials must be revoked at the database"
+    );
+
+    // The caller issues fresh credentials after recovery; these authenticate.
+    let leased = m2.issue(SystemTime::now()).await?;
+    let (u2, p2) = creds(&leased);
+    assert!(
+        pg_can_connect(&env, &u2, &p2).await?,
+        "freshly issued post-recovery credentials must authenticate"
     );
 
     // A delete/recreate replaces the incarnation. The new incarnation reconciles the
@@ -361,7 +385,7 @@ async fn pg_crash_recovery_and_orphan_e2e() -> Result<()> {
     let orphans = m3.reconcile_orphans().await?;
     assert_eq!(orphans.revoked, 1, "prior incarnation's lease is revoked");
     assert!(
-        wait_until_rejected(&env, &u1, &p1).await,
+        wait_until_rejected(&env, &u2, &p2).await,
         "orphaned credentials must be revoked at the database"
     );
 
@@ -488,10 +512,13 @@ async fn mysql_lease_lifecycle_e2e() -> Result<()> {
     m.renew(SystemTime::now()).await?;
     assert!(mysql_can_connect(&env, &u1, &p1).await?);
 
+    // Two-handle reissue + Applied resolution.
     let leased2 = m.reissue(SystemTime::now()).await?;
     let (u2, p2) = creds(&leased2);
     assert_ne!(u1, u2);
     assert!(mysql_can_connect(&env, &u2, &p2).await?);
+    let decision = m.resolve_reissue(ApplyOutcome::Applied, false).await?;
+    assert_eq!(decision, LeaseRevokeDecision::PromoteNewRevokeOld);
     assert!(
         wait_until_rejected_mysql(&env, &u1, &p1).await,
         "superseded MySQL credentials must be revoked"

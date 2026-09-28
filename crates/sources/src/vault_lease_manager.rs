@@ -25,9 +25,11 @@ use async_trait::async_trait;
 use metrics::{counter, gauge};
 use secrets::{LeaseInfo, LeasedRead, ProviderFailureKind, SecretError};
 
+use crate::rotation::ApplyOutcome;
 use crate::vault_lease::{
-    LeaseAction, LeaseEvent, LeaseHandle, LeaseId, LeaseRecord, LeaseState,
-    LeaseStore, LeasedCredentialSet, on_lease_event,
+    LeaseAction, LeaseEvent, LeaseHandle, LeaseId, LeaseRecord,
+    LeaseRevokeDecision, LeaseState, LeaseStore, LeasedCredentialSet,
+    lease_revoke_decision, on_lease_event,
 };
 
 // -----------------------------------------------------------------------------
@@ -71,15 +73,22 @@ pub(crate) enum LeaseTick {
     Wait(Duration),
     /// Renew the active (renewable) lease now.
     Renew,
-    /// Reissue now: the safety deadline was reached, or a non-renewable lease has
-    /// consumed its renew fraction.
+    /// Reissue now: inside the safety window (`expires_at - safety_margin <= now <
+    /// expires_at`), or a non-renewable lease has consumed its renew fraction. There is
+    /// still time to obtain a fresh lease before true expiry.
     Reissue,
+    /// Terminal fail-closed: the lease has reached (or passed) true expiry. The active
+    /// credential is no longer valid and service MUST stop; a reissue that did not
+    /// complete before this point does not permit continued service.
+    Expired,
 }
 
 /// The pure scheduling step. Given `now` and the active lease handle, decide whether
-/// to renew, reissue, or wait. Works from the *remaining* lifetime against the granted
-/// duration, so the decision is stable across recomputes: waking early only shortens
-/// the returned wait, it never triggers a premature action.
+/// to renew, reissue, wait, or fail closed. Works from the *remaining* lifetime against
+/// the granted duration, so the decision is stable across recomputes: waking early only
+/// shortens the returned wait, it never triggers a premature action. Past true expiry
+/// the result is the terminal [`LeaseTick::Expired`] - never `Reissue` - so a failed or
+/// too-late reissue cannot be mistaken for permission to keep serving.
 pub(crate) fn lease_tick(
     now: SystemTime,
     handle: &LeaseHandle,
@@ -90,7 +99,12 @@ pub(crate) fn lease_tick(
         .duration_since(now)
         .unwrap_or(Duration::ZERO);
 
-    // At or past the safety deadline: must stop serving the old lease -> reissue.
+    // At or past true expiry: fail closed. The credential is unusable; stop serving.
+    if remaining.is_zero() {
+        return LeaseTick::Expired;
+    }
+
+    // Inside the safety window (before true expiry): still time to get a fresh lease.
     if remaining <= cfg.safety_margin {
         return LeaseTick::Reissue;
     }
@@ -251,6 +265,12 @@ fn mint_generation_id(incarnation: &str, counter: u64) -> String {
 
 /// Owns the active leased credential set for one source scope, persists lease
 /// ownership, and performs issue/renew/reissue/revoke through the provider and store.
+///
+/// Reissue follows the approved **two-handle protocol**: a replacement lease is minted
+/// as a second `pending` handle while the current lease keeps serving; promotion of the
+/// new lease and revocation of the old happen only once an apply outcome is known
+/// (`resolve_reissue`). Phase 2 has no source DSN change or DB reconnect, so the apply
+/// outcome is supplied explicitly; Phase 3 will supply the real reconnect result.
 pub(crate) struct LeaseManager {
     provider: Arc<dyn LeaseProvider>,
     store: LeaseStore,
@@ -262,11 +282,14 @@ pub(crate) struct LeaseManager {
     epoch: u64,
     /// Monotonic generation counter feeding [`mint_generation_id`].
     gen_counter: u64,
-    /// The active lease's durable key and current slot version, once issued.
+    /// The active (serving) lease's durable key and current slot version, once issued.
     active: Option<ActiveLease>,
+    /// A pending replacement minted by `reissue`, awaiting an apply outcome. Coexists
+    /// with `active` until `resolve_reissue` promotes or revokes it.
+    pending: Option<ActiveLease>,
 }
 
-/// The manager's handle on the currently-serving lease.
+/// The manager's handle on a durable lease: its key and last-known slot version.
 struct ActiveLease {
     key: String,
     version: u64,
@@ -293,6 +316,7 @@ impl LeaseManager {
             epoch: 0,
             gen_counter: 0,
             active: None,
+            pending: None,
         }
     }
 
@@ -303,18 +327,25 @@ impl LeaseManager {
         &mut self,
         now: SystemTime,
     ) -> Result<LeasedCredentialSet> {
-        let leased = self.issue_pending(now).await?;
+        let (slot, leased) = self.mint_pending(now).await?;
         // Pending -> Active: the credential is durably owned, adopt it.
-        self.promote_active().await?;
+        let version =
+            self.transition_key(&slot.key, LeaseState::Active).await?;
+        self.active = Some(ActiveLease {
+            key: slot.key,
+            version,
+        });
         Ok(leased)
     }
 
-    /// Issue a lease and persist it as `Pending`, recording it as the active lease.
-    /// Split out so reissue can create the replacement before superseding the old one.
-    async fn issue_pending(
+    /// Issue a lease from Vault and persist it as a `Pending` durable record (written
+    /// **before** the credential material is exposed). Returns the durable handle and
+    /// the leased credentials; does not mutate `active`/`pending` (the caller places
+    /// the handle).
+    async fn mint_pending(
         &mut self,
         now: SystemTime,
-    ) -> Result<LeasedCredentialSet> {
+    ) -> Result<(ActiveLease, LeasedCredentialSet)> {
         let read = self.provider.issue(&self.mount, &self.role).await?;
         self.epoch += 1;
         self.gen_counter += 1;
@@ -339,51 +370,40 @@ impl LeaseManager {
             self.epoch,
         )?;
         let version = self.store.create_pending(&record).await?;
-        self.active = Some(ActiveLease {
-            key: record.key(),
-            version,
-        });
         self.metric_lifecycle("issued");
         self.metric_expiry(record.expires_at_ms);
-        Ok(LeasedCredentialSet {
-            credentials: read.credentials,
-            lease: handle,
-        })
+        Ok((
+            ActiveLease {
+                key: record.key(),
+                version,
+            },
+            LeasedCredentialSet {
+                credentials: read.credentials,
+                lease: handle,
+            },
+        ))
     }
 
-    /// Transition the active lease `Pending -> Active` via a validated CAS.
-    async fn promote_active(&mut self) -> Result<()> {
-        self.apply_transition(LeaseState::Active).await
-    }
-
-    /// Load, transition to `next`, and CAS the active record, refreshing the tracked
+    /// Load, transition to `next`, and CAS the record at `key`, returning the post-CAS
     /// slot version. Fails closed if the transition is illegal for the current state.
-    async fn apply_transition(&mut self, next: LeaseState) -> Result<()> {
-        let active = self
-            .active
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no active lease"))?;
-        let key = active.key.clone();
-        let (version, current) =
-            self.store.get(&key).await?.ok_or_else(|| {
-                anyhow::anyhow!("active lease record missing")
-            })?;
+    async fn transition_key(&self, key: &str, next: LeaseState) -> Result<u64> {
+        let (version, current) = self
+            .store
+            .get(key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("lease record missing"))?;
         let updated = current
             .transitioned(next)
             .ok_or_else(|| anyhow::anyhow!("illegal lease transition"))?;
-        if !self.store.cas(&key, version, &updated).await? {
+        if !self.store.cas(key, version, &updated).await? {
             anyhow::bail!("lease store version conflict on transition");
         }
-        // Re-read to capture the post-CAS slot version.
-        let (new_version, _) =
-            self.store.get(&key).await?.ok_or_else(|| {
-                anyhow::anyhow!("active lease record missing")
-            })?;
-        self.active = Some(ActiveLease {
-            key,
-            version: new_version,
-        });
-        Ok(())
+        let (new_version, _) = self
+            .store
+            .get(key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("lease record missing"))?;
+        Ok(new_version)
     }
 
     /// Renew the active lease. On success, advance timing via the state machine's
@@ -436,28 +456,84 @@ impl LeaseManager {
         Ok(refreshed.lease()?)
     }
 
-    /// Reissue: mint a fresh lease, adopt it as active, then revoke the superseded
-    /// one. Phase 2 does not touch any source DSN; the new credential simply becomes
-    /// the active lease. Returns the new leased credential set.
+    /// Begin a reissue under the two-handle protocol: mint a replacement lease as a
+    /// **pending** second handle while the current lease keeps serving. The replacement
+    /// is NOT promoted and the old lease is NOT revoked here - that waits for an apply
+    /// outcome via [`resolve_reissue`]. Requires an active lease; any store failure
+    /// while confirming it is propagated (never swallowed, so the old lease can never be
+    /// lost while a new one is issued).
     pub(crate) async fn reissue(
         &mut self,
         now: SystemTime,
     ) -> Result<LeasedCredentialSet> {
-        // Remember the outgoing lease so we can revoke it after the new one is owned.
-        let old = self.load_active().await.ok();
-
-        // Mint + adopt the replacement (Pending -> Active). `issue_pending` overwrites
-        // `self.active` with the new lease.
-        let leased = self.issue_pending(now).await?;
-        self.promote_active().await?;
-
-        self.metric_lifecycle("reissued");
-
-        // Supersede + revoke the old lease, if there was one.
-        if let Some((old_key, old_version, old_record)) = old {
-            self.drive_revoke(old_key, old_version, old_record).await?;
+        // Confirm a current active lease exists and its record loads; fail closed on a
+        // corrupt/unavailable store rather than orphaning it.
+        let _ = self.load_active().await?;
+        if self.pending.is_some() {
+            anyhow::bail!("a pending replacement lease already exists");
         }
+        let (slot, leased) = self.mint_pending(now).await?;
+        self.pending = Some(slot);
+        self.metric_lifecycle("reissued");
         Ok(leased)
+    }
+
+    /// Resolve a pending reissue given the apply outcome, per the approved revoke
+    /// decision table ([`lease_revoke_decision`]):
+    /// - `Applied` -> promote the pending replacement to active, then revoke the old
+    ///   lease;
+    /// - not adopted (terminal/kept-old/uncertain/failed) -> revoke the pending
+    ///   replacement, keep the old lease active;
+    /// - transient with a retry pending -> retain both (the caller retries apply and
+    ///   renews both meanwhile).
+    ///
+    /// In Phase 2 the outcome is supplied by the caller (no DB reconnect); Phase 3 will
+    /// pass the real reconnect result.
+    pub(crate) async fn resolve_reissue(
+        &mut self,
+        outcome: ApplyOutcome,
+        retry_pending: bool,
+    ) -> Result<LeaseRevokeDecision> {
+        let decision = lease_revoke_decision(&outcome, retry_pending);
+        match decision {
+            LeaseRevokeDecision::PromoteNewRevokeOld => {
+                let pending = self.pending.take().ok_or_else(|| {
+                    anyhow::anyhow!("no pending replacement to promote")
+                })?;
+                let old = self.active.take().ok_or_else(|| {
+                    anyhow::anyhow!("no active lease to supersede")
+                })?;
+                // Promote the replacement before revoking the old, so a serving lease
+                // always exists.
+                let version = self
+                    .transition_key(&pending.key, LeaseState::Active)
+                    .await?;
+                self.active = Some(ActiveLease {
+                    key: pending.key,
+                    version,
+                });
+                let (ov, orec) =
+                    self.store.get(&old.key).await?.ok_or_else(|| {
+                        anyhow::anyhow!("superseded lease record missing")
+                    })?;
+                self.drive_revoke(old.key, ov, orec).await?;
+            }
+            LeaseRevokeDecision::RevokeNew => {
+                let pending = self.pending.take().ok_or_else(|| {
+                    anyhow::anyhow!("no pending replacement to revoke")
+                })?;
+                let (pv, prec) =
+                    self.store.get(&pending.key).await?.ok_or_else(|| {
+                        anyhow::anyhow!("pending lease record missing")
+                    })?;
+                self.drive_revoke(pending.key, pv, prec).await?;
+                // The active lease is unchanged.
+            }
+            LeaseRevokeDecision::RetainBoth => {
+                // Keep both handles; the caller retries apply and renews both.
+            }
+        }
+        Ok(decision)
     }
 
     /// Revoke the active lease and finalize it to the retained `Revoked` tombstone.
@@ -567,19 +643,19 @@ impl LeaseManager {
         Ok((active.key.clone(), version, record))
     }
 
-    /// Recover this run's leases after a restart, from the durable store alone (no
-    /// Vault call for the adopt path). Scans the **current incarnation**:
-    /// - adopts the newest `Active` record as the serving lease;
-    /// - revokes any older `Active` duplicates (a crash mid-reissue can leave two);
-    /// - revokes `Pending` records - a `Pending` lease's material was never handed out
-    ///   (it becomes `Active` only after it is durably owned), so its Vault lease is a
-    ///   stray to clean up;
-    /// - re-drives `RevokePending` records to completion (a crash mid-revoke).
+    /// Recover this run's leases after a restart. Scans the **current incarnation** and
+    /// **reclaims** (revokes + finalizes) every non-terminal lease it finds.
     ///
-    /// `Orphaned`/`Revoked` records are counted and left in place.
+    /// A recovered lease is deliberately **not** adopted as a usable active credential:
+    /// the credential material (the password) is never persisted and cannot be
+    /// reconstructed from a lease lookup/renew, so a lease known only from durable
+    /// metadata cannot be served. The safe action is to revoke it (cleanup) and let the
+    /// caller issue a fresh lease. `Pending` leases were never handed out; `Active` were
+    /// serving before the crash; `RevokePending` were mid-revoke - all are reclaimed. A
+    /// 403 leaves a lease `Orphaned`; `Revoked` tombstones are counted and left.
+    /// `active`/`pending` remain unset after recovery.
     pub(crate) async fn recover(&mut self) -> Result<RecoverySummary> {
         let mut summary = RecoverySummary::default();
-        let mut actives: Vec<(String, u64, LeaseRecord)> = Vec::new();
         let mut to_revoke: Vec<(String, u64, LeaseRecord)> = Vec::new();
 
         let mut cursor: Option<String> = None;
@@ -589,13 +665,10 @@ impl LeaseManager {
                 .list_current_incarnation(cursor.as_deref(), RECONCILE_PAGE)
                 .await?;
             for (key, version, record) in page.records {
-                match record.state {
-                    LeaseState::Active => actives.push((key, version, record)),
-                    LeaseState::Pending | LeaseState::RevokePending => {
-                        to_revoke.push((key, version, record))
-                    }
-                    LeaseState::Orphaned => summary.orphaned += 1,
-                    LeaseState::Revoked => summary.tombstones += 1,
+                if record.state.is_terminal() {
+                    summary.tombstones += 1;
+                } else {
+                    to_revoke.push((key, version, record));
                 }
             }
             match page.next_cursor {
@@ -604,15 +677,9 @@ impl LeaseManager {
             }
         }
 
-        // Adopt the newest Active (latest expiry); revoke the rest.
-        actives.sort_by_key(|(_, _, r)| r.expires_at_ms);
-        if let Some((key, version, _)) = actives.pop() {
-            self.active = Some(ActiveLease { key, version });
-            summary.adopted = 1;
-        }
-        for (key, version, record) in actives.into_iter().chain(to_revoke) {
+        for (key, version, record) in to_revoke {
             match self.drive_revoke(key, version, record).await? {
-                RevokeOutcome::Finalized => summary.revoked += 1,
+                RevokeOutcome::Finalized => summary.reclaimed += 1,
                 RevokeOutcome::Orphaned => summary.orphaned += 1,
             }
         }
@@ -732,14 +799,14 @@ pub(crate) enum RevokeOutcome {
     Orphaned,
 }
 
-/// Non-secret counts from a restart recovery scan (for logging/metrics).
+/// Non-secret counts from a restart recovery scan (for logging/metrics). Recovery never
+/// adopts a lease (credential material is not reconstructible), so there is no
+/// "adopted" count - the caller issues fresh credentials afterwards.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RecoverySummary {
-    /// Active leases re-adopted as the serving lease (0 or 1).
-    pub adopted: u32,
-    /// Leases finalized (stray Pending / interrupted RevokePending / Active duplicates).
-    pub revoked: u32,
-    /// Leases now left `Orphaned` (unauthorized) plus any already `Orphaned`.
+    /// Non-terminal leases reclaimed (revoked + finalized) as unusable on restart.
+    pub reclaimed: u32,
+    /// Leases left `Orphaned` (unauthorized) during reclamation.
     pub orphaned: u32,
     /// Retained `Revoked` tombstones skipped.
     pub tombstones: u32,
@@ -813,17 +880,22 @@ mod tests {
     }
 
     #[test]
-    fn reissues_at_safety_deadline_even_if_renewable() {
+    fn reissues_in_safety_window_then_fails_closed_at_expiry() {
         let h = handle(3600, true, EPOCH_MS);
         // 10s before expiry (< 30s safety margin) -> reissue, not renew.
         assert_eq!(
             lease_tick(t(EPOCH_MS + 3_590_000), &h, &cfg()),
             LeaseTick::Reissue
         );
-        // Past true expiry -> still reissue (fail forward to a fresh lease).
+        // At true expiry -> terminal fail-closed, not reissue.
+        assert_eq!(
+            lease_tick(t(EPOCH_MS + 3_600_000), &h, &cfg()),
+            LeaseTick::Expired
+        );
+        // Past true expiry -> still Expired (never continued service).
         assert_eq!(
             lease_tick(t(EPOCH_MS + 4_000_000), &h, &cfg()),
-            LeaseTick::Reissue
+            LeaseTick::Expired
         );
     }
 
@@ -1016,22 +1088,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reissue_adopts_new_and_revokes_old() {
+    async fn reissue_keeps_old_active_until_apply() {
+        // Two-handle protocol: reissue mints a PENDING replacement; the old lease keeps
+        // serving (Active) and nothing is revoked until an apply outcome arrives.
         let provider = Arc::new(MockProvider::renewable());
         let mut m = manager(provider.clone());
         m.issue(t(EPOCH_MS)).await.unwrap();
         let old_key = m.active.as_ref().unwrap().key.clone();
 
         m.reissue(t(EPOCH_MS + 3_000_000)).await.unwrap();
-        let new_key = m.active.as_ref().unwrap().key.clone();
-        assert_ne!(old_key, new_key, "a fresh generation is adopted");
+        let new_key = m.pending.as_ref().unwrap().key.clone();
+        assert_ne!(old_key, new_key);
 
-        // New lease is Active; old lease is the retained Revoked tombstone.
+        // Old is still Active; new is Pending; nothing revoked yet.
+        let (_, old_rec) = m.store.get(&old_key).await.unwrap().unwrap();
+        assert_eq!(old_rec.state, LeaseState::Active);
+        let (_, new_rec) = m.store.get(&new_key).await.unwrap().unwrap();
+        assert_eq!(new_rec.state, LeaseState::Pending);
+        assert_eq!(provider.revokes.lock().unwrap().len(), 0);
+
+        // A second reissue while one is pending is rejected.
+        assert!(m.reissue(t(EPOCH_MS + 3_100_000)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_reissue_applied_promotes_new_and_revokes_old() {
+        let provider = Arc::new(MockProvider::renewable());
+        let mut m = manager(provider.clone());
+        m.issue(t(EPOCH_MS)).await.unwrap();
+        let old_key = m.active.as_ref().unwrap().key.clone();
+        m.reissue(t(EPOCH_MS + 3_000_000)).await.unwrap();
+        let new_key = m.pending.as_ref().unwrap().key.clone();
+
+        let decision = m
+            .resolve_reissue(ApplyOutcome::Applied, false)
+            .await
+            .unwrap();
+        assert_eq!(decision, LeaseRevokeDecision::PromoteNewRevokeOld);
+        assert_eq!(m.active.as_ref().unwrap().key, new_key);
+        assert!(m.pending.is_none());
+
         let (_, new_rec) = m.store.get(&new_key).await.unwrap().unwrap();
         assert_eq!(new_rec.state, LeaseState::Active);
         let (_, old_rec) = m.store.get(&old_key).await.unwrap().unwrap();
         assert_eq!(old_rec.state, LeaseState::Revoked);
         assert_eq!(provider.revokes.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_reissue_not_applied_revokes_new_keeps_old() {
+        use crate::rotation::RotationReject;
+        let provider = Arc::new(MockProvider::renewable());
+        let mut m = manager(provider.clone());
+        m.issue(t(EPOCH_MS)).await.unwrap();
+        let old_key = m.active.as_ref().unwrap().key.clone();
+        m.reissue(t(EPOCH_MS + 3_000_000)).await.unwrap();
+        let new_key = m.pending.as_ref().unwrap().key.clone();
+
+        // A non-transient kept-old outcome: revoke the new replacement, keep the old.
+        let decision = m
+            .resolve_reissue(
+                ApplyOutcome::KeptOld {
+                    reason: RotationReject::IdentityMismatch,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(decision, LeaseRevokeDecision::RevokeNew);
+        assert_eq!(m.active.as_ref().unwrap().key, old_key);
+        assert!(m.pending.is_none());
+        let (_, old_rec) = m.store.get(&old_key).await.unwrap().unwrap();
+        assert_eq!(old_rec.state, LeaseState::Active);
+        let (_, new_rec) = m.store.get(&new_key).await.unwrap().unwrap();
+        assert_eq!(new_rec.state, LeaseState::Revoked);
+    }
+
+    #[tokio::test]
+    async fn resolve_reissue_transient_retains_both() {
+        use crate::rotation::RotationReject;
+        let provider = Arc::new(MockProvider::renewable());
+        let mut m = manager(provider.clone());
+        m.issue(t(EPOCH_MS)).await.unwrap();
+        let old_key = m.active.as_ref().unwrap().key.clone();
+        m.reissue(t(EPOCH_MS + 3_000_000)).await.unwrap();
+        let new_key = m.pending.as_ref().unwrap().key.clone();
+
+        let decision = m
+            .resolve_reissue(
+                ApplyOutcome::KeptOld {
+                    reason: RotationReject::PreflightFailed,
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(decision, LeaseRevokeDecision::RetainBoth);
+        // Both handles survive; nothing revoked.
+        assert_eq!(m.active.as_ref().unwrap().key, old_key);
+        assert_eq!(m.pending.as_ref().unwrap().key, new_key);
+        assert_eq!(provider.revokes.lock().unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -1154,7 +1310,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recover_adopts_active_and_cleans_stray_pending() {
+    async fn recover_reclaims_current_incarnation_without_adopting() {
         let backend: storage::ArcStorageBackend =
             Arc::new(MemoryStorageBackend::new());
         let provider = Arc::new(MockProvider::renewable());
@@ -1165,20 +1321,26 @@ mod tests {
         let active_key = m1.active.as_ref().unwrap().key.clone();
         seed_pending(&m1, "inc-1", "stray-gen", "stray-lease").await;
 
-        // Second run over the same store: recover.
+        // Second run over the same store: recover reclaims BOTH (credential material is
+        // not reconstructible, so a recovered lease is never adopted as usable).
         let mut m2 = manager_on(provider.clone(), backend.clone(), identity());
         let summary = m2.recover().await.unwrap();
 
-        assert_eq!(summary.adopted, 1);
-        assert_eq!(summary.revoked, 1, "the stray Pending is finalized");
-        // The recovered Active is adopted and still Active.
-        assert_eq!(m2.active.as_ref().unwrap().key, active_key);
+        assert_eq!(
+            summary.reclaimed, 2,
+            "old Active + stray Pending reclaimed"
+        );
+        assert!(m2.active.is_none(), "recovery never adopts a usable lease");
         let (_, active) = m2.store.get(&active_key).await.unwrap().unwrap();
-        assert_eq!(active.state, LeaseState::Active);
+        assert_eq!(active.state, LeaseState::Revoked);
+
+        // The caller issues fresh credentials afterwards.
+        m2.issue(t(EPOCH_MS + 1000)).await.unwrap();
+        assert_eq!(m2.status().await.unwrap().state, "active");
     }
 
     #[tokio::test]
-    async fn recover_does_not_adopt_foreign_incarnation() {
+    async fn recover_leaves_foreign_incarnation_untouched() {
         let backend: storage::ArcStorageBackend =
             Arc::new(MemoryStorageBackend::new());
         let provider = Arc::new(MockProvider::renewable());
@@ -1190,16 +1352,23 @@ mod tests {
             identity_with("inc-0"),
         );
         old.issue(t(EPOCH_MS)).await.unwrap();
+        let old_key = old.active.as_ref().unwrap().key.clone();
 
-        // New incarnation recovers: nothing of its own to adopt.
+        // New incarnation recovers: nothing of its own to reclaim, old lease untouched.
         let mut new = manager_on(
             provider.clone(),
             backend.clone(),
             identity_with("inc-1"),
         );
         let summary = new.recover().await.unwrap();
-        assert_eq!(summary.adopted, 0);
+        assert_eq!(summary.reclaimed, 0);
         assert!(new.active.is_none());
+        let (_, rec) = new.store.get(&old_key).await.unwrap().unwrap();
+        assert_eq!(
+            rec.state,
+            LeaseState::Active,
+            "foreign incarnation untouched"
+        );
     }
 
     #[tokio::test]

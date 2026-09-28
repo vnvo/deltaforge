@@ -725,21 +725,67 @@ impl VaultShared {
         )
     }
 
-    /// POST with a token, ignoring an empty/!content response body (e.g. a 204 from
-    /// `sys/leases/revoke`).
-    async fn post_no_content<B: Serialize>(
+    /// Execute a lease-management request, mapping Vault's **absent-lease** responses
+    /// to [`SecretError::NotFound`] so the caller can treat an already-gone lease as
+    /// idempotent. Absent is signalled by a 404 or, in the versions that use it, a
+    /// 4xx whose small error body carries a known marker (matched without surfacing
+    /// the body). Everything else maps through [`map_status`]. A 2xx returns the body
+    /// (possibly empty for a 204).
+    async fn execute_lease(
+        &self,
+        req: reqwest::RequestBuilder,
+        reference: &SecretReference,
+    ) -> Result<Zeroizing<Vec<u8>>, SecretError> {
+        let resp = req.send().await.map_err(|e| send_err(&e, reference))?;
+        let status = resp.status();
+        if status.is_success() {
+            return read_body_capped(resp, CONTROL_RESPONSE_CAP, reference)
+                .await;
+        }
+        if status.as_u16() == 404 {
+            return Err(SecretError::NotFound(reference.safe()));
+        }
+        // Read the capped, scrubbed error body only to classify absent-lease; never
+        // surfaced. A read failure falls through to the status-based mapping.
+        let body = read_body_capped(resp, CONTROL_RESPONSE_CAP, reference)
+            .await
+            .unwrap_or_default();
+        if lease_absent_marker(&body) {
+            return Err(SecretError::NotFound(reference.safe()));
+        }
+        Err(map_status(status, reference))
+    }
+
+    /// POST a lease-management request and parse a JSON body, with absent-lease
+    /// mapping (see [`execute_lease`](Self::execute_lease)).
+    async fn lease_post_json<B: Serialize, T: DeserializeOwned>(
         &self,
         url: Url,
         token: Option<&str>,
         body: &B,
         reference: &SecretReference,
-    ) -> Result<(), SecretError> {
+    ) -> Result<T, SecretError> {
         let req = self.with_headers(self.http.post(url).json(body), token);
-        let _ = self
-            .execute(req, CONTROL_RESPONSE_CAP, false, reference)
-            .await?;
-        Ok(())
+        let bytes = self.execute_lease(req, reference).await?;
+        serde_json::from_slice(&bytes).map_err(|_| {
+            provider(reference, ProviderFailureKind::InvalidResponse)
+        })
     }
+}
+
+/// Whether a Vault error body indicates the lease is absent (already revoked or
+/// expired). Matches Vault's stable markers case-insensitively; the body is never
+/// surfaced, only classified.
+fn lease_absent_marker(bytes: &[u8]) -> bool {
+    let s = String::from_utf8_lossy(bytes).to_ascii_lowercase();
+    s.contains("invalid lease") || s.contains("lease not found")
+}
+
+/// A single Vault path segment safe to interpolate into an endpoint path: non-empty,
+/// no traversal/control/query characters, and no embedded `/` that could alter the
+/// intended endpoint.
+fn valid_path_segment(s: &str) -> bool {
+    !s.is_empty() && !s.contains('/') && valid_vault_path(s)
 }
 
 fn kv_response_cap(max_secret_bytes: usize) -> usize {
@@ -869,6 +915,12 @@ impl VaultLeaseApi for VaultShared {
             SecretProvider::Vault,
             format!("{mount}/creds/{role}"),
         );
+        // The dynamic mount/role are interpolated into the endpoint path, so validate
+        // them as single safe segments before the request. An invalid value is a hard
+        // configuration error (not an absent lease): fail closed.
+        if !valid_path_segment(mount) || !valid_path_segment(role) {
+            return Err(provider(&reference, ProviderFailureKind::Other));
+        }
         let token = self.current_token().await;
         let resp: DbCredsResponse = self
             .get_json(
@@ -917,11 +969,10 @@ impl VaultLeaseApi for VaultShared {
         let reference = self.reference();
         let token = self.current_token().await;
         let resp: LeaseLookupResponse = self
-            .post_json(
+            .lease_post_json(
                 self.url("sys/leases/lookup"),
                 Some(&token),
                 &serde_json::json!({ "lease_id": lease_id }),
-                CONTROL_RESPONSE_CAP,
                 &reference,
             )
             .await?;
@@ -945,11 +996,10 @@ impl VaultLeaseApi for VaultShared {
             None => serde_json::json!({ "lease_id": lease_id }),
         };
         let resp: LeaseRenewResponse = self
-            .post_json(
+            .lease_post_json(
                 self.url("sys/leases/renew"),
                 Some(&token),
                 &body,
-                CONTROL_RESPONSE_CAP,
                 &reference,
             )
             .await?;
@@ -962,13 +1012,15 @@ impl VaultLeaseApi for VaultShared {
     async fn revoke_lease(&self, lease_id: &str) -> Result<(), SecretError> {
         let reference = self.reference();
         let token = self.current_token().await;
-        self.post_no_content(
-            self.url("sys/leases/revoke"),
+        // A 2xx (incl. 204) is success; an absent lease maps to `NotFound` so the
+        // caller treats revocation as idempotent.
+        let req = self.with_headers(
+            self.http
+                .post(self.url("sys/leases/revoke"))
+                .json(&serde_json::json!({ "lease_id": lease_id })),
             Some(&token),
-            &serde_json::json!({ "lease_id": lease_id }),
-            &reference,
-        )
-        .await
+        );
+        self.execute_lease(req, &reference).await.map(|_| ())
     }
 }
 
@@ -1901,6 +1953,29 @@ mod tests {
         assert_eq!(kind(429), ProviderFailureKind::Timeout);
         assert_eq!(kind(503), ProviderFailureKind::Unavailable);
         assert_eq!(kind(400), ProviderFailureKind::Other);
+    }
+
+    #[test]
+    fn lease_absent_marker_matches_vault_markers() {
+        assert!(lease_absent_marker(br#"{"errors":["invalid lease"]}"#));
+        assert!(lease_absent_marker(br#"{"errors":["lease not found"]}"#));
+        // Case-insensitive.
+        assert!(lease_absent_marker(b"Invalid Lease"));
+        // Unrelated errors are not absent.
+        assert!(!lease_absent_marker(br#"{"errors":["permission denied"]}"#));
+        assert!(!lease_absent_marker(b""));
+    }
+
+    #[test]
+    fn valid_path_segment_rejects_endpoint_alteration() {
+        assert!(valid_path_segment("database"));
+        assert!(valid_path_segment("orders-ro"));
+        // No embedded slash, traversal, control, or query/fragment markers.
+        assert!(!valid_path_segment("db/creds"));
+        assert!(!valid_path_segment(".."));
+        assert!(!valid_path_segment(""));
+        assert!(!valid_path_segment("role?x"));
+        assert!(!valid_path_segment("role#x"));
     }
 
     // --- renewal scheduling (pure) ---
