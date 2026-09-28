@@ -749,6 +749,28 @@ impl LeaseManager {
         })
     }
 
+    /// The current active (serving) lease's runtime handle, or `None` when idle. Loads
+    /// from the durable store so timing reflects the last persisted renewal.
+    pub(crate) async fn active_handle(&self) -> Result<Option<LeaseHandle>> {
+        let Some(active) = self.active.as_ref() else {
+            return Ok(None);
+        };
+        match self.store.get(&active.key).await? {
+            Some((_, record)) => Ok(Some(record.lease()?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether a pending replacement lease is installed (a reissue is in flight).
+    pub(crate) fn has_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Whether a superseded lease is still staged for revocation.
+    pub(crate) fn has_revoking(&self) -> bool {
+        self.revoking.is_some()
+    }
+
     /// Load the active lease's key, version, and current record.
     async fn load_active(&self) -> Result<(String, u64, LeaseRecord)> {
         let active = self

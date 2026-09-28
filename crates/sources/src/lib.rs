@@ -29,6 +29,9 @@ mod vault_lease;
 #[cfg(feature = "vault")]
 #[allow(dead_code)]
 mod vault_lease_manager;
+#[cfg(feature = "vault")]
+#[allow(dead_code)]
+mod vault_lease_rotation;
 // Live Vault + PostgreSQL/MySQL lease lifecycle integration tests (ignored, env-gated).
 #[cfg(all(test, feature = "vault"))]
 mod vault_lease_e2e;
