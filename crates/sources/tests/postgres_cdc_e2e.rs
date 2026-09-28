@@ -225,6 +225,7 @@ async fn make_source(
         backend: make_storage_backend().await,
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
+        rotation: None,
     }
 }
 
@@ -2557,6 +2558,7 @@ async fn make_snap_source(
         backend,
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options,
+        rotation: None,
     }
 }
 

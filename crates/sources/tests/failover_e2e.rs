@@ -259,6 +259,7 @@ async fn make_pg_source(
         snapshot_cfg: SnapshotCfg::default(),
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
+        rotation: None,
     }
 }
 

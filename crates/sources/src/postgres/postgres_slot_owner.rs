@@ -96,7 +96,7 @@ pub fn ownership_proven(
         && rec.database_oid == id.database_oid
 }
 
-async fn connect(dsn: &str) -> Result<tokio_postgres::Client> {
+pub(super) async fn connect(dsn: &str) -> Result<tokio_postgres::Client> {
     let (client, conn) = tokio_postgres::connect(dsn, NoTls)
         .await
         .context("connect")?;
@@ -108,7 +108,7 @@ async fn connect(dsn: &str) -> Result<tokio_postgres::Client> {
     Ok(client)
 }
 
-async fn fetch_identity(
+pub(super) async fn fetch_identity(
     client: &tokio_postgres::Client,
 ) -> Result<ServerDbIdentity> {
     let sid: String = client
@@ -135,7 +135,7 @@ async fn fetch_identity(
 }
 
 /// `None` = slot missing; `Some(active)` = slot exists with that active flag.
-async fn slot_status(
+pub(super) async fn slot_status(
     client: &tokio_postgres::Client,
     slot: &str,
 ) -> Result<Option<bool>> {
@@ -174,16 +174,47 @@ async fn drop_slot(client: &tokio_postgres::Client, slot: &str) -> Result<()> {
     Ok(())
 }
 
-async fn load_owner(
+/// Outcome of reading the durable slot-ownership record, keeping the transient
+/// (retryable) case distinct from the terminal ones so a temporary checkpoint-store
+/// outage never permanently suppresses a valid credential generation.
+pub(super) enum OwnerRead {
+    /// The record was read and deserialized.
+    Present(SlotOwnership),
+    /// The store is reachable but has no record for this source (terminal identity).
+    Missing,
+    /// The store could not be read (transient/unavailable).
+    Unavailable,
+    /// A record exists but did not deserialize (terminal integrity).
+    Malformed,
+}
+
+/// Read the slot-ownership record, distinguishing store-unavailable (transient)
+/// from missing/malformed (terminal). Prefer this over [`load_owner`] where the
+/// caller must retry a transient authority outage rather than fail closed.
+pub(super) async fn read_owner(
+    chkpt: &Arc<dyn CheckpointStore>,
+    source_id: &str,
+) -> OwnerRead {
+    match chkpt.get_raw(&owner_key(source_id)).await {
+        Err(_) => OwnerRead::Unavailable,
+        Ok(None) => OwnerRead::Missing,
+        Ok(Some(bytes)) => {
+            match serde_json::from_slice::<SlotOwnership>(&bytes) {
+                Ok(rec) => OwnerRead::Present(rec),
+                Err(_) => OwnerRead::Malformed,
+            }
+        }
+    }
+}
+
+pub(super) async fn load_owner(
     chkpt: &Arc<dyn CheckpointStore>,
     source_id: &str,
 ) -> Option<SlotOwnership> {
-    chkpt
-        .get_raw(&owner_key(source_id))
-        .await
-        .ok()
-        .flatten()
-        .and_then(|b| serde_json::from_slice(&b).ok())
+    match read_owner(chkpt, source_id).await {
+        OwnerRead::Present(rec) => Some(rec),
+        _ => None,
+    }
 }
 
 async fn write_owner(
@@ -378,6 +409,80 @@ mod tests {
             "reset must propagate a persistence failure so the caller fails \
              closed instead of snapshotting on stale progress"
         );
+    }
+
+    /// A store whose `get_raw` always errors - to prove a transient authority
+    /// outage is classified as retryable, not a permanent identity failure.
+    struct FailingGetStore;
+
+    #[async_trait]
+    impl CheckpointStore for FailingGetStore {
+        async fn get_raw(
+            &self,
+            _source_id: &str,
+        ) -> CheckpointResult<Option<Vec<u8>>> {
+            Err(CheckpointError::Database("injected get_raw failure".into()))
+        }
+        async fn put_raw(
+            &self,
+            _source_id: &str,
+            _bytes: &[u8],
+        ) -> CheckpointResult<()> {
+            Ok(())
+        }
+        async fn delete(&self, _source_id: &str) -> CheckpointResult<bool> {
+            Ok(false)
+        }
+        async fn list(&self) -> CheckpointResult<Vec<String>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn read_owner_store_error_is_unavailable() {
+        let store: Arc<dyn CheckpointStore> = Arc::new(FailingGetStore);
+        assert!(matches!(
+            read_owner(&store, "src1").await,
+            OwnerRead::Unavailable
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_owner_absent_is_missing() {
+        let store: Arc<dyn CheckpointStore> =
+            Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+        assert!(matches!(
+            read_owner(&store, "src1").await,
+            OwnerRead::Missing
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_owner_corrupt_bytes_is_malformed() {
+        let store: Arc<dyn CheckpointStore> =
+            Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+        store
+            .put_raw(&owner_key("src1"), b"not-json")
+            .await
+            .unwrap();
+        assert!(matches!(
+            read_owner(&store, "src1").await,
+            OwnerRead::Malformed
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_owner_valid_record_is_present() {
+        let store: Arc<dyn CheckpointStore> =
+            Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+        write_owner(&store, &created_record()).await.unwrap();
+        match read_owner(&store, "src1").await {
+            OwnerRead::Present(rec) => {
+                assert_eq!(rec.source_id, "src1");
+                assert_eq!(rec.database_oid, 16384);
+            }
+            _ => panic!("expected Present owner record"),
+        }
     }
 
     fn id() -> ServerDbIdentity {

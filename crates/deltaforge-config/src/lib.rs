@@ -186,6 +186,47 @@ pub struct SourceCredentialsCfg {
     pub password: Option<secrets::SecretReference>,
 }
 
+/// Opt-in controlled credential rotation for a source whose credentials are
+/// file-backed (a projected secret volume). When set, the source watches the
+/// referenced files and, on a validated change, performs a two-stage reconnect at
+/// a safe boundary. Non-file-backed credentials ignore this (rotation stays off).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CredentialRotationCfg {
+    /// Trusted root directory for symlink resolution of the watched secret files
+    /// (the projected-volume mount point). Watched references must resolve within
+    /// it.
+    pub trusted_root: std::path::PathBuf,
+    /// How often to poll the watched files for a change.
+    #[serde(default = "default_rotation_poll_ms")]
+    pub poll_interval_ms: u64,
+    /// How long an observed change must be stable before it is applied (guards
+    /// against reading a half-written projected update).
+    #[serde(default = "default_rotation_debounce_ms")]
+    pub debounce_ms: u64,
+    /// Maximum size of any single watched secret file.
+    #[serde(default = "default_rotation_max_secret_bytes")]
+    pub max_secret_bytes: usize,
+    /// Per-step timeout bounding each stage of the boundary reconnect.
+    #[serde(default = "default_rotation_apply_timeout_ms")]
+    pub apply_timeout_ms: u64,
+}
+
+fn default_rotation_poll_ms() -> u64 {
+    2000
+}
+
+fn default_rotation_debounce_ms() -> u64 {
+    1000
+}
+
+fn default_rotation_max_secret_bytes() -> usize {
+    64 * 1024
+}
+
+fn default_rotation_apply_timeout_ms() -> u64 {
+    30_000
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PostgresSrcCfg {
     pub id: String,
@@ -220,6 +261,9 @@ pub struct PostgresSrcCfg {
     /// What to do when schema drift is detected after failover.
     #[serde(default)]
     pub on_schema_drift: OnSchemaDrift,
+    /// Opt-in controlled credential rotation (file-backed credentials only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<CredentialRotationCfg>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

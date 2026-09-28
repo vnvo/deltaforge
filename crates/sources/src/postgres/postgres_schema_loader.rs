@@ -77,6 +77,15 @@ impl PostgresSchemaLoader {
         }
     }
 
+    /// Replace the connection DSN after a credential rotation. The loader shares
+    /// the protected wrapper; the cache (shared via `Arc`) is preserved, and only
+    /// subsequent connections use the new credentials. Called by the run loop at a
+    /// quiesced boundary once the replacement stream is confirmed, so no schema
+    /// query is in flight against the old DSN.
+    pub(crate) fn set_dsn(&mut self, dsn: crate::credentials::ProtectedDsn) {
+        self.dsn = dsn;
+    }
+
     /// Get a database connection.
     async fn connect(&self) -> SourceResult<tokio_postgres::Client> {
         let (client, conn) = tokio_postgres::connect(self.dsn.expose(), NoTls)

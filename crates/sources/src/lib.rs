@@ -23,7 +23,10 @@ pub mod snapshot_generation;
 use anyhow::{Context, Result};
 use deltaforge_config::{PipelineSpec, SourceCfg};
 use deltaforge_core::ArcDynSource;
-use secrets::SecretResolver;
+use secrets::{
+    CompositeResolver, EnvResolver, FileMode, FilePolicy, FileResolver,
+    SecretResolver,
+};
 use std::sync::Arc;
 use storage::{ArcStorageBackend, DurableSchemaRegistry};
 
@@ -44,6 +47,32 @@ pub use rotation::{
     RotationComposition, RotationCoordinator, RotationReject, apply_two_stage,
     compose, earliest_expiry,
 };
+
+/// Build the secret resolver for a source's startup credential resolution.
+///
+/// When controlled rotation is configured, the credential files are on a Kubernetes
+/// projected volume, whose keys are symlinks; the resolver must run in
+/// [`FileMode::ProjectedVolume`] rooted at the configured `trusted_root`, or startup
+/// resolution of the initial DSN would fail on the symlinks before rotation is even
+/// wired. The same resolver is used for the initial DSN and for [`build_source`]'s
+/// rotation spec. Without rotation, the strict-symlink default is retained.
+pub fn source_secret_resolver(pipeline: &PipelineSpec) -> CompositeResolver {
+    if let SourceCfg::Postgres(c) = &pipeline.spec.source {
+        if let Some(rot) = &c.rotation {
+            return CompositeResolver::new(
+                EnvResolver::from_process(),
+                FileResolver::new(FilePolicy {
+                    max_size: rot.max_secret_bytes,
+                    mode: FileMode::ProjectedVolume {
+                        trusted_root: rot.trusted_root.clone(),
+                    },
+                    trim_trailing_newline: false,
+                }),
+            );
+        }
+    }
+    default_secret_resolver()
+}
 
 /// Resolve the source's connection DSN from configuration (inline, whole-DSN
 /// secret, or base DSN plus referenced credentials). This performs all secret
@@ -67,32 +96,41 @@ pub async fn resolve_source_dsn(
 }
 
 /// Build a CDC source from pipeline configuration and a pre-resolved DSN.
-pub fn build_source(
+///
+/// `resolver` is used only to resolve fixed (env) credential fields for controlled
+/// rotation; it is not retained. A misconfigured rotation fails closed here.
+pub async fn build_source(
     pipeline: &PipelineSpec,
     dsn: ProtectedDsn,
     registry: Arc<DurableSchemaRegistry>,
     backend: ArcStorageBackend,
+    resolver: &dyn SecretResolver,
 ) -> Result<ArcDynSource> {
     match &pipeline.spec.source {
-        SourceCfg::Postgres(c) => Ok(Arc::new(postgres::PostgresSource {
-            id: c.id.clone(),
-            dsn,
-            slot: c.slot.clone(),
-            publication: c.publication.clone(),
-            tables: c.tables.clone(),
-            pipeline: pipeline.metadata.name.clone(),
-            tenant: pipeline.metadata.tenant.clone(),
-            registry,
-            backend: Arc::clone(&backend),
-            outbox_prefixes: c
-                .outbox
-                .as_ref()
-                .map(|o| o.allow_list())
-                .unwrap_or_default(),
-            snapshot_cfg: c.snapshot.clone(),
-            on_schema_drift: c.on_schema_drift.clone(),
-            table_options: c.table_options.clone(),
-        })),
+        SourceCfg::Postgres(c) => {
+            let rotation =
+                postgres::postgres_rotation::build_spec(c, resolver).await?;
+            Ok(Arc::new(postgres::PostgresSource {
+                id: c.id.clone(),
+                dsn,
+                slot: c.slot.clone(),
+                publication: c.publication.clone(),
+                tables: c.tables.clone(),
+                pipeline: pipeline.metadata.name.clone(),
+                tenant: pipeline.metadata.tenant.clone(),
+                registry,
+                backend: Arc::clone(&backend),
+                outbox_prefixes: c
+                    .outbox
+                    .as_ref()
+                    .map(|o| o.allow_list())
+                    .unwrap_or_default(),
+                snapshot_cfg: c.snapshot.clone(),
+                on_schema_drift: c.on_schema_drift.clone(),
+                table_options: c.table_options.clone(),
+                rotation,
+            }))
+        }
 
         SourceCfg::Mysql(c) => Ok(Arc::new(mysql::MySqlSource {
             id: c.id.clone(),

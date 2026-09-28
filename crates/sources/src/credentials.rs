@@ -39,6 +39,14 @@ impl ProtectedDsn {
     pub fn expose(&self) -> &str {
         self.0.as_str()
     }
+
+    /// Whether two protected DSNs carry the same value, compared internally
+    /// without handing plaintext to the caller. Used to suppress a no-op rotation
+    /// to identical credentials; not a constant-time comparison and not for
+    /// authentication decisions.
+    pub fn same_dsn(&self, other: &ProtectedDsn) -> bool {
+        self.0.as_str() == other.0.as_str()
+    }
 }
 
 impl From<String> for ProtectedDsn {
