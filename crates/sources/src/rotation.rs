@@ -293,6 +293,15 @@ impl RotationCoordinator {
         self.in_flight
     }
 
+    /// Whether the coordinator currently holds a live transient-retry for `generation`
+    /// (it will re-hand this candidate). This is the authoritative `retry_pending` signal
+    /// carried in [`ApplyFeedback`], so a producer never has to infer coordinator state.
+    pub fn has_pending_retry(&self, generation: u64) -> bool {
+        self.retry
+            .as_ref()
+            .is_some_and(|r| r.generation == generation)
+    }
+
     /// Decide what the run loop should do with the latest candidate. Enforces, in
     /// order: terminal floor, in-flight de-duplication, supersession (a newer
     /// generation abandons an older in-flight one so the loop can cancel its
@@ -463,7 +472,7 @@ pub enum RotationReject {
 }
 
 /// Result of the Stage-B apply sequence.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApplyOutcome {
     /// Replacement opened; the caller swaps the runtime DSN and continues.
     Applied,
@@ -480,6 +489,17 @@ pub enum ApplyOutcome {
     /// Neither credential set reconnected. The caller must **stop fail-closed
     /// without advancing the checkpoint**.
     FailedClosed,
+}
+
+/// One reconnect outcome, fed back to a credential producer that needs to react to how
+/// its candidate was applied (e.g. the Vault lease driver, which promotes/revokes leases
+/// per the outcome). `retry_pending` is the coordinator's own decision - whether it has a
+/// live retry scheduled for this generation - never inferred by the consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplyFeedback {
+    pub generation: u64,
+    pub outcome: ApplyOutcome,
+    pub retry_pending: bool,
 }
 
 /// The Stage-B two-stage apply, run at a quiesced whole-transaction boundary.

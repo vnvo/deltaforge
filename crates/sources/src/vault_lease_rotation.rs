@@ -25,7 +25,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 
 use crate::credentials::ProtectedDsn;
-use crate::rotation::{ApplyOutcome, Candidate, RotationComposition, compose};
+use crate::rotation::{
+    ApplyFeedback, ApplyOutcome, Candidate, RotationComposition, compose,
+};
 use crate::rotation_manager::is_transient;
 use crate::vault_lease_manager::{
     LeaseManager, LeaseScheduleConfig, LeaseTick, lease_tick,
@@ -57,16 +59,6 @@ impl LeaseFatalReason {
             LeaseFatalReason::StoreFailure => "store_failure",
         }
     }
-}
-
-/// One reconnect outcome fed back from the rotation coordinator for the generation the
-/// driver published. `retry_pending` is the coordinator's own decision (whether it will
-/// re-hand this generation), never inferred by the driver.
-#[derive(Debug)]
-pub(crate) struct ApplyFeedback {
-    pub generation: u64,
-    pub outcome: ApplyOutcome,
-    pub retry_pending: bool,
 }
 
 /// Drives leased-credential rotation for one source.

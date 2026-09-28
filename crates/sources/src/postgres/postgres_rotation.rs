@@ -347,7 +347,7 @@ impl RotationRuntime {
         .await;
 
         if let ApplyStep::Applied =
-            self.mgr.finish_apply(generation, outcome)?
+            self.mgr.finish_apply(generation, outcome).await?
         {
             ctx.dsn = candidate.dsn.clone();
             ctx.schema.set_dsn(candidate.dsn.clone());

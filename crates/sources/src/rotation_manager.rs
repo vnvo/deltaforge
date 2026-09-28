@@ -31,16 +31,16 @@ use secrets::{
     CredentialFieldRequest, CredentialSet, FileWatcher, RotationOutcome,
     SecretProvider, SecretReference, SecretResolver, SecretString,
 };
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::credentials::ProtectedDsn;
 use crate::rotation::{
-    ApplyOutcome, Candidate, DbKind, Eligibility, FieldSource, RetryConfig,
-    RotationComposition, RotationCoordinator, RotationReject, compose,
-    earliest_expiry,
+    ApplyFeedback, ApplyOutcome, Candidate, DbKind, Eligibility, FieldSource,
+    RetryConfig, RotationComposition, RotationCoordinator, RotationReject,
+    compose, earliest_expiry,
 };
 
 pub(crate) fn fail_closed(
@@ -671,6 +671,11 @@ pub(crate) struct RotationManager {
     pipeline: String,
     apply_timeout: Duration,
     preflight: Option<Preflight>,
+    /// When set (leased dynamic credentials), each apply outcome is delivered here for
+    /// the lease-rotation driver to promote/revoke leases. Reliable, bounded delivery:
+    /// `finish_apply` awaits capacity, so a full channel pauses the apply path rather
+    /// than dropping an outcome. `None` for file/KV rotations (no behavior change).
+    feedback: Option<mpsc::Sender<ApplyFeedback>>,
 }
 
 impl RotationManager {
@@ -735,7 +740,19 @@ impl RotationManager {
             pipeline,
             apply_timeout: spec.apply_timeout,
             preflight: None,
+            feedback: None,
         })
+    }
+
+    /// Install the lease-rotation feedback sender (leased dynamic credentials only), so
+    /// each apply outcome is delivered to the driver. Wired by the VaultLease build path.
+    // Consumed by the VaultLease spawn wiring (next slice); allowed to be unused until then.
+    #[allow(dead_code)]
+    pub(crate) fn set_feedback(
+        &mut self,
+        feedback: mpsc::Sender<ApplyFeedback>,
+    ) {
+        self.feedback = Some(feedback);
     }
 
     pub(crate) fn apply_timeout(&self) -> Duration {
@@ -867,7 +884,7 @@ impl RotationManager {
     /// Record a Stage-B [`ApplyOutcome`], emit the matching metric, and decide the
     /// run loop's next step. `CloseUncertain`/`FailedClosed` map to a fatal error
     /// (the caller must stop without advancing the checkpoint).
-    pub(crate) fn finish_apply(
+    pub(crate) async fn finish_apply(
         &mut self,
         generation: u64,
         outcome: ApplyOutcome,
@@ -884,6 +901,23 @@ impl RotationManager {
         }
         let step =
             record_and_decide(&mut self.coordinator, generation, outcome);
+        // Deliver the outcome to the lease driver (if any) with the coordinator's own
+        // retry decision. Reliable: await capacity so a full channel pauses the apply
+        // path rather than dropping feedback.
+        if let Some(feedback) = &self.feedback {
+            let fb = ApplyFeedback {
+                generation,
+                outcome,
+                retry_pending: self.coordinator.has_pending_retry(generation),
+            };
+            if feedback.send(fb).await.is_err() {
+                warn!(
+                    source_id = %self.source_id,
+                    generation,
+                    "lease-rotation feedback channel closed; driver gone"
+                );
+            }
+        }
         match &step {
             Ok(ApplyStep::Applied) => {
                 info!(
