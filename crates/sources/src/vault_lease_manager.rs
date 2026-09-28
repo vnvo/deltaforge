@@ -22,6 +22,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use metrics::{counter, gauge};
 use secrets::{LeaseInfo, LeasedRead, ProviderFailureKind, SecretError};
 
 use crate::vault_lease::{
@@ -342,6 +343,8 @@ impl LeaseManager {
             key: record.key(),
             version,
         });
+        self.metric_lifecycle("issued");
+        self.metric_expiry(record.expires_at_ms);
         Ok(LeasedCredentialSet {
             credentials: read.credentials,
             lease: handle,
@@ -428,6 +431,8 @@ impl LeaseManager {
             key,
             version: new_version,
         });
+        self.metric_lifecycle("renewed");
+        self.metric_expiry(refreshed.expires_at_ms);
         Ok(refreshed.lease()?)
     }
 
@@ -445,6 +450,8 @@ impl LeaseManager {
         // `self.active` with the new lease.
         let leased = self.issue_pending(now).await?;
         self.promote_active().await?;
+
+        self.metric_lifecycle("reissued");
 
         // Supersede + revoke the old lease, if there was one.
         if let Some((old_key, old_version, old_record)) = old {
@@ -506,7 +513,12 @@ impl LeaseManager {
                 OpFault::Transient | OpFault::Fatal => return Err(e.into()),
             },
         };
-        self.resolve_revoke(&key, event).await
+        let outcome = self.resolve_revoke(&key, event).await?;
+        self.metric_lifecycle(match outcome {
+            RevokeOutcome::Finalized => "revoked",
+            RevokeOutcome::Orphaned => "orphaned",
+        });
+        Ok(outcome)
     }
 
     /// Apply a revoke-resolution event to the record at `key` (reloading for its
@@ -642,6 +654,70 @@ impl LeaseManager {
         }
         Ok(summary)
     }
+
+    /// A secret-free snapshot of the active lease for operational status. Carries no
+    /// lease id and no credential material - only the lifecycle state, role/mount,
+    /// renewability, expiry timing, and how many leases this run has issued. Safe to
+    /// log or return from an admin/status endpoint.
+    pub(crate) async fn status(&self) -> Result<LeaseStatus> {
+        let mut status = LeaseStatus {
+            state: "none",
+            mount: self.mount.clone(),
+            role: self.role.clone(),
+            renewable: false,
+            expires_at_ms: None,
+            issued_count: self.gen_counter,
+        };
+        if let Some(active) = &self.active {
+            if let Some((_, record)) = self.store.get(&active.key).await? {
+                status.state = record.state.name();
+                status.renewable = record.renewable;
+                status.expires_at_ms = Some(record.expires_at_ms);
+            }
+        }
+        Ok(status)
+    }
+
+    /// Increment a lifecycle counter, labeled by the non-secret scope identifiers only.
+    /// `event` is a fixed lifecycle label (`issued`/`renewed`/`reissued`/`revoked`/
+    /// `orphaned`), never anything derived from a lease id or credential.
+    fn metric_lifecycle(&self, event: &'static str) {
+        counter!(
+            "deltaforge_vault_lease_events_total",
+            "pipeline" => self.id.pipeline.clone(),
+            "source" => self.id.source.clone(),
+            "purpose" => self.id.credential_purpose.clone(),
+            "event" => event,
+        )
+        .increment(1);
+    }
+
+    /// Record the active lease's true expiry (unix seconds). Timing is not secret; the
+    /// lease id and credential are never emitted.
+    fn metric_expiry(&self, expires_at_ms: u64) {
+        gauge!(
+            "deltaforge_vault_lease_active_expires_at_seconds",
+            "pipeline" => self.id.pipeline.clone(),
+            "source" => self.id.source.clone(),
+            "purpose" => self.id.credential_purpose.clone(),
+        )
+        .set((expires_at_ms / 1000) as f64);
+    }
+}
+
+/// A secret-free operational status snapshot of the active lease. Deliberately holds
+/// no lease id and no credential material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LeaseStatus {
+    /// The active lease's lifecycle state name, or `"none"` when idle.
+    pub state: &'static str,
+    pub mount: String,
+    pub role: String,
+    pub renewable: bool,
+    /// True expiry as unix milliseconds, if a lease is active.
+    pub expires_at_ms: Option<u64>,
+    /// How many leases this run has issued (monotonic).
+    pub issued_count: u64,
 }
 
 /// Bounded page size for recovery / reconciliation scans.
@@ -1182,6 +1258,28 @@ mod tests {
         assert_eq!(summary.still_orphaned, 1);
         let (_, rec) = new.store.get(&old_key).await.unwrap().unwrap();
         assert_eq!(rec.state, LeaseState::Orphaned);
+    }
+
+    // --- operational status (secret-free) ---
+
+    #[tokio::test]
+    async fn status_is_secret_free_and_reflects_active_lease() {
+        let mut m = manager(Arc::new(MockProvider::renewable()));
+        // Idle before issuing.
+        assert_eq!(m.status().await.unwrap().state, "none");
+
+        m.issue(t(EPOCH_MS)).await.unwrap();
+        let s = m.status().await.unwrap();
+        assert_eq!(s.state, "active");
+        assert_eq!(s.role, "orders-ro");
+        assert!(s.renewable);
+        assert!(s.expires_at_ms.is_some());
+        assert_eq!(s.issued_count, 1);
+
+        // The status must never carry the lease id (mock issues "lease-1").
+        let dbg = format!("{s:?}");
+        assert!(!dbg.contains("lease-"), "status leaks a lease id: {dbg}");
+        assert!(!dbg.contains("username") && !dbg.contains("password"));
     }
 
     // helper for private-field assertions
