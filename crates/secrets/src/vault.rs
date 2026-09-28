@@ -38,7 +38,7 @@ use crate::error::{ProviderFailureKind, SecretError};
 use crate::material::SecretString;
 use crate::providers::{FileMode, FilePolicy, FileResolver};
 use crate::reference::{SecretProvider, SecretReference};
-use crate::resolved::{ResolvedSecret, SecretMaterial};
+use crate::resolved::{ResolutionGroup, ResolvedSecret, SecretMaterial};
 use crate::resolver::{
     CredentialFieldRequest, SecretResolver, check_no_duplicate_fields,
 };
@@ -717,6 +717,29 @@ impl VaultShared {
     fn secret_token(&self, raw: String) -> Result<SecretString, SecretError> {
         SecretString::new(raw, self.conn.max_secret_bytes, &self.reference())
     }
+
+    /// A scrubbed-on-drop copy of the current client token for a request header.
+    async fn current_token(&self) -> zeroize::Zeroizing<String> {
+        zeroize::Zeroizing::new(
+            self.token.read().await.expose_secret().to_string(),
+        )
+    }
+
+    /// POST with a token, ignoring an empty/!content response body (e.g. a 204 from
+    /// `sys/leases/revoke`).
+    async fn post_no_content<B: Serialize>(
+        &self,
+        url: Url,
+        token: Option<&str>,
+        body: &B,
+        reference: &SecretReference,
+    ) -> Result<(), SecretError> {
+        let req = self.with_headers(self.http.post(url).json(body), token);
+        let _ = self
+            .execute(req, CONTROL_RESPONSE_CAP, false, reference)
+            .await?;
+        Ok(())
+    }
 }
 
 fn kv_response_cap(max_secret_bytes: usize) -> usize {
@@ -766,6 +789,186 @@ impl VaultApi for VaultShared {
             fields,
             version: Some(resp.data.metadata.version.to_string()),
         })
+    }
+}
+
+/// A dynamic (leased) credential read from a Vault secrets engine: the atomic
+/// credential set plus its lease handle fields. The `credentials` carry
+/// `expires_at`/`renewable` so the rotation core's expiry handling applies. Callers
+/// (the sources lease manager) wrap `lease_id` in their own redacted, durable type.
+pub struct LeasedRead {
+    pub credentials: CredentialSet,
+    /// The Vault lease id. Sensitive-adjacent: never log it; the caller stores it in
+    /// a redacted, durable handle.
+    pub lease_id: String,
+    pub lease_duration: Duration,
+    pub renewable: bool,
+}
+
+/// The result of a lease lookup or renew: the (possibly extended) remaining duration
+/// and whether the lease is still renewable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseInfo {
+    pub lease_duration: Duration,
+    pub renewable: bool,
+}
+
+/// The Vault lease operations the sources lease manager drives, behind a trait so
+/// they are mockable without a live server. Engine reads issue a lease; `sys/leases`
+/// renews/looks-up/revokes it by id.
+#[async_trait]
+pub(crate) trait VaultLeaseApi: Send + Sync {
+    /// Read a dynamic credential from `<mount>/creds/<role>`, creating a lease.
+    async fn read_db_credentials(
+        &self,
+        mount: &str,
+        role: &str,
+    ) -> Result<LeasedRead, SecretError>;
+    async fn lookup_lease(
+        &self,
+        lease_id: &str,
+    ) -> Result<LeaseInfo, SecretError>;
+    async fn renew_lease(
+        &self,
+        lease_id: &str,
+        increment_secs: Option<u64>,
+    ) -> Result<LeaseInfo, SecretError>;
+    async fn revoke_lease(&self, lease_id: &str) -> Result<(), SecretError>;
+}
+
+#[derive(serde::Deserialize)]
+struct DbCredsResponse {
+    data: BTreeMap<String, serde_json::Value>,
+    lease_id: String,
+    lease_duration: u64,
+    renewable: bool,
+}
+#[derive(serde::Deserialize)]
+struct LeaseLookupResponse {
+    data: LeaseLookupData,
+}
+#[derive(serde::Deserialize)]
+struct LeaseLookupData {
+    ttl: u64,
+    renewable: bool,
+}
+#[derive(serde::Deserialize)]
+struct LeaseRenewResponse {
+    lease_duration: u64,
+    renewable: bool,
+}
+
+#[async_trait]
+impl VaultLeaseApi for VaultShared {
+    async fn read_db_credentials(
+        &self,
+        mount: &str,
+        role: &str,
+    ) -> Result<LeasedRead, SecretError> {
+        let reference = SecretReference::new(
+            SecretProvider::Vault,
+            format!("{mount}/creds/{role}"),
+        );
+        let token = self.current_token().await;
+        let resp: DbCredsResponse = self
+            .get_json(
+                self.url(&format!("{mount}/creds/{role}")),
+                Some(&token),
+                kv_response_cap(self.conn.max_secret_bytes),
+                false,
+                &reference,
+            )
+            .await?;
+
+        let limit = self.conn.max_secret_bytes;
+        let now = SystemTime::now();
+        let expires_at = now
+            .checked_add(Duration::from_secs(resp.lease_duration))
+            .unwrap_or(now);
+        // One issue read -> one resolution group; each field is expiry-aware so the
+        // rotation core treats the leased credential as time-bounded.
+        let group = ResolutionGroup::next();
+        let mut credentials = CredentialSet::new();
+        for (k, v) in resp.data {
+            let s = match v {
+                serde_json::Value::String(s) => s,
+                _ => return Err(SecretError::NotUtf8(reference.safe())),
+            };
+            let material =
+                SecretMaterial::Utf8(SecretString::new(s, limit, &reference)?);
+            let resolved = ResolvedSecret::new(material)
+                .in_group(group)
+                .with_expires_at(expires_at)
+                .with_renewable(resp.renewable);
+            credentials.insert(k, resolved)?;
+        }
+        Ok(LeasedRead {
+            credentials,
+            lease_id: resp.lease_id,
+            lease_duration: Duration::from_secs(resp.lease_duration),
+            renewable: resp.renewable,
+        })
+    }
+
+    async fn lookup_lease(
+        &self,
+        lease_id: &str,
+    ) -> Result<LeaseInfo, SecretError> {
+        let reference = self.reference();
+        let token = self.current_token().await;
+        let resp: LeaseLookupResponse = self
+            .post_json(
+                self.url("sys/leases/lookup"),
+                Some(&token),
+                &serde_json::json!({ "lease_id": lease_id }),
+                CONTROL_RESPONSE_CAP,
+                &reference,
+            )
+            .await?;
+        Ok(LeaseInfo {
+            lease_duration: Duration::from_secs(resp.data.ttl),
+            renewable: resp.data.renewable,
+        })
+    }
+
+    async fn renew_lease(
+        &self,
+        lease_id: &str,
+        increment_secs: Option<u64>,
+    ) -> Result<LeaseInfo, SecretError> {
+        let reference = self.reference();
+        let token = self.current_token().await;
+        let body = match increment_secs {
+            Some(i) => {
+                serde_json::json!({ "lease_id": lease_id, "increment": i })
+            }
+            None => serde_json::json!({ "lease_id": lease_id }),
+        };
+        let resp: LeaseRenewResponse = self
+            .post_json(
+                self.url("sys/leases/renew"),
+                Some(&token),
+                &body,
+                CONTROL_RESPONSE_CAP,
+                &reference,
+            )
+            .await?;
+        Ok(LeaseInfo {
+            lease_duration: Duration::from_secs(resp.lease_duration),
+            renewable: resp.renewable,
+        })
+    }
+
+    async fn revoke_lease(&self, lease_id: &str) -> Result<(), SecretError> {
+        let reference = self.reference();
+        let token = self.current_token().await;
+        self.post_no_content(
+            self.url("sys/leases/revoke"),
+            Some(&token),
+            &serde_json::json!({ "lease_id": lease_id }),
+            &reference,
+        )
+        .await
     }
 }
 
@@ -985,6 +1188,9 @@ async fn read_body_capped(
 /// versions honored and the record version propagated as `provider_version`.
 pub struct VaultResolver {
     api: Arc<dyn VaultApi>,
+    /// Vault lease operations (dynamic-credential issue + `sys/leases` lifecycle).
+    /// For the live client this is the same [`VaultShared`] as `api`.
+    lease: Arc<dyn VaultLeaseApi>,
 }
 
 impl std::fmt::Debug for VaultResolver {
@@ -1008,12 +1214,61 @@ impl VaultResolver {
         *shared.token.write().await = token;
         let shared = Arc::new(shared);
         spawn_renewal(Arc::downgrade(&shared), lease);
-        Ok(Self { api: shared })
+        Ok(Self {
+            api: shared.clone(),
+            lease: shared,
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn with_api(api: Arc<dyn VaultApi>) -> Self {
-        Self { api }
+        Self {
+            api,
+            lease: Arc::new(UnsupportedLease),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_lease_api(lease: Arc<dyn VaultLeaseApi>) -> Self {
+        Self {
+            api: Arc::new(UnsupportedKv),
+            lease,
+        }
+    }
+
+    /// Read a dynamic (leased) credential, creating a Vault lease. The caller owns
+    /// the returned lease id and must persist/renew/revoke it.
+    pub async fn read_db_credentials(
+        &self,
+        mount: &str,
+        role: &str,
+    ) -> Result<LeasedRead, SecretError> {
+        self.lease.read_db_credentials(mount, role).await
+    }
+
+    /// Look up a lease's remaining duration and renewability.
+    pub async fn lookup_lease(
+        &self,
+        lease_id: &str,
+    ) -> Result<LeaseInfo, SecretError> {
+        self.lease.lookup_lease(lease_id).await
+    }
+
+    /// Renew a lease, optionally requesting an increment (seconds).
+    pub async fn renew_lease(
+        &self,
+        lease_id: &str,
+        increment_secs: Option<u64>,
+    ) -> Result<LeaseInfo, SecretError> {
+        self.lease.renew_lease(lease_id, increment_secs).await
+    }
+
+    /// Revoke a lease.
+    pub async fn revoke_lease(
+        &self,
+        lease_id: &str,
+    ) -> Result<(), SecretError> {
+        self.lease.revoke_lease(lease_id).await
     }
 
     /// Split a reference location `"<mount>/<path>"` into `(mount, path)` and
@@ -1033,6 +1288,61 @@ impl VaultResolver {
         }
         Ok((mount, path))
     }
+}
+
+/// Test stub: a resolver built with a mock KV api has no lease backend.
+#[cfg(test)]
+struct UnsupportedLease;
+#[cfg(test)]
+#[async_trait]
+impl VaultLeaseApi for UnsupportedLease {
+    async fn read_db_credentials(
+        &self,
+        _mount: &str,
+        _role: &str,
+    ) -> Result<LeasedRead, SecretError> {
+        Err(unsupported_stub())
+    }
+    async fn lookup_lease(
+        &self,
+        _lease_id: &str,
+    ) -> Result<LeaseInfo, SecretError> {
+        Err(unsupported_stub())
+    }
+    async fn renew_lease(
+        &self,
+        _lease_id: &str,
+        _increment_secs: Option<u64>,
+    ) -> Result<LeaseInfo, SecretError> {
+        Err(unsupported_stub())
+    }
+    async fn revoke_lease(&self, _lease_id: &str) -> Result<(), SecretError> {
+        Err(unsupported_stub())
+    }
+}
+
+/// Test stub: a resolver built with a mock lease api has no KV backend.
+#[cfg(test)]
+struct UnsupportedKv;
+#[cfg(test)]
+#[async_trait]
+impl VaultApi for UnsupportedKv {
+    async fn read_kv2(
+        &self,
+        _mount: &str,
+        _path: &str,
+        _version: Option<&str>,
+        _reference: &SecretReference,
+    ) -> Result<KvRecord, SecretError> {
+        Err(unsupported_stub())
+    }
+}
+
+#[cfg(test)]
+fn unsupported_stub() -> SecretError {
+    SecretError::UnsupportedProvider(
+        SecretReference::new(SecretProvider::Vault, "stub").safe(),
+    )
 }
 
 #[async_trait]
@@ -1152,6 +1462,99 @@ mod tests {
                 version: ver.clone(),
             })
         }
+    }
+
+    // --- lease client (mock VaultLeaseApi) ---
+
+    struct MockLeaseApi;
+
+    #[async_trait]
+    impl VaultLeaseApi for MockLeaseApi {
+        async fn read_db_credentials(
+            &self,
+            _mount: &str,
+            _role: &str,
+        ) -> Result<LeasedRead, SecretError> {
+            let reference =
+                SecretReference::new(SecretProvider::Vault, "database/creds/r");
+            let expires_at = SystemTime::now() + Duration::from_secs(3600);
+            let group = ResolutionGroup::next();
+            let mut credentials = CredentialSet::new();
+            for (k, v) in [("username", "df-dyn"), ("password", "p@ss")] {
+                let material = SecretMaterial::Utf8(
+                    SecretString::new(
+                        v.to_string(),
+                        DEFAULT_MAX_SECRET_BYTES,
+                        &reference,
+                    )
+                    .unwrap(),
+                );
+                let resolved = ResolvedSecret::new(material)
+                    .in_group(group)
+                    .with_expires_at(expires_at)
+                    .with_renewable(true);
+                credentials.insert(k, resolved).unwrap();
+            }
+            Ok(LeasedRead {
+                credentials,
+                lease_id: "lease-xyz".to_string(),
+                lease_duration: Duration::from_secs(3600),
+                renewable: true,
+            })
+        }
+        async fn lookup_lease(
+            &self,
+            _lease_id: &str,
+        ) -> Result<LeaseInfo, SecretError> {
+            Ok(LeaseInfo {
+                lease_duration: Duration::from_secs(1800),
+                renewable: true,
+            })
+        }
+        async fn renew_lease(
+            &self,
+            _lease_id: &str,
+            _increment_secs: Option<u64>,
+        ) -> Result<LeaseInfo, SecretError> {
+            Ok(LeaseInfo {
+                lease_duration: Duration::from_secs(120),
+                renewable: true,
+            })
+        }
+        async fn revoke_lease(
+            &self,
+            _lease_id: &str,
+        ) -> Result<(), SecretError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn leased_read_is_grouped_and_expiry_aware() {
+        let r = VaultResolver::with_lease_api(Arc::new(MockLeaseApi));
+        let read = r
+            .read_db_credentials("database", "orders-ro")
+            .await
+            .unwrap();
+        assert_eq!(read.lease_id, "lease-xyz");
+        assert!(read.renewable);
+        // One issue read -> single provenance group; fields are expiry-aware.
+        assert!(read.credentials.single_resolution_group().is_ok());
+        let u = read.credentials.require("username").unwrap();
+        assert_eq!(u.material().as_utf8(), Some("df-dyn"));
+        assert!(u.expires_at().is_some());
+        assert!(u.renewable());
+    }
+
+    #[tokio::test]
+    async fn lease_ops_delegate_to_backend() {
+        let r = VaultResolver::with_lease_api(Arc::new(MockLeaseApi));
+        assert!(r.lookup_lease("l").await.unwrap().renewable);
+        assert_eq!(
+            r.renew_lease("l", Some(60)).await.unwrap().lease_duration,
+            Duration::from_secs(120)
+        );
+        r.revoke_lease("l").await.unwrap();
     }
 
     fn field_ref(location: &str, selector: &str) -> SecretReference {
