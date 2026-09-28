@@ -26,6 +26,9 @@ pub mod snapshot_generation;
 #[cfg(feature = "vault")]
 #[allow(dead_code)]
 mod vault_lease;
+#[cfg(feature = "vault")]
+#[allow(dead_code)]
+mod vault_lease_manager;
 
 use anyhow::{Context, Result};
 use deltaforge_config::{PipelineSpec, RotationTriggerCfg, SourceCfg};
