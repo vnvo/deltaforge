@@ -446,11 +446,18 @@ impl LeaseManager {
             renewable,
         } = action
         {
-            // Renew extends from now; keep issued_at, refresh duration/expiry.
-            updated.lease_duration_ms = info.lease_duration.as_millis() as u64;
+            // Renew extends from now; keep issued_at, refresh duration/expiry with
+            // checked conversions/arithmetic (no truncating `as u64`).
+            updated.lease_duration_ms = u64::try_from(
+                info.lease_duration.as_millis(),
+            )
+            .map_err(|_| anyhow::anyhow!("renewed lease duration overflow"))?;
             updated.expires_at_ms = expires_at_ms;
             updated.renewable = renewable;
-            updated.auth_session_epoch += 1;
+            updated.auth_session_epoch =
+                updated.auth_session_epoch.checked_add(1).ok_or_else(|| {
+                    anyhow::anyhow!("auth session epoch overflow")
+                })?;
         }
         if !self.store.cas(key, version, &updated).await? {
             anyhow::bail!("lease store version conflict on renew");
@@ -524,6 +531,15 @@ impl LeaseManager {
         let _ = self.load_active().await?;
         if self.pending.is_some() {
             anyhow::bail!("a pending replacement lease already exists");
+        }
+        // A superseded lease still awaiting revocation owns the single `revoking` slot;
+        // starting another reissue could overwrite it and lose retry ownership. Refuse
+        // until `retry_revoking` has drained it.
+        if self.revoking.is_some() {
+            anyhow::bail!(
+                "a superseded lease is still awaiting revocation; \
+                 retry_revoking must complete first"
+            );
         }
         let (slot, leased) = self.mint_pending(now).await?;
         self.pending = Some(slot);
@@ -1613,6 +1629,47 @@ mod tests {
         assert!(m.revoking.is_none());
         let (_, old_rec) = m.store.get(&old_key).await.unwrap().unwrap();
         assert_eq!(old_rec.state, LeaseState::Revoked);
+    }
+
+    #[tokio::test]
+    async fn reissue_refused_while_a_lease_awaits_revocation() {
+        // A transient revoke failure leaves the old lease staged in `revoking`; a new
+        // reissue must be refused until retry_revoking drains it, so the staged handle
+        // is never overwritten.
+        let provider = Arc::new(MockProvider::renewable());
+        provider.set_revoke_transient(1);
+        let backend: storage::ArcStorageBackend =
+            Arc::new(MemoryStorageBackend::new());
+        let (mut m, old_key, _new_key) =
+            issued_and_reissued(provider.clone(), backend).await;
+
+        // Applied: promotion + old load succeed, revoke fails transiently -> staged.
+        assert!(
+            m.resolve_reissue(ApplyOutcome::Applied, false)
+                .await
+                .is_err()
+        );
+        assert_eq!(m.revoking.as_ref().unwrap().key, old_key);
+
+        // Another reissue is refused while the earlier lease is still staged.
+        assert!(
+            m.reissue(t(EPOCH_MS + 6_000_000)).await.is_err(),
+            "reissue must be refused while a lease awaits revocation"
+        );
+        assert_eq!(
+            m.revoking.as_ref().unwrap().key,
+            old_key,
+            "the staged handle is preserved"
+        );
+
+        // Drain the staged revoke, then reissue is allowed again.
+        assert_eq!(
+            m.retry_revoking().await.unwrap(),
+            Some(RevokeOutcome::Finalized)
+        );
+        assert!(m.revoking.is_none());
+        m.reissue(t(EPOCH_MS + 7_000_000)).await.unwrap();
+        assert!(m.pending.is_some());
     }
 
     #[tokio::test]
