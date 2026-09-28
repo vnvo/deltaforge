@@ -37,6 +37,8 @@ use postgres_helpers::{
 };
 
 pub mod postgres_slot_owner;
+
+pub mod postgres_rotation;
 use postgres_slot_owner::prepare_snapshot_slot_anchor;
 
 pub mod postgres_object;
@@ -109,6 +111,9 @@ pub struct PostgresSource {
     /// fully-qualified `schema.table`.
     pub table_options:
         std::collections::BTreeMap<String, deltaforge_config::TableOptions>,
+    /// Controlled credential-rotation spec, when configured and file-backed.
+    /// `None` disables rotation for this source.
+    pub rotation: Option<Arc<postgres_rotation::PgRotationSpec>>,
 }
 
 // ============================================================================
@@ -655,7 +660,30 @@ impl PostgresSource {
             *ctx.repl_client.lock().await = new_client;
         }
 
+        // Controlled credential rotation (opt-in, file-backed credentials only).
+        // The runtime owns the watcher/manager task (a child of the source cancel
+        // token); it is cancelled and joined after the loop on every exit path
+        // (`shutdown` below), with `Drop` as the abort backstop for panics.
+        let mut rotation = match &self.rotation {
+            Some(spec) => Some(postgres_rotation::RotationRuntime::spawn(
+                spec,
+                ctx.dsn.clone(),
+                self.id.clone(),
+                self.pipeline.clone(),
+                self.slot.clone(),
+                self.publication.clone(),
+                chkpt_store.clone(),
+                &ctx.cancel,
+            )?),
+            None => None,
+        };
+
         info!("entering replication loop");
+        // The loop runs inside an async block so its result can be captured and the
+        // rotation runtime cancelled+joined before teardown, on both the normal and
+        // fatal exit paths. A fatal result (including gate-6 rotation failures) is
+        // re-propagated after join and before the teardown checkpoint put.
+        let loop_result: SourceResult<()> = async {
         loop {
             if !pause_until_resumed(&ctx.cancel, &ctx.paused, &ctx.pause_notify)
                 .await
@@ -663,15 +691,48 @@ impl PostgresSource {
                 break;
             }
 
+            // Rotation: schedule Stage-A preflight concurrently with the stream,
+            // and apply the Stage-B swap only at a whole-transaction boundary.
+            if let Some(rt) = rotation.as_mut() {
+                rt.drive_preflight(&ctx);
+                if ctx.current_tx_id.is_none() {
+                    // A CloseUncertain/FailedClosed outcome returns an error from
+                    // this block (gate 6). After join, `loop_result?` re-propagates
+                    // it before the teardown checkpoint put, so the checkpoint never
+                    // advances past the last committed transaction.
+                    rt.apply_at_boundary(&mut ctx).await?;
+                }
+            }
+
             debug!(source_id = %self.id, "reading next event");
 
-            let event_result = match read_next_event(&ctx).await {
-                Ok(Some(event)) => dispatch_event(&mut ctx, event).await,
-                Ok(None) => {
-                    info!(source_id = %self.id, "replication stream ended");
-                    break;
+            let event_result = match rotation.as_mut() {
+                // Idle-source wakeup: race the read against rotation activity so a
+                // rotation applies even when no events are flowing. The wait is
+                // cancellation-safe; the read future is dropped on a rotation wake.
+                Some(rt) => {
+                    tokio::select! {
+                        r = read_next_event(&ctx) => match r {
+                            Ok(Some(event)) => {
+                                dispatch_event(&mut ctx, event).await
+                            }
+                            Ok(None) => {
+                                info!(source_id = %self.id, "replication stream ended");
+                                break;
+                            }
+                            Err(ctrl) => Err(ctrl),
+                        },
+                        _ = rt.wait_activity() => continue,
+                    }
                 }
-                Err(ctrl) => Err(ctrl),
+                None => match read_next_event(&ctx).await {
+                    Ok(Some(event)) => dispatch_event(&mut ctx, event).await,
+                    Ok(None) => {
+                        info!(source_id = %self.id, "replication stream ended");
+                        break;
+                    }
+                    Err(ctrl) => Err(ctrl),
+                },
             };
 
             match event_result {
@@ -751,6 +812,20 @@ impl PostgresSource {
                 }
             }
         }
+        Ok(())
+        }
+        .await;
+
+        // Cancel and join the rotation tasks on every exit path (normal or fatal),
+        // so no watcher/preflight task outlives the source.
+        if let Some(rt) = rotation.take() {
+            rt.shutdown().await;
+        }
+
+        // Re-propagate a fatal loop outcome (e.g. a gate-6 rotation failure) before
+        // the teardown checkpoint put, so the checkpoint never advances past the
+        // last committed transaction.
+        loop_result?;
 
         let _ = chkpt_store
             .put(

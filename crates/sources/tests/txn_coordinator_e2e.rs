@@ -394,6 +394,7 @@ async fn pg_source(
         backend: test_common::make_storage_backend().await,
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
+        rotation: None,
     }
 }
 

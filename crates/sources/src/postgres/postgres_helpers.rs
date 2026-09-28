@@ -76,9 +76,25 @@ pub(super) async fn prepare_replication_client(
         Lsn::parse("0/0").unwrap()
     };
 
+    let config =
+        build_replication_config(&components, slot, publication, start_lsn);
+
+    Ok((components, config, last_checkpoint))
+}
+
+/// Build a `ReplicationConfig` from parsed DSN components at a specific start
+/// position. Single source of truth for the connection parameters used by both
+/// startup and credential-rotation reconnects, so a rotated stream is opened with
+/// exactly the production settings.
+pub(super) fn build_replication_config(
+    components: &DsnComponents,
+    slot: &str,
+    publication: &str,
+    start_lsn: Lsn,
+) -> ReplicationConfig {
     // ReplicationConfig is #[non_exhaustive] as of 0.4.0 — build it via the
     // constructor + builder methods rather than a struct literal.
-    let config = ReplicationConfig::new(
+    ReplicationConfig::new(
         components.host.clone(),
         components.user.clone(),
         components.password.clone(),
@@ -91,9 +107,7 @@ pub(super) async fn prepare_replication_client(
     .with_start_lsn(start_lsn)
     .with_status_interval(Duration::from_secs(STATUS_INTERVAL_SECS))
     .with_wakeup_interval(Duration::from_secs(IDLE_WAKEUP_INTERVAL_SECS))
-    .with_buffer_size(BUFFER_EVENTS);
-
-    Ok((components, config, last_checkpoint))
+    .with_buffer_size(BUFFER_EVENTS)
 }
 
 /// Connect to replication with retries.

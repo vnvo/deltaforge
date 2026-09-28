@@ -699,7 +699,10 @@ impl PipelineManager {
         // Resolve source credentials (inline DSN, whole-DSN secret, or referenced
         // username/password) up front, before the source takes long-lived
         // ownership. A missing/invalid secret fails startup here, cleanly.
-        let resolver = sources::default_secret_resolver();
+        // Use a projected-volume resolver when rotation is configured, so the
+        // initial DSN (whose credential files are projected symlinks) resolves; the
+        // strict default is retained otherwise.
+        let resolver = sources::source_secret_resolver(&spec);
         let source_dsn = sources::resolve_source_dsn(&spec, &resolver)
             .await
             .context("resolve source credentials")?;
@@ -708,7 +711,9 @@ impl PipelineManager {
             source_dsn.clone(),
             self.registry.clone(),
             Arc::clone(&self.backend),
+            &resolver,
         )
+        .await
         .context("build source")?;
         let processors = build_processors(&spec, &pipeline_name)
             .context("build processors")?;

@@ -141,6 +141,45 @@ pub fn describe_metrics() {
         "Fatal (non-retryable) source errors, labelled by kind"
     );
     describe_counter!(
+        "deltaforge_rotation_applied_total",
+        Unit::Count,
+        "Credential rotations applied at a transaction boundary"
+    );
+    describe_counter!(
+        "deltaforge_rotation_transient_failures_total",
+        Unit::Count,
+        "Credential rotation attempts that failed transiently (retryable)"
+    );
+    describe_counter!(
+        "deltaforge_rotation_terminal_rejections_total",
+        Unit::Count,
+        "Credential rotation candidates permanently rejected (identity, \
+         position, or expiry)"
+    );
+    describe_counter!(
+        "deltaforge_rotation_fatal_failures_total",
+        Unit::Count,
+        "Credential rotation apply failures that stop the source without \
+         advancing the checkpoint (close-uncertain or failed-closed)"
+    );
+    describe_counter!(
+        "deltaforge_rotation_watch_incomplete_total",
+        Unit::Count,
+        "Transitions into an incomplete watched rotation secret (missing or \
+         mid-swap material); counted once per alarm transition"
+    );
+    describe_counter!(
+        "deltaforge_rotation_watch_rejected_total",
+        Unit::Count,
+        "Transitions into a rejected/unsafe watched rotation secret (escaping, \
+         oversize, non-UTF-8, or malformed); counted once per alarm transition"
+    );
+    describe_gauge!(
+        "deltaforge_rotation_applied_generation",
+        Unit::Count,
+        "Generation number of the most recently applied credential rotation"
+    );
+    describe_counter!(
         "deltaforge_sink_batch_total",
         Unit::Count,
         "Total number of batches successfully delivered to a sink"

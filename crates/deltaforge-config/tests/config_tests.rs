@@ -946,6 +946,7 @@ fn postgres_cfg_with_inline_dsn(
         outbox: None,
         snapshot: Default::default(),
         on_schema_drift: Default::default(),
+        rotation: None,
     }
 }
 
