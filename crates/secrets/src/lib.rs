@@ -58,7 +58,7 @@ pub use resolver::{
 pub use structured::{StructuredSecret, credential_set_from_record};
 #[cfg(feature = "vault")]
 pub use vault::{
-    RenewPolicy, VaultAuth, VaultAuthFile, VaultConfigError, VaultConnection,
-    VaultResolver, VaultTimeouts,
+    LeaseInfo, LeasedRead, RenewPolicy, VaultAuth, VaultAuthFile,
+    VaultConfigError, VaultConnection, VaultResolver, VaultTimeouts,
 };
 pub use watch::{FileWatcher, RotationOutcome};

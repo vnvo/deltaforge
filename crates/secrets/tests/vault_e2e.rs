@@ -20,8 +20,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use secrets::{
-    RenewPolicy, SecretProvider, SecretReference, SecretResolver, VaultAuth,
-    VaultAuthFile, VaultConnection, VaultResolver, VaultTimeouts,
+    ProviderFailureKind, RenewPolicy, SecretError, SecretProvider,
+    SecretReference, SecretResolver, VaultAuth, VaultAuthFile, VaultConnection,
+    VaultResolver, VaultTimeouts,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -128,6 +129,36 @@ fn route(req: &CapturedRequest) -> (&'static str, String) {
             r#"{"data":{"data":{"password":"p@ss","username":"df"},"metadata":{"version":1}}}"#
                 .to_string(),
         )
+    } else if req.method == "POST"
+        && req.path.ends_with("/v1/sys/leases/lookup")
+    {
+        // An absent lease: Vault answers 4xx with an "invalid lease" marker body.
+        (
+            "400 Bad Request",
+            r#"{"errors":["invalid lease"]}"#.to_string(),
+        )
+    } else if req.method == "POST" && req.path.ends_with("/v1/sys/leases/renew")
+    {
+        // An absent lease can also surface as a 404.
+        (
+            "404 Not Found",
+            r#"{"errors":["lease not found"]}"#.to_string(),
+        )
+    } else if req.method == "POST"
+        && req.path.ends_with("/v1/sys/leases/revoke")
+    {
+        if req.body.contains("gone-lease") {
+            ("404 Not Found", r#"{"errors":[]}"#.to_string())
+        } else {
+            // Real revocation: 204 No Content.
+            ("204 No Content", String::new())
+        }
+    } else if req.method == "GET" && req.path.contains("/v1/database/creds/") {
+        (
+            "200 OK",
+            r#"{"data":{"username":"dyn","password":"pw"},"lease_id":"database/creds/x/abc","lease_duration":3600,"renewable":true}"#
+                .to_string(),
+        )
     } else {
         ("404 Not Found", r#"{"errors":[]}"#.to_string())
     }
@@ -207,6 +238,72 @@ async fn kubernetes_login_wire_path() {
         "jwt in login body"
     );
     assert!(!login.body.contains('\n'), "jwt newline trimmed");
+}
+
+#[tokio::test]
+async fn lease_ops_map_absent_and_validate_paths() {
+    let captured = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let addr = spawn_stub(captured.clone()).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let token_path = dir.path().join("token");
+    std::fs::write(&token_path, "root").unwrap();
+    let conn = VaultConnection::new(
+        addr,
+        None,
+        VaultAuth::TokenFile(VaultAuthFile::Strict { path: token_path }),
+        4096,
+        RenewPolicy::default(),
+        VaultTimeouts::default(),
+        true,
+    )
+    .unwrap();
+    let resolver = VaultResolver::connect(conn).await.unwrap();
+
+    // Absent lease on lookup (400 + marker) and renew (404) -> NotFound.
+    assert!(matches!(
+        resolver.lookup_lease("x").await.unwrap_err(),
+        SecretError::NotFound(_)
+    ));
+    assert!(matches!(
+        resolver.renew_lease("x", None).await.unwrap_err(),
+        SecretError::NotFound(_)
+    ));
+
+    // Revoke: 204 succeeds; an absent (404) lease maps to NotFound (idempotent).
+    resolver.revoke_lease("present-lease").await.unwrap();
+    assert!(matches!(
+        resolver.revoke_lease("gone-lease").await.unwrap_err(),
+        SecretError::NotFound(_)
+    ));
+
+    // A dynamic role with a path-altering segment is rejected before any request as a
+    // hard (non-absent) provider error.
+    let before = captured.lock().unwrap().len();
+    // `LeasedRead` is intentionally not `Debug` (it holds secret material), so match
+    // rather than `unwrap_err`.
+    match resolver.read_db_credentials("database", "bad/role").await {
+        Ok(_) => panic!("invalid role must be rejected"),
+        Err(SecretError::Provider {
+            kind: ProviderFailureKind::Other,
+            ..
+        }) => {}
+        Err(e) => {
+            panic!("expected hard provider error for invalid role: {e:?}")
+        }
+    }
+    assert_eq!(
+        captured.lock().unwrap().len(),
+        before,
+        "invalid role must not issue a request"
+    );
+
+    // A valid role reads dynamic credentials with a lease id.
+    let leased = resolver
+        .read_db_credentials("database", "orders")
+        .await
+        .unwrap();
+    assert_eq!(leased.lease_id, "database/creds/x/abc");
 }
 
 #[tokio::test]
