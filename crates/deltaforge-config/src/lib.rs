@@ -281,6 +281,37 @@ pub enum RotationTriggerCfg {
     },
     /// Vault KV v2 polled for a new record version.
     Vault(VaultRotationCfg),
+    /// Vault database secrets engine issuing dynamic (leased) credentials, renewed and
+    /// reissued on a lease schedule. Distinct from `Vault` (KV polling): leased dynamic
+    /// credentials have a materially different lifecycle (issue/renew/reissue/revoke with
+    /// durable lease ownership and expiry-driven fail-closed).
+    VaultLease(VaultLeaseRotationCfg),
+}
+
+/// Vault dynamic (leased) database-credential rotation. The source's DB username and
+/// password are issued by Vault's database secrets engine under `mount`/`role` and are
+/// renewed/reissued on a lease schedule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultLeaseRotationCfg {
+    /// Vault connection and client-token auth (same shape as the KV-poll trigger).
+    pub vault: VaultRotationCfg,
+    /// Database secrets-engine mount (a single path segment, e.g. `database`).
+    pub mount: String,
+    /// Role under the mount that issues the dynamic credentials (a single path segment).
+    pub role: String,
+    /// Stop serving on the current lease at least this long before true expiry (ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safety_margin_ms: Option<u64>,
+    /// Renew once this percent of the granted lease has been consumed, in `1..=100`
+    /// (an integer to keep the config `Eq`; converted to a fraction downstream).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renew_percent: Option<u8>,
+    /// Floor for any scheduled wait (ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_poll_ms: Option<u64>,
+    /// Ceiling for any scheduled wait (ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_poll_ms: Option<u64>,
 }
 
 /// Vault connection and auth for a Vault-triggered rotation. Non-secret: auth
@@ -871,6 +902,37 @@ trigger:
                 other => panic!("expected kubernetes, got {other:?}"),
             },
             other => panic!("expected vault trigger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vault_lease_trigger_parses() {
+        let yaml = r#"
+trigger:
+  type: vault_lease
+  vault:
+    address: http://127.0.0.1:8200
+    allow_insecure_http: true
+    auth:
+      method: token_file
+      path: /var/run/secrets/vault/token
+  mount: database
+  role: orders-ro
+  safety_margin_ms: 5000
+  renew_percent: 50
+poll_interval_ms: 500
+"#;
+        let cfg: CredentialRotationCfg = serde_yaml::from_str(yaml).unwrap();
+        match cfg.trigger {
+            RotationTriggerCfg::VaultLease(v) => {
+                assert_eq!(v.mount, "database");
+                assert_eq!(v.role, "orders-ro");
+                assert_eq!(v.safety_margin_ms, Some(5000));
+                assert_eq!(v.renew_percent, Some(50));
+                assert!(v.vault.allow_insecure_http);
+                assert!(matches!(v.vault.auth, VaultAuthCfg::TokenFile { .. }));
+            }
+            other => panic!("expected vault_lease trigger, got {other:?}"),
         }
     }
 
