@@ -774,11 +774,22 @@ impl VaultShared {
 }
 
 /// Whether a Vault error body indicates the lease is absent (already revoked or
-/// expired). Matches Vault's stable markers case-insensitively; the body is never
-/// surfaced, only classified.
+/// expired). Matches Vault's stable markers ASCII-case-insensitively **without
+/// allocating** or copying the body (which may carry lease identifiers or other
+/// sensitive context) into a new buffer; the body is only classified, never surfaced.
 fn lease_absent_marker(bytes: &[u8]) -> bool {
-    let s = String::from_utf8_lossy(bytes).to_ascii_lowercase();
-    s.contains("invalid lease") || s.contains("lease not found")
+    contains_ascii_ci(bytes, b"invalid lease")
+        || contains_ascii_ci(bytes, b"lease not found")
+}
+
+/// Allocation-free ASCII-case-insensitive substring search.
+fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return needle.is_empty();
+    }
+    haystack
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle))
 }
 
 /// A single Vault path segment safe to interpolate into an endpoint path: non-empty,
@@ -904,6 +915,21 @@ struct LeaseRenewResponse {
     renewable: bool,
 }
 
+/// Borrowing request body for lookup/revoke: serializes the lease id by reference,
+/// avoiding a `serde_json::Value` copy of the (sensitive) lease id.
+#[derive(Serialize)]
+struct LeaseIdBody<'a> {
+    lease_id: &'a str,
+}
+
+/// Borrowing request body for renew, with an optional increment.
+#[derive(Serialize)]
+struct LeaseRenewBody<'a> {
+    lease_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    increment: Option<u64>,
+}
+
 #[async_trait]
 impl VaultLeaseApi for VaultShared {
     async fn read_db_credentials(
@@ -972,7 +998,7 @@ impl VaultLeaseApi for VaultShared {
             .lease_post_json(
                 self.url("sys/leases/lookup"),
                 Some(&token),
-                &serde_json::json!({ "lease_id": lease_id }),
+                &LeaseIdBody { lease_id },
                 &reference,
             )
             .await?;
@@ -989,17 +1015,14 @@ impl VaultLeaseApi for VaultShared {
     ) -> Result<LeaseInfo, SecretError> {
         let reference = self.reference();
         let token = self.current_token().await;
-        let body = match increment_secs {
-            Some(i) => {
-                serde_json::json!({ "lease_id": lease_id, "increment": i })
-            }
-            None => serde_json::json!({ "lease_id": lease_id }),
-        };
         let resp: LeaseRenewResponse = self
             .lease_post_json(
                 self.url("sys/leases/renew"),
                 Some(&token),
-                &body,
+                &LeaseRenewBody {
+                    lease_id,
+                    increment: increment_secs,
+                },
                 &reference,
             )
             .await?;
@@ -1017,7 +1040,7 @@ impl VaultLeaseApi for VaultShared {
         let req = self.with_headers(
             self.http
                 .post(self.url("sys/leases/revoke"))
-                .json(&serde_json::json!({ "lease_id": lease_id })),
+                .json(&LeaseIdBody { lease_id }),
             Some(&token),
         );
         self.execute_lease(req, &reference).await.map(|_| ())

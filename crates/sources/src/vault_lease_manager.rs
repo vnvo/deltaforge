@@ -287,6 +287,11 @@ pub(crate) struct LeaseManager {
     /// A pending replacement minted by `reissue`, awaiting an apply outcome. Coexists
     /// with `active` until `resolve_reissue` promotes or revokes it.
     pending: Option<ActiveLease>,
+    /// A superseded/rejected lease staged for revocation. It stays installed here until
+    /// its revoke reaches a terminal (`Revoked`) or `Orphaned` outcome, so a store/Vault
+    /// failure mid-revoke never loses the handle or its retry capability
+    /// ([`retry_revoking`](Self::retry_revoking) completes it).
+    revoking: Option<ActiveLease>,
 }
 
 /// The manager's handle on a durable lease: its key and last-known slot version.
@@ -317,6 +322,7 @@ impl LeaseManager {
             gen_counter: 0,
             active: None,
             pending: None,
+            revoking: None,
         }
     }
 
@@ -406,14 +412,20 @@ impl LeaseManager {
         Ok(new_version)
     }
 
-    /// Renew the active lease. On success, advance timing via the state machine's
-    /// `UpdateTiming` action (persisted with a validated CAS). Returns the refreshed
-    /// handle timing so the caller can reschedule.
-    pub(crate) async fn renew(
-        &mut self,
+    /// Renew the lease at `key`. On success, advance timing via the state machine's
+    /// `UpdateTiming` action (persisted with a validated CAS). Returns the new slot
+    /// version and the refreshed record. Loads the current slot version fresh, so it is
+    /// robust to a stale tracked version.
+    async fn renew_key(
+        &self,
+        key: &str,
         now: SystemTime,
-    ) -> Result<LeaseHandle> {
-        let (key, version, current) = self.load_active().await?;
+    ) -> Result<(u64, LeaseRecord)> {
+        let (version, current) = self
+            .store
+            .get(key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("lease record missing"))?;
         let lease_id = current.lease_id.expose().to_string();
         let info = self.provider.renew(&lease_id, None).await?;
         let new_expires = now
@@ -440,14 +452,55 @@ impl LeaseManager {
             updated.renewable = renewable;
             updated.auth_session_epoch += 1;
         }
-        if !self.store.cas(&key, version, &updated).await? {
+        if !self.store.cas(key, version, &updated).await? {
             anyhow::bail!("lease store version conflict on renew");
         }
-        let (new_version, refreshed) =
-            self.store.get(&key).await?.ok_or_else(|| {
-                anyhow::anyhow!("active lease record missing")
-            })?;
+        let (new_version, refreshed) = self
+            .store
+            .get(key)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("lease record missing"))?;
+        Ok((new_version, refreshed))
+    }
+
+    /// Renew the active (serving) lease and refresh its tracked version. On any failure
+    /// the active handle is left installed unchanged for retry.
+    pub(crate) async fn renew(
+        &mut self,
+        now: SystemTime,
+    ) -> Result<LeaseHandle> {
+        let key = self
+            .active
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no active lease"))?
+            .key
+            .clone();
+        let (new_version, refreshed) = self.renew_key(&key, now).await?;
         self.active = Some(ActiveLease {
+            key,
+            version: new_version,
+        });
+        self.metric_lifecycle("renewed");
+        self.metric_expiry(refreshed.expires_at_ms);
+        Ok(refreshed.lease()?)
+    }
+
+    /// Renew the **pending replacement** lease and refresh its tracked version. Needed
+    /// while a reissue is retained across apply retries (`RetainBoth`), so the pending
+    /// lease cannot expire during a prolonged reconnect. On failure the pending handle
+    /// is left installed unchanged for retry.
+    pub(crate) async fn renew_pending(
+        &mut self,
+        now: SystemTime,
+    ) -> Result<LeaseHandle> {
+        let key = self
+            .pending
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no pending replacement"))?
+            .key
+            .clone();
+        let (new_version, refreshed) = self.renew_key(&key, now).await?;
+        self.pending = Some(ActiveLease {
             key,
             version: new_version,
         });
@@ -497,43 +550,83 @@ impl LeaseManager {
         let decision = lease_revoke_decision(&outcome, retry_pending);
         match decision {
             LeaseRevokeDecision::PromoteNewRevokeOld => {
-                let pending = self.pending.take().ok_or_else(|| {
-                    anyhow::anyhow!("no pending replacement to promote")
-                })?;
-                let old = self.active.take().ok_or_else(|| {
-                    anyhow::anyhow!("no active lease to supersede")
-                })?;
-                // Promote the replacement before revoking the old, so a serving lease
-                // always exists.
+                // Confirm both handles are present WITHOUT removing them, so a promotion
+                // failure leaves the old lease serving and the pending replacement
+                // installed for retry.
+                if self.active.is_none() {
+                    anyhow::bail!("no active lease to supersede");
+                }
+                let pending_key = self
+                    .pending
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("no pending replacement to promote")
+                    })?
+                    .key
+                    .clone();
+                // (1) Promote the replacement durably. On failure `self` is unchanged.
                 let version = self
-                    .transition_key(&pending.key, LeaseState::Active)
+                    .transition_key(&pending_key, LeaseState::Active)
                     .await?;
+                // Promotion is durable and infallible from here: switch the serving
+                // handle to the new lease and stage the old lease for revocation.
+                let old =
+                    self.active.take().expect("active present (checked above)");
                 self.active = Some(ActiveLease {
-                    key: pending.key,
+                    key: pending_key,
                     version,
                 });
-                let (ov, orec) =
-                    self.store.get(&old.key).await?.ok_or_else(|| {
-                        anyhow::anyhow!("superseded lease record missing")
-                    })?;
-                self.drive_revoke(old.key, ov, orec).await?;
+                self.pending = None;
+                self.revoking = Some(old);
+                // (2) Revoke the old lease; on failure it stays staged in `revoking`.
+                self.drain_revoking().await?;
             }
             LeaseRevokeDecision::RevokeNew => {
+                // Stage the pending replacement for revocation (still installed, now in
+                // `revoking`), then revoke it; a failure keeps it staged for retry.
                 let pending = self.pending.take().ok_or_else(|| {
                     anyhow::anyhow!("no pending replacement to revoke")
                 })?;
-                let (pv, prec) =
-                    self.store.get(&pending.key).await?.ok_or_else(|| {
-                        anyhow::anyhow!("pending lease record missing")
-                    })?;
-                self.drive_revoke(pending.key, pv, prec).await?;
+                self.revoking = Some(pending);
+                self.drain_revoking().await?;
                 // The active lease is unchanged.
             }
             LeaseRevokeDecision::RetainBoth => {
-                // Keep both handles; the caller retries apply and renews both.
+                // Keep both handles; the caller retries apply and renews both (see
+                // `renew`/`renew_pending`).
             }
         }
         Ok(decision)
+    }
+
+    /// Drive the lease staged in `revoking` to its terminal (`Revoked`) or `Orphaned`
+    /// outcome and clear the slot on success. On any store/Vault failure the slot is
+    /// left populated so the revoke can be retried without losing ownership.
+    async fn drain_revoking(&mut self) -> Result<RevokeOutcome> {
+        let key = self
+            .revoking
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no lease staged for revocation"))?
+            .key
+            .clone();
+        let (version, record) =
+            self.store.get(&key).await?.ok_or_else(|| {
+                anyhow::anyhow!("staged lease record missing")
+            })?;
+        let outcome = self.drive_revoke(key, version, record).await?;
+        self.revoking = None;
+        Ok(outcome)
+    }
+
+    /// Retry a revoke left staged by an earlier failure. Returns `None` when nothing is
+    /// staged. Keeps the handle staged if the retry fails again.
+    pub(crate) async fn retry_revoking(
+        &mut self,
+    ) -> Result<Option<RevokeOutcome>> {
+        if self.revoking.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(self.drain_revoking().await?))
     }
 
     /// Revoke the active lease and finalize it to the retained `Revoked` tombstone.
@@ -938,6 +1031,8 @@ mod tests {
         revokes: Mutex<Vec<String>>,
         renewable: bool,
         revoke_fault: Option<SecretError>,
+        /// Fail this many revoke calls transiently (Unavailable) before succeeding.
+        revoke_transient: Mutex<u32>,
     }
 
     impl MockProvider {
@@ -945,6 +1040,21 @@ mod tests {
             Self {
                 renewable: true,
                 ..Default::default()
+            }
+        }
+
+        fn set_revoke_transient(&self, n: u32) {
+            *self.revoke_transient.lock().unwrap() = n;
+        }
+
+        fn transient_err() -> SecretError {
+            let r = secrets::SecretReference::new(
+                secrets::SecretProvider::Vault,
+                "sys/leases/revoke",
+            );
+            SecretError::Provider {
+                reference: r.safe(),
+                kind: ProviderFailureKind::Unavailable,
             }
         }
     }
@@ -1000,6 +1110,13 @@ mod tests {
             })
         }
         async fn revoke(&self, lease_id: &str) -> Result<(), SecretError> {
+            {
+                let mut remaining = self.revoke_transient.lock().unwrap();
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Err(MockProvider::transient_err());
+                }
+            }
             if let Some(e) = &self.revoke_fault {
                 return Err(clone_err(e));
             }
@@ -1045,6 +1162,209 @@ mod tests {
         id: LeaseIdentity,
     ) -> LeaseManager {
         LeaseManager::new(provider, backend, id, "database", "orders-ro", cfg())
+    }
+
+    /// A storage backend that delegates to an inner one but can be told to fail
+    /// `slot_get`/`slot_cas` for a specific key, to inject store faults at precise
+    /// points (promotion CAS, record load) without racing.
+    #[derive(Debug)]
+    struct FaultyBackend {
+        inner: storage::ArcStorageBackend,
+        fail_get_key: Mutex<Option<String>>,
+        fail_cas_key: Mutex<Option<String>>,
+    }
+
+    impl FaultyBackend {
+        fn new(inner: storage::ArcStorageBackend) -> Self {
+            Self {
+                inner,
+                fail_get_key: Mutex::new(None),
+                fail_cas_key: Mutex::new(None),
+            }
+        }
+        fn fail_get_for(&self, key: Option<String>) {
+            *self.fail_get_key.lock().unwrap() = key;
+        }
+        fn fail_cas_for(&self, key: Option<String>) {
+            *self.fail_cas_key.lock().unwrap() = key;
+        }
+    }
+
+    #[async_trait]
+    impl storage::StorageBackend for FaultyBackend {
+        async fn kv_get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {
+            self.inner.kv_get(ns, key).await
+        }
+        async fn kv_put(&self, ns: &str, key: &str, v: &[u8]) -> Result<()> {
+            self.inner.kv_put(ns, key, v).await
+        }
+        async fn kv_put_with_ttl(
+            &self,
+            ns: &str,
+            key: &str,
+            v: &[u8],
+            ttl: u64,
+        ) -> Result<()> {
+            self.inner.kv_put_with_ttl(ns, key, v, ttl).await
+        }
+        async fn kv_delete(&self, ns: &str, key: &str) -> Result<bool> {
+            self.inner.kv_delete(ns, key).await
+        }
+        async fn kv_list(
+            &self,
+            ns: &str,
+            prefix: Option<&str>,
+        ) -> Result<Vec<String>> {
+            self.inner.kv_list(ns, prefix).await
+        }
+        async fn log_append(
+            &self,
+            ns: &str,
+            key: &str,
+            v: &[u8],
+        ) -> Result<u64> {
+            self.inner.log_append(ns, key, v).await
+        }
+        async fn log_list(
+            &self,
+            ns: &str,
+            key: &str,
+        ) -> Result<Vec<(u64, Vec<u8>)>> {
+            self.inner.log_list(ns, key).await
+        }
+        async fn log_since(
+            &self,
+            ns: &str,
+            key: &str,
+            since: u64,
+        ) -> Result<Vec<(u64, Vec<u8>)>> {
+            self.inner.log_since(ns, key, since).await
+        }
+        async fn log_latest(
+            &self,
+            ns: &str,
+            key: &str,
+        ) -> Result<Option<(u64, Vec<u8>)>> {
+            self.inner.log_latest(ns, key).await
+        }
+        async fn log_append_if_absent(
+            &self,
+            ns: &str,
+            key: &str,
+            cid: &str,
+            v: &[u8],
+        ) -> Result<storage::LogAppendOutcome> {
+            self.inner.log_append_if_absent(ns, key, cid, v).await
+        }
+        async fn log_truncate(
+            &self,
+            ns: &str,
+            key: &str,
+            req: storage::LogTruncateRequest,
+        ) -> Result<storage::LogTruncateOutcome> {
+            self.inner.log_truncate(ns, key, req).await
+        }
+        async fn log_stream_meta(
+            &self,
+            ns: &str,
+            key: &str,
+        ) -> Result<storage::LogStreamMeta> {
+            self.inner.log_stream_meta(ns, key).await
+        }
+        async fn log_read_meta_since(
+            &self,
+            ns: &str,
+            key: &str,
+            since: u64,
+            limit: usize,
+        ) -> Result<Vec<storage::LogEntryMeta>> {
+            self.inner.log_read_meta_since(ns, key, since, limit).await
+        }
+        async fn slot_upsert(
+            &self,
+            ns: &str,
+            key: &str,
+            s: &[u8],
+        ) -> Result<u64> {
+            self.inner.slot_upsert(ns, key, s).await
+        }
+        async fn slot_get(
+            &self,
+            ns: &str,
+            key: &str,
+        ) -> Result<Option<(u64, Vec<u8>)>> {
+            if self.fail_get_key.lock().unwrap().as_deref() == Some(key) {
+                anyhow::bail!("injected slot_get failure for {key}");
+            }
+            self.inner.slot_get(ns, key).await
+        }
+        async fn slot_cas(
+            &self,
+            ns: &str,
+            key: &str,
+            expected: u64,
+            s: &[u8],
+        ) -> Result<bool> {
+            if self.fail_cas_key.lock().unwrap().as_deref() == Some(key) {
+                anyhow::bail!("injected slot_cas failure for {key}");
+            }
+            self.inner.slot_cas(ns, key, expected, s).await
+        }
+        async fn slot_create(
+            &self,
+            ns: &str,
+            key: &str,
+            s: &[u8],
+        ) -> Result<Option<u64>> {
+            self.inner.slot_create(ns, key, s).await
+        }
+        async fn slot_delete(&self, ns: &str, key: &str) -> Result<bool> {
+            self.inner.slot_delete(ns, key).await
+        }
+        async fn slot_list(
+            &self,
+            ns: &str,
+            prefix: Option<&str>,
+            cursor: Option<&str>,
+            limit: usize,
+        ) -> Result<storage::SlotPage> {
+            self.inner.slot_list(ns, prefix, cursor, limit).await
+        }
+        async fn queue_push(
+            &self,
+            ns: &str,
+            key: &str,
+            v: &[u8],
+        ) -> Result<u64> {
+            self.inner.queue_push(ns, key, v).await
+        }
+        async fn queue_peek(
+            &self,
+            ns: &str,
+            key: &str,
+            limit: usize,
+        ) -> Result<Vec<(u64, Vec<u8>)>> {
+            self.inner.queue_peek(ns, key, limit).await
+        }
+        async fn queue_ack(
+            &self,
+            ns: &str,
+            key: &str,
+            up_to: u64,
+        ) -> Result<usize> {
+            self.inner.queue_ack(ns, key, up_to).await
+        }
+        async fn queue_len(&self, ns: &str, key: &str) -> Result<u64> {
+            self.inner.queue_len(ns, key).await
+        }
+        async fn queue_drop_oldest(
+            &self,
+            ns: &str,
+            key: &str,
+            count: usize,
+        ) -> Result<usize> {
+            self.inner.queue_drop_oldest(ns, key, count).await
+        }
     }
 
     #[tokio::test]
@@ -1188,6 +1508,177 @@ mod tests {
         assert_eq!(m.active.as_ref().unwrap().key, old_key);
         assert_eq!(m.pending.as_ref().unwrap().key, new_key);
         assert_eq!(provider.revokes.lock().unwrap().len(), 0);
+    }
+
+    // --- injected-failure resilience (handles retained until durable success) ---
+
+    async fn issued_and_reissued(
+        provider: Arc<MockProvider>,
+        backend: storage::ArcStorageBackend,
+    ) -> (LeaseManager, String, String) {
+        let mut m = manager_on(provider, backend, identity());
+        m.issue(t(EPOCH_MS)).await.unwrap();
+        let old_key = m.active.as_ref().unwrap().key.clone();
+        m.reissue(t(EPOCH_MS + 3_000_000)).await.unwrap();
+        let new_key = m.pending.as_ref().unwrap().key.clone();
+        (m, old_key, new_key)
+    }
+
+    #[tokio::test]
+    async fn resolve_reissue_promotion_failure_keeps_both_handles() {
+        let provider = Arc::new(MockProvider::renewable());
+        let faulty =
+            Arc::new(FaultyBackend::new(Arc::new(MemoryStorageBackend::new())));
+        let (mut m, old_key, new_key) =
+            issued_and_reissued(provider.clone(), faulty.clone()).await;
+
+        // Fail the promotion CAS on the pending key.
+        faulty.fail_cas_for(Some(new_key.clone()));
+        assert!(
+            m.resolve_reissue(ApplyOutcome::Applied, false)
+                .await
+                .is_err()
+        );
+        // Both handles remain installed; the old lease is still serving.
+        assert_eq!(m.active.as_ref().unwrap().key, old_key);
+        assert_eq!(m.pending.as_ref().unwrap().key, new_key);
+        assert_eq!(provider.revokes.lock().unwrap().len(), 0);
+
+        // Clear the fault and retry: the reissue completes.
+        faulty.fail_cas_for(None);
+        let decision = m
+            .resolve_reissue(ApplyOutcome::Applied, false)
+            .await
+            .unwrap();
+        assert_eq!(decision, LeaseRevokeDecision::PromoteNewRevokeOld);
+        assert_eq!(m.active.as_ref().unwrap().key, new_key);
+        assert!(m.pending.is_none() && m.revoking.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_reissue_old_record_load_failure_stages_for_retry() {
+        let provider = Arc::new(MockProvider::renewable());
+        let faulty =
+            Arc::new(FaultyBackend::new(Arc::new(MemoryStorageBackend::new())));
+        let (mut m, old_key, new_key) =
+            issued_and_reissued(provider.clone(), faulty.clone()).await;
+
+        // Promotion succeeds; the old-record load in drain_revoking fails.
+        faulty.fail_get_for(Some(old_key.clone()));
+        assert!(
+            m.resolve_reissue(ApplyOutcome::Applied, false)
+                .await
+                .is_err()
+        );
+        // The new lease is promoted and serving; the old lease is staged for retry.
+        assert_eq!(m.active.as_ref().unwrap().key, new_key);
+        assert!(m.pending.is_none());
+        assert_eq!(m.revoking.as_ref().unwrap().key, old_key);
+        assert_eq!(provider.revokes.lock().unwrap().len(), 0);
+
+        // Clear the fault and retry the staged revoke.
+        faulty.fail_get_for(None);
+        assert_eq!(
+            m.retry_revoking().await.unwrap(),
+            Some(RevokeOutcome::Finalized)
+        );
+        assert!(m.revoking.is_none());
+        let (_, old_rec) = m.store.get(&old_key).await.unwrap().unwrap();
+        assert_eq!(old_rec.state, LeaseState::Revoked);
+    }
+
+    #[tokio::test]
+    async fn resolve_reissue_revoke_failure_stages_for_retry() {
+        let provider = Arc::new(MockProvider::renewable());
+        provider.set_revoke_transient(1); // first revoke fails transiently
+        let backend: storage::ArcStorageBackend =
+            Arc::new(MemoryStorageBackend::new());
+        let (mut m, old_key, new_key) =
+            issued_and_reissued(provider.clone(), backend).await;
+
+        // Promotion + old load succeed; the Vault revoke fails transiently.
+        assert!(
+            m.resolve_reissue(ApplyOutcome::Applied, false)
+                .await
+                .is_err()
+        );
+        assert_eq!(m.active.as_ref().unwrap().key, new_key);
+        assert_eq!(m.revoking.as_ref().unwrap().key, old_key);
+
+        // Retry: the revoke now succeeds and the old lease is finalized.
+        assert_eq!(
+            m.retry_revoking().await.unwrap(),
+            Some(RevokeOutcome::Finalized)
+        );
+        assert!(m.revoking.is_none());
+        let (_, old_rec) = m.store.get(&old_key).await.unwrap().unwrap();
+        assert_eq!(old_rec.state, LeaseState::Revoked);
+    }
+
+    #[tokio::test]
+    async fn resolve_reissue_revoke_new_failure_keeps_old_and_stages_new() {
+        use crate::rotation::RotationReject;
+        let provider = Arc::new(MockProvider::renewable());
+        provider.set_revoke_transient(1);
+        let backend: storage::ArcStorageBackend =
+            Arc::new(MemoryStorageBackend::new());
+        let (mut m, old_key, new_key) =
+            issued_and_reissued(provider.clone(), backend).await;
+
+        // Not adopted -> revoke the pending; the first revoke fails transiently.
+        assert!(
+            m.resolve_reissue(
+                ApplyOutcome::KeptOld {
+                    reason: RotationReject::IdentityMismatch,
+                },
+                false,
+            )
+            .await
+            .is_err()
+        );
+        // Old lease still serving; the pending is staged for revoke retry.
+        assert_eq!(m.active.as_ref().unwrap().key, old_key);
+        assert_eq!(m.revoking.as_ref().unwrap().key, new_key);
+
+        assert_eq!(
+            m.retry_revoking().await.unwrap(),
+            Some(RevokeOutcome::Finalized)
+        );
+        let (_, new_rec) = m.store.get(&new_key).await.unwrap().unwrap();
+        assert_eq!(new_rec.state, LeaseState::Revoked);
+        // The old lease is untouched and still active.
+        let (_, old_rec) = m.store.get(&old_key).await.unwrap().unwrap();
+        assert_eq!(old_rec.state, LeaseState::Active);
+    }
+
+    #[tokio::test]
+    async fn renew_pending_extends_across_retries_beyond_initial_ttl() {
+        // RetainBoth keeps a pending replacement alive across a prolonged reconnect;
+        // renew_pending must extend it beyond its initial TTL.
+        let provider = Arc::new(MockProvider::renewable());
+        let mut m = manager(provider);
+        m.issue(t(EPOCH_MS)).await.unwrap();
+        m.reissue(t(EPOCH_MS + 100_000)).await.unwrap();
+        let pending_key = m.pending.as_ref().unwrap().key.clone();
+
+        // Initial pending expiry ~ issued(+100s) + 3600s.
+        let (_, before) = m.store.get(&pending_key).await.unwrap().unwrap();
+        let initial_expiry = before.expires_at_ms;
+
+        // Renew repeatedly, each well beyond the previous grant (each renew extends to
+        // now + 3600s). Walk past the initial TTL.
+        for step_s in [3000u64, 6000, 9000] {
+            let h = m.renew_pending(t(EPOCH_MS + step_s * 1000)).await.unwrap();
+            // Expiry keeps advancing and always stays in the future of `now`.
+            assert!(h.expires_at > t(EPOCH_MS + step_s * 1000));
+        }
+        let (_, after) = m.store.get(&pending_key).await.unwrap().unwrap();
+        assert!(
+            after.expires_at_ms > initial_expiry,
+            "pending lease renewed beyond its initial TTL"
+        );
+        // The active lease is untouched by pending renewal.
+        assert!(m.active.is_some());
     }
 
     #[tokio::test]
