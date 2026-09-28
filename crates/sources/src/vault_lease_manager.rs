@@ -566,35 +566,10 @@ impl LeaseManager {
         let decision = lease_revoke_decision(&outcome, retry_pending);
         match decision {
             LeaseRevokeDecision::PromoteNewRevokeOld => {
-                // Confirm both handles are present WITHOUT removing them, so a promotion
-                // failure leaves the old lease serving and the pending replacement
-                // installed for retry.
-                if self.active.is_none() {
-                    anyhow::bail!("no active lease to supersede");
-                }
-                let pending_key = self
-                    .pending
-                    .as_ref()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("no pending replacement to promote")
-                    })?
-                    .key
-                    .clone();
-                // (1) Promote the replacement durably. On failure `self` is unchanged.
-                let version = self
-                    .transition_key(&pending_key, LeaseState::Active)
-                    .await?;
-                // Promotion is durable and infallible from here: switch the serving
-                // handle to the new lease and stage the old lease for revocation.
-                let old =
-                    self.active.take().expect("active present (checked above)");
-                self.active = Some(ActiveLease {
-                    key: pending_key,
-                    version,
-                });
-                self.pending = None;
-                self.revoking = Some(old);
-                // (2) Revoke the old lease; on failure it stays staged in `revoking`.
+                // (1) Promote the replacement durably (fatal on failure - see
+                // `promote_pending`); (2) revoke the old lease, staged for retry on
+                // failure.
+                self.promote_pending().await?;
                 self.drain_revoking().await?;
             }
             LeaseRevokeDecision::RevokeNew => {
@@ -613,6 +588,41 @@ impl LeaseManager {
             }
         }
         Ok(decision)
+    }
+
+    /// Promote the pending replacement to the serving (active) lease and stage the old
+    /// lease for revocation, WITHOUT revoking it yet. Used on an `Applied` apply outcome,
+    /// where the DB stream has already switched to the new credential.
+    ///
+    /// The promotion CAS is the only fallible step and is done first: on failure `self`
+    /// is left unchanged (old still active, pending still installed) and `Err` is
+    /// returned. Because the caller reaches here only after `Applied`, a promotion
+    /// failure means the DB is already streaming on a credential whose durable lease
+    /// ownership was not recorded - the caller MUST treat this as fatal and stop without
+    /// advancing the checkpoint. After a successful promotion the moves are infallible.
+    pub(crate) async fn promote_pending(&mut self) -> Result<()> {
+        if self.active.is_none() {
+            anyhow::bail!("no active lease to supersede");
+        }
+        let pending_key = self
+            .pending
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("no pending replacement to promote")
+            })?
+            .key
+            .clone();
+        let version = self
+            .transition_key(&pending_key, LeaseState::Active)
+            .await?;
+        let old = self.active.take().expect("active present (checked above)");
+        self.active = Some(ActiveLease {
+            key: pending_key,
+            version,
+        });
+        self.pending = None;
+        self.revoking = Some(old);
+        Ok(())
     }
 
     /// Drive the lease staged in `revoking` to its terminal (`Revoked`) or `Orphaned`
@@ -1629,6 +1639,35 @@ mod tests {
         assert!(m.revoking.is_none());
         let (_, old_rec) = m.store.get(&old_key).await.unwrap().unwrap();
         assert_eq!(old_rec.state, LeaseState::Revoked);
+    }
+
+    #[tokio::test]
+    async fn promote_pending_success_stages_old_failure_keeps_handles() {
+        // Success: pending -> Active, old staged in `revoking`, not yet revoked.
+        let provider = Arc::new(MockProvider::renewable());
+        let mut m = manager(provider);
+        m.issue(t(EPOCH_MS)).await.unwrap();
+        let old_key = m.active.as_ref().unwrap().key.clone();
+        m.reissue(t(EPOCH_MS + 3_000_000)).await.unwrap();
+        let new_key = m.pending.as_ref().unwrap().key.clone();
+        m.promote_pending().await.unwrap();
+        assert_eq!(m.active.as_ref().unwrap().key, new_key);
+        assert!(m.pending.is_none());
+        assert_eq!(m.revoking.as_ref().unwrap().key, old_key);
+        let (_, new_rec) = m.store.get(&new_key).await.unwrap().unwrap();
+        assert_eq!(new_rec.state, LeaseState::Active);
+
+        // Failure (promotion CAS fails): handles unchanged for retry / fatal signalling.
+        let provider2 = Arc::new(MockProvider::renewable());
+        let faulty =
+            Arc::new(FaultyBackend::new(Arc::new(MemoryStorageBackend::new())));
+        let (mut m2, old2, new2) =
+            issued_and_reissued(provider2, faulty.clone()).await;
+        faulty.fail_cas_for(Some(new2.clone()));
+        assert!(m2.promote_pending().await.is_err());
+        assert_eq!(m2.active.as_ref().unwrap().key, old2);
+        assert_eq!(m2.pending.as_ref().unwrap().key, new2);
+        assert!(m2.revoking.is_none());
     }
 
     #[tokio::test]
