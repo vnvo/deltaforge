@@ -302,6 +302,10 @@ pub struct MysqlSrcCfg {
     /// What to do when schema drift is detected after failover.
     #[serde(default)]
     pub on_schema_drift: OnSchemaDrift,
+    /// Opt-in controlled credential rotation (file-backed credentials only).
+    /// Requires the server to run in GTID mode; startup fails otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<CredentialRotationCfg>,
 }
 
 /// Redacted rendering of an optional inline DSN for `Debug`. `Some` values have

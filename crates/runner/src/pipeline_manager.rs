@@ -2174,6 +2174,7 @@ mod tests {
                     outbox: None,
                     snapshot: SnapshotCfg::default(),
                     on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
+                    rotation: None,
                 }),
                 processors: vec![],
                 sinks: vec![SinkCfg::Redis(RedisSinkCfg {

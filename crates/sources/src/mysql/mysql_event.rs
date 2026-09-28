@@ -101,10 +101,7 @@ pub(super) async fn dispatch_event(
         EventData::UpdateRows(ur) => handle_update_rows(ctx, header, ur).await,
         EventData::DeleteRows(dr) => handle_delete_rows(ctx, header, dr).await,
         EventData::Query(q) => handle_query(ctx, header, q).await,
-        EventData::Gtid(gt) => {
-            handle_gtid(ctx, gt).await;
-            Ok(())
-        }
+        EventData::Gtid(gt) => handle_gtid(ctx, gt).await,
         EventData::Rotate(rot) => {
             handle_rotate(ctx, rot);
             Ok(())
@@ -501,13 +498,27 @@ fn source_error_kind(e: &SourceError) -> &'static str {
 async fn handle_gtid(
     ctx: &mut RunCtx,
     gt: mysql_binlog_connector_rust::event::gtid_event::GtidEvent,
-) {
+) -> SourceResult<()> {
     let gtid_str = gt.gtid.clone();
     debug!(source_id=%ctx.source_id, gtid=%gtid_str, "gtid");
+
+    // A new GTID must never arrive while the previous transaction is still open:
+    // that means the prior transaction was not terminated by any event we
+    // recognized (Xid / COMMIT / ROLLBACK / autocommit QueryEvent). Overwriting
+    // `current_gtid` here would silently drop the prior boundary and mis-frame the
+    // stream. The sequence cannot be safely classified, so fail closed.
+    if let Some(open) = &ctx.current_gtid {
+        return Err(SourceError::Other(anyhow::anyhow!(
+            "binlog framing error: GTID {gtid_str} arrived while transaction \
+             {open} is still open (no terminating Xid/COMMIT/ROLLBACK or \
+             autocommit statement was observed)"
+        )));
+    }
 
     // The exact per-transaction GTID (`uuid:gno`) is the immutable identity
     // coordinate - captured before it is merged into the accumulated set below.
     ctx.current_gtid = Some(gtid_str.clone());
+    ctx.in_explicit_txn = false;
     // New transaction boundary: reset the DDL message ordinal.
     ctx.message_ordinal = 0;
 
@@ -522,6 +533,7 @@ async fn handle_gtid(
     // The GTID event is the unambiguous start of every transaction (row, DDL,
     // or empty) - open it on the coordinator's stream.
     emit_tx_begin(ctx).await;
+    Ok(())
 }
 
 /// Merge a single GTID (e.g. "uuid:21") into an existing set (e.g. "uuid:1-20").
@@ -603,6 +615,9 @@ async fn emit_tx_begin(ctx: &RunCtx) {
 /// resume). A no-op without a GTID, so it never emits a marker for a transaction
 /// that had no `TxBegin`. Best-effort send (a closed channel means shutdown).
 async fn emit_tx_commit(ctx: &mut RunCtx) {
+    // Any close ends the explicit-transaction state (safe even in non-GTID mode,
+    // where the early return below skips the marker).
+    ctx.in_explicit_txn = false;
     let Some(tx_id) = ctx.current_gtid.clone() else {
         return;
     };
@@ -788,8 +803,13 @@ async fn handle_query(
 ) -> SourceResult<()> {
     let sql_upper = q.query.to_uppercase();
 
-    // BEGIN is a no-op: the transaction was already opened by its GTID event.
+    // BEGIN opens an explicit, multi-event transaction (row events + Xid, or an
+    // explicit COMMIT/ROLLBACK). The transaction was already opened on the
+    // coordinator by its GTID event; here we only record that we are inside an
+    // explicit block so a later control statement is not mistaken for a
+    // standalone autocommit transaction.
     if sql_upper == "BEGIN" {
+        ctx.in_explicit_txn = true;
         return Ok(());
     }
     // COMMIT / ROLLBACK close the transaction. Both are commit boundaries here:
@@ -902,8 +922,24 @@ async fn handle_query(
                 );
             }
         }
+        return Ok(());
     }
 
+    // Any other QueryEvent.
+    if ctx.in_explicit_txn {
+        // A control/ignored statement inside an explicit transaction (e.g.
+        // SAVEPOINT, SET) - part of that transaction, which is closed later by its
+        // Xid or COMMIT/ROLLBACK. Do not close here.
+        return Ok(());
+    }
+
+    // A GTID-backed autocommit single statement outside any explicit transaction
+    // (FLUSH, SET GLOBAL, GRANT/REVOKE, ANALYZE, ...). It is its own transaction
+    // with no row/DDL event, implicitly committed after this QueryEvent. Emit its
+    // commit boundary so the GTID is framed and checkpointed (a data-less
+    // boundary) and `current_gtid` is cleared - otherwise the transaction would
+    // stay open and the next GTID would fail closed.
+    emit_tx_commit(ctx).await;
     Ok(())
 }
 
@@ -991,6 +1027,7 @@ mod tests {
             current_gtid: Some(
                 "3e11fa47-71ca-11e1-9e33-c80aa9429562:5".to_string(),
             ),
+            in_explicit_txn: true,
             message_ordinal: 0,
             checkpoint_gtid: Some("GTID-UNIT".to_string()),
             checkpoint_file: "mysql-bin.000001".to_string(),
@@ -1706,6 +1743,8 @@ mod tests {
         // lose progress and cause re-delivery on reconnect.
         let (tx, _rx) = mpsc::channel::<SourceItem>(1);
         let mut ctx = make_runctx(tx);
+        // A GTID opens at a clean boundary (previous transaction terminated).
+        ctx.current_gtid = None;
         ctx.last_gtid = Some("uuid-a:1-10".to_string());
         handle_gtid(
             &mut ctx,
@@ -1714,8 +1753,76 @@ mod tests {
                 gtid: "uuid-a:11".into(),
             },
         )
-        .await;
+        .await
+        .expect("gtid at a clean boundary is accepted");
         assert_eq!(ctx.last_gtid.as_deref(), Some("uuid-a:1-11"));
+    }
+
+    #[tokio::test]
+    async fn handle_gtid_fails_closed_when_transaction_still_open() {
+        // A new GTID arriving while the previous transaction is unterminated is a
+        // framing violation: fail closed rather than overwrite/mis-frame.
+        let (tx, _rx) = mpsc::channel::<SourceItem>(1);
+        let mut ctx = make_runctx(tx);
+        ctx.current_gtid = Some("uuid-a:5".to_string());
+        let err = handle_gtid(
+            &mut ctx,
+            GtidEvent {
+                flags: 0,
+                gtid: "uuid-a:6".into(),
+            },
+        )
+        .await
+        .expect_err("a new GTID while one is open must fail closed");
+        assert!(matches!(err, SourceError::Other(_)));
+        // The open transaction's GTID is not overwritten.
+        assert_eq!(ctx.current_gtid.as_deref(), Some("uuid-a:5"));
+    }
+
+    #[tokio::test]
+    async fn handle_query_autocommit_closes_data_less_transaction() {
+        // A GTID-backed autocommit statement (e.g. FLUSH PRIVILEGES) outside an
+        // explicit BEGIN block is its own transaction: it must emit a data-less
+        // commit boundary and clear current_gtid, so the next GTID does not fail
+        // closed and rotation's boundary condition can open.
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        ctx.in_explicit_txn = false;
+        ctx.current_gtid = Some("uuid-a:7".to_string());
+        handle_query(&mut ctx, &make_header(), query_event("FLUSH PRIVILEGES"))
+            .await
+            .expect("ok");
+        // A commit boundary was emitted for the statement's GTID...
+        match rx.try_recv().expect("a commit boundary must be emitted") {
+            SourceItem::TxCommit { tx_id, .. } => {
+                assert_eq!(tx_id, "uuid-a:7")
+            }
+            other => panic!("expected TxCommit, got {other:?}"),
+        }
+        // ...with no data event, and current_gtid is cleared.
+        assert!(ctx.current_gtid.is_none(), "current_gtid must clear");
+    }
+
+    #[tokio::test]
+    async fn handle_query_control_statement_inside_txn_is_ignored() {
+        // A control statement inside an explicit transaction (e.g. SAVEPOINT) is
+        // part of that transaction - it must NOT close it.
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        ctx.in_explicit_txn = true;
+        ctx.current_gtid = Some("uuid-a:8".to_string());
+        handle_query(&mut ctx, &make_header(), query_event("SAVEPOINT sp1"))
+            .await
+            .expect("ok");
+        assert!(
+            rx.try_recv().is_err(),
+            "a control statement inside a transaction must not close it"
+        );
+        assert_eq!(
+            ctx.current_gtid.as_deref(),
+            Some("uuid-a:8"),
+            "the transaction stays open"
+        );
     }
 
     #[tokio::test]

@@ -113,7 +113,7 @@ pub struct PostgresSource {
         std::collections::BTreeMap<String, deltaforge_config::TableOptions>,
     /// Controlled credential-rotation spec, when configured and file-backed.
     /// `None` disables rotation for this source.
-    pub rotation: Option<Arc<postgres_rotation::PgRotationSpec>>,
+    pub rotation: Option<Arc<crate::rotation_manager::RotationSpec>>,
 }
 
 // ============================================================================
