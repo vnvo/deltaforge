@@ -14,6 +14,7 @@ pub mod failover;
 pub mod identity_resolution;
 pub mod mysql;
 pub mod postgres;
+pub mod rotation;
 pub mod schema_loader;
 pub mod snapshot_event_id;
 pub mod snapshot_frontier;
@@ -38,6 +39,11 @@ pub use credentials::{
 };
 pub use mysql::{MySqlCheckpoint, MySqlSchemaLoader, MySqlSource};
 pub use postgres::{PostgresCheckpoint, PostgresSource};
+pub use rotation::{
+    ApplyOutcome, Candidate, DbKind, FieldSource, RetryConfig,
+    RotationComposition, RotationCoordinator, RotationReject, apply_two_stage,
+    compose, earliest_expiry,
+};
 
 /// Resolve the source's connection DSN from configuration (inline, whole-DSN
 /// secret, or base DSN plus referenced credentials). This performs all secret
