@@ -103,6 +103,12 @@ pub async fn source_secret_resolver(
         RotationTriggerCfg::Vault(vcfg) => {
             build_vault_resolver(vcfg, rot.max_secret_bytes).await
         }
+        RotationTriggerCfg::VaultLease(lcfg) => {
+            // The leased dynamic-credential path uses the same Vault resolver (its lease
+            // client issues/renews/revokes through it); the lease driver is wired
+            // separately.
+            build_vault_resolver(&lcfg.vault, rot.max_secret_bytes).await
+        }
     }
 }
 

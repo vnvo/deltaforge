@@ -291,6 +291,15 @@ pub(crate) async fn build_spec(
             )
             .await
         }
+        RotationTriggerCfg::VaultLease(_) => {
+            // The leased dynamic-credential path is driven by the lease-rotation driver
+            // (see `vault_lease_rotation`), wired through a dedicated startup/build path -
+            // not through this static-credential `build_spec`. Until that wiring lands it
+            // fails closed rather than silently behaving like a static rotation.
+            Err(fail_closed(
+                "vault_lease rotation trigger is not wired into this build path yet",
+            ))
+        }
     }
 }
 
