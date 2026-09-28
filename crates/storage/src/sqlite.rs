@@ -737,6 +737,93 @@ impl StorageBackend for SqliteStorageBackend {
         })
     }
 
+    async fn slot_list(
+        &self,
+        ns: &str,
+        prefix: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::SlotPage> {
+        let prefix_norm = prefix.unwrap_or("");
+        let after = match cursor {
+            Some(c) => Some(crate::decode_slot_cursor(c, ns, prefix_norm)?),
+            None => None,
+        };
+        let eff = limit.min(crate::SLOT_LIST_MAX_LIMIT);
+        if eff == 0 {
+            return Ok(crate::SlotPage {
+                records: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let ns_owned = ns.to_string();
+        // Inclusive lower / exclusive upper bounds for "starts with prefix"; empty
+        // prefix means no prefix bounds (NULL).
+        let (lower, upper) = if prefix_norm.is_empty() {
+            (None, None)
+        } else {
+            (
+                Some(prefix_norm.to_string()),
+                crate::prefix_successor(prefix_norm),
+            )
+        };
+        let ns_for_cursor = ns.to_string();
+        let prefix_for_cursor = prefix_norm.to_string();
+        let ns = ns_owned;
+        // Comparison uses SQLite's default BINARY collation (case-sensitive,
+        // byte-wise), matching the in-memory `starts_with`/`>` semantics.
+        db!(self, move |conn: &Connection| {
+            let mut stmt = conn.prepare(
+                "SELECT key, version, state FROM df_slot
+                 WHERE ns = ?1
+                   AND (?2 IS NULL OR key >= ?2)
+                   AND (?3 IS NULL OR key <  ?3)
+                   AND (?4 IS NULL OR key >  ?4)
+                 ORDER BY key ASC
+                 LIMIT ?5",
+            )?;
+            let rows = stmt.query_map(
+                params![ns, lower, upper, after, (eff as i64) + 1],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)? as u64,
+                        r.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )?;
+            let mut all: Vec<(String, u64, Vec<u8>)> = Vec::new();
+            for row in rows {
+                all.push(row?);
+            }
+            let has_more = all.len() > eff;
+            all.truncate(eff);
+            let next_cursor = if has_more {
+                all.last().map(|(k, _, _)| {
+                    crate::encode_slot_cursor(
+                        &ns_for_cursor,
+                        &prefix_for_cursor,
+                        k,
+                    )
+                })
+            } else {
+                None
+            };
+            let records = all
+                .into_iter()
+                .map(|(key, version, value)| crate::SlotRecord {
+                    key,
+                    version,
+                    value,
+                })
+                .collect();
+            Ok(crate::SlotPage {
+                records,
+                next_cursor,
+            })
+        })
+    }
+
     async fn queue_push(
         &self,
         ns: &str,
@@ -883,6 +970,67 @@ mod tests {
     #[tokio::test]
     async fn concurrent_appends() {
         crate::log_contract_suite::concurrent_appends(be(), "journal").await;
+    }
+
+    // slot_list contract suite.
+    #[tokio::test]
+    async fn slot_list_namespace_isolation() {
+        crate::slot_list_contract_suite::namespace_isolation(be(), "slots")
+            .await;
+    }
+    #[tokio::test]
+    async fn slot_list_prefix_correctness() {
+        crate::slot_list_contract_suite::prefix_correctness(be(), "slots")
+            .await;
+    }
+    #[tokio::test]
+    async fn slot_list_pagination_without_duplicates() {
+        crate::slot_list_contract_suite::pagination_without_duplicates(
+            be(),
+            "slots",
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn slot_list_concurrent_mutation_tolerance() {
+        crate::slot_list_contract_suite::concurrent_mutation_tolerance(
+            be(),
+            "slots",
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn slot_list_malformed_cursor_rejected() {
+        crate::slot_list_contract_suite::malformed_cursor_rejected(
+            be(),
+            "slots",
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn slot_list_zero_limit_is_empty() {
+        crate::slot_list_contract_suite::zero_limit_is_empty(be(), "slots")
+            .await;
+    }
+    #[tokio::test]
+    async fn slot_list_unicode_ordering() {
+        crate::slot_list_contract_suite::unicode_ordering_and_pagination(
+            be(),
+            "slots",
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn slot_list_prefix_utf8_length_boundary() {
+        crate::slot_list_contract_suite::prefix_across_utf8_length_boundary(
+            be(),
+            "slots",
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn slot_list_cursor_validation() {
+        crate::slot_list_contract_suite::cursor_validation(be(), "slots").await;
     }
 
     /// A failure after the delete + horizon update but before commit rolls BOTH
