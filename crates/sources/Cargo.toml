@@ -6,6 +6,10 @@ license = "MIT OR Apache-2.0"
 
 [features]
 default = []
+# Native Vault-triggered credential rotation. Enables the secrets crate's Vault
+# provider so a `trigger: { type: vault }` rotation can connect and poll. Off by
+# default; a Vault-configured rotation fails closed in a build without it.
+vault = ["secrets/vault"]
 
 [dependencies]
 scopeguard = "1"
@@ -52,6 +56,9 @@ tracing-subscriber = { version = "0.3", features = [
     "json",
 ] }
 tempfile = "3"
+# Vault admin setup (write KV, create/rotate secrets) for the live Vault+source
+# integration test.
+reqwest = { workspace = true }
 processors ={ path = "../processors"}
 # Dev-only: source→coordinator acceptance tests exercise the real coordinator.
 # This is a dev-dependency cycle (runner depends on sources), which Cargo allows

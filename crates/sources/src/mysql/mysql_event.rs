@@ -796,6 +796,192 @@ fn ddl_source_lineage(ctx: &RunCtx) -> deltaforge_core::SourceLineage<'_> {
     }
 }
 
+/// Whether `b` can be part of a bareword (keyword/identifier) token.
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// Advance past a quoted run beginning at `start` (the opening quote `q`). Handles
+/// doubled-quote escaping for all quote kinds and backslash escaping for string /
+/// double-quote literals (not backticks). An unterminated quote consumes to the end,
+/// so no keyword-like text inside a literal can leak out as a bareword token.
+fn skip_quoted(bytes: &[u8], start: usize, q: u8) -> usize {
+    let n = bytes.len();
+    let mut i = start + 1;
+    while i < n {
+        let c = bytes[i];
+        if c == b'\\' && q != b'`' {
+            i += 2;
+            continue;
+        }
+        if c == q {
+            if i + 1 < n && bytes[i + 1] == q {
+                i += 2; // doubled-quote escape
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    n
+}
+
+/// Tokenize `sql` into its bareword (keyword/identifier) tokens, uppercased, in
+/// order. Skips whitespace and SQL comments (`/* ... */`, `-- ...`, `# ...`) and
+/// never emits text inside string literals or quoted identifiers (`'..'`, `".."`,
+/// `` `..` ``), so keyword-like text there is not mistaken for a keyword. `limit`
+/// caps how many barewords are collected (the classifier needs only a few, but a
+/// GRANT must be scanned for `IDENTIFIED`).
+fn bareword_tokens(sql: &str, limit: usize) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+    let mut words = Vec::new();
+    while i < n && words.len() < limit {
+        let c = bytes[i];
+        match c {
+            b' ' | b'\t' | b'\r' | b'\n' | 0x0b | 0x0c => i += 1,
+            b'/' if i + 1 < n && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = i.saturating_add(2).min(n);
+            }
+            b'-' if i + 1 < n && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < n && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'#' => {
+                i += 1;
+                while i < n && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'\'' | b'"' | b'`' => i = skip_quoted(bytes, i, c),
+            _ if is_word_byte(c) => {
+                let start = i;
+                while i < n && is_word_byte(bytes[i]) {
+                    i += 1;
+                }
+                words.push(
+                    std::str::from_utf8(&bytes[start..i])
+                        .unwrap_or("")
+                        .to_ascii_uppercase(),
+                );
+            }
+            _ => i += 1, // punctuation
+        }
+    }
+    words
+}
+
+/// Classify a credential-bearing account statement whose raw SQL must never be
+/// logged or emitted: it can carry a plaintext password, an authentication token,
+/// or a password hash/verifier (e.g. `ALTER USER ... IDENTIFIED ... AS '$A$...'`).
+/// Returns a fixed, non-sensitive operation label, or `None` for ordinary DDL.
+///
+/// Uses a comment- and quote-aware tokenizer, so forms with repeated whitespace,
+/// newlines, or interleaved comments between keywords
+/// (`ALTER /* x */ USER ...`) are classified correctly, while keyword-like text in
+/// string literals or quoted identifiers is ignored. `CREATE USER` / `ALTER USER`
+/// are always redacted (account statements, conservatively redacted even without a
+/// visible credential); a `GRANT` is redacted when an `IDENTIFIED` keyword appears
+/// outside any literal.
+///
+/// Credential DDL is intentionally **redacted rather than relayed faithfully**:
+/// downstream sinks, journals, replay, and the DLQ would otherwise persist the
+/// secret. Callers emit only the operation label plus non-sensitive context (the
+/// database), never the statement text.
+fn credential_ddl_operation(sql: &str) -> Option<&'static str> {
+    // The first two barewords settle CREATE/ALTER USER and SET PASSWORD; a GRANT
+    // needs the whole statement scanned for a bareword IDENTIFIED.
+    let head = bareword_tokens(sql, 2);
+    match (
+        head.first().map(String::as_str),
+        head.get(1).map(String::as_str),
+    ) {
+        (Some("CREATE"), Some("USER")) => Some("CREATE USER"),
+        (Some("ALTER"), Some("USER")) => Some("ALTER USER"),
+        (Some("SET"), Some("PASSWORD")) => Some("SET PASSWORD"),
+        (Some("GRANT"), _) => {
+            // Bounded scan; IDENTIFIED here is a real keyword (literals excluded).
+            let all = bareword_tokens(sql, 4096);
+            all.iter()
+                .any(|w| w == "IDENTIFIED")
+                .then_some("GRANT ... IDENTIFIED")
+        }
+        _ => None,
+    }
+}
+
+/// Build and emit one DDL event with the given (already safe) `payload`, then close
+/// its GTID transaction boundary. Shared by the ordinary-DDL and redacted
+/// credential-DDL paths so they stay consistent; `payload` is the only difference.
+async fn emit_ddl_event(
+    ctx: &mut RunCtx,
+    header: &EventHeader,
+    schema: &str,
+    payload: serde_json::Value,
+) -> SourceResult<()> {
+    let message_ordinal = ctx.message_ordinal;
+    ctx.message_ordinal += 1;
+
+    let source_info = SourceInfo {
+        version: concat!("deltaforge-", env!("CARGO_PKG_VERSION")).to_string(),
+        connector: "mysql".to_string(),
+        name: ctx.pipeline.clone(),
+        ts_ms: ts_sec_to_ms(header.timestamp),
+        db: schema.to_string(),
+        schema: None,
+        table: "_ddl".to_string(),
+        snapshot: None,
+        position: SourcePosition::mysql(
+            ctx.server_id as u32,
+            ctx.last_gtid.clone(),
+            Some(ctx.last_file.clone()),
+            Some(ctx.last_pos),
+            None,
+        ),
+    };
+
+    let lineage = ddl_source_lineage(ctx);
+    let source_position = format!("{}:{}", ctx.last_file, ctx.last_pos);
+    let ddl_id = deltaforge_core::EventId::ddl(
+        &lineage,
+        &source_position,
+        message_ordinal,
+    );
+
+    let mut ev = Event::new_ddl(
+        ddl_id,
+        source_info,
+        payload,
+        ts_sec_to_ms(header.timestamp),
+        header.event_length as usize,
+    )
+    .with_tenant(ctx.tenant.clone())
+    .with_checkpoint(make_checkpoint_meta(
+        &ctx.last_file,
+        ctx.last_pos,
+        &ctx.last_gtid,
+    ));
+    ev.transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
+        id: gtid.clone(),
+        total_order: None,
+        data_collection_order: None,
+    });
+
+    if (ctx.tx.send(SourceItem::Event(ev)).await).is_err() {
+        error!(source_id=%ctx.source_id, "channel send failed (op=ddl)");
+    }
+    // DDL is auto-committed (its own transaction) → emit its boundary.
+    emit_tx_commit(ctx).await;
+    Ok(())
+}
+
 async fn handle_query(
     ctx: &mut RunCtx,
     header: &EventHeader,
@@ -821,7 +1007,28 @@ async fn handle_query(
         return Ok(());
     }
 
-    // Handle DDL
+    // Credential-bearing account statements first: never log or emit their raw
+    // SQL (it can carry a password, token, or verifier). Emit a fixed redacted DDL
+    // payload with only the operation type and database. Credential rotation
+    // naturally exercises these (ALTER USER / SET PASSWORD), so this must precede
+    // the generic DDL handling below and is intentionally lossy.
+    if let Some(op) = credential_ddl_operation(&q.query) {
+        info!(
+            source_id=%ctx.source_id,
+            db=%q.schema,
+            operation=op,
+            "credential DDL detected; SQL redacted"
+        );
+        let payload = serde_json::json!({
+            "operation": op,
+            "database": q.schema,
+            "redacted": true,
+            "note": "credential-bearing account statement; raw SQL omitted",
+        });
+        return emit_ddl_event(ctx, header, &q.schema, payload).await;
+    }
+
+    // Ordinary (non-credential) DDL.
     if sql_upper.starts_with("ALTER")
         || sql_upper.starts_with("CREATE")
         || sql_upper.starts_with("DROP")
@@ -835,73 +1042,14 @@ async fn handle_query(
             "DDL detected"
         );
 
-        // DDL message ordinal assigned before any downstream filtering.
-        let message_ordinal = ctx.message_ordinal;
-        ctx.message_ordinal += 1;
-
-        // For DDL, we use the query's schema as both db and table context
-        let source_info = SourceInfo {
-            version: concat!("deltaforge-", env!("CARGO_PKG_VERSION"))
-                .to_string(),
-            connector: "mysql".to_string(),
-            name: ctx.pipeline.clone(),
-            ts_ms: ts_sec_to_ms(header.timestamp),
-            db: q.schema.clone(),
-            schema: None,
-            table: "_ddl".to_string(), // Placeholder for DDL events
-            snapshot: None,
-            position: SourcePosition::mysql(
-                ctx.server_id as u32,
-                ctx.last_gtid.clone(),
-                Some(ctx.last_file.clone()),
-                Some(ctx.last_pos),
-                None,
-            ),
-        };
-
-        // `ddl` id: source lineage + "file:pos" + message ordinal.
-        let lineage = ddl_source_lineage(ctx);
-        let source_position = format!("{}:{}", ctx.last_file, ctx.last_pos);
-        let ddl_id = deltaforge_core::EventId::ddl(
-            &lineage,
-            &source_position,
-            message_ordinal,
-        );
-
         let ddl_payload = serde_json::json!({
             "sql": q.query,
             "database": q.schema,
         });
+        emit_ddl_event(ctx, header, &q.schema, ddl_payload).await?;
 
-        let mut ev = Event::new_ddl(
-            ddl_id,
-            source_info,
-            ddl_payload,
-            ts_sec_to_ms(header.timestamp),
-            header.event_length as usize,
-        )
-        .with_tenant(ctx.tenant.clone())
-        .with_checkpoint(make_checkpoint_meta(
-            &ctx.last_file,
-            ctx.last_pos,
-            &ctx.last_gtid,
-        ));
-        // DDL is its own GTID transaction - stamp its identity so it belongs to
-        // the transaction opened at the GTID event and closed just below.
-        ev.transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
-            id: gtid.clone(),
-            total_order: None,
-            data_collection_order: None,
-        });
-
-        if (ctx.tx.send(SourceItem::Event(ev)).await).is_err() {
-            error!(source_id=%ctx.source_id, "channel send failed (op=ddl)");
-        }
-        // DDL is auto-committed (its own transaction) → emit its boundary.
-        emit_tx_commit(ctx).await;
-
-        // Reload schema after DDL to pick up changes
-        // Try to extract table name from DDL for targeted reload
+        // Reload schema after DDL to pick up changes. Try to extract the table
+        // name from the DDL for a targeted reload.
         if let Some(table_name) = extract_table_from_ddl(&q.query) {
             let db = if q.schema.is_empty() {
                 &ctx.default_db
@@ -1690,6 +1838,173 @@ mod tests {
             rx.try_recv().is_err(),
             "transaction markers must not emit events"
         );
+    }
+
+    #[test]
+    fn credential_ddl_operation_classifies_account_statements() {
+        let cred = |s: &str| credential_ddl_operation(s).is_some();
+        // Credential-bearing account statements (mixed case too).
+        assert!(cred("CREATE USER 'df'@'%' IDENTIFIED BY 'pw'"));
+        assert!(cred("alter user 'df'@'%' IDENTIFIED WITH x AS '$A$..'"));
+        assert!(cred("SET PASSWORD FOR 'df'@'%' = 'pw'"));
+        assert!(cred("GRANT ALL ON *.* TO 'df'@'%' IDENTIFIED BY 'pw'"));
+        // Ordinary DDL / GRANT without a secret must NOT be classified.
+        assert!(!cred("ALTER TABLE orders ADD COLUMN x INT"));
+        assert!(!cred("CREATE TABLE t (id INT)"));
+        assert!(!cred("GRANT SELECT ON db.* TO 'df'@'%'"));
+        assert!(!cred("DROP USER 'df'@'%'"));
+    }
+
+    #[test]
+    fn credential_classifier_is_whitespace_and_comment_insensitive() {
+        // Forms that a naive prefix match would miss must still be classified.
+        let bypass = [
+            "ALTER  USER 'df'@'%' IDENTIFIED BY 'pw'",
+            "ALTER /* rotation */ USER 'df'@'%' IDENTIFIED BY 'pw'",
+            "CREATE\n\tUSER 'df'@'%' IDENTIFIED BY 'pw'",
+            "GRANT ALL ON *.* TO 'df'@'%' IDENTIFIED /* c */ BY 'pw'",
+            "SET /* c */ PASSWORD FOR 'df'@'%' = 'pw'",
+            "-- lead\nALTER USER 'df'@'%' IDENTIFIED BY 'pw'",
+            "# lead\nCREATE USER 'df'@'%' IDENTIFIED BY 'pw'",
+        ];
+        for s in bypass {
+            assert!(
+                credential_ddl_operation(s).is_some(),
+                "must classify as credential DDL: {s:?}"
+            );
+        }
+        // Keyword-like text inside a string/identifier or a comment must NOT
+        // trigger a GRANT misclassification; an ordinary GRANT is not credential.
+        assert!(
+            credential_ddl_operation(
+                "GRANT SELECT ON `identified`.* TO 'df'@'%'"
+            )
+            .is_none(),
+            "IDENTIFIED inside a backtick identifier is not a keyword"
+        );
+        assert!(
+            credential_ddl_operation(
+                "GRANT SELECT ON db.* TO 'x' /* not identified */"
+            )
+            .is_none(),
+            "IDENTIFIED inside a comment is not a keyword"
+        );
+    }
+
+    /// A cloneable `io::Write` over a shared buffer, for capturing tracing output.
+    #[derive(Clone)]
+    struct VecWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for VecWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Sentinel: credential-bearing DDL must never leak the password, token, or
+    /// verifier - nor the complete original SQL - into either the emitted Event or
+    /// the formatted logs. Covers ALTER USER / CREATE USER / SET PASSWORD /
+    /// GRANT ... IDENTIFIED, the statements credential rotation exercises.
+    #[tokio::test]
+    async fn credential_ddl_is_redacted_in_event_and_logs() {
+        const VERIFIER: &str = "$A$005$SUPERSECRETVERIFIERBYTES1234567890";
+        const PLAINTEXT: &str = "hunter2plaintextpassword";
+        let statements = [
+            format!(
+                "ALTER USER 'df'@'%' IDENTIFIED WITH caching_sha2_password \
+                 AS '{VERIFIER}'"
+            ),
+            format!("CREATE USER 'df'@'%' IDENTIFIED BY '{PLAINTEXT}'"),
+            format!("SET PASSWORD FOR 'df'@'%' = '{VERIFIER}'"),
+            format!("GRANT ALL ON *.* TO 'df'@'%' IDENTIFIED BY '{PLAINTEXT}'"),
+            // Bypass forms: repeated whitespace, newlines, and each comment style
+            // between keywords must still redact in both the event and the logs.
+            format!(
+                "ALTER  /* rotation */ USER 'df'@'%' IDENTIFIED WITH \
+                 caching_sha2_password AS '{VERIFIER}'"
+            ),
+            format!("CREATE\n\tUSER 'df'@'%' IDENTIFIED BY '{PLAINTEXT}'"),
+            format!("-- rotate now\nSET PASSWORD FOR 'df'@'%' = '{VERIFIER}'"),
+            format!(
+                "# rotate\nGRANT ALL ON *.* TO 'df'@'%' IDENTIFIED BY \
+                 '{PLAINTEXT}'"
+            ),
+        ];
+
+        for sql in statements {
+            let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+            let writer = VecWriter(buf.clone());
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_max_level(tracing::Level::TRACE)
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+
+            let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
+            let mut ctx = make_runctx(tx);
+            // An account statement is its own autocommit GTID transaction.
+            ctx.in_explicit_txn = false;
+            handle_query(&mut ctx, &make_header(), query_event(&sql))
+                .await
+                .expect("handle_query should succeed");
+            drop(guard);
+
+            let ev = recv_event(&mut rx).await.unwrap_or_else(|| {
+                panic!(
+                    "credential DDL must emit a \
+                     (redacted) event: {sql}"
+                )
+            });
+
+            // The emitted Event, serialized as it would reach any sink, must carry
+            // neither the secret, the complete original SQL, nor a raw fragment
+            // (the account spec), and must mark redaction. (The non-sensitive
+            // operation label may itself contain words like "PASSWORD".)
+            let ev_json = serde_json::to_string(&ev).expect("event serializes");
+            assert!(
+                !ev_json.contains(VERIFIER),
+                "verifier leaked into event for: {sql}"
+            );
+            assert!(
+                !ev_json.contains(PLAINTEXT),
+                "password leaked into event for: {sql}"
+            );
+            assert!(
+                !ev_json.contains(&sql),
+                "complete original SQL leaked into event for: {sql}"
+            );
+            assert!(
+                !ev_json.contains("'df'@'%'"),
+                "raw SQL fragment leaked into event for: {sql}"
+            );
+            assert!(
+                ev_json.contains("redacted"),
+                "payload must mark redaction for: {sql}"
+            );
+
+            // The formatted logs must not contain the secret or the raw SQL.
+            let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+            assert!(
+                !logs.contains(VERIFIER),
+                "verifier leaked into logs for: {sql}"
+            );
+            assert!(
+                !logs.contains(PLAINTEXT),
+                "password leaked into logs for: {sql}"
+            );
+            assert!(
+                !logs.contains(&sql),
+                "complete original SQL leaked into logs for: {sql}"
+            );
+            assert!(
+                !logs.contains("'df'@'%'"),
+                "raw SQL fragment leaked into logs for: {sql}"
+            );
+        }
     }
 
     #[tokio::test]

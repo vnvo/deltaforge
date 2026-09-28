@@ -5378,6 +5378,7 @@ dependencies = [
  "testcontainers",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
  "zeroize",
 ]
 
@@ -5863,6 +5864,7 @@ dependencies = [
  "pgwire-replication",
  "processors",
  "rand 0.9.4",
+ "reqwest",
  "runner",
  "schema-registry",
  "scopeguard",

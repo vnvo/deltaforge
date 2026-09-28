@@ -186,29 +186,157 @@ pub struct SourceCredentialsCfg {
     pub password: Option<secrets::SecretReference>,
 }
 
-/// Opt-in controlled credential rotation for a source whose credentials are
-/// file-backed (a projected secret volume). When set, the source watches the
-/// referenced files and, on a validated change, performs a two-stage reconnect at
-/// a safe boundary. Non-file-backed credentials ignore this (rotation stays off).
+/// Opt-in controlled credential rotation for a source. When set, the source
+/// detects a rotated credential (via the configured `trigger`) and performs a
+/// two-stage reconnect at a safe transaction boundary. Non-rotatable references
+/// (an inline DSN, or an env value that never changes) fail closed at startup.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "RawRotationCfg")]
 pub struct CredentialRotationCfg {
-    /// Trusted root directory for symlink resolution of the watched secret files
-    /// (the projected-volume mount point). Watched references must resolve within
-    /// it.
-    pub trusted_root: std::path::PathBuf,
-    /// How often to poll the watched files for a change.
-    #[serde(default = "default_rotation_poll_ms")]
+    /// What drives rotation detection: watched projected-volume files, or Vault
+    /// KV polling. Exactly one rotating authority per credential set; immutable
+    /// env fields may be mixed alongside it.
+    pub trigger: RotationTriggerCfg,
+    /// How often to poll for a change (file mtime/inode/size, or Vault KV
+    /// record version).
     pub poll_interval_ms: u64,
     /// How long an observed change must be stable before it is applied (guards
-    /// against reading a half-written projected update).
-    #[serde(default = "default_rotation_debounce_ms")]
+    /// against reading a half-written projected update). File trigger only; the
+    /// Vault trigger uses atomic KV versions and ignores this. Zero is permitted
+    /// (projected-volume swaps are atomic) but a small non-zero value is
+    /// recommended to absorb non-atomic writers.
     pub debounce_ms: u64,
-    /// Maximum size of any single watched secret file.
-    #[serde(default = "default_rotation_max_secret_bytes")]
+    /// Maximum size of any single resolved secret value.
     pub max_secret_bytes: usize,
     /// Per-step timeout bounding each stage of the boundary reconnect.
-    #[serde(default = "default_rotation_apply_timeout_ms")]
     pub apply_timeout_ms: u64,
+}
+
+/// Deserialization shim for [`CredentialRotationCfg`]. Accepts both the current
+/// `trigger`-tagged shape and the deprecated flat file shape (a top-level
+/// `trusted_root` with no `trigger`), normalizing the latter to a `File` trigger so
+/// existing configurations keep parsing.
+#[derive(Deserialize)]
+struct RawRotationCfg {
+    #[serde(default)]
+    trigger: Option<RotationTriggerCfg>,
+    /// Deprecated: the pre-`trigger` file-rotation shape. Equivalent to
+    /// `trigger: { type: file, trusted_root: ... }`.
+    #[serde(default)]
+    trusted_root: Option<std::path::PathBuf>,
+    #[serde(default = "default_rotation_poll_ms")]
+    poll_interval_ms: u64,
+    #[serde(default = "default_rotation_debounce_ms")]
+    debounce_ms: u64,
+    #[serde(default = "default_rotation_max_secret_bytes")]
+    max_secret_bytes: usize,
+    #[serde(default = "default_rotation_apply_timeout_ms")]
+    apply_timeout_ms: u64,
+}
+
+impl TryFrom<RawRotationCfg> for CredentialRotationCfg {
+    type Error = String;
+
+    fn try_from(raw: RawRotationCfg) -> Result<Self, Self::Error> {
+        let trigger = match (raw.trigger, raw.trusted_root) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "rotation: set either `trigger` or the deprecated \
+                            `trusted_root`, not both"
+                        .to_string(),
+                );
+            }
+            (Some(trigger), None) => trigger,
+            // Deprecated flat shape -> file trigger (unchanged behavior).
+            (None, Some(trusted_root)) => {
+                RotationTriggerCfg::File { trusted_root }
+            }
+            (None, None) => {
+                return Err(
+                    "rotation requires a `trigger` (or the deprecated \
+                            `trusted_root`)"
+                        .to_string(),
+                );
+            }
+        };
+        Ok(CredentialRotationCfg {
+            trigger,
+            poll_interval_ms: raw.poll_interval_ms,
+            debounce_ms: raw.debounce_ms,
+            max_secret_bytes: raw.max_secret_bytes,
+            apply_timeout_ms: raw.apply_timeout_ms,
+        })
+    }
+}
+
+/// The rotation trigger. Tagged by `type` (`file` or `vault`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RotationTriggerCfg {
+    /// Kubernetes projected-volume file(s) watched for atomic replacement.
+    File {
+        /// Trusted root directory for symlink resolution of the watched secret
+        /// files. Watched references must resolve within it.
+        trusted_root: std::path::PathBuf,
+    },
+    /// Vault KV v2 polled for a new record version.
+    Vault(VaultRotationCfg),
+}
+
+/// Vault connection and auth for a Vault-triggered rotation. Non-secret: auth
+/// material (token / SA JWT) is read from files at connect time, never stored here.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VaultRotationCfg {
+    /// Vault base address. Production requires `https://`; set
+    /// `allow_insecure_http` for a dev/test Vault.
+    pub address: String,
+    /// Optional Vault namespace (Enterprise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// How the client authenticates to Vault.
+    pub auth: VaultAuthCfg,
+    /// Permit `http://` for a dev/test Vault. Off by default.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
+    /// Connection timeout (ms). Defaults applied by the provider when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_ms: Option<u64>,
+    /// Request timeout (ms). Defaults applied by the provider when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_ms: Option<u64>,
+    /// Absolute safety margin (ms) before token expiry to renew. Defaults applied
+    /// by the provider when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renew_safety_margin_ms: Option<u64>,
+}
+
+/// Vault auth method. Tagged by `method` (`token_file` or `kubernetes`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "method", rename_all = "snake_case")]
+pub enum VaultAuthCfg {
+    /// A Vault token read from a mounted/projected file.
+    TokenFile {
+        path: std::path::PathBuf,
+        /// When set, the path is a Kubernetes projected-volume symlink whose
+        /// resolved target must stay within this root; otherwise the path must
+        /// not be a symlink.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        projected_volume_root: Option<std::path::PathBuf>,
+    },
+    /// Kubernetes auth: POST the projected service-account JWT to
+    /// `auth/<mount>/login`.
+    Kubernetes {
+        #[serde(default = "default_vault_k8s_mount")]
+        mount: String,
+        role: String,
+        jwt_path: std::path::PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        projected_volume_root: Option<std::path::PathBuf>,
+    },
+}
+
+fn default_vault_k8s_mount() -> String {
+    "kubernetes".to_string()
 }
 
 fn default_rotation_poll_ms() -> u64 {
@@ -667,6 +795,135 @@ pub fn load_cfg(path: &str) -> ConfigResult<Vec<PipelineSpec>> {
             let spec = load_from_path(path)?;
             Ok(vec![spec])
         }
+    }
+}
+
+#[cfg(test)]
+mod rotation_trigger_tests {
+    use super::*;
+
+    #[test]
+    fn file_trigger_parses() {
+        let yaml = r#"
+trigger:
+  type: file
+  trusted_root: /var/run/secrets/db
+poll_interval_ms: 500
+"#;
+        let cfg: CredentialRotationCfg = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.poll_interval_ms, 500);
+        match cfg.trigger {
+            RotationTriggerCfg::File { trusted_root } => {
+                assert_eq!(trusted_root.to_str(), Some("/var/run/secrets/db"))
+            }
+            other => panic!("expected file trigger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vault_trigger_token_file_parses_with_defaults() {
+        let yaml = r#"
+trigger:
+  type: vault
+  address: https://vault.internal:8200
+  auth:
+    method: token_file
+    path: /var/run/secrets/vault/token
+"#;
+        let cfg: CredentialRotationCfg = serde_yaml::from_str(yaml).unwrap();
+        // Shared timing defaults still apply.
+        assert_eq!(cfg.poll_interval_ms, default_rotation_poll_ms());
+        match cfg.trigger {
+            RotationTriggerCfg::Vault(v) => {
+                assert_eq!(v.address, "https://vault.internal:8200");
+                assert!(!v.allow_insecure_http);
+                match v.auth {
+                    VaultAuthCfg::TokenFile { path, .. } => assert_eq!(
+                        path.to_str(),
+                        Some("/var/run/secrets/vault/token")
+                    ),
+                    other => panic!("expected token_file, got {other:?}"),
+                }
+            }
+            other => panic!("expected vault trigger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vault_trigger_kubernetes_defaults_mount() {
+        let yaml = r#"
+trigger:
+  type: vault
+  address: https://vault:8200
+  allow_insecure_http: false
+  auth:
+    method: kubernetes
+    role: orders-app
+    jwt_path: /var/run/secrets/kubernetes.io/serviceaccount/token
+"#;
+        let cfg: CredentialRotationCfg = serde_yaml::from_str(yaml).unwrap();
+        match cfg.trigger {
+            RotationTriggerCfg::Vault(v) => match v.auth {
+                VaultAuthCfg::Kubernetes { mount, role, .. } => {
+                    assert_eq!(mount, "kubernetes"); // defaulted
+                    assert_eq!(role, "orders-app");
+                }
+                other => panic!("expected kubernetes, got {other:?}"),
+            },
+            other => panic!("expected vault trigger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_trigger_and_legacy_root_is_rejected() {
+        // Neither a `trigger` nor the deprecated `trusted_root`: must not parse.
+        let yaml = "poll_interval_ms: 500\n";
+        assert!(serde_yaml::from_str::<CredentialRotationCfg>(yaml).is_err());
+    }
+
+    #[test]
+    fn deprecated_flat_file_shape_parses_identically() {
+        // Pre-`trigger` configurations used a top-level `trusted_root`; they must
+        // keep parsing, identically to the explicit file trigger.
+        let legacy = r#"
+trusted_root: /var/run/secrets/db
+poll_interval_ms: 300
+debounce_ms: 100
+"#;
+        let modern = r#"
+trigger:
+  type: file
+  trusted_root: /var/run/secrets/db
+poll_interval_ms: 300
+debounce_ms: 100
+"#;
+        let a: CredentialRotationCfg = serde_yaml::from_str(legacy).unwrap();
+        let b: CredentialRotationCfg = serde_yaml::from_str(modern).unwrap();
+        assert_eq!(a, b);
+        assert!(matches!(a.trigger, RotationTriggerCfg::File { .. }));
+    }
+
+    #[test]
+    fn trigger_and_legacy_root_together_is_rejected() {
+        let yaml = r#"
+trusted_root: /a
+trigger:
+  type: file
+  trusted_root: /b
+"#;
+        assert!(serde_yaml::from_str::<CredentialRotationCfg>(yaml).is_err());
+    }
+
+    #[test]
+    fn vault_trigger_requires_address() {
+        let yaml = r#"
+trigger:
+  type: vault
+  auth:
+    method: token_file
+    path: /t
+"#;
+        assert!(serde_yaml::from_str::<CredentialRotationCfg>(yaml).is_err());
     }
 }
 

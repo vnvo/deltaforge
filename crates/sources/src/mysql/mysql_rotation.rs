@@ -169,7 +169,7 @@ async fn open_binlog(
 /// separately at startup ([`require_gtid_mode`]).
 pub async fn build_spec(
     cfg: &MysqlSrcCfg,
-    resolver: &dyn SecretResolver,
+    resolver: Arc<dyn SecretResolver>,
 ) -> SourceResult<Option<Arc<RotationSpec>>> {
     crate::rotation_manager::build_spec(
         cfg.dsn.as_deref(),
