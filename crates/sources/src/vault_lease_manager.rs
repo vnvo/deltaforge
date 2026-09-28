@@ -448,36 +448,53 @@ impl LeaseManager {
 
         // Supersede + revoke the old lease, if there was one.
         if let Some((old_key, old_version, old_record)) = old {
-            self.supersede_and_revoke(old_key, old_version, old_record)
-                .await?;
+            self.drive_revoke(old_key, old_version, old_record).await?;
         }
         Ok(leased)
     }
 
     /// Revoke the active lease and finalize it to the retained `Revoked` tombstone.
-    pub(crate) async fn revoke_active(&mut self) -> Result<()> {
+    pub(crate) async fn revoke_active(&mut self) -> Result<RevokeOutcome> {
         let (key, version, record) = self.load_active().await?;
-        self.supersede_and_revoke(key, version, record).await?;
+        let outcome = self.drive_revoke(key, version, record).await?;
         self.active = None;
-        Ok(())
+        Ok(outcome)
     }
 
-    /// Drive one lease `Active -> RevokePending -> (Revoked | Orphaned)` by calling
-    /// Vault and feeding the outcome through the state machine. Idempotent on an
-    /// already-absent lease; a 403 leaves the lease `Orphaned` for reconciliation.
-    async fn supersede_and_revoke(
+    /// Drive one lease to its terminal (or `Orphaned`) state by calling Vault and
+    /// feeding the outcome through the state machine. The pre-revoke transition is
+    /// chosen from the record's current state, so this serves normal revoke, reissue
+    /// supersede, crash recovery, and orphan reconciliation alike:
+    /// - `Active` -> `RevokePending` (superseded),
+    /// - `Pending` -> `RevokePending` (a never-adopted lease is rejected),
+    /// - `RevokePending`/`Orphaned` -> revoke is retried from where it was left,
+    /// - `Revoked` -> already terminal, no-op.
+    ///
+    /// Idempotent on an absent lease; a 403 leaves the lease `Orphaned`. A transient
+    /// outage returns `Err` so the caller retries later without corrupting state.
+    async fn drive_revoke(
         &self,
         key: String,
         version: u64,
         record: LeaseRecord,
-    ) -> Result<()> {
-        // Active -> RevokePending (Superseded).
-        let (rp_state, _) =
-            on_lease_event(record.state, LeaseEvent::Superseded)?;
-        let mut rp = record.clone();
-        rp.state = rp_state;
-        if !self.store.cas(&key, version, &rp).await? {
-            anyhow::bail!("lease store version conflict on supersede");
+    ) -> Result<RevokeOutcome> {
+        // Move a live/never-adopted lease into RevokePending first; a lease already in
+        // RevokePending/Orphaned is retried in place.
+        let pre_event = match record.state {
+            LeaseState::Revoked => return Ok(RevokeOutcome::Finalized),
+            LeaseState::Active => Some(LeaseEvent::Superseded),
+            LeaseState::Pending => Some(LeaseEvent::Rejected),
+            LeaseState::RevokePending | LeaseState::Orphaned => None,
+        };
+        if let Some(event) = pre_event {
+            let (rp_state, _) = on_lease_event(record.state, event)?;
+            let mut rp = record.clone();
+            rp.state = rp_state;
+            if !self.store.cas(&key, version, &rp).await? {
+                anyhow::bail!(
+                    "lease store version conflict on revoke transition"
+                );
+            }
         }
 
         let lease_id = record.lease_id.expose().to_string();
@@ -493,19 +510,36 @@ impl LeaseManager {
     }
 
     /// Apply a revoke-resolution event to the record at `key` (reloading for its
-    /// current version), persisting the terminal/orphaned state.
-    async fn resolve_revoke(&self, key: &str, event: LeaseEvent) -> Result<()> {
+    /// current version), persisting the terminal/orphaned state. Idempotent: a record
+    /// already terminal, or already `Orphaned` when Vault stays unauthorized, is left
+    /// as-is rather than driven through an illegal transition.
+    async fn resolve_revoke(
+        &self,
+        key: &str,
+        event: LeaseEvent,
+    ) -> Result<RevokeOutcome> {
         let (version, current) =
             self.store.get(key).await?.ok_or_else(|| {
                 anyhow::anyhow!("revoking lease record missing")
             })?;
+        if current.state.is_terminal() {
+            return Ok(RevokeOutcome::Finalized);
+        }
+        if current.state == LeaseState::Orphaned
+            && event == LeaseEvent::RevokeUnauthorized
+        {
+            return Ok(RevokeOutcome::Orphaned);
+        }
         let (next_state, _) = on_lease_event(current.state, event)?;
         let mut updated = current.clone();
         updated.state = next_state;
         if !self.store.cas(key, version, &updated).await? {
             anyhow::bail!("lease store version conflict on revoke resolution");
         }
-        Ok(())
+        Ok(match next_state {
+            LeaseState::Orphaned => RevokeOutcome::Orphaned,
+            _ => RevokeOutcome::Finalized,
+        })
     }
 
     /// Load the active lease's key, version, and current record.
@@ -520,6 +554,128 @@ impl LeaseManager {
             })?;
         Ok((active.key.clone(), version, record))
     }
+
+    /// Recover this run's leases after a restart, from the durable store alone (no
+    /// Vault call for the adopt path). Scans the **current incarnation**:
+    /// - adopts the newest `Active` record as the serving lease;
+    /// - revokes any older `Active` duplicates (a crash mid-reissue can leave two);
+    /// - revokes `Pending` records - a `Pending` lease's material was never handed out
+    ///   (it becomes `Active` only after it is durably owned), so its Vault lease is a
+    ///   stray to clean up;
+    /// - re-drives `RevokePending` records to completion (a crash mid-revoke).
+    ///
+    /// `Orphaned`/`Revoked` records are counted and left in place.
+    pub(crate) async fn recover(&mut self) -> Result<RecoverySummary> {
+        let mut summary = RecoverySummary::default();
+        let mut actives: Vec<(String, u64, LeaseRecord)> = Vec::new();
+        let mut to_revoke: Vec<(String, u64, LeaseRecord)> = Vec::new();
+
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = self
+                .store
+                .list_current_incarnation(cursor.as_deref(), RECONCILE_PAGE)
+                .await?;
+            for (key, version, record) in page.records {
+                match record.state {
+                    LeaseState::Active => actives.push((key, version, record)),
+                    LeaseState::Pending | LeaseState::RevokePending => {
+                        to_revoke.push((key, version, record))
+                    }
+                    LeaseState::Orphaned => summary.orphaned += 1,
+                    LeaseState::Revoked => summary.tombstones += 1,
+                }
+            }
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        // Adopt the newest Active (latest expiry); revoke the rest.
+        actives.sort_by_key(|(_, _, r)| r.expires_at_ms);
+        if let Some((key, version, _)) = actives.pop() {
+            self.active = Some(ActiveLease { key, version });
+            summary.adopted = 1;
+        }
+        for (key, version, record) in actives.into_iter().chain(to_revoke) {
+            match self.drive_revoke(key, version, record).await? {
+                RevokeOutcome::Finalized => summary.revoked += 1,
+                RevokeOutcome::Orphaned => summary.orphaned += 1,
+            }
+        }
+        Ok(summary)
+    }
+
+    /// Reconcile leases left behind by a **prior incarnation** of this source (a
+    /// delete/recreate replaced the incarnation). Scans the whole scope and best-effort
+    /// revokes every non-terminal foreign-incarnation lease. A 403 leaves the lease
+    /// `Orphaned` for the operator; a transient outage aborts the sweep to retry later.
+    pub(crate) async fn reconcile_orphans(&mut self) -> Result<OrphanSummary> {
+        let mut summary = OrphanSummary::default();
+        let mut foreign: Vec<(String, u64, LeaseRecord)> = Vec::new();
+
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = self
+                .store
+                .list_scope(cursor.as_deref(), RECONCILE_PAGE)
+                .await?;
+            for (key, version, record) in page.records {
+                if record.source_incarnation != self.id.incarnation
+                    && !record.state.is_terminal()
+                {
+                    foreign.push((key, version, record));
+                }
+            }
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        for (key, version, record) in foreign {
+            match self.drive_revoke(key, version, record).await? {
+                RevokeOutcome::Finalized => summary.revoked += 1,
+                RevokeOutcome::Orphaned => summary.still_orphaned += 1,
+            }
+        }
+        Ok(summary)
+    }
+}
+
+/// Bounded page size for recovery / reconciliation scans.
+const RECONCILE_PAGE: usize = 256;
+
+/// The terminal disposition of a revoke attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RevokeOutcome {
+    /// Vault confirmed (or the lease was already absent): the retained tombstone stands.
+    Finalized,
+    /// Not actionable by this token (403): left `Orphaned` for reconciliation.
+    Orphaned,
+}
+
+/// Non-secret counts from a restart recovery scan (for logging/metrics).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecoverySummary {
+    /// Active leases re-adopted as the serving lease (0 or 1).
+    pub adopted: u32,
+    /// Leases finalized (stray Pending / interrupted RevokePending / Active duplicates).
+    pub revoked: u32,
+    /// Leases now left `Orphaned` (unauthorized) plus any already `Orphaned`.
+    pub orphaned: u32,
+    /// Retained `Revoked` tombstones skipped.
+    pub tombstones: u32,
+}
+
+/// Non-secret counts from an orphan (prior-incarnation) reconciliation sweep.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OrphanSummary {
+    /// Foreign-incarnation leases finalized.
+    pub revoked: u32,
+    /// Foreign-incarnation leases left `Orphaned` (unauthorized).
+    pub still_orphaned: u32,
 }
 
 fn system_time_to_ms(t: SystemTime) -> Result<u64> {
@@ -718,26 +874,29 @@ mod tests {
     }
 
     fn identity() -> LeaseIdentity {
+        identity_with("inc-1")
+    }
+
+    fn identity_with(incarnation: &str) -> LeaseIdentity {
         LeaseIdentity {
             tenant: "acme".into(),
             pipeline: "pipe".into(),
             source: "pg1".into(),
             credential_purpose: "source-db".into(),
-            incarnation: "inc-1".into(),
+            incarnation: incarnation.into(),
         }
     }
 
     fn manager(provider: Arc<dyn LeaseProvider>) -> LeaseManager {
-        let backend: storage::ArcStorageBackend =
-            Arc::new(MemoryStorageBackend::new());
-        LeaseManager::new(
-            provider,
-            backend,
-            identity(),
-            "database",
-            "orders-ro",
-            cfg(),
-        )
+        manager_on(provider, Arc::new(MemoryStorageBackend::new()), identity())
+    }
+
+    fn manager_on(
+        provider: Arc<dyn LeaseProvider>,
+        backend: storage::ArcStorageBackend,
+        id: LeaseIdentity,
+    ) -> LeaseManager {
+        LeaseManager::new(provider, backend, id, "database", "orders-ro", cfg())
     }
 
     #[tokio::test]
@@ -883,6 +1042,146 @@ mod tests {
             classify_fault(&p(ProviderFailureKind::Other)),
             OpFault::Fatal
         );
+    }
+
+    // --- recovery / orphan reconciliation ---
+
+    /// Seed a `Pending` record directly (simulating a crash after `create_pending` but
+    /// before the material was ever handed out).
+    async fn seed_pending(
+        m: &LeaseManager,
+        incarnation: &str,
+        gen_id: &str,
+        lease_id: &str,
+    ) {
+        let handle = LeaseHandle::new(
+            LeaseId::new(lease_id),
+            "database",
+            "orders-ro",
+            Duration::from_secs(3600),
+            true,
+            t(EPOCH_MS),
+        )
+        .unwrap();
+        let record = LeaseRecord::pending(
+            "acme",
+            "pipe",
+            "pg1",
+            incarnation,
+            "source-db",
+            gen_id,
+            &handle,
+            1,
+        )
+        .unwrap();
+        m.store.create_pending(&record).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recover_adopts_active_and_cleans_stray_pending() {
+        let backend: storage::ArcStorageBackend =
+            Arc::new(MemoryStorageBackend::new());
+        let provider = Arc::new(MockProvider::renewable());
+
+        // First run: issue an Active lease, then crash leaving a stray Pending.
+        let mut m1 = manager_on(provider.clone(), backend.clone(), identity());
+        m1.issue(t(EPOCH_MS)).await.unwrap();
+        let active_key = m1.active.as_ref().unwrap().key.clone();
+        seed_pending(&m1, "inc-1", "stray-gen", "stray-lease").await;
+
+        // Second run over the same store: recover.
+        let mut m2 = manager_on(provider.clone(), backend.clone(), identity());
+        let summary = m2.recover().await.unwrap();
+
+        assert_eq!(summary.adopted, 1);
+        assert_eq!(summary.revoked, 1, "the stray Pending is finalized");
+        // The recovered Active is adopted and still Active.
+        assert_eq!(m2.active.as_ref().unwrap().key, active_key);
+        let (_, active) = m2.store.get(&active_key).await.unwrap().unwrap();
+        assert_eq!(active.state, LeaseState::Active);
+    }
+
+    #[tokio::test]
+    async fn recover_does_not_adopt_foreign_incarnation() {
+        let backend: storage::ArcStorageBackend =
+            Arc::new(MemoryStorageBackend::new());
+        let provider = Arc::new(MockProvider::renewable());
+
+        // A prior incarnation's Active lease.
+        let mut old = manager_on(
+            provider.clone(),
+            backend.clone(),
+            identity_with("inc-0"),
+        );
+        old.issue(t(EPOCH_MS)).await.unwrap();
+
+        // New incarnation recovers: nothing of its own to adopt.
+        let mut new = manager_on(
+            provider.clone(),
+            backend.clone(),
+            identity_with("inc-1"),
+        );
+        let summary = new.recover().await.unwrap();
+        assert_eq!(summary.adopted, 0);
+        assert!(new.active.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_orphans_revokes_prior_incarnation() {
+        let backend: storage::ArcStorageBackend =
+            Arc::new(MemoryStorageBackend::new());
+        let provider = Arc::new(MockProvider::renewable());
+
+        let mut old = manager_on(
+            provider.clone(),
+            backend.clone(),
+            identity_with("inc-0"),
+        );
+        old.issue(t(EPOCH_MS)).await.unwrap();
+        let old_key = old.active.as_ref().unwrap().key.clone();
+
+        let mut new = manager_on(
+            provider.clone(),
+            backend.clone(),
+            identity_with("inc-1"),
+        );
+        let summary = new.reconcile_orphans().await.unwrap();
+        assert_eq!(summary.revoked, 1);
+        assert_eq!(summary.still_orphaned, 0);
+        let (_, rec) = new.store.get(&old_key).await.unwrap().unwrap();
+        assert_eq!(rec.state, LeaseState::Revoked);
+    }
+
+    #[tokio::test]
+    async fn reconcile_orphans_leaves_forbidden_lease_orphaned() {
+        let reference = secrets::SecretReference::new(
+            secrets::SecretProvider::Vault,
+            "database/creds/orders-ro",
+        );
+        let backend: storage::ArcStorageBackend =
+            Arc::new(MemoryStorageBackend::new());
+        // Old run can revoke; new run's provider is denied (403).
+        let ok_provider = Arc::new(MockProvider::renewable());
+        let mut old =
+            manager_on(ok_provider, backend.clone(), identity_with("inc-0"));
+        old.issue(t(EPOCH_MS)).await.unwrap();
+        let old_key = old.active.as_ref().unwrap().key.clone();
+
+        let denied = Arc::new(MockProvider {
+            renewable: true,
+            revoke_fault: Some(SecretError::Provider {
+                reference: reference.safe(),
+                kind: ProviderFailureKind::Forbidden,
+            }),
+            ..Default::default()
+        });
+        let mut new =
+            manager_on(denied, backend.clone(), identity_with("inc-1"));
+        let summary = new.reconcile_orphans().await.unwrap();
+        assert_eq!(summary.revoked, 0);
+        assert_eq!(summary.still_orphaned, 1);
+        let (_, rec) = new.store.get(&old_key).await.unwrap().unwrap();
+        assert_eq!(rec.state, LeaseState::Orphaned);
     }
 
     // helper for private-field assertions
