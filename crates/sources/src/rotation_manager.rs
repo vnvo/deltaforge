@@ -17,17 +17,19 @@
 //! The source-specific pieces (identity/position preflight, closing the old stream,
 //! opening the replacement) stay in each source's own `*_rotation.rs`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use deltaforge_config::{CredentialRotationCfg, SourceCredentialsCfg};
+use deltaforge_config::{
+    CredentialRotationCfg, RotationTriggerCfg, SourceCredentialsCfg,
+};
 use deltaforge_core::{SourceError, SourceResult};
 use metrics::{counter, gauge};
 use secrets::{
-    CredentialFieldRequest, FileWatcher, RotationOutcome, SecretProvider,
-    SecretReference, SecretResolver, SecretString,
+    CredentialFieldRequest, CredentialSet, FileWatcher, RotationOutcome,
+    SecretProvider, SecretReference, SecretResolver, SecretString,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -72,28 +74,44 @@ pub(crate) enum ApplyStep {
 /// composition material (a fixed env value is a `SecretString`). Opaque: an
 /// implementation handle with no public fields.
 pub struct RotationSpec {
-    /// Watched credential fields (file-backed references only). Never printed:
-    /// [`RotationSpec`]'s `Debug` redacts the references.
+    /// Watched credential fields (the rotating authority's references). Never
+    /// printed: [`RotationSpec`]'s `Debug` redacts the references.
     fields: Vec<CredentialFieldRequest>,
-    /// How to assemble a rotated DSN from the watcher's validated set, plus any
+    /// How to assemble a rotated DSN from the producer's validated set, plus any
     /// fixed (env) fields resolved once at build time.
     composition: RotationComposition,
-    /// Projected-volume trusted root for symlink resolution.
-    trusted_root: std::path::PathBuf,
+    /// Which candidate producer drives rotation (watched files or Vault polling).
+    trigger: SpecTrigger,
     max_size: usize,
-    debounce: Duration,
     poll_interval: Duration,
     apply_timeout: Duration,
+}
+
+/// The candidate producer bound into a [`RotationSpec`]: watched projected-volume
+/// files, or a resolver polled for a new Vault KV version. Both feed the same
+/// coordinator and boundary swap; only candidate production differs.
+enum SpecTrigger {
+    /// Projected-volume files watched for atomic replacement.
+    File {
+        trusted_root: PathBuf,
+        debounce: Duration,
+    },
+    /// A resolver (Vault backend installed) polled for a new record version. The
+    /// resolver resolves the watched Vault references on each poll.
+    Vault { resolver: Arc<dyn SecretResolver> },
 }
 
 impl std::fmt::Debug for RotationSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Redact the watched references; expose only non-secret shape/timing.
+        let kind = match &self.trigger {
+            SpecTrigger::File { .. } => "file",
+            SpecTrigger::Vault { .. } => "vault",
+        };
         f.debug_struct("RotationSpec")
             .field("watched_fields", &self.fields.len())
-            .field("trusted_root", &self.trusted_root)
+            .field("trigger", &kind)
             .field("max_size", &self.max_size)
-            .field("debounce", &self.debounce)
             .field("poll_interval", &self.poll_interval)
             .field("apply_timeout", &self.apply_timeout)
             .finish_non_exhaustive()
@@ -203,27 +221,107 @@ async fn field_source_for(
 /// Build a rotation spec from a source's credential config (source-agnostic).
 ///
 /// Fail-closed: `rotation` absent yields `Ok(None)`, but rotation configured with
-/// nothing file-backed to watch, a reference outside the trusted root, an
-/// unsupported provider, or missing required data yields an `Err` at startup rather
-/// than silently disabling the requested safety feature. Mixed env/file credentials
-/// are supported: the env field is resolved once as fixed and the file field is
-/// watched. `db` governs the credential-injection form used by `compose`.
+/// nothing rotatable to watch, an unsupported provider for the chosen trigger, a
+/// reference outside the trusted root (file trigger), or missing required data
+/// yields an `Err` at startup rather than silently disabling the requested safety
+/// feature. Exactly one rotating authority is permitted per credential set; an
+/// immutable env field may be mixed alongside it. `db` governs the
+/// credential-injection form used by `compose`. `resolver` is shared into a Vault
+/// trigger's spec so it can poll for a new record version.
 pub(crate) async fn build_spec(
     dsn: Option<&str>,
     dsn_secret: Option<&SecretReference>,
     credentials: Option<&SourceCredentialsCfg>,
     rotation: Option<&CredentialRotationCfg>,
     db: DbKind,
-    resolver: &dyn SecretResolver,
+    resolver: Arc<dyn SecretResolver>,
 ) -> SourceResult<Option<Arc<RotationSpec>>> {
     let Some(rot) = rotation else {
         return Ok(None);
     };
+    // Reject unsafe timing at startup: a zero poll would busy-loop, a zero apply
+    // timeout would guarantee a boundary-reconnect timeout, and a zero size limit
+    // rejects every secret. Zero `debounce_ms` is permitted (projected-volume swaps
+    // are atomic; see the config docs).
+    if rot.poll_interval_ms == 0 {
+        return Err(fail_closed(
+            "rotation poll_interval_ms must be non-zero (a zero poll would \
+             busy-loop)",
+        ));
+    }
+    if rot.apply_timeout_ms == 0 {
+        return Err(fail_closed(
+            "rotation apply_timeout_ms must be non-zero (a zero timeout would \
+             fail every boundary reconnect)",
+        ));
+    }
+    if rot.max_secret_bytes == 0 {
+        return Err(fail_closed("rotation max_secret_bytes must be non-zero"));
+    }
     let max_size = rot.max_secret_bytes;
-    let trusted_root = rot.trusted_root.clone();
-    let debounce = Duration::from_millis(rot.debounce_ms);
     let poll_interval = Duration::from_millis(rot.poll_interval_ms);
     let apply_timeout = Duration::from_millis(rot.apply_timeout_ms);
+
+    match &rot.trigger {
+        RotationTriggerCfg::File { trusted_root } => {
+            build_file_spec(
+                dsn,
+                dsn_secret,
+                credentials,
+                db,
+                resolver.as_ref(),
+                trusted_root.clone(),
+                Duration::from_millis(rot.debounce_ms),
+                max_size,
+                poll_interval,
+                apply_timeout,
+            )
+            .await
+        }
+        RotationTriggerCfg::Vault(_) => {
+            build_vault_spec(
+                dsn,
+                dsn_secret,
+                credentials,
+                db,
+                resolver,
+                max_size,
+                poll_interval,
+                apply_timeout,
+            )
+            .await
+        }
+    }
+}
+
+/// File-triggered spec: watch projected-volume files, resolve env fields once as
+/// fixed. Behavior is unchanged from the original single-trigger implementation.
+#[allow(clippy::too_many_arguments)]
+async fn build_file_spec(
+    dsn: Option<&str>,
+    dsn_secret: Option<&SecretReference>,
+    credentials: Option<&SourceCredentialsCfg>,
+    db: DbKind,
+    resolver: &dyn SecretResolver,
+    trusted_root: PathBuf,
+    debounce: Duration,
+    max_size: usize,
+    poll_interval: Duration,
+    apply_timeout: Duration,
+) -> SourceResult<Option<Arc<RotationSpec>>> {
+    let finish = |fields, composition| {
+        Ok(Some(Arc::new(RotationSpec {
+            fields,
+            composition,
+            trigger: SpecTrigger::File {
+                trusted_root: trusted_root.clone(),
+                debounce,
+            },
+            max_size,
+            poll_interval,
+            apply_timeout,
+        })))
+    };
 
     // Whole-DSN secret.
     if let Some(dsn_ref) = dsn_secret {
@@ -232,44 +330,22 @@ pub(crate) async fn build_spec(
                 validate_watched_path(&dsn_ref.location, &trusted_root).await?;
                 let fields =
                     vec![CredentialFieldRequest::new("dsn", dsn_ref.clone())];
-                let composition = RotationComposition::WholeDsn {
-                    field: "dsn".to_string(),
-                };
-                Ok(Some(Arc::new(RotationSpec {
+                finish(
                     fields,
-                    composition,
-                    trusted_root,
-                    max_size,
-                    debounce,
-                    poll_interval,
-                    apply_timeout,
-                })))
+                    RotationComposition::WholeDsn {
+                        field: "dsn".to_string(),
+                    },
+                )
             }
             _ => Err(fail_closed(
-                "rotation is configured but `dsn_secret` is not a \
-                 file-backed reference; env/Vault secrets do not rotate. Use a \
-                 file-backed `dsn_secret` or remove `rotation`.",
+                "file-triggered rotation requires a file-backed `dsn_secret`; \
+                 env/Vault secrets do not rotate under a file trigger.",
             )),
         };
     }
 
     // Username/password over a base DSN.
-    let creds = credentials.ok_or_else(|| {
-        fail_closed(
-            "rotation is configured but the source has no `dsn_secret` or \
-             `credentials` to rotate; remove `rotation` or reference a \
-             file-backed secret.",
-        )
-    })?;
-    let username = creds.username.as_ref().ok_or_else(|| {
-        fail_closed("rotation requires `credentials.username`")
-    })?;
-    let password = creds.password.as_ref().ok_or_else(|| {
-        fail_closed("rotation requires `credentials.password`")
-    })?;
-    let base_dsn = dsn.map(str::to_string).ok_or_else(|| {
-        fail_closed("rotation with `credentials` requires a base `dsn`")
-    })?;
+    let (username, password, base_dsn) = require_userpass(dsn, credentials)?;
 
     let mut fields = Vec::new();
     let username_src = field_source_for(
@@ -294,27 +370,199 @@ pub(crate) async fn build_spec(
     // At least one field must be file-backed, or nothing ever rotates.
     if fields.is_empty() {
         return Err(fail_closed(
-            "rotation is configured but neither credential field is \
-             file-backed; there is nothing to watch. Use at least one \
+            "file-triggered rotation is configured but neither credential \
+             field is file-backed; there is nothing to watch. Use at least one \
              file-backed credential or remove `rotation`.",
         ));
     }
 
-    let composition = RotationComposition::UsernamePassword {
-        db,
-        base_dsn,
-        username: username_src,
-        password: password_src,
-    };
-    Ok(Some(Arc::new(RotationSpec {
+    finish(
         fields,
-        composition,
-        trusted_root,
+        RotationComposition::UsernamePassword {
+            db,
+            base_dsn,
+            username: username_src,
+            password: password_src,
+        },
+    )
+}
+
+/// Vault-triggered spec: the rotating authority is a Vault KV record polled for a
+/// new version. Vault references are watched; env fields are resolved once as
+/// fixed. A file-backed reference is a second, independent rotating authority and
+/// is rejected. All watched Vault references must address the same record so the
+/// polled set is version-consistent.
+#[allow(clippy::too_many_arguments)]
+async fn build_vault_spec(
+    dsn: Option<&str>,
+    dsn_secret: Option<&SecretReference>,
+    credentials: Option<&SourceCredentialsCfg>,
+    db: DbKind,
+    resolver: Arc<dyn SecretResolver>,
+    max_size: usize,
+    poll_interval: Duration,
+    apply_timeout: Duration,
+) -> SourceResult<Option<Arc<RotationSpec>>> {
+    let finish = |fields, composition| {
+        Ok(Some(Arc::new(RotationSpec {
+            fields,
+            composition,
+            trigger: SpecTrigger::Vault {
+                resolver: Arc::clone(&resolver),
+            },
+            max_size,
+            poll_interval,
+            apply_timeout,
+        })))
+    };
+
+    // Whole-DSN secret.
+    if let Some(dsn_ref) = dsn_secret {
+        return match dsn_ref.provider {
+            SecretProvider::Vault => {
+                reject_version_pin(dsn_ref, "dsn")?;
+                let fields =
+                    vec![CredentialFieldRequest::new("dsn", dsn_ref.clone())];
+                finish(
+                    fields,
+                    RotationComposition::WholeDsn {
+                        field: "dsn".to_string(),
+                    },
+                )
+            }
+            _ => Err(fail_closed(
+                "vault-triggered rotation requires a Vault-backed `dsn_secret`.",
+            )),
+        };
+    }
+
+    // Username/password over a base DSN.
+    let (username, password, base_dsn) = require_userpass(dsn, credentials)?;
+
+    let mut fields = Vec::new();
+    let mut vault_location: Option<String> = None;
+    let username_src = field_source_vault(
+        username,
+        "username",
+        resolver.as_ref(),
         max_size,
-        debounce,
-        poll_interval,
-        apply_timeout,
-    })))
+        &mut fields,
+        &mut vault_location,
+    )
+    .await?;
+    let password_src = field_source_vault(
+        password,
+        "password",
+        resolver.as_ref(),
+        max_size,
+        &mut fields,
+        &mut vault_location,
+    )
+    .await?;
+
+    // At least one field must be Vault-backed, or nothing ever rotates.
+    if fields.is_empty() {
+        return Err(fail_closed(
+            "vault-triggered rotation is configured but neither credential \
+             field is Vault-backed; there is nothing to poll. Use at least one \
+             Vault-backed credential or remove `rotation`.",
+        ));
+    }
+
+    finish(
+        fields,
+        RotationComposition::UsernamePassword {
+            db,
+            base_dsn,
+            username: username_src,
+            password: password_src,
+        },
+    )
+}
+
+/// Extract the required username/password references and base DSN for a
+/// credentials-based rotation, failing closed on any missing piece.
+fn require_userpass<'a>(
+    dsn: Option<&str>,
+    credentials: Option<&'a SourceCredentialsCfg>,
+) -> SourceResult<(&'a SecretReference, &'a SecretReference, String)> {
+    let creds = credentials.ok_or_else(|| {
+        fail_closed(
+            "rotation is configured but the source has no `dsn_secret` or \
+             `credentials` to rotate; remove `rotation` or reference a \
+             rotatable secret.",
+        )
+    })?;
+    let username = creds.username.as_ref().ok_or_else(|| {
+        fail_closed("rotation requires `credentials.username`")
+    })?;
+    let password = creds.password.as_ref().ok_or_else(|| {
+        fail_closed("rotation requires `credentials.password`")
+    })?;
+    let base_dsn = dsn.map(str::to_string).ok_or_else(|| {
+        fail_closed("rotation with `credentials` requires a base `dsn`")
+    })?;
+    Ok((username, password, base_dsn))
+}
+
+/// Reject an immutable version pin on a Vault reference that participates in
+/// rotation. A pinned `version` always reads that exact record version, so the
+/// poller could never observe a newer one - rotation would be silently disabled.
+fn reject_version_pin(
+    reference: &SecretReference,
+    name: &str,
+) -> SourceResult<()> {
+    if reference.version.is_some() {
+        return Err(fail_closed(format!(
+            "vault-triggered rotation credential `{name}` pins an immutable \
+             `version`; a pinned version can never observe a newer record. \
+             Remove the version pin to rotate, or drop `rotation` for a fixed \
+             pinned read."
+        )));
+    }
+    Ok(())
+}
+
+/// Classify one credential field for a Vault trigger: a Vault reference is watched
+/// (and pinned to the single shared record location for version-consistency), an
+/// env reference is resolved once into a fixed value, and a file reference is a
+/// second rotating authority and fails closed.
+async fn field_source_vault(
+    reference: &SecretReference,
+    name: &'static str,
+    resolver: &dyn SecretResolver,
+    max_size: usize,
+    fields: &mut Vec<CredentialFieldRequest>,
+    vault_location: &mut Option<String>,
+) -> SourceResult<FieldSource> {
+    match reference.provider {
+        SecretProvider::Vault => {
+            reject_version_pin(reference, name)?;
+            match vault_location {
+                Some(loc) if loc != &reference.location => {
+                    return Err(fail_closed(
+                        "vault-triggered rotation credentials reference \
+                         different Vault records; both rotating fields must come \
+                         from one record so the polled set is version-consistent.",
+                    ));
+                }
+                Some(_) => {}
+                None => *vault_location = Some(reference.location.clone()),
+            }
+            fields.push(CredentialFieldRequest::new(name, reference.clone()));
+            Ok(FieldSource::Watched(name.to_string()))
+        }
+        SecretProvider::Env => {
+            let fixed =
+                resolve_fixed_env(resolver, reference, max_size).await?;
+            Ok(FieldSource::Fixed(fixed))
+        }
+        SecretProvider::File => Err(fail_closed(format!(
+            "vault-triggered rotation credential `{name}` is file-backed, a \
+             second independent rotating authority; use a Vault or env \
+             reference under a vault trigger."
+        ))),
+    }
 }
 
 /// What the manager should do for one observed [`RotationOutcome`], derived by the
@@ -428,30 +676,46 @@ impl RotationManager {
         pipeline: String,
         parent_cancel: &CancellationToken,
     ) -> SourceResult<Self> {
-        let watcher = FileWatcher::projected_volume(
-            spec.trusted_root.clone(),
-            spec.max_size,
-            spec.fields.clone(),
-            spec.debounce,
-        )
-        .map_err(|e| {
-            fail_closed(format!("credential rotation watcher: {e}"))
-        })?;
-
         let (tx, rx) = watch::channel::<Option<Candidate>>(None);
         let running = Arc::new(AtomicBool::new(true));
         let child_cancel = parent_cancel.child_token();
 
-        let manager = spawn_manager(
-            watcher,
-            Arc::clone(spec),
-            tx,
-            initial_dsn,
-            running.clone(),
-            child_cancel.clone(),
-            source_id.clone(),
-            pipeline.clone(),
-        );
+        let manager = match &spec.trigger {
+            SpecTrigger::File {
+                trusted_root,
+                debounce,
+            } => {
+                let watcher = FileWatcher::projected_volume(
+                    trusted_root.clone(),
+                    spec.max_size,
+                    spec.fields.clone(),
+                    *debounce,
+                )
+                .map_err(|e| {
+                    fail_closed(format!("credential rotation watcher: {e}"))
+                })?;
+                spawn_manager(
+                    watcher,
+                    Arc::clone(spec),
+                    tx,
+                    initial_dsn,
+                    running.clone(),
+                    child_cancel.clone(),
+                    source_id.clone(),
+                    pipeline.clone(),
+                )
+            }
+            SpecTrigger::Vault { resolver } => spawn_vault_manager(
+                Arc::clone(resolver),
+                Arc::clone(spec),
+                tx,
+                initial_dsn,
+                running.clone(),
+                child_cancel.clone(),
+                source_id.clone(),
+                pipeline.clone(),
+            ),
+        };
 
         Ok(Self {
             coordinator: RotationCoordinator::new(rx, RetryConfig::default()),
@@ -873,6 +1137,211 @@ fn spawn_manager(
     })
 }
 
+/// What one Vault poll result means. Derived purely so it is unit-testable.
+#[derive(Debug)]
+enum VaultPoll {
+    /// A new, version-consistent, composable set: publish it.
+    Changed {
+        version: String,
+        dsn: ProtectedDsn,
+        expires_at: Option<SystemTime>,
+    },
+    /// Same record version as last published: no reconnect.
+    Unchanged,
+    /// Read failed, or the set was version-inconsistent/incomplete/uncomposable:
+    /// retain the active credentials. `reason` is a fixed, secret-free phrase.
+    Retain { reason: &'static str },
+}
+
+/// The version verdict for a polled set, from the version-consistency primitives.
+#[derive(Debug, PartialEq, Eq)]
+enum VersionDecision {
+    /// One shared record version, different from the last published: `String`.
+    Changed(String),
+    /// One shared record version, identical to the last published.
+    Unchanged,
+    /// Not a single versioned read (multiple groups, or mixed/absent versions).
+    Inconsistent,
+}
+
+/// Decide the version verdict from the version-consistency primitives, so the rule
+/// is unit-testable without minting a `CredentialSet` (whose provenance is sealed in
+/// the secrets crate). A set is publishable only when it came from one provider read
+/// (`single_group`) and every field carries the same `Some` version.
+fn decide_version(
+    single_group: bool,
+    versions: &[Option<String>],
+    last_version: Option<&str>,
+) -> VersionDecision {
+    if !single_group {
+        return VersionDecision::Inconsistent;
+    }
+    let first = match versions.first() {
+        Some(Some(v)) => v.clone(),
+        _ => return VersionDecision::Inconsistent,
+    };
+    if versions
+        .iter()
+        .any(|v| v.as_deref() != Some(first.as_str()))
+    {
+        return VersionDecision::Inconsistent;
+    }
+    if last_version == Some(first.as_str()) {
+        VersionDecision::Unchanged
+    } else {
+        VersionDecision::Changed(first)
+    }
+}
+
+/// Interpret one poll of the Vault resolver against the last published version.
+/// Pure: no I/O, no state mutation. Publishes only complete, version-consistent
+/// sets; an unchanged version is a no-op; anything else retains.
+fn interpret_vault_poll(
+    result: Result<CredentialSet, secrets::SecretError>,
+    composition: &RotationComposition,
+    last_version: Option<&str>,
+) -> VaultPoll {
+    let set = match result {
+        Ok(set) => set,
+        Err(_) => {
+            return VaultPoll::Retain {
+                reason: "read failed",
+            };
+        }
+    };
+    let versions: Vec<Option<String>> =
+        set.provider_versions().into_values().collect();
+    let version = match decide_version(
+        set.single_resolution_group().is_ok(),
+        &versions,
+        last_version,
+    ) {
+        VersionDecision::Changed(v) => v,
+        VersionDecision::Unchanged => return VaultPoll::Unchanged,
+        VersionDecision::Inconsistent => {
+            return VaultPoll::Retain {
+                reason: "version-inconsistent or incomplete set",
+            };
+        }
+    };
+    match compose(&set, composition) {
+        Ok(dsn) => VaultPoll::Changed {
+            version,
+            dsn,
+            expires_at: earliest_expiry(&set, composition),
+        },
+        Err(_) => VaultPoll::Retain {
+            reason: "candidate composition failed",
+        },
+    }
+}
+
+/// Spawn the Vault-KV polling manager: on each poll resolve the watched Vault
+/// references as one record, and on a new record version compose a candidate DSN
+/// and publish it. A version identical to the last published one causes no
+/// reconnect; a read failure or a version-inconsistent/incomplete set raises one
+/// alarm (and one metric) per transition and never publishes. Suppresses a first
+/// candidate identical to `initial_dsn`, so the startup load does not reconnect.
+#[allow(clippy::too_many_arguments)]
+fn spawn_vault_manager(
+    resolver: Arc<dyn SecretResolver>,
+    spec: Arc<RotationSpec>,
+    tx: watch::Sender<Option<Candidate>>,
+    initial_dsn: ProtectedDsn,
+    running: Arc<AtomicBool>,
+    cancel: CancellationToken,
+    source_id: String,
+    pipeline: String,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last_published = initial_dsn;
+        let mut last_version: Option<String> = None;
+        let mut in_alarm = false;
+        let mut generation: u64 = 0;
+        let poll = spec.poll_interval;
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(poll) => {}
+            }
+            if !running.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let result = resolver.resolve_set(&spec.fields).await;
+            match interpret_vault_poll(
+                result,
+                &spec.composition,
+                last_version.as_deref(),
+            ) {
+                VaultPoll::Retain { reason } => {
+                    if !in_alarm {
+                        in_alarm = true;
+                        // Redacted: fixed phrase only, no path/value/error body.
+                        warn!(
+                            source_id = %source_id,
+                            pipeline = %pipeline,
+                            reason,
+                            "rotation vault poll unusable; retaining current \
+                             credentials"
+                        );
+                        watch_counter(
+                            "deltaforge_rotation_vault_poll_failures_total",
+                            &pipeline,
+                            &source_id,
+                        );
+                    }
+                }
+                VaultPoll::Unchanged => {
+                    if in_alarm {
+                        in_alarm = false;
+                        info!(
+                            source_id = %source_id,
+                            pipeline = %pipeline,
+                            "rotation vault secret is usable again"
+                        );
+                    }
+                }
+                VaultPoll::Changed {
+                    version,
+                    dsn,
+                    expires_at,
+                } => {
+                    if in_alarm {
+                        in_alarm = false;
+                        info!(
+                            source_id = %source_id,
+                            pipeline = %pipeline,
+                            "rotation vault secret is usable again"
+                        );
+                    }
+                    // A new version whose composed DSN is identical to the current
+                    // one needs no reconnect; adopt the version and move on.
+                    if dsn.same_dsn(&last_published) {
+                        last_version = Some(version);
+                        continue;
+                    }
+                    generation += 1;
+                    last_published = dsn.clone();
+                    last_version = Some(version);
+                    let candidate = Candidate::new(
+                        generation,
+                        dsn,
+                        SystemTime::now(),
+                        expires_at,
+                    );
+                    let _ = tx.send(Some(candidate));
+                    watch_counter(
+                        "deltaforge_rotation_vault_published_total",
+                        &pipeline,
+                        &source_id,
+                    );
+                }
+            }
+        }
+    })
+}
+
 /// Increment a watcher-failure counter with bounded, secret-free labels.
 fn watch_counter(name: &'static str, pipeline: &str, source_id: &str) {
     counter!(
@@ -886,6 +1355,323 @@ fn watch_counter(name: &'static str, pipeline: &str, source_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use deltaforge_config::{
+        RotationTriggerCfg, VaultAuthCfg, VaultRotationCfg,
+    };
+    use secrets::{ResolvedSecret, SecretError, SecretMaterial};
+
+    // --- Vault version-consistency decision (pure) ---
+
+    fn v(s: &str) -> Option<String> {
+        Some(s.to_string())
+    }
+
+    #[test]
+    fn decide_version_publishes_new_consistent_version() {
+        assert_eq!(
+            decide_version(true, &[v("7"), v("7")], Some("6")),
+            VersionDecision::Changed("7".to_string())
+        );
+        // First observation (no last version) is a change.
+        assert_eq!(
+            decide_version(true, &[v("1")], None),
+            VersionDecision::Changed("1".to_string())
+        );
+    }
+
+    #[test]
+    fn decide_version_same_version_is_unchanged_no_reconnect() {
+        assert_eq!(
+            decide_version(true, &[v("7"), v("7")], Some("7")),
+            VersionDecision::Unchanged
+        );
+    }
+
+    #[test]
+    fn decide_version_rejects_inconsistent_sets() {
+        // Multiple provider reads (not one record).
+        assert_eq!(
+            decide_version(false, &[v("7"), v("7")], Some("6")),
+            VersionDecision::Inconsistent
+        );
+        // Mixed versions within the set.
+        assert_eq!(
+            decide_version(true, &[v("7"), v("8")], Some("6")),
+            VersionDecision::Inconsistent
+        );
+        // A field with no version cannot be proven consistent.
+        assert_eq!(
+            decide_version(true, &[v("7"), None], Some("6")),
+            VersionDecision::Inconsistent
+        );
+        assert_eq!(
+            decide_version(true, &[], Some("6")),
+            VersionDecision::Inconsistent
+        );
+    }
+
+    #[test]
+    fn interpret_vault_poll_retains_on_read_failure() {
+        let comp = RotationComposition::WholeDsn {
+            field: "dsn".to_string(),
+        };
+        let err = Err(SecretError::NotFound(
+            SecretReference::new(SecretProvider::Vault, "secret/x").safe(),
+        ));
+        match interpret_vault_poll(err, &comp, None) {
+            VaultPoll::Retain { .. } => {}
+            other => panic!("expected Retain on read failure, got {other:?}"),
+        }
+    }
+
+    // --- Vault build_spec mixing rule ---
+
+    /// Resolves env references only (for Fixed fields); anything else errors.
+    struct MockEnvResolver;
+
+    #[async_trait]
+    impl SecretResolver for MockEnvResolver {
+        async fn resolve(
+            &self,
+            reference: &SecretReference,
+        ) -> Result<ResolvedSecret, SecretError> {
+            match reference.provider {
+                SecretProvider::Env => {
+                    Ok(ResolvedSecret::new(SecretMaterial::Utf8(
+                        SecretString::new(
+                            "envval".to_string(),
+                            4096,
+                            reference,
+                        )
+                        .unwrap(),
+                    )))
+                }
+                _ => Err(SecretError::UnsupportedProvider(reference.safe())),
+            }
+        }
+    }
+
+    fn vault_rotation_cfg() -> CredentialRotationCfg {
+        CredentialRotationCfg {
+            trigger: RotationTriggerCfg::Vault(VaultRotationCfg {
+                address: "https://vault:8200".to_string(),
+                namespace: None,
+                auth: VaultAuthCfg::TokenFile {
+                    path: "/run/secrets/token".into(),
+                    projected_volume_root: None,
+                },
+                allow_insecure_http: false,
+                connect_timeout_ms: None,
+                request_timeout_ms: None,
+                renew_safety_margin_ms: None,
+            }),
+            poll_interval_ms: 1000,
+            debounce_ms: 0,
+            max_secret_bytes: 4096,
+            apply_timeout_ms: 30_000,
+        }
+    }
+
+    fn vault_ref(location: &str, selector: &str) -> SecretReference {
+        SecretReference::new(SecretProvider::Vault, location)
+            .with_selector(selector)
+    }
+
+    fn env_ref(name: &str) -> SecretReference {
+        SecretReference::new(SecretProvider::Env, name)
+    }
+
+    fn file_ref(path: &str, selector: &str) -> SecretReference {
+        SecretReference::new(SecretProvider::File, path).with_selector(selector)
+    }
+
+    async fn build_vault(
+        creds: SourceCredentialsCfg,
+    ) -> SourceResult<Option<Arc<RotationSpec>>> {
+        let rot = vault_rotation_cfg();
+        let resolver: Arc<dyn SecretResolver> = Arc::new(MockEnvResolver);
+        build_spec(
+            Some("postgres://h/db"),
+            None,
+            Some(&creds),
+            Some(&rot),
+            DbKind::Postgres,
+            resolver,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn vault_whole_dsn_builds() {
+        let rot = vault_rotation_cfg();
+        let resolver: Arc<dyn SecretResolver> = Arc::new(MockEnvResolver);
+        let dsn_secret = vault_ref("secret/orders", "dsn");
+        let spec = build_spec(
+            None,
+            Some(&dsn_secret),
+            None,
+            Some(&rot),
+            DbKind::Postgres,
+            resolver,
+        )
+        .await
+        .unwrap();
+        assert!(spec.is_some());
+    }
+
+    #[tokio::test]
+    async fn vault_userpass_one_record_builds() {
+        let creds = SourceCredentialsCfg {
+            username: Some(vault_ref("secret/orders", "username")),
+            password: Some(vault_ref("secret/orders", "password")),
+        };
+        assert!(build_vault(creds).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn vault_plus_immutable_env_builds() {
+        // One rotating authority (Vault) plus an immutable env field is allowed.
+        let creds = SourceCredentialsCfg {
+            username: Some(env_ref("DF_USER")),
+            password: Some(vault_ref("secret/orders", "password")),
+        };
+        assert!(build_vault(creds).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn vault_plus_file_is_rejected_two_authorities() {
+        // A file field is a second, independent rotating authority.
+        let creds = SourceCredentialsCfg {
+            username: Some(file_ref("/proj/username", "username")),
+            password: Some(vault_ref("secret/orders", "password")),
+        };
+        assert!(build_vault(creds).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn two_vault_records_are_rejected() {
+        // Independent records rotate independently: not version-consistent.
+        let creds = SourceCredentialsCfg {
+            username: Some(vault_ref("secret/users", "username")),
+            password: Some(vault_ref("secret/orders", "password")),
+        };
+        assert!(build_vault(creds).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn vault_trigger_requires_a_vault_field() {
+        // All-env under a Vault trigger has nothing to poll.
+        let creds = SourceCredentialsCfg {
+            username: Some(env_ref("DF_USER")),
+            password: Some(env_ref("DF_PASS")),
+        };
+        assert!(build_vault(creds).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn vault_rotating_ref_rejects_version_pin() {
+        // A pinned version can never observe a newer record -> reject at startup.
+        let creds = SourceCredentialsCfg {
+            username: Some(vault_ref("secret/orders", "username")),
+            password: Some(
+                vault_ref("secret/orders", "password").with_version("2"),
+            ),
+        };
+        assert!(build_vault(creds).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn vault_whole_dsn_rejects_version_pin() {
+        let rot = vault_rotation_cfg();
+        let resolver: Arc<dyn SecretResolver> = Arc::new(MockEnvResolver);
+        let dsn_secret = vault_ref("secret/orders", "dsn").with_version("5");
+        assert!(
+            build_spec(
+                None,
+                Some(&dsn_secret),
+                None,
+                Some(&rot),
+                DbKind::Postgres,
+                resolver,
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_timing_values_are_rejected() {
+        let creds = SourceCredentialsCfg {
+            username: Some(vault_ref("secret/orders", "username")),
+            password: Some(vault_ref("secret/orders", "password")),
+        };
+        for mutate in [
+            |r: &mut CredentialRotationCfg| r.poll_interval_ms = 0,
+            |r: &mut CredentialRotationCfg| r.apply_timeout_ms = 0,
+            |r: &mut CredentialRotationCfg| r.max_secret_bytes = 0,
+        ] {
+            let mut rot = vault_rotation_cfg();
+            mutate(&mut rot);
+            let resolver: Arc<dyn SecretResolver> = Arc::new(MockEnvResolver);
+            assert!(
+                build_spec(
+                    Some("postgres://h/db"),
+                    None,
+                    Some(&creds),
+                    Some(&rot),
+                    DbKind::Postgres,
+                    resolver,
+                )
+                .await
+                .is_err(),
+                "zero timing value must fail closed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_debounce_is_allowed() {
+        let creds = SourceCredentialsCfg {
+            username: Some(vault_ref("secret/orders", "username")),
+            password: Some(vault_ref("secret/orders", "password")),
+        };
+        let mut rot = vault_rotation_cfg();
+        rot.debounce_ms = 0;
+        let resolver: Arc<dyn SecretResolver> = Arc::new(MockEnvResolver);
+        assert!(
+            build_spec(
+                Some("postgres://h/db"),
+                None,
+                Some(&creds),
+                Some(&rot),
+                DbKind::Postgres,
+                resolver,
+            )
+            .await
+            .is_ok(),
+            "zero debounce is permitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_trigger_rejects_non_vault_dsn_secret() {
+        let rot = vault_rotation_cfg();
+        let resolver: Arc<dyn SecretResolver> = Arc::new(MockEnvResolver);
+        let dsn_secret = file_ref("/proj/dsn", "dsn");
+        assert!(
+            build_spec(
+                None,
+                Some(&dsn_secret),
+                None,
+                Some(&rot),
+                DbKind::Postgres,
+                resolver,
+            )
+            .await
+            .is_err()
+        );
+    }
 
     fn coordinator_with_candidate(generation: u64) -> RotationCoordinator {
         // A coordinator holding one in-flight candidate, so record_* apply rather
@@ -1068,9 +1854,11 @@ mod tests {
             composition: RotationComposition::WholeDsn {
                 field: "dsn".to_string(),
             },
-            trusted_root: dir.clone(),
+            trigger: SpecTrigger::File {
+                trusted_root: dir.clone(),
+                debounce: Duration::from_millis(50),
+            },
             max_size: 1 << 20,
-            debounce: Duration::from_millis(50),
             poll_interval: Duration::from_millis(50),
             apply_timeout: Duration::from_secs(1),
         });

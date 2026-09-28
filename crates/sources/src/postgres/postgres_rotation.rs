@@ -138,7 +138,7 @@ async fn open_stream(
 /// [`crate::rotation_manager::build_spec`]).
 pub async fn build_spec(
     cfg: &PostgresSrcCfg,
-    resolver: &dyn SecretResolver,
+    resolver: Arc<dyn SecretResolver>,
 ) -> SourceResult<Option<Arc<RotationSpec>>> {
     crate::rotation_manager::build_spec(
         cfg.dsn.as_deref(),

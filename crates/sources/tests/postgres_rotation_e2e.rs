@@ -24,11 +24,13 @@ use common::AllowList;
 use ctor::dtor;
 use deltaforge_config::{
     CredentialRotationCfg, OnSchemaDrift, PipelineSpec, PostgresSrcCfg,
-    SnapshotCfg, SnapshotMode, SourceCfg, SourceCredentialsCfg,
+    RotationTriggerCfg, SnapshotCfg, SnapshotMode, SourceCfg,
+    SourceCredentialsCfg,
 };
 use deltaforge_core::{Op, Source, SourceHandle, SourceItem};
 use secrets::{
     FileMode, FilePolicy, FileResolver, SecretProvider, SecretReference,
+    SecretResolver,
 };
 use sources::credentials::resolve_postgres_credentials;
 use sources::postgres::{PostgresSource, postgres_rotation};
@@ -118,14 +120,14 @@ impl Drop for Projected {
     }
 }
 
-fn file_resolver(root: &Path) -> FileResolver {
-    FileResolver::new(FilePolicy {
+fn file_resolver(root: &Path) -> Arc<dyn SecretResolver> {
+    Arc::new(FileResolver::new(FilePolicy {
         max_size: LIMIT,
         mode: FileMode::ProjectedVolume {
             trusted_root: root.to_path_buf(),
         },
         trim_trailing_newline: false,
-    })
+    }))
 }
 
 /// Read the slot's walsender backend pid, or `None` when the slot is inactive.
@@ -270,7 +272,9 @@ fn pg_rotation_cfg(
         },
         on_schema_drift: OnSchemaDrift::Adapt,
         rotation: Some(CredentialRotationCfg {
-            trusted_root: proj.root.clone(),
+            trigger: RotationTriggerCfg::File {
+                trusted_root: proj.root.clone(),
+            },
             poll_interval_ms: 300,
             debounce_ms: 300,
             max_secret_bytes: LIMIT,
@@ -365,12 +369,13 @@ async fn start_rotation_harness(
     // Resolve the initial DSN through the real production path so the manager's
     // baseline compose matches it exactly (no spurious startup reconnect).
     let resolver = file_resolver(&proj.root);
-    let initial_dsn = resolve_postgres_credentials(&cfg, &resolver)
+    let initial_dsn = resolve_postgres_credentials(&cfg, resolver.as_ref())
         .await
         .map_err(|e| anyhow::anyhow!("resolve initial dsn: {e}"))?
         .build_dsn()
         .map_err(|e| anyhow::anyhow!("build initial dsn: {e}"))?;
-    let rotation = postgres_rotation::build_spec(&cfg, &resolver).await?;
+    let rotation =
+        postgres_rotation::build_spec(&cfg, resolver.clone()).await?;
     assert!(rotation.is_some(), "rotation spec should build");
 
     let src = PostgresSource {
@@ -738,7 +743,9 @@ fn cfg_with_file_creds(
         snapshot: Default::default(),
         on_schema_drift: OnSchemaDrift::Adapt,
         rotation: Some(CredentialRotationCfg {
-            trusted_root: trusted_root.to_path_buf(),
+            trigger: RotationTriggerCfg::File {
+                trusted_root: trusted_root.to_path_buf(),
+            },
             poll_interval_ms: 300,
             debounce_ms: 300,
             max_secret_bytes: LIMIT,
@@ -756,8 +763,8 @@ async fn projected_symlink_resolves_through_genuine_build_path() -> Result<()> {
         Projected::new(&[("username", b"puser"), ("password", b"ppass")]);
     let spec = pipeline_spec_with_rotation(&proj);
 
-    let resolver = source_secret_resolver(&spec);
-    let dsn = resolve_source_dsn(&spec, &resolver).await?;
+    let resolver = source_secret_resolver(&spec).await?;
+    let dsn = resolve_source_dsn(&spec, resolver.as_ref()).await?;
     assert!(
         dsn.expose().contains("user=puser"),
         "projected username must resolve at startup"
@@ -765,7 +772,7 @@ async fn projected_symlink_resolves_through_genuine_build_path() -> Result<()> {
     assert!(dsn.expose().contains("password=ppass"));
 
     if let SourceCfg::Postgres(c) = &spec.spec.source {
-        let rot = postgres_rotation::build_spec(c, &resolver).await?;
+        let rot = postgres_rotation::build_spec(c, resolver.clone()).await?;
         assert!(rot.is_some(), "rotation must build via the genuine path");
     }
 
@@ -774,7 +781,7 @@ async fn projected_symlink_resolves_through_genuine_build_path() -> Result<()> {
         dsn,
         make_registry().await,
         make_storage_backend().await,
-        &resolver,
+        resolver,
     )
     .await?;
     Ok(())
@@ -790,7 +797,7 @@ async fn build_spec_accepts_valid_projected_symlink() -> Result<()> {
         proj.root.join("password").to_str().unwrap(),
     );
     let resolver = file_resolver(&proj.root);
-    let rot = postgres_rotation::build_spec(&cfg, &resolver).await?;
+    let rot = postgres_rotation::build_spec(&cfg, resolver.clone()).await?;
     assert!(rot.is_some());
     Ok(())
 }
@@ -815,7 +822,7 @@ async fn build_spec_rejects_dotdot_traversal() {
     let cfg = cfg_with_file_creds(&root, &loc, &loc);
     let resolver = file_resolver(&root);
     assert!(
-        postgres_rotation::build_spec(&cfg, &resolver)
+        postgres_rotation::build_spec(&cfg, resolver.clone())
             .await
             .is_err(),
         "a `..` path escaping trusted_root must fail closed at startup"
@@ -838,7 +845,7 @@ async fn build_spec_rejects_escaping_symlink() {
     let cfg = cfg_with_file_creds(&root, &loc, &loc);
     let resolver = file_resolver(&root);
     assert!(
-        postgres_rotation::build_spec(&cfg, &resolver)
+        postgres_rotation::build_spec(&cfg, resolver.clone())
             .await
             .is_err(),
         "a symlink escaping trusted_root must fail closed at startup"
@@ -857,7 +864,7 @@ async fn build_spec_rejects_missing_target() {
     let cfg = cfg_with_file_creds(&root, &loc, &loc);
     let resolver = file_resolver(&root);
     assert!(
-        postgres_rotation::build_spec(&cfg, &resolver)
+        postgres_rotation::build_spec(&cfg, resolver.clone())
             .await
             .is_err(),
         "a missing watched target must fail closed at startup"

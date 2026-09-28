@@ -7,6 +7,10 @@ license = "MIT OR Apache-2.0"
 [features]
 default = ["jemalloc"]
 jemalloc = ["tikv-jemallocator"]
+# Native Vault-triggered credential rotation. Off by default; build the binary
+# with `--features vault` to enable connecting to Vault. Without it a
+# Vault-configured rotation fails closed at startup.
+vault = ["sources/vault"]
 
 [dependencies]
 metrics.workspace = true

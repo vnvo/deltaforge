@@ -20,12 +20,14 @@ use common::AllowList;
 use ctor::dtor;
 use deltaforge_config::{
     CredentialRotationCfg, MysqlSrcCfg, OnSchemaDrift, PipelineSpec,
-    SnapshotCfg, SnapshotMode, SourceCfg, SourceCredentialsCfg,
+    RotationTriggerCfg, SnapshotCfg, SnapshotMode, SourceCfg,
+    SourceCredentialsCfg,
 };
 use deltaforge_core::{Op, Source, SourceHandle, SourceItem};
 use mysql_async::{Pool, prelude::Queryable};
 use secrets::{
     FileMode, FilePolicy, FileResolver, SecretProvider, SecretReference,
+    SecretResolver,
 };
 use sources::credentials::resolve_mysql_credentials;
 use sources::failover::identity::{IdentityStore, ServerIdentity};
@@ -120,14 +122,14 @@ impl Drop for Projected {
     }
 }
 
-fn file_resolver(root: &Path) -> FileResolver {
-    FileResolver::new(FilePolicy {
+fn file_resolver(root: &Path) -> Arc<dyn SecretResolver> {
+    Arc::new(FileResolver::new(FilePolicy {
         max_size: LIMIT,
         mode: FileMode::ProjectedVolume {
             trusted_root: root.to_path_buf(),
         },
         trim_trailing_newline: false,
-    })
+    }))
 }
 
 /// Ids of the binlog dump threads currently connected (via root, which sees all).
@@ -335,7 +337,9 @@ fn mysql_rotation_cfg(db: &str, port: u16, proj: &Projected) -> MysqlSrcCfg {
         },
         on_schema_drift: OnSchemaDrift::Adapt,
         rotation: Some(CredentialRotationCfg {
-            trusted_root: proj.root.clone(),
+            trigger: RotationTriggerCfg::File {
+                trusted_root: proj.root.clone(),
+            },
             poll_interval_ms: 300,
             debounce_ms: 300,
             max_secret_bytes: LIMIT,
@@ -412,12 +416,12 @@ async fn start_rotation_harness(
     // Resolve the initial DSN through the real production path so the manager's
     // baseline compose matches it exactly (no spurious startup reconnect).
     let resolver = file_resolver(&proj.root);
-    let initial_dsn = resolve_mysql_credentials(&cfg, &resolver)
+    let initial_dsn = resolve_mysql_credentials(&cfg, resolver.as_ref())
         .await
         .map_err(|e| anyhow::anyhow!("resolve initial dsn: {e}"))?
         .build_dsn()
         .map_err(|e| anyhow::anyhow!("build initial dsn: {e}"))?;
-    let rotation = mysql_rotation::build_spec(&cfg, &resolver).await?;
+    let rotation = mysql_rotation::build_spec(&cfg, resolver.clone()).await?;
     assert!(rotation.is_some(), "rotation spec should build");
 
     let backend = make_storage_backend().await;
@@ -887,13 +891,13 @@ async fn mysql_projected_symlink_resolves_through_genuine_build_path()
     let spec = mysql_pipeline_spec_with_rotation(&proj);
 
     // The spec-aware resolver must handle projected symlinks for MySQL too.
-    let resolver = source_secret_resolver(&spec);
-    let dsn = resolve_source_dsn(&spec, &resolver).await?;
+    let resolver = source_secret_resolver(&spec).await?;
+    let dsn = resolve_source_dsn(&spec, resolver.as_ref()).await?;
     assert!(dsn.expose().contains("myuser"));
     assert!(dsn.expose().contains("mypass"));
 
     if let SourceCfg::Mysql(c) = &spec.spec.source {
-        let rot = mysql_rotation::build_spec(c, &resolver).await?;
+        let rot = mysql_rotation::build_spec(c, resolver.clone()).await?;
         assert!(rot.is_some(), "rotation must build via the genuine path");
     }
 
@@ -902,7 +906,7 @@ async fn mysql_projected_symlink_resolves_through_genuine_build_path()
         dsn,
         make_registry().await,
         make_storage_backend().await,
-        &resolver,
+        resolver,
     )
     .await?;
     Ok(())

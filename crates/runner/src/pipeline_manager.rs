@@ -702,8 +702,10 @@ impl PipelineManager {
         // Use a projected-volume resolver when rotation is configured, so the
         // initial DSN (whose credential files are projected symlinks) resolves; the
         // strict default is retained otherwise.
-        let resolver = sources::source_secret_resolver(&spec);
-        let source_dsn = sources::resolve_source_dsn(&spec, &resolver)
+        let resolver = sources::source_secret_resolver(&spec)
+            .await
+            .context("build source secret resolver")?;
+        let source_dsn = sources::resolve_source_dsn(&spec, resolver.as_ref())
             .await
             .context("resolve source credentials")?;
         let source = build_source(
@@ -711,7 +713,7 @@ impl PipelineManager {
             source_dsn.clone(),
             self.registry.clone(),
             Arc::clone(&self.backend),
-            &resolver,
+            resolver,
         )
         .await
         .context("build source")?;

@@ -516,6 +516,10 @@ async fn recheck(
 fn spawn_renewal(weak: Weak<VaultShared>, mut lease: Lease) {
     tokio::spawn(async move {
         let mut acquired = Instant::now();
+        // Alarm latch: warn once on entering a failure state, one recovery event
+        // when it clears, so a Vault outage cannot flood logs near expiry (where
+        // retries fire every min_delay).
+        let mut in_failure = false;
         loop {
             let delay = match weak.upgrade() {
                 None => return,
@@ -535,17 +539,43 @@ fn spawn_renewal(weak: Weak<VaultShared>, mut lease: Lease) {
             let Some(shared) = weak.upgrade() else {
                 return;
             };
-            match drive_tick(&*shared, &shared.token, &mut lease).await {
+            // Secret-free lifecycle observability: outcome + non-secret lease
+            // shape only (never the token, JWT, or address credentials).
+            let outcome = drive_tick(&*shared, &shared.token, &mut lease).await;
+            match outcome {
                 // A new lease started now: reset the elapsed-time baseline.
                 TickOutcome::Renewed
                 | TickOutcome::Reauthenticated
                 | TickOutcome::Rechecked => {
+                    if in_failure {
+                        in_failure = false;
+                        tracing::info!(
+                            "vault token lifecycle recovered after failures"
+                        );
+                    }
+                    tracing::debug!(
+                        outcome = ?outcome,
+                        ttl_secs = lease.ttl.as_secs(),
+                        renewable = lease.renewable,
+                        "vault token lifecycle advanced"
+                    );
                     acquired = Instant::now();
                 }
                 // Vault unreachable / auth broken: retain the current token and
                 // lease. `acquired` is unchanged, so the next retry is bounded by
                 // the old token's remaining safe lifetime, not the interval.
-                TickOutcome::Failed => {}
+                // Warn only on the transition into failure so repeated near-expiry
+                // retries during an outage cannot flood the logs.
+                TickOutcome::Failed => {
+                    if !in_failure {
+                        in_failure = true;
+                        tracing::warn!(
+                            "vault token renewal and reauthentication both \
+                             failed; retaining current token and retrying within \
+                             its remaining safe lifetime"
+                        );
+                    }
+                }
             }
         }
     });
@@ -969,6 +999,12 @@ impl VaultResolver {
     pub async fn connect(conn: VaultConnection) -> Result<Self, SecretError> {
         let shared = VaultShared::build(conn)?;
         let (token, lease) = shared.authenticate().await?;
+        // Secret-free: non-secret lease shape only.
+        tracing::debug!(
+            ttl_secs = lease.ttl.as_secs(),
+            renewable = lease.renewable,
+            "vault authenticated; starting token renewal task"
+        );
         *shared.token.write().await = token;
         let shared = Arc::new(shared);
         spawn_renewal(Arc::downgrade(&shared), lease);
