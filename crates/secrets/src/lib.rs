@@ -35,6 +35,8 @@ mod registry;
 mod resolved;
 mod resolver;
 mod structured;
+#[cfg(feature = "vault")]
+mod vault;
 mod watch;
 
 pub use credential_set::CredentialSet;
@@ -54,4 +56,9 @@ pub use resolver::{
     CredentialFieldRequest, SecretResolver, check_no_duplicate_fields,
 };
 pub use structured::{StructuredSecret, credential_set_from_record};
+#[cfg(feature = "vault")]
+pub use vault::{
+    RenewPolicy, VaultAuth, VaultAuthFile, VaultConfigError, VaultConnection,
+    VaultResolver, VaultTimeouts,
+};
 pub use watch::{FileWatcher, RotationOutcome};

@@ -14,17 +14,49 @@ use crate::resolved::ResolvedSecret;
 use crate::resolver::{
     CredentialFieldRequest, SecretResolver, check_no_duplicate_fields,
 };
+#[cfg(feature = "vault")]
+use crate::vault::VaultResolver;
 
-/// Routes references to the environment and file resolvers. Vault references
-/// return a typed unsupported-provider error until the Vault provider is installed.
+/// Routes references to the environment and file resolvers, and - when the
+/// `vault` feature is enabled and a backend has been installed - to Vault.
+/// Vault references return a typed unsupported-provider error when no Vault
+/// backend is installed.
 pub struct CompositeResolver {
     env: EnvResolver,
     file: FileResolver,
+    #[cfg(feature = "vault")]
+    vault: Option<VaultResolver>,
 }
 
 impl CompositeResolver {
     pub fn new(env: EnvResolver, file: FileResolver) -> Self {
-        Self { env, file }
+        Self {
+            env,
+            file,
+            #[cfg(feature = "vault")]
+            vault: None,
+        }
+    }
+
+    /// Install a Vault backend so `SecretProvider::Vault` references resolve
+    /// through it instead of failing closed as unsupported.
+    #[cfg(feature = "vault")]
+    pub fn with_vault(mut self, vault: VaultResolver) -> Self {
+        self.vault = Some(vault);
+        self
+    }
+
+    /// Resolve a single Vault reference, or fail closed when no backend is
+    /// installed. The `not(vault)` build compiles this to the unsupported error.
+    async fn resolve_vault(
+        &self,
+        reference: &SecretReference,
+    ) -> Result<ResolvedSecret, SecretError> {
+        #[cfg(feature = "vault")]
+        if let Some(v) = &self.vault {
+            return v.resolve(reference).await;
+        }
+        Err(SecretError::UnsupportedProvider(reference.safe()))
     }
 }
 
@@ -37,9 +69,7 @@ impl SecretResolver for CompositeResolver {
         match reference.provider {
             SecretProvider::Env => self.env.resolve(reference).await,
             SecretProvider::File => self.file.resolve(reference).await,
-            SecretProvider::Vault => {
-                Err(SecretError::UnsupportedProvider(reference.safe()))
-            }
+            SecretProvider::Vault => self.resolve_vault(reference).await,
         }
     }
 
@@ -50,19 +80,34 @@ impl SecretResolver for CompositeResolver {
         // Reject duplicate connector field names before any provider access.
         check_no_duplicate_fields(requests)?;
 
-        // Partition by provider. A Vault reference fails here, still before access.
+        // Partition by provider. When the Vault backend is absent, a Vault
+        // reference fails here, still before any provider access.
         let mut env_reqs: Vec<CredentialFieldRequest> = Vec::new();
         let mut file_reqs: Vec<CredentialFieldRequest> = Vec::new();
+        #[cfg(feature = "vault")]
+        let mut vault_reqs: Vec<CredentialFieldRequest> = Vec::new();
         for req in requests {
             match req.reference.provider {
                 SecretProvider::Env => env_reqs.push(req.clone()),
                 SecretProvider::File => file_reqs.push(req.clone()),
                 SecretProvider::Vault => {
+                    #[cfg(feature = "vault")]
+                    vault_reqs.push(req.clone());
+                    #[cfg(not(feature = "vault"))]
                     return Err(SecretError::UnsupportedProvider(
                         req.reference.safe(),
                     ));
                 }
             }
+        }
+
+        // Fail closed on a missing Vault backend BEFORE any provider access, so a
+        // batch that cannot be fully satisfied performs zero env/file reads.
+        #[cfg(feature = "vault")]
+        if !vault_reqs.is_empty() && self.vault.is_none() {
+            return Err(SecretError::UnsupportedProvider(
+                vault_reqs[0].reference.safe(),
+            ));
         }
 
         // Each provider resolves its own subset (file grouping/provenance intact),
@@ -79,6 +124,18 @@ impl SecretResolver for CompositeResolver {
             let sub = self.file.resolve_set(&file_reqs).await?;
             for (name, secret) in sub.into_fields() {
                 cs.insert(name, secret)?;
+            }
+        }
+        // A missing backend was already rejected above, so `vault` is present here.
+        #[cfg(feature = "vault")]
+        if !vault_reqs.is_empty() {
+            if let Some(v) = &self.vault {
+                // The Vault resolver groups by record, so each record's fields
+                // keep their single-read provenance in the merge.
+                let sub = v.resolve_set(&vault_reqs).await?;
+                for (name, secret) in sub.into_fields() {
+                    cs.insert(name, secret)?;
+                }
             }
         }
         Ok(cs)
@@ -261,6 +318,35 @@ mod tests {
             ),
         ];
         let err = c.resolve_set(&reqs).await.unwrap_err();
+        assert!(matches!(err, SecretError::UnsupportedProvider(_)));
+    }
+
+    /// With the `vault` feature on but no backend installed, a batch containing a
+    /// Vault reference must fail closed BEFORE any env/file provider is touched.
+    /// The file reference points at a path that does not exist: if the file
+    /// provider were accessed we would see its error, not the Vault one.
+    #[cfg(feature = "vault")]
+    #[tokio::test]
+    async fn missing_vault_backend_rejected_before_any_access() {
+        let t = Temp::new();
+        let bogus = t.dir.join("does-not-exist");
+        let c = composite(&[]); // no with_vault() -> no backend
+        let reqs = vec![
+            CredentialFieldRequest::new(
+                "f",
+                SecretReference::new(
+                    SecretProvider::File,
+                    bogus.to_str().unwrap(),
+                ),
+            ),
+            CredentialFieldRequest::new(
+                "v",
+                SecretReference::new(SecretProvider::Vault, "secret/x")
+                    .with_selector("k"),
+            ),
+        ];
+        let err = c.resolve_set(&reqs).await.unwrap_err();
+        // Vault-missing wins; the nonexistent file was never read.
         assert!(matches!(err, SecretError::UnsupportedProvider(_)));
     }
 
