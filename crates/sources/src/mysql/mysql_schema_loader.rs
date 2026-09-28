@@ -83,6 +83,16 @@ impl MySqlSchemaLoader {
         self.registry.current_sequence()
     }
 
+    /// Replace the connection DSN after a credential rotation, rebuilding the cached
+    /// connection pool so later schema queries use the new credentials. The schema
+    /// cache (shared via `Arc`) is preserved. Called by the run loop at a quiesced
+    /// boundary once the replacement stream is confirmed, so no query is in flight
+    /// against the old DSN.
+    pub(crate) fn set_dsn(&mut self, dsn: crate::credentials::ProtectedDsn) {
+        self.pool = Pool::new(dsn.expose());
+        self.dsn = dsn;
+    }
+
     /// Expand wildcard patterns and preload all matching schemas.
     ///
     /// Warm-start path: schemas already known to the durable registry are

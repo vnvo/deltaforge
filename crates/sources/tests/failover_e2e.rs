@@ -235,6 +235,7 @@ async fn make_mysql_source(
         snapshot_cfg: SnapshotCfg::default(),
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
+        rotation: None,
     }
 }
 
@@ -521,6 +522,7 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
             snapshot_cfg: SnapshotCfg::default(),
             on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
             table_options: Default::default(),
+            rotation: None,
         };
         let (tx, mut rx) = mpsc::channel(64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -570,6 +572,7 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
             snapshot_cfg: SnapshotCfg::default(),
             on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
             table_options: Default::default(),
+            rotation: None,
         };
         let (tx, mut rx) = mpsc::channel(64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -663,6 +666,7 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
             snapshot_cfg: SnapshotCfg::default(),
             on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
             table_options: Default::default(),
+            rotation: None,
         };
         let (tx, mut rx) = mpsc::channel(64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -711,6 +715,7 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
             snapshot_cfg: SnapshotCfg::default(),
             on_schema_drift: deltaforge_config::OnSchemaDrift::Halt,
             table_options: Default::default(),
+            rotation: None,
         };
         let (tx, _rx) = mpsc::channel(64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
@@ -802,6 +807,7 @@ async fn mysql_failover_schema_drift_halt_no_drift_continues() -> Result<()> {
             snapshot_cfg: SnapshotCfg::default(),
             on_schema_drift: deltaforge_config::OnSchemaDrift::Halt,
             table_options: Default::default(),
+            rotation: None,
         };
         let (tx, mut rx) = mpsc::channel(64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;

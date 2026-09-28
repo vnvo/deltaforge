@@ -15,6 +15,7 @@ pub mod identity_resolution;
 pub mod mysql;
 pub mod postgres;
 pub mod rotation;
+pub mod rotation_manager;
 pub mod schema_loader;
 pub mod snapshot_event_id;
 pub mod snapshot_frontier;
@@ -57,19 +58,21 @@ pub use rotation::{
 /// wired. The same resolver is used for the initial DSN and for [`build_source`]'s
 /// rotation spec. Without rotation, the strict-symlink default is retained.
 pub fn source_secret_resolver(pipeline: &PipelineSpec) -> CompositeResolver {
-    if let SourceCfg::Postgres(c) = &pipeline.spec.source {
-        if let Some(rot) = &c.rotation {
-            return CompositeResolver::new(
-                EnvResolver::from_process(),
-                FileResolver::new(FilePolicy {
-                    max_size: rot.max_secret_bytes,
-                    mode: FileMode::ProjectedVolume {
-                        trusted_root: rot.trusted_root.clone(),
-                    },
-                    trim_trailing_newline: false,
-                }),
-            );
-        }
+    let rotation = match &pipeline.spec.source {
+        SourceCfg::Postgres(c) => c.rotation.as_ref(),
+        SourceCfg::Mysql(c) => c.rotation.as_ref(),
+    };
+    if let Some(rot) = rotation {
+        return CompositeResolver::new(
+            EnvResolver::from_process(),
+            FileResolver::new(FilePolicy {
+                max_size: rot.max_secret_bytes,
+                mode: FileMode::ProjectedVolume {
+                    trusted_root: rot.trusted_root.clone(),
+                },
+                trim_trailing_newline: false,
+            }),
+        );
     }
     default_secret_resolver()
 }
@@ -132,23 +135,28 @@ pub async fn build_source(
             }))
         }
 
-        SourceCfg::Mysql(c) => Ok(Arc::new(mysql::MySqlSource {
-            id: c.id.clone(),
-            dsn,
-            tables: c.tables.clone(),
-            tenant: pipeline.metadata.tenant.clone(),
-            pipeline: pipeline.metadata.name.clone(),
-            registry,
-            backend: Arc::clone(&backend),
-            outbox_tables: c
-                .outbox
-                .as_ref()
-                .map(|o| o.allow_list())
-                .unwrap_or_default(),
-            snapshot_cfg: c.snapshot.clone(),
-            on_schema_drift: c.on_schema_drift.clone(),
-            table_options: c.table_options.clone(),
-        })),
+        SourceCfg::Mysql(c) => {
+            let rotation =
+                mysql::mysql_rotation::build_spec(c, resolver).await?;
+            Ok(Arc::new(mysql::MySqlSource {
+                id: c.id.clone(),
+                dsn,
+                tables: c.tables.clone(),
+                tenant: pipeline.metadata.tenant.clone(),
+                pipeline: pipeline.metadata.name.clone(),
+                registry,
+                backend: Arc::clone(&backend),
+                outbox_tables: c
+                    .outbox
+                    .as_ref()
+                    .map(|o| o.allow_list())
+                    .unwrap_or_default(),
+                snapshot_cfg: c.snapshot.clone(),
+                on_schema_drift: c.on_schema_drift.clone(),
+                table_options: c.table_options.clone(),
+                rotation,
+            }))
+        }
     }
 }
 

@@ -36,6 +36,8 @@ pub mod mysql_object;
 mod mysql_schema_loader;
 pub use mysql_schema_loader::{LoadedSchema, MySqlSchemaLoader};
 
+pub mod mysql_rotation;
+
 mod mysql_event;
 
 pub mod mysql_event_id;
@@ -91,12 +93,15 @@ pub struct MySqlSource {
     /// fully-qualified `db.table`.
     pub table_options:
         std::collections::BTreeMap<String, deltaforge_config::TableOptions>,
+    /// Controlled credential-rotation spec, when configured and file-backed.
+    /// `None` disables rotation for this source. Requires GTID mode.
+    pub rotation: Option<Arc<crate::rotation_manager::RotationSpec>>,
 }
 
-const HEARTBEAT_INTERVAL_SECS: u64 = 15;
-const READ_TIMEOUT: u64 = 90;
+pub(crate) const HEARTBEAT_INTERVAL_SECS: u64 = 15;
+pub(crate) const READ_TIMEOUT: u64 = 90;
 
-struct RunCtx {
+pub(crate) struct RunCtx {
     source_id: String,
     pipeline: String,
     tenant: String,
@@ -122,6 +127,13 @@ struct RunCtx {
     /// event before it is merged into `last_gtid`'s accumulated executed set.
     /// Used as the immutable per-event identity coordinate.
     current_gtid: Option<String>,
+    /// Whether the current GTID transaction has entered an explicit `BEGIN` block
+    /// (multi-event transaction ending in `Xid`/`COMMIT`/`ROLLBACK`). A GTID-backed
+    /// autocommit statement (DDL, `FLUSH`, ...) never sets this, so it is its own
+    /// single-statement transaction closed by its `QueryEvent`. Used to tell a
+    /// control statement inside a transaction (e.g. `SAVEPOINT`) from a standalone
+    /// autocommit statement.
+    in_explicit_txn: bool,
     /// DDL message ordinal: reset per transaction (GTID / BEGIN), incremented
     /// **before filtering** for each DDL so a skipped DDL never renumbers a
     /// retained one.
@@ -496,6 +508,7 @@ impl MySqlSource {
             last_pos: init_pos,
             last_gtid: init_gtid,
             current_gtid: None,
+            in_explicit_txn: false,
             message_ordinal: 0,
             checkpoint_gtid,
             checkpoint_file,
@@ -518,7 +531,33 @@ impl MySqlSource {
         let tracked = ctx.schema.preload(&self.tables).await?;
         info!(source_id=%self.id, tables = tracked.len(), "schemas preloaded");
 
+        // Controlled credential rotation (opt-in, file-backed credentials only).
+        // GTID mode is mandatory for live rotation - fail startup otherwise. The
+        // runtime owns the watcher/manager task; it is cancelled and joined after
+        // the loop on every exit path, with `Drop` as the abort backstop.
+        let mut rotation = match &self.rotation {
+            Some(spec) => {
+                mysql_rotation::require_gtid_mode(self.dsn.expose()).await?;
+                Some(mysql_rotation::MySqlRotationRuntime::spawn(
+                    spec,
+                    ctx.dsn.clone(),
+                    self.id.clone(),
+                    self.pipeline.clone(),
+                    Arc::clone(&self.backend),
+                    ctx.server_id,
+                    ctx.default_db.clone(),
+                    &ctx.cancel,
+                )?)
+            }
+            None => None,
+        };
+
         info!("entering binlog read loop");
+        // The loop runs inside an async block so its result can be captured and the
+        // rotation runtime cancelled+joined before teardown, on both the normal and
+        // fatal exit paths. A fatal result (including gate-6 rotation failures) is
+        // re-propagated after join and before the teardown checkpoint put.
+        let loop_result: SourceResult<()> = async {
         loop {
             if !pause_until_resumed(&ctx.cancel, &ctx.paused, &ctx.pause_notify)
                 .await
@@ -527,12 +566,46 @@ impl MySqlSource {
                 break;
             }
 
-            debug!(source_id=%ctx.source_id, "reading the next event ..");
-            match read_next_event(&mut stream, &ctx).await {
-                Ok((header, data)) => {
-                    ctx.last_pos = header.next_event_position as u64;
-                    dispatch_event(&mut ctx, &header, data).await?;
+            // Rotation: schedule Stage-A preflight concurrently with the stream,
+            // and apply the Stage-B swap only at a whole-transaction GTID boundary
+            // (between transactions, with an established GTID position).
+            if let Some(rt) = rotation.as_mut() {
+                rt.drive_preflight(&ctx);
+                if ctx.current_gtid.is_none() && ctx.last_gtid.is_some() {
+                    // A CloseUncertain/FailedClosed outcome returns an error from
+                    // this block (gate 6); `loop_result?` re-propagates it before the
+                    // teardown checkpoint put, so the checkpoint never advances.
+                    stream = rt.apply_at_boundary(&mut ctx, stream).await?;
                 }
+            }
+
+            debug!(source_id=%ctx.source_id, "reading the next event ..");
+            // Idle-source wakeup: race the read against rotation activity so a
+            // rotation applies even when no binlog events are flowing.
+            let control: Result<(), LoopControl> = match rotation.as_mut() {
+                Some(rt) => tokio::select! {
+                    r = read_next_event(&mut stream, &ctx) => match r {
+                        Ok((header, data)) => {
+                            ctx.last_pos = header.next_event_position as u64;
+                            dispatch_event(&mut ctx, &header, data).await?;
+                            Ok(())
+                        }
+                        Err(ctrl) => Err(ctrl),
+                    },
+                    _ = rt.wait_activity() => continue,
+                },
+                None => match read_next_event(&mut stream, &ctx).await {
+                    Ok((header, data)) => {
+                        ctx.last_pos = header.next_event_position as u64;
+                        dispatch_event(&mut ctx, &header, data).await?;
+                        Ok(())
+                    }
+                    Err(ctrl) => Err(ctrl),
+                },
+            };
+
+            match control {
+                Ok(()) => {}
                 Err(LoopControl::ReloadSchema { db, table }) => {
                     if let (Some(d), Some(t)) = (db, table) {
                         let _ = ctx.schema.reload_schema(&d, &t).await?;
@@ -554,6 +627,15 @@ impl MySqlSource {
                 Err(LoopControl::Fail(e)) => return Err(e),
             }
         }
+        Ok(())
+        }
+        .await;
+
+        // Cancel and join the rotation tasks on every exit path (normal or fatal).
+        if let Some(rt) = rotation.take() {
+            rt.shutdown().await;
+        }
+        loop_result?;
 
         // best-effort final checkpoint update
         let _ = ctx

@@ -123,6 +123,7 @@ fn my_cfg(
         outbox: None,
         snapshot: Default::default(),
         on_schema_drift: Default::default(),
+        rotation: None,
     }
 }
 
