@@ -91,8 +91,10 @@ impl LogStore {
     }
 }
 
+/// Ordered by `(ns, key)` so `slot_list` can range-iterate a prefix with bounded
+/// (`O(limit)`) temporary memory instead of materializing and sorting all matches.
 #[derive(Debug, Default)]
-struct SlotStore(HashMap<NsKey, (u64, Vec<u8>)>);
+struct SlotStore(BTreeMap<NsKey, (u64, Vec<u8>)>);
 
 #[derive(Debug, Default)]
 struct QueueStore(HashMap<NsKey, VecDeque<QueueEntry>>);
@@ -514,7 +516,7 @@ impl StorageBackend for MemoryStorageBackend {
         key: &str,
         state: &[u8],
     ) -> Result<Option<u64>> {
-        use std::collections::hash_map::Entry;
+        use std::collections::btree_map::Entry;
         let mut store = self.slot.write().await;
         let k = (ns.to_string(), key.to_string());
         match store.0.entry(k) {
@@ -529,6 +531,65 @@ impl StorageBackend for MemoryStorageBackend {
     async fn slot_delete(&self, ns: &str, key: &str) -> Result<bool> {
         let mut store = self.slot.write().await;
         Ok(store.0.remove(&(ns.to_string(), key.to_string())).is_some())
+    }
+
+    async fn slot_list(
+        &self,
+        ns: &str,
+        prefix: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::SlotPage> {
+        let prefix_norm = prefix.unwrap_or("");
+        let after = match cursor {
+            Some(c) => Some(crate::decode_slot_cursor(c, ns, prefix_norm)?),
+            None => None,
+        };
+        let eff = limit.min(crate::SLOT_LIST_MAX_LIMIT);
+        if eff == 0 {
+            return Ok(crate::SlotPage {
+                records: Vec::new(),
+                next_cursor: None,
+            });
+        }
+
+        // Range-scan from the exclusive cursor (or the prefix start) and stop at the
+        // first non-match; the BTreeMap is ordered by `(ns, key)`, so matches are
+        // contiguous and we keep at most `eff + 1` records in memory.
+        use std::ops::Bound;
+        let start = match &after {
+            Some(a) => Bound::Excluded((ns.to_string(), a.clone())),
+            None => Bound::Included((ns.to_string(), prefix_norm.to_string())),
+        };
+        let store = self.slot.read().await;
+        let mut records: Vec<crate::SlotRecord> = Vec::new();
+        for ((n, k), (v, val)) in store.0.range((start, Bound::Unbounded)) {
+            if n != ns || !k.starts_with(prefix_norm) {
+                break;
+            }
+            records.push(crate::SlotRecord {
+                key: k.clone(),
+                version: *v,
+                value: val.clone(),
+            });
+            if records.len() > eff {
+                break; // one extra fetched -> "more" detected
+            }
+        }
+
+        let has_more = records.len() > eff;
+        records.truncate(eff);
+        let next_cursor = if has_more {
+            records
+                .last()
+                .map(|r| crate::encode_slot_cursor(ns, prefix_norm, &r.key))
+        } else {
+            None
+        };
+        Ok(crate::SlotPage {
+            records,
+            next_cursor,
+        })
     }
 
     // ── Queue ────────────────────────────────────────────────────────────────
@@ -636,5 +697,66 @@ mod tests {
     #[tokio::test]
     async fn concurrent_appends() {
         crate::log_contract_suite::concurrent_appends(be(), "journal").await;
+    }
+
+    // slot_list contract suite.
+    #[tokio::test]
+    async fn slot_list_namespace_isolation() {
+        crate::slot_list_contract_suite::namespace_isolation(be(), "slots")
+            .await;
+    }
+    #[tokio::test]
+    async fn slot_list_prefix_correctness() {
+        crate::slot_list_contract_suite::prefix_correctness(be(), "slots")
+            .await;
+    }
+    #[tokio::test]
+    async fn slot_list_pagination_without_duplicates() {
+        crate::slot_list_contract_suite::pagination_without_duplicates(
+            be(),
+            "slots",
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn slot_list_concurrent_mutation_tolerance() {
+        crate::slot_list_contract_suite::concurrent_mutation_tolerance(
+            be(),
+            "slots",
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn slot_list_malformed_cursor_rejected() {
+        crate::slot_list_contract_suite::malformed_cursor_rejected(
+            be(),
+            "slots",
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn slot_list_zero_limit_is_empty() {
+        crate::slot_list_contract_suite::zero_limit_is_empty(be(), "slots")
+            .await;
+    }
+    #[tokio::test]
+    async fn slot_list_unicode_ordering() {
+        crate::slot_list_contract_suite::unicode_ordering_and_pagination(
+            be(),
+            "slots",
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn slot_list_prefix_utf8_length_boundary() {
+        crate::slot_list_contract_suite::prefix_across_utf8_length_boundary(
+            be(),
+            "slots",
+        )
+        .await;
+    }
+    #[tokio::test]
+    async fn slot_list_cursor_validation() {
+        crate::slot_list_contract_suite::cursor_validation(be(), "slots").await;
     }
 }

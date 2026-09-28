@@ -2872,6 +2872,15 @@ mod tests {
         async fn slot_delete(&self, ns: &str, key: &str) -> Result<bool> {
             self.inner.slot_delete(ns, key).await
         }
+        async fn slot_list(
+            &self,
+            ns: &str,
+            prefix: Option<&str>,
+            cursor: Option<&str>,
+            limit: usize,
+        ) -> Result<storage::SlotPage> {
+            self.inner.slot_list(ns, prefix, cursor, limit).await
+        }
         async fn queue_push(
             &self,
             ns: &str,

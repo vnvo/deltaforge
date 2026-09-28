@@ -651,6 +651,83 @@ impl StorageBackend for PostgresStorageBackend {
         Ok(n > 0)
     }
 
+    async fn slot_list(
+        &self,
+        ns: &str,
+        prefix: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::SlotPage> {
+        let prefix_norm = prefix.unwrap_or("");
+        let after = match cursor {
+            Some(c) => Some(crate::decode_slot_cursor(c, ns, prefix_norm)?),
+            None => None,
+        };
+        let eff = limit.min(crate::SLOT_LIST_MAX_LIMIT);
+        if eff == 0 {
+            return Ok(crate::SlotPage {
+                records: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let (lower, upper) = if prefix_norm.is_empty() {
+            (None, None)
+        } else {
+            (
+                Some(prefix_norm.to_string()),
+                crate::prefix_successor(prefix_norm),
+            )
+        };
+        let fetch = (eff as i64) + 1;
+        let c = client!(self);
+        // `COLLATE "C"` forces byte-wise comparison/order regardless of the
+        // database's default collation, so ordering agrees with Rust `str` order
+        // (and the SQLite/Memory backends) and keyset pagination never skips or
+        // duplicates a stable key.
+        let rows = c
+            .query(
+                "SELECT key, version, state FROM df_slot
+                 WHERE ns = $1
+                   AND ($2::text IS NULL OR key COLLATE \"C\" >= $2)
+                   AND ($3::text IS NULL OR key COLLATE \"C\" <  $3)
+                   AND ($4::text IS NULL OR key COLLATE \"C\" >  $4)
+                 ORDER BY key COLLATE \"C\" ASC
+                 LIMIT $5",
+                &[&ns, &lower, &upper, &after, &fetch],
+            )
+            .await?;
+        let mut all: Vec<(String, u64, Vec<u8>)> = rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<_, String>(0),
+                    r.get::<_, i64>(1) as u64,
+                    r.get::<_, Vec<u8>>(2),
+                )
+            })
+            .collect();
+        let has_more = all.len() > eff;
+        all.truncate(eff);
+        let next_cursor = if has_more {
+            all.last()
+                .map(|(k, _, _)| crate::encode_slot_cursor(ns, prefix_norm, k))
+        } else {
+            None
+        };
+        let records = all
+            .into_iter()
+            .map(|(key, version, value)| crate::SlotRecord {
+                key,
+                version,
+                value,
+            })
+            .collect();
+        Ok(crate::SlotPage {
+            records,
+            next_cursor,
+        })
+    }
+
     // ── Queue ────────────────────────────────────────────────────────────────
 
     async fn queue_push(
@@ -776,5 +853,46 @@ mod tests {
         suite::pin_invariant(be.clone(), &format!("it{base}_pin")).await;
         suite::empty_vs_truncated(be.clone(), &format!("it{base}_empty")).await;
         suite::concurrent_appends(be.clone(), &format!("it{base}_conc")).await;
+    }
+
+    /// The shared `slot_list` contract suite against a live PostgreSQL, exercising
+    /// the `COLLATE "C"` byte-wise ordering path. #[ignore] + env-gated; each case
+    /// runs under a unique namespace so it is safe against a shared database and
+    /// repeated runs.
+    #[tokio::test]
+    #[ignore = "requires a live PostgreSQL (DELTAFORGE_IT_PG_DSN)"]
+    async fn pg_slot_list_contracts() {
+        let dsn = std::env::var("DELTAFORGE_IT_PG_DSN")
+            .expect("DELTAFORGE_IT_PG_DSN must be set to run this test");
+        use crate::slot_list_contract_suite as suite;
+        let be: Arc<dyn StorageBackend> =
+            PostgresStorageBackend::connect(&dsn).await.unwrap();
+        let base = now_ms();
+        suite::namespace_isolation(be.clone(), &format!("it{base}_iso")).await;
+        suite::prefix_correctness(be.clone(), &format!("it{base}_pfx")).await;
+        suite::pagination_without_duplicates(
+            be.clone(),
+            &format!("it{base}_page"),
+        )
+        .await;
+        suite::concurrent_mutation_tolerance(
+            be.clone(),
+            &format!("it{base}_conc"),
+        )
+        .await;
+        suite::malformed_cursor_rejected(be.clone(), &format!("it{base}_cur"))
+            .await;
+        suite::zero_limit_is_empty(be.clone(), &format!("it{base}_zero")).await;
+        suite::unicode_ordering_and_pagination(
+            be.clone(),
+            &format!("it{base}_uni"),
+        )
+        .await;
+        suite::prefix_across_utf8_length_boundary(
+            be.clone(),
+            &format!("it{base}_utf8"),
+        )
+        .await;
+        suite::cursor_validation(be.clone(), &format!("it{base}_curval")).await;
     }
 }
