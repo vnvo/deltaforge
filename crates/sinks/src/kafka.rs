@@ -172,6 +172,7 @@ impl KafkaSink {
         cancel: CancellationToken,
         pipeline: &str,
         source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
+        creds: &crate::ResolvedSinkCreds,
     ) -> anyhow::Result<Self> {
         let mut client_cfg = ClientConfig::new();
 
@@ -232,6 +233,12 @@ impl KafkaSink {
 
         // Apply user overrides last
         for (k, v) in &cfg.client_conf {
+            client_cfg.set(k, v);
+        }
+        // Merge resolved client_conf references (protected runtime values, e.g.
+        // sasl.password). A key cannot collide with an inline one (rejected during
+        // resolution).
+        for (k, v) in creds.iter() {
             client_cfg.set(k, v);
         }
 

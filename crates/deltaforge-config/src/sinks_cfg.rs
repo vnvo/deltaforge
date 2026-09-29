@@ -510,7 +510,7 @@ pub struct ElasticsearchSinkCfg {
 ///         type_prefix: "com.example.cdc"
 ///       encoding: json
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct KafkaSinkCfg {
     /// Unique identifier for this sink instance.
     pub id: String,
@@ -565,13 +565,44 @@ pub struct KafkaSinkCfg {
     /// - `sasl.username`, `sasl.password`: SASL credentials
     /// - `linger.ms`: Batching delay (default: 5)
     /// - `compression.type`: none, gzip, snappy, lz4, zstd (default: lz4)
+    /// - `sasl.username`, `sasl.password`: prefer `secret_refs` over inline here.
     #[serde(default)]
     pub client_conf: HashMap<String, String>,
+
+    /// librdkafka config values resolved from references (e.g. `sasl.password`), merged
+    /// into `client_conf` at construction. A key present in both `client_conf` and
+    /// `secret_refs` is a fail-closed conflict.
+    #[serde(
+        default,
+        skip_serializing_if = "std::collections::HashMap::is_empty"
+    )]
+    pub secret_refs:
+        std::collections::HashMap<String, secrets::SecretReference>,
 
     /// Optional filter applied before delivery. Events not matching the filter
     /// are silently ignored by this sink.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<SinkFilter>,
+}
+
+impl std::fmt::Debug for KafkaSinkCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaSinkCfg")
+            .field("id", &self.id)
+            .field("brokers", &self.brokers)
+            .field("topic", &self.topic)
+            .field("key", &self.key)
+            .field("envelope", &self.envelope)
+            .field("encoding", &self.encoding)
+            .field("required", &self.required)
+            .field("exactly_once", &self.exactly_once)
+            .field("send_timeout_secs", &self.send_timeout_secs)
+            // client_conf may hold SASL creds - redact all values.
+            .field("client_conf", &redact_map_values(&self.client_conf))
+            .field("secret_refs", &self.secret_refs.keys().collect::<Vec<_>>())
+            .field("filter", &self.filter)
+            .finish()
+    }
 }
 
 /// Redis Streams sink configuration.

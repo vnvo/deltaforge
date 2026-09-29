@@ -12,8 +12,8 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 use deltaforge_config::{
-    ClickHouseSinkCfg, HttpSinkCfg, NatsSinkCfg, PipelineSpec, RedisSinkCfg,
-    SinkCfg,
+    ClickHouseSinkCfg, HttpSinkCfg, KafkaSinkCfg, NatsSinkCfg, PipelineSpec,
+    RedisSinkCfg, SinkCfg,
 };
 use secrets::{SecretReference, SecretResolver};
 use zeroize::Zeroizing;
@@ -70,6 +70,7 @@ pub async fn resolve_sink_secrets(
             SinkCfg::Redis(c) => resolve_redis(c, resolver).await?,
             SinkCfg::Nats(c) => resolve_nats(c, resolver).await?,
             SinkCfg::Http(c) => resolve_http(c, resolver).await?,
+            SinkCfg::Kafka(c) => resolve_kafka(c, resolver).await?,
             // Other connectors are adopted in later increments; until then they use
             // their inline (deprecated) fields and contribute no resolved secrets.
             _ => ResolvedSinkCreds::default(),
@@ -183,13 +184,49 @@ async fn resolve_http(
     cfg: &HttpSinkCfg,
     resolver: &dyn SecretResolver,
 ) -> Result<ResolvedSinkCreds> {
+    resolve_map_refs(
+        "http",
+        &cfg.id,
+        "header",
+        &cfg.headers,
+        &cfg.secret_refs,
+        resolver,
+    )
+    .await
+}
+
+async fn resolve_kafka(
+    cfg: &KafkaSinkCfg,
+    resolver: &dyn SecretResolver,
+) -> Result<ResolvedSinkCreds> {
+    resolve_map_refs(
+        "kafka",
+        &cfg.id,
+        "client_conf key",
+        &cfg.client_conf,
+        &cfg.secret_refs,
+        resolver,
+    )
+    .await
+}
+
+/// Resolve a `secret_refs` overlay for a free-form string map (HTTP headers, Kafka
+/// client_conf): each referenced key must NOT also be set in the plaintext map (a
+/// fail-closed conflict), and resolves to a protected value keyed by that name.
+async fn resolve_map_refs(
+    connector: &str,
+    id: &str,
+    kind: &str,
+    plaintext: &std::collections::HashMap<String, String>,
+    secret_refs: &std::collections::HashMap<String, SecretReference>,
+    resolver: &dyn SecretResolver,
+) -> Result<ResolvedSinkCreds> {
     let mut creds = ResolvedSinkCreds::default();
-    for (name, reference) in &cfg.secret_refs {
-        if cfg.headers.contains_key(name) {
+    for (name, reference) in secret_refs {
+        if plaintext.contains_key(name) {
             bail!(
-                "http sink '{}': header '{name}' is set both inline and in \
-                 secret_refs; use exactly one",
-                cfg.id
+                "{connector} sink '{id}': {kind} '{name}' is set both inline and \
+                 in secret_refs; use exactly one"
             );
         }
         creds.insert(name.clone(), resolve_ref(resolver, reference).await?);

@@ -287,9 +287,16 @@ fn make_sink(
         exactly_once: None,
         send_timeout_secs: Some(30),
         client_conf: HashMap::new(),
+        secret_refs: Default::default(),
         filter: None,
     };
-    KafkaSink::new(&cfg, CancellationToken::new(), "", None)
+    KafkaSink::new(
+        &cfg,
+        CancellationToken::new(),
+        "",
+        None,
+        &sinks::ResolvedSinkCreds::default(),
+    )
 }
 
 /// Consume up to `n` messages, waiting at most `secs` seconds.
@@ -844,11 +851,13 @@ async fn kafka_sink_idempotent_mode() -> Result<()> {
             exactly_once: Some(false),
             send_timeout_secs: Some(30),
             client_conf: HashMap::new(),
+            secret_refs: Default::default(),
             filter: None,
         },
         CancellationToken::new(),
         "",
         None,
+        &sinks::ResolvedSinkCreds::default(),
     )?;
 
     // Send multiple events
@@ -886,11 +895,13 @@ async fn kafka_sink_exactly_once_mode() -> Result<()> {
             exactly_once: Some(true),
             send_timeout_secs: Some(30),
             client_conf: HashMap::new(),
+            secret_refs: Default::default(),
             filter: None,
         },
         CancellationToken::new(),
         "",
         None,
+        &sinks::ResolvedSinkCreds::default(),
     )?;
 
     // Note: Full EOS testing requires transaction support; this just validates
@@ -1037,10 +1048,17 @@ async fn kafka_sink_custom_config() -> Result<()> {
         exactly_once: None,
         send_timeout_secs: Some(30),
         client_conf,
+        secret_refs: Default::default(),
         filter: None,
     };
 
-    let sink = KafkaSink::new(&cfg, CancellationToken::new(), "", None)?;
+    let sink = KafkaSink::new(
+        &cfg,
+        CancellationToken::new(),
+        "",
+        None,
+        &sinks::ResolvedSinkCreds::default(),
+    )?;
 
     let event = make_test_event(1);
     sink.send(&event).await?;
@@ -1104,10 +1122,17 @@ async fn kafka_sink_optional() -> Result<()> {
         exactly_once: None,
         send_timeout_secs: None,
         client_conf: HashMap::new(),
+        secret_refs: Default::default(),
         filter: None,
     };
 
-    let sink = KafkaSink::new(&cfg, CancellationToken::new(), "", None)?;
+    let sink = KafkaSink::new(
+        &cfg,
+        CancellationToken::new(),
+        "",
+        None,
+        &sinks::ResolvedSinkCreds::default(),
+    )?;
 
     assert!(!sink.required(), "sink should be optional");
 
@@ -1173,11 +1198,13 @@ async fn kafka_sink_recovers_after_restart() -> Result<()> {
             exactly_once: None,
             send_timeout_secs: Some(30),
             client_conf: HashMap::new(),
+            secret_refs: Default::default(),
             filter: None,
         },
         cancel.clone(),
         "",
         None,
+        &sinks::ResolvedSinkCreds::default(),
     )?);
 
     // Send first event successfully
@@ -1323,11 +1350,13 @@ async fn kafka_sink_respects_cancellation() -> Result<()> {
             exactly_once: None,
             send_timeout_secs: Some(2),
             client_conf: HashMap::new(),
+            secret_refs: Default::default(),
             filter: None,
         },
         cancel.clone(),
         "",
         None,
+        &sinks::ResolvedSinkCreds::default(),
     )?);
 
     let sink_clone = sink.clone();
@@ -1570,10 +1599,17 @@ async fn kafka_sink_routing_key_and_headers() -> Result<()> {
         exactly_once: None,
         send_timeout_secs: Some(30),
         client_conf: HashMap::new(),
+        secret_refs: Default::default(),
         filter: None,
     };
 
-    let sink = KafkaSink::new(&cfg, CancellationToken::new(), "", None)?;
+    let sink = KafkaSink::new(
+        &cfg,
+        CancellationToken::new(),
+        "",
+        None,
+        &sinks::ResolvedSinkCreds::default(),
+    )?;
 
     let mut event = make_event_for_table(1, "orders");
     event.after = Some(json!({"id": 1, "customer_id": "cust-42"}));
@@ -1729,9 +1765,16 @@ fn make_txn_sink(
         exactly_once: Some(true),
         send_timeout_secs: Some(30),
         client_conf: HashMap::new(),
+        secret_refs: Default::default(),
         filter: None,
     };
-    KafkaSink::new(&cfg, CancellationToken::new(), pipeline, None)
+    KafkaSink::new(
+        &cfg,
+        CancellationToken::new(),
+        pipeline,
+        None,
+        &sinks::ResolvedSinkCreds::default(),
+    )
 }
 
 /// Create a consumer with read_committed isolation — only sees committed
