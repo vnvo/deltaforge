@@ -4,6 +4,7 @@
 - [Change Data Capture](cdc.md)
 - [Quickstart](quickstart.md)
 - [Configuration](configuration.md)
+- [Secrets & Credentials](secrets.md)
 - [API Reference](apireference.md)
 - [Pipelines](pipelines.md)
 - [Sources](sources/README.md)
