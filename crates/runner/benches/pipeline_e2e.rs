@@ -33,6 +33,7 @@ use deltaforge_core::{
 };
 use serde_json::json;
 
+use runner::coordinator::PauseState;
 use runner::{
     CommitCpFn, Coordinator, ProcessBatchFn, ProcessedBatch, SchemaSensorState,
 };
@@ -499,7 +500,7 @@ async fn run_coordinator_bench(
 ) -> Result<()> {
     let (tx, rx) = mpsc::channel::<SourceItem>(events.len() + 100);
     let cancel = CancellationToken::new();
-    let (_pause_tx, pause_rx) = watch::channel(false);
+    let (_pause_tx, pause_rx) = watch::channel(PauseState::default());
 
     let mut builder = Coordinator::builder("bench-pipeline")
         .sinks(sinks.clone())
@@ -528,7 +529,7 @@ async fn run_coordinator_bench_with_sensing(
 ) -> Result<()> {
     let (tx, rx) = mpsc::channel::<SourceItem>(events.len() + 100);
     let cancel = CancellationToken::new();
-    let (_pause_tx, pause_rx) = watch::channel(false);
+    let (_pause_tx, pause_rx) = watch::channel(PauseState::default());
 
     let sensor = Arc::new(SchemaSensorState::new(sensing_config));
 
