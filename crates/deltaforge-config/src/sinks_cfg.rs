@@ -6,6 +6,14 @@ fn redact_opt(v: &Option<String>) -> Option<&'static str> {
     v.as_ref().map(|_| "***REDACTED***")
 }
 
+/// Debug helper: show a string map's keys with redacted values (values may be secrets,
+/// e.g. HTTP header tokens or Kafka SASL entries). Ordered for stable output.
+fn redact_map_values(
+    m: &HashMap<String, String>,
+) -> std::collections::BTreeMap<&str, &'static str> {
+    m.keys().map(|k| (k.as_str(), "***REDACTED***")).collect()
+}
+
 // ============================================================================
 // Envelope Configuration
 // ============================================================================
@@ -794,7 +802,7 @@ impl std::fmt::Debug for NatsSinkCfg {
 ///
 /// Delivers events via HTTP POST (or PUT) to any URL. Supports dynamic URL
 /// templates, custom headers with env var expansion, and optional batch mode.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct HttpSinkCfg {
     /// Unique identifier for this sink.
     pub id: String,
@@ -808,9 +816,19 @@ pub struct HttpSinkCfg {
     pub method: String,
 
     /// Static headers added to every request. Values support `${ENV_VAR}` expansion.
-    /// Example: `{"Authorization": "Bearer ${API_TOKEN}", "X-Source": "deltaforge"}`
+    /// Example: `{"Authorization": "Bearer ${API_TOKEN}", "X-Source": "deltaforge"}`.
+    /// Sensitive header values (tokens, keys) should use `secret_refs` instead of inline.
     #[serde(default)]
     pub headers: std::collections::HashMap<String, String>,
+
+    /// Header values resolved from references, merged into `headers` at construction. A
+    /// header name present in both `headers` and `secret_refs` is a fail-closed conflict.
+    #[serde(
+        default,
+        skip_serializing_if = "std::collections::HashMap::is_empty"
+    )]
+    pub secret_refs:
+        std::collections::HashMap<String, secrets::SecretReference>,
 
     /// Batch mode: if true, send a JSON array of events in one request.
     /// If false (default), send one request per event.
@@ -844,6 +862,27 @@ pub struct HttpSinkCfg {
     /// Optional filter applied before delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<SinkFilter>,
+}
+
+impl std::fmt::Debug for HttpSinkCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpSinkCfg")
+            .field("id", &self.id)
+            .field("url", &common::dsn::redact_url_password(&self.url))
+            .field("method", &self.method)
+            // Header values may carry tokens - redact all values in Debug.
+            .field("headers", &redact_map_values(&self.headers))
+            .field("secret_refs", &self.secret_refs.keys().collect::<Vec<_>>())
+            .field("batch_mode", &self.batch_mode)
+            .field("envelope", &self.envelope)
+            .field("encoding", &self.encoding)
+            .field("required", &self.required)
+            .field("send_timeout_secs", &self.send_timeout_secs)
+            .field("batch_timeout_secs", &self.batch_timeout_secs)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("filter", &self.filter)
+            .finish()
+    }
 }
 
 fn default_http_method() -> String {
