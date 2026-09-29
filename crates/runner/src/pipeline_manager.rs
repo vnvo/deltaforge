@@ -345,6 +345,7 @@ async fn build_durable_s3_sinks(
     ckpt_store: &dyn CheckpointStore,
     pipeline: &str,
     arrow_resolver: Option<sinks::s3::SchemaResolver>,
+    secrets: &sinks::ResolvedSinkSecrets,
 ) -> Result<Vec<deltaforge_core::ArcDynSink>> {
     use deltaforge_config::{S3Durability, SinkCfg};
 
@@ -383,6 +384,7 @@ async fn build_durable_s3_sinks(
                 &source_id,
                 comparator,
                 arrow_resolver.clone(),
+                secrets.for_sink(&cfg.id),
             )
             .await
             .context("build durable_v2 S3 sink")?,
@@ -766,6 +768,7 @@ impl PipelineManager {
             self.ckpt_store.as_ref(),
             &pipeline_name,
             arrow_schema_resolver.clone(),
+            &sink_secrets,
         )
         .await?;
         sinks.extend(durable);
@@ -2224,6 +2227,10 @@ mod tests {
             endpoint: None,
             access_key_id: None,
             secret_access_key: None,
+            session_token: None,
+            access_key_id_ref: None,
+            secret_access_key_ref: None,
+            session_token_ref: None,
             virtual_hosted_style: false,
             local: true,
             format: deltaforge_config::S3FileFormat::Jsonl,
@@ -2366,6 +2373,7 @@ mod tests {
             store.as_ref(),
             "p",
             None,
+            &sinks::ResolvedSinkSecrets::default(),
         )
         .await;
         assert!(err.is_err(), "startup check must abort construction");

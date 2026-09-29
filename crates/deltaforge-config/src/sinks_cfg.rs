@@ -996,7 +996,7 @@ fn default_http_method() -> String {
 ///         idle_age_secs: 600         # 10 min
 ///       required: true
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct S3SinkCfg {
     /// Unique identifier for this sink instance.
     pub id: String,
@@ -1018,14 +1018,30 @@ pub struct S3SinkCfg {
     #[serde(default)]
     pub endpoint: Option<String>,
 
-    /// Inline access key (supports `${ENV_VAR}` expansion). Prefer IAM
-    /// instance roles in production.
+    /// Inline access key (supports `${ENV_VAR}` expansion). **Deprecated** as an inline
+    /// secret; prefer `access_key_id_ref`, or omit all keys to use the ambient AWS
+    /// identity (IAM instance/role credentials).
     #[serde(default)]
     pub access_key_id: Option<String>,
 
-    /// Inline secret key (supports `${ENV_VAR}` expansion).
+    /// Inline secret key. **Deprecated**; prefer `secret_access_key_ref`.
     #[serde(default)]
     pub secret_access_key: Option<String>,
+
+    /// Optional session token for temporary AWS credentials (STS). **Deprecated** as an
+    /// inline secret; prefer `session_token_ref`.
+    #[serde(default)]
+    pub session_token: Option<String>,
+
+    /// Reference resolving the access key id (mutually exclusive with `access_key_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key_id_ref: Option<secrets::SecretReference>,
+    /// Reference resolving the secret key (mutually exclusive with `secret_access_key`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_access_key_ref: Option<secrets::SecretReference>,
+    /// Reference resolving the session token (mutually exclusive with `session_token`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token_ref: Option<secrets::SecretReference>,
 
     /// Use virtual-hosted-style addressing. Defaults to `false` (path-style),
     /// which works for MinIO. Set `true` for AWS S3 with custom domains.
@@ -1075,6 +1091,33 @@ pub struct S3SinkCfg {
     /// are silently ignored by this sink.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<SinkFilter>,
+}
+
+impl std::fmt::Debug for S3SinkCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3SinkCfg")
+            .field("id", &self.id)
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &redact_opt(&self.access_key_id))
+            .field("secret_access_key", &redact_opt(&self.secret_access_key))
+            .field("session_token", &redact_opt(&self.session_token))
+            .field("access_key_id_ref", &self.access_key_id_ref)
+            .field("secret_access_key_ref", &self.secret_access_key_ref)
+            .field("session_token_ref", &self.session_token_ref)
+            .field("virtual_hosted_style", &self.virtual_hosted_style)
+            .field("local", &self.local)
+            .field("format", &self.format)
+            .field("compression", &self.compression)
+            .field("file_roll", &self.file_roll)
+            .field("send_timeout_secs", &self.send_timeout_secs)
+            .field("required", &self.required)
+            .field("durability", &self.durability)
+            .field("filter", &self.filter)
+            .finish()
+    }
 }
 
 /// Durability mode for the S3 sink. Explicit and fail-closed: unknown values are

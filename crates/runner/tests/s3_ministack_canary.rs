@@ -322,6 +322,10 @@ async fn ministack_canary_parquet_roundtrip() -> Result<()> {
         endpoint: Some(infra.endpoint.clone()),
         access_key_id: Some(MS_KEY.into()),
         secret_access_key: Some(MS_SECRET.into()),
+        session_token: None,
+        access_key_id_ref: None,
+        secret_access_key_ref: None,
+        session_token_ref: None,
         virtual_hosted_style: false,
         local: false,
         format: S3FileFormat::Parquet,
@@ -351,6 +355,7 @@ async fn ministack_canary_parquet_roundtrip() -> Result<()> {
         CancellationToken::new(),
         "canary",
         Some(resolver),
+        &sinks::ResolvedSinkCreds::default(),
     )?;
 
     // 3 events → exactly one rolled file via max_events.

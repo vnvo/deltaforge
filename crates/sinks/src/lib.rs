@@ -255,6 +255,7 @@ fn build_sinks_impl(
                             cancel.clone(),
                             pipeline,
                             arrow_schema_resolver.clone(),
+                            secrets.for_sink(&cfg.id),
                         )?) as ArcDynSink,
                         cfg.filter.clone(),
                     ),
@@ -336,10 +337,13 @@ pub fn build_sink(
             None,
             &ResolvedSinkCreds::default(),
         )?) as ArcDynSink,
-        SinkCfg::S3(s3_cfg) => {
-            Arc::new(build_s3_sink(s3_cfg, cancel, pipeline, None)?)
-                as ArcDynSink
-        }
+        SinkCfg::S3(s3_cfg) => Arc::new(build_s3_sink(
+            s3_cfg,
+            cancel,
+            pipeline,
+            None,
+            &ResolvedSinkCreds::default(),
+        )?) as ArcDynSink,
         SinkCfg::Elasticsearch(cfg) => {
             Arc::new(elasticsearch::build_elasticsearch_sink(
                 cfg,

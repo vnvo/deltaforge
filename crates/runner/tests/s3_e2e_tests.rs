@@ -279,6 +279,10 @@ fn s3_cfg(format: S3FileFormat, prefix: &str, max_events: u64) -> S3SinkCfg {
         endpoint: None, // overridden below
         access_key_id: Some(MINIO_KEY.into()),
         secret_access_key: Some(MINIO_SECRET.into()),
+        session_token: None,
+        access_key_id_ref: None,
+        secret_access_key_ref: None,
+        session_token_ref: None,
         virtual_hosted_style: false,
         local: false,
         format,
@@ -365,6 +369,7 @@ async fn e2e_parquet_with_ddl_schema_minio() -> Result<()> {
         CancellationToken::new(),
         "pipeline-e2e",
         Some(schema_resolver_for_test()),
+        &sinks::ResolvedSinkCreds::default(),
     )?;
 
     // 5 events → exactly one rolled file (max_events: 5).
@@ -476,6 +481,7 @@ async fn e2e_jsonl_gzip_with_ddl_schema_minio() -> Result<()> {
         CancellationToken::new(),
         "pipeline-e2e",
         Some(schema_resolver_for_test()),
+        &sinks::ResolvedSinkCreds::default(),
     )?;
 
     let events = vec![
@@ -527,6 +533,7 @@ async fn e2e_multi_day_partitions_produce_separate_files() -> Result<()> {
         CancellationToken::new(),
         "pipeline-e2e",
         Some(schema_resolver_for_test()),
+        &sinks::ResolvedSinkCreds::default(),
     )?;
 
     let events = vec![
@@ -570,7 +577,13 @@ async fn e2e_envelope_only_fallback_when_no_resolver() -> Result<()> {
     };
 
     // No schema resolver — should fall back to envelope-only Parquet.
-    let sink = build_s3_sink(&cfg, CancellationToken::new(), "pipe", None)?;
+    let sink = build_s3_sink(
+        &cfg,
+        CancellationToken::new(),
+        "pipe",
+        None,
+        &sinks::ResolvedSinkCreds::default(),
+    )?;
     sink.send_batch(&[
         make_order(Op::Create, 25, 1, Some("a@x"), "1.00", true),
         make_order(Op::Create, 25, 2, Some("b@x"), "2.00", true),

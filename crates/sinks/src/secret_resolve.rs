@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use anyhow::{Result, bail};
 use deltaforge_config::{
     ClickHouseSinkCfg, ElasticsearchSinkCfg, EsAuth, HttpSinkCfg, KafkaSinkCfg,
-    NatsSinkCfg, PipelineSpec, RedisSinkCfg, SinkCfg,
+    NatsSinkCfg, PipelineSpec, RedisSinkCfg, S3SinkCfg, SinkCfg,
 };
 use secrets::{SecretReference, SecretResolver};
 use zeroize::Zeroizing;
@@ -74,9 +74,7 @@ pub async fn resolve_sink_secrets(
             SinkCfg::Elasticsearch(c) => {
                 resolve_elasticsearch(c, resolver).await?
             }
-            // Other connectors are adopted in later increments; until then they use
-            // their inline (deprecated) fields and contribute no resolved secrets.
-            _ => ResolvedSinkCreds::default(),
+            SinkCfg::S3(c) => resolve_s3(c, resolver).await?,
         };
         by_sink.insert(sink.sink_id().to_string(), creds);
     }
@@ -211,6 +209,30 @@ async fn resolve_kafka(
         resolver,
     )
     .await
+}
+
+async fn resolve_s3(
+    cfg: &S3SinkCfg,
+    resolver: &dyn SecretResolver,
+) -> Result<ResolvedSinkCreds> {
+    let mut creds = ResolvedSinkCreds::default();
+    for (field, inline, reference) in [
+        ("access_key_id", &cfg.access_key_id, &cfg.access_key_id_ref),
+        (
+            "secret_access_key",
+            &cfg.secret_access_key,
+            &cfg.secret_access_key_ref,
+        ),
+        ("session_token", &cfg.session_token, &cfg.session_token_ref),
+    ] {
+        resolve_field(
+            &mut creds, "s3", &cfg.id, field, inline, reference, resolver,
+        )
+        .await?;
+    }
+    // The access/secret pair completeness (xor) is enforced at build time, where inline
+    // and reference values are combined into the effective params.
+    Ok(creds)
 }
 
 async fn resolve_elasticsearch(

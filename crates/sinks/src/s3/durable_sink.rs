@@ -320,25 +320,12 @@ pub async fn build_durable_s3_sink(
     source_id: &str,
     comparator: Arc<dyn CheckpointComparator>,
     schema_resolver: Option<SchemaResolver>,
+    creds: &crate::ResolvedSinkCreds,
 ) -> anyhow::Result<DurableS3Sink> {
-    use super::object_writer::{ObjectStoreParams, build_object_store};
+    use super::object_writer::{build_object_store, s3_object_store_params};
     use deltaforge_config::{S3Compression as C, S3FileFormat as F};
 
-    let expand = |v: &Option<String>| -> anyhow::Result<Option<String>> {
-        Ok(v.as_deref()
-            .map(shellexpand::env)
-            .transpose()?
-            .map(|s| s.into_owned()))
-    };
-    let params = ObjectStoreParams {
-        bucket: cfg.bucket.clone(),
-        endpoint: cfg.endpoint.clone(),
-        region: cfg.region.clone(),
-        access_key_id: expand(&cfg.access_key_id)?,
-        secret_access_key: expand(&cfg.secret_access_key)?,
-        virtual_hosted_style: cfg.virtual_hosted_style,
-        local: cfg.local,
-    };
+    let params = s3_object_store_params(cfg, creds)?;
     let store = build_object_store(&params)
         .map_err(|e| anyhow::anyhow!("build S3 object store: {e}"))?;
 
