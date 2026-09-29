@@ -12,8 +12,8 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 use deltaforge_config::{
-    ClickHouseSinkCfg, HttpSinkCfg, KafkaSinkCfg, NatsSinkCfg, PipelineSpec,
-    RedisSinkCfg, SinkCfg,
+    ClickHouseSinkCfg, ElasticsearchSinkCfg, EsAuth, HttpSinkCfg, KafkaSinkCfg,
+    NatsSinkCfg, PipelineSpec, RedisSinkCfg, SinkCfg,
 };
 use secrets::{SecretReference, SecretResolver};
 use zeroize::Zeroizing;
@@ -71,6 +71,9 @@ pub async fn resolve_sink_secrets(
             SinkCfg::Nats(c) => resolve_nats(c, resolver).await?,
             SinkCfg::Http(c) => resolve_http(c, resolver).await?,
             SinkCfg::Kafka(c) => resolve_kafka(c, resolver).await?,
+            SinkCfg::Elasticsearch(c) => {
+                resolve_elasticsearch(c, resolver).await?
+            }
             // Other connectors are adopted in later increments; until then they use
             // their inline (deprecated) fields and contribute no resolved secrets.
             _ => ResolvedSinkCreds::default(),
@@ -208,6 +211,59 @@ async fn resolve_kafka(
         resolver,
     )
     .await
+}
+
+async fn resolve_elasticsearch(
+    cfg: &ElasticsearchSinkCfg,
+    resolver: &dyn SecretResolver,
+) -> Result<ResolvedSinkCreds> {
+    let mut creds = ResolvedSinkCreds::default();
+    match &cfg.auth {
+        Some(EsAuth::Basic {
+            username,
+            password,
+            username_ref,
+            password_ref,
+        }) => {
+            resolve_field(
+                &mut creds,
+                "elasticsearch",
+                &cfg.id,
+                "username",
+                username,
+                username_ref,
+                resolver,
+            )
+            .await?;
+            resolve_field(
+                &mut creds,
+                "elasticsearch",
+                &cfg.id,
+                "password",
+                password,
+                password_ref,
+                resolver,
+            )
+            .await?;
+        }
+        Some(EsAuth::ApiKey {
+            api_key,
+            api_key_ref,
+        }) => {
+            resolve_field(
+                &mut creds,
+                "elasticsearch",
+                &cfg.id,
+                "api_key",
+                api_key,
+                api_key_ref,
+                resolver,
+            )
+            .await?;
+        }
+        Some(EsAuth::None) | None => {}
+    }
+    Ok(creds)
 }
 
 /// Resolve a `secret_refs` overlay for a free-form string map (HTTP headers, Kafka

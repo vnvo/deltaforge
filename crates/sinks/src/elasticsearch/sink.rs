@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use deltaforge_config::{ElasticsearchSinkCfg, EsAuth, EsVersionSource};
+use deltaforge_config::{ElasticsearchSinkCfg, EsVersionSource};
 use deltaforge_core::{BatchResult, Event, Op, Sink, SinkError, SinkResult};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -240,20 +240,12 @@ pub fn build_elasticsearch_sink(
     _cancel: CancellationToken,
     pipeline: &str,
     resolver: Option<EsSchemaResolver>,
+    creds: &crate::ResolvedSinkCreds,
 ) -> anyhow::Result<ElasticsearchSink> {
-    // Expand ${ENV} in the URL and auth secrets, like the other sinks.
+    // Expand ${ENV} in the URL. Auth is resolved (references win over inline).
     let mut expanded = cfg.clone();
     expanded.url = shellexpand::env(&cfg.url)?.into_owned();
-    expanded.auth = match &cfg.auth {
-        Some(EsAuth::Basic { username, password }) => Some(EsAuth::Basic {
-            username: shellexpand::env(username)?.into_owned(),
-            password: shellexpand::env(password)?.into_owned(),
-        }),
-        Some(EsAuth::ApiKey { api_key }) => Some(EsAuth::ApiKey {
-            api_key: shellexpand::env(api_key)?.into_owned(),
-        }),
-        other => other.clone(),
-    };
+    let auth = super::client::resolve_es_auth(&cfg.auth, creds)?;
 
     let needs_schema = cfg.id_fields.is_empty() || cfg.auto_create_index;
     if resolver.is_none() && needs_schema {
@@ -265,7 +257,7 @@ pub fn build_elasticsearch_sink(
         );
     }
 
-    let client = ElasticsearchClient::new(&expanded)?;
+    let client = ElasticsearchClient::new(&expanded, auth)?;
     Ok(ElasticsearchSink {
         id: cfg.id.clone(),
         pipeline: pipeline.to_string(),

@@ -416,16 +416,59 @@ pub enum EsVersionSource {
     TsMs,
 }
 
-/// Elasticsearch authentication. Tagged by `type`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Elasticsearch authentication. Tagged by `type`. Each secret may be inline
+/// (**deprecated**) or a reference (`*_ref`); the two are mutually exclusive per field.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EsAuth {
     /// HTTP basic auth (self-hosted).
-    Basic { username: String, password: String },
+    Basic {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username_ref: Option<secrets::SecretReference>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password_ref: Option<secrets::SecretReference>,
+    },
     /// Elastic Cloud / serverless API key (`Authorization: ApiKey <key>`).
-    ApiKey { api_key: String },
+    ApiKey {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key_ref: Option<secrets::SecretReference>,
+    },
     /// No auth.
     None,
+}
+
+impl std::fmt::Debug for EsAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EsAuth::Basic {
+                username,
+                password,
+                username_ref,
+                password_ref,
+            } => f
+                .debug_struct("Basic")
+                .field("username", &redact_opt(username))
+                .field("password", &redact_opt(password))
+                .field("username_ref", username_ref)
+                .field("password_ref", password_ref)
+                .finish(),
+            EsAuth::ApiKey {
+                api_key,
+                api_key_ref,
+            } => f
+                .debug_struct("ApiKey")
+                .field("api_key", &redact_opt(api_key))
+                .field("api_key_ref", api_key_ref)
+                .finish(),
+            EsAuth::None => f.write_str("None"),
+        }
+    }
 }
 
 /// TLS options for the Elasticsearch HTTPS endpoint.

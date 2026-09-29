@@ -275,6 +275,7 @@ fn build_sinks_impl(
                             cancel.clone(),
                             pipeline,
                             es_resolver.clone(),
+                            secrets.for_sink(&cfg.id),
                         )?) as ArcDynSink,
                         // v1: Elasticsearch sink does not support sink-level filters.
                         None,
@@ -341,7 +342,11 @@ pub fn build_sink(
         }
         SinkCfg::Elasticsearch(cfg) => {
             Arc::new(elasticsearch::build_elasticsearch_sink(
-                cfg, cancel, pipeline, None,
+                cfg,
+                cancel,
+                pipeline,
+                None,
+                &ResolvedSinkCreds::default(),
             )?) as ArcDynSink
         }
         SinkCfg::ClickHouse(cfg) => Arc::new(clickhouse::build_clickhouse_sink(
