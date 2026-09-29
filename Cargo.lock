@@ -4725,6 +4725,7 @@ dependencies = [
  "hmac 0.12.1",
  "metrics",
  "mysql-binlog-connector-rust",
+ "mysql_async",
  "o11y",
  "object_store",
  "parking_lot",
