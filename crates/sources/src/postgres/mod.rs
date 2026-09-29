@@ -74,7 +74,8 @@ use crate::failover::identity::{
 };
 use crate::failover::reconciler::{ReconcileInput, SchemaReconciler};
 use crate::postgres::postgres_health::{
-    PositionReachability, check_position_reachability, fetch_server_identity,
+    PositionReachability, PostgresServerIdentity, check_position_reachability,
+    fetch_server_identity,
 };
 
 // ============================================================================
@@ -563,6 +564,16 @@ impl PostgresSource {
             .set(if unsafe_legacy { 1.0 } else { 0.0 });
         }
 
+        // Fetch the verified, nonzero cluster identity exactly ONCE before
+        // opening replication. The same authority is reused for the pre-connect
+        // LSN adjustment, the provisional row/DDL/message ids, and the initial
+        // failover identity check. If the lineage cannot be verified we fail
+        // closed rather than open replication on an unknown server.
+        let startup_identity =
+            fetch_pg_identity_verified(self.dsn.expose()).await?;
+        let system_identifier = startup_identity.system_identifier as u64;
+        let startup_server_identity = ServerIdentity::from(startup_identity);
+
         // Adjust start_lsn BEFORE opening the replication stream.
         // If a failover has occurred, START_REPLICATION with A's stale LSN would
         // advance B's slot.confirmed_flush_lsn past B's uncommitted changes, making
@@ -573,10 +584,11 @@ impl PostgresSource {
                 self.dsn.expose(),
                 &self.slot,
                 start_lsn,
+                &startup_server_identity,
                 &id_store,
                 &self.id,
             )
-            .await
+            .await?
         };
 
         info!(
@@ -597,14 +609,6 @@ impl PostgresSource {
 
         let backend = Arc::clone(&self.backend);
         let cancel_ref = cancel.clone();
-        // Capture the cluster lineage once for provisional row/DDL/message ids
-        // (the same authority used by snapshot + failover identity).
-        let system_identifier = fetch_server_identity(self.dsn.expose())
-            .await
-            .ok()
-            .flatten()
-            .map(|id| id.system_identifier as u64)
-            .unwrap_or(0);
         let mut ctx = RunCtx {
             source_id: self.id.clone(),
             pipeline: self.pipeline.clone(),
@@ -643,8 +647,10 @@ impl PostgresSource {
             cached_lsn: None,
         };
 
-        // Store initial server identity (FirstSeen path).
-        check_identity_post_reconnect(&mut ctx).await?;
+        // Store initial server identity (FirstSeen path). Reuse the lineage
+        // already verified above rather than re-fetching it.
+        check_identity_post_reconnect(&mut ctx, Some(startup_server_identity))
+            .await?;
 
         // If failover was detected, ctx.last_lsn was reset to B's slot position.
         // The existing stream was opened from A's stale LSN - reconnect from the correct point.
@@ -816,7 +822,7 @@ impl PostgresSource {
                             *ctx.repl_client.lock().await = new_client;
                             ctx.retry.reset();
                             info!(source_id = %self.id, "reconnected successfully");
-                            check_identity_post_reconnect(&mut ctx).await?;
+                            check_identity_post_reconnect(&mut ctx, None).await?;
                         }
                         Err(e) => {
                             error!(
@@ -1157,7 +1163,69 @@ impl Source for PostgresSource {
 // Failover detection + reconciliation
 // ============================================================================
 
-/// Adjusts `start_lsn` for a possible failover **before** opening the replication stream.
+/// Number of bounded attempts to obtain a verified server identity before
+/// failing closed.
+const IDENTITY_FETCH_ATTEMPTS: u32 = 5;
+
+/// Fetch the PostgreSQL cluster identity, failing closed.
+///
+/// Retries a bounded number of times on transient fetch errors, then returns an
+/// error rather than proceeding on an unverified lineage. A `None` result
+/// (`pg_control_system()` restricted/unsupported) or a zero `system_identifier`
+/// is treated as unverifiable: we refuse to stream rather than freeze a bogus
+/// lineage into event IDs and the failover check. This is the single authority
+/// used for both provisional event IDs and identity comparison.
+async fn fetch_pg_identity_verified(
+    dsn: &str,
+) -> SourceResult<PostgresServerIdentity> {
+    let mut attempt = 0u32;
+    loop {
+        match fetch_server_identity(dsn).await {
+            Ok(Some(id)) if id.system_identifier != 0 => return Ok(id),
+            Ok(Some(_)) => {
+                return Err(SourceError::Other(anyhow::anyhow!(
+                    "server identity has a zero system_identifier; cannot \
+                     verify cluster lineage - refusing to stream"
+                )));
+            }
+            Ok(None) => {
+                return Err(SourceError::Other(anyhow::anyhow!(
+                    "server identity unavailable (pg_control_system() \
+                     restricted or unsupported); cannot verify cluster \
+                     lineage - refusing to stream"
+                )));
+            }
+            Err(e) => {
+                attempt += 1;
+                if attempt >= IDENTITY_FETCH_ATTEMPTS {
+                    return Err(SourceError::Other(anyhow::anyhow!(
+                        "failed to fetch server identity after {attempt} \
+                         attempts: {e}; refusing to stream on unverified \
+                         identity"
+                    )));
+                }
+                warn!(
+                    attempt, error = %e,
+                    "postgres identity fetch failed; retrying before failing closed"
+                );
+                tokio::time::sleep(Duration::from_millis(
+                    200 * 2u64.pow(attempt.min(5)),
+                ))
+                .await;
+            }
+        }
+    }
+}
+
+/// Resolves the cluster identity and the `start_lsn` **before** opening the
+/// replication stream. Compares the verified live identity against the durable
+/// authority and acts before any stream opens:
+///
+/// - `FirstSeen`: persist the verified identity. A durable-write failure fails
+///   closed here so no stream is ever opened on an unpersisted identity.
+/// - `Same`: nothing to do.
+/// - `Changed`: adjust `start_lsn` to B's slot position (the schema
+///   reconciliation runs post-connect but before any row is consumed).
 ///
 /// `START_REPLICATION` immediately advances the slot's `confirmed_flush_lsn` to
 /// `max(start_lsn, slot.confirmed_flush_lsn)`.  If we start with A's stale checkpoint
@@ -1166,72 +1234,83 @@ impl Source for PostgresSource {
 /// reconnect from the correct LSN afterwards.
 ///
 /// By fetching the correct start LSN before the first replication connection, we avoid
-/// permanently advancing the slot past unread data.
+/// permanently advancing the slot past unread data. `live` is the identity already
+/// verified once at startup; the comparison, persistence, and any position lookup
+/// fail closed.
 async fn pre_connect_lsn_adjust(
     dsn: &str,
     slot: &str,
     start_lsn: Lsn,
+    live: &ServerIdentity,
     id_store: &IdentityStore,
     source_id: &str,
-) -> Lsn {
-    let live_pg = match fetch_server_identity(dsn).await {
-        Ok(Some(id)) => id,
-        _ => return start_lsn,
-    };
-    let live = ServerIdentity::from(live_pg);
-
+) -> SourceResult<Lsn> {
     match id_store
-        .compare(source_id, &live)
+        .compare(source_id, live)
         .await
-        .unwrap_or(IdentityComparison::Same)
+        .map_err(SourceError::Other)?
     {
+        IdentityComparison::FirstSeen => {
+            // Persist the verified identity BEFORE the stream opens. If the
+            // durable write fails we stop startup with no replication opened,
+            // rather than opening and only failing on the deferred write.
+            id_store
+                .store(source_id, live)
+                .await
+                .map_err(SourceError::Other)?;
+            Ok(start_lsn)
+        }
         IdentityComparison::Changed { .. } => {
             // Failover detected: use the slot's actual confirmed_flush_lsn on B.
-            match fetch_slot_confirmed_lsn(dsn, slot).await {
-                Ok(slot_lsn) => {
-                    debug!(
-                        source_id = %source_id,
-                        original_lsn = %start_lsn,
-                        slot_lsn = %slot_lsn,
-                        "pre-connect failover adjustment: using slot LSN"
-                    );
-                    slot_lsn
-                }
-                Err(e) => {
-                    warn!(
-                        source_id = %source_id, error = %e,
-                        "could not fetch slot LSN for pre-connect adjustment, using checkpoint LSN"
-                    );
-                    start_lsn
-                }
-            }
+            // If B's slot position cannot be resolved we must NOT fall back to
+            // A's stale checkpoint LSN - doing so would advance B's slot past
+            // unread data. The identity authority is unavailable, so fail closed.
+            let slot_lsn =
+                fetch_slot_confirmed_lsn(dsn, slot).await.map_err(|e| {
+                    SourceError::Other(anyhow::anyhow!(
+                        "failover detected but could not resolve slot '{slot}' \
+                         confirmed_flush_lsn on the new server: {e}; refusing to \
+                         open replication on a stale checkpoint LSN"
+                    ))
+                })?;
+            debug!(
+                source_id = %source_id,
+                original_lsn = %start_lsn,
+                slot_lsn = %slot_lsn,
+                "pre-connect failover adjustment: using slot LSN"
+            );
+            Ok(slot_lsn)
         }
-        _ => start_lsn,
+        _ => Ok(start_lsn),
     }
 }
 
-async fn check_identity_post_reconnect(ctx: &mut RunCtx) -> SourceResult<()> {
-    let live_pg = match fetch_server_identity(ctx.dsn.expose()).await {
-        Ok(Some(id)) => id,
-        Ok(None) => return Ok(()),
-        Err(e) => {
-            warn!(
-                source_id = %ctx.source_id, error = %e,
-                "could not fetch server identity, skipping check"
-            );
-            return Ok(());
-        }
+async fn check_identity_post_reconnect(
+    ctx: &mut RunCtx,
+    prefetched: Option<ServerIdentity>,
+) -> SourceResult<()> {
+    // Reuse a lineage already verified by the caller (startup), or fetch and
+    // verify one here (reconnect). Either way a live identity is required: an
+    // unverifiable identity fails closed rather than silently skipping the
+    // failover check.
+    let live = match prefetched {
+        Some(live) => live,
+        None => fetch_pg_identity_verified(ctx.dsn.expose())
+            .await
+            .map(ServerIdentity::from)?,
     };
-    let live = ServerIdentity::from(live_pg);
 
     match ctx
         .identity_store
         .compare(&ctx.source_id, &live)
         .await
-        .unwrap_or(IdentityComparison::Same)
+        .map_err(SourceError::Other)?
     {
         IdentityComparison::FirstSeen => {
-            let _ = ctx.identity_store.store(&ctx.source_id, &live).await;
+            ctx.identity_store
+                .store(&ctx.source_id, &live)
+                .await
+                .map_err(SourceError::Other)?;
         }
         IdentityComparison::Same => {}
         IdentityComparison::Changed { previous, current } => {
@@ -1384,7 +1463,14 @@ async fn run_failover_reconciliation(
         }
     }
 
-    let _ = ctx.identity_store.store(&ctx.source_id, &current).await;
+    // Persist the new identity only after reconciliation succeeds. A failure to
+    // record the new lineage must fail closed: silently discarding it would let
+    // the next reconnect re-detect the same "change" or, worse, treat a later
+    // failover as first-seen.
+    ctx.identity_store
+        .store(&ctx.source_id, &current)
+        .await
+        .map_err(SourceError::Other)?;
 
     info!(source_id = %ctx.source_id, "failover reconciliation complete");
     Ok(())
@@ -1673,6 +1759,365 @@ mod schema_drift_policy_tests {
         assert!(
             r.is_err(),
             "adapt must fail closed when the schema reload fails"
+        );
+    }
+}
+
+#[cfg(test)]
+mod identity_fail_closed_tests {
+    //! R3-C2: PostgreSQL identity/lineage authority fails closed.
+    //!
+    //! These exercise the real production functions (`fetch_pg_identity_verified`,
+    //! `pre_connect_lsn_adjust`) directly. Container-backed failover behaviour is
+    //! covered by `tests/failover_e2e.rs`; here we prove that when the identity
+    //! store or the live position authority is unavailable, we refuse to open the
+    //! stream and never fall back to a stale LSN.
+    use super::*;
+    use crate::failover::identity::{IdentityStore, ServerIdentity};
+    use std::sync::Arc;
+    use storage::{MemoryStorageBackend, StorageBackend};
+
+    // Port 1 is not bound; a replication/identity connect fails fast rather than
+    // hanging, and the short connect_timeout bounds the OS-level wait.
+    const UNREACHABLE_DSN: &str =
+        "host=127.0.0.1 port=1 user=none dbname=none connect_timeout=1";
+
+    fn pg_identity(n: i64) -> ServerIdentity {
+        ServerIdentity::Postgres(PostgresServerIdentity {
+            system_identifier: n,
+        })
+    }
+
+    /// A durable store whose identity read and/or write fail, standing in for an
+    /// unavailable identity backend. Every other method delegates to a real
+    /// in-memory backend so the double stays faithful to the trait contract.
+    #[derive(Debug)]
+    struct IdentityStoreDown {
+        inner: MemoryStorageBackend,
+        fail_get: bool,
+        fail_put: bool,
+    }
+
+    impl IdentityStoreDown {
+        /// Both the identity read and write fail (store fully unavailable).
+        fn new() -> Self {
+            Self {
+                inner: MemoryStorageBackend::new(),
+                fail_get: true,
+                fail_put: true,
+            }
+        }
+        /// Reads succeed (so a fresh source sees `FirstSeen`) but the durable
+        /// write fails - the FirstSeen persistence-failure case.
+        fn write_only_down() -> Self {
+            Self {
+                inner: MemoryStorageBackend::new(),
+                fail_get: false,
+                fail_put: true,
+            }
+        }
+        fn boom() -> anyhow::Error {
+            anyhow::anyhow!("identity store unavailable")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for IdentityStoreDown {
+        async fn kv_get(
+            &self,
+            ns: &str,
+            key: &str,
+        ) -> anyhow::Result<Option<Vec<u8>>> {
+            if self.fail_get {
+                return Err(Self::boom());
+            }
+            self.inner.kv_get(ns, key).await
+        }
+        async fn kv_put(
+            &self,
+            ns: &str,
+            key: &str,
+            value: &[u8],
+        ) -> anyhow::Result<()> {
+            if self.fail_put {
+                return Err(Self::boom());
+            }
+            self.inner.kv_put(ns, key, value).await
+        }
+        async fn kv_put_with_ttl(
+            &self,
+            ns: &str,
+            key: &str,
+            value: &[u8],
+            ttl_secs: u64,
+        ) -> anyhow::Result<()> {
+            self.inner.kv_put_with_ttl(ns, key, value, ttl_secs).await
+        }
+        async fn kv_delete(&self, ns: &str, key: &str) -> anyhow::Result<bool> {
+            self.inner.kv_delete(ns, key).await
+        }
+        async fn kv_list(
+            &self,
+            ns: &str,
+            prefix: Option<&str>,
+        ) -> anyhow::Result<Vec<String>> {
+            self.inner.kv_list(ns, prefix).await
+        }
+        async fn log_append(
+            &self,
+            ns: &str,
+            key: &str,
+            value: &[u8],
+        ) -> anyhow::Result<u64> {
+            self.inner.log_append(ns, key, value).await
+        }
+        async fn log_list(
+            &self,
+            ns: &str,
+            key: &str,
+        ) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
+            self.inner.log_list(ns, key).await
+        }
+        async fn log_since(
+            &self,
+            ns: &str,
+            key: &str,
+            since_seq: u64,
+        ) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
+            self.inner.log_since(ns, key, since_seq).await
+        }
+        async fn log_latest(
+            &self,
+            ns: &str,
+            key: &str,
+        ) -> anyhow::Result<Option<(u64, Vec<u8>)>> {
+            self.inner.log_latest(ns, key).await
+        }
+        async fn log_append_if_absent(
+            &self,
+            ns: &str,
+            key: &str,
+            capture_id: &str,
+            value: &[u8],
+        ) -> anyhow::Result<storage::LogAppendOutcome> {
+            self.inner
+                .log_append_if_absent(ns, key, capture_id, value)
+                .await
+        }
+        async fn log_truncate(
+            &self,
+            ns: &str,
+            key: &str,
+            req: storage::LogTruncateRequest,
+        ) -> anyhow::Result<storage::LogTruncateOutcome> {
+            self.inner.log_truncate(ns, key, req).await
+        }
+        async fn log_stream_meta(
+            &self,
+            ns: &str,
+            key: &str,
+        ) -> anyhow::Result<storage::LogStreamMeta> {
+            self.inner.log_stream_meta(ns, key).await
+        }
+        async fn log_read_meta_since(
+            &self,
+            ns: &str,
+            key: &str,
+            since_seq: u64,
+            limit: usize,
+        ) -> anyhow::Result<Vec<storage::LogEntryMeta>> {
+            self.inner
+                .log_read_meta_since(ns, key, since_seq, limit)
+                .await
+        }
+        async fn slot_upsert(
+            &self,
+            ns: &str,
+            key: &str,
+            state: &[u8],
+        ) -> anyhow::Result<u64> {
+            self.inner.slot_upsert(ns, key, state).await
+        }
+        async fn slot_get(
+            &self,
+            ns: &str,
+            key: &str,
+        ) -> anyhow::Result<Option<(u64, Vec<u8>)>> {
+            self.inner.slot_get(ns, key).await
+        }
+        async fn slot_cas(
+            &self,
+            ns: &str,
+            key: &str,
+            expected_version: u64,
+            state: &[u8],
+        ) -> anyhow::Result<bool> {
+            self.inner.slot_cas(ns, key, expected_version, state).await
+        }
+        async fn slot_create(
+            &self,
+            ns: &str,
+            key: &str,
+            state: &[u8],
+        ) -> anyhow::Result<Option<u64>> {
+            self.inner.slot_create(ns, key, state).await
+        }
+        async fn slot_delete(
+            &self,
+            ns: &str,
+            key: &str,
+        ) -> anyhow::Result<bool> {
+            self.inner.slot_delete(ns, key).await
+        }
+        async fn slot_list(
+            &self,
+            ns: &str,
+            prefix: Option<&str>,
+            cursor: Option<&str>,
+            limit: usize,
+        ) -> anyhow::Result<storage::SlotPage> {
+            self.inner.slot_list(ns, prefix, cursor, limit).await
+        }
+        async fn queue_push(
+            &self,
+            ns: &str,
+            key: &str,
+            value: &[u8],
+        ) -> anyhow::Result<u64> {
+            self.inner.queue_push(ns, key, value).await
+        }
+        async fn queue_peek(
+            &self,
+            ns: &str,
+            key: &str,
+            limit: usize,
+        ) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
+            self.inner.queue_peek(ns, key, limit).await
+        }
+        async fn queue_ack(
+            &self,
+            ns: &str,
+            key: &str,
+            up_to_id: u64,
+        ) -> anyhow::Result<usize> {
+            self.inner.queue_ack(ns, key, up_to_id).await
+        }
+        async fn queue_len(&self, ns: &str, key: &str) -> anyhow::Result<u64> {
+            self.inner.queue_len(ns, key).await
+        }
+        async fn queue_drop_oldest(
+            &self,
+            ns: &str,
+            key: &str,
+            count: usize,
+        ) -> anyhow::Result<usize> {
+            self.inner.queue_drop_oldest(ns, key, count).await
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_identity_verified_fails_closed_when_query_unavailable() {
+        // The live identity query cannot reach the server: after bounded retries
+        // this must return an error, never a silently-absent identity that would
+        // let the stream open on an unknown lineage.
+        let err = fetch_pg_identity_verified(UNREACHABLE_DSN)
+            .await
+            .expect_err("unreachable server must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to stream"),
+            "error should refuse to stream, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_connect_lsn_adjust_fails_closed_when_store_unavailable() {
+        // Startup: the durable identity store is down, so the identity comparison
+        // cannot be made. We must fail closed rather than assume Same and proceed.
+        let store = IdentityStore::new(Arc::new(IdentityStoreDown::new()));
+        let start = Lsn::from(0x1000u64);
+        let result = pre_connect_lsn_adjust(
+            UNREACHABLE_DSN,
+            "slot_a",
+            start,
+            &pg_identity(42),
+            &store,
+            "src1",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "unavailable identity store must fail closed, not return an LSN"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_connect_lsn_adjust_never_falls_back_to_old_lsn_on_change() {
+        // A different identity is already recorded, so the live server is a
+        // failover target (Changed). The new server's slot position cannot be
+        // resolved (unreachable). We must NOT fall back to A's stale checkpoint
+        // LSN - doing so would advance B's slot past unread data.
+        let backend = Arc::new(MemoryStorageBackend::new());
+        let store = IdentityStore::new(backend);
+        store
+            .store("src1", &pg_identity(111))
+            .await
+            .expect("seed previous identity");
+
+        let stale = Lsn::from(0xDEAD_BEEFu64);
+        let result = pre_connect_lsn_adjust(
+            UNREACHABLE_DSN,
+            "slot_a",
+            stale,
+            &pg_identity(222), // different -> Changed
+            &store,
+            "src1",
+        )
+        .await;
+        match result {
+            Err(_) => {}
+            Ok(lsn) => panic!(
+                "identity changed but position authority was unavailable; \
+                 must fail closed, instead returned {lsn}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_connect_lsn_adjust_fails_closed_when_firstseen_persist_fails()
+    {
+        // Fresh source (FirstSeen): the identity read succeeds but the durable
+        // write fails. The FirstSeen identity MUST be persisted before the stream
+        // opens, so a persist failure fails closed here - no LSN is returned and
+        // therefore no stream is ever opened.
+        let store =
+            IdentityStore::new(Arc::new(IdentityStoreDown::write_only_down()));
+        let start = Lsn::from(0x2000u64);
+        let result = pre_connect_lsn_adjust(
+            UNREACHABLE_DSN,
+            "slot_a",
+            start,
+            &pg_identity(99),
+            &store,
+            "src_new",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "FirstSeen persist failure must fail closed before opening the stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_store_persist_failure_fails_closed() {
+        // The persistence step after reconciliation (and the FirstSeen store at
+        // startup) relies on IdentityStore::store surfacing backend errors. A
+        // failed durable write must propagate, never be discarded.
+        let store = IdentityStore::new(Arc::new(IdentityStoreDown::new()));
+        let result = store.store("src1", &pg_identity(7)).await;
+        assert!(
+            result.is_err(),
+            "a failed identity persist must propagate, not be swallowed"
         );
     }
 }

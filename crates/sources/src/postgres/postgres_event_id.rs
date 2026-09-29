@@ -23,6 +23,16 @@ pub fn pg_row_event_id(
     source: &SourceInfo,
     system_identifier: u64,
 ) -> Result<EventId, String> {
+    // A zero system_identifier means the cluster lineage was never verified
+    // (fetch failed or returned no identity). Startup fails closed before this
+    // is ever reached, but the id authority guards it too: minting a stable id
+    // on a zero lineage would collide across unrelated clusters.
+    if system_identifier == 0 {
+        return Err(
+            "pg event id: system_identifier unavailable (unverified lineage)"
+                .to_string(),
+        );
+    }
     // A row observed without an active transaction identity (no BEGIN final LSN)
     // is a coordinate error — never a silently-derived id.
     let final_lsn_str =
@@ -108,6 +118,20 @@ mod tests {
     fn row_without_transaction_identity_is_error() {
         let si = src(pos(None, Some(1), Some(0)));
         assert!(pg_row_event_id(&si, 7).is_err());
+    }
+
+    #[test]
+    fn zero_lineage_is_error() {
+        // A zero system_identifier means the cluster lineage was never verified.
+        // Minting a stable id on it would collide across unrelated clusters, so
+        // the id derivation must fail closed even with a fully valid position.
+        let si = src(pos(Some("16/B374D8"), Some(1), Some(0)));
+        let err = pg_row_event_id(&si, 0)
+            .expect_err("zero lineage must not produce an id");
+        assert!(
+            err.contains("system_identifier"),
+            "error should name the missing lineage, got: {err}"
+        );
     }
 
     #[test]

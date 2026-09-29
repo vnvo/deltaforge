@@ -22,6 +22,7 @@ use sources::failover::identity::{
 use sources::failover::reconciler::{SchemaDelta, SchemaReconciler};
 use sources::mysql::{MySqlSource, mysql_health};
 use sources::postgres::{PostgresSource, postgres_health};
+use sources::stream_probe::{reset_streams_opened, streams_opened};
 use std::sync::Arc;
 use std::time::Instant;
 use storage::{ArcStorageBackend, MemoryStorageBackend};
@@ -851,6 +852,11 @@ async fn postgres_failover_streaming_resumes_after_identity_change()
     let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
 
+    // Positive control for the stream-open seam used by the fault tests: a normal
+    // run MUST increment the counter, so a zero reading elsewhere is meaningful
+    // (not a broken/never-incremented probe).
+    reset_streams_opened();
+
     // run 1: A's system_identifier stored
     {
         let src = make_pg_source(
@@ -879,6 +885,12 @@ async fn postgres_failover_streaming_resumes_after_identity_change()
         handle.join().await.ok();
         info!("✓ A's system_identifier stored");
     }
+
+    // The healthy run above opened at least one replication stream.
+    assert!(
+        streams_opened() >= 1,
+        "stream-open seam must count a real open (positive control)"
+    );
 
     // primary B: fresh container → different system_identifier by construction
     let (_c_b, port_b) = start_postgres().await;
@@ -1027,5 +1039,378 @@ async fn postgres_failover_slot_absent_stops_source() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+// ============================================================================
+// R3-C2: startup identity-persistence failure must open ZERO replication streams
+//
+// The FirstSeen identity must be persisted BEFORE the source opens replication.
+// These tests inject a backend whose identity-namespace writes fail, run the
+// source against a fresh server (FirstSeen), and assert the source stops with the
+// identity error AND that the server shows no replication stream was ever opened
+// (PG: no active walsender; MySQL: no Binlog Dump thread). Covers PostgreSQL,
+// MySQL GTID mode, and MySQL non-GTID (file/pos) mode.
+// ============================================================================
+
+/// A backend that fails writes to the failover/identity namespace, delegating
+/// everything else to a real in-memory backend. Simulates a durable identity
+/// store that cannot persist, so a FirstSeen write fails while snapshot,
+/// checkpoint, and registry writes still succeed.
+#[derive(Debug)]
+struct FailIdentityWrites {
+    inner: ArcStorageBackend,
+}
+
+impl FailIdentityWrites {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(MemoryStorageBackend::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl storage::StorageBackend for FailIdentityWrites {
+    async fn kv_get(
+        &self,
+        ns: &str,
+        key: &str,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        self.inner.kv_get(ns, key).await
+    }
+    async fn kv_put(
+        &self,
+        ns: &str,
+        key: &str,
+        value: &[u8],
+    ) -> anyhow::Result<()> {
+        if ns == "failover" {
+            return Err(anyhow::anyhow!("injected identity write failure"));
+        }
+        self.inner.kv_put(ns, key, value).await
+    }
+    async fn kv_put_with_ttl(
+        &self,
+        ns: &str,
+        key: &str,
+        value: &[u8],
+        ttl_secs: u64,
+    ) -> anyhow::Result<()> {
+        self.inner.kv_put_with_ttl(ns, key, value, ttl_secs).await
+    }
+    async fn kv_delete(&self, ns: &str, key: &str) -> anyhow::Result<bool> {
+        self.inner.kv_delete(ns, key).await
+    }
+    async fn kv_list(
+        &self,
+        ns: &str,
+        prefix: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
+        self.inner.kv_list(ns, prefix).await
+    }
+    async fn log_append(
+        &self,
+        ns: &str,
+        key: &str,
+        value: &[u8],
+    ) -> anyhow::Result<u64> {
+        self.inner.log_append(ns, key, value).await
+    }
+    async fn log_list(
+        &self,
+        ns: &str,
+        key: &str,
+    ) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
+        self.inner.log_list(ns, key).await
+    }
+    async fn log_since(
+        &self,
+        ns: &str,
+        key: &str,
+        since_seq: u64,
+    ) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
+        self.inner.log_since(ns, key, since_seq).await
+    }
+    async fn log_latest(
+        &self,
+        ns: &str,
+        key: &str,
+    ) -> anyhow::Result<Option<(u64, Vec<u8>)>> {
+        self.inner.log_latest(ns, key).await
+    }
+    async fn log_append_if_absent(
+        &self,
+        ns: &str,
+        key: &str,
+        capture_id: &str,
+        value: &[u8],
+    ) -> anyhow::Result<storage::LogAppendOutcome> {
+        self.inner
+            .log_append_if_absent(ns, key, capture_id, value)
+            .await
+    }
+    async fn log_truncate(
+        &self,
+        ns: &str,
+        key: &str,
+        req: storage::LogTruncateRequest,
+    ) -> anyhow::Result<storage::LogTruncateOutcome> {
+        self.inner.log_truncate(ns, key, req).await
+    }
+    async fn log_stream_meta(
+        &self,
+        ns: &str,
+        key: &str,
+    ) -> anyhow::Result<storage::LogStreamMeta> {
+        self.inner.log_stream_meta(ns, key).await
+    }
+    async fn log_read_meta_since(
+        &self,
+        ns: &str,
+        key: &str,
+        since_seq: u64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<storage::LogEntryMeta>> {
+        self.inner
+            .log_read_meta_since(ns, key, since_seq, limit)
+            .await
+    }
+    async fn slot_upsert(
+        &self,
+        ns: &str,
+        key: &str,
+        state: &[u8],
+    ) -> anyhow::Result<u64> {
+        self.inner.slot_upsert(ns, key, state).await
+    }
+    async fn slot_get(
+        &self,
+        ns: &str,
+        key: &str,
+    ) -> anyhow::Result<Option<(u64, Vec<u8>)>> {
+        self.inner.slot_get(ns, key).await
+    }
+    async fn slot_cas(
+        &self,
+        ns: &str,
+        key: &str,
+        expected_version: u64,
+        state: &[u8],
+    ) -> anyhow::Result<bool> {
+        self.inner.slot_cas(ns, key, expected_version, state).await
+    }
+    async fn slot_create(
+        &self,
+        ns: &str,
+        key: &str,
+        state: &[u8],
+    ) -> anyhow::Result<Option<u64>> {
+        self.inner.slot_create(ns, key, state).await
+    }
+    async fn slot_delete(&self, ns: &str, key: &str) -> anyhow::Result<bool> {
+        self.inner.slot_delete(ns, key).await
+    }
+    async fn slot_list(
+        &self,
+        ns: &str,
+        prefix: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<storage::SlotPage> {
+        self.inner.slot_list(ns, prefix, cursor, limit).await
+    }
+    async fn queue_push(
+        &self,
+        ns: &str,
+        key: &str,
+        value: &[u8],
+    ) -> anyhow::Result<u64> {
+        self.inner.queue_push(ns, key, value).await
+    }
+    async fn queue_peek(
+        &self,
+        ns: &str,
+        key: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
+        self.inner.queue_peek(ns, key, limit).await
+    }
+    async fn queue_ack(
+        &self,
+        ns: &str,
+        key: &str,
+        up_to_id: u64,
+    ) -> anyhow::Result<usize> {
+        self.inner.queue_ack(ns, key, up_to_id).await
+    }
+    async fn queue_len(&self, ns: &str, key: &str) -> anyhow::Result<u64> {
+        self.inner.queue_len(ns, key).await
+    }
+    async fn queue_drop_oldest(
+        &self,
+        ns: &str,
+        key: &str,
+        count: usize,
+    ) -> anyhow::Result<usize> {
+        self.inner.queue_drop_oldest(ns, key, count).await
+    }
+}
+
+/// MySQL 8.4 container in non-GTID (file/pos) mode.
+async fn start_mysql_nongtid() -> (ContainerAsync<GenericImage>, u16) {
+    let c = GenericImage::new("mysql", "8.4")
+        .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
+        .with_env_var("MYSQL_ROOT_PASSWORD", MYSQL_ROOT_PASSWORD)
+        .with_cmd([
+            "--server-id=1",
+            "--log-bin=mysql-bin",
+            "--binlog-format=ROW",
+            "--binlog-row-image=FULL",
+            "--binlog-checksum=NONE",
+        ])
+        .start()
+        .await
+        .expect("start mysql (non-gtid)");
+    let port = c.get_host_port_ipv4(3306).await.expect("mysql port");
+    provision_mysql_cdc_user(port).await;
+    (c, port)
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn postgres_startup_identity_persist_failure_opens_no_stream()
+-> Result<()> {
+    init_test_tracing();
+    const DB: &str = "shop";
+    const SLOT: &str = "slot_no_open";
+    const PUB: &str = "pub_no_open";
+
+    let (_c, port) = start_postgres().await;
+    pg_create_schema(port, DB, SLOT, PUB).await;
+
+    // Fresh backend -> FirstSeen; identity writes fail.
+    let backend: ArcStorageBackend = Arc::new(FailIdentityWrites::new());
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+
+    let src =
+        make_pg_source("no_open", &pg_dsn(port, DB), SLOT, PUB, backend).await;
+    let (tx, _rx) = mpsc::channel(64);
+    reset_streams_opened();
+    let handle = src.run(tx, ckpt).await;
+
+    match timeout(Duration::from_secs(30), handle.join()).await {
+        Ok(Err(e)) => {
+            assert!(
+                e.to_string().contains("IdentityStore")
+                    || e.to_string().contains("identity"),
+                "expected an identity-persistence error, got: {e}"
+            );
+            info!("✓ pg source stopped on identity-persist failure");
+        }
+        Ok(Ok(())) => {
+            panic!("source must not succeed when identity persistence fails")
+        }
+        Err(_) => panic!("source did not stop within timeout"),
+    }
+
+    // Deterministic: the real connect path increments this counter on every
+    // successful open. It must be zero - the stream was never opened, not merely
+    // opened-then-dropped-before-a-post-mortem-query.
+    assert_eq!(
+        streams_opened(),
+        0,
+        "no replication stream must ever be opened when identity persist fails"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_startup_identity_persist_failure_opens_no_stream() -> Result<()>
+{
+    init_test_tracing();
+    const DB: &str = "shop";
+
+    let (_c, port) = start_mysql().await;
+    mysql_create_schema(port, DB).await;
+
+    let backend: ArcStorageBackend = Arc::new(FailIdentityWrites::new());
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+
+    let src =
+        make_mysql_source("no_open", &mysql_cdc_dsn(port, DB), DB, backend)
+            .await;
+    let (tx, _rx) = mpsc::channel(64);
+    reset_streams_opened();
+    let handle = src.run(tx, ckpt).await;
+
+    match timeout(Duration::from_secs(30), handle.join()).await {
+        Ok(Err(e)) => {
+            assert!(
+                e.to_string().contains("IdentityStore")
+                    || e.to_string().contains("identity"),
+                "expected an identity-persistence error, got: {e}"
+            );
+            info!("✓ mysql (gtid) source stopped on identity-persist failure");
+        }
+        Ok(Ok(())) => {
+            panic!("source must not succeed when identity persistence fails")
+        }
+        Err(_) => panic!("source did not stop within timeout"),
+    }
+
+    assert_eq!(
+        streams_opened(),
+        0,
+        "no binlog stream must ever be opened when identity persist fails"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_nongtid_startup_identity_persist_failure_opens_no_stream()
+-> Result<()> {
+    init_test_tracing();
+    const DB: &str = "shop";
+
+    // Non-GTID (file/pos) mode: previously the startup path performed NO identity
+    // comparison before opening the stream. It must now fail closed too.
+    let (_c, port) = start_mysql_nongtid().await;
+    mysql_create_schema(port, DB).await;
+
+    let backend: ArcStorageBackend = Arc::new(FailIdentityWrites::new());
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+
+    let src =
+        make_mysql_source("no_open", &mysql_cdc_dsn(port, DB), DB, backend)
+            .await;
+    let (tx, _rx) = mpsc::channel(64);
+    reset_streams_opened();
+    let handle = src.run(tx, ckpt).await;
+
+    match timeout(Duration::from_secs(30), handle.join()).await {
+        Ok(Err(e)) => {
+            assert!(
+                e.to_string().contains("IdentityStore")
+                    || e.to_string().contains("identity"),
+                "expected an identity-persistence error, got: {e}"
+            );
+            info!(
+                "✓ mysql (non-gtid) source stopped on identity-persist failure"
+            );
+        }
+        Ok(Ok(())) => {
+            panic!("source must not succeed when identity persistence fails")
+        }
+        Err(_) => panic!("source did not stop within timeout"),
+    }
+
+    assert_eq!(
+        streams_opened(),
+        0,
+        "no binlog stream must ever be opened when identity persist fails"
+    );
     Ok(())
 }

@@ -124,7 +124,7 @@ pub(super) async fn connect_binlog_with_retries(
     let default_db = default_db_for_hints.to_string();
     let mk = make_client.clone();
 
-    retry_async(
+    let result = retry_async(
         move |_| {
             let mut mk = mk.clone();
             let source_id = source_id.clone();
@@ -152,7 +152,13 @@ pub(super) async fn connect_binlog_with_retries(
             last_error
         }
         RetryOutcome::Failed(e) => e,
-    })
+    });
+    if result.is_ok() {
+        // Real stream-open seam: lets tests assert a startup fault opens zero
+        // streams (identity must be resolved/persisted before we get here).
+        crate::stream_probe::record_stream_opened();
+    }
+    result
 }
 
 /// Determine if a SourceError is worth retrying.

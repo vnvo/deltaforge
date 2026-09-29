@@ -120,7 +120,7 @@ pub(super) async fn connect_replication_with_retries(
     let source_id = source_id.to_string();
     let cfg = config.clone();
 
-    retry_async(
+    let result = retry_async(
         move |_| {
             let cfg = cfg.clone();
             let source_id = source_id.clone();
@@ -147,7 +147,13 @@ pub(super) async fn connect_replication_with_retries(
             last_error
         }
         RetryOutcome::Failed(e) => e,
-    })
+    });
+    if result.is_ok() {
+        // Real stream-open seam: lets tests assert a startup fault opens zero
+        // streams (identity must be resolved/persisted before we get here).
+        crate::stream_probe::record_stream_opened();
+    }
+    result
 }
 
 /// Determine if a SourceError is worth retrying.
