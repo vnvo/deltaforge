@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Debug helper: show a present inline secret as a redaction, `None` otherwise.
+fn redact_opt(v: &Option<String>) -> Option<&'static str> {
+    v.as_ref().map(|_| "***REDACTED***")
+}
+
 // ============================================================================
 // Envelope Configuration
 // ============================================================================
@@ -319,7 +324,7 @@ pub struct ChTls {
 }
 
 /// ClickHouse sink configuration (`type: clickhouse`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClickHouseSinkCfg {
     /// Unique identifier for this sink.
     pub id: String,
@@ -332,12 +337,19 @@ pub struct ClickHouseSinkCfg {
     /// Write shape - see [`ChMode`]. Defaults to `changelog`.
     #[serde(default)]
     pub mode: ChMode,
-    /// ClickHouse user. Values support `${ENV_VAR}` expansion.
+    /// ClickHouse user. Values support `${ENV_VAR}` expansion. **Deprecated** as an
+    /// inline secret; prefer `user_ref`.
     #[serde(default)]
     pub user: Option<String>,
-    /// ClickHouse password/key. Values support `${ENV_VAR}` expansion.
+    /// ClickHouse password/key. **Deprecated** as an inline secret; prefer `password_ref`.
     #[serde(default)]
     pub password: Option<String>,
+    /// Reference resolving the ClickHouse user (mutually exclusive with `user`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_ref: Option<secrets::SecretReference>,
+    /// Reference resolving the ClickHouse password (mutually exclusive with `password`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_ref: Option<secrets::SecretReference>,
     /// TLS options (for `https://` endpoints).
     #[serde(default)]
     pub tls: Option<ChTls>,
@@ -354,6 +366,27 @@ pub struct ClickHouseSinkCfg {
     /// require a pre-created table (locked-down environments).
     #[serde(default = "default_true")]
     pub auto_create: bool,
+}
+
+impl std::fmt::Debug for ClickHouseSinkCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClickHouseSinkCfg")
+            .field("id", &self.id)
+            .field("url", &self.url)
+            .field("database", &self.database)
+            .field("table", &self.table)
+            .field("mode", &self.mode)
+            .field("user", &redact_opt(&self.user))
+            .field("password", &redact_opt(&self.password))
+            .field("user_ref", &self.user_ref)
+            .field("password_ref", &self.password_ref)
+            .field("tls", &self.tls)
+            .field("version_source", &self.version_source)
+            .field("send_timeout_secs", &self.send_timeout_secs)
+            .field("required", &self.required)
+            .field("auto_create", &self.auto_create)
+            .finish()
+    }
 }
 
 // ============================================================================

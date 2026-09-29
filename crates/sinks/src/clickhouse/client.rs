@@ -31,7 +31,15 @@ pub struct ClickHouseClient {
 }
 
 impl ClickHouseClient {
-    pub fn new(cfg: &ClickHouseSinkCfg) -> anyhow::Result<Self> {
+    /// Build the client from non-secret config plus already-resolved credentials
+    /// (protected runtime values from a reference, or inline fallback). Credentials are
+    /// never read from `cfg` here, so a resolved secret is not taken from the serializable
+    /// config.
+    pub fn new(
+        cfg: &ClickHouseSinkCfg,
+        user: Option<String>,
+        password: Option<String>,
+    ) -> anyhow::Result<Self> {
         let mut b = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.send_timeout_secs));
         if let Some(tls) = &cfg.tls {
@@ -43,8 +51,8 @@ impl ClickHouseClient {
             http: b.build()?,
             base: cfg.url.trim_end_matches('/').to_string(),
             database: cfg.database.clone(),
-            user: cfg.user.clone(),
-            password: cfg.password.clone(),
+            user,
+            password,
             timeout: Duration::from_secs(cfg.send_timeout_secs),
         })
     }
@@ -165,6 +173,8 @@ mod tests {
             mode: ChMode::Upsert,
             user: Some("default".into()),
             password: None,
+            user_ref: None,
+            password_ref: None,
             tls: None,
             version_source: ChVersionSource::SourcePosition,
             send_timeout_secs: 30,
@@ -175,7 +185,7 @@ mod tests {
 
     #[test]
     fn builds_insert_query() {
-        let c = ClickHouseClient::new(&cfg()).unwrap();
+        let c = ClickHouseClient::new(&cfg(), None, None).unwrap();
         assert_eq!(
             c.insert_query("orders"),
             "INSERT INTO analytics.orders FORMAT RowBinary"

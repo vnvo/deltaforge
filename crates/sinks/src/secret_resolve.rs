@@ -1,0 +1,252 @@
+//! Resolve sink credential references to **protected runtime values** before any sink
+//! client is constructed.
+//!
+//! Per the secret-coverage design (P2), resolved secrets are never materialized back into
+//! the serializable config. They are held here in `Zeroizing` buffers, keyed by sink id
+//! and logical field, and handed to each sink builder, which passes them straight to its
+//! client (never storing them on a config struct). Resolution runs before construction, so
+//! a missing/invalid reference or an inline/reference conflict fails closed before any
+//! network access.
+
+use std::collections::HashMap;
+
+use anyhow::{Result, bail};
+use deltaforge_config::{ClickHouseSinkCfg, PipelineSpec, SinkCfg};
+use secrets::{SecretReference, SecretResolver};
+use zeroize::Zeroizing;
+
+/// Resolved secret values for one sink, keyed by logical field name. Runtime-only,
+/// zeroized on drop, never serialized.
+#[derive(Default)]
+pub struct ResolvedSinkCreds {
+    fields: HashMap<&'static str, Zeroizing<String>>,
+}
+
+impl ResolvedSinkCreds {
+    /// The resolved value for `field`, if a reference supplied one.
+    pub fn get(&self, field: &str) -> Option<&str> {
+        self.fields.get(field).map(|z| z.as_str())
+    }
+    fn insert(&mut self, field: &'static str, value: Zeroizing<String>) {
+        self.fields.insert(field, value);
+    }
+}
+
+/// Resolved secrets for every sink in a pipeline, keyed by sink id.
+#[derive(Default)]
+pub struct ResolvedSinkSecrets {
+    by_sink: HashMap<String, ResolvedSinkCreds>,
+}
+
+impl ResolvedSinkSecrets {
+    /// The resolved credentials for a sink id, or an empty set (no references).
+    pub fn for_sink(&self, id: &str) -> &ResolvedSinkCreds {
+        static EMPTY: std::sync::OnceLock<ResolvedSinkCreds> =
+            std::sync::OnceLock::new();
+        self.by_sink
+            .get(id)
+            .unwrap_or_else(|| EMPTY.get_or_init(ResolvedSinkCreds::default))
+    }
+}
+
+/// Resolve every sink's credential references up front. Fails closed on a missing/invalid
+/// reference or an inline/reference conflict, before any sink client is built.
+pub async fn resolve_sink_secrets(
+    spec: &PipelineSpec,
+    resolver: &dyn SecretResolver,
+) -> Result<ResolvedSinkSecrets> {
+    let mut by_sink = HashMap::new();
+    for sink in &spec.spec.sinks {
+        let creds = match sink {
+            SinkCfg::ClickHouse(c) => resolve_clickhouse(c, resolver).await?,
+            // Other connectors are adopted in later increments; until then they use
+            // their inline (deprecated) fields and contribute no resolved secrets.
+            _ => ResolvedSinkCreds::default(),
+        };
+        by_sink.insert(sink.sink_id().to_string(), creds);
+    }
+    Ok(ResolvedSinkSecrets { by_sink })
+}
+
+async fn resolve_clickhouse(
+    cfg: &ClickHouseSinkCfg,
+    resolver: &dyn SecretResolver,
+) -> Result<ResolvedSinkCreds> {
+    let mut creds = ResolvedSinkCreds::default();
+    resolve_field(
+        &mut creds,
+        "clickhouse",
+        &cfg.id,
+        "user",
+        &cfg.user,
+        &cfg.user_ref,
+        resolver,
+    )
+    .await?;
+    resolve_field(
+        &mut creds,
+        "clickhouse",
+        &cfg.id,
+        "password",
+        &cfg.password,
+        &cfg.password_ref,
+        resolver,
+    )
+    .await?;
+    Ok(creds)
+}
+
+/// Resolve one field: reject an inline/reference conflict; resolve a reference to a
+/// non-empty protected value; leave an inline-only field for `${ENV}` expansion at
+/// construction (nothing resolved here).
+#[allow(clippy::too_many_arguments)]
+async fn resolve_field(
+    creds: &mut ResolvedSinkCreds,
+    connector: &str,
+    id: &str,
+    field: &'static str,
+    inline: &Option<String>,
+    reference: &Option<SecretReference>,
+    resolver: &dyn SecretResolver,
+) -> Result<()> {
+    match (inline, reference) {
+        (Some(_), Some(_)) => bail!(
+            "{connector} sink '{id}': {field} sets both an inline value and a \
+             reference; use exactly one"
+        ),
+        (_, Some(reference)) => {
+            let value = resolve_ref(resolver, reference).await?;
+            creds.insert(field, value);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn resolve_ref(
+    resolver: &dyn SecretResolver,
+    reference: &SecretReference,
+) -> Result<Zeroizing<String>> {
+    let resolved = resolver
+        .resolve(reference)
+        .await
+        .map_err(|e| anyhow::anyhow!("resolve sink secret: {e}"))?;
+    let value = resolved
+        .material()
+        .as_utf8()
+        .ok_or_else(|| anyhow::anyhow!("sink secret is not valid UTF-8"))?;
+    if value.is_empty() {
+        bail!("sink secret resolved to an empty value");
+    }
+    Ok(Zeroizing::new(value.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deltaforge_config::{ChMode, ChVersionSource, SinkCfg};
+    use secrets::{
+        CompositeResolver, EnvResolver, FilePolicy, FileResolver,
+        SecretProvider,
+    };
+
+    fn resolver() -> CompositeResolver {
+        CompositeResolver::new(
+            EnvResolver::from_process(),
+            FileResolver::new(FilePolicy::default()),
+        )
+    }
+
+    fn write_secret(v: &str) -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(v.as_bytes()).unwrap();
+        f
+    }
+
+    fn ch(user: Option<&str>, password: Option<&str>) -> ClickHouseSinkCfg {
+        ClickHouseSinkCfg {
+            id: "ch".into(),
+            url: "http://ch:8123".into(),
+            database: "db".into(),
+            table: "t".into(),
+            mode: ChMode::Upsert,
+            user: user.map(String::from),
+            password: password.map(String::from),
+            user_ref: None,
+            password_ref: None,
+            tls: None,
+            version_source: ChVersionSource::SourcePosition,
+            send_timeout_secs: 30,
+            required: Some(true),
+            auto_create: true,
+        }
+    }
+
+    async fn resolve_one(cfg: ClickHouseSinkCfg) -> Result<ResolvedSinkCreds> {
+        resolve_clickhouse(&cfg, &resolver()).await
+    }
+
+    #[tokio::test]
+    async fn inline_and_ref_conflict_rejected() {
+        let mut c = ch(Some("u"), None);
+        c.user_ref = Some(SecretReference::new(SecretProvider::File, "/x"));
+        assert!(resolve_one(c).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn reference_resolves_to_protected_value() {
+        let pw = write_secret("s3cr3t");
+        let mut c = ch(Some("default"), None); // inline user, referenced password
+        c.password_ref = Some(SecretReference::new(
+            SecretProvider::File,
+            pw.path().to_str().unwrap(),
+        ));
+        let creds = resolve_one(c).await.unwrap();
+        assert_eq!(creds.get("password"), Some("s3cr3t"));
+        // Inline-only user is left for ${ENV} expansion at construction.
+        assert_eq!(creds.get("user"), None);
+    }
+
+    #[tokio::test]
+    async fn empty_reference_fails_closed() {
+        let empty = write_secret("");
+        let mut c = ch(None, None);
+        c.password_ref = Some(SecretReference::new(
+            SecretProvider::File,
+            empty.path().to_str().unwrap(),
+        ));
+        assert!(resolve_one(c).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_sink_secrets_keys_by_id() {
+        let pw = write_secret("p");
+        let mut c = ch(Some("u"), None);
+        c.password_ref = Some(SecretReference::new(
+            SecretProvider::File,
+            pw.path().to_str().unwrap(),
+        ));
+        let spec = spec_with(vec![SinkCfg::ClickHouse(c)]);
+        let out = resolve_sink_secrets(&spec, &resolver()).await.unwrap();
+        assert_eq!(out.for_sink("ch").get("password"), Some("p"));
+        assert_eq!(out.for_sink("missing").get("password"), None);
+    }
+
+    fn spec_with(sinks: Vec<SinkCfg>) -> PipelineSpec {
+        let yaml = r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata: { name: t, tenant: t }
+spec:
+  source:
+    type: postgres
+    config: { id: pg, dsn: host=h dbname=d, publication: p, slot: s, tables: [public.t] }
+  processors: []
+  sinks: []
+"#;
+        let mut spec: PipelineSpec = serde_yaml::from_str(yaml).unwrap();
+        spec.spec.sinks = sinks;
+        spec
+    }
+}

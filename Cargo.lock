@@ -5762,8 +5762,10 @@ dependencies = [
  "rdkafka",
  "redis",
  "reqwest",
+ "secrets",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.10.9",
  "shellexpand",
  "tempfile",
@@ -5775,6 +5777,7 @@ dependencies = [
  "tracing-subscriber",
  "ulid",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

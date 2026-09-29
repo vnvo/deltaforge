@@ -713,7 +713,7 @@ impl PipelineManager {
             source_dsn.clone(),
             self.registry.clone(),
             Arc::clone(&self.backend),
-            resolver,
+            resolver.clone(),
         )
         .await
         .context("build source")?;
@@ -738,6 +738,12 @@ impl PipelineManager {
         // Build every non-durable sink. Durable_v2 S3 sinks are deferred (the
         // builder fails closed on them via the public API): they are built below,
         // in order, only after the durable-startup guard.
+        // Resolve every sink's credential references (protected runtime values) through
+        // the pipeline resolver, before any sink client is constructed.
+        let sink_secrets =
+            sinks::resolve_sink_secrets(&spec, resolver.as_ref())
+                .await
+                .context("resolve sink credentials")?;
         let mut sinks = sinks::build_sinks_deferring_durable_s3(
             &spec,
             cancel.clone(),
@@ -746,6 +752,7 @@ impl PipelineManager {
             arrow_schema_resolver.clone(),
             clickhouse_resolver,
             es_resolver,
+            &sink_secrets,
         )
         .context("build sinks")?;
 
@@ -2249,6 +2256,7 @@ mod tests {
             None,
             None,
             None,
+            &sinks::ResolvedSinkSecrets::default(),
         );
         assert!(err.is_err(), "durable_v2 must not build via the public API");
 
@@ -2262,6 +2270,7 @@ mod tests {
             None,
             None,
             None,
+            &sinks::ResolvedSinkSecrets::default(),
         )
         .unwrap();
         assert!(deferred.is_empty(), "durable S3 deferred, not built here");
