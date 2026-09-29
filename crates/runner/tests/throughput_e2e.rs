@@ -19,15 +19,17 @@
 //! conservative regression floor.
 //!
 //! Row count is `THROUGHPUT_ROWS` (default 50_000; override with the env var of
-//! the same name). ALWAYS run in release for a representative number - a debug
-//! build throttles CPU-bound work (JSON encoding) several-fold:
+//! the same name). ALWAYS run in release - a debug build throttles CPU-bound
+//! work (JSON encoding) several-fold:
 //!   THROUGHPUT_ROWS=1000000 cargo test --release -p runner --test throughput_e2e \
 //!     -- --include-ignored --nocapture
 //!
-//! Measured release baseline (dev machine, PostgreSQL 17 -> cp-kafka 7.5, JSON):
-//! 1,000,000 rows drained in ~8s = ~125k events/s wall-clock, ~156k events/s
-//! steady-state; backlog write ~800k rows/s. (A debug build or a small backlog
-//! reports far lower - the fixed startup cost dominates.)
+//! The reported throughput is for local capacity work only and is
+//! environment-dependent: on a shared developer machine it varies substantially
+//! (2x+) with background CPU/IO load, so a single run is not a headline figure -
+//! measure on a quiet/dedicated host, or take the median of several runs. What
+//! this test ASSERTS and guards in CI-style runs is correctness (every distinct
+//! row delivered) and a conservative regression floor, not an absolute rate.
 
 use std::collections::HashMap;
 use std::sync::Arc;
