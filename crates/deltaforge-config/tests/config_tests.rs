@@ -1063,3 +1063,174 @@ fn config_debug_does_not_reveal_dsn_password() {
         "config Debug leaked password: {shown}"
     );
 }
+
+// --- sink credential redaction (Slice 1) ---
+
+/// Every current sink type, each secret field set to a unique sentinel, so a leak is
+/// unambiguous and a newly-added sink secret can be caught by adding it here.
+const ALL_SINKS_YAML: &str = r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata: { name: sinks, tenant: t }
+spec:
+  source:
+    type: postgres
+    config:
+      id: pg
+      dsn: host=db dbname=o
+      publication: pub
+      slot: s
+      tables: [public.t]
+  processors: []
+  sinks:
+    - type: clickhouse
+      config:
+        id: ch
+        url: "http://ch:8123"
+        database: db
+        table: t
+        user: chuser
+        password: SENTINEL_CH_PW
+    - type: elasticsearch
+      config:
+        id: es
+        url: "http://es:9200"
+        index: idx
+        auth: { type: basic, username: esuser, password: SENTINEL_ES_PW }
+    - type: kafka
+      config:
+        id: k
+        brokers: "b:9092"
+        topic: t
+        client_conf:
+          "sasl.username": SENTINEL_KAFKA_USER
+          "sasl.password": SENTINEL_KAFKA_PW
+          "security.protocol": SASL_SSL
+        encoding:
+          type: avro
+          schema_registry_url: "http://sr:8081"
+          username: sruser
+          password: SENTINEL_SR_PW
+    - type: redis
+      config:
+        id: r
+        uri: "redis://:SENTINEL_REDIS_PW@localhost:6379/0"
+        stream: st
+    - type: nats
+      config:
+        id: n
+        url: "nats://localhost:4222"
+        subject: sub
+        username: natsuser
+        password: SENTINEL_NATS_PW
+        token: SENTINEL_NATS_TOKEN
+    - type: http
+      config:
+        id: h
+        url: "http://x/y"
+        headers:
+          "Authorization": "Bearer SENTINEL_HTTP_TOKEN"
+    - type: s3
+      config:
+        id: s3
+        bucket: b
+        access_key_id: SENTINEL_S3_AKID
+        secret_access_key: SENTINEL_S3_SECRET
+"#;
+
+const SINK_SENTINELS: &[&str] = &[
+    "SENTINEL_CH_PW",
+    "SENTINEL_ES_PW",
+    "SENTINEL_KAFKA_USER",
+    "SENTINEL_KAFKA_PW",
+    "SENTINEL_SR_PW",
+    "SENTINEL_REDIS_PW",
+    "SENTINEL_NATS_PW",
+    "SENTINEL_NATS_TOKEN",
+    "SENTINEL_HTTP_TOKEN",
+    "SENTINEL_S3_AKID",
+    "SENTINEL_S3_SECRET",
+];
+
+#[test]
+fn sink_credentials_never_leak_in_sanitized_output() {
+    let spec =
+        load_from_path(write_temp(ALL_SINKS_YAML).to_str().unwrap()).unwrap();
+
+    // Persistence/round-trip stays lossless (the fixture really sets each secret).
+    let raw = serde_json::to_string(&spec).unwrap();
+    for s in SINK_SENTINELS {
+        assert!(raw.contains(s), "fixture must set sentinel {s}");
+    }
+
+    // The sanitized status/API serialization must expose none of them.
+    let shown = sanitized_spec_json(&spec);
+    for s in SINK_SENTINELS {
+        assert!(
+            !shown.contains(s),
+            "sanitized output leaked sink secret {s}: {shown}"
+        );
+    }
+    // Non-secret fields still survive (host/port, message topic).
+    assert!(shown.contains("ch:8123"), "non-secret host must survive");
+    assert!(shown.contains("localhost:6379"), "redis host must survive");
+}
+
+/// Shape guard: the sanitized sinks must differ from the normal serialization ONLY by
+/// redaction (a `***REDACTED***` value or a `***`-masked URL password). A new sink field
+/// that is silently dropped, or altered to anything other than a redaction, fails here;
+/// a new *secret* field is additionally caught by the sentinel leak test above.
+#[test]
+fn sanitized_sinks_differ_from_normal_only_by_redaction() {
+    let spec =
+        load_from_path(write_temp(ALL_SINKS_YAML).to_str().unwrap()).unwrap();
+    let normal: serde_json::Value = serde_json::to_value(&spec).unwrap();
+    let sanitized: serde_json::Value =
+        serde_json::from_str(&sanitized_spec_json(&spec)).unwrap();
+
+    let n_sinks = normal["spec"]["sinks"].as_array().unwrap();
+    let s_sinks = sanitized["spec"]["sinks"].as_array().unwrap();
+    assert_eq!(n_sinks.len(), s_sinks.len(), "sink count changed");
+    assert_eq!(n_sinks.len(), 7, "expected all 7 sink types in the fixture");
+
+    let mut redactions = 0usize;
+    for (n, s) in n_sinks.iter().zip(s_sinks) {
+        assert_leaf_diffs_are_redactions(n, s, &mut redactions);
+    }
+    assert!(redactions > 0, "expected sink redactions but found none");
+}
+
+fn assert_leaf_diffs_are_redactions(
+    normal: &serde_json::Value,
+    sanitized: &serde_json::Value,
+    redactions: &mut usize,
+) {
+    use serde_json::Value;
+    match (normal, sanitized) {
+        (Value::Object(n), Value::Object(s)) => {
+            assert_eq!(
+                n.keys().collect::<Vec<_>>(),
+                s.keys().collect::<Vec<_>>(),
+                "sanitized object dropped/added a key (normal={n:?})"
+            );
+            for (k, nv) in n {
+                assert_leaf_diffs_are_redactions(nv, &s[k], redactions);
+            }
+        }
+        (Value::Array(n), Value::Array(s)) => {
+            assert_eq!(n.len(), s.len(), "sanitized array length changed");
+            for (nv, sv) in n.iter().zip(s) {
+                assert_leaf_diffs_are_redactions(nv, sv, redactions);
+            }
+        }
+        (n, s) if n == s => {} // unchanged non-secret leaf
+        (_, Value::String(s)) => {
+            assert!(
+                s == "***REDACTED***" || s.contains("***"),
+                "a leaf changed to a non-redaction value: {s}"
+            );
+            *redactions += 1;
+        }
+        (n, s) => panic!("unexpected non-redaction change: {n:?} -> {s:?}"),
+    }
+}
