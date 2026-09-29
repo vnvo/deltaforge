@@ -581,6 +581,7 @@ mod tests {
                     sink_batch_deadline_secs: None,
                     schema_sensing: Default::default(),
                     journal: None,
+                    secrets: None,
                 },
             },
             ops: None,

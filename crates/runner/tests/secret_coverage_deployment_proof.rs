@@ -243,3 +243,81 @@ async fn storage_deployment_fails_closed_on_partial_credentials() {
         "storage must reject a partial credential set before opening the backend"
     );
 }
+
+/// Build a spec with an ordinary (non-rotation) PostgreSQL source and a single
+/// ClickHouse sink whose password is a `file` reference at `password_path`. When
+/// `projected_root` is set, a pipeline-level `secrets.projected_file_root` is included.
+fn spec_with_clickhouse_ref(
+    password_path: &str,
+    projected_root: Option<&str>,
+) -> PipelineSpec {
+    let secrets_block = match projected_root {
+        Some(root) => format!("\n  secrets:\n    projected_file_root: {root}"),
+        None => String::new(),
+    };
+    let yaml = format!(
+        r#"
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: sink-provider-independence
+  tenant: test
+spec:
+  source:
+    type: postgres
+    config:
+      id: pg
+      dsn: postgres://localhost:5432/orders
+      publication: df_pub
+      slot: df_slot
+      tables: [public.orders]
+  processors: []
+  sinks:
+    - type: clickhouse
+      config:
+        id: ch
+        url: http://clickhouse:8123
+        database: db
+        table: t
+        mode: upsert
+        password_ref: {{ provider: file, location: {password_path} }}{secrets_block}
+"#,
+    );
+    serde_yaml::from_str(&yaml).expect("parse pipeline spec")
+}
+
+/// A Vault-backed or projected-volume sink credential must resolve even when the
+/// source uses ordinary credentials. This exercises the file-provider case: a sink
+/// credential behind a projected-volume symlink resolves only because pipeline-level
+/// `secrets.projected_file_root` drives the shared resolver; the strict default (no
+/// pipeline secrets) rejects the symlink. Guards blocker 1 for the file provider.
+#[tokio::test]
+async fn sink_projected_file_resolves_via_pipeline_secrets() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let actual = root.path().join("ch_password");
+    std::fs::write(&actual, b"ch-secret")?;
+    // A Kubernetes projected volume exposes each key as a symlink; model that.
+    let link = root.path().join("ch_password_link");
+    std::os::unix::fs::symlink(&actual, &link)?;
+    let link_path = link.to_str().expect("utf-8 path");
+    let root_path = root.path().to_str().expect("utf-8 path");
+
+    // Without pipeline-level secrets, the shared resolver is strict-symlink mode and a
+    // non-rotation source contributes no projected root: the sink reference is rejected.
+    let strict = spec_with_clickhouse_ref(link_path, None);
+    let resolver = sources::source_secret_resolver(&strict).await?;
+    assert!(
+        sinks::resolve_sink_secrets(&strict, resolver.as_ref())
+            .await
+            .is_err(),
+        "a projected symlink must be rejected under the strict default"
+    );
+
+    // With pipeline-level projected_file_root, the same reference resolves.
+    let projected = spec_with_clickhouse_ref(link_path, Some(root_path));
+    let resolver = sources::source_secret_resolver(&projected).await?;
+    let secrets =
+        sinks::resolve_sink_secrets(&projected, resolver.as_ref()).await?;
+    assert_eq!(secrets.for_sink("ch").get("password"), Some("ch-secret"));
+    Ok(())
+}

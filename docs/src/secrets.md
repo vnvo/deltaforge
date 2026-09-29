@@ -52,9 +52,10 @@ A projected `Secret` volume mounts each key as a symlink into a versioned direct
 To follow those symlinks safely, set a **trusted root** so the resolved target must
 stay within the mounted volume:
 
+- **Sources and sinks:** set `projected_file_root` under `spec.secrets` (see
+  [Pipeline-level secret providers](#pipeline-level-secret-providers)). A source file
+  rotation trigger's `trusted_root` is honored as a fallback.
 - **Storage backend:** set `secret_trusted_root` on the storage config.
-- **Sources:** configure a file rotation trigger with `trusted_root` (see
-  [Sources](sources/README.md)).
 
 ```yaml
 storage:
@@ -68,14 +69,17 @@ storage:
 
 ### HashiCorp Vault KV (`vault`)
 
-A Vault reference points at a KV v2 record; `selector` picks the field:
+A Vault reference points at a KV v2 record; `location` is `<mount>/<path>` (the KV v2
+`data/` segment is added automatically, so do not include it) and `selector` picks the
+field:
 
 ```yaml
-{ provider: vault, location: secret/data/deltaforge/pg, selector: password }
+{ provider: vault, location: secret/deltaforge/pg, selector: password }
 ```
 
-Vault KV references require a Vault connection. Storage configures its own,
-independent of any pipeline:
+Vault KV references require a Vault connection. Configure it in the scope that owns the
+reference: the **pipeline** (`spec.secrets`) for source and sink references, and the
+**storage** config for the storage backend. The two are independent.
 
 ```yaml
 storage:
@@ -87,11 +91,36 @@ storage:
       method: kubernetes
       role: deltaforge-storage
       jwt_path: /var/run/secrets/kubernetes.io/serviceaccount/token
-  dsn_secret: { provider: vault, location: secret/data/deltaforge/store, selector: dsn }
+  dsn_secret: { provider: vault, location: secret/deltaforge/store, selector: dsn }
 ```
 
 The runner must be built with the `vault` feature; otherwise a Vault-referenced
 credential fails closed at startup with a clear error.
+
+### Pipeline-level secret providers
+
+`spec.secrets` assembles the single resolver shared by **both** source and sink
+credential resolution. Configure it here whenever any source or sink reference needs
+Vault or a Kubernetes projected volume - the source does not need to use credential
+rotation for a sink's Vault or projected-file reference to resolve.
+
+```yaml
+spec:
+  secrets:
+    # Enables `vault` references on the source and any sink.
+    vault:
+      address: https://vault.internal:8200
+      auth:
+        method: kubernetes
+        role: deltaforge-pipeline
+        jwt_path: /var/run/secrets/kubernetes.io/serviceaccount/token
+    # Enables projected-volume (symlink) `file` references for the source and any sink.
+    projected_file_root: /var/run/secrets
+```
+
+When `spec.secrets` is absent, the resolver falls back to the source's rotation
+configuration (backward compatible): a source `file` rotation trigger supplies the
+projected-file root, and a source `vault` trigger supplies the Vault connection.
 
 ## Where references apply
 
@@ -103,7 +132,7 @@ Three mutually exclusive forms:
 source:
   type: postgres
   config:
-    dsn_secret: { provider: vault, location: secret/data/pg, selector: dsn }   # whole DSN
+    dsn_secret: { provider: vault, location: secret/pg, selector: dsn }   # whole DSN
 ```
 
 or a password-less base DSN plus credential references:
@@ -145,7 +174,7 @@ encoding:
   type: avro
   schema_registry_url: https://schema-registry.internal:8081
   username: sr-user
-  password_ref: { provider: vault, location: secret/data/sr, selector: password }
+  password_ref: { provider: vault, location: secret/sr, selector: password }
 ```
 
 ### S3 and ambient AWS identity
