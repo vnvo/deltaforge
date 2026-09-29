@@ -18,6 +18,7 @@ use tracing::{debug, info};
 
 use runner::{PipelineManager, SchemaApi, SensingApi};
 
+mod storage_secrets;
 mod version;
 
 #[derive(Parser, Debug)]
@@ -98,6 +99,7 @@ async fn main() -> Result<()> {
         },
         path: args.storage_path.clone(),
         dsn: args.storage_dsn.clone(),
+        ..Default::default()
     };
 
     let backend = build_storage_backend(&storage_cfg)
@@ -190,11 +192,17 @@ async fn build_storage_backend(
                 .context("open SQLite storage backend")
         }
         StorageBackendKind::Postgres => {
-            let dsn = cfg.dsn.as_deref().context(
-                "--storage-dsn is required when using --storage-backend postgres"
-            )?;
+            // Resolve credentials (inline dsn | dsn_secret | base + credential refs)
+            // through the bootstrap resolver and fail closed BEFORE opening the backend.
+            let dsn = storage_secrets::resolve_storage_dsn(cfg)
+                .await
+                .context("resolve storage credentials")?
+                .context(
+                    "storage postgres backend requires a dsn, dsn_secret, or \
+                     base dsn + credentials",
+                )?;
             info!("using PostgreSQL storage backend");
-            storage::PostgresStorageBackend::connect(dsn)
+            storage::PostgresStorageBackend::connect(&dsn)
                 .await
                 .map(|b| b as storage::ArcStorageBackend)
                 .context("connect PostgreSQL storage backend")

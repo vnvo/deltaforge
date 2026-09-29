@@ -186,6 +186,17 @@ pub struct SourceCredentialsCfg {
     pub password: Option<secrets::SecretReference>,
 }
 
+/// Username/password credential references shared by storage and sinks. Like
+/// [`SourceCredentialsCfg`] but connector-agnostic. Each field is a
+/// [`SecretReference`](secrets::SecretReference) (never a value).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CredentialRefsCfg {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<secrets::SecretReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<secrets::SecretReference>,
+}
+
 /// Opt-in controlled credential rotation for a source. When set, the source
 /// detects a rotated credential (via the configured `trigger`) and performs a
 /// two-stage reconnect at a safe transaction boundary. Non-rotatable references

@@ -4999,6 +4999,7 @@ dependencies = [
  "checkpoints",
  "chrono",
  "clap",
+ "common",
  "criterion",
  "ctor",
  "deltaforge-config",
@@ -5018,12 +5019,14 @@ dependencies = [
  "rest-api",
  "schema-registry",
  "schema-sensing",
+ "secrets",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "sinks",
  "sources",
  "storage",
+ "tempfile",
  "testcontainers",
  "thiserror 1.0.69",
  "tikv-jemallocator",
@@ -5033,6 +5036,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
