@@ -11,7 +11,7 @@ Complete pipeline configurations demonstrating common DeltaForge use cases. Each
 | [Multi-Sink Fan-Out](multi_sink_fanout.md) | MySQL | Kafka + Redis + NATS | Multiple envelopes, selective checkpointing |
 | [Event Filtering](event_filtering.md) | MySQL | Kafka | JavaScript filtering, PII redaction |
 | [Schema Sensing](schema_sensing.md) | PostgreSQL | Kafka | JSON schema inference, drift detection |
-| [Production Kafka](kafka_production.md) | PostgreSQL | Kafka | SASL/SSL auth, exactly-once, tuning |
+| [Production Kafka](kafka_production.md) | PostgreSQL | Kafka | SASL/SSL auth, transactional delivery, tuning |
 | [Cache Invalidation](cache_invalidation.md) | MySQL | Redis | CDC stream for cache invalidation workers |
 | [Audit Trail](audit_trail.md) | PostgreSQL | Kafka | Compliance logging, PII redaction |
 | [Analytics Preprocessing](analytics_preprocessing.md) | MySQL | Kafka + Redis | Metrics enrichment, analytics stream |
@@ -37,7 +37,7 @@ Complete pipeline configurations demonstrating common DeltaForge use cases. Each
 ### Production Patterns
 | Example | Description |
 |---------|-------------|
-| [Production Kafka](kafka_production.md) | Authentication, exactly-once, performance tuning |
+| [Production Kafka](kafka_production.md) | Authentication, transactional delivery, performance tuning |
 | [Multi-Sink Fan-Out](multi_sink_fanout.md) | Multiple sinks with different formats |
 | [Cache Invalidation](cache_invalidation.md) | CDC stream for cache invalidation |
 | [Outbox Pattern](outbox_mysql_kafka.md) | Transactional outbox with raw payload delivery |

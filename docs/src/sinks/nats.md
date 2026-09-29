@@ -228,6 +228,8 @@ NATS also exposes a monitoring endpoint (default `:8222`) with JSON stats:
 
 ## Failure modes
 
+In the table below, "retries" means a **bounded in-sink retry** (exponential backoff, finite attempts) inside a single `send_batch` call. There is no unbounded pipeline-level retry loop: once in-sink attempts are exhausted on a required sink, the checkpoint is held and the batch is recovered by source replay on the next restart. JetStream delivery is at-least-once; server-side dedup via `Nats-Msg-Id` within `duplicate_window` collapses duplicates.
+
 | Failure | Symptoms | DeltaForge behavior | Resolution |
 |---------|----------|---------------------|------------|
 | **Server unavailable** | Connection refused | Retries with backoff; blocks checkpoint | Restore NATS; check network |
@@ -265,7 +267,7 @@ NATS also exposes a monitoring endpoint (default `:8222`) with JSON stats:
 1. JetStream stream hits max_bytes or max_msgs limit
 2. With `discard: old` → oldest messages removed, publish succeeds
 3. With `discard: new` → publish rejected
-4. DeltaForge retries on rejection
+4. Bounded in-sink retry runs; if the stream stays full, the required-sink failure holds the checkpoint and backpressures (retrying alone will not clear a full stream)
 5. Resolution: Increase limits or enable `discard: old`
 
 ### JetStream acknowledgement levels

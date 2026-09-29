@@ -1,6 +1,6 @@
 # Guarantees & Correctness
 
-This page defines DeltaForge's data delivery guarantees, ordering model, transaction semantics, failure handling, and operational boundaries. Every claim here is backed by the implementation — no aspirational statements.
+This page defines DeltaForge's data delivery guarantees, ordering model, transaction semantics, failure handling, and operational boundaries. The guarantees below describe current behavior. Where a verification is planned rather than already in place, the [Correctness Test Matrix](#correctness-test-matrix) marks it explicitly, so read a guarantee together with its test status.
 
 ## Delivery Guarantees
 
@@ -8,26 +8,28 @@ This page defines DeltaForge's data delivery guarantees, ordering model, transac
 
 | Sink | Delivery guarantee | Dedup mechanism | Consumer action required |
 |------|-------------------|-----------------|------------------------|
-| **Kafka** (`exactly_once: true`) | **End-to-end exactly-once** | Kafka two-phase commit per batch | Set `isolation.level=read_committed` |
+| **Kafka** (`exactly_once: true`) | Transactional atomic-batch delivery; **at-least-once across restart** | Each batch is one Kafka transaction, so `read_committed` consumers never see a partial batch; a restart can replay an already-committed batch as a new transaction (duplicate) | Set `isolation.level=read_committed`, **and** dedup by event ID for cross-restart duplicates |
 | **Kafka** (default) | At-least-once (idempotent producer) | Retries are deduped by rdkafka; crash-replay produces duplicates | Dedup by event ID or idempotency key |
 | **NATS JetStream** | At-least-once + server-side dedup | `Nats-Msg-Id` header within `duplicate_window` | Configure `duplicate_window` on stream |
 | **Redis Streams** | At-least-once + consumer-side dedup | `idempotency_key` field in XADD payload | Check `idempotency_key` before processing |
 | **HTTP/Webhook** | At-least-once | Retry on 5xx/timeout; no server-side dedup | Consumer must be idempotent (use event `id`) |
 | **S3** (Parquet / JSON Lines) | At-least-once at file granularity, atomic at file boundary | Same file may be re-emitted with a different ULID on retry/replay | Dedup downstream via `MERGE INTO` or `event_id` |
 
-**Terminology rule:** "exactly-once" is used only when DeltaForge guarantees no duplicates without consumer cooperation. All other sinks are "at-least-once" with a stated dedup mechanism. This distinction matters — calling NATS or Redis "exactly-once" would be misleading because dedup depends on server configuration or consumer behavior outside DeltaForge's control.
+**Terminology rule:** DeltaForge does not claim end-to-end exactly-once delivery for any sink. Every sink is at-least-once; the differences are in what each sink adds on top. Kafka `exactly_once: true` adds transactional atomic-batch visibility (a `read_committed` consumer sees a whole batch or none of it) but still delivers at-least-once across a restart, so consumers must dedup to reach exactly-once end to end. NATS and Redis add a dedup mechanism (server-side or consumer-side) whose effectiveness depends on configuration or consumer behavior outside DeltaForge's control. Calling any of these "exactly-once" without the consumer's cooperation would be misleading.
 
 ### What "at-least-once" means
 
 - **No data loss**: every event from the source is delivered to the sink at least once. Checkpoints are saved only after the sink acknowledges delivery — never before.
 - **Duplicates on crash recovery**: if DeltaForge crashes after delivering a batch but before saving the checkpoint, that batch is replayed on restart. Consumers must handle duplicates (see [Consumer Guidance](#consumer-guidance) below).
-- **No silent drops**: events are never discarded. If delivery fails, the batch is retried with exponential backoff until it succeeds or a fatal error stops the pipeline.
+- **No silent drops**: events are never discarded. On a transient delivery error a sink applies a bounded in-sink retry (exponential backoff, finite attempts). If those attempts are exhausted on a `required` sink, the checkpoint does not advance and the batch is re-delivered from the source on the next pipeline restart (source replay) - there is no unbounded in-session retry loop. See [Error Classification & Retry](#error-classification--retry).
 
-### What "exactly-once" means (Kafka)
+### What Kafka transactions guarantee (`exactly_once: true`)
 
-With `exactly_once: true`, each batch is wrapped in a Kafka transaction (`begin_transaction` / `commit_transaction`). Consumers using `isolation.level=read_committed` only see committed batches — no partial deliveries. If a transaction fails, it is aborted and retried from the same checkpoint position.
+`exactly_once: true` gives **transactional atomic-batch delivery**, not end-to-end exactly-once. Each batch is wrapped in a Kafka transaction (`begin_transaction` / `commit_transaction`), so consumers using `isolation.level=read_committed` see a whole batch or none of it - never a partial batch. If a transaction fails before commit, it is aborted and re-attempted from the same checkpoint position.
 
-Exactly-once overhead is **~7-11%** with properly tuned batch sizes. See the [Performance guide](performance.md#exactly-once-delivery-overhead) for benchmark details.
+The restart boundary is still **at-least-once**: DeltaForge advances its own checkpoint only after the Kafka transaction commits, so a crash between the commit and the checkpoint persist replays that batch on restart as a **new** transaction. A `read_committed` consumer then sees the batch a second time. To reach exactly-once end to end, consumers must dedup on the event `id` (or idempotency key), which is stable across replays.
+
+The transactional-producer overhead is **~7-11%** with properly tuned batch sizes. See the [Performance guide](performance.md#transactional-producer-overhead) for benchmark details.
 
 ## Ordering Model
 
@@ -78,9 +80,10 @@ The batch accumulator will not split a batch at a point that would separate rows
 ### What this guarantees
 
 - All rows from one database transaction appear in the **same batch**.
-- Each batch is delivered **atomically** to each sink (all events in the batch succeed or fail together).
-- With Kafka `exactly_once: true`, the entire batch is committed as a single Kafka transaction — consumers see all rows from the DB transaction atomically.
-- **Cross-table transactions**: a transaction spanning tables A and B is emitted as a single batch containing events for both tables, tagged with the same `tx_id`. The batch is delivered atomically. This is stronger than "tagged but not grouped" — all events from one DB transaction are in one batch and delivered as a unit.
+- A batch is DeltaForge's unit of delivery accounting: a sink's checkpoint advances only if the whole batch succeeds. Whether a *consumer* observes the batch atomically depends on the sink:
+  - **Kafka `exactly_once: true`**: the batch is one Kafka transaction, so a `read_committed` consumer sees all rows from the DB transaction together or not at all - within a single delivery. Across a restart the batch can be replayed as a new transaction, so the consumer may see the same transaction twice (at-least-once); dedup on event `id` to collapse it.
+  - **Non-transactional sinks** (Redis, HTTP, NATS, S3, ClickHouse, Elasticsearch): DeltaForge does not make the batch atomic for the consumer. A sink failure partway through a batch can leave some rows visible downstream, and a retry or restart re-delivers the batch, producing duplicates. These sinks are at-least-once; use their stated dedup mechanism.
+- **Cross-table transactions**: a transaction spanning tables A and B is emitted as a single batch containing events for both tables, tagged with the same `tx_id`, and delivered as a unit. This is stronger than "tagged but not grouped" - all events from one DB transaction are in one batch. Consumer-visible atomicity for that batch still follows the per-sink rule above.
 
 ### Precise transaction semantics
 
@@ -88,10 +91,9 @@ To avoid ambiguity, here is exactly what DeltaForge guarantees about transaction
 
 - Events from one source transaction are emitted **contiguously** within a single batch.
 - Multi-table transactions preserve commit grouping — all rows from tables A and B in one DB transaction appear in the same batch.
-- **Within a single sink**, events from one transaction are delivered atomically (the batch succeeds or fails as a unit).
+- **Within a single sink**, the batch is the unit of delivery accounting: the sink's checkpoint advances only if the whole batch succeeds. Consumer-visible atomicity of that batch holds only for a transactional sink (Kafka `exactly_once: true`) and only within one delivery; see [What this guarantees](#what-this-guarantees).
 - **Across heterogeneous sinks**, DeltaForge does not guarantee atomic commit. Kafka may commit a transaction while Redis is still retrying. Each sink's checkpoint tracks its own progress independently.
-- Retries do not break transaction grouping — a retried batch contains the same events in the same order.
-- Under non-sharded operation, no sink may observe partial progress within a source transaction (the batch is the commit unit).
+- Retries and restarts do not break transaction grouping (a replayed batch contains the same events in the same order), but they can re-deliver a transaction that was already delivered. Delivery is at-least-once; consumers dedup on event `id`.
 
 ### Edge cases
 
@@ -196,9 +198,9 @@ The policy is checked **before** any checkpoint is committed. If the policy isn'
 
 Each sink maintains its own checkpoint key (`{source_id}::sink::{sink_id}`). On restart, the source replays from the **minimum** checkpoint across all sinks. This means:
 
-- A fast sink is never held back by a slow one during normal operation.
-- A slow or failed sink only causes replay for itself, not re-delivery to sinks that are already ahead.
-- Adding a new sink triggers replay from the source's earliest available position for that sink only.
+- A fast sink is never held back by a slow one during normal operation: while the pipeline keeps running, the source's in-memory read position does not rewind for a lagging sink.
+- Recovery is **not** selective per sink. On restart the source resumes from the `MIN` checkpoint across all sinks, so every sink - including ones already ahead - is re-delivered the events from that minimum forward. Sinks that were ahead receive duplicates and must dedup (see [On crash recovery](#on-crash-recovery)).
+- Adding a new sink lowers the `MIN` to that sink's earliest position, so on the next restart the source replays from there and the existing sinks are re-delivered those events too (they dedup). The new sink is not backfilled in isolation.
 
 ### Fatal errors
 
@@ -272,7 +274,7 @@ All sinks use exponential backoff with jitter. The classification determines whe
 
 If all retry attempts fail for a retryable error, the error is propagated to the coordinator. The coordinator's behavior depends on the commit policy:
 
-- **Required sink**: the batch is not committed, and the pipeline will retry the entire batch on the next cycle.
+- **Required sink**: the batch is not committed and its checkpoint stays put. The coordinator does not re-inject the same batch from the source channel in-session; recovery happens by source replay from `MIN(checkpoints)` on the next restart (see [Multi-batch retries vs in-batch retries](#multi-batch-retries-vs-in-batch-retries)).
 - **Optional sink**: the failure is logged, and the pipeline continues with other sinks.
 
 ## Checkpoint Semantics
@@ -295,7 +297,7 @@ The checkpoint commit follows a strict sequence:
 
 1. DeltaForge reads per-sink checkpoints from the checkpoint store.
 2. The source resumes from the **minimum** checkpoint across all sinks.
-3. Sinks that were already ahead of the minimum position receive duplicate events — they must handle these idempotently (or use exactly-once mode).
+3. Sinks that were already ahead of the minimum position receive duplicate events - they must handle these idempotently (Kafka `read_committed` still sees the replayed batch as a new transaction, so dedup on event `id` there too).
 4. Sinks that were behind receive their missing events.
 
 ### Checkpoint storage
@@ -366,12 +368,13 @@ How long should consumers remember processed event IDs? Match your maximum expec
 
 ## Correctness Test Matrix
 
-Every guarantee is backed by a test. This matrix maps guarantees to their verification:
+This matrix maps guarantees to their verification. Rows marked **Exists** have a test in the suite today; rows marked **Planned** do not yet - treat those guarantees as design intent pending verification, not as tested behavior.
 
 | Guarantee | Test | Type | Status |
 |-----------|------|------|--------|
 | No data loss (at-least-once) | `crash_recovery` chaos scenario | Chaos | Exists |
-| Kafka end-to-end exactly-once | `exactly_once` chaos scenario + `kafka_sink_exactly_once_*` | Chaos + Integration | Exists |
+| Kafka transactional atomic-batch delivery | `exactly_once` chaos scenario + `kafka_sink_exactly_once_*` | Chaos + Integration | Exists |
+| At-least-once across restart (committed row reaches Kafka after outage + restart) | `kafka_outage_restart_e2e` | Integration | Exists |
 | Producer fencing detection | `kafka_sink_exactly_once_producer_fencing` | Integration | Exists |
 | Per-primary-key ordering | Events keyed by PK → same Kafka partition | By design | Verified via Kafka partition assignment |
 | Transaction boundary preservation | `respect_source_tx` + `check_and_split` coordinator logic | Unit | Exists |

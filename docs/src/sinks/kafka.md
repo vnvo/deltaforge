@@ -30,7 +30,7 @@ Kafka excels as the backbone for event-driven architectures where durability, or
 | ✅ **Replay capability** - Configurable retention allows reprocessing | ❌ **Resource intensive** - High disk I/O and memory requirements |
 | ✅ **Ecosystem** - Connect, Streams, Schema Registry, ksqlDB | ❌ **Learning curve** - Partitioning, offsets, consumer groups to master |
 | ✅ **Throughput** - Handles millions of messages per second | ❌ **Cold start** - Cluster setup and topic configuration overhead |
-| ✅ **Exactly-once semantics** - Transactions for critical workloads | ❌ **Cost** - Managed services can be expensive at scale |
+| ✅ **Transactional atomic-batch delivery** - Transactions for critical workloads | ❌ **Cost** - Managed services can be expensive at scale |
 
 ## Configuration
 
@@ -61,16 +61,18 @@ sinks:
 | `brokers` | string | — | Comma-separated broker list |
 | `topic` | string | — | Destination topic |
 | `required` | bool | `true` | Gates checkpoints |
-| `exactly_once` | bool | `false` | Enable EOS semantics |
+| `exactly_once` | bool | `false` | Enable the transactional producer (atomic-batch delivery) |
 | `client_conf` | map | `{}` | librdkafka overrides |
 
 </td>
 </tr>
 </table>
 
-## Exactly-once semantics
+## Transactional atomic-batch delivery (`exactly_once: true`)
 
-When `exactly_once: true`, the Kafka sink uses a **transactional producer**. Each batch is wrapped in a Kafka transaction (`begin_transaction` / `commit_transaction`), so either all events in the batch are committed atomically or none are.
+When `exactly_once: true`, the Kafka sink uses a **transactional producer**. Each batch is wrapped in a Kafka transaction (`begin_transaction` / `commit_transaction`), so a `read_committed` consumer sees either all events in the batch or none - never a partial batch.
+
+This is **not** end-to-end exactly-once. DeltaForge advances its own checkpoint only after the Kafka transaction commits, so a crash between the commit and the checkpoint persist replays that batch on restart as a **new** transaction, and a `read_committed` consumer sees it twice. Delivery is at-least-once across a restart; dedup on the event `id` (stable across replays) to reach exactly-once end to end. The config field is named `exactly_once` for historical reasons; read it as "transactional producer."
 
 ```yaml
 sinks:
@@ -87,8 +89,8 @@ sinks:
 1. DeltaForge assigns a stable `transactional.id` per pipeline-sink pair (`deltaforge-{pipeline}-{sink_id}`)
 2. On startup, `init_transactions()` registers with the broker and fences any zombie producer from a previous instance
 3. Each batch: `begin_transaction()` → produce messages → `commit_transaction()`
-4. If commit fails, the transaction is aborted and the batch retried
-5. Consumers using `isolation.level=read_committed` only see committed batches
+4. If the commit fails before completing, the transaction is aborted and the batch is re-attempted from the same checkpoint (bounded in-sink retry); a persistent failure holds the checkpoint and recovers by source replay on restart
+5. Consumers using `isolation.level=read_committed` only see committed batches; a batch replayed after a restart appears as a new committed transaction (duplicate), so consumers still dedup on event `id`
 
 ### Requirements
 
@@ -117,7 +119,7 @@ If the broker fences the producer (another instance started with the same `trans
 
 ### Performance impact
 
-Transactions add ~1-3ms overhead per batch for the two-phase commit. With properly sized batches (`max_events=16000, max_bytes=16MB`), throughput impact is **~7-11%**. See the [Performance guide](../performance.md#exactly-once-delivery-overhead) for tuning details and benchmark results.
+Transactions add ~1-3ms overhead per batch for the two-phase commit. With properly sized batches (`max_events=16000, max_bytes=16MB`), throughput impact is **~7-11%**. See the [Performance guide](../performance.md#transactional-producer-overhead) for tuning details and benchmark results.
 
 ## Recommended client_conf settings
 
@@ -225,6 +227,8 @@ for message in consumer:
 
 ## Failure modes
 
+In the table below, "retries" means a **bounded in-sink retry** (exponential backoff, finite attempts) inside a single `send_batch` call. DeltaForge does not run an unbounded pipeline-level retry loop: once in-sink attempts are exhausted on a required sink, the checkpoint is held and the batch is recovered by source replay on the next restart. "Blocks checkpoint" means the source backpressures until the sink recovers.
+
 | Failure | Symptoms | DeltaForge behavior | Resolution |
 |---------|----------|---------------------|------------|
 | **Broker unavailable** | Connection refused, timeout | Retries with backoff; blocks checkpoint | Restore broker; check network |
@@ -233,7 +237,7 @@ for message in consumer:
 | **Authorization failure** | `TopicAuthorizationFailed` | Fails fast, no retry | Grant ACLs for producer |
 | **Message too large** | `MessageSizeTooLarge` | Fails message permanently | Increase `message.max.bytes` or filter large events |
 | **Leader election** | `NotLeaderForPartition` | Automatic retry after metadata refresh | Wait for election; usually transient |
-| **Disk full** | `KafkaStorageException` | Retries indefinitely | Add disk space; purge old segments |
+| **Disk full** | `KafkaStorageException` | Bounded in-sink retry, then holds checkpoint and backpressures | Add disk space; purge old segments |
 | **Network partition** | Timeouts, partial failures | Retries; may produce duplicates | Restore network; idempotence prevents dups |
 | **Producer fenced** | `ProducerFenced` error | **Fatal** — pipeline stops immediately | Ensure only one instance per pipeline; restart after resolving |
 | **Transaction timeout** | `transaction.timeout.ms` exceeded | Transaction aborted; batch retried | Increase timeout or reduce batch size |
@@ -280,7 +284,7 @@ For deeper Kafka broker visibility, monitor your Kafka cluster directly:
 ## Notes
 
 - Combine Kafka with other sinks to fan out data; use commit policy to control checkpoint behavior
-- For exactly-once semantics, set `exactly_once: true` and ensure your Kafka cluster supports transactions (2.5+)
+- For transactional atomic-batch delivery, set `exactly_once: true` and ensure your Kafka cluster supports transactions (2.5+); this is not end-to-end exactly-once, so consumers still dedup on event `id` across restarts
 - With `exactly_once: false` (default), idempotent production is still enabled — duplicates are prevented during retries but not across DeltaForge restarts
 - Adjust `client_conf` for durability (`acks=all`) or performance based on your requirements
 - Consider partitioning strategy for ordering guarantees within partitions

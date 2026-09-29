@@ -164,7 +164,7 @@ Output: `{"schema":null,"payload":{...}}`
     - Native Rust processor for dropping events by op type, table pattern, or field predicates (eq, ne, gt, in, regex, changed, and more)
 
 - **Sinks**
-  - Kafka producer sink (via `rdkafka`) — end-to-end exactly-once via transactional producer
+  - Kafka producer sink (via `rdkafka`) - transactional atomic-batch delivery via the transactional producer (`read_committed` consumers never see a partial batch); at-least-once across restart, so dedup on event `id` for exactly-once end to end
   - Redis stream sink — idempotency keys for consumer-side dedup
   - NATS JetStream sink (via `async_nats`) — server-side dedup via `Nats-Msg-Id`
   - HTTP/Webhook sink — POST/PUT to any URL with custom headers, URL templates, batch mode
@@ -272,15 +272,15 @@ The container persists state to a SQLite database at `./data/deltaforge.db` by d
 
 ### Delivery Guarantees
 
-DeltaForge supports **end-to-end exactly-once** (Kafka transactions), **at-least-once with server-side dedup** (NATS), and **at-least-once with consumer-side dedup** (Redis). Checkpoints are saved only after sink acknowledgement — never before.
+All sinks are **at-least-once**. Kafka `exactly_once: true` adds **transactional atomic-batch delivery** (a `read_committed` consumer sees a whole batch or none of it); across a restart a committed batch can be replayed as a new transaction, so consumers dedup on event `id` to reach exactly-once end to end. NATS adds server-side dedup (`Nats-Msg-Id`), Redis adds consumer-side dedup (`idempotency_key`). Checkpoints are saved only after sink acknowledgement, never before.
 
-Each sink maintains its own independent checkpoint. The fastest sink is never held back by the slowest. On restart, the source replays from the minimum checkpoint across all sinks.
+Each sink maintains its own independent checkpoint, so a fast sink is not held back by a slow one while the pipeline runs. On restart the source replays from the minimum checkpoint across all sinks; sinks that were ahead are re-delivered those events and must dedup (recovery is not selective per sink).
 
 ```
 Source → Processor → Sinks (deliver concurrently) → Policy check → Per-sink checkpoints
 ```
 
-Transaction boundaries are preserved: all rows from one database transaction appear in the same batch and are delivered atomically to each sink (`respect_source_tx: true` by default).
+Transaction boundaries are preserved: all rows from one database transaction appear in the same batch (`respect_source_tx: true` by default). A batch is the unit of delivery accounting - a sink's checkpoint advances only if the whole batch succeeds. Consumer-visible atomicity of that batch holds only for a transactional sink (Kafka `exactly_once: true`) and only within one delivery; DeltaForge does not provide atomic commit across heterogeneous sinks.
 
 📘 Full details: [Guarantees & Correctness](docs/src/guarantees.md)
 
@@ -478,7 +478,7 @@ View actual examples: [Example Configurations](docs/src/examples/README.md)
 - [x] HTTP/Webhook sink
 - [x] Dead letter queue with per-event routing
 - [x] Per-sink independent checkpoints
-- [x] Exactly-once delivery (Kafka transactions)
+- [x] Transactional atomic-batch delivery (Kafka transactions; at-least-once across restart)
 - [x] Avro encoding with Confluent Schema Registry
 - [x] Helm chart for Kubernetes deployment
 - [x] S3/Parquet/JSON Lines sink

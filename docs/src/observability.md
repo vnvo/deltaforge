@@ -49,7 +49,7 @@ The sections below call out concrete metrics and log events to add per component
 | ✅ Implemented | `deltaforge_sink_events_total{pipeline,sink}` counter and `deltaforge_sink_latency_seconds{pipeline,sink}` histogram around each send. | Throughput and responsiveness per sink. |
 | ✅ Implemented | `deltaforge_sink_batch_total{pipeline,sink}` counter for send. | Number of batches sent per sink. |
 | ✅ Implemented | `deltaforge_sink_errors_total{pipeline,sink}` counter with per-sink error tracking. | Alert on sink failures. |
-| ✅ Implemented | `deltaforge_sink_txn_commits_total{pipeline,sink}` counter — Kafka transaction commits/s. | Track exactly-once throughput. |
+| ✅ Implemented | `deltaforge_sink_txn_commits_total{pipeline,sink}` counter - Kafka transaction commits/s. | Track transactional-commit throughput. |
 | ✅ Implemented | `deltaforge_sink_txn_aborts_total{pipeline,sink}` counter — Kafka transaction aborts/s. Should be ~0. | Detect fencing or broker issues. |
 | ✅ Implemented | `deltaforge_sink_checkpoint_status{pipeline,sink}` gauge (1=ok, 0=behind). | Per-sink checkpoint health. |
 | ✅ Implemented | `deltaforge_sink_last_checkpoint_ts{pipeline,sink}` epoch timestamp. | Per-sink checkpoint age. |
@@ -138,7 +138,7 @@ Import it via Grafana UI → Dashboards → Import → Upload JSON file.
 | **Top Pipelines** | Top 10 laggiest, top 10 throughput, top 10 DLQ backlogs | Identify outliers without drowning in 300 series |
 | **Throughput** | Aggregate events/s, per-pipeline events/s, data throughput | Capacity planning and anomaly detection |
 | **Latency & Lag** | E2E latency p50/p95, source lag, per-table lag (top 10) | SLA monitoring, identify slow tables |
-| **Checkpoints & EOS** | Per-sink status, commit rate, txn commits/aborts | Exactly-once health, checkpoint freshness |
+| **Checkpoints & transactions** | Per-sink status, commit rate, txn commits/aborts | Transactional-commit health, checkpoint freshness |
 | **Dead Letter Queue** | Entries, events/s, saturation, overflow rate | DLQ monitoring and alerting |
 | **Errors & Reliability** | Sink errors, reconnects, pipeline state timeline | Incident detection |
 | **Batching & Kafka** | Batch size, batch bytes, sink latency (collapsed) | Tuning reference |

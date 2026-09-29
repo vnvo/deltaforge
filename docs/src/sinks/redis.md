@@ -202,6 +202,8 @@ while True:
 
 ## Failure modes
 
+In the table below, "retries" means a **bounded in-sink retry** (exponential backoff, finite attempts) inside a single `send_batch` call. There is no unbounded pipeline-level retry loop: once in-sink attempts are exhausted on a required sink, the checkpoint is held and the batch is recovered by source replay on the next restart. Redis Streams delivery is at-least-once (XADD is not transactional across the batch); dedup on the event `idempotency_key`.
+
 | Failure | Symptoms | DeltaForge behavior | Resolution |
 |---------|----------|---------------------|------------|
 | **Server unavailable** | Connection refused | Retries with backoff; blocks checkpoint | Restore Redis; check network |
@@ -218,12 +220,12 @@ while True:
 
 **Redis OOM during batch delivery**
 
-1. DeltaForge sends batch of 100 events via pipeline
-2. 50 events written, Redis hits maxmemory
-3. Pipeline fails atomically (all or nothing per pipeline)
-4. DeltaForge retries entire batch
-5. If OOM persists: batch blocked until memory available
-6. Checkpoint only saved after ALL events acknowledged
+1. DeltaForge sends a batch of 100 events
+2. 50 events are written, then Redis hits maxmemory and the rest fail (XADD is not atomic across the batch, so the 50 already-written entries remain)
+3. `send_batch` returns an error; the checkpoint does not advance
+4. DeltaForge applies bounded in-sink retry; if OOM persists, the required-sink failure holds the checkpoint and backpressures until memory is available
+5. On recovery/restart the batch is re-delivered from the source, so the already-written entries reappear as duplicates - consumers dedup on `idempotency_key`
+6. Checkpoint is saved only after the full batch is acknowledged
 
 **DeltaForge crash after XADD, before checkpoint**
 
@@ -238,8 +240,8 @@ while True:
 1. Master fails, Sentinel promotes replica
 2. In-flight XADD may fail with connection error
 3. DeltaForge reconnects to new master
-4. Retries failed batch
-5. Possible duplicates if original write succeeded
+4. Bounded in-sink retry re-sends the batch (or it is replayed from the source on restart)
+5. Possible duplicates if the original write succeeded - consumers dedup on `idempotency_key`
 
 ### Handling duplicates in consumers
 

@@ -350,12 +350,12 @@ WHERE ARRAY_CONTAINS(payload.tags, 'regulation:PCI-DSS');
 - **Full Change Capture**: Before and after values with REPLICA IDENTITY FULL
 - **PII Redaction**: Sensitive fields masked, presence tracked via `_field_redacted`
 - **Tag-Based Metadata**: Audit info stored in `event.tags` as parseable strings
-- **Immutable Storage**: Exactly-once delivery to append-only Kafka log
+- **Immutable Storage**: Transactional atomic-batch delivery to append-only Kafka log (at-least-once across restart; dedup on event `id`)
 - **Compliance Tagging**: Retention periods, classifications, regulations as tags
 
 ## Related Documentation
 
 - [PostgreSQL Source](../sources/postgres.md) - Logical replication setup
-- [Kafka Sink](../sinks/kafka.md) - Exactly-once and durability settings
+- [Kafka Sink](../sinks/kafka.md) - Transactional producer and durability settings
 - [Processors](../configuration.md#processors) - JavaScript processor constraints
 - [Envelopes](../envelopes.md) - Output format options

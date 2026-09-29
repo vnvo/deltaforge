@@ -15,11 +15,11 @@ Measured on Docker containers on a single developer machine (not dedicated infra
 | Source | Mode | Avg (events/s) | Peak (events/s) |
 |--------|------|----------------|-----------------|
 | MySQL | at-least-once | **151K** | **159K** |
-| MySQL | exactly-once | **134K** | **143K** |
+| MySQL | transactional | **134K** | **143K** |
 | Postgres | at-least-once | **57K** | **64K** |
-| Postgres | exactly-once | **53K** | **55K** |
+| Postgres | transactional | **53K** | **55K** |
 
-Exactly-once overhead is **~7-11%** when batch sizes are properly tuned.
+Transactional-producer overhead is **~7-11%** when batch sizes are properly tuned.
 
 ### Why `max_bytes` matters
 
@@ -28,7 +28,7 @@ These results show the impact of a small `max_bytes` (3MB) with `max_events=8000
 | Source | Mode | Avg (events/s) | Peak (events/s) |
 |--------|------|----------------|-----------------|
 | MySQL | at-least-once | **110K** | **122K** |
-| MySQL | exactly-once | **48K** | **57K** |
+| MySQL | transactional | **48K** | **57K** |
 
 A 3MB byte limit caps batches at ~6,000 events regardless of `max_events`, making transaction commits proportionally expensive. The default `max_bytes` is 16MB — sufficient for batches up to ~32K events at typical event sizes.
 
@@ -147,7 +147,7 @@ Postgres logical replication (pgoutput) sends one WAL message per row change, ma
 
 The throughput gap between Postgres and MySQL is primarily due to protocol-level differences (one WAL message per row vs. batched rows), not code inefficiency.
 
-## Exactly-Once Delivery Overhead
+## Transactional-Producer Overhead
 
 Enabling `exactly_once: true` on sinks adds per-batch transaction overhead:
 
@@ -157,7 +157,7 @@ Each batch is wrapped in `begin_transaction()` / `commit_transaction()`. The tra
 
 **Measured overhead** (Docker containers, single developer machine, 1-10M row drain):
 
-| Source | at-least-once | exactly-once | Overhead |
+| Source | at-least-once | transactional | Overhead |
 |--------|--------------|-------------|----------|
 | MySQL | 151K events/s | 134K events/s | ~11% |
 | Postgres | 57K events/s | 53K events/s | ~7% |
@@ -183,7 +183,7 @@ Idempotency keys are embedded in the XADD payload. No transaction overhead on th
 Each sink maintains its own checkpoint, committed independently after successful delivery. The source replays from the minimum checkpoint across all sinks. This means:
 
 - **Faster sinks are not held back** by slower ones — they advance their own checkpoints independently.
-- **Adding a new sink** to an existing pipeline triggers a replay from the source's earliest available position for that sink only.
+- **Adding a new sink** lowers the minimum checkpoint to that sink's earliest position, so on the next restart the source replays from there and all existing sinks are re-delivered those events too (they dedup); the new sink is not backfilled in isolation.
 - **Checkpoint storage overhead** scales linearly with the number of sinks (one key per sink per source).
 
 ## Profiling
