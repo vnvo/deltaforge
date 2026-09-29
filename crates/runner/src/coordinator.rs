@@ -1908,20 +1908,65 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         for (sink_id, required, elapsed, result) in raw_outcomes {
             match result {
                 Ok(batch_result) => {
-                    // Route per-event DLQ failures if a DLQ writer is configured.
+                    // A sink returning Ok can still have isolated per-row
+                    // failures. Route each to the DLQ and track whether EVERY
+                    // one was durably captured. A row that has no DLQ, or whose
+                    // DLQ write was dropped (overflow/reject/serialize/backend
+                    // error), is not durably accounted for.
+                    let mut all_captured = true;
                     if !batch_result.dlq_failures.is_empty() {
-                        if let Some(dlq) = &self.dlq_writer {
-                            for &(idx, ref err) in &batch_result.dlq_failures {
-                                if idx < frozen.events.len() {
-                                    dlq.write(
-                                        &frozen.events[idx],
-                                        &sink_id,
-                                        err,
-                                    )
-                                    .await;
+                        match &self.dlq_writer {
+                            Some(dlq) => {
+                                for &(idx, ref err) in
+                                    &batch_result.dlq_failures
+                                {
+                                    if idx < frozen.events.len() {
+                                        if dlq
+                                            .write(
+                                                &frozen.events[idx],
+                                                &sink_id,
+                                                err,
+                                            )
+                                            .await
+                                            == crate::dlq::DlqWrite::Dropped
+                                        {
+                                            all_captured = false;
+                                        }
+                                    }
                                 }
                             }
+                            None => {
+                                // No DLQ configured: the failed rows have no
+                                // durable home.
+                                all_captured = false;
+                            }
                         }
+                    }
+
+                    // Fail closed for a REQUIRED sink that could not deliver or
+                    // durably capture every row: it must not acknowledge, so the
+                    // checkpoint does not advance past the lost rows. An OPTIONAL
+                    // sink stays best-effort (documented lossy tolerance).
+                    let succeeded = !required || all_captured;
+
+                    if !succeeded {
+                        sink_results.push((sink_id.clone(), required, false));
+                        counter!(
+                            "deltaforge_sink_errors_total",
+                            "pipeline" => self.pipeline_name.to_string(),
+                            "sink" => sink_id.clone()
+                        )
+                        .increment(1);
+                        warn!(
+                            pipeline = %self.pipeline_name,
+                            sink = %sink_id,
+                            unrouted = batch_result.dlq_failures.len(),
+                            "required sink batch not acknowledged: rows could \
+                             not be delivered or durably routed to the DLQ; \
+                             holding checkpoint (configure a DLQ to isolate \
+                             poison rows and let the pipeline advance)"
+                        );
+                        continue;
                     }
 
                     let delivered =
@@ -4763,6 +4808,100 @@ mod tests {
         assert_eq!(cp.unwrap(), b"{\"pos\":100}");
     }
 
+    /// R3-C1: when the DLQ cannot durably capture a required sink's failed row
+    /// (here: full queue under the `Reject` overflow policy), the sink must not
+    /// acknowledge and the checkpoint must not advance - the row is not silently
+    /// lost.
+    #[tokio::test]
+    async fn test_required_sink_dlq_full_reject_holds_checkpoint() {
+        use checkpoints::MemCheckpointStore;
+        use deltaforge_config::{DlqStreamConfig, OverflowPolicy};
+        use storage::MemoryStorageBackend;
+
+        let ckpt_store = Arc::new(MemCheckpointStore::new().unwrap());
+        let storage_backend: storage::ArcStorageBackend =
+            Arc::new(MemoryStorageBackend::new());
+
+        let sink = DlqMockSink::new("kafka", vec![0]);
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+
+        let cp_fn =
+            build_commit_fn(ckpt_store.clone(), "src::sink::kafka".to_string());
+        let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![]);
+        let batch_processor =
+            build_batch_processor(processors, "test".to_string());
+
+        // A DLQ that is always full and rejects: no row can be persisted.
+        let dlq_writer = Arc::new(crate::dlq::DlqWriter::new(
+            storage_backend.clone(),
+            "test-dlq-full".to_string(),
+            DlqStreamConfig {
+                max_entries: 0,
+                max_age_secs: 0,
+                overflow_policy: OverflowPolicy::Reject,
+            },
+            256 * 1024,
+        ));
+
+        let coord = Coordinator::builder("test-dlq-full")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(10),
+                max_bytes: None,
+                max_ms: Some(100),
+                respect_source_tx: None,
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_fn("kafka", cp_fn)
+            .process_fn(batch_processor)
+            .dlq_writer(dlq_writer.clone())
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
+
+        let source = deltaforge_core::SourceInfo {
+            version: "test".into(),
+            connector: "mysql".into(),
+            name: "test".into(),
+            db: "db".into(),
+            schema: None,
+            table: "table".into(),
+            ts_ms: 0,
+            snapshot: None,
+            position: deltaforge_core::SourcePosition::default(),
+        };
+
+        let mut ev = Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
+            source,
+            deltaforge_core::Op::Create,
+            None,
+            Some(serde_json::json!({"id": 1})),
+            0,
+            0,
+        );
+        ev.set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":10}".to_vec()));
+        ev.tx_end = true;
+        tx.send(SourceItem::Event(ev)).await.unwrap();
+        drop(tx);
+
+        let result = coord.run(rx, cancel, pause_rx).await;
+        assert!(
+            result.is_err(),
+            "required sink whose DLQ rejected the row must fail closed"
+        );
+        let cp = ckpt_store.get_raw("src::sink::kafka").await.unwrap();
+        assert!(
+            cp.is_none(),
+            "checkpoint must NOT advance when the DLQ could not persist the row"
+        );
+    }
+
     /// Verify that a batch where ALL events fail serialization does not
     /// call send on the sink and all events go to DLQ.
     #[tokio::test]
@@ -4859,10 +4998,11 @@ mod tests {
         assert!(cp.is_some(), "checkpoint should be committed");
     }
 
-    /// Without a DLQ writer configured, DLQ failures in BatchResult are
-    /// silently ignored (no panic, no error). Pipeline continues normally.
+    /// R3-C1: without a DLQ writer configured, a required sink's per-row failure
+    /// has no durable home. The sink must NOT acknowledge and the checkpoint must
+    /// not advance (fail closed), rather than silently committing past the row.
     #[tokio::test]
-    async fn test_dlq_failures_ignored_when_no_writer() {
+    async fn test_required_sink_dlq_failure_no_writer_holds_checkpoint() {
         use checkpoints::MemCheckpointStore;
 
         let ckpt_store = Arc::new(MemCheckpointStore::new().unwrap());
@@ -4924,13 +5064,21 @@ mod tests {
         tx.send(SourceItem::Event(ev)).await.unwrap();
         drop(tx);
 
-        // Should not panic even with DLQ failures and no writer.
+        // R3-C1: a required sink with a per-row failure and NO DLQ has no
+        // durable home for the lost row. It must fail closed: the commit policy
+        // is not satisfied, the coordinator errors, and the checkpoint does not
+        // advance past the un-captured row (previously it silently committed).
         let result = coord.run(rx, cancel, pause_rx).await;
-        assert!(result.is_ok(), "pipeline should complete without error");
+        assert!(
+            result.is_err(),
+            "required sink with an un-routable row and no DLQ must fail closed"
+        );
 
-        // Checkpoint committed.
         let cp = ckpt_store.get_raw("src::sink::kafka").await.unwrap();
-        assert!(cp.is_some());
+        assert!(
+            cp.is_none(),
+            "checkpoint must NOT advance when a required sink dropped a row"
+        );
     }
 
     // -----------------------------------------------------------------------

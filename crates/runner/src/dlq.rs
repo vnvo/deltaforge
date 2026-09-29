@@ -19,6 +19,19 @@ use tracing::{debug, error, warn};
 /// Namespace used for all journal queue entries in the StorageBackend.
 const JOURNAL_NS: &str = "journal";
 
+/// Whether a per-row DLQ write durably captured the row. A required sink may
+/// only acknowledge a batch (and advance its checkpoint) when every isolated
+/// row is [`DlqWrite::Persisted`]; a [`DlqWrite::Dropped`] row is not durably
+/// captured and must block the checkpoint to avoid permanent data loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DlqWrite {
+    /// The row was durably appended to the DLQ with no data loss.
+    Persisted,
+    /// The row was not durably captured (overflow drop/reject, serialization
+    /// failure, or backend write failure).
+    Dropped,
+}
+
 /// DLQ writer - thin wrapper over StorageBackend.queue_* primitives.
 pub struct DlqWriter {
     backend: ArcStorageBackend,
@@ -50,10 +63,19 @@ impl DlqWriter {
 
     /// Write a failed event to the DLQ.
     ///
-    /// Handles payload truncation, overflow policy, and metrics.
-    /// Errors from the DLQ write itself are logged but do not propagate -
-    /// a broken DLQ should not stop the pipeline.
-    pub async fn write(&self, event: &Event, sink_id: &str, error: &SinkError) {
+    /// Handles payload truncation, overflow policy, and metrics. Returns whether
+    /// the row was **durably captured**: [`DlqWrite::Persisted`] only when the
+    /// entry is durably appended with no data loss, and [`DlqWrite::Dropped`]
+    /// when it was not (overflow drop/reject, serialization failure, or backend
+    /// write failure). Callers gating a required sink's acknowledgement MUST
+    /// treat `Dropped` as an unhandled failure and refuse to advance the
+    /// checkpoint - otherwise the row is permanently lost.
+    pub async fn write(
+        &self,
+        event: &Event,
+        sink_id: &str,
+        error: &SinkError,
+    ) -> DlqWrite {
         let error_kind = error.kind().to_string();
 
         // Build the journal entry.
@@ -85,7 +107,10 @@ impl DlqWriter {
         // Truncate oversized payloads.
         entry.truncate_payload(self.max_event_bytes);
 
-        // Check overflow.
+        // Check overflow. `overflow_dropped` records that satisfying this write
+        // cost previously-captured data (eviction), which is a durability loss:
+        // a required sink must not acknowledge on that basis.
+        let mut overflow_dropped = false;
         let current_len = self
             .backend
             .queue_len(JOURNAL_NS, &self.queue_key)
@@ -94,6 +119,7 @@ impl DlqWriter {
         if current_len >= self.config.max_entries {
             match self.config.overflow_policy {
                 OverflowPolicy::DropOldest => {
+                    overflow_dropped = true;
                     let to_drop =
                         (current_len - self.config.max_entries + 1) as usize;
                     if let Err(e) = self
@@ -125,7 +151,7 @@ impl DlqWriter {
                         "pipeline" => self.pipeline.clone(),
                     )
                     .increment(1);
-                    return;
+                    return DlqWrite::Dropped;
                 }
                 OverflowPolicy::Block => {
                     // Block until space is available (operator acks entries).
@@ -163,11 +189,11 @@ impl DlqWriter {
                     "pipeline" => self.pipeline.clone(),
                 )
                 .increment(1);
-                return;
+                return DlqWrite::Dropped;
             }
         };
 
-        match self
+        let outcome = match self
             .backend
             .queue_push(JOURNAL_NS, &self.queue_key, &bytes)
             .await
@@ -188,6 +214,13 @@ impl DlqWriter {
                     "error_kind" => error_kind,
                 )
                 .increment(1);
+                // Durably appended - but if we had to evict older entries to
+                // make room, that eviction is itself a loss.
+                if overflow_dropped {
+                    DlqWrite::Dropped
+                } else {
+                    DlqWrite::Persisted
+                }
             }
             Err(e) => {
                 error!(
@@ -200,11 +233,13 @@ impl DlqWriter {
                     "pipeline" => self.pipeline.clone(),
                 )
                 .increment(1);
+                DlqWrite::Dropped
             }
-        }
+        };
 
         // Update gauges.
         self.update_gauges().await;
+        outcome
     }
 
     /// Peek at the oldest N unacked entries.
