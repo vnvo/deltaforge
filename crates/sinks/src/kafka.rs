@@ -285,8 +285,8 @@ impl KafkaSink {
                 AvroEncoder::with_source_schemas(
                     schema_registry_url,
                     strategy,
-                    username.as_deref(),
-                    password.as_deref(),
+                    creds.schema_registry_username().or(username.as_deref()),
+                    creds.schema_registry_password().or(password.as_deref()),
                     source_schemas,
                 )
                 .context("creating Avro encoder")?,

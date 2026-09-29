@@ -12,8 +12,8 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 use deltaforge_config::{
-    ClickHouseSinkCfg, ElasticsearchSinkCfg, EsAuth, HttpSinkCfg, KafkaSinkCfg,
-    NatsSinkCfg, PipelineSpec, RedisSinkCfg, S3SinkCfg, SinkCfg,
+    ClickHouseSinkCfg, ElasticsearchSinkCfg, EncodingCfg, EsAuth, HttpSinkCfg,
+    KafkaSinkCfg, NatsSinkCfg, PipelineSpec, RedisSinkCfg, S3SinkCfg, SinkCfg,
 };
 use secrets::{SecretReference, SecretResolver};
 use zeroize::Zeroizing;
@@ -23,6 +23,8 @@ use zeroize::Zeroizing;
 #[derive(Default)]
 pub struct ResolvedSinkCreds {
     fields: HashMap<String, Zeroizing<String>>,
+    sr_username: Option<Zeroizing<String>>,
+    sr_password: Option<Zeroizing<String>>,
 }
 
 impl ResolvedSinkCreds {
@@ -31,9 +33,19 @@ impl ResolvedSinkCreds {
         self.fields.get(field).map(|z| z.as_str())
     }
     /// Iterate resolved (field, value) pairs - used by map-valued sinks (HTTP headers,
-    /// Kafka client_conf) that merge every resolved entry.
+    /// Kafka client_conf) that merge every resolved entry. Schema Registry credentials
+    /// are held out of this iterator so they never leak into request headers or broker
+    /// config; read them through the dedicated accessors instead.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
         self.fields.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+    /// Resolved Schema Registry basic-auth username, if a reference supplied one.
+    pub fn schema_registry_username(&self) -> Option<&str> {
+        self.sr_username.as_ref().map(|z| z.as_str())
+    }
+    /// Resolved Schema Registry basic-auth password, if a reference supplied one.
+    pub fn schema_registry_password(&self) -> Option<&str> {
+        self.sr_password.as_ref().map(|z| z.as_str())
     }
     fn insert(&mut self, field: impl Into<String>, value: Zeroizing<String>) {
         self.fields.insert(field.into(), value);
@@ -160,6 +172,8 @@ async fn resolve_redis(
             ),
         }
     }
+    resolve_encoding_sr("redis", &cfg.id, &cfg.encoding, resolver, &mut creds)
+        .await?;
     Ok(creds)
 }
 
@@ -178,6 +192,8 @@ async fn resolve_nats(
         )
         .await?;
     }
+    resolve_encoding_sr("nats", &cfg.id, &cfg.encoding, resolver, &mut creds)
+        .await?;
     Ok(creds)
 }
 
@@ -185,7 +201,7 @@ async fn resolve_http(
     cfg: &HttpSinkCfg,
     resolver: &dyn SecretResolver,
 ) -> Result<ResolvedSinkCreds> {
-    resolve_map_refs(
+    let mut creds = resolve_map_refs(
         "http",
         &cfg.id,
         "header",
@@ -193,14 +209,17 @@ async fn resolve_http(
         &cfg.secret_refs,
         resolver,
     )
-    .await
+    .await?;
+    resolve_encoding_sr("http", &cfg.id, &cfg.encoding, resolver, &mut creds)
+        .await?;
+    Ok(creds)
 }
 
 async fn resolve_kafka(
     cfg: &KafkaSinkCfg,
     resolver: &dyn SecretResolver,
 ) -> Result<ResolvedSinkCreds> {
-    resolve_map_refs(
+    let mut creds = resolve_map_refs(
         "kafka",
         &cfg.id,
         "client_conf key",
@@ -208,7 +227,10 @@ async fn resolve_kafka(
         &cfg.secret_refs,
         resolver,
     )
-    .await
+    .await?;
+    resolve_encoding_sr("kafka", &cfg.id, &cfg.encoding, resolver, &mut creds)
+        .await?;
+    Ok(creds)
 }
 
 async fn resolve_s3(
@@ -310,6 +332,48 @@ async fn resolve_map_refs(
         creds.insert(name.clone(), resolve_ref(resolver, reference).await?);
     }
     Ok(creds)
+}
+
+/// Resolve Schema Registry basic-auth references on an Avro encoding into protected
+/// values held apart from the flat field map (so they never merge into HTTP headers or
+/// Kafka client config). Rejects an inline/reference conflict; fails closed on an empty
+/// reference. Non-Avro encodings contribute nothing.
+async fn resolve_encoding_sr(
+    connector: &str,
+    id: &str,
+    encoding: &EncodingCfg,
+    resolver: &dyn SecretResolver,
+    creds: &mut ResolvedSinkCreds,
+) -> Result<()> {
+    let EncodingCfg::Avro {
+        username,
+        password,
+        username_ref,
+        password_ref,
+        ..
+    } = encoding
+    else {
+        return Ok(());
+    };
+    if username.is_some() && username_ref.is_some() {
+        bail!(
+            "{connector} sink '{id}': schema registry username sets both an \
+             inline value and a reference; use exactly one"
+        );
+    }
+    if password.is_some() && password_ref.is_some() {
+        bail!(
+            "{connector} sink '{id}': schema registry password sets both an \
+             inline value and a reference; use exactly one"
+        );
+    }
+    if let Some(reference) = username_ref {
+        creds.sr_username = Some(resolve_ref(resolver, reference).await?);
+    }
+    if let Some(reference) = password_ref {
+        creds.sr_password = Some(resolve_ref(resolver, reference).await?);
+    }
+    Ok(())
 }
 
 /// Resolve one field: reject an inline/reference conflict; resolve a reference to a
@@ -447,6 +511,61 @@ mod tests {
         let out = resolve_sink_secrets(&spec, &resolver()).await.unwrap();
         assert_eq!(out.for_sink("ch").get("password"), Some("p"));
         assert_eq!(out.for_sink("missing").get("password"), None);
+    }
+
+    fn avro(
+        password: Option<&str>,
+        password_ref: Option<SecretReference>,
+    ) -> EncodingCfg {
+        EncodingCfg::Avro {
+            schema_registry_url: "http://sr:8081".into(),
+            subject_strategy: Default::default(),
+            username: None,
+            password: password.map(String::from),
+            username_ref: None,
+            password_ref,
+            unsigned_bigint_mode: None,
+            enum_mode: None,
+            naive_timestamp_mode: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_registry_password_ref_held_apart_from_flat_map() {
+        let pw = write_secret("sr-pass");
+        let encoding = avro(
+            None,
+            Some(SecretReference::new(
+                SecretProvider::File,
+                pw.path().to_str().unwrap(),
+            )),
+        );
+        let mut creds = ResolvedSinkCreds::default();
+        resolve_encoding_sr("kafka", "k", &encoding, &resolver(), &mut creds)
+            .await
+            .unwrap();
+        assert_eq!(creds.schema_registry_password(), Some("sr-pass"));
+        // Must not merge into the flat map that HTTP headers / Kafka config draw from.
+        assert_eq!(creds.iter().count(), 0);
+        assert_eq!(creds.get("password"), None);
+    }
+
+    #[tokio::test]
+    async fn schema_registry_inline_and_ref_conflict_rejected() {
+        let encoding = avro(
+            Some("inline"),
+            Some(SecretReference::new(SecretProvider::File, "/x")),
+        );
+        let mut creds = ResolvedSinkCreds::default();
+        let err = resolve_encoding_sr(
+            "kafka",
+            "k",
+            &encoding,
+            &resolver(),
+            &mut creds,
+        )
+        .await;
+        assert!(err.is_err());
     }
 
     fn spec_with(sinks: Vec<SinkCfg>) -> PipelineSpec {

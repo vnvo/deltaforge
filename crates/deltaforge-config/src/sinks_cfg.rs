@@ -55,7 +55,11 @@ pub enum EnvelopeCfg {
 /// Supports two YAML forms:
 /// - Simple: `encoding: json`
 /// - Structured: `encoding: { type: avro, schema_registry_url: "..." }`
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+// Parsed once per pipeline at config load, never in a hot path, so the size
+// difference between the unit `Json` variant and the credential-bearing `Avro`
+// variant is not worth a heap indirection.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub enum EncodingCfg {
     /// JSON encoding (UTF-8).
     #[default]
@@ -79,11 +83,21 @@ pub enum EncodingCfg {
         /// Subject naming strategy for schema registration.
         subject_strategy: SubjectStrategy,
 
-        /// Basic auth username for Schema Registry.
+        /// Basic auth username for Schema Registry. **Deprecated** as an inline secret;
+        /// prefer `username_ref`.
         username: Option<String>,
 
-        /// Basic auth password for Schema Registry.
+        /// Basic auth password for Schema Registry. **Deprecated** as an inline secret;
+        /// prefer `password_ref`.
         password: Option<String>,
+
+        /// Reference resolving the Schema Registry username (mutually exclusive with
+        /// `username`).
+        username_ref: Option<secrets::SecretReference>,
+
+        /// Reference resolving the Schema Registry password (mutually exclusive with
+        /// `password`).
+        password_ref: Option<secrets::SecretReference>,
 
         /// How to map MySQL BIGINT UNSIGNED. Default: "string" (safe).
         /// "long" risks overflow for values >= 2^63.
@@ -99,6 +113,36 @@ pub enum EncodingCfg {
     },
 }
 
+impl std::fmt::Debug for EncodingCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EncodingCfg::Json => f.write_str("Json"),
+            EncodingCfg::Avro {
+                schema_registry_url,
+                subject_strategy,
+                username,
+                password,
+                username_ref,
+                password_ref,
+                unsigned_bigint_mode,
+                enum_mode,
+                naive_timestamp_mode,
+            } => f
+                .debug_struct("Avro")
+                .field("schema_registry_url", schema_registry_url)
+                .field("subject_strategy", subject_strategy)
+                .field("username", &redact_opt(username))
+                .field("password", &redact_opt(password))
+                .field("username_ref", username_ref)
+                .field("password_ref", password_ref)
+                .field("unsigned_bigint_mode", unsigned_bigint_mode)
+                .field("enum_mode", enum_mode)
+                .field("naive_timestamp_mode", naive_timestamp_mode)
+                .finish(),
+        }
+    }
+}
+
 impl Serialize for EncodingCfg {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -111,6 +155,8 @@ impl Serialize for EncodingCfg {
                 subject_strategy,
                 username,
                 password,
+                username_ref,
+                password_ref,
                 unsigned_bigint_mode,
                 enum_mode,
                 naive_timestamp_mode,
@@ -128,6 +174,12 @@ impl Serialize for EncodingCfg {
                 }
                 if let Some(p) = password {
                     map.serialize_entry("password", p)?;
+                }
+                if let Some(r) = username_ref {
+                    map.serialize_entry("username_ref", r)?;
+                }
+                if let Some(r) = password_ref {
+                    map.serialize_entry("password_ref", r)?;
                 }
                 if let Some(v) = unsigned_bigint_mode {
                     map.serialize_entry("unsigned_bigint_mode", v)?;
@@ -186,6 +238,7 @@ impl<'de> Deserialize<'de> for EncodingCfg {
                 self,
                 map: A,
             ) -> Result<Self::Value, A::Error> {
+                #[allow(clippy::large_enum_variant)]
                 #[derive(Deserialize)]
                 #[serde(tag = "type", rename_all = "lowercase")]
                 enum Tagged {
@@ -198,6 +251,10 @@ impl<'de> Deserialize<'de> for EncodingCfg {
                         username: Option<String>,
                         #[serde(default)]
                         password: Option<String>,
+                        #[serde(default)]
+                        username_ref: Option<secrets::SecretReference>,
+                        #[serde(default)]
+                        password_ref: Option<secrets::SecretReference>,
                         #[serde(default)]
                         unsigned_bigint_mode: Option<String>,
                         #[serde(default)]
@@ -216,6 +273,8 @@ impl<'de> Deserialize<'de> for EncodingCfg {
                         subject_strategy,
                         username,
                         password,
+                        username_ref,
+                        password_ref,
                         unsigned_bigint_mode,
                         enum_mode,
                         naive_timestamp_mode,
@@ -224,6 +283,8 @@ impl<'de> Deserialize<'de> for EncodingCfg {
                         subject_strategy,
                         username,
                         password,
+                        username_ref,
+                        password_ref,
                         unsigned_bigint_mode,
                         enum_mode,
                         naive_timestamp_mode,
