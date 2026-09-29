@@ -172,6 +172,7 @@ impl KafkaSink {
         cancel: CancellationToken,
         pipeline: &str,
         source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
+        creds: &crate::ResolvedSinkCreds,
     ) -> anyhow::Result<Self> {
         let mut client_cfg = ClientConfig::new();
 
@@ -234,6 +235,12 @@ impl KafkaSink {
         for (k, v) in &cfg.client_conf {
             client_cfg.set(k, v);
         }
+        // Merge resolved client_conf references (protected runtime values, e.g.
+        // sasl.password). A key cannot collide with an inline one (rejected during
+        // resolution).
+        for (k, v) in creds.iter() {
+            client_cfg.set(k, v);
+        }
 
         let context = KafkaMetricsContext {
             pipeline: pipeline.to_string(),
@@ -278,8 +285,8 @@ impl KafkaSink {
                 AvroEncoder::with_source_schemas(
                     schema_registry_url,
                     strategy,
-                    username.as_deref(),
-                    password.as_deref(),
+                    creds.schema_registry_username().or(username.as_deref()),
+                    creds.schema_registry_password().or(password.as_deref()),
                     source_schemas,
                 )
                 .context("creating Avro encoder")?,

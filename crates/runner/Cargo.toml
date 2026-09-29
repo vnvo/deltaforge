@@ -37,6 +37,9 @@ o11y = { path = "../o11y" }
 schema-registry = { path = "../schema-registry" }
 sources = { path = "../sources" }
 sinks = { path = "../sinks" }
+secrets = { path = "../secrets" }
+common = { path = "../common" }
+zeroize = "1"
 processors = { path = "../processors" }
 arrow-schema = "58"
 rest-api = { path = "../rest-api" }
@@ -44,6 +47,8 @@ checkpoints = { path = "../checkpoints" }
 tikv-jemallocator = { version = "0.6", optional = true }
 
 [dev-dependencies]
+tempfile = "3"
+serde_yaml.workspace = true
 criterion = { version = "0.5", features = ["async_tokio"] }
 testcontainers = "0.25"
 ctor = "0.6"

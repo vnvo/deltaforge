@@ -29,6 +29,8 @@ pub struct ObjectStoreParams {
     pub access_key_id: Option<String>,
     /// Inline secret key (env-expanded by caller).
     pub secret_access_key: Option<String>,
+    /// Optional session token for temporary AWS credentials.
+    pub session_token: Option<String>,
     /// Force path-style addressing (`endpoint/bucket/key` vs `bucket.endpoint/key`).
     /// MinIO and most non-AWS S3 services need this.
     pub virtual_hosted_style: bool,
@@ -49,6 +51,7 @@ impl ObjectStoreParams {
             region: Some("us-east-1".to_string()),
             access_key_id: Some(access_key_id.into()),
             secret_access_key: Some(secret_access_key.into()),
+            session_token: None,
             virtual_hosted_style: false,
             local: false,
         }
@@ -61,10 +64,51 @@ impl ObjectStoreParams {
             region: None,
             access_key_id: None,
             secret_access_key: None,
+            session_token: None,
             virtual_hosted_style: false,
             local: true,
         }
     }
+}
+
+/// Compute `ObjectStoreParams` from an S3 sink config plus resolved credential
+/// references. A reference wins over the inline (deprecated) value; inline values are
+/// `${ENV}`-expanded. Providing one of access key / secret key without the other is a
+/// fail-closed error; providing neither uses the ambient AWS credential chain.
+pub fn s3_object_store_params(
+    cfg: &deltaforge_config::S3SinkCfg,
+    creds: &crate::ResolvedSinkCreds,
+) -> Result<ObjectStoreParams> {
+    let eff =
+        |field: &str, inline: &Option<String>| -> Result<Option<String>> {
+            if let Some(v) = creds.get(field) {
+                return Ok(Some(v.to_string()));
+            }
+            match inline {
+                Some(s) => Ok(Some(shellexpand::env(s)?.into_owned())),
+                None => Ok(None),
+            }
+        };
+    let access_key_id = eff("access_key_id", &cfg.access_key_id)?;
+    let secret_access_key = eff("secret_access_key", &cfg.secret_access_key)?;
+    if access_key_id.is_some() != secret_access_key.is_some() {
+        anyhow::bail!(
+            "s3 sink '{}': access_key_id and secret_access_key must be set \
+             together (or both omitted to use the ambient AWS identity)",
+            cfg.id
+        );
+    }
+    let session_token = eff("session_token", &cfg.session_token)?;
+    Ok(ObjectStoreParams {
+        bucket: cfg.bucket.clone(),
+        endpoint: cfg.endpoint.clone(),
+        region: cfg.region.clone(),
+        access_key_id,
+        secret_access_key,
+        session_token,
+        virtual_hosted_style: cfg.virtual_hosted_style,
+        local: cfg.local,
+    })
 }
 
 /// Build an `ObjectStore` client from params. Lives behind an Arc because
@@ -99,6 +143,11 @@ pub fn build_object_store(
         builder = builder
             .with_access_key_id(key)
             .with_secret_access_key(secret);
+    }
+    // else: no static keys -> AmazonS3Builder uses the ambient AWS credential chain
+    // (IAM instance/role, env, profile), a first-class no-static-secret mode.
+    if let Some(token) = &params.session_token {
+        builder = builder.with_token(token);
     }
     builder =
         builder.with_virtual_hosted_style_request(params.virtual_hosted_style);

@@ -47,12 +47,16 @@ pub mod kafka;
 pub mod nats;
 pub mod redis;
 pub mod s3;
+pub mod secret_resolve;
 pub use filter::FilteredSink;
 pub use http::HttpSink;
 pub use kafka::KafkaSink;
 pub use nats::NatsSink;
 pub use redis::RedisSink;
 pub use s3::{S3Sink, build_s3_sink};
+pub use secret_resolve::{
+    ResolvedSinkCreds, ResolvedSinkSecrets, resolve_sink_secrets,
+};
 
 /// Build all sinks from a pipeline specification.
 ///
@@ -101,12 +105,22 @@ pub fn build_sinks(
     cancel: CancellationToken,
     pipeline: &str,
 ) -> anyhow::Result<Vec<ArcDynSink>> {
-    build_sinks_with_schemas(ps, cancel, pipeline, None, None, None, None)
+    build_sinks_with_schemas(
+        ps,
+        cancel,
+        pipeline,
+        None,
+        None,
+        None,
+        None,
+        &ResolvedSinkSecrets::default(),
+    )
 }
 
 /// Build all sinks, optionally injecting a DDL-derived schema provider for
 /// Avro encoding (Path A), an Arrow `SchemaResolver` for the S3 sink, and/or a
 /// `ClickHouseSchemaResolver` (source columns + PK) for the ClickHouse sink.
+#[allow(clippy::too_many_arguments)]
 pub fn build_sinks_with_schemas(
     ps: &PipelineSpec,
     cancel: CancellationToken,
@@ -115,6 +129,7 @@ pub fn build_sinks_with_schemas(
     arrow_schema_resolver: Option<s3::SchemaResolver>,
     clickhouse_resolver: Option<clickhouse::ClickHouseSchemaResolver>,
     es_resolver: Option<elasticsearch::EsSchemaResolver>,
+    secrets: &ResolvedSinkSecrets,
 ) -> anyhow::Result<Vec<ArcDynSink>> {
     // Public API: NEVER silently omit a configured sink. A durable_v2 S3 sink
     // cannot be built here (it needs async probe/recovery + an injected
@@ -127,6 +142,7 @@ pub fn build_sinks_with_schemas(
         arrow_schema_resolver,
         clickhouse_resolver,
         es_resolver,
+        secrets,
         /* defer_durable_s3 */ false,
     )
 }
@@ -135,6 +151,7 @@ pub fn build_sinks_with_schemas(
 /// them async with an injected comparator after the durable-startup guard). All
 /// other sinks are built here. Callers MUST then build the deferred durable
 /// sinks and validate the final sink set against configuration.
+#[allow(clippy::too_many_arguments)]
 pub fn build_sinks_deferring_durable_s3(
     ps: &PipelineSpec,
     cancel: CancellationToken,
@@ -143,6 +160,7 @@ pub fn build_sinks_deferring_durable_s3(
     arrow_schema_resolver: Option<s3::SchemaResolver>,
     clickhouse_resolver: Option<clickhouse::ClickHouseSchemaResolver>,
     es_resolver: Option<elasticsearch::EsSchemaResolver>,
+    secrets: &ResolvedSinkSecrets,
 ) -> anyhow::Result<Vec<ArcDynSink>> {
     build_sinks_impl(
         ps,
@@ -152,6 +170,7 @@ pub fn build_sinks_deferring_durable_s3(
         arrow_schema_resolver,
         clickhouse_resolver,
         es_resolver,
+        secrets,
         /* defer_durable_s3 */ true,
     )
 }
@@ -165,6 +184,7 @@ fn build_sinks_impl(
     arrow_schema_resolver: Option<s3::SchemaResolver>,
     clickhouse_resolver: Option<clickhouse::ClickHouseSchemaResolver>,
     es_resolver: Option<elasticsearch::EsSchemaResolver>,
+    secrets: &ResolvedSinkSecrets,
     defer_durable_s3: bool,
 ) -> anyhow::Result<Vec<ArcDynSink>> {
     ps.spec
@@ -195,6 +215,7 @@ fn build_sinks_impl(
                             cancel.clone(),
                             pipeline,
                             source_schemas.clone(),
+                            secrets.for_sink(&cfg.id),
                         )?) as ArcDynSink,
                         cfg.filter.clone(),
                     ),
@@ -204,6 +225,7 @@ fn build_sinks_impl(
                             cancel.clone(),
                             pipeline,
                             source_schemas.clone(),
+                            secrets.for_sink(&cfg.id),
                         )?) as ArcDynSink,
                         cfg.filter.clone(),
                     ),
@@ -213,6 +235,7 @@ fn build_sinks_impl(
                             cancel.clone(),
                             pipeline,
                             source_schemas.clone(),
+                            secrets.for_sink(&cfg.id),
                         )?) as ArcDynSink,
                         cfg.filter.clone(),
                     ),
@@ -222,6 +245,7 @@ fn build_sinks_impl(
                             cancel.clone(),
                             pipeline,
                             source_schemas.clone(),
+                            secrets.for_sink(&cfg.id),
                         )?) as ArcDynSink,
                         cfg.filter.clone(),
                     ),
@@ -231,6 +255,7 @@ fn build_sinks_impl(
                             cancel.clone(),
                             pipeline,
                             arrow_schema_resolver.clone(),
+                            secrets.for_sink(&cfg.id),
                         )?) as ArcDynSink,
                         cfg.filter.clone(),
                     ),
@@ -240,6 +265,7 @@ fn build_sinks_impl(
                             cancel.clone(),
                             pipeline,
                             clickhouse_resolver.clone(),
+                            secrets.for_sink(&cfg.id),
                         )?) as ArcDynSink,
                         // v1: ClickHouse sink does not support sink-level filters.
                         None,
@@ -250,6 +276,7 @@ fn build_sinks_impl(
                             cancel.clone(),
                             pipeline,
                             es_resolver.clone(),
+                            secrets.for_sink(&cfg.id),
                         )?) as ArcDynSink,
                         // v1: Elasticsearch sink does not support sink-level filters.
                         None,
@@ -282,33 +309,56 @@ pub fn build_sink(
     pipeline: &str,
 ) -> anyhow::Result<ArcDynSink> {
     let sink: ArcDynSink = match cfg {
-        SinkCfg::Kafka(kafka_cfg) => {
-            Arc::new(KafkaSink::new(kafka_cfg, cancel, pipeline, None)?)
-                as ArcDynSink
-        }
-        SinkCfg::Redis(redis_cfg) => {
-            Arc::new(RedisSink::new(redis_cfg, cancel, pipeline, None)?)
-                as ArcDynSink
-        }
-        SinkCfg::Nats(nats_sink_cfg) => {
-            Arc::new(NatsSink::new(nats_sink_cfg, cancel, pipeline, None)?)
-                as ArcDynSink
-        }
-        SinkCfg::Http(http_cfg) => {
-            Arc::new(HttpSink::new(http_cfg, cancel, pipeline, None)?)
-                as ArcDynSink
-        }
-        SinkCfg::S3(s3_cfg) => {
-            Arc::new(build_s3_sink(s3_cfg, cancel, pipeline, None)?)
-                as ArcDynSink
-        }
+        SinkCfg::Kafka(kafka_cfg) => Arc::new(KafkaSink::new(
+            kafka_cfg,
+            cancel,
+            pipeline,
+            None,
+            &ResolvedSinkCreds::default(),
+        )?) as ArcDynSink,
+        SinkCfg::Redis(redis_cfg) => Arc::new(RedisSink::new(
+            redis_cfg,
+            cancel,
+            pipeline,
+            None,
+            &ResolvedSinkCreds::default(),
+        )?) as ArcDynSink,
+        SinkCfg::Nats(nats_sink_cfg) => Arc::new(NatsSink::new(
+            nats_sink_cfg,
+            cancel,
+            pipeline,
+            None,
+            &ResolvedSinkCreds::default(),
+        )?) as ArcDynSink,
+        SinkCfg::Http(http_cfg) => Arc::new(HttpSink::new(
+            http_cfg,
+            cancel,
+            pipeline,
+            None,
+            &ResolvedSinkCreds::default(),
+        )?) as ArcDynSink,
+        SinkCfg::S3(s3_cfg) => Arc::new(build_s3_sink(
+            s3_cfg,
+            cancel,
+            pipeline,
+            None,
+            &ResolvedSinkCreds::default(),
+        )?) as ArcDynSink,
         SinkCfg::Elasticsearch(cfg) => {
             Arc::new(elasticsearch::build_elasticsearch_sink(
-                cfg, cancel, pipeline, None,
+                cfg,
+                cancel,
+                pipeline,
+                None,
+                &ResolvedSinkCreds::default(),
             )?) as ArcDynSink
         }
         SinkCfg::ClickHouse(cfg) => Arc::new(clickhouse::build_clickhouse_sink(
-            cfg, cancel, pipeline, None,
+            cfg,
+            cancel,
+            pipeline,
+            None,
+            &ResolvedSinkCreds::default(),
         )?) as ArcDynSink,
     };
     Ok(sink)
@@ -331,12 +381,14 @@ mod tests {
             CancellationToken,
             &str,
             Option<Arc<dyn SourceSchemaProvider>>,
+            &ResolvedSinkCreds,
         ) -> anyhow::Result<KafkaSink> = KafkaSink::new;
         let _: fn(
             &RedisSinkCfg,
             CancellationToken,
             &str,
             Option<Arc<dyn SourceSchemaProvider>>,
+            &ResolvedSinkCreds,
         ) -> anyhow::Result<RedisSink> = RedisSink::new;
     }
 

@@ -25,6 +25,8 @@ tokio-util.workspace = true
 deltaforge-core = { path = "../deltaforge-core" }
 deltaforge-config = { path = "../deltaforge-config" }
 common = { path = "../common" }
+secrets = { path = "../secrets" }
+zeroize = "1"
 
 # S3 / Parquet / JSONL file sink
 object_store = { version = "0.13", features = ["aws"] }
@@ -46,6 +48,7 @@ chrono.workspace = true
 uuid.workspace = true
 testcontainers = "0.25"
 tempfile = "3"
+serde_yaml = "0.9"
 metrics-util = "0.19"
 tracing.workspace = true
 apache-avro.workspace = true

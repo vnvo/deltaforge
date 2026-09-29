@@ -141,6 +141,13 @@ pub struct Spec {
     /// instead of blocking the pipeline.
     #[serde(default)]
     pub journal: Option<JournalConfig>,
+
+    /// Pipeline-level secret-provider configuration. Assembles the shared resolver used
+    /// for both source and sink credential references (Vault connection/auth, projected-
+    /// volume file root, size policy). When absent, the resolver falls back to the
+    /// source's rotation configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<SecretProvidersCfg>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -184,6 +191,53 @@ pub struct SourceCredentialsCfg {
     pub username: Option<secrets::SecretReference>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<secrets::SecretReference>,
+}
+
+/// Username/password credential references shared by storage and sinks. Like
+/// [`SourceCredentialsCfg`] but connector-agnostic. Each field is a
+/// [`SecretReference`](secrets::SecretReference) (never a value).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CredentialRefsCfg {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<secrets::SecretReference>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<secrets::SecretReference>,
+}
+
+/// Pipeline-level secret-provider configuration. It assembles the single resolver
+/// shared by **both** source and sink credential resolution, so a `vault` or
+/// projected-volume `file` reference on any sink works even when the source uses
+/// ordinary (non-rotating) credentials. Independent of source rotation; when this is
+/// absent the resolver falls back to the source's rotation configuration for backward
+/// compatibility.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecretProvidersCfg {
+    /// Vault connection/auth for resolving `vault` references from the source or any
+    /// sink. Reuses the same shape as a Vault rotation trigger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault: Option<VaultRotationCfg>,
+    /// Trusted root that enables projected-volume (symlink) `file` references for source
+    /// and sink credentials. When unset, `file` references must be regular files (strict
+    /// mode, no symlink traversal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projected_file_root: Option<std::path::PathBuf>,
+    /// Maximum size of any single resolved secret value.
+    #[serde(default = "default_pipeline_max_secret_bytes")]
+    pub max_secret_bytes: usize,
+}
+
+fn default_pipeline_max_secret_bytes() -> usize {
+    secrets::DEFAULT_MAX_SECRET_BYTES
+}
+
+impl Default for SecretProvidersCfg {
+    fn default() -> Self {
+        Self {
+            vault: None,
+            projected_file_root: None,
+            max_secret_bytes: default_pipeline_max_secret_bytes(),
+        }
+    }
 }
 
 /// Opt-in controlled credential rotation for a source. When set, the source

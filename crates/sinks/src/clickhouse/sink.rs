@@ -181,19 +181,26 @@ pub fn build_clickhouse_sink(
     _cancel: CancellationToken,
     pipeline: &str,
     resolver: Option<ClickHouseSchemaResolver>,
+    creds: &crate::ResolvedSinkCreds,
 ) -> anyhow::Result<ClickHouseSink> {
-    // Expand ${ENV} in user/password like other DSNs.
-    let expand = |o: &Option<String>| -> anyhow::Result<Option<String>> {
-        match o {
+    // Effective credential: a resolved reference (protected runtime value) wins; otherwise
+    // fall back to the inline (deprecated) field with `${ENV}` expansion. Resolved values
+    // are never written back into the config.
+    let effective = |field: &str,
+                     inline: &Option<String>|
+     -> anyhow::Result<Option<String>> {
+        if let Some(v) = creds.get(field) {
+            return Ok(Some(v.to_string()));
+        }
+        match inline {
             Some(s) => Ok(Some(shellexpand::env(s)?.into_owned())),
             None => Ok(None),
         }
     };
-    let mut expanded = cfg.clone();
-    expanded.user = expand(&cfg.user)?;
-    expanded.password = expand(&cfg.password)?;
+    let user = effective("user", &cfg.user)?;
+    let password = effective("password", &cfg.password)?;
 
-    let client = ClickHouseClient::new(&expanded)?;
+    let client = ClickHouseClient::new(cfg, user, password)?;
     if resolver.is_none() {
         warn!(
             sink = %cfg.id,

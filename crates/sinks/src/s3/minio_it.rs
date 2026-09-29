@@ -124,6 +124,7 @@ fn it_store() -> Arc<ObjectStoreConditional> {
         ),
         access_key_id: Some(require_env("DELTAFORGE_IT_S3_ACCESS_KEY")),
         secret_access_key: Some(require_env("DELTAFORGE_IT_S3_SECRET_KEY")),
+        session_token: None,
         virtual_hosted_style: false,
         local: false,
     };

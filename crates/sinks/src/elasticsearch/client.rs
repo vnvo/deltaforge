@@ -1,7 +1,69 @@
 //! Elasticsearch HTTP transport: `_bulk` and index creation over reqwest.
 
 use async_trait::async_trait;
-use deltaforge_config::{ElasticsearchSinkCfg, EsAuth};
+use deltaforge_config::ElasticsearchSinkCfg;
+
+/// Effective ES auth after reference resolution (protected runtime values; never
+/// serialized). Distinct from the config `EsAuth`, which may carry references.
+#[derive(Clone, Default)]
+pub enum EsAuthResolved {
+    Basic {
+        username: String,
+        password: zeroize::Zeroizing<String>,
+    },
+    ApiKey {
+        api_key: zeroize::Zeroizing<String>,
+    },
+    #[default]
+    None,
+}
+
+/// Compute the effective ES auth from config auth (which may carry references) plus the
+/// resolved credential values. A reference wins over an inline value; inline values are
+/// `${ENV}`-expanded. Basic requires both username and password; ApiKey requires the key.
+pub fn resolve_es_auth(
+    cfg_auth: &Option<deltaforge_config::EsAuth>,
+    creds: &crate::ResolvedSinkCreds,
+) -> anyhow::Result<EsAuthResolved> {
+    use deltaforge_config::EsAuth;
+    let eff = |field: &str,
+               inline: &Option<String>|
+     -> anyhow::Result<Option<String>> {
+        if let Some(v) = creds.get(field) {
+            return Ok(Some(v.to_string()));
+        }
+        match inline {
+            Some(s) => Ok(Some(shellexpand::env(s)?.into_owned())),
+            None => Ok(None),
+        }
+    };
+    match cfg_auth {
+        None | Some(EsAuth::None) => Ok(EsAuthResolved::None),
+        Some(EsAuth::Basic {
+            username, password, ..
+        }) => match (eff("username", username)?, eff("password", password)?) {
+            (Some(u), Some(p)) => Ok(EsAuthResolved::Basic {
+                username: u,
+                password: zeroize::Zeroizing::new(p),
+            }),
+            _ => anyhow::bail!(
+                "elasticsearch basic auth requires both username and password \
+                 (inline or reference)"
+            ),
+        },
+        Some(EsAuth::ApiKey { api_key, .. }) => {
+            match eff("api_key", api_key)? {
+                Some(k) => Ok(EsAuthResolved::ApiKey {
+                    api_key: zeroize::Zeroizing::new(k),
+                }),
+                None => anyhow::bail!(
+                    "elasticsearch api_key auth requires api_key (inline or \
+                     reference)"
+                ),
+            }
+        }
+    }
+}
 use deltaforge_core::SinkError;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -24,12 +86,15 @@ pub trait EsTransport: Send + Sync {
 pub struct ElasticsearchClient {
     http: reqwest::Client,
     base: String,
-    auth: Option<EsAuth>,
+    auth: EsAuthResolved,
     timeout: Duration,
 }
 
 impl ElasticsearchClient {
-    pub fn new(cfg: &ElasticsearchSinkCfg) -> anyhow::Result<Self> {
+    pub fn new(
+        cfg: &ElasticsearchSinkCfg,
+        auth: EsAuthResolved,
+    ) -> anyhow::Result<Self> {
         let mut b = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.send_timeout_secs));
         if let Some(tls) = &cfg.tls {
@@ -47,7 +112,7 @@ impl ElasticsearchClient {
         Ok(Self {
             http: b.build()?,
             base: cfg.url.trim_end_matches('/').to_string(),
-            auth: cfg.auth.clone(),
+            auth,
             timeout: Duration::from_secs(cfg.send_timeout_secs),
         })
     }
@@ -66,13 +131,14 @@ impl ElasticsearchClient {
         req: reqwest::RequestBuilder,
     ) -> reqwest::RequestBuilder {
         match &self.auth {
-            Some(EsAuth::Basic { username, password }) => {
-                req.basic_auth(username, Some(password))
+            EsAuthResolved::Basic { username, password } => {
+                req.basic_auth(username, Some(password.as_str()))
             }
-            Some(EsAuth::ApiKey { api_key }) => {
-                req.header("Authorization", format!("ApiKey {api_key}"))
-            }
-            Some(EsAuth::None) | None => req,
+            EsAuthResolved::ApiKey { api_key } => req.header(
+                "Authorization",
+                format!("ApiKey {}", api_key.as_str()),
+            ),
+            EsAuthResolved::None => req,
         }
     }
 
@@ -176,9 +242,11 @@ mod tests {
             id_fields: vec![],
             id_separator: "_".into(),
             version_source: EsVersionSource::SourcePosition,
-            auth: Some(EsAuth::Basic {
-                username: "elastic".into(),
-                password: "pw".into(),
+            auth: Some(deltaforge_config::EsAuth::Basic {
+                username: Some("elastic".into()),
+                password: Some("pw".into()),
+                username_ref: None,
+                password_ref: None,
             }),
             tls: None,
             send_timeout_secs: 30,
@@ -188,7 +256,7 @@ mod tests {
 
     #[test]
     fn builds_client_and_urls() {
-        let c = ElasticsearchClient::new(&cfg()).unwrap();
+        let c = ElasticsearchClient::new(&cfg(), EsAuthResolved::None).unwrap();
         assert_eq!(c.bulk_url(), "http://es:9200/_bulk");
         assert_eq!(c.index_url("orders"), "http://es:9200/orders");
     }
@@ -197,7 +265,7 @@ mod tests {
     fn trims_trailing_slash_from_base() {
         let mut cf = cfg();
         cf.url = "http://es:9200/".into();
-        let c = ElasticsearchClient::new(&cf).unwrap();
+        let c = ElasticsearchClient::new(&cf, EsAuthResolved::None).unwrap();
         assert_eq!(c.bulk_url(), "http://es:9200/_bulk");
     }
 }

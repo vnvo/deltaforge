@@ -54,6 +54,7 @@ impl HttpSink {
         cancel: CancellationToken,
         pipeline: &str,
         source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
+        creds: &crate::ResolvedSinkCreds,
     ) -> anyhow::Result<Self> {
         let connect_timeout = cfg
             .connect_timeout_secs
@@ -116,6 +117,19 @@ impl HttpSink {
                 })?;
             headers.insert(header_name, header_value);
         }
+        // Merge resolved header references (protected runtime values). A name cannot
+        // collide with an inline header (rejected during resolution).
+        for (key, value) in creds.iter() {
+            let header_name =
+                key.parse::<reqwest::header::HeaderName>().map_err(|e| {
+                    anyhow::anyhow!("invalid header name '{key}': {e}")
+                })?;
+            let header_value =
+                value.parse::<reqwest::header::HeaderValue>().map_err(|e| {
+                    anyhow::anyhow!("invalid header value for '{key}': {e}")
+                })?;
+            headers.insert(header_name, header_value);
+        }
 
         let envelope_type = cfg.envelope.to_envelope_type();
         let encoding_type = cfg.encoding.to_encoding_type();
@@ -141,8 +155,8 @@ impl HttpSink {
                 AvroEncoder::with_source_schemas(
                     schema_registry_url,
                     strategy,
-                    username.as_deref(),
-                    password.as_deref(),
+                    creds.schema_registry_username().or(username.as_deref()),
+                    creds.schema_registry_password().or(password.as_deref()),
                     source_schemas,
                 )
                 .context("creating Avro encoder")?,

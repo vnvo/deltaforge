@@ -1,6 +1,19 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Debug helper: show a present inline secret as a redaction, `None` otherwise.
+fn redact_opt(v: &Option<String>) -> Option<&'static str> {
+    v.as_ref().map(|_| "***REDACTED***")
+}
+
+/// Debug helper: show a string map's keys with redacted values (values may be secrets,
+/// e.g. HTTP header tokens or Kafka SASL entries). Ordered for stable output.
+fn redact_map_values(
+    m: &HashMap<String, String>,
+) -> std::collections::BTreeMap<&str, &'static str> {
+    m.keys().map(|k| (k.as_str(), "***REDACTED***")).collect()
+}
+
 // ============================================================================
 // Envelope Configuration
 // ============================================================================
@@ -42,7 +55,11 @@ pub enum EnvelopeCfg {
 /// Supports two YAML forms:
 /// - Simple: `encoding: json`
 /// - Structured: `encoding: { type: avro, schema_registry_url: "..." }`
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+// Parsed once per pipeline at config load, never in a hot path, so the size
+// difference between the unit `Json` variant and the credential-bearing `Avro`
+// variant is not worth a heap indirection.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub enum EncodingCfg {
     /// JSON encoding (UTF-8).
     #[default]
@@ -66,11 +83,21 @@ pub enum EncodingCfg {
         /// Subject naming strategy for schema registration.
         subject_strategy: SubjectStrategy,
 
-        /// Basic auth username for Schema Registry.
+        /// Basic auth username for Schema Registry. **Deprecated** as an inline secret;
+        /// prefer `username_ref`.
         username: Option<String>,
 
-        /// Basic auth password for Schema Registry.
+        /// Basic auth password for Schema Registry. **Deprecated** as an inline secret;
+        /// prefer `password_ref`.
         password: Option<String>,
+
+        /// Reference resolving the Schema Registry username (mutually exclusive with
+        /// `username`).
+        username_ref: Option<secrets::SecretReference>,
+
+        /// Reference resolving the Schema Registry password (mutually exclusive with
+        /// `password`).
+        password_ref: Option<secrets::SecretReference>,
 
         /// How to map MySQL BIGINT UNSIGNED. Default: "string" (safe).
         /// "long" risks overflow for values >= 2^63.
@@ -86,6 +113,36 @@ pub enum EncodingCfg {
     },
 }
 
+impl std::fmt::Debug for EncodingCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EncodingCfg::Json => f.write_str("Json"),
+            EncodingCfg::Avro {
+                schema_registry_url,
+                subject_strategy,
+                username,
+                password,
+                username_ref,
+                password_ref,
+                unsigned_bigint_mode,
+                enum_mode,
+                naive_timestamp_mode,
+            } => f
+                .debug_struct("Avro")
+                .field("schema_registry_url", schema_registry_url)
+                .field("subject_strategy", subject_strategy)
+                .field("username", &redact_opt(username))
+                .field("password", &redact_opt(password))
+                .field("username_ref", username_ref)
+                .field("password_ref", password_ref)
+                .field("unsigned_bigint_mode", unsigned_bigint_mode)
+                .field("enum_mode", enum_mode)
+                .field("naive_timestamp_mode", naive_timestamp_mode)
+                .finish(),
+        }
+    }
+}
+
 impl Serialize for EncodingCfg {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -98,6 +155,8 @@ impl Serialize for EncodingCfg {
                 subject_strategy,
                 username,
                 password,
+                username_ref,
+                password_ref,
                 unsigned_bigint_mode,
                 enum_mode,
                 naive_timestamp_mode,
@@ -115,6 +174,12 @@ impl Serialize for EncodingCfg {
                 }
                 if let Some(p) = password {
                     map.serialize_entry("password", p)?;
+                }
+                if let Some(r) = username_ref {
+                    map.serialize_entry("username_ref", r)?;
+                }
+                if let Some(r) = password_ref {
+                    map.serialize_entry("password_ref", r)?;
                 }
                 if let Some(v) = unsigned_bigint_mode {
                     map.serialize_entry("unsigned_bigint_mode", v)?;
@@ -173,6 +238,7 @@ impl<'de> Deserialize<'de> for EncodingCfg {
                 self,
                 map: A,
             ) -> Result<Self::Value, A::Error> {
+                #[allow(clippy::large_enum_variant)]
                 #[derive(Deserialize)]
                 #[serde(tag = "type", rename_all = "lowercase")]
                 enum Tagged {
@@ -185,6 +251,10 @@ impl<'de> Deserialize<'de> for EncodingCfg {
                         username: Option<String>,
                         #[serde(default)]
                         password: Option<String>,
+                        #[serde(default)]
+                        username_ref: Option<secrets::SecretReference>,
+                        #[serde(default)]
+                        password_ref: Option<secrets::SecretReference>,
                         #[serde(default)]
                         unsigned_bigint_mode: Option<String>,
                         #[serde(default)]
@@ -203,6 +273,8 @@ impl<'de> Deserialize<'de> for EncodingCfg {
                         subject_strategy,
                         username,
                         password,
+                        username_ref,
+                        password_ref,
                         unsigned_bigint_mode,
                         enum_mode,
                         naive_timestamp_mode,
@@ -211,6 +283,8 @@ impl<'de> Deserialize<'de> for EncodingCfg {
                         subject_strategy,
                         username,
                         password,
+                        username_ref,
+                        password_ref,
                         unsigned_bigint_mode,
                         enum_mode,
                         naive_timestamp_mode,
@@ -319,7 +393,7 @@ pub struct ChTls {
 }
 
 /// ClickHouse sink configuration (`type: clickhouse`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClickHouseSinkCfg {
     /// Unique identifier for this sink.
     pub id: String,
@@ -332,12 +406,19 @@ pub struct ClickHouseSinkCfg {
     /// Write shape - see [`ChMode`]. Defaults to `changelog`.
     #[serde(default)]
     pub mode: ChMode,
-    /// ClickHouse user. Values support `${ENV_VAR}` expansion.
+    /// ClickHouse user. Values support `${ENV_VAR}` expansion. **Deprecated** as an
+    /// inline secret; prefer `user_ref`.
     #[serde(default)]
     pub user: Option<String>,
-    /// ClickHouse password/key. Values support `${ENV_VAR}` expansion.
+    /// ClickHouse password/key. **Deprecated** as an inline secret; prefer `password_ref`.
     #[serde(default)]
     pub password: Option<String>,
+    /// Reference resolving the ClickHouse user (mutually exclusive with `user`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_ref: Option<secrets::SecretReference>,
+    /// Reference resolving the ClickHouse password (mutually exclusive with `password`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_ref: Option<secrets::SecretReference>,
     /// TLS options (for `https://` endpoints).
     #[serde(default)]
     pub tls: Option<ChTls>,
@@ -354,6 +435,27 @@ pub struct ClickHouseSinkCfg {
     /// require a pre-created table (locked-down environments).
     #[serde(default = "default_true")]
     pub auto_create: bool,
+}
+
+impl std::fmt::Debug for ClickHouseSinkCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClickHouseSinkCfg")
+            .field("id", &self.id)
+            .field("url", &self.url)
+            .field("database", &self.database)
+            .field("table", &self.table)
+            .field("mode", &self.mode)
+            .field("user", &redact_opt(&self.user))
+            .field("password", &redact_opt(&self.password))
+            .field("user_ref", &self.user_ref)
+            .field("password_ref", &self.password_ref)
+            .field("tls", &self.tls)
+            .field("version_source", &self.version_source)
+            .field("send_timeout_secs", &self.send_timeout_secs)
+            .field("required", &self.required)
+            .field("auto_create", &self.auto_create)
+            .finish()
+    }
 }
 
 // ============================================================================
@@ -375,16 +477,59 @@ pub enum EsVersionSource {
     TsMs,
 }
 
-/// Elasticsearch authentication. Tagged by `type`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Elasticsearch authentication. Tagged by `type`. Each secret may be inline
+/// (**deprecated**) or a reference (`*_ref`); the two are mutually exclusive per field.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EsAuth {
     /// HTTP basic auth (self-hosted).
-    Basic { username: String, password: String },
+    Basic {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username_ref: Option<secrets::SecretReference>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        password_ref: Option<secrets::SecretReference>,
+    },
     /// Elastic Cloud / serverless API key (`Authorization: ApiKey <key>`).
-    ApiKey { api_key: String },
+    ApiKey {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key_ref: Option<secrets::SecretReference>,
+    },
     /// No auth.
     None,
+}
+
+impl std::fmt::Debug for EsAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EsAuth::Basic {
+                username,
+                password,
+                username_ref,
+                password_ref,
+            } => f
+                .debug_struct("Basic")
+                .field("username", &redact_opt(username))
+                .field("password", &redact_opt(password))
+                .field("username_ref", username_ref)
+                .field("password_ref", password_ref)
+                .finish(),
+            EsAuth::ApiKey {
+                api_key,
+                api_key_ref,
+            } => f
+                .debug_struct("ApiKey")
+                .field("api_key", &redact_opt(api_key))
+                .field("api_key_ref", api_key_ref)
+                .finish(),
+            EsAuth::None => f.write_str("None"),
+        }
+    }
 }
 
 /// TLS options for the Elasticsearch HTTPS endpoint.
@@ -469,7 +614,7 @@ pub struct ElasticsearchSinkCfg {
 ///         type_prefix: "com.example.cdc"
 ///       encoding: json
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct KafkaSinkCfg {
     /// Unique identifier for this sink instance.
     pub id: String,
@@ -524,13 +669,44 @@ pub struct KafkaSinkCfg {
     /// - `sasl.username`, `sasl.password`: SASL credentials
     /// - `linger.ms`: Batching delay (default: 5)
     /// - `compression.type`: none, gzip, snappy, lz4, zstd (default: lz4)
+    /// - `sasl.username`, `sasl.password`: prefer `secret_refs` over inline here.
     #[serde(default)]
     pub client_conf: HashMap<String, String>,
+
+    /// librdkafka config values resolved from references (e.g. `sasl.password`), merged
+    /// into `client_conf` at construction. A key present in both `client_conf` and
+    /// `secret_refs` is a fail-closed conflict.
+    #[serde(
+        default,
+        skip_serializing_if = "std::collections::HashMap::is_empty"
+    )]
+    pub secret_refs:
+        std::collections::HashMap<String, secrets::SecretReference>,
 
     /// Optional filter applied before delivery. Events not matching the filter
     /// are silently ignored by this sink.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<SinkFilter>,
+}
+
+impl std::fmt::Debug for KafkaSinkCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KafkaSinkCfg")
+            .field("id", &self.id)
+            .field("brokers", &self.brokers)
+            .field("topic", &self.topic)
+            .field("key", &self.key)
+            .field("envelope", &self.envelope)
+            .field("encoding", &self.encoding)
+            .field("required", &self.required)
+            .field("exactly_once", &self.exactly_once)
+            .field("send_timeout_secs", &self.send_timeout_secs)
+            // client_conf may hold SASL creds - redact all values.
+            .field("client_conf", &redact_map_values(&self.client_conf))
+            .field("secret_refs", &self.secret_refs.keys().collect::<Vec<_>>())
+            .field("filter", &self.filter)
+            .finish()
+    }
 }
 
 /// Redis Streams sink configuration.
@@ -548,15 +724,25 @@ pub struct KafkaSinkCfg {
 ///       encoding: json
 ///       required: true
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RedisSinkCfg {
     /// Unique identifier for this sink instance.
     pub id: String,
 
     /// Redis connection URI.
     /// Supports: redis://, rediss:// (TLS), redis+sentinel://
-    /// Example: "redis://:password@localhost:6379/0"
+    /// Example: "redis://:password@localhost:6379/0". **Deprecated** when it embeds a
+    /// password inline; prefer `uri_secret` or a password-less `uri` + `credentials`.
     pub uri: String,
+
+    /// Reference resolving the whole Redis URI (mutually exclusive with `credentials` and
+    /// with an inline password in `uri`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri_secret: Option<secrets::SecretReference>,
+
+    /// Username/password references injected into the (password-less) base `uri`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<crate::CredentialRefsCfg>,
 
     /// Target Redis Stream name for CDC events. Supports `${path}` templates.
     pub stream: String,
@@ -602,6 +788,26 @@ pub struct RedisSinkCfg {
     pub filter: Option<SinkFilter>,
 }
 
+impl std::fmt::Debug for RedisSinkCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisSinkCfg")
+            .field("id", &self.id)
+            .field("uri", &common::dsn::redact_url_password(&self.uri))
+            .field("uri_secret", &self.uri_secret)
+            .field("credentials", &self.credentials)
+            .field("stream", &self.stream)
+            .field("key", &self.key)
+            .field("envelope", &self.envelope)
+            .field("encoding", &self.encoding)
+            .field("required", &self.required)
+            .field("send_timeout_secs", &self.send_timeout_secs)
+            .field("batch_timeout_secs", &self.batch_timeout_secs)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("filter", &self.filter)
+            .finish()
+    }
+}
+
 /// NATS JetStream sink configuration.
 ///
 /// # Example
@@ -616,7 +822,7 @@ pub struct RedisSinkCfg {
 ///       envelope: native
 ///       encoding: json
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct NatsSinkCfg {
     /// Unique identifier for this sink.
     pub id: String,
@@ -680,9 +886,20 @@ pub struct NatsSinkCfg {
     #[serde(default)]
     pub password: Option<String>,
 
-    /// Token for token-based authentication.
+    /// Token for token-based authentication. **Deprecated** as an inline secret;
+    /// prefer `token_ref`.
     #[serde(default)]
     pub token: Option<String>,
+
+    /// Reference resolving the username (mutually exclusive with `username`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username_ref: Option<secrets::SecretReference>,
+    /// Reference resolving the password (mutually exclusive with `password`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_ref: Option<secrets::SecretReference>,
+    /// Reference resolving the auth token (mutually exclusive with `token`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_ref: Option<secrets::SecretReference>,
 
     /// Optional filter applied before delivery. Events not matching the filter
     /// are silently ignored by this sink.
@@ -690,11 +907,37 @@ pub struct NatsSinkCfg {
     pub filter: Option<SinkFilter>,
 }
 
+impl std::fmt::Debug for NatsSinkCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NatsSinkCfg")
+            .field("id", &self.id)
+            .field("url", &common::dsn::redact_url_password(&self.url))
+            .field("subject", &self.subject)
+            .field("key", &self.key)
+            .field("envelope", &self.envelope)
+            .field("encoding", &self.encoding)
+            .field("stream", &self.stream)
+            .field("required", &self.required)
+            .field("send_timeout_secs", &self.send_timeout_secs)
+            .field("batch_timeout_secs", &self.batch_timeout_secs)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("credentials_file", &self.credentials_file)
+            .field("username", &redact_opt(&self.username))
+            .field("password", &redact_opt(&self.password))
+            .field("token", &redact_opt(&self.token))
+            .field("username_ref", &self.username_ref)
+            .field("password_ref", &self.password_ref)
+            .field("token_ref", &self.token_ref)
+            .field("filter", &self.filter)
+            .finish()
+    }
+}
+
 /// HTTP/Webhook sink configuration.
 ///
 /// Delivers events via HTTP POST (or PUT) to any URL. Supports dynamic URL
 /// templates, custom headers with env var expansion, and optional batch mode.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct HttpSinkCfg {
     /// Unique identifier for this sink.
     pub id: String,
@@ -708,9 +951,19 @@ pub struct HttpSinkCfg {
     pub method: String,
 
     /// Static headers added to every request. Values support `${ENV_VAR}` expansion.
-    /// Example: `{"Authorization": "Bearer ${API_TOKEN}", "X-Source": "deltaforge"}`
+    /// Example: `{"Authorization": "Bearer ${API_TOKEN}", "X-Source": "deltaforge"}`.
+    /// Sensitive header values (tokens, keys) should use `secret_refs` instead of inline.
     #[serde(default)]
     pub headers: std::collections::HashMap<String, String>,
+
+    /// Header values resolved from references, merged into `headers` at construction. A
+    /// header name present in both `headers` and `secret_refs` is a fail-closed conflict.
+    #[serde(
+        default,
+        skip_serializing_if = "std::collections::HashMap::is_empty"
+    )]
+    pub secret_refs:
+        std::collections::HashMap<String, secrets::SecretReference>,
 
     /// Batch mode: if true, send a JSON array of events in one request.
     /// If false (default), send one request per event.
@@ -744,6 +997,27 @@ pub struct HttpSinkCfg {
     /// Optional filter applied before delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<SinkFilter>,
+}
+
+impl std::fmt::Debug for HttpSinkCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpSinkCfg")
+            .field("id", &self.id)
+            .field("url", &common::dsn::redact_url_password(&self.url))
+            .field("method", &self.method)
+            // Header values may carry tokens - redact all values in Debug.
+            .field("headers", &redact_map_values(&self.headers))
+            .field("secret_refs", &self.secret_refs.keys().collect::<Vec<_>>())
+            .field("batch_mode", &self.batch_mode)
+            .field("envelope", &self.envelope)
+            .field("encoding", &self.encoding)
+            .field("required", &self.required)
+            .field("send_timeout_secs", &self.send_timeout_secs)
+            .field("batch_timeout_secs", &self.batch_timeout_secs)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("filter", &self.filter)
+            .finish()
+    }
 }
 
 fn default_http_method() -> String {
@@ -783,7 +1057,7 @@ fn default_http_method() -> String {
 ///         idle_age_secs: 600         # 10 min
 ///       required: true
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct S3SinkCfg {
     /// Unique identifier for this sink instance.
     pub id: String,
@@ -805,14 +1079,30 @@ pub struct S3SinkCfg {
     #[serde(default)]
     pub endpoint: Option<String>,
 
-    /// Inline access key (supports `${ENV_VAR}` expansion). Prefer IAM
-    /// instance roles in production.
+    /// Inline access key (supports `${ENV_VAR}` expansion). **Deprecated** as an inline
+    /// secret; prefer `access_key_id_ref`, or omit all keys to use the ambient AWS
+    /// identity (IAM instance/role credentials).
     #[serde(default)]
     pub access_key_id: Option<String>,
 
-    /// Inline secret key (supports `${ENV_VAR}` expansion).
+    /// Inline secret key. **Deprecated**; prefer `secret_access_key_ref`.
     #[serde(default)]
     pub secret_access_key: Option<String>,
+
+    /// Optional session token for temporary AWS credentials (STS). **Deprecated** as an
+    /// inline secret; prefer `session_token_ref`.
+    #[serde(default)]
+    pub session_token: Option<String>,
+
+    /// Reference resolving the access key id (mutually exclusive with `access_key_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key_id_ref: Option<secrets::SecretReference>,
+    /// Reference resolving the secret key (mutually exclusive with `secret_access_key`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_access_key_ref: Option<secrets::SecretReference>,
+    /// Reference resolving the session token (mutually exclusive with `session_token`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token_ref: Option<secrets::SecretReference>,
 
     /// Use virtual-hosted-style addressing. Defaults to `false` (path-style),
     /// which works for MinIO. Set `true` for AWS S3 with custom domains.
@@ -862,6 +1152,33 @@ pub struct S3SinkCfg {
     /// are silently ignored by this sink.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<SinkFilter>,
+}
+
+impl std::fmt::Debug for S3SinkCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3SinkCfg")
+            .field("id", &self.id)
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &redact_opt(&self.access_key_id))
+            .field("secret_access_key", &redact_opt(&self.secret_access_key))
+            .field("session_token", &redact_opt(&self.session_token))
+            .field("access_key_id_ref", &self.access_key_id_ref)
+            .field("secret_access_key_ref", &self.secret_access_key_ref)
+            .field("session_token_ref", &self.session_token_ref)
+            .field("virtual_hosted_style", &self.virtual_hosted_style)
+            .field("local", &self.local)
+            .field("format", &self.format)
+            .field("compression", &self.compression)
+            .field("file_roll", &self.file_roll)
+            .field("send_timeout_secs", &self.send_timeout_secs)
+            .field("required", &self.required)
+            .field("durability", &self.durability)
+            .field("filter", &self.filter)
+            .finish()
+    }
 }
 
 /// Durability mode for the S3 sink. Explicit and fail-closed: unknown values are

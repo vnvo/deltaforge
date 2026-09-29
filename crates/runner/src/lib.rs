@@ -10,6 +10,7 @@ pub mod replay_worker;
 mod schema_api;
 mod schema_provider;
 mod sensing_api;
+pub mod storage_secrets;
 
 pub use schema_provider::{
     ArcSchemaProvider, AvroSchemaProviderImpl, ColumnSchemaInfo,

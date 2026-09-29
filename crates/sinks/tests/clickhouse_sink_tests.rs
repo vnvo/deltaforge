@@ -70,6 +70,8 @@ fn cfg(
         mode,
         user: Some("default".into()),
         password: Some(CH_PASSWORD.into()),
+        user_ref: None,
+        password_ref: None,
         tls: None,
         version_source: ChVersionSource::TsMs,
         send_timeout_secs: 30,
@@ -182,6 +184,7 @@ async fn upsert_mode_auto_creates_and_reflects_current_state() {
         CancellationToken::new(),
         "p",
         Some(resolver()),
+        &sinks::ResolvedSinkCreds::default(),
     )
     .unwrap();
 
@@ -248,6 +251,7 @@ async fn changelog_mode_retains_all_changes() {
         CancellationToken::new(),
         "p",
         Some(resolver()),
+        &sinks::ResolvedSinkCreds::default(),
     )
     .unwrap();
 
@@ -317,6 +321,7 @@ async fn dedup_token_prevents_double_insert() {
         CancellationToken::new(),
         "p",
         Some(resolver()),
+        &sinks::ResolvedSinkCreds::default(),
     )
     .unwrap();
 

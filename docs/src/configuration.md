@@ -2,6 +2,8 @@
 
 Pipelines are defined as YAML documents that map directly to the `PipelineSpec` type. Environment variables are expanded before parsing using `${VAR}` syntax, so secrets and connection strings can be injected at runtime. Unknown variables (e.g. `${source.table}`) pass through for use as [routing templates](routing.md).
 
+For credentials, prefer references (env, file, Kubernetes projected volume, or Vault KV) over inline values and `${ENV}` expansion. See [Secrets & Credentials](secrets.md).
+
 ## Document structure
 
 ```yaml

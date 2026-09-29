@@ -158,6 +158,26 @@ impl DsnComponents {
 // libpq key=value parsing and DSN reconstruction
 // =============================================================================
 
+/// Strictly determine whether a DSN already carries a non-empty password.
+///
+/// Uses the same parsers as credential injection (the URL parser for `scheme://`
+/// DSNs, the strict libpq tokenizer otherwise), so detection and injection agree:
+/// whitespace around `=`, single-quoting, and backslash escaping cannot hide a
+/// password the way a substring scan can. A malformed DSN is an error (fail closed),
+/// never a silent "no password", so a caller can reject a base DSN whose password
+/// would be overridden by injected credential references.
+pub fn dsn_has_password(dsn: &str) -> Result<bool, String> {
+    if dsn.contains("://") {
+        Ok(!DsnComponents::from_url(dsn, 0)?.password.is_empty())
+    } else {
+        let pairs = tokenize_libpq(dsn)
+            .map_err(|()| "malformed libpq DSN".to_string())?;
+        Ok(pairs
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("password") && !v.is_empty()))
+    }
+}
+
 /// Tokenize a libpq-style `key=value` connection string into ordered pairs.
 ///
 /// Implements the libpq quoting rules precisely so reconstruction and redaction
@@ -914,6 +934,63 @@ mod tests {
                 extract_host_from_url("https://mydb.example.com"),
                 "mydb.example.com"
             );
+        }
+    }
+
+    mod has_password {
+        use super::*;
+
+        #[test]
+        fn url_password_detected_and_absence_reported() {
+            assert_eq!(
+                dsn_has_password("postgres://u:secret@h:5432/db"),
+                Ok(true)
+            );
+            assert_eq!(dsn_has_password("postgres://u@h:5432/db"), Ok(false));
+            // An explicit empty password is treated as no password.
+            assert_eq!(dsn_has_password("postgres://u:@h:5432/db"), Ok(false));
+        }
+
+        #[test]
+        fn libpq_plain_password_detected() {
+            assert_eq!(
+                dsn_has_password("host=h user=u password=secret"),
+                Ok(true)
+            );
+            assert_eq!(dsn_has_password("host=h user=u"), Ok(false));
+        }
+
+        #[test]
+        fn libpq_password_with_whitespace_around_equals_detected() {
+            // A substring scan for "password=" misses this; the tokenizer does not.
+            assert_eq!(dsn_has_password("host=h password = secret"), Ok(true));
+        }
+
+        #[test]
+        fn libpq_quoted_and_escaped_password_detected() {
+            assert_eq!(
+                dsn_has_password("host=h password='s e c r e t'"),
+                Ok(true)
+            );
+            assert_eq!(dsn_has_password(r"host=h password=se\ cret"), Ok(true));
+        }
+
+        #[test]
+        fn libpq_password_inside_another_value_not_misdetected() {
+            // A value that merely contains "password=" must not be read as a password
+            // key (a substring scan would false-positive here).
+            assert_eq!(
+                dsn_has_password("host=h options='-c foo=password=x'"),
+                Ok(false)
+            );
+        }
+
+        #[test]
+        fn malformed_libpq_dsn_fails_closed() {
+            // Unterminated quote and a keyword without a value are malformed: Err, never
+            // a silent "no password".
+            assert!(dsn_has_password("host=h password='unterminated").is_err());
+            assert!(dsn_has_password("host=h password").is_err());
         }
     }
 }

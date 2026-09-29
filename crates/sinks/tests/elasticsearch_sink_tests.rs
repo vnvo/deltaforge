@@ -214,6 +214,7 @@ async fn upsert_delete_and_typed_mapping() {
         CancellationToken::new(),
         "p",
         Some(resolver()),
+        &sinks::ResolvedSinkCreds::default(),
     )
     .unwrap();
 
@@ -274,6 +275,7 @@ async fn real_cdc_value_shapes_land_and_map_correctly() {
         CancellationToken::new(),
         "p",
         Some(resolver()),
+        &sinks::ResolvedSinkCreds::default(),
     )
     .unwrap();
 
@@ -332,6 +334,7 @@ async fn replay_and_out_of_order_are_idempotent() {
         CancellationToken::new(),
         "p",
         Some(resolver()),
+        &sinks::ResolvedSinkCreds::default(),
     )
     .unwrap();
 
@@ -406,6 +409,7 @@ async fn per_document_error_routes_to_dlq() {
         CancellationToken::new(),
         "p",
         Some(resolver()),
+        &sinks::ResolvedSinkCreds::default(),
     )
     .unwrap();
 

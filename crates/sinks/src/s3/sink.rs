@@ -29,7 +29,7 @@ use tracing::{info, warn};
 
 use super::file_format::{Compression, FileFormat};
 use super::jsonl_writer::JsonLinesFormat;
-use super::object_writer::{ObjectStoreParams, build_object_store};
+use super::object_writer::build_object_store;
 use super::parquet_writer::ParquetFormat;
 use super::rolling::RollingConfig;
 use super::writer_pool::{
@@ -359,6 +359,7 @@ pub fn build_s3_sink(
     cancel: CancellationToken,
     pipeline: &str,
     schema_resolver: Option<SchemaResolver>,
+    creds: &crate::ResolvedSinkCreds,
 ) -> anyhow::Result<S3Sink> {
     use deltaforge_config::{S3Compression as C, S3FileFormat as F};
 
@@ -399,31 +400,8 @@ pub fn build_s3_sink(
     )
     .set(1.0);
 
-    // Build object store.
-    let access_key = cfg
-        .access_key_id
-        .as_deref()
-        .map(shellexpand::env)
-        .transpose()
-        .context("expand S3 access_key_id")?
-        .map(|s| s.into_owned());
-    let secret_key = cfg
-        .secret_access_key
-        .as_deref()
-        .map(shellexpand::env)
-        .transpose()
-        .context("expand S3 secret_access_key")?
-        .map(|s| s.into_owned());
-
-    let params = ObjectStoreParams {
-        bucket: cfg.bucket.clone(),
-        endpoint: cfg.endpoint.clone(),
-        region: cfg.region.clone(),
-        access_key_id: access_key,
-        secret_access_key: secret_key,
-        virtual_hosted_style: cfg.virtual_hosted_style,
-        local: cfg.local,
-    };
+    // Build object store from config + resolved credential references.
+    let params = super::object_writer::s3_object_store_params(cfg, creds)?;
     let store = build_object_store(&params).context("build S3 object store")?;
 
     // File format + compression.
@@ -922,6 +900,10 @@ mod tests {
             endpoint: None,
             access_key_id: None,
             secret_access_key: None,
+            session_token: None,
+            access_key_id_ref: None,
+            secret_access_key_ref: None,
+            session_token_ref: None,
             virtual_hosted_style: false,
             local: true,
             format: deltaforge_config::S3FileFormat::Jsonl,
@@ -975,6 +957,7 @@ mod tests {
                 CancellationToken::new(),
                 "test-pipeline",
                 None,
+                &crate::ResolvedSinkCreds::default(),
             )
             .expect("legacy S3 sink builds");
         });

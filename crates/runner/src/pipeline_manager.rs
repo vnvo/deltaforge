@@ -345,6 +345,7 @@ async fn build_durable_s3_sinks(
     ckpt_store: &dyn CheckpointStore,
     pipeline: &str,
     arrow_resolver: Option<sinks::s3::SchemaResolver>,
+    secrets: &sinks::ResolvedSinkSecrets,
 ) -> Result<Vec<deltaforge_core::ArcDynSink>> {
     use deltaforge_config::{S3Durability, SinkCfg};
 
@@ -383,6 +384,7 @@ async fn build_durable_s3_sinks(
                 &source_id,
                 comparator,
                 arrow_resolver.clone(),
+                secrets.for_sink(&cfg.id),
             )
             .await
             .context("build durable_v2 S3 sink")?,
@@ -713,7 +715,7 @@ impl PipelineManager {
             source_dsn.clone(),
             self.registry.clone(),
             Arc::clone(&self.backend),
-            resolver,
+            resolver.clone(),
         )
         .await
         .context("build source")?;
@@ -738,6 +740,12 @@ impl PipelineManager {
         // Build every non-durable sink. Durable_v2 S3 sinks are deferred (the
         // builder fails closed on them via the public API): they are built below,
         // in order, only after the durable-startup guard.
+        // Resolve every sink's credential references (protected runtime values) through
+        // the pipeline resolver, before any sink client is constructed.
+        let sink_secrets =
+            sinks::resolve_sink_secrets(&spec, resolver.as_ref())
+                .await
+                .context("resolve sink credentials")?;
         let mut sinks = sinks::build_sinks_deferring_durable_s3(
             &spec,
             cancel.clone(),
@@ -746,6 +754,7 @@ impl PipelineManager {
             arrow_schema_resolver.clone(),
             clickhouse_resolver,
             es_resolver,
+            &sink_secrets,
         )
         .context("build sinks")?;
 
@@ -759,6 +768,7 @@ impl PipelineManager {
             self.ckpt_store.as_ref(),
             &pipeline_name,
             arrow_schema_resolver.clone(),
+            &sink_secrets,
         )
         .await?;
         sinks.extend(durable);
@@ -2182,6 +2192,8 @@ mod tests {
                 sinks: vec![SinkCfg::Redis(RedisSinkCfg {
                     id: "redis".to_string(),
                     uri: "redis://localhost".to_string(),
+                    uri_secret: None,
+                    credentials: None,
                     stream: "events".to_string(),
                     key: None,
                     required: Some(true),
@@ -2198,6 +2210,7 @@ mod tests {
                 sink_batch_deadline_secs: None,
                 schema_sensing: Default::default(),
                 journal: None,
+                secrets: None,
             },
         }
     }
@@ -2215,6 +2228,10 @@ mod tests {
             endpoint: None,
             access_key_id: None,
             secret_access_key: None,
+            session_token: None,
+            access_key_id_ref: None,
+            secret_access_key_ref: None,
+            session_token_ref: None,
             virtual_hosted_style: false,
             local: true,
             format: deltaforge_config::S3FileFormat::Jsonl,
@@ -2249,6 +2266,7 @@ mod tests {
             None,
             None,
             None,
+            &sinks::ResolvedSinkSecrets::default(),
         );
         assert!(err.is_err(), "durable_v2 must not build via the public API");
 
@@ -2262,6 +2280,7 @@ mod tests {
             None,
             None,
             None,
+            &sinks::ResolvedSinkSecrets::default(),
         )
         .unwrap();
         assert!(deferred.is_empty(), "durable S3 deferred, not built here");
@@ -2289,6 +2308,8 @@ mod tests {
             SinkCfg::Redis(RedisSinkCfg {
                 id: "redis".into(),
                 uri: "redis://x".into(),
+                uri_secret: None,
+                credentials: None,
                 stream: "e".into(),
                 key: None,
                 required: Some(true),
@@ -2353,6 +2374,7 @@ mod tests {
             store.as_ref(),
             "p",
             None,
+            &sinks::ResolvedSinkSecrets::default(),
         )
         .await;
         assert!(err.is_err(), "startup check must abort construction");
@@ -2685,6 +2707,8 @@ mod tests {
         let kafka = SinkCfg::Redis(RedisSinkCfg {
             id: "my-redis".to_string(),
             uri: "redis://localhost".to_string(),
+            uri_secret: None,
+            credentials: None,
             stream: "events".to_string(),
             key: None,
             required: Some(true),
