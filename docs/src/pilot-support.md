@@ -15,8 +15,8 @@ The delivery and correctness guarantees referenced below are defined in [Guarant
 | Component | Validated for the pilot | Notes |
 |-----------|------------------------|-------|
 | PostgreSQL (source) | **17** | Logical replication (`wal_level = logical`). There is no hard server-version gate in code; other recent majors likely work but are not part of the validated pilot envelope. Validate before relying on a different major. |
-| MySQL (source) | **8.4** | Native binlog CDC. **MariaDB is not supported.** The CDC user must authenticate with `mysql_native_password`. |
-| Kafka (sink) | **2.5+** when using `exactly_once: true` | Broker transaction support is required for the transactional producer. |
+| MySQL (source) | **8.4** | Native binlog CDC. **MariaDB is not supported.** |
+| Kafka (sink) | Tested on **Confluent Platform 7.5 and 7.7** (`cp-kafka`) | The transactional producer (`exactly_once: true`) needs a broker with transaction support (the Kafka 2.5+ protocol floor). Other broker versions and distributions are untested - validate during onboarding. |
 
 Other sinks (Redis, NATS, HTTP, S3-compatible object storage, ClickHouse, Elasticsearch) are supported as documented on their per-sink pages; run your target versions through a disposable pipeline during onboarding.
 
@@ -65,7 +65,7 @@ DeltaForge resolves credentials from typed secret references and never stores re
 Plan the pilot network on the basis that **DeltaForge's source database connections and its own HTTP endpoints are not encrypted or authenticated in this build**. Deploy accordingly.
 
 - **Source DB connections are not encrypted.** Neither the PostgreSQL nor the MySQL source establishes TLS to the database in this build. Run DeltaForge on a trusted/private network segment with the source database, or place an encrypted tunnel (for example a service mesh sidecar, stunnel, or a cloud private link) between DeltaForge and the database. Do not run source traffic across an untrusted network in the pilot.
-- **REST API is unauthenticated.** It binds `http://localhost:8080` by default (configurable via `--api-addr`). Restrict access with network controls (loopback, firewall, Kubernetes NetworkPolicy); do not expose it publicly.
+- **REST API is unauthenticated and binds all interfaces by default.** The default `--api-addr` is `0.0.0.0:8080` (every interface), so an unrestricted deployment exposes the unauthenticated API on the network. Bind it to loopback (`--api-addr 127.0.0.1:8080`) where the client is local, or confine it with a firewall / Kubernetes NetworkPolicy; do not expose it publicly.
 - **Metrics endpoint is unauthenticated** and defaults to `0.0.0.0:9000` (all interfaces). Bind it to loopback (`--metrics-addr 127.0.0.1:9000`) where the scraper is local, or confine it with a firewall/NetworkPolicy. See [Observability](observability.md#metrics-endpoint-address-and-exposure).
 - **Sink TLS/auth is supported** where the sink provides it: Kafka (SASL + `SASL_SSL` via `client_conf`), Elasticsearch (`https://` with `tls.ca_file`, basic/API-key auth), HTTP (`https://` with header-based auth), NATS (TLS + credentials/token). Confirm Redis and ClickHouse TLS in your environment before relying on it.
 
@@ -73,8 +73,13 @@ Plan the pilot network on the basis that **DeltaForge's source database connecti
 
 DeltaForge keeps all runtime state (checkpoints, schema registry, snapshot progress, DLQ/journal) in one storage backend. See [Storage](storage.md) and [Checkpoints](checkpoints.md).
 
-- **Backends**: `sqlite` (default; single-instance production) and `postgres` (for HA/multi-instance, **beta** - not yet given the same crash/recovery validation as SQLite; use with caution in the pilot). `memory` is for testing only and is lost on restart.
-- **Back up the state store regularly.** For SQLite this is the `deltaforge.db` file (default under `./data/`), which holds both checkpoints and schema history; losing it means losing resume position and schema lineage. For the PostgreSQL backend, back up that database.
+- **Backends**: `sqlite` (default; single-instance production) and `postgres` (a shared storage backend, **beta** - not yet given the same crash/recovery validation as SQLite). The PostgreSQL backend lets multiple processes share one state store, but it does **not** make source processing highly available and does **not** provide ownership fencing between instances - the single-owner-per-source rule above still applies. Use with caution in the pilot. `memory` is for testing only and is lost on restart.
+- **Back up the state store regularly.** For SQLite the store is the `deltaforge.db` file (default under `./data/`), which holds both checkpoints and schema history; losing it means losing resume position and schema lineage. The store runs in **WAL mode**, so do not copy `deltaforge.db` on its own while DeltaForge is running - committed data may still be in the `-wal` file, and a bare file copy can be inconsistent. Use one of:
+  - SQLite's online-backup API or `VACUUM INTO 'backup.db'` against the live database;
+  - stop DeltaForge cleanly, checkpoint the WAL (`PRAGMA wal_checkpoint(TRUNCATE)`), then copy the file;
+  - a storage-level consistent snapshot that captures the database together with its `-wal` and `-shm` files.
+
+  For the PostgreSQL backend, back up that database with your normal PostgreSQL backup tooling (`pg_dump` or a consistent base backup).
 - **Durability**: the SQLite store runs in WAL mode with `synchronous = NORMAL` and survives `SIGKILL` without a graceful shutdown; a checkpoint is persisted only after the sink acknowledges delivery and the commit policy is satisfied (the basis of at-least-once).
 - Restoring from a backup rewinds to that backup's position; expect at-least-once re-delivery (duplicates) of everything after the backup point, which consumers dedup on the event `id`.
 
