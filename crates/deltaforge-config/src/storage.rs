@@ -48,6 +48,12 @@ pub struct StorageConfig {
     /// projected symlinks); when unset, file references must be regular files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_trusted_root: Option<std::path::PathBuf>,
+
+    /// Process-level Vault connection/auth for resolving storage credential references
+    /// from Vault KV. Independent of any pipeline's Vault configuration; installed on the
+    /// storage bootstrap resolver before the backend is opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault: Option<crate::VaultRotationCfg>,
 }
 
 impl std::fmt::Debug for StorageConfig {
@@ -63,6 +69,7 @@ impl std::fmt::Debug for StorageConfig {
             .field("dsn_secret", &self.dsn_secret)
             .field("credentials", &self.credentials)
             .field("secret_trusted_root", &self.secret_trusted_root)
+            .field("vault", &self.vault)
             .finish()
     }
 }
@@ -76,6 +83,7 @@ impl Default for StorageConfig {
             dsn_secret: None,
             credentials: None,
             secret_trusted_root: None,
+            vault: None,
         }
     }
 }

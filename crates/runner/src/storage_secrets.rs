@@ -5,8 +5,6 @@
 //! missing/invalid/conflicting credential fails closed **before** any network access or
 //! pipeline start, and pipeline-scoped Vault config is never forced into storage startup.
 
-use std::path::Path;
-
 use anyhow::{Context, Result, bail};
 use deltaforge_config::{StorageBackendKind, StorageConfig};
 use secrets::{
@@ -17,21 +15,55 @@ use zeroize::Zeroizing;
 
 /// Build the storage bootstrap resolver: environment variables (covers Kubernetes
 /// `secretKeyRef`) plus files (regular files, or projected-volume symlinks when a trusted
-/// root is configured). No Vault: storage does not inherit pipeline Vault configuration.
-fn bootstrap_resolver(trusted_root: Option<&Path>) -> CompositeResolver {
-    let mode = match trusted_root {
+/// root is configured), plus **process-level Vault KV** when `cfg.vault` is set. This
+/// Vault configuration is the storage backend's own - it never depends on any pipeline's
+/// Vault configuration. Connecting Vault here (before storage opens) means a bad Vault
+/// config fails closed before the backend is touched.
+async fn bootstrap_resolver(cfg: &StorageConfig) -> Result<CompositeResolver> {
+    let mode = match cfg.secret_trusted_root.as_deref() {
         Some(root) => FileMode::ProjectedVolume {
             trusted_root: root.to_path_buf(),
         },
         None => FileMode::Strict,
     };
-    CompositeResolver::new(
+    let base = CompositeResolver::new(
         EnvResolver::from_process(),
         FileResolver::new(FilePolicy {
             max_size: DEFAULT_MAX_SECRET_BYTES,
             mode,
             trim_trailing_newline: true,
         }),
+    );
+    match &cfg.vault {
+        None => Ok(base),
+        Some(vcfg) => install_vault(base, vcfg).await,
+    }
+}
+
+/// Install a process-level Vault KV provider on the storage resolver.
+#[cfg(feature = "vault")]
+async fn install_vault(
+    base: CompositeResolver,
+    vcfg: &deltaforge_config::VaultRotationCfg,
+) -> Result<CompositeResolver> {
+    let conn = sources::vault_connection(vcfg, DEFAULT_MAX_SECRET_BYTES)
+        .context("invalid storage Vault configuration")?;
+    let vault = secrets::VaultResolver::connect(conn)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect storage Vault: {e}"))?;
+    Ok(base.with_vault(vault))
+}
+
+/// Without the `vault` feature, a Vault-configured storage backend fails closed.
+#[cfg(not(feature = "vault"))]
+async fn install_vault(
+    _base: CompositeResolver,
+    _vcfg: &deltaforge_config::VaultRotationCfg,
+) -> Result<CompositeResolver> {
+    bail!(
+        "storage credentials are configured to use Vault, but this binary was built \
+         without the `vault` feature; rebuild with `--features vault` or use env/file \
+         references"
     )
 }
 
@@ -109,9 +141,8 @@ pub async fn resolve_storage_dsn(
         _ => {}
     }
 
-    let resolver = bootstrap_resolver(cfg.secret_trusted_root.as_deref());
-
     if let Some(reference) = &cfg.dsn_secret {
+        let resolver = bootstrap_resolver(cfg).await?;
         return Ok(Some(resolve_ref(&resolver, reference).await?));
     }
 
@@ -135,6 +166,7 @@ pub async fn resolve_storage_dsn(
                  references are set (that would silently override them)"
             );
         }
+        let resolver = bootstrap_resolver(cfg).await?;
         let user = resolve_ref(&resolver, user_ref).await?;
         let pass = resolve_ref(&resolver, pass_ref).await?;
         return Ok(Some(Zeroizing::new(inject_credentials(
@@ -160,6 +192,7 @@ mod tests {
             dsn_secret: None,
             credentials: None,
             secret_trusted_root: None,
+            vault: None,
         }
     }
 

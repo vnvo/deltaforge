@@ -139,9 +139,11 @@ async fn build_vault_resolver(
     ))
 }
 
-/// Map the serde Vault config onto a validated [`secrets::VaultConnection`].
+/// Map the serde Vault config onto a validated [`secrets::VaultConnection`]. Public so
+/// other startup paths (e.g. the storage bootstrap resolver) reuse the same validated
+/// mapping instead of duplicating it.
 #[cfg(feature = "vault")]
-fn vault_connection(
+pub fn vault_connection(
     vcfg: &deltaforge_config::VaultRotationCfg,
     max_secret_bytes: usize,
 ) -> Result<secrets::VaultConnection> {
