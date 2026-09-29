@@ -147,6 +147,89 @@ impl PostgresTableSchema {
     pub fn is_primary_key(&self, name: &str) -> bool {
         self.primary_key.iter().any(|pk| pk == name)
     }
+
+    /// Ordered `(column name, type_oid)` signature for first-resolution comparison
+    /// against a pgoutput Relation message. `type_oid` may be `None` for schemas
+    /// persisted before type OIDs were recorded, which [`verify_first_resolution`]
+    /// treats as unverifiable (fail-closed).
+    pub(crate) fn signature(&self) -> Vec<(String, Option<u32>)> {
+        self.columns
+            .iter()
+            .map(|c| (c.name.clone(), c.type_oid))
+            .collect()
+    }
+}
+
+/// Result of verifying a table's first Relation this run against its persisted baseline.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FirstResolution {
+    NoDrift,
+    Drift(String),
+}
+
+/// Compare the first Relation for a table against its durably persisted schema,
+/// deterministically and without any catalog query.
+///
+/// The persisted schema already carries each column's `type_oid` (populated at load
+/// time), so the comparison is a direct match of the ordered `(name, type_oid)`
+/// signature the pgoutput Relation message sends - the same fields the in-stream path
+/// compares (name/order/count/type-OID).
+///
+/// Fails closed: a persisted column whose `type_oid` is unavailable (e.g. a schema
+/// persisted before type OIDs were recorded) is **unverifiable** and reported as drift,
+/// never silently accepted as unchanged.
+///
+/// Note on scope: this guards replication-visible structural changes
+/// (name/order/count/type-OID), matching the in-stream contract. Catalog-only changes
+/// not present in the Relation payload (nullability, defaults, identity metadata) are out
+/// of scope.
+pub(crate) fn verify_first_resolution(
+    persisted_signature: &[(String, Option<u32>)],
+    relation_signature: &[(String, u32)],
+) -> FirstResolution {
+    let describe = || {
+        let persisted = persisted_signature
+            .iter()
+            .map(|(n, o)| match o {
+                Some(o) => format!("{n}:{o}"),
+                None => format!("{n}:?"),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let relation = relation_signature
+            .iter()
+            .map(|(n, o)| format!("{n}:{o}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("columns [{persisted}] -> [{relation}]")
+    };
+
+    if persisted_signature.len() != relation_signature.len() {
+        return FirstResolution::Drift(describe());
+    }
+    for ((p_name, p_oid), (r_name, r_oid)) in
+        persisted_signature.iter().zip(relation_signature.iter())
+    {
+        if p_name != r_name {
+            return FirstResolution::Drift(describe());
+        }
+        match p_oid {
+            // Persisted type OID unavailable: cannot verify -> fail closed as drift
+            // (unverifiable), never treated as unchanged.
+            None => {
+                return FirstResolution::Drift(format!(
+                    "persisted type OID unavailable for column \"{p_name}\"; \
+                     cannot verify schema ({})",
+                    describe()
+                ));
+            }
+            Some(o) if o != r_oid => {
+                return FirstResolution::Drift(describe());
+            }
+            _ => {}
+        }
+    }
+    FirstResolution::NoDrift
 }
 
 impl PostgresColumn {

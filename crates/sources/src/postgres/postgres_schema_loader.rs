@@ -20,7 +20,10 @@ use tracing::{debug, info, warn};
 use deltaforge_core::{SourceError, SourceResult};
 
 use super::postgres_helpers::redact_password;
-use super::postgres_table_schema::{PostgresColumn, PostgresTableSchema};
+use super::postgres_table_schema::{
+    FirstResolution, PostgresColumn, PostgresTableSchema,
+    verify_first_resolution,
+};
 use crate::schema_loader::{
     LoadedSchema as ApiLoadedSchema, SchemaListEntry, SourceSchemaLoader,
 };
@@ -260,14 +263,34 @@ impl PostgresSchemaLoader {
 
         let t0 = Instant::now();
         let pg_schema = self.fetch_schema(schema, table).await?;
+        let loaded = self
+            .register_and_cache(schema, table, pg_schema, checkpoint)
+            .await?;
+
+        let elapsed = t0.elapsed();
+        if elapsed.as_millis() > 200 {
+            warn!(schema = %schema, table = %table, ms = elapsed.as_millis(), "slow schema load");
+        } else {
+            debug!(schema = %schema, table = %table, version = loaded.registry_version, ms = elapsed.as_millis(), "schema loaded");
+        }
+
+        Ok(loaded)
+    }
+
+    /// Register a freshly fetched schema in the durable registry and cache it.
+    async fn register_and_cache(
+        &self,
+        schema: &str,
+        table: &str,
+        pg_schema: PostgresTableSchema,
+        checkpoint: Option<&[u8]>,
+    ) -> SourceResult<LoadedSchema> {
         let fingerprint = pg_schema.fingerprint();
         let column_names: Arc<Vec<String>> = Arc::new(
             pg_schema.columns.iter().map(|c| c.name.clone()).collect(),
         );
-
         let schema_json = serde_json::to_value(&pg_schema)
             .map_err(|e| SourceError::Other(e.into()))?;
-
         let version = self
             .registry
             .register_with_checkpoint(
@@ -280,7 +303,6 @@ impl PostgresSchemaLoader {
             )
             .await
             .map_err(SourceError::Other)?;
-
         let loaded = LoadedSchema {
             schema: Arc::new(pg_schema),
             registry_version: version,
@@ -288,17 +310,102 @@ impl PostgresSchemaLoader {
             sequence: self.registry.current_sequence(),
             column_names,
         };
+        self.cache
+            .write()
+            .await
+            .insert((schema.to_string(), table.to_string()), loaded.clone());
+        Ok(loaded)
+    }
 
-        self.cache.write().await.insert(key, loaded.clone());
-
-        let elapsed = t0.elapsed();
-        if elapsed.as_millis() > 200 {
-            warn!(schema = %schema, table = %table, ms = elapsed.as_millis(), "slow schema load");
-        } else {
-            debug!(schema = %schema, table = %table, version, ms = elapsed.as_millis(), "schema loaded");
+    /// Load a table's schema for decoding a pgoutput row, using the durable historical
+    /// schema when the live table no longer exists.
+    ///
+    /// Resolution order:
+    /// 1. cache hit -> return it;
+    /// 2. live catalog has the table -> fetch, register, cache (normal path);
+    /// 3. live table is GONE -> fall back to the durable registry, but only when the
+    ///    persisted schema's ordered `(name, type_oid)` signature matches the Relation
+    ///    payload. On a mismatch, or when no durable history exists, fail closed with an
+    ///    actionable diagnostic - never guess a schema, skip the event, or advance the
+    ///    checkpoint.
+    ///
+    /// `relation_signature` is the ordered `(name, type_oid)` list from the pgoutput
+    /// Relation message for this table.
+    pub async fn load_schema_for_relation(
+        &self,
+        schema: &str,
+        table: &str,
+        checkpoint: Option<&[u8]>,
+        relation_signature: &[(String, u32)],
+    ) -> SourceResult<LoadedSchema> {
+        let key = (schema.to_string(), table.to_string());
+        if let Some(cached) = self.cache.read().await.get(&key) {
+            return Ok(cached.clone());
         }
 
-        Ok(loaded)
+        // Live catalog first: an existing table takes the normal fetch+register path.
+        if let Some(pg_schema) = self.fetch_schema_opt(schema, table).await? {
+            return self
+                .register_and_cache(schema, table, pg_schema, checkpoint)
+                .await;
+        }
+
+        // The live table is gone. Recover from the durable historical schema, gated on
+        // an exact signature match with the replication stream.
+        let Some(sv) = self.registry.get_latest(&self.tenant, schema, table)
+        else {
+            return Err(SourceError::Schema {
+                details: format!(
+                    "table {schema}.{table} no longer exists and no durable schema \
+                     history is available; cannot decode its retained WAL \
+                     (fail-closed). Reset the replication slot past these changes to \
+                     continue."
+                )
+                .into(),
+            });
+        };
+        let version = sv.version;
+        let sequence = sv.sequence;
+        let pg_schema: PostgresTableSchema =
+            serde_json::from_value(sv.schema_json)
+                .map_err(|e| SourceError::Other(e.into()))?;
+
+        match verify_first_resolution(
+            &pg_schema.signature(),
+            relation_signature,
+        ) {
+            FirstResolution::NoDrift => {
+                let fingerprint = pg_schema.fingerprint();
+                let column_names: Arc<Vec<String>> = Arc::new(
+                    pg_schema
+                        .columns
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect(),
+                );
+                let loaded = LoadedSchema {
+                    schema: Arc::new(pg_schema),
+                    registry_version: version,
+                    fingerprint: fingerprint.into(),
+                    sequence,
+                    column_names,
+                };
+                self.cache.write().await.insert(key, loaded.clone());
+                info!(
+                    schema = %schema, table = %table, version,
+                    "decoding retained WAL for dropped table from durable schema"
+                );
+                Ok(loaded)
+            }
+            FirstResolution::Drift(detail) => Err(SourceError::Schema {
+                details: format!(
+                    "table {schema}.{table} no longer exists and its durable schema \
+                     does not match the replication stream ({detail}); refusing to \
+                     decode its retained WAL (fail-closed)."
+                )
+                .into(),
+            }),
+        }
     }
 
     /// Force reload schema from database (bypasses cache).
@@ -334,12 +441,29 @@ impl PostgresSchemaLoader {
         })
     }
 
-    /// Fetch full schema from information_schema.
+    /// Fetch full schema from information_schema, mapping a missing table to the
+    /// `table not found` schema error (the historical behavior).
     async fn fetch_schema(
         &self,
         schema_name: &str,
         table_name: &str,
     ) -> SourceResult<PostgresTableSchema> {
+        self.fetch_schema_opt(schema_name, table_name)
+            .await?
+            .ok_or_else(|| SourceError::Schema {
+                details: format!("table {schema_name}.{table_name} not found")
+                    .into(),
+            })
+    }
+
+    /// Fetch full schema from information_schema, returning `Ok(None)` when the table
+    /// no longer exists in the live catalog (so callers can fall back to the durable
+    /// historical schema instead of failing).
+    async fn fetch_schema_opt(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+    ) -> SourceResult<Option<PostgresTableSchema>> {
         let client = self.connect().await?;
 
         // `a.atttypid` is the column's pgoutput type OID; it is joined in so the
@@ -371,13 +495,7 @@ impl PostgresSchemaLoader {
             .map_err(query_error)?;
 
         if col_rows.is_empty() {
-            return Err(SourceError::Schema {
-                details: format!(
-                    "table {}.{} not found",
-                    schema_name, table_name
-                )
-                .into(),
-            });
+            return Ok(None);
         }
 
         let columns: Vec<PostgresColumn> =
@@ -432,13 +550,13 @@ impl PostgresSchemaLoader {
             .map_err(query_error)?
             .map(|r| r.get::<_, u32>(0));
 
-        Ok(PostgresTableSchema {
+        Ok(Some(PostgresTableSchema {
             columns,
             primary_key,
             replica_identity,
             oid,
             schema_name: Some(schema_name.to_string()),
-        })
+        }))
     }
 
     /// Get column names only (for backward compatibility).
