@@ -13,7 +13,7 @@ docker run --rm \
 
 ## Docker Compose
 
-For a full local deployment, run DeltaForge alongside its dependencies with Docker Compose: a source database (MySQL or PostgreSQL), Kafka, and a monitoring stack (Prometheus and Grafana). Point the container at your pipeline YAML and expose the API (8080) and metrics (9000) ports as shown in the Docker example above.
+See the [chaos testing environment](https://github.com/vnvo/deltaforge/blob/main/docker-compose.chaos.yml) for a full Docker Compose example with MySQL, Kafka, Prometheus, Grafana, and Loki.
 
 ## Kubernetes (Helm)
 

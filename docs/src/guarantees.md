@@ -372,9 +372,9 @@ This matrix maps guarantees to their verification. Rows marked **Exists** have a
 
 | Guarantee | Test | Type | Status |
 |-----------|------|------|--------|
-| No data loss (at-least-once) across restart | `kafka_outage_across_restart_loses_no_events_and_holds_checkpoint` (`kafka_outage_restart_e2e`) | Integration | Exists |
-| Kafka transactional atomic-batch delivery | `kafka_sink_exactly_once_*` | Integration | Exists |
-| Backlog-drain throughput (PostgreSQL → Kafka) | `pg_to_kafka_backlog_drain_throughput` (`throughput_e2e`) | Integration (perf) | Exists |
+| No data loss (at-least-once) | `crash_recovery` chaos scenario | Chaos | Exists |
+| Kafka transactional atomic-batch delivery | `exactly_once` chaos scenario + `kafka_sink_exactly_once_*` | Chaos + Integration | Exists |
+| At-least-once across restart (committed row reaches Kafka after outage + restart) | `kafka_outage_restart_e2e` | Integration | Exists |
 | Producer fencing detection | `kafka_sink_exactly_once_producer_fencing` | Integration | Exists |
 | Per-primary-key ordering | Events keyed by PK → same Kafka partition | By design | Verified via Kafka partition assignment |
 | Transaction boundary preservation | `respect_source_tx` + `check_and_split` coordinator logic | Unit | Exists |
@@ -388,14 +388,13 @@ This matrix maps guarantees to their verification. Rows marked **Exists** have a
 | DLQ overflow (block) | `dlq::overflow_block_waits_for_ack` | Unit | Exists |
 | DLQ cleanup expired | `dlq::cleanup_expired_removes_old_entries` | Unit | Exists |
 | Partial batch timer flush | `test_partial_batch_flushed_by_timer` | Unit | Exists |
-| Sink unreachable across restart (no loss, checkpoint held) | `kafka_outage_across_restart_loses_no_events_and_holds_checkpoint` | Integration | Exists |
-| Sink outage / lagging sink recovery | `pg_two_sink_restart_resumes_from_slowest_sink` | Integration | Exists |
-| Schema drift handling (adapt / halt / in-stream) | `pg_schema_drift_adapt_*`, `pg_schema_drift_halt_*`, `mysql_failover_schema_drift_*` | Integration | Exists |
-| MySQL failover detection | `mysql_failover_position_lost_stops_source`, `mysql_failover_streaming_resumes_after_identity_change` | Integration | Exists |
-| Postgres failover detection | `postgres_failover_slot_absent_stops_source`, `postgres_failover_streaming_resumes_after_identity_change` | Integration | Exists |
-| Replication slot absent detection | `postgres_failover_slot_absent_stops_source` | Integration | Exists |
-| Source-side network partition (mid-stream) | dedicated e2e | Integration | Planned |
-| MySQL binlog purge detection | dedicated e2e | Integration | Planned |
+| Network partition recovery | `network_partition` chaos scenario | Chaos | Exists |
+| Sink outage recovery | `sink_outage` chaos scenario | Chaos | Exists |
+| Schema drift handling | `schema_drift` chaos scenario | Chaos | Exists |
+| MySQL failover detection | `failover` chaos scenario | Chaos | Exists |
+| Postgres failover detection | `pg_failover` chaos scenario | Chaos | Exists |
+| Binlog purge detection | `binlog_purge` chaos scenario | Chaos | Exists |
+| Replication slot drop detection | `slot_dropped` chaos scenario | Chaos | Exists |
 | NATS dedup within window | Verify `Nats-Msg-Id` prevents duplicates | Integration | Planned |
 | Redis idempotency key | Verify consumer-side dedup via key | Integration | Planned |
 | Snapshot → CDC handoff | No gaps; engine-specific documented overlap | Integration | Planned |

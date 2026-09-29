@@ -124,9 +124,11 @@ The **replication lag** metric (separate from E2E latency) uses the binlog times
 
 ## Grafana Dashboard
 
-A production-ready Grafana dashboard, optimized for fleet operations with hundreds of pipelines, was part of the removed chaos tooling. See git history if you need the JSON.
+A production-ready Grafana dashboard is included in the repository, optimized for fleet operations with hundreds of pipelines:
 
-Import it via Grafana UI -> Dashboards -> Import -> Upload JSON file.
+**[Download: deltaforge.json](https://github.com/vnvo/deltaforge/blob/main/chaos/grafana/dashboards/deltaforge.json)**
+
+Import it via Grafana UI → Dashboards → Import → Upload JSON file.
 
 ### What's included
 

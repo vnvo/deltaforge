@@ -3,8 +3,10 @@
 //! Self-provisioning (testcontainers) companion to `throughput_e2e` (PostgreSQL).
 //! It wires the real production pipeline - `MySqlSource` -> `Coordinator` ->
 //! `KafkaSink` through the production `PerSinkCheckpointProxy` - against real
-//! MySQL 8.4 and Kafka containers, with no fixed source port, no manual pipeline
-//! apply, and no proxy.
+//! MySQL 8.4 and Kafka containers, with a dynamic mapped MySQL port and no
+//! manual pipeline apply or proxy. Kafka uses a dedicated host port (fixed at
+//! start for the broker's advertised listener), overridable via
+//! `THROUGHPUT_KAFKA_PORT` for parallel/CI runs.
 //!
 //! Unlike PostgreSQL (whose slot retains WAL from creation), MySQL has no slot,
 //! so a source started "from end" sits at the current binlog tail and would skip
@@ -40,8 +42,9 @@ use deltaforge_core::{
     ArcDynProcessor, ArcDynSink, Source, SourceHandle, SourceItem,
 };
 use mysql_async::prelude::Queryable;
+use rdkafka::Message;
 use rdkafka::config::ClientConfig;
-use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::consumer::{BaseConsumer, Consumer, StreamConsumer};
 use runner::coordinator::{
     Coordinator, PauseState, build_batch_processor, build_commit_fn,
 };
@@ -57,8 +60,15 @@ use testcontainers::{
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-const KAFKA_PORT: u16 = 9392;
 const KAFKA_INTERNAL_PORT: u16 = 29092;
+
+/// Host port for the Kafka container (env-overridable for parallel/CI runs).
+fn kafka_port() -> u16 {
+    std::env::var("THROUGHPUT_KAFKA_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9392)
+}
 const SID: &str = "mysqlthroughput";
 const TOPIC: &str = "orders.events";
 const WARMUP: usize = 20;
@@ -73,6 +83,7 @@ fn row_count() -> usize {
 // ── Kafka container ──────────────────────────────────────────────────────────
 
 async fn start_kafka() -> (ContainerAsync<GenericImage>, String) {
+    let kp = kafka_port();
     let image = GenericImage::new("confluentinc/cp-kafka", "7.5.0")
         .with_wait_for(WaitFor::Duration { length: Duration::from_secs(15) })
         .with_env_var("KAFKA_NODE_ID", "1")
@@ -81,13 +92,13 @@ async fn start_kafka() -> (ContainerAsync<GenericImage>, String) {
         .with_env_var(
             "KAFKA_LISTENERS",
             format!(
-                "PLAINTEXT://0.0.0.0:{KAFKA_INTERNAL_PORT},CONTROLLER://0.0.0.0:29093,EXTERNAL://0.0.0.0:{KAFKA_PORT}"
+                "PLAINTEXT://0.0.0.0:{KAFKA_INTERNAL_PORT},CONTROLLER://0.0.0.0:29093,EXTERNAL://0.0.0.0:{kp}"
             ),
         )
         .with_env_var(
             "KAFKA_ADVERTISED_LISTENERS",
             format!(
-                "PLAINTEXT://localhost:{KAFKA_INTERNAL_PORT},EXTERNAL://localhost:{KAFKA_PORT}"
+                "PLAINTEXT://localhost:{KAFKA_INTERNAL_PORT},EXTERNAL://localhost:{kp}"
             ),
         )
         .with_env_var(
@@ -102,9 +113,9 @@ async fn start_kafka() -> (ContainerAsync<GenericImage>, String) {
         .with_env_var("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "0")
         .with_env_var("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "true")
         .with_env_var("CLUSTER_ID", "MkU3OEVBNTcwNTJENDM2Qg")
-        .with_mapped_port(KAFKA_PORT, KAFKA_PORT.tcp());
+        .with_mapped_port(kp, kp.tcp());
     let container = image.start().await.expect("start kafka");
-    let brokers = format!("localhost:{KAFKA_PORT}");
+    let brokers = format!("localhost:{kp}");
     wait_for_kafka(&brokers, Duration::from_secs(60)).await;
     (container, brokers)
 }
@@ -130,6 +141,49 @@ async fn wait_for_kafka(brokers: &str, dur: Duration) {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     panic!("kafka not ready after {dur:?}");
+}
+
+/// Consume the topic from the beginning and return the set of unique `after.id`
+/// values present. Proves every distinct row arrived (a high-watermark count can
+/// be satisfied by duplicates while rows are missing).
+async fn consume_unique_ids(
+    brokers: &str,
+    expected: usize,
+    secs: u64,
+) -> std::collections::HashSet<i64> {
+    let consumer: StreamConsumer = ClientConfig::new()
+        .set("bootstrap.servers", brokers)
+        .set("group.id", "mysql-throughput-verify")
+        .set("auto.offset.reset", "earliest")
+        .set("enable.auto.commit", "false")
+        .create()
+        .expect("verify consumer");
+    consumer.subscribe(&[TOPIC]).expect("subscribe");
+    let mut ids = std::collections::HashSet::new();
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while ids.len() < expected && Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(5), consumer.recv())
+            .await
+        {
+            Ok(Ok(m)) => {
+                if let Some(p) = m.payload() {
+                    if let Ok(v) =
+                        serde_json::from_slice::<serde_json::Value>(p)
+                    {
+                        if let Some(id) = v
+                            .get("after")
+                            .and_then(|a| a.get("id"))
+                            .and_then(|i| i.as_i64())
+                        {
+                            ids.insert(id);
+                        }
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    ids
 }
 
 /// High-watermark offset of the topic (total messages produced). 0 if absent.
@@ -520,6 +574,22 @@ async fn mysql_to_kafka_backlog_drain_throughput() -> Result<()> {
         delivered, target,
         "backlog not fully drained: {delivered}/{target}"
     );
+
+    // Correctness: every DISTINCT row (warmup + backlog) must be present, not
+    // just a matching count. Backlog ids are (WARMUP+1)..=(WARMUP+rows).
+    let ids = consume_unique_ids(&brokers, target as usize, 180).await;
+    assert_eq!(
+        ids.len(),
+        target as usize,
+        "expected {target} unique rows in Kafka, found {} (missing or duplicated)",
+        ids.len()
+    );
+    assert!(
+        ids.contains(&((WARMUP + 1) as i64))
+            && ids.contains(&((WARMUP + rows) as i64)),
+        "backlog boundary rows missing from Kafka"
+    );
+
     assert!(
         wall_eps > 2000.0,
         "drain throughput {wall_eps:.0} ev/s below the 2000 ev/s floor"

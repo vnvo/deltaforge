@@ -1,0 +1,486 @@
+# Chaos testing environment for DeltaForge
+#
+# Network topology:
+#   DeltaForge -> toxiproxy -> mysql / postgres / kafka
+#
+# Profiles — infra and app are independent so you can start/stop DeltaForge
+# containers without affecting the underlying infrastructure:
+#
+#   base          — toxiproxy, prometheus, grafana, cadvisor, loki, promtail
+#   mysql-infra   — mysql, mysql-b
+#   pg-infra      — postgres, postgres-b
+#   kafka-infra   — kafka, schema-registry
+#   df            — 3 DeltaForge instances (release :8080, debug :8081, profile :8082)
+#
+# The `df` profile starts one container per build variant. Pipeline configs
+# are selected dynamically via the REST API — the chaos UI or CLI pushes
+# a config (DELETE + POST /pipelines) before each scenario.
+#
+# Usage:
+#   # Start everything for chaos testing
+#   docker compose -f docker-compose.chaos.yml \
+#     --profile base --profile mysql-infra --profile kafka-infra --profile df up -d
+#
+#   # Restart only DeltaForge containers (infra stays up)
+#   docker compose -f docker-compose.chaos.yml --profile df restart
+#
+#   # Add Postgres infra without touching anything else
+#   docker compose -f docker-compose.chaos.yml --profile pg-infra up -d
+#
+#   # View all container logs in Grafana Explore (Loki datasource)
+#   open http://localhost:3000/explore
+#     Query: {service="deltaforge-soak"} or {container=~"deltaforge.*"}
+
+services:
+
+  # ==========================================================================
+  # mysql-infra — MySQL primary + failover replica
+  # ==========================================================================
+
+  mysql:
+    image: mysql:8.4
+    profiles: [mysql-infra]
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+    volumes:
+      - ./chaos/init/mysql-chaos.sql:/docker-entrypoint-initdb.d/01_init.sql
+      - ./chaos/init/mysql-soak.sql:/docker-entrypoint-initdb.d/02_soak.sql
+      - ./chaos/init/mysql-tpcc.sql:/docker-entrypoint-initdb.d/03_tpcc.sql
+      - mysql_data:/var/lib/mysql
+    command:
+      - --server-id=101
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --binlog-checksum=NONE
+      # 1 hour retention — long enough for large drain benchmarks (10M+ rows)
+      - --binlog-expire-logs-seconds=3600
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-ppassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    ports:
+      - "3306:3306"
+    networks: [chaos_net]
+
+  mysql-b:
+    image: mysql:8.4
+    profiles: [mysql-infra]
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+    volumes:
+      - ./chaos/init/mysql-chaos.sql:/docker-entrypoint-initdb.d/01_init.sql
+      - mysql_b_data:/var/lib/mysql
+    command:
+      - --server-id=102
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+      - --binlog-row-image=FULL
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+      - --binlog-checksum=NONE
+      - --binlog-expire-logs-seconds=3600
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-ppassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    networks: [chaos_net]
+
+  # ==========================================================================
+  # pg-infra — PostgreSQL primary + failover replica
+  # ==========================================================================
+
+  postgres:
+    image: postgres:17
+    profiles: [pg-infra]
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: orders
+    volumes:
+      - ./chaos/init/postgres-chaos.sql:/docker-entrypoint-initdb.d/01_init.sql
+      - ./chaos/init/postgres-soak.sql:/docker-entrypoint-initdb.d/02_soak.sql
+      - postgres_data:/var/lib/postgresql/data
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+      # Short WAL retention so slot_dropped scenario triggers quickly
+      - -c
+      - wal_keep_size=8MB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d orders"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+    networks: [chaos_net]
+
+  postgres-b:
+    image: postgres:17
+    profiles: [pg-infra]
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: orders
+    volumes:
+      - ./chaos/init/postgres-chaos.sql:/docker-entrypoint-initdb.d/01_init.sql
+      - postgres_b_data:/var/lib/postgresql/data
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d orders"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [chaos_net]
+
+  # ==========================================================================
+  # kafka-infra — Kafka broker (KRaft, no Zookeeper)
+  # ==========================================================================
+
+  kafka:
+    image: confluentinc/cp-kafka:7.7.1
+    profiles: [kafka-infra]
+    environment:
+      # KRaft mode — combined broker + controller in a single node
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      # Listeners: CONTROLLER for KRaft consensus, BROKER for inter-broker,
+      # CLIENT for toxiproxy routing, EXTERNAL for host access
+      KAFKA_LISTENERS: CONTROLLER://0.0.0.0:9093,BROKER://0.0.0.0:29092,CLIENT://0.0.0.0:9094,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: BROKER://kafka:29092,CLIENT://toxiproxy:5102,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,BROKER:PLAINTEXT,CLIENT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: BROKER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Keep topics lean: 5 min retention, 1 min segments so cleanup fires quickly
+      KAFKA_LOG_RETENTION_MS: "300000"
+      KAFKA_LOG_SEGMENT_MS: "60000"
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: "30000"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    ports:
+      - "9092:9092"
+    networks: [chaos_net]
+
+  # MinIO (S3-compatible object storage for S3/Parquet sink tests)
+  minio:
+    image: minio/minio:latest
+    profiles: [s3-infra]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    # Pre-create the test bucket via filesystem trick (MinIO filesystem mode
+    # treats top-level dirs under /data as buckets). The bucket lifecycle
+    # policy for abort-incomplete-multipart-upload (production requirement)
+    # is documented in docs/specs/s3-parquet-sink.md and applied via mc in
+    # `mc-bootstrap` below.
+    entrypoint: ["/bin/sh"]
+    command:
+      - "-c"
+      - "mkdir -p /data/deltaforge-chaos && minio server /data --console-address :9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      # Host ports shifted to avoid clashes with DeltaForge container
+      # metrics on 9000/9001/9002. Inside the chaos_net (where the
+      # toxiproxy route points), MinIO is still on container port 9000.
+      - "9100:9000"   # S3 API on host (also proxied at toxiproxy:5104 for chaos)
+      - "9101:9001"   # Web console (host access for inspection)
+    networks: [chaos_net]
+
+  # mc bootstrap: apply the lifecycle policy that aborts abandoned
+  # multipart uploads (operational prereq for the S3 sink — see
+  # docs/specs/s3-parquet-sink.md). One-shot container.
+  mc-bootstrap:
+    image: minio/mc:latest
+    profiles: [s3-infra]
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh"]
+    command:
+      - "-c"
+      - |
+        set -e
+        mc alias set local http://minio:9000 minioadmin minioadmin
+        # Idempotent: ignore if bucket already exists
+        mc mb -p local/deltaforge-chaos || true
+        # Apply lifecycle: abort incomplete multipart uploads older than 1 day.
+        # This is the operational requirement for the S3 sink on AWS S3
+        # (see docs/specs/s3-parquet-sink.md). Best-effort here: MinIO
+        # RELEASE.2025-09-07 rejects a standalone AbortIncompleteMultipartUpload
+        # lifecycle rule (verified with both mc and the AWS CLI — the server
+        # returns InvalidArgument / silently drops the action), so don't fail
+        # the bootstrap when it can't be applied.
+        cat >/tmp/lifecycle.json <<'JSON'
+        {
+          "Rules": [{
+            "ID": "abort-abandoned-multiparts",
+            "Status": "Enabled",
+            "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}
+          }]
+        }
+        JSON
+        if mc ilm import local/deltaforge-chaos < /tmp/lifecycle.json 2>/dev/null; then
+          echo "MinIO bucket and lifecycle policy ready"
+        else
+          echo "MinIO bucket ready (lifecycle rule skipped — not supported by this MinIO version)"
+        fi
+    networks: [chaos_net]
+
+  # ClickHouse (for the ClickHouse sink chaos scenarios). DeltaForge writes
+  # through the toxiproxy route (toxiproxy:5105) so the sink can be cut; the
+  # chaos harness queries ground-truth directly on host port 8124.
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    profiles: [ch-infra]
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    ports:
+      - "8124:8123"   # HTTP on host (harness queries this directly, bypassing proxy)
+      - "9010:9000"   # native TCP (host access for inspection)
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [chaos_net]
+
+  # Elasticsearch — target for the elasticsearch sink (es-backlog-drain).
+  # Security disabled for the chaos harness; single-node. Host port 9201 avoids
+  # clashing with a local Elasticsearch on 9200.
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    profiles: [es-infra]
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      # Sized for multi-million-row drains across 120 indices. Xms == Xmx (locked
+      # heap, ES best practice). Keep heap <= 50% of the container's RAM; bump
+      # both together (e.g. -Xms8g -Xmx8g) for very large drains.
+      ES_JAVA_OPTS: "-Xms4g -Xmx4g"
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    ports:
+      - "9201:9200"   # HTTP on host (harness/inspection); services use elasticsearch:9200
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    networks: [chaos_net]
+
+  # Confluent Schema Registry (for Avro encoding tests)
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.7.1
+    profiles: [kafka-infra]
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/subjects"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "8085:8081"   # host port 8085 to avoid conflict with DeltaForge on 8081
+    networks: [chaos_net]
+
+  # ==========================================================================
+  # base — proxy, observability, log aggregation
+  # ==========================================================================
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    profiles: [base]
+    command: ["-host=0.0.0.0", "-config=/etc/toxiproxy/proxies.json"]
+    volumes:
+      - ./chaos/toxiproxy/proxies.json:/etc/toxiproxy/proxies.json:ro
+    ports:
+      - "8474:8474"   # Toxiproxy API  <-- scenario runner talks here
+      - "5100:5100"   # mysql proxy    <-- also exposed for ad-hoc inspection
+      - "5101:5101"   # postgres proxy
+      - "5102:5102"   # kafka proxy
+      - "5103:5103"   # schema-registry proxy
+      - "5104:5104"   # minio (S3) proxy — chaos S3 sink target
+    # No depends_on — infra profiles start independently. Toxiproxy retries
+    # upstream connections automatically; backends just need to be up before
+    # DeltaForge connects through the proxy.
+    networks: [chaos_net]
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    profiles: [base]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./chaos/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+    networks: [chaos_net]
+
+  loki:
+    image: grafana/loki:3.0.0
+    profiles: [base]
+    command: -config.file=/etc/loki/loki-config.yml
+    volumes:
+      - ./chaos/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+    ports: ["3100:3100"]
+    networks: [chaos_net]
+
+  promtail:
+    image: grafana/promtail:3.0.0
+    profiles: [base]
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - ./chaos/promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    networks: [chaos_net]
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    profiles: [base]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/deltaforge.json
+    volumes:
+      - ./chaos/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./chaos/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports: ["3000:3000"]
+    networks: [chaos_net]
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.2
+    profiles: [base]
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    ports: ["8888:8080"]
+    networks: [chaos_net]
+
+  # ==========================================================================
+  # DeltaForge instances — one per build variant
+  # ==========================================================================
+  #
+  # Three instances differentiated by image tag, not config. Pipeline configs
+  # are selected dynamically via the REST API (DELETE + POST /pipelines) from
+  # the chaos UI or CLI.
+  #
+  # All start with mysql-to-kafka.yaml as a default. The UI swaps configs
+  # before running scenarios.
+  #
+  #   release  (:8080/:9000) — production build, no debug symbols
+  #   debug    (:8081/:9001) — debug build with assertions + verbose logging
+  #   profile  (:8082/:9002) — profiling build with perf + flamegraph support
+
+  deltaforge-release:
+    image: deltaforge:dev
+    profiles: [df]
+    command: ["--storage-path", "/data/deltaforge.db"]
+    volumes:
+      - ./chaos/config:/etc/deltaforge:ro
+      - deltaforge_release_data:/data
+    environment:
+      RUST_LOG: "deltaforge=info,sources=info,sinks=info,warn"
+      # Enable jemalloc's background purge thread so freed memory is returned
+      # to the OS after load bursts (drains/soaks) instead of being held as
+      # dirty pages. Lets RSS decay back toward baseline within seconds.
+      _RJEM_MALLOC_CONF: "background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000"
+    ports:
+      - "8080:8080"   # REST API / health
+      - "9000:9000"   # Prometheus /metrics
+    restart: on-failure
+    networks: [chaos_net]
+
+  deltaforge-debug:
+    image: deltaforge:dev-debug
+    profiles: [df]
+    command: ["--storage-path", "/data/deltaforge.db"]
+    user: root
+    volumes:
+      - ./chaos/config:/etc/deltaforge:ro
+      - deltaforge_debug_data:/data
+    environment:
+      RUST_LOG: "deltaforge=debug,sources=debug,sinks=info,warn"
+      _RJEM_MALLOC_CONF: "background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000"
+    ports:
+      - "8081:8080"   # REST API / health
+      - "9001:9000"   # Prometheus /metrics
+    restart: on-failure
+    networks: [chaos_net]
+
+  deltaforge-profile:
+    image: deltaforge:dev-profile
+    profiles: [df]
+    command: ["--storage-path", "/data/deltaforge.db"]
+    user: root
+    # SYS_ADMIN + perf_event_open access needed for CPU profiling via perf.
+    cap_add: [SYS_ADMIN]
+    security_opt: ["seccomp=unconfined"]
+    volumes:
+      - ./chaos/config:/etc/deltaforge:ro
+      - deltaforge_profile_data:/data
+    environment:
+      RUST_LOG: "deltaforge=info,sources=info,sinks=info,warn"
+      _RJEM_MALLOC_CONF: "background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000"
+    ports:
+      - "8082:8080"   # REST API / health
+      - "9002:9000"   # Prometheus /metrics
+    restart: on-failure
+    networks: [chaos_net]
+
+networks:
+  chaos_net:
+
+volumes:
+  deltaforge_release_data:
+  deltaforge_debug_data:
+  deltaforge_profile_data:
+  grafana_data:
+  loki_data:
+  mysql_data:
+  mysql_b_data:
+  postgres_data:
+  postgres_b_data:

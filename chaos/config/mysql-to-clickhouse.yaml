@@ -1,0 +1,53 @@
+apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: chaos-mysql-clickhouse
+  tenant: chaos
+
+spec:
+  source:
+    type: mysql
+    config:
+      id: chaos-mysql-clickhouse
+      dsn: "mysql://cdc_user:cdc_password@toxiproxy:5100/orders"
+      # The ClickHouse sink (v1) targets a single table, so capture just one
+      # source table (not orders.* — the shared chaos DB has many tables).
+      tables:
+        - "orders.customers"
+      on_schema_drift: adapt
+      # The ClickHouse sink loads the source column types + PK on demand (it
+      # queries INFORMATION_SCHEMA the first time it sees a table), so it does
+      # NOT need a snapshot for schema — snapshot: never works too. We keep
+      # snapshot: initial here only to backfill existing rows so the scenario
+      # starts with data.
+      snapshot:
+        mode: initial
+
+  processors: []
+
+  sinks:
+    # ClickHouse via toxiproxy (toxiproxy:5105) so we can inject faults
+    # (network partition). Direct address is "http://clickhouse:8123".
+    # change-log mode: every change is a row, so the row count grows
+    # monotonically with inserts — easy to assert backpressure/recovery.
+    - type: clickhouse
+      config:
+        id: chaos-clickhouse
+        url: "http://toxiproxy:5105"
+        database: default
+        table: customers
+        mode: changelog
+        user: default
+        auto_create: true
+        # Bound per-batch wait so a cut ClickHouse returns Backpressure
+        # instead of blocking the coordinator. Coordinator handles per `required`.
+        send_timeout_secs: 10
+        required: true
+
+  batch:
+    max_events: 500
+    max_ms: 100
+    respect_source_tx: true
+
+  commit_policy:
+    mode: required

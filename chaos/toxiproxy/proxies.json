@@ -1,0 +1,38 @@
+[
+  {
+    "name": "mysql",
+    "listen": "0.0.0.0:5100",
+    "upstream": "mysql:3306",
+    "enabled": true
+  },
+  {
+    "name": "postgres",
+    "listen": "0.0.0.0:5101",
+    "upstream": "postgres:5432",
+    "enabled": true
+  },
+  {
+    "name": "kafka",
+    "listen": "0.0.0.0:5102",
+    "upstream": "kafka:9094",
+    "enabled": true
+  },
+  {
+    "name": "schema-registry",
+    "listen": "0.0.0.0:5103",
+    "upstream": "schema-registry:8081",
+    "enabled": true
+  },
+  {
+    "name": "minio",
+    "listen": "0.0.0.0:5104",
+    "upstream": "minio:9000",
+    "enabled": true
+  },
+  {
+    "name": "clickhouse",
+    "listen": "0.0.0.0:5105",
+    "upstream": "clickhouse:8123",
+    "enabled": true
+  }
+]

@@ -21,6 +21,7 @@ All contributions are welcome and highly appreciated.
 - `crates/sinks` : sink implementations (Kafka producer, Redis streams, NATS JetStream) plus sink utilities.
 - `crates/rest-api` : HTTP control plane with health/readiness and pipeline lifecycle endpoints.
 - `crates/runner` : CLI entrypoint that wires the runtime, metrics, and control plane together.
+- `crates/chaos` : end-to-end chaos scenario runner, benchmarks, and interactive playground UI.
 
 Use these crate boundaries as reference points when adding new sources, sinks, or pipeline behaviors.
 
@@ -196,24 +197,149 @@ The `dev.sh` script provides shortcuts for common tasks:
 ./dev.sh release-check  # run all checks + build all Docker variants
 ```
 
-## End-to-end tests
+## Chaos testing
 
-Reliable validation runs through self-provisioning end-to-end test suites. Each suite spins up its own containers (PostgreSQL, MySQL, Kafka, and so on) via [testcontainers](https://github.com/testcontainers/testcontainers-rs), so there are no fixed ports and no manual stack setup - you only need Docker available. The suites are marked `#[ignore]`, so pass `--include-ignored` to run them.
+End-to-end resilience tests and benchmarks run against a live Docker Compose stack with fault injection via [Toxiproxy](https://github.com/Shopify/toxiproxy). Scenarios cover network partitions, sink outages, crash recovery, server failover, schema drift, binlog purge, long-running endurance runs, and binlog backlog drain benchmarks.
+
+### Prerequisites
+
+Build the debug image first (includes a shell, needed for some scenarios):
 
 ```bash
-# PostgreSQL CDC + snapshot + recovery
-cargo test -p sources --test postgres_cdc_e2e -- --include-ignored
-cargo test -p sources --test postgres_snapshot_e2e -- --include-ignored
-# MySQL
-cargo test -p sources --test mysql_cdc_e2e -- --include-ignored
-# Failover / rotation
-cargo test -p sources --test failover_e2e -- --include-ignored
-# Durability + throughput
-cargo test -p runner --test kafka_outage_restart_e2e -- --include-ignored
-cargo test -p runner --test throughput_e2e -- --include-ignored --nocapture
+docker build -t deltaforge:dev-debug -f Dockerfile.debug .
 ```
 
-See [Performance Tuning](performance.md) for detailed throughput optimization guidance, the `throughput_e2e` drain benchmark, and profiling instructions.
+### Stack profiles
+
+The `df` compose profile starts 3 DeltaForge instances — one per build variant:
+
+| Instance | Port | Image | Use case |
+|----------|------|-------|----------|
+| `deltaforge-release` | 8080 | `deltaforge:latest` | Production behavior, regression testing |
+| `deltaforge-debug` | 8081 | `deltaforge:dev-debug` | Verbose logging, assertions, chaos scenarios |
+| `deltaforge-profile` | 8082 | `deltaforge:dev-profile` | Flamegraphs, CPU profiling, benchmarks |
+
+Pipeline configs are selected dynamically — either via the chaos UI config dropdown, or the CLI `--port` flag. All 3 instances start with a default config (`mysql-to-kafka.yaml`) and can be swapped at runtime.
+
+### Start the chaos environment
+
+```bash
+docker compose -f docker-compose.chaos.yml \
+  --profile base --profile mysql-infra --profile kafka-infra --profile df up -d
+```
+
+Add `--profile pg-infra` if testing PostgreSQL scenarios.
+
+### Run resilience scenarios
+
+```bash
+# Target the debug instance (default --port 8080, override with --port)
+cargo run -p chaos -- --scenario all --source mysql
+cargo run -p chaos -- --scenario network-partition --port 8081
+cargo run -p chaos -- --scenario all --source postgres --port 8080
+```
+
+Exit code is `0` on full pass, `1` on any failure — suitable for CI.
+
+### Run endurance and benchmark scenarios
+
+Before running soak/drain, apply the appropriate config via the UI or REST API:
+
+```bash
+# Apply soak config to the profile instance (for flamegraphs)
+curl -X POST http://localhost:7474/api/apply-config \
+  -H 'Content-Type: application/json' \
+  -d '{"port": 8082, "config": "mysql-soak.yaml"}'
+
+# Soak — long-running with random fault injection
+cargo run -p chaos -- --scenario soak --port 8082 --topic chaos.soak
+
+# Soak-stable — same workload, no faults (baseline)
+cargo run -p chaos -- --scenario soak-stable --port 8082 --topic chaos.soak --duration-mins 30
+
+# Backlog-drain — measures catch-up throughput (1M row replay)
+cargo run -p chaos -- --scenario backlog-drain --port 8082 --topic chaos.soak --no-proxy
+
+# Backlog-drain with custom tuning
+cargo run -p chaos -- --scenario backlog-drain --port 8082 --topic chaos.soak --no-proxy \
+  --drain-max-events 4000 --drain-max-ms 100 \
+  --drain-kafka-conf linger.ms=0
+
+# TPC-C — apply tpcc config first, then run
+curl -X POST http://localhost:7474/api/apply-config \
+  -H 'Content-Type: application/json' \
+  -d '{"port": 8081, "config": "mysql-tpcc.yaml"}'
+cargo run -p chaos -- --scenario tpcc --port 8081 --duration-mins 30
+```
+
+### Avro encoding tests
+
+```bash
+# Unit + mock tests (no Docker needed)
+cargo test -p sinks --test avro_encoding_tests
+
+# Real Schema Registry integration tests (Docker, needs kafka-infra for SR)
+cargo test -p sinks --test avro_encoding_tests -- --include-ignored --nocapture --test-threads=1
+
+# Avro chaos scenario: apply Avro config, then run SR outage
+curl -X POST http://localhost:7474/api/apply-config \
+  -H 'Content-Type: application/json' \
+  -d '{"port": 8081, "config": "mysql-to-kafka-avro.yaml"}'
+cargo run -p chaos -- --scenario sr-outage --port 8081
+
+# JSON vs Avro throughput comparison:
+# Instance 1 (debug): JSON soak
+curl -X POST http://localhost:7474/api/apply-config \
+  -H 'Content-Type: application/json' \
+  -d '{"port": 8081, "config": "mysql-soak.yaml"}'
+cargo run -p chaos -- --scenario soak-stable --port 8081 --topic chaos.soak --duration-mins 30
+
+# Instance 2 (profile): Avro soak
+curl -X POST http://localhost:7474/api/apply-config \
+  -H 'Content-Type: application/json' \
+  -d '{"port": 8082, "config": "mysql-soak-avro.yaml"}'
+cargo run -p chaos -- --scenario soak-stable --port 8082 --topic chaos.soak.avro --duration-mins 30
+```
+
+Compare in Grafana: `rate(deltaforge_sink_events_total[1m])` by instance port.
+
+See [Performance Tuning](performance.md) for detailed throughput optimization guidance and profiling instructions.
+
+### Playground UI
+
+The chaos binary also ships an interactive web UI for manual exploration:
+
+```bash
+cargo run -p chaos -- --scenario ui
+# Open http://localhost:7474
+```
+
+The UI provides:
+- **Live service status** with health dots, port badges, and Docker image selector
+- **Stale image detection** — warns when a container is running an older image after a rebuild
+- **Activity bar** — shows current operation with per-button loading state and task history
+- **Console log** — unified output for all actions (infra, faults, scenarios) with smart auto-scroll
+- **One-click fault injection** via Toxiproxy (partitions, latency, bandwidth throttle)
+- **Scenario runner** with proxy bypass toggle, drain settings, and live log streaming
+- **Pipeline API browser** for any DeltaForge instance
+- **Config Lab** for A/B config comparison with presets
+- **CPU profiler** — captures flamegraphs from running containers with pipeline context in the subtitle
+
+#### Data management
+
+The UI includes a **Data Management** card for resetting persistent state between test runs:
+
+- **Reset Checkpoints** — stops all DeltaForge instances and deletes their SQLite checkpoint databases (GTID positions, replication offsets). Source databases and Kafka are untouched. Use this when switching branches or after a binlog purge leaves stale checkpoint state.
+- **Reset All Volumes** — runs `docker compose down -v` across all profiles, removing every named volume (MySQL data, Kafka state, Postgres data, checkpoints, Grafana). Full clean slate that requires re-initialization of all services.
+
+### Teardown
+
+```bash
+docker compose -f docker-compose.chaos.yml --profile app down -v
+docker compose -f docker-compose.chaos.yml down -v
+```
+
+See [`crates/chaos/README.md`](../../crates/chaos/README.md) for the full scenario catalogue, network topology, all CLI flags, and instructions for adding new scenarios.
 
 ## Contributing
 
