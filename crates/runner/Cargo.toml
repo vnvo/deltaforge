@@ -48,6 +48,7 @@ tikv-jemallocator = { version = "0.6", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+serde_yaml.workspace = true
 criterion = { version = "0.5", features = ["async_tokio"] }
 testcontainers = "0.25"
 ctor = "0.6"

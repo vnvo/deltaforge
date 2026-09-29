@@ -16,9 +16,9 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{debug, info};
 
+use runner::storage_secrets;
 use runner::{PipelineManager, SchemaApi, SensingApi};
 
-mod storage_secrets;
 mod version;
 
 #[derive(Parser, Debug)]
