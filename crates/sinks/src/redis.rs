@@ -113,11 +113,30 @@ impl RedisSink {
         cancel: CancellationToken,
         pipeline: &str,
         source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
+        creds: &crate::ResolvedSinkCreds,
     ) -> anyhow::Result<Self> {
-        let client =
-            redis::Client::open(cfg.uri.clone()).with_context(|| {
-                format!("invalid redis URI: {}", redact_url_password(&cfg.uri))
-            })?;
+        // Effective URI: a resolved whole-URI reference wins; else inject resolved
+        // username/password references into the base URI; else the inline URI.
+        let uri: String = if let Some(u) = creds.get("uri") {
+            u.to_string()
+        } else if let Some(pw) = creds.get("password") {
+            common::dsn::inject_url_credentials(
+                &cfg.uri,
+                creds.get("username").unwrap_or(""),
+                pw,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "inject redis credentials into {}: {e}",
+                    redact_url_password(&cfg.uri)
+                )
+            })?
+        } else {
+            cfg.uri.clone()
+        };
+        let client = redis::Client::open(uri.clone()).with_context(|| {
+            format!("invalid redis URI: {}", redact_url_password(&uri))
+        })?;
 
         // Extract timeouts from config or use defaults
         let send_timeout = cfg

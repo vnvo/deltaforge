@@ -172,6 +172,8 @@ fn make_sink(
         &RedisSinkCfg {
             id: id.into(),
             uri: uri.into(),
+            uri_secret: None,
+            credentials: None,
             stream: stream.into(),
             key: None,
             envelope,
@@ -185,6 +187,7 @@ fn make_sink(
         CancellationToken::new(),
         "",
         None,
+        &sinks::ResolvedSinkCreds::default(),
     )
 }
 
@@ -760,6 +763,8 @@ async fn redis_sink_respects_cancellation() -> Result<()> {
         &RedisSinkCfg {
             id: "test-cancel".into(),
             uri: "redis://invalid-host:9999/0".into(),
+            uri_secret: None,
+            credentials: None,
             stream: "df.test.cancel".into(),
             key: None,
             envelope: EnvelopeCfg::Native,
@@ -773,6 +778,7 @@ async fn redis_sink_respects_cancellation() -> Result<()> {
         cancel.clone(),
         "",
         None,
+        &sinks::ResolvedSinkCreds::default(),
     )?);
 
     let sink_clone = sink.clone();
@@ -806,6 +812,8 @@ async fn redis_sink_large_events() -> Result<()> {
         &RedisSinkCfg {
             id: "test-large".into(),
             uri: uri.clone(),
+            uri_secret: None,
+            credentials: None,
             stream: stream.clone(),
             key: None,
             envelope: EnvelopeCfg::Native,
@@ -819,6 +827,7 @@ async fn redis_sink_large_events() -> Result<()> {
         CancellationToken::new(),
         "",
         None,
+        &sinks::ResolvedSinkCreds::default(),
     )?;
 
     // Send a 1MB event
@@ -843,6 +852,8 @@ async fn redis_sink_large_batch() -> Result<()> {
         &RedisSinkCfg {
             id: "test-large-batch".into(),
             uri: uri.clone(),
+            uri_secret: None,
+            credentials: None,
             stream: stream.clone(),
             key: None,
             envelope: EnvelopeCfg::Native,
@@ -856,6 +867,7 @@ async fn redis_sink_large_batch() -> Result<()> {
         CancellationToken::new(),
         "",
         None,
+        &sinks::ResolvedSinkCreds::default(),
     )?;
 
     // Send 10 events of 100KB each
@@ -885,6 +897,8 @@ async fn redis_sink_concurrent_sends() -> Result<()> {
         &RedisSinkCfg {
             id: "test-concurrent".into(),
             uri: uri.clone(),
+            uri_secret: None,
+            credentials: None,
             stream: stream.clone(),
             key: None,
             envelope: EnvelopeCfg::Native,
@@ -898,6 +912,7 @@ async fn redis_sink_concurrent_sends() -> Result<()> {
         CancellationToken::new(),
         "",
         None,
+        &sinks::ResolvedSinkCreds::default(),
     )?);
 
     // Spawn 10 concurrent tasks, each sending 10 events
@@ -1117,6 +1132,8 @@ async fn redis_sink_optional() -> Result<()> {
         &RedisSinkCfg {
             id: "test-optional".into(),
             uri: redis_uri(),
+            uri_secret: None,
+            credentials: None,
             stream: "df.test.optional".into(),
             key: None,
             envelope: EnvelopeCfg::Native,
@@ -1130,6 +1147,7 @@ async fn redis_sink_optional() -> Result<()> {
         CancellationToken::new(),
         "",
         None,
+        &sinks::ResolvedSinkCreds::default(),
     )?;
 
     assert!(!sink.required(), "sink should be optional");

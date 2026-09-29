@@ -221,6 +221,8 @@ mod tests {
                     sinks: vec![SinkCfg::Redis(RedisSinkCfg {
                         id: "redis".to_string(),
                         uri: "redis://localhost".to_string(),
+                        uri_secret: None,
+                        credentials: None,
                         stream: "events".to_string(),
                         key: None,
                         required: Some(true),

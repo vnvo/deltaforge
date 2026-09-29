@@ -581,15 +581,25 @@ pub struct KafkaSinkCfg {
 ///       encoding: json
 ///       required: true
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RedisSinkCfg {
     /// Unique identifier for this sink instance.
     pub id: String,
 
     /// Redis connection URI.
     /// Supports: redis://, rediss:// (TLS), redis+sentinel://
-    /// Example: "redis://:password@localhost:6379/0"
+    /// Example: "redis://:password@localhost:6379/0". **Deprecated** when it embeds a
+    /// password inline; prefer `uri_secret` or a password-less `uri` + `credentials`.
     pub uri: String,
+
+    /// Reference resolving the whole Redis URI (mutually exclusive with `credentials` and
+    /// with an inline password in `uri`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri_secret: Option<secrets::SecretReference>,
+
+    /// Username/password references injected into the (password-less) base `uri`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<crate::CredentialRefsCfg>,
 
     /// Target Redis Stream name for CDC events. Supports `${path}` templates.
     pub stream: String,
@@ -633,6 +643,26 @@ pub struct RedisSinkCfg {
     /// are silently ignored by this sink.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<SinkFilter>,
+}
+
+impl std::fmt::Debug for RedisSinkCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedisSinkCfg")
+            .field("id", &self.id)
+            .field("uri", &common::dsn::redact_url_password(&self.uri))
+            .field("uri_secret", &self.uri_secret)
+            .field("credentials", &self.credentials)
+            .field("stream", &self.stream)
+            .field("key", &self.key)
+            .field("envelope", &self.envelope)
+            .field("encoding", &self.encoding)
+            .field("required", &self.required)
+            .field("send_timeout_secs", &self.send_timeout_secs)
+            .field("batch_timeout_secs", &self.batch_timeout_secs)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("filter", &self.filter)
+            .finish()
+    }
 }
 
 /// NATS JetStream sink configuration.

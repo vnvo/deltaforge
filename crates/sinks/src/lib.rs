@@ -224,6 +224,7 @@ fn build_sinks_impl(
                             cancel.clone(),
                             pipeline,
                             source_schemas.clone(),
+                            secrets.for_sink(&cfg.id),
                         )?) as ArcDynSink,
                         cfg.filter.clone(),
                     ),
@@ -307,10 +308,13 @@ pub fn build_sink(
             Arc::new(KafkaSink::new(kafka_cfg, cancel, pipeline, None)?)
                 as ArcDynSink
         }
-        SinkCfg::Redis(redis_cfg) => {
-            Arc::new(RedisSink::new(redis_cfg, cancel, pipeline, None)?)
-                as ArcDynSink
-        }
+        SinkCfg::Redis(redis_cfg) => Arc::new(RedisSink::new(
+            redis_cfg,
+            cancel,
+            pipeline,
+            None,
+            &ResolvedSinkCreds::default(),
+        )?) as ArcDynSink,
         SinkCfg::Nats(nats_sink_cfg) => {
             Arc::new(NatsSink::new(nats_sink_cfg, cancel, pipeline, None)?)
                 as ArcDynSink
@@ -362,6 +366,7 @@ mod tests {
             CancellationToken,
             &str,
             Option<Arc<dyn SourceSchemaProvider>>,
+            &ResolvedSinkCreds,
         ) -> anyhow::Result<RedisSink> = RedisSink::new;
     }
 

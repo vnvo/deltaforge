@@ -11,7 +11,9 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, bail};
-use deltaforge_config::{ClickHouseSinkCfg, PipelineSpec, SinkCfg};
+use deltaforge_config::{
+    ClickHouseSinkCfg, PipelineSpec, RedisSinkCfg, SinkCfg,
+};
 use secrets::{SecretReference, SecretResolver};
 use zeroize::Zeroizing;
 
@@ -59,6 +61,7 @@ pub async fn resolve_sink_secrets(
     for sink in &spec.spec.sinks {
         let creds = match sink {
             SinkCfg::ClickHouse(c) => resolve_clickhouse(c, resolver).await?,
+            SinkCfg::Redis(c) => resolve_redis(c, resolver).await?,
             // Other connectors are adopted in later increments; until then they use
             // their inline (deprecated) fields and contribute no resolved secrets.
             _ => ResolvedSinkCreds::default(),
@@ -93,6 +96,60 @@ async fn resolve_clickhouse(
         resolver,
     )
     .await?;
+    Ok(creds)
+}
+
+/// Whether a URL's authority carries a `user:password@` userinfo password.
+pub(crate) fn url_has_password(s: &str) -> bool {
+    let Some((_, rest)) = s.split_once("://") else {
+        return false;
+    };
+    rest.split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit_once('@')
+        .is_some_and(|(userinfo, _)| userinfo.contains(':'))
+}
+
+async fn resolve_redis(
+    cfg: &RedisSinkCfg,
+    resolver: &dyn SecretResolver,
+) -> Result<ResolvedSinkCreds> {
+    let mut creds = ResolvedSinkCreds::default();
+    let uri_has_pw = url_has_password(&cfg.uri);
+    match (&cfg.uri_secret, &cfg.credentials) {
+        (Some(_), Some(_)) => bail!(
+            "redis sink '{}': set either uri_secret or credentials, not both",
+            cfg.id
+        ),
+        (Some(_), None) if uri_has_pw => bail!(
+            "redis sink '{}': uri_secret is set but the inline uri also embeds a \
+             password",
+            cfg.id
+        ),
+        (None, Some(_)) if uri_has_pw => bail!(
+            "redis sink '{}': credentials are set but the base uri embeds a \
+             password (that would be overridden)",
+            cfg.id
+        ),
+        _ => {}
+    }
+    if let Some(reference) = &cfg.uri_secret {
+        creds.insert("uri", resolve_ref(resolver, reference).await?);
+    } else if let Some(c) = &cfg.credentials {
+        if let Some(user) = &c.username {
+            creds.insert("username", resolve_ref(resolver, user).await?);
+        }
+        match &c.password {
+            Some(pw) => {
+                creds.insert("password", resolve_ref(resolver, pw).await?)
+            }
+            None => bail!(
+                "redis sink '{}': credentials require a password reference",
+                cfg.id
+            ),
+        }
+    }
     Ok(creds)
 }
 
