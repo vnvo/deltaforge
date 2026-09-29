@@ -104,9 +104,9 @@ sinks:
 
 Each sink maintains its own checkpoint, committed independently after successful delivery. This means:
 
-- **Faster sinks are not held back** by slower ones — each sink advances its own checkpoint
-- The source replays from the **minimum** checkpoint across all sinks, so a slow sink only causes replay for itself, not re-delivery to sinks that are already ahead
-- **Adding a new sink** to an existing pipeline triggers replay from the source's earliest position for that sink only; existing sinks are unaffected
+- **Faster sinks are not held back** by slower ones while the pipeline runs - each sink advances its own checkpoint and the source's read position does not rewind for a lagging sink in-session
+- The source replays from the **minimum** checkpoint across all sinks. Recovery is **not** selective per sink: on restart every sink, including ones already ahead, is re-delivered from that minimum forward, so sinks that were ahead receive duplicates and must dedup
+- **Adding a new sink** lowers the minimum to that sink's earliest position, so on the next restart the source replays from there and existing sinks are re-delivered those events too (they dedup); the new sink is not backfilled in isolation
 - **Removing a sink** cleans up its checkpoint automatically on the next pipeline patch
 
 This architecture avoids the common CDC pitfall where the slowest sink becomes a bottleneck for all other sinks.
@@ -115,13 +115,13 @@ This architecture avoids the common CDC pitfall where the slowest sink becomes a
 
 | Sink | Guarantee | Mechanism | Consumer action |
 |------|-----------|-----------|-----------------|
-| Kafka (`exactly_once: true`) | **End-to-end exactly-once** | Kafka transactions (two-phase commit) | Set `isolation.level=read_committed` |
+| Kafka (`exactly_once: true`) | Transactional atomic-batch; at-least-once across restart | Each batch is one Kafka transaction (no partial batch); a restart replays a committed batch as a new transaction | Set `isolation.level=read_committed` **and** dedup by event `id` |
 | Kafka (`exactly_once: false`) | At-least-once (idempotent) | Retries deduped; crash-replay produces duplicates | Dedup by event ID |
 | NATS JetStream | At-least-once + server dedup | `Nats-Msg-Id` header within `duplicate_window` | Configure `duplicate_window` |
 | Redis Streams | At-least-once + consumer dedup | `idempotency_key` field in XADD payload | Check key before processing |
 | HTTP/Webhook | At-least-once | Retry on 5xx/timeout; no server-side dedup | Consumer must be idempotent (use event `id`) |
 
-"Exactly-once" means DeltaForge guarantees no duplicates without consumer cooperation. All other sinks are "at-least-once" with a stated dedup mechanism.
+DeltaForge does not claim end-to-end exactly-once for any sink. Every sink is at-least-once; Kafka `exactly_once: true` adds transactional atomic-batch visibility on top, and NATS/Redis add a dedup mechanism. Reaching exactly-once end to end always requires consumer cooperation (dedup on the event `id`).
 
 ### Practical patterns
 
@@ -129,7 +129,7 @@ This architecture avoids the common CDC pitfall where the slowest sink becomes a
 
 **Quorum for redundancy**: Three sinks with `commit_policy.mode: quorum` and `quorum: 2`. Checkpoint advances when any two succeed, providing fault tolerance.
 
-**All-or-nothing**: Use `commit_policy.mode: all` when every destination is critical and you need the strongest consistency guarantee (but affecting rate of delivery).
+**All-or-nothing checkpointing**: Use `commit_policy.mode: all` when every destination is critical - the checkpoint advances only once all sinks have acknowledged (throughput is gated by the slowest sink). This gates checkpoint advancement across sinks; it is not an atomic cross-sink commit - a batch can still land in some sinks and not others within a cycle, and those are reconciled by replay on restart.
 
 ### Multi-format fan-out
 

@@ -10,7 +10,7 @@
 
 # Introduction
 
-DeltaForge is a versatile, high-performance [Change Data Capture](cdc.md) (CDC) engine built in Rust. It streams database changes into downstream systems like Kafka, Redis, NATS, HTTP endpoints, and S3 object storage - giving you full control over how events are routed, transformed, and delivered. Supports JSON and Avro encoding (with Confluent Schema Registry), end-to-end exactly-once delivery via Kafka transactions, and built-in schema discovery that automatically infers and tracks the shape of your data as it flows through.
+DeltaForge is a versatile, high-performance [Change Data Capture](cdc.md) (CDC) engine built in Rust. It streams database changes into downstream systems like Kafka, Redis, NATS, HTTP endpoints, and S3 object storage - giving you full control over how events are routed, transformed, and delivered. Supports JSON and Avro encoding (with Confluent Schema Registry), transactional atomic-batch delivery via Kafka transactions (at-least-once across restart; consumers dedup on event `id` for exactly-once end to end), and built-in schema discovery that automatically infers and tracks the shape of your data as it flows through.
 
 Pipelines are defined declaratively in YAML, making it straightforward to onboard new use cases without custom code.
 
@@ -70,7 +70,7 @@ Pipelines are defined declaratively in YAML, making it straightforward to onboar
 - ⚡ **Powered by Rust** : Predictable performance, memory safety, and minimal resource footprint.
 - 🔌 **Pluggable architecture** : Sources, processors, and sinks are modular and independently extensible.
 - 🧩 **Declarative pipelines** : Define sources, transforms, sinks, and commit policies in version-controlled YAML with environment variable expansion for secrets.
-- 📦 **Reliable checkpointing** : Per-sink independent checkpoints. Exactly-once delivery via Kafka transactions. At-least-once with dedup for NATS and Redis.
+- 📦 **Reliable checkpointing** : Per-sink independent checkpoints. All sinks at-least-once; Kafka transactions add atomic-batch delivery (dedup on event `id` for exactly-once end to end). At-least-once with dedup for NATS and Redis.
 - 🔁 **Avro encoding** : Confluent wire format with Schema Registry. DDL-derived schemas with exact types and nullability. Safe defaults for unsigned integers, enums, and timestamps.
 - 🪦 **Dead letter queue** : Poison events routed to DLQ instead of blocking the pipeline. REST API for inspection, filtering, and replay.
 - 🔀 **Dynamic routing** : Route events to per-table topics, streams, or subjects using templates or JavaScript logic.

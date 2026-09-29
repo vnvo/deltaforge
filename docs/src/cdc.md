@@ -26,7 +26,7 @@ CDC flips the model. Instead of pulling data on a schedule, you subscribe to cha
 
 These benefits compound as systems scale and teams decentralize:
 
-- **Deterministic replay**: Ordered events allow consumers to reconstruct state or power exactly-once delivery with checkpointing.
+- **Deterministic replay**: Ordered events with stable idempotency keys let consumers reconstruct state and dedup replays, so at-least-once delivery becomes effectively exactly-once at the consumer.
 - **Polyglot delivery**: The same change feed can serve caches, queues, warehouses, and search indexes simultaneously without additional source queries.
 
 ---
@@ -205,7 +205,7 @@ Not all fields are present for every operation-`before` is omitted for INSERTs, 
 
 ### The outbox pattern
 
-When you need to update a database and publish an event atomically, the outbox pattern provides exactly-once semantics without distributed transactions.
+When you need to update a database and record the intent to publish an event atomically, the outbox pattern ties the event to the same transaction as the business write - the event is captured if and only if the transaction commits, with no dual-write gap and no distributed transaction. Delivery of that captured event downstream is still at-least-once; consumers dedup on the event `id`.
 
 ```
 ┌─────────────────────────────────────────┐
@@ -265,16 +265,16 @@ Kafka sink uses consistent partitioning by primary key to maintain ordering with
 
 ### Delivery guarantees
 
-Network failures, process crashes, and consumer restarts can cause duplicates or gaps. End-to-end exactly-once requires coordination between source, pipeline, and sink.
+Network failures, process crashes, and consumer restarts can cause duplicates. DeltaForge delivers at-least-once and gives every event a stable idempotency key so consumers can collapse duplicates into an effectively exactly-once result.
 
 **DeltaForge approach**:
 - Checkpoints track the last committed position in the source log.
 - Configurable commit policies (`all`, `required`, `quorum`) control when checkpoints advance.
-- **Kafka**: end-to-end exactly-once via transactional producer (`exactly_once: true`). Consumers set `isolation.level=read_committed`.
+- **Kafka**: transactional atomic-batch delivery via the transactional producer (`exactly_once: true`); consumers set `isolation.level=read_committed` to avoid partial batches. Still at-least-once across restart - a replayed batch is a new transaction - so consumers dedup on event `id`.
 - **NATS**: at-least-once with server-side dedup via `Nats-Msg-Id` header within `duplicate_window`.
 - **Redis**: at-least-once with consumer-side dedup via `idempotency_key` field.
 
-**Default behavior**: DeltaForge provides at-least-once delivery out of the box. End-to-end exactly-once is available for Kafka with `exactly_once: true`. See the [Guarantees page](guarantees.md) for the full delivery tier matrix.
+**Default behavior**: DeltaForge provides at-least-once delivery out of the box. Kafka `exactly_once: true` adds transactional atomic-batch visibility on top; it is not end-to-end exactly-once on its own. See the [Guarantees page](guarantees.md) for the full delivery tier matrix.
 
 ### High availability
 

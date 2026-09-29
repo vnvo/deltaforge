@@ -17,7 +17,7 @@ You're deploying DeltaForge to production and need:
 - Secure authentication (SASL/SCRAM or mTLS)
 - High availability with proper acknowledgment settings
 - Optimal batching and compression for throughput
-- Exactly-once semantics for critical data
+- Transactional atomic-batch delivery for critical data
 
 ## Pipeline Configuration
 
@@ -53,7 +53,7 @@ spec:
         encoding: json
         required: true
         
-        # enable exactly-once semantics
+        # enable the transactional producer (atomic-batch delivery)
         exactly_once: true
         
         # timeout for individual sends
@@ -74,7 +74,7 @@ spec:
           # reliability - wait for all replicas
           acks: "all"
           
-          # idempotence (required for exactly-once)
+          # idempotence (required for the transactional producer)
           enable.idempotence: "true"
           
           # retries and timeouts
@@ -255,7 +255,7 @@ curl http://localhost:8080/pipelines/orders-to-kafka-prod
 ## Key Concepts Demonstrated
 
 - **SASL/SSL Authentication**: Secure broker connections
-- **Exactly-Once Semantics**: Transactional producer for no duplicates
+- **Transactional atomic-batch delivery**: transactional producer; consumers use `read_committed` and dedup on event `id` for exactly-once end to end (at-least-once across restart)
 - **Acknowledgment Modes**: Trade-off between durability and latency
 - **Batching & Compression**: Optimize throughput
 - **Production Tuning**: Real-world configuration patterns

@@ -129,6 +129,8 @@ Batch mode reduces HTTP overhead but means the consumer must handle arrays.
 
 ## Failure modes
 
+In the table below, "retries" means a **bounded in-sink retry** (exponential backoff, finite attempts) inside a single `send_batch` call. There is no unbounded pipeline-level retry loop: once in-sink attempts are exhausted on a required sink, the checkpoint is held and the batch is recovered by source replay on the next restart. HTTP delivery is at-least-once with no server-side dedup, so the endpoint must be idempotent (dedup on event `id`).
+
 | Failure | Symptoms | DeltaForge behavior | Resolution |
 |---------|----------|---------------------|------------|
 | **Endpoint unavailable** | Connection refused | Retries with backoff; blocks checkpoint | Restore endpoint |

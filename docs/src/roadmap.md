@@ -12,7 +12,7 @@
 - **Event replay** - re-deliver captured commit units from the durable journal to selected sinks (recover from consumer bugs, catch a sink up after an outage) with a durable, resumable job model, an acknowledged pause/handoff back to live delivery, at-least-once semantics, and a REST API (start/dry-run/status/cancel). See [Event Replay](replay.md).
 - **Transaction-aware batching** - a commit unit contains only whole transactions; the checkpoint only ever lands at a transaction boundary; resume restarts on a clean boundary. Oversized-transaction fail-closed with a typed error. See [Guarantees & Correctness](guarantees.md).
 - **Per-sink independent checkpoints** - each sink advances independently, source replays from minimum
-- **Exactly-once delivery** - Kafka transactional producer with producer fencing detection
+- **Transactional atomic-batch delivery** - Kafka transactional producer (at-least-once across restart) with producer fencing detection
 - **Helm chart** - StatefulSet, ConfigMap, PVC, ServiceMonitor, PDB
 - **Schema sensing** - automatic schema inference from payloads, high-cardinality key detection
 
