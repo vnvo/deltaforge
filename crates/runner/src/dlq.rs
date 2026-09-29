@@ -6,7 +6,7 @@
 //! serialization or routing. The pipeline continues with the remaining events.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use deltaforge_config::{DlqStreamConfig, OverflowPolicy};
@@ -18,6 +18,11 @@ use tracing::{debug, error, warn};
 
 /// Namespace used for all journal queue entries in the StorageBackend.
 const JOURNAL_NS: &str = "journal";
+
+/// Maximum time the `Block` overflow policy waits for space before failing
+/// closed (returning [`DlqWrite::Dropped`]) so a full DLQ can never hang the
+/// delivery task indefinitely.
+const BLOCK_MAX_WAIT: Duration = Duration::from_secs(60);
 
 /// Whether a per-row DLQ write durably captured the row. A required sink may
 /// only acknowledge a batch (and advance its checkpoint) when every isolated
@@ -41,6 +46,8 @@ pub struct DlqWriter {
     max_event_bytes: usize,
     /// Notified when entries are acked (unblocks Block overflow policy).
     ack_notify: tokio::sync::Notify,
+    /// Upper bound on the `Block` overflow wait before failing closed.
+    block_max_wait: Duration,
 }
 
 impl DlqWriter {
@@ -58,6 +65,7 @@ impl DlqWriter {
             config,
             max_event_bytes,
             ack_notify: tokio::sync::Notify::new(),
+            block_max_wait: BLOCK_MAX_WAIT,
         }
     }
 
@@ -154,21 +162,65 @@ impl DlqWriter {
                     return DlqWrite::Dropped;
                 }
                 OverflowPolicy::Block => {
-                    // Block until space is available (operator acks entries).
-                    // The ack() method calls ack_notify.notify_one() after removing entries.
+                    // Block until space is available (operator acks entries) -
+                    // but bounded and fail-closed. An unbounded wait would hang
+                    // the delivery task forever (past any sink deadline), and a
+                    // backend that keeps erroring must not be mistaken for a full
+                    // queue. On the deadline or a backend error we return
+                    // `Dropped` so a required sink refuses to acknowledge rather
+                    // than blocking indefinitely or silently losing the row.
                     warn!(
                         pipeline = %self.pipeline,
-                        "DLQ overflow (block): pipeline blocked until operator acks entries"
+                        "DLQ overflow (block): waiting up to {}s for operator acks",
+                        self.block_max_wait.as_secs(),
                     );
+                    let deadline =
+                        std::time::Instant::now() + self.block_max_wait;
                     loop {
-                        self.ack_notify.notified().await;
-                        let new_len = self
+                        let remaining = deadline.saturating_duration_since(
+                            std::time::Instant::now(),
+                        );
+                        if remaining.is_zero() {
+                            warn!(
+                                pipeline = %self.pipeline,
+                                "DLQ overflow (block): timed out waiting for space; failing closed"
+                            );
+                            counter!(
+                                "deltaforge_dlq_write_failures_total",
+                                "pipeline" => self.pipeline.clone(),
+                            )
+                            .increment(1);
+                            return DlqWrite::Dropped;
+                        }
+                        // Wake on an ack, or re-check periodically on timeout.
+                        let _ = tokio::time::timeout(
+                            remaining.min(Duration::from_secs(1)),
+                            self.ack_notify.notified(),
+                        )
+                        .await;
+                        match self
                             .backend
                             .queue_len(JOURNAL_NS, &self.queue_key)
                             .await
-                            .unwrap_or(current_len);
-                        if new_len < self.config.max_entries {
-                            break;
+                        {
+                            Ok(new_len) => {
+                                if new_len < self.config.max_entries {
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    pipeline = %self.pipeline,
+                                    error = %e,
+                                    "DLQ overflow (block): backend error while waiting; failing closed"
+                                );
+                                counter!(
+                                    "deltaforge_dlq_write_failures_total",
+                                    "pipeline" => self.pipeline.clone(),
+                                )
+                                .increment(1);
+                                return DlqWrite::Dropped;
+                            }
                         }
                     }
                 }
@@ -576,6 +628,42 @@ mod tests {
 
         // Queue should have 2 entries (1 original + 1 new, after 1 acked).
         assert_eq!(dlq.len().await.unwrap(), 2);
+    }
+
+    /// R3-C2 review follow-up: the Block overflow policy must be bounded - if no
+    /// operator ack arrives, the write fails closed (Dropped) instead of hanging
+    /// the delivery task forever.
+    #[tokio::test]
+    async fn overflow_block_times_out_and_fails_closed() {
+        let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        let mut dlq = make_dlq_writer(backend, 1, OverflowPolicy::Block);
+        dlq.block_max_wait = Duration::from_millis(300);
+
+        let err = SinkError::Serialization {
+            details: "bad".into(),
+        };
+        // Fill to capacity: the next write hits Block with no ack coming.
+        assert_eq!(
+            dlq.write(&make_test_event(0), "kafka", &err).await,
+            DlqWrite::Persisted
+        );
+
+        let start = std::time::Instant::now();
+        let outcome = dlq.write(&make_test_event(1), "kafka", &err).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            outcome,
+            DlqWrite::Dropped,
+            "Block must fail closed when no space is freed"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(250)
+                && elapsed < Duration::from_secs(5),
+            "Block wait must be bounded (~block_max_wait), took {elapsed:?}"
+        );
+        // The blocked row was NOT persisted (queue still at capacity).
+        assert_eq!(dlq.len().await.unwrap(), 1);
     }
 
     #[tokio::test]
