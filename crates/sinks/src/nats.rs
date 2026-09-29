@@ -70,10 +70,20 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 // =============================================================================
 
 /// NATS JetStream sink with connection management and retry logic.
+/// Effective NATS auth (resolved references win over inline config). Runtime-only,
+/// zeroized on drop; never serialized.
+#[derive(Clone, Default)]
+struct NatsAuth {
+    username: Option<zeroize::Zeroizing<String>>,
+    password: Option<zeroize::Zeroizing<String>>,
+    token: Option<zeroize::Zeroizing<String>>,
+}
+
 pub struct NatsSink {
     id: String,
     pipeline: String,
     cfg: NatsSinkCfg,
+    auth: NatsAuth,
 
     subject: String, // static fallback
     subject_template: CompiledTemplate,
@@ -122,7 +132,20 @@ impl NatsSink {
         cancel: CancellationToken,
         pipeline: &str,
         source_schemas: Option<Arc<dyn SourceSchemaProvider>>,
+        creds: &crate::ResolvedSinkCreds,
     ) -> anyhow::Result<Self> {
+        // Effective auth: a resolved reference wins over the inline (deprecated) value.
+        let effective = |field: &str, inline: &Option<String>| {
+            creds
+                .get(field)
+                .map(|v| zeroize::Zeroizing::new(v.to_string()))
+                .or_else(|| inline.clone().map(zeroize::Zeroizing::new))
+        };
+        let auth = NatsAuth {
+            username: effective("username", &cfg.username),
+            password: effective("password", &cfg.password),
+            token: effective("token", &cfg.token),
+        };
         // Extract timeouts from config or use defaults
         let send_timeout = cfg
             .send_timeout_secs
@@ -198,6 +221,7 @@ impl NatsSink {
         );
 
         Ok(Self {
+            auth,
             id: cfg.id.clone(),
             pipeline: pipeline.to_string(),
             cfg: cfg.clone(),
@@ -422,14 +446,16 @@ impl NatsSink {
         );
 
         let cfg = self.cfg.clone();
+        let auth = self.auth.clone();
         let url_redacted = redact_nats_url(&cfg.url);
 
         let result = retry_async(
             |attempt| {
                 let cfg = cfg.clone();
+                let auth = auth.clone();
                 async move {
                     debug!(attempt, "attempting nats connection");
-                    connect_nats(&cfg)
+                    connect_nats(&cfg, &auth)
                         .await
                         .map_err(|e| NatsRetryError::Connect(e.to_string()))
                 }
@@ -520,7 +546,10 @@ impl NatsSink {
 }
 
 /// Connect to NATS and create JetStream context.
-async fn connect_nats(cfg: &NatsSinkCfg) -> anyhow::Result<ClientState> {
+async fn connect_nats(
+    cfg: &NatsSinkCfg,
+    auth: &NatsAuth,
+) -> anyhow::Result<ClientState> {
     let mut options = async_nats::ConnectOptions::new();
 
     // Apply credentials if provided
@@ -534,14 +563,14 @@ async fn connect_nats(cfg: &NatsSinkCfg) -> anyhow::Result<ClientState> {
                 })?;
     }
 
-    // Apply username/password if provided
-    if let (Some(user), Some(pass)) = (&cfg.username, &cfg.password) {
-        options = options.user_and_password(user.clone(), pass.clone());
+    // Apply resolved username/password if provided
+    if let (Some(user), Some(pass)) = (&auth.username, &auth.password) {
+        options = options.user_and_password(user.to_string(), pass.to_string());
     }
 
-    // Apply token if provided
-    if let Some(ref token) = cfg.token {
-        options = options.token(token.clone());
+    // Apply resolved token if provided
+    if let Some(token) = &auth.token {
+        options = options.token(token.to_string());
     }
 
     let client = options.connect(&cfg.url).await.with_context(|| {

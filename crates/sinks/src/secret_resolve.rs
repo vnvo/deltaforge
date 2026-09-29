@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 use deltaforge_config::{
-    ClickHouseSinkCfg, PipelineSpec, RedisSinkCfg, SinkCfg,
+    ClickHouseSinkCfg, NatsSinkCfg, PipelineSpec, RedisSinkCfg, SinkCfg,
 };
 use secrets::{SecretReference, SecretResolver};
 use zeroize::Zeroizing;
@@ -62,6 +62,7 @@ pub async fn resolve_sink_secrets(
         let creds = match sink {
             SinkCfg::ClickHouse(c) => resolve_clickhouse(c, resolver).await?,
             SinkCfg::Redis(c) => resolve_redis(c, resolver).await?,
+            SinkCfg::Nats(c) => resolve_nats(c, resolver).await?,
             // Other connectors are adopted in later increments; until then they use
             // their inline (deprecated) fields and contribute no resolved secrets.
             _ => ResolvedSinkCreds::default(),
@@ -149,6 +150,24 @@ async fn resolve_redis(
                 cfg.id
             ),
         }
+    }
+    Ok(creds)
+}
+
+async fn resolve_nats(
+    cfg: &NatsSinkCfg,
+    resolver: &dyn SecretResolver,
+) -> Result<ResolvedSinkCreds> {
+    let mut creds = ResolvedSinkCreds::default();
+    for (field, inline, reference) in [
+        ("username", &cfg.username, &cfg.username_ref),
+        ("password", &cfg.password, &cfg.password_ref),
+        ("token", &cfg.token, &cfg.token_ref),
+    ] {
+        resolve_field(
+            &mut creds, "nats", &cfg.id, field, inline, reference, resolver,
+        )
+        .await?;
     }
     Ok(creds)
 }

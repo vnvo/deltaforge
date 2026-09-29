@@ -236,11 +236,15 @@ fn make_sink(
             username: None,
             password: None,
             token: None,
+            username_ref: None,
+            password_ref: None,
+            token_ref: None,
             filter: None,
         },
         CancellationToken::new(),
         "",
         None,
+        &sinks::ResolvedSinkCreds::default(),
     )
 }
 
@@ -656,11 +660,15 @@ async fn nats_sink_large_payload() -> Result<()> {
             username: None,
             password: None,
             token: None,
+            username_ref: None,
+            password_ref: None,
+            token_ref: None,
             filter: None,
         },
         CancellationToken::new(),
         "",
         None,
+        &sinks::ResolvedSinkCreds::default(),
     )?;
 
     // Test various payload sizes
@@ -706,11 +714,15 @@ async fn nats_sink_batch_large_payload() -> Result<()> {
             username: None,
             password: None,
             token: None,
+            username_ref: None,
+            password_ref: None,
+            token_ref: None,
             filter: None,
         },
         CancellationToken::new(),
         "",
         None,
+        &sinks::ResolvedSinkCreds::default(),
     )?;
 
     // 20 events at 50KB each = ~1MB total
@@ -754,11 +766,15 @@ async fn nats_sink_concurrent_sends() -> Result<()> {
             username: None,
             password: None,
             token: None,
+            username_ref: None,
+            password_ref: None,
+            token_ref: None,
             filter: None,
         },
         CancellationToken::new(),
         "",
         None,
+        &sinks::ResolvedSinkCreds::default(),
     )?);
 
     // Spawn multiple concurrent send tasks
@@ -816,11 +832,15 @@ async fn nats_sink_concurrent_batches() -> Result<()> {
             username: None,
             password: None,
             token: None,
+            username_ref: None,
+            password_ref: None,
+            token_ref: None,
             filter: None,
         },
         CancellationToken::new(),
         "",
         None,
+        &sinks::ResolvedSinkCreds::default(),
     )?);
 
     // Spawn multiple concurrent batch send tasks
@@ -1000,11 +1020,15 @@ async fn nats_sink_handles_rapid_sends() -> Result<()> {
             username: None,
             password: None,
             token: None,
+            username_ref: None,
+            password_ref: None,
+            token_ref: None,
             filter: None,
         },
         CancellationToken::new(),
         "",
         None,
+        &sinks::ResolvedSinkCreds::default(),
     )?);
 
     // Send multiple events rapidly
@@ -1059,11 +1083,15 @@ async fn nats_sink_batch_resilience() -> Result<()> {
             username: None,
             password: None,
             token: None,
+            username_ref: None,
+            password_ref: None,
+            token_ref: None,
             filter: None,
         },
         CancellationToken::new(),
         "",
         None,
+        &sinks::ResolvedSinkCreds::default(),
     )?;
 
     // Send multiple batches in sequence
@@ -1115,11 +1143,15 @@ async fn nats_sink_respects_cancellation() -> Result<()> {
             username: None,
             password: None,
             token: None,
+            username_ref: None,
+            password_ref: None,
+            token_ref: None,
             filter: None,
         },
         cancel.clone(),
         "",
         None,
+        &sinks::ResolvedSinkCreds::default(),
     )?);
 
     let sink_clone = sink.clone();
@@ -1241,11 +1273,15 @@ async fn nats_sink_optional() -> Result<()> {
             username: None,
             password: None,
             token: None,
+            username_ref: None,
+            password_ref: None,
+            token_ref: None,
             filter: None,
         },
         CancellationToken::new(),
         "",
         None,
+        &sinks::ResolvedSinkCreds::default(),
     )?;
 
     assert!(!sink.required(), "sink should be optional");

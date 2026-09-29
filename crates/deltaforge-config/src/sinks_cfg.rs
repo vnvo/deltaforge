@@ -679,7 +679,7 @@ impl std::fmt::Debug for RedisSinkCfg {
 ///       envelope: native
 ///       encoding: json
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct NatsSinkCfg {
     /// Unique identifier for this sink.
     pub id: String,
@@ -743,14 +743,51 @@ pub struct NatsSinkCfg {
     #[serde(default)]
     pub password: Option<String>,
 
-    /// Token for token-based authentication.
+    /// Token for token-based authentication. **Deprecated** as an inline secret;
+    /// prefer `token_ref`.
     #[serde(default)]
     pub token: Option<String>,
+
+    /// Reference resolving the username (mutually exclusive with `username`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username_ref: Option<secrets::SecretReference>,
+    /// Reference resolving the password (mutually exclusive with `password`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_ref: Option<secrets::SecretReference>,
+    /// Reference resolving the auth token (mutually exclusive with `token`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_ref: Option<secrets::SecretReference>,
 
     /// Optional filter applied before delivery. Events not matching the filter
     /// are silently ignored by this sink.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<SinkFilter>,
+}
+
+impl std::fmt::Debug for NatsSinkCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NatsSinkCfg")
+            .field("id", &self.id)
+            .field("url", &common::dsn::redact_url_password(&self.url))
+            .field("subject", &self.subject)
+            .field("key", &self.key)
+            .field("envelope", &self.envelope)
+            .field("encoding", &self.encoding)
+            .field("stream", &self.stream)
+            .field("required", &self.required)
+            .field("send_timeout_secs", &self.send_timeout_secs)
+            .field("batch_timeout_secs", &self.batch_timeout_secs)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("credentials_file", &self.credentials_file)
+            .field("username", &redact_opt(&self.username))
+            .field("password", &redact_opt(&self.password))
+            .field("token", &redact_opt(&self.token))
+            .field("username_ref", &self.username_ref)
+            .field("password_ref", &self.password_ref)
+            .field("token_ref", &self.token_ref)
+            .field("filter", &self.filter)
+            .finish()
+    }
 }
 
 /// HTTP/Webhook sink configuration.

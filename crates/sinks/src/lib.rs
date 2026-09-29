@@ -234,6 +234,7 @@ fn build_sinks_impl(
                             cancel.clone(),
                             pipeline,
                             source_schemas.clone(),
+                            secrets.for_sink(&cfg.id),
                         )?) as ArcDynSink,
                         cfg.filter.clone(),
                     ),
@@ -315,10 +316,13 @@ pub fn build_sink(
             None,
             &ResolvedSinkCreds::default(),
         )?) as ArcDynSink,
-        SinkCfg::Nats(nats_sink_cfg) => {
-            Arc::new(NatsSink::new(nats_sink_cfg, cancel, pipeline, None)?)
-                as ArcDynSink
-        }
+        SinkCfg::Nats(nats_sink_cfg) => Arc::new(NatsSink::new(
+            nats_sink_cfg,
+            cancel,
+            pipeline,
+            None,
+            &ResolvedSinkCreds::default(),
+        )?) as ArcDynSink,
         SinkCfg::Http(http_cfg) => {
             Arc::new(HttpSink::new(http_cfg, cancel, pipeline, None)?)
                 as ArcDynSink
