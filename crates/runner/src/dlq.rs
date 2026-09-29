@@ -496,6 +496,220 @@ mod tests {
         )
     }
 
+    /// A backend that delegates to an inner `MemoryStorageBackend` for everything
+    /// except `queue_push`, which always fails - to prove the DLQ write reports
+    /// `Dropped` (and callers fail closed) when the durable append cannot commit.
+    #[derive(Debug)]
+    struct QueuePushFailBackend(MemoryStorageBackend);
+
+    #[async_trait::async_trait]
+    impl storage::StorageBackend for QueuePushFailBackend {
+        async fn kv_get(
+            &self,
+            ns: &str,
+            key: &str,
+        ) -> anyhow::Result<Option<Vec<u8>>> {
+            self.0.kv_get(ns, key).await
+        }
+        async fn kv_put(
+            &self,
+            ns: &str,
+            key: &str,
+            value: &[u8],
+        ) -> anyhow::Result<()> {
+            self.0.kv_put(ns, key, value).await
+        }
+        async fn kv_put_with_ttl(
+            &self,
+            ns: &str,
+            key: &str,
+            value: &[u8],
+            ttl_secs: u64,
+        ) -> anyhow::Result<()> {
+            self.0.kv_put_with_ttl(ns, key, value, ttl_secs).await
+        }
+        async fn kv_delete(&self, ns: &str, key: &str) -> anyhow::Result<bool> {
+            self.0.kv_delete(ns, key).await
+        }
+        async fn kv_list(
+            &self,
+            ns: &str,
+            prefix: Option<&str>,
+        ) -> anyhow::Result<Vec<String>> {
+            self.0.kv_list(ns, prefix).await
+        }
+        async fn log_append(
+            &self,
+            ns: &str,
+            key: &str,
+            value: &[u8],
+        ) -> anyhow::Result<u64> {
+            self.0.log_append(ns, key, value).await
+        }
+        async fn log_list(
+            &self,
+            ns: &str,
+            key: &str,
+        ) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
+            self.0.log_list(ns, key).await
+        }
+        async fn log_since(
+            &self,
+            ns: &str,
+            key: &str,
+            since_seq: u64,
+        ) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
+            self.0.log_since(ns, key, since_seq).await
+        }
+        async fn log_latest(
+            &self,
+            ns: &str,
+            key: &str,
+        ) -> anyhow::Result<Option<(u64, Vec<u8>)>> {
+            self.0.log_latest(ns, key).await
+        }
+        async fn log_append_if_absent(
+            &self,
+            ns: &str,
+            key: &str,
+            capture_id: &str,
+            value: &[u8],
+        ) -> anyhow::Result<storage::LogAppendOutcome> {
+            self.0
+                .log_append_if_absent(ns, key, capture_id, value)
+                .await
+        }
+        async fn log_truncate(
+            &self,
+            ns: &str,
+            key: &str,
+            req: storage::LogTruncateRequest,
+        ) -> anyhow::Result<storage::LogTruncateOutcome> {
+            self.0.log_truncate(ns, key, req).await
+        }
+        async fn log_stream_meta(
+            &self,
+            ns: &str,
+            key: &str,
+        ) -> anyhow::Result<storage::LogStreamMeta> {
+            self.0.log_stream_meta(ns, key).await
+        }
+        async fn log_read_meta_since(
+            &self,
+            ns: &str,
+            key: &str,
+            since_seq: u64,
+            limit: usize,
+        ) -> anyhow::Result<Vec<storage::LogEntryMeta>> {
+            self.0.log_read_meta_since(ns, key, since_seq, limit).await
+        }
+        async fn slot_upsert(
+            &self,
+            ns: &str,
+            key: &str,
+            state: &[u8],
+        ) -> anyhow::Result<u64> {
+            self.0.slot_upsert(ns, key, state).await
+        }
+        async fn slot_get(
+            &self,
+            ns: &str,
+            key: &str,
+        ) -> anyhow::Result<Option<(u64, Vec<u8>)>> {
+            self.0.slot_get(ns, key).await
+        }
+        async fn slot_cas(
+            &self,
+            ns: &str,
+            key: &str,
+            expected_version: u64,
+            state: &[u8],
+        ) -> anyhow::Result<bool> {
+            self.0.slot_cas(ns, key, expected_version, state).await
+        }
+        async fn slot_create(
+            &self,
+            ns: &str,
+            key: &str,
+            state: &[u8],
+        ) -> anyhow::Result<Option<u64>> {
+            self.0.slot_create(ns, key, state).await
+        }
+        async fn slot_delete(
+            &self,
+            ns: &str,
+            key: &str,
+        ) -> anyhow::Result<bool> {
+            self.0.slot_delete(ns, key).await
+        }
+        async fn slot_list(
+            &self,
+            ns: &str,
+            prefix: Option<&str>,
+            cursor: Option<&str>,
+            limit: usize,
+        ) -> anyhow::Result<storage::SlotPage> {
+            self.0.slot_list(ns, prefix, cursor, limit).await
+        }
+        async fn queue_push(
+            &self,
+            _ns: &str,
+            _key: &str,
+            _value: &[u8],
+        ) -> anyhow::Result<u64> {
+            Err(anyhow::anyhow!("injected queue_push failure"))
+        }
+        async fn queue_peek(
+            &self,
+            ns: &str,
+            key: &str,
+            limit: usize,
+        ) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
+            self.0.queue_peek(ns, key, limit).await
+        }
+        async fn queue_ack(
+            &self,
+            ns: &str,
+            key: &str,
+            up_to_id: u64,
+        ) -> anyhow::Result<usize> {
+            self.0.queue_ack(ns, key, up_to_id).await
+        }
+        async fn queue_len(&self, ns: &str, key: &str) -> anyhow::Result<u64> {
+            self.0.queue_len(ns, key).await
+        }
+        async fn queue_drop_oldest(
+            &self,
+            ns: &str,
+            key: &str,
+            count: usize,
+        ) -> anyhow::Result<usize> {
+            self.0.queue_drop_oldest(ns, key, count).await
+        }
+    }
+
+    /// R3-C1 durability boundary: when the storage backend's `queue_push` fails,
+    /// the DLQ write must report `Dropped` (nothing durably captured) so a
+    /// required sink refuses to acknowledge and the checkpoint is held.
+    #[tokio::test]
+    async fn queue_push_backend_failure_returns_dropped() {
+        let backend: ArcStorageBackend =
+            Arc::new(QueuePushFailBackend(MemoryStorageBackend::new()));
+        // Large capacity so this is the plain push path, not overflow.
+        let dlq = make_dlq_writer(backend, 1000, OverflowPolicy::Reject);
+        let err = SinkError::Serialization {
+            details: "bad".into(),
+        };
+        let outcome = dlq.write(&make_test_event(0), "kafka", &err).await;
+        assert_eq!(
+            outcome,
+            DlqWrite::Dropped,
+            "a failed queue_push must report Dropped, not silently succeed"
+        );
+        // Nothing was durably captured.
+        assert_eq!(dlq.len().await.unwrap(), 0);
+    }
+
     #[tokio::test]
     async fn write_and_peek() {
         let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
