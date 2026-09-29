@@ -21,8 +21,7 @@ use deltaforge_core::{SourceError, SourceResult};
 
 use super::postgres_helpers::redact_password;
 use super::postgres_table_schema::{
-    FirstResolution, PostgresColumn, PostgresTableSchema,
-    verify_first_resolution,
+    PostgresColumn, PostgresTableSchema, RelationIdentity,
 };
 use crate::schema_loader::{
     LoadedSchema as ApiLoadedSchema, SchemaListEntry, SourceSchemaLoader,
@@ -323,20 +322,20 @@ impl PostgresSchemaLoader {
     /// Resolution order:
     /// 1. cache hit -> return it;
     /// 2. live catalog has the table -> fetch, register, cache (normal path);
-    /// 3. live table is GONE -> fall back to the durable registry, but only when the
-    ///    persisted schema's ordered `(name, type_oid)` signature matches the Relation
-    ///    payload. On a mismatch, or when no durable history exists, fail closed with an
-    ///    actionable diagnostic - never guess a schema, skip the event, or advance the
-    ///    checkpoint.
-    ///
-    /// `relation_signature` is the ordered `(name, type_oid)` list from the pgoutput
-    /// Relation message for this table.
-    pub async fn load_schema_for_relation(
+    /// 3. live table is GONE -> recover from the durable registry, selecting the **one**
+    ///    historical version whose relation identity ([`RelationIdentity`]: table OID +
+    ///    ordered `(name, type_oid)` signature + replica identity) matches the retained
+    ///    relation. Searches the full version history (not just the latest), so WAL
+    ///    encoded under an earlier schema version (A of an A->B evolution) still decodes.
+    ///    Fails closed - never guesses, skips, or advances the checkpoint - when there is
+    ///    no history, no matching version, or more than one matching version (ambiguous
+    ///    lineage, e.g. a same-named relation in another database whose OID collides).
+    pub(crate) async fn load_schema_for_relation(
         &self,
         schema: &str,
         table: &str,
         checkpoint: Option<&[u8]>,
-        relation_signature: &[(String, u32)],
+        rel: &RelationIdentity,
     ) -> SourceResult<LoadedSchema> {
         let key = (schema.to_string(), table.to_string());
         if let Some(cached) = self.cache.read().await.get(&key) {
@@ -350,10 +349,10 @@ impl PostgresSchemaLoader {
                 .await;
         }
 
-        // The live table is gone. Recover from the durable historical schema, gated on
-        // an exact signature match with the replication stream.
-        let Some(sv) = self.registry.get_latest(&self.tenant, schema, table)
-        else {
+        // The live table is gone. Recover from the durable historical schema, selecting
+        // the unique version bound to this relation's lifetime and structure.
+        let versions = self.registry.list_versions(&self.tenant, schema, table);
+        if versions.is_empty() {
             return Err(SourceError::Schema {
                 details: format!(
                     "table {schema}.{table} no longer exists and no durable schema \
@@ -363,18 +362,20 @@ impl PostgresSchemaLoader {
                 )
                 .into(),
             });
-        };
-        let version = sv.version;
-        let sequence = sv.sequence;
-        let pg_schema: PostgresTableSchema =
-            serde_json::from_value(sv.schema_json)
-                .map_err(|e| SourceError::Other(e.into()))?;
-
-        match verify_first_resolution(
-            &pg_schema.signature(),
-            relation_signature,
-        ) {
-            FirstResolution::NoDrift => {
+        }
+        let mut matched: Vec<(i32, u64, PostgresTableSchema)> = Vec::new();
+        for sv in versions {
+            let (version, sequence) = (sv.version, sv.sequence);
+            if let Ok(s) =
+                serde_json::from_value::<PostgresTableSchema>(sv.schema_json)
+                && s.matches_relation(rel)
+            {
+                matched.push((version, sequence, s));
+            }
+        }
+        match matched.len() {
+            1 => {
+                let (version, sequence, pg_schema) = matched.pop().unwrap();
                 let fingerprint = pg_schema.fingerprint();
                 let column_names: Arc<Vec<String>> = Arc::new(
                     pg_schema
@@ -393,15 +394,28 @@ impl PostgresSchemaLoader {
                 self.cache.write().await.insert(key, loaded.clone());
                 info!(
                     schema = %schema, table = %table, version,
+                    relation_oid = rel.oid,
                     "decoding retained WAL for dropped table from durable schema"
                 );
                 Ok(loaded)
             }
-            FirstResolution::Drift(detail) => Err(SourceError::Schema {
+            0 => Err(SourceError::Schema {
                 details: format!(
                     "table {schema}.{table} no longer exists and its durable schema \
-                     does not match the replication stream ({detail}); refusing to \
-                     decode its retained WAL (fail-closed)."
+                     does not match the retained relation (oid={}, replica identity \
+                     '{}', column signature) in any historical version; refusing to \
+                     decode its retained WAL (fail-closed).",
+                    rel.oid, rel.replica_identity
+                )
+                .into(),
+            }),
+            n => Err(SourceError::Schema {
+                details: format!(
+                    "table {schema}.{table}: {n} durable schema versions match the \
+                     retained relation (oid={}) - ambiguous lineage (e.g. a same-named \
+                     relation in another database); refusing to decode to avoid \
+                     applying the wrong schema (fail-closed).",
+                    rel.oid
                 )
                 .into(),
             }),

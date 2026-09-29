@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, atomic::AtomicBool},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -681,14 +681,12 @@ impl PostgresSource {
         info!("entering replication loop");
         // Durable delivery frontier (separate from `ctx.last_lsn`, the read position):
         // the acknowledged LSN reported to PostgreSQL as flushed, sourced only from the
-        // per-sink checkpoint store. A ticker refreshes it even while the source is idle
-        // so a just-acknowledged batch is confirmed promptly (idle keepalives themselves
-        // are emitted by the replication worker, carrying whatever frontier is set).
-        let mut durable_frontier: Option<Lsn> = None;
-        let mut feedback_ticker =
-            tokio::time::interval(Duration::from_millis(500));
-        feedback_ticker
-            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // per-sink checkpoint store. Refreshed change-driven via
+        // `CheckpointStore::await_checkpoint_change` (the coordinator signals after each
+        // per-sink commit; a long fallback re-confirms during idle) so idle sources do
+        // not poll the control store. Idle keepalives are emitted by the replication
+        // worker, carrying whatever frontier is set.
+        let mut wal_feedback = WalFeedback::new();
         // The loop runs inside an async block so its result can be captured and the
         // rotation runtime cancelled+joined before teardown, on both the normal and
         // fatal exit paths. A fatal result (including gate-6 rotation failures) is
@@ -717,7 +715,9 @@ impl PostgresSource {
             // Report the durable delivery frontier to PostgreSQL before blocking on the
             // next read. Runs after every processed event and on each idle ticker wake,
             // so WAL is released only up to what the sinks have durably acknowledged.
-            advance_wal_feedback(&ctx, &chkpt_store, &mut durable_frontier).await;
+            // Fails closed (stops the source before the teardown put) on a malformed
+            // checkpoint or prolonged checkpoint-store unavailability.
+            advance_wal_feedback(&ctx, &chkpt_store, &mut wal_feedback).await?;
 
             debug!(source_id = %self.id, "reading next event");
 
@@ -740,7 +740,7 @@ impl PostgresSource {
                             Err(ctrl) => Err(ctrl),
                         },
                         _ = rt.wait_activity() => continue,
-                        _ = feedback_ticker.tick() => continue,
+                        _ = chkpt_store.await_checkpoint_change() => continue,
                     }
                 }
                 None => {
@@ -755,7 +755,7 @@ impl PostgresSource {
                             }
                             Err(ctrl) => Err(ctrl),
                         },
-                        _ = feedback_ticker.tick() => continue,
+                        _ = chkpt_store.await_checkpoint_change() => continue,
                     }
                 }
             };
@@ -878,69 +878,152 @@ impl PostgresSource {
     }
 }
 
-/// Advance the WAL feedback sent to PostgreSQL to the **durable delivery frontier** -
-/// the minimum per-sink checkpoint that every required sink has acknowledged and the
-/// coordinator has committed - never the read/enqueued position.
-///
-/// The frontier is read from the checkpoint store (the per-sink [`CheckpointStore`]
-/// proxy folds the minimum and fails closed on incomparable/corrupt checkpoints). Since
-/// the store only ever holds committed, acknowledged checkpoints at transaction
-/// boundaries, the reported LSN can never be inside an open transaction or ahead of an
-/// unacknowledged batch. `durable_frontier` is the separately-tracked durable state; on
-/// any read/parse error it is left untouched so feedback holds at the last durable
-/// position (WAL is retained, never over-released).
-async fn advance_wal_feedback(
-    ctx: &RunCtx,
-    chkpt: &Arc<dyn CheckpointStore>,
-    durable_frontier: &mut Option<Lsn>,
-) {
-    *durable_frontier =
-        durable_frontier_lsn(chkpt, &ctx.source_id, *durable_frontier).await;
-    if let Some(frontier) = *durable_frontier {
-        ctx.repl_client.lock().await.update_applied_lsn(frontier);
+/// How long the durable checkpoint store may be transiently unavailable before the
+/// source stops fail-closed rather than keep consuming with stale recovery authority
+/// (and unbounded retained WAL).
+const FEEDBACK_STORE_UNAVAILABLE_STOP: Duration = Duration::from_secs(60);
+
+/// Mutable state for WAL feedback across loop iterations: the last durable frontier, the
+/// start of a transient store-unavailability window, and an edge latch so a persistent
+/// storage failure warns once, not every poll.
+struct WalFeedback {
+    frontier: Option<Lsn>,
+    unavailable_since: Option<Instant>,
+    warned_unavailable: bool,
+}
+
+impl WalFeedback {
+    fn new() -> Self {
+        Self {
+            frontier: None,
+            unavailable_since: None,
+            warned_unavailable: false,
+        }
     }
 }
 
-/// Compute the durable frontier LSN to confirm to PostgreSQL: the per-sink minimum from
-/// the checkpoint store, advanced monotonically. On any read/parse error - including the
-/// per-sink proxy's fail-closed incomparable/corrupt error - the prior frontier `prev` is
-/// held (feedback never regresses or advances past the durable minimum). `None` means
-/// nothing has been durably acknowledged yet, so nothing is confirmed.
-///
-/// The store only ever holds committed, acknowledged checkpoints at transaction
-/// boundaries, so the returned LSN can never be inside an open transaction or ahead of an
-/// unacknowledged/backpressured batch.
-async fn durable_frontier_lsn(
+/// Classification of a durable-frontier read for WAL feedback.
+#[derive(Debug, PartialEq, Eq)]
+enum FeedbackOutcome {
+    /// A usable durable frontier (strictly newer than the prior).
+    Frontier(Lsn),
+    /// Nothing durable yet (`Ok(None)`), or a valid checkpoint at/behind the prior
+    /// frontier: hold the prior frontier, no error.
+    Hold,
+    /// The checkpoint store was transiently unavailable (I/O / backend): hold, but count
+    /// toward a bounded stop threshold.
+    Transient(String),
+    /// The durable checkpoint is malformed or incomparable, or the store cannot serve it:
+    /// terminal, fail closed.
+    FailClosed(String),
+}
+
+/// Read and classify the durable delivery frontier from the checkpoint store. Never
+/// collapses distinct failure modes into "hold": `Ok(None)` and a valid older checkpoint
+/// hold; a malformed/incomparable checkpoint fails closed; transient storage
+/// unavailability is reported so the caller can bound it.
+async fn classify_durable_frontier(
     chkpt: &Arc<dyn CheckpointStore>,
     source_id: &str,
     prev: Option<Lsn>,
-) -> Option<Lsn> {
+) -> FeedbackOutcome {
     let bytes = match chkpt.get_raw(source_id).await {
         Ok(Some(bytes)) => bytes,
-        Ok(None) => return prev, // nothing durable yet
-        Err(e) => {
-            // Read/incomparable/corrupt: hold at the prior durable position.
-            warn!(source_id = %source_id, error = %e,
-                "durable checkpoint unavailable; holding WAL feedback");
-            return prev;
-        }
+        Ok(None) => return FeedbackOutcome::Hold, // nothing durable yet
+        Err(e) => return classify_store_error(&e),
     };
-    let lsn = match serde_json::from_slice::<PostgresCheckpoint>(&bytes)
+    match serde_json::from_slice::<PostgresCheckpoint>(&bytes)
         .ok()
         .and_then(|cp| Lsn::parse(&cp.lsn).ok())
     {
-        Some(lsn) => lsn,
-        None => {
-            warn!(source_id = %source_id,
-                "durable checkpoint LSN unparseable; holding WAL feedback");
-            return prev;
-        }
-    };
-    // Monotonic: never regress below the prior frontier.
-    match prev {
-        Some(p) if lsn <= p => Some(p),
-        _ => Some(lsn),
+        // Monotonic: a valid checkpoint at/behind the frontier holds; newer advances.
+        Some(lsn) => match prev {
+            Some(p) if lsn <= p => FeedbackOutcome::Hold,
+            _ => FeedbackOutcome::Frontier(lsn),
+        },
+        None => FeedbackOutcome::FailClosed(format!(
+            "durable checkpoint for source '{source_id}' is malformed (unparseable); \
+             refusing to advance WAL feedback"
+        )),
     }
+}
+
+/// Map a checkpoint-store error onto a feedback outcome. Malformed/incomparable/
+/// unserviceable errors are terminal; I/O and backend errors are transient.
+fn classify_store_error(e: &checkpoints::CheckpointError) -> FeedbackOutcome {
+    use checkpoints::CheckpointError as E;
+    match e {
+        // Malformed, incomparable (proxy fold), or a store that cannot serve the
+        // checkpoint: terminal.
+        E::Data(_)
+        | E::Serde(_)
+        | E::NotSupported(_)
+        | E::UnsupportedAtomicOperation(_) => FeedbackOutcome::FailClosed(
+            format!("durable checkpoint is unusable: {e}"),
+        ),
+        // Storage unavailability: transient, bounded by the caller.
+        E::Io(_) | E::Database(_) | E::Other(_) => {
+            FeedbackOutcome::Transient(e.to_string())
+        }
+    }
+}
+
+/// Advance the WAL feedback sent to PostgreSQL to the durable delivery frontier - the
+/// minimum per-sink checkpoint every required sink has acknowledged - never the
+/// read/enqueued position. The store only ever holds committed, acknowledged checkpoints
+/// at transaction boundaries, so the reported LSN can never be inside an open transaction
+/// or ahead of an unacknowledged/backpressured batch.
+///
+/// Fails closed (returns `Err`, stopping the source before the teardown checkpoint put)
+/// on a malformed/incomparable durable checkpoint, or when the store has been transiently
+/// unavailable for longer than [`FEEDBACK_STORE_UNAVAILABLE_STOP`] - so the source never
+/// keeps consuming indefinitely against unavailable recovery authority.
+async fn advance_wal_feedback(
+    ctx: &RunCtx,
+    chkpt: &Arc<dyn CheckpointStore>,
+    state: &mut WalFeedback,
+) -> SourceResult<()> {
+    match classify_durable_frontier(chkpt, &ctx.source_id, state.frontier).await
+    {
+        FeedbackOutcome::Frontier(lsn) => {
+            state.frontier = Some(lsn);
+            state.unavailable_since = None;
+            state.warned_unavailable = false;
+            ctx.repl_client.lock().await.update_applied_lsn(lsn);
+        }
+        FeedbackOutcome::Hold => {
+            state.unavailable_since = None;
+            state.warned_unavailable = false;
+            if let Some(f) = state.frontier {
+                ctx.repl_client.lock().await.update_applied_lsn(f);
+            }
+        }
+        FeedbackOutcome::Transient(detail) => {
+            let now = Instant::now();
+            let since = *state.unavailable_since.get_or_insert(now);
+            if !state.warned_unavailable {
+                warn!(source_id = %ctx.source_id, error = %detail,
+                    "durable checkpoint store unavailable; holding WAL feedback");
+                state.warned_unavailable = true; // edge-latched
+            }
+            if now.duration_since(since) >= FEEDBACK_STORE_UNAVAILABLE_STOP {
+                return Err(SourceError::Other(anyhow::anyhow!(
+                    "durable checkpoint store unavailable for {}s for source '{}'; \
+                     stopping fail-closed to avoid unbounded WAL retention ({detail})",
+                    FEEDBACK_STORE_UNAVAILABLE_STOP.as_secs(),
+                    ctx.source_id
+                )));
+            }
+            // Hold at the prior frontier while unavailability is within bounds.
+            if let Some(f) = state.frontier {
+                ctx.repl_client.lock().await.update_applied_lsn(f);
+            }
+        }
+        FeedbackOutcome::FailClosed(detail) => {
+            return Err(SourceError::Other(anyhow::anyhow!(detail)));
+        }
+    }
+    Ok(())
 }
 
 /// Order two PostgreSQL checkpoints by LSN, failing closed.
@@ -1329,23 +1412,25 @@ async fn fetch_slot_confirmed_lsn(
 
 #[cfg(test)]
 mod wal_feedback_tests {
-    use super::{Lsn, durable_frontier_lsn};
-    use checkpoints::{CheckpointResult, CheckpointStore, MemCheckpointStore};
+    use super::{FeedbackOutcome, Lsn, classify_durable_frontier};
+    use checkpoints::{
+        CheckpointError, CheckpointResult, CheckpointStore, MemCheckpointStore,
+    };
     use std::sync::Arc;
 
     fn cp(lsn: &str) -> Vec<u8> {
         format!(r#"{{"lsn":"{lsn}","tx_id":null}}"#).into_bytes()
     }
 
-    /// A store whose reads always fail, to exercise the fail-closed hold path.
-    struct FailingStore;
+    /// A store whose reads fail with a caller-chosen error kind.
+    struct FailingStore(fn() -> CheckpointError);
     #[async_trait::async_trait]
     impl CheckpointStore for FailingStore {
         async fn get_raw(
             &self,
             _key: &str,
         ) -> CheckpointResult<Option<Vec<u8>>> {
-            Err(checkpoints::CheckpointError::Data("boom".to_string()))
+            Err((self.0)())
         }
         async fn put_raw(
             &self,
@@ -1363,50 +1448,80 @@ mod wal_feedback_tests {
     }
 
     #[tokio::test]
-    async fn none_when_no_durable_checkpoint() {
+    async fn no_durable_checkpoint_holds() {
         let store: Arc<dyn CheckpointStore> =
             Arc::new(MemCheckpointStore::new().unwrap());
-        assert_eq!(durable_frontier_lsn(&store, "s", None).await, None);
-    }
-
-    #[tokio::test]
-    async fn reports_committed_checkpoint_lsn() {
-        let store: Arc<dyn CheckpointStore> =
-            Arc::new(MemCheckpointStore::new().unwrap());
-        store.put_raw("s", &cp("0/200")).await.unwrap();
         assert_eq!(
-            durable_frontier_lsn(&store, "s", None).await,
-            Some(Lsn::parse("0/200").unwrap())
+            classify_durable_frontier(&store, "s", None).await,
+            FeedbackOutcome::Hold
         );
     }
 
     #[tokio::test]
-    async fn never_regresses_below_prior_frontier() {
-        // A committed checkpoint lower than the prior frontier (never happens for a
-        // healthy min-fold, but must be safe): the frontier holds, never regresses.
+    async fn newer_checkpoint_advances_frontier() {
+        let store: Arc<dyn CheckpointStore> =
+            Arc::new(MemCheckpointStore::new().unwrap());
+        store.put_raw("s", &cp("0/200")).await.unwrap();
+        assert_eq!(
+            classify_durable_frontier(&store, "s", None).await,
+            FeedbackOutcome::Frontier(Lsn::parse("0/200").unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_older_checkpoint_holds_monotonic() {
+        // A committed checkpoint at/behind the prior frontier holds (never regresses).
         let store: Arc<dyn CheckpointStore> =
             Arc::new(MemCheckpointStore::new().unwrap());
         store.put_raw("s", &cp("0/100")).await.unwrap();
         let prev = Some(Lsn::parse("0/300").unwrap());
-        assert_eq!(durable_frontier_lsn(&store, "s", prev).await, prev);
+        assert_eq!(
+            classify_durable_frontier(&store, "s", prev).await,
+            FeedbackOutcome::Hold
+        );
     }
 
     #[tokio::test]
-    async fn holds_prior_frontier_on_read_error() {
-        // Mandatory: a checkpoint-store read failure must not advance feedback.
-        let store: Arc<dyn CheckpointStore> = Arc::new(FailingStore);
-        let prev = Some(Lsn::parse("0/300").unwrap());
-        assert_eq!(durable_frontier_lsn(&store, "s", prev).await, prev);
-        assert_eq!(durable_frontier_lsn(&store, "s", None).await, None);
+    async fn transient_store_error_is_transient() {
+        // I/O and backend errors are transient (bounded hold), not terminal.
+        let io = FailingStore(|| {
+            CheckpointError::Io(std::io::Error::other("unreachable"))
+        });
+        let store: Arc<dyn CheckpointStore> = Arc::new(io);
+        assert!(matches!(
+            classify_durable_frontier(&store, "s", None).await,
+            FeedbackOutcome::Transient(_)
+        ));
+        let db: Arc<dyn CheckpointStore> =
+            Arc::new(FailingStore(|| CheckpointError::Database("down".into())));
+        assert!(matches!(
+            classify_durable_frontier(&db, "s", None).await,
+            FeedbackOutcome::Transient(_)
+        ));
     }
 
     #[tokio::test]
-    async fn holds_prior_frontier_on_corrupt_checkpoint() {
+    async fn incomparable_or_malformed_store_error_fails_closed() {
+        // The proxy's incomparable/corrupt error is CheckpointError::Data -> terminal.
+        let store: Arc<dyn CheckpointStore> = Arc::new(FailingStore(|| {
+            CheckpointError::Data("incomparable per-sink checkpoints".into())
+        }));
+        assert!(matches!(
+            classify_durable_frontier(&store, "s", None).await,
+            FeedbackOutcome::FailClosed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn corrupt_checkpoint_bytes_fail_closed() {
+        // A malformed durable checkpoint is terminal, not a silent hold.
         let store: Arc<dyn CheckpointStore> =
             Arc::new(MemCheckpointStore::new().unwrap());
         store.put_raw("s", b"{ not json").await.unwrap();
-        let prev = Some(Lsn::parse("0/300").unwrap());
-        assert_eq!(durable_frontier_lsn(&store, "s", prev).await, prev);
+        assert!(matches!(
+            classify_durable_frontier(&store, "s", None).await,
+            FeedbackOutcome::FailClosed(_)
+        ));
     }
 }
 

@@ -39,6 +39,15 @@ pub trait CheckpointStore: Send + Sync {
         false
     }
 
+    /// Wait until the durable checkpoint set may have changed, so a source can advance
+    /// WAL feedback change-driven rather than by fixed high-frequency polling. A
+    /// change-driven store (the per-sink proxy) resolves on the next commit with a long
+    /// safety fallback; the default resolves on a short fixed interval for plain
+    /// single-writer stores.
+    async fn await_checkpoint_change(&self) {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
     /// Get raw checkpoint bytes.
     async fn get_raw(
         &self,

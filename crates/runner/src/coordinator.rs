@@ -879,6 +879,9 @@ pub struct Coordinator<Tok> {
     /// in response to a replay pause, and `false` when it resumes. The handoff waits on it
     /// so `H` is read against a genuinely frozen tail.
     quiesce_ack: Option<watch::Sender<bool>>,
+    /// Notified after each successful per-sink checkpoint commit so the source can
+    /// refresh its WAL feedback change-driven instead of polling the checkpoint store.
+    commit_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 pub struct CoordinatorBuilder<Tok> {
@@ -895,6 +898,7 @@ pub struct CoordinatorBuilder<Tok> {
     replay_capture: Option<ReplayCapture>,
     replay_gate: Option<Arc<crate::replay_gate::ReplaySinkGate>>,
     quiesce_ack: Option<watch::Sender<bool>>,
+    commit_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
@@ -913,7 +917,15 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             replay_capture: None,
             replay_gate: None,
             quiesce_ack: None,
+            commit_notify: None,
         }
+    }
+
+    /// Wire a notify signaled after each successful per-sink checkpoint commit, so the
+    /// source can refresh WAL feedback change-driven instead of polling.
+    pub fn commit_notify(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.commit_notify = Some(notify);
+        self
     }
 
     pub fn sinks(mut self, sinks: Vec<ArcDynSink>) -> Self {
@@ -1012,6 +1024,7 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             replay_capture: self.replay_capture,
             replay_gate: self.replay_gate,
             quiesce_ack: self.quiesce_ack,
+            commit_notify: self.commit_notify,
         }
     }
 }
@@ -2082,6 +2095,12 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                         .map(|d| d.as_secs_f64())
                         .unwrap_or(0.0),
                 );
+
+                // Wake the source so it refreshes WAL feedback from the newly persisted
+                // durable minimum (change-driven, not polled).
+                if let Some(n) = &self.commit_notify {
+                    n.notify_waiters();
+                }
             }
         }
 

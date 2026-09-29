@@ -57,7 +57,17 @@ pub struct PerSinkCheckpointProxy {
     inner: Arc<dyn CheckpointStore>,
     source_id: String,
     cmp_fn: CheckpointCmpFn,
+    /// Notified by the coordinator after each per-sink checkpoint commit, so the source
+    /// advances WAL feedback change-driven (on commit) rather than by fixed polling. A
+    /// long fallback still re-confirms during long idle. Defaults to an unshared handle
+    /// (never signaled) so a proxy built without wiring falls back to the interval.
+    commit_signal: Arc<tokio::sync::Notify>,
 }
+
+/// Fallback re-confirmation interval when no commit notification arrives (long, so idle
+/// sources at fleet scale generate negligible control-store load).
+const FEEDBACK_FALLBACK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 impl PerSinkCheckpointProxy {
     /// Build the proxy for a source, wiring the fold to the source's own
@@ -74,12 +84,32 @@ impl PerSinkCheckpointProxy {
             inner,
             source_id,
             cmp_fn: Arc::new(move |a, b| source.compare_checkpoints(a, b)),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Wire the coordinator's commit signal so WAL-feedback refreshes are change-driven.
+    #[must_use]
+    pub fn with_commit_signal(
+        mut self,
+        signal: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.commit_signal = signal;
+        self
     }
 }
 
 #[async_trait]
 impl CheckpointStore for PerSinkCheckpointProxy {
+    async fn await_checkpoint_change(&self) {
+        // Change-driven: wake on the coordinator's commit signal, with a long fallback so
+        // a missed signal or a long idle still re-confirms without high-frequency polling.
+        tokio::select! {
+            _ = self.commit_signal.notified() => {}
+            _ = tokio::time::sleep(FEEDBACK_FALLBACK_INTERVAL) => {}
+        }
+    }
+
     fn manages_per_sink_checkpoints(&self) -> bool {
         // The source's resume position is the minimum of the coordinator's per-sink
         // checkpoints (written only after sink acknowledgement), so the source must not
@@ -808,14 +838,19 @@ impl PipelineManager {
         let alive = Arc::new(AtomicBool::new(true));
 
         let (event_tx, event_rx) = mpsc::channel::<SourceItem>(32_768);
+        // Signal the source (change-driven) after each per-sink commit so it refreshes
+        // WAL feedback from the newly persisted durable minimum instead of polling.
+        let commit_signal = Arc::new(tokio::sync::Notify::new());
         // Wrap checkpoint store so the source reads the minimum per-sink
         // checkpoint - it replays from the position the slowest sink needs.
-        let source_ckpt: Arc<dyn CheckpointStore> =
-            Arc::new(PerSinkCheckpointProxy::for_source(
+        let source_ckpt: Arc<dyn CheckpointStore> = Arc::new(
+            PerSinkCheckpointProxy::for_source(
                 self.ckpt_store.clone(),
                 spec.spec.source.source_id().to_string(),
                 &source,
-            ));
+            )
+            .with_commit_signal(commit_signal.clone()),
+        );
 
         let src_handle = source.run(event_tx, source_ckpt).await;
 
@@ -885,6 +920,7 @@ impl PipelineManager {
                     .sink_batch_deadline_secs
                     .map(|s| std::time::Duration::from_secs(s.into())),
             )
+            .commit_notify(commit_signal.clone())
             .process_fn(batch_processor);
 
         for sink in &sinks {
@@ -2466,6 +2502,7 @@ mod tests {
             inner: store,
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         // No per-sink checkpoints and no legacy key - fresh start.
         let result = proxy.get_raw("mysql").await.unwrap();
@@ -2481,6 +2518,7 @@ mod tests {
             inner: store,
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         // No per-sink keys exist, so it should fall back to the legacy key.
         let result = proxy.get_raw("mysql").await.unwrap().unwrap();
@@ -2510,6 +2548,7 @@ mod tests {
             inner: store,
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
 
         // Should return the minimum (redis at pos 100).
@@ -2526,6 +2565,7 @@ mod tests {
             inner: store,
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
 
         // Non-source-id keys pass through directly.
@@ -2545,6 +2585,7 @@ mod tests {
             inner: store,
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
 
         let result = proxy.get_raw("mysql").await.unwrap().unwrap();
@@ -2621,6 +2662,7 @@ mod tests {
             inner: OrderedTestStore::with(entries),
             source_id: "src".to_string(),
             cmp_fn: test_cmp_fn(),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         proxy
             .get_raw("src")
@@ -2692,6 +2734,7 @@ mod tests {
             ]),
             source_id: "src".to_string(),
             cmp_fn: test_cmp_fn(),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         let got = proxy.get_raw("src").await.unwrap().unwrap();
         assert_eq!(got, VALID_A, "must return the earliest checkpoint");
@@ -2716,6 +2759,7 @@ mod tests {
             cmp_fn: Arc::new(|a: &[u8], b: &[u8]| {
                 sources::postgres::compare_pg_checkpoints(a, b)
             }),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         let got = proxy.get_raw("pg").await.unwrap().unwrap();
         assert_eq!(got, slow, "must rewind to the slower sink's LSN");
@@ -2736,6 +2780,7 @@ mod tests {
             cmp_fn: Arc::new(|a: &[u8], b: &[u8]| {
                 sources::postgres::compare_pg_checkpoints(a, b)
             }),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         let err = proxy
             .get_raw("pg")

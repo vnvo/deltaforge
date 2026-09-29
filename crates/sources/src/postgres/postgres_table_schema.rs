@@ -158,6 +158,47 @@ impl PostgresTableSchema {
             .map(|c| (c.name.clone(), c.type_oid))
             .collect()
     }
+
+    /// The stored replica identity as a pgoutput identity char (`d`/`n`/`f`/`i`), or
+    /// `None` when it was not recorded (older schema) or is unrecognized.
+    fn replica_identity_char(&self) -> Option<char> {
+        match self.replica_identity.as_deref() {
+            Some("default") => Some('d'),
+            Some("nothing") => Some('n'),
+            Some("full") => Some('f'),
+            Some("index") => Some('i'),
+            _ => None,
+        }
+    }
+
+    /// Whether this persisted schema version is a safe match for a retained pgoutput
+    /// relation, binding the **relation lifetime** (table OID), the ordered
+    /// `(name, type_oid)` structural signature, and the replica identity. All three must
+    /// be known and equal; a missing/unverifiable field is not a match (fail-closed).
+    ///
+    /// The OID binds a specific relation lifetime (a dropped-and-recreated table gets a
+    /// new OID), and, within a cluster, a specific database's relation - so historical
+    /// versions of other relations, other lifetimes, or a same-named table in a different
+    /// database do not match. Callers additionally require a *unique* match across the
+    /// table's version history, failing closed on zero or multiple candidates.
+    pub(crate) fn matches_relation(&self, rel: &RelationIdentity) -> bool {
+        self.oid == Some(rel.oid)
+            && self.replica_identity_char() == Some(rel.replica_identity)
+            && matches!(
+                verify_first_resolution(&self.signature(), &rel.signature),
+                FirstResolution::NoDrift
+            )
+    }
+}
+
+/// Identity of a retained pgoutput relation, used to select the correct historical
+/// schema version for decoding: the table OID (relation lifetime + within-cluster
+/// database/relation identity), the ordered `(name, type_oid)` signature, and the
+/// replica identity char.
+pub(crate) struct RelationIdentity {
+    pub oid: u32,
+    pub signature: Vec<(String, u32)>,
+    pub replica_identity: char,
 }
 
 /// Result of verifying a table's first Relation this run against its persisted baseline.
@@ -484,5 +525,63 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let parsed: PostgresTableSchema = serde_json::from_str(&json).unwrap();
         assert_eq!(s, parsed);
+    }
+
+    fn oid_schema() -> PostgresTableSchema {
+        PostgresTableSchema::new(vec![
+            PostgresColumn::new("id", "integer", false, 1)
+                .with_type_oid(type_oids::INT4),
+            PostgresColumn::new("sku", "character varying(64)", true, 2)
+                .with_type_oid(type_oids::VARCHAR),
+        ])
+        .with_oid(16386)
+        .with_replica_identity("full")
+    }
+
+    fn rel(oid: u32, sig: Vec<(&str, u32)>, replica: char) -> RelationIdentity {
+        RelationIdentity {
+            oid,
+            signature: sig
+                .into_iter()
+                .map(|(n, o)| (n.to_string(), o))
+                .collect(),
+            replica_identity: replica,
+        }
+    }
+
+    #[test]
+    fn matches_relation_binds_oid_signature_and_replica() {
+        let s = oid_schema();
+        let sig = vec![("id", type_oids::INT4), ("sku", type_oids::VARCHAR)];
+
+        // Exact match: OID + ordered (name, type_oid) + replica identity.
+        assert!(s.matches_relation(&rel(16386, sig.clone(), 'f')));
+        // Dropped-and-recreated: a new OID must not match the old version.
+        assert!(!s.matches_relation(&rel(16400, sig.clone(), 'f')));
+        // Replica identity differs.
+        assert!(!s.matches_relation(&rel(16386, sig.clone(), 'd')));
+        // Structural drift (extra column).
+        let mut sig2 = sig.clone();
+        sig2.push(("status", type_oids::VARCHAR));
+        assert!(!s.matches_relation(&rel(16386, sig2, 'f')));
+        // Type OID drift on an existing column.
+        let sig3 = vec![("id", type_oids::INT8), ("sku", type_oids::VARCHAR)];
+        assert!(!s.matches_relation(&rel(16386, sig3, 'f')));
+    }
+
+    #[test]
+    fn matches_relation_fails_closed_without_oid_or_replica() {
+        // A version missing the table OID or replica identity is unverifiable, never a
+        // match (fail-closed).
+        let no_oid = PostgresTableSchema::new(vec![
+            PostgresColumn::new("id", "integer", false, 1)
+                .with_type_oid(type_oids::INT4),
+        ])
+        .with_replica_identity("full");
+        assert!(!no_oid.matches_relation(&rel(
+            16386,
+            vec![("id", type_oids::INT4)],
+            'f'
+        )));
     }
 }

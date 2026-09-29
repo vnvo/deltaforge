@@ -23,7 +23,9 @@ use super::postgres_helpers::{
 };
 use super::postgres_logical_message;
 use super::postgres_object::{RelationColumn, build_object, parse_tuple_data};
-use super::postgres_table_schema::{FirstResolution, verify_first_resolution};
+use super::postgres_table_schema::{
+    FirstResolution, RelationIdentity, verify_first_resolution,
+};
 
 /// Relation metadata from pgoutput.
 #[derive(Debug, Clone)]
@@ -640,17 +642,22 @@ async fn handle_insert(
 
     // Extract all needed data from relation upfront to release the borrow.
     let columns = Arc::clone(&relation.columns);
+    let replica_identity = relation.replica_identity;
     let qualified_name = Arc::clone(&relation.qualified_name);
     let schema = relation.schema.clone();
     let table = relation.table.clone();
 
-    let relation_signature: Vec<(String, u32)> = columns
-        .iter()
-        .map(|c| (c.name.clone(), c.type_oid))
-        .collect();
+    let rel_identity = RelationIdentity {
+        oid: relation_id,
+        signature: columns
+            .iter()
+            .map(|c| (c.name.clone(), c.type_oid))
+            .collect(),
+        replica_identity,
+    };
     let loaded = ctx
         .schema
-        .load_schema_for_relation(&schema, &table, None, &relation_signature)
+        .load_schema_for_relation(&schema, &table, None, &rel_identity)
         .await?;
 
     let tuple_data = payload_bytes.slice(5..);
@@ -726,6 +733,7 @@ async fn handle_update(
     }
 
     let columns = Arc::clone(&relation.columns);
+    let replica_identity = relation.replica_identity;
     let qualified_name = Arc::clone(&relation.qualified_name);
     let schema = relation.schema.clone();
     let table = relation.table.clone();
@@ -760,13 +768,17 @@ async fn handle_update(
         return Ok(());
     };
 
-    let relation_signature: Vec<(String, u32)> = columns
-        .iter()
-        .map(|c| (c.name.clone(), c.type_oid))
-        .collect();
+    let rel_identity = RelationIdentity {
+        oid: relation_id,
+        signature: columns
+            .iter()
+            .map(|c| (c.name.clone(), c.type_oid))
+            .collect(),
+        replica_identity,
+    };
     let loaded = ctx
         .schema
-        .load_schema_for_relation(&schema, &table, None, &relation_signature)
+        .load_schema_for_relation(&schema, &table, None, &rel_identity)
         .await?;
 
     let before = before_values.map(|v| build_object(&columns, &v));
@@ -846,17 +858,22 @@ async fn handle_delete(
     }
 
     let columns = Arc::clone(&relation.columns);
+    let replica_identity = relation.replica_identity;
     let qualified_name = Arc::clone(&relation.qualified_name);
     let schema = relation.schema.clone();
     let table = relation.table.clone();
 
-    let relation_signature: Vec<(String, u32)> = columns
-        .iter()
-        .map(|c| (c.name.clone(), c.type_oid))
-        .collect();
+    let rel_identity = RelationIdentity {
+        oid: relation_id,
+        signature: columns
+            .iter()
+            .map(|c| (c.name.clone(), c.type_oid))
+            .collect(),
+        replica_identity,
+    };
     let loaded = ctx
         .schema
-        .load_schema_for_relation(&schema, &table, None, &relation_signature)
+        .load_schema_for_relation(&schema, &table, None, &rel_identity)
         .await?;
 
     let tuple_data = payload_bytes.slice(5..);
