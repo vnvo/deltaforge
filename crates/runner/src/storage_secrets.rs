@@ -85,19 +85,6 @@ async fn resolve_ref(
     Ok(Zeroizing::new(value.to_string()))
 }
 
-/// Whether a base DSN already carries a password (so injecting credential references
-/// would silently override it - rejected).
-fn base_has_password(base: &str) -> bool {
-    if let Some((_, rest)) = base.split_once("://") {
-        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-        authority
-            .rsplit_once('@')
-            .is_some_and(|(userinfo, _)| userinfo.contains(':'))
-    } else {
-        base.to_ascii_lowercase().contains("password=")
-    }
-}
-
 fn inject_credentials(base: &str, user: &str, pass: &str) -> Result<String> {
     let dsn = if base.contains("://") {
         common::dsn::inject_url_credentials(base, user, pass)
@@ -160,7 +147,11 @@ pub async fn resolve_storage_dsn(
                  reference (partial credential sets are rejected)"
             );
         };
-        if base_has_password(base) {
+        if common::dsn::dsn_has_password(base).map_err(|e| {
+            anyhow::anyhow!(
+                "storage: base dsn is not a valid connection string: {e}"
+            )
+        })? {
             bail!(
                 "storage: base dsn must not contain a password when credential \
                  references are set (that would silently override them)"
@@ -243,6 +234,31 @@ mod tests {
     #[tokio::test]
     async fn base_with_password_plus_credentials_rejected() {
         let mut c = pg(Some("host=h dbname=d password=inline"));
+        c.credentials = Some(CredentialRefsCfg {
+            username: Some(env_ref("DF_STORE_USER")),
+            password: Some(env_ref("DF_STORE_PASS")),
+        });
+        assert!(resolve_storage_dsn(&c).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn quoted_base_password_plus_credentials_rejected() {
+        // Whitespace around '=' and single-quoting hide the password from a substring
+        // scan; the strict tokenizer still detects it, so credential refs are rejected
+        // rather than silently overriding it.
+        let mut c = pg(Some("host=h dbname=d password = 'in line pw'"));
+        c.credentials = Some(CredentialRefsCfg {
+            username: Some(env_ref("DF_STORE_USER")),
+            password: Some(env_ref("DF_STORE_PASS")),
+        });
+        assert!(resolve_storage_dsn(&c).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_base_dsn_plus_credentials_fails_closed() {
+        // An unterminated quote is malformed; resolution must fail closed instead of
+        // treating it as "no password" and injecting over it.
+        let mut c = pg(Some("host=h password='unterminated"));
         c.credentials = Some(CredentialRefsCfg {
             username: Some(env_ref("DF_STORE_USER")),
             password: Some(env_ref("DF_STORE_PASS")),
