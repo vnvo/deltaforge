@@ -144,7 +144,7 @@ The two timeout layers are complementary:
 
 Each sink is marked `required: true` (default) or `required: false`:
 
-- **Required**: must succeed for the pipeline to consider the batch delivered. If a required sink fails, no checkpoint advances for any sink. The same batch is retried until success or operator intervention.
+- **Required**: must succeed for the pipeline to consider the batch delivered. Each sink applies bounded sink-local retries (finite attempts with backoff) within a single `send_batch`; if those are exhausted for a required sink, no checkpoint advances for any sink and the pipeline stops. There is no in-session pipeline-level retry of the batch - recovery is by source replay from `MIN(checkpoints)` on the next restart.
 - **Optional** (best-effort): failures are logged but don't prevent the pipeline from advancing. The failed sink's own checkpoint stays at its last-successful position; the source's MIN-checkpoint reader doesn't go back, but **on the next pipeline restart**, the source replays from the failed sink's stuck position and the failed sink catches up.
 
 #### What an optional sink failure means in practice
@@ -397,7 +397,7 @@ This matrix maps guarantees to their verification. Rows marked **Exists** have a
 | Replication slot drop detection | `slot_dropped` chaos scenario | Chaos | Exists |
 | NATS dedup within window | Verify `Nats-Msg-Id` prevents duplicates | Integration | Planned |
 | Redis idempotency key | Verify consumer-side dedup via key | Integration | Planned |
-| Snapshot → CDC handoff | No gaps or duplicates at boundary | Integration | Planned |
+| Snapshot → CDC handoff | No gaps; engine-specific documented overlap | Integration | Planned |
 
 ## Limitations
 
