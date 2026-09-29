@@ -584,6 +584,24 @@ impl PipelineRuntime {
     }
 }
 
+/// Decide whether a coordinator task's exit represents a pipeline failure (drives
+/// `alive` and therefore `/health` + `/ready`).
+///
+/// The coordinator returns `Err` on any internal failure, including a terminal
+/// required-sink failure - and in that case its delivery task cancels the shared
+/// cancellation token *before* `run` returns. So cancellation alone cannot distinguish
+/// an operator stop from an internal failure: a returned error always means failure,
+/// even when the token is cancelled. A clean `Ok` after an operator cancellation is the
+/// only non-failure exit; a clean `Ok` with no cancellation means the coordinator
+/// stopped on its own (e.g. the source closed the event channel), which is also a
+/// failure.
+pub(crate) fn coordinator_exit_failed(
+    result: &Result<()>,
+    cancelled: bool,
+) -> bool {
+    result.is_err() || !cancelled
+}
+
 // ============================================================================
 // Pipeline Manager
 // ============================================================================
@@ -1090,10 +1108,12 @@ impl PipelineManager {
 
         let join = tokio::spawn(async move {
             let result = coord.run(event_rx, cancel_for_task, pause_rx).await;
-            if !cancel_check.is_cancelled() {
-                // Coordinator exited without an explicit stop - also mark
-                // failed (covers errors that originate inside the coordinator
-                // itself rather than in the source task).
+            // A returned error means an internal failure (e.g. a terminal
+            // required-sink failure), even though the coordinator self-cancelled
+            // the shared token on its way out; an operator stop is a clean Ok
+            // after cancellation. Mark the pipeline failed in every case except
+            // that clean operator stop, so /health and /ready surface it.
+            if coordinator_exit_failed(&result, cancel_check.is_cancelled()) {
                 alive_for_task.store(false, Ordering::Release);
                 gauge!("deltaforge_pipeline_status", "pipeline" => pname.clone())
                     .set(-1.0);
@@ -2091,6 +2111,26 @@ mod tests {
         BatchConfig, CommitPolicy, Metadata, MysqlSrcCfg, RedisSinkCfg,
         SinkCfg, SnapshotCfg, SourceCfg, Spec,
     };
+
+    #[test]
+    fn coordinator_exit_failed_classifies_every_exit() {
+        // Internal failure that self-cancelled the shared token (required-sink
+        // failure): still a failure despite cancellation.
+        assert!(coordinator_exit_failed(
+            &Err(anyhow::anyhow!("required sink failed")),
+            true,
+        ));
+        // Internal error before any cancellation (e.g. startup validation).
+        assert!(coordinator_exit_failed(
+            &Err(anyhow::anyhow!("boom")),
+            false,
+        ));
+        // Coordinator exited cleanly on its own (source closed the channel) with no
+        // operator stop: a failure.
+        assert!(coordinator_exit_failed(&Ok(()), false));
+        // Clean stop after an operator cancellation: NOT a failure.
+        assert!(!coordinator_exit_failed(&Ok(()), true));
+    }
 
     #[test]
     fn authorize_replay_start_validates_targets_and_policy() {

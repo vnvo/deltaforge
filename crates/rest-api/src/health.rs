@@ -43,14 +43,29 @@ struct ReadyStatus {
     pipelines: Vec<PipeInfo>,
 }
 
-async fn readyz(State(st): State<AppState>) -> Json<ReadyStatus> {
-    // Basic readiness surface that reflects pipeline states.
-    // Future revisions can incorporate dependency checks.
+async fn readyz(State(st): State<AppState>) -> impl IntoResponse {
+    // Readiness reflects pipeline health: a failed pipeline makes the instance
+    // not-ready (503) and names the offender, so Kubernetes removes it from Service
+    // endpoints. Otherwise 200 with the current pipeline states.
     let pipelines = st.controller.list().await;
+    let failed: Vec<_> = pipelines
+        .iter()
+        .filter(|p| p.status == "failed")
+        .map(|p| p.name.clone())
+        .collect();
+
+    if !failed.is_empty() {
+        let body = serde_json::json!({
+            "status": "not_ready",
+            "failed_pipelines": failed,
+        });
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    }
     Json(ReadyStatus {
         status: "ready",
         pipelines,
     })
+    .into_response()
 }
 
 // ── Log level ────────────────────────────────────────────────────────────────

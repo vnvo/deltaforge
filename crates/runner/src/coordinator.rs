@@ -4359,6 +4359,89 @@ mod tests {
         assert_eq!(redis_sink.delivery_count(), 0);
     }
 
+    /// A terminal required-sink failure must make `run` return `Err`, and on its way
+    /// out the delivery task self-cancels the shared token. This is the exact scenario
+    /// the pipeline_manager wrapper must still recognize as a failure (see
+    /// `coordinator_exit_failed`): cancellation alone cannot be read as "operator stop".
+    #[tokio::test]
+    async fn required_sink_failure_returns_err_and_self_cancels() {
+        use checkpoints::MemCheckpointStore;
+
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let kafka = MockSink::new("kafka", true); // required
+        kafka.set_fail(true);
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&kafka) as ArcDynSink];
+
+        let cp_fn =
+            build_commit_fn(store.clone(), "mysql::sink::kafka".to_string());
+        let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![]);
+        let batch_processor =
+            build_batch_processor(processors, "test".to_string());
+
+        let coord = Coordinator::builder("test-required-fail")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(10),
+                max_bytes: None,
+                max_ms: Some(50),
+                respect_source_tx: None,
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_fn("kafka", cp_fn)
+            .process_fn(batch_processor)
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_observed = cancel.clone();
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
+
+        let source = deltaforge_core::SourceInfo {
+            version: "test".into(),
+            connector: "mysql".into(),
+            name: "test".into(),
+            db: "db".into(),
+            schema: None,
+            table: "t".into(),
+            ts_ms: 0,
+            snapshot: None,
+            position: deltaforge_core::SourcePosition::default(),
+        };
+        let mut event = Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
+            source,
+            deltaforge_core::Op::Create,
+            None,
+            Some(serde_json::json!({"id": 1})),
+            0,
+            0,
+        );
+        event
+            .set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":42}".to_vec()));
+        event.tx_end = true;
+        tx.send(SourceItem::Event(event)).await.unwrap();
+        drop(tx);
+
+        let result = coord.run(rx, cancel, pause_rx).await;
+
+        assert!(
+            result.is_err(),
+            "a terminal required-sink failure must make run() return Err"
+        );
+        assert!(
+            cancel_observed.is_cancelled(),
+            "the delivery task self-cancels the shared token on failure"
+        );
+        // The required sink's checkpoint must not have advanced.
+        assert!(
+            store.get_raw("mysql::sink::kafka").await.unwrap().is_none(),
+            "a failed required sink must not advance its checkpoint"
+        );
+    }
+
     /// Regression test: a partial batch (fewer events than max_events) must be
     /// flushed by the timer when the source goes idle - not stuck waiting for
     /// more events to fill the batch.
