@@ -14,16 +14,14 @@
 //! condition) rather than stopping the container, so the run is deterministic; "restore"
 //! points the sink at the live broker. Requires docker.
 //!
-//! STATUS: RED reproduction. This test currently FAILS on `main`, exposing a durability
-//! bug: the PostgreSQL source reports `wal_end` as the flushed LSN to PostgreSQL as soon
-//! as each message is handed to the coordinator (postgres_event.rs, `update_applied_lsn`),
-//! before any sink acknowledges it. PostgreSQL then advances the slot's
-//! `confirmed_flush_lsn` and releases the WAL, so a Kafka outage across a restart loses
-//! the un-acked rows. The per-sink checkpoint store correctly withholds Kafka's
-//! checkpoint, but the source's standby feedback is not bounded by it. The fix (bound the
-//! reported flush LSN by the durable per-sink minimum) is out of the current bounded
-//! scope and must not silently redesign the source run loop; this test will pass once
-//! that fix lands.
+//! This originally reproduced a durability bug: the PostgreSQL source reported `wal_end`
+//! as the flushed LSN to PostgreSQL as soon as each message was handed to the coordinator
+//! (before any sink acknowledged it), and it persisted its read position as the resume
+//! checkpoint on a clean stop. PostgreSQL then released the WAL and a restart resumed
+//! ahead of un-acknowledged deliveries, losing them. The fix bounds both the WAL feedback
+//! and the resume checkpoint by the durable per-sink minimum (only what every required
+//! sink has acknowledged); this test now passes and guards that invariant. It also
+//! records the observed `confirmed_flush_lsn` at each stage as evidence.
 #![cfg(test)]
 
 use std::collections::HashMap;
@@ -159,6 +157,31 @@ async fn pg_connect(port: u16) -> Result<tokio_postgres::Client> {
         let _ = conn.await;
     });
     Ok(client)
+}
+
+/// The slot's `confirmed_flush_lsn` - how far PostgreSQL believes the consumer has
+/// durably flushed, and therefore how much WAL it may release.
+async fn confirmed_flush(client: &tokio_postgres::Client) -> Result<String> {
+    let row = client
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots \
+             WHERE slot_name = 'slot_outage'",
+            &[],
+        )
+        .await?;
+    Ok(row.get::<_, String>(0))
+}
+
+/// Whether `a` is strictly greater than `b` as PostgreSQL LSNs.
+async fn lsn_gt(
+    client: &tokio_postgres::Client,
+    a: &str,
+    b: &str,
+) -> Result<bool> {
+    let row = client
+        .query_one("SELECT $1::text::pg_lsn > $2::text::pg_lsn", &[&a, &b])
+        .await?;
+    Ok(row.get::<_, bool>(0))
 }
 
 // ── Pipeline wiring (production components) ─────────────────────────────────
@@ -357,6 +380,8 @@ async fn kafka_outage_across_restart_loses_no_events_and_holds_checkpoint()
             .execute("INSERT INTO orders VALUES ($1, $2)", &[&id, &sku])
             .await?;
     }
+    let cf_initial = confirmed_flush(&client).await?;
+    println!("gate1: confirmed_flush after inserts = {cf_initial}");
 
     // (2) Run while Kafka is down: delivery fails, checkpoint must not advance.
     let r1 = run_pipeline(
@@ -368,10 +393,18 @@ async fn kafka_outage_across_restart_loses_no_events_and_holds_checkpoint()
         Duration::from_secs(25),
     )
     .await;
-    println!("gate1: run 1 (kafka down) result = {r1:?}");
+    let cf_run1 = confirmed_flush(&client).await?;
+    println!(
+        "gate1: run 1 (kafka down) result = {r1:?}, confirmed_flush = {cf_run1}"
+    );
     assert!(
         kafka_checkpoint(&store).await.is_none(),
         "Kafka checkpoint must not advance while Kafka is unavailable"
+    );
+    assert!(
+        !lsn_gt(&client, &cf_run1, &cf_initial).await?,
+        "confirmed_flush_lsn must not advance past the last acked checkpoint while \
+         Kafka is unavailable (was {cf_initial}, now {cf_run1})"
     );
 
     // (3) Restart while Kafka is still down: still no advance, still no loss.
@@ -384,10 +417,18 @@ async fn kafka_outage_across_restart_loses_no_events_and_holds_checkpoint()
         Duration::from_secs(25),
     )
     .await;
-    println!("gate1: run 2 (kafka down, restart) result = {r2:?}");
+    let cf_run2 = confirmed_flush(&client).await?;
+    println!(
+        "gate1: run 2 (kafka down, restart) result = {r2:?}, confirmed_flush = {cf_run2}"
+    );
     assert!(
         kafka_checkpoint(&store).await.is_none(),
         "Kafka checkpoint must still not advance across the restart"
+    );
+    assert!(
+        !lsn_gt(&client, &cf_run2, &cf_initial).await?,
+        "confirmed_flush_lsn must still not advance across the restart while Kafka is \
+         unavailable (was {cf_initial}, now {cf_run2})"
     );
 
     // (4) Restore Kafka: the retained rows are delivered and the checkpoint advances.
@@ -425,6 +466,29 @@ async fn kafka_outage_across_restart_loses_no_events_and_holds_checkpoint()
     println!(
         "gate1: delivered ids={ids:?} unique={} duplicates={duplicates} checkpoint={cp_after:?}",
         sorted.len()
+    );
+
+    // (5) Restart once more (Kafka still up, no new data). On resume the source
+    // initializes BOTH its read position and the WAL feedback from the same durable
+    // checkpoint, so PostgreSQL's confirmed_flush_lsn advances to the acknowledged
+    // position and the now-durable WAL is released.
+    run_pipeline(
+        &pg_dsn(port),
+        &brokers,
+        store.clone(),
+        backend.clone(),
+        registry.clone(),
+        Duration::from_secs(12),
+    )
+    .await?;
+    let cf_after = confirmed_flush(&client).await?;
+    println!(
+        "gate1: after feedback restart, confirmed_flush = {cf_after} (was {cf_initial}, checkpoint {cp_after:?})"
+    );
+    assert!(
+        lsn_gt(&client, &cf_after, &cf_initial).await?,
+        "confirmed_flush_lsn must advance to the durable checkpoint after Kafka \
+         acknowledges delivery (was {cf_initial}, now {cf_after})"
     );
 
     Ok(())

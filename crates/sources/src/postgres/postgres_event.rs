@@ -128,7 +128,10 @@ pub(super) async fn dispatch_event(
             .increment(data.len() as u64);
             ctx.last_lsn = wal_end;
             handle_pgoutput_message(ctx, &data, wal_end).await?;
-            ctx.repl_client.lock().await.update_applied_lsn(wal_end);
+            // NOTE: the LSN confirmed to PostgreSQL (which releases retained WAL) is
+            // driven separately from the durable per-sink checkpoint by the WAL-feedback
+            // task (see `mod.rs`), never from the read position here - otherwise WAL for
+            // events no sink has acknowledged would be released, losing them on restart.
         }
         ReplicationEvent::KeepAlive {
             wal_end,
@@ -259,7 +262,8 @@ pub(super) async fn dispatch_event(
             }
 
             ctx.last_lsn = lsn;
-            ctx.repl_client.lock().await.update_applied_lsn(lsn);
+            // WAL confirmation to PostgreSQL is driven by the durable per-sink
+            // checkpoint (see `mod.rs`), not the read position.
         }
     }
     Ok(())

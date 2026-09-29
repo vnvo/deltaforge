@@ -679,6 +679,16 @@ impl PostgresSource {
         };
 
         info!("entering replication loop");
+        // Durable delivery frontier (separate from `ctx.last_lsn`, the read position):
+        // the acknowledged LSN reported to PostgreSQL as flushed, sourced only from the
+        // per-sink checkpoint store. A ticker refreshes it even while the source is idle
+        // so a just-acknowledged batch is confirmed promptly (idle keepalives themselves
+        // are emitted by the replication worker, carrying whatever frontier is set).
+        let mut durable_frontier: Option<Lsn> = None;
+        let mut feedback_ticker =
+            tokio::time::interval(Duration::from_millis(500));
+        feedback_ticker
+            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The loop runs inside an async block so its result can be captured and the
         // rotation runtime cancelled+joined before teardown, on both the normal and
         // fatal exit paths. A fatal result (including gate-6 rotation failures) is
@@ -704,12 +714,19 @@ impl PostgresSource {
                 }
             }
 
+            // Report the durable delivery frontier to PostgreSQL before blocking on the
+            // next read. Runs after every processed event and on each idle ticker wake,
+            // so WAL is released only up to what the sinks have durably acknowledged.
+            advance_wal_feedback(&ctx, &chkpt_store, &mut durable_frontier).await;
+
             debug!(source_id = %self.id, "reading next event");
 
+            // The read future is dropped when the rotation or feedback arm fires; both
+            // are cancellation-safe (the mpsc receiver keeps any buffered event and the
+            // client lock is released), so the next iteration simply reads again.
             let event_result = match rotation.as_mut() {
                 // Idle-source wakeup: race the read against rotation activity so a
-                // rotation applies even when no events are flowing. The wait is
-                // cancellation-safe; the read future is dropped on a rotation wake.
+                // rotation applies even when no events are flowing.
                 Some(rt) => {
                     tokio::select! {
                         r = read_next_event(&ctx) => match r {
@@ -723,16 +740,24 @@ impl PostgresSource {
                             Err(ctrl) => Err(ctrl),
                         },
                         _ = rt.wait_activity() => continue,
+                        _ = feedback_ticker.tick() => continue,
                     }
                 }
-                None => match read_next_event(&ctx).await {
-                    Ok(Some(event)) => dispatch_event(&mut ctx, event).await,
-                    Ok(None) => {
-                        info!(source_id = %self.id, "replication stream ended");
-                        break;
+                None => {
+                    tokio::select! {
+                        r = read_next_event(&ctx) => match r {
+                            Ok(Some(event)) => {
+                                dispatch_event(&mut ctx, event).await
+                            }
+                            Ok(None) => {
+                                info!(source_id = %self.id, "replication stream ended");
+                                break;
+                            }
+                            Err(ctrl) => Err(ctrl),
+                        },
+                        _ = feedback_ticker.tick() => continue,
                     }
-                    Err(ctrl) => Err(ctrl),
-                },
+                }
             };
 
             match event_result {
@@ -827,21 +852,94 @@ impl PostgresSource {
         // last committed transaction.
         loop_result?;
 
-        let _ = chkpt_store
-            .put(
-                &self.id,
-                PostgresCheckpoint {
-                    lsn: ctx.last_lsn.to_string(),
-                    tx_id: None,
-                },
-            )
-            .await;
+        // Persist the read position as the aggregate checkpoint ONLY when this store
+        // does not derive the resume position from per-sink checkpoints. In production
+        // the coordinator writes per-sink checkpoints (only after sink acknowledgement)
+        // and the resume position is their minimum; writing the read position here would
+        // resume ahead of un-acknowledged deliveries and lose them on restart (e.g. a
+        // clean stop during a sink outage).
+        if !chkpt_store.manages_per_sink_checkpoints() {
+            let _ = chkpt_store
+                .put(
+                    &self.id,
+                    PostgresCheckpoint {
+                        lsn: ctx.last_lsn.to_string(),
+                        tx_id: None,
+                    },
+                )
+                .await;
+        }
 
         if let Err(e) = ctx.repl_client.lock().await.shutdown().await {
             warn!(error = %e, "error during replication client shutdown");
         }
 
         Ok(())
+    }
+}
+
+/// Advance the WAL feedback sent to PostgreSQL to the **durable delivery frontier** -
+/// the minimum per-sink checkpoint that every required sink has acknowledged and the
+/// coordinator has committed - never the read/enqueued position.
+///
+/// The frontier is read from the checkpoint store (the per-sink [`CheckpointStore`]
+/// proxy folds the minimum and fails closed on incomparable/corrupt checkpoints). Since
+/// the store only ever holds committed, acknowledged checkpoints at transaction
+/// boundaries, the reported LSN can never be inside an open transaction or ahead of an
+/// unacknowledged batch. `durable_frontier` is the separately-tracked durable state; on
+/// any read/parse error it is left untouched so feedback holds at the last durable
+/// position (WAL is retained, never over-released).
+async fn advance_wal_feedback(
+    ctx: &RunCtx,
+    chkpt: &Arc<dyn CheckpointStore>,
+    durable_frontier: &mut Option<Lsn>,
+) {
+    *durable_frontier =
+        durable_frontier_lsn(chkpt, &ctx.source_id, *durable_frontier).await;
+    if let Some(frontier) = *durable_frontier {
+        ctx.repl_client.lock().await.update_applied_lsn(frontier);
+    }
+}
+
+/// Compute the durable frontier LSN to confirm to PostgreSQL: the per-sink minimum from
+/// the checkpoint store, advanced monotonically. On any read/parse error - including the
+/// per-sink proxy's fail-closed incomparable/corrupt error - the prior frontier `prev` is
+/// held (feedback never regresses or advances past the durable minimum). `None` means
+/// nothing has been durably acknowledged yet, so nothing is confirmed.
+///
+/// The store only ever holds committed, acknowledged checkpoints at transaction
+/// boundaries, so the returned LSN can never be inside an open transaction or ahead of an
+/// unacknowledged/backpressured batch.
+async fn durable_frontier_lsn(
+    chkpt: &Arc<dyn CheckpointStore>,
+    source_id: &str,
+    prev: Option<Lsn>,
+) -> Option<Lsn> {
+    let bytes = match chkpt.get_raw(source_id).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return prev, // nothing durable yet
+        Err(e) => {
+            // Read/incomparable/corrupt: hold at the prior durable position.
+            warn!(source_id = %source_id, error = %e,
+                "durable checkpoint unavailable; holding WAL feedback");
+            return prev;
+        }
+    };
+    let lsn = match serde_json::from_slice::<PostgresCheckpoint>(&bytes)
+        .ok()
+        .and_then(|cp| Lsn::parse(&cp.lsn).ok())
+    {
+        Some(lsn) => lsn,
+        None => {
+            warn!(source_id = %source_id,
+                "durable checkpoint LSN unparseable; holding WAL feedback");
+            return prev;
+        }
+    };
+    // Monotonic: never regress below the prior frontier.
+    match prev {
+        Some(p) if lsn <= p => Some(p),
+        _ => Some(lsn),
     }
 }
 
@@ -1227,6 +1325,89 @@ async fn fetch_slot_confirmed_lsn(
         .await?;
     let s: &str = row.get(0);
     s.parse::<Lsn>().map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+#[cfg(test)]
+mod wal_feedback_tests {
+    use super::{Lsn, durable_frontier_lsn};
+    use checkpoints::{CheckpointResult, CheckpointStore, MemCheckpointStore};
+    use std::sync::Arc;
+
+    fn cp(lsn: &str) -> Vec<u8> {
+        format!(r#"{{"lsn":"{lsn}","tx_id":null}}"#).into_bytes()
+    }
+
+    /// A store whose reads always fail, to exercise the fail-closed hold path.
+    struct FailingStore;
+    #[async_trait::async_trait]
+    impl CheckpointStore for FailingStore {
+        async fn get_raw(
+            &self,
+            _key: &str,
+        ) -> CheckpointResult<Option<Vec<u8>>> {
+            Err(checkpoints::CheckpointError::Data("boom".to_string()))
+        }
+        async fn put_raw(
+            &self,
+            _key: &str,
+            _bytes: &[u8],
+        ) -> CheckpointResult<()> {
+            Ok(())
+        }
+        async fn delete(&self, _key: &str) -> CheckpointResult<bool> {
+            Ok(false)
+        }
+        async fn list(&self) -> CheckpointResult<Vec<String>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn none_when_no_durable_checkpoint() {
+        let store: Arc<dyn CheckpointStore> =
+            Arc::new(MemCheckpointStore::new().unwrap());
+        assert_eq!(durable_frontier_lsn(&store, "s", None).await, None);
+    }
+
+    #[tokio::test]
+    async fn reports_committed_checkpoint_lsn() {
+        let store: Arc<dyn CheckpointStore> =
+            Arc::new(MemCheckpointStore::new().unwrap());
+        store.put_raw("s", &cp("0/200")).await.unwrap();
+        assert_eq!(
+            durable_frontier_lsn(&store, "s", None).await,
+            Some(Lsn::parse("0/200").unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn never_regresses_below_prior_frontier() {
+        // A committed checkpoint lower than the prior frontier (never happens for a
+        // healthy min-fold, but must be safe): the frontier holds, never regresses.
+        let store: Arc<dyn CheckpointStore> =
+            Arc::new(MemCheckpointStore::new().unwrap());
+        store.put_raw("s", &cp("0/100")).await.unwrap();
+        let prev = Some(Lsn::parse("0/300").unwrap());
+        assert_eq!(durable_frontier_lsn(&store, "s", prev).await, prev);
+    }
+
+    #[tokio::test]
+    async fn holds_prior_frontier_on_read_error() {
+        // Mandatory: a checkpoint-store read failure must not advance feedback.
+        let store: Arc<dyn CheckpointStore> = Arc::new(FailingStore);
+        let prev = Some(Lsn::parse("0/300").unwrap());
+        assert_eq!(durable_frontier_lsn(&store, "s", prev).await, prev);
+        assert_eq!(durable_frontier_lsn(&store, "s", None).await, None);
+    }
+
+    #[tokio::test]
+    async fn holds_prior_frontier_on_corrupt_checkpoint() {
+        let store: Arc<dyn CheckpointStore> =
+            Arc::new(MemCheckpointStore::new().unwrap());
+        store.put_raw("s", b"{ not json").await.unwrap();
+        let prev = Some(Lsn::parse("0/300").unwrap());
+        assert_eq!(durable_frontier_lsn(&store, "s", prev).await, prev);
+    }
 }
 
 #[cfg(test)]

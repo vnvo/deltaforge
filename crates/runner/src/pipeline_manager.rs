@@ -80,6 +80,13 @@ impl PerSinkCheckpointProxy {
 
 #[async_trait]
 impl CheckpointStore for PerSinkCheckpointProxy {
+    fn manages_per_sink_checkpoints(&self) -> bool {
+        // The source's resume position is the minimum of the coordinator's per-sink
+        // checkpoints (written only after sink acknowledgement), so the source must not
+        // persist its own read position as the aggregate checkpoint.
+        true
+    }
+
     async fn get_raw(&self, key: &str) -> CheckpointResult<Option<Vec<u8>>> {
         if key == self.source_id {
             let prefix = format!("{}::sink::", self.source_id);

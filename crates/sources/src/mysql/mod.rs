@@ -637,18 +637,27 @@ impl MySqlSource {
         }
         loop_result?;
 
-        // best-effort final checkpoint update
-        let _ = ctx
-            .chkpt
-            .put(
-                &ctx.source_id,
-                MySqlCheckpoint {
-                    file: ctx.last_file,
-                    pos: ctx.last_pos,
-                    gtid_set: ctx.last_gtid,
-                },
-            )
-            .await;
+        // Best-effort final checkpoint update. Persist the read position as the
+        // aggregate checkpoint ONLY when this store does not derive the resume position
+        // from per-sink checkpoints. In production the coordinator writes per-sink
+        // checkpoints (only after sink acknowledgement) and the resume position is their
+        // minimum; writing the read position here would resume ahead of un-acknowledged
+        // deliveries and lose them on restart (a clean stop during a sink outage). MySQL
+        // has no consumer-driven binlog purge, so there is no server-side WAL feedback to
+        // fix - only this resume checkpoint.
+        if !ctx.chkpt.manages_per_sink_checkpoints() {
+            let _ = ctx
+                .chkpt
+                .put(
+                    &ctx.source_id,
+                    MySqlCheckpoint {
+                        file: ctx.last_file,
+                        pos: ctx.last_pos,
+                        gtid_set: ctx.last_gtid,
+                    },
+                )
+                .await;
+        }
 
         Ok(())
     }
