@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Reliable end-to-end throughput baseline** (`crates/runner/tests/throughput_e2e.rs`) - a self-provisioning (testcontainers) backlog-drain test that wires the real `PostgresSource` -> `Coordinator` -> `KafkaSink` pipeline against real PostgreSQL + Kafka containers, writes a backlog (default 50,000 rows, `THROUGHPUT_ROWS` env override), drains PG->Kafka, and reports write rate, drain throughput (wall-clock + steady-state events/s) and peak process RSS with a throughput regression floor. No fixed host ports, no manual pipeline apply, no proxy. Run: `cargo test -p runner --test throughput_e2e -- --include-ignored --nocapture`.
+- **Reliable end-to-end throughput baseline** (`crates/runner/tests/throughput_e2e.rs`) - a self-provisioning (testcontainers) backlog-drain test that wires the real `PostgresSource` -> `Coordinator` -> `KafkaSink` pipeline against real PostgreSQL + Kafka containers, writes a backlog (default 50,000 rows, `THROUGHPUT_ROWS` env override), drains PG->Kafka, and reports write rate, drain throughput (wall-clock + steady-state events/s) and peak process RSS with a throughput regression floor. No fixed host ports, no manual pipeline apply, no proxy. Run in release for representative numbers: `THROUGHPUT_ROWS=1000000 cargo test --release -p runner --test throughput_e2e -- --include-ignored --nocapture`. Measured release baseline: 1,000,000 rows drained in ~8s = ~125k events/s wall-clock, ~156k events/s steady-state (PostgreSQL 17 -> cp-kafka 7.5, JSON).
 
 ### Removed
 

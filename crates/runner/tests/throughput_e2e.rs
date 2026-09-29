@@ -15,8 +15,15 @@
 //! conservative regression floor.
 //!
 //! Row count is `THROUGHPUT_ROWS` (default 50_000; override with the env var of
-//! the same name). Run with:
-//!   cargo test -p runner --test throughput_e2e -- --include-ignored --nocapture
+//! the same name). ALWAYS run in release for a representative number - a debug
+//! build throttles CPU-bound work (JSON encoding) several-fold:
+//!   THROUGHPUT_ROWS=1000000 cargo test --release -p runner --test throughput_e2e \
+//!     -- --include-ignored --nocapture
+//!
+//! Measured release baseline (dev machine, PostgreSQL 17 -> cp-kafka 7.5, JSON):
+//! 1,000,000 rows drained in ~8s = ~125k events/s wall-clock, ~156k events/s
+//! steady-state; backlog write ~800k rows/s. (A debug build or a small backlog
+//! reports far lower - the fixed startup cost dominates.)
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -287,10 +294,20 @@ async fn pg_to_kafka_backlog_drain_throughput() -> Result<()> {
             required: Some(true),
             exactly_once: None,
             send_timeout_secs: Some(30),
-            client_conf: HashMap::from([(
-                "linger.ms".to_string(),
-                "5".to_string(),
-            )]),
+            // Drain/catch-up tuning: linger.ms=0 for maximum throughput, larger
+            // producer queue so batches never stall on a full librdkafka queue.
+            client_conf: HashMap::from([
+                ("linger.ms".to_string(), "0".to_string()),
+                (
+                    "queue.buffering.max.messages".to_string(),
+                    "2000000".to_string(),
+                ),
+                (
+                    "queue.buffering.max.kbytes".to_string(),
+                    "2097152".to_string(),
+                ),
+                ("compression.type".to_string(), "lz4".to_string()),
+            ]),
             secret_refs: Default::default(),
             filter: None,
         },
@@ -305,12 +322,14 @@ async fn pg_to_kafka_backlog_drain_throughput() -> Result<()> {
     let batch_processor = build_batch_processor(processors, "test".to_string());
     let coord = Coordinator::builder(SID)
         .sinks(vec![kafka])
+        // Tuned drain/catch-up batching (matches the documented high-throughput
+        // profile): large batches, deep pipelining, transaction grouping off.
         .batch_config(Some(BatchConfig {
-            max_events: Some(5000),
+            max_events: Some(16000),
             max_bytes: Some(16 * 1024 * 1024),
             max_ms: Some(100),
             respect_source_tx: Some(false),
-            max_inflight: Some(4),
+            max_inflight: Some(8),
             ..BatchConfig::default()
         }))
         .commit_fn("kafka", cp_fn)
@@ -350,7 +369,7 @@ async fn pg_to_kafka_backlog_drain_throughput() -> Result<()> {
             first_delivery = Some(Instant::now());
         }
         if delivered < rows as i64 {
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
     let drain_end = Instant::now();

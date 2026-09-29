@@ -6,7 +6,7 @@ This guide covers throughput optimization for DeltaForge CDC pipelines, based on
 
 ## Benchmark Results
 
-Measured on Docker containers on a single developer machine (not dedicated infrastructure), draining a 1-10M row backlog to a single-node Kafka broker.
+Measured on Docker containers on a single developer machine (not dedicated infrastructure), draining a 1-10M row backlog to a single-node Kafka broker. The table below records historical figures; for a reproducible current baseline run the `throughput_e2e` drain benchmark (see [Running the Drain Benchmark](#running-the-drain-benchmark)), which measures ~156K events/s steady-state for PostgreSQL → Kafka (JSON, release, in-process).
 
 ### With tuned batching (recommended)
 
@@ -184,7 +184,7 @@ Each sink maintains its own checkpoint, committed independently after successful
 
 ## Profiling
 
-The `throughput_e2e` test prints drain throughput and peak RSS; use `cargo flamegraph`/`perf` against a debug run for CPU profiling.
+The `throughput_e2e` test prints drain throughput and peak RSS; use `cargo flamegraph`/`perf` against a release build for CPU profiling.
 
 Key areas to watch in flamegraphs:
 
@@ -201,17 +201,16 @@ Key areas to watch in flamegraphs:
 
 The backlog drain benchmark measures catch-up throughput: how fast DeltaForge replays a pre-built backlog. It is the `throughput_e2e` end-to-end test, which self-provisions PostgreSQL and Kafka via testcontainers (Docker required), writes a backlog, drains PG to Kafka, and reports write rate, drain throughput (wall-clock and steady-state events/s), and peak process RSS.
 
-```bash
-cargo test -p runner --test throughput_e2e -- --include-ignored --nocapture
-```
-
-The backlog defaults to 50,000 rows; override it with the `THROUGHPUT_ROWS` environment variable:
+**Always run in release** - a debug build throttles CPU-bound work (JSON encoding) several-fold, and use a large backlog so the fixed startup cost does not dominate:
 
 ```bash
-THROUGHPUT_ROWS=200000 cargo test -p runner --test throughput_e2e -- --include-ignored --nocapture
+THROUGHPUT_ROWS=1000000 cargo test --release -p runner --test throughput_e2e \
+  -- --include-ignored --nocapture
 ```
 
-Measured baseline: 50,000 rows drained in ~2.7s = ~18,750 events/s wall-clock / ~34,800 events/s steady-state, peak RSS ~129 MiB (in-process).
+The backlog defaults to 50,000 rows; `THROUGHPUT_ROWS` overrides it.
+
+Measured release baseline (PostgreSQL 17 → cp-kafka 7.5, JSON, single dev machine): 1,000,000 rows drained in ~8s = **~125,000 events/s wall-clock / ~156,000 events/s steady-state**; backlog write ~800,000 rows/s. (A debug build or a small backlog reports far lower - e.g. 50k rows in debug is ~18k ev/s wall - because the source-connect/startup cost dominates; those numbers are not representative.)
 
 The in-process coordinator-throughput benchmarks remain available:
 
