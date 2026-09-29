@@ -5538,4 +5538,110 @@ mod tests {
         assert_eq!(d[1].1, b"snap-done");
         assert_eq!(d[1].2.as_deref(), Some(&b"COMPLETED"[..]));
     }
+
+    /// A checkpoint store whose writes always fail, to model a crash between sink
+    /// acknowledgement and checkpoint persistence.
+    struct FailingPutStore;
+    #[async_trait::async_trait]
+    impl checkpoints::CheckpointStore for FailingPutStore {
+        async fn get_raw(
+            &self,
+            _key: &str,
+        ) -> checkpoints::CheckpointResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn put_raw(
+            &self,
+            _key: &str,
+            _bytes: &[u8],
+        ) -> checkpoints::CheckpointResult<()> {
+            Err(checkpoints::CheckpointError::Data(
+                "simulated persist failure".to_string(),
+            ))
+        }
+        async fn delete(
+            &self,
+            _key: &str,
+        ) -> checkpoints::CheckpointResult<bool> {
+            Ok(false)
+        }
+        async fn list(&self) -> checkpoints::CheckpointResult<Vec<String>> {
+            Ok(vec![])
+        }
+    }
+
+    /// Mandatory (at-least-once): if the sink acknowledges a batch but persisting the
+    /// checkpoint then fails (a crash before the write lands), the coordinator surfaces
+    /// the error and does NOT report success - so on restart the batch is replayed
+    /// (a duplicate, never a loss). The checkpoint never advances past what was persisted.
+    #[tokio::test]
+    async fn checkpoint_persist_failure_after_ack_does_not_advance() {
+        let sink = MockSink::new("kafka", true);
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        // The sink acks, but the checkpoint write fails.
+        let cp_fn = build_commit_fn(
+            Arc::new(FailingPutStore),
+            "mysql::sink::kafka".to_string(),
+        );
+        let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![]);
+        let batch_processor =
+            build_batch_processor(processors, "test".to_string());
+        let coord = Coordinator::builder("persist-fail")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(10),
+                max_bytes: None,
+                max_ms: Some(50),
+                respect_source_tx: None,
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_fn("kafka", cp_fn)
+            .process_fn(batch_processor)
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
+
+        let source = deltaforge_core::SourceInfo {
+            version: "test".into(),
+            connector: "mysql".into(),
+            name: "test".into(),
+            db: "db".into(),
+            schema: None,
+            table: "t".into(),
+            ts_ms: 0,
+            snapshot: None,
+            position: deltaforge_core::SourcePosition::default(),
+        };
+        let mut event = Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
+            source,
+            deltaforge_core::Op::Create,
+            None,
+            Some(serde_json::json!({"id": 1})),
+            0,
+            0,
+        );
+        event.set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":9}".to_vec()));
+        event.tx_end = true;
+        tx.send(SourceItem::Event(event)).await.unwrap();
+        drop(tx);
+
+        let result = coord.run(rx, cancel, pause_rx).await;
+        assert!(
+            result.is_err(),
+            "a checkpoint persist failure after ack must surface as an error so the \
+             batch replays on restart (never a silent loss)"
+        );
+        // The sink DID acknowledge the batch (the ack happened before persistence).
+        assert_eq!(
+            sink.delivery_count(),
+            1,
+            "the sink acknowledged the batch before the persist failure"
+        );
+    }
 }
