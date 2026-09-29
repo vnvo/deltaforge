@@ -39,7 +39,24 @@ fn cleanup() {
     }
 }
 
-async fn create_pub_slot(
+/// Drop a replication slot if it exists (inactive). Best-effort; used to force a
+/// snapshot source to recreate its own owned slot on a subsequent run.
+async fn drop_repl_slot(client: &tokio_postgres::Client, slot: &str) {
+    client
+        .batch_execute(&format!(
+            "SELECT pg_drop_replication_slot('{slot}') WHERE EXISTS \
+             (SELECT 1 FROM pg_replication_slots WHERE slot_name='{slot}')"
+        ))
+        .await
+        .ok();
+}
+
+/// Create only the publication (and clear any stale slot). Snapshot-mode sources
+/// establish the replication slot themselves via `prepare_snapshot_slot_anchor`
+/// to record durable ownership and anchor at the slot's consistent point;
+/// pre-creating the slot would fail closed ("cannot prove exclusive ownership").
+/// CDC-only tests that stream from a pre-existing slot use `create_pub_slot`.
+async fn create_publication_only(
     client: &tokio_postgres::Client,
     pub_name: &str,
     slot: &str,
@@ -48,7 +65,7 @@ async fn create_pub_slot(
     client
         .execute(&format!("DROP PUBLICATION IF EXISTS {pub_name}"), &[])
         .await?;
-    client.batch_execute(&format!("SELECT pg_drop_replication_slot('{slot}') WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='{slot}')")).await.ok();
+    drop_repl_slot(client, slot).await;
     let tbl = if tables.is_empty() {
         "ALL TABLES".into()
     } else {
@@ -57,6 +74,19 @@ async fn create_pub_slot(
     client
         .execute(&format!("CREATE PUBLICATION {pub_name} FOR {tbl}"), &[])
         .await?;
+    Ok(())
+}
+
+/// Create the publication and pre-create the replication slot. For CDC-only
+/// (`snapshot.mode = never`) tests that stream from an operator-provisioned slot.
+/// Snapshot-mode tests must use [`create_publication_only`] instead.
+async fn create_pub_slot(
+    client: &tokio_postgres::Client,
+    pub_name: &str,
+    slot: &str,
+    tables: &[&str],
+) -> Result<()> {
+    create_publication_only(client, pub_name, slot, tables).await?;
     client
         .batch_execute(&format!(
             "SELECT pg_create_logical_replication_slot('{slot}', 'pgoutput')"
@@ -2950,8 +2980,13 @@ async fn pg_uuid_pk_snapshot_ids_are_stable() -> Result<()> {
     client
         .execute(&format!("GRANT SELECT ON items TO {PG_CDC_USER}"), &[])
         .await?;
-    create_pub_slot(&client, "pub_snap_uuid", "slot_snap_uuid", &["items"])
-        .await?;
+    create_publication_only(
+        &client,
+        "pub_snap_uuid",
+        "slot_snap_uuid",
+        &["items"],
+    )
+    .await?;
 
     let src = make_snap_source(
         "pg-snap-uuid",
@@ -3007,7 +3042,7 @@ async fn pg_resnapshot_allocates_new_generation() -> Result<()> {
     client
         .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
         .await?;
-    create_pub_slot(
+    create_publication_only(
         &client,
         "pub_snap_resnap",
         "slot_snap_resnap",
@@ -3049,6 +3084,11 @@ async fn pg_resnapshot_allocates_new_generation() -> Result<()> {
     };
 
     let first = run(SnapshotMode::Initial).await;
+    // Each run uses a fresh checkpoint store (so slot ownership does not carry
+    // over); drop the inactive slot the first run created so the re-snapshot
+    // establishes its own owned slot. The generation still bumps to 2 because it
+    // is durable in the shared backend and the second run uses `Always`.
+    drop_repl_slot(&client, "slot_snap_resnap").await;
     let second = run(SnapshotMode::Always).await;
 
     let first_reads = snap_reads(&first);
@@ -3086,7 +3126,7 @@ async fn pg_keyless_table_rejected_before_rows() -> Result<()> {
     client
         .execute(&format!("GRANT SELECT ON logs TO {PG_CDC_USER}"), &[])
         .await?;
-    create_pub_slot(
+    create_publication_only(
         &client,
         "pub_snap_keyless",
         "slot_snap_keyless",
@@ -3126,8 +3166,12 @@ async fn pg_keyless_table_rejected_before_rows() -> Result<()> {
     Ok(())
 }
 
-/// Restart midway through a snapshot resumes with the SAME generation, and the
-/// rows emitted before the interruption keep identical ids afterward.
+/// Restart after an interrupted snapshot re-anchors the owned inactive slot and
+/// re-scans with the SAME generation, so the rows emitted before the interruption
+/// keep identical ids afterward. (The interrupted snapshot is fully re-scanned
+/// under the new anchor rather than resumed from partial progress - a full
+/// re-scan is required for safety when the anchor moves - but the ids are
+/// deterministic from the primary key plus the generation, so they are stable.)
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn pg_snapshot_resumes_midway_with_stable_ids() -> Result<()> {
@@ -3141,7 +3185,7 @@ async fn pg_snapshot_resumes_midway_with_stable_ids() -> Result<()> {
     client
         .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
         .await?;
-    create_pub_slot(
+    create_publication_only(
         &client,
         "pub_snap_resume",
         "slot_snap_resume",
@@ -3149,8 +3193,9 @@ async fn pg_snapshot_resumes_midway_with_stable_ids() -> Result<()> {
     )
     .await?;
 
-    // Shared backend (generation) AND checkpoint store (table progress) so the
-    // second run genuinely resumes rather than starting fresh.
+    // Shared backend (generation) AND checkpoint store (slot ownership + progress)
+    // so the second run re-anchors the slot the first run created and owns, rather
+    // than failing closed on an unowned slot.
     let backend = make_storage_backend().await;
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     let cfg = || deltaforge_config::SnapshotCfg {
@@ -3249,7 +3294,7 @@ async fn pg_temporal_ids_are_datestyle_timezone_invariant() -> Result<()> {
     client
         .execute(&format!("GRANT SELECT ON ev TO {PG_CDC_USER}"), &[])
         .await?;
-    create_pub_slot(
+    create_publication_only(
         &client,
         "pub_snap_temporal",
         "slot_snap_temporal",
@@ -3257,9 +3302,11 @@ async fn pg_temporal_ids_are_datestyle_timezone_invariant() -> Result<()> {
     )
     .await?;
 
-    // Both runs use Initial with a fresh checkpoint store (so each re-scans) but
-    // a SHARED backend, so the generation is reused (Resume) and stays 1 — the
-    // only variable across the two runs is the session DateStyle/TimeZone.
+    // Both runs use Initial with a fresh checkpoint store (so each re-scans and
+    // establishes its own owned slot) but a SHARED backend, so the generation is
+    // reused (Resume) and stays 1. The slot is dropped between runs so the second
+    // run creates a fresh owned slot instead of failing closed on an unowned one.
+    // The only variable across the two runs is the session DateStyle/TimeZone.
     let backend = make_storage_backend().await;
     let run = || {
         let backend = backend.clone();
@@ -3303,6 +3350,7 @@ async fn pg_temporal_ids_are_datestyle_timezone_invariant() -> Result<()> {
         .await?;
     let ids_utc = run().await;
 
+    drop_repl_slot(&client, "slot_snap_temporal").await;
     client
         .batch_execute(&format!(
             "ALTER DATABASE {db} SET timezone='America/New_York'; \
@@ -3337,7 +3385,7 @@ async fn pg_parallel_and_sequential_pk_produce_identical_ids() -> Result<()> {
     client
         .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
         .await?;
-    create_pub_slot(
+    create_publication_only(
         &client,
         "pub_snap_parallel",
         "slot_snap_parallel",
@@ -3387,10 +3435,13 @@ async fn pg_parallel_and_sequential_pk_produce_identical_ids() -> Result<()> {
         }
     };
 
-    // Fresh checkpoint store each run (so each re-scans the whole table) but a
-    // shared backend (so the generation is reused at 1) — the only difference
-    // between the runs is the scan path.
+    // Fresh checkpoint store each run (so each re-scans the whole table and
+    // establishes its own owned slot) but a shared backend (so the generation is
+    // reused at 1). The slot is dropped between runs so the second run creates a
+    // fresh owned slot instead of failing closed on an unowned one. The only
+    // difference between the runs is the scan path.
     let sequential = run(SnapshotMode::Initial, false).await;
+    drop_repl_slot(&client, "slot_snap_parallel").await;
     let parallel = run(SnapshotMode::Initial, true).await;
 
     assert_eq!(sequential.len(), 50);
@@ -3425,7 +3476,7 @@ async fn pg_enum_and_domain_identities_work() -> Result<()> {
     client
         .execute(&format!("GRANT SELECT ON em, dm TO {PG_CDC_USER}"), &[])
         .await?;
-    create_pub_slot(
+    create_publication_only(
         &client,
         "pub_snap_enumdom",
         "slot_snap_enumdom",
