@@ -23,6 +23,9 @@ use super::postgres_helpers::{
 };
 use super::postgres_logical_message;
 use super::postgres_object::{RelationColumn, build_object, parse_tuple_data};
+use super::postgres_table_schema::{
+    FirstResolution, RelationIdentity, verify_first_resolution,
+};
 
 /// Relation metadata from pgoutput.
 #[derive(Debug, Clone)]
@@ -127,7 +130,10 @@ pub(super) async fn dispatch_event(
             .increment(data.len() as u64);
             ctx.last_lsn = wal_end;
             handle_pgoutput_message(ctx, &data, wal_end).await?;
-            ctx.repl_client.lock().await.update_applied_lsn(wal_end);
+            // NOTE: the LSN confirmed to PostgreSQL (which releases retained WAL) is
+            // driven separately from the durable per-sink checkpoint by the WAL-feedback
+            // task (see `mod.rs`), never from the read position here - otherwise WAL for
+            // events no sink has acknowledged would be released, losing them on restart.
         }
         ReplicationEvent::KeepAlive {
             wal_end,
@@ -258,7 +264,8 @@ pub(super) async fn dispatch_event(
             }
 
             ctx.last_lsn = lsn;
-            ctx.repl_client.lock().await.update_applied_lsn(lsn);
+            // WAL confirmation to PostgreSQL is driven by the durable per-sink
+            // checkpoint (see `mod.rs`), not the read position.
         }
     }
     Ok(())
@@ -490,12 +497,7 @@ fn handle_relation(
     // query.
     if is_new {
         if let Some(persisted) = ctx.schema.get_cached(&schema, &table) {
-            let persisted_signature: Vec<(String, Option<u32>)> = persisted
-                .schema
-                .columns
-                .iter()
-                .map(|c| (c.name.clone(), c.type_oid))
-                .collect();
+            let persisted_signature = persisted.schema.signature();
             if let FirstResolution::Drift(detail) = verify_first_resolution(
                 &persisted_signature,
                 &relation_signature,
@@ -514,82 +516,6 @@ fn handle_relation(
     }
 
     Ok(())
-}
-
-/// Result of verifying a table's first Relation this run against the persisted
-/// baseline.
-#[derive(Debug, PartialEq, Eq)]
-enum FirstResolution {
-    NoDrift,
-    Drift(String),
-}
-
-/// Compare the first Relation for a table against its durably persisted schema,
-/// deterministically and without any catalog query.
-///
-/// The persisted schema already carries each column's `type_oid` (populated at
-/// load time), so the comparison is a direct match of the ordered
-/// `(name, type_oid)` signature the pgoutput Relation message sends - the same
-/// fields the in-stream path compares (name/order/count/type-OID).
-///
-/// Fails closed: a persisted column whose `type_oid` is unavailable (e.g. a schema
-/// persisted before type OIDs were recorded) is **unverifiable** and reported as
-/// drift, never silently accepted as unchanged. Under Halt the caller stops; under
-/// Adapt it reloads, which re-persists the type OID so later restarts verify
-/// cleanly.
-///
-/// Note on scope: this guards replication-visible structural changes
-/// (name/order/count/type-OID), matching the in-stream contract. Catalog-only
-/// changes not present in the Relation payload (nullability, defaults, identity
-/// metadata) are out of scope and would require a durable relation/catalog
-/// signature plus batched reconciliation rather than per-table point queries.
-fn verify_first_resolution(
-    persisted_signature: &[(String, Option<u32>)],
-    relation_signature: &[(String, u32)],
-) -> FirstResolution {
-    let describe = || {
-        let persisted = persisted_signature
-            .iter()
-            .map(|(n, o)| match o {
-                Some(o) => format!("{n}:{o}"),
-                None => format!("{n}:?"),
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let relation = relation_signature
-            .iter()
-            .map(|(n, o)| format!("{n}:{o}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("columns [{persisted}] -> [{relation}]")
-    };
-
-    if persisted_signature.len() != relation_signature.len() {
-        return FirstResolution::Drift(describe());
-    }
-    for ((p_name, p_oid), (r_name, r_oid)) in
-        persisted_signature.iter().zip(relation_signature.iter())
-    {
-        if p_name != r_name {
-            return FirstResolution::Drift(describe());
-        }
-        match p_oid {
-            // Persisted type OID unavailable: cannot verify -> fail closed as
-            // drift (unverifiable), never treated as unchanged.
-            None => {
-                return FirstResolution::Drift(format!(
-                    "persisted type OID unavailable for column \"{p_name}\"; \
-                     cannot verify schema ({})",
-                    describe()
-                ));
-            }
-            Some(o) if o != r_oid => {
-                return FirstResolution::Drift(describe());
-            }
-            _ => {}
-        }
-    }
-    FirstResolution::NoDrift
 }
 
 /// Describe a relation-definition change as `old cols -> new cols`, for the
@@ -716,11 +642,23 @@ async fn handle_insert(
 
     // Extract all needed data from relation upfront to release the borrow.
     let columns = Arc::clone(&relation.columns);
+    let replica_identity = relation.replica_identity;
     let qualified_name = Arc::clone(&relation.qualified_name);
     let schema = relation.schema.clone();
     let table = relation.table.clone();
 
-    let loaded = ctx.schema.load_schema(&schema, &table).await?;
+    let rel_identity = RelationIdentity {
+        oid: relation_id,
+        signature: columns
+            .iter()
+            .map(|c| (c.name.clone(), c.type_oid))
+            .collect(),
+        replica_identity,
+    };
+    let loaded = ctx
+        .schema
+        .load_schema_for_relation(&schema, &table, None, &rel_identity)
+        .await?;
 
     let tuple_data = payload_bytes.slice(5..);
     let (values, _) = parse_tuple_data(&tuple_data, columns.len());
@@ -795,6 +733,7 @@ async fn handle_update(
     }
 
     let columns = Arc::clone(&relation.columns);
+    let replica_identity = relation.replica_identity;
     let qualified_name = Arc::clone(&relation.qualified_name);
     let schema = relation.schema.clone();
     let table = relation.table.clone();
@@ -829,7 +768,18 @@ async fn handle_update(
         return Ok(());
     };
 
-    let loaded = ctx.schema.load_schema(&schema, &table).await?;
+    let rel_identity = RelationIdentity {
+        oid: relation_id,
+        signature: columns
+            .iter()
+            .map(|c| (c.name.clone(), c.type_oid))
+            .collect(),
+        replica_identity,
+    };
+    let loaded = ctx
+        .schema
+        .load_schema_for_relation(&schema, &table, None, &rel_identity)
+        .await?;
 
     let before = before_values.map(|v| build_object(&columns, &v));
     let after = build_object(&columns, &after_vals);
@@ -908,11 +858,23 @@ async fn handle_delete(
     }
 
     let columns = Arc::clone(&relation.columns);
+    let replica_identity = relation.replica_identity;
     let qualified_name = Arc::clone(&relation.qualified_name);
     let schema = relation.schema.clone();
     let table = relation.table.clone();
 
-    let loaded = ctx.schema.load_schema(&schema, &table).await?;
+    let rel_identity = RelationIdentity {
+        oid: relation_id,
+        signature: columns
+            .iter()
+            .map(|c| (c.name.clone(), c.type_oid))
+            .collect(),
+        replica_identity,
+    };
+    let loaded = ctx
+        .schema
+        .load_schema_for_relation(&schema, &table, None, &rel_identity)
+        .await?;
 
     let tuple_data = payload_bytes.slice(5..);
     let (values, _) = parse_tuple_data(&tuple_data, columns.len());

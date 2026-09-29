@@ -313,6 +313,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_and_ready_return_503_when_pipeline_failed() {
+        // A failed pipeline must surface on BOTH probes: /health (liveness) and
+        // /ready (readiness) return 503 and name the failed pipeline.
+        let mut info = sample_pipe_info();
+        info.status = "failed".to_string();
+        let app = router(AppState {
+            controller: Arc::new(HappyController { info }),
+        });
+
+        for uri in ["/health", "/ready"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder().uri(uri).body(Body::empty()).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                StatusCode::SERVICE_UNAVAILABLE,
+                resp.status(),
+                "{uri} must return 503 when a pipeline is failed"
+            );
+            let payload: serde_json::Value = serde_json::from_slice(
+                &to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                payload["failed_pipelines"],
+                json!(["demo"]),
+                "{uri} must name the failed pipeline"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_returns_200_when_all_pipelines_healthy() {
+        let app = router(AppState {
+            controller: Arc::new(HappyController {
+                info: sample_pipe_info(),
+            }),
+        });
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, resp.status());
+    }
+
+    #[tokio::test]
     async fn pipeline_routes_surface_errors() {
         let controller = ErrorController;
         let app = router(AppState {

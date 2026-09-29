@@ -879,6 +879,9 @@ pub struct Coordinator<Tok> {
     /// in response to a replay pause, and `false` when it resumes. The handoff waits on it
     /// so `H` is read against a genuinely frozen tail.
     quiesce_ack: Option<watch::Sender<bool>>,
+    /// Notified after each successful per-sink checkpoint commit so the source can
+    /// refresh its WAL feedback change-driven instead of polling the checkpoint store.
+    commit_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 pub struct CoordinatorBuilder<Tok> {
@@ -895,6 +898,7 @@ pub struct CoordinatorBuilder<Tok> {
     replay_capture: Option<ReplayCapture>,
     replay_gate: Option<Arc<crate::replay_gate::ReplaySinkGate>>,
     quiesce_ack: Option<watch::Sender<bool>>,
+    commit_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
@@ -913,7 +917,15 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             replay_capture: None,
             replay_gate: None,
             quiesce_ack: None,
+            commit_notify: None,
         }
+    }
+
+    /// Wire a notify signaled after each successful per-sink checkpoint commit, so the
+    /// source can refresh WAL feedback change-driven instead of polling.
+    pub fn commit_notify(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.commit_notify = Some(notify);
+        self
     }
 
     pub fn sinks(mut self, sinks: Vec<ArcDynSink>) -> Self {
@@ -1012,6 +1024,7 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             replay_capture: self.replay_capture,
             replay_gate: self.replay_gate,
             quiesce_ack: self.quiesce_ack,
+            commit_notify: self.commit_notify,
         }
     }
 }
@@ -2082,6 +2095,15 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                         .map(|d| d.as_secs_f64())
                         .unwrap_or(0.0),
                 );
+
+                // Wake the source so it refreshes WAL feedback from the newly persisted
+                // durable minimum (change-driven, not polled). `notify_one` retains a
+                // permit if the source is not currently awaiting, so a commit is never
+                // lost; multiple commits coalesce because the source rereads the
+                // authoritative minimum on wake.
+                if let Some(n) = &self.commit_notify {
+                    n.notify_one();
+                }
             }
         }
 
@@ -4359,6 +4381,89 @@ mod tests {
         assert_eq!(redis_sink.delivery_count(), 0);
     }
 
+    /// A terminal required-sink failure must make `run` return `Err`, and on its way
+    /// out the delivery task self-cancels the shared token. This is the exact scenario
+    /// the pipeline_manager wrapper must still recognize as a failure (see
+    /// `coordinator_exit_failed`): cancellation alone cannot be read as "operator stop".
+    #[tokio::test]
+    async fn required_sink_failure_returns_err_and_self_cancels() {
+        use checkpoints::MemCheckpointStore;
+
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let kafka = MockSink::new("kafka", true); // required
+        kafka.set_fail(true);
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&kafka) as ArcDynSink];
+
+        let cp_fn =
+            build_commit_fn(store.clone(), "mysql::sink::kafka".to_string());
+        let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![]);
+        let batch_processor =
+            build_batch_processor(processors, "test".to_string());
+
+        let coord = Coordinator::builder("test-required-fail")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(10),
+                max_bytes: None,
+                max_ms: Some(50),
+                respect_source_tx: None,
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_fn("kafka", cp_fn)
+            .process_fn(batch_processor)
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_observed = cancel.clone();
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
+
+        let source = deltaforge_core::SourceInfo {
+            version: "test".into(),
+            connector: "mysql".into(),
+            name: "test".into(),
+            db: "db".into(),
+            schema: None,
+            table: "t".into(),
+            ts_ms: 0,
+            snapshot: None,
+            position: deltaforge_core::SourcePosition::default(),
+        };
+        let mut event = Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
+            source,
+            deltaforge_core::Op::Create,
+            None,
+            Some(serde_json::json!({"id": 1})),
+            0,
+            0,
+        );
+        event
+            .set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":42}".to_vec()));
+        event.tx_end = true;
+        tx.send(SourceItem::Event(event)).await.unwrap();
+        drop(tx);
+
+        let result = coord.run(rx, cancel, pause_rx).await;
+
+        assert!(
+            result.is_err(),
+            "a terminal required-sink failure must make run() return Err"
+        );
+        assert!(
+            cancel_observed.is_cancelled(),
+            "the delivery task self-cancels the shared token on failure"
+        );
+        // The required sink's checkpoint must not have advanced.
+        assert!(
+            store.get_raw("mysql::sink::kafka").await.unwrap().is_none(),
+            "a failed required sink must not advance its checkpoint"
+        );
+    }
+
     /// Regression test: a partial batch (fewer events than max_events) must be
     /// flushed by the timer when the source goes idle - not stuck waiting for
     /// more events to fill the batch.
@@ -5454,5 +5559,111 @@ mod tests {
         );
         assert_eq!(d[1].1, b"snap-done");
         assert_eq!(d[1].2.as_deref(), Some(&b"COMPLETED"[..]));
+    }
+
+    /// A checkpoint store whose writes always fail, to model a crash between sink
+    /// acknowledgement and checkpoint persistence.
+    struct FailingPutStore;
+    #[async_trait::async_trait]
+    impl checkpoints::CheckpointStore for FailingPutStore {
+        async fn get_raw(
+            &self,
+            _key: &str,
+        ) -> checkpoints::CheckpointResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn put_raw(
+            &self,
+            _key: &str,
+            _bytes: &[u8],
+        ) -> checkpoints::CheckpointResult<()> {
+            Err(checkpoints::CheckpointError::Data(
+                "simulated persist failure".to_string(),
+            ))
+        }
+        async fn delete(
+            &self,
+            _key: &str,
+        ) -> checkpoints::CheckpointResult<bool> {
+            Ok(false)
+        }
+        async fn list(&self) -> checkpoints::CheckpointResult<Vec<String>> {
+            Ok(vec![])
+        }
+    }
+
+    /// Mandatory (at-least-once): if the sink acknowledges a batch but persisting the
+    /// checkpoint then fails (a crash before the write lands), the coordinator surfaces
+    /// the error and does NOT report success - so on restart the batch is replayed
+    /// (a duplicate, never a loss). The checkpoint never advances past what was persisted.
+    #[tokio::test]
+    async fn checkpoint_persist_failure_after_ack_does_not_advance() {
+        let sink = MockSink::new("kafka", true);
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        // The sink acks, but the checkpoint write fails.
+        let cp_fn = build_commit_fn(
+            Arc::new(FailingPutStore),
+            "mysql::sink::kafka".to_string(),
+        );
+        let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
+            Arc::from(vec![]);
+        let batch_processor =
+            build_batch_processor(processors, "test".to_string());
+        let coord = Coordinator::builder("persist-fail")
+            .sinks(sinks)
+            .batch_config(Some(BatchConfig {
+                max_events: Some(10),
+                max_bytes: None,
+                max_ms: Some(50),
+                respect_source_tx: None,
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }))
+            .commit_fn("kafka", cp_fn)
+            .process_fn(batch_processor)
+            .build();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
+
+        let source = deltaforge_core::SourceInfo {
+            version: "test".into(),
+            connector: "mysql".into(),
+            name: "test".into(),
+            db: "db".into(),
+            schema: None,
+            table: "t".into(),
+            ts_ms: 0,
+            snapshot: None,
+            position: deltaforge_core::SourcePosition::default(),
+        };
+        let mut event = Event::new_row(
+            deltaforge_core::EventId::mysql_row_server(1, "t", 1, 0),
+            source,
+            deltaforge_core::Op::Create,
+            None,
+            Some(serde_json::json!({"id": 1})),
+            0,
+            0,
+        );
+        event.set_checkpoint(CheckpointMeta::from_vec(b"{\"pos\":9}".to_vec()));
+        event.tx_end = true;
+        tx.send(SourceItem::Event(event)).await.unwrap();
+        drop(tx);
+
+        let result = coord.run(rx, cancel, pause_rx).await;
+        assert!(
+            result.is_err(),
+            "a checkpoint persist failure after ack must surface as an error so the \
+             batch replays on restart (never a silent loss)"
+        );
+        // The sink DID acknowledge the batch (the ack happened before persistence).
+        assert_eq!(
+            sink.delivery_count(),
+            1,
+            "the sink acknowledged the batch before the persist failure"
+        );
     }
 }

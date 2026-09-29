@@ -760,6 +760,365 @@ async fn pg_schema_drift_halt_fails_closed_and_does_not_skip() -> Result<()> {
     Ok(())
 }
 
+/// Dropped-table retained-WAL recovery. Sequence: consume + register the schema,
+/// stop, write more rows into the table, DROP it (its earlier changes stay in the
+/// retained WAL), then restart from the prior checkpoint.
+///
+/// The retained rows must be delivered by decoding them against the durable historical
+/// schema (whose ordered (name, type_oid) signature matches the pgoutput Relation), the
+/// checkpoint must advance after delivery, and the source must continue - not enter a
+/// "table not found" restart loop.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_dropped_table_retained_wal_recovers_via_durable_schema()
+-> Result<()> {
+    use deltaforge_config::OnSchemaDrift;
+
+    let (db, client) = pg_setup("dropwal").await?;
+    client
+        .execute(
+            "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64))",
+            &[],
+        )
+        .await?;
+    client
+        .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
+        .await?;
+    // FOR ALL TABLES so a DROP cannot remove the table from the publication and
+    // suppress decoding of its retained changes.
+    create_pub_slot(&client, "pub_dropwal", "slot_dropwal", &[]).await?;
+
+    let (registry, backend) = shared_registry().await;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+
+    // Run 1: deliver one row so the schema is registered durably, then stop at a
+    // committed boundary.
+    {
+        let src = configured_source(
+            "dropwal",
+            &db,
+            "slot_dropwal",
+            "pub_dropwal",
+            OnSchemaDrift::Adapt,
+            registry.clone(),
+            backend.clone(),
+        )
+        .await;
+        let (tx, mut rx) = mpsc::channel(128);
+        let h = src.run(tx, ckpt.clone()).await;
+        wait_ready(&h, Duration::from_secs(3)).await?;
+        client
+            .execute("INSERT INTO orders VALUES (1, 'a')", &[])
+            .await?;
+        let ev = collect_until(&mut rx, Duration::from_secs(10), |e| {
+            e.iter().any(|x| has_id(x, 1))
+        })
+        .await;
+        assert!(ev.iter().any(|e| has_id(e, 1)), "row 1 delivered in run 1");
+        h.stop();
+        h.join().await.ok();
+    }
+    let cp0 = ckpt.get_raw("dropwal").await?.expect("run 1 checkpoint");
+
+    // While the source is down: write two more rows (retained in the WAL) and DROP
+    // the table. The two inserts precede the drop, so they remain decodable from the
+    // historic catalog snapshot.
+    client
+        .execute("INSERT INTO orders VALUES (2, 'b')", &[])
+        .await?;
+    client
+        .execute("INSERT INTO orders VALUES (3, 'c')", &[])
+        .await?;
+    client.execute("DROP TABLE orders", &[]).await?;
+
+    // Run 2: resume from cp0. The table is gone from the live catalog, but its
+    // retained rows must still be delivered from the durable schema.
+    let src = configured_source(
+        "dropwal",
+        &db,
+        "slot_dropwal",
+        "pub_dropwal",
+        OnSchemaDrift::Adapt,
+        registry.clone(),
+        backend.clone(),
+    )
+    .await;
+    let (tx, mut rx) = mpsc::channel(128);
+    let h = src.run(tx, ckpt.clone()).await;
+    let ready = wait_ready(&h, Duration::from_secs(10)).await;
+    let items = drain_items(&mut rx, Duration::from_secs(5)).await;
+    let events: Vec<&Event> = items
+        .iter()
+        .filter_map(|i| match i {
+            SourceItem::Event(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+    // The source persists its checkpoint at teardown (only on a clean, non-erroring
+    // run), so read it after stop+join.
+    h.stop();
+    let _ = h.join().await;
+    let cp_after = ckpt.get_raw("dropwal").await?;
+
+    assert!(
+        ready.is_ok(),
+        "source must not die on a dropped table with retained WAL"
+    );
+    assert!(
+        events.iter().any(|e| has_id(e, 2)),
+        "retained row 2 must be delivered from the durable schema; got {} events",
+        events.len()
+    );
+    assert!(
+        events.iter().any(|e| has_id(e, 3)),
+        "retained row 3 must be delivered from the durable schema"
+    );
+    assert!(
+        cp_after.as_deref() != Some(cp0.as_slice()),
+        "checkpoint must advance past the retained rows after delivery"
+    );
+
+    cleanup_repl(&client, "pub_dropwal", "slot_dropwal").await;
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+/// Dropped table whose durable schema does NOT match the retained WAL's Relation
+/// (the table was altered while the source was down, then dropped). The source must
+/// fail closed - never guess a schema, skip the event, or advance the checkpoint.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_dropped_table_schema_mismatch_fails_closed() -> Result<()> {
+    use deltaforge_config::OnSchemaDrift;
+
+    let (db, client) = pg_setup("dropmis").await?;
+    client
+        .execute(
+            "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64))",
+            &[],
+        )
+        .await?;
+    client
+        .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
+        .await?;
+    create_pub_slot(&client, "pub_dropmis", "slot_dropmis", &[]).await?;
+
+    let (registry, backend) = shared_registry().await;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+
+    // Run 1: register the [id, sku] schema, commit a boundary, stop.
+    {
+        let src = configured_source(
+            "dropmis",
+            &db,
+            "slot_dropmis",
+            "pub_dropmis",
+            OnSchemaDrift::Adapt,
+            registry.clone(),
+            backend.clone(),
+        )
+        .await;
+        let (tx, mut rx) = mpsc::channel(128);
+        let h = src.run(tx, ckpt.clone()).await;
+        wait_ready(&h, Duration::from_secs(3)).await?;
+        client
+            .execute("INSERT INTO orders VALUES (1, 'a')", &[])
+            .await?;
+        let ev = collect_until(&mut rx, Duration::from_secs(10), |e| {
+            e.iter().any(|x| has_id(x, 1))
+        })
+        .await;
+        assert!(ev.iter().any(|e| has_id(e, 1)), "row 1 delivered in run 1");
+        h.stop();
+        h.join().await.ok();
+    }
+    let cp0 = ckpt.get_raw("dropmis").await?.expect("run 1 checkpoint");
+
+    // While down: alter the schema, write a row under it, then drop the table. The
+    // retained Relation now has three columns; the durable schema still has two.
+    client
+        .execute("ALTER TABLE orders ADD COLUMN status VARCHAR(32)", &[])
+        .await?;
+    client
+        .execute("INSERT INTO orders VALUES (2, 'b', 'active')", &[])
+        .await?;
+    client.execute("DROP TABLE orders", &[]).await?;
+
+    // Run 2: resume from cp0 and fail closed on the signature mismatch.
+    let src = configured_source(
+        "dropmis",
+        &db,
+        "slot_dropmis",
+        "pub_dropmis",
+        OnSchemaDrift::Adapt,
+        registry.clone(),
+        backend.clone(),
+    )
+    .await;
+    let (tx, mut rx) = mpsc::channel(128);
+    let h = src.run(tx, ckpt.clone()).await;
+    let ready = wait_ready(&h, Duration::from_secs(10)).await;
+    let items = drain_items(&mut rx, Duration::from_secs(3)).await;
+    h.stop();
+    let joined = h.join().await;
+
+    assert!(
+        ready.is_err(),
+        "source must fail closed on a dropped-table schema mismatch"
+    );
+    let err = format!("{:?}", joined.expect_err("run must fail closed"));
+    assert!(
+        err.contains("orders") && err.contains("does not match"),
+        "error must name the table and the mismatch: {err}"
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|i| matches!(i, SourceItem::Event(e) if has_id(e, 2))),
+        "the mismatched retained row must not be delivered"
+    );
+    assert_eq!(
+        ckpt.get_raw("dropmis").await?.as_deref(),
+        Some(cp0.as_slice()),
+        "checkpoint must not advance on a fail-closed mismatch"
+    );
+
+    cleanup_repl(&client, "pub_dropmis", "slot_dropmis").await;
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+/// Drop + recreate the table under the SAME name with the SAME column signature but a
+/// different OID and different PK/replica metadata. The retained WAL for the ORIGINAL
+/// relation must be decoded with the ORIGINAL schema (found by version history), never
+/// with the recreated live table's schema.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_dropped_table_recreated_uses_historical_not_recreated() -> Result<()>
+{
+    use deltaforge_config::OnSchemaDrift;
+
+    let (db, client) = pg_setup("droprecr").await?;
+    client
+        .execute(
+            "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64))",
+            &[],
+        )
+        .await?;
+    client
+        .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
+        .await?;
+    create_pub_slot(&client, "pub_droprecr", "slot_droprecr", &[]).await?;
+
+    let (registry, backend) = shared_registry().await;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+
+    // Run 1: register the original schema and capture its fingerprint.
+    let original_fp;
+    {
+        let src = configured_source(
+            "droprecr",
+            &db,
+            "slot_droprecr",
+            "pub_droprecr",
+            OnSchemaDrift::Adapt,
+            registry.clone(),
+            backend.clone(),
+        )
+        .await;
+        let (tx, mut rx) = mpsc::channel(128);
+        let h = src.run(tx, ckpt.clone()).await;
+        wait_ready(&h, Duration::from_secs(3)).await?;
+        client
+            .execute("INSERT INTO orders VALUES (1, 'a')", &[])
+            .await?;
+        let ev = collect_until(&mut rx, Duration::from_secs(10), |e| {
+            e.iter().any(|x| has_id(x, 1))
+        })
+        .await;
+        let row1 = ev.iter().find(|e| has_id(e, 1)).expect("row 1");
+        original_fp = row1
+            .schema_version
+            .clone()
+            .expect("row 1 has a schema version");
+        h.stop();
+        h.join().await.ok();
+    }
+
+    // While down: write retained rows under the ORIGINAL relation, then drop and recreate
+    // it under the same name with the same columns but a different PK and replica identity
+    // (and therefore a different OID).
+    client
+        .execute("INSERT INTO orders VALUES (2, 'b')", &[])
+        .await?;
+    client
+        .execute("INSERT INTO orders VALUES (3, 'c')", &[])
+        .await?;
+    client.execute("DROP TABLE orders", &[]).await?;
+    client
+        .execute(
+            "CREATE TABLE orders (id INT, sku VARCHAR(64), PRIMARY KEY (id, sku))",
+            &[],
+        )
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
+        .await?;
+
+    // Run 2: the retained rows must be decoded with the ORIGINAL schema (via history),
+    // not the recreated live table's schema.
+    let src = configured_source(
+        "droprecr",
+        &db,
+        "slot_droprecr",
+        "pub_droprecr",
+        OnSchemaDrift::Adapt,
+        registry.clone(),
+        backend.clone(),
+    )
+    .await;
+    let (tx, mut rx) = mpsc::channel(128);
+    let h = src.run(tx, ckpt.clone()).await;
+    let ready = wait_ready(&h, Duration::from_secs(10)).await;
+    let items = drain_items(&mut rx, Duration::from_secs(5)).await;
+    let events: Vec<&Event> = items
+        .iter()
+        .filter_map(|i| match i {
+            SourceItem::Event(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+    h.stop();
+    let _ = h.join().await;
+
+    assert!(ready.is_ok(), "source must not die recovering retained WAL");
+    for want in [2, 3] {
+        let ev = events
+            .iter()
+            .find(|e| has_id(e, want))
+            .unwrap_or_else(|| panic!("retained row {want} must be delivered"));
+        assert_eq!(
+            ev.schema_version.as_deref(),
+            Some(original_fp.as_str()),
+            "retained row {want} must be decoded with the ORIGINAL schema \
+             (fingerprint {original_fp}), never the recreated table's schema"
+        );
+    }
+
+    cleanup_repl(&client, "pub_droprecr", "slot_droprecr").await;
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
 /// on_schema_drift = Halt, drift detected in-stream (an ALTER while the source is
 /// actively streaming): the source fails closed at the Relation message, before
 /// any row under the changed schema is emitted, and advances no checkpoint.

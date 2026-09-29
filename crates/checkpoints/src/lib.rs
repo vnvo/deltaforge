@@ -26,6 +26,28 @@ pub use sqlite_store::SqliteCheckpointStore;
 /// Backends may optionally support versioning - check `supports_versioning()`.
 #[async_trait]
 pub trait CheckpointStore: Send + Sync {
+    /// Whether this store derives a source's resume position from **per-sink**
+    /// checkpoints written by the delivery layer (the coordinator), rather than from a
+    /// single source-written checkpoint.
+    ///
+    /// When `true`, the source must NOT persist its own read position as the aggregate
+    /// checkpoint: doing so could resume ahead of what every required sink has durably
+    /// acknowledged (losing un-acked events on restart). The per-sink minimum, written
+    /// only after sink acknowledgement, is authoritative. Defaults to `false` for plain
+    /// single-writer stores (the source owns its checkpoint).
+    fn manages_per_sink_checkpoints(&self) -> bool {
+        false
+    }
+
+    /// Wait until the durable checkpoint set may have changed, so a source can advance
+    /// WAL feedback change-driven rather than by fixed high-frequency polling. A
+    /// change-driven store (the per-sink proxy) resolves on the next commit with a long
+    /// safety fallback; the default resolves on a short fixed interval for plain
+    /// single-writer stores.
+    async fn await_checkpoint_change(&self) {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
     /// Get raw checkpoint bytes.
     async fn get_raw(
         &self,

@@ -57,7 +57,17 @@ pub struct PerSinkCheckpointProxy {
     inner: Arc<dyn CheckpointStore>,
     source_id: String,
     cmp_fn: CheckpointCmpFn,
+    /// Notified by the coordinator after each per-sink checkpoint commit, so the source
+    /// advances WAL feedback change-driven (on commit) rather than by fixed polling. A
+    /// long fallback still re-confirms during long idle. Defaults to an unshared handle
+    /// (never signaled) so a proxy built without wiring falls back to the interval.
+    commit_signal: Arc<tokio::sync::Notify>,
 }
+
+/// Fallback re-confirmation interval when no commit notification arrives (long, so idle
+/// sources at fleet scale generate negligible control-store load).
+const FEEDBACK_FALLBACK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(30);
 
 impl PerSinkCheckpointProxy {
     /// Build the proxy for a source, wiring the fold to the source's own
@@ -74,12 +84,39 @@ impl PerSinkCheckpointProxy {
             inner,
             source_id,
             cmp_fn: Arc::new(move |a, b| source.compare_checkpoints(a, b)),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Wire the coordinator's commit signal so WAL-feedback refreshes are change-driven.
+    #[must_use]
+    pub fn with_commit_signal(
+        mut self,
+        signal: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.commit_signal = signal;
+        self
     }
 }
 
 #[async_trait]
 impl CheckpointStore for PerSinkCheckpointProxy {
+    async fn await_checkpoint_change(&self) {
+        // Change-driven: wake on the coordinator's commit signal, with a long fallback so
+        // a missed signal or a long idle still re-confirms without high-frequency polling.
+        tokio::select! {
+            _ = self.commit_signal.notified() => {}
+            _ = tokio::time::sleep(FEEDBACK_FALLBACK_INTERVAL) => {}
+        }
+    }
+
+    fn manages_per_sink_checkpoints(&self) -> bool {
+        // The source's resume position is the minimum of the coordinator's per-sink
+        // checkpoints (written only after sink acknowledgement), so the source must not
+        // persist its own read position as the aggregate checkpoint.
+        true
+    }
+
     async fn get_raw(&self, key: &str) -> CheckpointResult<Option<Vec<u8>>> {
         if key == self.source_id {
             let prefix = format!("{}::sink::", self.source_id);
@@ -584,6 +621,24 @@ impl PipelineRuntime {
     }
 }
 
+/// Decide whether a coordinator task's exit represents a pipeline failure (drives
+/// `alive` and therefore `/health` + `/ready`).
+///
+/// The coordinator returns `Err` on any internal failure, including a terminal
+/// required-sink failure - and in that case its delivery task cancels the shared
+/// cancellation token *before* `run` returns. So cancellation alone cannot distinguish
+/// an operator stop from an internal failure: a returned error always means failure,
+/// even when the token is cancelled. A clean `Ok` after an operator cancellation is the
+/// only non-failure exit; a clean `Ok` with no cancellation means the coordinator
+/// stopped on its own (e.g. the source closed the event channel), which is also a
+/// failure.
+pub(crate) fn coordinator_exit_failed(
+    result: &Result<()>,
+    cancelled: bool,
+) -> bool {
+    result.is_err() || !cancelled
+}
+
 // ============================================================================
 // Pipeline Manager
 // ============================================================================
@@ -783,14 +838,19 @@ impl PipelineManager {
         let alive = Arc::new(AtomicBool::new(true));
 
         let (event_tx, event_rx) = mpsc::channel::<SourceItem>(32_768);
+        // Signal the source (change-driven) after each per-sink commit so it refreshes
+        // WAL feedback from the newly persisted durable minimum instead of polling.
+        let commit_signal = Arc::new(tokio::sync::Notify::new());
         // Wrap checkpoint store so the source reads the minimum per-sink
         // checkpoint - it replays from the position the slowest sink needs.
-        let source_ckpt: Arc<dyn CheckpointStore> =
-            Arc::new(PerSinkCheckpointProxy::for_source(
+        let source_ckpt: Arc<dyn CheckpointStore> = Arc::new(
+            PerSinkCheckpointProxy::for_source(
                 self.ckpt_store.clone(),
                 spec.spec.source.source_id().to_string(),
                 &source,
-            ));
+            )
+            .with_commit_signal(commit_signal.clone()),
+        );
 
         let src_handle = source.run(event_tx, source_ckpt).await;
 
@@ -860,6 +920,7 @@ impl PipelineManager {
                     .sink_batch_deadline_secs
                     .map(|s| std::time::Duration::from_secs(s.into())),
             )
+            .commit_notify(commit_signal.clone())
             .process_fn(batch_processor);
 
         for sink in &sinks {
@@ -1090,10 +1151,12 @@ impl PipelineManager {
 
         let join = tokio::spawn(async move {
             let result = coord.run(event_rx, cancel_for_task, pause_rx).await;
-            if !cancel_check.is_cancelled() {
-                // Coordinator exited without an explicit stop - also mark
-                // failed (covers errors that originate inside the coordinator
-                // itself rather than in the source task).
+            // A returned error means an internal failure (e.g. a terminal
+            // required-sink failure), even though the coordinator self-cancelled
+            // the shared token on its way out; an operator stop is a clean Ok
+            // after cancellation. Mark the pipeline failed in every case except
+            // that clean operator stop, so /health and /ready surface it.
+            if coordinator_exit_failed(&result, cancel_check.is_cancelled()) {
                 alive_for_task.store(false, Ordering::Release);
                 gauge!("deltaforge_pipeline_status", "pipeline" => pname.clone())
                     .set(-1.0);
@@ -2093,6 +2156,26 @@ mod tests {
     };
 
     #[test]
+    fn coordinator_exit_failed_classifies_every_exit() {
+        // Internal failure that self-cancelled the shared token (required-sink
+        // failure): still a failure despite cancellation.
+        assert!(coordinator_exit_failed(
+            &Err(anyhow::anyhow!("required sink failed")),
+            true,
+        ));
+        // Internal error before any cancellation (e.g. startup validation).
+        assert!(coordinator_exit_failed(
+            &Err(anyhow::anyhow!("boom")),
+            false,
+        ));
+        // Coordinator exited cleanly on its own (source closed the channel) with no
+        // operator stop: a failure.
+        assert!(coordinator_exit_failed(&Ok(()), false));
+        // Clean stop after an operator cancellation: NOT a failure.
+        assert!(!coordinator_exit_failed(&Ok(()), true));
+    }
+
+    #[test]
     fn authorize_replay_start_validates_targets_and_policy() {
         let sinks = vec!["kafka".to_string(), "s3".to_string()];
         let current = EncoderSchemaPolicy::Current;
@@ -2419,6 +2502,7 @@ mod tests {
             inner: store,
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         // No per-sink checkpoints and no legacy key - fresh start.
         let result = proxy.get_raw("mysql").await.unwrap();
@@ -2434,6 +2518,7 @@ mod tests {
             inner: store,
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         // No per-sink keys exist, so it should fall back to the legacy key.
         let result = proxy.get_raw("mysql").await.unwrap().unwrap();
@@ -2463,6 +2548,7 @@ mod tests {
             inner: store,
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
 
         // Should return the minimum (redis at pos 100).
@@ -2479,6 +2565,7 @@ mod tests {
             inner: store,
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
 
         // Non-source-id keys pass through directly.
@@ -2498,6 +2585,7 @@ mod tests {
             inner: store,
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
 
         let result = proxy.get_raw("mysql").await.unwrap().unwrap();
@@ -2574,6 +2662,7 @@ mod tests {
             inner: OrderedTestStore::with(entries),
             source_id: "src".to_string(),
             cmp_fn: test_cmp_fn(),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         proxy
             .get_raw("src")
@@ -2645,6 +2734,7 @@ mod tests {
             ]),
             source_id: "src".to_string(),
             cmp_fn: test_cmp_fn(),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         let got = proxy.get_raw("src").await.unwrap().unwrap();
         assert_eq!(got, VALID_A, "must return the earliest checkpoint");
@@ -2669,6 +2759,7 @@ mod tests {
             cmp_fn: Arc::new(|a: &[u8], b: &[u8]| {
                 sources::postgres::compare_pg_checkpoints(a, b)
             }),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         let got = proxy.get_raw("pg").await.unwrap().unwrap();
         assert_eq!(got, slow, "must rewind to the slower sink's LSN");
@@ -2689,6 +2780,7 @@ mod tests {
             cmp_fn: Arc::new(|a: &[u8], b: &[u8]| {
                 sources::postgres::compare_pg_checkpoints(a, b)
             }),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         let err = proxy
             .get_raw("pg")
