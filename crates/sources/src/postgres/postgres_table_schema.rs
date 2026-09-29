@@ -182,12 +182,21 @@ impl PostgresTableSchema {
     /// database do not match. Callers additionally require a *unique* match across the
     /// table's version history, failing closed on zero or multiple candidates.
     pub(crate) fn matches_relation(&self, rel: &RelationIdentity) -> bool {
-        self.oid == Some(rel.oid)
-            && self.replica_identity_char() == Some(rel.replica_identity)
-            && matches!(
-                verify_first_resolution(&self.signature(), &rel.signature),
-                FirstResolution::NoDrift
-            )
+        // Allocation-free (runs on the per-row cache-hit path): compare OID, replica
+        // identity, then the ordered (name, type_oid) columns in lockstep. A column whose
+        // persisted `type_oid` is unavailable never matches (fail-closed), mirroring
+        // `verify_first_resolution`.
+        if self.oid != Some(rel.oid)
+            || self.replica_identity_char() != Some(rel.replica_identity)
+            || self.columns.len() != rel.signature.len()
+        {
+            return false;
+        }
+        self.columns.iter().zip(rel.signature.iter()).all(
+            |(col, (name, type_oid))| {
+                col.name == *name && col.type_oid == Some(*type_oid)
+            },
+        )
     }
 }
 

@@ -994,6 +994,131 @@ async fn pg_dropped_table_schema_mismatch_fails_closed() -> Result<()> {
     Ok(())
 }
 
+/// Drop + recreate the table under the SAME name with the SAME column signature but a
+/// different OID and different PK/replica metadata. The retained WAL for the ORIGINAL
+/// relation must be decoded with the ORIGINAL schema (found by version history), never
+/// with the recreated live table's schema.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_dropped_table_recreated_uses_historical_not_recreated() -> Result<()>
+{
+    use deltaforge_config::OnSchemaDrift;
+
+    let (db, client) = pg_setup("droprecr").await?;
+    client
+        .execute(
+            "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64))",
+            &[],
+        )
+        .await?;
+    client
+        .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
+        .await?;
+    create_pub_slot(&client, "pub_droprecr", "slot_droprecr", &[]).await?;
+
+    let (registry, backend) = shared_registry().await;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+
+    // Run 1: register the original schema and capture its fingerprint.
+    let original_fp;
+    {
+        let src = configured_source(
+            "droprecr",
+            &db,
+            "slot_droprecr",
+            "pub_droprecr",
+            OnSchemaDrift::Adapt,
+            registry.clone(),
+            backend.clone(),
+        )
+        .await;
+        let (tx, mut rx) = mpsc::channel(128);
+        let h = src.run(tx, ckpt.clone()).await;
+        wait_ready(&h, Duration::from_secs(3)).await?;
+        client
+            .execute("INSERT INTO orders VALUES (1, 'a')", &[])
+            .await?;
+        let ev = collect_until(&mut rx, Duration::from_secs(10), |e| {
+            e.iter().any(|x| has_id(x, 1))
+        })
+        .await;
+        let row1 = ev.iter().find(|e| has_id(e, 1)).expect("row 1");
+        original_fp = row1
+            .schema_version
+            .clone()
+            .expect("row 1 has a schema version");
+        h.stop();
+        h.join().await.ok();
+    }
+
+    // While down: write retained rows under the ORIGINAL relation, then drop and recreate
+    // it under the same name with the same columns but a different PK and replica identity
+    // (and therefore a different OID).
+    client
+        .execute("INSERT INTO orders VALUES (2, 'b')", &[])
+        .await?;
+    client
+        .execute("INSERT INTO orders VALUES (3, 'c')", &[])
+        .await?;
+    client.execute("DROP TABLE orders", &[]).await?;
+    client
+        .execute(
+            "CREATE TABLE orders (id INT, sku VARCHAR(64), PRIMARY KEY (id, sku))",
+            &[],
+        )
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
+        .await?;
+
+    // Run 2: the retained rows must be decoded with the ORIGINAL schema (via history),
+    // not the recreated live table's schema.
+    let src = configured_source(
+        "droprecr",
+        &db,
+        "slot_droprecr",
+        "pub_droprecr",
+        OnSchemaDrift::Adapt,
+        registry.clone(),
+        backend.clone(),
+    )
+    .await;
+    let (tx, mut rx) = mpsc::channel(128);
+    let h = src.run(tx, ckpt.clone()).await;
+    let ready = wait_ready(&h, Duration::from_secs(10)).await;
+    let items = drain_items(&mut rx, Duration::from_secs(5)).await;
+    let events: Vec<&Event> = items
+        .iter()
+        .filter_map(|i| match i {
+            SourceItem::Event(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+    h.stop();
+    let _ = h.join().await;
+
+    assert!(ready.is_ok(), "source must not die recovering retained WAL");
+    for want in [2, 3] {
+        let ev = events
+            .iter()
+            .find(|e| has_id(e, want))
+            .unwrap_or_else(|| panic!("retained row {want} must be delivered"));
+        assert_eq!(
+            ev.schema_version.as_deref(),
+            Some(original_fp.as_str()),
+            "retained row {want} must be decoded with the ORIGINAL schema \
+             (fingerprint {original_fp}), never the recreated table's schema"
+        );
+    }
+
+    cleanup_repl(&client, "pub_droprecr", "slot_droprecr").await;
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
 /// on_schema_drift = Halt, drift detected in-stream (an ALTER while the source is
 /// actively streaming): the source fails closed at the Relation message, before
 /// any row under the changed schema is emitted, and advances no checkpoint.

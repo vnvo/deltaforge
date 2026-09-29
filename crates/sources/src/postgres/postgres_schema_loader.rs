@@ -338,27 +338,37 @@ impl PostgresSchemaLoader {
         rel: &RelationIdentity,
     ) -> SourceResult<LoadedSchema> {
         let key = (schema.to_string(), table.to_string());
-        if let Some(cached) = self.cache.read().await.get(&key) {
+        // 1. Cached schema, ONLY if it is THIS relation's schema. A cache entry for the
+        //    same name but a different relation (e.g. a recreated table) must not be used.
+        if let Some(cached) = self.cache.read().await.get(&key)
+            && cached.schema.matches_relation(rel)
+        {
             return Ok(cached.clone());
         }
 
-        // Live catalog first: an existing table takes the normal fetch+register path.
-        if let Some(pg_schema) = self.fetch_schema_opt(schema, table).await? {
+        // 2. Live catalog, ONLY if it matches this relation identity. A live table whose
+        //    OID/signature/replica differs from the retained relation - e.g. the table
+        //    was dropped and recreated under the same name with a new OID - must NOT be
+        //    used to decode the retained WAL; fall through to the durable history search.
+        if let Some(pg_schema) = self.fetch_schema_opt(schema, table).await?
+            && pg_schema.matches_relation(rel)
+        {
             return self
                 .register_and_cache(schema, table, pg_schema, checkpoint)
                 .await;
         }
 
-        // The live table is gone. Recover from the durable historical schema, selecting
-        // the unique version bound to this relation's lifetime and structure.
+        // 3. Neither the cache nor the live catalog is this relation. Recover from the
+        //    durable history, selecting the UNIQUE version bound to this relation's
+        //    lifetime (OID) and structure. Zero or multiple matches fail closed.
         let versions = self.registry.list_versions(&self.tenant, schema, table);
         if versions.is_empty() {
             return Err(SourceError::Schema {
                 details: format!(
-                    "table {schema}.{table} no longer exists and no durable schema \
-                     history is available; cannot decode its retained WAL \
-                     (fail-closed). Reset the replication slot past these changes to \
-                     continue."
+                    "table {schema}.{table}: no durable schema history is available to \
+                     decode its retained WAL (oid={}); cannot decode (fail-closed). \
+                     Reset the replication slot past these changes to continue.",
+                    rel.oid
                 )
                 .into(),
             });
@@ -401,10 +411,10 @@ impl PostgresSchemaLoader {
             }
             0 => Err(SourceError::Schema {
                 details: format!(
-                    "table {schema}.{table} no longer exists and its durable schema \
-                     does not match the retained relation (oid={}, replica identity \
-                     '{}', column signature) in any historical version; refusing to \
-                     decode its retained WAL (fail-closed).",
+                    "table {schema}.{table}: the retained relation (oid={}, replica \
+                     identity '{}', column signature) does not match any cached, live, \
+                     or historical schema - the table is absent or was replaced under \
+                     the same name; refusing to decode its retained WAL (fail-closed).",
                     rel.oid, rel.replica_identity
                 )
                 .into(),

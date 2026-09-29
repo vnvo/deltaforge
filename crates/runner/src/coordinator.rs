@@ -2097,9 +2097,12 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                 );
 
                 // Wake the source so it refreshes WAL feedback from the newly persisted
-                // durable minimum (change-driven, not polled).
+                // durable minimum (change-driven, not polled). `notify_one` retains a
+                // permit if the source is not currently awaiting, so a commit is never
+                // lost; multiple commits coalesce because the source rereads the
+                // authoritative minimum on wake.
                 if let Some(n) = &self.commit_notify {
-                    n.notify_waiters();
+                    n.notify_one();
                 }
             }
         }
