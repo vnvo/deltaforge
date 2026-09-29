@@ -37,7 +37,7 @@ storage:
 
 The SQLite backend creates the database file and parent directories automatically on first start. The PostgreSQL backend runs schema migrations on first connect - no manual table creation is needed.
 
-> **PostgreSQL backend** is implemented and available under the `postgres` feature flag, but has not yet received the same chaos/recovery validation as the SQLite backend. Treat it as beta for production use.
+> **PostgreSQL backend** is implemented and available under the `postgres` feature flag, but has not yet received the same recovery validation as the SQLite backend. Treat it as beta for production use.
 
 ## Primitives
 

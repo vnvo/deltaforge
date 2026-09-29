@@ -1,6 +1,6 @@
 # Performance Tuning
 
-This guide covers throughput optimization for DeltaForge CDC pipelines, based on profiling and benchmarking with the chaos test suite.
+This guide covers throughput optimization for DeltaForge CDC pipelines, based on the `throughput_e2e` end-to-end test and the `pipeline_e2e` criterion benchmarks.
 
 > **Note:** These results and recommendations are a starting point. Every deployment has unique requirements — hardware, network topology, database workload patterns, event sizes, and downstream consumer capacity all affect real-world throughput. Profile your own workload and iterate.
 
@@ -105,10 +105,6 @@ spec:
 
 Re-enable for steady-state operation when schema tracking is needed. Be mindful, schema sensing is a CPU-intensive task.
 
-### Proxy Bypass - Chaos/Bench Testing
-
-When running with Toxiproxy (chaos testing), use `--no-proxy` to bypass the proxy for direct database and Kafka connections. The proxy adds measurable overhead to throughput.
-
 ## Source-Specific Tuning
 
 ### MySQL
@@ -188,23 +184,7 @@ Each sink maintains its own checkpoint, committed independently after successful
 
 ## Profiling
 
-Use the chaos UI's built-in CPU profiler to capture flamegraphs during drain runs:
-
-1. Start a drain scenario from the chaos UI
-2. Once the drain phase starts (step 5/6), click **Record** on the target container
-3. The generated flamegraph SVG includes pipeline config, batch settings, and connection mode in the subtitle automatically
-
-Or from the command line:
-
-```bash
-# Start drain in terminal 1
-cargo run -p chaos --release -- --scenario backlog-drain --source mysql --no-proxy
-
-# Capture flamegraph in terminal 2 (after drain phase starts)
-docker exec <container-name> perf record -F 99 -p 1 -g --call-graph dwarf -o /tmp/perf.data -- sleep 30
-```
-
-Requires the profiling image (`deltaforge:dev-profile`) which includes `perf` and debug symbols.
+The `throughput_e2e` test prints drain throughput and peak RSS; use `cargo flamegraph`/`perf` against a debug run for CPU profiling.
 
 Key areas to watch in flamegraphs:
 
@@ -219,27 +199,25 @@ Key areas to watch in flamegraphs:
 
 ## Running the Drain Benchmark
 
-The backlog drain benchmark measures catch-up throughput: how fast DeltaForge replays a pre-built backlog of 1M rows.
+The backlog drain benchmark measures catch-up throughput: how fast DeltaForge replays a pre-built backlog. It is the `throughput_e2e` end-to-end test, which self-provisions PostgreSQL and Kafka via testcontainers (Docker required), writes a backlog, drains PG to Kafka, and reports write rate, drain throughput (wall-clock and steady-state events/s), and peak process RSS.
 
 ```bash
-# MySQL — requires the soak compose profile
-docker compose -f docker-compose.chaos.yml --profile soak up -d
-cargo run -p chaos --release -- --scenario backlog-drain --source mysql --no-proxy \
-  --drain-max-events 4000 --drain-max-ms 100 --drain-kafka-conf linger.ms=0
-
-# Postgres — requires the pg-soak compose profile
-docker compose -f docker-compose.chaos.yml --profile pg-soak up -d
-cargo run -p chaos --release -- --scenario backlog-drain --source postgres --no-proxy \
-  --drain-max-events 4000 --drain-max-ms 100 --drain-kafka-conf linger.ms=0
+cargo test -p runner --test throughput_e2e -- --include-ignored --nocapture
 ```
 
-The benchmark:
-1. Stops the pipeline and saves its checkpoint
-2. Writes 1M rows to the source database using 32 concurrent writers
-3. Resumes the pipeline and measures how fast events appear in Kafka
-4. Reports avg/p50/peak events/s with full configuration in the output
+The backlog defaults to 50,000 rows; override it with the `THROUGHPUT_ROWS` environment variable:
 
-Tune `--drain-max-events`, `--drain-max-ms`, and `--drain-kafka-conf` to experiment with different settings. The chaos UI also exposes these as form fields for interactive tuning.
+```bash
+THROUGHPUT_ROWS=200000 cargo test -p runner --test throughput_e2e -- --include-ignored --nocapture
+```
+
+Measured baseline: 50,000 rows drained in ~2.7s = ~18,750 events/s wall-clock / ~34,800 events/s steady-state, peak RSS ~129 MiB (in-process).
+
+The in-process coordinator-throughput benchmarks remain available:
+
+```bash
+cargo bench -p runner --bench pipeline_e2e
+```
 
 ## Avro Encoding Performance
 
@@ -259,21 +237,7 @@ The system-level throughput (events/sec end-to-end) usually stays the same or im
 
 ### Comparing JSON vs Avro
 
-Run both soak tests side by side (different containers, same source):
-
-```bash
-docker compose -f docker-compose.chaos.yml \
-  --profile base --profile mysql-infra --profile kafka-infra \
-  --profile soak --profile avro-soak up -d
-
-# JSON baseline
-cargo run -p chaos -- --scenario soak-stable --duration-mins 30
-
-# Avro comparison
-cargo run -p chaos -- --scenario soak-stable-avro --duration-mins 30
-```
-
-Compare in Grafana: `rate(deltaforge_sink_events_total[1m])` filtered by instance port 9001 (JSON) vs 9006 (Avro).
+Long-running soak/load coverage for comparing JSON and Avro encoding side by side is a planned follow-up (no reliable harness yet).
 
 ### Avro-specific flamegraph areas
 

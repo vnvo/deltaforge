@@ -271,4 +271,4 @@ Planned enhancements:
 - **Event store**: time-based replay and schema evolution using the Log primitive
 - **Distributed coordination**: leader election via the Slot primitive with TTL-based leases
 - **Additional sources**: SQL Server, TiDB
-- **PostgreSQL storage validation**: chaos/recovery testing to bring it to production parity with SQLite
+- **PostgreSQL storage validation**: recovery testing to bring it to production parity with SQLite
