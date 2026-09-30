@@ -131,33 +131,50 @@ fn legacy_key_for_numbering(tenant: &str, db: &str, table: &str) -> String {
 /// `b/c` collide), so such keys are refused rather than read.
 fn legacy_key_for_read(tenant: &str, db: &str, table: &str) -> Result<String> {
     for (what, segment) in [("tenant", tenant), ("db", db), ("table", table)] {
-        anyhow::ensure!(
-            !segment.contains('/'),
-            "schema registry: legacy {what} `{segment}` contains `/`; the \
-             pre-lineage key `{tenant}/{db}/{table}` is ambiguous and is not read"
-        );
+        if segment.contains('/') {
+            return Err(anyhow::Error::new(LegacyReadRefused(format!(
+                "legacy {what} `{segment}` contains `/`; the pre-lineage key \
+                 `{tenant}/{db}/{table}` is ambiguous and is not read"
+            ))));
+        }
     }
     Ok(format!("{tenant}/{db}/{table}"))
 }
+
+/// A legacy stream that is refused on its own content (an ambiguous key or a
+/// record that is not a genuine pre-lineage entry) - as opposed to a storage
+/// failure. Downcast it from the error chain to tell the two apart.
+#[derive(Debug, thiserror::Error)]
+#[error("schema registry: {0}")]
+pub struct LegacyReadRefused(pub String);
 
 /// Parse an entry from the pre-lineage flat key. Such entries were written
 /// before format versioning existed, so anything carrying v1 fields is not a
 /// genuine legacy record and is refused.
 fn parse_legacy(bytes: &[u8], stream: &str) -> Result<LogEntry> {
-    let e: LogEntry = serde_json::from_slice(bytes).with_context(|| {
-        format!("schema registry: corrupt legacy entry in {stream}")
+    let e: LogEntry = serde_json::from_slice(bytes).map_err(|err| {
+        anyhow::Error::new(LegacyReadRefused(format!(
+            "corrupt legacy entry in {stream}: {err}"
+        )))
     })?;
-    anyhow::ensure!(
-        e.format_version == 0
-            && e.record_version == 0
-            && e.version.is_none()
-            && e.origin_sequence.is_none(),
-        "schema registry: entry in legacy stream {stream} is not a pre-lineage \
-         record (format_version {}, record_version {}); refusing to interpret it",
-        e.format_version,
-        e.record_version
-    );
+    if !(e.format_version == 0
+        && e.record_version == 0
+        && e.version.is_none()
+        && e.origin_sequence.is_none())
+    {
+        return Err(anyhow::Error::new(LegacyReadRefused(format!(
+            "entry in legacy stream {stream} is not a pre-lineage record \
+             (format_version {}, record_version {}); refusing to interpret it",
+            e.format_version, e.record_version
+        ))));
+    }
     Ok(e)
+}
+
+/// SHA-256 (hex) of the exact stored bytes of a record.
+fn record_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// Which v1 stream a version lives in.
@@ -192,6 +209,30 @@ struct KeyMeta {
 struct MigrationMarker {
     migrated_at_ms: i64,
     format_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provenance: Option<MigrationProvenance>,
+}
+
+/// What an explicit migration recorded when it completed a table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationProvenance {
+    /// Identity of the migrated action (target lineage, table and the exact
+    /// legacy content); equal identities are the same action.
+    pub migration_identity: String,
+    /// Proof digest of the plan that performed the migration.
+    pub proof_digest: String,
+    /// Digest of the adopted legacy content.
+    pub legacy_digest: String,
+    /// Number of legacy versions adopted.
+    pub legacy_versions: u64,
+}
+
+/// A validated migration marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationMarkerInfo {
+    pub migrated_at_ms: i64,
+    /// `None` for a marker written without provenance.
+    pub provenance: Option<MigrationProvenance>,
 }
 
 /// Registry construction/behaviour knobs.
@@ -332,6 +373,9 @@ pub struct LegacyVersion {
     /// Original legacy log sequence; preserved on adoption.
     pub sequence: u64,
     pub checkpoint: Option<Vec<u8>>,
+    /// SHA-256 of the exact stored record bytes (binds every field above,
+    /// the declared hash and the record encoding).
+    pub record_digest: String,
 }
 
 /// Continuation for [`DurableSchemaRegistry::legacy_page`]. Carries the next
@@ -390,6 +434,27 @@ impl DurableSchemaRegistry {
         let seq = load_or_bootstrap_hw(&backend).await?;
         info!(seq, "DurableSchemaRegistry: lazy init (no startup replay)");
         Ok(Arc::new(Self::build(backend, config, seq)))
+    }
+
+    /// Read-only construction for inspection (the migration dry run): never
+    /// writes - the sequence high-water is read if present and NOT
+    /// bootstrapped. Do not register or adopt through this instance.
+    pub async fn open_for_inspection(
+        backend: ArcStorageBackend,
+    ) -> Result<Arc<Self>> {
+        let seq =
+            match backend.kv_get(INDEX_NS, HW_KEY).await.context(
+                "schema registry: failed to read sequence high-water",
+            )? {
+                Some(b) => serde_json::from_slice(&b)
+                    .context("schema registry: corrupt sequence high-water")?,
+                None => 0,
+            };
+        Ok(Arc::new(Self::build(
+            backend,
+            RegistryConfig::default(),
+            seq,
+        )))
     }
 
     /// Sync constructor for unit tests - fresh memory backend, empty cache.
@@ -687,6 +752,7 @@ impl DurableSchemaRegistry {
         let mut versions = Vec::with_capacity(rows.len());
         for (i, r) in rows.iter().enumerate() {
             let e = parse_legacy(&r.value, &lk)?;
+            let digest = record_digest(&r.value);
             versions.push(LegacyVersion {
                 version: cur.next_version + i as i32,
                 hash: e.hash,
@@ -694,6 +760,7 @@ impl DurableSchemaRegistry {
                 registered_at: e.registered_at,
                 sequence: r.seq,
                 checkpoint: e.checkpoint,
+                record_digest: digest,
             });
         }
         let next = match rows.last() {
@@ -797,6 +864,24 @@ impl DurableSchemaRegistry {
 
     /// Record that the whole legacy stream for `key` has been migrated.
     pub async fn mark_migrated(&self, key: &SchemaKey) -> Result<()> {
+        self.write_marker(key, None).await
+    }
+
+    /// Record that `key`'s legacy history was migrated by an explicit, proven
+    /// action.
+    pub async fn mark_migrated_with(
+        &self,
+        key: &SchemaKey,
+        provenance: MigrationProvenance,
+    ) -> Result<()> {
+        self.write_marker(key, Some(provenance)).await
+    }
+
+    async fn write_marker(
+        &self,
+        key: &SchemaKey,
+        provenance: Option<MigrationProvenance>,
+    ) -> Result<()> {
         anyhow::ensure!(
             self.config.migration_enabled,
             "schema registry: migration is disabled"
@@ -804,6 +889,7 @@ impl DurableSchemaRegistry {
         let marker = MigrationMarker {
             migrated_at_ms: Utc::now().timestamp_millis(),
             format_version: CURRENT_FORMAT_VERSION,
+            provenance,
         };
         self.backend
             .kv_put(
@@ -813,6 +899,46 @@ impl DurableSchemaRegistry {
             )
             .await
             .context("schema registry: failed to write migration marker")
+    }
+
+    /// The validated migration marker for `key`, if any.
+    pub async fn migration_marker(
+        &self,
+        key: &SchemaKey,
+    ) -> Result<Option<MigrationMarkerInfo>> {
+        let Some(bytes) = self
+            .backend
+            .kv_get(MIGRATION_NS, &key.backend_key())
+            .await
+            .context("schema registry: failed to read migration marker")?
+        else {
+            return Ok(None);
+        };
+        let marker: MigrationMarker = serde_json::from_slice(&bytes)
+            .context("schema registry: corrupt migration marker")?;
+        anyhow::ensure!(
+            marker.format_version == CURRENT_FORMAT_VERSION,
+            "schema registry: unsupported migration marker format_version {} \
+             (this build reads {CURRENT_FORMAT_VERSION}); refusing to interpret it",
+            marker.format_version
+        );
+        Ok(Some(MigrationMarkerInfo {
+            migrated_at_ms: marker.migrated_at_ms,
+            provenance: marker.provenance,
+        }))
+    }
+
+    /// The hash recorded for `version` of `key`, if that version exists in the
+    /// qualified streams (read from the version index; no history scan).
+    pub async fn version_hash(
+        &self,
+        key: &SchemaKey,
+        version: i32,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .version_index(&key.backend_key(), version)
+            .await?
+            .map(|v| v.hash))
     }
 
     /// Whether a whole-stream migration marker exists for `key`.

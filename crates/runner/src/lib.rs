@@ -9,6 +9,7 @@ pub mod replay_job;
 pub mod replay_journal;
 pub mod replay_worker;
 mod schema_api;
+pub mod schema_migrate;
 mod schema_provider;
 mod sensing_api;
 pub mod storage_secrets;

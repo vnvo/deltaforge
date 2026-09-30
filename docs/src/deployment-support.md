@@ -24,7 +24,7 @@ Other sinks (Redis, NATS, HTTP, S3-compatible object storage, ClickHouse, Elasti
 
 Run **one DeltaForge instance per source (per replication slot / binlog reader)**. DeltaForge does not yet provide a cluster-wide lock or lease that prevents two instances from being started against the same source; single ownership is enforced at the slot and producer level, not globally.
 
-**Single-instance requirement.** For the supported single-instance deployment, run exactly **one** DeltaForge process against a given checkpoint/state store. Within one process, lifecycle operations (start, stop, delete, patch, resume) are serialized and a durable per-source-id claim rejects a second pipeline that reuses an active source id, so two pipelines can never share a source id and corrupt each other's checkpoints (checkpoints are keyed by source id). That claim is **not** a cross-process lock: two DeltaForge processes sharing the same state store are not protected against each other and are unsupported. Deploy DeltaForge as a single instance (a single replica; if orchestrated, `replicas: 1` with `strategy: Recreate`, not rolling), and do not point a second process at the same state store.
+**Single-instance requirement.** For the supported single-instance deployment, run exactly **one** DeltaForge process against a given checkpoint/state store. Within one process, lifecycle operations (start, stop, delete, patch, resume) are serialized and a durable per-source-id claim rejects a second pipeline that reuses an active source id, so two pipelines can never share a source id and corrupt each other's checkpoints (checkpoints are keyed by source id). Across processes, the [store gate](#store-gate) makes a second server against the same state store refuse to start. Deploy DeltaForge as a single instance (a single replica; if orchestrated, `replicas: 1` with `strategy: Recreate`, not rolling), and do not point a second process at the same state store.
 
 - **PostgreSQL**: the replication slot has durable, DeltaForge-recorded ownership. DeltaForge only drops or recreates a slot it can prove it owns, whose lineage matches, and that is inactive; a foreign, ambiguously owned, or active slot **fails closed** with remediation rather than being taken over. A slot created outside DeltaForge (no ownership record) fails closed on re-snapshot - drop it and let DeltaForge recreate it, or run `snapshot.mode = never`.
 - **Kafka**: with `exactly_once: true`, a second producer using the same `transactional.id` fences the first. Fencing is a fatal error that stops the pipeline. This is a safety net, not a substitute for running a single instance.
@@ -47,6 +47,55 @@ Preflight resolves the config's secrets and source DSN exactly as startup does, 
 - **Both**: connectivity; **source and sink credential references** are resolved (a missing/invalid secret or an inline+reference conflict fails here); commit-policy validity vs sink count; at least one sink configured; and **source ids are unique** across the supplied config(s).
 
 Wildcard table patterns are reported as not validated per-table (server-level checks still run). Preflight validates **credentials and configuration**, not endpoints: **sink endpoint reachability is not probed** (a documented follow-up), and the slot-ownership check requires pointing preflight at the deployment's storage backend (the same `--storage-*` flags the server uses).
+
+## Store gate
+
+> **Breaking change on upgrade.** Earlier releases let several processes share one PostgreSQL-backed state store. That topology now refuses to start; give each process its own store. Upgrade by stopping the old version cleanly before starting the new one; if the old process crashed instead, release its gate with `deltaforge store-gate break` as described below.
+
+The state store carries one durable **store gate**. A DeltaForge server acquires it at startup, before it reads any schema history, and holds it until it shuts down cleanly; `deltaforge schema-migrate --apply` holds it while it writes. Only one holder can exist, so a second server, or a migration apply while a server runs, refuses to start with an error that names the holder (role, owner id, host, pid, since) and the command to release it.
+
+- **Clean shutdown** (`SIGTERM`/`SIGINT`) stops the API, stops every pipeline and waits for its tasks, then releases the gate. Give the process enough time to do this (the Helm chart's `terminationGracePeriodSeconds` is 30).
+- **A crash keeps the gate held.** Nothing expires. After an OOM kill, a `SIGKILL` (including one sent after the grace period), or a host loss, the next start fails until an operator releases the gate. In Kubernetes this shows as the restarted container exiting with the store-gate error (CrashLoopBackOff). This is deliberate: DeltaForge will not guess that the previous holder is gone.
+- **Recovery:**
+
+  ```
+  deltaforge store-gate status            # who holds it (add --json for scripts)
+  deltaforge store-gate break --owner <owner-id>
+  ```
+
+  Before breaking, confirm that the recorded process (host and pid) is no longer running. `break` releases the gate only if that owner still holds it, so a stale or mistyped owner id changes nothing. Pass the same `--storage-backend`/`--storage-path`/`--storage-dsn` flags the server uses.
+
+## Migrating pre-upgrade schema history
+
+Schema history written by earlier releases is kept but not used automatically: a table's history is only trusted once it is tied to the source's verified lineage (PostgreSQL system identifier and database OID; MySQL server UUID). `deltaforge schema-migrate` adopts it into the lineage-scoped history for tables you list explicitly. It never deletes the old records.
+
+1. Start the pipeline once on the new release so it records the source lineage, then stop the server. `deltaforge schema-migrate` needs the lineage hash of each source; the dry run prints the recorded one.
+2. Write a mapping file that lists each table (no wildcards):
+
+   ```yaml
+   mappings:
+     - tenant: acme
+       source_id: orders-pg
+       lineage_hash: <recorded lineage hash>
+       tables:
+         - { db: public, table: orders }
+         - { db: public, table: order_items }
+   ```
+
+3. Dry run (the default; read-only, safe while the server runs):
+
+   ```
+   deltaforge schema-migrate --mapping mapping.yaml [--tenant T] [--source S] [--json]
+   ```
+
+   It classifies every table as `migrate`, `already migrated`, `ambiguous` or `rejected` (with the reason: lineage missing or different from the asserted hash, empty or corrupt history, a version that conflicts with existing history, or a marker from a different migration), and prints a **proof** digest over everything it would adopt.
+4. With the server stopped, apply exactly that plan:
+
+   ```
+   deltaforge schema-migrate --mapping mapping.yaml --apply --expect-proof <proof>
+   ```
+
+   The apply recomputes the plan under the store gate and refuses if the proof differs, so anything that changed since the review stops it. It is safe to re-run with the same proof after an interruption: completed work counts as progress, not as a change, and the run converges.
 
 ## Required privileges
 
@@ -92,7 +141,7 @@ Plan the network on the basis that **DeltaForge's source database connections an
 
 DeltaForge keeps all runtime state (checkpoints, schema registry, snapshot progress, DLQ/journal) in one storage backend. See [Storage](storage.md) and [Checkpoints](checkpoints.md).
 
-- **Backends**: `sqlite` (default; single-instance production) and `postgres` (a shared storage backend, **beta** - not yet given the same crash/recovery validation as SQLite). The PostgreSQL backend lets multiple processes share one state store, but it does **not** make source processing highly available and does **not** provide ownership fencing between instances - the single-owner-per-source rule above still applies. Use with caution. `memory` is for testing only and is lost on restart.
+- **Backends**: `sqlite` (default; single-instance production) and `postgres` (a shared storage backend, **beta** - not yet given the same crash/recovery validation as SQLite). One state store serves exactly one DeltaForge server at a time (enforced by the [store gate](#store-gate)); the PostgreSQL backend does **not** make source processing highly available. Use with caution. `memory` is for testing only and is lost on restart.
 - **Back up the state store regularly.** For SQLite the store is the `deltaforge.db` file (default under `./data/`), which holds both checkpoints and schema history; losing it means losing resume position and schema lineage. The store runs in **WAL mode**, so do not copy `deltaforge.db` on its own while DeltaForge is running - committed data may still be in the `-wal` file, and a bare file copy can be inconsistent. Use one of:
   - SQLite's online-backup API or `VACUUM INTO 'backup.db'` against the live database;
   - stop DeltaForge cleanly, checkpoint the WAL (`PRAGMA wal_checkpoint(TRUNCATE)`), then copy the file;

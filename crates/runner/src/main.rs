@@ -43,13 +43,13 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:9000")]
     metrics_addr: String,
     /// Storage backend: sqlite (default), memory, or postgres
-    #[arg(long, default_value = "sqlite")]
+    #[arg(long, global = true, default_value = "sqlite")]
     storage_backend: String,
     /// SQLite database path (sqlite backend only)
-    #[arg(long, default_value = "./data/deltaforge.db")]
+    #[arg(long, global = true, default_value = "./data/deltaforge.db")]
     storage_path: String,
     /// PostgreSQL DSN (postgres backend only)
-    #[arg(long)]
+    #[arg(long, global = true)]
     storage_dsn: Option<String>,
     /// Byte budget for cached latest schema versions, shared by all pipelines
     /// (primary bound; a conservative estimate of resident memory). A schema
@@ -77,6 +77,54 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Migrate pre-upgrade schema history to explicitly mapped sources.
+    ///
+    /// Dry run by default: prints the plan and its proof digest and writes
+    /// nothing. `--apply --expect-proof <digest>` applies exactly the reviewed
+    /// plan while holding the store gate, so the server must be stopped.
+    /// Legacy records are never deleted.
+    SchemaMigrate {
+        /// Mapping file (YAML): explicit tables per source and asserted lineage.
+        #[arg(long)]
+        mapping: String,
+        /// Only mapping entries of this tenant.
+        #[arg(long)]
+        tenant: Option<String>,
+        /// Only mapping entries of this source id.
+        #[arg(long)]
+        source: Option<String>,
+        /// Write the migration (requires --expect-proof).
+        #[arg(long, requires = "expect_proof")]
+        apply: bool,
+        /// Proof digest printed by the dry run being applied.
+        #[arg(long)]
+        expect_proof: Option<String>,
+        /// Emit JSON instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect or break the store gate that keeps the server and the schema
+    /// migration from using the state store at the same time.
+    StoreGate {
+        #[command(subcommand)]
+        action: GateAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum GateAction {
+    /// Show who holds the store gate.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Release a gate left behind by a process that is no longer running.
+    /// Verify first that the recorded owner (host/pid) is not alive.
+    Break {
+        /// The owner id shown by `store-gate status`.
+        #[arg(long)]
+        owner: String,
+    },
 }
 
 #[tokio::main]
@@ -94,6 +142,41 @@ async fn main() -> Result<()> {
         let chkpt: Arc<dyn checkpoints::CheckpointStore> =
             Arc::new(storage::BackendCheckpointStore::new(backend));
         return runner::preflight::run(config, *json, chkpt).await;
+    }
+    if let Some(Command::SchemaMigrate {
+        mapping,
+        tenant,
+        source,
+        apply,
+        expect_proof,
+        json,
+    }) = &args.command
+    {
+        let backend = build_storage_backend(&storage_config_from(&args))
+            .await
+            .context("initialise storage backend for schema-migrate")?;
+        let migrate = runner::schema_migrate::MigrateArgs {
+            mapping: mapping.clone(),
+            tenant: tenant.clone(),
+            source: source.clone(),
+            apply: *apply,
+            expect_proof: expect_proof.clone(),
+            json: *json,
+        };
+        return runner::schema_migrate::run(migrate, backend).await;
+    }
+    if let Some(Command::StoreGate { action }) = &args.command {
+        let backend = build_storage_backend(&storage_config_from(&args))
+            .await
+            .context("initialise storage backend for store-gate")?;
+        return match action {
+            GateAction::Status { json } => {
+                runner::schema_migrate::gate_status(backend, *json).await
+            }
+            GateAction::Break { owner } => {
+                runner::schema_migrate::gate_break(backend, owner).await
+            }
+        };
     }
 
     eprintln!("{}", version::startup_banner());
@@ -142,6 +225,54 @@ async fn main() -> Result<()> {
 
     info!(backend = %args.storage_backend, "storage backend ready");
 
+    // ── Store gate ────────────────────────────────────────────────────────────
+    // Held from before any schema access until every pipeline has stopped, so
+    // the schema migration can never write while this server runs. A crash
+    // leaves it held until `deltaforge store-gate break`.
+    let gate = storage::adapters::store_gate::acquire(
+        &backend,
+        storage::adapters::store_gate::GateRole::Server,
+    )
+    .await
+    .context("acquire the store gate")?;
+    info!(holder = %gate.holder(), "store gate acquired");
+
+    let mut manager_slot = None;
+    let served = serve(
+        &args,
+        backend,
+        pipeline_specs,
+        &pipeline_specs_summary,
+        &mut manager_slot,
+    )
+    .await;
+
+    // Quiesce every pipeline (and with it every registry writer) before the
+    // gate is released, on a clean shutdown and on a startup failure alike.
+    if let Some(manager) = manager_slot {
+        info!("stopping pipelines");
+        manager.shutdown_all().await;
+    }
+    let released = gate.release().await;
+    // A startup/serve failure is the primary error; report it over a failed release.
+    if let Err(e) = served {
+        if let Err(r) = released {
+            tracing::error!(error = %r, "release the store gate");
+        }
+        return Err(e);
+    }
+    released.context("release the store gate")?;
+    info!("store gate released");
+    Ok(())
+}
+
+async fn serve(
+    args: &Args,
+    backend: storage::ArcStorageBackend,
+    pipeline_specs: Vec<deltaforge_config::PipelineSpec>,
+    pipeline_specs_summary: &[String],
+    manager_slot: &mut Option<Arc<PipelineManager>>,
+) -> Result<()> {
     // ── Build pipeline manager ────────────────────────────────────────────────
     let registry_config = storage::adapters::RegistryConfig {
         cache_max_bytes: args.schema_cache_max_bytes,
@@ -161,6 +292,7 @@ async fn main() -> Result<()> {
         .await
         .context("build pipeline manager")?,
     );
+    *manager_slot = Some(manager.clone());
     let schema_api = Arc::new(SchemaApi::new(manager.clone()));
     let sensing_api = Arc::new(SensingApi::new(manager.clone()));
 
@@ -174,7 +306,7 @@ async fn main() -> Result<()> {
         &args.storage_backend,
         pipeline_specs_summary.len(),
     );
-    for summary in &pipeline_specs_summary {
+    for summary in pipeline_specs_summary {
         eprintln!("{summary}");
     }
     if pipeline_specs_summary.is_empty() {
@@ -205,9 +337,35 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind --api-addr {addr}"))?;
-    axum::serve(listener, app).await?;
-
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    info!("api server stopped");
     Ok(())
+}
+
+/// Resolves on SIGINT or SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    info!("shutdown signal received");
 }
 
 /// Parse a `host:port` listen address, failing with a clear message on bad input.

@@ -1408,6 +1408,20 @@ impl PipelineManager {
     /// Stop a pipeline. Serialized against other lifecycle operations. Awaits
     /// full termination of the coordinator and source tasks before returning, so
     /// a caller can rely on the pipeline having stopped writing once this returns.
+    /// Stop every pipeline and await its tasks (coordinator, source,
+    /// retention, replay). On return no pipeline task - and so no schema
+    /// registry writer - is running; the server then releases the store gate.
+    pub async fn shutdown_all(&self) {
+        let _lifecycle = self.lifecycle.lock().await;
+        let names: Vec<String> =
+            self.pipelines.read().keys().cloned().collect();
+        for name in names {
+            if let Err(e) = self.stop_pipeline_locked(&name).await {
+                tracing::warn!(pipeline = %name, error = %e, "stop during shutdown");
+            }
+        }
+    }
+
     pub async fn stop_pipeline(
         &self,
         name: &str,
@@ -1432,13 +1446,17 @@ impl PipelineManager {
 
         runtime.cancel.cancel();
         // Stop the replay-retention background task with the coordinator.
+        // Aborted tasks are awaited too, so nothing of this pipeline still
+        // runs when stop returns.
         if let Some(task) = runtime.retention_task.take() {
             task.abort();
+            let _ = task.await;
         }
         // Stop any in-flight replay controller (a restart's startup barrier resumes it).
         if let Some((c, task)) = runtime.replay_controller.take() {
             c.cancel();
             task.abort();
+            let _ = task.await;
         }
         let sources = std::mem::take(&mut runtime.sources);
         for src in &sources {
