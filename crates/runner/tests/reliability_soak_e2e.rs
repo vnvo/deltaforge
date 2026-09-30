@@ -310,6 +310,7 @@ async fn start_pipe(
         tenant: "acme".into(),
         pipeline: "soak".into(),
         registry,
+        registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         outbox_prefixes: Default::default(),
         snapshot_cfg: SnapshotCfg {
             mode: SnapshotMode::Never,

@@ -11,6 +11,28 @@ use serde_json::Value;
 
 use crate::pipeline_manager::PipelineManager;
 
+/// Typed, retryable response for schema requests made before the pipeline's
+/// source has verified its server identity (its registry scope does not exist
+/// yet). Never reported as an internal error or as "no schema".
+fn lineage_not_established(pipeline: &str) -> PipelineAPIError {
+    PipelineAPIError::SchemaLineageNotEstablished(format!(
+        "pipeline {pipeline}: schemas are unavailable because its source has not \
+         yet verified its database server identity (it may still be starting, or \
+         failing before it connects). Retry once the source is running; if this \
+         persists, check the pipeline status and the source logs."
+    ))
+}
+
+/// Map a schema-loader error: an unestablished lineage becomes the typed 503,
+/// anything else stays a failure.
+fn loader_error(pipeline: &str, err: anyhow::Error) -> PipelineAPIError {
+    if sources::registry_scope::is_lineage_not_established(&err) {
+        lineage_not_established(pipeline)
+    } else {
+        PipelineAPIError::Failed(err)
+    }
+}
+
 #[derive(Clone)]
 pub struct SchemaApi(pub Arc<PipelineManager>);
 
@@ -27,6 +49,9 @@ impl SchemaController for SchemaApi {
         pipeline: &str,
     ) -> Result<Vec<SchemaInfo>, PipelineAPIError> {
         let loader = self.0.get_loader(pipeline)?;
+        if !loader.lineage_established() {
+            return Err(lineage_not_established(pipeline));
+        }
         Ok(loader
             .list_cached()
             .await
@@ -52,7 +77,7 @@ impl SchemaController for SchemaApi {
         let loaded = loader
             .load(db, table)
             .await
-            .map_err(PipelineAPIError::Failed)?;
+            .map_err(|e| loader_error(pipeline, e))?;
 
         let columns = extract_columns(&loaded.schema_json);
 
@@ -105,7 +130,7 @@ impl SchemaController for SchemaApi {
         let tables = loader
             .reload_all(&patterns)
             .await
-            .map_err(PipelineAPIError::Failed)?;
+            .map_err(|e| loader_error(pipeline, e))?;
 
         Ok(ReloadResult {
             pipeline: pipeline.to_string(),
@@ -134,7 +159,7 @@ impl SchemaController for SchemaApi {
         loader
             .reload(db, table)
             .await
-            .map_err(PipelineAPIError::Failed)?;
+            .map_err(|e| loader_error(pipeline, e))?;
         self.get_schema(pipeline, db, table).await
     }
 
@@ -144,37 +169,79 @@ impl SchemaController for SchemaApi {
         db: &str,
         table: &str,
     ) -> Result<Vec<SchemaVersionInfo>, PipelineAPIError> {
-        let tenant = self
-            .0
-            .pipelines
-            .read()
-            .get(pipeline)
-            .ok_or_else(|| PipelineAPIError::NotFound(pipeline.to_string()))?
-            .spec
-            .metadata
-            .tenant
-            .clone();
+        let (tenant, source_id, live_scope) = {
+            let pipelines = self.0.pipelines.read();
+            let rt = pipelines.get(pipeline).ok_or_else(|| {
+                PipelineAPIError::NotFound(pipeline.to_string())
+            })?;
+            (
+                rt.spec.metadata.tenant.clone(),
+                rt.spec.spec.source.source_id().to_string(),
+                rt.registry_scope.current().ok(),
+            )
+        };
 
-        Ok(self
-            .0
-            .registry()
-            .list_versions(&tenant, db, table)
-            .into_iter()
-            .map(|v| {
+        // The registry is keyed by the source's verified lineage: use the scope
+        // the running source published, else the durably recorded lineage (the
+        // source is stopped). Storage failures are errors, never "no versions".
+        let key = match live_scope {
+            Some(scope) => scope.key(db, table),
+            None => {
+                let record = storage::adapters::source_lineage::load(
+                    self.0.backend(),
+                    &tenant,
+                    &source_id,
+                )
+                .await
+                .map_err(PipelineAPIError::Failed)?
+                .ok_or_else(|| lineage_not_established(pipeline))?;
+                storage::adapters::SchemaKey::new(
+                    tenant.as_str(),
+                    source_id.as_str(),
+                    record.current.lineage_hash.as_str(),
+                    db,
+                    table,
+                )
+            }
+        };
+
+        // Bounded pages; a table whose history exceeds the cap is refused rather
+        // than materialized without bound.
+        const MAX_VERSIONS: usize = 10_000;
+        let registry = self.0.registry();
+        let mut out = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = registry
+                .history_page(&key, cursor, 256)
+                .await
+                .map_err(PipelineAPIError::Failed)?;
+            for v in page.versions {
+                if out.len() == MAX_VERSIONS {
+                    return Err(PipelineAPIError::BadRequest(format!(
+                        "{db}.{table} has more than {MAX_VERSIONS} schema versions"
+                    )));
+                }
                 let col_count = v
                     .schema_json
                     .get("columns")
                     .and_then(|c| c.as_array())
                     .map(|arr| arr.len())
                     .unwrap_or(0);
-                SchemaVersionInfo {
+                out.push(SchemaVersionInfo {
                     version: v.version,
                     fingerprint: v.hash,
                     column_count: col_count,
                     registered_at: v.registered_at,
-                }
-            })
-            .collect())
+                });
+            }
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        out.sort_by_key(|v| v.version);
+        Ok(out)
     }
 }
 

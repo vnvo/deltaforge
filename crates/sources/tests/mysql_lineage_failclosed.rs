@@ -35,6 +35,7 @@ async fn unverified_lineage_prevents_stream_opening() {
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry: make_registry().await,
+        registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         backend,
         outbox_tables: AllowList::default(),
         snapshot_cfg: SnapshotCfg::default(),

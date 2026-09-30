@@ -15,7 +15,7 @@ pub mod storage_secrets;
 
 pub use schema_provider::{
     ArcSchemaProvider, AvroSchemaProviderImpl, ColumnSchemaInfo,
-    SchemaLoaderAdapter, SchemaProvider, TableSchemaInfo,
+    SchemaLoaderAdapter, SchemaLookupError, SchemaProvider, TableSchemaInfo,
     build_arrow_schema_resolver, is_json_type, might_be_json,
 };
 

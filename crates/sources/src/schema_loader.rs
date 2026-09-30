@@ -80,6 +80,16 @@ pub trait SourceSchemaLoader: Send + Sync {
 
     /// List cached schemas.
     async fn list_cached(&self) -> Vec<SchemaListEntry>;
+
+    /// Whether the source has established the verified lineage its schema
+    /// registry access is scoped by. Until it has, `load`/`reload`/`reload_all`
+    /// fail with a typed
+    /// [`RegistryError::NotEstablished`](crate::registry_scope::RegistryError)
+    /// (detect it with
+    /// [`is_lineage_not_established`](crate::registry_scope::is_lineage_not_established)).
+    fn lineage_established(&self) -> bool {
+        true
+    }
 }
 
 /// Arc-wrapped schema loader.

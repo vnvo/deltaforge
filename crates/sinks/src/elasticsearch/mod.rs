@@ -26,5 +26,8 @@ pub use sink::{ElasticsearchSink, build_elasticsearch_sink};
 /// Built by the runner from its `SchemaProvider` and injected into the sink, so
 /// the `sinks` crate never depends on `runner`. Same inversion the ClickHouse
 /// and S3 sinks use.
+/// `Ok(None)`: no schema is known for the table yet. `Err`: the schema cannot
+/// be read right now (for example the source has not verified its server yet);
+/// the error carries the reason. Both are retryable and never cached.
 pub type EsSchemaResolver =
-    Arc<dyn Fn(&str) -> Option<TableColumns> + Send + Sync>;
+    Arc<dyn Fn(&str) -> anyhow::Result<Option<TableColumns>> + Send + Sync>;

@@ -11,12 +11,16 @@ use mysql_async::{Pool, Row, prelude::Queryable};
 use schema_registry::SourceSchema;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use storage::DurableSchemaRegistry;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use super::mysql_table_schema::{MySqlColumn, MySqlTableSchema};
+use crate::registry_scope::{
+    RegistryError, RegistryScope, SharedRegistryScope,
+};
 use crate::schema_loader::{
     LoadedSchema as ApiLoadedSchema, SchemaListEntry, SourceSchemaLoader,
 };
@@ -36,14 +40,26 @@ pub struct LoadedSchema {
 type ArcSchemaCache = Arc<RwLock<HashMap<(String, String), Arc<LoadedSchema>>>>;
 
 /// Schema loader with caching and registry integration.
+///
+/// Every registry access is qualified by the source's verified `server_uuid`
+/// lineage, taken from the shared [`SharedRegistryScope`]; with no established
+/// scope, registry access fails closed. Cache entries belong to one scope
+/// generation and are discarded when the source moves to a new lineage.
+///
+/// MySQL has no historical schema resolution and never adopts pre-upgrade
+/// (unscoped) history automatically: legacy versions are preserved untouched and
+/// only reserve version numbers, so none is ever reused.
 #[derive(Clone)]
 pub struct MySqlSchemaLoader {
     pool: Pool,
     dsn: crate::credentials::ProtectedDsn,
     /// Cache: (db, table) -> Arc<LoadedSchema>
     cache: ArcSchemaCache,
+    /// Scope generation the cache entries were loaded under (0 = none).
+    cache_generation: Arc<AtomicU64>,
     /// Schema registry for versioning
     registry: Arc<DurableSchemaRegistry>,
+    scope: SharedRegistryScope,
     tenant: String,
 }
 
@@ -64,6 +80,7 @@ impl MySqlSchemaLoader {
         dsn: impl Into<crate::credentials::ProtectedDsn>,
         registry: Arc<DurableSchemaRegistry>,
         tenant: &str,
+        scope: SharedRegistryScope,
     ) -> Self {
         let dsn = dsn.into();
         info!(
@@ -74,9 +91,35 @@ impl MySqlSchemaLoader {
             pool: Pool::new(dsn.expose()),
             dsn,
             cache: Arc::new(RwLock::new(HashMap::new())),
+            cache_generation: Arc::new(AtomicU64::new(0)),
             registry,
+            scope,
             tenant: tenant.to_string(),
         }
+    }
+
+    /// The established registry scope. Fails closed when none is published.
+    /// Discards cache entries loaded under an earlier lineage.
+    async fn scope(&self) -> SourceResult<Arc<RegistryScope>> {
+        let scope = self.scope.current()?;
+        if self.cache_generation.load(Ordering::Acquire) != scope.generation() {
+            let mut cache = self.cache.write().await;
+            if self.cache_generation.load(Ordering::Acquire)
+                != scope.generation()
+            {
+                cache.clear();
+                self.cache_generation
+                    .store(scope.generation(), Ordering::Release);
+            }
+        }
+        Ok(scope)
+    }
+
+    /// Whether cache entries belong to the currently published scope.
+    fn cache_valid(&self) -> bool {
+        let generation = self.scope.generation();
+        generation != 0
+            && generation == self.cache_generation.load(Ordering::Acquire)
     }
 
     pub fn current_sequence(&self) -> u64 {
@@ -95,6 +138,11 @@ impl MySqlSchemaLoader {
 
     /// Expand wildcard patterns and preload all matching schemas.
     ///
+    /// This is the eager (catalog-sized) startup path. It is deliberately
+    /// self-contained - it only reads latest versions through the scoped
+    /// registry and falls back to [`Self::load_schema`] - so removing the eager
+    /// preload later changes only its call sites, not the registry contract.
+    ///
     /// Warm-start path: schemas already known to the durable registry are
     /// deserialized directly into the in-memory cache, avoiding an
     /// INFORMATION_SCHEMA query per table on restart. Tables missing from the
@@ -111,6 +159,7 @@ impl MySqlSchemaLoader {
         patterns: &[String],
     ) -> SourceResult<Vec<(String, String)>> {
         let t0 = Instant::now();
+        let scope = self.scope().await?;
         let tables = self.expand_patterns(patterns).await?;
 
         info!(
@@ -127,11 +176,18 @@ impl MySqlSchemaLoader {
         // call reload_schema for just that table when the mismatch is detected.
         let mut from_registry = 0usize;
         let mut needs_fetch: Vec<&(String, String)> = Vec::new();
-        {
-            let mut cache = self.cache.write().await;
-            for pair in &tables {
-                let (db, table) = pair;
-                match self.registry.get_latest(&self.tenant, db, table) {
+        for pair in &tables {
+            let (db, table) = pair;
+            // A registry storage error fails closed; only a genuinely absent
+            // schema falls back to INFORMATION_SCHEMA.
+            let latest = self
+                .registry
+                .get_latest(&scope.key(db, table))
+                .await
+                .map_err(RegistryError::Storage)?;
+            {
+                let mut cache = self.cache.write().await;
+                match latest {
                     Some(sv) => {
                         match serde_json::from_value::<MySqlTableSchema>(
                             sv.schema_json,
@@ -265,11 +321,12 @@ impl MySqlSchemaLoader {
         table: &str,
         checkpoint: Option<&[u8]>,
     ) -> SourceResult<Arc<LoadedSchema>> {
-        if let Some(cached) = self
-            .cache
-            .read()
-            .await
-            .get(&(db.to_string(), table.to_string()))
+        if self.cache_valid()
+            && let Some(cached) = self
+                .cache
+                .read()
+                .await
+                .get(&(db.to_string(), table.to_string()))
         {
             debug!(db = %db, table = %table, "schema cache hit");
             counter!("deltaforge_source_schema_cache_hits_total",
@@ -290,19 +347,18 @@ impl MySqlSchemaLoader {
         // Register with schema registry
         let schema_json = serde_json::to_value(&schema)
             .map_err(|e| SourceError::Other(e.into()))?;
-        // Register with checkpoint
+        // Register with checkpoint, under the verified lineage.
+        let scope = self.scope().await?;
         let version = self
             .registry
             .register_with_checkpoint(
-                &self.tenant,
-                db,
-                table,
+                &scope.key(db, table),
                 &fingerprint,
                 &schema_json,
                 checkpoint,
             )
             .await
-            .map_err(SourceError::Other)?;
+            .map_err(RegistryError::Storage)?;
         let loaded = Arc::new(LoadedSchema {
             schema,
             registry_version: version,
@@ -361,6 +417,9 @@ impl MySqlSchemaLoader {
         table: &str,
     ) -> Option<Arc<LoadedSchema>> {
         // Note: This is sync because we're using try_read to avoid blocking
+        if !self.cache_valid() {
+            return None;
+        }
         self.cache.try_read().ok().and_then(|guard| {
             guard.get(&(db.to_string(), table.to_string())).cloned()
         })
@@ -368,6 +427,7 @@ impl MySqlSchemaLoader {
 
     /// Returns all (db, table) pairs currently in cache.
     /// Sync, for failover reconciliation - avoids async where not needed.
+    /// Deliberately ignores the scope generation (see the PostgreSQL loader).
     pub fn cached_tables(&self) -> Vec<(String, String)> {
         self.cache
             .try_read()
@@ -571,11 +631,21 @@ impl MySqlSchemaLoader {
             })
             .collect();
 
+        let scope = SharedRegistryScope::new("test");
+        let published = scope.publish_for_test(
+            "test",
+            storage::adapters::LineageDescriptor::mysql(
+                "3e11fa47-71ca-11e1-9e33-c80aa9429562",
+            )
+            .expect("test lineage"),
+        );
         Self {
             pool: Pool::new("mysql://localhost/ignored"),
             dsn: "mysql://localhost/ignored".into(),
             cache: Arc::new(RwLock::new(cache)),
+            cache_generation: Arc::new(AtomicU64::new(published.generation())),
             registry: storage::DurableSchemaRegistry::for_testing(),
+            scope,
             tenant: "test".to_string(),
         }
     }
@@ -646,6 +716,7 @@ impl SourceSchemaLoader for MySqlSchemaLoader {
         db: &str,
         table: &str,
     ) -> anyhow::Result<ApiLoadedSchema> {
+        self.scope.current()?;
         let loaded = self.load_schema(db, table).await?;
         Ok(to_api_schema(db, table, &loaded))
     }
@@ -655,6 +726,7 @@ impl SourceSchemaLoader for MySqlSchemaLoader {
         db: &str,
         table: &str,
     ) -> anyhow::Result<ApiLoadedSchema> {
+        self.scope.current()?;
         let loaded = self.reload_schema(db, table).await?;
         Ok(to_api_schema(db, table, &loaded))
     }
@@ -663,12 +735,20 @@ impl SourceSchemaLoader for MySqlSchemaLoader {
         &self,
         patterns: &[String],
     ) -> anyhow::Result<Vec<(String, String)>> {
+        self.scope.current()?;
         // Clear cache and re-preload (reuse existing preload logic)
         self.cache.write().await.clear();
         self.preload(patterns).await.map_err(Into::into)
     }
 
+    fn lineage_established(&self) -> bool {
+        self.scope.generation() != 0
+    }
+
     async fn list_cached(&self) -> Vec<SchemaListEntry> {
+        if !self.cache_valid() {
+            return Vec::new();
+        }
         self.cache
             .read()
             .await

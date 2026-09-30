@@ -64,13 +64,14 @@ impl ClickHouseSink {
         let resolver = self.resolver.as_ref().ok_or_else(|| SinkError::Other(
             anyhow::anyhow!("clickhouse sink has no schema resolver (source schema unavailable)"),
         ))?;
-        let resolved = resolver(&key).ok_or_else(|| {
-            // Transient during startup (before the snapshot loads the schema) —
-            // return a retryable error so the batch replays later.
-            SinkError::Other(anyhow::anyhow!(
-                "no schema yet for source table '{key}'"
-            ))
-        })?;
+        let resolved =
+            resolver(&key).map_err(SinkError::Other)?.ok_or_else(|| {
+                // Transient during startup (before the snapshot loads the schema) —
+                // return a retryable error so the batch replays later.
+                SinkError::Other(anyhow::anyhow!(
+                    "no schema yet for source table '{key}'"
+                ))
+            })?;
 
         let typed: Vec<_> = resolved
             .columns
@@ -272,10 +273,10 @@ mod tests {
 
     fn sink_with(cap: Arc<Captured>) -> ClickHouseSink {
         let resolver: ClickHouseSchemaResolver = Arc::new(|_key: &str| {
-            Some(TableColumns {
+            Ok(Some(TableColumns {
                 columns: vec![id_col()],
                 primary_key: vec!["id".into()],
-            })
+            }))
         });
         ClickHouseSink {
             id: "c".into(),

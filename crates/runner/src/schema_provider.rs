@@ -62,16 +62,33 @@ impl TableSchemaInfo {
     }
 }
 
+/// Why a schema lookup could not be answered. Distinct from "no schema"
+/// (`Ok(None)`): consumers must retry later and must never cache a fallback
+/// built from this outcome.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SchemaLookupError {
+    #[error(
+        "source schema unavailable for {table}: the pipeline's source has not \
+         yet verified its database server identity, so its schema registry \
+         scope does not exist yet; retry once the source is running"
+    )]
+    LineageNotEstablished { table: String },
+}
+
 /// Trait for providing database schema information.
 #[async_trait]
 pub trait SchemaProvider: Send + Sync {
-    /// Get schema for a table.
+    /// Get schema for a table: `Ok(Some)` when known, `Ok(None)` when no schema
+    /// is known, `Err` when it cannot be determined right now.
     ///
     /// The `table` parameter may be in various formats:
     /// - "table_name" (table only)
     /// - "db.table" (database.table)
     /// - "schema.table" (for Postgres)
-    async fn get_table_schema(&self, table: &str) -> Option<TableSchemaInfo>;
+    async fn get_table_schema(
+        &self,
+        table: &str,
+    ) -> Result<Option<TableSchemaInfo>, SchemaLookupError>;
 
     /// Get all cached schemas.
     async fn list_schemas(&self) -> Vec<TableSchemaInfo>;
@@ -111,24 +128,37 @@ impl SchemaLoaderAdapter {
 
 #[async_trait]
 impl SchemaProvider for SchemaLoaderAdapter {
-    async fn get_table_schema(&self, table: &str) -> Option<TableSchemaInfo> {
+    async fn get_table_schema(
+        &self,
+        table: &str,
+    ) -> Result<Option<TableSchemaInfo>, SchemaLookupError> {
         // Parse "db.table" format
         let (db, tbl) = match table.split_once('.') {
             Some((d, t)) => (d, t),
             None => ("", table),
         };
 
-        let loaded = self.loader.load(db, tbl).await.ok()?;
+        let loaded = match self.loader.load(db, tbl).await {
+            Ok(loaded) => loaded,
+            Err(e)
+                if sources::registry_scope::is_lineage_not_established(&e) =>
+            {
+                return Err(SchemaLookupError::LineageNotEstablished {
+                    table: table.to_string(),
+                });
+            }
+            Err(_) => return Ok(None),
+        };
 
         // Convert LoadedSchema to TableSchemaInfo
         let columns = extract_column_infos(&loaded.schema_json);
 
-        Some(TableSchemaInfo {
+        Ok(Some(TableSchemaInfo {
             database: loaded.database,
             table: loaded.table,
             columns,
             primary_key: loaded.primary_key,
-        })
+        }))
     }
 
     async fn list_schemas(&self) -> Vec<TableSchemaInfo> {
@@ -209,7 +239,9 @@ fn extract_column_infos(
 use std::collections::HashMap;
 
 use apache_avro::Schema as AvroSchema;
-use deltaforge_core::encoding::avro::SourceSchemaProvider;
+use deltaforge_core::encoding::avro::{
+    EnvelopeSchemaLookup, SourceSchemaProvider,
+};
 use deltaforge_core::encoding::avro_schema::{
     build_envelope_schema, build_value_schema,
 };
@@ -328,10 +360,10 @@ impl SourceSchemaProvider for AvroSchemaProviderImpl {
         connector: &str,
         db: &str,
         table: &str,
-    ) -> Option<(String, Arc<AvroSchema>)> {
+    ) -> EnvelopeSchemaLookup {
         // Ignore if connector doesn't match
         if connector != self.connector {
-            return None;
+            return EnvelopeSchemaLookup::Absent;
         }
 
         let key = format!("{db}.{table}");
@@ -339,8 +371,11 @@ impl SourceSchemaProvider for AvroSchemaProviderImpl {
         // Check cache
         {
             let cache = self.cache.read();
-            if let Some(cached) = cache.get(&key) {
-                return Some(cached.clone());
+            if let Some((json, schema)) = cache.get(&key) {
+                return EnvelopeSchemaLookup::Found(
+                    json.clone(),
+                    schema.clone(),
+                );
             }
         }
 
@@ -353,13 +388,21 @@ impl SourceSchemaProvider for AvroSchemaProviderImpl {
         // to call the async method. This is acceptable because:
         // 1. Schema lookups are rare (only on first event per table + DDL changes)
         // 2. The underlying SchemaLoaderAdapter typically hits an in-memory cache
-        let table_schema = tokio::task::block_in_place(|| {
+        let table_schema = match tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(self.schema_provider.get_table_schema(&key))
-        })?;
+        }) {
+            Ok(Some(ts)) => ts,
+            Ok(None) => return EnvelopeSchemaLookup::Absent,
+            // Not cached: the next event retries the lookup.
+            Err(e) => return EnvelopeSchemaLookup::Unavailable(e.to_string()),
+        };
 
         // Build the envelope schema
-        let result = self.build_for_table(db, table, &table_schema)?;
+        let Some(result) = self.build_for_table(db, table, &table_schema)
+        else {
+            return EnvelopeSchemaLookup::Absent;
+        };
 
         // Cache it
         {
@@ -367,7 +410,7 @@ impl SourceSchemaProvider for AvroSchemaProviderImpl {
             cache.insert(key, result.clone());
         }
 
-        Some(result)
+        EnvelopeSchemaLookup::Found(result.0, result.1)
     }
 }
 
@@ -458,12 +501,16 @@ pub fn build_arrow_schema_resolver(
         });
 
         let schema = match table_schema {
-            Some(ts) => {
+            // Never fall back to (and cache) an envelope-only schema when the
+            // source schema cannot be read yet: fail this writer so the batch
+            // is retried.
+            Err(e) => return Err(anyhow::Error::new(e)),
+            Ok(Some(ts)) => {
                 let cols: Vec<ColumnDesc> =
                     ts.columns.iter().map(column_info_to_desc).collect();
                 build_envelope_arrow_schema_arc(arrow_connector, &cols, &opts)
             }
-            None => {
+            Ok(None) => {
                 // Log the fallback once per table.
                 let mut logged = fallback_logged.write();
                 if logged.insert(lookup_key.clone(), ()).is_none() {
@@ -497,10 +544,13 @@ pub fn build_clickhouse_schema_resolver(
     Arc::new(move |key: &str| {
         let provider = schema_provider.clone();
         let key_owned = key.to_string();
-        let ts = tokio::task::block_in_place(|| {
+        let Some(ts) = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(provider.get_table_schema(&key_owned))
-        })?;
+        })?
+        else {
+            return Ok(None);
+        };
         let columns = ts
             .columns
             .iter()
@@ -514,10 +564,10 @@ pub fn build_clickhouse_schema_resolver(
                 scale: c.numeric_scale,
             })
             .collect();
-        Some(TableColumns {
+        Ok(Some(TableColumns {
             columns,
             primary_key: ts.primary_key.clone(),
-        })
+        }))
     })
 }
 
@@ -599,8 +649,8 @@ mod tests {
         async fn get_table_schema(
             &self,
             table: &str,
-        ) -> Option<TableSchemaInfo> {
-            self.tables.get(table).cloned()
+        ) -> Result<Option<TableSchemaInfo>, SchemaLookupError> {
+            Ok(self.tables.get(table).cloned())
         }
         async fn list_schemas(&self) -> Vec<TableSchemaInfo> {
             self.tables.values().cloned().collect()
@@ -728,6 +778,114 @@ mod tests {
         );
     }
 
+    /// Reports the source schema as unavailable on its first lookup, then
+    /// serves it - the shape of a request racing the source's startup.
+    struct UnavailableThenReady {
+        calls: std::sync::atomic::AtomicUsize,
+        schema: TableSchemaInfo,
+    }
+
+    #[async_trait]
+    impl SchemaProvider for UnavailableThenReady {
+        async fn get_table_schema(
+            &self,
+            table: &str,
+        ) -> Result<Option<TableSchemaInfo>, SchemaLookupError> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+            {
+                return Err(SchemaLookupError::LineageNotEstablished {
+                    table: table.to_string(),
+                });
+            }
+            Ok(Some(self.schema.clone()))
+        }
+        async fn list_schemas(&self) -> Vec<TableSchemaInfo> {
+            vec![]
+        }
+    }
+
+    fn orders_schema() -> TableSchemaInfo {
+        TableSchemaInfo {
+            database: "shop".into(),
+            table: "orders".into(),
+            columns: vec![ColumnSchemaInfo {
+                name: "id".into(),
+                data_type: "bigint".into(),
+                full_type: "bigint".into(),
+                nullable: false,
+                is_json_like: false,
+                unsigned: false,
+                is_array: false,
+                numeric_precision: None,
+                numeric_scale: None,
+                element_type: None,
+            }],
+            primary_key: vec!["id".into()],
+        }
+    }
+
+    fn flaky() -> ArcSchemaProvider {
+        Arc::new(UnavailableThenReady {
+            calls: Default::default(),
+            schema: orders_schema(),
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn arrow_resolver_never_caches_an_unavailable_schema() {
+        let resolver = build_arrow_schema_resolver(
+            flaky(),
+            "mysql",
+            deltaforge_core::encoding::avro_types::TypeConversionOpts::default(
+            ),
+        );
+        let key = PartitionKey {
+            namespace: "shop".into(),
+            table: "orders".into(),
+            year: 2026,
+            month: 5,
+            day: 19,
+        };
+        // Unavailable: the writer fails (retried) instead of writing an
+        // envelope-only file...
+        let err = resolver(&key).unwrap_err();
+        assert!(
+            err.downcast_ref::<SchemaLookupError>().is_some(),
+            "typed reason must be preserved: {err:#}"
+        );
+        // ...and nothing was cached: the next attempt gets the real columns.
+        let schema = resolver(&key).unwrap();
+        assert!(schema.field_with_name("after_id").is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clickhouse_resolver_surfaces_unavailable_as_an_error() {
+        let resolver = build_clickhouse_schema_resolver(flaky());
+        let Err(err) = resolver("shop.orders") else {
+            panic!("an unavailable schema must be an error");
+        };
+        assert!(err.downcast_ref::<SchemaLookupError>().is_some(), "{err:#}");
+        let cols = resolver("shop.orders").unwrap().unwrap();
+        assert_eq!(cols.primary_key, vec!["id".to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn avro_provider_reports_unavailable_and_does_not_cache_it() {
+        let avro = AvroSchemaProviderImpl::new(
+            flaky(),
+            "mysql",
+            TypeConversionOpts::default(),
+        );
+        assert!(matches!(
+            avro.get_envelope_schema("mysql", "shop", "orders"),
+            EnvelopeSchemaLookup::Unavailable(_)
+        ));
+        assert!(matches!(
+            avro.get_envelope_schema("mysql", "shop", "orders"),
+            EnvelopeSchemaLookup::Found(..)
+        ));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn arrow_resolver_caches_lookups() {
         // Run the resolver twice for the same table; second call must not
@@ -740,8 +898,9 @@ mod tests {
             async fn get_table_schema(
                 &self,
                 _table: &str,
-            ) -> Option<TableSchemaInfo> {
-                self.schema.lock().take()
+            ) -> Result<Option<TableSchemaInfo>, SchemaLookupError>
+            {
+                Ok(self.schema.lock().take())
             }
             async fn list_schemas(&self) -> Vec<TableSchemaInfo> {
                 vec![]

@@ -231,6 +231,7 @@ async fn make_mysql_source(
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry: make_registry().await,
+        registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         backend,
         outbox_tables: AllowList::default(),
         snapshot_cfg: SnapshotCfg::default(),
@@ -256,6 +257,7 @@ async fn make_pg_source(
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry: make_registry().await,
+        registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         backend,
         outbox_prefixes: AllowList::default(),
         snapshot_cfg: SnapshotCfg::default(),
@@ -518,6 +520,8 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
             tenant: "acme".into(),
             pipeline: "test".into(),
             registry: Arc::clone(&registry),
+            registry_scope:
+                sources::registry_scope::SharedRegistryScope::default(),
             backend: Arc::clone(&backend),
             outbox_tables: AllowList::default(),
             snapshot_cfg: SnapshotCfg::default(),
@@ -568,6 +572,8 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
             tenant: "acme".into(),
             pipeline: "test".into(),
             registry: Arc::clone(&registry),
+            registry_scope:
+                sources::registry_scope::SharedRegistryScope::default(),
             backend: Arc::clone(&backend),
             outbox_tables: AllowList::default(),
             snapshot_cfg: SnapshotCfg::default(),
@@ -603,11 +609,8 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
         handle.join().await.ok();
 
         let uuid_b = mysql_fetch_uuid(port_b).await;
-        let reconciler = SchemaReconciler::new(
-            Arc::clone(&registry),
-            Arc::clone(&backend),
-            "acme",
-        );
+        let reconciler =
+            SchemaReconciler::new(Arc::clone(&registry), Arc::clone(&backend));
         let id_a = ServerIdentity::MySql(mysql_health::MySqlServerIdentity {
             server_uuid: uuid_a,
         });
@@ -662,6 +665,8 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
             tenant: "acme".into(),
             pipeline: "test".into(),
             registry: Arc::clone(&registry),
+            registry_scope:
+                sources::registry_scope::SharedRegistryScope::default(),
             backend: Arc::clone(&backend),
             outbox_tables: AllowList::default(),
             snapshot_cfg: SnapshotCfg::default(),
@@ -711,6 +716,8 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
             tenant: "acme".into(),
             pipeline: "test".into(),
             registry: Arc::clone(&registry),
+            registry_scope:
+                sources::registry_scope::SharedRegistryScope::default(),
             backend: Arc::clone(&backend),
             outbox_tables: AllowList::default(),
             snapshot_cfg: SnapshotCfg::default(),
@@ -803,6 +810,8 @@ async fn mysql_failover_schema_drift_halt_no_drift_continues() -> Result<()> {
             tenant: "acme".into(),
             pipeline: "test".into(),
             registry: make_registry().await,
+            registry_scope:
+                sources::registry_scope::SharedRegistryScope::default(),
             backend: Arc::clone(&backend),
             outbox_tables: AllowList::default(),
             snapshot_cfg: SnapshotCfg::default(),
@@ -1139,6 +1148,9 @@ impl storage::StorageBackend for FailIdentityWrites {
         key: &str,
     ) -> anyhow::Result<Option<(u64, Vec<u8>)>> {
         self.inner.log_latest(ns, key).await
+    }
+    async fn log_ns_max_seq(&self, ns: &str) -> anyhow::Result<u64> {
+        self.inner.log_ns_max_seq(ns).await
     }
     async fn log_append_if_absent(
         &self,

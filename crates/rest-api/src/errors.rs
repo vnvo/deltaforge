@@ -15,6 +15,10 @@ pub enum PipelineAPIError {
     BadRequest(String),
     /// A conflict with current state, e.g. an already-active replay job (maps to 409).
     Conflict(String),
+    /// The pipeline's source has not yet verified its server identity, so its
+    /// schema registry scope does not exist yet (maps to 503, retryable). The
+    /// message names the pipeline and the action to take.
+    SchemaLineageNotEstablished(String),
     Failed(anyhow::Error),
 }
 
@@ -45,6 +49,9 @@ impl std::fmt::Display for PipelineAPIError {
             }
             PipelineAPIError::BadRequest(msg) => write!(f, "{msg}"),
             PipelineAPIError::Conflict(msg) => write!(f, "{msg}"),
+            PipelineAPIError::SchemaLineageNotEstablished(msg) => {
+                write!(f, "{msg}")
+            }
             PipelineAPIError::Failed(e) => std::fmt::Display::fmt(e, f),
         }
     }
@@ -81,6 +88,10 @@ pub fn pipeline_error(err: PipelineAPIError) -> (StatusCode, Json<ApiError>) {
             (StatusCode::BAD_REQUEST, "BAD_REQUEST")
         }
         PipelineAPIError::Conflict(_) => (StatusCode::CONFLICT, "CONFLICT"),
+        PipelineAPIError::SchemaLineageNotEstablished(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SCHEMA_LINEAGE_NOT_ESTABLISHED",
+        ),
         PipelineAPIError::Failed(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")
         }
@@ -93,4 +104,20 @@ pub fn pipeline_error(err: PipelineAPIError) -> (StatusCode, Json<ApiError>) {
             message: err.to_string(),
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lineage_not_established_is_a_typed_retryable_503() {
+        let (status, body) =
+            pipeline_error(PipelineAPIError::SchemaLineageNotEstablished(
+                "pipeline p: retry once the source is running".into(),
+            ));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.0.code, "SCHEMA_LINEAGE_NOT_ESTABLISHED");
+        assert!(body.0.message.contains("retry once the source is running"));
+    }
 }

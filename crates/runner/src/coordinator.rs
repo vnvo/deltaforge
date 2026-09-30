@@ -1189,7 +1189,15 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
 
         // Fetch from provider
         let provider = self.schema_provider.as_ref()?;
-        let schema = provider.get_table_schema(table).await?;
+        let schema = match provider.get_table_schema(table).await {
+            Ok(Some(schema)) => schema,
+            Ok(None) => return None,
+            // Temporarily unavailable: skip sensing for now, cache nothing.
+            Err(e) => {
+                tracing::debug!(table, error = %e, "schema unavailable for sensing");
+                return None;
+            }
+        };
 
         // Register with drift detector
         if let Some(ref sensor) = self.schema_sensor {

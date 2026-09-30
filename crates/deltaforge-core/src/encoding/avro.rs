@@ -43,16 +43,25 @@ use super::EncodingError;
 /// (built by [`super::avro_schema::build_envelope_schema`]).
 pub trait SourceSchemaProvider: Send + Sync {
     /// Look up the Avro envelope schema for a given source table.
-    ///
-    /// Returns `Some((schema_json, parsed_schema))` if DDL is available
-    /// for the given connector/db/table, or `None` to fall back to
-    /// JSON inference (Path C).
     fn get_envelope_schema(
         &self,
         connector: &str,
         db: &str,
         table: &str,
-    ) -> Option<(String, Arc<AvroSchema>)>;
+    ) -> EnvelopeSchemaLookup;
+}
+
+/// Outcome of a DDL-derived Avro schema lookup.
+#[derive(Debug, Clone)]
+pub enum EnvelopeSchemaLookup {
+    /// DDL is available: `(schema_json, parsed_schema)` (Path A).
+    Found(String, Arc<AvroSchema>),
+    /// No DDL is known for the table: fall back to JSON inference (Path C).
+    Absent,
+    /// The source schema cannot be read right now (for example the source has
+    /// not yet verified its server). Encoding must fail retryably: inferring
+    /// and registering a schema here would fix a wrong schema for the subject.
+    Unavailable(String),
 }
 
 // =============================================================================
@@ -518,18 +527,29 @@ impl AvroEncoder {
         // Slow path: need to register schema with SR (first event per subject)
         // 1. Try Path A: DDL-derived schema
         if let Some(ref provider) = self.source_schemas {
-            if let Some((schema_json, schema)) =
-                provider.get_envelope_schema(connector, db, table)
-            {
-                debug!(
-                    connector,
-                    db, table, "using DDL-derived Avro schema (Path A)"
-                );
-                counter!("deltaforge_avro_encode_total", "path" => "ddl")
-                    .increment(1);
-                return self
-                    .encode_with_schema(&subject, value, &schema_json, &schema)
-                    .await;
+            match provider.get_envelope_schema(connector, db, table) {
+                EnvelopeSchemaLookup::Found(schema_json, schema) => {
+                    debug!(
+                        connector,
+                        db, table, "using DDL-derived Avro schema (Path A)"
+                    );
+                    counter!("deltaforge_avro_encode_total", "path" => "ddl")
+                        .increment(1);
+                    return self
+                        .encode_with_schema(
+                            &subject,
+                            value,
+                            &schema_json,
+                            &schema,
+                        )
+                        .await;
+                }
+                EnvelopeSchemaLookup::Unavailable(reason) => {
+                    return Err(EncodingError::SchemaUnavailable(format!(
+                        "{connector} {db}.{table}: {reason}"
+                    )));
+                }
+                EnvelopeSchemaLookup::Absent => {}
             }
         }
 
@@ -1058,6 +1078,55 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    struct UnavailableSchemas;
+
+    impl SourceSchemaProvider for UnavailableSchemas {
+        fn get_envelope_schema(
+            &self,
+            _connector: &str,
+            _db: &str,
+            _table: &str,
+        ) -> EnvelopeSchemaLookup {
+            EnvelopeSchemaLookup::Unavailable(
+                "schema lineage not established".into(),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_source_schema_fails_retryably_without_inferring() {
+        // The registry URL is unreachable: falling back to JSON inference would
+        // try to register an inferred schema and fail with a registry error.
+        // An unavailable source schema must instead stop before any registry
+        // call, with the dedicated retryable error.
+        let encoder = AvroEncoder::with_source_schemas(
+            "http://127.0.0.1:1",
+            SubjectStrategy::TopicName,
+            None,
+            None,
+            Some(Arc::new(UnavailableSchemas)),
+        )
+        .unwrap();
+        let err = encoder
+            .encode_event(
+                "orders",
+                &json!({"id": 1}),
+                "mysql",
+                "shop",
+                "orders",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EncodingError::SchemaUnavailable(ref m) if m.contains("lineage")),
+            "{err:?}"
+        );
+        assert!(matches!(
+            err.into_sink_error(),
+            crate::SinkError::Backpressure { .. }
+        ));
+    }
 
     #[test]
     fn test_subject_strategy_topic_name() {

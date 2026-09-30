@@ -30,8 +30,8 @@ use object_store::path::Path;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_reader::ParquetObjectReader;
 use runner::{
-    ArcSchemaProvider, ColumnSchemaInfo, SchemaProvider, TableSchemaInfo,
-    build_arrow_schema_resolver,
+    ArcSchemaProvider, ColumnSchemaInfo, SchemaLookupError, SchemaProvider,
+    TableSchemaInfo, build_arrow_schema_resolver,
 };
 use serde_json::json;
 use sinks::s3::{ObjectStoreParams, build_object_store, build_s3_sink};
@@ -205,8 +205,11 @@ struct FakeSchemaProvider {
 
 #[async_trait]
 impl SchemaProvider for FakeSchemaProvider {
-    async fn get_table_schema(&self, table: &str) -> Option<TableSchemaInfo> {
-        self.by_table.get(table).cloned()
+    async fn get_table_schema(
+        &self,
+        table: &str,
+    ) -> Result<Option<TableSchemaInfo>, SchemaLookupError> {
+        Ok(self.by_table.get(table).cloned())
     }
     async fn list_schemas(&self) -> Vec<TableSchemaInfo> {
         self.by_table.values().cloned().collect()

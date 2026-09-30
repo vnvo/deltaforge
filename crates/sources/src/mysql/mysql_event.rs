@@ -1233,8 +1233,10 @@ mod tests {
             reconciler: SchemaReconciler::new(
                 storage::DurableSchemaRegistry::for_testing(),
                 Arc::new(storage::MemoryStorageBackend::new()),
-                "test-tenant",
             ),
+            registry_scope: crate::registry_scope::SharedRegistryScope::default(
+            ),
+            registry_backend: Arc::new(storage::MemoryStorageBackend::new()),
             on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
             durable_lineage: None,
         }

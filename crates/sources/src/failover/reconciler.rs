@@ -35,6 +35,7 @@ use storage::{ArcStorageBackend, DurableSchemaRegistry};
 use tracing::info;
 
 use crate::failover::identity::ServerIdentity;
+use crate::registry_scope::RegistryScope;
 
 const NS: &str = "failover";
 
@@ -269,20 +270,14 @@ pub struct ReconcileInput {
 pub struct SchemaReconciler {
     registry: Arc<DurableSchemaRegistry>,
     backend: ArcStorageBackend,
-    tenant: String,
 }
 
 impl SchemaReconciler {
     pub fn new(
         registry: Arc<DurableSchemaRegistry>,
         backend: ArcStorageBackend,
-        tenant: impl Into<String>,
     ) -> Self {
-        Self {
-            registry,
-            backend,
-            tenant: tenant.into(),
-        }
+        Self { registry, backend }
     }
 
     /// Check whether this reconciliation already completed for this identity pair.
@@ -311,7 +306,12 @@ impl SchemaReconciler {
 
     /// Run reconciliation for all tracked tables and persist the record.
     ///
-    /// Returns `Err` on any hard stop (PK change).
+    /// `previous` is the registry scope of the lineage the source ran under
+    /// before the failover; the last-known schemas are read from it explicitly
+    /// (never from the new server's namespace). `None` - no recorded predecessor
+    /// lineage - means there is no last-known schema to diff against.
+    ///
+    /// Returns `Err` on any hard stop (PK change) or registry storage failure.
     /// On success, the caller must call `reload_schema` on any table where
     /// `record.table_results[i].deltas` is non-empty.
     pub async fn run(
@@ -319,15 +319,21 @@ impl SchemaReconciler {
         source_id: &str,
         prev: &ServerIdentity,
         new: &ServerIdentity,
+        previous: Option<&RegistryScope>,
         tables: &[ReconcileInput],
     ) -> Result<ReconciliationRecord> {
         let mut table_results = Vec::new();
 
         for input in tables {
-            let stored = self
-                .registry
-                .get_latest(&self.tenant, &input.db, &input.table)
-                .map(|sv| sv.schema_json);
+            let stored = match previous {
+                Some(scope) => self
+                    .registry
+                    .get_latest(&scope.key(&input.db, &input.table))
+                    .await
+                    .context("SchemaReconciler: read last-known schema")?
+                    .map(|sv| sv.schema_json),
+                None => None,
+            };
 
             let deltas = match reconcile_table(
                 stored.as_ref(),
@@ -443,7 +449,6 @@ mod tests {
         let reconciler = SchemaReconciler::new(
             Arc::clone(&registry),
             Arc::clone(&backend) as ArcStorageBackend,
-            "t1",
         );
         (reconciler, registry)
     }
@@ -516,13 +521,30 @@ mod tests {
 
     // --- SchemaReconciler (storage) ---
 
+    fn scope(uuid: &str) -> RegistryScope {
+        RegistryScope::detached(
+            "t1",
+            "src1",
+            storage::adapters::LineageRef::new(
+                storage::adapters::LineageDescriptor::mysql(uuid).unwrap(),
+            ),
+        )
+    }
+
+    const A: &str = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+    const B: &str = "5f22fb58-82db-22f2-af44-d91bb0530673";
+
     #[tokio::test]
     async fn run_persists_record_and_returns_deltas() {
         let (reconciler, registry) = make_reconciler().await;
+        let prev = scope(A);
         let schema = stored_schema(&[("id", "int", true)]);
         registry
             .register_with_checkpoint(
-                "t1", "shop", "orders", "h1", &schema, None,
+                &prev.key("shop", "orders"),
+                "h1",
+                &schema,
+                None,
             )
             .await
             .unwrap();
@@ -532,6 +554,7 @@ mod tests {
                 "src1",
                 &mysql_id("server-a"),
                 &mysql_id("server-b"),
+                Some(&prev),
                 &[ReconcileInput {
                     db: "shop".into(),
                     table: "orders".into(),
@@ -552,13 +575,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_diffs_against_the_previous_lineage_only() {
+        let (reconciler, registry) = make_reconciler().await;
+        let (prev, current) = (scope(A), scope(B));
+        // Last-known schema on the old server...
+        registry
+            .register_with_checkpoint(
+                &prev.key("shop", "orders"),
+                "h1",
+                &stored_schema(&[("id", "int", true)]),
+                None,
+            )
+            .await
+            .unwrap();
+        // ...and something already registered under the new server's lineage,
+        // which must NOT be used as the baseline.
+        registry
+            .register_with_checkpoint(
+                &current.key("shop", "orders"),
+                "h2",
+                &stored_schema(&[
+                    ("id", "int", true),
+                    ("email", "varchar", false),
+                ]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let record = reconciler
+            .run(
+                "src1",
+                &mysql_id("server-a"),
+                &mysql_id("server-b"),
+                Some(&prev),
+                &[ReconcileInput {
+                    db: "shop".into(),
+                    table: "orders".into(),
+                    live_columns: Some(vec![
+                        col("id", "int", true),
+                        col("email", "varchar", false),
+                    ]),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            record.table_results[0].deltas.len(),
+            1,
+            "the email column is new relative to the OLD server's schema"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_predecessor_lineage_means_no_baseline() {
+        let (reconciler, _) = make_reconciler().await;
+        let record = reconciler
+            .run(
+                "src1",
+                &mysql_id("server-a"),
+                &mysql_id("server-b"),
+                None,
+                &[ReconcileInput {
+                    db: "shop".into(),
+                    table: "orders".into(),
+                    live_columns: Some(vec![col("id", "int", true)]),
+                }],
+            )
+            .await
+            .unwrap();
+        assert!(record.table_results[0].deltas.is_empty());
+    }
+
+    #[tokio::test]
     async fn already_completed_hits_on_same_pair_misses_on_different() {
         let (reconciler, _) = make_reconciler().await;
         let prev = mysql_id("server-a");
         let b = mysql_id("server-b");
         let c = mysql_id("server-c");
 
-        reconciler.run("src1", &prev, &b, &[]).await.unwrap();
+        reconciler.run("src1", &prev, &b, None, &[]).await.unwrap();
 
         assert!(
             reconciler
@@ -579,10 +675,14 @@ mod tests {
     #[tokio::test]
     async fn run_errors_on_pk_change() {
         let (reconciler, registry) = make_reconciler().await;
+        let prev = scope(A);
         let schema = stored_schema(&[("id", "int", true)]);
         registry
             .register_with_checkpoint(
-                "t1", "shop", "orders", "h1", &schema, None,
+                &prev.key("shop", "orders"),
+                "h1",
+                &schema,
+                None,
             )
             .await
             .unwrap();
@@ -592,6 +692,7 @@ mod tests {
                 "src1",
                 &mysql_id("a"),
                 &mysql_id("b"),
+                Some(&prev),
                 &[ReconcileInput {
                     db: "shop".into(),
                     table: "orders".into(),

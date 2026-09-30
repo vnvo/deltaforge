@@ -503,6 +503,9 @@ pub(crate) struct PipelineRuntime {
     pub(crate) sources: Vec<SourceHandle>,
     pub(crate) join: Option<JoinHandle<Result<()>>>,
     pub(crate) schema_loader: Option<ArcSchemaLoader>,
+    /// The verified-lineage registry scope shared by this pipeline's source and
+    /// schema loader; unestablished until the source verifies its server.
+    pub(crate) registry_scope: sources::registry_scope::SharedRegistryScope,
     pub(crate) table_patterns: Vec<String>,
     pub(crate) sensor_state: Option<Arc<SchemaSensorState>>,
     pub(crate) dlq_writer: Option<Arc<crate::dlq::DlqWriter>>,
@@ -736,6 +739,11 @@ impl PipelineManager {
         &self.registry
     }
 
+    /// The durable state backend (lineage records, checkpoints, registry).
+    pub(crate) fn backend(&self) -> &ArcStorageBackend {
+        &self.backend
+    }
+
     /// Get schema loader for a pipeline.
     pub fn get_loader(
         &self,
@@ -792,10 +800,16 @@ impl PipelineManager {
         let source_dsn = sources::resolve_source_dsn(&spec, resolver.as_ref())
             .await
             .context("resolve source credentials")?;
+        // One verified-lineage scope per pipeline, shared by the source (which
+        // establishes it) and the schema loader (which fails closed until then).
+        let registry_scope = sources::registry_scope::SharedRegistryScope::new(
+            spec.spec.source.source_id(),
+        );
         let source = build_source(
             &spec,
             source_dsn.clone(),
             self.registry.clone(),
+            registry_scope.clone(),
             Arc::clone(&self.backend),
             resolver.clone(),
         )
@@ -803,8 +817,12 @@ impl PipelineManager {
         .context("build source")?;
         let processors = build_processors(&spec, &pipeline_name)
             .context("build processors")?;
-        let schema_loader =
-            build_schema_loader(&spec, &source_dsn, self.registry.clone());
+        let schema_loader = build_schema_loader(
+            &spec,
+            &source_dsn,
+            self.registry.clone(),
+            registry_scope.clone(),
+        );
 
         // Build Avro schema provider if any sink uses Avro encoding
         let avro_source_schemas = build_avro_provider(&spec, &schema_loader);
@@ -1252,6 +1270,7 @@ impl PipelineManager {
             sources: vec![src_handle],
             join: Some(join),
             schema_loader,
+            registry_scope,
             table_patterns,
             sensor_state: sensor_for_runtime,
             dlq_writer,
@@ -2611,6 +2630,61 @@ mod tests {
         }
     }
 
+    /// REST schema requests made before the pipeline's source has verified its
+    /// server get the typed, retryable 503 - never an opaque internal error or
+    /// an empty "no schema" answer.
+    #[tokio::test]
+    async fn schema_requests_before_lineage_are_typed_unavailable() {
+        use rest_api::SchemaController;
+        let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        let mgr = Arc::new(
+            manager_with_ckpt(
+                Arc::clone(&backend),
+                Arc::new(checkpoints::MemCheckpointStore::new().unwrap()),
+            )
+            .await,
+        );
+        let mut rt = bare_runtime(sample_spec("p"), None);
+        let scope = sources::registry_scope::SharedRegistryScope::new("mysql");
+        rt.registry_scope = scope.clone();
+        rt.schema_loader =
+            Some(Arc::new(sources::mysql::MySqlSchemaLoader::new(
+                "mysql://none@127.0.0.1:1/none",
+                mgr.registry().clone(),
+                "acme",
+                scope,
+            )));
+        mgr.pipelines.write().insert("p".to_string(), rt);
+        let api = crate::schema_api::SchemaApi::new(Arc::clone(&mgr));
+
+        let unavailable = |r: Result<(), PipelineAPIError>, what: &str| {
+            let err = r.expect_err(what);
+            assert!(
+                matches!(err, PipelineAPIError::SchemaLineageNotEstablished(ref m)
+                    if m.contains("pipeline p") && m.contains("Retry")),
+                "{what}: {err:?}"
+            );
+        };
+        unavailable(
+            api.get_schema("p", "shop", "orders").await.map(|_| ()),
+            "get",
+        );
+        unavailable(api.list_schemas("p").await.map(|_| ()), "list");
+        unavailable(
+            api.reload_table_schema("p", "shop", "orders")
+                .await
+                .map(|_| ()),
+            "reload table",
+        );
+        unavailable(api.reload_schemas("p").await.map(|_| ()), "reload all");
+        unavailable(
+            api.get_schema_versions("p", "shop", "orders")
+                .await
+                .map(|_| ()),
+            "versions",
+        );
+    }
+
     /// A registered runtime with no live tasks (unless `join` is supplied), for
     /// driving delete() without spawning a real source.
     fn bare_runtime(
@@ -2627,6 +2701,8 @@ mod tests {
             sources: vec![],
             join,
             schema_loader: None,
+            registry_scope:
+                sources::registry_scope::SharedRegistryScope::default(),
             table_patterns: vec![],
             sensor_state: None,
             dlq_writer: None,
@@ -3627,6 +3703,9 @@ mod tests {
         ) -> Result<Option<(u64, Vec<u8>)>> {
             self.inner.log_latest(ns, key).await
         }
+        async fn log_ns_max_seq(&self, ns: &str) -> Result<u64> {
+            self.inner.log_ns_max_seq(ns).await
+        }
         async fn log_append_if_absent(
             &self,
             ns: &str,
@@ -3821,6 +3900,8 @@ mod tests {
             sources: vec![],
             join: None,
             schema_loader: None,
+            registry_scope:
+                sources::registry_scope::SharedRegistryScope::default(),
             table_patterns: vec![],
             sensor_state: None,
             dlq_writer: None,

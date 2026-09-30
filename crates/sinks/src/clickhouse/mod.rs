@@ -26,5 +26,8 @@ pub struct TableColumns {
 /// Built by the runner from its `SchemaProvider` and passed into the sink — the
 /// same inversion the S3 sink uses for its Arrow schema resolver, so the `sinks`
 /// crate never depends on `runner`.
+/// `Ok(None)`: no schema is known for the table yet. `Err`: the schema cannot
+/// be read right now (for example the source has not verified its server yet);
+/// the error carries the reason. Both are retryable and never cached.
 pub type ClickHouseSchemaResolver =
-    Arc<dyn Fn(&str) -> Option<TableColumns> + Send + Sync>;
+    Arc<dyn Fn(&str) -> anyhow::Result<Option<TableColumns>> + Send + Sync>;

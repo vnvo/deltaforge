@@ -234,12 +234,63 @@ pub async fn make_storage_backend() -> ArcStorageBackend {
     Arc::new(storage::MemoryStorageBackend::new()) as storage::ArcStorageBackend
 }
 
+/// Build a schema loader whose registry scope is established through the real
+/// PostgreSQL startup path (verified live lineage, durably recorded).
 pub async fn pg_make_schema_loader(dsn: &str) -> Result<PostgresSchemaLoader> {
-    Ok(PostgresSchemaLoader::new(
-        dsn,
-        make_registry().await,
-        "test",
+    let backend = make_storage_backend().await;
+    let registry = DurableSchemaRegistry::new(Arc::clone(&backend))
+        .await
+        .expect("registry");
+    let scope = sources::registry_scope::SharedRegistryScope::new("test");
+    sources::postgres::establish_registry_scope(
+        dsn, &backend, &scope, "test", "test",
+    )
+    .await?;
+    Ok(PostgresSchemaLoader::new(dsn, registry, "test", scope))
+}
+
+/// Build a schema loader over an existing registry, with its registry scope
+/// established through the real PostgreSQL startup path. Returns the scope so
+/// a test can build the same qualified keys the loader uses.
+pub async fn pg_scoped_loader(
+    dsn: &str,
+    registry: Arc<DurableSchemaRegistry>,
+    tenant: &str,
+) -> Result<(
+    PostgresSchemaLoader,
+    sources::registry_scope::SharedRegistryScope,
+)> {
+    let backend = make_storage_backend().await;
+    let scope = sources::registry_scope::SharedRegistryScope::new("test");
+    sources::postgres::establish_registry_scope(
+        dsn, &backend, &scope, tenant, "test",
+    )
+    .await?;
+    Ok((
+        PostgresSchemaLoader::new(dsn, registry, tenant, scope.clone()),
+        scope,
     ))
+}
+
+/// Every version of one qualified table, read in bounded pages (test-only
+/// convenience over the production `history_page`).
+pub async fn registry_history(
+    registry: &DurableSchemaRegistry,
+    key: &storage::adapters::SchemaKey,
+) -> Vec<schema_registry::SchemaVersion> {
+    let mut out = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = registry
+            .history_page(key, cursor, 256)
+            .await
+            .expect("registry history page");
+        out.extend(page.versions);
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => return out,
+        }
+    }
 }
 
 /// Convenience: build a schema loader using the admin DSN for a given db.

@@ -10,9 +10,7 @@ use deltaforge_core::{
     BatchContext, Event, Op, Source, SourceHandle, SourceItem,
 };
 
-use sources::postgres::{
-    PostgresSchemaLoader, PostgresSource, pg_row_event_id,
-};
+use sources::postgres::{PostgresSource, pg_row_event_id};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::{
@@ -250,6 +248,7 @@ async fn make_source(
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry: make_registry().await,
+        registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         outbox_prefixes,
         snapshot_cfg: deltaforge_config::SnapshotCfg::default(),
         backend: make_storage_backend().await,
@@ -346,11 +345,12 @@ async fn postgres_schema_loader() -> Result<()> {
     client.execute("CREATE TABLE order_items (id SERIAL PRIMARY KEY, order_id INT, product VARCHAR(128))", &[]).await?;
 
     let registry = make_registry().await;
-    let loader = PostgresSchemaLoader::new(
+    let (loader, _scope) = test_common::pg_scoped_loader(
         &pg_admin_dsn(&db).await,
         registry.clone(),
         "acme",
-    );
+    )
+    .await?;
 
     // Single table load
     let loaded = loader.load_schema("public", "orders").await?;
@@ -2075,11 +2075,12 @@ async fn postgres_cdc_replica_identity_modes() -> Result<()> {
         .await?;
 
     let registry = make_registry().await;
-    let loader = PostgresSchemaLoader::new(
+    let (loader, _scope) = test_common::pg_scoped_loader(
         &pg_admin_dsn(&db).await,
         registry.clone(),
         "acme",
-    );
+    )
+    .await?;
 
     let default_schema = loader.load_schema("public", "ri_default").await?;
     assert_eq!(
@@ -2942,6 +2943,7 @@ async fn make_snap_source(
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry: make_registry().await,
+        registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         outbox_prefixes: AllowList::default(),
         snapshot_cfg,
         backend,
