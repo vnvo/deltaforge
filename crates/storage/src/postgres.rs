@@ -332,6 +332,17 @@ impl StorageBackend for PostgresStorageBackend {
         Ok(row.map(|r| (r.get::<_, i64>(0) as u64, r.get(1))))
     }
 
+    async fn log_ns_max_seq(&self, ns: &str) -> Result<u64> {
+        let c = client!(self);
+        let row = c
+            .query_one(
+                "SELECT COALESCE(MAX(seq), 0) FROM df_log WHERE ns=$1",
+                &[&ns],
+            )
+            .await?;
+        Ok(row.get::<_, i64>(0) as u64)
+    }
+
     async fn log_append_if_absent(
         &self,
         ns: &str,
@@ -853,6 +864,7 @@ mod tests {
         suite::pin_invariant(be.clone(), &format!("it{base}_pin")).await;
         suite::empty_vs_truncated(be.clone(), &format!("it{base}_empty")).await;
         suite::concurrent_appends(be.clone(), &format!("it{base}_conc")).await;
+        suite::ns_max_seq_scoped(be.clone(), &format!("it{base}_nsmax")).await;
     }
 
     /// The shared `slot_list` contract suite against a live PostgreSQL, exercising

@@ -6,14 +6,18 @@
 use std::sync::Arc;
 
 use checkpoints::CheckpointStore;
-use deltaforge_core::SchemaRegistry;
 use storage::{
     ArcStorageBackend, MemoryStorageBackend,
-    adapters::{BackendCheckpointStore, DurableSchemaRegistry},
+    adapters::{BackendCheckpointStore, DurableSchemaRegistry, SchemaKey},
 };
 
 #[cfg(feature = "sqlite")]
 use storage::SqliteStorageBackend;
+
+/// Build a fully-qualified schema key with a fixed test lineage hash.
+fn skey(tenant: &str, db: &str, table: &str) -> SchemaKey {
+    SchemaKey::new(tenant, "src", "testlineage", db, table)
+}
 
 async fn memory_backend() -> ArcStorageBackend {
     Arc::new(MemoryStorageBackend::new())
@@ -250,9 +254,7 @@ async fn schema_registry_cold_start_replay() {
             let reg = DurableSchemaRegistry::new(Arc::clone(&b)).await.unwrap();
             let v1 = reg
                 .register_with_checkpoint(
-                    "t",
-                    "db",
-                    "tbl",
+                    &skey("t", "db", "tbl"),
                     "h1",
                     &serde_json::json!({"cols":["id"]}),
                     Some(b"cp1"),
@@ -264,9 +266,7 @@ async fn schema_registry_cold_start_replay() {
             // Idempotent: same hash → same version
             let v1b = reg
                 .register_with_checkpoint(
-                    "t",
-                    "db",
-                    "tbl",
+                    &skey("t", "db", "tbl"),
                     "h1",
                     &serde_json::json!({"cols":["id"]}),
                     None,
@@ -276,9 +276,7 @@ async fn schema_registry_cold_start_replay() {
             assert_eq!(v1b, 1);
 
             reg.register_with_checkpoint(
-                "t",
-                "db",
-                "tbl",
+                &skey("t", "db", "tbl"),
                 "h2",
                 &serde_json::json!({"cols":["id","name"]}),
                 None,
@@ -287,13 +285,25 @@ async fn schema_registry_cold_start_replay() {
             .unwrap();
         }
 
-        // Cold-start: new registry from same backend should replay log
+        // Cold-start: new registry reads persisted versions lazily on demand.
         let reg2 = DurableSchemaRegistry::new(Arc::clone(&b)).await.unwrap();
-        let versions = reg2.list_versions("t", "db", "tbl");
+        let page = reg2
+            .history_page(&skey("t", "db", "tbl"), None, 10)
+            .await
+            .unwrap();
+        let versions = page.versions;
+        assert_eq!(
+            reg2.get_latest(&skey("t", "db", "tbl"))
+                .await
+                .unwrap()
+                .unwrap()
+                .hash,
+            "h2"
+        );
         assert_eq!(
             versions.len(),
             2,
-            "both schema versions should be replayed"
+            "both schema versions should be read back"
         );
         assert_eq!(versions[0].hash, "h1");
         assert_eq!(versions[1].hash, "h2");
@@ -311,22 +321,38 @@ async fn schema_registry_get_at_sequence() {
     for_each_backend!(|b: ArcStorageBackend| async move {
         let reg = DurableSchemaRegistry::new(Arc::clone(&b)).await.unwrap();
 
-        reg.register("t", "db", "tbl", "h1", &serde_json::json!({}))
-            .await
-            .unwrap();
+        reg.register_with_checkpoint(
+            &skey("t", "db", "tbl"),
+            "h1",
+            &serde_json::json!({}),
+            None,
+        )
+        .await
+        .unwrap();
         let seq_after_v1 = reg.current_sequence();
 
-        reg.register("t", "db", "tbl", "h2", &serde_json::json!({}))
-            .await
-            .unwrap();
+        reg.register_with_checkpoint(
+            &skey("t", "db", "tbl"),
+            "h2",
+            &serde_json::json!({}),
+            None,
+        )
+        .await
+        .unwrap();
 
         // At seq_after_v1, should resolve v1
-        let sv = reg.get_at_sequence("t", "db", "tbl", seq_after_v1).unwrap();
+        let sv = reg
+            .get_at_sequence(&skey("t", "db", "tbl"), seq_after_v1)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(sv.version, 1);
 
         // Latest seq resolves v2
         let sv = reg
-            .get_at_sequence("t", "db", "tbl", reg.current_sequence())
+            .get_at_sequence(&skey("t", "db", "tbl"), reg.current_sequence())
+            .await
+            .unwrap()
             .unwrap();
         assert_eq!(sv.version, 2);
     });
@@ -423,20 +449,36 @@ async fn schema_registry_multi_tenant_isolation() {
     for_each_backend!(|b: ArcStorageBackend| async move {
         let reg = DurableSchemaRegistry::new(Arc::clone(&b)).await.unwrap();
 
-        reg.register("tenant-a", "db", "orders", "h1", &serde_json::json!({}))
+        reg.register_with_checkpoint(
+            &skey("tenant-a", "db", "orders"),
+            "h1",
+            &serde_json::json!({}),
+            None,
+        )
+        .await
+        .unwrap();
+        reg.register_with_checkpoint(
+            &skey("tenant-b", "db", "orders"),
+            "h2",
+            &serde_json::json!({}),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let va = reg
+            .get_latest(&skey("tenant-a", "db", "orders"))
             .await
+            .unwrap()
             .unwrap();
-        reg.register("tenant-b", "db", "orders", "h2", &serde_json::json!({}))
+        let vb = reg
+            .get_latest(&skey("tenant-b", "db", "orders"))
             .await
+            .unwrap()
             .unwrap();
 
-        let va = reg.list_versions("tenant-a", "db", "orders");
-        let vb = reg.list_versions("tenant-b", "db", "orders");
-
-        assert_eq!(va.len(), 1);
-        assert_eq!(vb.len(), 1);
-        assert_eq!(va[0].hash, "h1");
-        assert_eq!(vb[0].hash, "h2");
+        assert_eq!((va.version, va.hash.as_str()), (1, "h1"));
+        assert_eq!((vb.version, vb.hash.as_str()), (1, "h2"));
     });
 }
 
@@ -445,17 +487,32 @@ async fn schema_registry_sequence_monotonic_across_tables() {
     for_each_backend!(|b: ArcStorageBackend| async move {
         let reg = DurableSchemaRegistry::new(Arc::clone(&b)).await.unwrap();
 
-        reg.register("t", "db", "tbl1", "h1", &serde_json::json!({}))
-            .await
-            .unwrap();
+        reg.register_with_checkpoint(
+            &skey("t", "db", "tbl1"),
+            "h1",
+            &serde_json::json!({}),
+            None,
+        )
+        .await
+        .unwrap();
         let s1 = reg.current_sequence();
-        reg.register("t", "db", "tbl2", "h1", &serde_json::json!({}))
-            .await
-            .unwrap();
+        reg.register_with_checkpoint(
+            &skey("t", "db", "tbl2"),
+            "h1",
+            &serde_json::json!({}),
+            None,
+        )
+        .await
+        .unwrap();
         let s2 = reg.current_sequence();
-        reg.register("t", "db", "tbl1", "h2", &serde_json::json!({}))
-            .await
-            .unwrap();
+        reg.register_with_checkpoint(
+            &skey("t", "db", "tbl1"),
+            "h2",
+            &serde_json::json!({}),
+            None,
+        )
+        .await
+        .unwrap();
         let s3 = reg.current_sequence();
 
         assert!(
@@ -471,21 +528,44 @@ async fn schema_registry_cold_start_sequence_continues() {
     for_each_backend!(|b: ArcStorageBackend| async move {
         let seq_before_restart = {
             let reg = DurableSchemaRegistry::new(Arc::clone(&b)).await.unwrap();
-            reg.register("t", "db", "tbl", "h1", &serde_json::json!({}))
-                .await
-                .unwrap();
+            reg.register_with_checkpoint(
+                &skey("t", "db", "tbl"),
+                "h1",
+                &serde_json::json!({}),
+                None,
+            )
+            .await
+            .unwrap();
             reg.current_sequence()
         };
 
         let reg2 = DurableSchemaRegistry::new(Arc::clone(&b)).await.unwrap();
-        reg2.register("t", "db", "tbl", "h2", &serde_json::json!({}))
-            .await
-            .unwrap();
+        reg2.register_with_checkpoint(
+            &skey("t", "db", "tbl"),
+            "h2",
+            &serde_json::json!({}),
+            None,
+        )
+        .await
+        .unwrap();
         let seq_after_restart = reg2.current_sequence();
 
         assert!(
             seq_after_restart > seq_before_restart,
             "sequence must continue after cold-start replay: {seq_after_restart} > {seq_before_restart}"
         );
+    });
+}
+
+#[tokio::test]
+async fn log_ns_max_seq_is_namespace_scoped() {
+    for_each_backend!(|b: ArcStorageBackend| async move {
+        assert_eq!(b.log_ns_max_seq("schemas").await.unwrap(), 0);
+        b.log_append("schemas", "t/db/a", b"1").await.unwrap();
+        let top = b.log_append("schemas", "t/db/b", b"2").await.unwrap();
+        // Later appends in another namespace must not leak into the result.
+        b.log_append("journal", "x", b"3").await.unwrap();
+        assert_eq!(b.log_ns_max_seq("schemas").await.unwrap(), top);
+        assert!(b.log_ns_max_seq("journal").await.unwrap() > top);
     });
 }

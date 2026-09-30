@@ -409,6 +409,18 @@ impl StorageBackend for SqliteStorageBackend {
         })
     }
 
+    async fn log_ns_max_seq(&self, ns: &str) -> Result<u64> {
+        let ns = ns.to_string();
+        db!(self, move |conn: &Connection| {
+            let seq: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM df_log WHERE ns=?1",
+                params![ns],
+                |r| r.get(0),
+            )?;
+            Ok(seq as u64)
+        })
+    }
+
     async fn log_append_if_absent(
         &self,
         ns: &str,
@@ -970,6 +982,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_appends() {
         crate::log_contract_suite::concurrent_appends(be(), "journal").await;
+        crate::log_contract_suite::ns_max_seq_scoped(be(), "nsmax").await;
     }
 
     // slot_list contract suite.
