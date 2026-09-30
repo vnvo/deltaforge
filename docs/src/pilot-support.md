@@ -31,6 +31,23 @@ Run **one DeltaForge instance per source (per replication slot / binlog reader)*
 - **MySQL**: each instance derives its replication `server_id` from the source `id`; give each source a unique `id` to avoid `server_id` collisions on the same MySQL server.
 - **Failover**: for planned HA, use GTID (MySQL) and a slot-aware HA tool (for example Patroni `permanent_slots`) so the replication position survives a primary change. See [Failover Handling](failover.md).
 
+## Deployment preflight
+
+Before deploying a pipeline, validate its config against the live source:
+
+```
+deltaforge preflight <config-file-or-dir>      # human-readable report
+deltaforge preflight <config-file-or-dir> --json   # machine-readable report
+```
+
+Preflight resolves the config's secrets and source DSN exactly as startup does, connects to the source, and runs the source checks plus local config validation. It exits non-zero (fail closed) if any check fails, so it is safe to gate a deploy on it in CI/CD.
+
+- **PostgreSQL**: `wal_level = logical`; the replication slot exists, is valid, and its WAL is retained; the publication exists and has tables; WAL-retention capacity vs estimated snapshot size.
+- **MySQL**: `log_bin` on, `binlog_format = ROW`, `gtid_mode = ON`, the `RELOAD` privilege (when a snapshot will run), captured tables on InnoDB, binlog retention window.
+- **Both**: connectivity and credential resolution (a missing secret fails here), commit-policy validity vs sink count, and at least one sink configured.
+
+Wildcard table patterns are reported as not validated per-table (server-level checks still run). **Sink reachability is not yet probed** - preflight validates the source and config, not sink endpoints.
+
 ## Required privileges
 
 ### PostgreSQL

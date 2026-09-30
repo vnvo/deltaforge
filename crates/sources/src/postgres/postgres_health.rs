@@ -520,6 +520,23 @@ pub async fn fetch_server_identity(
     Ok(identity)
 }
 
+/// Read the server's `wal_level`. Logical replication (all DeltaForge PostgreSQL
+/// CDC) requires `wal_level = logical`; a deployment preflight uses this to catch
+/// a misconfigured server before a pipeline is started.
+pub async fn fetch_wal_level(dsn: &str) -> Result<String> {
+    let (client, conn) = tokio_postgres::connect(dsn, NoTls)
+        .await
+        .context("fetch_wal_level: connect failed")?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let row = client
+        .query_one("SHOW wal_level", &[])
+        .await
+        .context("fetch_wal_level: query failed")?;
+    Ok(row.get(0))
+}
+
 // ============================================================================
 // Position Reachability
 // ============================================================================
