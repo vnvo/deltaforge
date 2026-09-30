@@ -75,8 +75,12 @@ use crate::failover::identity::{
 use crate::failover::reconciler::{ReconcileInput, SchemaReconciler};
 use crate::postgres::postgres_health::{
     PositionReachability, PostgresServerIdentity, check_position_reachability,
-    fetch_server_identity,
 };
+use crate::registry_scope::{
+    RegistryError, ScopeChange, SharedRegistryScope, establish_scope,
+    previous_scope,
+};
+use storage::adapters::LineageDescriptor;
 
 // ============================================================================
 // Checkpoint
@@ -104,6 +108,9 @@ pub struct PostgresSource {
     pub tenant: String,
     pub pipeline: String,
     pub registry: Arc<DurableSchemaRegistry>,
+    /// Verified-lineage scope shared with the pipeline's schema loaders. The
+    /// source establishes it before any registry access.
+    pub registry_scope: crate::registry_scope::SharedRegistryScope,
     pub backend: ArcStorageBackend,
     pub outbox_prefixes: AllowList,
     pub snapshot_cfg: deltaforge_config::SnapshotCfg,
@@ -164,6 +171,10 @@ pub(crate) struct RunCtx {
     pub outbox_prefixes: AllowList,
     pub identity_store: IdentityStore,
     pub reconciler: SchemaReconciler,
+    /// Verified-lineage registry scope (shared with the pipeline's loaders).
+    pub registry_scope: SharedRegistryScope,
+    /// Backend holding the durable source-lineage record.
+    pub registry_backend: ArcStorageBackend,
     pub on_schema_drift: OnSchemaDrift,
     /// Cached metrics counter handles keyed by (qualified_table_name, op).
     /// Avoids hash-lookup + key-comparison in the metrics registry per event.
@@ -335,6 +346,20 @@ impl PostgresSource {
         paused: Arc<AtomicBool>,
         pause_notify: Arc<Notify>,
     ) -> SourceResult<()> {
+        // Verify the physical lineage (cluster system_identifier + database OID)
+        // and establish the schema-registry scope BEFORE any registry access:
+        // persist it durably (fail closed), then publish it to this pipeline's
+        // loaders. A replaced database therefore gets a fresh schema namespace
+        // instead of inheriting schemas through a reused source id.
+        establish_registry_scope(
+            self.dsn.expose(),
+            &self.backend,
+            &self.registry_scope,
+            &self.tenant,
+            &self.id,
+        )
+        .await?;
+
         let (components, config, last_checkpoint) = prepare_replication_client(
             self.dsn.expose(),
             &self.id,
@@ -455,6 +480,7 @@ impl PostgresSource {
             self.dsn.clone(),
             self.registry.clone(),
             &self.tenant,
+            self.registry_scope.clone(),
         );
         let tracked = schema_loader.preload(&self.tables).await?;
         info!(tables = tracked.len(), "schemas preloaded");
@@ -564,15 +590,19 @@ impl PostgresSource {
             .set(if unsafe_legacy { 1.0 } else { 0.0 });
         }
 
-        // Fetch the verified, nonzero cluster identity exactly ONCE before
-        // opening replication. The same authority is reused for the pre-connect
-        // LSN adjustment, the provisional row/DDL/message ids, and the initial
-        // failover identity check. If the lineage cannot be verified we fail
-        // closed rather than open replication on an unknown server.
-        let startup_identity =
-            fetch_pg_identity_verified(self.dsn.expose()).await?;
-        let system_identifier = startup_identity.system_identifier as u64;
-        let startup_server_identity = ServerIdentity::from(startup_identity);
+        // Re-verify the lineage immediately before opening replication (a
+        // snapshot may have run since the startup read, and the server may have
+        // failed over meanwhile). The same verified read is reused for the
+        // pre-connect LSN adjustment, the provisional row/DDL/message ids, the
+        // initial failover identity check, and the registry-scope comparison.
+        // If the lineage cannot be verified we fail closed rather than open
+        // replication on an unknown server.
+        let stream_lineage =
+            fetch_pg_lineage_verified(self.dsn.expose()).await?;
+        let system_identifier =
+            stream_lineage.identity.system_identifier as u64;
+        let startup_server_identity =
+            ServerIdentity::from(stream_lineage.identity.clone());
 
         // Adjust start_lsn BEFORE opening the replication stream.
         // If a failover has occurred, START_REPLICATION with A's stale LSN would
@@ -640,8 +670,9 @@ impl PostgresSource {
             reconciler: SchemaReconciler::new(
                 Arc::clone(&self.registry),
                 Arc::clone(&backend),
-                self.tenant.clone(),
             ),
+            registry_scope: self.registry_scope.clone(),
+            registry_backend: Arc::clone(&backend),
             on_schema_drift: self.on_schema_drift.clone(),
             counter_cache: HashMap::new(),
             cached_lsn: None,
@@ -649,8 +680,11 @@ impl PostgresSource {
 
         // Store initial server identity (FirstSeen path). Reuse the lineage
         // already verified above rather than re-fetching it.
-        check_identity_post_reconnect(&mut ctx, Some(startup_server_identity))
-            .await?;
+        check_identity_post_reconnect(
+            &mut ctx,
+            Some((stream_lineage.descriptor, startup_server_identity)),
+        )
+        .await?;
 
         // If failover was detected, ctx.last_lsn was reset to B's slot position.
         // The existing stream was opened from A's stale LSN - reconnect from the correct point.
@@ -1170,26 +1204,47 @@ impl Source for PostgresSource {
 /// failing closed.
 const IDENTITY_FETCH_ATTEMPTS: u32 = 5;
 
-/// Fetch the PostgreSQL cluster identity, failing closed.
+/// Verified PostgreSQL lineage: the schema-registry descriptor and the failover
+/// identity, derived from the same live read.
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedPgLineage {
+    pub descriptor: LineageDescriptor,
+    pub identity: PostgresServerIdentity,
+}
+
+/// Fetch and verify the PostgreSQL lineage (cluster `system_identifier` +
+/// current database OID), failing closed.
 ///
 /// Retries a bounded number of times on transient fetch errors, then returns an
 /// error rather than proceeding on an unverified lineage. A `None` result
-/// (`pg_control_system()` restricted/unsupported) or a zero `system_identifier`
-/// is treated as unverifiable: we refuse to stream rather than freeze a bogus
-/// lineage into event IDs and the failover check. This is the single authority
-/// used for both provisional event IDs and identity comparison.
-async fn fetch_pg_identity_verified(
+/// (`pg_control_system()` restricted/unsupported) or a zero identifier is
+/// unverifiable: we refuse to stream rather than freeze a bogus lineage into
+/// event IDs, the failover check, or schema-registry keys. This is the single
+/// authority for provisional event IDs, identity comparison, and the registry
+/// scope.
+async fn fetch_pg_lineage_verified(
     dsn: &str,
-) -> SourceResult<PostgresServerIdentity> {
+) -> SourceResult<VerifiedPgLineage> {
     let mut attempt = 0u32;
     loop {
-        match fetch_server_identity(dsn).await {
-            Ok(Some(id)) if id.system_identifier != 0 => return Ok(id),
-            Ok(Some(_)) => {
-                return Err(SourceError::Other(anyhow::anyhow!(
-                    "server identity has a zero system_identifier; cannot \
-                     verify cluster lineage - refusing to stream"
-                )));
+        match postgres_health::fetch_registry_lineage(dsn).await {
+            Ok(Some((sysid, dboid))) => {
+                if sysid == 0 || dboid == 0 {
+                    return Err(SourceError::Other(anyhow::anyhow!(
+                        "server lineage has a zero system_identifier or \
+                         database oid; cannot verify cluster lineage - \
+                         refusing to stream"
+                    )));
+                }
+                let descriptor =
+                    LineageDescriptor::postgres(sysid as u64, dboid as u64)
+                        .map_err(SourceError::Other)?;
+                return Ok(VerifiedPgLineage {
+                    descriptor,
+                    identity: PostgresServerIdentity {
+                        system_identifier: sysid,
+                    },
+                });
             }
             Ok(None) => {
                 return Err(SourceError::Other(anyhow::anyhow!(
@@ -1217,6 +1272,134 @@ async fn fetch_pg_identity_verified(
                 .await;
             }
         }
+    }
+}
+
+/// Verify the live PostgreSQL lineage and establish it as the registry scope of
+/// `(tenant, source_id)`: durably recorded (fail closed), then published into
+/// `shared`. This is the startup step every PostgreSQL source runs before any
+/// schema-registry access.
+pub async fn establish_registry_scope(
+    dsn: &str,
+    backend: &ArcStorageBackend,
+    shared: &SharedRegistryScope,
+    tenant: &str,
+    source_id: &str,
+) -> SourceResult<ScopeChange> {
+    let lineage = fetch_pg_lineage_verified(dsn).await?;
+    Ok(
+        establish_scope(backend, shared, tenant, source_id, lineage.descriptor)
+            .await?,
+    )
+}
+
+/// Bring the published registry scope in line with a lineage just verified
+/// against the live server, before any further registry access.
+///
+/// - Unchanged: nothing to do (loader caches stay warm).
+/// - A different cluster (`system_identifier` changed): a failover to another
+///   server; the new lineage is durably recorded and published, which gives it
+///   a fresh schema namespace and invalidates caches from the old lineage.
+///   Failure to persist fails closed.
+/// - Same cluster but a different database OID: the database was replaced under
+///   the running source. That is not a failover; fail closed.
+async fn sync_registry_lineage(
+    ctx: &RunCtx,
+    live: &LineageDescriptor,
+) -> SourceResult<()> {
+    let current = ctx.registry_scope.current()?;
+    let expected = &current.lineage().descriptor;
+    match lineage_transition(expected, live) {
+        LineageTransition::Same => return Ok(()),
+        LineageTransition::ReplacedDatabase => {
+            return Err(RegistryError::LineageMismatch {
+                source_id: ctx.source_id.clone(),
+                expected: format!("{expected:?}"),
+                live: format!("{live:?}"),
+            }
+            .into());
+        }
+        LineageTransition::Failover => {}
+    }
+    let change = establish_scope(
+        &ctx.registry_backend,
+        &ctx.registry_scope,
+        &ctx.tenant,
+        &ctx.source_id,
+        live.clone(),
+    )
+    .await?;
+    warn!(
+        source_id = %ctx.source_id,
+        lineage = %change.scope.lineage().lineage_hash,
+        "source lineage changed; schema registry re-scoped to the new server"
+    );
+    Ok(())
+}
+
+/// How a running PostgreSQL source's verified lineage moved.
+#[derive(Debug, PartialEq, Eq)]
+enum LineageTransition {
+    Same,
+    /// A different cluster: failover to another server (supported).
+    Failover,
+    /// Same cluster, different database OID: the database was replaced under a
+    /// running source. Not a failover; fail closed.
+    ReplacedDatabase,
+}
+
+fn lineage_transition(
+    expected: &LineageDescriptor,
+    live: &LineageDescriptor,
+) -> LineageTransition {
+    if expected == live {
+        return LineageTransition::Same;
+    }
+    match (expected, live) {
+        (
+            LineageDescriptor::Postgres {
+                system_identifier: a,
+                ..
+            },
+            LineageDescriptor::Postgres {
+                system_identifier: b,
+                ..
+            },
+        ) if a == b => LineageTransition::ReplacedDatabase,
+        _ => LineageTransition::Failover,
+    }
+}
+
+#[cfg(test)]
+mod lineage_transition_tests {
+    use super::*;
+
+    fn pg(sysid: u64, dboid: u64) -> LineageDescriptor {
+        LineageDescriptor::postgres(sysid, dboid).unwrap()
+    }
+
+    #[test]
+    fn unchanged_lineage_is_same() {
+        assert_eq!(
+            lineage_transition(&pg(1, 5), &pg(1, 5)),
+            LineageTransition::Same
+        );
+    }
+
+    #[test]
+    fn different_cluster_is_a_failover() {
+        assert_eq!(
+            lineage_transition(&pg(1, 5), &pg(2, 5)),
+            LineageTransition::Failover
+        );
+    }
+
+    #[test]
+    fn same_cluster_new_database_fails_closed() {
+        assert_eq!(
+            lineage_transition(&pg(1, 5), &pg(1, 6)),
+            LineageTransition::ReplacedDatabase
+        );
     }
 }
 
@@ -1290,18 +1473,22 @@ async fn pre_connect_lsn_adjust(
 
 async fn check_identity_post_reconnect(
     ctx: &mut RunCtx,
-    prefetched: Option<ServerIdentity>,
+    prefetched: Option<(LineageDescriptor, ServerIdentity)>,
 ) -> SourceResult<()> {
     // Reuse a lineage already verified by the caller (startup), or fetch and
     // verify one here (reconnect). Either way a live identity is required: an
     // unverifiable identity fails closed rather than silently skipping the
     // failover check.
-    let live = match prefetched {
-        Some(live) => live,
-        None => fetch_pg_identity_verified(ctx.dsn.expose())
-            .await
-            .map(ServerIdentity::from)?,
+    let (descriptor, live) = match prefetched {
+        Some(pair) => pair,
+        None => {
+            let verified = fetch_pg_lineage_verified(ctx.dsn.expose()).await?;
+            (verified.descriptor, ServerIdentity::from(verified.identity))
+        }
     };
+    // Re-scope the registry to the live lineage before any registry access on
+    // this connection (fails closed on a replaced database or a persist error).
+    sync_registry_lineage(ctx, &descriptor).await?;
 
     match ctx
         .identity_store
@@ -1440,9 +1627,14 @@ async fn run_failover_reconciliation(
             });
         }
 
+        // Diff against the last-known schemas of the lineage the source ran
+        // under before this failover (read explicitly from its namespace).
+        let prior =
+            previous_scope(&ctx.registry_backend, &ctx.tenant, &ctx.source_id)
+                .await?;
         let record = ctx
             .reconciler
-            .run(&ctx.source_id, &previous, &current, &inputs)
+            .run(&ctx.source_id, &previous, &current, prior.as_ref(), &inputs)
             .await
             .map_err(SourceError::Other)?;
 
@@ -1726,7 +1918,12 @@ mod schema_drift_policy_tests {
         let backend = Arc::new(MemoryStorageBackend::new());
         let registry =
             DurableSchemaRegistry::new(backend).await.expect("registry");
-        PostgresSchemaLoader::new(dsn, registry, "acme")
+        let scope = crate::registry_scope::SharedRegistryScope::new("src");
+        scope.publish_for_test(
+            "acme",
+            storage::adapters::LineageDescriptor::postgres(1, 1).unwrap(),
+        );
+        PostgresSchemaLoader::new(dsn, registry, "acme", scope)
     }
 
     fn drift() -> SchemaDrift {
@@ -1770,7 +1967,7 @@ mod schema_drift_policy_tests {
 mod identity_fail_closed_tests {
     //! R3-C2: PostgreSQL identity/lineage authority fails closed.
     //!
-    //! These exercise the real production functions (`fetch_pg_identity_verified`,
+    //! These exercise the real production functions (`fetch_pg_lineage_verified`,
     //! `pre_connect_lsn_adjust`) directly. Container-backed failover behaviour is
     //! covered by `tests/failover_e2e.rs`; here we prove that when the identity
     //! store or the live position authority is unavailable, we refuse to open the
@@ -1895,6 +2092,9 @@ mod identity_fail_closed_tests {
             key: &str,
         ) -> anyhow::Result<Option<(u64, Vec<u8>)>> {
             self.inner.log_latest(ns, key).await
+        }
+        async fn log_ns_max_seq(&self, ns: &str) -> anyhow::Result<u64> {
+            self.inner.log_ns_max_seq(ns).await
         }
         async fn log_append_if_absent(
             &self,
@@ -2023,7 +2223,7 @@ mod identity_fail_closed_tests {
         // The live identity query cannot reach the server: after bounded retries
         // this must return an error, never a silently-absent identity that would
         // let the stream open on an unknown lineage.
-        let err = fetch_pg_identity_verified(UNREACHABLE_DSN)
+        let err = fetch_pg_lineage_verified(UNREACHABLE_DSN)
             .await
             .expect_err("unreachable server must fail closed");
         let msg = err.to_string();

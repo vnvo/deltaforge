@@ -219,6 +219,39 @@ impl SqliteStorageBackend {
     }
 }
 
+// SQLite cannot turn `(? IS NULL OR key >= ?)` into an index bound, so the
+// key-range queries below include only the bounds that exist; each present
+// bound is then part of the `(ns, key)` primary-key range (BINARY collation =
+// byte-wise, matching the in-memory backend).
+
+/// `kv_list` with a prefix: `[?1 ns, ?2 lower, ?3 upper?, now]`.
+fn kv_list_prefix_sql(has_upper: bool) -> &'static str {
+    if has_upper {
+        "SELECT key FROM df_kv WHERE ns=?1 AND key >= ?2 AND key < ?3
+         AND (expires_at IS NULL OR expires_at > ?4) ORDER BY key"
+    } else {
+        "SELECT key FROM df_kv WHERE ns=?1 AND key >= ?2
+         AND (expires_at IS NULL OR expires_at > ?3) ORDER BY key"
+    }
+}
+
+/// `slot_list`: parameters in order ns, [lower], [upper], [after], limit.
+fn slot_list_sql(lower: bool, upper: bool, after: bool) -> String {
+    let mut sql =
+        String::from("SELECT key, version, state FROM df_slot WHERE ns = ?");
+    if lower {
+        sql.push_str(" AND key >= ?");
+    }
+    if upper {
+        sql.push_str(" AND key < ?");
+    }
+    if after {
+        sql.push_str(" AND key > ?");
+    }
+    sql.push_str(" ORDER BY key ASC LIMIT ?");
+    sql
+}
+
 /// Dispatch a closure to the blocking thread pool with the locked connection.
 macro_rules! db {
     ($self:expr, $body:expr) => {{
@@ -312,20 +345,28 @@ impl StorageBackend for SqliteStorageBackend {
         prefix: Option<&str>,
     ) -> Result<Vec<String>> {
         let ns = ns.to_string();
-        let prefix_pat = prefix.map(|p| format!("{p}%"));
+        // Literal, byte-wise "starts with": a range on the key (never LIKE,
+        // whose `%`/`_` wildcards and ASCII case-folding would match other
+        // keys). Same semantics as the in-memory `starts_with`.
+        let bounds =
+            prefix.map(|p| (p.to_string(), crate::prefix_successor(p)));
         let now = now_secs();
         db!(self, move |conn: &Connection| {
             let mut keys = Vec::new();
-            if let Some(pat) = &prefix_pat {
-                let mut stmt = conn.prepare(
-                    "SELECT key FROM df_kv WHERE ns=?1 AND key LIKE ?2
-                     AND (expires_at IS NULL OR expires_at > ?3) ORDER BY key",
-                )?;
-                let rows =
-                    stmt.query_map(params![ns, pat, now], |r| r.get(0))?;
-                for r in rows {
-                    keys.push(r?);
-                }
+            if let Some((lower, upper)) = &bounds {
+                let mut stmt =
+                    conn.prepare(kv_list_prefix_sql(upper.is_some()))?;
+                let rows: Vec<String> = match upper {
+                    Some(upper) => stmt
+                        .query_map(params![ns, lower, upper, now], |r| {
+                            r.get(0)
+                        })?
+                        .collect::<rusqlite::Result<_>>()?,
+                    None => stmt
+                        .query_map(params![ns, lower, now], |r| r.get(0))?
+                        .collect::<rusqlite::Result<_>>()?,
+                };
+                keys.extend(rows);
             } else {
                 let mut stmt = conn.prepare(
                     "SELECT key FROM df_kv WHERE ns=?1
@@ -406,6 +447,18 @@ impl StorageBackend for SqliteStorageBackend {
             )
             .optional()
             .map_err(Into::into)
+        })
+    }
+
+    async fn log_ns_max_seq(&self, ns: &str) -> Result<u64> {
+        let ns = ns.to_string();
+        db!(self, move |conn: &Connection| {
+            let seq: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM df_log WHERE ns=?1",
+                params![ns],
+                |r| r.get(0),
+            )?;
+            Ok(seq as u64)
         })
     }
 
@@ -773,25 +826,25 @@ impl StorageBackend for SqliteStorageBackend {
         // Comparison uses SQLite's default BINARY collation (case-sensitive,
         // byte-wise), matching the in-memory `starts_with`/`>` semantics.
         db!(self, move |conn: &Connection| {
-            let mut stmt = conn.prepare(
-                "SELECT key, version, state FROM df_slot
-                 WHERE ns = ?1
-                   AND (?2 IS NULL OR key >= ?2)
-                   AND (?3 IS NULL OR key <  ?3)
-                   AND (?4 IS NULL OR key >  ?4)
-                 ORDER BY key ASC
-                 LIMIT ?5",
-            )?;
-            let rows = stmt.query_map(
-                params![ns, lower, upper, after, (eff as i64) + 1],
-                |r| {
+            use rusqlite::types::Value as V;
+            let mut stmt = conn.prepare(&slot_list_sql(
+                lower.is_some(),
+                upper.is_some(),
+                after.is_some(),
+            ))?;
+            let mut args = vec![V::Text(ns.clone())];
+            args.extend(
+                [lower, upper, after].into_iter().flatten().map(V::Text),
+            );
+            args.push(V::Integer((eff as i64) + 1));
+            let rows =
+                stmt.query_map(rusqlite::params_from_iter(args), |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, i64>(1)? as u64,
                         r.get::<_, Vec<u8>>(2)?,
                     ))
-                },
-            )?;
+                })?;
             let mut all: Vec<(String, u64, Vec<u8>)> = Vec::new();
             for row in rows {
                 all.push(row?);
@@ -970,6 +1023,65 @@ mod tests {
     #[tokio::test]
     async fn concurrent_appends() {
         crate::log_contract_suite::concurrent_appends(be(), "journal").await;
+        crate::log_contract_suite::ns_max_seq_scoped(be(), "nsmax").await;
+    }
+
+    /// Every prefix/cursor shape of `kv_list` and `slot_list` is a bounded
+    /// range on the `(ns, key)` primary key: no table scan, and every present
+    /// bound is part of the index search.
+    #[tokio::test]
+    async fn prefix_listings_are_primary_key_ranges() {
+        let be = SqliteStorageBackend::in_memory().unwrap();
+        let conn = be.conn.lock().unwrap();
+        let plan = |sql: &str, n: usize| -> String {
+            let placeholders: Vec<rusqlite::types::Value> = (0..n)
+                .map(|_| rusqlite::types::Value::Text("x".into()))
+                .collect();
+            let mut stmt =
+                conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(placeholders), |r| {
+                    r.get::<_, String>(3)
+                })
+                .unwrap();
+            rows.map(|r| r.unwrap()).collect::<Vec<_>>().join(" | ")
+        };
+        let mut cases = vec![
+            (kv_list_prefix_sql(true).to_string(), 4, "key>? AND key<?"),
+            (kv_list_prefix_sql(false).to_string(), 3, "key>?"),
+        ];
+        for (l, u, a) in [
+            (true, true, false),
+            (true, true, true),
+            (true, false, false),
+            (false, false, true),
+            (true, false, true),
+        ] {
+            let n = 2 + [l, u, a].iter().filter(|b| **b).count();
+            let want = match (l || a, u) {
+                (true, true) => "key>? AND key<?",
+                (true, false) => "key>?",
+                (false, _) => "key<?",
+            };
+            cases.push((slot_list_sql(l, u, a), n, want));
+        }
+        for (sql, n, want) in cases {
+            let p = plan(&sql, n);
+            assert!(!p.contains("SCAN"), "table scan: {p}\n{sql}");
+            assert!(
+                p.contains("PRIMARY KEY") || p.contains("sqlite_autoindex"),
+                "not the (ns, key) index: {p}"
+            );
+            assert!(
+                p.contains(&format!("ns=? AND {want}")),
+                "bounds not in the index search: {p}\n{sql}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kv_list_prefix_is_literal() {
+        crate::kv_list_contract_suite::literal_prefix(be(), "kvp").await;
     }
 
     // slot_list contract suite.

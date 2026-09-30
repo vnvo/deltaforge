@@ -1263,6 +1263,9 @@ mod tests {
         ) -> Result<Option<(u64, Vec<u8>)>> {
             self.inner.log_latest(ns, key).await
         }
+        async fn log_ns_max_seq(&self, ns: &str) -> Result<u64> {
+            self.inner.log_ns_max_seq(ns).await
+        }
         async fn log_append_if_absent(
             &self,
             ns: &str,

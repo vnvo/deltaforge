@@ -520,9 +520,7 @@ impl KafkaSink {
                     error = %e,
                     "Avro encoding failed"
                 );
-                SinkError::Serialization {
-                    details: e.to_string().into(),
-                }
+                e.into_sink_error()
             })?;
 
         Ok(bytes.to_vec())

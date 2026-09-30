@@ -432,6 +432,7 @@ async fn start_rotation_harness(
         tenant: "acme".to_string(),
         pipeline: "test".to_string(),
         registry: make_registry().await,
+        registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         backend: Arc::clone(&backend),
         outbox_tables: AllowList::default(),
         snapshot_cfg: SnapshotCfg {
@@ -905,6 +906,7 @@ async fn mysql_projected_symlink_resolves_through_genuine_build_path()
         &spec,
         dsn,
         make_registry().await,
+        sources::registry_scope::SharedRegistryScope::default(),
         make_storage_backend().await,
         resolver,
     )

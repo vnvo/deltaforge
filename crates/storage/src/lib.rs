@@ -82,6 +82,12 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
         key: &str,
     ) -> Result<Option<(u64, Vec<u8>)>>;
 
+    /// Highest seq among entries currently retained in namespace `ns` (0 if
+    /// none), computed backend-side without returning any entry. Intended for
+    /// one-time bootstraps of a durable per-namespace high-water record, not for
+    /// the hot path.
+    async fn log_ns_max_seq(&self, ns: &str) -> Result<u64>;
+
     /// Append `value` under a deterministic capture identity, idempotently and
     /// atomically. The backend computes the content digest from `value` itself and
     /// never trusts a caller-supplied one.
@@ -218,6 +224,9 @@ pub trait StorageBackend: Send + Sync + std::fmt::Debug {
 }
 
 pub type ArcStorageBackend = Arc<dyn StorageBackend>;
+
+/// KV namespace of source checkpoints (see [`adapters::BackendCheckpointStore`]).
+pub const CHECKPOINTS_NS: &str = "checkpoints";
 
 /// Whether an idempotent append inserted a new entry or matched an existing one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -691,6 +700,72 @@ pub(crate) mod log_contract_suite {
         assert_eq!(oks, 1, "exactly one insert wins");
         assert_eq!(conflicts, 1, "the other is a conflict");
         assert_eq!(be.log_since(&ns, "s:d", 0).await.unwrap().len(), 1);
+    }
+
+    /// `log_ns_max_seq` sees only its own namespace and returns 0 when empty.
+    pub async fn ns_max_seq_scoped(be: Arc<dyn StorageBackend>, ns: &str) {
+        let other = format!("{ns}_other");
+        assert_eq!(be.log_ns_max_seq(ns).await.unwrap(), 0);
+        be.log_append(ns, "a", b"1").await.unwrap();
+        let top = be.log_append(ns, "b", b"2").await.unwrap();
+        be.log_append(&other, "x", b"3").await.unwrap();
+        assert_eq!(be.log_ns_max_seq(ns).await.unwrap(), top);
+        assert!(be.log_ns_max_seq(&other).await.unwrap() > top);
+    }
+}
+
+/// Shared contract for `kv_list` prefix semantics, run against every backend
+/// (Memory, SQLite in-crate; PostgreSQL env-gated).
+#[cfg(test)]
+pub(crate) mod kv_list_contract_suite {
+    use super::*;
+
+    /// `kv_list` with a prefix is a literal, byte-wise, case-sensitive
+    /// "starts with": SQL wildcard and escape characters in the prefix match
+    /// only themselves, and a prefix never matches a longer sibling id's keys
+    /// unless it is literally their prefix.
+    pub async fn literal_prefix(be: Arc<dyn StorageBackend>, ns: &str) {
+        let keys = [
+            "orders::sink::kafka",
+            "orders::sink::s3",
+            "orders-archive::sink::kafka",
+            "ORDERS::sink::kafka",
+            "ord%rs::sink::a",
+            "ordXrs::sink::a",
+            "ord_rs::sink::a",
+            "ordYrs::sink::a",
+            "a\\b::x",
+            "aXb::x",
+            "a!b::x",
+        ];
+        for k in keys {
+            be.kv_put(ns, k, b"v").await.unwrap();
+        }
+        be.kv_put(&format!("{ns}_other"), "orders::sink::kafka", b"v")
+            .await
+            .unwrap();
+        for prefix in [
+            "orders::sink::",
+            "orders",
+            "ORDERS",
+            "ord%",
+            "ord%rs::",
+            "ord_",
+            "ord_rs::",
+            "a\\",
+            "a!",
+            "",
+            "zzz",
+        ] {
+            let mut want: Vec<String> = keys
+                .iter()
+                .filter(|k| k.starts_with(prefix))
+                .map(|k| k.to_string())
+                .collect();
+            want.sort();
+            let got = be.kv_list(ns, Some(prefix)).await.unwrap();
+            assert_eq!(got, want, "prefix {prefix:?}");
+        }
     }
 }
 

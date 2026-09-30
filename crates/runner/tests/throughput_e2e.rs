@@ -318,6 +318,7 @@ async fn pg_to_kafka_backlog_drain_throughput() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry,
+        registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         outbox_prefixes: Default::default(),
         snapshot_cfg: SnapshotCfg {
             mode: SnapshotMode::Never,

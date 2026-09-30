@@ -80,7 +80,45 @@ const MIGRATIONS: &[&str] = &[
         id BIGSERIAL PRIMARY KEY, ns TEXT NOT NULL, key TEXT NOT NULL,
         val BYTEA NOT NULL, ts BIGINT NOT NULL)",
     "CREATE INDEX IF NOT EXISTS df_queue_ns_key_id ON df_queue(ns, key, id)",
+    "CREATE INDEX IF NOT EXISTS df_kv_checkpoints_key_c ON df_kv ((key COLLATE \"C\"))
+        WHERE ns = 'checkpoints'",
+    "CREATE INDEX IF NOT EXISTS df_slot_ns_key_c ON df_slot (ns, (key COLLATE \"C\"))",
 ];
+
+// Prefix listings compare keys byte-wise (`COLLATE "C"`), whatever the database
+// collation. The checkpoint namespace (listed by prefix on the resume / feedback
+// hot path) has a partial "C"-collated index, `df_kv_checkpoints_key_c`, and its
+// own query with the literal namespace predicate that index requires, so the
+// index is provably usable even by a generic plan. Other namespaces have no
+// production prefix caller and no catalog-wide index (df_kv also holds the dense
+// schema-registry indexes). Each query comes with and without an upper bound, so
+// no bound is hidden behind `$n IS NULL OR`.
+const KV_LIST_CHECKPOINTS_PREFIX_SQL: &str = "SELECT key FROM df_kv
+     WHERE ns = 'checkpoints'
+       AND key COLLATE \"C\" >= $1 AND key COLLATE \"C\" < $2
+       AND (expires_at IS NULL OR expires_at > $3)
+     ORDER BY key COLLATE \"C\"";
+const KV_LIST_CHECKPOINTS_PREFIX_OPEN_SQL: &str = "SELECT key FROM df_kv
+     WHERE ns = 'checkpoints'
+       AND key COLLATE \"C\" >= $1
+       AND (expires_at IS NULL OR expires_at > $2)
+     ORDER BY key COLLATE \"C\"";
+const KV_LIST_PREFIX_SQL: &str = "SELECT key FROM df_kv
+     WHERE ns = $1 AND key COLLATE \"C\" >= $2 AND key COLLATE \"C\" < $3
+       AND (expires_at IS NULL OR expires_at > $4)
+     ORDER BY key COLLATE \"C\"";
+const KV_LIST_PREFIX_OPEN_SQL: &str = "SELECT key FROM df_kv
+     WHERE ns = $1 AND key COLLATE \"C\" >= $2
+       AND (expires_at IS NULL OR expires_at > $3)
+     ORDER BY key COLLATE \"C\"";
+
+const SLOT_LIST_SQL: &str = "SELECT key, version, state FROM df_slot
+     WHERE ns = $1
+       AND ($2::text IS NULL OR key COLLATE \"C\" >= $2)
+       AND ($3::text IS NULL OR key COLLATE \"C\" <  $3)
+       AND ($4::text IS NULL OR key COLLATE \"C\" >  $4)
+     ORDER BY key COLLATE \"C\" ASC
+     LIMIT $5";
 
 // ── Backend ───────────────────────────────────────────────────────────────────
 
@@ -235,13 +273,26 @@ impl StorageBackend for PostgresStorageBackend {
         let c = client!(self);
         let now = now_secs();
         let rows = if let Some(p) = prefix {
-            let pat = format!("{p}%");
-            c.query(
-                "SELECT key FROM df_kv WHERE ns=$1 AND key LIKE $2
-                 AND (expires_at IS NULL OR expires_at > $3) ORDER BY key",
-                &[&ns, &pat, &now],
-            )
-            .await?
+            // Literal, byte-wise "starts with" (never LIKE, whose `%`/`_`
+            // wildcards would match other keys); `COLLATE "C"` keeps the range
+            // byte-wise whatever the database collation.
+            let upper = crate::prefix_successor(p);
+            match (ns == crate::CHECKPOINTS_NS, &upper) {
+                (true, Some(u)) => {
+                    c.query(KV_LIST_CHECKPOINTS_PREFIX_SQL, &[&p, u, &now])
+                        .await?
+                }
+                (true, None) => {
+                    c.query(KV_LIST_CHECKPOINTS_PREFIX_OPEN_SQL, &[&p, &now])
+                        .await?
+                }
+                (false, Some(u)) => {
+                    c.query(KV_LIST_PREFIX_SQL, &[&ns, &p, u, &now]).await?
+                }
+                (false, None) => {
+                    c.query(KV_LIST_PREFIX_OPEN_SQL, &[&ns, &p, &now]).await?
+                }
+            }
         } else {
             c.query(
                 "SELECT key FROM df_kv WHERE ns=$1
@@ -330,6 +381,17 @@ impl StorageBackend for PostgresStorageBackend {
             )
             .await?;
         Ok(row.map(|r| (r.get::<_, i64>(0) as u64, r.get(1))))
+    }
+
+    async fn log_ns_max_seq(&self, ns: &str) -> Result<u64> {
+        let c = client!(self);
+        let row = c
+            .query_one(
+                "SELECT COALESCE(MAX(seq), 0) FROM df_log WHERE ns=$1",
+                &[&ns],
+            )
+            .await?;
+        Ok(row.get::<_, i64>(0) as u64)
     }
 
     async fn log_append_if_absent(
@@ -685,16 +747,7 @@ impl StorageBackend for PostgresStorageBackend {
         // (and the SQLite/Memory backends) and keyset pagination never skips or
         // duplicates a stable key.
         let rows = c
-            .query(
-                "SELECT key, version, state FROM df_slot
-                 WHERE ns = $1
-                   AND ($2::text IS NULL OR key COLLATE \"C\" >= $2)
-                   AND ($3::text IS NULL OR key COLLATE \"C\" <  $3)
-                   AND ($4::text IS NULL OR key COLLATE \"C\" >  $4)
-                 ORDER BY key COLLATE \"C\" ASC
-                 LIMIT $5",
-                &[&ns, &lower, &upper, &after, &fetch],
-            )
+            .query(SLOT_LIST_SQL, &[&ns, &lower, &upper, &after, &fetch])
             .await?;
         let mut all: Vec<(String, u64, Vec<u8>)> = rows
             .into_iter()
@@ -853,6 +906,270 @@ mod tests {
         suite::pin_invariant(be.clone(), &format!("it{base}_pin")).await;
         suite::empty_vs_truncated(be.clone(), &format!("it{base}_empty")).await;
         suite::concurrent_appends(be.clone(), &format!("it{base}_conc")).await;
+        suite::ns_max_seq_scoped(be.clone(), &format!("it{base}_nsmax")).await;
+    }
+
+    /// A fresh database whose default collation is NOT "C", with the schema
+    /// applied by `connect`.
+    async fn non_c_database(
+        dsn: &str,
+    ) -> (String, deadpool_postgres::tokio_postgres::Client, String) {
+        use deadpool_postgres::tokio_postgres;
+        let db = format!("collate_it_{}", now_ms());
+        let (admin, conn) = tokio_postgres::connect(dsn, NoTls).await.unwrap();
+        tokio::spawn(conn);
+        admin
+            .batch_execute(&format!(
+                "CREATE DATABASE {db} TEMPLATE template0 \
+                 LC_COLLATE 'en_US.utf8' LC_CTYPE 'en_US.utf8'"
+            ))
+            .await
+            .unwrap();
+        let db_dsn = format!("{dsn} dbname={db}");
+        let (c, conn) = tokio_postgres::connect(&db_dsn, NoTls).await.unwrap();
+        tokio::spawn(conn);
+        let collation: String = c
+            .query_one(
+                "SELECT datcollate FROM pg_database WHERE datname = current_database()",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(
+            collation != "C" && collation != "POSIX",
+            "the test database must not use the C collation ({collation})"
+        );
+        (db, c, db_dsn)
+    }
+
+    async fn drop_database(dsn: &str, db: &str) {
+        use deadpool_postgres::tokio_postgres;
+        let (admin, conn) = tokio_postgres::connect(dsn, NoTls).await.unwrap();
+        tokio::spawn(conn);
+        let _ = admin
+            .batch_execute(&format!("DROP DATABASE {db} WITH (FORCE)"))
+            .await;
+    }
+
+    fn plan_text(rows: Vec<deadpool_postgres::tokio_postgres::Row>) -> String {
+        rows.iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn assert_bounded_by(what: &str, plan: &str, index: &str) {
+        assert!(
+            !plan.contains("Seq Scan"),
+            "{what} scans the table:\n{plan}"
+        );
+        assert!(plan.contains(index), "{what} does not use {index}:\n{plan}");
+        let cond = plan
+            .lines()
+            .find(|l| l.contains("Index Cond"))
+            .unwrap_or_else(|| panic!("{what}: no index condition:\n{plan}"));
+        assert!(
+            cond.contains(">=") && cond.contains("<") && cond.contains("key"),
+            "{what}: the key range is not the index condition:\n{plan}"
+        );
+    }
+
+    /// On a non-"C" database, the checkpoint prefix query (exact production SQL)
+    /// is a bounded range on the PARTIAL checkpoint index - also as a generic
+    /// plan - and `slot_list` a bounded range on `df_slot_ns_key_c`. #[ignore] +
+    /// env-gated; creates and drops its own database.
+    #[tokio::test]
+    #[ignore = "requires a live PostgreSQL (DELTAFORGE_IT_PG_DSN)"]
+    async fn pg_prefix_listings_use_the_c_collated_indexes() {
+        let dsn = std::env::var("DELTAFORGE_IT_PG_DSN")
+            .expect("DELTAFORGE_IT_PG_DSN must be set to run this test");
+        let (db, c, db_dsn) = non_c_database(&dsn).await;
+        let be = PostgresStorageBackend::connect(&db_dsn).await.unwrap();
+
+        // Checkpoints alongside many registry-index rows in the same table.
+        for i in 0..2000 {
+            let key = format!("src-{i:04}::sink::kafka");
+            be.kv_put(crate::CHECKPOINTS_NS, &key, b"cp").await.unwrap();
+            be.kv_put("schemas.v1.index", &format!("v/{key}"), b"i")
+                .await
+                .unwrap();
+            be.slot_upsert("snapshots", &key, b"s").await.unwrap();
+        }
+        c.batch_execute("ANALYZE df_kv; ANALYZE df_slot")
+            .await
+            .unwrap();
+
+        let prefix = "src-0042::sink::";
+        let upper = crate::prefix_successor(prefix).unwrap();
+        let now: i64 = 0;
+        let custom = plan_text(
+            c.query(
+                &format!("EXPLAIN {KV_LIST_CHECKPOINTS_PREFIX_SQL}"),
+                &[&prefix, &upper, &now],
+            )
+            .await
+            .unwrap(),
+        );
+        // The same statement as a generic plan (as a cached prepared
+        // statement could be): the literal namespace still proves the partial
+        // index's predicate.
+        c.batch_execute(&format!(
+            "SET plan_cache_mode = force_generic_plan;
+             PREPARE cp(text, text, bigint) AS {KV_LIST_CHECKPOINTS_PREFIX_SQL}"
+        ))
+        .await
+        .unwrap();
+        let generic = plan_text(
+            c.query(
+                &format!("EXPLAIN EXECUTE cp('{prefix}', '{upper}', 0)"),
+                &[],
+            )
+            .await
+            .unwrap(),
+        );
+        c.batch_execute("DEALLOCATE cp; RESET plan_cache_mode")
+            .await
+            .unwrap();
+
+        let fetch: i64 = 101;
+        let after: Option<String> = None;
+        let slot = plan_text(
+            c.query(
+                &format!("EXPLAIN {SLOT_LIST_SQL}"),
+                &[&"snapshots", &Some(prefix), &Some(&upper), &after, &fetch],
+            )
+            .await
+            .unwrap(),
+        );
+        println!(
+            "checkpoint prefix (custom):\n{custom}\n\ncheckpoint prefix (generic):\n\
+             {generic}\n\nslot_list:\n{slot}"
+        );
+        assert_bounded_by(
+            "checkpoint prefix",
+            &custom,
+            "df_kv_checkpoints_key_c",
+        );
+        assert_bounded_by(
+            "checkpoint prefix (generic plan)",
+            &generic,
+            "df_kv_checkpoints_key_c",
+        );
+        assert_bounded_by("slot_list", &slot, "df_slot_ns_key_c");
+
+        // The checkpoint index is partial: it covers checkpoint rows only.
+        let def: String = c
+            .query_one(
+                "SELECT indexdef FROM pg_indexes WHERE indexname = 'df_kv_checkpoints_key_c'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(def.contains("WHERE (ns = 'checkpoints'::text)"), "{def}");
+
+        drop(be);
+        drop(c);
+        drop_database(&dsn, &db).await;
+    }
+
+    /// Upgrading a populated store: connecting the new version creates the
+    /// prefix indexes and changes no row. #[ignore] + env-gated.
+    #[tokio::test]
+    #[ignore = "requires a live PostgreSQL (DELTAFORGE_IT_PG_DSN)"]
+    async fn pg_upgrade_adds_the_prefix_indexes_without_touching_data() {
+        let dsn = std::env::var("DELTAFORGE_IT_PG_DSN")
+            .expect("DELTAFORGE_IT_PG_DSN must be set to run this test");
+        let (db, c, db_dsn) = non_c_database(&dsn).await;
+        {
+            let be = PostgresStorageBackend::connect(&db_dsn).await.unwrap();
+            for i in 0..500 {
+                let key = format!("src-{i:03}::sink::kafka");
+                be.kv_put(
+                    crate::CHECKPOINTS_NS,
+                    &key,
+                    format!("cp{i}").as_bytes(),
+                )
+                .await
+                .unwrap();
+                be.kv_put("schemas.v1.index", &format!("v/{key}"), b"i")
+                    .await
+                    .unwrap();
+                be.slot_upsert("snapshots", &key, b"s").await.unwrap();
+            }
+        }
+        // A store as the previous version left it: no prefix indexes.
+        c.batch_execute(
+            "DROP INDEX df_kv_checkpoints_key_c; DROP INDEX df_slot_ns_key_c",
+        )
+        .await
+        .unwrap();
+        let fingerprint = || async {
+            let kv: String = c
+                .query_one(
+                    "SELECT md5(string_agg(ns || '/' || key || '/' || encode(val, 'hex') \
+                     || '/' || updated_at || '/' || coalesce(expires_at::text, '-'), \
+                     ',' ORDER BY ns, key)) FROM df_kv",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            let slot: String = c
+                .query_one(
+                    "SELECT md5(string_agg(ns || '/' || key || '/' || version || '/' \
+                     || encode(state, 'hex') || '/' || updated_at, ',' ORDER BY ns, key)) \
+                     FROM df_slot",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            (kv, slot)
+        };
+        let indexes = || async {
+            c.query(
+                "SELECT indexname FROM pg_indexes WHERE indexname IN \
+                 ('df_kv_checkpoints_key_c', 'df_slot_ns_key_c') ORDER BY 1",
+                &[],
+            )
+            .await
+            .unwrap()
+            .len()
+        };
+        let before = fingerprint().await;
+        assert_eq!(indexes().await, 0);
+
+        let be = PostgresStorageBackend::connect(&db_dsn).await.unwrap();
+        assert_eq!(indexes().await, 2, "connect created the prefix indexes");
+        assert_eq!(fingerprint().await, before, "no row changed");
+        let mut keys = be
+            .kv_list(crate::CHECKPOINTS_NS, Some("src-042::"))
+            .await
+            .unwrap();
+        keys.sort();
+        assert_eq!(keys, ["src-042::sink::kafka"]);
+
+        drop(be);
+        drop(c);
+        drop_database(&dsn, &db).await;
+    }
+
+    /// `kv_list` literal-prefix contract against a live PostgreSQL (LIKE
+    /// wildcards and escapes must not apply). #[ignore] + env-gated.
+    #[tokio::test]
+    #[ignore = "requires a live PostgreSQL (DELTAFORGE_IT_PG_DSN)"]
+    async fn pg_kv_list_prefix_is_literal() {
+        let dsn = std::env::var("DELTAFORGE_IT_PG_DSN")
+            .expect("DELTAFORGE_IT_PG_DSN must be set to run this test");
+        let be: Arc<dyn StorageBackend> =
+            PostgresStorageBackend::connect(&dsn).await.unwrap();
+        crate::kv_list_contract_suite::literal_prefix(
+            be,
+            &format!("it{}_kvp", now_ms()),
+        )
+        .await;
     }
 
     /// The shared `slot_list` contract suite against a live PostgreSQL, exercising

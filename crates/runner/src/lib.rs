@@ -9,13 +9,14 @@ pub mod replay_job;
 pub mod replay_journal;
 pub mod replay_worker;
 mod schema_api;
+pub mod schema_migrate;
 mod schema_provider;
 mod sensing_api;
 pub mod storage_secrets;
 
 pub use schema_provider::{
     ArcSchemaProvider, AvroSchemaProviderImpl, ColumnSchemaInfo,
-    SchemaLoaderAdapter, SchemaProvider, TableSchemaInfo,
+    SchemaLoaderAdapter, SchemaLookupError, SchemaProvider, TableSchemaInfo,
     build_arrow_schema_resolver, is_json_type, might_be_json,
 };
 

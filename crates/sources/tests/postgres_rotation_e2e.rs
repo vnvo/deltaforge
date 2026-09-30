@@ -387,6 +387,7 @@ async fn start_rotation_harness(
         tenant: "acme".to_string(),
         pipeline: "test".to_string(),
         registry: make_registry().await,
+        registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         backend: make_storage_backend().await,
         outbox_prefixes: AllowList::default(),
         snapshot_cfg: SnapshotCfg {
@@ -780,6 +781,7 @@ async fn projected_symlink_resolves_through_genuine_build_path() -> Result<()> {
         &spec,
         dsn,
         make_registry().await,
+        sources::registry_scope::SharedRegistryScope::default(),
         make_storage_backend().await,
         resolver,
     )

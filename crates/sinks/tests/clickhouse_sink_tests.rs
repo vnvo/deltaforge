@@ -25,34 +25,36 @@ const CH_PASSWORD: &str = "chtest";
 
 /// Columns for a test `orders` table: `id BIGINT PK`, `amount DECIMAL(12,2)`.
 fn resolver() -> ClickHouseSchemaResolver {
-    Arc::new(|_key: &str| {
-        Some(TableColumns {
-            columns: vec![
-                ColDesc {
-                    name: "id".into(),
-                    data_type: "bigint".into(),
-                    full_type: "bigint".into(),
-                    nullable: false,
-                    unsigned: false,
-                    precision: None,
-                    scale: None,
-                },
-                ColDesc {
-                    name: "amount".into(),
-                    data_type: "decimal".into(),
-                    full_type: "decimal(12,2)".into(),
-                    nullable: true,
-                    unsigned: false,
-                    // Mirror the real MySQL schema loader, which leaves
-                    // numeric_precision/scale unset and only carries the type
-                    // string — so this exercises the parse-from-`full_type` path
-                    // (the decimal(38,0) default bug lived here).
-                    precision: None,
-                    scale: None,
-                },
-            ],
-            primary_key: vec!["id".into()],
-        })
+    Arc::new(|_key: &str| Ok(fixture_columns()))
+}
+
+fn fixture_columns() -> Option<TableColumns> {
+    Some(TableColumns {
+        columns: vec![
+            ColDesc {
+                name: "id".into(),
+                data_type: "bigint".into(),
+                full_type: "bigint".into(),
+                nullable: false,
+                unsigned: false,
+                precision: None,
+                scale: None,
+            },
+            ColDesc {
+                name: "amount".into(),
+                data_type: "decimal".into(),
+                full_type: "decimal(12,2)".into(),
+                nullable: true,
+                unsigned: false,
+                // Mirror the real MySQL schema loader, which leaves
+                // numeric_precision/scale unset and only carries the type
+                // string — so this exercises the parse-from-`full_type` path
+                // (the decimal(38,0) default bug lived here).
+                precision: None,
+                scale: None,
+            },
+        ],
+        primary_key: vec!["id".into()],
     })
 }
 

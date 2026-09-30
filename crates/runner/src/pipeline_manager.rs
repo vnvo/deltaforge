@@ -503,6 +503,9 @@ pub(crate) struct PipelineRuntime {
     pub(crate) sources: Vec<SourceHandle>,
     pub(crate) join: Option<JoinHandle<Result<()>>>,
     pub(crate) schema_loader: Option<ArcSchemaLoader>,
+    /// The verified-lineage registry scope shared by this pipeline's source and
+    /// schema loader; unestablished until the source verifies its server.
+    pub(crate) registry_scope: sources::registry_scope::SharedRegistryScope,
     pub(crate) table_patterns: Vec<String>,
     pub(crate) sensor_state: Option<Arc<SchemaSensorState>>,
     pub(crate) dlq_writer: Option<Arc<crate::dlq::DlqWriter>>,
@@ -699,9 +702,26 @@ impl PipelineManager {
     /// checkpoint and schema registry subsystems. Replays the schema log
     /// on startup so the cache is warm before any pipeline starts.
     pub async fn with_backend(backend: ArcStorageBackend) -> Result<Self> {
+        Self::with_backend_and_registry_config(
+            backend,
+            storage::adapters::RegistryConfig::default(),
+        )
+        .await
+    }
+
+    /// Like [`Self::with_backend`], with explicit schema-registry budgets
+    /// (validated; an invalid budget fails construction).
+    pub async fn with_backend_and_registry_config(
+        backend: ArcStorageBackend,
+        registry_config: storage::adapters::RegistryConfig,
+    ) -> Result<Self> {
         let ckpt_store: Arc<dyn CheckpointStore> =
             Arc::new(BackendCheckpointStore::new(Arc::clone(&backend)));
-        let registry = DurableSchemaRegistry::new(Arc::clone(&backend)).await?;
+        let registry = DurableSchemaRegistry::with_config(
+            Arc::clone(&backend),
+            registry_config,
+        )
+        .await?;
 
         Ok(Self {
             pipelines: Arc::new(RwLock::new(HashMap::new())),
@@ -734,6 +754,11 @@ impl PipelineManager {
     /// Access the schema registry (for version lookups).
     pub fn registry(&self) -> &Arc<DurableSchemaRegistry> {
         &self.registry
+    }
+
+    /// The durable state backend (lineage records, checkpoints, registry).
+    pub(crate) fn backend(&self) -> &ArcStorageBackend {
+        &self.backend
     }
 
     /// Get schema loader for a pipeline.
@@ -792,10 +817,16 @@ impl PipelineManager {
         let source_dsn = sources::resolve_source_dsn(&spec, resolver.as_ref())
             .await
             .context("resolve source credentials")?;
+        // One verified-lineage scope per pipeline, shared by the source (which
+        // establishes it) and the schema loader (which fails closed until then).
+        let registry_scope = sources::registry_scope::SharedRegistryScope::new(
+            spec.spec.source.source_id(),
+        );
         let source = build_source(
             &spec,
             source_dsn.clone(),
             self.registry.clone(),
+            registry_scope.clone(),
             Arc::clone(&self.backend),
             resolver.clone(),
         )
@@ -803,8 +834,12 @@ impl PipelineManager {
         .context("build source")?;
         let processors = build_processors(&spec, &pipeline_name)
             .context("build processors")?;
-        let schema_loader =
-            build_schema_loader(&spec, &source_dsn, self.registry.clone());
+        let schema_loader = build_schema_loader(
+            &spec,
+            &source_dsn,
+            self.registry.clone(),
+            registry_scope.clone(),
+        );
 
         // Build Avro schema provider if any sink uses Avro encoding
         let avro_source_schemas = build_avro_provider(&spec, &schema_loader);
@@ -1252,6 +1287,7 @@ impl PipelineManager {
             sources: vec![src_handle],
             join: Some(join),
             schema_loader,
+            registry_scope,
             table_patterns,
             sensor_state: sensor_for_runtime,
             dlq_writer,
@@ -1372,6 +1408,20 @@ impl PipelineManager {
     /// Stop a pipeline. Serialized against other lifecycle operations. Awaits
     /// full termination of the coordinator and source tasks before returning, so
     /// a caller can rely on the pipeline having stopped writing once this returns.
+    /// Stop every pipeline and await its tasks (coordinator, source,
+    /// retention, replay). On return no pipeline task - and so no schema
+    /// registry writer - is running; the server then releases the store gate.
+    pub async fn shutdown_all(&self) {
+        let _lifecycle = self.lifecycle.lock().await;
+        let names: Vec<String> =
+            self.pipelines.read().keys().cloned().collect();
+        for name in names {
+            if let Err(e) = self.stop_pipeline_locked(&name).await {
+                tracing::warn!(pipeline = %name, error = %e, "stop during shutdown");
+            }
+        }
+    }
+
     pub async fn stop_pipeline(
         &self,
         name: &str,
@@ -1396,13 +1446,17 @@ impl PipelineManager {
 
         runtime.cancel.cancel();
         // Stop the replay-retention background task with the coordinator.
+        // Aborted tasks are awaited too, so nothing of this pipeline still
+        // runs when stop returns.
         if let Some(task) = runtime.retention_task.take() {
             task.abort();
+            let _ = task.await;
         }
         // Stop any in-flight replay controller (a restart's startup barrier resumes it).
         if let Some((c, task)) = runtime.replay_controller.take() {
             c.cancel();
             task.abort();
+            let _ = task.await;
         }
         let sources = std::mem::take(&mut runtime.sources);
         for src in &sources {
@@ -2611,6 +2665,129 @@ mod tests {
         }
     }
 
+    /// REST schema requests made before the pipeline's source has verified its
+    /// server get the typed, retryable 503 - never an opaque internal error or
+    /// an empty "no schema" answer.
+    #[tokio::test]
+    async fn schema_requests_before_lineage_are_typed_unavailable() {
+        use rest_api::SchemaController;
+        let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        let mgr = Arc::new(
+            manager_with_ckpt(
+                Arc::clone(&backend),
+                Arc::new(checkpoints::MemCheckpointStore::new().unwrap()),
+            )
+            .await,
+        );
+        let mut rt = bare_runtime(sample_spec("p"), None);
+        let scope = sources::registry_scope::SharedRegistryScope::new("mysql");
+        rt.registry_scope = scope.clone();
+        rt.schema_loader =
+            Some(Arc::new(sources::mysql::MySqlSchemaLoader::new(
+                "mysql://none@127.0.0.1:1/none",
+                mgr.registry().clone(),
+                "acme",
+                scope,
+            )));
+        mgr.pipelines.write().insert("p".to_string(), rt);
+        let api = crate::schema_api::SchemaApi::new(Arc::clone(&mgr));
+
+        let unavailable = |r: Result<(), PipelineAPIError>, what: &str| {
+            let err = r.expect_err(what);
+            assert!(
+                matches!(err, PipelineAPIError::SchemaLineageNotEstablished(ref m)
+                    if m.contains("pipeline p") && m.contains("Retry")),
+                "{what}: {err:?}"
+            );
+        };
+        unavailable(
+            api.get_schema("p", "shop", "orders").await.map(|_| ()),
+            "get",
+        );
+        unavailable(api.list_schemas("p").await.map(|_| ()), "list");
+        unavailable(
+            api.reload_table_schema("p", "shop", "orders")
+                .await
+                .map(|_| ()),
+            "reload table",
+        );
+        unavailable(api.reload_schemas("p").await.map(|_| ()), "reload all");
+        unavailable(
+            api.get_schema_versions("p", "shop", "orders")
+                .await
+                .map(|_| ()),
+            "versions",
+        );
+    }
+
+    /// After a restart the durable lineage record still names the PREVIOUS
+    /// server. Until the restarted source verifies its current server, the
+    /// versions endpoint must not serve that predecessor's history; only a
+    /// definitively stopped pipeline may read the recorded lineage.
+    #[tokio::test]
+    async fn versions_do_not_expose_the_recorded_lineage_while_starting() {
+        use rest_api::SchemaController;
+        use storage::adapters::{LineageDescriptor, SchemaKey, source_lineage};
+        let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        let mgr = Arc::new(
+            manager_with_ckpt(
+                Arc::clone(&backend),
+                Arc::new(checkpoints::MemCheckpointStore::new().unwrap()),
+            )
+            .await,
+        );
+        // Previous run: lineage recorded and a version registered under it.
+        let previous =
+            LineageDescriptor::mysql("3e11fa47-71ca-11e1-9e33-c80aa9429562")
+                .unwrap();
+        let record =
+            source_lineage::establish(&backend, "acme", "mysql", previous)
+                .await
+                .unwrap()
+                .record;
+        mgr.registry()
+            .register_with_checkpoint(
+                &SchemaKey::new(
+                    "acme",
+                    "mysql",
+                    record.current.lineage_hash.as_str(),
+                    "shop",
+                    "orders",
+                ),
+                "h1",
+                &serde_json::json!({"columns": []}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Restarted: running, but the source has not verified its server yet.
+        let rt = bare_runtime(sample_spec("p"), None);
+        assert!(matches!(rt.status, PipelineStatus::Running));
+        mgr.pipelines.write().insert("p".to_string(), rt);
+        let api = crate::schema_api::SchemaApi::new(Arc::clone(&mgr));
+        let err = api
+            .get_schema_versions("p", "shop", "orders")
+            .await
+            .expect_err(
+                "a starting source must not expose the recorded lineage",
+            );
+        assert!(
+            matches!(err, PipelineAPIError::SchemaLineageNotEstablished(_)),
+            "{err:?}"
+        );
+
+        // Definitively stopped: the recorded lineage is the right one to read.
+        mgr.pipelines.write().get_mut("p").unwrap().status =
+            PipelineStatus::Stopped;
+        let versions = api
+            .get_schema_versions("p", "shop", "orders")
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].fingerprint, "h1");
+    }
+
     /// A registered runtime with no live tasks (unless `join` is supplied), for
     /// driving delete() without spawning a real source.
     fn bare_runtime(
@@ -2627,6 +2804,8 @@ mod tests {
             sources: vec![],
             join,
             schema_loader: None,
+            registry_scope:
+                sources::registry_scope::SharedRegistryScope::default(),
             table_patterns: vec![],
             sensor_state: None,
             dlq_writer: None,
@@ -3627,6 +3806,9 @@ mod tests {
         ) -> Result<Option<(u64, Vec<u8>)>> {
             self.inner.log_latest(ns, key).await
         }
+        async fn log_ns_max_seq(&self, ns: &str) -> Result<u64> {
+            self.inner.log_ns_max_seq(ns).await
+        }
         async fn log_append_if_absent(
             &self,
             ns: &str,
@@ -3821,6 +4003,8 @@ mod tests {
             sources: vec![],
             join: None,
             schema_loader: None,
+            registry_scope:
+                sources::registry_scope::SharedRegistryScope::default(),
             table_patterns: vec![],
             sensor_state: None,
             dlq_writer: None,

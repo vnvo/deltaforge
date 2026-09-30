@@ -72,12 +72,13 @@ impl ElasticsearchSink {
                 "elasticsearch sink has no schema resolver (source schema unavailable)"
             ))
         })?;
-        let tc = resolver(&key).ok_or_else(|| {
-            // Transient during startup (before the schema is loadable) — retry.
-            SinkError::Other(anyhow::anyhow!(
-                "no schema yet for source table '{key}'"
-            ))
-        })?;
+        let tc =
+            resolver(&key).map_err(SinkError::Other)?.ok_or_else(|| {
+                // Transient during startup (before the schema is loadable) — retry.
+                SinkError::Other(anyhow::anyhow!(
+                    "no schema yet for source table '{key}'"
+                ))
+            })?;
         let tc = Arc::new(tc);
         self.resolved.write().unwrap().insert(key, tc.clone());
         Ok(tc)
@@ -326,30 +327,32 @@ mod tests {
     }
 
     fn resolver() -> EsSchemaResolver {
-        Arc::new(|_key: &str| {
-            Some(TableColumns {
-                columns: vec![
-                    ColDesc {
-                        name: "id".into(),
-                        data_type: "bigint".into(),
-                        full_type: "bigint".into(),
-                        nullable: false,
-                        unsigned: false,
-                        precision: None,
-                        scale: None,
-                    },
-                    ColDesc {
-                        name: "amount".into(),
-                        data_type: "decimal".into(),
-                        full_type: "decimal(12,2)".into(),
-                        nullable: true,
-                        unsigned: false,
-                        precision: None,
-                        scale: Some(2),
-                    },
-                ],
-                primary_key: vec!["id".into()],
-            })
+        Arc::new(|_key: &str| Ok(fixture_columns()))
+    }
+
+    fn fixture_columns() -> Option<TableColumns> {
+        Some(TableColumns {
+            columns: vec![
+                ColDesc {
+                    name: "id".into(),
+                    data_type: "bigint".into(),
+                    full_type: "bigint".into(),
+                    nullable: false,
+                    unsigned: false,
+                    precision: None,
+                    scale: None,
+                },
+                ColDesc {
+                    name: "amount".into(),
+                    data_type: "decimal".into(),
+                    full_type: "decimal(12,2)".into(),
+                    nullable: true,
+                    unsigned: false,
+                    precision: None,
+                    scale: Some(2),
+                },
+            ],
+            primary_key: vec!["id".into()],
         })
     }
 

@@ -329,9 +329,7 @@ impl RedisSink {
                 &event.source.table,
             )
             .await
-            .map_err(|e| SinkError::Serialization {
-                details: e.to_string().into(),
-            })?;
+            .map_err(|e| e.into_sink_error())?;
 
         Ok(bytes.to_vec())
     }

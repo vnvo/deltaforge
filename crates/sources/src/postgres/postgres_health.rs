@@ -542,6 +542,29 @@ pub async fn fetch_server_identity(
     Ok(identity)
 }
 
+/// Read the verified physical lineage used to qualify schema-registry keys: the
+/// cluster `system_identifier` and the current database's OID, in one round
+/// trip. `Ok(None)` when `pg_control_system()` is restricted/unsupported or the
+/// database row is missing. Callers treat `None` and zero values as unverifiable.
+pub async fn fetch_registry_lineage(dsn: &str) -> Result<Option<(i64, i64)>> {
+    let (client, conn) = tokio_postgres::connect(dsn, NoTls)
+        .await
+        .context("fetch_registry_lineage: connect failed")?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let row = client
+        .query_opt(
+            "SELECT s.system_identifier, d.oid::int8 \
+             FROM pg_control_system() s, pg_database d \
+             WHERE d.datname = current_database()",
+            &[],
+        )
+        .await
+        .context("fetch_registry_lineage: query failed")?;
+    Ok(row.map(|r| (r.get::<_, i64>(0), r.get::<_, i64>(1))))
+}
+
 /// Read the server's `wal_level`. Logical replication (all DeltaForge PostgreSQL
 /// CDC) requires `wal_level = logical`; a deployment preflight uses this to catch
 /// a misconfigured server before a pipeline is started.

@@ -538,6 +538,7 @@ async fn schema_loader_debug_does_not_reveal_dsn() {
         "postgres://u:S3NT1NEL-loader@db/orders",
         registry,
         "t",
+        sources::registry_scope::SharedRegistryScope::new("pg"),
     );
     let shown = format!("{loader:?}");
     assert!(!shown.contains("S3NT1NEL-loader"), "leaked: {shown}");

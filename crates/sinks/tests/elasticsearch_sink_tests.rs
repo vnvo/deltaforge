@@ -27,60 +27,62 @@ const ES_HTTP: u16 = 9200;
 /// must resolve the scale from `full_type` — proving `amount` lands as
 /// `scaled_float(100)`, not a truncating fallback.
 fn resolver() -> EsSchemaResolver {
-    Arc::new(|_key: &str| {
-        Some(TableColumns {
-            columns: vec![
-                ColDesc {
-                    name: "id".into(),
-                    data_type: "bigint".into(),
-                    full_type: "bigint".into(),
-                    nullable: false,
-                    unsigned: false,
-                    precision: None,
-                    scale: None,
-                },
-                ColDesc {
-                    name: "amount".into(),
-                    data_type: "decimal".into(),
-                    full_type: "decimal(12,2)".into(),
-                    nullable: true,
-                    unsigned: false,
-                    precision: None,
-                    scale: None,
-                },
-                // TEXT (binlog delivers it base64-wrapped), TIMESTAMP (binlog
-                // delivers integer microseconds), and BLOB — the real CDC value
-                // shapes that must be normalized to match the mapping.
-                ColDesc {
-                    name: "data".into(),
-                    data_type: "text".into(),
-                    full_type: "text".into(),
-                    nullable: true,
-                    unsigned: false,
-                    precision: None,
-                    scale: None,
-                },
-                ColDesc {
-                    name: "created_at".into(),
-                    data_type: "timestamp".into(),
-                    full_type: "timestamp".into(),
-                    nullable: true,
-                    unsigned: false,
-                    precision: None,
-                    scale: None,
-                },
-                ColDesc {
-                    name: "blobby".into(),
-                    data_type: "blob".into(),
-                    full_type: "blob".into(),
-                    nullable: true,
-                    unsigned: false,
-                    precision: None,
-                    scale: None,
-                },
-            ],
-            primary_key: vec!["id".into()],
-        })
+    Arc::new(|_key: &str| Ok(fixture_columns()))
+}
+
+fn fixture_columns() -> Option<TableColumns> {
+    Some(TableColumns {
+        columns: vec![
+            ColDesc {
+                name: "id".into(),
+                data_type: "bigint".into(),
+                full_type: "bigint".into(),
+                nullable: false,
+                unsigned: false,
+                precision: None,
+                scale: None,
+            },
+            ColDesc {
+                name: "amount".into(),
+                data_type: "decimal".into(),
+                full_type: "decimal(12,2)".into(),
+                nullable: true,
+                unsigned: false,
+                precision: None,
+                scale: None,
+            },
+            // TEXT (binlog delivers it base64-wrapped), TIMESTAMP (binlog
+            // delivers integer microseconds), and BLOB — the real CDC value
+            // shapes that must be normalized to match the mapping.
+            ColDesc {
+                name: "data".into(),
+                data_type: "text".into(),
+                full_type: "text".into(),
+                nullable: true,
+                unsigned: false,
+                precision: None,
+                scale: None,
+            },
+            ColDesc {
+                name: "created_at".into(),
+                data_type: "timestamp".into(),
+                full_type: "timestamp".into(),
+                nullable: true,
+                unsigned: false,
+                precision: None,
+                scale: None,
+            },
+            ColDesc {
+                name: "blobby".into(),
+                data_type: "blob".into(),
+                full_type: "blob".into(),
+                nullable: true,
+                unsigned: false,
+                precision: None,
+                scale: None,
+            },
+        ],
+        primary_key: vec!["id".into()],
     })
 }
 

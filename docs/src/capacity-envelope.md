@@ -17,8 +17,8 @@ This page states DeltaForge's resource behaviour so operators can size a deploym
 | Dimension | Conservative starting guidance | Basis |
 |---|---|---|
 | Pipelines (source units) per instance | Unvalidated starting point: a small number (single digits); single instance only. Not a supported ceiling either way. | [unknown] scale; single-owner is [code-derived] |
-| Tables per source | Tens to low hundreds; watch metric cardinality and startup cost | [code-derived] O(tables²) enumeration, [unknown] at scale |
-| Memory | Provision for channel-depth × event-size + in-flight batch bytes + full schema cache; **no aggregate cap exists** | [code-derived] / [unknown] |
+| Tables per source | Tens to low hundreds; watch metric cardinality and startup cost. The schema registry itself no longer grows startup or memory with the catalog (see [Schema registry at scale](#schema-registry-at-scale)); table discovery, the startup schema preload and per-table metrics still do | registry [measured] to 1M tables; discovery O(tables²) [code-derived], [unknown] at scale |
+| Memory | Provision for channel-depth × event-size + in-flight batch bytes + the schema cache budget (default 64 MiB); **no aggregate cap exists** | [code-derived] / [unknown] |
 | Throughput | Benchmark per environment; do not assume a headline number | [measured] dev-only / [unknown] |
 
 Everything else is detailed below.
@@ -29,8 +29,8 @@ DeltaForge has **no aggregate (pipeline-wide or process-wide) memory or byte bud
 
 - **Source→coordinator channel: 32,768 items, item-count bound only, no byte cap** [code-derived]. A burst of large change events can hold up to 32,768 `SourceItem`s resident with no byte ceiling. This is the primary backpressure lever and is **not operator-configurable**. Worst-case channel memory ≈ `32768 × (largest event size)`; size RAM for your widest rows/transactions accordingly.
 - **In-flight batch bytes**: bounded per batch by `batch.max_bytes` (default **16 MiB** [operator]) and per source transaction by `batch.max_tx_bytes` (default **512 MiB** [operator], only when `respect_source_tx = true`). If an operator sets these to unset/`None`, the effective cap becomes unbounded (`usize::MAX`) [code-derived] - do not disable them.
-- **Schema cache**: the full schema registry is held in memory (see [Checkpoint-store and schema-registry load](#checkpoint-store-and-schema-registry-load)); grows with tables × schema versions [code-derived, unbounded in that dimension].
-- **Guidance**: budget ≈ (channel depth × typical event size) + `max_tx_bytes` per active pipeline + schema-cache growth, with generous headroom. There is no backstop if you under-provision. Actual RSS under load is **[unknown]** pending a soak in your environment.
+- **Schema cache**: only the latest version of tables in use is cached, process-wide, bounded by `--schema-cache-max-bytes` (default **64 MiB**, a conservative estimate of resident bytes) and `--schema-cache-max-entries` (default **50,000**) [operator]. Older versions and unused tables stay in the state store and are read on demand. See [Schema registry at scale](#schema-registry-at-scale).
+- **Guidance**: budget ≈ (channel depth × typical event size) + `max_tx_bytes` per active pipeline + the schema cache budget, with generous headroom. There is no backstop if you under-provision. Actual RSS under load is **[unknown]** pending a soak in your environment.
 
 ## Transaction and batch size
 
@@ -91,7 +91,28 @@ Size `max_connections` on the source and on the PostgreSQL storage DB for the su
   ```
 
   This is workload-dependent and has **no configured QPS ceiling**. `max_ms = 50` is a time-based *flush ceiling*, not a rate cap: batches also flush on `max_events`, `max_bytes`, and transaction boundaries, so committed-batches/sec can be much higher than `1000/max_ms` under load. Size the checkpoint/storage backend for the actual committed-batch rate × checkpointed sinks across all pipelines. Reads are change-driven (the source is notified on commit), not polled.
-- **Schema registry loads ALL namespaces and ALL versions at startup** [code-derived]: a full `kv_list` + per-key log replay into an in-memory cache. Startup cost and memory grow with (tables × schema versions) and are **[unknown]** at large catalog sizes - a concern for many-table deployments.
+- **Checkpoint reads are scoped to the source** [code-derived, measured]: a source reads its per-sink checkpoints by key prefix, answered by the store as a bounded key range (PostgreSQL: a partial index on the checkpoint namespace). Cost does not grow with the number of other sources or pipelines sharing the store.
+- **Schema registry startup reads one record** [measured]: no namespace scan and no history replay; each table's latest schema is read on first use and cached within the budget above. See below.
+
+## Schema registry at scale
+
+Measured with the dense-catalog harness (`crates/scale-harness`, `registry-scale`; see its README to reproduce) at commit `664838a`, on a developer machine, single runs, SQLite state store. The numbers are indicative, not guarantees; the shape (what does and does not grow) is the point.
+
+Synthetic registries: *N* tables per source × 2 sources with the same table names (colliding across sources), 2-3 versions each, generated through the normal registration path. 100 active tables are looked up.
+
+| | 100K tables × 3 versions | 1M tables × 2 versions |
+|---|---|---|
+| Registry startup | 1 key read, 0.04 ms | 1 key read, 0.04 ms |
+| First lookup of a table (cold) | 1 read; p50 31 µs, p99 230 µs | 1 read; p50 21 µs, p99 35 µs |
+| Repeat lookup (cached) | no store access; p50 3 µs | no store access; p50 2 µs |
+| Working set 4× the cache budget | stays within budget, evicts | stays within budget, evicts |
+| 64 concurrent first lookups of one table | 1 store read | 1 store read |
+| Reads of another source's records | 0 | 0 |
+| Time to first CDC event after a restart (PostgreSQL / MySQL) | 34 ms / 21 ms | 45 ms / 21 ms |
+
+- **PostgreSQL state store** (100K tables × 2 versions × 2 sources, local container): the same operation counts as SQLite - startup 1 key read (1.4 ms), a cold lookup 1 read (p50 205 µs, p99 816 µs, network round trips), cached lookups no store access, 1 read for 64 concurrent first lookups, 0 reads of other sources. Migration of 10K tables: ~56-60 s at 1 version and ~185 s at 5 versions per table (vs ~4 s / ~14 s on SQLite); memory the same ~2.4-2.5 KB per mapped table. Registrations ran at ~250/s against ~3,600/s on SQLite.
+- **Time to first CDC event**: the source's own registry holds *N* synthetic tables (they are not in the source database); a row committed while the pipeline was stopped is timed from source start until the sink receives it. The storage calls in that window are identical at 100K and 1M tables (PostgreSQL: 12 key reads, 8 prefix-scoped checkpoint listings, 1 write, 1 schema read; MySQL: 5, 1, 1, 1) with no registry scan. This isolates the registry; it does not exercise table discovery or the startup schema preload, which still scale with the tables captured (below).
+- **Pre-upgrade schema history migration** (`deltaforge schema-migrate`) [measured]: memory grows with the number of **mapped tables**, not with history length: about 2.4-2.8 KB per mapped table (10K tables: ~39 MiB peak; 100K tables: ~243 MiB peak), unchanged between 1 and 5 versions per table and between page sizes. Time: 100K tables took ~36 s at 1 version and ~135 s at 5 versions per table. For very large catalogs, split the migration with `--tenant` / `--source` or several mapping files.
 
 ## Metric cardinality
 
@@ -99,7 +120,7 @@ Size `max_connections` on the source and on the PostgreSQL storage DB for the su
 
 ## Table and source-unit counts
 
-- **No coded limit on tables per source or pipelines per instance** [confirmed absent]. Practical limits come from: the O(tables²) table-enumeration dedup during schema load [code-derived], per-table metric cardinality, the full schema-registry load at startup, and connection/slot math above.
+- **No coded limit on tables per source or pipelines per instance** [confirmed absent]. Practical limits come from: the O(tables²) table-enumeration dedup during schema load [code-derived], the startup schema preload of every captured table [code-derived], per-table metric cardinality, and connection/slot math above. The schema registry is no longer one of them ([measured] to 1M tables per source).
 - **Single-instance requirement**: run exactly one DeltaForge process against a given state store (see [Supported Deployment Envelope](deployment-support.md#topology-single-owner-per-source)) [code-derived containment].
 - **Conservative starting configuration (unvalidated, not a supported limit)**: a small number of pipelines (single digits) and tens-to-low-hundreds of tables per source is a reasonable place to start, and grow only after a soak in your environment. We have not measured enough to claim either that larger configurations are unsupported or that this range is universally safe - both directions are **[unknown]** pending benchmark.
 
@@ -112,7 +133,7 @@ Throughput is environment-dependent and is **[measured] only on a developer mach
 These are **[unknown]** and should be validated before scaling up:
 
 - Aggregate/RSS memory under sustained load (no coded cap).
-- Startup time and memory for large schema catalogs (full registry load).
+- Startup time for sources capturing many tables: pattern expansion and the startup schema preload query the source catalog per captured table (the registry itself is [measured], see above).
 - Per-table metric cardinality at hundreds/thousands of tables.
 - O(tables²) schema-enumeration cost at large table counts.
 - MySQL `mysql_async` control-pool sizing under many concurrent pipelines.

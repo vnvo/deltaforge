@@ -32,8 +32,31 @@ pub enum EncodingError {
     #[error("Schema Registry error: {0}")]
     SchemaRegistry(String),
 
+    /// The source schema needed to encode is temporarily unavailable. Not a
+    /// property of the event: callers must retry, never dead-letter it.
+    #[error("source schema unavailable: {0}")]
+    SchemaUnavailable(String),
+
     #[error("encoding error: {0}")]
     Other(String),
+}
+
+impl EncodingError {
+    /// The sink error for a failed encode: a temporarily unavailable source
+    /// schema is retryable backpressure (never routed to the DLQ as a poison
+    /// event); every other encoding failure is a serialization error.
+    pub fn into_sink_error(self) -> crate::SinkError {
+        match self {
+            EncodingError::SchemaUnavailable(details) => {
+                crate::SinkError::Backpressure {
+                    details: details.into(),
+                }
+            }
+            other => crate::SinkError::Serialization {
+                details: other.to_string().into(),
+            },
+        }
+    }
 }
 
 /// Encoding type for sink configuration.
@@ -82,5 +105,26 @@ impl EncodingType {
                 "use AvroEncoder for Avro serialization".into(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod sink_error_tests {
+    use super::*;
+
+    #[test]
+    fn only_unavailable_schema_is_retryable_backpressure() {
+        assert!(matches!(
+            EncodingError::SchemaUnavailable("x".into()).into_sink_error(),
+            crate::SinkError::Backpressure { .. }
+        ));
+        assert!(matches!(
+            EncodingError::Avro("bad".into()).into_sink_error(),
+            crate::SinkError::Serialization { .. }
+        ));
+        assert!(matches!(
+            EncodingError::SchemaRegistry("down".into()).into_sink_error(),
+            crate::SinkError::Serialization { .. }
+        ));
     }
 }

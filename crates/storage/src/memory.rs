@@ -271,6 +271,17 @@ impl StorageBackend for MemoryStorageBackend {
             .map(|e| (e.seq, e.value.clone())))
     }
 
+    async fn log_ns_max_seq(&self, ns: &str) -> Result<u64> {
+        let store = self.log.read().await;
+        Ok(store
+            .entries
+            .iter()
+            .filter(|((n, _), _)| n == ns)
+            .filter_map(|(_, v)| v.last().map(|e| e.seq))
+            .max()
+            .unwrap_or(0))
+    }
+
     async fn log_append_if_absent(
         &self,
         ns: &str,
@@ -697,6 +708,12 @@ mod tests {
     #[tokio::test]
     async fn concurrent_appends() {
         crate::log_contract_suite::concurrent_appends(be(), "journal").await;
+        crate::log_contract_suite::ns_max_seq_scoped(be(), "nsmax").await;
+    }
+
+    #[tokio::test]
+    async fn kv_list_prefix_is_literal() {
+        crate::kv_list_contract_suite::literal_prefix(be(), "kvp").await;
     }
 
     // slot_list contract suite.

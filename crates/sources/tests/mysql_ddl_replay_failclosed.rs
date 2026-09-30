@@ -90,6 +90,9 @@ async fn replay(
         tenant: "acme".into(),
         pipeline: "ddl-replay".into(),
         registry: make_registry().await,
+        registry_scope: sources::registry_scope::SharedRegistryScope::new(
+            SOURCE_ID,
+        ),
         backend: make_storage_backend().await,
         outbox_tables: AllowList::default(),
         snapshot_cfg: SnapshotCfg::default(),
@@ -251,6 +254,9 @@ async fn replay_without_ddl_decodes_normally() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "ddl-replay".into(),
         registry: make_registry().await,
+        registry_scope: sources::registry_scope::SharedRegistryScope::new(
+            SOURCE_ID,
+        ),
         backend: make_storage_backend().await,
         outbox_tables: AllowList::default(),
         snapshot_cfg: SnapshotCfg::default(),

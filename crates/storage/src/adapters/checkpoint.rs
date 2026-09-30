@@ -10,7 +10,7 @@ use checkpoints::{
     SnapshotStateStore,
 };
 
-use crate::ArcStorageBackend;
+use crate::{ArcStorageBackend, CHECKPOINTS_NS};
 
 /// Namespace for snapshot-generation allocation slots, kept separate from the
 /// `"checkpoints"` KV namespace.
@@ -38,7 +38,7 @@ impl CheckpointStore for BackendCheckpointStore {
         source_id: &str,
     ) -> CheckpointResult<Option<Vec<u8>>> {
         self.backend
-            .kv_get("checkpoints", source_id)
+            .kv_get(CHECKPOINTS_NS, source_id)
             .await
             .map_err(map_err)
     }
@@ -49,21 +49,34 @@ impl CheckpointStore for BackendCheckpointStore {
         bytes: &[u8],
     ) -> CheckpointResult<()> {
         self.backend
-            .kv_put("checkpoints", source_id, bytes)
+            .kv_put(CHECKPOINTS_NS, source_id, bytes)
             .await
             .map_err(map_err)
     }
 
     async fn delete(&self, source_id: &str) -> CheckpointResult<bool> {
         self.backend
-            .kv_delete("checkpoints", source_id)
+            .kv_delete(CHECKPOINTS_NS, source_id)
             .await
             .map_err(map_err)
     }
 
     async fn list(&self) -> CheckpointResult<Vec<String>> {
         self.backend
-            .kv_list("checkpoints", None)
+            .kv_list(CHECKPOINTS_NS, None)
+            .await
+            .map_err(map_err)
+    }
+
+    /// Only the keys under `prefix`, selected by the backend: the default
+    /// implementation would list every checkpoint key in the store (every
+    /// source's) and filter in memory, on the resume/feedback hot path.
+    async fn list_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> CheckpointResult<Vec<String>> {
+        self.backend
+            .kv_list(CHECKPOINTS_NS, Some(prefix))
             .await
             .map_err(map_err)
     }
@@ -143,6 +156,50 @@ mod tests {
     use super::*;
     use crate::memory::MemoryStorageBackend;
     use std::sync::Arc;
+
+    /// The prefix reaches the backend (the checkpoint namespace is never
+    /// listed whole), and colliding source ids stay apart.
+    #[tokio::test]
+    async fn list_with_prefix_is_scoped_by_the_backend() {
+        use crate::adapters::test_util::FaultBackend;
+        use checkpoints::CheckpointStore;
+
+        let fault = Arc::new(FaultBackend::new());
+        let store = BackendCheckpointStore::new(fault.clone());
+        for key in [
+            "orders::sink::kafka",
+            "orders::sink::s3",
+            "orders-archive::sink::kafka",
+            "orders",
+            "ord_rs::sink::kafka",
+            "ordXrs::sink::kafka",
+        ] {
+            store.put_raw(key, b"cp").await.unwrap();
+        }
+
+        let mut got = store.list_with_prefix("orders::sink::").await.unwrap();
+        got.sort();
+        assert_eq!(got, ["orders::sink::kafka", "orders::sink::s3"]);
+        assert_eq!(
+            store
+                .list_with_prefix("orders-archive::sink::")
+                .await
+                .unwrap(),
+            ["orders-archive::sink::kafka"]
+        );
+        assert_eq!(
+            store.list_with_prefix("ord_rs::sink::").await.unwrap(),
+            ["ord_rs::sink::kafka"]
+        );
+
+        let calls = fault.kv_list_calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 3);
+        assert!(
+            calls.iter().all(|(ns, prefix)| ns == "checkpoints"
+                && prefix.as_deref().is_some_and(|p| p.ends_with("::sink::"))),
+            "the checkpoint namespace was listed without the prefix: {calls:?}"
+        );
+    }
 
     #[tokio::test]
     async fn backend_snapshot_state_contract() {

@@ -161,7 +161,16 @@ impl CoordinatorReplayDelivery {
         if let Some(s) = self.schema_cache.lock().get(table) {
             return Some(s.clone());
         }
-        let schema = self.provider.as_ref()?.get_table_schema(table).await?;
+        let schema = match self.provider.as_ref()?.get_table_schema(table).await
+        {
+            Ok(Some(schema)) => schema,
+            Ok(None) => return None,
+            // Temporarily unavailable: skip sensing for now, cache nothing.
+            Err(e) => {
+                tracing::debug!(table, error = %e, "schema unavailable for sensing");
+                return None;
+            }
+        };
         if let Some(sensor) = &self.sensor {
             sensor.register_table_schema(schema.clone());
         }

@@ -298,6 +298,7 @@ async fn spawn_pipeline(
         tenant: "acme".into(),
         pipeline: "test".into(),
         registry,
+        registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         backend,
         outbox_tables: AllowList::default(),
         snapshot_cfg: SnapshotCfg {

@@ -68,6 +68,10 @@ use crate::failover::reconciler::{ReconcileInput, SchemaReconciler};
 use crate::mysql::mysql_health::{
     PositionReachability, check_position_reachability, fetch_server_identity,
 };
+use crate::registry_scope::{
+    ScopeChange, SharedRegistryScope, establish_scope, previous_scope,
+};
+use storage::adapters::LineageDescriptor;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MySqlCheckpoint {
@@ -86,6 +90,9 @@ pub struct MySqlSource {
     pub tenant: String,
     pub pipeline: String,
     pub registry: Arc<DurableSchemaRegistry>,
+    /// Verified-lineage scope shared with the pipeline's schema loaders. The
+    /// source establishes it before any registry access.
+    pub registry_scope: crate::registry_scope::SharedRegistryScope,
     pub backend: ArcStorageBackend,
     pub outbox_tables: AllowList,
     pub snapshot_cfg: deltaforge_config::SnapshotCfg,
@@ -148,6 +155,10 @@ pub(crate) struct RunCtx {
     outbox_tables: AllowList,
     identity_store: IdentityStore,
     reconciler: SchemaReconciler,
+    /// Verified-lineage registry scope (shared with the pipeline's loaders).
+    registry_scope: SharedRegistryScope,
+    /// Backend holding the durable source-lineage record.
+    registry_backend: ArcStorageBackend,
     on_schema_drift: deltaforge_config::OnSchemaDrift,
     /// Frozen source lineage captured once at startup, for durable CDC
     /// watermarks. `None` if lineage could not be resolved (durable mode then
@@ -315,6 +326,19 @@ impl MySqlSource {
         // durable watermarks.
         let durable_lineage = self.capture_snapshot_lineage().await?;
 
+        // Verify the server_uuid lineage and establish the schema-registry scope
+        // BEFORE any registry access (the snapshot preload below included), in
+        // every binlog mode: persist it durably (fail closed), then publish it
+        // to this pipeline's loaders.
+        establish_registry_scope(
+            self.dsn.expose(),
+            &self.backend,
+            &self.registry_scope,
+            &self.tenant,
+            &self.id,
+        )
+        .await?;
+
         // snapshot (if configured)
         let snapshot_progress: Option<MysqlSnapshotProgress> = chkpt_store
             .get_raw(&mysql_snapshot::progress_key(&self.id))
@@ -351,6 +375,7 @@ impl MySqlSource {
                 self.dsn.clone(),
                 self.registry.clone(),
                 &self.tenant,
+                self.registry_scope.clone(),
             );
             let tracked = snap_schema_loader.preload(&self.tables).await?;
 
@@ -494,6 +519,7 @@ impl MySqlSource {
             self.dsn.clone(),
             self.registry.clone(),
             &self.tenant,
+            self.registry_scope.clone(),
         );
 
         // NOTE: preload deferred until after check_identity_post_reconnect so the
@@ -527,8 +553,9 @@ impl MySqlSource {
             reconciler: SchemaReconciler::new(
                 Arc::clone(&self.registry),
                 Arc::clone(&backend),
-                self.tenant.clone(),
             ),
+            registry_scope: self.registry_scope.clone(),
+            registry_backend: Arc::clone(&backend),
             inactivity: Duration::from_secs(60),
             table_map: HashMap::new(),
             last_file: init_file,
@@ -1005,6 +1032,75 @@ async fn fetch_identity_verified(dsn: &str) -> SourceResult<ServerIdentity> {
     }
 }
 
+/// The schema-registry lineage of a verified MySQL identity: its `server_uuid`,
+/// in every binlog mode (GTID is not required to read `@@server_uuid`). An
+/// empty or all-zero UUID fails closed - `server_id` is never a substitute,
+/// since it is operator-assigned and reused after replacement.
+fn mysql_registry_lineage(
+    live: &ServerIdentity,
+) -> SourceResult<LineageDescriptor> {
+    match live {
+        ServerIdentity::MySql(id) => LineageDescriptor::mysql(&id.server_uuid)
+            .map_err(|e| SourceError::Incompatible {
+                details: format!("{e:#}").into(),
+            }),
+        other => Err(SourceError::Other(anyhow::anyhow!(
+            "expected a MySQL server identity, got {other:?}"
+        ))),
+    }
+}
+
+/// Verify the live MySQL `server_uuid` lineage and establish it as the registry
+/// scope of `(tenant, source_id)`: durably recorded (fail closed), then
+/// published into `shared`. This is the startup step every MySQL source runs
+/// before any schema-registry access, in every binlog mode.
+pub async fn establish_registry_scope(
+    dsn: &str,
+    backend: &ArcStorageBackend,
+    shared: &SharedRegistryScope,
+    tenant: &str,
+    source_id: &str,
+) -> SourceResult<ScopeChange> {
+    let live = fetch_identity_verified(dsn).await?;
+    Ok(establish_scope(
+        backend,
+        shared,
+        tenant,
+        source_id,
+        mysql_registry_lineage(&live)?,
+    )
+    .await?)
+}
+
+/// Bring the published registry scope in line with a lineage just verified
+/// against the live server, before any further registry access. A changed
+/// `server_uuid` is a failover to another server: the new lineage is durably
+/// recorded (fail closed) and published, giving it a fresh schema namespace and
+/// invalidating caches from the old lineage.
+async fn sync_registry_lineage(
+    ctx: &RunCtx,
+    live: &ServerIdentity,
+) -> SourceResult<()> {
+    let descriptor = mysql_registry_lineage(live)?;
+    if ctx.registry_scope.current()?.lineage().descriptor == descriptor {
+        return Ok(());
+    }
+    let change = establish_scope(
+        &ctx.registry_backend,
+        &ctx.registry_scope,
+        &ctx.tenant,
+        &ctx.source_id,
+        descriptor,
+    )
+    .await?;
+    warn!(
+        source_id = %ctx.source_id,
+        lineage = %change.scope.lineage().lineage_hash,
+        "source lineage changed; schema registry re-scoped to the new server"
+    );
+    Ok(())
+}
+
 /// Compare the live server identity against the stored one.
 ///
 /// - `FirstSeen`: store and continue (clean start or wiped state).
@@ -1025,6 +1121,9 @@ async fn check_identity_post_reconnect(
         Some(live) => live,
         None => fetch_identity_verified(ctx.dsn.expose()).await?,
     };
+    // Re-scope the registry to the live lineage before any registry access on
+    // this connection (fails closed if the new lineage cannot be persisted).
+    sync_registry_lineage(ctx, &live).await?;
 
     match ctx
         .identity_store
@@ -1142,9 +1241,14 @@ async fn run_failover_reconciliation(
             });
         }
 
+        // Diff against the last-known schemas of the lineage the source ran
+        // under before this failover (read explicitly from its namespace).
+        let prior =
+            previous_scope(&ctx.registry_backend, &ctx.tenant, &ctx.source_id)
+                .await?;
         let record = ctx
             .reconciler
-            .run(&ctx.source_id, &previous, &current, &inputs)
+            .run(&ctx.source_id, &previous, &current, prior.as_ref(), &inputs)
             .await
             .map_err(SourceError::Other)?;
 

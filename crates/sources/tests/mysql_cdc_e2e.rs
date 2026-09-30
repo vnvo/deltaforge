@@ -131,6 +131,7 @@ async fn make_source(
         tenant: "acme".into(),
         pipeline: "test".to_string(),
         registry: make_registry().await,
+        registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         outbox_tables,
         snapshot_cfg: SnapshotCfg::default(),
         backend: make_storage_backend().await,
@@ -177,7 +178,18 @@ async fn mysql_schema_loader() -> Result<()> {
     .await?;
 
     let registry = make_registry().await;
-    let schema_loader = MySqlSchemaLoader::new(&dsn, registry.clone(), "acme");
+    let scope = sources::registry_scope::SharedRegistryScope::new("test");
+    sources::mysql::establish_registry_scope(
+        &dsn,
+        &make_storage_backend().await,
+        &scope,
+        "acme",
+        "test",
+    )
+    .await?;
+    let orders_key = scope.current()?.key(&db_name, "orders");
+    let schema_loader =
+        MySqlSchemaLoader::new(&dsn, registry.clone(), "acme", scope.clone());
 
     // Test: expand exact pattern
     {
@@ -233,7 +245,8 @@ async fn mysql_schema_loader() -> Result<()> {
 
     // Test: schema registered in registry
     {
-        let versions = registry.list_versions("acme", &db_name, "orders");
+        let versions =
+            test_common::registry_history(&registry, &orders_key).await;
         assert!(!versions.is_empty());
         assert_eq!(versions[0].version, 1);
         info!("✓ schema registered in registry");
@@ -281,7 +294,8 @@ async fn mysql_schema_loader() -> Result<()> {
         assert_eq!(reloaded.schema.columns.len(), 6);
         assert!(reloaded.schema.column("notes").is_some());
 
-        let versions = registry.list_versions("acme", &db_name, "orders");
+        let versions =
+            test_common::registry_history(&registry, &orders_key).await;
         assert!(versions.len() >= 2);
         info!("✓ reload detects DDL changes");
     }
@@ -328,6 +342,7 @@ async fn mysql_cdc_basic_events() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".to_string(),
         registry: registry.clone(),
+        registry_scope: sources::registry_scope::SharedRegistryScope::default(),
         outbox_tables: AllowList::default(),
         snapshot_cfg: SnapshotCfg::default(),
         backend,
@@ -442,6 +457,7 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
     .await?;
 
     let registry = make_registry().await;
+    let scope = sources::registry_scope::SharedRegistryScope::new("schema-ddl");
     let src = MySqlSource {
         id: "schema-ddl".into(),
         dsn: dsn.clone().into(),
@@ -449,6 +465,7 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
         tenant: "acme".into(),
         pipeline: "test".to_string(),
         registry: registry.clone(),
+        registry_scope: scope.clone(),
         outbox_tables: AllowList::default(),
         snapshot_cfg: SnapshotCfg::default(),
         backend: make_storage_backend().await,
@@ -514,7 +531,11 @@ async fn mysql_cdc_schema_reload_on_ddl() -> Result<()> {
     info!("✓ schema version changed: {} -> {}", schema_v1, schema_v2);
 
     // Verify registry has multiple versions
-    let versions = registry.list_versions("acme", &db_name, "orders");
+    let versions = test_common::registry_history(
+        &registry,
+        &scope.current()?.key(&db_name, "orders"),
+    )
+    .await;
     assert!(
         versions.len() >= 2,
         "registry should have at least 2 schema versions"

@@ -14,6 +14,7 @@ pub mod failover;
 pub mod identity_resolution;
 pub mod mysql;
 pub mod postgres;
+pub mod registry_scope;
 pub mod rotation;
 pub mod rotation_manager;
 pub mod schema_loader;
@@ -288,6 +289,10 @@ pub async fn resolve_source_dsn(
 
 /// Build a CDC source from pipeline configuration and a pre-resolved DSN.
 ///
+/// `registry_scope` is the pipeline's shared registry scope: the source
+/// establishes its verified lineage into it, and the pipeline's schema loader
+/// (see [`build_schema_loader`]) reads the same handle.
+///
 /// `resolver` resolves fixed (env) credential fields for controlled rotation and,
 /// for a Vault trigger, is retained in the rotation spec to poll for new record
 /// versions. A misconfigured rotation fails closed here.
@@ -295,6 +300,7 @@ pub async fn build_source(
     pipeline: &PipelineSpec,
     dsn: ProtectedDsn,
     registry: Arc<DurableSchemaRegistry>,
+    registry_scope: registry_scope::SharedRegistryScope,
     backend: ArcStorageBackend,
     resolver: Arc<CompositeResolver>,
 ) -> Result<ArcDynSource> {
@@ -315,6 +321,7 @@ pub async fn build_source(
                 pipeline: pipeline.metadata.name.clone(),
                 tenant: pipeline.metadata.tenant.clone(),
                 registry,
+                registry_scope,
                 backend: Arc::clone(&backend),
                 outbox_prefixes: c
                     .outbox
@@ -339,6 +346,7 @@ pub async fn build_source(
                 tenant: pipeline.metadata.tenant.clone(),
                 pipeline: pipeline.metadata.name.clone(),
                 registry,
+                registry_scope,
                 backend: Arc::clone(&backend),
                 outbox_tables: c
                     .outbox
@@ -356,11 +364,16 @@ pub async fn build_source(
 
 /// Build a schema loader from pipeline configuration and the pre-resolved DSN.
 ///
+/// The loader shares `registry_scope` with the pipeline's source; it can reach
+/// the registry only once the source has established its verified lineage, and
+/// fails closed before that.
+///
 /// Returns None for sources that handle schemas internally.
 pub fn build_schema_loader(
     pipeline: &PipelineSpec,
     dsn: &ProtectedDsn,
     registry: Arc<DurableSchemaRegistry>,
+    registry_scope: registry_scope::SharedRegistryScope,
 ) -> Option<ArcSchemaLoader> {
     match &pipeline.spec.source {
         SourceCfg::Postgres(_) => {
@@ -368,6 +381,7 @@ pub fn build_schema_loader(
                 dsn.clone(),
                 registry,
                 &pipeline.metadata.tenant,
+                registry_scope,
             )))
         }
 
@@ -375,6 +389,7 @@ pub fn build_schema_loader(
             dsn.clone(),
             registry,
             &pipeline.metadata.tenant,
+            registry_scope,
         ))),
     }
 }
