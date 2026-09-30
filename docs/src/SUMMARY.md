@@ -3,6 +3,7 @@
 - [Introduction](introduction.md)
 - [Change Data Capture](cdc.md)
 - [Quickstart](quickstart.md)
+- [Production Quick Start](quickstart-production.md)
 - [Supported Deployment Envelope](deployment-support.md)
 - [Capacity & Resource Envelope](capacity-envelope.md)
 - [Configuration](configuration.md)
