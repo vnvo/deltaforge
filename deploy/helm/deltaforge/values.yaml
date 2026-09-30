@@ -53,6 +53,16 @@ pipeline:
   existingConfigMap: ""
 
 # ---------------------------------------------------------------------------
+# Deployment preflight gate
+# ---------------------------------------------------------------------------
+# Runs `deltaforge preflight` as an initContainer before the pipeline starts,
+# validating the config against the live source (and slot ownership via the same
+# storage backend) and failing the pod if any check fails. Keep enabled in
+# production so a misconfigured deployment never begins streaming.
+preflight:
+  enabled: true
+
+# ---------------------------------------------------------------------------
 # Storage backend (checkpoints + DLQ)
 # ---------------------------------------------------------------------------
 storage:
