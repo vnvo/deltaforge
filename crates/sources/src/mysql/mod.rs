@@ -172,6 +172,7 @@ impl MySqlSource {
         &self,
         loader: &MySqlSchemaLoader,
         tracked: &[(String, String)],
+        lineage: PersistedLineage,
     ) -> SourceResult<SnapshotPlan> {
         use crate::identity_resolution::{
             IdentitySchemaView, resolve_identity,
@@ -226,8 +227,8 @@ impl MySqlSource {
             identity_map.insert(fqn, resolved.columns);
         }
 
-        // Step 5: freeze lineage. Step 6: fingerprint. Step 7: allocate.
-        let lineage = self.capture_snapshot_lineage().await?;
+        // Step 5: lineage is captured once by the caller and passed in. Step 6:
+        // fingerprint. Step 7: allocate.
         let fingerprint = SnapshotConfigFingerprint::compute(&specs);
         let mode = if self.snapshot_cfg.mode == SnapshotMode::Always {
             AllocationMode::ForceNew
@@ -305,6 +306,14 @@ impl MySqlSource {
         paused: Arc<AtomicBool>,
         pause_notify: Arc<Notify>,
     ) -> SourceResult<()> {
+        // Verify the source lineage ONCE, before any snapshot, stream, or RunCtx.
+        // Fail closed if it cannot be established: a swallowed error here would
+        // proceed to snapshot/stream with no durable-watermark identity, leaving
+        // correctness to downstream consumers instead of stopping the source. The
+        // same verified value anchors both the snapshot generation and the CDC
+        // durable watermarks.
+        let durable_lineage = self.capture_snapshot_lineage().await?;
+
         // snapshot (if configured)
         let snapshot_progress: Option<MysqlSnapshotProgress> = chkpt_store
             .get_raw(&mysql_snapshot::progress_key(&self.id))
@@ -347,7 +356,11 @@ impl MySqlSource {
             // Validate every table + freeze lineage + allocate the generation
             // BEFORE emitting any row (keyless/unsupported tables fail here).
             let plan = self
-                .prepare_snapshot_generation(&snap_schema_loader, &tracked)
+                .prepare_snapshot_generation(
+                    &snap_schema_loader,
+                    &tracked,
+                    durable_lineage.clone(),
+                )
                 .await?;
 
             let snapshot_ctx = mysql_snapshot::SnapshotCtx {
@@ -528,10 +541,8 @@ impl MySqlSource {
             tables: self.tables.clone(),
             outbox_tables: self.outbox_tables.clone(),
             on_schema_drift: self.on_schema_drift.clone(),
-            // Freeze lineage once at startup for durable CDC watermarks. Same
-            // authority as snapshot lineage; best-effort (None -> durable sink
-            // fails closed, never a synthetic fallback).
-            durable_lineage: self.capture_snapshot_lineage().await.ok(),
+            // Verified once above, before the stream opens.
+            durable_lineage: Some(durable_lineage),
         };
 
         // Resolve the identity BEFORE opening the stream: persist FirstSeen,
