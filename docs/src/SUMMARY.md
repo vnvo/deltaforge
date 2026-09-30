@@ -4,6 +4,7 @@
 - [Change Data Capture](cdc.md)
 - [Quickstart](quickstart.md)
 - [Pilot Support Envelope](pilot-support.md)
+- [Capacity & Resource Envelope](capacity-envelope.md)
 - [Configuration](configuration.md)
 - [Secrets & Credentials](secrets.md)
 - [API Reference](apireference.md)
