@@ -1048,9 +1048,10 @@ async fn postgres_failover_slot_absent_stops_source() -> Result<()> {
 // The FirstSeen identity must be persisted BEFORE the source opens replication.
 // These tests inject a backend whose identity-namespace writes fail, run the
 // source against a fresh server (FirstSeen), and assert the source stops with the
-// identity error AND that the server shows no replication stream was ever opened
-// (PG: no active walsender; MySQL: no Binlog Dump thread). Covers PostgreSQL,
-// MySQL GTID mode, and MySQL non-GTID (file/pos) mode.
+// identity error AND that the real connect-path counter (stream_probe) recorded
+// zero opens - proving no stream was ever opened, not merely opened-then-dropped
+// before a post-mortem query. Covers PostgreSQL, MySQL GTID mode, and MySQL
+// non-GTID (file/pos) mode.
 // ============================================================================
 
 /// A backend that fails writes to the failover/identity namespace, delegating
