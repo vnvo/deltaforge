@@ -313,38 +313,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_and_ready_return_503_when_pipeline_failed() {
-        // A failed pipeline must surface on BOTH probes: /health (liveness) and
-        // /ready (readiness) return 503 and name the failed pipeline.
+    async fn failed_pipeline_makes_ready_503_but_health_stays_200() {
+        // A failed pipeline is a readiness concern, not a liveness one:
+        //  - /health (liveness) MUST stay 200 so Kubernetes does not restart the
+        //    whole process for an intentionally fail-closed pipeline (e.g. schema
+        //    drift under Halt), which would loop forever.
+        //  - /ready (readiness) returns 503 and names the failed pipeline so
+        //    Kubernetes drains it from the Service.
         let mut info = sample_pipe_info();
         info.status = "failed".to_string();
         let app = router(AppState {
             controller: Arc::new(HappyController { info }),
         });
 
-        for uri in ["/health", "/ready"] {
-            let resp = app
-                .clone()
-                .oneshot(
-                    Request::builder().uri(uri).body(Body::empty()).unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                StatusCode::SERVICE_UNAVAILABLE,
-                resp.status(),
-                "{uri} must return 503 when a pipeline is failed"
-            );
-            let payload: serde_json::Value = serde_json::from_slice(
-                &to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+        // /health stays 200 (liveness) but reports the failed count.
+        let health = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
             )
+            .await
             .unwrap();
-            assert_eq!(
-                payload["failed_pipelines"],
-                json!(["demo"]),
-                "{uri} must name the failed pipeline"
-            );
-        }
+        assert_eq!(
+            StatusCode::OK,
+            health.status(),
+            "/health must stay 200 (liveness) even when a pipeline is failed"
+        );
+        let hbody: serde_json::Value = serde_json::from_slice(
+            &to_bytes(health.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(hbody["status"], json!("healthy"));
+        assert_eq!(hbody["failed_pipelines"], json!(1));
+
+        // /ready returns 503 and names the offender.
+        let ready = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ready.status(),
+            "/ready must return 503 when a pipeline is failed"
+        );
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(ready.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            payload["failed_pipelines"],
+            json!(["demo"]),
+            "/ready must name the failed pipeline"
+        );
     }
 
     #[tokio::test]
