@@ -76,7 +76,15 @@ async fn main() -> Result<()> {
 
     // One-shot subcommands run before server/observability boot (no port binds).
     if let Some(Command::Preflight { config, json }) = &args.command {
-        return runner::preflight::run(config, *json).await;
+        // Use the deployment's own storage backend so slot-ownership checks see
+        // the same durable owner records startup uses.
+        let storage_cfg = storage_config_from(&args);
+        let backend = build_storage_backend(&storage_cfg)
+            .await
+            .context("initialise storage backend for preflight")?;
+        let chkpt: Arc<dyn checkpoints::CheckpointStore> =
+            Arc::new(storage::BackendCheckpointStore::new(backend));
+        return runner::preflight::run(config, *json, chkpt).await;
     }
 
     eprintln!("{}", version::startup_banner());
@@ -117,16 +125,7 @@ async fn main() -> Result<()> {
         pipeline_specs.iter().map(format_pipeline_summary).collect();
 
     // ── Build storage backend ─────────────────────────────────────────────────
-    let storage_cfg = StorageConfig {
-        backend: match args.storage_backend.as_str() {
-            "memory" => StorageBackendKind::Memory,
-            "postgres" => StorageBackendKind::Postgres,
-            _ => StorageBackendKind::Sqlite,
-        },
-        path: args.storage_path.clone(),
-        dsn: args.storage_dsn.clone(),
-        ..Default::default()
-    };
+    let storage_cfg = storage_config_from(&args);
 
     let backend = build_storage_backend(&storage_cfg)
         .await
@@ -196,6 +195,19 @@ fn parse_listen_addr(flag: &str, value: &str) -> Result<SocketAddr> {
             "invalid --{flag} '{value}' (expected host:port, e.g. 127.0.0.1:9000)"
         )
     })
+}
+
+fn storage_config_from(args: &Args) -> StorageConfig {
+    StorageConfig {
+        backend: match args.storage_backend.as_str() {
+            "memory" => StorageBackendKind::Memory,
+            "postgres" => StorageBackendKind::Postgres,
+            _ => StorageBackendKind::Sqlite,
+        },
+        path: args.storage_path.clone(),
+        dsn: args.storage_dsn.clone(),
+        ..Default::default()
+    }
 }
 
 async fn build_storage_backend(

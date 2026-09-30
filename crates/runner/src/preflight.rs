@@ -10,13 +10,17 @@
 //! Sink reachability is not yet probed (the sink trait has no health primitive);
 //! that is a documented follow-up.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use anyhow::Result;
+use checkpoints::CheckpointStore;
 use deltaforge_config::{PipelineSpec, SourceCfg, load_cfg};
 use serde::Serialize;
 use sources::mysql::mysql_health;
-use sources::postgres::postgres_health;
+use sources::postgres::postgres_health::{self, SlotPresence};
+use sources::postgres::postgres_slot_owner::{self, SlotPreflight};
 
 use crate::coordinator::validate_commit_policy;
 
@@ -94,17 +98,53 @@ fn parse_concrete_tables(
     (concrete, skipped)
 }
 
+/// A duplicate source id across the supplied specs collides on the (source-id-
+/// keyed) checkpoint store - the same containment the pipeline manager enforces
+/// at deploy time. Report it here so it is caught before deployment.
+fn duplicate_source_ids(specs: &[PipelineSpec]) -> Vec<String> {
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    for spec in specs {
+        *seen.entry(spec.spec.source.source_id()).or_insert(0) += 1;
+    }
+    let mut dups: Vec<String> = seen
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(id, n)| format!("{id} (used by {n} pipelines)"))
+        .collect();
+    dups.sort();
+    dups
+}
+
 /// Preflight every pipeline in `specs`. Never panics: each pipeline's failures
-/// are collected into its `PipelineCheck`.
-pub async fn check_all(specs: &[PipelineSpec]) -> PreflightReport {
+/// are collected into its `PipelineCheck`. `chkpt` is the deployment's checkpoint
+/// store, used to check replication-slot ownership under the startup rules.
+pub async fn check_all(
+    specs: &[PipelineSpec],
+    chkpt: &Arc<dyn CheckpointStore>,
+) -> PreflightReport {
+    let dups = duplicate_source_ids(specs);
     let mut checks = Vec::with_capacity(specs.len());
     for spec in specs {
-        checks.push(check_pipeline(spec).await);
+        let mut check = check_pipeline(spec, chkpt).await;
+        // A duplicated source id fails every pipeline that shares it.
+        if dups.iter().any(|d| {
+            d.starts_with(&format!("{} ", spec.spec.source.source_id()))
+        }) {
+            check.hard_errors.push(format!(
+                "source id '{}' is used by more than one pipeline; source ids \
+                 must be unique (checkpoints are keyed by source id)",
+                spec.spec.source.source_id()
+            ));
+        }
+        checks.push(check);
     }
     PreflightReport::from_checks(checks)
 }
 
-async fn check_pipeline(spec: &PipelineSpec) -> PipelineCheck {
+async fn check_pipeline(
+    spec: &PipelineSpec,
+    chkpt: &Arc<dyn CheckpointStore>,
+) -> PipelineCheck {
     let mut hard = Vec::new();
     let mut warn = Vec::new();
 
@@ -123,17 +163,30 @@ async fn check_pipeline(spec: &PipelineSpec) -> PipelineCheck {
         hard.push("pipeline has no sinks configured".to_string());
     }
 
-    // Resolve secrets + source DSN exactly as startup does, failing closed.
+    // Resolve secrets once, then validate BOTH the source DSN and every sink's
+    // credential references (missing refs / inline+ref conflicts) fail closed
+    // here rather than at startup. Sink endpoints are not probed.
     match sources::source_secret_resolver(spec).await {
         Ok(resolver) => {
             match sources::resolve_source_dsn(spec, resolver.as_ref()).await {
                 Ok(dsn) => {
-                    check_source_live(spec, dsn.expose(), &mut hard, &mut warn)
-                        .await
+                    check_source_live(
+                        spec,
+                        dsn.expose(),
+                        chkpt,
+                        &mut hard,
+                        &mut warn,
+                    )
+                    .await
                 }
                 Err(e) => {
                     hard.push(format!("resolve source credentials: {e:#}"))
                 }
+            }
+            if let Err(e) =
+                sinks::resolve_sink_secrets(spec, resolver.as_ref()).await
+            {
+                hard.push(format!("resolve sink credentials: {e:#}"));
             }
         }
         Err(e) => hard.push(format!("resolve secret providers: {e:#}")),
@@ -150,6 +203,7 @@ async fn check_pipeline(spec: &PipelineSpec) -> PipelineCheck {
 async fn check_source_live(
     spec: &PipelineSpec,
     dsn: &str,
+    chkpt: &Arc<dyn CheckpointStore>,
     hard: &mut Vec<String>,
     warn: &mut Vec<String>,
 ) {
@@ -171,9 +225,14 @@ async fn check_source_live(
                     skipped.join(", ")
                 ));
             }
+
+            // Slot health (invalidated / WAL retention) + publication + capacity.
+            // DeltaForge creates and owns the slot in every supported mode, so an
+            // absent slot is informational here.
             match postgres_health::run_preflight(
                 dsn,
                 Some(&c.slot),
+                SlotPresence::CreatedByDeltaforge,
                 &c.publication,
                 &tables,
                 c.snapshot.max_parallel_tables,
@@ -185,6 +244,39 @@ async fn check_source_live(
                     warn.extend(report.warnings);
                 }
                 Err(e) => hard.push(format!("postgres preflight: {e:#}")),
+            }
+
+            // Ownership of an existing slot, under the same rules as startup.
+            match postgres_slot_owner::preflight_classify_slot(
+                chkpt,
+                dsn,
+                c.id.as_str(),
+                &spec.metadata.name,
+                &c.slot,
+            )
+            .await
+            {
+                Ok(SlotPreflight::AbsentWillCreate)
+                | Ok(SlotPreflight::OwnedInactive) => {}
+                Ok(SlotPreflight::OwnedActive) => hard.push(format!(
+                    "replication slot '{}' is currently active (another consumer \
+                     is connected); DeltaForge requires exclusive use",
+                    c.slot
+                )),
+                Ok(SlotPreflight::Foreign) => hard.push(format!(
+                    "replication slot '{}' already exists but is not owned by this \
+                     pipeline (no matching ownership record for this server/db); \
+                     use a different slot name or drop the foreign slot",
+                    c.slot
+                )),
+                Ok(SlotPreflight::OwnerStoreUnavailable) => warn.push(
+                    "could not read slot ownership (storage unavailable); \
+                     ownership will be reconciled fail-closed at startup"
+                        .to_string(),
+                ),
+                Err(e) => {
+                    hard.push(format!("slot ownership check: {e:#}"))
+                }
             }
         }
         SourceCfg::Mysql(c) => {
@@ -214,13 +306,18 @@ async fn check_source_live(
 
 /// Entry point for the `preflight` subcommand. Loads the config, preflights every
 /// pipeline, prints a report, and exits non-zero if any hard error was found.
-pub async fn run(config_path: &str, json: bool) -> Result<()> {
+/// `chkpt` is the deployment's checkpoint store (used for slot-ownership checks).
+pub async fn run(
+    config_path: &str,
+    json: bool,
+    chkpt: Arc<dyn CheckpointStore>,
+) -> Result<()> {
     let specs = load_cfg(config_path)?;
     if specs.is_empty() {
         anyhow::bail!("no pipeline specs found at '{config_path}'");
     }
 
-    let report = check_all(&specs).await;
+    let report = check_all(&specs, &chkpt).await;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -283,6 +380,59 @@ mod tests {
         assert!(text.contains("[FAILED] b"));
         assert!(text.contains("ERROR: boom"));
         assert!(text.contains("preflight: FAIL"));
+    }
+
+    #[test]
+    fn duplicate_source_ids_detected_across_specs() {
+        use deltaforge_config::{
+            BatchConfig, Metadata, MysqlSrcCfg, SnapshotCfg, SourceCfg, Spec,
+        };
+        fn spec(name: &str, source_id: &str) -> PipelineSpec {
+            PipelineSpec {
+                metadata: Metadata {
+                    name: name.into(),
+                    tenant: "acme".into(),
+                    labels: Default::default(),
+                    annotations: Default::default(),
+                },
+                spec: Spec {
+                    sharding: None,
+                    source: SourceCfg::Mysql(MysqlSrcCfg {
+                        id: source_id.into(),
+                        dsn: Some("mysql://x/y".into()),
+                        dsn_secret: None,
+                        credentials: None,
+                        tables: vec![],
+                        table_options: Default::default(),
+                        outbox: None,
+                        snapshot: SnapshotCfg::default(),
+                        on_schema_drift: Default::default(),
+                        rotation: None,
+                    }),
+                    processors: vec![],
+                    sinks: vec![],
+                    connection_policy: None,
+                    batch: Some(BatchConfig::default()),
+                    commit_policy: None,
+                    sink_batch_deadline_secs: None,
+                    schema_sensing: Default::default(),
+                    journal: None,
+                    secrets: None,
+                },
+            }
+        }
+        let specs = vec![
+            spec("p1", "shared"),
+            spec("p2", "shared"),
+            spec("p3", "unique"),
+        ];
+        let dups = duplicate_source_ids(&specs);
+        assert_eq!(dups.len(), 1);
+        assert!(dups[0].starts_with("shared "));
+
+        // A config with all-distinct source ids has no duplicates.
+        let ok = vec![spec("p1", "a"), spec("p2", "b")];
+        assert!(duplicate_source_ids(&ok).is_empty());
     }
 
     #[test]

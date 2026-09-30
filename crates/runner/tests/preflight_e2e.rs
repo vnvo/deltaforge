@@ -1,16 +1,29 @@
-//! Live coverage for the `deltaforge preflight` command (item 1 of the
-//! operational pass): it must PASS a correctly provisioned PostgreSQL source and
-//! FAIL (fail closed) when a required object is missing - here, the replication
-//! slot. Sink reachability is intentionally not probed.
+//! Live coverage for the `deltaforge preflight` command (operational pass item 1).
+//!
+//! - A valid FRESH deployment (no slot yet) must PASS: DeltaForge creates and owns
+//!   the slot, so an absent slot is informational, not a hard error.
+//! - An existing FOREIGN slot (no matching ownership record) must FAIL closed.
+//! - An existing OWNED slot (matching ownership record) must PASS.
+//! - A missing sink credential must FAIL closed (no container needed).
+//!
+//! Sink endpoint reachability is intentionally not probed.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use checkpoints::{CheckpointStore, MemCheckpointStore};
 use deltaforge_config::load_cfg;
 use runner::preflight::check_all;
+use sources::postgres::postgres_slot_owner::{
+    SLOT_OWNER_RECORD_VERSION, SlotLifecycle, SlotOwnership,
+};
 use testcontainers::{
     ContainerAsync, GenericImage, ImageExt, core::WaitFor, runners::AsyncRunner,
 };
 use tokio_postgres::NoTls;
+
+const SOURCE_ID: &str = "orders-pg";
+const SLOT: &str = "df_pf_slot";
 
 async fn start_pg() -> (ContainerAsync<GenericImage>, u16) {
     let image = GenericImage::new("postgres", "17")
@@ -38,15 +51,13 @@ fn pg_dsn(port: u16) -> String {
     )
 }
 
-async fn pg_exec(port: u16, sql: &str) {
+async fn pg_client(port: u16) -> tokio_postgres::Client {
     let (client, conn) =
         tokio_postgres::connect(&pg_dsn(port), NoTls).await.unwrap();
     tokio::spawn(async move {
         let _ = conn.await;
     });
-    // One statement per simple query: pg_create_logical_replication_slot cannot
-    // run inside the implicit transaction that batching several statements forms.
-    client.execute(sql, &[]).await.unwrap();
+    client
 }
 
 fn config_yaml(port: u16) -> String {
@@ -60,9 +71,9 @@ spec:
   source:
     type: postgres
     config:
-      id: orders-pg
+      id: {SOURCE_ID}
       dsn: "host=127.0.0.1 port={port} user=postgres password=password dbname=postgres"
-      slot: df_pf_slot
+      slot: {SLOT}
       publication: df_pf_pub
       tables:
         - public.orders
@@ -85,51 +96,163 @@ spec:
     )
 }
 
-fn write_config(port: u16) -> tempfile::NamedTempFile {
+fn write_config(yaml: &str) -> tempfile::NamedTempFile {
     use std::io::Write;
     let mut f = tempfile::NamedTempFile::new().unwrap();
-    f.write_all(config_yaml(port).as_bytes()).unwrap();
+    f.write_all(yaml.as_bytes()).unwrap();
     f.flush().unwrap();
     f
 }
 
 #[tokio::test]
 #[ignore = "requires docker"]
-async fn preflight_passes_on_healthy_source_and_fails_when_slot_missing() {
+async fn preflight_slot_ownership_lifecycle() {
     let (_c, port) = start_pg().await;
+    let client = pg_client(port).await;
 
-    // Provision a correct source: table, publication, logical slot.
-    pg_exec(port, "CREATE TABLE orders (id INT PRIMARY KEY, sku TEXT)").await;
-    pg_exec(port, "ALTER TABLE orders REPLICA IDENTITY FULL").await;
-    pg_exec(port, "CREATE PUBLICATION df_pf_pub FOR TABLE orders").await;
-    pg_exec(
-        port,
-        "SELECT pg_create_logical_replication_slot('df_pf_slot', 'pgoutput')",
-    )
-    .await;
+    // Table + publication, but NO slot (fresh deployment).
+    client
+        .batch_execute("CREATE TABLE orders (id INT PRIMARY KEY, sku TEXT)")
+        .await
+        .unwrap();
+    client
+        .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
+        .await
+        .unwrap();
+    client
+        .execute("CREATE PUBLICATION df_pf_pub FOR TABLE orders", &[])
+        .await
+        .unwrap();
 
-    let cfg = write_config(port);
-    let path = cfg.path().to_str().unwrap();
+    let cfg = write_config(&config_yaml(port));
+    let specs = load_cfg(cfg.path().to_str().unwrap()).expect("load config");
+    let chkpt: Arc<dyn CheckpointStore> =
+        Arc::new(MemCheckpointStore::new().unwrap());
 
-    // Healthy: preflight must pass.
-    let specs = load_cfg(path).expect("load config");
-    let report = check_all(&specs).await;
+    // 1. Fresh deployment: absent slot is OK (DeltaForge will create+own it).
+    let report = check_all(&specs, &chkpt).await;
     assert!(
         report.ok,
-        "preflight must pass on a correctly provisioned source; got: {:?}",
+        "fresh deployment must pass preflight; got: {:?}",
         report.pipelines
     );
 
-    // Drop the slot -> preflight must fail closed and name the slot.
-    pg_exec(port, "SELECT pg_drop_replication_slot('df_pf_slot');").await;
-    let report = check_all(&specs).await;
+    // 2. Foreign slot: create it out of band with no ownership record -> FAIL.
+    client
+        .execute(
+            "SELECT pg_create_logical_replication_slot($1, 'pgoutput')",
+            &[&SLOT],
+        )
+        .await
+        .unwrap();
+    let report = check_all(&specs, &chkpt).await;
+    assert!(!report.ok, "a foreign existing slot must fail preflight");
     assert!(
-        !report.ok,
-        "preflight must fail when the replication slot is missing"
+        report.pipelines[0]
+            .hard_errors
+            .iter()
+            .any(|e| e.contains("not owned by this pipeline")),
+        "foreign slot must be reported; got: {:?}",
+        report.pipelines[0].hard_errors
     );
-    let errs = report.pipelines[0].hard_errors.join(" | ");
+
+    // 3. Owned slot: write a matching ownership record -> PASS.
+    let sid: String = client
+        .query_one(
+            "SELECT system_identifier::text FROM pg_control_system()",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let db_row = client
+        .query_one(
+            "SELECT current_database()::text, \
+             (SELECT oid::int8 FROM pg_database WHERE datname = current_database())",
+            &[],
+        )
+        .await
+        .unwrap();
+    let record = SlotOwnership {
+        record_version: SLOT_OWNER_RECORD_VERSION,
+        source_id: SOURCE_ID.into(),
+        pipeline: "pf-e2e".into(),
+        system_identifier: sid,
+        database: db_row.get(0),
+        database_oid: db_row.get(1),
+        slot: SLOT.into(),
+        plugin: "pgoutput".into(),
+        lifecycle: SlotLifecycle::Created,
+        consistent_lsn: Some("0/0".into()),
+        created_at_ms: 0,
+    };
+    chkpt
+        .put_raw(
+            &format!("slot_owner:{SOURCE_ID}"),
+            &serde_json::to_vec(&record).unwrap(),
+        )
+        .await
+        .unwrap();
+    let report = check_all(&specs, &chkpt).await;
     assert!(
-        errs.contains("df_pf_slot") || errs.to_lowercase().contains("slot"),
-        "hard errors should name the missing slot, got: {errs}"
+        report.ok,
+        "an owned existing slot must pass preflight; got: {:?}",
+        report.pipelines
+    );
+}
+
+/// A missing sink credential must fail closed. No container: the source points at
+/// a dead port (its own hard error), and we assert the sink credential error is
+/// also reported - proving sink secret references are validated during preflight.
+#[tokio::test]
+async fn preflight_fails_on_missing_sink_secret() {
+    let yaml = r#"apiVersion: deltaforge/v1
+kind: Pipeline
+metadata:
+  name: pf-sink-secret
+  tenant: acme
+spec:
+  source:
+    type: postgres
+    config:
+      id: s
+      dsn: "host=127.0.0.1 port=59999 user=none dbname=none connect_timeout=1"
+      slot: s_slot
+      publication: s_pub
+      tables:
+        - public.orders
+  processors: []
+  sinks:
+    - type: redis
+      config:
+        id: r1
+        uri: "redis://127.0.0.1:6379"
+        uri_secret:
+          provider: env
+          location: DEFINITELY_MISSING_REDIS_URI_SECRET_XYZ
+        stream: df.events
+        envelope:
+          type: native
+        encoding: json
+        required: true
+  batch:
+    max_events: 100
+    max_bytes: 8388608
+    max_ms: 200
+"#;
+    let cfg = write_config(yaml);
+    let specs = load_cfg(cfg.path().to_str().unwrap()).expect("load config");
+    let chkpt: Arc<dyn CheckpointStore> =
+        Arc::new(MemCheckpointStore::new().unwrap());
+
+    let report = check_all(&specs, &chkpt).await;
+    assert!(!report.ok);
+    assert!(
+        report.pipelines[0]
+            .hard_errors
+            .iter()
+            .any(|e| e.contains("sink credentials")),
+        "a missing sink credential must be reported; got: {:?}",
+        report.pipelines[0].hard_errors
     );
 }

@@ -207,6 +207,57 @@ pub(super) async fn read_owner(
     }
 }
 
+/// Preflight verdict for the configured replication slot, evaluated under the
+/// same durable-ownership rules startup uses.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SlotPreflight {
+    /// Slot does not exist; DeltaForge will create and own it.
+    AbsentWillCreate,
+    /// Slot exists, this pipeline's ownership is proven, and it is inactive.
+    OwnedInactive,
+    /// Slot exists and is owned by this pipeline but currently active (another
+    /// consumer is connected).
+    OwnedActive,
+    /// Slot exists but ownership cannot be proven (no or mismatched owner record):
+    /// a foreign slot that startup would refuse to take over.
+    Foreign,
+    /// The ownership store could not be read (transient); cannot classify.
+    OwnerStoreUnavailable,
+}
+
+/// Classify the configured slot for a deployment preflight, using the same
+/// ownership rules as startup: an existing slot is OK only when this pipeline's
+/// durable ownership record proves it owns that slot on this exact server/db, and
+/// it is not already in active use.
+pub async fn preflight_classify_slot(
+    chkpt: &Arc<dyn CheckpointStore>,
+    dsn: &str,
+    source_id: &str,
+    pipeline: &str,
+    slot: &str,
+) -> Result<SlotPreflight> {
+    let client = connect(dsn).await?;
+    let active = match slot_status(&client, slot).await? {
+        None => return Ok(SlotPreflight::AbsentWillCreate),
+        Some(active) => active,
+    };
+    let id = fetch_identity(&client).await?;
+    match read_owner(chkpt, source_id).await {
+        OwnerRead::Unavailable => Ok(SlotPreflight::OwnerStoreUnavailable),
+        OwnerRead::Present(rec)
+            if ownership_proven(&rec, source_id, pipeline, slot, &id) =>
+        {
+            if active {
+                Ok(SlotPreflight::OwnedActive)
+            } else {
+                Ok(SlotPreflight::OwnedInactive)
+            }
+        }
+        // Missing, malformed, or mismatched record -> not provably ours.
+        _ => Ok(SlotPreflight::Foreign),
+    }
+}
+
 pub(super) async fn load_owner(
     chkpt: &Arc<dyn CheckpointStore>,
     source_id: &str,
