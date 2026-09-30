@@ -702,9 +702,26 @@ impl PipelineManager {
     /// checkpoint and schema registry subsystems. Replays the schema log
     /// on startup so the cache is warm before any pipeline starts.
     pub async fn with_backend(backend: ArcStorageBackend) -> Result<Self> {
+        Self::with_backend_and_registry_config(
+            backend,
+            storage::adapters::RegistryConfig::default(),
+        )
+        .await
+    }
+
+    /// Like [`Self::with_backend`], with explicit schema-registry budgets
+    /// (validated; an invalid budget fails construction).
+    pub async fn with_backend_and_registry_config(
+        backend: ArcStorageBackend,
+        registry_config: storage::adapters::RegistryConfig,
+    ) -> Result<Self> {
         let ckpt_store: Arc<dyn CheckpointStore> =
             Arc::new(BackendCheckpointStore::new(Arc::clone(&backend)));
-        let registry = DurableSchemaRegistry::new(Arc::clone(&backend)).await?;
+        let registry = DurableSchemaRegistry::with_config(
+            Arc::clone(&backend),
+            registry_config,
+        )
+        .await?;
 
         Ok(Self {
             pipelines: Arc::new(RwLock::new(HashMap::new())),

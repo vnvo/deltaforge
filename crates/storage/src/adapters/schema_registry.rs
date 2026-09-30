@@ -209,6 +209,25 @@ pub struct RegistryConfig {
     pub history_page_size: usize,
 }
 
+impl RegistryConfig {
+    /// Refuse budgets that cannot bound anything or cannot work.
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.cache_max_bytes > 0,
+            "schema cache byte budget must be greater than zero"
+        );
+        anyhow::ensure!(
+            self.cache_max_entries > 0,
+            "schema cache entry budget must be greater than zero"
+        );
+        anyhow::ensure!(
+            (1..=MAX_HISTORY_PAGE).contains(&self.history_page_size),
+            "history page size must be between 1 and {MAX_HISTORY_PAGE}"
+        );
+        Ok(())
+    }
+}
+
 impl Default for RegistryConfig {
     fn default() -> Self {
         Self {
@@ -365,6 +384,9 @@ impl DurableSchemaRegistry {
         backend: ArcStorageBackend,
         config: RegistryConfig,
     ) -> Result<Arc<Self>> {
+        config
+            .validate()
+            .context("invalid schema registry configuration")?;
         let seq = load_or_bootstrap_hw(&backend).await?;
         info!(seq, "DurableSchemaRegistry: lazy init (no startup replay)");
         Ok(Arc::new(Self::build(backend, config, seq)))
@@ -1606,6 +1628,33 @@ mod tests {
         assert_eq!(register(&r, &key(&a), "h3").await, 4);
         // An already-registered schema on A keeps its identity.
         assert_eq!(register(&r, &key(&a), "h2").await, 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_budgets_are_refused_at_construction() {
+        let (_f, b) = backend();
+        for bad in [
+            RegistryConfig {
+                cache_max_bytes: 0,
+                ..RegistryConfig::default()
+            },
+            RegistryConfig {
+                cache_max_entries: 0,
+                ..RegistryConfig::default()
+            },
+            RegistryConfig {
+                history_page_size: MAX_HISTORY_PAGE + 1,
+                ..RegistryConfig::default()
+            },
+        ] {
+            assert!(
+                DurableSchemaRegistry::with_config(Arc::clone(&b), bad.clone())
+                    .await
+                    .is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(RegistryConfig::default().validate().is_ok());
     }
 
     // ---- integrity / version gates ----------------------------------------

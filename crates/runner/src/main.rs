@@ -51,6 +51,15 @@ struct Args {
     /// PostgreSQL DSN (postgres backend only)
     #[arg(long)]
     storage_dsn: Option<String>,
+    /// Byte budget for cached latest schema versions, shared by all pipelines
+    /// (primary bound; a conservative estimate of resident memory). A schema
+    /// larger than the whole budget is served without being cached.
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    schema_cache_max_bytes: usize,
+    /// Maximum number of cached latest schema versions, shared by all
+    /// pipelines (secondary bound, one entry per table).
+    #[arg(long, default_value_t = 50_000)]
+    schema_cache_max_entries: usize,
 }
 
 #[derive(Subcommand, Debug)]
@@ -134,10 +143,23 @@ async fn main() -> Result<()> {
     info!(backend = %args.storage_backend, "storage backend ready");
 
     // ── Build pipeline manager ────────────────────────────────────────────────
+    let registry_config = storage::adapters::RegistryConfig {
+        cache_max_bytes: args.schema_cache_max_bytes,
+        cache_max_entries: args.schema_cache_max_entries,
+        ..storage::adapters::RegistryConfig::default()
+    };
+    info!(
+        cache_max_bytes = registry_config.cache_max_bytes,
+        cache_max_entries = registry_config.cache_max_entries,
+        "schema registry cache budget"
+    );
     let manager = Arc::new(
-        PipelineManager::with_backend(backend)
-            .await
-            .context("build pipeline manager")?,
+        PipelineManager::with_backend_and_registry_config(
+            backend,
+            registry_config,
+        )
+        .await
+        .context("build pipeline manager")?,
     );
     let schema_api = Arc::new(SchemaApi::new(manager.clone()));
     let sensing_api = Arc::new(SensingApi::new(manager.clone()));
