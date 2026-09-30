@@ -769,12 +769,15 @@ impl PostgresSource {
             match event_result {
                 Ok(()) => {}
                 Err(LoopControl::ReloadSchema { schema, table }) => {
+                    // Fail closed if the reload fails: continuing would decode the
+                    // rows that triggered the reload against a stale cached schema.
+                    // (MySQL already propagates here; this matches it.)
                     if let (Some(s), Some(t)) = (schema, table) {
                         info!(schema = %s, table = %t, "reloading schema");
-                        let _ = ctx.schema.reload_schema(&s, &t).await;
+                        ctx.schema.reload_schema(&s, &t).await?;
                     } else {
                         info!("reloading all schemas");
-                        let _ = ctx.schema.reload_all(&self.tables).await;
+                        ctx.schema.reload_all(&self.tables).await?;
                     }
                 }
                 Err(LoopControl::SchemaDrift(drift)) => {

@@ -90,6 +90,27 @@ pub fn progress_key(source_id: &str) -> String {
     format!("mysql_snapshot_progress:{source_id}")
 }
 
+/// Load persisted snapshot progress, failing closed on an unreadable or corrupt
+/// record. A genuinely absent record is a fresh start (`default`). Silently
+/// treating a store error or corrupt bytes as "no progress" would restart the
+/// whole snapshot - re-exporting rows and, for a finished snapshot, discarding
+/// the saved CDC start position.
+pub(crate) async fn load_snapshot_progress(
+    store: &dyn CheckpointStore,
+    source_id: &str,
+) -> Result<MysqlSnapshotProgress> {
+    match store.get_raw(&progress_key(source_id)).await.context(
+        "reading mysql snapshot progress; refusing to restart the snapshot on \
+         an unreadable progress record",
+    )? {
+        Some(bytes) => serde_json::from_slice(&bytes).context(
+            "parsing mysql snapshot progress; refusing to restart the snapshot \
+             on a corrupt progress record",
+        ),
+        None => Ok(MysqlSnapshotProgress::default()),
+    }
+}
+
 // ============================================================================
 // Entry point
 // ============================================================================
@@ -184,15 +205,10 @@ pub async fn run_snapshot(
 ) -> Result<MySqlCheckpoint> {
     let t0 = Instant::now();
 
-    // load previous progress for crash resume
-    let mut progress: MysqlSnapshotProgress = ctx
-        .chkpt_store
-        .get_raw(&progress_key(ctx.source_id))
-        .await
-        .ok()
-        .flatten()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
+    // Load previous progress for crash resume. Fail closed on an unreadable or
+    // corrupt progress record; only a genuinely absent record is a fresh start.
+    let mut progress =
+        load_snapshot_progress(ctx.chkpt_store.as_ref(), ctx.source_id).await?;
 
     if progress.finished {
         info!(
@@ -1086,6 +1102,86 @@ fn base64_encode(bytes: &[u8]) -> String {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod progress_load_tests {
+    //! R3-C7: snapshot-progress load fails closed on an unreadable/corrupt
+    //! record; only a genuinely absent record is a fresh start.
+    use super::*;
+    use checkpoints::{CheckpointError, CheckpointResult, MemCheckpointStore};
+
+    #[tokio::test]
+    async fn absent_progress_is_fresh_default() {
+        let store = MemCheckpointStore::new().unwrap();
+        let p = load_snapshot_progress(&store, "s1").await.unwrap();
+        assert!(
+            !p.finished,
+            "absent record must be a fresh (unfinished) start"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_progress_round_trips() {
+        let store = MemCheckpointStore::new().unwrap();
+        let saved = MysqlSnapshotProgress {
+            start_position: "pos".into(),
+            done_tables: vec!["db.t".into()],
+            finished: true,
+        };
+        store
+            .put_raw(&progress_key("s1"), &serde_json::to_vec(&saved).unwrap())
+            .await
+            .unwrap();
+        let got = load_snapshot_progress(&store, "s1").await.unwrap();
+        assert!(got.finished);
+        assert_eq!(got.done_tables, vec!["db.t".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn corrupt_progress_fails_closed() {
+        let store = MemCheckpointStore::new().unwrap();
+        store
+            .put_raw(&progress_key("s1"), b"not json at all")
+            .await
+            .unwrap();
+        assert!(
+            load_snapshot_progress(&store, "s1").await.is_err(),
+            "a corrupt progress record must fail closed, not restart the snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_error_fails_closed() {
+        #[derive(Debug)]
+        struct ErrStore;
+        #[async_trait::async_trait]
+        impl CheckpointStore for ErrStore {
+            async fn get_raw(
+                &self,
+                _k: &str,
+            ) -> CheckpointResult<Option<Vec<u8>>> {
+                Err(CheckpointError::Data("injected read failure".into()))
+            }
+            async fn put_raw(
+                &self,
+                _k: &str,
+                _b: &[u8],
+            ) -> CheckpointResult<()> {
+                Ok(())
+            }
+            async fn delete(&self, _k: &str) -> CheckpointResult<bool> {
+                Ok(false)
+            }
+            async fn list(&self) -> CheckpointResult<Vec<String>> {
+                Ok(vec![])
+            }
+        }
+        assert!(
+            load_snapshot_progress(&ErrStore, "s1").await.is_err(),
+            "a store read error must fail closed, not restart the snapshot"
+        );
+    }
 }
 
 #[cfg(test)]

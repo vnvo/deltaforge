@@ -172,6 +172,7 @@ impl MySqlSource {
         &self,
         loader: &MySqlSchemaLoader,
         tracked: &[(String, String)],
+        lineage: PersistedLineage,
     ) -> SourceResult<SnapshotPlan> {
         use crate::identity_resolution::{
             IdentitySchemaView, resolve_identity,
@@ -226,8 +227,8 @@ impl MySqlSource {
             identity_map.insert(fqn, resolved.columns);
         }
 
-        // Step 5: freeze lineage. Step 6: fingerprint. Step 7: allocate.
-        let lineage = self.capture_snapshot_lineage().await?;
+        // Step 5: lineage is captured once by the caller and passed in. Step 6:
+        // fingerprint. Step 7: allocate.
         let fingerprint = SnapshotConfigFingerprint::compute(&specs);
         let mode = if self.snapshot_cfg.mode == SnapshotMode::Always {
             AllocationMode::ForceNew
@@ -273,19 +274,28 @@ impl MySqlSource {
                 return Ok(PersistedLineage::MysqlGtid { source_uuid: bytes });
             }
         }
+        // Non-GTID fallback lineage = (server_id, current binlog file). Both must
+        // be real: a zero server_id or an empty/absent binlog file is an unverified
+        // lineage. The build step returns an error rather than a bogus anchor, and
+        // the caller propagates it with `?` at startup, so the source fails closed
+        // before opening a stream instead of binding to a meaningless identity.
         let server_id: u32 = conn
             .query_first("SELECT @@server_id")
             .await
             .map_err(|e| SourceError::Other(e.into()))?
             .unwrap_or(0);
-        let file: String = conn
-            .query_first::<Row, _>("SHOW BINARY LOG STATUS")
-            .await
-            .ok()
-            .flatten()
+        let row: Option<Row> =
+            match conn.query_first("SHOW BINARY LOG STATUS").await {
+                Ok(r) => r,
+                Err(_) => conn
+                    .query_first("SHOW MASTER STATUS")
+                    .await
+                    .map_err(|e| SourceError::Other(e.into()))?,
+            };
+        let file: String = row
             .and_then(|mut r| r.take::<String, _>(0))
             .unwrap_or_default();
-        Ok(PersistedLineage::MysqlServer { server_id, file })
+        mysql_server_lineage(server_id, file)
     }
 
     async fn run_inner(
@@ -296,6 +306,14 @@ impl MySqlSource {
         paused: Arc<AtomicBool>,
         pause_notify: Arc<Notify>,
     ) -> SourceResult<()> {
+        // Verify the source lineage ONCE, before any snapshot, stream, or RunCtx.
+        // Fail closed if it cannot be established: a swallowed error here would
+        // proceed to snapshot/stream with no durable-watermark identity, leaving
+        // correctness to downstream consumers instead of stopping the source. The
+        // same verified value anchors both the snapshot generation and the CDC
+        // durable watermarks.
+        let durable_lineage = self.capture_snapshot_lineage().await?;
+
         // snapshot (if configured)
         let snapshot_progress: Option<MysqlSnapshotProgress> = chkpt_store
             .get_raw(&mysql_snapshot::progress_key(&self.id))
@@ -338,7 +356,11 @@ impl MySqlSource {
             // Validate every table + freeze lineage + allocate the generation
             // BEFORE emitting any row (keyless/unsupported tables fail here).
             let plan = self
-                .prepare_snapshot_generation(&snap_schema_loader, &tracked)
+                .prepare_snapshot_generation(
+                    &snap_schema_loader,
+                    &tracked,
+                    durable_lineage.clone(),
+                )
                 .await?;
 
             let snapshot_ctx = mysql_snapshot::SnapshotCtx {
@@ -519,10 +541,8 @@ impl MySqlSource {
             tables: self.tables.clone(),
             outbox_tables: self.outbox_tables.clone(),
             on_schema_drift: self.on_schema_drift.clone(),
-            // Freeze lineage once at startup for durable CDC watermarks. Same
-            // authority as snapshot lineage; best-effort (None -> durable sink
-            // fails closed, never a synthetic fallback).
-            durable_lineage: self.capture_snapshot_lineage().await.ok(),
+            // Verified once above, before the stream opens.
+            durable_lineage: Some(durable_lineage),
         };
 
         // Resolve the identity BEFORE opening the stream: persist FirstSeen,
@@ -918,6 +938,32 @@ async fn do_reconnect(ctx: &mut RunCtx) -> SourceResult<Option<BinlogStream>> {
 // Failover detection + reconciliation
 // ============================================================================
 
+/// Build a non-GTID MySQL lineage from `(server_id, binlog file)`, failing closed
+/// on an unverified anchor. A zero `server_id` (server exposed neither a GTID
+/// `server_uuid` nor a real `server_id`) or an empty binlog file (binary logging
+/// off, or `SHOW BINARY LOG STATUS` returned nothing) must not be recorded: the
+/// error is propagated by the caller (with `?`) at startup, so the source fails
+/// closed before opening a stream rather than binding to a meaningless identity.
+fn mysql_server_lineage(
+    server_id: u32,
+    file: String,
+) -> SourceResult<PersistedLineage> {
+    if server_id == 0 {
+        return Err(SourceError::Other(anyhow::anyhow!(
+            "cannot capture MySQL lineage: server exposes neither a server_uuid \
+             (GTID) nor a nonzero server_id; refusing to record an unverified \
+             lineage"
+        )));
+    }
+    if file.is_empty() {
+        return Err(SourceError::Other(anyhow::anyhow!(
+            "cannot capture MySQL lineage: no current binlog file (is binary \
+             logging enabled?); refusing to record an empty-file lineage"
+        )));
+    }
+    Ok(PersistedLineage::MysqlServer { server_id, file })
+}
+
 /// Bounded attempts to fetch the live server identity before failing closed.
 const IDENTITY_FETCH_ATTEMPTS: u32 = 5;
 
@@ -1142,6 +1188,40 @@ async fn run_failover_reconciliation(
 
     info!(source_id = %ctx.source_id, "failover reconciliation complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod server_lineage_tests {
+    //! R3-C8: the non-GTID fallback lineage fails closed on a zero server_id or
+    //! an empty binlog file, rather than persisting an unverified anchor.
+    use super::{PersistedLineage, mysql_server_lineage};
+
+    #[test]
+    fn rejects_zero_server_id() {
+        assert!(
+            mysql_server_lineage(0, "binlog.000001".into()).is_err(),
+            "a zero server_id is an unverified lineage"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_binlog_file() {
+        assert!(
+            mysql_server_lineage(5, String::new()).is_err(),
+            "an empty binlog file must not be recorded as lineage"
+        );
+    }
+
+    #[test]
+    fn accepts_valid_server_and_file() {
+        match mysql_server_lineage(5, "binlog.000007".into()) {
+            Ok(PersistedLineage::MysqlServer { server_id, file }) => {
+                assert_eq!(server_id, 5);
+                assert_eq!(file, "binlog.000007");
+            }
+            other => panic!("expected a MysqlServer lineage, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
