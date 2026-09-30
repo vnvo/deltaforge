@@ -38,7 +38,14 @@ pipeline:
         type: mysql
         config:
           id: orders-src
-          dsn: "mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql-primary:3306/orders"
+          dsn: "mysql://mysql-primary:3306/orders"
+          credentials:                # typed secret references (protected resolution)
+            username:
+              provider: env
+              location: MYSQL_USER
+            password:
+              provider: env
+              location: MYSQL_PASSWORD
           tables: ["orders.*"]
       sinks:
         - type: kafka
@@ -70,34 +77,22 @@ resources:
 
 Probes (`/health` liveness, `/ready` readiness) and the single-instance StatefulSet come from the chart defaults; you do not need to set them.
 
-## 3. Gate the deploy on preflight
+The deployment is gated on preflight automatically: with `preflight.enabled: true` the chart runs `deltaforge preflight` as an initContainer - with the same config, secrets, and `--storage-*` settings as the pipeline container - before the pipeline starts. A failing check fails the pod, so a misconfigured deployment never begins streaming, and it re-runs on every rollout.
 
-Validate before rolling anything out (same checks the initContainer runs):
+## 3. Install
 
-```bash
-kubectl run deltaforge-preflight --rm -i --restart=Never \
-  --image=ghcr.io/vnvo/deltaforge:latest \
-  --overrides='{"spec":{"containers":[{"name":"p","image":"ghcr.io/vnvo/deltaforge:latest",
-    "args":["preflight","/etc/deltaforge/pipeline.yaml"],
-    "envFrom":[{"secretRef":{"name":"mysql-creds"}}],
-    "volumeMounts":[{"name":"c","mountPath":"/etc/deltaforge"}]}],
-    "volumes":[{"name":"c","configMap":{"name":"orders-config"}}]}}'
-```
-
-In the chart this is automatic: an initContainer runs `deltaforge preflight` before the pipeline container starts, so a misconfigured deployment fails the pod instead of streaming. Point it at the **same** `--storage-*` settings as the deployment (the chart does this) so the slot-ownership check sees the real ownership records.
-
-## 4. Install
+`helm install` creates the ConfigMap and Secret wiring and runs the preflight initContainer as the authoritative deployment gate:
 
 ```bash
 helm install orders ./deploy/helm/deltaforge -f values.prod.yaml
 ```
 
-## 5. Verify
+## 4. Verify
 
 ```bash
-# The preflight initContainer must complete before the app starts:
+# The preflight initContainer must complete before the app container starts.
 kubectl get pods -l app.kubernetes.io/instance=orders
-kubectl logs orders-0 -c preflight        # preflight report
+kubectl logs orders-0 -c preflight        # the preflight report (the deploy gate)
 
 # Readiness gates traffic; liveness restarts a wedged process:
 kubectl get pod orders-0 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
@@ -107,8 +102,10 @@ kubectl port-forward svc/orders 8080:8080 &
 curl -fsS localhost:8080/ready
 ```
 
+If preflight fails, the pod stays in `Init` and `kubectl logs orders-0 -c preflight` shows the hard errors to fix before the pipeline can start.
+
 ## Notes
 
-- **Single instance is required.** The StatefulSet runs `replicaCount: 1` and the checkpoint volume is `ReadWriteOnce`, so at most one process ever holds the state store. Do not scale the replica count or point a second install at the same volume - see the [single-owner rule](deployment-support.md#topology-single-owner-per-source).
-- **Persistent storage.** SQLite checkpoints and the DLQ live on the PVC; losing it rewinds to the last durable checkpoint (at-least-once re-delivery, deduped on event `id`). For a shared store, use the `postgres` storage backend (still single-instance).
+- **Single instance is required.** The guarantee that only one process holds the state store comes from `replicaCount: 1`, the StatefulSet's one-pod-at-a-time behavior, and the documented prohibition against a second installation against the same store - **not** from `ReadWriteOnce` (RWO restricts volume attachment to one node, but multiple pods on that node could still mount it). Do not scale the replica count or point a second install at the same volume - see the [single-owner rule](deployment-support.md#topology-single-owner-per-source).
+- **Persistent storage.** SQLite checkpoints and the DLQ live on the PVC. Treat the state volume as durable production data. Back it up using the documented SQLite-safe procedure. If it is lost, stop the pipeline and recover the state or explicitly reinitialize/re-snapshot; do not assume automatic checkpoint recovery (a lost volume loses the durable checkpoint, and exact recovery may be impossible once source logs expire). For a shared store, use the `postgres` storage backend (still single-instance).
 - **Upgrades.** A single-replica StatefulSet terminates the old pod before starting the new one; the preflight initContainer re-gates every rollout.
