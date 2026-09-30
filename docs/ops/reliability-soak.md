@@ -11,7 +11,7 @@ Fault/lifecycle soak of the real source → coordinator → sink pipeline, recor
 
 ## Recovery model (important)
 
-DeltaForge currently has **no internal automatic pipeline restart**. When a required sink or the checkpoint store fails, the pipeline **terminates fail-closed** and stays down; restoring the sink or the storage does **not** restart it. Recovery requires a **pipeline/process restart** (the harness performs this explicitly with a second run; in production an external supervisor - Kubernetes restarting the pod, or an operator - must do it). Until that restart succeeds, `/ready` stays 503. Automatic pipeline supervision is future work and is recorded as such in the release checklist.
+DeltaForge currently has **no internal automatic pipeline restart**. When a required sink or the checkpoint store fails, the pipeline **terminates fail-closed** and stays down; restoring the sink or the storage does **not** restart it. Recovery requires an **explicit pipeline/process restart** (the harness performs this with a second run). Note that standard Kubernetes probes do **not** recover it: `/health` stays 200 (so the pod is not restarted) and `/ready` returns 503 (which only removes the pod from Service endpoints). In production an operator - or external automation that watches `/ready` or `deltaforge_pipeline_status` and deliberately acts - must restart the pipeline (stop/resume via the API) or the process/pod (e.g. `kubectl rollout restart`). Until that restart succeeds, `/ready` stays 503. Automatic pipeline supervision is future work and is recorded as such in the release checklist.
 
 ## HTTP readiness / health (recorded separately)
 
