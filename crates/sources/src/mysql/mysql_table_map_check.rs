@@ -10,10 +10,14 @@
 //! any difference so the caller can refuse to decode.
 //!
 //! Compared per column:
-//! - the column count;
+//! - the column count (and one type meta per column);
 //! - the storage type family (the binlog type, with `CHAR`/`ENUM`/`SET`
 //!   resolved from the column meta, against `INFORMATION_SCHEMA.DATA_TYPE`);
 //! - the column name, when the server writes it (`binlog_row_metadata=FULL`).
+//!
+//! Compatibility must be proven, never assumed: a binlog type or schema type
+//! this check cannot classify, or missing per-column type metadata, is a
+//! mismatch.
 //!
 //! Residual limitation: with `binlog_row_metadata=MINIMAL` (the MySQL default)
 //! names are not in the binlog, so a layout change that keeps the column count
@@ -51,8 +55,8 @@ enum TypeFamily {
     Geometry,
 }
 
-/// Family of a binlog column type code. `None` for codes this check does not
-/// classify (the column's type is then not compared).
+/// Family of a binlog column type code. `None` for codes this check cannot
+/// classify (treated as a mismatch by the caller).
 fn binlog_family(code: u8, meta: u16) -> Option<TypeFamily> {
     use TypeFamily::*;
     let code = if code == ColumnType::String as u8 {
@@ -60,7 +64,7 @@ fn binlog_family(code: u8, meta: u16) -> Option<TypeFamily> {
         // type is carried in the column meta.
         ColumnType::parse_string_column_meta(meta, code)
             .map(|(real, _)| real)
-            .unwrap_or(code)
+            .ok()?
     } else {
         code
     };
@@ -94,7 +98,8 @@ fn binlog_family(code: u8, meta: u16) -> Option<TypeFamily> {
 }
 
 /// Family of an `INFORMATION_SCHEMA.COLUMNS.DATA_TYPE` value. `None` for types
-/// this check does not classify.
+/// this check cannot classify (treated as a mismatch by the caller). Covers
+/// every data type of the supported MySQL version (8.4).
 fn schema_family(data_type: &str) -> Option<TypeFamily> {
     use TypeFamily::*;
     Some(match data_type.to_ascii_lowercase().as_str() {
@@ -140,14 +145,35 @@ pub(crate) fn table_map_mismatch(
             columns.len()
         ));
     }
+    if tm.column_metas.len() != tm.column_types.len() {
+        return Some(format!(
+            "the binlog table map carries type metadata for {} of its {} \
+             columns; the row layout cannot be verified",
+            tm.column_metas.len(),
+            tm.column_types.len()
+        ));
+    }
     let names = tm.table_metadata.as_ref().map(|m| &m.columns);
     for (i, col) in columns.iter().enumerate() {
-        let meta = tm.column_metas.get(i).copied().unwrap_or(0);
-        if let (Some(binlog), Some(schema)) = (
-            binlog_family(tm.column_types[i], meta),
-            schema_family(&col.data_type),
-        ) && binlog != schema
-        {
+        let code = tm.column_types[i];
+        let Some(binlog) = binlog_family(code, tm.column_metas[i]) else {
+            return Some(format!(
+                "column {} (`{}`): unrecognized binlog column type {code}; \
+                 compatibility with the schema cannot be proven",
+                i + 1,
+                col.name
+            ));
+        };
+        let Some(schema) = schema_family(&col.data_type) else {
+            return Some(format!(
+                "column {} (`{}`): unrecognized schema data type `{}`; \
+                 compatibility with the binlog cannot be proven",
+                i + 1,
+                col.name,
+                col.data_type
+            ));
+        };
+        if binlog != schema {
             return Some(format!(
                 "column {} (`{}`): the binlog recorded a {binlog:?} value but \
                  the schema declares {}",
@@ -304,14 +330,45 @@ mod tests {
     }
 
     #[test]
-    fn unclassified_types_are_not_compared() {
+    fn unknown_binlog_type_is_a_mismatch() {
         let mut t = tm(&[(ColumnType::Long, 0), (ColumnType::Long, 0)], None);
         // 242 is not a type code this crate knows (e.g. a newer server type).
         t.column_types[1] = 242;
-        assert_eq!(
-            table_map_mismatch(&t, &[col("id", "int"), col("v", "vector")]),
+        let why = table_map_mismatch(&t, &[col("id", "int"), col("v", "int")])
+            .expect("an unclassified binlog type cannot prove compatibility");
+        assert!(why.contains("unrecognized binlog column type 242"), "{why}");
+    }
+
+    #[test]
+    fn unknown_schema_type_is_a_mismatch() {
+        let t = tm(&[(ColumnType::Long, 0), (ColumnType::Blob, 2)], None);
+        let why =
+            table_map_mismatch(&t, &[col("id", "int"), col("v", "vector")])
+                .expect(
+                    "an unclassified schema type cannot prove compatibility",
+                );
+        assert!(
+            why.contains("unrecognized schema data type `vector`"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn missing_column_metadata_is_a_mismatch() {
+        let mut t = tm(
+            &[
+                (ColumnType::Long, 0),
+                (ColumnType::String, string_meta(ColumnType::Enum, 1)),
+            ],
             None,
-            "count still matches; an unclassified type cannot be compared"
+        );
+        // The meta that resolves CHAR/ENUM/SET is absent.
+        t.column_metas.pop();
+        let why = table_map_mismatch(&t, &[col("id", "int"), col("e", "enum")])
+            .expect("missing type metadata cannot prove compatibility");
+        assert!(
+            why.contains("type metadata for 1 of its 2 columns"),
+            "{why}"
         );
     }
 

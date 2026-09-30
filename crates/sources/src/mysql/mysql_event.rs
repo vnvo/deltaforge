@@ -189,8 +189,12 @@ async fn verified_schema(
                      Decoding them positionally would put values under the wrong \
                      columns, so no event was emitted and the checkpoint was not \
                      advanced (fail-closed). Replaying MySQL rows across a DDL is \
-                     not supported yet: resume from a binlog position after the \
-                     DDL, or re-snapshot the table."
+                     not supported yet. Safe recovery: re-snapshot (restart once \
+                     with snapshot mode 'always'). Moving the source position \
+                     past the DDL instead intentionally abandons every retained \
+                     change between the checkpoint and the new position, for all \
+                     captured tables, and requires an operator assessment of \
+                     that data loss."
                 )
                 .into(),
             })
@@ -198,7 +202,7 @@ async fn verified_schema(
     }
 }
 
-/// Build SourceInfo for MySQL events/// Build SourceInfo for MySQL events
+/// Build SourceInfo for MySQL events
 fn build_source_info(
     ctx: &RunCtx,
     header: &EventHeader,

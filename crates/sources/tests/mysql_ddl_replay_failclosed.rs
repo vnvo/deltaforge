@@ -143,10 +143,11 @@ fn assert_failed_closed(r: &Replay, seeded: &MySqlCheckpoint) {
         "no row may be emitted for undecodable rows, got {:?}",
         rows.iter().map(|e| &e.after).collect::<Vec<_>>()
     );
-    let after = r.checkpoint_after.as_ref().expect("checkpoint kept");
+    // The complete checkpoint (file, position, and executed GTID set) is
+    // exactly the seeded one: nothing past the refused rows was recorded.
     assert_eq!(
-        (after.file.as_str(), after.pos),
-        (seeded.file.as_str(), seeded.pos),
+        r.checkpoint_after.as_ref(),
+        Some(seeded),
         "the checkpoint must not advance past the refused rows"
     );
 }

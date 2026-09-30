@@ -69,7 +69,7 @@ use crate::mysql::mysql_health::{
     PositionReachability, check_position_reachability, fetch_server_identity,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MySqlCheckpoint {
     pub file: String,
     pub pos: u64,
