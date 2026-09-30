@@ -8,7 +8,7 @@ Binary, evidence-backed gate for cutting a DeltaForge release. Every criterion i
 
 **Release decision rule:** release only when there are **zero BLOCKED** criteria and every ACCEPTED LIMITATION is documented in the [Supported Deployment Envelope](../src/deployment-support.md) with its operator control in place.
 
-Evidence baseline: `main` at the release commit; PRs #103-#110.
+Evidence baseline: `main` at the release commit; PRs #103-#110 and the MySQL TableMap fail-closed fix.
 
 ## Correctness
 
@@ -20,6 +20,8 @@ Evidence baseline: `main` at the release commit; PRs #103-#110.
 | C4 | Source authority fail-closed: PG schema reload propagates; MySQL snapshot-progress + non-GTID lineage fail closed | **PASS** | PR #106; `load_snapshot_progress` / `mysql_server_lineage` unit tests; PG reload live tests |
 | C5 | Green live fault/lifecycle matrix on merged main | **PASS** | Consolidated matrix: `failover_e2e` 10, PG/MySQL snapshot, `txn_coordinator_e2e`, PG schema-drift subset, MySQL schema-reload, throughput - 38 tests, 0 fail |
 | C6 | Internal reliability soak recorded | **PASS** | PR #110; [reliability-soak.md](reliability-soak.md) - restart, required-sink outage, checkpoint-store outage, shutdown with committed tx in flight (4/4) + schema compatible/Halt/Adapt |
+| C7 | MySQL rows whose binlog layout does not match, or cannot be proven to match, the decoding schema are never emitted | **PASS** | `mysql_ddl_replay_failclosed` (drop column, drop + recreate, mid-table add column: typed error, no row, checkpoint unchanged; plus a no-DDL replay control) and `mysql_table_map_check` unit tests (including unknown binlog type, unknown schema type, missing type metadata) |
+| C8 | MySQL replay of binlog rows across a DDL | **ACCEPTED LIMITATION** | Not supported until historical schema selection lands: the source stops fail-closed (C7) instead of decoding. **Operator control:** keep the pipeline caught up before applying DDL; on this failure, re-snapshot (restart once with snapshot mode `always`) as the safe default - manually moving the position past the DDL intentionally abandons every retained change in between, for all captured tables, and requires an operator impact assessment; set `binlog_row_metadata=FULL` so column names are verified too (with `MINIMAL`, a DDL that preserves column count and every storage type is not detectable). Evidence: [Guarantees](../src/guarantees.md#mysql-replay-across-a-schema-change). |
 
 ## Delivery semantics
 
@@ -80,9 +82,9 @@ Evidence: `crates/rest-api/src/health.rs`, `crates/o11y/src/df_metrics.rs`, [Obs
 
 A release is **accepted** when:
 
-1. C1-C6 are **PASS** (correctness + green matrix + soak).
+1. C1-C7 are **PASS** (correctness + green matrix + soak).
 2. R1-R3 are **PASS** (rollback, observability, CI gates).
-3. Every ACCEPTED LIMITATION (D1-D2, O1-O2, O4, O6, S1-S2) is documented in the Supported Deployment Envelope with its operator control in place.
+3. Every ACCEPTED LIMITATION (C8, D1-D2, O1-O2, O4, O6, S1-S2) is documented in the Supported Deployment Envelope with its operator control in place.
 4. There are **zero BLOCKED** criteria.
 
-Current status against this release baseline (#103-#110): **no BLOCKED criteria**; all correctness and release-engineering criteria PASS; the listed limitations are accepted with operator controls documented.
+Current status against this release baseline (#103-#110 plus the MySQL TableMap fail-closed fix): **no BLOCKED criteria**; all correctness and release-engineering criteria PASS; the listed limitations are accepted with operator controls documented.

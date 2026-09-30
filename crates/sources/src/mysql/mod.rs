@@ -49,6 +49,7 @@ pub use mysql_identity::{
     MysqlIdentityError, mysql_identity_cell, mysql_identity_kind,
 };
 
+mod mysql_table_map_check;
 mod mysql_table_schema;
 use crate::mysql::mysql_helpers::{
     connect_binlog_with_retries, resolve_binlog_tail,
@@ -68,7 +69,7 @@ use crate::mysql::mysql_health::{
     PositionReachability, check_position_reachability, fetch_server_identity,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MySqlCheckpoint {
     pub file: String,
     pub pos: u64,
