@@ -5268,6 +5268,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ece8e78b2f38ec51c51f5d475df0a7187ba5111b2a28bdc761ee05b075d40a71"
 
 [[package]]
+name = "scale-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "checkpoints",
+ "chrono",
+ "clap",
+ "deltaforge-config",
+ "deltaforge-core",
+ "hex",
+ "mysql_async 0.36.2",
+ "runner",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sources",
+ "storage",
+ "tempfile",
+ "testcontainers",
+ "tokio",
+ "tokio-postgres",
+ "tokio-util",
+]
+
+[[package]]
 name = "scc"
 version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

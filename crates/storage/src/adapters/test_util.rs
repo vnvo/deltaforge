@@ -25,6 +25,8 @@ pub struct FaultBackend {
     /// When set, only the first write past the budget fails; later writes
     /// succeed again (a transient failure).
     one_shot: AtomicBool,
+    /// Every `kv_list` call: (namespace, prefix).
+    pub kv_list_calls: std::sync::Mutex<Vec<(String, Option<String>)>>,
 }
 
 impl Default for FaultBackend {
@@ -50,6 +52,7 @@ impl FaultBackend {
             fail_log_read_meta: AtomicBool::new(false),
             writes_left: std::sync::atomic::AtomicU64::new(u64::MAX),
             one_shot: AtomicBool::new(false),
+            kv_list_calls: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -116,6 +119,10 @@ impl StorageBackend for FaultBackend {
         ns: &str,
         prefix: Option<&str>,
     ) -> Result<Vec<String>> {
+        self.kv_list_calls
+            .lock()
+            .unwrap()
+            .push((ns.to_string(), prefix.map(str::to_string)));
         self.inner.kv_list(ns, prefix).await
     }
     async fn log_append(

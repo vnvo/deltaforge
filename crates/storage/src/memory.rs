@@ -711,6 +711,11 @@ mod tests {
         crate::log_contract_suite::ns_max_seq_scoped(be(), "nsmax").await;
     }
 
+    #[tokio::test]
+    async fn kv_list_prefix_is_literal() {
+        crate::kv_list_contract_suite::literal_prefix(be(), "kvp").await;
+    }
+
     // slot_list contract suite.
     #[tokio::test]
     async fn slot_list_namespace_isolation() {

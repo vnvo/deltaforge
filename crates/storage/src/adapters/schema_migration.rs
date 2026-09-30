@@ -33,7 +33,8 @@ use crate::ArcStorageBackend;
 const PLAN_DOMAIN: &str = "DeltaForge.SchemaMigration.Plan.v1";
 const LEGACY_DOMAIN: &[u8] = b"DeltaForge.SchemaMigration.Legacy.v1\0";
 const IDENTITY_DOMAIN: &[u8] = b"DeltaForge.SchemaMigration.Identity.v1\0";
-const PAGE: usize = 256;
+/// Default page size for streaming legacy history.
+pub const DEFAULT_PAGE: usize = 256;
 
 /// The operator's mapping file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +219,7 @@ async fn scan_legacy(
     tenant: &str,
     t: &TableRef,
     key: &SchemaKey,
+    page_size: usize,
 ) -> Result<std::result::Result<LegacyScan, String>> {
     let mut h = Sha256::new();
     h.update(LEGACY_DOMAIN);
@@ -230,7 +232,7 @@ async fn scan_legacy(
     let mut cursor = None;
     loop {
         let page = match registry
-            .legacy_page(tenant, &t.db, &t.table, cursor, PAGE)
+            .legacy_page(tenant, &t.db, &t.table, cursor, page_size)
             .await
         {
             Ok(p) => p,
@@ -391,6 +393,18 @@ pub async fn plan(
     mapping: &Mapping,
     filters: &Filters,
 ) -> Result<Plan> {
+    plan_paged(backend, registry, mapping, filters, DEFAULT_PAGE).await
+}
+
+/// [`plan`] with an explicit legacy page size (the proof does not depend on
+/// it).
+pub async fn plan_paged(
+    backend: &ArcStorageBackend,
+    registry: &DurableSchemaRegistry,
+    mapping: &Mapping,
+    filters: &Filters,
+    page_size: usize,
+) -> Result<Plan> {
     // How many entries (in the WHOLE mapping, regardless of filters) claim
     // each legacy stream: more than one is ambiguous ownership.
     let mut claims: HashMap<String, usize> = HashMap::new();
@@ -481,7 +495,9 @@ pub async fn plan(
             } else if let Some(reason) = &lineage_problem {
                 rt.fixed = Some(Classification::Rejected(reason.clone()));
             } else {
-                match scan_legacy(registry, &e.tenant, t, &key).await? {
+                match scan_legacy(registry, &e.tenant, t, &key, page_size)
+                    .await?
+                {
                     Err(reason) => {
                         rt.fixed = Some(Classification::Rejected(reason));
                     }
@@ -588,7 +604,28 @@ pub async fn apply(
     filters: &Filters,
     expected_proof: &str,
 ) -> Result<ApplyOutcome> {
-    let plan = plan(backend, registry, mapping, filters).await?;
+    apply_paged(
+        backend,
+        registry,
+        mapping,
+        filters,
+        expected_proof,
+        DEFAULT_PAGE,
+    )
+    .await
+}
+
+/// [`apply`] with an explicit legacy page size.
+pub async fn apply_paged(
+    backend: &ArcStorageBackend,
+    registry: &DurableSchemaRegistry,
+    mapping: &Mapping,
+    filters: &Filters,
+    expected_proof: &str,
+    page_size: usize,
+) -> Result<ApplyOutcome> {
+    let plan =
+        plan_paged(backend, registry, mapping, filters, page_size).await?;
     if plan.proof != expected_proof {
         return Err(ProofMismatch {
             expected: expected_proof.to_string(),
@@ -626,7 +663,13 @@ pub async fn apply(
             let mut cursor = None;
             loop {
                 let page = registry
-                    .legacy_page(&entry.tenant, &tp.db, &tp.table, cursor, PAGE)
+                    .legacy_page(
+                        &entry.tenant,
+                        &tp.db,
+                        &tp.table,
+                        cursor,
+                        page_size,
+                    )
                     .await?;
                 for lv in &page.versions {
                     h.update(lv.version.to_be_bytes());
