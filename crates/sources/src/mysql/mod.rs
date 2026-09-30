@@ -273,19 +273,28 @@ impl MySqlSource {
                 return Ok(PersistedLineage::MysqlGtid { source_uuid: bytes });
             }
         }
+        // Non-GTID fallback lineage = (server_id, current binlog file). Both must
+        // be real: a zero server_id or an empty/absent binlog file is an unverified
+        // lineage. The build step fails closed rather than persist a bogus anchor -
+        // the caller treats an error as "no lineage" and the durable watermark then
+        // fails closed instead of binding to a meaningless empty-file identity.
         let server_id: u32 = conn
             .query_first("SELECT @@server_id")
             .await
             .map_err(|e| SourceError::Other(e.into()))?
             .unwrap_or(0);
-        let file: String = conn
-            .query_first::<Row, _>("SHOW BINARY LOG STATUS")
-            .await
-            .ok()
-            .flatten()
+        let row: Option<Row> =
+            match conn.query_first("SHOW BINARY LOG STATUS").await {
+                Ok(r) => r,
+                Err(_) => conn
+                    .query_first("SHOW MASTER STATUS")
+                    .await
+                    .map_err(|e| SourceError::Other(e.into()))?,
+            };
+        let file: String = row
             .and_then(|mut r| r.take::<String, _>(0))
             .unwrap_or_default();
-        Ok(PersistedLineage::MysqlServer { server_id, file })
+        mysql_server_lineage(server_id, file)
     }
 
     async fn run_inner(
@@ -918,6 +927,32 @@ async fn do_reconnect(ctx: &mut RunCtx) -> SourceResult<Option<BinlogStream>> {
 // Failover detection + reconciliation
 // ============================================================================
 
+/// Build a non-GTID MySQL lineage from `(server_id, binlog file)`, failing closed
+/// on an unverified anchor. A zero `server_id` (server exposed neither a GTID
+/// `server_uuid` nor a real `server_id`) or an empty binlog file (binary logging
+/// off, or `SHOW BINARY LOG STATUS` returned nothing) must not be recorded: the
+/// caller treats an error as "no lineage" so the durable watermark fails closed
+/// rather than binding to a meaningless empty-file identity.
+fn mysql_server_lineage(
+    server_id: u32,
+    file: String,
+) -> SourceResult<PersistedLineage> {
+    if server_id == 0 {
+        return Err(SourceError::Other(anyhow::anyhow!(
+            "cannot capture MySQL lineage: server exposes neither a server_uuid \
+             (GTID) nor a nonzero server_id; refusing to record an unverified \
+             lineage"
+        )));
+    }
+    if file.is_empty() {
+        return Err(SourceError::Other(anyhow::anyhow!(
+            "cannot capture MySQL lineage: no current binlog file (is binary \
+             logging enabled?); refusing to record an empty-file lineage"
+        )));
+    }
+    Ok(PersistedLineage::MysqlServer { server_id, file })
+}
+
 /// Bounded attempts to fetch the live server identity before failing closed.
 const IDENTITY_FETCH_ATTEMPTS: u32 = 5;
 
@@ -1142,6 +1177,40 @@ async fn run_failover_reconciliation(
 
     info!(source_id = %ctx.source_id, "failover reconciliation complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod server_lineage_tests {
+    //! R3-C8: the non-GTID fallback lineage fails closed on a zero server_id or
+    //! an empty binlog file, rather than persisting an unverified anchor.
+    use super::{PersistedLineage, mysql_server_lineage};
+
+    #[test]
+    fn rejects_zero_server_id() {
+        assert!(
+            mysql_server_lineage(0, "binlog.000001".into()).is_err(),
+            "a zero server_id is an unverified lineage"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_binlog_file() {
+        assert!(
+            mysql_server_lineage(5, String::new()).is_err(),
+            "an empty binlog file must not be recorded as lineage"
+        );
+    }
+
+    #[test]
+    fn accepts_valid_server_and_file() {
+        match mysql_server_lineage(5, "binlog.000007".into()) {
+            Ok(PersistedLineage::MysqlServer { server_id, file }) => {
+                assert_eq!(server_id, 5);
+                assert_eq!(file, "binlog.000007");
+            }
+            other => panic!("expected a MysqlServer lineage, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]
