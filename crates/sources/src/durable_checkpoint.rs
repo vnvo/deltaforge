@@ -335,7 +335,39 @@ pub fn order(a: &DurableWatermark, b: &DurableWatermark) -> CheckpointOrder {
     if !a.lineage.stable_matches(&b.lineage) {
         return CheckpointOrder::Incomparable;
     }
-    match (&a.pos, &b.pos) {
+    order_positions(&a.pos, &b.pos)
+}
+
+/// The position of a MySQL source checkpoint `{file, pos, gtid_set}`: its GTID
+/// set when it carries one (GTID mode), else its binlog coordinate. `None` when
+/// the binlog filename has no `<base>.<index>` shape.
+pub fn mysql_checkpoint_position(
+    file: &str,
+    pos: u64,
+    gtid_set: Option<&str>,
+) -> Option<WmPos> {
+    match gtid_set {
+        Some(g) => Some(WmPos::MysqlGtid {
+            gtid_set: g.to_string(),
+        }),
+        None => {
+            let (file_base, file_index) = binlog_file_parts(file)?;
+            Some(WmPos::MysqlBinlog {
+                file_base,
+                file_index,
+                pos,
+            })
+        }
+    }
+}
+
+/// Order two positions known to belong to the SAME lineage (the caller has
+/// established that; [`order`] checks it for watermarks). The single position
+/// comparator shared by durable watermarks, MySQL checkpoint selection and
+/// schema activation selection. Fail-closed: any doubt, including positions of
+/// different kinds (GTID set vs binlog coordinate), is `Incomparable`.
+pub fn order_positions(a: &WmPos, b: &WmPos) -> CheckpointOrder {
+    match (a, b) {
         (
             WmPos::PgLsn {
                 lsn: la,

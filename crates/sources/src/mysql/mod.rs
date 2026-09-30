@@ -726,29 +726,39 @@ impl MySqlSource {
 /// silently treated as an orderable position (which could select a resume point
 /// ahead of a sink and drop its events).
 pub fn compare_mysql_checkpoints(a: &[u8], b: &[u8]) -> CheckpointOrder {
+    // Delegates to the shared position comparator: GTID sets by inclusion,
+    // binlog coordinates by (base, numeric index, pos) - never lexically - and
+    // a GTID checkpoint against a file/pos one is Incomparable.
     #[derive(serde::Deserialize)]
     struct Cp {
         file: String,
         pos: u64,
+        #[serde(default)]
+        gtid_set: Option<String>,
     }
-    let a: Cp = match serde_json::from_slice(a) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(error = %e, "incomparable checkpoint a: parse failed");
-            return CheckpointOrder::Incomparable;
+    let position = |raw: &[u8], which: &str| {
+        let cp: Cp = match serde_json::from_slice(raw) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "incomparable checkpoint {which}: parse failed");
+                return None;
+            }
+        };
+        let p = crate::durable_checkpoint::mysql_checkpoint_position(
+            &cp.file,
+            cp.pos,
+            cp.gtid_set.as_deref(),
+        );
+        if p.is_none() {
+            tracing::warn!(file = %cp.file, "incomparable checkpoint {which}: unrecognised binlog file name");
         }
+        p
     };
-    let b: Cp = match serde_json::from_slice(b) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(error = %e, "incomparable checkpoint b: parse failed");
-            return CheckpointOrder::Incomparable;
+    match (position(a, "a"), position(b, "b")) {
+        (Some(a), Some(b)) => {
+            crate::durable_checkpoint::order_positions(&a, &b)
         }
-    };
-    match a.file.cmp(&b.file).then(a.pos.cmp(&b.pos)) {
-        std::cmp::Ordering::Less => CheckpointOrder::Before,
-        std::cmp::Ordering::Equal => CheckpointOrder::Equal,
-        std::cmp::Ordering::Greater => CheckpointOrder::After,
+        _ => CheckpointOrder::Incomparable,
     }
 }
 
@@ -1394,6 +1404,105 @@ mod compare_checkpoints_tests {
                 CheckpointOrder::Equal
             );
         }
+    }
+
+    fn gcp(file: &str, pos: u64, gtid: &str) -> Vec<u8> {
+        format!(r#"{{"file":"{file}","pos":{pos},"gtid_set":"{gtid}"}}"#)
+            .into_bytes()
+    }
+
+    /// Lexical file order is wrong once the index outgrows its zero padding;
+    /// the numeric index decides.
+    #[test]
+    fn binlog_index_is_numeric_not_lexical() {
+        assert_eq!(
+            compare_mysql_checkpoints(
+                &cp("bin.999999", 500),
+                &cp("bin.1000000", 4)
+            ),
+            CheckpointOrder::Before
+        );
+        assert_eq!(
+            compare_mysql_checkpoints(&cp("bin.000010", 4), &cp("bin.9", 900)),
+            CheckpointOrder::After
+        );
+    }
+
+    #[test]
+    fn different_binlog_bases_are_incomparable() {
+        assert_eq!(
+            compare_mysql_checkpoints(
+                &cp("bin.000001", 1),
+                &cp("other.000001", 1)
+            ),
+            CheckpointOrder::Incomparable
+        );
+    }
+
+    /// GTID checkpoints are ordered by set inclusion; the file/pos they also
+    /// carry does not override it.
+    #[test]
+    fn gtid_sets_order_by_inclusion() {
+        let u = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+        let small = gcp("bin.000009", 900, &format!("{u}:1-5"));
+        let large = gcp("bin.000001", 4, &format!("{u}:1-9"));
+        assert_eq!(
+            compare_mysql_checkpoints(&small, &large),
+            CheckpointOrder::Before
+        );
+        assert_eq!(
+            compare_mysql_checkpoints(&large, &small),
+            CheckpointOrder::After
+        );
+        assert_eq!(
+            compare_mysql_checkpoints(&small, &small),
+            CheckpointOrder::Equal
+        );
+        // Multi-line Executed_Gtid_Set formatting is accepted.
+        let v = "4f2a0b1c-71ca-11e1-9e33-c80aa9429562";
+        let a = gcp("bin.000001", 4, &format!("{u}:1-5,\\n{v}:1-2"));
+        let b = gcp("bin.000001", 4, &format!("{u}:1-6,{v}:1-2"));
+        assert_eq!(compare_mysql_checkpoints(&a, &b), CheckpointOrder::Before);
+    }
+
+    #[test]
+    fn disjoint_gtid_sets_are_incomparable() {
+        let u = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+        let v = "4f2a0b1c-71ca-11e1-9e33-c80aa9429562";
+        assert_eq!(
+            compare_mysql_checkpoints(
+                &gcp("bin.000001", 1, &format!("{u}:1-5")),
+                &gcp("bin.000001", 2, &format!("{v}:1-5"))
+            ),
+            CheckpointOrder::Incomparable
+        );
+    }
+
+    #[test]
+    fn gtid_against_file_pos_is_incomparable() {
+        let u = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+        assert_eq!(
+            compare_mysql_checkpoints(
+                &gcp("bin.000001", 1, &format!("{u}:1-5")),
+                &cp("bin.000002", 1)
+            ),
+            CheckpointOrder::Incomparable
+        );
+    }
+
+    #[test]
+    fn malformed_gtid_or_file_is_incomparable() {
+        assert_eq!(
+            compare_mysql_checkpoints(
+                &gcp("bin.000001", 1, "not-a-gtid-set"),
+                &gcp("bin.000001", 1, "not-a-gtid-set")
+            ),
+            CheckpointOrder::Incomparable
+        );
+        assert_eq!(
+            compare_mysql_checkpoints(&cp("binlog", 1), &cp("binlog", 1)),
+            CheckpointOrder::Incomparable
+        );
     }
 
     #[test]
