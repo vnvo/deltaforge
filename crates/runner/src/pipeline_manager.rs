@@ -474,6 +474,11 @@ pub(crate) enum PipelineStatus {
     Running,
     Paused,
     Stopped,
+    /// Destructive delete has begun (incarnation cleared and/or checkpoints being
+    /// removed). The runtime is non-runnable: only another `delete` may proceed
+    /// (start/resume/patch are rejected), so a delete that failed part-way is
+    /// never restarted with half its checkpoints gone.
+    Deleting,
 }
 
 impl PipelineStatus {
@@ -482,6 +487,7 @@ impl PipelineStatus {
             Self::Running => "running",
             Self::Paused => "paused",
             Self::Stopped => "stopped",
+            Self::Deleting => "deleting",
         }
     }
 }
@@ -1874,13 +1880,19 @@ impl PipelineController for PipelineManager {
         // other lifecycle operations.
         let _lifecycle = self.lifecycle.lock().await;
 
-        let old_spec = self
-            .pipelines
-            .read()
-            .get(name)
-            .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?
-            .spec
-            .clone();
+        let old_spec = {
+            let guard = self.pipelines.read();
+            let runtime = guard
+                .get(name)
+                .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?;
+            if runtime.status == PipelineStatus::Deleting {
+                return Err(PipelineAPIError::Conflict(format!(
+                    "pipeline '{name}' is being deleted and cannot be patched; \
+                     retry delete to finish removing it"
+                )));
+            }
+            runtime.spec.clone()
+        };
 
         let new_spec = merge_spec(old_spec.clone(), patch)?;
 
@@ -1943,7 +1955,13 @@ impl PipelineController for PipelineManager {
                 Ok(runtime.info())
             }
             PipelineStatus::Stopped => {
-                // Re-spawn from the stored spec and replace the stopped runtime.
+                // Await the stopped pipeline's tasks to full termination BEFORE
+                // spawning the replacement, so the old source cannot still be
+                // running (writing checkpoints / holding the slot) when the new
+                // one opens. Interactive stop only cancels; cancellation is not
+                // proof of termination.
+                self.terminate_pipeline_tasks(name).await;
+
                 let spec = self
                     .pipelines
                     .read()
@@ -1965,6 +1983,12 @@ impl PipelineController for PipelineManager {
                 .get(name)
                 .expect("runtime was not removed")
                 .info()),
+            PipelineStatus::Deleting => {
+                Err(PipelineAPIError::Conflict(format!(
+                    "pipeline '{name}' is being deleted and cannot be resumed; \
+                 retry delete to finish removing it"
+                )))
+            }
         }
     }
 
@@ -2053,6 +2077,15 @@ impl PipelineController for PipelineManager {
         // stopped writing. Runtime stays registered (retryable); it is removed only
         // after cleanup and claim release both succeed.
         self.terminate_pipeline_tasks(name).await;
+
+        // Mark the runtime non-runnable now that destructive cleanup is about to
+        // begin (the replay incarnation is already cleared). If cleanup below
+        // fails, the runtime stays in Deleting so resume/patch/start are rejected -
+        // a half-deleted pipeline (some checkpoints gone, incarnation removed) can
+        // never be restarted; only a delete retry may finish the teardown.
+        if let Some(rt) = self.pipelines.write().get_mut(name) {
+            rt.status = PipelineStatus::Deleting;
+        }
 
         // Fail-closed checkpoint cleanup. If we cannot enumerate or delete every
         // per-sink checkpoint, abort the delete WITHOUT releasing the source-id
@@ -2609,6 +2642,31 @@ mod tests {
         keys: Vec<String>,
         fail_list: bool,
         fail_delete: bool,
+        /// Fail the delete of this exact key exactly once (transient), then
+        /// succeed - to model a partial cleanup that a delete retry completes.
+        fail_delete_key_once: Option<String>,
+        once_fired: std::sync::atomic::AtomicBool,
+    }
+
+    impl FaultyCheckpointStore {
+        fn new(keys: Vec<String>, fail_list: bool, fail_delete: bool) -> Self {
+            Self {
+                keys,
+                fail_list,
+                fail_delete,
+                fail_delete_key_once: None,
+                once_fired: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+        fn fail_key_once(keys: Vec<String>, key: &str) -> Self {
+            Self {
+                keys,
+                fail_list: false,
+                fail_delete: false,
+                fail_delete_key_once: Some(key.to_string()),
+                once_fired: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
     }
 
     #[async_trait]
@@ -2619,12 +2677,22 @@ mod tests {
         async fn put_raw(&self, _k: &str, _b: &[u8]) -> CheckpointResult<()> {
             Ok(())
         }
-        async fn delete(&self, _k: &str) -> CheckpointResult<bool> {
+        async fn delete(&self, k: &str) -> CheckpointResult<bool> {
             if self.fail_delete {
-                Err(CheckpointError::Data("injected delete failure".into()))
-            } else {
-                Ok(true)
+                return Err(CheckpointError::Data(
+                    "injected delete failure".into(),
+                ));
             }
+            if self.fail_delete_key_once.as_deref() == Some(k)
+                && !self
+                    .once_fired
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(CheckpointError::Data(
+                    "injected transient delete failure".into(),
+                ));
+            }
+            Ok(true)
         }
         async fn list(&self) -> CheckpointResult<Vec<String>> {
             if self.fail_list {
@@ -2698,11 +2766,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn delete_fails_closed_on_checkpoint_list_failure_retains_claim() {
         let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
-        let ckpt: Arc<dyn CheckpointStore> = Arc::new(FaultyCheckpointStore {
-            keys: vec![],
-            fail_list: true,
-            fail_delete: false,
-        });
+        let ckpt: Arc<dyn CheckpointStore> =
+            Arc::new(FaultyCheckpointStore::new(vec![], true, false));
         let mgr = manager_with_ckpt(Arc::clone(&backend), ckpt).await;
 
         // Register a pipeline (source id "mysql") and its claim.
@@ -2732,11 +2797,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn delete_fails_closed_on_checkpoint_delete_failure_retains_claim() {
         let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
-        let ckpt: Arc<dyn CheckpointStore> = Arc::new(FaultyCheckpointStore {
-            keys: vec!["mysql::sink::redis".into()],
-            fail_list: false,
-            fail_delete: true,
-        });
+        let ckpt: Arc<dyn CheckpointStore> =
+            Arc::new(FaultyCheckpointStore::new(
+                vec!["mysql::sink::redis".into()],
+                false,
+                true,
+            ));
         let mgr = manager_with_ckpt(Arc::clone(&backend), ckpt).await;
 
         mgr.pipelines
@@ -2762,11 +2828,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn delete_releases_claim_after_successful_cleanup() {
         let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
-        let ckpt: Arc<dyn CheckpointStore> = Arc::new(FaultyCheckpointStore {
-            keys: vec!["mysql::sink::redis".into()],
-            fail_list: false,
-            fail_delete: false,
-        });
+        let ckpt: Arc<dyn CheckpointStore> =
+            Arc::new(FaultyCheckpointStore::new(
+                vec!["mysql::sink::redis".into()],
+                false,
+                false,
+            ));
         let mgr = manager_with_ckpt(Arc::clone(&backend), ckpt).await;
 
         mgr.pipelines
@@ -2798,11 +2865,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn delete_awaits_task_termination_before_release() {
         let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
-        let ckpt: Arc<dyn CheckpointStore> = Arc::new(FaultyCheckpointStore {
-            keys: vec![],
-            fail_list: false,
-            fail_delete: false,
-        });
+        let ckpt: Arc<dyn CheckpointStore> =
+            Arc::new(FaultyCheckpointStore::new(vec![], false, false));
         let mgr = manager_with_ckpt(Arc::clone(&backend), ckpt).await;
 
         // A coordinator task that only finishes after a delay and records that it
@@ -2856,6 +2920,97 @@ mod tests {
         );
         // The pipeline is untouched and still registered.
         assert!(mgr.get_pipeline("pl").is_some());
+    }
+
+    // ── Blocker 1: resume awaits stopped tasks before respawning ──
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_awaits_old_task_termination_before_respawn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mgr = PipelineManager::for_testing();
+
+        // A Stopped runtime whose coordinator task only finishes after a delay.
+        // resume() must await it (via the synchronous termination helper) before
+        // spawning the replacement, so two source instances never overlap.
+        let finished = Arc::new(AtomicBool::new(false));
+        let f2 = Arc::clone(&finished);
+        let join: JoinHandle<Result<()>> = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            f2.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        let mut rt = bare_runtime(spec_dead("pl"), Some(join));
+        rt.status = PipelineStatus::Stopped;
+        mgr.pipelines.write().insert("pl".into(), rt);
+
+        mgr.resume("pl").await.expect("resume succeeds");
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "resume must await the stopped task's termination before respawning"
+        );
+    }
+
+    // ── Blocker 2: a failed delete leaves a non-runnable pipeline; only retry ──
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn partial_delete_failure_blocks_resume_patch_then_retry_succeeds() {
+        let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        // list returns two sink checkpoints; deleting the second fails ONCE, so
+        // the first delete partially cleans up and then fails, and a retry
+        // completes the deletion.
+        let ckpt: Arc<dyn CheckpointStore> =
+            Arc::new(FaultyCheckpointStore::fail_key_once(
+                vec!["mysql::sink::a".into(), "mysql::sink::b".into()],
+                "mysql::sink::b",
+            ));
+        let mgr = manager_with_ckpt(Arc::clone(&backend), ckpt).await;
+
+        mgr.pipelines
+            .write()
+            .insert("pl".into(), bare_runtime(sample_spec("pl"), None));
+        backend
+            .slot_create(ACTIVE_SOURCES_NS, "mysql", b"pl")
+            .await
+            .unwrap();
+
+        // First delete: partial cleanup then fails -> runtime left in Deleting.
+        assert!(mgr.delete("pl").await.is_err(), "first delete fails closed");
+        assert_eq!(
+            mgr.get_pipeline("pl").map(|i| i.status),
+            Some("deleting".to_string()),
+            "a half-deleted pipeline is marked non-runnable"
+        );
+        // Claim retained -> no reuse.
+        assert!(
+            backend
+                .slot_create(ACTIVE_SOURCES_NS, "mysql", b"other")
+                .await
+                .unwrap()
+                .is_none(),
+            "claim retained while the pipeline is half-deleted"
+        );
+
+        // resume and patch are rejected for a Deleting pipeline.
+        assert!(matches!(
+            mgr.resume("pl").await,
+            Err(PipelineAPIError::Conflict(_))
+        ));
+        assert!(matches!(
+            mgr.patch("pl", serde_json::json!({})).await,
+            Err(PipelineAPIError::Conflict(_))
+        ));
+
+        // A delete retry completes: the transient failure has cleared.
+        mgr.delete("pl").await.expect("delete retry succeeds");
+        assert!(mgr.get_pipeline("pl").is_none(), "runtime removed on retry");
+        assert!(
+            backend
+                .slot_create(ACTIVE_SOURCES_NS, "mysql", b"other")
+                .await
+                .unwrap()
+                .is_some(),
+            "claim released after the delete finally succeeds"
+        );
     }
 
     // ── Durable_v2 wiring: fail-closed builders, ID validation, startup order ──
