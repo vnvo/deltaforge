@@ -124,6 +124,47 @@ async fn slot_cas_exactly_one_winner_under_contention() {
 }
 
 #[tokio::test]
+async fn slot_create_exactly_one_winner_under_contention() {
+    for_each_backend!(|b: ArcStorageBackend| async move {
+        // Two concurrent create-only-if-absent calls for the same key: exactly
+        // one mints it (Some), the other observes it already exists (None). This
+        // is the primitive the duplicate-source-id containment relies on.
+        let (r1, r2) = tokio::join!(
+            b.slot_create("active_sources", "src", b"pipeline-a"),
+            b.slot_create("active_sources", "src", b"pipeline-b"),
+        );
+        let results = [r1.unwrap(), r2.unwrap()];
+        assert_eq!(
+            results.iter().filter(|r| r.is_some()).count(),
+            1,
+            "exactly one slot_create must win the claim"
+        );
+        assert_eq!(
+            results.iter().filter(|r| r.is_none()).count(),
+            1,
+            "the losing slot_create must report the slot already exists"
+        );
+
+        // A third attempt still loses, and delete frees it for reuse.
+        assert!(
+            b.slot_create("active_sources", "src", b"pipeline-c")
+                .await
+                .unwrap()
+                .is_none(),
+            "an existing claim is never overwritten"
+        );
+        assert!(b.slot_delete("active_sources", "src").await.unwrap());
+        assert!(
+            b.slot_create("active_sources", "src", b"pipeline-c")
+                .await
+                .unwrap()
+                .is_some(),
+            "a released claim can be minted again"
+        );
+    });
+}
+
+#[tokio::test]
 async fn slot_cas_wrong_version_returns_false() {
     for_each_backend!(|b: ArcStorageBackend| async move {
         b.slot_upsert("snapshots", "pipe/t", b"v0").await.unwrap();

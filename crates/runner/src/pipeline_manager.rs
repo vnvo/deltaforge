@@ -474,6 +474,11 @@ pub(crate) enum PipelineStatus {
     Running,
     Paused,
     Stopped,
+    /// Destructive delete has begun (incarnation cleared and/or checkpoints being
+    /// removed). The runtime is non-runnable: only another `delete` may proceed
+    /// (start/resume/patch are rejected), so a delete that failed part-way is
+    /// never restarted with half its checkpoints gone.
+    Deleting,
 }
 
 impl PipelineStatus {
@@ -482,6 +487,7 @@ impl PipelineStatus {
             Self::Running => "running",
             Self::Paused => "paused",
             Self::Stopped => "stopped",
+            Self::Deleting => "deleting",
         }
     }
 }
@@ -643,12 +649,31 @@ pub(crate) fn coordinator_exit_failed(
 // Pipeline Manager
 // ============================================================================
 
+/// Namespace for the durable "active source id" claim.
+///
+/// Checkpoint keys are `{source_id}::sink::{sink_id}` - they carry no tenant or
+/// pipeline qualifier, so two pipelines that reuse the same `source_id` would
+/// collide in the checkpoint store and corrupt each other's resume position.
+/// This claim rejects a second pipeline that reuses an active `source_id`. It is
+/// keyed by `source_id` alone, matching the checkpoint-key collision domain
+/// (keying it by tenant would not, since the keys themselves are not
+/// tenant-scoped).
+const ACTIVE_SOURCES_NS: &str = "active_sources";
+
 #[derive(Clone)]
 pub struct PipelineManager {
     pub(crate) pipelines: Arc<RwLock<HashMap<String, PipelineRuntime>>>,
     pub(crate) ckpt_store: Arc<dyn CheckpointStore>,
     pub(crate) registry: Arc<DurableSchemaRegistry>,
     pub(crate) backend: ArcStorageBackend,
+    /// Serializes destructive lifecycle transitions (start / stop / delete /
+    /// patch) within this manager so `check name -> claim source id -> spawn ->
+    /// register` runs atomically and a delete's teardown+cleanup never interleaves
+    /// with a concurrent start. This is single-instance containment: the pilot
+    /// must run exactly ONE manager against a given checkpoint/claim store (see
+    /// the deployment constraint in the pilot support envelope); two processes
+    /// sharing storage are not protected by this lock.
+    pub(crate) lifecycle: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl PipelineManager {
@@ -683,6 +708,7 @@ impl PipelineManager {
             ckpt_store,
             registry,
             backend,
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -701,6 +727,7 @@ impl PipelineManager {
             ckpt_store,
             registry,
             backend,
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -1235,7 +1262,20 @@ impl PipelineManager {
         })
     }
 
+    /// Start a pipeline. Serialized against other start/stop/delete/patch
+    /// operations so the name check, source-id claim, spawn, and registration
+    /// happen atomically (no two concurrent starts can both pass the checks).
     pub async fn start_pipeline(
+        &self,
+        spec: PipelineSpec,
+    ) -> Result<PipeInfo, PipelineAPIError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        self.start_pipeline_locked(spec).await
+    }
+
+    /// Start body run while the lifecycle lock is held. Never acquires the lock
+    /// itself, so lock-holding callers (`patch`) can reuse it without deadlock.
+    async fn start_pipeline_locked(
         &self,
         spec: PipelineSpec,
     ) -> Result<PipeInfo, PipelineAPIError> {
@@ -1254,16 +1294,97 @@ impl PipelineManager {
         )
         .map_err(|e| PipelineAPIError::Failed(anyhow::anyhow!(e)))?;
 
-        let runtime = self
-            .spawn_pipeline(spec)
-            .await
-            .map_err(PipelineAPIError::Failed)?;
+        // Claim the source id before spawning so two pipelines can never share a
+        // source id and corrupt each other's checkpoints. A restart of the same
+        // pipeline reuses its own claim; a different pipeline is rejected.
+        let source_id = spec.spec.source.source_id().to_string();
+        let newly_claimed = self.claim_source_id(&source_id, &name).await?;
+
+        let runtime = match self.spawn_pipeline(spec).await {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                // A failed start must not leave behind a claim this call minted.
+                // (A restart reused an existing claim; that one stays and is
+                // released on delete.)
+                if newly_claimed {
+                    if let Err(re) = self
+                        .backend
+                        .slot_delete(ACTIVE_SOURCES_NS, &source_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            pipeline = %name, source_id = %source_id, error = %re,
+                            "failed to release active-source claim after a \
+                             failed start; source id stays locked until retry"
+                        );
+                    }
+                }
+                return Err(PipelineAPIError::Failed(e));
+            }
+        };
         let info = runtime.info();
         self.pipelines.write().insert(name, runtime);
         Ok(info)
     }
 
+    /// Claim `source_id` for `pipeline_name` before the pipeline starts.
+    ///
+    /// Checkpoints are keyed by `source_id`, so two pipelines sharing one would
+    /// clobber each other. This uses the durable create-only-if-absent slot to
+    /// admit exactly one owner. Returns `true` when this call minted the claim,
+    /// `false` when the same pipeline already owned it (a restart), and
+    /// `Err(Conflict)` when a different pipeline owns it.
+    async fn claim_source_id(
+        &self,
+        source_id: &str,
+        pipeline_name: &str,
+    ) -> Result<bool, PipelineAPIError> {
+        match self
+            .backend
+            .slot_create(ACTIVE_SOURCES_NS, source_id, pipeline_name.as_bytes())
+            .await
+            .map_err(PipelineAPIError::Failed)?
+        {
+            Some(_) => Ok(true),
+            None => {
+                let owner = self
+                    .backend
+                    .slot_get(ACTIVE_SOURCES_NS, source_id)
+                    .await
+                    .map_err(PipelineAPIError::Failed)?
+                    .map(|(_, bytes)| {
+                        String::from_utf8_lossy(&bytes).into_owned()
+                    })
+                    .unwrap_or_default();
+                if owner == pipeline_name {
+                    Ok(false)
+                } else {
+                    Err(PipelineAPIError::Conflict(format!(
+                        "source id '{source_id}' is already in use by pipeline \
+                         '{owner}'; a source id must be unique across pipelines \
+                         because checkpoints are keyed by source id"
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Stop a pipeline. Serialized against other lifecycle operations. Awaits
+    /// full termination of the coordinator and source tasks before returning, so
+    /// a caller can rely on the pipeline having stopped writing once this returns.
     pub async fn stop_pipeline(
+        &self,
+        name: &str,
+    ) -> Result<(), PipelineAPIError> {
+        let _lifecycle = self.lifecycle.lock().await;
+        self.stop_pipeline_locked(name).await
+    }
+
+    /// Stop body run while the lifecycle lock is held. Cancels the coordinator,
+    /// source, retention, and replay tasks and **awaits** the coordinator + source
+    /// joins so the pipeline is confirmed terminated (no further checkpoint writes)
+    /// before this returns - the synchronous teardown that `delete` depends on.
+    async fn stop_pipeline_locked(
         &self,
         name: &str,
     ) -> Result<(), PipelineAPIError> {
@@ -1298,6 +1419,50 @@ impl PipelineManager {
         gauge!("deltaforge_pipeline_status", "pipeline" => name.to_string())
             .set(0.0);
         Ok(())
+    }
+
+    /// Cancel and AWAIT the coordinator + source tasks for `name` in place,
+    /// without removing the runtime from the registry, so the caller (`delete`)
+    /// stays retryable with full state if a later step fails. Awaits the join
+    /// handles held in the runtime, so on return the tasks are confirmed
+    /// terminated and no longer writing checkpoints. Idempotent: once the handles
+    /// are taken and awaited, later calls find none and return at once. The
+    /// lifecycle lock must be held.
+    async fn terminate_pipeline_tasks(&self, name: &str) {
+        let (cancel, sources, join, retention, replay) = {
+            let mut guard = self.pipelines.write();
+            let Some(rt) = guard.get_mut(name) else {
+                return;
+            };
+            rt.status = PipelineStatus::Stopped;
+            (
+                rt.cancel.clone(),
+                std::mem::take(&mut rt.sources),
+                rt.join.take(),
+                rt.retention_task.take(),
+                rt.replay_controller.take(),
+            )
+        };
+
+        cancel.cancel();
+        if let Some(task) = retention {
+            task.abort();
+        }
+        if let Some((c, task)) = replay {
+            c.cancel();
+            task.abort();
+        }
+        for src in &sources {
+            src.cancel.cancel();
+        }
+        if let Some(join) = join {
+            let _ = join.await;
+        }
+        for src in sources {
+            let _ = src.join.await;
+        }
+        gauge!("deltaforge_pipeline_status", "pipeline" => name.to_string())
+            .set(0.0);
     }
 
     pub fn list_pipelines(&self) -> Vec<PipeInfo> {
@@ -1711,43 +1876,47 @@ impl PipelineController for PipelineManager {
         name: &str,
         patch: Value,
     ) -> Result<PipeInfo, PipelineAPIError> {
-        let old_spec = self
-            .pipelines
-            .read()
-            .get(name)
-            .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?
-            .spec
-            .clone();
+        // Serialize the whole reconfigure (read -> merge -> stop -> start) against
+        // other lifecycle operations.
+        let _lifecycle = self.lifecycle.lock().await;
+
+        let old_spec = {
+            let guard = self.pipelines.read();
+            let runtime = guard
+                .get(name)
+                .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?;
+            if runtime.status == PipelineStatus::Deleting {
+                return Err(PipelineAPIError::Conflict(format!(
+                    "pipeline '{name}' is being deleted and cannot be patched; \
+                     retry delete to finish removing it"
+                )));
+            }
+            runtime.spec.clone()
+        };
 
         let new_spec = merge_spec(old_spec.clone(), patch)?;
 
-        // Clean up per-sink checkpoints for removed sinks.
-        let source_id = old_spec.spec.source.source_id();
+        // Adding or removing a sink means creating or deleting a per-sink
+        // checkpoint key, which is not crash-safe (a crash mid-change can leave a
+        // sink with no checkpoint or an orphaned one). That reconfiguration path is
+        // disabled for the pilot: reject any PATCH that changes the sink set, while
+        // still allowing patches that leave the sink set intact. Delete and
+        // recreate the pipeline to change its sinks.
         let old_sink_ids: std::collections::HashSet<&str> =
             old_spec.spec.sinks.iter().map(|s| s.sink_id()).collect();
         let new_sink_ids: std::collections::HashSet<&str> =
             new_spec.spec.sinks.iter().map(|s| s.sink_id()).collect();
-
-        for removed in old_sink_ids.difference(&new_sink_ids) {
-            let cp_key = format!("{}::sink::{}", source_id, removed);
-            if let Err(e) = self.ckpt_store.delete(&cp_key).await {
-                tracing::warn!(
-                    pipeline = %name,
-                    sink = %removed,
-                    error = %e,
-                    "failed to clean up checkpoint for removed sink"
-                );
-            } else {
-                tracing::info!(
-                    pipeline = %name,
-                    sink = %removed,
-                    "cleaned up per-sink checkpoint for removed sink"
-                );
-            }
+        if old_sink_ids != new_sink_ids {
+            return Err(PipelineAPIError::BadRequest(
+                "changing a pipeline's sink set via PATCH is disabled in this \
+                 build (per-sink checkpoint changes are not crash-safe); delete \
+                 and recreate the pipeline to change its sinks"
+                    .to_string(),
+            ));
         }
 
-        self.stop_pipeline(name).await?;
-        self.start_pipeline(new_spec).await
+        self.stop_pipeline_locked(name).await?;
+        self.start_pipeline_locked(new_spec).await
     }
 
     async fn pause(&self, name: &str) -> Result<PipeInfo, PipelineAPIError> {
@@ -1762,6 +1931,11 @@ impl PipelineController for PipelineManager {
     }
 
     async fn resume(&self, name: &str) -> Result<PipeInfo, PipelineAPIError> {
+        // Serialize against other lifecycle operations: the Stopped branch below
+        // re-spawns and replaces the runtime, which must not interleave with a
+        // concurrent delete/start of the same pipeline.
+        let _lifecycle = self.lifecycle.lock().await;
+
         let status = self
             .pipelines
             .read()
@@ -1781,7 +1955,13 @@ impl PipelineController for PipelineManager {
                 Ok(runtime.info())
             }
             PipelineStatus::Stopped => {
-                // Re-spawn from the stored spec and replace the stopped runtime.
+                // Await the stopped pipeline's tasks to full termination BEFORE
+                // spawning the replacement, so the old source cannot still be
+                // running (writing checkpoints / holding the slot) when the new
+                // one opens. Interactive stop only cancels; cancellation is not
+                // proof of termination.
+                self.terminate_pipeline_tasks(name).await;
+
                 let spec = self
                     .pipelines
                     .read()
@@ -1803,13 +1983,27 @@ impl PipelineController for PipelineManager {
                 .get(name)
                 .expect("runtime was not removed")
                 .info()),
+            PipelineStatus::Deleting => {
+                Err(PipelineAPIError::Conflict(format!(
+                    "pipeline '{name}' is being deleted and cannot be resumed; \
+                 retry delete to finish removing it"
+                )))
+            }
         }
     }
 
     async fn stop(&self, name: &str) -> Result<PipeInfo, PipelineAPIError> {
-        // Cancel tasks and clear handles, but keep the runtime in the registry
-        // so the pipeline can be resumed later.
-        let (cancel, sources, join) = {
+        // Serialize against other lifecycle operations.
+        let _lifecycle = self.lifecycle.lock().await;
+
+        // Interactive stop stays asynchronous: cancel the tasks and return
+        // promptly without awaiting their shutdown (a source may be slow to notice
+        // cancellation in a TCP read). Crucially it KEEPS the coordinator/source
+        // join handles in the runtime rather than detaching them into a background
+        // task, so a subsequent destructive delete can await confirmed termination
+        // instead of racing an untracked join. A restart replaces the runtime and
+        // drops the (already cancelled) handles.
+        let info = {
             let mut guard = self.pipelines.write();
             let runtime = guard
                 .get_mut(name)
@@ -1820,11 +2014,12 @@ impl PipelineController for PipelineManager {
             }
 
             runtime.status = PipelineStatus::Stopped;
-            let cancel = runtime.cancel.clone();
-            let sources = std::mem::take(&mut runtime.sources);
-            let join = runtime.join.take();
-            // Stop the replay-retention background task with the coordinator; there is
-            // nothing to retain while the pipeline is not capturing.
+            runtime.cancel.cancel();
+            for src in &runtime.sources {
+                src.cancel.cancel();
+            }
+            // Stop the replay-retention background task with the coordinator; there
+            // is nothing to retain while the pipeline is not capturing.
             if let Some(task) = runtime.retention_task.take() {
                 task.abort();
             }
@@ -1833,50 +2028,39 @@ impl PipelineController for PipelineManager {
                 c.cancel();
                 task.abort();
             }
-            (cancel, sources, join)
+            runtime.info()
         };
 
-        cancel.cancel();
-        for src in &sources {
-            src.cancel.cancel();
-        }
-        // Update the gauge immediately - the status is already Stopped in the
-        // registry. Don't wait for the join handles; the source task may be
-        // stuck in a TCP read that is slow to notice cancellation.
         gauge!("deltaforge_pipeline_status", "pipeline" => name.to_string())
             .set(0.0);
-        // Await cleanup in the background so the HTTP handler returns promptly.
-        tokio::spawn(async move {
-            if let Some(j) = join {
-                let _ = j.await;
-            }
-            for src in sources {
-                let _ = src.join.await;
-            }
-        });
-
-        Ok(self
-            .pipelines
-            .read()
-            .get(name)
-            .expect("runtime was not removed")
-            .info())
+        Ok(info)
     }
 
     async fn delete(&self, name: &str) -> Result<(), PipelineAPIError> {
-        // Capture source_id before stopping (spec is removed by stop).
-        let source_id = self
+        // Serialize the whole destructive teardown against other lifecycle ops so
+        // a replacement pipeline cannot start (and claim the freed source id) while
+        // this one is still stopping or being cleaned up.
+        let _lifecycle = self.lifecycle.lock().await;
+
+        // The source id is needed for checkpoint cleanup and claim release. Read it
+        // from the still-registered runtime; the runtime is only removed at the very
+        // end, so a delete that fails partway is retryable with full state.
+        let source_id = match self
             .pipelines
             .read()
             .get(name)
-            .map(|r| r.spec.spec.source.source_id().to_string());
+            .map(|r| r.spec.spec.source.source_id().to_string())
+        {
+            Some(id) => id,
+            None => return Err(PipelineAPIError::NotFound(name.to_string())),
+        };
 
-        // Fail-closed incarnation invalidation FIRST, before the pipeline is removed. If
-        // clearing the replay incarnation slot fails, abort the delete: the pipeline
-        // stays registered and deletable on retry, and we never report a successful
-        // deletion that leaves the old incarnation behind for a recreated pipeline to
-        // inherit. slot_delete is idempotent (Ok(false) when nothing was there), so a
-        // non-replay pipeline is a no-op and a retry after a partial delete still works.
+        // Fail-closed incarnation invalidation FIRST. If clearing the replay
+        // incarnation slot fails, abort the delete: the pipeline stays registered
+        // and deletable on retry, and we never report a successful deletion that
+        // leaves the old incarnation behind for a recreated pipeline to inherit.
+        // slot_delete is idempotent, so a non-replay pipeline is a no-op and a
+        // retry after a partial delete still works.
         let inc_key = format!("{name}:incarnation");
         self.backend
             .slot_delete(crate::replay_journal::REPLAY_NS, &inc_key)
@@ -1888,31 +2072,64 @@ impl PipelineController for PipelineManager {
                 ))
             })?;
 
-        self.stop_pipeline(name).await?;
+        // Synchronous teardown: cancel and AWAIT the coordinator + source tasks to
+        // full termination before touching checkpoints, so the old source has
+        // stopped writing. Runtime stays registered (retryable); it is removed only
+        // after cleanup and claim release both succeed.
+        self.terminate_pipeline_tasks(name).await;
 
-        // Clean up all per-sink checkpoints for this pipeline.
-        if let Some(source_id) = source_id {
-            let prefix = format!("{}::sink::", source_id);
-            if let Ok(keys) = self.ckpt_store.list_with_prefix(&prefix).await {
-                for key in keys {
-                    if let Err(e) = self.ckpt_store.delete(&key).await {
-                        tracing::warn!(
-                            pipeline = %name,
-                            key = %key,
-                            error = %e,
-                            "failed to clean up per-sink checkpoint on delete"
-                        );
-                    }
-                }
-                if !prefix.is_empty() {
-                    tracing::info!(
-                        pipeline = %name,
-                        "cleaned up per-sink checkpoints on delete"
-                    );
-                }
-            }
+        // Mark the runtime non-runnable now that destructive cleanup is about to
+        // begin (the replay incarnation is already cleared). If cleanup below
+        // fails, the runtime stays in Deleting so resume/patch/start are rejected -
+        // a half-deleted pipeline (some checkpoints gone, incarnation removed) can
+        // never be restarted; only a delete retry may finish the teardown.
+        if let Some(rt) = self.pipelines.write().get_mut(name) {
+            rt.status = PipelineStatus::Deleting;
         }
 
+        // Fail-closed checkpoint cleanup. If we cannot enumerate or delete every
+        // per-sink checkpoint, abort the delete WITHOUT releasing the source-id
+        // claim: a recreated pipeline reusing this source id would otherwise
+        // inherit or collide with the leftovers - the exact corruption the claim
+        // exists to prevent. The claim stays held (source id locked) and delete is
+        // retryable.
+        let prefix = format!("{}::sink::", source_id);
+        let keys =
+            self.ckpt_store.list_with_prefix(&prefix).await.map_err(|e| {
+                PipelineAPIError::Failed(anyhow::anyhow!(
+                    "failed to list checkpoints for cleanup ({e}); delete aborted \
+                     and source id '{source_id}' stays locked so no pipeline reuses \
+                     it while stale checkpoints remain"
+                ))
+            })?;
+        for key in keys {
+            self.ckpt_store.delete(&key).await.map_err(|e| {
+                PipelineAPIError::Failed(anyhow::anyhow!(
+                    "failed to delete checkpoint '{key}' ({e}); delete aborted and \
+                     source id '{source_id}' stays locked"
+                ))
+            })?;
+        }
+        tracing::info!(
+            pipeline = %name,
+            "cleaned up per-sink checkpoints on delete"
+        );
+
+        // Release the source-id claim only after confirmed shutdown AND successful
+        // checkpoint cleanup. A release failure keeps the id locked (safe) and the
+        // delete is retryable.
+        self.backend
+            .slot_delete(ACTIVE_SOURCES_NS, &source_id)
+            .await
+            .map_err(|e| {
+                PipelineAPIError::Failed(anyhow::anyhow!(
+                    "failed to release active-source claim for '{source_id}' ({e}); \
+                     delete aborted, claim retained"
+                ))
+            })?;
+
+        // Everything durable is cleaned; now drop the in-memory runtime.
+        self.pipelines.write().remove(name);
         Ok(())
     }
 
@@ -2296,6 +2513,504 @@ mod tests {
                 secrets: None,
             },
         }
+    }
+
+    // ── R3-C3: duplicate active source-id containment ────────────────────────
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplicate_source_id_across_pipelines_is_rejected() {
+        let mgr = PipelineManager::for_testing();
+
+        // First pipeline claims the source id.
+        assert!(
+            mgr.claim_source_id("shared-src", "pipeline-a")
+                .await
+                .expect("first claim succeeds"),
+            "first claim should be newly minted"
+        );
+
+        // The same pipeline restarting reuses its own claim (not a conflict, and
+        // not a fresh mint).
+        assert!(
+            !mgr.claim_source_id("shared-src", "pipeline-a")
+                .await
+                .expect("restart re-claim succeeds"),
+            "same-pipeline restart should reuse the existing claim"
+        );
+
+        // A different pipeline reusing the same source id is rejected - two
+        // pipelines sharing a source id would collide on checkpoint keys.
+        match mgr.claim_source_id("shared-src", "pipeline-b").await {
+            Err(PipelineAPIError::Conflict(msg)) => {
+                assert!(
+                    msg.contains("shared-src") && msg.contains("pipeline-a"),
+                    "conflict must name the source id and the owning pipeline, \
+                     got: {msg}"
+                );
+            }
+            other => {
+                panic!(
+                    "expected Conflict for a duplicate source id, got {other:?}"
+                )
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn releasing_the_claim_frees_the_source_id_for_reuse() {
+        let mgr = PipelineManager::for_testing();
+        assert!(mgr.claim_source_id("src", "p1").await.unwrap());
+
+        // While the claim is held, a different pipeline cannot take it.
+        assert!(matches!(
+            mgr.claim_source_id("src", "p2").await,
+            Err(PipelineAPIError::Conflict(_))
+        ));
+
+        // delete() releases the claim via slot_delete on ACTIVE_SOURCES_NS; after
+        // that same release a different pipeline can reuse the source id.
+        mgr.backend
+            .slot_delete(ACTIVE_SOURCES_NS, "src")
+            .await
+            .expect("release succeeds");
+        assert!(
+            mgr.claim_source_id("src", "p2")
+                .await
+                .expect("reuse after release succeeds"),
+            "a released source id should be claimable by another pipeline"
+        );
+    }
+
+    // ── R3-C3/C4/C5: lifecycle safety (serialization, fail-closed delete, PATCH) ──
+
+    /// A spec whose source points at a dead TCP port, so a spawned source fails to
+    /// connect fast and cancels promptly (no dependency on a live database).
+    fn spec_dead(name: &str) -> PipelineSpec {
+        let mut s = sample_spec(name);
+        if let SourceCfg::Mysql(ref mut c) = s.spec.source {
+            c.dsn = Some("mysql://root:root@127.0.0.1:59999/db".to_string());
+        }
+        s
+    }
+
+    /// Build a manager with a caller-supplied checkpoint store (for fault
+    /// injection) sharing one in-memory backend for the claim/registry.
+    async fn manager_with_ckpt(
+        backend: ArcStorageBackend,
+        ckpt: Arc<dyn CheckpointStore>,
+    ) -> PipelineManager {
+        let registry = DurableSchemaRegistry::new(Arc::clone(&backend))
+            .await
+            .expect("memory registry");
+        PipelineManager {
+            pipelines: Arc::new(RwLock::new(HashMap::new())),
+            ckpt_store: ckpt,
+            registry,
+            backend,
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    /// A registered runtime with no live tasks (unless `join` is supplied), for
+    /// driving delete() without spawning a real source.
+    fn bare_runtime(
+        spec: PipelineSpec,
+        join: Option<JoinHandle<Result<()>>>,
+    ) -> PipelineRuntime {
+        let (pause_tx, _pr) = watch::channel(PauseState::default());
+        PipelineRuntime {
+            spec,
+            status: PipelineStatus::Running,
+            alive: Arc::new(AtomicBool::new(true)),
+            cancel: CancellationToken::new(),
+            pause: pause_tx,
+            sources: vec![],
+            join,
+            schema_loader: None,
+            table_patterns: vec![],
+            sensor_state: None,
+            dlq_writer: None,
+            retention_task: None,
+            replay_ctx: None,
+            replay_controller: None,
+            started_at: std::time::Instant::now(),
+        }
+    }
+
+    /// Checkpoint store with injectable list/delete failures; other ops succeed.
+    struct FaultyCheckpointStore {
+        keys: Vec<String>,
+        fail_list: bool,
+        fail_delete: bool,
+        /// Fail the delete of this exact key exactly once (transient), then
+        /// succeed - to model a partial cleanup that a delete retry completes.
+        fail_delete_key_once: Option<String>,
+        once_fired: std::sync::atomic::AtomicBool,
+    }
+
+    impl FaultyCheckpointStore {
+        fn new(keys: Vec<String>, fail_list: bool, fail_delete: bool) -> Self {
+            Self {
+                keys,
+                fail_list,
+                fail_delete,
+                fail_delete_key_once: None,
+                once_fired: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+        fn fail_key_once(keys: Vec<String>, key: &str) -> Self {
+            Self {
+                keys,
+                fail_list: false,
+                fail_delete: false,
+                fail_delete_key_once: Some(key.to_string()),
+                once_fired: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CheckpointStore for FaultyCheckpointStore {
+        async fn get_raw(&self, _k: &str) -> CheckpointResult<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn put_raw(&self, _k: &str, _b: &[u8]) -> CheckpointResult<()> {
+            Ok(())
+        }
+        async fn delete(&self, k: &str) -> CheckpointResult<bool> {
+            if self.fail_delete {
+                return Err(CheckpointError::Data(
+                    "injected delete failure".into(),
+                ));
+            }
+            if self.fail_delete_key_once.as_deref() == Some(k)
+                && !self
+                    .once_fired
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(CheckpointError::Data(
+                    "injected transient delete failure".into(),
+                ));
+            }
+            Ok(true)
+        }
+        async fn list(&self) -> CheckpointResult<Vec<String>> {
+            if self.fail_list {
+                Err(CheckpointError::Data("injected list failure".into()))
+            } else {
+                Ok(self.keys.clone())
+            }
+        }
+    }
+
+    // ── Blocker 3: concurrent starts serialize; only one owner spawns ──
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_starts_same_name_admit_only_one() {
+        let mgr = Arc::new(PipelineManager::for_testing());
+        let (m1, m2) = (Arc::clone(&mgr), Arc::clone(&mgr));
+
+        // Two concurrent starts of the SAME pipeline name. The lifecycle lock
+        // serializes them, so the name check admits exactly one; the other is
+        // rejected before it can spawn.
+        let (r1, r2) = tokio::join!(
+            tokio::spawn(
+                async move { m1.start_pipeline(spec_dead("dup")).await }
+            ),
+            tokio::spawn(
+                async move { m2.start_pipeline(spec_dead("dup")).await }
+            ),
+        );
+        // Map the Ok payload away (PipeInfo is not Debug) so results are printable.
+        let r1 = r1.unwrap().map(|_| ());
+        let r2 = r2.unwrap().map(|_| ());
+
+        let oks = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+        let already = [&r1, &r2]
+            .iter()
+            .filter(|r| matches!(r, Err(PipelineAPIError::AlreadyExists(_))))
+            .count();
+        assert_eq!(
+            oks, 1,
+            "exactly one concurrent start may win: {r1:?} {r2:?}"
+        );
+        assert_eq!(already, 1, "the loser must see AlreadyExists");
+        assert_eq!(
+            mgr.list_pipelines().len(),
+            1,
+            "only one runtime registered"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplicate_source_id_rejected_at_start() {
+        let mgr = PipelineManager::for_testing();
+        // Both specs carry source id "mysql" (from sample_spec) under different
+        // pipeline names.
+        mgr.start_pipeline(spec_dead("p1"))
+            .await
+            .expect("first pipeline starts");
+        let err = mgr
+            .start_pipeline(spec_dead("p2"))
+            .await
+            .map(|_| ())
+            .expect_err("second pipeline sharing the source id is rejected");
+        assert!(
+            matches!(err, PipelineAPIError::Conflict(_)),
+            "expected Conflict, got {err:?}"
+        );
+    }
+
+    // ── Blocker 1 / R3-C5: delete fails closed and keeps the claim ──
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_fails_closed_on_checkpoint_list_failure_retains_claim() {
+        let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        let ckpt: Arc<dyn CheckpointStore> =
+            Arc::new(FaultyCheckpointStore::new(vec![], true, false));
+        let mgr = manager_with_ckpt(Arc::clone(&backend), ckpt).await;
+
+        // Register a pipeline (source id "mysql") and its claim.
+        mgr.pipelines
+            .write()
+            .insert("pl".into(), bare_runtime(sample_spec("pl"), None));
+        backend
+            .slot_create(ACTIVE_SOURCES_NS, "mysql", b"pl")
+            .await
+            .unwrap();
+
+        let err = mgr.delete("pl").await.expect_err("delete must fail closed");
+        assert!(matches!(err, PipelineAPIError::Failed(_)));
+        // Claim retained -> reuse still blocked.
+        assert!(
+            backend
+                .slot_create(ACTIVE_SOURCES_NS, "mysql", b"other")
+                .await
+                .unwrap()
+                .is_none(),
+            "the source-id claim must be retained when cleanup fails"
+        );
+        // Runtime still registered -> delete is retryable with full state.
+        assert!(mgr.get_pipeline("pl").is_some(), "runtime kept for retry");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_fails_closed_on_checkpoint_delete_failure_retains_claim() {
+        let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        let ckpt: Arc<dyn CheckpointStore> =
+            Arc::new(FaultyCheckpointStore::new(
+                vec!["mysql::sink::redis".into()],
+                false,
+                true,
+            ));
+        let mgr = manager_with_ckpt(Arc::clone(&backend), ckpt).await;
+
+        mgr.pipelines
+            .write()
+            .insert("pl".into(), bare_runtime(sample_spec("pl"), None));
+        backend
+            .slot_create(ACTIVE_SOURCES_NS, "mysql", b"pl")
+            .await
+            .unwrap();
+
+        let err = mgr.delete("pl").await.expect_err("delete must fail closed");
+        assert!(matches!(err, PipelineAPIError::Failed(_)));
+        assert!(
+            backend
+                .slot_create(ACTIVE_SOURCES_NS, "mysql", b"other")
+                .await
+                .unwrap()
+                .is_none(),
+            "the source-id claim must be retained when a checkpoint delete fails"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_releases_claim_after_successful_cleanup() {
+        let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        let ckpt: Arc<dyn CheckpointStore> =
+            Arc::new(FaultyCheckpointStore::new(
+                vec!["mysql::sink::redis".into()],
+                false,
+                false,
+            ));
+        let mgr = manager_with_ckpt(Arc::clone(&backend), ckpt).await;
+
+        mgr.pipelines
+            .write()
+            .insert("pl".into(), bare_runtime(sample_spec("pl"), None));
+        backend
+            .slot_create(ACTIVE_SOURCES_NS, "mysql", b"pl")
+            .await
+            .unwrap();
+
+        mgr.delete("pl").await.expect("delete succeeds");
+        // Claim released -> reusable.
+        assert!(
+            backend
+                .slot_create(ACTIVE_SOURCES_NS, "mysql", b"other")
+                .await
+                .unwrap()
+                .is_some(),
+            "a fully-deleted pipeline frees its source id"
+        );
+        assert!(
+            mgr.get_pipeline("pl").is_none(),
+            "runtime removed on success"
+        );
+    }
+
+    // ── Blocker 2: delete awaits source termination before releasing the claim ──
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_awaits_task_termination_before_release() {
+        let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        let ckpt: Arc<dyn CheckpointStore> =
+            Arc::new(FaultyCheckpointStore::new(vec![], false, false));
+        let mgr = manager_with_ckpt(Arc::clone(&backend), ckpt).await;
+
+        // A coordinator task that only finishes after a delay and records that it
+        // finished. delete() must await this before releasing the claim.
+        let finished = Arc::new(AtomicBool::new(false));
+        let f2 = Arc::clone(&finished);
+        let join: JoinHandle<Result<()>> = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            f2.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        mgr.pipelines
+            .write()
+            .insert("pl".into(), bare_runtime(sample_spec("pl"), Some(join)));
+        backend
+            .slot_create(ACTIVE_SOURCES_NS, "mysql", b"pl")
+            .await
+            .unwrap();
+
+        mgr.delete("pl").await.expect("delete succeeds");
+        // If delete released the claim without awaiting the task, this would be
+        // false. Confirmed termination happens-before cleanup and release.
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "delete must await task termination before releasing the claim"
+        );
+    }
+
+    // ── R3-C4: sink-set PATCH is disabled for the pilot ──
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn patch_rejects_sink_set_change() {
+        let mgr = PipelineManager::for_testing();
+        mgr.start_pipeline(spec_dead("pl"))
+            .await
+            .expect("pipeline starts");
+
+        // Rename the only sink via PATCH (id redis -> redis2) -> the sink-set
+        // changes (a per-sink checkpoint key would be added/removed) -> rejected.
+        let patch = serde_json::json!({
+            "spec": { "sinks": [ { "config": { "id": "redis2" } } ] }
+        });
+        let err = mgr
+            .patch("pl", patch)
+            .await
+            .map(|_| ())
+            .expect_err("sink-set change must be rejected");
+        assert!(
+            matches!(err, PipelineAPIError::BadRequest(_)),
+            "expected BadRequest, got {err:?}"
+        );
+        // The pipeline is untouched and still registered.
+        assert!(mgr.get_pipeline("pl").is_some());
+    }
+
+    // ── Blocker 1: resume awaits stopped tasks before respawning ──
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_awaits_old_task_termination_before_respawn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mgr = PipelineManager::for_testing();
+
+        // A Stopped runtime whose coordinator task only finishes after a delay.
+        // resume() must await it (via the synchronous termination helper) before
+        // spawning the replacement, so two source instances never overlap.
+        let finished = Arc::new(AtomicBool::new(false));
+        let f2 = Arc::clone(&finished);
+        let join: JoinHandle<Result<()>> = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            f2.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        let mut rt = bare_runtime(spec_dead("pl"), Some(join));
+        rt.status = PipelineStatus::Stopped;
+        mgr.pipelines.write().insert("pl".into(), rt);
+
+        mgr.resume("pl").await.expect("resume succeeds");
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "resume must await the stopped task's termination before respawning"
+        );
+    }
+
+    // ── Blocker 2: a failed delete leaves a non-runnable pipeline; only retry ──
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn partial_delete_failure_blocks_resume_patch_then_retry_succeeds() {
+        let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        // list returns two sink checkpoints; deleting the second fails ONCE, so
+        // the first delete partially cleans up and then fails, and a retry
+        // completes the deletion.
+        let ckpt: Arc<dyn CheckpointStore> =
+            Arc::new(FaultyCheckpointStore::fail_key_once(
+                vec!["mysql::sink::a".into(), "mysql::sink::b".into()],
+                "mysql::sink::b",
+            ));
+        let mgr = manager_with_ckpt(Arc::clone(&backend), ckpt).await;
+
+        mgr.pipelines
+            .write()
+            .insert("pl".into(), bare_runtime(sample_spec("pl"), None));
+        backend
+            .slot_create(ACTIVE_SOURCES_NS, "mysql", b"pl")
+            .await
+            .unwrap();
+
+        // First delete: partial cleanup then fails -> runtime left in Deleting.
+        assert!(mgr.delete("pl").await.is_err(), "first delete fails closed");
+        assert_eq!(
+            mgr.get_pipeline("pl").map(|i| i.status),
+            Some("deleting".to_string()),
+            "a half-deleted pipeline is marked non-runnable"
+        );
+        // Claim retained -> no reuse.
+        assert!(
+            backend
+                .slot_create(ACTIVE_SOURCES_NS, "mysql", b"other")
+                .await
+                .unwrap()
+                .is_none(),
+            "claim retained while the pipeline is half-deleted"
+        );
+
+        // resume and patch are rejected for a Deleting pipeline.
+        assert!(matches!(
+            mgr.resume("pl").await,
+            Err(PipelineAPIError::Conflict(_))
+        ));
+        assert!(matches!(
+            mgr.patch("pl", serde_json::json!({})).await,
+            Err(PipelineAPIError::Conflict(_))
+        ));
+
+        // A delete retry completes: the transient failure has cleared.
+        mgr.delete("pl").await.expect("delete retry succeeds");
+        assert!(mgr.get_pipeline("pl").is_none(), "runtime removed on retry");
+        assert!(
+            backend
+                .slot_create(ACTIVE_SOURCES_NS, "mysql", b"other")
+                .await
+                .unwrap()
+                .is_some(),
+            "claim released after the delete finally succeeds"
+        );
     }
 
     // ── Durable_v2 wiring: fail-closed builders, ID validation, startup order ──

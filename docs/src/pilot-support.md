@@ -24,6 +24,8 @@ Other sinks (Redis, NATS, HTTP, S3-compatible object storage, ClickHouse, Elasti
 
 Run **one DeltaForge instance per source (per replication slot / binlog reader)**. DeltaForge does not yet provide a cluster-wide lock or lease that prevents two instances from being started against the same source; single ownership is enforced at the slot and producer level, not globally.
 
+**Single-instance requirement (required for the pilot).** Run exactly **one** DeltaForge process against a given checkpoint/state store. Within one process, lifecycle operations (start, stop, delete, patch, resume) are serialized and a durable per-source-id claim rejects a second pipeline that reuses an active source id, so two pipelines can never share a source id and corrupt each other's checkpoints (checkpoints are keyed by source id). That claim is **not** a cross-process lock: two DeltaForge processes sharing the same state store are not protected against each other and are unsupported. Deploy DeltaForge as a single instance (a single replica; if orchestrated, `replicas: 1` with `strategy: Recreate`, not rolling), and do not point a second process at the same state store.
+
 - **PostgreSQL**: the replication slot has durable, DeltaForge-recorded ownership. DeltaForge only drops or recreates a slot it can prove it owns, whose lineage matches, and that is inactive; a foreign, ambiguously owned, or active slot **fails closed** with remediation rather than being taken over. A slot created outside DeltaForge (no ownership record) fails closed on re-snapshot - drop it and let DeltaForge recreate it, or run `snapshot.mode = never`.
 - **Kafka**: with `exactly_once: true`, a second producer using the same `transactional.id` fences the first. Fencing is a fatal error that stops the pipeline. This is a safety net, not a substitute for running a single instance.
 - **MySQL**: each instance derives its replication `server_id` from the source `id`; give each source a unique `id` to avoid `server_id` collisions on the same MySQL server.
@@ -95,6 +97,8 @@ These are documented in full on [Guarantees & Correctness](guarantees.md); the p
 - **S3 sink is at-least-once at file granularity** and requires an `AbortIncompleteMultipartUpload` bucket lifecycle policy in production to reclaim orphaned multiparts.
 - **DLQ must be enabled** (`journal.enabled: true`) to isolate poison events; without it a single unprocessable event blocks the pipeline.
 - **PostgreSQL `start_position` is not implemented** - a newly created slot always starts at the current WAL position.
+- **Changing a pipeline's sink set via `PATCH` is disabled.** Adding or removing a sink changes the per-sink checkpoint keys, which is not crash-safe; a `PATCH` that alters the sink set is rejected. Patches that leave the sink set unchanged are allowed. To change sinks, delete and recreate the pipeline.
+- **Deleting a pipeline is fail-closed.** Delete stops the source, cleans up its checkpoints, and only then releases the source-id claim; if checkpoint cleanup fails, the delete fails and the source id stays locked (safe: it blocks reuse rather than exposing stale checkpoints). Retry the delete once the store is reachable.
 - Cross-primary position safety at failover depends on GTID (MySQL) and slot-aware HA (PostgreSQL); see [Failover Handling](failover.md).
 
 ## Out of scope for the pilot
