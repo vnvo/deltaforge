@@ -11,7 +11,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use checkpoints::{CheckpointStore, MemCheckpointStore};
+use async_trait::async_trait;
+use checkpoints::{
+    CheckpointError, CheckpointResult, CheckpointStore, MemCheckpointStore,
+};
 use deltaforge_config::load_cfg;
 use runner::preflight::check_all;
 use sources::postgres::postgres_slot_owner::{
@@ -96,6 +99,27 @@ spec:
     )
 }
 
+/// A checkpoint store whose reads fail, to simulate the ownership authority being
+/// unavailable. Writes/list/delete are no-ops.
+#[derive(Debug)]
+struct FailingReadStore;
+
+#[async_trait]
+impl CheckpointStore for FailingReadStore {
+    async fn get_raw(&self, _k: &str) -> CheckpointResult<Option<Vec<u8>>> {
+        Err(CheckpointError::Data("injected read failure".into()))
+    }
+    async fn put_raw(&self, _k: &str, _b: &[u8]) -> CheckpointResult<()> {
+        Ok(())
+    }
+    async fn delete(&self, _k: &str) -> CheckpointResult<bool> {
+        Ok(false)
+    }
+    async fn list(&self) -> CheckpointResult<Vec<String>> {
+        Ok(vec![])
+    }
+}
+
 fn write_config(yaml: &str) -> tempfile::NamedTempFile {
     use std::io::Write;
     let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -153,6 +177,23 @@ async fn preflight_slot_ownership_lifecycle() {
             .iter()
             .any(|e| e.contains("not owned by this pipeline")),
         "foreign slot must be reported; got: {:?}",
+        report.pipelines[0].hard_errors
+    );
+
+    // 2b. Ownership store unreadable while the slot exists -> FAIL closed
+    //     (must not PASS by skipping the ownership check).
+    let failing: Arc<dyn CheckpointStore> = Arc::new(FailingReadStore);
+    let report = check_all(&specs, &failing).await;
+    assert!(
+        !report.ok,
+        "an unreadable ownership store must fail preflight for an existing slot"
+    );
+    assert!(
+        report.pipelines[0]
+            .hard_errors
+            .iter()
+            .any(|e| e.contains("state store is unavailable")),
+        "ownership-store-unavailable must be a hard error; got: {:?}",
         report.pipelines[0].hard_errors
     );
 

@@ -269,9 +269,10 @@ async fn check_source_live(
                      use a different slot name or drop the foreign slot",
                     c.slot
                 )),
-                Ok(SlotPreflight::OwnerStoreUnavailable) => warn.push(
-                    "could not read slot ownership (storage unavailable); \
-                     ownership will be reconciled fail-closed at startup"
+                Ok(SlotPreflight::OwnerStoreUnavailable) => hard.push(
+                    "cannot verify replication-slot ownership because the \
+                     configured state store is unavailable; preflight must use \
+                     the same --storage-* settings as deployment"
                         .to_string(),
                 ),
                 Err(e) => {
