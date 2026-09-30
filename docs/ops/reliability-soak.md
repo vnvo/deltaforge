@@ -9,14 +9,19 @@ Fault/lifecycle soak of the real source → coordinator → sink pipeline, recor
 - **Schema scenarios**: run from the existing live suites `postgres_cdc_e2e` / `mysql_cdc_e2e` / `failover_e2e` (green in the consolidated fault/lifecycle matrix on the same `main`).
 - **Config per scenario**: PG logical replication, `snapshot.mode = never`, one **required** Kafka sink, `respect_source_tx = true`, `max_inflight = 1`, `send_timeout = 4s`.
 
+## Recovery model (important)
+
+DeltaForge currently has **no internal automatic pipeline restart**. When a required sink or the checkpoint store fails, the pipeline **terminates fail-closed** and stays down; restoring the sink or the storage does **not** restart it. Recovery requires a **pipeline/process restart** (the harness performs this explicitly with a second run; in production an external supervisor - Kubernetes restarting the pod, or an operator - must do it). Until that restart succeeds, `/ready` stays 503. Automatic pipeline supervision is future work and is recorded as such in the release checklist.
+
 ## HTTP readiness / health (recorded separately)
 
 This harness drives the pipeline components directly and does **not** run the REST layer, so its per-scenario field is **"pipeline task state"**, not HTTP health. The HTTP behaviour is covered by the rest-api readiness regression (`crates/rest-api/src/lib.rs`):
 
-- `health_and_ready_return_503_when_pipeline_failed` - when a pipeline's status is `failed`, **both `/health` and `/ready` return 503** and name the offending pipeline (`crates/rest-api/src/health.rs:18,46`). Note: in the current code `/health` also reflects failed pipelines (not purely process-liveness); `/ready` is the one Kubernetes uses to drain the Service.
-- `ready_returns_200_when_all_pipelines_healthy` - `/ready` returns 200 once all pipelines are healthy again (recovery restores readiness).
+- `/health` (liveness) **stays 200** while the process/API event loop is alive, even when a pipeline is `failed` - so Kubernetes does not restart the whole process for an intentionally fail-closed pipeline (e.g. schema drift under Halt), which would loop forever.
+- `/ready` (readiness) returns **503** and names the failed pipeline when any pipeline's status is `failed`, so Kubernetes drains it from the Service; it returns 200 once all pipelines are healthy again.
+- Tests: `failed_pipeline_makes_ready_503_but_health_stays_200`, `ready_returns_200_when_all_pipelines_healthy` (`crates/rest-api/src/health.rs:18,46`).
 
-So for the outage scenarios below, the required-sink / checkpoint failures that stop a pipeline drive its status to `failed` → `/ready` 503; a successful restart returns `/ready` to 200.
+So for the outage scenarios below, the required-sink / checkpoint failures drive the pipeline status to `failed` → `/ready` 503 (liveness `/health` unaffected). **Readiness stays 503 until the pipeline/process is restarted** (see the recovery note below); a successful restart returns `/ready` to 200.
 
 ## Scenario ledger
 
@@ -35,8 +40,8 @@ So for the outage scenarios below, the required-sink / checkpoint failures that 
 - **Positions**: source before `0/1512508`; **during outage `0/1512508` (unchanged)**, checkpoint `None` (held=true); after recovery checkpoint `0/1512778`.
 - **Coordinator result while down**: `Err(commit policy not satisfied: required 0/1 acks, total 0)` - required-sink failure stops the pipeline (fail-closed).
 - **Delivery after recovery**: 3/3 distinct ids, **0 duplicates**, **0 missing**.
-- **Recovery**: automatic once the sink was reachable (~137s including outage hold); no operator intervention.
-- **HTTP**: pipeline status `failed` during outage → `/ready` 503; 200 after restart (per the readiness regression above).
+- **Recovery**: **required a pipeline/process restart** after the sink became reachable (the harness started a new pipeline run; ~137s wall clock). DeltaForge does not auto-restart a terminated pipeline - **operator/supervisor intervention required**.
+- **HTTP**: pipeline status `failed` during outage → `/ready` 503 (and it stays 503 until the restart); `/health` stays 200; `/ready` returns 200 after the restart.
 - **WAL retention**: slot retained WAL during the outage; released after durable ack.
 
 ### 3. Checkpoint-store outage - PASS
@@ -45,7 +50,7 @@ So for the outage scenarios below, the required-sink / checkpoint failures that 
 - **Positions**: source before `0/1512508`; **during outage `0/1512508` (unchanged)**, checkpoint `None` (held=true); after recovery checkpoint and source `0/1512778`.
 - **Coordinator result while down**: `Err(commit checkpoint … injected checkpoint-store outage)` - the checkpoint write failure surfaces fail-closed; the source position is not released after a sink ack it could not durably record.
 - **Delivery**: 3/3 distinct ids, **0 duplicates observed**, **0 missing**. (Duplicates are permitted here - at-least-once re-delivery is expected if the checkpoint could not be recorded during the outage.)
-- **Recovery**: automatic once the store was writable (~16s); no operator intervention.
+- **Recovery**: **required a pipeline/process restart** after the store became writable (the harness started a new pipeline run; ~16s wall clock). DeltaForge does not auto-restart a terminated pipeline - **operator/supervisor intervention required**. `/ready` stays 503 until the restart.
 - **WAL retention**: slot held WAL while the checkpoint could not advance.
 
 ### 4. Shutdown with a committed transaction in flight - PASS
@@ -72,15 +77,15 @@ So for the outage scenarios below, the required-sink / checkpoint failures that 
 
 | # | Scenario | Result | Loss | Operator intervention |
 |---|----------|--------|------|-----------------------|
-| 1 | Restart durability | PASS | none | no |
-| 2 | Required-sink outage | PASS | none (checkpoint held) | no |
-| 3 | Checkpoint-store outage | PASS | none (fail-closed) | no |
-| 4 | Shutdown, committed tx in flight | PASS | none (tx whole) | no |
+| 1 | Restart durability | PASS | none | restart is the scenario |
+| 2 | Required-sink outage | PASS | none (checkpoint held) | **yes - restart after sink reachable** |
+| 3 | Checkpoint-store outage | PASS | none (fail-closed) | **yes - restart after store writable** |
+| 4 | Shutdown, committed tx in flight | PASS | none (tx whole) | restart is the scenario |
 | 5 | Schema-compatible change | PASS | none | no |
 | 6 | Schema-incompatible / Halt | PASS | none (fails closed, no skip) | yes - fix schema, then restart |
 | 7 | Schema-incompatible / Adapt | PASS | none | no |
 
-Every scenario preserved the no-loss invariant; checkpoints and source WAL/binlog positions advanced only after a durable acknowledgement, and every outage recovered automatically except the Halt case, which is intentionally operator-gated.
+Every scenario preserved the no-loss invariant; checkpoints and source WAL/binlog positions advanced only after a durable acknowledgement. **DeltaForge does not auto-restart a terminated pipeline**: the required-sink and checkpoint-store outages recover only after a pipeline/process restart (an external supervisor or operator), and `/ready` stays 503 until then. Automatic pipeline supervision is future work (tracked for the release checklist).
 
 ## Reproduce
 

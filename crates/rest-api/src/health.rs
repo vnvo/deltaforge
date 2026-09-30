@@ -16,23 +16,17 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn healthz(State(st): State<AppState>) -> impl IntoResponse {
+    // Liveness only: 200 while the process/API event loop is alive. A failed
+    // pipeline is a *readiness* concern, not liveness - returning 503 here would
+    // make Kubernetes restart the whole process for an intentionally fail-closed
+    // pipeline (e.g. schema drift under Halt), looping forever. Use /ready to
+    // gate traffic and surface failed pipelines.
     let pipelines = st.controller.list().await;
-    let failed: Vec<_> = pipelines
-        .iter()
-        .filter(|p| p.status == "failed")
-        .map(|p| p.name.clone())
-        .collect();
-
-    if !failed.is_empty() {
-        let body = serde_json::json!({
-            "status": "unhealthy",
-            "failed_pipelines": failed,
-        });
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
-    }
+    let failed = pipelines.iter().filter(|p| p.status == "failed").count();
     let body = serde_json::json!({
         "status": "healthy",
         "pipelines": pipelines.len(),
+        "failed_pipelines": failed,
     });
     (StatusCode::OK, Json(body)).into_response()
 }
