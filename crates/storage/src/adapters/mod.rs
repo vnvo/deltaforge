@@ -16,3 +16,10 @@ pub use schema_registry::{
     RegistryMetrics,
 };
 pub use source_lineage::{Established, LineageRef, SourceLineageRecord};
+
+/// A durable record that exists but cannot be interpreted (malformed,
+/// unsupported version, failed integrity check) - as opposed to a storage
+/// failure. Downcast it from the error chain to tell the two apart.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct CorruptRecord(pub String);

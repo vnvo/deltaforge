@@ -5,14 +5,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
 
 use crate::{
-    LogAppendOutcome, LogEntryMeta, LogStreamMeta, LogTruncateOutcome,
-    LogTruncateRequest, MemoryStorageBackend, SlotPage, StorageBackend,
+    ArcStorageBackend, LogAppendOutcome, LogEntryMeta, LogStreamMeta,
+    LogTruncateOutcome, LogTruncateRequest, MemoryStorageBackend, SlotPage,
+    StorageBackend,
 };
 
-/// Delegates to an in-memory backend; each flag makes one primitive fail.
-#[derive(Debug, Default)]
+/// Delegates to another backend (in-memory by default); each flag makes one
+/// primitive fail.
+#[derive(Debug)]
 pub struct FaultBackend {
-    inner: MemoryStorageBackend,
+    inner: ArcStorageBackend,
     pub fail_log_list: AtomicBool,
     pub fail_log_latest: AtomicBool,
     pub fail_kv_get: AtomicBool,
@@ -20,23 +22,56 @@ pub struct FaultBackend {
     pub fail_log_read_meta: AtomicBool,
     /// Writes still allowed before every further write fails (crash model).
     pub writes_left: std::sync::atomic::AtomicU64,
+    /// When set, only the first write past the budget fails; later writes
+    /// succeed again (a transient failure).
+    one_shot: AtomicBool,
+}
+
+impl Default for FaultBackend {
+    fn default() -> Self {
+        Self::wrap(std::sync::Arc::new(MemoryStorageBackend::new()))
+    }
 }
 
 impl FaultBackend {
     pub fn new() -> Self {
-        let b = Self::default();
-        b.writes_left.store(u64::MAX, Ordering::SeqCst);
-        b
+        Self::default()
+    }
+
+    /// Inject faults in front of `inner` (for example a SQLite store shared
+    /// with another process).
+    pub fn wrap(inner: ArcStorageBackend) -> Self {
+        Self {
+            inner,
+            fail_log_list: AtomicBool::new(false),
+            fail_log_latest: AtomicBool::new(false),
+            fail_kv_get: AtomicBool::new(false),
+            fail_kv_put: AtomicBool::new(false),
+            fail_log_read_meta: AtomicBool::new(false),
+            writes_left: std::sync::atomic::AtomicU64::new(u64::MAX),
+            one_shot: AtomicBool::new(false),
+        }
+    }
+
+    /// Allow exactly `n` more writes, fail the next one, then succeed again.
+    pub fn fail_one_write_after(&self, n: u64) {
+        self.one_shot.store(true, Ordering::SeqCst);
+        self.writes_left.store(n, Ordering::SeqCst);
     }
 
     /// Allow exactly `n` more writes, then fail every write (a crash at that
     /// boundary). `u64::MAX` removes the limit.
     pub fn allow_writes(&self, n: u64) {
+        self.one_shot.store(false, Ordering::SeqCst);
         self.writes_left.store(n, Ordering::SeqCst);
     }
 
     fn write(&self) -> Result<()> {
         let left = self.writes_left.load(Ordering::SeqCst);
+        if left == 0 && self.one_shot.swap(false, Ordering::SeqCst) {
+            self.writes_left.store(u64::MAX, Ordering::SeqCst);
+            anyhow::bail!("injected transient write failure");
+        }
         anyhow::ensure!(left > 0, "injected crash: write budget exhausted");
         if left != u64::MAX {
             self.writes_left.store(left - 1, Ordering::SeqCst);

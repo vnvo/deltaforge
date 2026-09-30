@@ -2,18 +2,22 @@
 //! the explicit, proof-gated migration of pre-upgrade schema history.
 //!
 //! The dry run (default) is read-only and takes no gate. `--apply` requires the
-//! proof printed by a dry run, holds the store gate (role `migration`) while it
-//! recomputes the plan and writes, and releases it when done - also when the
-//! apply fails, since the process has stopped writing by then. A crash leaves
-//! the gate held until `store-gate break`.
+//! proof printed by a dry run and holds the store gate (role `migration`,
+//! recording that proof) while it recomputes the plan and writes. The gate is
+//! released only when the migration completed, or when a fresh run found that
+//! the plan no longer matches the proof (nothing was written). Any other
+//! failure, like a crash, leaves the gate held, because part of the plan may
+//! already be written and a server must never read partially migrated
+//! history. The only way forward is `--resume-owner <id>`, which takes the held
+//! gate over in one step and finishes the same proof.
 
 use anyhow::{Context, Result};
 use storage::ArcStorageBackend;
 use storage::adapters::DurableSchemaRegistry;
 use storage::adapters::schema_migration::{
-    self, Classification, Filters, Mapping, Plan,
+    self, Classification, Filters, Mapping, Plan, ProofMismatch,
 };
-use storage::adapters::store_gate::{self, GateRole, GateState};
+use storage::adapters::store_gate::{self, GateState};
 
 /// Options of `schema-migrate`.
 #[derive(Debug, Clone)]
@@ -23,6 +27,8 @@ pub struct MigrateArgs {
     pub source: Option<String>,
     pub apply: bool,
     pub expect_proof: Option<String>,
+    /// Owner id of the unfinished migration to take over and finish.
+    pub resume_owner: Option<String>,
     pub json: bool,
 }
 
@@ -114,6 +120,28 @@ fn render_plan(plan: &Plan) -> String {
     out
 }
 
+fn apply_command(
+    args: &MigrateArgs,
+    proof: &str,
+    resume_owner: Option<&str>,
+) -> String {
+    format!(
+        "deltaforge schema-migrate --mapping {}{}{} --apply --expect-proof {proof}{}",
+        args.mapping,
+        args.tenant
+            .as_ref()
+            .map(|t| format!(" --tenant {t}"))
+            .unwrap_or_default(),
+        args.source
+            .as_ref()
+            .map(|s| format!(" --source {s}"))
+            .unwrap_or_default(),
+        resume_owner
+            .map(|o| format!(" --resume-owner {o}"))
+            .unwrap_or_default()
+    )
+}
+
 /// Run `schema-migrate`.
 pub async fn run(args: MigrateArgs, backend: ArcStorageBackend) -> Result<()> {
     let mapping = load_mapping(&args.mapping)?;
@@ -136,18 +164,8 @@ pub async fn run(args: MigrateArgs, backend: ArcStorageBackend) -> Result<()> {
             print!("{}", render_plan(&plan));
             println!(
                 "\nDry run: nothing was written. To apply exactly this plan (the \
-                 DeltaForge server must be stopped):\n  deltaforge schema-migrate \
-                 --mapping {}{}{} --apply --expect-proof {}",
-                args.mapping,
-                args.tenant
-                    .as_ref()
-                    .map(|t| format!(" --tenant {t}"))
-                    .unwrap_or_default(),
-                args.source
-                    .as_ref()
-                    .map(|s| format!(" --source {s}"))
-                    .unwrap_or_default(),
-                plan.proof
+                 DeltaForge server must be stopped):\n  {}",
+                apply_command(&args, &plan.proof, None)
             );
         }
         return Ok(());
@@ -157,9 +175,14 @@ pub async fn run(args: MigrateArgs, backend: ArcStorageBackend) -> Result<()> {
         .expect_proof
         .as_deref()
         .context("--apply requires --expect-proof <digest> from a dry run")?;
-    let gate = store_gate::acquire(&backend, GateRole::Migration)
-        .await
-        .context("acquire the store gate for the migration")?;
+    let gate = match &args.resume_owner {
+        Some(owner) => store_gate::resume_migration(&backend, owner, expected)
+            .await
+            .context("take over the unfinished migration's store gate")?,
+        None => store_gate::acquire_for_migration(&backend, expected)
+            .await
+            .context("acquire the store gate for the migration")?,
+    };
     let result = async {
         let registry = DurableSchemaRegistry::new(backend.clone())
             .await
@@ -170,10 +193,37 @@ pub async fn run(args: MigrateArgs, backend: ArcStorageBackend) -> Result<()> {
         .await
     }
     .await;
-    // The apply has stopped writing (success or failure): release the gate.
-    let released = gate.release().await;
-    let outcome = result?;
-    released.context("release the store gate after the migration")?;
+    let outcome = match result {
+        Ok(outcome) => {
+            gate.release()
+                .await
+                .context("release the store gate after the migration")?;
+            outcome
+        }
+        // A fresh run that finds a different plan wrote nothing, and a fresh
+        // acquisition proves no earlier migration was left unfinished (that
+        // would still hold the gate), so the store holds no partial work.
+        Err(e)
+            if args.resume_owner.is_none()
+                && e.downcast_ref::<ProofMismatch>().is_some() =>
+        {
+            gate.release()
+                .await
+                .context("release the store gate after a proof mismatch")?;
+            return Err(e);
+        }
+        Err(e) => {
+            let owner = gate.holder().owner_id.clone();
+            // Dropped without release: the gate stays held.
+            drop(gate);
+            return Err(e.context(format!(
+                "the migration did not complete. The store gate stays held \
+                 (owner {owner}) so no server can read partially migrated \
+                 history. Fix the cause, then finish it with: {}",
+                apply_command(&args, expected, Some(&owner))
+            )));
+        }
+    };
     if args.json {
         println!("{}", serde_json::to_string_pretty(&outcome)?);
     } else {

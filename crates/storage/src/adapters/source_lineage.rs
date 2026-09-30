@@ -209,12 +209,17 @@ pub async fn load(
     {
         Some(bytes) => {
             let record: SourceLineageRecord = serde_json::from_slice(&bytes)
-                .context("source lineage: corrupt lineage record")?;
-            record.validate().with_context(|| {
-                format!(
+                .map_err(|e| {
+                    anyhow::Error::new(super::CorruptRecord(format!(
+                        "source lineage: corrupt lineage record of \
+                         {tenant}/{source_id}: {e}"
+                    )))
+                })?;
+            record.validate().map_err(|e| {
+                anyhow::Error::new(super::CorruptRecord(format!(
                     "source lineage: refusing the lineage record of \
-                     {tenant}/{source_id}"
-                )
+                     {tenant}/{source_id}: {e:#}"
+                )))
             })?;
             Ok(Some(record))
         }

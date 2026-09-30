@@ -64,6 +64,7 @@ The state store carries one durable **store gate**. A DeltaForge server acquires
   ```
 
   Before breaking, confirm that the recorded process (host and pid) is no longer running. `break` releases the gate only if that owner still holds it, so a stale or mistyped owner id changes nothing. Pass the same `--storage-backend`/`--storage-path`/`--storage-dsn` flags the server uses.
+- **A migration's gate cannot be broken.** A schema migration that failed or crashed may have written part of its plan, and a server must never read partially migrated history, so `store-gate break` refuses it. Finish the migration instead (see below); the error message prints the exact command.
 
 ## Migrating pre-upgrade schema history
 
@@ -95,7 +96,14 @@ Schema history written by earlier releases is kept but not used automatically: a
    deltaforge schema-migrate --mapping mapping.yaml --apply --expect-proof <proof>
    ```
 
-   The apply recomputes the plan under the store gate and refuses if the proof differs, so anything that changed since the review stops it. It is safe to re-run with the same proof after an interruption: completed work counts as progress, not as a change, and the run converges.
+   The apply recomputes the plan under the store gate and refuses if the proof differs, so anything that changed since the review stops it (nothing is written and the gate is released). Tables already migrated by a *different* reviewed proof are reported as rejected, with that migration's details, rather than counted as done.
+5. **If the apply fails or is interrupted**, the store gate stays held (role `migration`, recording the proof) and the server cannot start, because part of the plan may already be written. After confirming the failed process is no longer running and fixing the cause, finish the same plan:
+
+   ```
+   deltaforge schema-migrate --mapping mapping.yaml --apply --expect-proof <proof> --resume-owner <owner-id>
+   ```
+
+   The owner id is in the error message and in `deltaforge store-gate status`. The resume takes the gate over in one step (it is never unlocked in between), accepts only the recorded owner and the same proof, treats the work already done as progress, and releases the gate once the migration completes.
 
 ## Required privileges
 

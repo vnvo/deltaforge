@@ -1257,6 +1257,90 @@ mod tests {
             assert!(scoped_versions(&r).await.is_empty(), "nothing adopted");
         }
 
+        /// Two legacy versions match the retained relation. Only the COMPLETE
+        /// migration makes that visible (ambiguous, fail closed); the partial
+        /// state after a failed apply resolves to a unique match - wrong - which
+        /// is why the store gate stays held until the migration completes.
+        #[tokio::test]
+        async fn a_partial_migration_of_two_matching_versions_is_a_false_unique_match()
+         {
+            use storage::adapters::schema_migration::{
+                self, Filters, Mapping, MappingEntry, TableRef,
+            };
+            use storage::adapters::source_lineage;
+
+            let mut saw_partial = false;
+            for budget in 0..16u64 {
+                let f = Arc::new(FaultBackend::new());
+                let b: ArcStorageBackend = f.clone();
+                let lh = source_lineage::establish(
+                    &b,
+                    "t",
+                    "src",
+                    LineageDescriptor::postgres(7, 8).unwrap(),
+                )
+                .await
+                .unwrap()
+                .record
+                .current
+                .lineage_hash;
+                let k =
+                    SchemaKey::new("t", "src", lh.as_str(), "public", "orders");
+                seed_legacy(&b, &table(10, ORDERS, &[])).await;
+                seed_legacy(&b, &table(10, ORDERS, &["id"])).await;
+                let r = registry(&b).await;
+                let m = Mapping {
+                    mappings: vec![MappingEntry {
+                        tenant: "t".into(),
+                        source_id: "src".into(),
+                        lineage_hash: lh.clone(),
+                        tables: vec![TableRef {
+                            db: "public".into(),
+                            table: "orders".into(),
+                        }],
+                    }],
+                };
+                let f0 = Filters::default();
+                let p = schema_migration::plan(&b, &r, &m, &f0).await.unwrap();
+
+                f.allow_writes(budget);
+                let failed = schema_migration::apply(&b, &r, &m, &f0, &p.proof)
+                    .await
+                    .is_err();
+                f.allow_writes(u64::MAX);
+                let adopted =
+                    r.history_page(&k, None, 10).await.unwrap().versions.len();
+                if failed && adopted == 1 {
+                    saw_partial = true;
+                    // The hazard: the incomplete history looks unique.
+                    assert!(
+                        resolve_retained_relation(&r, &k, &rel(10))
+                            .await
+                            .is_ok()
+                    );
+                }
+                // Resuming under the original proof completes it...
+                let again =
+                    schema_migration::plan(&b, &r, &m, &f0).await.unwrap();
+                assert_eq!(again.proof, p.proof, "budget {budget}");
+                schema_migration::apply(&b, &r, &m, &f0, &p.proof)
+                    .await
+                    .unwrap();
+                // ...and only then is the true answer visible: ambiguous.
+                let err = resolve_retained_relation(&r, &k, &rel(10))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        err,
+                        RegistryError::AmbiguousHistory { matches: 2, .. }
+                    ),
+                    "budget {budget}: {err:?}"
+                );
+            }
+            assert!(saw_partial, "no write budget produced a partial adoption");
+        }
+
         #[tokio::test]
         async fn several_legacy_matches_also_fail_closed() {
             let b = mem();

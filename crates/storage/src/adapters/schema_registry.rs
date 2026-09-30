@@ -47,6 +47,7 @@ use serde_json::Value;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
 
+use super::CorruptRecord;
 use super::schema_key::SchemaKey;
 use super::source_lineage;
 use crate::ArcStorageBackend;
@@ -914,14 +915,22 @@ impl DurableSchemaRegistry {
         else {
             return Ok(None);
         };
-        let marker: MigrationMarker = serde_json::from_slice(&bytes)
-            .context("schema registry: corrupt migration marker")?;
-        anyhow::ensure!(
-            marker.format_version == CURRENT_FORMAT_VERSION,
-            "schema registry: unsupported migration marker format_version {} \
-             (this build reads {CURRENT_FORMAT_VERSION}); refusing to interpret it",
-            marker.format_version
-        );
+        let marker: MigrationMarker =
+            serde_json::from_slice(&bytes).map_err(|e| {
+                anyhow::Error::new(CorruptRecord(format!(
+                    "schema registry: corrupt migration marker for {}: {e}",
+                    key.backend_key()
+                )))
+            })?;
+        if marker.format_version != CURRENT_FORMAT_VERSION {
+            return Err(anyhow::Error::new(CorruptRecord(format!(
+                "schema registry: unsupported migration marker format_version \
+                 {} for {} (this build reads {CURRENT_FORMAT_VERSION}); refusing \
+                 to interpret it",
+                marker.format_version,
+                key.backend_key()
+            ))));
+        }
         Ok(Some(MigrationMarkerInfo {
             migrated_at_ms: marker.migrated_at_ms,
             provenance: marker.provenance,
@@ -1035,7 +1044,12 @@ impl DurableSchemaRegistry {
             .await
             .context("schema registry: failed to read version index")?
         {
-            Some(b) => Ok(Some(serde_json::from_slice(&b)?)),
+            Some(b) => Ok(Some(serde_json::from_slice(&b).map_err(|e| {
+                anyhow::Error::new(CorruptRecord(format!(
+                    "schema registry: corrupt version index {version} of \
+                     {bkey}: {e}"
+                )))
+            })?)),
             None => Ok(None),
         }
     }

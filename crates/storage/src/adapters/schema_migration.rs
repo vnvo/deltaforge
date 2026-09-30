@@ -21,9 +21,11 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::CorruptRecord;
 use super::schema_key::SchemaKey;
 use super::schema_registry::{
-    DurableSchemaRegistry, LegacyReadRefused, MigrationProvenance,
+    DurableSchemaRegistry, LegacyReadRefused, MigrationMarkerInfo,
+    MigrationProvenance,
 };
 use super::source_lineage::{self, LineageRef};
 use crate::ArcStorageBackend;
@@ -189,6 +191,16 @@ fn migration_identity(
     hex::encode(h.finalize())
 }
 
+/// Durable-record corruption (as opposed to a storage failure) in an error
+/// chain: the affected table or entry is rejected with this reason instead of
+/// aborting the whole report.
+fn record_problem(e: &anyhow::Error) -> Option<String> {
+    if let Some(r) = e.downcast_ref::<LegacyReadRefused>() {
+        return Some(r.to_string());
+    }
+    e.downcast_ref::<CorruptRecord>().map(|c| c.to_string())
+}
+
 /// Result of streaming a legacy stream once.
 struct LegacyScan {
     versions: u64,
@@ -199,7 +211,8 @@ struct LegacyScan {
 
 /// Stream the legacy history of `t` (paged): content digest over every
 /// version's number, original sequence and exact stored-record digest, plus
-/// conflicts / progress against the qualified target `key`.
+/// conflicts / progress against the qualified target `key`. A corrupt record
+/// yields `Ok(Err(reason))`; a storage failure yields `Err`.
 async fn scan_legacy(
     registry: &DurableSchemaRegistry,
     tenant: &str,
@@ -221,19 +234,18 @@ async fn scan_legacy(
             .await
         {
             Ok(p) => p,
-            Err(e) => {
-                if let Some(refused) = e.downcast_ref::<LegacyReadRefused>() {
-                    return Ok(Err(refused.to_string()));
-                }
-                return Err(e);
-            }
+            Err(e) => return record_problem(&e).map(Err).ok_or(e),
         };
         for lv in &page.versions {
             scan.versions += 1;
             h.update(lv.version.to_be_bytes());
             h.update(lv.sequence.to_be_bytes());
             lp(&mut h, lv.record_digest.as_bytes());
-            match registry.version_hash(key, lv.version).await? {
+            let existing = match registry.version_hash(key, lv.version).await {
+                Ok(v) => v,
+                Err(e) => return record_problem(&e).map(Err).ok_or(e),
+            };
+            match existing {
                 Some(v1) if v1 == lv.hash => scan.present += 1,
                 Some(v1) => scan.conflicts.push(Conflict {
                     version: lv.version,
@@ -256,7 +268,123 @@ fn legacy_key(tenant: &str, t: &TableRef) -> String {
     format!("{tenant}/{}/{}", t.db, t.table)
 }
 
+/// Everything read about one table, before deciding which markers are this
+/// action's own.
+struct RawTable {
+    /// Canonical fields except `foreign_marker` / `classification`.
+    tp: TablePlan,
+    /// Final classification that does not depend on markers (ambiguous,
+    /// lineage, corrupt or unreadable history).
+    fixed: Option<Classification>,
+    marker: Option<MigrationMarkerInfo>,
+    present: u64,
+}
+
+struct RawEntry {
+    tenant: String,
+    source_id: String,
+    asserted_lineage_hash: String,
+    current_lineage: Option<LineageRef>,
+    tables: Vec<RawTable>,
+}
+
+/// A marker is this action's own progress only if it carries the table's
+/// migration identity AND the proof being applied.
+fn is_own(raw: &RawTable, own_proof: Option<&str>) -> bool {
+    let (Some(proof), Some(m)) = (own_proof, &raw.marker) else {
+        return false;
+    };
+    m.provenance.as_ref().is_some_and(|p| {
+        Some(&p.migration_identity) == raw.tp.migration_identity.as_ref()
+            && p.proof_digest == proof
+    })
+}
+
+/// The canonical plan, progress and totals under the hypothesis that markers
+/// carrying `own_proof` (and the table's identity) are this action's own; every
+/// other marker is foreign and bound into the plan with its full provenance.
+fn build(
+    raw: &[RawEntry],
+    filters: &Filters,
+    own_proof: Option<&str>,
+) -> (CanonicalPlan, Vec<Vec<Progress>>, Totals) {
+    let mut entries = Vec::new();
+    let mut progress = Vec::new();
+    let mut totals = Totals::default();
+    for e in raw {
+        let mut tables = Vec::new();
+        let mut entry_progress = Vec::new();
+        for rt in &e.tables {
+            let mut tp = rt.tp.clone();
+            let own = is_own(rt, own_proof);
+            if !own && let Some(m) = &rt.marker {
+                tp.foreign_marker = Some(ForeignMarker {
+                    migrated_at_ms: m.migrated_at_ms,
+                    provenance: m.provenance.clone(),
+                });
+            }
+            tp.classification = match &rt.fixed {
+                Some(c) => c.clone(),
+                None if tp.legacy_versions == 0 => {
+                    Classification::Rejected("no pre-upgrade history".into())
+                }
+                None if !tp.conflicts.is_empty() => {
+                    Classification::Rejected(format!(
+                        "{} legacy version number(s) already exist with a \
+                         different hash",
+                        tp.conflicts.len()
+                    ))
+                }
+                None if tp.foreign_marker.is_some() => Classification::Rejected(
+                    "a marker from a different migration (other identity or \
+                         other proof) exists; review it"
+                        .into(),
+                ),
+                None => Classification::Migrate,
+            };
+            let prog = Progress {
+                versions_present: rt.present,
+                marker_written: own,
+            };
+            match &tp.classification {
+                Classification::Migrate if own => totals.already_migrated += 1,
+                Classification::Migrate => totals.migrate += 1,
+                Classification::Ambiguous(_) => totals.ambiguous += 1,
+                Classification::Rejected(_) => totals.rejected += 1,
+            }
+            tables.push(tp);
+            entry_progress.push(prog);
+        }
+        entries.push(EntryPlan {
+            tenant: e.tenant.clone(),
+            source_id: e.source_id.clone(),
+            asserted_lineage_hash: e.asserted_lineage_hash.clone(),
+            current_lineage: e.current_lineage.clone(),
+            tables,
+        });
+        progress.push(entry_progress);
+    }
+    let canonical = CanonicalPlan {
+        domain: PLAN_DOMAIN.to_string(),
+        filters: filters.clone(),
+        entries,
+    };
+    (canonical, progress, totals)
+}
+
+fn digest(canonical: &CanonicalPlan) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(
+        serde_json::to_vec(canonical).context("encode canonical plan")?,
+    )))
+}
+
 /// Build the read-only proof report. Never writes.
+///
+/// The proof is independent of this action's own progress: a marker is own
+/// only when its identity matches and its proof digest equals the proof of the
+/// plan computed with that marker treated as own (a fixed point). Any other
+/// marker - including one with the same identity but another proof - is
+/// foreign, bound into the plan with its provenance, and rejects its table.
 pub async fn plan(
     backend: &ArcStorageBackend,
     registry: &DurableSchemaRegistry,
@@ -275,35 +403,44 @@ pub async fn plan(
         }
     }
 
-    let mut entries = Vec::new();
-    let mut progress = Vec::new();
-    let mut totals = Totals::default();
+    let mut raw = Vec::new();
     for e in mapping.mappings.iter().filter(|e| filters.selects(e)) {
-        let record = source_lineage::load(backend, &e.tenant, &e.source_id)
-            .await
-            .with_context(|| {
-                format!(
-                    "read the lineage record of {}/{}",
+        let (current_lineage, lineage_problem) = match source_lineage::load(
+            backend,
+            &e.tenant,
+            &e.source_id,
+        )
+        .await
+        {
+            Ok(None) => (
+                None,
+                Some(format!(
+                    "source {}/{} has no verified lineage record (start it \
+                         once so it verifies its server)",
                     e.tenant, e.source_id
-                )
-            })?;
-        let current_lineage = record.map(|r| r.current);
-        let lineage_problem = match &current_lineage {
-            None => Some(format!(
-                "source {}/{} has no verified lineage record (start it once so \
-                 it verifies its server)",
-                e.tenant, e.source_id
-            )),
-            Some(c) if c.lineage_hash != e.lineage_hash => Some(format!(
-                "asserted lineage {} is not the source's current verified \
-                 lineage {}",
-                e.lineage_hash, c.lineage_hash
-            )),
-            Some(_) => None,
+                )),
+            ),
+            Ok(Some(r)) if r.current.lineage_hash != e.lineage_hash => {
+                let problem = format!(
+                    "asserted lineage {} is not the source's current \
+                         verified lineage {}",
+                    e.lineage_hash, r.current.lineage_hash
+                );
+                (Some(r.current), Some(problem))
+            }
+            Ok(Some(r)) => (Some(r.current), None),
+            Err(err) => match record_problem(&err) {
+                Some(reason) => (None, Some(reason)),
+                None => {
+                    return Err(err.context(format!(
+                        "read the lineage record of {}/{}",
+                        e.tenant, e.source_id
+                    )));
+                }
+            },
         };
 
         let mut tables = Vec::new();
-        let mut entry_progress = Vec::new();
         for t in &e.tables {
             let lk = legacy_key(&e.tenant, t);
             let key = SchemaKey::new(
@@ -313,116 +450,104 @@ pub async fn plan(
                 t.db.as_str(),
                 t.table.as_str(),
             );
-            let mut tp = TablePlan {
-                db: t.db.clone(),
-                table: t.table.clone(),
-                legacy_key: lk.clone(),
-                legacy_versions: 0,
-                legacy_digest: None,
-                migration_identity: None,
-                conflicts: Vec::new(),
-                foreign_marker: None,
-                classification: Classification::Migrate,
+            let mut rt = RawTable {
+                tp: TablePlan {
+                    db: t.db.clone(),
+                    table: t.table.clone(),
+                    legacy_key: lk.clone(),
+                    legacy_versions: 0,
+                    legacy_digest: None,
+                    migration_identity: None,
+                    conflicts: Vec::new(),
+                    foreign_marker: None,
+                    classification: Classification::Migrate,
+                },
+                fixed: None,
+                marker: None,
+                present: 0,
             };
-            let mut prog = Progress::default();
 
-            let ambiguous = if [&e.tenant, &t.db, &t.table]
-                .iter()
-                .any(|s| s.contains('/'))
-            {
-                Some(
+            if [&e.tenant, &t.db, &t.table].iter().any(|s| s.contains('/')) {
+                rt.fixed = Some(Classification::Ambiguous(
                     "the pre-upgrade key is ambiguous (a name contains `/`)"
-                        .to_string(),
-                )
+                        .into(),
+                ));
             } else if claims.get(&lk).copied().unwrap_or(0) > 1 {
-                Some("the same legacy stream is claimed by more than one mapping entry".to_string())
-            } else {
-                None
-            };
-
-            tp.classification = if let Some(reason) = ambiguous {
-                Classification::Ambiguous(reason)
+                rt.fixed = Some(Classification::Ambiguous(
+                    "the same legacy stream is claimed by more than one \
+                     mapping entry"
+                        .into(),
+                ));
             } else if let Some(reason) = &lineage_problem {
-                Classification::Rejected(reason.clone())
+                rt.fixed = Some(Classification::Rejected(reason.clone()));
             } else {
                 match scan_legacy(registry, &e.tenant, t, &key).await? {
-                    Err(refused) => Classification::Rejected(refused),
+                    Err(reason) => {
+                        rt.fixed = Some(Classification::Rejected(reason));
+                    }
                     Ok(scan) => {
-                        tp.legacy_versions = scan.versions;
-                        prog.versions_present = scan.present;
-                        let identity = migration_identity(
+                        rt.tp.legacy_versions = scan.versions;
+                        rt.present = scan.present;
+                        rt.tp.migration_identity = Some(migration_identity(
                             &e.tenant,
                             &e.source_id,
                             &e.lineage_hash,
                             t,
                             &scan.digest,
-                        );
-                        tp.legacy_digest = Some(scan.digest);
-                        tp.migration_identity = Some(identity.clone());
-                        tp.conflicts = scan.conflicts;
-                        let marker = registry.migration_marker(&key).await?;
-                        let own = marker.as_ref().is_some_and(|m| {
-                            m.provenance.as_ref().is_some_and(|p| {
-                                p.migration_identity == identity
-                            })
-                        });
-                        if let Some(m) = marker.filter(|_| !own) {
-                            tp.foreign_marker = Some(ForeignMarker {
-                                migrated_at_ms: m.migrated_at_ms,
-                                provenance: m.provenance,
-                            });
-                        }
-                        prog.marker_written = own;
-                        if scan.versions == 0 {
-                            Classification::Rejected(
-                                "no pre-upgrade history".into(),
-                            )
-                        } else if !tp.conflicts.is_empty() {
-                            Classification::Rejected(format!(
-                                "{} legacy version number(s) already exist with a \
-                                 different hash",
-                                tp.conflicts.len()
-                            ))
-                        } else if tp.foreign_marker.is_some() {
-                            Classification::Rejected(
-                                "a marker from a different migration exists; review it"
-                                    .into(),
-                            )
-                        } else {
-                            Classification::Migrate
+                        ));
+                        rt.tp.legacy_digest = Some(scan.digest);
+                        rt.tp.conflicts = scan.conflicts;
+                        match registry.migration_marker(&key).await {
+                            Ok(m) => rt.marker = m,
+                            Err(err) => match record_problem(&err) {
+                                Some(reason) => {
+                                    rt.fixed =
+                                        Some(Classification::Rejected(reason))
+                                }
+                                None => return Err(err),
+                            },
                         }
                     }
                 }
-            };
-            match &tp.classification {
-                Classification::Migrate if prog.marker_written => {
-                    totals.already_migrated += 1
-                }
-                Classification::Migrate => totals.migrate += 1,
-                Classification::Ambiguous(_) => totals.ambiguous += 1,
-                Classification::Rejected(_) => totals.rejected += 1,
             }
-            tables.push(tp);
-            entry_progress.push(prog);
+            tables.push(rt);
         }
-        entries.push(EntryPlan {
+        raw.push(RawEntry {
             tenant: e.tenant.clone(),
             source_id: e.source_id.clone(),
             asserted_lineage_hash: e.lineage_hash.clone(),
             current_lineage,
             tables,
         });
-        progress.push(entry_progress);
     }
 
-    let canonical = CanonicalPlan {
-        domain: PLAN_DOMAIN.to_string(),
-        filters: filters.clone(),
-        entries,
-    };
-    let proof = hex::encode(Sha256::digest(
-        serde_json::to_vec(&canonical).context("encode canonical plan")?,
-    ));
+    // Candidate own proofs: those recorded by markers that carry the table's
+    // identity. A candidate is this action's proof only if it reproduces
+    // itself.
+    let mut candidates: Vec<&str> = raw
+        .iter()
+        .flat_map(|e| &e.tables)
+        .filter_map(|rt| {
+            let p = rt.marker.as_ref()?.provenance.as_ref()?;
+            (Some(&p.migration_identity) == rt.tp.migration_identity.as_ref())
+                .then_some(p.proof_digest.as_str())
+        })
+        .collect();
+    candidates.sort_unstable();
+    candidates.dedup();
+    for q in candidates {
+        let (canonical, progress, totals) = build(&raw, filters, Some(q));
+        if digest(&canonical)? == q {
+            return Ok(Plan {
+                canonical,
+                proof: q.to_string(),
+                progress,
+                totals,
+            });
+        }
+    }
+    let (canonical, progress, totals) = build(&raw, filters, None);
+    let proof = digest(&canonical)?;
     Ok(Plan {
         canonical,
         proof,
@@ -1039,6 +1164,181 @@ mod tests {
             .unwrap()
             .versions;
         assert_eq!(conflict.len(), 1, "the conflicting table was not extended");
+    }
+
+    #[tokio::test]
+    async fn a_marker_from_another_proof_is_foreign_not_progress() {
+        let (_f, b) = fresh();
+        seed_table(&b, "orders", 2).await;
+        seed_table(&b, "items", 1).await;
+        let lh = establish(&b).await;
+        let r = registry(&b).await;
+
+        // Proof A migrates orders alone.
+        let only_orders = mapping(&lh, &["orders"]);
+        let a = plan(&b, &r, &only_orders, &Filters::default())
+            .await
+            .unwrap();
+        apply(&b, &r, &only_orders, &Filters::default(), &a.proof)
+            .await
+            .unwrap();
+
+        // Re-running proof A itself: the marker is its own completed work.
+        let again = plan(&b, &r, &only_orders, &Filters::default())
+            .await
+            .unwrap();
+        assert_eq!(again.proof, a.proof);
+        assert_eq!(again.totals.already_migrated, 1);
+
+        // Proof B (orders + items) must not count proof A's marker as its own:
+        // same migration identity, different proof => foreign, bound, rejected.
+        let both = mapping(&lh, &["orders", "items"]);
+        let pb = plan(&b, &r, &both, &Filters::default()).await.unwrap();
+        assert_ne!(pb.proof, a.proof);
+        let orders = &pb.canonical.entries[0].tables[0];
+        assert!(
+            matches!(&orders.classification, Classification::Rejected(r) if r.contains("different migration")),
+            "{:?}",
+            orders.classification
+        );
+        let foreign = orders.foreign_marker.as_ref().expect("bound into plan");
+        let prov = foreign.provenance.as_ref().unwrap();
+        assert_eq!(prov.proof_digest, a.proof);
+        assert_eq!(
+            Some(&prov.migration_identity),
+            orders.migration_identity.as_ref()
+        );
+        assert_eq!(
+            pb.canonical.entries[0].tables[1].classification,
+            Classification::Migrate
+        );
+        assert!(!pb.progress[0][0].marker_written);
+        assert_eq!(
+            (
+                pb.totals.migrate,
+                pb.totals.already_migrated,
+                pb.totals.rejected
+            ),
+            (1, 0, 1)
+        );
+
+        // Applying B migrates items only; proof A's marker is left as it was.
+        let out = apply(&b, &r, &both, &Filters::default(), &pb.proof)
+            .await
+            .unwrap();
+        assert_eq!((out.migrated, out.rejected), (1, 1));
+        let orders_marker = r
+            .migration_marker(&key(&lh, "orders"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(orders_marker.provenance.unwrap().proof_digest, a.proof);
+        let items_marker = r
+            .migration_marker(&key(&lh, "items"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(items_marker.provenance.unwrap().proof_digest, pb.proof);
+        // And B stays stable after its own writes.
+        let pb2 = plan(&b, &r, &both, &Filters::default()).await.unwrap();
+        assert_eq!(pb2.proof, pb.proof);
+        assert_eq!(pb2.totals.already_migrated, 1);
+    }
+
+    #[tokio::test]
+    async fn corrupt_records_reject_their_table_and_storage_failures_abort() {
+        let (f, b) = fresh();
+        for t in ["orders", "badjson", "badmarker", "badindex"] {
+            seed_table(&b, t, 1).await;
+        }
+        b.log_append(
+            "schemas",
+            &format!("{TENANT}/public/badjson"),
+            b"{not json",
+        )
+        .await
+        .unwrap();
+        let lh = establish(&b).await;
+        let r = registry(&b).await;
+        b.kv_put(
+            "schemas.v1.migration",
+            &key(&lh, "badmarker").backend_key(),
+            b"{nope",
+        )
+        .await
+        .unwrap();
+        b.kv_put(
+            "schemas.v1.index",
+            &format!("v/{}/1", key(&lh, "badindex").backend_key()),
+            b"garbage",
+        )
+        .await
+        .unwrap();
+        // Another source whose lineage record is corrupt.
+        b.kv_put(
+            "schema_lineage",
+            &format!("{TENANT}/broken"),
+            b"not a record",
+        )
+        .await
+        .unwrap();
+
+        let mut m =
+            mapping(&lh, &["orders", "badjson", "badmarker", "badindex"]);
+        m.mappings.push(MappingEntry {
+            tenant: TENANT.into(),
+            source_id: "broken".into(),
+            lineage_hash: lh.clone(),
+            tables: vec![TableRef {
+                db: "public".into(),
+                table: "x".into(),
+            }],
+        });
+        let p = plan(&b, &r, &m, &Filters::default()).await.unwrap();
+        let class = |ei: usize, t: &str| {
+            p.canonical.entries[ei]
+                .tables
+                .iter()
+                .find(|tp| tp.table == t)
+                .unwrap()
+                .classification
+                .clone()
+        };
+        assert_eq!(class(0, "orders"), Classification::Migrate);
+        for (t, why) in [
+            ("badjson", "corrupt legacy entry"),
+            ("badmarker", "corrupt migration marker"),
+            ("badindex", "corrupt version index"),
+        ] {
+            assert!(
+                matches!(class(0, t), Classification::Rejected(ref r) if r.contains(why)),
+                "{t}: {:?}",
+                class(0, t)
+            );
+        }
+        assert!(
+            matches!(class(1, "x"), Classification::Rejected(ref r) if r.contains("corrupt lineage record")),
+            "{:?}",
+            class(1, "x")
+        );
+        assert_eq!(p.totals.rejected, 4);
+
+        // Only the healthy table is written.
+        let out = apply(&b, &r, &m, &Filters::default(), &p.proof)
+            .await
+            .unwrap();
+        assert_eq!(out.migrated, 1);
+        assert!(
+            r.history_page(&key(&lh, "badjson"), None, 10)
+                .await
+                .unwrap()
+                .versions
+                .is_empty()
+        );
+
+        // A storage failure is not corruption: the report aborts.
+        f.fail_kv_get.store(true, Ordering::SeqCst);
+        assert!(plan(&b, &r, &m, &Filters::default()).await.is_err());
     }
 
     #[tokio::test]

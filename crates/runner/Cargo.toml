@@ -48,6 +48,8 @@ serde_yaml.workspace = true
 tikv-jemallocator = { version = "0.6", optional = true }
 
 [dev-dependencies]
+# Fault-injecting backend for the process-level store-gate tests.
+storage = { path = "../storage", features = ["testing"] }
 tempfile = "3"
 rdkafka.workspace = true
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }

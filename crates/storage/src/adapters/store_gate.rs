@@ -7,10 +7,13 @@
 //! before any schema access and releases it only after a clean shutdown; the
 //! migration command acquires it before planning and releases it when done.
 //!
-//! Nothing expires. A process that dies while holding the gate leaves it held;
-//! only an explicit [`break_gate`] naming the recorded owner releases it, after
-//! an operator has verified that the owner is no longer alive. This favours
-//! correctness over automatic stale-lock recovery.
+//! Nothing expires. A process that dies while holding the gate leaves it held.
+//! A server's gate is released only by an explicit [`break_gate`] naming the
+//! recorded owner, after an operator has verified that the owner is no longer
+//! alive. A migration's gate is never broken: the migration may have written
+//! part of its plan, so the only way forward is [`resume_migration`], which
+//! hands the held gate to a new process for the same proof without ever
+//! unlocking it. This favours correctness over automatic stale-lock recovery.
 
 use anyhow::Context;
 use chrono::Utc;
@@ -50,6 +53,10 @@ pub struct GateHolder {
     pub hostname: String,
     pub pid: u32,
     pub acquired_at_ms: i64,
+    /// For a migration: the proof digest being applied. A resume must apply
+    /// the same proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration_proof: Option<String>,
 }
 
 impl std::fmt::Display for GateHolder {
@@ -60,9 +67,13 @@ impl std::fmt::Display for GateHolder {
                 .unwrap_or_else(|| self.acquired_at_ms.to_string());
         write!(
             f,
-            "{} (owner {}, host {}, pid {}, since {since})",
+            "{} (owner {}, host {}, pid {}, since {since}",
             self.role, self.owner_id, self.hostname, self.pid
-        )
+        )?;
+        if let Some(proof) = &self.migration_proof {
+            write!(f, ", proof {proof}")?;
+        }
+        f.write_str(")")
     }
 }
 
@@ -79,15 +90,40 @@ pub enum GateState {
     Held(GateHolder),
 }
 
+/// What an operator can do about a gate held by `h`.
+fn remedy(h: &GateHolder) -> String {
+    match h.role {
+        GateRole::Server => format!(
+            "If that process is no longer running (for example it crashed), \
+             verify it and release the gate with `deltaforge store-gate break \
+             --owner {}`",
+            h.owner_id
+        ),
+        GateRole::Migration => format!(
+            "A schema migration holds it and may have written part of its \
+             plan, so the gate cannot be broken. If that process is no longer \
+             running, verify it and finish the migration with `deltaforge \
+             schema-migrate --mapping <same mapping> --apply --expect-proof {} \
+             --resume-owner {}`",
+            h.migration_proof.as_deref().unwrap_or("<proof>"),
+            h.owner_id
+        ),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GateError {
-    #[error(
-        "the store is held by {0}. If that process is no longer running (for \
-         example it crashed), verify it and release the gate with \
-         `deltaforge store-gate break --owner {owner}`",
-        owner = .0.owner_id
-    )]
+    #[error("the store is held by {0}. {}", remedy(.0))]
     Held(GateHolder),
+
+    #[error(
+        "the store gate is held by an unfinished schema migration: {0}. {}",
+        remedy(.0)
+    )]
+    MigrationUnfinished(GateHolder),
+
+    #[error("cannot resume: {reason}; current state: {current}")]
+    NotResumable { reason: String, current: String },
 
     #[error(
         "store gate is not held by owner {owner}; current state: {current}"
@@ -119,7 +155,7 @@ impl GateGuard {
 
     /// Release the gate (only if this guard's owner still holds it).
     pub async fn release(self) -> Result<(), GateError> {
-        break_gate(&self.backend, &self.holder.owner_id)
+        release_owned(&self.backend, &self.holder.owner_id)
             .await
             .map(|_| ())
     }
@@ -179,19 +215,39 @@ pub async fn status(
     })
 }
 
+fn new_holder(role: GateRole, migration_proof: Option<String>) -> GateHolder {
+    GateHolder {
+        role,
+        owner_id: uuid::Uuid::new_v4().to_string(),
+        hostname: hostname(),
+        pid: std::process::id(),
+        acquired_at_ms: Utc::now().timestamp_millis(),
+        migration_proof,
+    }
+}
+
 /// Acquire the gate for `role`. Fails with [`GateError::Held`] if anyone (any
 /// role) holds it.
 pub async fn acquire(
     backend: &ArcStorageBackend,
     role: GateRole,
 ) -> Result<GateGuard, GateError> {
-    let holder = GateHolder {
-        role,
-        owner_id: uuid::Uuid::new_v4().to_string(),
-        hostname: hostname(),
-        pid: std::process::id(),
-        acquired_at_ms: Utc::now().timestamp_millis(),
-    };
+    acquire_as(backend, new_holder(role, None)).await
+}
+
+/// Acquire the gate for a migration applying `proof`.
+pub async fn acquire_for_migration(
+    backend: &ArcStorageBackend,
+    proof: &str,
+) -> Result<GateGuard, GateError> {
+    acquire_as(backend, new_holder(GateRole::Migration, Some(proof.into())))
+        .await
+}
+
+async fn acquire_as(
+    backend: &ArcStorageBackend,
+    holder: GateHolder,
+) -> Result<GateGuard, GateError> {
     for _ in 0..ACQUIRE_ATTEMPTS {
         let won = match read(backend).await? {
             None => backend
@@ -224,10 +280,87 @@ pub async fn acquire(
     Err(GateError::Contended)
 }
 
-/// Release the gate if, and only if, `owner_id` still holds it. Used by a
-/// clean release and by the operator break after a crash. Returns the holder
-/// that was released.
+/// Take over a gate held by the unfinished migration `owner_id` for the same
+/// `proof`, in one CAS: the gate passes from the old owner to a new one
+/// without ever being unlocked. The operator must have verified that the old
+/// owner is no longer running. Exactly one concurrent resume can win.
+pub async fn resume_migration(
+    backend: &ArcStorageBackend,
+    owner_id: &str,
+    proof: &str,
+) -> Result<GateGuard, GateError> {
+    let holder = new_holder(GateRole::Migration, Some(proof.into()));
+    for _ in 0..ACQUIRE_ATTEMPTS {
+        let (version, current) = match read(backend).await? {
+            Some((
+                version,
+                GateRecord {
+                    holder: Some(h), ..
+                },
+            )) => (version, h),
+            _ => {
+                return Err(GateError::NotResumable {
+                    reason: "no migration holds the store gate".into(),
+                    current: "unlocked".into(),
+                });
+            }
+        };
+        let reason = if current.role != GateRole::Migration {
+            Some("the gate is not held by a migration".to_string())
+        } else if current.owner_id != owner_id {
+            Some(format!("the gate is not held by owner {owner_id}"))
+        } else if current.migration_proof.as_deref() != Some(proof) {
+            Some(format!(
+                "the unfinished migration applies proof {}, not {proof}",
+                current.migration_proof.as_deref().unwrap_or("(none)")
+            ))
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(GateError::NotResumable {
+                reason,
+                current: format!("held by {current}"),
+            });
+        }
+        if backend
+            .slot_cas(NS, KEY, version, &encode(Some(&holder)))
+            .await
+            .context("take over store gate")
+            .map_err(GateError::Storage)?
+        {
+            return Ok(GateGuard {
+                backend: backend.clone(),
+                holder,
+            });
+        }
+    }
+    Err(GateError::Contended)
+}
+
+/// Operator break after a crash: release a SERVER's gate if, and only if,
+/// `owner_id` still holds it. A migration's gate is refused
+/// ([`GateError::MigrationUnfinished`]); finish it with [`resume_migration`].
+/// Returns the holder that was released.
 pub async fn break_gate(
+    backend: &ArcStorageBackend,
+    owner_id: &str,
+) -> Result<GateHolder, GateError> {
+    if let Some((
+        _,
+        GateRecord {
+            holder: Some(h), ..
+        },
+    )) = read(backend).await?
+        && h.role == GateRole::Migration
+    {
+        return Err(GateError::MigrationUnfinished(h));
+    }
+    release_owned(backend, owner_id).await
+}
+
+/// Release the gate if, and only if, `owner_id` still holds it.
+async fn release_owned(
     backend: &ArcStorageBackend,
     owner_id: &str,
 ) -> Result<GateHolder, GateError> {
@@ -359,6 +492,87 @@ mod tests {
         assert!(
             matches!(status(&b).await.unwrap(), GateState::Held(h) if h.owner_id == second.holder().owner_id)
         );
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_migration_cannot_be_broken_only_resumed() {
+        let b = backend();
+        let owner = {
+            let g = acquire_for_migration(&b, "proof-a").await.unwrap();
+            g.holder().owner_id.clone()
+            // dropped: the migration died mid-apply
+        };
+
+        // Nobody else gets in, and the operator break is refused.
+        let held = acquire(&b, GateRole::Server).await.unwrap_err();
+        assert!(held.to_string().contains("--resume-owner"), "{held}");
+        assert!(held.to_string().contains("proof-a"), "{held}");
+        assert!(matches!(
+            break_gate(&b, &owner).await.unwrap_err(),
+            GateError::MigrationUnfinished(h) if h.owner_id == owner
+        ));
+
+        // A resume must name the recorded owner and the same proof.
+        for (who, proof) in [("someone-else", "proof-a"), (&*owner, "proof-b")]
+        {
+            assert!(matches!(
+                resume_migration(&b, who, proof).await.unwrap_err(),
+                GateError::NotResumable { .. }
+            ));
+        }
+
+        // The handover never unlocks: the new owner holds it immediately and
+        // the old owner id is no longer valid for anything.
+        let resumed = resume_migration(&b, &owner, "proof-a").await.unwrap();
+        assert_ne!(resumed.holder().owner_id, owner);
+        assert!(matches!(
+            status(&b).await.unwrap(),
+            GateState::Held(h) if h.owner_id == resumed.holder().owner_id
+                && h.role == GateRole::Migration
+                && h.migration_proof.as_deref() == Some("proof-a")
+        ));
+        assert!(resume_migration(&b, &owner, "proof-a").await.is_err());
+        assert!(release_owned(&b, &owner).await.is_err());
+
+        resumed.release().await.unwrap();
+        assert_eq!(status(&b).await.unwrap(), GateState::Unlocked);
+    }
+
+    #[tokio::test]
+    async fn concurrent_resumes_have_exactly_one_winner() {
+        for _ in 0..25 {
+            let b = backend();
+            let owner = acquire_for_migration(&b, "p")
+                .await
+                .unwrap()
+                .holder()
+                .owner_id
+                .clone();
+            let (x, y) = tokio::join!(
+                resume_migration(&b, &owner, "p"),
+                resume_migration(&b, &owner, "p")
+            );
+            assert_eq!(
+                [x.is_ok(), y.is_ok()].iter().filter(|w| **w).count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_gate_cannot_be_resumed_as_a_migration() {
+        let b = backend();
+        let owner = acquire(&b, GateRole::Server)
+            .await
+            .unwrap()
+            .holder()
+            .owner_id
+            .clone();
+        assert!(matches!(
+            resume_migration(&b, &owner, "p").await.unwrap_err(),
+            GateError::NotResumable { .. }
+        ));
+        break_gate(&b, &owner).await.unwrap();
     }
 
     /// Mutual exclusion on SQLite through two independent handles to one file,

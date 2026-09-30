@@ -197,7 +197,8 @@ async fn migration_apply_is_gated_and_dry_run_takes_no_gate() {
     assert!(applied.status.success(), "{}", text(&applied));
     assert_eq!(store_gate::status(&b).await.unwrap(), GateState::Unlocked);
 
-    // A proof mismatch fails and still releases the gate.
+    // A proof mismatch on a fresh run happens before any write, so it is the
+    // one failure that releases the gate.
     let mismatch = run(
         &db,
         &[
@@ -218,6 +219,181 @@ async fn migration_apply_is_gated_and_dry_run_takes_no_gate() {
             .status
             .success()
     );
+}
+
+/// Two legacy versions of `acme/public/orders` and the source's verified
+/// lineage on a SQLite store; returns the lineage hash.
+async fn seed_migration(db: &Path) -> String {
+    let b = backend(db);
+    for (i, pk) in [(1, "[]"), (2, "[\"id\"]")] {
+        let entry = serde_json::json!({
+            "hash": format!("orders-h{i}"),
+            "schema_json": serde_json::json!({"oid": 10, "primary_key": pk}),
+            "registered_at": "2026-01-01T00:00:00Z",
+            "checkpoint": null,
+        });
+        b.log_append(
+            "schemas",
+            "acme/public/orders",
+            &serde_json::to_vec(&entry).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    storage::adapters::source_lineage::establish(
+        &b,
+        "acme",
+        "orders-pg",
+        storage::adapters::LineageDescriptor::postgres(7, 8).unwrap(),
+    )
+    .await
+    .unwrap()
+    .record
+    .current
+    .lineage_hash
+}
+
+async fn adopted_versions(db: &Path, lh: &str) -> usize {
+    let r = storage::DurableSchemaRegistry::new(backend(db))
+        .await
+        .unwrap();
+    let key = storage::adapters::SchemaKey::new(
+        "acme",
+        "orders-pg",
+        lh,
+        "public",
+        "orders",
+    );
+    r.history_page(&key, None, 10).await.unwrap().versions.len()
+}
+
+/// A migration that fails after adopting one of two versions keeps the gate:
+/// no server can start and the operator break is refused, so the partial
+/// history is never read. Only a resume of the same proof (taking the gate
+/// over without unlocking it) finishes the work and releases the gate.
+#[tokio::test]
+async fn a_failed_apply_keeps_the_gate_until_the_same_migration_is_resumed() {
+    use storage::adapters::test_util::FaultBackend;
+
+    for budget in 1..64u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("df.db");
+        let lh = seed_migration(&db).await;
+        let mapping = dir.path().join("mapping.yaml");
+        std::fs::write(
+            &mapping,
+            format!(
+                "mappings:\n  - tenant: acme\n    source_id: orders-pg\n    \
+                 lineage_hash: {lh}\n    tables:\n      - {{db: public, table: orders}}\n"
+            ),
+        )
+        .unwrap();
+        let mapping = mapping.to_str().unwrap().to_string();
+        let dry =
+            run(&db, &["schema-migrate", "--mapping", &mapping, "--json"]);
+        let plan: serde_json::Value =
+            serde_json::from_slice(&dry.stdout).unwrap();
+        let proof = plan["proof"].as_str().unwrap().to_string();
+
+        // The apply's writes go through a fault backend that fails ONE write
+        // after `budget` writes (the gate acquisition is one of them) and then
+        // works again: a transient failure, after which releasing the gate
+        // would succeed - it must not happen.
+        let fault = std::sync::Arc::new(FaultBackend::wrap(backend(&db)));
+        fault.fail_one_write_after(budget);
+        let err = runner::schema_migrate::run(
+            runner::schema_migrate::MigrateArgs {
+                mapping: mapping.clone(),
+                tenant: None,
+                source: None,
+                apply: true,
+                expect_proof: Some(proof.clone()),
+                resume_owner: None,
+                json: false,
+            },
+            fault.clone(),
+        )
+        .await
+        .expect_err("the budget is too small for the whole apply");
+        let b = backend(&db);
+        let GateState::Held(holder) = store_gate::status(&b).await.unwrap()
+        else {
+            continue; // failed before the gate was taken
+        };
+        if adopted_versions(&db, &lh).await != 1 {
+            // Not the partial state this test is about; try the next budget.
+            continue;
+        }
+        assert_eq!(holder.role, GateRole::Migration);
+        assert_eq!(holder.migration_proof.as_deref(), Some(proof.as_str()));
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--resume-owner"), "{msg}");
+        assert!(msg.contains(&holder.owner_id), "{msg}");
+
+        // The partial history is unreachable: no server, no break, no new apply.
+        let refused = start_server(&db).wait_with_output().unwrap();
+        assert!(!refused.status.success());
+        assert!(
+            text(&refused).contains("--resume-owner"),
+            "{}",
+            text(&refused)
+        );
+        let broke =
+            run(&db, &["store-gate", "break", "--owner", &holder.owner_id]);
+        assert!(!broke.status.success());
+        assert!(
+            text(&broke).contains("unfinished schema migration"),
+            "{}",
+            text(&broke)
+        );
+        let apply = [
+            "schema-migrate",
+            "--mapping",
+            &mapping,
+            "--apply",
+            "--expect-proof",
+            &proof,
+        ];
+        assert!(!run(&db, &apply).status.success());
+        // A resume must name the recorded owner and the same proof.
+        let wrong_proof = run(
+            &db,
+            &[
+                "schema-migrate",
+                "--mapping",
+                &mapping,
+                "--apply",
+                "--expect-proof",
+                "0000",
+                "--resume-owner",
+                &holder.owner_id,
+            ],
+        );
+        assert!(!wrong_proof.status.success());
+        assert!(matches!(store_gate::status(&b).await.unwrap(),
+            GateState::Held(h) if h.owner_id == holder.owner_id));
+        assert_eq!(
+            adopted_versions(&db, &lh).await,
+            1,
+            "nothing more was written"
+        );
+
+        // Resume under the same gate: completes, then releases.
+        let mut resume: Vec<&str> = apply.to_vec();
+        resume.extend(["--resume-owner", &holder.owner_id]);
+        let resumed = run(&db, &resume);
+        assert!(resumed.status.success(), "{}", text(&resumed));
+        assert_eq!(store_gate::status(&b).await.unwrap(), GateState::Unlocked);
+        assert_eq!(adopted_versions(&db, &lh).await, 2);
+
+        // Now, and only now, a server may start.
+        let mut server = start_server(&db);
+        wait_for_server_gate(&b, server.id()).await;
+        signal(&server, "-TERM");
+        assert!(wait_exit(&mut server).success());
+        return;
+    }
+    panic!("no write budget produced a partial adoption under a held gate");
 }
 
 #[test]

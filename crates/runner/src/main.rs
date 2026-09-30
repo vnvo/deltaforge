@@ -99,6 +99,11 @@ enum Command {
         /// Proof digest printed by the dry run being applied.
         #[arg(long)]
         expect_proof: Option<String>,
+        /// Take over and finish an unfinished migration (owner id from
+        /// `store-gate status` or the failed run). Verify first that the
+        /// recorded process is no longer running.
+        #[arg(long, requires = "apply")]
+        resume_owner: Option<String>,
         /// Emit JSON instead of human-readable text.
         #[arg(long)]
         json: bool,
@@ -118,8 +123,10 @@ enum GateAction {
         #[arg(long)]
         json: bool,
     },
-    /// Release a gate left behind by a process that is no longer running.
-    /// Verify first that the recorded owner (host/pid) is not alive.
+    /// Release a server's gate left behind by a process that is no longer
+    /// running. Verify first that the recorded owner (host/pid) is not alive.
+    /// A migration's gate cannot be broken: finish it with
+    /// `schema-migrate ... --resume-owner`.
     Break {
         /// The owner id shown by `store-gate status`.
         #[arg(long)]
@@ -149,6 +156,7 @@ async fn main() -> Result<()> {
         source,
         apply,
         expect_proof,
+        resume_owner,
         json,
     }) = &args.command
     {
@@ -161,6 +169,7 @@ async fn main() -> Result<()> {
             source: source.clone(),
             apply: *apply,
             expect_proof: expect_proof.clone(),
+            resume_owner: resume_owner.clone(),
             json: *json,
         };
         return runner::schema_migrate::run(migrate, backend).await;
