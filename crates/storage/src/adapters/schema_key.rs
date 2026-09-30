@@ -92,6 +92,25 @@ impl LineageDescriptor {
         })
     }
 
+    /// Re-check a descriptor read back from durable storage with the same rules
+    /// the constructors enforce (non-zero PostgreSQL identifiers; a non-empty,
+    /// non-zero, normalized MySQL UUID). A stored descriptor that would not
+    /// have been constructible is refused.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let rebuilt = match self {
+            Self::Postgres {
+                system_identifier,
+                database_oid,
+            } => Self::postgres(*system_identifier, *database_oid)?,
+            Self::Mysql { server_uuid } => Self::mysql(server_uuid)?,
+        };
+        anyhow::ensure!(
+            &rebuilt == self,
+            "lineage descriptor is not in canonical form: {self:?}"
+        );
+        Ok(())
+    }
+
     /// Stable, domain-separated hex hash of the verified physical lineage.
     ///
     /// A one-byte variant tag ensures PostgreSQL and MySQL identities occupy

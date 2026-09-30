@@ -34,6 +34,26 @@ impl LineageRef {
             lineage_hash,
         }
     }
+
+    /// Integrity check for a reference read back from storage: the descriptor
+    /// must be valid and canonical, and the stored hash must equal the hash
+    /// recomputed from it (a stored hash is never trusted on its own).
+    pub fn verify(&self) -> Result<()> {
+        self.descriptor.validate()?;
+        let expected = self.descriptor.lineage_hash();
+        anyhow::ensure!(
+            self.lineage_hash == expected,
+            "lineage hash {} does not match its descriptor (expected {expected})",
+            self.lineage_hash
+        );
+        Ok(())
+    }
+}
+
+/// A lineage hash as produced by `LineageDescriptor::lineage_hash`: 32
+/// lowercase hex characters.
+fn is_lineage_hash(h: &str) -> bool {
+    h.len() == 32 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// The verified physical lineage a source currently runs under, its immediate
@@ -54,6 +74,46 @@ pub struct SourceLineageRecord {
 }
 
 impl SourceLineageRecord {
+    /// Refuse a record this build cannot interpret or that is internally
+    /// inconsistent, so a corrupt or foreign record can never select a
+    /// namespace. Checked on every read.
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.record_version == RECORD_VERSION,
+            "unsupported source-lineage record_version {} (this build reads \
+             {RECORD_VERSION})",
+            self.record_version
+        );
+        self.current.verify().context("current lineage")?;
+        let mut seen = std::collections::HashSet::new();
+        for h in &self.prior_lineage_hashes {
+            anyhow::ensure!(
+                is_lineage_hash(h),
+                "malformed prior lineage hash `{h}`"
+            );
+            anyhow::ensure!(
+                *h != self.current.lineage_hash,
+                "the current lineage is also listed as a prior lineage"
+            );
+            anyhow::ensure!(
+                seen.insert(h.as_str()),
+                "duplicate prior lineage hash `{h}`"
+            );
+        }
+        if let Some(prev) = &self.previous {
+            prev.verify().context("previous lineage")?;
+            anyhow::ensure!(
+                prev.lineage_hash != self.current.lineage_hash,
+                "the previous lineage equals the current lineage"
+            );
+            anyhow::ensure!(
+                seen.contains(prev.lineage_hash.as_str()),
+                "the previous lineage is missing from the prior lineage list"
+            );
+        }
+        Ok(())
+    }
+
     /// Current and prior lineage hashes.
     pub fn all_lineage_hashes(&self) -> impl Iterator<Item = &str> {
         std::iter::once(self.current.lineage_hash.as_str())
@@ -147,10 +207,17 @@ pub async fn load(
         .await
         .context("source lineage: failed to read lineage record")?
     {
-        Some(bytes) => Ok(Some(
-            serde_json::from_slice(&bytes)
-                .context("source lineage: corrupt lineage record")?,
-        )),
+        Some(bytes) => {
+            let record: SourceLineageRecord = serde_json::from_slice(&bytes)
+                .context("source lineage: corrupt lineage record")?;
+            record.validate().with_context(|| {
+                format!(
+                    "source lineage: refusing the lineage record of \
+                     {tenant}/{source_id}"
+                )
+            })?;
+            Ok(Some(record))
+        }
         None => Ok(None),
     }
 }
@@ -232,6 +299,122 @@ mod tests {
         f.fail_kv_put.store(false, Ordering::SeqCst);
         let rec = load(&b, "acme", "src1").await.unwrap().unwrap();
         assert_eq!(rec.current, LineageRef::new(pg(1, 2)));
+    }
+
+    /// Write a record as raw JSON (bypassing `establish`) and read it back.
+    async fn load_raw(
+        v: serde_json::Value,
+    ) -> Result<Option<SourceLineageRecord>> {
+        let b = backend();
+        b.kv_put(
+            NS,
+            &record_key("acme", "src1"),
+            &serde_json::to_vec(&v).unwrap(),
+        )
+        .await
+        .unwrap();
+        load(&b, "acme", "src1").await
+    }
+
+    fn valid_record() -> serde_json::Value {
+        let prev = LineageRef::new(pg(1, 2));
+        serde_json::to_value(SourceLineageRecord {
+            record_version: RECORD_VERSION,
+            current: LineageRef::new(pg(1, 3)),
+            previous: Some(prev.clone()),
+            prior_lineage_hashes: vec![prev.lineage_hash],
+            established_at_ms: 0,
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn valid_record_is_accepted() {
+        assert!(load_raw(valid_record()).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn future_record_version_is_refused() {
+        let mut v = valid_record();
+        v["record_version"] = 2.into();
+        assert!(load_raw(v).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stored_hash_is_recomputed_not_trusted() {
+        let mut v = valid_record();
+        // Well-formed hash, but of a different lineage.
+        v["current"]["lineage_hash"] = pg(9, 9).lineage_hash().into();
+        let err = load_raw(v).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("does not match its descriptor"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_descriptor_is_refused() {
+        let mut v = valid_record();
+        v["current"]["descriptor"]["Postgres"]["system_identifier"] = 0.into();
+        v["current"]["lineage_hash"] = LineageDescriptor::Postgres {
+            system_identifier: 0,
+            database_oid: 3,
+        }
+        .lineage_hash()
+        .into();
+        assert!(
+            load_raw(v).await.is_err(),
+            "a zero identifier is never valid"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_canonical_mysql_uuid_is_refused() {
+        let mut v = valid_record();
+        let upper = LineageDescriptor::Mysql {
+            server_uuid: "3E11FA47-71CA-11E1-9E33-C80AA9429562".into(),
+        };
+        v["current"] = serde_json::to_value(LineageRef::new(upper)).unwrap();
+        assert!(load_raw(v).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn inconsistent_predecessor_references_are_refused() {
+        // previous not listed among prior hashes
+        let mut v = valid_record();
+        v["prior_lineage_hashes"] = serde_json::json!([]);
+        assert!(load_raw(v).await.is_err());
+        // previous with a tampered hash
+        let mut v = valid_record();
+        v["previous"]["lineage_hash"] = pg(7, 7).lineage_hash().into();
+        assert!(load_raw(v).await.is_err());
+        // malformed prior hash
+        let mut v = valid_record();
+        v["prior_lineage_hashes"] =
+            serde_json::json!([LineageRef::new(pg(1, 2)).lineage_hash, "zz"]);
+        assert!(load_raw(v).await.is_err());
+        // current listed as prior
+        let mut v = valid_record();
+        v["prior_lineage_hashes"] = serde_json::json!([
+            LineageRef::new(pg(1, 2)).lineage_hash,
+            LineageRef::new(pg(1, 3)).lineage_hash
+        ]);
+        assert!(load_raw(v).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn establish_refuses_to_build_on_a_corrupt_record() {
+        let b = backend();
+        let mut v = valid_record();
+        v["record_version"] = 99.into();
+        b.kv_put(
+            NS,
+            &record_key("acme", "src1"),
+            &serde_json::to_vec(&v).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(establish(&b, "acme", "src1", pg(1, 3)).await.is_err());
     }
 
     #[tokio::test]

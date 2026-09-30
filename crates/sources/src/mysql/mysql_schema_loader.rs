@@ -9,9 +9,9 @@
 use metrics::counter;
 use mysql_async::{Pool, Row, prelude::Queryable};
 use schema_registry::SourceSchema;
+#[cfg(test)]
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use storage::DurableSchemaRegistry;
 use tokio::sync::RwLock;
@@ -19,8 +19,15 @@ use tracing::{debug, info, warn};
 
 use super::mysql_table_schema::{MySqlColumn, MySqlTableSchema};
 use crate::registry_scope::{
-    RegistryError, RegistryScope, SharedRegistryScope,
+    RegistryError, RegistryScope, ScopedCache, SharedRegistryScope,
 };
+
+/// The live catalog's answer for one table.
+enum Live {
+    Found(MySqlTableSchema),
+    /// The server is not the scope's lineage (described for the error).
+    OtherLineage(String),
+}
 use crate::schema_loader::{
     LoadedSchema as ApiLoadedSchema, SchemaListEntry, SourceSchemaLoader,
 };
@@ -37,7 +44,11 @@ pub struct LoadedSchema {
     pub column_names: Arc<Vec<String>>,
 }
 
-type ArcSchemaCache = Arc<RwLock<HashMap<(String, String), Arc<LoadedSchema>>>>;
+type ArcSchemaCache = Arc<RwLock<ScopedCache<Arc<LoadedSchema>>>>;
+
+/// Attempts at a load whose lineage keeps moving before giving up with the
+/// typed, retryable [`RegistryError::ScopeChanged`].
+const SCOPE_ATTEMPTS: usize = 3;
 
 /// Schema loader with caching and registry integration.
 ///
@@ -55,8 +66,6 @@ pub struct MySqlSchemaLoader {
     dsn: crate::credentials::ProtectedDsn,
     /// Cache: (db, table) -> Arc<LoadedSchema>
     cache: ArcSchemaCache,
-    /// Scope generation the cache entries were loaded under (0 = none).
-    cache_generation: Arc<AtomicU64>,
     /// Schema registry for versioning
     registry: Arc<DurableSchemaRegistry>,
     scope: SharedRegistryScope,
@@ -90,8 +99,7 @@ impl MySqlSchemaLoader {
         Self {
             pool: Pool::new(dsn.expose()),
             dsn,
-            cache: Arc::new(RwLock::new(HashMap::new())),
-            cache_generation: Arc::new(AtomicU64::new(0)),
+            cache: Arc::new(RwLock::new(ScopedCache::default())),
             registry,
             scope,
             tenant: tenant.to_string(),
@@ -99,27 +107,57 @@ impl MySqlSchemaLoader {
     }
 
     /// The established registry scope. Fails closed when none is published.
-    /// Discards cache entries loaded under an earlier lineage.
-    async fn scope(&self) -> SourceResult<Arc<RegistryScope>> {
-        let scope = self.scope.current()?;
-        if self.cache_generation.load(Ordering::Acquire) != scope.generation() {
-            let mut cache = self.cache.write().await;
-            if self.cache_generation.load(Ordering::Acquire)
-                != scope.generation()
-            {
-                cache.clear();
-                self.cache_generation
-                    .store(scope.generation(), Ordering::Release);
-            }
-        }
-        Ok(scope)
+    fn current_scope(&self) -> SourceResult<Arc<RegistryScope>> {
+        Ok(self.scope.current()?)
     }
 
-    /// Whether cache entries belong to the currently published scope.
-    fn cache_valid(&self) -> bool {
-        let generation = self.scope.generation();
-        generation != 0
-            && generation == self.cache_generation.load(Ordering::Acquire)
+    /// Cache `value`, produced under `scope`, only if `scope` is still the
+    /// published one. `false` means the lineage moved while it was produced:
+    /// the value was discarded and the caller must retry under the new scope.
+    async fn cache_insert(
+        &self,
+        scope: &RegistryScope,
+        key: (String, String),
+        value: Arc<LoadedSchema>,
+    ) -> bool {
+        let mut cache = self.cache.write().await;
+        cache.insert_if_current(
+            scope.generation(),
+            self.scope.generation(),
+            key,
+            value,
+        )
+    }
+
+    /// The error after the lineage kept moving for every attempt.
+    fn scope_changed(&self) -> SourceError {
+        RegistryError::ScopeChanged {
+            source_id: self
+                .scope
+                .current()
+                .map(|s| s.source_id().to_string())
+                .unwrap_or_default(),
+        }
+        .into()
+    }
+
+    /// The live catalog answered from a different server than `scope`. If the
+    /// published scope has moved on, retry under it; otherwise the server
+    /// behind the DSN is not the one this source verified - fail closed.
+    fn lineage_moved(
+        &self,
+        scope: &RegistryScope,
+        live: String,
+    ) -> SourceResult<()> {
+        if self.scope.generation() != scope.generation() {
+            return Ok(());
+        }
+        Err(RegistryError::LineageMismatch {
+            source_id: scope.source_id().to_string(),
+            expected: format!("{:?}", scope.lineage().descriptor),
+            live,
+        }
+        .into())
     }
 
     pub fn current_sequence(&self) -> u64 {
@@ -159,7 +197,7 @@ impl MySqlSchemaLoader {
         patterns: &[String],
     ) -> SourceResult<Vec<(String, String)>> {
         let t0 = Instant::now();
-        let scope = self.scope().await?;
+        let scope = self.current_scope()?;
         let tables = self.expand_patterns(patterns).await?;
 
         info!(
@@ -185,43 +223,47 @@ impl MySqlSchemaLoader {
                 .get_latest(&scope.key(db, table))
                 .await
                 .map_err(RegistryError::Storage)?;
-            {
-                let mut cache = self.cache.write().await;
-                match latest {
-                    Some(sv) => {
-                        match serde_json::from_value::<MySqlTableSchema>(
-                            sv.schema_json,
-                        ) {
-                            Ok(schema) => {
-                                let fingerprint = schema.fingerprint();
-                                let column_names = Arc::new(
-                                    schema
-                                        .columns
-                                        .iter()
-                                        .map(|c| c.name.clone())
-                                        .collect::<Vec<_>>(),
-                                );
-                                cache.insert(
+            match latest {
+                Some(sv) => {
+                    match serde_json::from_value::<MySqlTableSchema>(
+                        sv.schema_json,
+                    ) {
+                        Ok(schema) => {
+                            let fingerprint = schema.fingerprint();
+                            let column_names = Arc::new(
+                                schema
+                                    .columns
+                                    .iter()
+                                    .map(|c| c.name.clone())
+                                    .collect::<Vec<_>>(),
+                            );
+                            let loaded = Arc::new(LoadedSchema {
+                                schema,
+                                registry_version: sv.version,
+                                fingerprint: fingerprint.into(),
+                                sequence: sv.sequence,
+                                column_names,
+                            });
+                            if !self
+                                .cache_insert(
+                                    &scope,
                                     (db.clone(), table.clone()),
-                                    Arc::new(LoadedSchema {
-                                        schema,
-                                        registry_version: sv.version,
-                                        fingerprint: fingerprint.into(),
-                                        sequence: sv.sequence,
-                                        column_names,
-                                    }),
-                                );
-                                from_registry += 1;
+                                    loaded,
+                                )
+                                .await
+                            {
+                                return Err(self.scope_changed());
                             }
-                            Err(e) => {
-                                warn!(db=%db, table=%table, error=%e,
-                                    "failed to deserialize registry schema; fetching from source");
-                                needs_fetch.push(pair);
-                            }
+                            from_registry += 1;
+                        }
+                        Err(e) => {
+                            warn!(db=%db, table=%table, error=%e,
+                                "failed to deserialize registry schema; fetching from source");
+                            needs_fetch.push(pair);
                         }
                     }
-                    None => needs_fetch.push(pair),
                 }
+                None => needs_fetch.push(pair),
             }
         }
 
@@ -315,73 +357,85 @@ impl MySqlSchemaLoader {
         self.load_schema_at_checkpoint(db, table, None).await
     }
 
+    /// Load schema with optional checkpoint for registry correlation.
+    ///
+    /// The schema is fetched from INFORMATION_SCHEMA on a connection that proves
+    /// it belongs to the scope's `server_uuid` lineage, registered under that
+    /// scope, and cached only if the scope is still the published one;
+    /// otherwise the work is discarded and retried under the new scope.
     pub async fn load_schema_at_checkpoint(
         &self,
         db: &str,
         table: &str,
         checkpoint: Option<&[u8]>,
     ) -> SourceResult<Arc<LoadedSchema>> {
-        if self.cache_valid()
-            && let Some(cached) = self
-                .cache
-                .read()
-                .await
-                .get(&(db.to_string(), table.to_string()))
-        {
-            debug!(db = %db, table = %table, "schema cache hit");
-            counter!("deltaforge_source_schema_cache_hits_total",
+        let key = (db.to_string(), table.to_string());
+        for _ in 0..SCOPE_ATTEMPTS {
+            let scope = self.current_scope()?;
+            if let Some(cached) =
+                self.cache.read().await.get(scope.generation(), &key)
+            {
+                debug!(db = %db, table = %table, "schema cache hit");
+                counter!("deltaforge_source_schema_cache_hits_total",
+                    "pipeline" => self.tenant.clone(), "source" => "mysql")
+                .increment(1);
+                return Ok(cached);
+            }
+            counter!("deltaforge_source_schema_cache_misses_total",
                 "pipeline" => self.tenant.clone(), "source" => "mysql")
             .increment(1);
-            return Ok(Arc::clone(cached));
+
+            let t0 = Instant::now();
+            let schema = match self.fetch_schema(&scope, db, table).await? {
+                Live::Found(schema) => schema,
+                Live::OtherLineage(live) => {
+                    self.lineage_moved(&scope, live)?;
+                    continue;
+                }
+            };
+            let fingerprint = schema.fingerprint();
+            let column_names: Arc<Vec<String>> = Arc::new(
+                schema.columns.iter().map(|c| c.name.clone()).collect(),
+            );
+
+            // Register with checkpoint, under the verified lineage.
+            let schema_json = serde_json::to_value(&schema)
+                .map_err(|e| SourceError::Other(e.into()))?;
+            let version = self
+                .registry
+                .register_with_checkpoint(
+                    &scope.key(db, table),
+                    &fingerprint,
+                    &schema_json,
+                    checkpoint,
+                )
+                .await
+                .map_err(RegistryError::Storage)?;
+            let loaded = Arc::new(LoadedSchema {
+                schema,
+                registry_version: version,
+                fingerprint: fingerprint.into(),
+                sequence: self.registry.current_sequence(),
+                column_names,
+            });
+            if !self
+                .cache_insert(&scope, key.clone(), Arc::clone(&loaded))
+                .await
+            {
+                continue;
+            }
+
+            let elapsed = t0.elapsed();
+            if elapsed.as_millis() > 200 {
+                warn!(db = %db, table = %table, ms = elapsed.as_millis(), "slow schema load");
+            } else {
+                debug!(db = %db, table = %table, version = version, ms = elapsed.as_millis(), "schema loaded");
+            }
+            return Ok(loaded);
         }
-        counter!("deltaforge_source_schema_cache_misses_total",
-            "pipeline" => self.tenant.clone(), "source" => "mysql")
-        .increment(1);
-
-        let t0 = Instant::now();
-        let schema = self.fetch_schema(db, table).await?;
-        let fingerprint = schema.fingerprint();
-        let column_names: Arc<Vec<String>> =
-            Arc::new(schema.columns.iter().map(|c| c.name.clone()).collect());
-
-        // Register with schema registry
-        let schema_json = serde_json::to_value(&schema)
-            .map_err(|e| SourceError::Other(e.into()))?;
-        // Register with checkpoint, under the verified lineage.
-        let scope = self.scope().await?;
-        let version = self
-            .registry
-            .register_with_checkpoint(
-                &scope.key(db, table),
-                &fingerprint,
-                &schema_json,
-                checkpoint,
-            )
-            .await
-            .map_err(RegistryError::Storage)?;
-        let loaded = Arc::new(LoadedSchema {
-            schema,
-            registry_version: version,
-            fingerprint: fingerprint.into(),
-            sequence: self.registry.current_sequence(),
-            column_names,
-        });
-
-        // Cache it
-        self.cache
-            .write()
-            .await
-            .insert((db.to_string(), table.to_string()), Arc::clone(&loaded));
-
-        let elapsed = t0.elapsed();
-        if elapsed.as_millis() > 200 {
-            warn!(db = %db, table = %table, ms = elapsed.as_millis(), "slow schema load");
-        } else {
-            debug!(db = %db, table = %table, version = version, ms = elapsed.as_millis(), "schema loaded");
-        }
-
-        Ok(loaded)
+        Err(self.scope_changed())
     }
+
     /// Force reload schema from database (bypasses cache).
     pub async fn reload_schema(
         &self,
@@ -417,11 +471,9 @@ impl MySqlSchemaLoader {
         table: &str,
     ) -> Option<Arc<LoadedSchema>> {
         // Note: This is sync because we're using try_read to avoid blocking
-        if !self.cache_valid() {
-            return None;
-        }
+        let published = self.scope.generation();
         self.cache.try_read().ok().and_then(|guard| {
-            guard.get(&(db.to_string(), table.to_string())).cloned()
+            guard.get(published, &(db.to_string(), table.to_string()))
         })
     }
 
@@ -431,7 +483,7 @@ impl MySqlSchemaLoader {
     pub fn cached_tables(&self) -> Vec<(String, String)> {
         self.cache
             .try_read()
-            .map(|c| c.keys().cloned().collect())
+            .map(|c| c.keys_any_generation())
             .unwrap_or_default()
     }
 
@@ -441,15 +493,22 @@ impl MySqlSchemaLoader {
         db: &str,
         table: &str,
     ) -> SourceResult<bool> {
-        let current = self.fetch_schema(db, table).await?;
-        let current_fp = current.fingerprint();
-
-        let changed = {
-            let cache = self.cache.read().await;
-            cache
-                .get(&(db.to_string(), table.to_string()))
-                .map(|cached| cached.fingerprint != current_fp.into())
-                .unwrap_or(true)
+        let scope = self.current_scope()?;
+        let changed = match self.fetch_schema(&scope, db, table).await? {
+            Live::Found(current) => {
+                let current_fp = current.fingerprint();
+                self.cache
+                    .read()
+                    .await
+                    .get(
+                        scope.generation(),
+                        &(db.to_string(), table.to_string()),
+                    )
+                    .map(|cached| cached.fingerprint != current_fp.into())
+                    .unwrap_or(true)
+            }
+            // A different server answered: whatever is cached is not current.
+            Live::OtherLineage(_) => true,
         };
 
         if changed {
@@ -462,19 +521,40 @@ impl MySqlSchemaLoader {
 
     /// Invalidate cache for a database (called on DDL).
     pub async fn invalidate_db(&self, db: &str) {
-        let before = self.cache.read().await.len();
-        self.cache.write().await.retain(|(d, _), _| d != db);
-        let after = self.cache.read().await.len();
+        let mut cache = self.cache.write().await;
+        let before = cache.keys_any_generation().len();
+        cache.retain(|(d, _)| d != db);
+        let after = cache.keys_any_generation().len();
+        drop(cache);
         info!(db = %db, removed = before.saturating_sub(after), "schema cache invalidated");
     }
 
     /// Fetch schema from INFORMATION_SCHEMA.
     async fn fetch_schema(
         &self,
+        scope: &RegistryScope,
         db: &str,
         table: &str,
-    ) -> SourceResult<MySqlTableSchema> {
+    ) -> SourceResult<Live> {
         let mut conn = self.pool.get_conn().await.map_err(conn_error)?;
+
+        // Prove on this same connection that the catalog belongs to the
+        // scope's lineage, so a schema read from another server can never be
+        // registered under this lineage.
+        let live_uuid: Option<String> = conn
+            .query_first("SELECT @@global.server_uuid")
+            .await
+            .map_err(|e| SourceError::Other(e.into()))?;
+        let same = match (&scope.lineage().descriptor, live_uuid.as_deref()) {
+            (
+                storage::adapters::LineageDescriptor::Mysql { server_uuid },
+                Some(live),
+            ) => server_uuid.eq_ignore_ascii_case(live.trim()),
+            _ => false,
+        };
+        if !same {
+            return Ok(Live::OtherLineage(format!("{live_uuid:?}")));
+        }
 
         // Fetch columns
         let col_rows: Vec<Row> = conn
@@ -576,13 +656,13 @@ impl MySqlSchemaLoader {
             (None, None)
         };
 
-        Ok(MySqlTableSchema {
+        Ok(Live::Found(MySqlTableSchema {
             columns,
             primary_key,
             engine,
             charset: None,
             collation,
-        })
+        }))
     }
 
     /// Get column names only (for backward compatibility with event handling).
@@ -639,11 +719,19 @@ impl MySqlSchemaLoader {
             )
             .expect("test lineage"),
         );
+        let mut scoped = ScopedCache::default();
+        for (key, loaded) in cache {
+            scoped.insert_if_current(
+                published.generation(),
+                published.generation(),
+                key,
+                loaded,
+            );
+        }
         Self {
             pool: Pool::new("mysql://localhost/ignored"),
             dsn: "mysql://localhost/ignored".into(),
-            cache: Arc::new(RwLock::new(cache)),
-            cache_generation: Arc::new(AtomicU64::new(published.generation())),
+            cache: Arc::new(RwLock::new(scoped)),
             registry: storage::DurableSchemaRegistry::for_testing(),
             scope,
             tenant: "test".to_string(),
@@ -746,13 +834,12 @@ impl SourceSchemaLoader for MySqlSchemaLoader {
     }
 
     async fn list_cached(&self) -> Vec<SchemaListEntry> {
-        if !self.cache_valid() {
-            return Vec::new();
-        }
+        let published = self.scope.generation();
         self.cache
             .read()
             .await
-            .iter()
+            .entries_for(published)
+            .into_iter()
             .map(|((db, table), loaded)| SchemaListEntry {
                 database: db.clone(),
                 table: table.clone(),
@@ -786,6 +873,83 @@ fn to_api_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod scope_race {
+        use super::*;
+        use storage::adapters::LineageDescriptor;
+
+        fn loaded(column: &str) -> Arc<LoadedSchema> {
+            let schema = MySqlTableSchema::new(vec![MySqlColumn::new(
+                column, "int", "int", true, 1,
+            )]);
+            Arc::new(LoadedSchema {
+                fingerprint: schema.fingerprint().into(),
+                schema,
+                registry_version: 1,
+                sequence: 0,
+                column_names: Arc::new(vec![column.to_string()]),
+            })
+        }
+
+        fn key() -> (String, String) {
+            ("shop".to_string(), "orders".to_string())
+        }
+
+        fn loader(scope: &SharedRegistryScope) -> MySqlSchemaLoader {
+            MySqlSchemaLoader::new(
+                "mysql://none@127.0.0.1:1/none",
+                storage::DurableSchemaRegistry::for_testing(),
+                "acme",
+                scope.clone(),
+            )
+        }
+
+        fn uuid(last: u8) -> LineageDescriptor {
+            LineageDescriptor::mysql(&format!(
+                "3e11fa47-71ca-11e1-9e33-c80aa94295{last:02x}"
+            ))
+            .unwrap()
+        }
+
+        /// Reviewer interleaving: a load starts under A; the lineage changes
+        /// to B; a B lookup populates the cache; the A load finishes last.
+        #[tokio::test]
+        async fn late_result_from_previous_lineage_is_discarded() {
+            let scope = SharedRegistryScope::new("src");
+            scope.publish_for_test("acme", uuid(1));
+            let l = loader(&scope);
+
+            let under_a = l.current_scope().unwrap();
+            scope.publish_for_test("acme", uuid(2));
+            let under_b = l.current_scope().unwrap();
+            assert!(l.cache_insert(&under_b, key(), loaded("b_col")).await);
+            assert!(
+                !l.cache_insert(&under_a, key(), loaded("a_col")).await,
+                "a result produced under the previous lineage must be discarded"
+            );
+            let served = l.get_cached("shop", "orders").unwrap();
+            assert_eq!(served.column_names.as_slice(), ["b_col"]);
+        }
+
+        /// The A result arrives after the lineage changed but before any B
+        /// lookup touched the cache: still discarded, nothing is served.
+        #[tokio::test]
+        async fn result_from_previous_lineage_is_never_cached() {
+            let scope = SharedRegistryScope::new("src");
+            scope.publish_for_test("acme", uuid(1));
+            let l = loader(&scope);
+
+            let under_a = l.current_scope().unwrap();
+            assert!(l.cache_insert(&under_a, key(), loaded("a_col")).await);
+            scope.publish_for_test("acme", uuid(2));
+            assert!(
+                l.get_cached("shop", "orders").is_none(),
+                "A entry not served under B"
+            );
+            assert!(!l.cache_insert(&under_a, key(), loaded("a_col2")).await);
+            assert!(l.get_cached("shop", "orders").is_none());
+        }
+    }
 
     #[test]
     fn test_parse_pattern() {

@@ -6,15 +6,13 @@
 //! - Schema registry integration with fingerprinting
 //! - On-demand reload capability
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use metrics::counter;
 use schema_registry::SourceSchema;
 use storage::DurableSchemaRegistry;
-use storage::adapters::{LegacyVersion, SchemaKey};
+use storage::adapters::{LineageDescriptor, SchemaKey};
 use tokio::sync::RwLock;
 use tokio_postgres::NoTls;
 use tracing::{debug, info, warn};
@@ -26,7 +24,7 @@ use super::postgres_table_schema::{
     PostgresColumn, PostgresTableSchema, RelationIdentity,
 };
 use crate::registry_scope::{
-    RegistryError, RegistryScope, SharedRegistryScope,
+    RegistryError, RegistryScope, ScopedCache, SharedRegistryScope,
 };
 use crate::schema_loader::{
     LoadedSchema as ApiLoadedSchema, SchemaListEntry, SourceSchemaLoader,
@@ -34,6 +32,18 @@ use crate::schema_loader::{
 
 /// Page size for durable history scans (memory is O(page), never O(history)).
 const HISTORY_PAGE: usize = 256;
+
+/// Attempts at a load whose lineage keeps moving before giving up with the
+/// typed, retryable [`RegistryError::ScopeChanged`].
+const SCOPE_ATTEMPTS: usize = 3;
+
+/// The live catalog's answer for one table.
+enum Live {
+    Found(PostgresTableSchema),
+    Missing,
+    /// The catalog is not the scope's lineage (described for the error).
+    OtherLineage(String),
+}
 
 /// Loaded schema with metadata.
 ///
@@ -56,9 +66,7 @@ pub struct LoadedSchema {
 #[derive(Clone)]
 pub struct PostgresSchemaLoader {
     dsn: crate::credentials::ProtectedDsn,
-    cache: Arc<RwLock<HashMap<(String, String), LoadedSchema>>>,
-    /// Scope generation the cache entries were loaded under (0 = none).
-    cache_generation: Arc<AtomicU64>,
+    cache: Arc<RwLock<ScopedCache<LoadedSchema>>>,
     registry: Arc<DurableSchemaRegistry>,
     scope: SharedRegistryScope,
     tenant: String,
@@ -90,8 +98,7 @@ impl PostgresSchemaLoader {
         );
         Self {
             dsn,
-            cache: Arc::new(RwLock::new(HashMap::new())),
-            cache_generation: Arc::new(AtomicU64::new(0)),
+            cache: Arc::new(RwLock::new(ScopedCache::default())),
             registry,
             scope,
             tenant: tenant.to_string(),
@@ -99,27 +106,57 @@ impl PostgresSchemaLoader {
     }
 
     /// The established registry scope. Fails closed when none is published.
-    /// Discards cache entries loaded under an earlier lineage.
-    async fn scope(&self) -> SourceResult<Arc<RegistryScope>> {
-        let scope = self.scope.current()?;
-        if self.cache_generation.load(Ordering::Acquire) != scope.generation() {
-            let mut cache = self.cache.write().await;
-            if self.cache_generation.load(Ordering::Acquire)
-                != scope.generation()
-            {
-                cache.clear();
-                self.cache_generation
-                    .store(scope.generation(), Ordering::Release);
-            }
-        }
-        Ok(scope)
+    fn current_scope(&self) -> SourceResult<Arc<RegistryScope>> {
+        Ok(self.scope.current()?)
     }
 
-    /// Whether cache entries belong to the currently published scope.
-    fn cache_valid(&self) -> bool {
-        let generation = self.scope.generation();
-        generation != 0
-            && generation == self.cache_generation.load(Ordering::Acquire)
+    /// Cache `value`, produced under `scope`, only if `scope` is still the
+    /// published one. `false` means the lineage moved while it was produced:
+    /// the value was discarded and the caller must retry under the new scope.
+    async fn cache_insert(
+        &self,
+        scope: &RegistryScope,
+        key: (String, String),
+        value: LoadedSchema,
+    ) -> bool {
+        let mut cache = self.cache.write().await;
+        cache.insert_if_current(
+            scope.generation(),
+            self.scope.generation(),
+            key,
+            value,
+        )
+    }
+
+    /// The error after the lineage kept moving for every attempt.
+    fn scope_changed(&self) -> SourceError {
+        RegistryError::ScopeChanged {
+            source_id: self
+                .scope
+                .current()
+                .map(|s| s.source_id().to_string())
+                .unwrap_or_default(),
+        }
+        .into()
+    }
+
+    /// The live catalog answered from a different lineage than `scope`. If the
+    /// published scope has moved on, retry under it; otherwise the database
+    /// behind the DSN is not the one this source verified - fail closed.
+    fn lineage_moved(
+        &self,
+        scope: &RegistryScope,
+        live: String,
+    ) -> SourceResult<()> {
+        if self.scope.generation() != scope.generation() {
+            return Ok(());
+        }
+        Err(RegistryError::LineageMismatch {
+            source_id: scope.source_id().to_string(),
+            expected: format!("{:?}", scope.lineage().descriptor),
+            live,
+        }
+        .into())
     }
 
     /// Replace the connection DSN after a credential rotation. The loader shares
@@ -168,7 +205,7 @@ impl PostgresSchemaLoader {
         patterns: &[String],
     ) -> SourceResult<Vec<(String, String)>> {
         let t0 = Instant::now();
-        let scope = self.scope().await?;
+        let scope = self.current_scope()?;
         let tables = self.expand_patterns(patterns).await?;
 
         info!(
@@ -189,43 +226,47 @@ impl PostgresSchemaLoader {
                 .get_latest(&scope.key(schema, table))
                 .await
                 .map_err(RegistryError::Storage)?;
-            {
-                let mut cache = self.cache.write().await;
-                match latest {
-                    Some(sv) => {
-                        match serde_json::from_value::<PostgresTableSchema>(
-                            sv.schema_json,
-                        ) {
-                            Ok(pg_schema) => {
-                                let fingerprint = pg_schema.fingerprint();
-                                let column_names = Arc::new(
-                                    pg_schema
-                                        .columns
-                                        .iter()
-                                        .map(|c| c.name.clone())
-                                        .collect::<Vec<_>>(),
-                                );
-                                cache.insert(
+            match latest {
+                Some(sv) => {
+                    match serde_json::from_value::<PostgresTableSchema>(
+                        sv.schema_json,
+                    ) {
+                        Ok(pg_schema) => {
+                            let fingerprint = pg_schema.fingerprint();
+                            let column_names = Arc::new(
+                                pg_schema
+                                    .columns
+                                    .iter()
+                                    .map(|c| c.name.clone())
+                                    .collect::<Vec<_>>(),
+                            );
+                            let loaded = LoadedSchema {
+                                schema: Arc::new(pg_schema),
+                                registry_version: sv.version,
+                                fingerprint: fingerprint.into(),
+                                sequence: sv.sequence,
+                                column_names,
+                            };
+                            if !self
+                                .cache_insert(
+                                    &scope,
                                     (schema.clone(), table.clone()),
-                                    LoadedSchema {
-                                        schema: Arc::new(pg_schema),
-                                        registry_version: sv.version,
-                                        fingerprint: fingerprint.into(),
-                                        sequence: sv.sequence,
-                                        column_names,
-                                    },
-                                );
-                                from_registry += 1;
+                                    loaded,
+                                )
+                                .await
+                            {
+                                return Err(self.scope_changed());
                             }
-                            Err(e) => {
-                                warn!(schema=%schema, table=%table, error=%e,
-                                    "failed to deserialize registry schema; fetching from source");
-                                needs_fetch.push(pair);
-                            }
+                            from_registry += 1;
+                        }
+                        Err(e) => {
+                            warn!(schema=%schema, table=%table, error=%e,
+                                "failed to deserialize registry schema; fetching from source");
+                            needs_fetch.push(pair);
                         }
                     }
-                    None => needs_fetch.push(pair),
                 }
+                None => needs_fetch.push(pair),
             }
         }
 
@@ -296,6 +337,11 @@ impl PostgresSchemaLoader {
     }
 
     /// Load schema with optional checkpoint for registry correlation.
+    ///
+    /// The schema is fetched from the live catalog on a connection that proves
+    /// it belongs to the scope's lineage, registered under that scope, and
+    /// cached only if the scope is still the published one; otherwise the work
+    /// is discarded and retried under the new scope (bounded).
     pub async fn load_schema_at_checkpoint(
         &self,
         schema: &str,
@@ -303,39 +349,58 @@ impl PostgresSchemaLoader {
         checkpoint: Option<&[u8]>,
     ) -> SourceResult<LoadedSchema> {
         let key = (schema.to_string(), table.to_string());
-
-        if self.cache_valid()
-            && let Some(cached) = self.cache.read().await.get(&key)
-        {
-            debug!(schema = %schema, table = %table, "schema cache hit");
-            counter!("deltaforge_source_schema_cache_hits_total",
+        for _ in 0..SCOPE_ATTEMPTS {
+            let scope = self.current_scope()?;
+            if let Some(cached) =
+                self.cache.read().await.get(scope.generation(), &key)
+            {
+                debug!(schema = %schema, table = %table, "schema cache hit");
+                counter!("deltaforge_source_schema_cache_hits_total",
+                    "pipeline" => self.tenant.clone(), "source" => "postgres")
+                .increment(1);
+                return Ok(cached);
+            }
+            counter!("deltaforge_source_schema_cache_misses_total",
                 "pipeline" => self.tenant.clone(), "source" => "postgres")
             .increment(1);
-            return Ok(cached.clone());
+
+            let t0 = Instant::now();
+            let pg_schema = match self.fetch_live(&scope, schema, table).await?
+            {
+                Live::Found(s) => s,
+                Live::Missing => {
+                    return Err(SourceError::Schema {
+                        details: format!("table {schema}.{table} not found")
+                            .into(),
+                    });
+                }
+                Live::OtherLineage(live) => {
+                    self.lineage_moved(&scope, live)?;
+                    continue;
+                }
+            };
+            let loaded = self
+                .register(&scope, schema, table, pg_schema, checkpoint)
+                .await?;
+            if !self.cache_insert(&scope, key.clone(), loaded.clone()).await {
+                continue;
+            }
+
+            let elapsed = t0.elapsed();
+            if elapsed.as_millis() > 200 {
+                warn!(schema = %schema, table = %table, ms = elapsed.as_millis(), "slow schema load");
+            } else {
+                debug!(schema = %schema, table = %table, version = loaded.registry_version, ms = elapsed.as_millis(), "schema loaded");
+            }
+            return Ok(loaded);
         }
-        counter!("deltaforge_source_schema_cache_misses_total",
-            "pipeline" => self.tenant.clone(), "source" => "postgres")
-        .increment(1);
-
-        let t0 = Instant::now();
-        let pg_schema = self.fetch_schema(schema, table).await?;
-        let loaded = self
-            .register_and_cache(schema, table, pg_schema, checkpoint)
-            .await?;
-
-        let elapsed = t0.elapsed();
-        if elapsed.as_millis() > 200 {
-            warn!(schema = %schema, table = %table, ms = elapsed.as_millis(), "slow schema load");
-        } else {
-            debug!(schema = %schema, table = %table, version = loaded.registry_version, ms = elapsed.as_millis(), "schema loaded");
-        }
-
-        Ok(loaded)
+        Err(self.scope_changed())
     }
 
-    /// Register a freshly fetched schema in the durable registry and cache it.
-    async fn register_and_cache(
+    /// Register a freshly fetched schema under `scope` (not cached here).
+    async fn register(
         &self,
+        scope: &RegistryScope,
         schema: &str,
         table: &str,
         pg_schema: PostgresTableSchema,
@@ -347,7 +412,6 @@ impl PostgresSchemaLoader {
         );
         let schema_json = serde_json::to_value(&pg_schema)
             .map_err(|e| SourceError::Other(e.into()))?;
-        let scope = self.scope().await?;
         let version = self
             .registry
             .register_with_checkpoint(
@@ -358,34 +422,26 @@ impl PostgresSchemaLoader {
             )
             .await
             .map_err(RegistryError::Storage)?;
-        let loaded = LoadedSchema {
+        Ok(LoadedSchema {
             schema: Arc::new(pg_schema),
             registry_version: version,
             fingerprint: fingerprint.into(),
             sequence: self.registry.current_sequence(),
             column_names,
-        };
-        self.cache
-            .write()
-            .await
-            .insert((schema.to_string(), table.to_string()), loaded.clone());
-        Ok(loaded)
+        })
     }
 
     /// Load a table's schema for decoding a pgoutput row, using the durable historical
     /// schema when the live table no longer exists.
     ///
-    /// Resolution order:
-    /// 1. cache hit -> return it;
-    /// 2. live catalog has the table -> fetch, register, cache (normal path);
-    /// 3. live table is GONE -> recover from the durable registry, selecting the **one**
-    ///    historical version whose relation identity ([`RelationIdentity`]: table OID +
-    ///    ordered `(name, type_oid)` signature + replica identity) matches the retained
-    ///    relation. Searches the full version history (not just the latest), so WAL
-    ///    encoded under an earlier schema version (A of an A->B evolution) still decodes.
-    ///    Fails closed - never guesses, skips, or advances the checkpoint - when there is
-    ///    no history, no matching version, or more than one matching version (ambiguous
-    ///    lineage, e.g. a same-named relation in another database whose OID collides).
+    /// Resolution order (each attempt under one captured scope, cached only if
+    /// that scope is still published - otherwise retried):
+    /// 1. cache hit for THIS relation -> return it;
+    /// 2. live catalog (proven to be the scope's lineage) has this relation ->
+    ///    register and cache it (normal path);
+    /// 3. otherwise recover from this source's lineage-scoped history via
+    ///    [`resolve_retained_relation`], which fails closed on zero or several
+    ///    matches and never adopts unproven pre-upgrade history.
     pub(crate) async fn load_schema_for_relation(
         &self,
         schema: &str,
@@ -394,56 +450,67 @@ impl PostgresSchemaLoader {
         rel: &RelationIdentity,
     ) -> SourceResult<LoadedSchema> {
         let key = (schema.to_string(), table.to_string());
-        // 1. Cached schema, ONLY if it is THIS relation's schema. A cache entry for the
-        //    same name but a different relation (e.g. a recreated table) must not be used.
-        if self.cache_valid()
-            && let Some(cached) = self.cache.read().await.get(&key)
-            && cached.schema.matches_relation(rel)
-        {
-            return Ok(cached.clone());
-        }
+        for _ in 0..SCOPE_ATTEMPTS {
+            let scope = self.current_scope()?;
+            // 1. Cached schema, ONLY if it is THIS relation's schema. A cache entry
+            //    for the same name but a different relation (e.g. a recreated
+            //    table) must not be used.
+            if let Some(cached) =
+                self.cache.read().await.get(scope.generation(), &key)
+                && cached.schema.matches_relation(rel)
+            {
+                return Ok(cached);
+            }
 
-        // 2. Live catalog, ONLY if it matches this relation identity. A live table whose
-        //    OID/signature/replica differs from the retained relation - e.g. the table
-        //    was dropped and recreated under the same name with a new OID - must NOT be
-        //    used to decode the retained WAL; fall through to the durable history search.
-        if let Some(pg_schema) = self.fetch_schema_opt(schema, table).await?
-            && pg_schema.matches_relation(rel)
-        {
-            return self
-                .register_and_cache(schema, table, pg_schema, checkpoint)
-                .await;
+            // 2. Live catalog, ONLY if it matches this relation identity. A live
+            //    table whose OID/signature/replica differs from the retained
+            //    relation (dropped and recreated under the same name) must NOT be
+            //    used to decode the retained WAL; fall through to history.
+            let loaded = match self.fetch_live(&scope, schema, table).await? {
+                Live::OtherLineage(live) => {
+                    self.lineage_moved(&scope, live)?;
+                    continue;
+                }
+                Live::Found(pg_schema) if pg_schema.matches_relation(rel) => {
+                    self.register(&scope, schema, table, pg_schema, checkpoint)
+                        .await?
+                }
+                Live::Found(_) | Live::Missing => {
+                    // 3. Durable history under this source's verified lineage.
+                    let (version, sequence, pg_schema) =
+                        resolve_retained_relation(
+                            &self.registry,
+                            &scope.key(schema, table),
+                            rel,
+                        )
+                        .await?;
+                    info!(
+                        schema = %schema, table = %table, version,
+                        relation_oid = rel.oid,
+                        "decoding retained WAL for dropped table from durable schema"
+                    );
+                    let fingerprint = pg_schema.fingerprint();
+                    let column_names: Arc<Vec<String>> = Arc::new(
+                        pg_schema
+                            .columns
+                            .iter()
+                            .map(|c| c.name.clone())
+                            .collect(),
+                    );
+                    LoadedSchema {
+                        schema: Arc::new(pg_schema),
+                        registry_version: version,
+                        fingerprint: fingerprint.into(),
+                        sequence,
+                        column_names,
+                    }
+                }
+            };
+            if self.cache_insert(&scope, key.clone(), loaded.clone()).await {
+                return Ok(loaded);
+            }
         }
-
-        // 3. Neither the cache nor the live catalog is this relation. Recover from the
-        //    durable history under this source's verified lineage (paged), then - only
-        //    if that has no match - from the pre-upgrade unscoped history, adopting the
-        //    single uniquely matching version. Zero or multiple matches fail closed.
-        let scope = self.scope().await?;
-        let (version, sequence, pg_schema) = resolve_retained_relation(
-            &self.registry,
-            &scope.key(schema, table),
-            rel,
-        )
-        .await?;
-        let fingerprint = pg_schema.fingerprint();
-        let column_names: Arc<Vec<String>> = Arc::new(
-            pg_schema.columns.iter().map(|c| c.name.clone()).collect(),
-        );
-        let loaded = LoadedSchema {
-            schema: Arc::new(pg_schema),
-            registry_version: version,
-            fingerprint: fingerprint.into(),
-            sequence,
-            column_names,
-        };
-        self.cache.write().await.insert(key, loaded.clone());
-        info!(
-            schema = %schema, table = %table, version,
-            relation_oid = rel.oid,
-            "decoding retained WAL for dropped table from durable schema"
-        );
-        Ok(loaded)
+        Err(self.scope_changed())
     }
 
     /// Force reload schema from database (bypasses cache).
@@ -474,38 +541,43 @@ impl PostgresSchemaLoader {
         schema: &str,
         table: &str,
     ) -> Option<LoadedSchema> {
-        if !self.cache_valid() {
-            return None;
-        }
+        let published = self.scope.generation();
         self.cache.try_read().ok().and_then(|c| {
-            c.get(&(schema.to_string(), table.to_string())).cloned()
+            c.get(published, &(schema.to_string(), table.to_string()))
         })
     }
 
-    /// Fetch full schema from information_schema, mapping a missing table to the
-    /// `table not found` schema error (the historical behavior).
-    async fn fetch_schema(
+    /// Fetch the live schema of `schema_name.table_name`, proving on the SAME
+    /// connection that the catalog belongs to `scope`'s lineage, so a schema read
+    /// from another server can never be registered under this lineage.
+    async fn fetch_live(
         &self,
+        scope: &RegistryScope,
         schema_name: &str,
         table_name: &str,
-    ) -> SourceResult<PostgresTableSchema> {
-        self.fetch_schema_opt(schema_name, table_name)
-            .await?
-            .ok_or_else(|| SourceError::Schema {
-                details: format!("table {schema_name}.{table_name} not found")
-                    .into(),
-            })
-    }
-
-    /// Fetch full schema from information_schema, returning `Ok(None)` when the table
-    /// no longer exists in the live catalog (so callers can fall back to the durable
-    /// historical schema instead of failing).
-    async fn fetch_schema_opt(
-        &self,
-        schema_name: &str,
-        table_name: &str,
-    ) -> SourceResult<Option<PostgresTableSchema>> {
+    ) -> SourceResult<Live> {
         let client = self.connect().await?;
+
+        let live = client
+            .query_opt(
+                "SELECT s.system_identifier, d.oid::int8 \
+                 FROM pg_control_system() s, pg_database d \
+                 WHERE d.datname = current_database()",
+                &[],
+            )
+            .await
+            .map_err(query_error)?
+            .map(|r| (r.get::<_, i64>(0) as u64, r.get::<_, i64>(1) as u64));
+        let same = matches!(
+            (&scope.lineage().descriptor, live),
+            (
+                LineageDescriptor::Postgres { system_identifier, database_oid },
+                Some((sysid, dboid)),
+            ) if *system_identifier == sysid && *database_oid == dboid
+        );
+        if !same {
+            return Ok(Live::OtherLineage(format!("{live:?}")));
+        }
 
         // `a.atttypid` is the column's pgoutput type OID; it is joined in so the
         // persisted schema carries the same (name, type_oid) signature the
@@ -536,7 +608,7 @@ impl PostgresSchemaLoader {
             .map_err(query_error)?;
 
         if col_rows.is_empty() {
-            return Ok(None);
+            return Ok(Live::Missing);
         }
 
         let columns: Vec<PostgresColumn> =
@@ -591,7 +663,7 @@ impl PostgresSchemaLoader {
             .map_err(query_error)?
             .map(|r| r.get::<_, u32>(0));
 
-        Ok(Some(PostgresTableSchema {
+        Ok(Live::Found(PostgresTableSchema {
             columns,
             primary_key,
             replica_identity,
@@ -619,22 +691,25 @@ impl PostgresSchemaLoader {
     pub fn cached_tables(&self) -> Vec<(String, String)> {
         self.cache
             .try_read()
-            .map(|c| c.keys().cloned().collect())
+            .map(|c| c.keys_any_generation())
             .unwrap_or_default()
     }
 }
 
 /// Resolve the schema of a retained pgoutput relation from durable history.
 ///
-/// 1. Page the version history under the source's verified lineage (`key`);
-///    exactly one version matching the full relation identity (OID + ordered
-///    `(name, type_oid)` + replica identity) is used; several are ambiguous.
-/// 2. Only if (1) has no match and migration is enabled: page the pre-upgrade
-///    unscoped history for the same schema/table. A legacy flat key carries no
-///    lineage, so only the single uniquely matching version is adopted - with
-///    its version number, hash and sequence preserved - and every other legacy
-///    version stays unmigrated. Several matches are ambiguous and nothing is
-///    adopted.
+/// Only this source's lineage-scoped history can supply the schema: exactly one
+/// version matching the full relation identity (OID + ordered
+/// `(name, type_oid)` + replica identity) is used; several are ambiguous.
+///
+/// Pre-upgrade (unscoped) history is never adopted here. Its flat key carries no
+/// source or database lineage, and PostgreSQL relation OIDs are database-local,
+/// so a matching OID and column shape cannot prove that the stream belongs to
+/// this database. When the scoped history has no match, the legacy history is
+/// only inspected to fail closed with an actionable error
+/// ([`RegistryError::LegacyOwnershipUnproven`]) if it holds candidates;
+/// adopting them requires the explicit operator mapping of the migration
+/// command. Nothing is written by this function.
 ///
 /// Memory is O(page): only the first match is held while counting.
 pub(crate) async fn resolve_retained_relation(
@@ -690,8 +765,30 @@ pub(crate) async fn resolve_retained_relation(
         return Err(no_match(seen_any, table, relation));
     }
 
-    let mut legacy_found: Option<(LegacyVersion, PostgresTableSchema)> = None;
-    let mut legacy_matches = 0usize;
+    // A `/` inside any segment makes the pre-upgrade flat key ambiguous, so it
+    // is never read; its existence (a conservative count) still blocks
+    // decoding, since unmapped pre-upgrade history might hold this relation.
+    if [&key.tenant, &key.db, &key.table]
+        .iter()
+        .any(|s| s.contains('/'))
+    {
+        let legacy = registry
+            .legacy_len(&key.tenant, &key.db, &key.table)
+            .await
+            .map_err(RegistryError::Storage)?;
+        if legacy > 0 {
+            return Err(RegistryError::LegacyOwnershipUnproven {
+                table,
+                relation,
+                detail: "its pre-upgrade history key is ambiguous (a name \
+                         contains `/`)"
+                    .into(),
+            });
+        }
+        return Err(no_match(seen_any, table, relation));
+    }
+
+    let mut candidates = 0usize;
     let mut cursor = None;
     loop {
         let page = registry
@@ -700,14 +797,10 @@ pub(crate) async fn resolve_retained_relation(
             .map_err(RegistryError::Storage)?;
         for lv in page.versions {
             seen_any = true;
-            if let Ok(s) = serde_json::from_value::<PostgresTableSchema>(
-                lv.schema_json.clone(),
-            ) && s.matches_relation(rel)
+            if serde_json::from_value::<PostgresTableSchema>(lv.schema_json)
+                .is_ok_and(|s| s.matches_relation(rel))
             {
-                legacy_matches += 1;
-                if legacy_found.is_none() {
-                    legacy_found = Some((lv, s));
-                }
+                candidates += 1;
             }
         }
         match page.next {
@@ -715,25 +808,16 @@ pub(crate) async fn resolve_retained_relation(
             None => break,
         }
     }
-    match (legacy_matches, legacy_found) {
-        (1, Some((lv, s))) => {
-            registry
-                .adopt_legacy_version(key, &lv)
-                .await
-                .map_err(RegistryError::Storage)?;
-            info!(
-                table = %table, version = lv.version,
-                "adopted the uniquely matching pre-upgrade schema version"
-            );
-            Ok((lv.version, lv.sequence, s))
-        }
-        (0, _) => Err(no_match(seen_any, table, relation)),
-        (n, _) => Err(RegistryError::AmbiguousLegacy {
+    if candidates > 0 {
+        return Err(RegistryError::LegacyOwnershipUnproven {
             table,
             relation,
-            matches: n,
-        }),
+            detail: format!(
+                "{candidates} pre-upgrade version(s) match its relation identity"
+            ),
+        });
     }
+    Err(no_match(seen_any, table, relation))
 }
 
 fn no_match(seen_any: bool, table: String, relation: String) -> RegistryError {
@@ -909,13 +993,12 @@ impl SourceSchemaLoader for PostgresSchemaLoader {
     }
 
     async fn list_cached(&self) -> Vec<SchemaListEntry> {
-        if !self.cache_valid() {
-            return Vec::new();
-        }
+        let published = self.scope.generation();
         self.cache
             .read()
             .await
-            .iter()
+            .entries_for(published)
+            .into_iter()
             .map(|((schema, table), loaded)| SchemaListEntry {
                 database: schema.clone(),
                 table: table.clone(),
@@ -931,6 +1014,84 @@ impl SourceSchemaLoader for PostgresSchemaLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod scope_race {
+        use super::*;
+
+        fn loaded(column: &str) -> LoadedSchema {
+            let pg_schema =
+                PostgresTableSchema::new(vec![PostgresColumn::new(
+                    column, "integer", true, 1,
+                )]);
+            LoadedSchema {
+                fingerprint: pg_schema.fingerprint().into(),
+                schema: Arc::new(pg_schema),
+                registry_version: 1,
+                sequence: 0,
+                column_names: Arc::new(vec![column.to_string()]),
+            }
+        }
+
+        fn key() -> (String, String) {
+            ("public".to_string(), "orders".to_string())
+        }
+
+        fn loader(scope: &SharedRegistryScope) -> PostgresSchemaLoader {
+            PostgresSchemaLoader::new(
+                "host=127.0.0.1 port=1 user=none dbname=none",
+                DurableSchemaRegistry::for_testing(),
+                "acme",
+                scope.clone(),
+            )
+        }
+
+        fn pg(n: u64) -> LineageDescriptor {
+            LineageDescriptor::postgres(n, n).unwrap()
+        }
+
+        /// Reviewer interleaving: a load starts under A; the lineage changes
+        /// to B; a B lookup populates the cache; the A load finishes last.
+        #[tokio::test]
+        async fn late_result_from_previous_lineage_is_discarded() {
+            let scope = SharedRegistryScope::new("src");
+            scope.publish_for_test("acme", pg(1));
+            let l = loader(&scope);
+
+            let under_a = l.current_scope().unwrap();
+            scope.publish_for_test("acme", pg(2));
+            let under_b = l.current_scope().unwrap();
+            assert!(l.cache_insert(&under_b, key(), loaded("b_col")).await);
+            assert!(
+                !l.cache_insert(&under_a, key(), loaded("a_col")).await,
+                "a result produced under the previous lineage must be discarded"
+            );
+            let served = l.get_cached("public", "orders").unwrap();
+            assert_eq!(served.column_names.as_slice(), ["b_col"]);
+        }
+
+        /// The A result arrives after the lineage changed but before any B
+        /// lookup touched the cache: still discarded, nothing is served.
+        #[tokio::test]
+        async fn result_from_previous_lineage_is_never_cached() {
+            let scope = SharedRegistryScope::new("src");
+            scope.publish_for_test("acme", pg(1));
+            let l = loader(&scope);
+
+            let under_a = l.current_scope().unwrap();
+            assert!(l.cache_insert(&under_a, key(), loaded("a_col")).await);
+            scope.publish_for_test("acme", pg(2));
+            assert!(
+                l.get_cached("public", "orders").is_none(),
+                "A entry not served under B"
+            );
+            assert!(!l.cache_insert(&under_a, key(), loaded("a_col2")).await);
+            assert!(l.get_cached("public", "orders").is_none());
+            assert!(
+                l.cached_tables().contains(&key()),
+                "reconciliation still sees A's tables"
+            );
+        }
+    }
 
     mod retained_resolution {
         use super::*;
@@ -1076,30 +1237,28 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn only_the_unique_legacy_match_is_adopted() {
+        async fn a_unique_legacy_match_does_not_prove_ownership() {
+            // Relation OIDs are database-local: another database in the cluster
+            // (or another source of the tenant) can supply the only legacy
+            // version with this OID and shape. It must not be adopted.
             let b = mem();
             seed_legacy(&b, &table(99, ORDERS, &[])).await;
-            let seq = seed_legacy(&b, &table(10, ORDERS, &[])).await;
+            seed_legacy(&b, &table(10, ORDERS, &[])).await;
             seed_legacy(&b, &table(98, ORDERS, &[])).await;
             let r = registry(&b).await;
-            let (version, sequence, schema) =
-                resolve_retained_relation(&r, &key(), &rel(10))
-                    .await
-                    .unwrap();
-            // Pre-upgrade identity preserved: positional version 2, original sequence.
-            assert_eq!((version, sequence, schema.oid), (2, seq, Some(10)));
-            // The two unproven legacy versions stay unmigrated.
-            assert_eq!(scoped_versions(&r).await, vec![2]);
-            // Resolving again is served from the scoped history.
-            let again = resolve_retained_relation(&r, &key(), &rel(10))
+            let err = resolve_retained_relation(&r, &key(), &rel(10))
                 .await
-                .unwrap();
-            assert_eq!(again.0, 2);
-            assert_eq!(scoped_versions(&r).await, vec![2]);
+                .unwrap_err();
+            assert!(
+                matches!(err, RegistryError::LegacyOwnershipUnproven { ref detail, .. }
+                    if detail.contains("1 pre-upgrade version")),
+                "{err:?}"
+            );
+            assert!(scoped_versions(&r).await.is_empty(), "nothing adopted");
         }
 
         #[tokio::test]
-        async fn ambiguous_legacy_adopts_nothing() {
+        async fn several_legacy_matches_also_fail_closed() {
             let b = mem();
             seed_legacy(&b, &table(10, ORDERS, &[])).await;
             seed_legacy(&b, &table(10, ORDERS, &["id"])).await;
@@ -1108,13 +1267,57 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                matches!(
-                    err,
-                    RegistryError::AmbiguousLegacy { matches: 2, .. }
-                ),
+                matches!(err, RegistryError::LegacyOwnershipUnproven { ref detail, .. }
+                    if detail.contains("2 pre-upgrade version")),
                 "{err:?}"
             );
             assert!(scoped_versions(&r).await.is_empty(), "nothing adopted");
+        }
+
+        #[tokio::test]
+        async fn legacy_history_without_a_match_is_no_match() {
+            let b = mem();
+            seed_legacy(&b, &table(55, ORDERS, &[])).await;
+            let r = registry(&b).await;
+            let err = resolve_retained_relation(&r, &key(), &rel(10))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RegistryError::NoMatch { .. }), "{err:?}");
+        }
+
+        #[tokio::test]
+        async fn ambiguous_legacy_key_is_never_read() {
+            let b = mem();
+            // `public` + `a/b` and `public/a` + `b` share the flat key.
+            let entry = serde_json::json!({
+                "hash": "h",
+                "schema_json": serde_json::to_value(table(10, ORDERS, &[])).unwrap(),
+                "registered_at": serde_json::to_value(chrono::Utc::now()).unwrap(),
+                "checkpoint": null,
+            });
+            b.log_append(
+                "schemas",
+                "t/public/a/b",
+                &serde_json::to_vec(&entry).unwrap(),
+            )
+            .await
+            .unwrap();
+            let r = registry(&b).await;
+            let slash_key = SchemaKey::new("t", "src", "lin", "public", "a/b");
+            let err = resolve_retained_relation(&r, &slash_key, &rel(10))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, RegistryError::LegacyOwnershipUnproven { ref detail, .. }
+                    if detail.contains("ambiguous")),
+                "{err:?}"
+            );
+            // Without any legacy history under that flat key it is simply absent.
+            let other = SchemaKey::new("t", "src", "lin", "public", "x/y");
+            let err = resolve_retained_relation(&r, &other, &rel(10))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, RegistryError::NoHistory { .. }), "{err:?}");
         }
 
         #[tokio::test]

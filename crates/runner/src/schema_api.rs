@@ -9,7 +9,7 @@ use rest_api::{
 };
 use serde_json::Value;
 
-use crate::pipeline_manager::PipelineManager;
+use crate::pipeline_manager::{PipelineManager, PipelineStatus};
 
 /// Typed, retryable response for schema requests made before the pipeline's
 /// source has verified its server identity (its registry scope does not exist
@@ -26,7 +26,7 @@ fn lineage_not_established(pipeline: &str) -> PipelineAPIError {
 /// Map a schema-loader error: an unestablished lineage becomes the typed 503,
 /// anything else stays a failure.
 fn loader_error(pipeline: &str, err: anyhow::Error) -> PipelineAPIError {
-    if sources::registry_scope::is_lineage_not_established(&err) {
+    if sources::registry_scope::is_lineage_unavailable(&err) {
         lineage_not_established(pipeline)
     } else {
         PipelineAPIError::Failed(err)
@@ -169,7 +169,7 @@ impl SchemaController for SchemaApi {
         db: &str,
         table: &str,
     ) -> Result<Vec<SchemaVersionInfo>, PipelineAPIError> {
-        let (tenant, source_id, live_scope) = {
+        let (tenant, source_id, live_scope, stopped) = {
             let pipelines = self.0.pipelines.read();
             let rt = pipelines.get(pipeline).ok_or_else(|| {
                 PipelineAPIError::NotFound(pipeline.to_string())
@@ -178,14 +178,20 @@ impl SchemaController for SchemaApi {
                 rt.spec.metadata.tenant.clone(),
                 rt.spec.spec.source.source_id().to_string(),
                 rt.registry_scope.current().ok(),
+                matches!(rt.status, PipelineStatus::Stopped),
             )
         };
 
-        // The registry is keyed by the source's verified lineage: use the scope
-        // the running source published, else the durably recorded lineage (the
-        // source is stopped). Storage failures are errors, never "no versions".
+        // The registry is keyed by the source's verified lineage. Use the scope
+        // this runtime's source published. Only a definitively stopped pipeline
+        // may fall back to the durably recorded lineage: a starting or running
+        // source that has not verified its server yet may be connected to a
+        // different (replaced) server than the recorded one, so it gets the
+        // typed "not established" response instead of the predecessor's
+        // history. Storage failures are errors, never "no versions".
         let key = match live_scope {
             Some(scope) => scope.key(db, table),
+            None if !stopped => return Err(lineage_not_established(pipeline)),
             None => {
                 let record = storage::adapters::source_lineage::load(
                     self.0.backend(),

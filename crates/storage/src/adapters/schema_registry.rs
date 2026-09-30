@@ -100,6 +100,12 @@ fn parse_v1(bytes: &[u8], log_seq: u64, stream: &str) -> Result<SchemaVersion> {
         "schema registry: unexpected format_version {} in {stream}",
         e.format_version
     );
+    anyhow::ensure!(
+        e.record_version == CURRENT_RECORD_VERSION,
+        "schema registry: unsupported record_version {} in {stream} \
+         (this build reads {CURRENT_RECORD_VERSION}); refusing to interpret it",
+        e.record_version
+    );
     let version = e.version.with_context(|| {
         format!("schema registry: v1 entry without version in {stream}")
     })?;
@@ -113,8 +119,45 @@ fn parse_v1(bytes: &[u8], log_seq: u64, stream: &str) -> Result<SchemaVersion> {
     })
 }
 
-fn legacy_key(tenant: &str, db: &str, table: &str) -> String {
+/// The pre-lineage flat key. Only for the numbering floor, where an ambiguous
+/// key (a `/` inside a segment can make two tables share it) can only
+/// over-count and so keeps version numbers monotonic.
+fn legacy_key_for_numbering(tenant: &str, db: &str, table: &str) -> String {
     format!("{tenant}/{db}/{table}")
+}
+
+/// The pre-lineage flat key for READING legacy versions. A `/` inside any
+/// segment makes the flat key structurally ambiguous (`a/b` + `c` and `a` +
+/// `b/c` collide), so such keys are refused rather than read.
+fn legacy_key_for_read(tenant: &str, db: &str, table: &str) -> Result<String> {
+    for (what, segment) in [("tenant", tenant), ("db", db), ("table", table)] {
+        anyhow::ensure!(
+            !segment.contains('/'),
+            "schema registry: legacy {what} `{segment}` contains `/`; the \
+             pre-lineage key `{tenant}/{db}/{table}` is ambiguous and is not read"
+        );
+    }
+    Ok(format!("{tenant}/{db}/{table}"))
+}
+
+/// Parse an entry from the pre-lineage flat key. Such entries were written
+/// before format versioning existed, so anything carrying v1 fields is not a
+/// genuine legacy record and is refused.
+fn parse_legacy(bytes: &[u8], stream: &str) -> Result<LogEntry> {
+    let e: LogEntry = serde_json::from_slice(bytes).with_context(|| {
+        format!("schema registry: corrupt legacy entry in {stream}")
+    })?;
+    anyhow::ensure!(
+        e.format_version == 0
+            && e.record_version == 0
+            && e.version.is_none()
+            && e.origin_sequence.is_none(),
+        "schema registry: entry in legacy stream {stream} is not a pre-lineage \
+         record (format_version {}, record_version {}); refusing to interpret it",
+        e.format_version,
+        e.record_version
+    );
+    Ok(e)
 }
 
 /// Which v1 stream a version lives in.
@@ -574,7 +617,7 @@ impl DurableSchemaRegistry {
         db: &str,
         table: &str,
     ) -> Result<u64> {
-        let lk = legacy_key(tenant, db, table);
+        let lk = legacy_key_for_numbering(tenant, db, table);
         let exists = self
             .backend
             .log_latest(LEGACY_NS, &lk)
@@ -607,7 +650,7 @@ impl DurableSchemaRegistry {
         limit: usize,
     ) -> Result<LegacyPage> {
         let limit = limit.clamp(1, MAX_HISTORY_PAGE);
-        let lk = legacy_key(tenant, db, table);
+        let lk = legacy_key_for_read(tenant, db, table)?;
         let cur = cursor.unwrap_or(LegacyCursor {
             after_seq: 0,
             next_version: 1,
@@ -621,10 +664,7 @@ impl DurableSchemaRegistry {
             })?;
         let mut versions = Vec::with_capacity(rows.len());
         for (i, r) in rows.iter().enumerate() {
-            let e: LogEntry =
-                serde_json::from_slice(&r.value).with_context(|| {
-                    format!("schema registry: corrupt legacy entry in {lk}")
-                })?;
+            let e = parse_legacy(&r.value, &lk)?;
             versions.push(LegacyVersion {
                 version: cur.next_version + i as i32,
                 hash: e.hash,
@@ -755,12 +795,23 @@ impl DurableSchemaRegistry {
 
     /// Whether a whole-stream migration marker exists for `key`.
     pub async fn is_migrated(&self, key: &SchemaKey) -> Result<bool> {
-        Ok(self
+        let Some(bytes) = self
             .backend
             .kv_get(MIGRATION_NS, &key.backend_key())
             .await
             .context("schema registry: failed to read migration marker")?
-            .is_some())
+        else {
+            return Ok(false);
+        };
+        let marker: MigrationMarker = serde_json::from_slice(&bytes)
+            .context("schema registry: corrupt migration marker")?;
+        anyhow::ensure!(
+            marker.format_version == CURRENT_FORMAT_VERSION,
+            "schema registry: unsupported migration marker format_version {} \
+             (this build reads {CURRENT_FORMAT_VERSION}); refusing to interpret it",
+            marker.format_version
+        );
+        Ok(true)
     }
 
     // ---- indexes + sequence high-water ------------------------------------
@@ -1555,6 +1606,117 @@ mod tests {
         assert_eq!(register(&r, &key(&a), "h3").await, 4);
         // An already-registered schema on A keeps its identity.
         assert_eq!(register(&r, &key(&a), "h2").await, 2);
+    }
+
+    // ---- integrity / version gates ----------------------------------------
+
+    async fn append_raw_v1(
+        b: &ArcStorageBackend,
+        key: &SchemaKey,
+        v: serde_json::Value,
+    ) {
+        b.log_append(
+            V1_NS,
+            &key.backend_key(),
+            &serde_json::to_vec(&v).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    fn raw_v1(record_version: u32) -> serde_json::Value {
+        json!({
+            "format_version": 1,
+            "record_version": record_version,
+            "version": 1,
+            "hash": "h1",
+            "schema_json": {},
+            "registered_at": serde_json::to_value(Utc::now()).unwrap(),
+            "checkpoint": null,
+        })
+    }
+
+    #[tokio::test]
+    async fn v1_entries_require_a_supported_record_version() {
+        let (_f, b) = backend();
+        let key = skey("s", "lin", "t");
+        append_raw_v1(&b, &key, raw_v1(1)).await;
+        assert!(reg(&b).await.get_latest(&key).await.unwrap().is_some());
+
+        let key2 = skey("s", "lin", "future");
+        append_raw_v1(&b, &key2, raw_v1(2)).await;
+        let err = reg(&b).await.get_latest(&key2).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("unsupported record_version 2"),
+            "{err:#}"
+        );
+        let key3 = skey("s", "lin", "zero");
+        append_raw_v1(&b, &key3, raw_v1(0)).await;
+        assert!(reg(&b).await.get_latest(&key3).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_stream_refuses_entries_with_v1_fields() {
+        let (_f, b) = backend();
+        b.log_append(
+            LEGACY_NS,
+            "t/db/orders",
+            &serde_json::to_vec(&raw_v1(1)).unwrap(),
+        )
+        .await
+        .unwrap();
+        let r = reg(&b).await;
+        assert!(r.legacy_page("t", "db", "orders", None, 10).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn ambiguous_legacy_keys_are_not_read() {
+        let (_f, b) = backend();
+        // `a` + `b/c` and `a/b` + `c` share the flat key `t/a/b/c`.
+        b.log_append(
+            LEGACY_NS,
+            "t/a/b/c",
+            &serde_json::to_vec(&json!({
+                "hash": "h", "schema_json": {},
+                "registered_at": serde_json::to_value(Utc::now()).unwrap(),
+                "checkpoint": null,
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let r = reg(&b).await;
+        assert!(r.legacy_page("t", "a", "b/c", None, 10).await.is_err());
+        assert!(r.legacy_page("t", "a/b", "c", None, 10).await.is_err());
+        assert!(r.legacy_page("t/x", "a", "b", None, 10).await.is_err());
+        // Numbering stays conservative: the ambiguous stream still reserves
+        // its versions, so a new version never reuses a number.
+        assert_eq!(
+            register(&r, &SchemaKey::new("t", "s", "lin", "a", "b/c"), "hNew")
+                .await,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_markers_are_version_gated() {
+        let (_f, b) = backend();
+        let key = skey("s", "lin", "orders");
+        let r = reg(&b).await;
+        assert!(!r.is_migrated(&key).await.unwrap());
+        r.mark_migrated(&key).await.unwrap();
+        assert!(r.is_migrated(&key).await.unwrap());
+        b.kv_put(
+            MIGRATION_NS,
+            &key.backend_key(),
+            &serde_json::to_vec(
+                &json!({"migrated_at_ms": 0, "format_version": 7}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(r.is_migrated(&key).await.is_err());
     }
 
     // ---- selected-version adoption ----------------------------------------

@@ -14,9 +14,9 @@
 //! published with a new generation, which invalidates loader caches built under
 //! the old lineage.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use deltaforge_core::SourceError;
 use storage::ArcStorageBackend;
@@ -37,6 +37,13 @@ pub enum RegistryError {
 
     #[error("schema registry storage failure: {0:#}")]
     Storage(anyhow::Error),
+
+    #[error(
+        "source '{source_id}' moved to a new server lineage while a schema was \
+         being loaded; the result was discarded rather than attributed to the \
+         wrong lineage. Retry."
+    )]
+    ScopeChanged { source_id: String },
 
     #[error(
         "source '{source_id}': live lineage {live} does not match the \
@@ -75,15 +82,18 @@ pub enum RegistryError {
     },
 
     #[error(
-        "table {table}: {matches} pre-upgrade (unscoped) schema versions match \
-         the retained relation ({relation}); their ownership cannot be proven, \
-         so none is adopted (fail-closed). Map the legacy history explicitly \
-         with the schema migration command."
+        "table {table}: the retained relation ({relation}) is not in this \
+         source's lineage-scoped schema history, and {detail}. Pre-upgrade \
+         (unscoped) history cannot be attributed to this database \
+         automatically - PostgreSQL relation OIDs are database-local, so a \
+         matching OID and column shape do not prove ownership. Refusing to \
+         decode (fail-closed); map the pre-upgrade history to this source \
+         explicitly with the schema migration command."
     )]
-    AmbiguousLegacy {
+    LegacyOwnershipUnproven {
         table: String,
         relation: String,
-        matches: usize,
+        detail: String,
     },
 }
 
@@ -94,6 +104,7 @@ impl From<RegistryError> for SourceError {
                 err.context("schema registry storage failure"),
             ),
             e @ (RegistryError::NotEstablished { .. }
+            | RegistryError::ScopeChanged { .. }
             | RegistryError::LineageMismatch { .. }) => {
                 SourceError::Incompatible {
                     details: e.to_string().into(),
@@ -106,17 +117,116 @@ impl From<RegistryError> for SourceError {
     }
 }
 
-/// Whether `err` (anywhere in its chain) is [`RegistryError::NotEstablished`]:
-/// the source has not yet verified its server, so schemas are temporarily
-/// unavailable. Callers should report this as "unavailable, retry" - never as
-/// an internal failure and never as "no schema".
-pub fn is_lineage_not_established(err: &anyhow::Error) -> bool {
+/// Whether `err` (anywhere in its chain) says the source's registry lineage is
+/// temporarily unavailable: not yet established
+/// ([`RegistryError::NotEstablished`]) or changing under the request
+/// ([`RegistryError::ScopeChanged`]). Callers should report this as
+/// "unavailable, retry" - never as an internal failure and never as "no schema".
+pub fn is_lineage_unavailable(err: &anyhow::Error) -> bool {
     err.chain().any(|e| {
         matches!(
             e.downcast_ref::<RegistryError>(),
-            Some(RegistryError::NotEstablished { .. })
+            Some(
+                RegistryError::NotEstablished { .. }
+                    | RegistryError::ScopeChanged { .. }
+            )
         )
     })
+}
+
+/// A schema-loader cache whose entries always belong to exactly one scope
+/// generation. A value may only be inserted if the generation it was produced
+/// under is still the published one, so a load that finished after a lineage
+/// change can never be served under the new lineage.
+#[derive(Debug)]
+pub(crate) struct ScopedCache<V> {
+    generation: u64,
+    entries: HashMap<(String, String), V>,
+}
+
+impl<V: Clone> Default for ScopedCache<V> {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            entries: HashMap::new(),
+        }
+    }
+}
+
+impl<V: Clone> ScopedCache<V> {
+    /// The entry for `key`, only if the cache belongs to `published` (the
+    /// generation currently published).
+    pub(crate) fn get(
+        &self,
+        published: u64,
+        key: &(String, String),
+    ) -> Option<V> {
+        if published == 0 || self.generation != published {
+            return None;
+        }
+        self.entries.get(key).cloned()
+    }
+
+    /// Insert `value`, produced under generation `produced`, only if that is
+    /// still the `published` generation. Otherwise nothing is inserted and
+    /// `false` is returned; the caller must retry under the new scope.
+    pub(crate) fn insert_if_current(
+        &mut self,
+        produced: u64,
+        published: u64,
+        key: (String, String),
+        value: V,
+    ) -> bool {
+        // Generations only move forward: never let an older generation's value
+        // (even one paired with a stale reading of the published generation)
+        // replace a newer cache.
+        if produced == 0 || produced != published || produced < self.generation
+        {
+            return false;
+        }
+        if self.generation != produced {
+            self.entries.clear();
+            self.generation = produced;
+        }
+        self.entries.insert(key, value);
+        true
+    }
+
+    pub(crate) fn remove(&mut self, key: &(String, String)) {
+        self.entries.remove(key);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// Drop entries whose key does not satisfy `keep`.
+    pub(crate) fn retain(
+        &mut self,
+        mut keep: impl FnMut(&(String, String)) -> bool,
+    ) {
+        self.entries.retain(|k, _| keep(k));
+    }
+
+    /// Keys of the cached entries regardless of generation (failover
+    /// reconciliation diffs exactly the tables tracked before a lineage change).
+    pub(crate) fn keys_any_generation(&self) -> Vec<(String, String)> {
+        self.entries.keys().cloned().collect()
+    }
+
+    /// Entries belonging to `published`, for listing.
+    pub(crate) fn entries_for(
+        &self,
+        published: u64,
+    ) -> Vec<((String, String), V)> {
+        if published == 0 || self.generation != published {
+            return Vec::new();
+        }
+        self.entries
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
 }
 
 /// The verified lineage a source's registry keys are qualified by.
@@ -174,43 +284,46 @@ impl RegistryScope {
     }
 }
 
+/// Published scope and the last generation handed out, under ONE lock so the
+/// scope and its generation can never be observed out of step.
 #[derive(Debug, Default)]
-struct Inner {
-    current: RwLock<Option<Arc<RegistryScope>>>,
-    generation: AtomicU64,
+struct ScopeState {
+    current: Option<Arc<RegistryScope>>,
+    last_generation: u64,
 }
 
 /// Handle shared by one source and every schema loader of its pipeline.
 #[derive(Debug, Clone, Default)]
 pub struct SharedRegistryScope {
-    inner: Arc<Inner>,
+    state: Arc<RwLock<ScopeState>>,
     source_id: Arc<str>,
 }
 
 impl SharedRegistryScope {
     pub fn new(source_id: &str) -> Self {
         Self {
-            inner: Arc::default(),
+            state: Arc::default(),
             source_id: source_id.into(),
         }
     }
 
-    /// Generation of the published scope; 0 until one is established. Cheap
-    /// (one atomic load) so loaders can validate cache entries per event.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, ScopeState> {
+        self.state.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Generation of the published scope; 0 until one is established. Read
+    /// from the same state as [`Self::current`], so the two always agree.
     pub fn generation(&self) -> u64 {
-        self.inner.generation.load(Ordering::Acquire)
+        self.read().current.as_ref().map_or(0, |s| s.generation)
     }
 
     /// The published scope, or [`RegistryError::NotEstablished`].
     pub fn current(&self) -> Result<Arc<RegistryScope>, RegistryError> {
-        self.inner
-            .current
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
-            .ok_or_else(|| RegistryError::NotEstablished {
+        self.read().current.clone().ok_or_else(|| {
+            RegistryError::NotEstablished {
                 source_id: self.source_id.to_string(),
-            })
+            }
+        })
     }
 
     fn publish(
@@ -219,24 +332,15 @@ impl SharedRegistryScope {
         source_id: &str,
         lineage: LineageRef,
     ) -> Arc<RegistryScope> {
-        let mut slot = self
-            .inner
-            .current
-            .write()
-            .unwrap_or_else(|p| p.into_inner());
-        let generation = self
-            .inner
-            .generation
-            .load(Ordering::Acquire)
-            .saturating_add(1);
+        let mut state = self.state.write().unwrap_or_else(|p| p.into_inner());
+        state.last_generation = state.last_generation.saturating_add(1);
         let scope = Arc::new(RegistryScope {
             tenant: tenant.to_string(),
             source_id: source_id.to_string(),
             lineage,
-            generation,
+            generation: state.last_generation,
         });
-        *slot = Some(scope.clone());
-        self.inner.generation.store(generation, Ordering::Release);
+        state.current = Some(scope.clone());
         scope
     }
 
@@ -442,15 +546,13 @@ mod tests {
         let err = anyhow::Error::new(RegistryError::NotEstablished {
             source_id: "src".into(),
         });
-        assert!(is_lineage_not_established(&err));
+        assert!(is_lineage_unavailable(&err));
         let wrapped = err.context("loading schema for public.orders");
-        assert!(is_lineage_not_established(&wrapped));
-        assert!(!is_lineage_not_established(&anyhow::anyhow!(
-            "table not found"
-        )));
+        assert!(is_lineage_unavailable(&wrapped));
+        assert!(!is_lineage_unavailable(&anyhow::anyhow!("table not found")));
         let storage =
             anyhow::Error::new(RegistryError::Storage(anyhow::anyhow!("io")));
-        assert!(!is_lineage_not_established(&storage));
+        assert!(!is_lineage_unavailable(&storage));
     }
 
     #[tokio::test]
@@ -475,11 +577,11 @@ mod tests {
         for loader in loaders {
             assert!(!loader.lineage_established());
             let err = loader.load("public", "orders").await.unwrap_err();
-            assert!(is_lineage_not_established(&err), "{err:#}");
+            assert!(is_lineage_unavailable(&err), "{err:#}");
             let err = loader.reload("public", "orders").await.unwrap_err();
-            assert!(is_lineage_not_established(&err), "{err:#}");
+            assert!(is_lineage_unavailable(&err), "{err:#}");
             let err = loader.reload_all(&[]).await.unwrap_err();
-            assert!(is_lineage_not_established(&err), "{err:#}");
+            assert!(is_lineage_unavailable(&err), "{err:#}");
         }
         scope.publish_for_test("acme", pg_desc());
         assert!(pg.lineage_established() && my.lineage_established());
@@ -487,6 +589,43 @@ mod tests {
 
     fn pg_desc() -> LineageDescriptor {
         pg(1, 2)
+    }
+
+    #[test]
+    fn scoped_cache_only_accepts_values_from_the_published_generation() {
+        let key = ("public".to_string(), "orders".to_string());
+        let mut cache = ScopedCache::<&str>::default();
+        // Produced under generation 1 while 1 is published: accepted.
+        assert!(cache.insert_if_current(1, 1, key.clone(), "a"));
+        assert_eq!(cache.get(1, &key), Some("a"));
+        // Generation 2 is published: the generation-1 entry is not served...
+        assert_eq!(cache.get(2, &key), None);
+        // ...and a late generation-1 value is rejected.
+        assert!(!cache.insert_if_current(1, 2, key.clone(), "stale"));
+        // A generation-2 value replaces everything from generation 1.
+        assert!(cache.insert_if_current(2, 2, key.clone(), "b"));
+        assert_eq!(cache.get(2, &key), Some("b"));
+        // Once the cache is at generation 2, a late generation-1 value is still
+        // rejected even if it claims generation 1 is published (stale reader).
+        assert!(!cache.insert_if_current(1, 1, key.clone(), "stale"));
+        assert_eq!(cache.get(2, &key), Some("b"));
+        // Unpublished (0) is never cached or served.
+        assert!(!cache.insert_if_current(0, 0, key.clone(), "x"));
+        assert_eq!(cache.get(0, &key), None);
+    }
+
+    #[test]
+    fn published_scope_and_generation_always_agree() {
+        let shared = SharedRegistryScope::new("src");
+        assert_eq!(shared.generation(), 0);
+        for i in 1..=5u64 {
+            let s = shared.publish_for_test("acme", pg(i, i));
+            assert_eq!(s.generation(), i);
+            assert_eq!(
+                shared.generation(),
+                shared.current().unwrap().generation()
+            );
+        }
     }
 
     #[test]
@@ -499,10 +638,10 @@ mod tests {
         }
         .into();
         assert!(matches!(missing, SourceError::Incompatible { .. }));
-        let ambiguous: SourceError = RegistryError::AmbiguousLegacy {
+        let ambiguous: SourceError = RegistryError::LegacyOwnershipUnproven {
             table: "t".into(),
             relation: "r".into(),
-            matches: 2,
+            detail: "2 pre-upgrade versions match".into(),
         }
         .into();
         assert!(matches!(ambiguous, SourceError::Schema { .. }));

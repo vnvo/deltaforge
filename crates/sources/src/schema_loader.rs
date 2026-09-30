@@ -86,7 +86,7 @@ pub trait SourceSchemaLoader: Send + Sync {
     /// fail with a typed
     /// [`RegistryError::NotEstablished`](crate::registry_scope::RegistryError)
     /// (detect it with
-    /// [`is_lineage_not_established`](crate::registry_scope::is_lineage_not_established)).
+    /// [`is_lineage_unavailable`](crate::registry_scope::is_lineage_unavailable)).
     fn lineage_established(&self) -> bool {
         true
     }

@@ -140,9 +140,7 @@ impl SchemaProvider for SchemaLoaderAdapter {
 
         let loaded = match self.loader.load(db, tbl).await {
             Ok(loaded) => loaded,
-            Err(e)
-                if sources::registry_scope::is_lineage_not_established(&e) =>
-            {
+            Err(e) if sources::registry_scope::is_lineage_unavailable(&e) => {
                 return Err(SchemaLookupError::LineageNotEstablished {
                     table: table.to_string(),
                 });

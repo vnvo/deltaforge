@@ -2685,6 +2685,74 @@ mod tests {
         );
     }
 
+    /// After a restart the durable lineage record still names the PREVIOUS
+    /// server. Until the restarted source verifies its current server, the
+    /// versions endpoint must not serve that predecessor's history; only a
+    /// definitively stopped pipeline may read the recorded lineage.
+    #[tokio::test]
+    async fn versions_do_not_expose_the_recorded_lineage_while_starting() {
+        use rest_api::SchemaController;
+        use storage::adapters::{LineageDescriptor, SchemaKey, source_lineage};
+        let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        let mgr = Arc::new(
+            manager_with_ckpt(
+                Arc::clone(&backend),
+                Arc::new(checkpoints::MemCheckpointStore::new().unwrap()),
+            )
+            .await,
+        );
+        // Previous run: lineage recorded and a version registered under it.
+        let previous =
+            LineageDescriptor::mysql("3e11fa47-71ca-11e1-9e33-c80aa9429562")
+                .unwrap();
+        let record =
+            source_lineage::establish(&backend, "acme", "mysql", previous)
+                .await
+                .unwrap()
+                .record;
+        mgr.registry()
+            .register_with_checkpoint(
+                &SchemaKey::new(
+                    "acme",
+                    "mysql",
+                    record.current.lineage_hash.as_str(),
+                    "shop",
+                    "orders",
+                ),
+                "h1",
+                &serde_json::json!({"columns": []}),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Restarted: running, but the source has not verified its server yet.
+        let rt = bare_runtime(sample_spec("p"), None);
+        assert!(matches!(rt.status, PipelineStatus::Running));
+        mgr.pipelines.write().insert("p".to_string(), rt);
+        let api = crate::schema_api::SchemaApi::new(Arc::clone(&mgr));
+        let err = api
+            .get_schema_versions("p", "shop", "orders")
+            .await
+            .expect_err(
+                "a starting source must not expose the recorded lineage",
+            );
+        assert!(
+            matches!(err, PipelineAPIError::SchemaLineageNotEstablished(_)),
+            "{err:?}"
+        );
+
+        // Definitively stopped: the recorded lineage is the right one to read.
+        mgr.pipelines.write().get_mut("p").unwrap().status =
+            PipelineStatus::Stopped;
+        let versions = api
+            .get_schema_versions("p", "shop", "orders")
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].fingerprint, "h1");
+    }
+
     /// A registered runtime with no live tasks (unless `join` is supplied), for
     /// driving delete() without spawning a real source.
     fn bare_runtime(
