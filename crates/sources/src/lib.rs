@@ -20,6 +20,7 @@ pub mod schema_loader;
 pub mod snapshot_event_id;
 pub mod snapshot_frontier;
 pub mod snapshot_generation;
+pub mod stream_probe;
 // Phase 2 lease-lifecycle machinery (models + durable store + pure state machine).
 // Consumed by the Phase 2 integration slice (Vault lease ops/scheduler/recovery) and
 // Phase 3; unused in production until then, so its API is allowed to be dead here.

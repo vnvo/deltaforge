@@ -422,38 +422,42 @@ impl MySqlSource {
             client.gtid_enabled.then(|| client.gtid_set.clone());
         let checkpoint_file = client.binlog_filename.clone();
 
-        // Pre-connect failover adjustment: if A's GTID checkpoint would be rejected
-        // by B ("purged required binary logs"), switch to B's tail before capturing
-        // init_gtid so the first stream opens cleanly. Without this, the "purged"
-        // error fires on the first stream read and the reconnect loop re-sends the
-        // stale GTID forever (identity_store already stores B after reconciliation,
-        // so the in-loop pre-connect check always sees Same).
-        if client.gtid_enabled {
-            let id_store = IdentityStore::new(Arc::clone(&self.backend));
-            if let Ok(Some(live_id)) =
-                fetch_server_identity(self.dsn.expose()).await
-            {
-                let live = ServerIdentity::from(live_id);
-                if matches!(
-                    id_store.compare(&self.id, &live).await,
-                    Ok(IdentityComparison::Changed { .. })
-                ) {
-                    match resolve_binlog_tail(self.dsn.expose()).await {
-                        Ok((fname, fpos)) => {
-                            warn!(
-                                source_id = %self.id,
-                                "pre-connect failover: switching from A's GTID to B's binlog tail"
-                            );
-                            client.gtid_enabled = false;
-                            client.gtid_set = String::new();
-                            client.binlog_filename = fname;
-                            client.binlog_position = fpos as u32;
-                        }
-                        Err(e) => {
-                            warn!(source_id = %self.id, error = %e,
-                                "pre-connect: could not resolve B's tail, will attempt with stale GTID");
-                        }
-                    }
+        // Fetch and verify the live server identity ONCE, in every mode, before
+        // opening the binlog stream. Reused below for the pre-connect position
+        // decision and for the durable identity resolution. Fails closed: the
+        // stream must not open on an unverified server.
+        let live = fetch_identity_verified(self.dsn.expose()).await?;
+        let id_store = IdentityStore::new(Arc::clone(&self.backend));
+
+        // Pre-connect failover position: if the server changed, A's checkpoint
+        // GTID/file is meaningless on B. Switch to B's binlog tail before
+        // capturing the init position so the first stream opens cleanly - in
+        // file/pos mode too, not only GTID. Fail closed if the tail cannot be
+        // resolved rather than open on A's stale position against B.
+        if matches!(
+            id_store
+                .compare(&self.id, &live)
+                .await
+                .map_err(SourceError::Other)?,
+            IdentityComparison::Changed { .. }
+        ) {
+            match resolve_binlog_tail(self.dsn.expose()).await {
+                Ok((fname, fpos)) => {
+                    warn!(
+                        source_id = %self.id,
+                        "pre-connect failover: switching from A's position to B's binlog tail"
+                    );
+                    client.gtid_enabled = false;
+                    client.gtid_set = String::new();
+                    client.binlog_filename = fname;
+                    client.binlog_position = fpos as u32;
+                }
+                Err(e) => {
+                    return Err(SourceError::Other(anyhow::anyhow!(
+                        "failover detected but could not resolve the new \
+                         server's binlog tail: {e}; refusing to stream on a \
+                         stale position"
+                    )));
                 }
             }
         }
@@ -521,11 +525,15 @@ impl MySqlSource {
             durable_lineage: self.capture_snapshot_lineage().await.ok(),
         };
 
+        // Resolve the identity BEFORE opening the stream: persist FirstSeen,
+        // reconcile a detected change, or verify a Same position is still
+        // reachable. Reuse the identity already verified above. A failure here
+        // means no binlog stream is opened. The registry still holds A's schema
+        // for the reconciler's drift diff; preload stays deferred until after.
+        check_identity_post_reconnect(&mut ctx, Some(live)).await?;
+
         info!(source_id=%self.id, "connecting for binlog stream ..");
         let mut stream = connect_first_stream(&ctx, client).await?;
-
-        // Identity check before preload: registry still holds A's schema here.
-        check_identity_post_reconnect(&mut ctx).await?;
 
         // Safe to preload now: reconciliation has run, registry reflects post-reconcile state.
         let tracked = ctx.schema.preload(&self.tables).await?;
@@ -873,7 +881,7 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
 
     ctx.retry.reset();
 
-    check_identity_post_reconnect(ctx).await?;
+    check_identity_post_reconnect(ctx, None).await?;
 
     Ok(stream)
 }
@@ -910,30 +918,78 @@ async fn do_reconnect(ctx: &mut RunCtx) -> SourceResult<Option<BinlogStream>> {
 // Failover detection + reconciliation
 // ============================================================================
 
+/// Bounded attempts to fetch the live server identity before failing closed.
+const IDENTITY_FETCH_ATTEMPTS: u32 = 5;
+
+/// Fetch the live MySQL server identity with bounded retries, failing closed if
+/// it cannot be obtained or is absent. Identity is a correctness authority: the
+/// source must never continue against an unverified server, so a persistent
+/// fetch failure (or a server that exposes no identity) stops the source rather
+/// than being silently skipped.
+async fn fetch_identity_verified(dsn: &str) -> SourceResult<ServerIdentity> {
+    let mut attempt = 0u32;
+    loop {
+        match fetch_server_identity(dsn).await {
+            Ok(Some(id)) => return Ok(ServerIdentity::from(id)),
+            Ok(None) => {
+                return Err(SourceError::Other(anyhow::anyhow!(
+                    "server identity unavailable (no server_uuid/server_id); \
+                     cannot verify server lineage - refusing to stream"
+                )));
+            }
+            Err(e) => {
+                attempt += 1;
+                if attempt >= IDENTITY_FETCH_ATTEMPTS {
+                    return Err(SourceError::Other(anyhow::anyhow!(
+                        "failed to fetch server identity after {attempt} \
+                         attempts: {e}; refusing to stream on unverified identity"
+                    )));
+                }
+                warn!(
+                    source_id = "?", attempt, error = %e,
+                    "identity fetch failed; retrying before failing closed"
+                );
+                tokio::time::sleep(Duration::from_millis(
+                    200 * 2u64.pow(attempt.min(5)),
+                ))
+                .await;
+            }
+        }
+    }
+}
+
 /// Compare the live server identity against the stored one.
 ///
 /// - `FirstSeen`: store and continue (clean start or wiped state).
 /// - `Same`: normal reconnect, nothing to do.
 /// - `Changed`: run full failover reconciliation before returning.
-async fn check_identity_post_reconnect(ctx: &mut RunCtx) -> SourceResult<()> {
-    let live_mysql = match fetch_server_identity(ctx.dsn.expose()).await {
-        Ok(Some(id)) => id,
-        Ok(None) => return Ok(()), // MySQL < 5.6 or unavailable - skip silently
-        Err(e) => {
-            warn!(source_id = %ctx.source_id, error = %e, "could not fetch server identity, skipping check");
-            return Ok(());
-        }
+///
+/// Identity fetch, comparison, and persistence are correctness authority: any
+/// failure fails closed (propagated), never mapped to `Same`.
+///
+/// `prefetched` reuses an identity already verified by the caller (startup path)
+/// so the live server is queried once; `None` fetches and verifies here (the
+/// reconnect path).
+async fn check_identity_post_reconnect(
+    ctx: &mut RunCtx,
+    prefetched: Option<ServerIdentity>,
+) -> SourceResult<()> {
+    let live = match prefetched {
+        Some(live) => live,
+        None => fetch_identity_verified(ctx.dsn.expose()).await?,
     };
-    let live = ServerIdentity::from(live_mysql);
 
     match ctx
         .identity_store
         .compare(&ctx.source_id, &live)
         .await
-        .unwrap_or(IdentityComparison::Same) // transient storage error -> treat as same
+        .map_err(SourceError::Other)?
     {
         IdentityComparison::FirstSeen => {
-            let _ = ctx.identity_store.store(&ctx.source_id, &live).await;
+            ctx.identity_store
+                .store(&ctx.source_id, &live)
+                .await
+                .map_err(SourceError::Other)?;
         }
         IdentityComparison::Same => {
             // A RESET BINARY LOGS AND GTIDS wipes the GTID history without
@@ -1067,8 +1123,13 @@ async fn run_failover_reconciliation(
         }
     }
 
-    // Persist new identity only after reconciliation completes.
-    let _ = ctx.identity_store.store(&ctx.source_id, &current).await;
+    // Persist new identity only after reconciliation completes. Fail closed if
+    // the durable write does not commit: continuing would leave stale identity
+    // authority and re-run reconciliation (or miss a later change).
+    ctx.identity_store
+        .store(&ctx.source_id, &current)
+        .await
+        .map_err(SourceError::Other)?;
 
     // Clear streaming position so subsequent reconnects resolve B's binlog tail
     // rather than re-sending A's GTID. Covers mid-run failovers where the stream
@@ -1158,6 +1219,34 @@ mod compare_checkpoints_tests {
                 &cp("bin.000001", 42)
             ),
             CheckpointOrder::Equal
+        );
+    }
+}
+
+#[cfg(test)]
+mod identity_fail_closed_tests {
+    //! R3-C2: MySQL live identity fetch fails closed.
+    //!
+    //! Container-backed failover behaviour (identity change detection, GTID tail
+    //! switch, reconciliation) is covered by `tests/failover_e2e.rs`. Here we
+    //! prove the shared `fetch_identity_verified` helper - used by both the
+    //! pre-connect and post-reconnect paths - refuses to return when the live
+    //! identity query cannot reach the server, instead of yielding an absent
+    //! identity that would let the stream open on an unverified lineage.
+    use super::fetch_identity_verified;
+
+    // Port 1 is not bound; the connect is refused fast (ECONNREFUSED).
+    const UNREACHABLE_DSN: &str = "mysql://root:none@127.0.0.1:1/none";
+
+    #[tokio::test]
+    async fn fetch_identity_verified_fails_closed_when_query_unavailable() {
+        let err = fetch_identity_verified(UNREACHABLE_DSN)
+            .await
+            .expect_err("unreachable server must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to stream"),
+            "error should refuse to stream on unverified identity, got: {msg}"
         );
     }
 }
