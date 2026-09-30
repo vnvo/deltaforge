@@ -117,6 +117,7 @@ These are documented in full on [Guarantees & Correctness](guarantees.md); the s
 - **Changing a pipeline's sink set via `PATCH` is disabled.** Adding or removing a sink changes the per-sink checkpoint keys, which is not crash-safe; a `PATCH` that alters the sink set is rejected. Patches that leave the sink set unchanged are allowed. To change sinks, delete and recreate the pipeline.
 - **Deleting a pipeline is fail-closed.** Delete stops the source, cleans up its checkpoints, and only then releases the source-id claim; if checkpoint cleanup fails, the delete fails and the source id stays locked (safe: it blocks reuse rather than exposing stale checkpoints). Retry the delete once the store is reachable.
 - Cross-primary position safety at failover depends on GTID (MySQL) and slot-aware HA (PostgreSQL); see [Failover Handling](failover.md).
+- **MySQL cannot replay binlog rows across a DDL.** If a restart replays rows written before a DDL on the table, the source stops fail-closed (no event, no checkpoint advance) instead of decoding them against the newer schema. Recover by resuming from a position after the DDL or re-snapshotting the table. Set `binlog_row_metadata=FULL` so column names are verified as well as count and types. See [Guarantees](guarantees.md#mysql-replay-across-a-schema-change).
 
 ## Out of scope
 

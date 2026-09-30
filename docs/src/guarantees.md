@@ -211,6 +211,14 @@ Some errors are unrecoverable and stop the pipeline immediately:
 
 Fatal errors return `SinkError::Fatal` and are not retried. The pipeline stops and requires operator intervention.
 
+### MySQL replay across a schema change
+
+MySQL rows are decoded by column position against the table's current schema. Before decoding each rows event, the source checks that the column layout the binlog recorded for those rows (column count, storage types, and column names when the server writes them with `binlog_row_metadata=FULL`) matches that schema. If the loaded schema may be stale it is reloaded once; if the rows still do not match, the source **stops fail-closed**: it emits no event for those rows and does not advance the checkpoint, rather than put values under the wrong columns.
+
+This happens when a restart replays binlog rows that were written **before a DDL** on the table (the rows are older than the table's current definition) - for example when the pipeline stopped after the DDL but before its checkpoint passed it. Replaying MySQL rows across a DDL is **not supported yet** (historical schema selection is planned). To recover, resume from a binlog position after the DDL, or re-snapshot the table.
+
+Residual limitation: with `binlog_row_metadata=MINIMAL` (the MySQL default) column names are not in the binlog, so a DDL that keeps the column count and every column's storage type (for example swapping two same-typed columns) cannot be detected. Set `binlog_row_metadata=FULL` to have names verified too.
+
 ### S3 sink atomicity guarantees
 
 The S3 sink commits at **file granularity**, not event granularity. Specifically:

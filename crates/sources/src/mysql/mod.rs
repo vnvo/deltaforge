@@ -49,6 +49,7 @@ pub use mysql_identity::{
     MysqlIdentityError, mysql_identity_cell, mysql_identity_kind,
 };
 
+mod mysql_table_map_check;
 mod mysql_table_schema;
 use crate::mysql::mysql_helpers::{
     connect_binlog_with_retries, resolve_binlog_tail,

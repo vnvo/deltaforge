@@ -18,6 +18,9 @@ use tracing::instrument;
 use tracing::{debug, error, info, warn};
 
 use crate::mysql::mysql_helpers::{make_checkpoint_meta, short_sql};
+use crate::mysql::mysql_schema_loader::LoadedSchema;
+use crate::mysql::mysql_table_map_check::table_map_mismatch;
+use std::sync::Arc;
 
 use deltaforge_config::OUTBOX_SCHEMA_SENTINEL;
 
@@ -152,7 +155,50 @@ async fn handle_table_map(
     Ok(())
 }
 
-/// Build SourceInfo for MySQL events
+/// The schema to decode `tm`'s rows with, verified against the layout the
+/// binlog recorded for them.
+///
+/// Rows are decoded positionally, so decoding them with a schema of a different
+/// layout would put values under the wrong columns. A mismatch against the
+/// cached schema triggers one reload (the cache can predate a DDL that was not
+/// attributed to this table); a mismatch against the live schema fails closed
+/// before any event for these rows is emitted, so the checkpoint cannot move
+/// past them.
+async fn verified_schema(
+    ctx: &RunCtx,
+    tm: &TableMapEvent,
+) -> SourceResult<Arc<LoadedSchema>> {
+    let (db, table) = (&tm.database_name, &tm.table_name);
+    let loaded = ctx.schema.load_schema(db, table).await?;
+    if table_map_mismatch(tm, &loaded.schema.columns).is_none() {
+        return Ok(loaded);
+    }
+    let reloaded = ctx.schema.reload_schema(db, table).await?;
+    match table_map_mismatch(tm, &reloaded.schema.columns) {
+        None => Ok(reloaded),
+        Some(reason) => {
+            error!(
+                source_id = %ctx.source_id, db = %db, table = %table, %reason,
+                "binlog rows do not match the table's current schema; failing closed"
+            );
+            Err(SourceError::Schema {
+                details: format!(
+                    "table {db}.{table}: {reason}. These binlog rows were written \
+                     under a different table definition than the current one (for \
+                     example, a restart replaying rows written before a DDL). \
+                     Decoding them positionally would put values under the wrong \
+                     columns, so no event was emitted and the checkpoint was not \
+                     advanced (fail-closed). Replaying MySQL rows across a DDL is \
+                     not supported yet: resume from a binlog position after the \
+                     DDL, or re-snapshot the table."
+                )
+                .into(),
+            })
+        }
+    }
+}
+
+/// Build SourceInfo for MySQL events/// Build SourceInfo for MySQL events
 fn build_source_info(
     ctx: &RunCtx,
     header: &EventHeader,
@@ -199,10 +245,7 @@ async fn handle_write_rows(
         if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
-        let loaded = ctx
-            .schema
-            .load_schema(&tm.database_name, &tm.table_name)
-            .await?;
+        let loaded = verified_schema(ctx, tm).await?;
         let row_count = wr.rows.len();
         debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=row_count, "write_rows");
 
@@ -298,10 +341,7 @@ async fn handle_update_rows(
         if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
-        let loaded = ctx
-            .schema
-            .load_schema(&tm.database_name, &tm.table_name)
-            .await?;
+        let loaded = verified_schema(ctx, tm).await?;
         debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=ur.rows.len(), "update_rows");
 
         let ts_ms = ts_sec_to_ms(header.timestamp);
@@ -397,10 +437,7 @@ async fn handle_delete_rows(
         if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
-        let loaded = ctx
-            .schema
-            .load_schema(&tm.database_name, &tm.table_name)
-            .await?;
+        let loaded = verified_schema(ctx, tm).await?;
         debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=dr.rows.len(), "delete_rows");
 
         let ts_ms = ts_sec_to_ms(header.timestamp);
@@ -1141,9 +1178,14 @@ mod tests {
                 table_id: TABLE_ID,
                 database_name: "shop".to_string(),
                 table_name: "orders".to_string(),
-                column_types: vec![],
-                column_metas: vec![],
-                null_bits: vec![],
+                // Matches the from_static schema: two varchar columns.
+                column_types: vec![
+                    mysql_binlog_connector_rust::column::column_type::ColumnType::VarChar
+                        as u8;
+                    2
+                ],
+                column_metas: vec![255, 255],
+                null_bits: vec![true, true],
                 table_metadata: None,
             },
         );
@@ -1203,6 +1245,44 @@ mod tests {
             next_event_position: 1234,
             event_flags: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn rows_with_an_incompatible_table_map_fail_closed_without_emitting()
+    {
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        // The binlog recorded three columns (a row written before a column was
+        // dropped); the schema used for decoding has two. The reload of the live
+        // schema cannot fix it, so the rows must be refused.
+        ctx.table_map.get_mut(&TABLE_ID).unwrap().column_types.push(
+            mysql_binlog_connector_rust::column::column_type::ColumnType::VarChar
+                as u8,
+        );
+        ctx.table_map
+            .get_mut(&TABLE_ID)
+            .unwrap()
+            .column_metas
+            .push(255);
+
+        let ev = WriteRowsEvent {
+            table_id: TABLE_ID,
+            included_columns: vec![true, true, true],
+            rows: vec![RowEvent {
+                column_values: vec![
+                    ColumnValue::LongLong(1),
+                    ColumnValue::String(b"A1".to_vec()),
+                    ColumnValue::String(b"B1".to_vec()),
+                ],
+            }],
+        };
+
+        let result = handle_write_rows(&mut ctx, &make_header(), ev).await;
+        assert!(result.is_err(), "mismatched rows must fail closed");
+        assert!(
+            rx.try_recv().is_err(),
+            "no event may be emitted for rows that cannot be decoded safely"
+        );
     }
 
     #[tokio::test]
