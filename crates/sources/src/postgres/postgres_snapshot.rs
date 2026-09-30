@@ -217,6 +217,9 @@ pub async fn run_snapshot(
     let preflight = health::run_preflight(
         ctx.dsn,
         ctx.slot_name,
+        // DeltaForge creates and owns the slot as part of the snapshot anchor, so
+        // an absent slot here is expected, not a hard error.
+        health::SlotPresence::CreatedByDeltaforge,
         // publication name not on ctx - pass empty string; publication check
         // is already done in ensure_slot_and_publication before we get here.
         // Pass slot_name here only for slot health checks.

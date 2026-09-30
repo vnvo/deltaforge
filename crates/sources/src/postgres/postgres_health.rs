@@ -87,10 +87,24 @@ impl PreflightReport {
     }
 }
 
+/// Whether the configured replication slot must already exist, or DeltaForge will
+/// create and own it. In every supported startup/snapshot mode DeltaForge
+/// auto-creates the slot (the snapshot anchor, or `ensure_slot_and_publication`),
+/// so a fresh deployment passes `CreatedByDeltaforge` and an absent slot is
+/// informational rather than a hard error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotPresence {
+    /// The slot must already exist; absence is a hard error.
+    Required,
+    /// DeltaForge creates and owns the slot on first start; absence is OK.
+    CreatedByDeltaforge,
+}
+
 /// Run all preflight checks.
 pub async fn run_preflight(
     dsn: &str,
     slot_name: Option<&str>,
+    slot_presence: SlotPresence,
     publication: &str,
     tables: &[(String, String)], // (schema, table)
     max_parallel_tables: usize,
@@ -124,13 +138,21 @@ pub async fn run_preflight(
             .context("preflight: query pg_replication_slots")?;
 
         match row {
-            None => {
-                report.hard_errors.push(format!(
-                    "replication slot '{slot}' does not exist. \
-                     Create it with: \
-                     SELECT pg_create_logical_replication_slot('{slot}', 'pgoutput');"
-                ));
-            }
+            None => match slot_presence {
+                SlotPresence::CreatedByDeltaforge => {
+                    report.warnings.push(format!(
+                        "replication slot '{slot}' does not exist yet; \
+                         DeltaForge will create and own it on first start"
+                    ));
+                }
+                SlotPresence::Required => {
+                    report.hard_errors.push(format!(
+                        "replication slot '{slot}' does not exist. \
+                         Create it with: \
+                         SELECT pg_create_logical_replication_slot('{slot}', 'pgoutput');"
+                    ));
+                }
+            },
             Some(r) => {
                 let invalidation: Option<String> = r.get(0);
                 if let Some(reason) = &invalidation {
@@ -518,6 +540,23 @@ pub async fn fetch_server_identity(
     });
 
     Ok(identity)
+}
+
+/// Read the server's `wal_level`. Logical replication (all DeltaForge PostgreSQL
+/// CDC) requires `wal_level = logical`; a deployment preflight uses this to catch
+/// a misconfigured server before a pipeline is started.
+pub async fn fetch_wal_level(dsn: &str) -> Result<String> {
+    let (client, conn) = tokio_postgres::connect(dsn, NoTls)
+        .await
+        .context("fetch_wal_level: connect failed")?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let row = client
+        .query_one("SHOW wal_level", &[])
+        .await
+        .context("fetch_wal_level: query failed")?;
+    Ok(row.get(0))
 }
 
 // ============================================================================

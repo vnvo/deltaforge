@@ -6,7 +6,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use anyhow::{Context, Result};
 use axum::Router;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use deltaforge_config::{StorageBackendKind, StorageConfig, load_cfg};
 use rest_api::{
     AppState, PipelineController, SchemaState, SensingState, router_full,
@@ -26,6 +26,9 @@ mod version;
 #[command(version = version::VERSION)]
 #[command(about = "High-performance Change Data Capture Engine")]
 struct Args {
+    /// Optional subcommand. With none, DeltaForge starts the server.
+    #[command(subcommand)]
+    command: Option<Command>,
     /// Pipeline config file or directory. Omit to start with no pipelines
     /// (pipelines can be added via REST API).
     #[arg(short, long)]
@@ -50,9 +53,40 @@ struct Args {
     storage_dsn: Option<String>,
 }
 
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Validate a pipeline config against its live source before deploying.
+    ///
+    /// Resolves secrets, connects to the source, and runs the source preflight
+    /// checks (PostgreSQL: wal_level, replication slot, publication, WAL
+    /// retention; MySQL: gtid_mode, binlog_format, RELOAD privilege, InnoDB) plus
+    /// local config validation. Exits non-zero if any check fails.
+    Preflight {
+        /// Pipeline config file or directory.
+        config: String,
+        /// Emit a JSON report instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    // One-shot subcommands run before server/observability boot (no port binds).
+    if let Some(Command::Preflight { config, json }) = &args.command {
+        // Use the deployment's own storage backend so slot-ownership checks see
+        // the same durable owner records startup uses.
+        let storage_cfg = storage_config_from(&args);
+        let backend = build_storage_backend(&storage_cfg)
+            .await
+            .context("initialise storage backend for preflight")?;
+        let chkpt: Arc<dyn checkpoints::CheckpointStore> =
+            Arc::new(storage::BackendCheckpointStore::new(backend));
+        return runner::preflight::run(config, *json, chkpt).await;
+    }
+
     eprintln!("{}", version::startup_banner());
 
     // Parse listen addresses up front so an invalid value fails startup clearly.
@@ -91,16 +125,7 @@ async fn main() -> Result<()> {
         pipeline_specs.iter().map(format_pipeline_summary).collect();
 
     // ── Build storage backend ─────────────────────────────────────────────────
-    let storage_cfg = StorageConfig {
-        backend: match args.storage_backend.as_str() {
-            "memory" => StorageBackendKind::Memory,
-            "postgres" => StorageBackendKind::Postgres,
-            _ => StorageBackendKind::Sqlite,
-        },
-        path: args.storage_path.clone(),
-        dsn: args.storage_dsn.clone(),
-        ..Default::default()
-    };
+    let storage_cfg = storage_config_from(&args);
 
     let backend = build_storage_backend(&storage_cfg)
         .await
@@ -170,6 +195,19 @@ fn parse_listen_addr(flag: &str, value: &str) -> Result<SocketAddr> {
             "invalid --{flag} '{value}' (expected host:port, e.g. 127.0.0.1:9000)"
         )
     })
+}
+
+fn storage_config_from(args: &Args) -> StorageConfig {
+    StorageConfig {
+        backend: match args.storage_backend.as_str() {
+            "memory" => StorageBackendKind::Memory,
+            "postgres" => StorageBackendKind::Postgres,
+            _ => StorageBackendKind::Sqlite,
+        },
+        path: args.storage_path.clone(),
+        dsn: args.storage_dsn.clone(),
+        ..Default::default()
+    }
 }
 
 async fn build_storage_backend(
