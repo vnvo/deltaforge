@@ -276,9 +276,9 @@ impl MySqlSource {
         }
         // Non-GTID fallback lineage = (server_id, current binlog file). Both must
         // be real: a zero server_id or an empty/absent binlog file is an unverified
-        // lineage. The build step fails closed rather than persist a bogus anchor -
-        // the caller treats an error as "no lineage" and the durable watermark then
-        // fails closed instead of binding to a meaningless empty-file identity.
+        // lineage. The build step returns an error rather than a bogus anchor, and
+        // the caller propagates it with `?` at startup, so the source fails closed
+        // before opening a stream instead of binding to a meaningless identity.
         let server_id: u32 = conn
             .query_first("SELECT @@server_id")
             .await
@@ -942,8 +942,8 @@ async fn do_reconnect(ctx: &mut RunCtx) -> SourceResult<Option<BinlogStream>> {
 /// on an unverified anchor. A zero `server_id` (server exposed neither a GTID
 /// `server_uuid` nor a real `server_id`) or an empty binlog file (binary logging
 /// off, or `SHOW BINARY LOG STATUS` returned nothing) must not be recorded: the
-/// caller treats an error as "no lineage" so the durable watermark fails closed
-/// rather than binding to a meaningless empty-file identity.
+/// error is propagated by the caller (with `?`) at startup, so the source fails
+/// closed before opening a stream rather than binding to a meaningless identity.
 fn mysql_server_lineage(
     server_id: u32,
     file: String,
