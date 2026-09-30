@@ -1,6 +1,6 @@
-# Capacity & Resource Envelope (Pilot)
+# Capacity & Resource Envelope
 
-This page states DeltaForge's resource behaviour for the pilot so operators can size a deployment conservatively. It is a description of how the engine behaves today, not a set of guaranteed maximums.
+This page states DeltaForge's resource behaviour so operators can size a deployment conservatively. It is a description of how the engine behaves today, not a set of guaranteed maximums.
 
 **Every bound below is tagged with how we know it:**
 
@@ -10,13 +10,13 @@ This page states DeltaForge's resource behaviour for the pilot so operators can 
 - **[operator]** - a configuration default the operator can change.
 - **[unknown]** - not yet benchmarked; treat with caution.
 
-> These are not product ceilings. Where a number is **[code-derived]** or **[operator]** it describes a default or a mechanism, not a validated limit. Do not quote them as maximums. Run the [preflight command](pilot-support.md#deployment-preflight) and a disposable soak in your environment before committing to any number.
+> These are not product ceilings. Where a number is **[code-derived]** or **[operator]** it describes a default or a mechanism, not a validated limit. Do not quote them as maximums. Run the [preflight command](deployment-support.md#deployment-preflight) and a disposable soak in your environment before committing to any number.
 
-## At-a-glance conservative pilot guidance
+## At-a-glance conservative starting guidance
 
-| Dimension | Conservative pilot guidance | Basis |
+| Dimension | Conservative starting guidance | Basis |
 |---|---|---|
-| Pipelines (source units) per instance | Start at **1-10**; single instance only | [unknown] scale; single-owner is [code-derived] |
+| Pipelines (source units) per instance | Unvalidated starting point: a small number (single digits); single instance only. Not a supported ceiling either way. | [unknown] scale; single-owner is [code-derived] |
 | Tables per source | Tens to low hundreds; watch metric cardinality and startup cost | [code-derived] O(tables²) enumeration, [unknown] at scale |
 | Memory | Provision for channel-depth × event-size + in-flight batch bytes + full schema cache; **no aggregate cap exists** | [code-derived] / [unknown] |
 | Throughput | Benchmark per environment; do not assume a headline number | [measured] dev-only / [unknown] |
@@ -28,7 +28,7 @@ Everything else is detailed below.
 DeltaForge has **no aggregate (pipeline-wide or process-wide) memory or byte budget** [code-derived - confirmed absent]. Resident memory is bounded only indirectly by the levers below, so you must provision headroom rather than rely on a cap.
 
 - **Source→coordinator channel: 32,768 items, item-count bound only, no byte cap** [code-derived]. A burst of large change events can hold up to 32,768 `SourceItem`s resident with no byte ceiling. This is the primary backpressure lever and is **not operator-configurable**. Worst-case channel memory ≈ `32768 × (largest event size)`; size RAM for your widest rows/transactions accordingly.
-- **In-flight batch bytes**: bounded per batch by `batch.max_bytes` (default **16 MiB** [operator]) and per source transaction by `batch.max_tx_bytes` (default **512 MiB** [operator], only when `respect_source_tx = true`). If an operator sets these to unset/`None`, the effective cap becomes unbounded (`usize::MAX`) [code-derived] - do not disable them in the pilot.
+- **In-flight batch bytes**: bounded per batch by `batch.max_bytes` (default **16 MiB** [operator]) and per source transaction by `batch.max_tx_bytes` (default **512 MiB** [operator], only when `respect_source_tx = true`). If an operator sets these to unset/`None`, the effective cap becomes unbounded (`usize::MAX`) [code-derived] - do not disable them.
 - **Schema cache**: the full schema registry is held in memory (see [Checkpoint-store and schema-registry load](#checkpoint-store-and-schema-registry-load)); grows with tables × schema versions [code-derived, unbounded in that dimension].
 - **Guidance**: budget ≈ (channel depth × typical event size) + `max_tx_bytes` per active pipeline + schema-cache growth, with generous headroom. There is no backstop if you under-provision. Actual RSS under load is **[unknown]** pending a soak in your environment.
 
@@ -47,7 +47,7 @@ DeltaForge has **no aggregate (pipeline-wide or process-wide) memory or byte bud
 | `max_tx_bytes` | 512 MiB | serialized bytes in one source transaction |
 | `oversized_tx` | Fail | behaviour when a transaction exceeds the caps |
 
-A single source transaction larger than `max_tx_events`/`max_tx_bytes` is failed closed by default (`oversized_tx = Fail`). Very large transactions on the source are the main way to blow past the byte budget - keep the defaults for the pilot.
+A single source transaction larger than `max_tx_events`/`max_tx_bytes` is failed closed by default (`oversized_tx = Fail`). Very large transactions on the source are the main way to blow past the byte budget - keep the defaults.
 
 ## Concurrency and in-flight
 
@@ -84,7 +84,13 @@ Size `max_connections` on the source and on the PostgreSQL storage DB for the su
 
 ## Checkpoint-store and schema-registry load
 
-- **Checkpoint writes: one `put_raw` per required sink per committed batch, with no coalescing** [code-derived]. Write volume ≈ (batches/sec) × (required sink count). At the `max_ms = 50` floor that is up to ~20 batch-commits/s per pipeline × sinks. Size the checkpoint/storage backend for that write rate across all pipelines. Reads are change-driven (the source is notified on commit), not polled.
+- **Checkpoint writes: one `put_raw` per checkpointed sink per committed batch, with no coalescing** [code-derived]:
+
+  ```
+  checkpoint writes/sec = committed batches/sec × checkpointed sinks
+  ```
+
+  This is workload-dependent and has **no configured QPS ceiling**. `max_ms = 50` is a time-based *flush ceiling*, not a rate cap: batches also flush on `max_events`, `max_bytes`, and transaction boundaries, so committed-batches/sec can be much higher than `1000/max_ms` under load. Size the checkpoint/storage backend for the actual committed-batch rate × checkpointed sinks across all pipelines. Reads are change-driven (the source is notified on commit), not polled.
 - **Schema registry loads ALL namespaces and ALL versions at startup** [code-derived]: a full `kv_list` + per-key log replay into an in-memory cache. Startup cost and memory grow with (tables × schema versions) and are **[unknown]** at large catalog sizes - a concern for many-table deployments.
 
 ## Metric cardinality
@@ -94,16 +100,16 @@ Size `max_connections` on the source and on the PostgreSQL storage DB for the su
 ## Table and source-unit counts
 
 - **No coded limit on tables per source or pipelines per instance** [confirmed absent]. Practical limits come from: the O(tables²) table-enumeration dedup during schema load [code-derived], per-table metric cardinality, the full schema-registry load at startup, and connection/slot math above.
-- **Single-instance requirement**: run exactly one DeltaForge process against a given state store (see [Pilot Support Envelope](pilot-support.md#topology-single-owner-per-source)) [code-derived containment].
-- **Conservative pilot recommendation**: start with a small number of pipelines (single digits to ~10) and tens-to-low-hundreds of tables per source, and grow only after a soak in your environment. Larger catalogs are **[unknown]** pending benchmark.
+- **Single-instance requirement**: run exactly one DeltaForge process against a given state store (see [Supported Deployment Envelope](deployment-support.md#topology-single-owner-per-source)) [code-derived containment].
+- **Conservative starting configuration (unvalidated, not a supported limit)**: a small number of pipelines (single digits) and tens-to-low-hundreds of tables per source is a reasonable place to start, and grow only after a soak in your environment. We have not measured enough to claim either that larger configurations are unsupported or that this range is universally safe - both directions are **[unknown]** pending benchmark.
 
 ## Throughput
 
-Throughput is environment-dependent and is **[measured] only on a developer machine** (single runs, heavy desktop contention observed), so no headline number is published as a guarantee. Treat sustained throughput as **[unknown]** for your environment until you run a soak. The engine's backpressure (the 32,768-item channel and batch caps above) is what bounds memory when a sink cannot keep up.
+Throughput is environment-dependent and is **[measured] only on a developer machine** (single runs, heavy desktop contention observed), so no headline number is published as a guarantee. Treat sustained throughput as **[unknown]** for your environment until you run a soak. Backpressure bounds queued item count and batch/transaction payloads where their byte limits are enabled, but it does not provide a process-wide memory bound.
 
 ## Known scaling caveats (pending benchmark)
 
-These are **[unknown]** and should be validated before scaling a pilot up:
+These are **[unknown]** and should be validated before scaling up:
 
 - Aggregate/RSS memory under sustained load (no coded cap).
 - Startup time and memory for large schema catalogs (full registry load).

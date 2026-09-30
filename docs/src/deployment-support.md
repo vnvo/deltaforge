@@ -1,20 +1,20 @@
-# Pilot Support Envelope
+# Supported Deployment Envelope
 
-This page defines the **bounded support envelope for the DeltaForge user-testing (pilot) build**: the configurations DeltaForge is validated for during the pilot, what operators must provide, and what is explicitly out of scope. Anything not listed here as supported should be treated as unvalidated for the pilot - test it in a disposable environment first, and talk to us before relying on it.
+This page defines the **bounded support envelope for the current DeltaForge release**: the configurations DeltaForge is validated for, what operators must provide, and what is explicitly out of scope. Anything not listed here as supported should be treated as unvalidated - test it in a disposable environment first, and talk to us before relying on it.
 
 The delivery and correctness guarantees referenced below are defined in [Guarantees & Correctness](guarantees.md). Read that page together with this one.
 
 ## Build and freeze
 
-- The pilot build is the state of `main` at the pilot freeze commit. Pin your deployment to that commit or tag rather than tracking `main`, so your environment does not drift during the pilot.
+- Pin your deployment to a specific release commit or tag rather than tracking `main`, so your environment does not drift.
 - Toolchain: built with the Rust **stable** toolchain, edition **2024**. Single static binary; no JVM, no runtime GC.
-- Report issues against the exact pilot commit/tag so we can reproduce them.
+- Report issues against the exact commit/tag so we can reproduce them.
 
 ## Supported versions
 
-| Component | Validated for the pilot | Notes |
+| Component | Validated version | Notes |
 |-----------|------------------------|-------|
-| PostgreSQL (source) | **17** | Logical replication (`wal_level = logical`). There is no hard server-version gate in code; other recent majors likely work but are not part of the validated pilot envelope. Validate before relying on a different major. |
+| PostgreSQL (source) | **17** | Logical replication (`wal_level = logical`). There is no hard server-version gate in code; other recent majors likely work but are not part of the validated envelope. Validate before relying on a different major. |
 | MySQL (source) | **8.4** | Native binlog CDC. **MariaDB is not supported.** |
 | Kafka (sink) | Tested on **Confluent Platform 7.5 and 7.7** (`cp-kafka`) | The transactional producer (`exactly_once: true`) needs a broker with transaction support (the Kafka 2.5+ protocol floor). Other broker versions and distributions are untested - validate during onboarding. |
 
@@ -24,7 +24,7 @@ Other sinks (Redis, NATS, HTTP, S3-compatible object storage, ClickHouse, Elasti
 
 Run **one DeltaForge instance per source (per replication slot / binlog reader)**. DeltaForge does not yet provide a cluster-wide lock or lease that prevents two instances from being started against the same source; single ownership is enforced at the slot and producer level, not globally.
 
-**Single-instance requirement (required for the pilot).** Run exactly **one** DeltaForge process against a given checkpoint/state store. Within one process, lifecycle operations (start, stop, delete, patch, resume) are serialized and a durable per-source-id claim rejects a second pipeline that reuses an active source id, so two pipelines can never share a source id and corrupt each other's checkpoints (checkpoints are keyed by source id). That claim is **not** a cross-process lock: two DeltaForge processes sharing the same state store are not protected against each other and are unsupported. Deploy DeltaForge as a single instance (a single replica; if orchestrated, `replicas: 1` with `strategy: Recreate`, not rolling), and do not point a second process at the same state store.
+**Single-instance requirement.** For the supported single-instance deployment, run exactly **one** DeltaForge process against a given checkpoint/state store. Within one process, lifecycle operations (start, stop, delete, patch, resume) are serialized and a durable per-source-id claim rejects a second pipeline that reuses an active source id, so two pipelines can never share a source id and corrupt each other's checkpoints (checkpoints are keyed by source id). That claim is **not** a cross-process lock: two DeltaForge processes sharing the same state store are not protected against each other and are unsupported. Deploy DeltaForge as a single instance (a single replica; if orchestrated, `replicas: 1` with `strategy: Recreate`, not rolling), and do not point a second process at the same state store.
 
 - **PostgreSQL**: the replication slot has durable, DeltaForge-recorded ownership. DeltaForge only drops or recreates a slot it can prove it owns, whose lineage matches, and that is inactive; a foreign, ambiguously owned, or active slot **fails closed** with remediation rather than being taken over. A slot created outside DeltaForge (no ownership record) fails closed on re-snapshot - drop it and let DeltaForge recreate it, or run `snapshot.mode = never`.
 - **Kafka**: with `exactly_once: true`, a second producer using the same `transactional.id` fences the first. Fencing is a fatal error that stops the pipeline. This is a safety net, not a substitute for running a single instance.
@@ -76,14 +76,14 @@ Sink credentials and auth modes are documented per sink (see [Sinks](sinks/READM
 DeltaForge resolves credentials from typed secret references and never stores resolved secrets in serialized config. See [Secrets & Credentials](secrets.md).
 
 - **Secret providers**: `env`, `file`, and `vault` (Vault KV v2). Kubernetes is not a separate provider - inject secrets as env (`secretKeyRef`) or as files (projected volume) and reference them with the `env` or `file` provider.
-- **Vault**: static KV references are supported (the runner must be built with the `vault` feature; a Vault reference fails closed at startup otherwise). **Dynamic Vault database credentials (lease-driven reconnect) are not live in the pilot** - the lease lifecycle exists but does not yet drive a DSN swap.
-- **Rotation (pilot baseline): treat credential rotation as restart-required.** Change the secret, then restart the affected pipeline or the runner for it to take effect. An opt-in live-reconnect path for file-backed *source* database credentials exists in the code (MySQL requires GTID mode), but it is **outside the bounded pilot support envelope** - validate it in a disposable environment before considering it. Environment-variable credentials are process-immutable and never rotate live; sink credentials are restart-required.
+- **Vault**: static KV references are supported (the runner must be built with the `vault` feature; a Vault reference fails closed at startup otherwise). **Dynamic Vault database credentials (lease-driven reconnect) are not live in the current release** - the lease lifecycle exists but does not yet drive a DSN swap.
+- **Rotation: treat credential rotation as restart-required.** Change the secret, then restart the affected pipeline or the runner for it to take effect. An opt-in live-reconnect path for file-backed *source* database credentials exists in the code (MySQL requires GTID mode), but it is **outside the supported deployment envelope** - validate it in a disposable environment before considering it. Environment-variable credentials are process-immutable and never rotate live; sink credentials are restart-required.
 
 ## Network and TLS
 
-Plan the pilot network on the basis that **DeltaForge's source database connections and its own HTTP endpoints are not encrypted or authenticated in this build**. Deploy accordingly.
+Plan the network on the basis that **DeltaForge's source database connections and its own HTTP endpoints are not encrypted or authenticated in this release**. Deploy accordingly.
 
-- **Source DB connections are not encrypted.** Neither the PostgreSQL nor the MySQL source establishes TLS to the database in this build. Run DeltaForge on a trusted/private network segment with the source database, or place an encrypted tunnel (for example a service mesh sidecar, stunnel, or a cloud private link) between DeltaForge and the database. Do not run source traffic across an untrusted network in the pilot.
+- **Source DB connections are not encrypted.** Neither the PostgreSQL nor the MySQL source establishes TLS to the database in this build. Run DeltaForge on a trusted/private network segment with the source database, or place an encrypted tunnel (for example a service mesh sidecar, stunnel, or a cloud private link) between DeltaForge and the database. Do not run source traffic across an untrusted network.
 - **REST API is unauthenticated and binds all interfaces by default.** The default `--api-addr` is `0.0.0.0:8080` (every interface), so an unrestricted deployment exposes the unauthenticated API on the network. Bind it to loopback (`--api-addr 127.0.0.1:8080`) where the client is local, or confine it with a firewall / Kubernetes NetworkPolicy; do not expose it publicly.
 - **Metrics endpoint is unauthenticated** and defaults to `0.0.0.0:9000` (all interfaces). Bind it to loopback (`--metrics-addr 127.0.0.1:9000`) where the scraper is local, or confine it with a firewall/NetworkPolicy. See [Observability](observability.md#metrics-endpoint-address-and-exposure).
 - **Sink TLS/auth is supported** where the sink provides it: Kafka (SASL + `SASL_SSL` via `client_conf`), Elasticsearch (`https://` with `tls.ca_file`, basic/API-key auth), HTTP (`https://` with header-based auth), NATS (TLS + credentials/token). Confirm Redis and ClickHouse TLS in your environment before relying on it.
@@ -92,7 +92,7 @@ Plan the pilot network on the basis that **DeltaForge's source database connecti
 
 DeltaForge keeps all runtime state (checkpoints, schema registry, snapshot progress, DLQ/journal) in one storage backend. See [Storage](storage.md) and [Checkpoints](checkpoints.md).
 
-- **Backends**: `sqlite` (default; single-instance production) and `postgres` (a shared storage backend, **beta** - not yet given the same crash/recovery validation as SQLite). The PostgreSQL backend lets multiple processes share one state store, but it does **not** make source processing highly available and does **not** provide ownership fencing between instances - the single-owner-per-source rule above still applies. Use with caution in the pilot. `memory` is for testing only and is lost on restart.
+- **Backends**: `sqlite` (default; single-instance production) and `postgres` (a shared storage backend, **beta** - not yet given the same crash/recovery validation as SQLite). The PostgreSQL backend lets multiple processes share one state store, but it does **not** make source processing highly available and does **not** provide ownership fencing between instances - the single-owner-per-source rule above still applies. Use with caution. `memory` is for testing only and is lost on restart.
 - **Back up the state store regularly.** For SQLite the store is the `deltaforge.db` file (default under `./data/`), which holds both checkpoints and schema history; losing it means losing resume position and schema lineage. The store runs in **WAL mode**, so do not copy `deltaforge.db` on its own while DeltaForge is running - committed data may still be in the `-wal` file, and a bare file copy can be inconsistent. Use one of:
   - SQLite's online-backup API or `VACUUM INTO 'backup.db'` against the live database;
   - stop DeltaForge cleanly, checkpoint the WAL (`PRAGMA wal_checkpoint(TRUNCATE)`), then copy the file;
@@ -102,9 +102,9 @@ DeltaForge keeps all runtime state (checkpoints, schema registry, snapshot progr
 - **Durability**: the SQLite store runs in WAL mode with `synchronous = NORMAL` and survives `SIGKILL` without a graceful shutdown; a checkpoint is persisted only after the sink acknowledges delivery and the commit policy is satisfied (the basis of at-least-once).
 - Restoring from a backup rewinds to that backup's position; expect at-least-once re-delivery (duplicates) of everything after the backup point, which consumers dedup on the event `id`.
 
-## Known limitations (pilot)
+## Known limitations
 
-These are documented in full on [Guarantees & Correctness](guarantees.md); the pilot-relevant summary:
+These are documented in full on [Guarantees & Correctness](guarantees.md); the summary:
 
 - **Delivery is at-least-once.** No sink is end-to-end exactly-once. Kafka `exactly_once: true` adds transactional atomic-batch delivery (a `read_committed` consumer never sees a partial batch) but is still at-least-once across a restart. Consumers must dedup on the event `id` for exactly-once end to end.
 - **Snapshot to CDC has a bounded at-least-once overlap** - rows committed between the anchor and the snapshot export are delivered by both the snapshot and CDC. Current-state sinks converge; append-only sinks see duplicates.
@@ -118,9 +118,9 @@ These are documented in full on [Guarantees & Correctness](guarantees.md); the p
 - **Deleting a pipeline is fail-closed.** Delete stops the source, cleans up its checkpoints, and only then releases the source-id claim; if checkpoint cleanup fails, the delete fails and the source id stays locked (safe: it blocks reuse rather than exposing stale checkpoints). Retry the delete once the store is reachable.
 - Cross-primary position safety at failover depends on GTID (MySQL) and slot-aware HA (PostgreSQL); see [Failover Handling](failover.md).
 
-## Out of scope for the pilot
+## Out of scope
 
-Not part of the pilot support envelope (do not rely on these):
+Not part of the supported deployment envelope (do not rely on these):
 
 - Multi-instance HA for a single source (no cluster-wide ownership lock/lease yet).
 - TLS directly to the source database (use a trusted network or an external tunnel).
