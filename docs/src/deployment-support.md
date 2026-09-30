@@ -54,7 +54,7 @@ Wildcard table patterns are reported as not validated per-table (server-level ch
 
 The state store carries one durable **store gate**. A DeltaForge server acquires it at startup, before it reads any schema history, and holds it until it shuts down cleanly; `deltaforge schema-migrate --apply` holds it while it writes. Only one holder can exist, so a second server, or a migration apply while a server runs, refuses to start with an error that names the holder (role, owner id, host, pid, since) and the command to release it.
 
-- **Clean shutdown** (`SIGTERM`/`SIGINT`) stops the API, stops every pipeline and waits for its tasks, then releases the gate. Give the process enough time to do this (the Helm chart's `terminationGracePeriodSeconds` is 30).
+- **Clean shutdown** (`SIGTERM`/`SIGINT`) stops the API, stops every pipeline and waits for its tasks, then releases the gate. This also holds for a signal that arrives while the server is still starting: the signal handlers are installed before the gate is acquired, and startup stops at the next step. Give the process enough time to do this (the Helm chart's `terminationGracePeriodSeconds` is 30).
 - **A crash keeps the gate held.** Nothing expires. After an OOM kill, a `SIGKILL` (including one sent after the grace period), or a host loss, the next start fails until an operator releases the gate. In Kubernetes this shows as the restarted container exiting with the store-gate error (CrashLoopBackOff). This is deliberate: DeltaForge will not guess that the previous holder is gone.
 - **Recovery:**
 

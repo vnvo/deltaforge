@@ -38,7 +38,12 @@ fn backend(db: &Path) -> ArcStorageBackend {
 }
 
 fn start_server(db: &Path) -> Child {
+    start_server_with(db, &[])
+}
+
+fn start_server_with(db: &Path, env: &[(&str, &str)]) -> Child {
     bin()
+        .envs(env.iter().copied())
         .args([
             "--api-addr",
             "127.0.0.1:0",
@@ -154,6 +159,84 @@ async fn server_holds_the_gate_and_releases_it_only_on_clean_shutdown() {
     wait_for_server_gate(&b, server.id()).await;
     signal(&server, "-TERM");
     assert!(wait_exit(&mut server).success());
+}
+
+/// Wait until the server prints the startup-hold marker for `point`.
+fn wait_for_hold(
+    server: &mut Child,
+    point: &str,
+) -> std::thread::JoinHandle<()> {
+    use std::io::{BufRead, BufReader};
+    let stderr = server.stderr.take().expect("stderr piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let marker = format!("holding at {point}");
+    let drain = std::thread::spawn(move || {
+        let mut tx = Some(tx);
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if line.contains(&marker)
+                && let Some(tx) = tx.take()
+            {
+                let _ = tx.send(());
+            }
+        }
+    });
+    rx.recv_timeout(Duration::from_secs(60))
+        .expect("server never reached the startup hold point");
+    drain
+}
+
+/// A signal that arrives during startup must end in a clean exit with the
+/// gate released - both before the gate is acquired and while it is held
+/// (manager built, API not yet serving). Startup is held at each point until
+/// the signal arrives, so the timing is deterministic.
+#[tokio::test]
+async fn a_signal_during_startup_releases_the_gate() {
+    for point in ["before-gate", "after-gate"] {
+        for sig in ["-TERM", "-INT"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("df.db");
+            let b = backend(&db);
+            let mut server = start_server_with(
+                &db,
+                &[("DELTAFORGE_TEST_HOLD_STARTUP", point)],
+            );
+            let drain = wait_for_hold(&mut server, point);
+            if point == "after-gate" {
+                wait_for_server_gate(&b, server.id()).await;
+            }
+            signal(&server, sig);
+            let status = wait_exit(&mut server);
+            let _ = drain.join();
+            assert!(status.success(), "{sig} at {point}: {status:?}");
+            assert_eq!(
+                store_gate::status(&b).await.unwrap(),
+                GateState::Unlocked,
+                "{sig} at {point} left the gate held"
+            );
+        }
+    }
+}
+
+/// SIGTERM at many points from process start through startup: whatever the
+/// timing, the gate is never left held (a signal before the handlers exist
+/// kills the process before it can acquire the gate; any later one is
+/// handled), and a process that did acquire it exits cleanly.
+#[tokio::test]
+async fn sigterm_at_any_point_of_startup_never_leaves_the_gate_held() {
+    for delay_ms in [0u64, 1, 2, 5, 10, 20, 35, 50, 75, 100, 150, 250, 400] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("df.db");
+        let mut server = start_server(&db);
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        signal(&server, "-TERM");
+        let status = wait_exit(&mut server);
+        let b = backend(&db);
+        assert_eq!(
+            store_gate::status(&b).await.unwrap(),
+            GateState::Unlocked,
+            "SIGTERM after {delay_ms} ms left the gate held ({status:?})"
+        );
+    }
 }
 
 #[tokio::test]

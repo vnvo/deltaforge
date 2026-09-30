@@ -14,6 +14,7 @@ use rest_api::{
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
 use runner::storage_secrets;
@@ -188,6 +189,13 @@ async fn main() -> Result<()> {
         };
     }
 
+    // Register SIGTERM/SIGINT handling first, before the store gate can be
+    // acquired: from here on a signal no longer kills the process but cancels
+    // `shutdown`, which startup and serving both honour, so every signal after
+    // acquisition reaches the quiesce-and-release path.
+    let shutdown = CancellationToken::new();
+    install_shutdown_signals(shutdown.clone())?;
+
     eprintln!("{}", version::startup_banner());
 
     // Parse listen addresses up front so an invalid value fails startup clearly.
@@ -238,6 +246,11 @@ async fn main() -> Result<()> {
     // Held from before any schema access until every pipeline has stopped, so
     // the schema migration can never write while this server runs. A crash
     // leaves it held until `deltaforge store-gate break`.
+    hold_startup_for_test("before-gate", &shutdown).await;
+    if shutdown.is_cancelled() {
+        info!("shutdown requested before startup; exiting");
+        return Ok(());
+    }
     let gate = storage::adapters::store_gate::acquire(
         &backend,
         storage::adapters::store_gate::GateRole::Server,
@@ -253,6 +266,7 @@ async fn main() -> Result<()> {
         pipeline_specs,
         &pipeline_specs_summary,
         &mut manager_slot,
+        &shutdown,
     )
     .await;
 
@@ -281,7 +295,18 @@ async fn serve(
     pipeline_specs: Vec<deltaforge_config::PipelineSpec>,
     pipeline_specs_summary: &[String],
     manager_slot: &mut Option<Arc<PipelineManager>>,
+    shutdown: &CancellationToken,
 ) -> Result<()> {
+    // Startup steps are never abandoned half-way (a dropped pipeline start
+    // could leave tasks the manager does not track); a shutdown requested
+    // meanwhile is honoured between steps.
+    let stop_requested = || {
+        let requested = shutdown.is_cancelled();
+        if requested {
+            info!("shutdown requested during startup");
+        }
+        requested
+    };
     // ── Build pipeline manager ────────────────────────────────────────────────
     let registry_config = storage::adapters::RegistryConfig {
         cache_max_bytes: args.schema_cache_max_bytes,
@@ -305,8 +330,16 @@ async fn serve(
     let schema_api = Arc::new(SchemaApi::new(manager.clone()));
     let sensing_api = Arc::new(SensingApi::new(manager.clone()));
 
+    hold_startup_for_test("after-gate", shutdown).await;
+    if stop_requested() {
+        return Ok(());
+    }
+
     for ps in pipeline_specs {
         manager.create(ps).await?;
+        if stop_requested() {
+            return Ok(());
+        }
     }
 
     version::print_runtime_info(
@@ -346,35 +379,62 @@ async fn serve(
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind --api-addr {addr}"))?;
+    if stop_requested() {
+        return Ok(());
+    }
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown.clone().cancelled_owned())
         .await?;
     info!("api server stopped");
     Ok(())
 }
 
-/// Resolves on SIGINT or SIGTERM.
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut s) => {
-                s.recv().await;
-            }
-            Err(_) => std::future::pending::<()>().await,
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
+/// Test hook: with `DELTAFORGE_TEST_HOLD_STARTUP=<point>`, startup waits at
+/// `point` (`before-gate`: signal handling installed, gate not yet acquired;
+/// `after-gate`: gate held, pipeline manager built) until a shutdown is
+/// requested, so a test can signal the process at that exact point.
+async fn hold_startup_for_test(point: &str, shutdown: &CancellationToken) {
+    if std::env::var("DELTAFORGE_TEST_HOLD_STARTUP")
+        .ok()
+        .as_deref()
+        != Some(point)
+    {
+        return;
     }
-    info!("shutdown signal received");
+    eprintln!("DELTAFORGE_TEST_HOLD_STARTUP: holding at {point}");
+    tokio::select! {
+        _ = shutdown.cancelled() => {}
+        _ = tokio::time::sleep(std::time::Duration::from_secs(120)) => {}
+    }
+}
+
+/// Register SIGTERM and SIGINT handlers now (registration is synchronous, so
+/// a signal arriving at any later point is caught) and cancel `shutdown` on
+/// the first one.
+fn install_shutdown_signals(shutdown: CancellationToken) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate())
+            .context("install the SIGTERM handler")?;
+        let mut int = signal(SignalKind::interrupt())
+            .context("install the SIGINT handler")?;
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+            }
+            info!("shutdown signal received");
+            shutdown.cancel();
+        });
+    }
+    #[cfg(not(unix))]
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("shutdown signal received");
+        shutdown.cancel();
+    });
+    Ok(())
 }
 
 /// Parse a `host:port` listen address, failing with a clear message on bad input.
