@@ -28,6 +28,7 @@ use deltaforge_core::{
 mod mysql_errors;
 pub use mysql_errors::{LoopControl, MySqlSourceError, MySqlSourceResult};
 
+mod mysql_activation;
 mod mysql_checkpoint_lineage;
 mod mysql_helpers;
 use mysql_helpers::{checkpoint_lineage, prepare_client};
