@@ -345,21 +345,30 @@ impl MySqlSource {
         )
         .await?;
 
-        // Checkpoints carry the verified lineage. Before anything reads the
-        // resume position, adopt pre-lineage per-sink checkpoints into it when
-        // that is provable; otherwise the fold fails closed on the mixed set.
-        let lineage_hash = checkpoint_lineage(&self.registry_scope)
-            .ok_or_else(|| {
-                SourceError::Other(anyhow::anyhow!(
-                    "registry scope not published after establishing it"
-                ))
-            })?;
-        mysql_checkpoint_lineage::adopt_legacy_checkpoints(
+        // Checkpoints carry the verified lineage. Before anything reads
+        // snapshot progress or the resume position, reconcile the stored
+        // checkpoints with it: adopt pre-lineage ones (no lineage change ever
+        // recorded), carry a failover predecessor's GTID checkpoints over after
+        // verifying them on the current server, and otherwise STOP here.
+        let scope = self.registry_scope.current()?;
+        let lineage_hash = scope.lineage().lineage_hash.clone();
+        let storage::adapters::LineageDescriptor::Mysql { server_uuid } =
+            scope.lineage().descriptor.clone()
+        else {
+            return Err(SourceError::Other(anyhow::anyhow!(
+                "MySQL source established a non-MySQL lineage"
+            )));
+        };
+        mysql_checkpoint_lineage::reconcile_checkpoint_lineage(
             chkpt_store.as_ref(),
             &self.backend,
             &self.tenant,
             &self.id,
             &lineage_hash,
+            &mysql_checkpoint_lineage::LiveGtidAvailability {
+                dsn: self.dsn.expose(),
+                server_uuid,
+            },
         )
         .await?;
 
