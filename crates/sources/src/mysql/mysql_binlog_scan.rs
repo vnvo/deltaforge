@@ -296,8 +296,14 @@ impl Walk {
                 self.complete_txn()?
             }
             EventData::TransactionPayload(tp) => {
+                // Inner events have no binlog position of their own; they
+                // all end where the payload ends.
                 for (h, d) in &tp.uncompressed_events {
-                    self.event(h, d)?;
+                    let inner = EventHeader {
+                        next_event_position: header.next_event_position,
+                        ..h.clone()
+                    };
+                    self.event(&inner, d)?;
                 }
             }
             EventData::NotSupported => {
@@ -685,6 +691,51 @@ mod tests {
     }
 
     #[test]
+    fn statements_inside_a_compressed_payload_take_the_payload_position() {
+        use mysql_binlog_connector_rust::event::query_event::QueryEvent;
+        use mysql_binlog_connector_rust::event::transaction_payload_event::TransactionPayloadEvent;
+        let header = |event_type, next_event_position| EventHeader {
+            timestamp: 0,
+            event_type,
+            server_id: 1,
+            event_length: 0,
+            next_event_position,
+            event_flags: 0,
+        };
+        let mut walk = Walk {
+            gtid_mode: false,
+            to_set: None,
+            done: GtidSet::default(),
+            current_gtid: None,
+            ordinal: 0,
+            in_explicit_txn: false,
+            file: "binlog.000001".into(),
+            statements: Vec::new(),
+            reached: false,
+        };
+        // Inner events carry no binlog position of their own.
+        let ddl = EventData::Query(QueryEvent {
+            thread_id: 0,
+            exec_time: 0,
+            error_code: 0,
+            schema: "d".into(),
+            query: "ALTER TABLE t ADD COLUMN c INT".into(),
+        });
+        let payload = EventData::TransactionPayload(TransactionPayloadEvent {
+            uncompressed_size: 0,
+            uncompressed_events: vec![(header(2, 0), ddl)],
+        });
+        walk.event(&header(40, 4321), &payload).unwrap();
+        assert_eq!(
+            walk.statements[0].event,
+            EventIdentity::FilePos {
+                file: "binlog.000001".into(),
+                end_pos: 4321
+            }
+        );
+    }
+
+    #[test]
     fn only_known_harmless_unparsed_events_are_accepted() {
         for t in [3u8, 5, 13, 14, 28, 34, 36, 37, 39] {
             assert!(harmless_unparsed(t), "{t}");
@@ -895,8 +946,41 @@ mod tests {
             )
             .await;
             let to = position(&dsn).await;
+            // The interval really holds a compressed transaction.
+            assert_eq!(from.file, to.file);
+            let mut c =
+                mysql_async::Conn::from_url(dsn.as_str()).await.unwrap();
+            let kinds: Vec<String> = c
+                .query_map(
+                    format!(
+                        "SHOW BINLOG EVENTS IN '{}' FROM {}",
+                        to.file, from.pos
+                    ),
+                    |row: mysql_async::Row| row.get::<String, _>(2).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(kinds.iter().any(|k| k == "Transaction_payload"));
             let r = scan(&dsn, &from, &to).await.unwrap();
             assert_eq!(affected(&r), ["scan_zstd.t"]);
+            // The same workload uncompressed classifies identically and
+            // ends at the same kind of boundary.
+            let from2 = position(&dsn).await;
+            sql(
+                &dsn,
+                &[
+                    "SET SESSION binlog_transaction_compression = OFF",
+                    "INSERT INTO scan_zstd.t VALUES (2, REPEAT('x', 4000), 1)",
+                    "ALTER TABLE scan_zstd.t ADD COLUMN w2 INT",
+                ],
+            )
+            .await;
+            let to2 = position(&dsn).await;
+            let r2 = scan(&dsn, &from2, &to2).await.unwrap();
+            assert_eq!(
+                r.statements.iter().map(|s| &s.effect).collect::<Vec<_>>(),
+                r2.statements.iter().map(|s| &s.effect).collect::<Vec<_>>()
+            );
         }
 
         #[tokio::test]
