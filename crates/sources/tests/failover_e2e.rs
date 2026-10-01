@@ -118,6 +118,19 @@ async fn mysql_fetch_uuid(port: u16) -> String {
         .server_uuid
 }
 
+/// `@@GLOBAL.gtid_executed` of the server on `port`: what a replica promoted
+/// from it has executed.
+async fn mysql_gtid_executed(port: u16) -> String {
+    let pool = mysql_root_pool(port).await;
+    let mut conn = pool.get_conn().await.unwrap();
+    let set: String = conn
+        .query_first("SELECT @@GLOBAL.gtid_executed")
+        .await
+        .unwrap()
+        .unwrap();
+    set.replace('\n', "")
+}
+
 async fn mysql_create_schema(port: u16, db: &str) {
     let pool = mysql_root_pool(port).await;
     let mut conn = pool.get_conn().await.unwrap();
@@ -351,16 +364,18 @@ async fn mysql_failover_streaming_resumes_after_identity_change() -> Result<()>
         info!("✓ Run 1 complete — UUID_A stored");
     }
 
-    let uuid_a = mysql_fetch_uuid(port_a).await;
-
-    // failover: B is a fresh promoted replica with gtid_purged covering A's range
+    // failover: B is a fresh promoted replica that executed exactly A's
+    // transactions (gtid_purged = A's gtid_executed)
     let (_c_b, port_b) = start_mysql().await;
     mysql_create_schema(port_b, DB).await;
     {
         let pool = mysql_root_pool(port_b).await;
         let mut conn = pool.get_conn().await?;
-        conn.query_drop(format!("SET GLOBAL gtid_purged='{uuid_a}:1-100'"))
-            .await?;
+        conn.query_drop(format!(
+            "SET GLOBAL gtid_purged='{}'",
+            mysql_gtid_executed(port_a).await
+        ))
+        .await?;
     }
 
     // run 2: same backend (UUID_A stored), new DSN (B)
@@ -559,8 +574,11 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
         conn.query_drop(format!("USE {DB}")).await?;
         conn.query_drop("ALTER TABLE orders ADD COLUMN status VARCHAR(32)")
             .await?;
-        conn.query_drop(format!("SET GLOBAL gtid_purged='{uuid_a}:1-100'"))
-            .await?;
+        conn.query_drop(format!(
+            "SET GLOBAL gtid_purged='{}'",
+            mysql_gtid_executed(port_a).await
+        ))
+        .await?;
     }
 
     // run 2: reconciliation diffs registry (id,sku) vs live (id,sku,status)
@@ -692,8 +710,6 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
         handle.join().await.ok();
     }
 
-    let uuid_a = mysql_fetch_uuid(port_a).await;
-
     // B: extra column added, simulating an un-synced replica schema
     let (_c_b, port_b) = start_mysql().await;
     mysql_create_schema(port_b, DB).await;
@@ -703,8 +719,11 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
         conn.query_drop(format!("USE {DB}")).await?;
         conn.query_drop("ALTER TABLE orders ADD COLUMN status VARCHAR(32)")
             .await?;
-        conn.query_drop(format!("SET GLOBAL gtid_purged='{uuid_a}:1-100'"))
-            .await?;
+        conn.query_drop(format!(
+            "SET GLOBAL gtid_purged='{}'",
+            mysql_gtid_executed(port_a).await
+        ))
+        .await?;
     }
 
     // run 2: on_schema_drift=halt → source must stop with drift error
@@ -789,16 +808,17 @@ async fn mysql_failover_schema_drift_halt_no_drift_continues() -> Result<()> {
         handle.join().await.ok();
     }
 
-    let uuid_a = mysql_fetch_uuid(port_a).await;
-
     // B: identical schema, GTID purged to simulate promoted replica
     let (_c_b, port_b) = start_mysql().await;
     mysql_create_schema(port_b, DB).await;
     {
         let pool = mysql_root_pool(port_b).await;
         let mut conn = pool.get_conn().await?;
-        conn.query_drop(format!("SET GLOBAL gtid_purged='{uuid_a}:1-100'"))
-            .await?;
+        conn.query_drop(format!(
+            "SET GLOBAL gtid_purged='{}'",
+            mysql_gtid_executed(port_a).await
+        ))
+        .await?;
     }
 
     // run 2: on_schema_drift=halt, but B has no drift → must stream normally

@@ -486,7 +486,7 @@ impl MySqlSource {
 
         // binlog streaming - retry prepare_client on transient connection errors
         // (MySQL or toxiproxy may not be ready yet during startup).
-        let (host, default_db, server_id, mut client) = {
+        let (host, default_db, server_id, client) = {
             let mut retry = common::retry::RetryPolicy::default();
             loop {
                 match prepare_client(
@@ -544,46 +544,11 @@ impl MySqlSource {
         // stream must not open on an unverified server.
         let live =
             fetch_identity_verified_as(self.dsn.expose(), &server_uuid).await?;
-        let id_store = IdentityStore::new(Arc::clone(&self.backend));
 
-        // Pre-connect failover position: if the server changed, A's checkpoint
-        // GTID/file is meaningless on B. Switch to B's binlog tail before
-        // capturing the init position so the first stream opens cleanly - in
-        // file/pos mode too, not only GTID. Fail closed if the tail cannot be
-        // resolved rather than open on A's stale position against B.
-        if matches!(
-            id_store
-                .compare(&self.id, &live)
-                .await
-                .map_err(SourceError::Other)?,
-            IdentityComparison::Changed { .. }
-        ) {
-            match resolve_binlog_tail(self.dsn.expose(), &server_uuid).await {
-                Ok((fname, fpos)) => {
-                    warn!(
-                        source_id = %self.id,
-                        "pre-connect failover: switching from A's position to B's binlog tail"
-                    );
-                    client.gtid_enabled = false;
-                    client.gtid_set = String::new();
-                    client.binlog_filename = fname;
-                    client.binlog_position = fpos as u32;
-                }
-                Err(MySqlSourceError::Lineage(details)) => {
-                    return Err(SourceError::Lineage {
-                        details: details.into(),
-                    });
-                }
-                Err(e) => {
-                    return Err(SourceError::Other(anyhow::anyhow!(
-                        "failover detected but could not resolve the new \
-                         server's binlog tail: {e}; refusing to stream on a \
-                         stale position"
-                    )));
-                }
-            }
-        }
-
+        // A failover (stored identity != live) is reconciled below, before
+        // the stream opens, against the EXACT position the stream will start
+        // from: the (carried-over) checkpoint GTID set. A file/position start
+        // across servers cannot be proven and stops there.
         let init_gtid = client.gtid_enabled.then(|| client.gtid_set.clone());
         let init_file = client.binlog_filename.clone();
         let init_pos = client.binlog_position as u64;
@@ -652,7 +617,8 @@ impl MySqlSource {
         // reachable. Reuse the identity already verified above. A failure here
         // means no binlog stream is opened. The registry still holds A's schema
         // for the reconciler's drift diff; preload stays deferred until after.
-        check_identity_post_reconnect(&mut ctx, Some(live)).await?;
+        let resume = ResumeAt::of(&client);
+        check_identity_post_reconnect(&mut ctx, Some(live), &resume).await?;
 
         info!(source_id=%self.id, "connecting for binlog stream ..");
         let mut stream = connect_first_stream(&ctx, client).await?;
@@ -1029,6 +995,15 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
         }
     };
 
+    // The exact position the replacement stream starts from: what any
+    // failover below must prove on the new server.
+    let resume = match &gtid_to_use {
+        Some(g) => ResumeAt::Gtid(g.clone()),
+        None => ResumeAt::FilePos {
+            file: file_to_use.clone().unwrap_or_default(),
+            pos: pos_to_use.unwrap_or_default().into(),
+        },
+    };
     let dsn = ctx.dsn.clone();
     let sid = ctx.server_id;
     let make_client = move || {
@@ -1063,7 +1038,7 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     let found = match opened {
         Opened::Stream(stream) => {
             ctx.retry.reset();
-            check_identity_post_reconnect(ctx, None).await?;
+            check_identity_post_reconnect(ctx, None, &resume).await?;
             return Ok(stream);
         }
         Opened::OtherServer(found) => found,
@@ -1080,7 +1055,7 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
     );
     let previous = mysql_identity(&expected);
     let current = mysql_identity(&found);
-    run_failover_reconciliation(ctx, previous, current).await?;
+    run_failover_reconciliation(ctx, previous, current, &resume).await?;
 
     // The candidate is now the verified lineage: the fresh session must prove
     // it is that server before its dump command.
@@ -1363,6 +1338,7 @@ async fn sync_registry_lineage(
 async fn check_identity_post_reconnect(
     ctx: &mut RunCtx,
     prefetched: Option<ServerIdentity>,
+    resume: &ResumeAt,
 ) -> SourceResult<()> {
     let expected = ctx.expected_uuid()?;
     let live = match prefetched {
@@ -1433,27 +1409,57 @@ async fn check_identity_post_reconnect(
                 new = ?current,
                 "server identity changed - failover detected, reconciling"
             );
-            run_failover_reconciliation(ctx, previous, current).await?;
+            run_failover_reconciliation(ctx, previous, current, resume).await?;
         }
     }
 
     Ok(())
 }
 
+/// The exact position a stream (re)opens from, which a failover must prove on
+/// the new server.
+#[derive(Debug, Clone)]
+pub(crate) enum ResumeAt {
+    Gtid(String),
+    FilePos { file: String, pos: u64 },
+}
+
+impl ResumeAt {
+    fn of(client: &BinlogClient) -> Self {
+        if client.gtid_enabled {
+            Self::Gtid(client.gtid_set.clone())
+        } else {
+            Self::FilePos {
+                file: client.binlog_filename.clone(),
+                pos: client.binlog_position.into(),
+            }
+        }
+    }
+}
+
 /// Reconcile a failover from `previous` to `current` and only then make
 /// `current` the verified lineage.
 ///
-/// Every live-server fact (position reachability, live columns) is read on ONE
-/// control connection that first proves it is `current`; any connection that
-/// reports another server or no identity stops with a lineage error. The
-/// durable lineage edge (and with it the expected server of every later
-/// connection) and the identity record change only after reconciliation
-/// completes. A crash before that keeps the previous lineage; a crash after it
-/// recovers through the startup checkpoint carry-over.
+/// Cross-server failover is supported only in GTID mode: the exact GTID set
+/// the stream resumes from must be proven executed by `current`
+/// (`GTID_SUBSET` exactly 1); a file/position resume is never comparable
+/// across servers and stops. Every live-server fact is read on ONE control
+/// connection that first proves it is `current`.
+///
+/// The reconciliation record (loaded when a previous attempt persisted it,
+/// else created) is the single source of the drift decision: drift is
+/// derived from it and `on_schema_drift=halt` applied on every attempt.
+/// Order: proof, record, halt, durable lineage edge (the expected server of
+/// every later connection), schema reloads (failures stop: no stream opens),
+/// and only then the identity record, so a restart after any failure
+/// re-enters this path from the stored record. A crash before the lineage
+/// edge keeps the previous lineage; after it, startup carries eligible GTID
+/// checkpoints over.
 async fn run_failover_reconciliation(
     ctx: &mut RunCtx,
     previous: ServerIdentity,
     current: ServerIdentity,
+    resume: &ResumeAt,
 ) -> SourceResult<()> {
     let ServerIdentity::MySql(current_id) = &current else {
         return Err(SourceError::Lineage {
@@ -1462,66 +1468,45 @@ async fn run_failover_reconciliation(
         });
     };
     let current_uuid = current_id.server_uuid.clone();
+    let resume_set = match resume {
+        ResumeAt::Gtid(set) => set,
+        ResumeAt::FilePos { file, pos } => {
+            return Err(SourceError::Lineage {
+                details: format!(
+                    "failover from {previous:?} to {current_uuid} at \
+                     {file}:{pos}: binlog positions are not comparable across \
+                     servers; cross-server failover requires GTID mode"
+                )
+                .into(),
+            });
+        }
+    };
 
-    // Idempotency: skip catalog queries if this transition already reconciled.
-    let existing = ctx
-        .reconciler
-        .already_completed(&ctx.source_id, &previous, &current)
-        .await
-        .unwrap_or(None);
+    let mut conn = open_control_connection(
+        ctx.dsn.expose(),
+        &current_uuid,
+        CONTROL_CONNECT_TIMEOUT,
+    )
+    .await
+    .map_err(|e| e.into_source_error(&current_uuid))?;
+    let record =
+        failover_record(ctx, &mut conn, &previous, &current, resume_set).await;
+    conn.disconnect().await.ok();
+    let record = record?;
 
-    let mut drifted = Vec::new();
-    if existing.is_none() {
-        let mut conn = open_control_connection(
-            ctx.dsn.expose(),
-            &current_uuid,
-            CONTROL_CONNECT_TIMEOUT,
-        )
-        .await
-        .map_err(|e| e.into_source_error(&current_uuid))?;
-        let facts = failover_facts(ctx, &mut conn).await;
-        conn.disconnect().await.ok();
-        let inputs = facts?;
-
-        // Diff against the last-known schemas of the lineage the source ran
-        // under before this failover: the published scope while it still is
-        // that lineage (reconnect), else its recorded predecessor (startup,
-        // where the scope was established on the new server already).
-        let scope_now = ctx.registry_scope.current()?;
-        let prior_recorded;
-        let prior = if scope_now.lineage().descriptor
-            == mysql_registry_lineage(&current)?
-        {
-            prior_recorded = previous_scope(
-                &ctx.registry_backend,
-                &ctx.tenant,
-                &ctx.source_id,
-            )
-            .await?;
-            prior_recorded.as_ref()
-        } else {
-            Some(scope_now.as_ref())
-        };
-        let record = ctx
-            .reconciler
-            .run(&ctx.source_id, &previous, &current, prior, &inputs)
-            .await
-            .map_err(SourceError::Other)?;
-
-        drifted = record
-            .table_results
-            .iter()
-            .filter(|r| !r.deltas.is_empty())
-            .map(|r| (r.db.clone(), r.table.clone()))
-            .collect();
-        if !drifted.is_empty() {
-            warn!(pipeline=%ctx.pipeline, source_id=%ctx.source_id, "schema drift detected after failover");
-            if ctx.on_schema_drift == deltaforge_config::OnSchemaDrift::Halt {
-                return Err(SourceError::Other(anyhow::anyhow!(
-                    "schema drift detected after failover and on_schema_drift=halt. \
+    let drifted: Vec<(String, String)> = record
+        .table_results
+        .iter()
+        .filter(|r| !r.deltas.is_empty())
+        .map(|r| (r.db.clone(), r.table.clone()))
+        .collect();
+    if !drifted.is_empty() {
+        warn!(pipeline=%ctx.pipeline, source_id=%ctx.source_id, "schema drift detected after failover");
+        if ctx.on_schema_drift == deltaforge_config::OnSchemaDrift::Halt {
+            return Err(SourceError::Other(anyhow::anyhow!(
+                "schema drift detected after failover and on_schema_drift=halt. \
                 Verify B's schema and apply any missing migrations before restarting."
-                )));
-            }
+            )));
         }
     }
 
@@ -1529,25 +1514,23 @@ async fn run_failover_reconciliation(
     // here on every connection must prove it is `current`.
     sync_registry_lineage(ctx, &current).await?;
 
-    // Persist new identity only after reconciliation completes. Fail closed if
-    // the durable write does not commit: continuing would leave stale identity
-    // authority and re-run reconciliation (or miss a later change).
+    // Reload every drifted table under the new lineage before any stream
+    // opens; a failure stops here and a restart repeats it from the record.
+    for (db, table) in &drifted {
+        ctx.schema.reload_schema(db, table).await?;
+    }
+
+    // Persist new identity only after everything above completed. Fail closed
+    // if the durable write does not commit.
     ctx.identity_store
         .store(&ctx.source_id, &current)
         .await
         .map_err(SourceError::Other)?;
 
-    // Invalidate schema loader cache for changed tables so the next row
-    // event triggers a fresh load and registry registration (under the new
-    // lineage's scope).
-    for (db, table) in &drifted {
-        let _ = ctx.schema.reload_schema(db, table).await;
-    }
-
-    // Clear streaming position so subsequent reconnects resolve B's binlog tail
-    // rather than re-sending A's GTID. Covers mid-run failovers where the stream
-    // was already open when the switch happened.
-    ctx.last_gtid = None;
+    // The stream resumes from the proven set: keep it (a later reconnect
+    // must not lose the previous server's part of it). File/position
+    // coordinates of the previous server mean nothing here.
+    ctx.last_gtid = Some(resume_set.clone());
     ctx.current_gtid = None;
     ctx.message_ordinal = 0;
     ctx.last_file = String::new();
@@ -1557,37 +1540,34 @@ async fn run_failover_reconciliation(
     Ok(())
 }
 
-/// The live-server facts reconciliation needs, all read on `conn` (verified as
-/// the failover candidate by the caller): position reachability of the
-/// original checkpoint, and the live columns of every configured table.
-async fn failover_facts(
+/// Prove the exact resume set on `conn` (verified as the failover candidate
+/// by the caller), then return the reconciliation record: the one a previous
+/// attempt persisted, else a new one built from the live columns of every
+/// configured table read on `conn`.
+async fn failover_record(
     ctx: &RunCtx,
     conn: &mut mysql_async::Conn,
-) -> SourceResult<Vec<ReconcileInput>> {
-    // Position reachability - use the original checkpoint position, not the
-    // (potentially adjusted) streaming position in last_gtid/last_file.
-    match check_position_reachability_on(
-        conn,
-        &ctx.checkpoint_file,
-        ctx.checkpoint_gtid.as_deref(),
-    )
-    .await
-    .unwrap_or(PositionReachability::Unknown {
-        reason: "reachability check failed".into(),
-    }) {
-        PositionReachability::Reachable => {}
-        PositionReachability::Unknown { reason } => {
-            warn!(
-                source_id = %ctx.source_id,
-                %reason,
-                "could not verify position reachability after failover - resuming anyway"
-            );
-        }
-        PositionReachability::Lost { reason } => {
-            return Err(SourceError::Other(anyhow::anyhow!(
-                "position lost after failover: {reason}. Re-snapshot required."
-            )));
-        }
+    previous: &ServerIdentity,
+    current: &ServerIdentity,
+    resume_set: &str,
+) -> SourceResult<crate::failover::reconciler::ReconciliationRecord> {
+    mysql_health::require_gtid_executed(conn, resume_set)
+        .await
+        .map_err(|why| SourceError::Checkpoint {
+            details: format!(
+                "failover to {current:?}: the resume position {resume_set:?} \
+                 is not proven on the new server ({why}). Re-snapshot required."
+            )
+            .into(),
+        })?;
+
+    if let Some(record) = ctx
+        .reconciler
+        .already_completed(&ctx.source_id, previous, current)
+        .await
+        .map_err(SourceError::Other)?
+    {
+        return Ok(record);
     }
 
     // Schema diff - use ctx.tables (configured patterns) since the schema cache
@@ -1615,7 +1595,27 @@ async fn failover_facts(
             live_columns: live_cols,
         });
     }
-    Ok(inputs)
+
+    // Diff against the last-known schemas of the lineage the source ran
+    // under before this failover: the published scope while it still is
+    // that lineage (reconnect), else its recorded predecessor (startup,
+    // where the scope was established on the new server already).
+    let scope_now = ctx.registry_scope.current()?;
+    let prior_recorded;
+    let prior = if scope_now.lineage().descriptor
+        == mysql_registry_lineage(current)?
+    {
+        prior_recorded =
+            previous_scope(&ctx.registry_backend, &ctx.tenant, &ctx.source_id)
+                .await?;
+        prior_recorded.as_ref()
+    } else {
+        Some(scope_now.as_ref())
+    };
+    ctx.reconciler
+        .run(&ctx.source_id, previous, current, prior, &inputs)
+        .await
+        .map_err(SourceError::Other)
 }
 
 #[cfg(test)]

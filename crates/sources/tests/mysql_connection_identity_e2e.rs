@@ -37,6 +37,7 @@ use sources::MySqlCheckpoint;
 use sources::credentials::resolve_mysql_credentials;
 use sources::failover::identity::{IdentityStore, ServerIdentity};
 use sources::mysql::{MySqlSource, mysql_rotation};
+use storage::adapters::test_util::FaultBackend;
 use storage::adapters::{LineageDescriptor, SchemaKey, source_lineage};
 use storage::{ArcStorageBackend, DurableSchemaRegistry, MemoryStorageBackend};
 use testcontainers::{
@@ -329,7 +330,16 @@ struct State {
 
 impl State {
     async fn new() -> Self {
-        let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        Self::over(Arc::new(MemoryStorageBackend::new())).await
+    }
+
+    /// State whose storage writes can be failed per namespace.
+    async fn faulty() -> (Self, Arc<FaultBackend>) {
+        let fault = Arc::new(FaultBackend::new());
+        (Self::over(fault.clone()).await, fault)
+    }
+
+    async fn over(backend: ArcStorageBackend) -> Self {
         Self {
             registry: DurableSchemaRegistry::new(backend.clone())
                 .await
@@ -337,6 +347,27 @@ impl State {
             ckpt: Arc::new(MemCheckpointStore::new().unwrap()),
             backend,
         }
+    }
+
+    async fn identity(&self, id: &str) -> Option<String> {
+        match IdentityStore::new(self.backend.clone())
+            .load(id)
+            .await
+            .unwrap()
+        {
+            Some(ServerIdentity::MySql(i)) => Some(i.server_uuid),
+            None => None,
+            Some(other) => panic!("identity {other:?}"),
+        }
+    }
+
+    async fn lineage(&self, id: &str) -> Option<(String, Option<String>)> {
+        source_lineage::load(&self.backend, TENANT, id)
+            .await
+            .unwrap()
+            .map(|r| {
+                (r.current.lineage_hash, r.previous.map(|p| p.lineage_hash))
+            })
     }
 
     /// Nothing durable from the server `wrong` (or anything but `right`).
@@ -921,6 +952,346 @@ async fn a_failover_rejected_by_reconciliation_changes_nothing_durable() {
         !watch.saw_dump().await,
         "binlog dump on the rejected server"
     );
+    proxy.all_to(a);
+}
+
+// ----------------------------------------------------------------------------
+// Failover continuation: exact resume position, the stored reconciliation
+// record, and schema reloads.
+// ----------------------------------------------------------------------------
+
+/// A's `@@GLOBAL.gtid_executed`.
+async fn executed(port: u16) -> String {
+    let mut c = mysql_async::Conn::from_url(root_dsn(port, ""))
+        .await
+        .unwrap();
+    let s: String = c
+        .query_first("SELECT @@GLOBAL.gtid_executed")
+        .await
+        .unwrap()
+        .unwrap();
+    c.disconnect().await.ok();
+    s.replace('\n', "")
+}
+
+/// A fresh GTID server holding `db.t` (with an extra column when `drift`)
+/// that has executed `set` of another server (a promoted replica).
+async fn promoted(id: u32, db: &str, drift: bool, set: &str) -> Server {
+    let srv = start(true, id).await;
+    let extra = if drift { ", b_only INT" } else { "" };
+    sql(
+        srv.1,
+        &[
+            format!("CREATE DATABASE {db}"),
+            format!(
+                "CREATE TABLE {db}.t (id INT PRIMARY KEY, src VARCHAR(8){extra})"
+            ),
+            format!("SET GLOBAL gtid_purged = '+{set}'"),
+        ],
+    )
+    .await;
+    srv
+}
+
+/// Run a source on A until it streams, stop it cleanly (A's checkpoint is
+/// stored), and start it again on A. Returns the second run.
+async fn streaming_on_a(
+    proxy: &Proxy,
+    a: u16,
+    id: &str,
+    db: &str,
+    st: &State,
+    drift: OnSchemaDrift,
+) -> Run {
+    let mut r = run(source(id, proxy.dsn(db), db, st, drift.clone()), st).await;
+    proxy
+        .settled_since(proxy.opened(), Duration::from_secs(3))
+        .await;
+    insert(a, db, 1, "a").await;
+    let got = rows_until(&mut r.rx, Some(1), Duration::from_secs(30)).await;
+    assert!(got.contains(&(1, "a".into())), "streams on A");
+    stop(r.handle).await;
+    let r = run(source(id, proxy.dsn(db), db, st, drift), st).await;
+    proxy
+        .settled_since(proxy.opened(), Duration::from_secs(3))
+        .await;
+    r
+}
+
+async fn stopped(handle: SourceHandle) -> Result<(), SourceError> {
+    timeout(Duration::from_secs(90), handle.join)
+        .await
+        .expect("source stops")
+        .expect("source task")
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn failover_must_prove_the_exact_resume_set_not_the_checkpoint() {
+    init_test_tracing();
+    let a = port(&GTID_A, true, 11).await;
+    let ua = uuid(a).await;
+    let db = "ident_exact";
+    prepare(a, db, "a").await;
+    let proxy = Proxy::start(a).await;
+    let st = State::new().await;
+    let id = "ident_exact";
+    let mut r =
+        streaming_on_a(&proxy, a, id, db, &st, OnSchemaDrift::Adapt).await;
+    // The stored checkpoint ends here; the target executed exactly it.
+    let checkpoint_set = executed(a).await;
+    // One more A transaction is consumed: the reconnect resumes after it.
+    insert(a, db, 2, "a").await;
+    let got = rows_until(&mut r.rx, Some(2), Duration::from_secs(30)).await;
+    assert!(got.contains(&(2, "a".into())));
+    let (_g, g) = promoted(31, db, false, &checkpoint_set).await;
+    let ug = uuid(g).await;
+    let before = (stored(&st).await, st.lineage(id).await);
+
+    let watch = DumpWatch::start(g);
+    proxy.all_to(g);
+    proxy.sever();
+    insert(g, db, 7000, "g").await;
+    let res = stopped(r.handle).await;
+    assert!(
+        matches!(res, Err(SourceError::Checkpoint { .. })),
+        "the unproven resume set stops the failover: {res:?}"
+    );
+    let rows = rows_until(&mut r.rx, None, Duration::from_millis(200)).await;
+    assert!(rows.iter().all(|(_, s)| s != "g"), "{rows:?}");
+    assert_eq!((stored(&st).await, st.lineage(id).await), before);
+    assert_eq!(st.identity(id).await, Some(ua.clone()));
+    st.assert_nothing_from(id, db, &ua, &ug, "exact resume set")
+        .await;
+    assert!(
+        !watch.saw_dump().await,
+        "binlog dump on the unproven server"
+    );
+    proxy.all_to(a);
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn file_position_failover_stops_even_when_the_file_name_matches() {
+    init_test_tracing();
+    let (a, b) = pair(false).await;
+    let (ua, ub) = (uuid(a).await, uuid(b).await);
+    let db = "ident_samefile";
+    prepare(a, db, "a").await;
+    prepare(b, db, "a").await; // same shape: only the position is at stake
+    let proxy = Proxy::start(a).await;
+    let st = State::new().await;
+    let id = "ident_samefile";
+    let mut r =
+        streaming_on_a(&proxy, a, id, db, &st, OnSchemaDrift::Adapt).await;
+    insert(a, db, 2, "a").await;
+    let got = rows_until(&mut r.rx, Some(2), Duration::from_secs(30)).await;
+    assert!(got.contains(&(2, "a".into())));
+
+    // B deliberately has A's current binlog file name.
+    let mut c = mysql_async::Conn::from_url(root_dsn(a, "")).await.unwrap();
+    let row: mysql_async::Row = c
+        .query_first("SHOW BINARY LOG STATUS")
+        .await
+        .unwrap()
+        .unwrap();
+    let a_file: String = row.get(0).unwrap();
+    c.disconnect().await.ok();
+    for _ in 0..50 {
+        let mut c = mysql_async::Conn::from_url(root_dsn(b, "")).await.unwrap();
+        let files: Vec<String> = c
+            .query_map("SHOW BINARY LOGS", |r: mysql_async::Row| {
+                r.get::<String, _>(0).unwrap()
+            })
+            .await
+            .unwrap();
+        if files.contains(&a_file) {
+            break;
+        }
+        c.query_drop("FLUSH BINARY LOGS").await.unwrap();
+    }
+    let before = (stored(&st).await, st.lineage(id).await);
+
+    let watch = DumpWatch::start(b);
+    proxy.all_to(b);
+    proxy.sever();
+    insert(b, db, 8000, "b").await;
+    assert_lineage_stop(r.handle, "file/position failover").await;
+    let rows = rows_until(&mut r.rx, None, Duration::from_millis(200)).await;
+    assert!(rows.iter().all(|(id, _)| *id < 8000), "{rows:?}");
+    assert_eq!((stored(&st).await, st.lineage(id).await), before);
+    assert_eq!(st.identity(id).await, Some(ua.clone()));
+    st.assert_nothing_from(id, db, &ua, &ub, "file/position failover")
+        .await;
+    assert!(!watch.saw_dump().await, "binlog dump on the other server");
+    proxy.all_to(a);
+}
+
+/// Fail over to a drifted promoted replica with the lineage write failing:
+/// the reconciliation record is persisted, the lineage is not published.
+async fn interrupted_before_lineage_publication(
+    drift_policy: OnSchemaDrift,
+    db: &str,
+    server_id: u32,
+) -> (State, Proxy, u16, Server, String) {
+    let a = port(&GTID_A, true, 11).await;
+    let ua = uuid(a).await;
+    prepare(a, db, "a").await;
+    let proxy = Proxy::start(a).await;
+    let (st, fault) = State::faulty().await;
+    let id = db.to_string();
+    let r = streaming_on_a(&proxy, a, &id, db, &st, drift_policy.clone()).await;
+    let target = promoted(server_id, db, true, &executed(a).await).await;
+    let before = stored(&st).await;
+
+    fault
+        .fail_writes_to
+        .lock()
+        .unwrap()
+        .push("schema_lineage".into());
+    let watch = DumpWatch::start(target.1);
+    proxy.all_to(target.1);
+    proxy.sever();
+    let res = stopped(r.handle).await;
+    assert!(res.is_err(), "the interrupted failover stops: {res:?}");
+    fault.fail_writes_to.lock().unwrap().clear();
+    // Nothing moved: lineage, identity and checkpoints are A's.
+    assert_eq!(st.lineage(&id).await.map(|l| l.0), Some(lineage_hash(&ua)));
+    assert_eq!(st.identity(&id).await, Some(ua));
+    assert_eq!(stored(&st).await, before);
+    assert!(!watch.saw_dump().await, "binlog dump before reconciliation");
+    (st, proxy, a, target, id)
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_failover_record_persisted_before_lineage_publication_is_resumed_adapt()
+ {
+    init_test_tracing();
+    let db = "ident_rec_adapt";
+    let (st, proxy, a, (_t, t), id) =
+        interrupted_before_lineage_publication(OnSchemaDrift::Adapt, db, 32)
+            .await;
+    let ut = uuid(t).await;
+    // Restart on the target: the stored record drives the reload, then the
+    // stream opens.
+    let mut r = run(
+        source(&id, proxy.dsn(db), db, &st, OnSchemaDrift::Adapt),
+        &st,
+    )
+    .await;
+    insert(t, db, 9000, "t").await;
+    let got = rows_until(&mut r.rx, Some(9000), Duration::from_secs(60)).await;
+    assert!(got.contains(&(9000, "t".into())), "streams on the target");
+    assert_eq!(st.identity(&id).await, Some(ut.clone()));
+    let key = SchemaKey::new(TENANT, id.as_str(), lineage_hash(&ut), db, "t");
+    let versions = registry_history(&st.registry, &key).await;
+    assert!(
+        versions
+            .iter()
+            .any(|v| v.schema_json.to_string().contains("b_only")),
+        "the drifted shape is registered under the target lineage"
+    );
+    stop(r.handle).await;
+    proxy.all_to(a);
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_failover_record_persisted_before_lineage_publication_is_resumed_halt()
+ {
+    init_test_tracing();
+    let db = "ident_rec_halt";
+    let (st, proxy, a, (_t, t), id) =
+        interrupted_before_lineage_publication(OnSchemaDrift::Halt, db, 33)
+            .await;
+    let ua = uuid(a).await;
+    // Every restart re-derives the drift from the stored record and halts.
+    for attempt in 0..2 {
+        let watch = DumpWatch::start(t);
+        let mut r = run(
+            source(&id, proxy.dsn(db), db, &st, OnSchemaDrift::Halt),
+            &st,
+        )
+        .await;
+        insert(t, db, 9100 + attempt, "t").await;
+        let res = stopped(r.handle).await;
+        assert!(
+            matches!(&res, Err(SourceError::Other(e)) if e.to_string().contains("on_schema_drift=halt")),
+            "restart {attempt} halts again: {res:?}"
+        );
+        let rows =
+            rows_until(&mut r.rx, None, Duration::from_millis(200)).await;
+        assert!(rows.is_empty(), "{rows:?}");
+        assert_eq!(st.identity(&id).await, Some(ua.clone()));
+        assert!(!watch.saw_dump().await, "binlog dump while halted");
+    }
+    proxy.all_to(a);
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_failed_schema_reload_opens_no_stream_and_is_retried_on_restart() {
+    init_test_tracing();
+    let a = port(&GTID_A, true, 11).await;
+    let ua = uuid(a).await;
+    let db = "ident_reload";
+    prepare(a, db, "a").await;
+    let proxy = Proxy::start(a).await;
+    let (st, fault) = State::faulty().await;
+    let id = "ident_reload";
+    let r = streaming_on_a(&proxy, a, id, db, &st, OnSchemaDrift::Adapt).await;
+    let (_t, t) = promoted(34, db, true, &executed(a).await).await;
+    let ut = uuid(t).await;
+    let fail_registry = || {
+        let mut f = fault.fail_writes_to.lock().unwrap();
+        f.push("schemas.v1".into());
+        f.push("schemas.v1.index".into());
+    };
+
+    // Online failover: reconciled and published, but the reload fails.
+    fail_registry();
+    let watch = DumpWatch::start(t);
+    proxy.all_to(t);
+    proxy.sever();
+    insert(t, db, 9500, "t").await;
+    let mut r = r;
+    assert!(stopped(r.handle).await.is_err(), "the failed reload stops");
+    let rows = rows_until(&mut r.rx, None, Duration::from_millis(200)).await;
+    assert!(rows.iter().all(|(_, s)| s != "t"), "{rows:?}");
+    assert!(
+        !watch.saw_dump().await,
+        "a stream opened after a failed reload"
+    );
+    assert_eq!(st.identity(id).await, Some(ua.clone()));
+
+    // Restart, reload still failing: retried from the stored record before
+    // any stream opens, and stops again.
+    let watch = DumpWatch::start(t);
+    let r = run(
+        source(id, proxy.dsn(db), db, &st, OnSchemaDrift::Adapt),
+        &st,
+    )
+    .await;
+    assert!(stopped(r.handle).await.is_err(), "the retried reload stops");
+    assert!(!watch.saw_dump().await, "a stream opened before the reload");
+    assert_eq!(st.identity(id).await, Some(ua));
+
+    // Restart, reload succeeds: then it streams.
+    fault.fail_writes_to.lock().unwrap().clear();
+    let mut r = run(
+        source(id, proxy.dsn(db), db, &st, OnSchemaDrift::Adapt),
+        &st,
+    )
+    .await;
+    insert(t, db, 9501, "t").await;
+    let got = rows_until(&mut r.rx, Some(9501), Duration::from_secs(60)).await;
+    assert!(
+        got.contains(&(9501, "t".into())),
+        "streams after the reload"
+    );
+    assert_eq!(st.identity(id).await, Some(ut));
+    stop(r.handle).await;
     proxy.all_to(a);
 }
 

@@ -27,6 +27,8 @@ pub struct FaultBackend {
     one_shot: AtomicBool,
     /// Every `kv_list` call: (namespace, prefix).
     pub kv_list_calls: std::sync::Mutex<Vec<(String, Option<String>)>>,
+    /// Every write to one of these namespaces fails while it is listed.
+    pub fail_writes_to: std::sync::Mutex<Vec<String>>,
 }
 
 impl Default for FaultBackend {
@@ -53,6 +55,7 @@ impl FaultBackend {
             writes_left: std::sync::atomic::AtomicU64::new(u64::MAX),
             one_shot: AtomicBool::new(false),
             kv_list_calls: std::sync::Mutex::new(Vec::new()),
+            fail_writes_to: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -69,7 +72,11 @@ impl FaultBackend {
         self.writes_left.store(n, Ordering::SeqCst);
     }
 
-    fn write(&self) -> Result<()> {
+    fn write(&self, ns: &str) -> Result<()> {
+        anyhow::ensure!(
+            !self.fail_writes_to.lock().unwrap().iter().any(|n| n == ns),
+            "injected write failure in namespace {ns}"
+        );
         let left = self.writes_left.load(Ordering::SeqCst);
         if left == 0 && self.one_shot.swap(false, Ordering::SeqCst) {
             self.writes_left.store(u64::MAX, Ordering::SeqCst);
@@ -93,7 +100,7 @@ impl StorageBackend for FaultBackend {
         self.inner.kv_get(ns, key).await
     }
     async fn kv_put(&self, ns: &str, key: &str, value: &[u8]) -> Result<()> {
-        self.write()?;
+        self.write(ns)?;
         anyhow::ensure!(
             !self.fail_kv_put.load(Ordering::SeqCst),
             "injected kv_put failure"
@@ -107,11 +114,11 @@ impl StorageBackend for FaultBackend {
         value: &[u8],
         ttl: u64,
     ) -> Result<()> {
-        self.write()?;
+        self.write(ns)?;
         self.inner.kv_put_with_ttl(ns, key, value, ttl).await
     }
     async fn kv_delete(&self, ns: &str, key: &str) -> Result<bool> {
-        self.write()?;
+        self.write(ns)?;
         self.inner.kv_delete(ns, key).await
     }
     async fn kv_list(
@@ -131,7 +138,7 @@ impl StorageBackend for FaultBackend {
         key: &str,
         value: &[u8],
     ) -> Result<u64> {
-        self.write()?;
+        self.write(ns)?;
         self.inner.log_append(ns, key, value).await
     }
     async fn log_list(
@@ -174,7 +181,7 @@ impl StorageBackend for FaultBackend {
         capture_id: &str,
         value: &[u8],
     ) -> Result<LogAppendOutcome> {
-        self.write()?;
+        self.write(ns)?;
         self.inner
             .log_append_if_absent(ns, key, capture_id, value)
             .await
@@ -185,7 +192,7 @@ impl StorageBackend for FaultBackend {
         key: &str,
         req: LogTruncateRequest,
     ) -> Result<LogTruncateOutcome> {
-        self.write()?;
+        self.write(ns)?;
         self.inner.log_truncate(ns, key, req).await
     }
     async fn log_stream_meta(
@@ -214,7 +221,7 @@ impl StorageBackend for FaultBackend {
         key: &str,
         state: &[u8],
     ) -> Result<u64> {
-        self.write()?;
+        self.write(ns)?;
         self.inner.slot_upsert(ns, key, state).await
     }
     async fn slot_get(
@@ -231,7 +238,7 @@ impl StorageBackend for FaultBackend {
         expected: u64,
         state: &[u8],
     ) -> Result<bool> {
-        self.write()?;
+        self.write(ns)?;
         self.inner.slot_cas(ns, key, expected, state).await
     }
     async fn slot_create(
@@ -240,11 +247,11 @@ impl StorageBackend for FaultBackend {
         key: &str,
         state: &[u8],
     ) -> Result<Option<u64>> {
-        self.write()?;
+        self.write(ns)?;
         self.inner.slot_create(ns, key, state).await
     }
     async fn slot_delete(&self, ns: &str, key: &str) -> Result<bool> {
-        self.write()?;
+        self.write(ns)?;
         self.inner.slot_delete(ns, key).await
     }
     async fn slot_list(
@@ -262,7 +269,7 @@ impl StorageBackend for FaultBackend {
         key: &str,
         value: &[u8],
     ) -> Result<u64> {
-        self.write()?;
+        self.write(ns)?;
         self.inner.queue_push(ns, key, value).await
     }
     async fn queue_peek(
@@ -279,7 +286,7 @@ impl StorageBackend for FaultBackend {
         key: &str,
         up_to: u64,
     ) -> Result<usize> {
-        self.write()?;
+        self.write(ns)?;
         self.inner.queue_ack(ns, key, up_to).await
     }
     async fn queue_len(&self, ns: &str, key: &str) -> Result<u64> {
@@ -291,7 +298,7 @@ impl StorageBackend for FaultBackend {
         key: &str,
         count: usize,
     ) -> Result<usize> {
-        self.write()?;
+        self.write(ns)?;
         self.inner.queue_drop_oldest(ns, key, count).await
     }
 }

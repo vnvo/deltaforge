@@ -525,14 +525,21 @@ pub(crate) async fn check_position_reachability_on(
                     }),
                 };
             }
-            Ok(None) => { /* GTID unavailable, fall through */ }
+            // A GTID position is never "proven" by a file name.
+            Ok(None) => {
+                return Ok(PositionReachability::Unknown {
+                    reason: "GTID_SUBSET returned no row".into(),
+                });
+            }
             Err(e) => {
-                warn!(error = %e, "GTID_SUBSET check failed, falling back to file check");
+                return Ok(PositionReachability::Unknown {
+                    reason: format!("GTID_SUBSET failed: {e}"),
+                });
             }
         }
     }
 
-    // File/pos fallback.
+    // File/pos position (no GTID set given).
     let rows: Vec<Row> = match conn.query("SHOW BINARY LOGS").await {
         Ok(r) => r,
         Err(e) => {
@@ -563,6 +570,33 @@ pub(crate) async fn check_position_reachability_on(
                 available.join(", ")
             ),
         })
+    }
+}
+
+/// Require `GTID_SUBSET(set, @@GLOBAL.gtid_executed)` to be exactly 1 on
+/// `conn` (whose identity the caller verified). Anything else - 0, NULL, no
+/// row, a query error (e.g. a malformed set) - is an error carrying the reason.
+pub(crate) async fn require_gtid_executed(
+    conn: &mut mysql_async::Conn,
+    set: &str,
+) -> std::result::Result<(), String> {
+    let row: std::result::Result<Option<Option<i64>>, _> = conn
+        .exec_first("SELECT GTID_SUBSET(?, @@GLOBAL.gtid_executed)", (set,))
+        .await;
+    gtid_executed_outcome(row.map_err(|e| e.to_string()))
+}
+
+fn gtid_executed_outcome(
+    row: std::result::Result<Option<Option<i64>>, String>,
+) -> std::result::Result<(), String> {
+    match row {
+        Ok(Some(Some(1))) => Ok(()),
+        Ok(Some(Some(0))) => {
+            Err("not executed by the server (GTID_SUBSET = 0)".into())
+        }
+        Ok(Some(other)) => Err(format!("GTID_SUBSET returned {other:?}")),
+        Ok(None) => Err("GTID_SUBSET returned no row".into()),
+        Err(e) => Err(format!("GTID_SUBSET failed: {e}")),
     }
 }
 
@@ -727,6 +761,20 @@ fn engine_hard_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_exact_gtid_subset_proves_a_resume_position() {
+        assert_eq!(gtid_executed_outcome(Ok(Some(Some(1)))), Ok(()));
+        for row in [
+            Ok(Some(Some(0))),
+            Ok(Some(Some(2))),
+            Ok(Some(None)),
+            Ok(None),
+            Err("Malformed GTID set specification".to_string()),
+        ] {
+            assert!(gtid_executed_outcome(row.clone()).is_err(), "{row:?}");
+        }
+    }
 
     #[test]
     fn file_present_in_list() {
