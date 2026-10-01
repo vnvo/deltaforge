@@ -33,6 +33,7 @@ mod mysql_binlog_scan;
 mod mysql_checkpoint_lineage;
 mod mysql_ddl_attribution;
 mod mysql_helpers;
+mod mysql_session;
 use mysql_helpers::{checkpoint_lineage, prepare_client};
 
 pub mod mysql_object;
@@ -56,8 +57,9 @@ pub use mysql_identity::{
 mod mysql_table_map_check;
 mod mysql_table_schema;
 use crate::mysql::mysql_helpers::{
-    connect_binlog_with_retries, resolve_binlog_tail,
+    Opened, connect_binlog_with_retries, resolve_binlog_tail,
 };
+use crate::mysql::mysql_session::{SessionError, open_control_connection};
 pub use mysql_table_schema::{MySqlColumn, MySqlTableSchema};
 
 pub mod mysql_snapshot;
@@ -70,7 +72,7 @@ use crate::failover::identity::{
 };
 use crate::failover::reconciler::{ReconcileInput, SchemaReconciler};
 use crate::mysql::mysql_health::{
-    PositionReachability, check_position_reachability, fetch_server_identity,
+    PositionReachability, check_position_reachability_on, fetch_server_identity,
 };
 use crate::registry_scope::{
     ScopeChange, SharedRegistryScope, establish_scope, previous_scope,
@@ -338,13 +340,36 @@ impl MySqlSource {
         // Verify the server_uuid lineage and establish the schema-registry scope
         // BEFORE any registry access (the snapshot preload below included), in
         // every binlog mode: persist it durably (fail closed), then publish it
-        // to this pipeline's loaders.
-        establish_registry_scope(
-            self.dsn.expose(),
+        // to this pipeline's loaders. The snapshot lineage above was read on
+        // another connection: both must name one server before anything is
+        // recorded. From here on every connection proves it is this server
+        // before it is trusted.
+        let root = fetch_identity_verified(self.dsn.expose()).await?;
+        let same_server = match (&durable_lineage, &root) {
+            (
+                PersistedLineage::MysqlGtid { source_uuid },
+                ServerIdentity::MySql(id),
+            ) => {
+                mysql_event_id::parse_uuid16(&id.server_uuid)
+                    == Some(*source_uuid)
+            }
+            _ => false,
+        };
+        if !same_server {
+            return Err(SourceError::Lineage {
+                details: format!(
+                    "startup connections disagree on the server: snapshot \
+                     lineage {durable_lineage:?}, identity {root:?}"
+                )
+                .into(),
+            });
+        }
+        establish_scope(
             &self.backend,
             &self.registry_scope,
             &self.tenant,
             &self.id,
+            mysql_registry_lineage(&root)?,
         )
         .await?;
 
@@ -370,7 +395,7 @@ impl MySqlSource {
             &lineage_hash,
             &mysql_checkpoint_lineage::LiveGtidAvailability {
                 dsn: self.dsn.expose(),
-                server_uuid,
+                server_uuid: server_uuid.clone(),
             },
         )
         .await?;
@@ -428,6 +453,7 @@ impl MySqlSource {
             let snapshot_ctx = mysql_snapshot::SnapshotCtx {
                 checkpoint_lineage: checkpoint_lineage(&self.registry_scope),
                 dsn: self.dsn.expose(),
+                expected_uuid: &server_uuid,
                 source_id: &self.id,
                 pipeline: &self.pipeline,
                 tenant: &self.tenant,
@@ -463,8 +489,13 @@ impl MySqlSource {
         let (host, default_db, server_id, mut client) = {
             let mut retry = common::retry::RetryPolicy::default();
             loop {
-                match prepare_client(self.dsn.expose(), &self.id, &chkpt_store)
-                    .await
+                match prepare_client(
+                    self.dsn.expose(),
+                    &server_uuid,
+                    &self.id,
+                    &chkpt_store,
+                )
+                .await
                 {
                     Ok(result) => break result,
                     Err(e) => {
@@ -511,7 +542,8 @@ impl MySqlSource {
         // opening the binlog stream. Reused below for the pre-connect position
         // decision and for the durable identity resolution. Fails closed: the
         // stream must not open on an unverified server.
-        let live = fetch_identity_verified(self.dsn.expose()).await?;
+        let live =
+            fetch_identity_verified_as(self.dsn.expose(), &server_uuid).await?;
         let id_store = IdentityStore::new(Arc::clone(&self.backend));
 
         // Pre-connect failover position: if the server changed, A's checkpoint
@@ -526,7 +558,7 @@ impl MySqlSource {
                 .map_err(SourceError::Other)?,
             IdentityComparison::Changed { .. }
         ) {
-            match resolve_binlog_tail(self.dsn.expose()).await {
+            match resolve_binlog_tail(self.dsn.expose(), &server_uuid).await {
                 Ok((fname, fpos)) => {
                     warn!(
                         source_id = %self.id,
@@ -536,6 +568,11 @@ impl MySqlSource {
                     client.gtid_set = String::new();
                     client.binlog_filename = fname;
                     client.binlog_position = fpos as u32;
+                }
+                Err(MySqlSourceError::Lineage(details)) => {
+                    return Err(SourceError::Lineage {
+                        details: details.into(),
+                    });
                 }
                 Err(e) => {
                     return Err(SourceError::Other(anyhow::anyhow!(
@@ -630,7 +667,11 @@ impl MySqlSource {
         // the loop on every exit path, with `Drop` as the abort backstop.
         let mut rotation = match &self.rotation {
             Some(spec) => {
-                mysql_rotation::require_gtid_mode(self.dsn.expose()).await?;
+                mysql_rotation::require_gtid_mode(
+                    self.dsn.expose(),
+                    &ctx.expected_uuid()?,
+                )
+                .await?;
                 Some(mysql_rotation::MySqlRotationRuntime::spawn(
                     spec,
                     ctx.dsn.clone(),
@@ -934,28 +975,51 @@ async fn connect_first_stream(
         c
     };
 
-    connect_binlog_with_retries(
+    let expected = ctx.expected_uuid()?;
+    match connect_binlog_with_retries(
         &ctx.source_id,
+        &expected,
         make_client,
         &ctx.cancel,
         &ctx.default_db,
         ctx.retry.clone(),
     )
-    .await
+    .await?
+    {
+        Opened::Stream(stream) => Ok(stream),
+        // Startup verified this server on every earlier connection: a
+        // replication session elsewhere is split routing, never a failover.
+        Opened::OtherServer(found) => Err(SourceError::Lineage {
+            details: format!(
+                "startup replication session reached server {found}, \
+                 expected {expected}"
+            )
+            .into(),
+        }),
+    }
 }
 
-/// Reconnect using the best available resume position, then run the identity
-/// check. If a failover is detected, reconciliation runs before returning the
-/// stream - callers see a ready stream regardless.
+/// Reconnect using the best available resume position. Every replication
+/// session is verified as the expected server before its dump command. A
+/// session that reached another server U was closed before the dump: U is a
+/// failover candidate, accepted only after reconciliation proves it on
+/// connections verified as U and records it durably; a fresh session verified
+/// as U is then opened. Callers see a ready stream regardless.
 async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
+    let expected = ctx.expected_uuid()?;
     let (gtid_to_use, file_to_use, pos_to_use) = if let Some(g) = &ctx.last_gtid
     {
         (Some(g.clone()), None, None)
     } else if !ctx.last_file.is_empty() && ctx.last_pos > 0 {
         (None, Some(ctx.last_file.clone()), Some(ctx.last_pos as u32))
     } else {
-        match resolve_binlog_tail(ctx.dsn.expose()).await {
+        match resolve_binlog_tail(ctx.dsn.expose(), &expected).await {
             Ok((f, p)) => (None, Some(f), Some(p as u32)),
+            Err(MySqlSourceError::Lineage(details)) => {
+                return Err(SourceError::Lineage {
+                    details: details.into(),
+                });
+            }
             Err(_) => {
                 return Err(SourceError::Connect {
                     details: "could not resolve binlog tail during reconnect"
@@ -987,20 +1051,62 @@ async fn reconnect_stream(ctx: &mut RunCtx) -> SourceResult<BinlogStream> {
         c
     };
 
-    let stream = connect_binlog_with_retries(
+    let opened = connect_binlog_with_retries(
         &ctx.source_id,
-        make_client,
+        &expected,
+        make_client.clone(),
         &ctx.cancel,
         &ctx.default_db,
         ctx.retry.clone(),
     )
     .await?;
+    let found = match opened {
+        Opened::Stream(stream) => {
+            ctx.retry.reset();
+            check_identity_post_reconnect(ctx, None).await?;
+            return Ok(stream);
+        }
+        Opened::OtherServer(found) => found,
+    };
 
-    ctx.retry.reset();
+    // Failover candidate. Nothing has been read from it and nothing durable
+    // has changed; reconciliation proves it (on connections verified as
+    // `found`) and only then records it.
+    warn!(
+        source_id = %ctx.source_id,
+        %expected,
+        candidate = %found,
+        "reconnect reached another server; reconciling a possible failover"
+    );
+    let previous = mysql_identity(&expected);
+    let current = mysql_identity(&found);
+    run_failover_reconciliation(ctx, previous, current).await?;
 
-    check_identity_post_reconnect(ctx, None).await?;
-
-    Ok(stream)
+    // The candidate is now the verified lineage: the fresh session must prove
+    // it is that server before its dump command.
+    let expected = ctx.expected_uuid()?;
+    match connect_binlog_with_retries(
+        &ctx.source_id,
+        &expected,
+        make_client,
+        &ctx.cancel,
+        &ctx.default_db,
+        ctx.retry.clone(),
+    )
+    .await?
+    {
+        Opened::Stream(stream) => {
+            ctx.retry.reset();
+            Ok(stream)
+        }
+        Opened::OtherServer(other) => Err(SourceError::Lineage {
+            details: format!(
+                "after failover to {expected}, the replication session \
+                 reached server {other}"
+            )
+            .into(),
+        }),
+    }
 }
 
 /// Apply backoff, sleep (cancel-aware), reconnect, and absorb transient errors.
@@ -1059,6 +1165,77 @@ fn mysql_server_lineage(
         )));
     }
     Ok(PersistedLineage::MysqlServer { server_id, file })
+}
+
+impl RunCtx {
+    /// The verified `server_uuid` (the published registry lineage) that every
+    /// connection of this run must prove it is before it is trusted.
+    pub(crate) fn expected_uuid(&self) -> SourceResult<String> {
+        match &self.registry_scope.current()?.lineage().descriptor {
+            LineageDescriptor::Mysql { server_uuid } => Ok(server_uuid.clone()),
+            other => Err(SourceError::Lineage {
+                details: format!(
+                    "MySQL source scoped to a non-MySQL lineage {other:?}"
+                )
+                .into(),
+            }),
+        }
+    }
+}
+
+/// Connect timeout for identity-verified control connections.
+const CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn mysql_identity(server_uuid: &str) -> ServerIdentity {
+    ServerIdentity::MySql(mysql_health::MySqlServerIdentity {
+        server_uuid: server_uuid.to_string(),
+    })
+}
+
+/// The live identity, proven on a control connection to be `expected_uuid`
+/// (the verified registry lineage). Transient connect failures are retried
+/// (bounded); another server or an unverifiable identity is a lineage error.
+async fn fetch_identity_verified_as(
+    dsn: &str,
+    expected_uuid: &str,
+) -> SourceResult<ServerIdentity> {
+    let mut attempt = 0u32;
+    loop {
+        match open_control_connection(
+            dsn,
+            expected_uuid,
+            CONTROL_CONNECT_TIMEOUT,
+        )
+        .await
+        {
+            Ok(conn) => {
+                conn.disconnect().await.ok();
+                return Ok(mysql_identity(expected_uuid));
+            }
+            Err(SessionError::Connect(e)) => {
+                attempt += 1;
+                if attempt >= IDENTITY_FETCH_ATTEMPTS {
+                    return Err(SourceError::Connect {
+                        details: format!(
+                            "failed to verify server identity after {attempt} \
+                             attempts: {e}; refusing to stream on an unverified \
+                             server"
+                        )
+                        .into(),
+                    });
+                }
+                warn!(
+                    attempt, error = %e,
+                    "identity verification connect failed; retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(
+                    200 * 2u64.pow(attempt.min(5)),
+                ))
+                .await;
+            }
+            Err(e) => return Err(e.into_source_error(expected_uuid)),
+        }
+    }
 }
 
 /// Bounded attempts to fetch the live server identity before failing closed.
@@ -1177,7 +1354,8 @@ async fn sync_registry_lineage(
 /// - `Changed`: run full failover reconciliation before returning.
 ///
 /// Identity fetch, comparison, and persistence are correctness authority: any
-/// failure fails closed (propagated), never mapped to `Same`.
+/// failure fails closed (propagated), never mapped to `Same`. The live
+/// identity is the run's verified lineage, proven on a control connection.
 ///
 /// `prefetched` reuses an identity already verified by the caller (startup path)
 /// so the live server is queried once; `None` fetches and verifies here (the
@@ -1186,13 +1364,11 @@ async fn check_identity_post_reconnect(
     ctx: &mut RunCtx,
     prefetched: Option<ServerIdentity>,
 ) -> SourceResult<()> {
+    let expected = ctx.expected_uuid()?;
     let live = match prefetched {
         Some(live) => live,
-        None => fetch_identity_verified(ctx.dsn.expose()).await?,
+        None => fetch_identity_verified_as(ctx.dsn.expose(), &expected).await?,
     };
-    // Re-scope the registry to the live lineage before any registry access on
-    // this connection (fails closed if the new lineage cannot be persisted).
-    sync_registry_lineage(ctx, &live).await?;
 
     match ctx
         .identity_store
@@ -1213,15 +1389,31 @@ async fn check_identity_post_reconnect(
             // Skip when there is no GTID checkpoint (file/pos mode or fresh
             // start) to avoid false positives from the file-presence fallback.
             if ctx.checkpoint_gtid.is_some() {
-                match check_position_reachability(
+                let reach = match open_control_connection(
                     ctx.dsn.expose(),
-                    &ctx.checkpoint_file,
-                    ctx.checkpoint_gtid.as_deref(),
+                    &expected,
+                    CONTROL_CONNECT_TIMEOUT,
                 )
                 .await
-                .unwrap_or(PositionReachability::Unknown {
-                    reason: "reachability check failed".into(),
-                }) {
+                {
+                    Ok(mut conn) => {
+                        let r = check_position_reachability_on(
+                            &mut conn,
+                            &ctx.checkpoint_file,
+                            ctx.checkpoint_gtid.as_deref(),
+                        )
+                        .await;
+                        conn.disconnect().await.ok();
+                        r.unwrap_or(PositionReachability::Unknown {
+                            reason: "reachability check failed".into(),
+                        })
+                    }
+                    Err(SessionError::Connect(e)) => {
+                        PositionReachability::Unknown { reason: e }
+                    }
+                    Err(e) => return Err(e.into_source_error(&expected)),
+                };
+                match reach {
                     PositionReachability::Reachable
                     | PositionReachability::Unknown { .. } => {}
                     PositionReachability::Lost { reason } => {
@@ -1248,11 +1440,29 @@ async fn check_identity_post_reconnect(
     Ok(())
 }
 
+/// Reconcile a failover from `previous` to `current` and only then make
+/// `current` the verified lineage.
+///
+/// Every live-server fact (position reachability, live columns) is read on ONE
+/// control connection that first proves it is `current`; any connection that
+/// reports another server or no identity stops with a lineage error. The
+/// durable lineage edge (and with it the expected server of every later
+/// connection) and the identity record change only after reconciliation
+/// completes. A crash before that keeps the previous lineage; a crash after it
+/// recovers through the startup checkpoint carry-over.
 async fn run_failover_reconciliation(
     ctx: &mut RunCtx,
     previous: ServerIdentity,
     current: ServerIdentity,
 ) -> SourceResult<()> {
+    let ServerIdentity::MySql(current_id) = &current else {
+        return Err(SourceError::Lineage {
+            details: format!("failover to a non-MySQL identity {current:?}")
+                .into(),
+        });
+    };
+    let current_uuid = current_id.server_uuid.clone();
+
     // Idempotency: skip catalog queries if this transition already reconciled.
     let existing = ctx
         .reconciler
@@ -1260,79 +1470,51 @@ async fn run_failover_reconciliation(
         .await
         .unwrap_or(None);
 
+    let mut drifted = Vec::new();
     if existing.is_none() {
-        // Position reachability - use the original checkpoint position, not the
-        // (potentially adjusted) streaming position in last_gtid/last_file.
-        match check_position_reachability(
+        let mut conn = open_control_connection(
             ctx.dsn.expose(),
-            &ctx.checkpoint_file,
-            ctx.checkpoint_gtid.as_deref(),
+            &current_uuid,
+            CONTROL_CONNECT_TIMEOUT,
         )
         .await
-        .unwrap_or(PositionReachability::Unknown {
-            reason: "reachability check failed".into(),
-        }) {
-            PositionReachability::Reachable => {}
-            PositionReachability::Unknown { reason } => {
-                warn!(
-                    source_id = %ctx.source_id,
-                    %reason,
-                    "could not verify position reachability after failover - resuming anyway"
-                );
-            }
-            PositionReachability::Lost { reason } => {
-                return Err(SourceError::Other(anyhow::anyhow!(
-                    "position lost after failover: {reason}. Re-snapshot required."
-                )));
-            }
-        }
-
-        // Schema diff - use ctx.tables (configured patterns) since the schema cache
-        // may be empty (preload is intentionally deferred until after reconciliation).
-        let mut inputs = Vec::new();
-        for pattern in &ctx.tables {
-            let parts: Vec<&str> = pattern.splitn(2, '.').collect();
-            if parts.len() != 2 || parts[1].contains('*') {
-                continue;
-            }
-            let (db, table) = (parts[0].to_owned(), parts[1].to_owned());
-            let live_cols: Option<
-                Vec<crate::failover::reconciler::ColumnSnapshot>,
-            > = mysql_health::fetch_live_columns(ctx.dsn.expose(), &db, &table)
-                .await
-                .ok()
-                .flatten()
-                .map(|cols| cols.into_iter().map(Into::into).collect());
-            inputs.push(ReconcileInput {
-                db,
-                table,
-                live_columns: live_cols,
-            });
-        }
+        .map_err(|e| e.into_source_error(&current_uuid))?;
+        let facts = failover_facts(ctx, &mut conn).await;
+        conn.disconnect().await.ok();
+        let inputs = facts?;
 
         // Diff against the last-known schemas of the lineage the source ran
-        // under before this failover (read explicitly from its namespace).
-        let prior =
-            previous_scope(&ctx.registry_backend, &ctx.tenant, &ctx.source_id)
-                .await?;
+        // under before this failover: the published scope while it still is
+        // that lineage (reconnect), else its recorded predecessor (startup,
+        // where the scope was established on the new server already).
+        let scope_now = ctx.registry_scope.current()?;
+        let prior_recorded;
+        let prior = if scope_now.lineage().descriptor
+            == mysql_registry_lineage(&current)?
+        {
+            prior_recorded = previous_scope(
+                &ctx.registry_backend,
+                &ctx.tenant,
+                &ctx.source_id,
+            )
+            .await?;
+            prior_recorded.as_ref()
+        } else {
+            Some(scope_now.as_ref())
+        };
         let record = ctx
             .reconciler
-            .run(&ctx.source_id, &previous, &current, prior.as_ref(), &inputs)
+            .run(&ctx.source_id, &previous, &current, prior, &inputs)
             .await
             .map_err(SourceError::Other)?;
 
-        // Invalidate schema loader cache for changed tables so the next row
-        // event triggers a fresh load and registry registration.
-        for result in &record.table_results {
-            if !result.deltas.is_empty() {
-                let _ =
-                    ctx.schema.reload_schema(&result.db, &result.table).await;
-            }
-        }
-
-        let has_drift =
-            record.table_results.iter().any(|r| !r.deltas.is_empty());
-        if has_drift {
+        drifted = record
+            .table_results
+            .iter()
+            .filter(|r| !r.deltas.is_empty())
+            .map(|r| (r.db.clone(), r.table.clone()))
+            .collect();
+        if !drifted.is_empty() {
             warn!(pipeline=%ctx.pipeline, source_id=%ctx.source_id, "schema drift detected after failover");
             if ctx.on_schema_drift == deltaforge_config::OnSchemaDrift::Halt {
                 return Err(SourceError::Other(anyhow::anyhow!(
@@ -1343,6 +1525,10 @@ async fn run_failover_reconciliation(
         }
     }
 
+    // Reconciled: record the lineage edge (fail closed) and publish it - from
+    // here on every connection must prove it is `current`.
+    sync_registry_lineage(ctx, &current).await?;
+
     // Persist new identity only after reconciliation completes. Fail closed if
     // the durable write does not commit: continuing would leave stale identity
     // authority and re-run reconciliation (or miss a later change).
@@ -1350,6 +1536,13 @@ async fn run_failover_reconciliation(
         .store(&ctx.source_id, &current)
         .await
         .map_err(SourceError::Other)?;
+
+    // Invalidate schema loader cache for changed tables so the next row
+    // event triggers a fresh load and registry registration (under the new
+    // lineage's scope).
+    for (db, table) in &drifted {
+        let _ = ctx.schema.reload_schema(db, table).await;
+    }
 
     // Clear streaming position so subsequent reconnects resolve B's binlog tail
     // rather than re-sending A's GTID. Covers mid-run failovers where the stream
@@ -1362,6 +1555,67 @@ async fn run_failover_reconciliation(
 
     info!(source_id = %ctx.source_id, "failover reconciliation complete");
     Ok(())
+}
+
+/// The live-server facts reconciliation needs, all read on `conn` (verified as
+/// the failover candidate by the caller): position reachability of the
+/// original checkpoint, and the live columns of every configured table.
+async fn failover_facts(
+    ctx: &RunCtx,
+    conn: &mut mysql_async::Conn,
+) -> SourceResult<Vec<ReconcileInput>> {
+    // Position reachability - use the original checkpoint position, not the
+    // (potentially adjusted) streaming position in last_gtid/last_file.
+    match check_position_reachability_on(
+        conn,
+        &ctx.checkpoint_file,
+        ctx.checkpoint_gtid.as_deref(),
+    )
+    .await
+    .unwrap_or(PositionReachability::Unknown {
+        reason: "reachability check failed".into(),
+    }) {
+        PositionReachability::Reachable => {}
+        PositionReachability::Unknown { reason } => {
+            warn!(
+                source_id = %ctx.source_id,
+                %reason,
+                "could not verify position reachability after failover - resuming anyway"
+            );
+        }
+        PositionReachability::Lost { reason } => {
+            return Err(SourceError::Other(anyhow::anyhow!(
+                "position lost after failover: {reason}. Re-snapshot required."
+            )));
+        }
+    }
+
+    // Schema diff - use ctx.tables (configured patterns) since the schema cache
+    // may be empty (preload is intentionally deferred until after reconciliation).
+    let mut inputs = Vec::new();
+    for pattern in &ctx.tables {
+        let parts: Vec<&str> = pattern.splitn(2, '.').collect();
+        if parts.len() != 2 || parts[1].contains('*') {
+            continue;
+        }
+        let (db, table) = (parts[0].to_owned(), parts[1].to_owned());
+        // A failed read is not "table dropped": stop (retried by reconnect).
+        let live_cols = mysql_health::fetch_live_columns_on(conn, &db, &table)
+            .await
+            .map_err(|e| SourceError::Connect {
+                details: format!(
+                    "failover live columns of {db}.{table}: {e:#}"
+                )
+                .into(),
+            })?
+            .map(|cols| cols.into_iter().map(Into::into).collect());
+        inputs.push(ReconcileInput {
+            db,
+            table,
+            live_columns: live_cols,
+        });
+    }
+    Ok(inputs)
 }
 
 #[cfg(test)]

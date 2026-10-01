@@ -24,7 +24,7 @@ use std::time::SystemTime;
 use common::RetryPolicy;
 use deltaforge_config::MysqlSrcCfg;
 use deltaforge_core::{SourceError, SourceResult};
-use mysql_async::{Pool, prelude::Queryable};
+use mysql_async::prelude::Queryable;
 use mysql_binlog_connector_rust::{
     binlog_client::BinlogClient, binlog_stream::BinlogStream,
 };
@@ -33,115 +33,143 @@ use storage::ArcStorageBackend;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::failover::identity::{
-    IdentityComparison, IdentityStore, ServerIdentity,
-};
+use crate::failover::identity::{IdentityStore, ServerIdentity};
 use crate::rotation::{DbKind, RotationReject, apply_two_stage};
 use crate::rotation_manager::{
     ApplyStep, ReadyPreflight, RotationManager, RotationSpec, fail_closed,
 };
 
-use super::mysql_health::fetch_server_identity;
-use super::mysql_helpers::connect_binlog_with_retries;
+use std::time::Duration;
+
+use super::mysql_helpers::{Opened, connect_binlog_with_retries};
+use super::mysql_session::{SessionError, open_control_connection};
 use super::{HEARTBEAT_INTERVAL_SECS, READ_TIMEOUT, RunCtx};
 
 // ----------------------------------------------------------------------------
 // Control-plane queries (own short-lived pool; never touch the binlog stream)
 // ----------------------------------------------------------------------------
 
-async fn query_gtid_mode(dsn: &str) -> anyhow::Result<Option<String>> {
-    let pool = Pool::new(dsn);
-    let mut conn = pool.get_conn().await?;
-    let row: Option<(Option<String>,)> =
-        conn.query_first("SELECT @@GLOBAL.gtid_mode").await?;
+async fn query_gtid_mode(
+    dsn: &str,
+    expected_uuid: &str,
+) -> Result<Option<String>, SourceError> {
+    let mut conn =
+        open_control_connection(dsn, expected_uuid, Duration::from_secs(10))
+            .await
+            .map_err(|e| e.into_source_error(expected_uuid))?;
+    let row: Result<Option<(Option<String>,)>, _> =
+        conn.query_first("SELECT @@GLOBAL.gtid_mode").await;
     conn.disconnect().await.ok();
+    let row = row.map_err(|e| SourceError::Connect {
+        details: format!("rotation gtid_mode check failed: {e}").into(),
+    })?;
     Ok(row.and_then(|(s,)| s))
 }
 
 /// Whether the frozen accumulated GTID set is a subset of the server's executed set
 /// (the replacement has executed everything we have consumed - we are not ahead).
-async fn gtid_set_is_subset(dsn: &str, frozen: &str) -> anyhow::Result<bool> {
-    let pool = Pool::new(dsn);
-    let mut conn = pool.get_conn().await?;
+/// Asked on a connection whose identity the caller verified.
+async fn gtid_set_is_subset(
+    conn: &mut mysql_async::Conn,
+    frozen: &str,
+) -> anyhow::Result<bool> {
     let row: Option<(Option<i64>,)> = conn
         .exec_first("SELECT GTID_SUBSET(?, @@GLOBAL.gtid_executed)", (frozen,))
         .await?;
-    conn.disconnect().await.ok();
     Ok(matches!(row, Some((Some(1),))))
 }
 
 /// Startup gate: rotation requires the server to run in GTID mode. Fails closed if
-/// `@@GLOBAL.gtid_mode` is not `ON`, or if it cannot be read.
-pub(crate) async fn require_gtid_mode(dsn: &str) -> SourceResult<()> {
-    match query_gtid_mode(dsn).await {
+/// `@@GLOBAL.gtid_mode` is not `ON`, or if it cannot be read on a connection
+/// verified as `expected_uuid`.
+pub(crate) async fn require_gtid_mode(
+    dsn: &str,
+    expected_uuid: &str,
+) -> SourceResult<()> {
+    match query_gtid_mode(dsn, expected_uuid).await {
         Ok(Some(mode)) if mode.eq_ignore_ascii_case("ON") => Ok(()),
         Ok(mode) => Err(fail_closed(format!(
             "controlled credential rotation requires @@GLOBAL.gtid_mode = ON, \
              but the server reports {}; enable GTID mode or remove `rotation`",
             mode.as_deref().unwrap_or("an unknown value")
         ))),
-        Err(e) => Err(SourceError::Connect {
-            details: format!("rotation gtid_mode check failed: {e}").into(),
-        }),
+        Err(e) => Err(e),
     }
 }
 
-/// Stage-A preflight for a replacement DSN, on a fresh control connection.
-///
-/// Validates `server_uuid` against the durable identity authority and the frozen
-/// accumulated GTID set against `@@GLOBAL.gtid_executed`. A transient
-/// authority/read failure is retryable (`PreflightFailed`); a different server
-/// (`IdentityMismatch`) or a divergent GTID set (`PositionIncompatible`) is
-/// terminal.
+/// Stage-A preflight for a replacement DSN, on ONE fresh control connection
+/// that first proves it is the server of the durable identity authority; the
+/// frozen accumulated GTID set is then checked against `@@GLOBAL.gtid_executed`
+/// on that same connection. A transient authority/read failure is retryable
+/// (`PreflightFailed`); a different server (`IdentityMismatch`) or a divergent
+/// GTID set (`PositionIncompatible`) is terminal.
 pub async fn preflight(
     new_dsn: &str,
     source_id: &str,
     backend: &ArcStorageBackend,
     frozen_gtid: Option<&str>,
 ) -> Result<(), RotationReject> {
-    // Identity: the replacement must be the same server (server_uuid), proven
-    // against the durable IdentityStore - never the new connection alone.
-    let live = fetch_server_identity(new_dsn)
+    // Identity: the replacement must be the server of the durable
+    // IdentityStore, proven on the connection that answers the position check.
+    let expected = match IdentityStore::new(Arc::clone(backend))
+        .load(source_id)
         .await
-        .map_err(|_| RotationReject::PreflightFailed)?
-        // A server that reports no uuid yet is a transient, retryable state.
-        .ok_or(RotationReject::PreflightFailed)?;
-    let store = IdentityStore::new(Arc::clone(backend));
-    match store.compare(source_id, &ServerIdentity::from(live)).await {
+    {
         // Store unreachable: retry rather than permanently suppress the candidate.
         Err(_) => return Err(RotationReject::PreflightFailed),
-        Ok(IdentityComparison::Same) => {}
-        // A different server, or no durable identity to prove against: terminal.
+        Ok(Some(ServerIdentity::MySql(id))) => id.server_uuid,
+        // No durable identity to prove against: terminal.
         Ok(_) => return Err(RotationReject::IdentityMismatch),
-    }
+    };
+    let mut conn = match open_control_connection(
+        new_dsn,
+        &expected,
+        Duration::from_secs(10),
+    )
+    .await
+    {
+        Ok(conn) => conn,
+        Err(SessionError::OtherServer { .. }) => {
+            return Err(RotationReject::IdentityMismatch);
+        }
+        // Unreachable, or no uuid reported yet: transient, retryable.
+        Err(SessionError::Connect(_) | SessionError::NoIdentity(_)) => {
+            return Err(RotationReject::PreflightFailed);
+        }
+    };
 
     // Position: the frozen accumulated GTID set must be a subset of the server's
     // executed set (we are not ahead of the replacement). A read failure is
     // transient; a proven non-subset is terminal.
     if let Some(frozen) = frozen_gtid {
         if !frozen.is_empty() {
-            match gtid_set_is_subset(new_dsn, frozen).await {
+            let subset = gtid_set_is_subset(&mut conn, frozen).await;
+            conn.disconnect().await.ok();
+            match subset {
                 Err(_) => return Err(RotationReject::PreflightFailed),
                 Ok(true) => {}
                 Ok(false) => return Err(RotationReject::PositionIncompatible),
             }
+            return Ok(());
         }
     }
-
+    conn.disconnect().await.ok();
     Ok(())
 }
 
 /// Open a binlog stream for `dsn` resuming from the exact frozen accumulated GTID
-/// set, via the production connect path (same server_id, heartbeat/timeout, and
-/// retry policy as startup/reconnect).
+/// set, via the production connect path (same server_id, heartbeat/timeout,
+/// retry policy and session identity verification as startup/reconnect). A
+/// session that reached another server is an `IdentityMismatch`.
 async fn open_binlog(
     dsn: &str,
+    expected_uuid: &str,
     source_id: &str,
     server_id: u64,
     frozen_gtid: &str,
     default_db: &str,
     cancel: &CancellationToken,
-) -> Result<BinlogStream, ()> {
+) -> Result<BinlogStream, RotationReject> {
     let url = dsn.to_string();
     let gtid = frozen_gtid.to_string();
     let make_client = move || BinlogClient {
@@ -153,15 +181,22 @@ async fn open_binlog(
         gtid_set: gtid.clone(),
         ..Default::default()
     };
-    connect_binlog_with_retries(
+    match connect_binlog_with_retries(
         source_id,
+        expected_uuid,
         make_client,
         cancel,
         default_db,
         RetryPolicy::default(),
     )
     .await
-    .map_err(|_| ())
+    {
+        Ok(Opened::Stream(stream)) => Ok(stream),
+        Ok(Opened::OtherServer(_)) | Err(SourceError::Lineage { .. }) => {
+            Err(RotationReject::IdentityMismatch)
+        }
+        Err(_) => Err(RotationReject::ReplacementOpenFailed),
+    }
 }
 
 /// Build a MySQL rotation spec from source config (fail-closed; see
@@ -266,6 +301,9 @@ impl MySqlRotationRuntime {
         // close it and install the replacement; the resulting stream is taken back
         // out afterwards.
         let holder = Arc::new(Mutex::new(Some(stream)));
+        // Both the replacement and a recovery session must prove they are the
+        // verified server before their dump command.
+        let expected = ctx.expected_uuid()?;
         let frozen_gtid = ctx.last_gtid.clone().unwrap_or_default();
         let new_dsn = candidate.dsn.clone();
         let old_dsn = ctx.dsn.clone();
@@ -322,6 +360,7 @@ impl MySqlRotationRuntime {
 
         // open_new: replacement stream from the frozen GTID set with the new creds.
         let open_new = {
+            let expected = expected.clone();
             let holder = Arc::clone(&holder);
             let new_dsn = new_dsn.clone();
             let source_id = source_id.clone();
@@ -331,6 +370,7 @@ impl MySqlRotationRuntime {
             move || async move {
                 let s = open_binlog(
                     new_dsn.expose(),
+                    &expected,
                     &source_id,
                     server_id,
                     &frozen,
@@ -339,12 +379,13 @@ impl MySqlRotationRuntime {
                 )
                 .await?;
                 *holder.lock().await = Some(s);
-                Ok::<(), ()>(())
+                Ok::<(), RotationReject>(())
             }
         };
 
         // open_old: bounded recovery to the old creds if the replacement fails.
         let open_old = {
+            let expected = expected.clone();
             let holder = Arc::clone(&holder);
             let old_dsn = old_dsn.clone();
             let source_id = source_id.clone();
@@ -354,6 +395,7 @@ impl MySqlRotationRuntime {
             move || async move {
                 let s = open_binlog(
                     old_dsn.expose(),
+                    &expected,
                     &source_id,
                     server_id,
                     &frozen,
@@ -362,7 +404,7 @@ impl MySqlRotationRuntime {
                 )
                 .await?;
                 *holder.lock().await = Some(s);
-                Ok::<(), ()>(())
+                Ok::<(), RotationReject>(())
             }
         };
 

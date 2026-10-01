@@ -79,22 +79,19 @@ pub(crate) struct LiveGtidAvailability<'a> {
 impl GtidAvailability for LiveGtidAvailability<'_> {
     async fn verify_executed(&self, sets: &[String]) -> Result<(), String> {
         use mysql_async::prelude::Queryable;
-        let pool = mysql_async::Pool::new(self.dsn);
+        let mut conn = super::mysql_session::open_control_connection(
+            self.dsn,
+            &self.server_uuid,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "connection is not the verified {}: {e:?}",
+                self.server_uuid
+            )
+        })?;
         let result = async {
-            let mut conn = pool
-                .get_conn()
-                .await
-                .map_err(|e| format!("connect failed: {e}"))?;
-            let uuid: Option<String> = conn
-                .query_first("SELECT @@GLOBAL.server_uuid")
-                .await
-                .map_err(|e| format!("server_uuid query failed: {e}"))?;
-            if uuid.as_deref() != Some(self.server_uuid.as_str()) {
-                return Err(format!(
-                    "the server answering is {uuid:?}, not the verified {}",
-                    self.server_uuid
-                ));
-            }
             for set in sets {
                 let executed: Option<i64> = conn
                     .exec_first(
@@ -117,11 +114,10 @@ impl GtidAvailability for LiveGtidAvailability<'_> {
                     }
                 }
             }
-            conn.disconnect().await.ok();
             Ok(())
         }
         .await;
-        pool.disconnect().await.ok();
+        conn.disconnect().await.ok();
         result
     }
 }

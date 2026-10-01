@@ -81,6 +81,24 @@ impl IdentityStore {
         format!("identity:{source_id}")
     }
 
+    /// The stored identity for `source_id`, if any.
+    pub async fn load(
+        &self,
+        source_id: &str,
+    ) -> Result<Option<ServerIdentity>> {
+        let stored = self
+            .backend
+            .kv_get(NS, &Self::key(source_id))
+            .await
+            .context("IdentityStore: kv_get failed")?;
+        stored
+            .map(|bytes| {
+                serde_json::from_slice(&bytes)
+                    .context("IdentityStore: deserialize stored identity")
+            })
+            .transpose()
+    }
+
     /// Compare `live` against the stored identity for `source_id`.
     ///
     /// Returns the comparison result. Does **not** update storage — the caller
@@ -90,20 +108,9 @@ impl IdentityStore {
         source_id: &str,
         live: &ServerIdentity,
     ) -> Result<IdentityComparison> {
-        let key = Self::key(source_id);
-        let stored = self
-            .backend
-            .kv_get(NS, &key)
-            .await
-            .context("IdentityStore: kv_get failed")?;
-
-        match stored {
+        match self.load(source_id).await? {
             None => Ok(IdentityComparison::FirstSeen),
-            Some(bytes) => {
-                let previous: ServerIdentity = serde_json::from_slice(&bytes)
-                    .context(
-                    "IdentityStore: deserialize stored identity",
-                )?;
+            Some(previous) => {
                 if &previous == live {
                     Ok(IdentityComparison::Same)
                 } else {

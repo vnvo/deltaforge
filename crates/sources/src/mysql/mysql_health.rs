@@ -119,7 +119,36 @@ pub async fn run_preflight(
         .get_conn()
         .await
         .context("preflight: failed to connect")?;
+    let report = run_preflight_on(&mut conn, tables, max_parallel_tables).await;
+    conn.disconnect().await.ok();
+    report
+}
 
+/// [`run_preflight`] on a control connection verified as `expected_uuid`:
+/// the checks that gate a snapshot describe the verified server only.
+pub(crate) async fn run_preflight_verified(
+    dsn: &str,
+    expected_uuid: &str,
+    tables: &[(String, String)],
+    max_parallel_tables: usize,
+) -> Result<PreflightReport> {
+    let mut conn = super::mysql_session::open_control_connection(
+        dsn,
+        expected_uuid,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .map_err(|e| anyhow::Error::new(e.into_source_error(expected_uuid)))?;
+    let report = run_preflight_on(&mut conn, tables, max_parallel_tables).await;
+    conn.disconnect().await.ok();
+    report
+}
+
+async fn run_preflight_on(
+    conn: &mut mysql_async::Conn,
+    tables: &[(String, String)], // (db, table)
+    max_parallel_tables: usize,
+) -> Result<PreflightReport> {
     let mut report = PreflightReport {
         hard_errors: Vec::new(),
         warnings: Vec::new(),
@@ -313,7 +342,6 @@ pub async fn run_preflight(
         }
     }
 
-    conn.disconnect().await.ok();
     Ok(report)
 }
 
@@ -323,13 +351,18 @@ pub async fn run_preflight(
 /// Returns Err only on confirmed purge.
 pub async fn verify_binlog_position(
     dsn: &str,
+    expected_uuid: &str,
     captured_file: &str,
 ) -> Result<()> {
-    let pool = Pool::new(dsn);
-    let mut conn = pool
-        .get_conn()
-        .await
-        .context("final position check: failed to connect")?;
+    // Only the verified server's binlog list answers this.
+    let mut conn = super::mysql_session::open_control_connection(
+        dsn,
+        expected_uuid,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .map_err(|e| anyhow::Error::new(e.into_source_error(expected_uuid)))
+    .context("final position check")?;
 
     let rows: Vec<Row> = conn
         .query("SHOW BINARY LOGS")
@@ -455,7 +488,18 @@ pub async fn check_position_reachability(
             });
         }
     };
+    let r = check_position_reachability_on(&mut conn, file, gtid_set).await;
+    conn.disconnect().await.ok();
+    r
+}
 
+/// [`check_position_reachability`] on an already-open connection (one whose
+/// server identity the caller has verified).
+pub(crate) async fn check_position_reachability_on(
+    conn: &mut mysql_async::Conn,
+    file: &str,
+    gtid_set: Option<&str>,
+) -> Result<PositionReachability> {
     // GTID path: ask the new primary whether it has already executed the
     // transactions in our saved set. GTID_SUBSET(saved, executed) = 1 means
     // all our transactions are present.
@@ -468,7 +512,6 @@ pub async fn check_position_reachability(
         match conn.query_first::<Row, _>(&query).await {
             Ok(Some(mut row)) => {
                 let is_subset: Option<i64> = row.take(0);
-                conn.disconnect().await.ok();
                 return match is_subset {
                     Some(1) => Ok(PositionReachability::Reachable),
                     Some(0) => Ok(PositionReachability::Lost {
@@ -493,14 +536,11 @@ pub async fn check_position_reachability(
     let rows: Vec<Row> = match conn.query("SHOW BINARY LOGS").await {
         Ok(r) => r,
         Err(e) => {
-            conn.disconnect().await.ok();
             return Ok(PositionReachability::Unknown {
                 reason: format!("SHOW BINARY LOGS failed: {e}"),
             });
         }
     };
-
-    conn.disconnect().await.ok();
 
     let available: Vec<String> = rows
         .into_iter()
@@ -557,7 +597,18 @@ pub async fn fetch_live_columns(
         .get_conn()
         .await
         .context("fetch_live_columns: connect failed")?;
+    let r = fetch_live_columns_on(&mut conn, db, table).await;
+    conn.disconnect().await.ok();
+    r
+}
 
+/// [`fetch_live_columns`] on an already-open connection (one whose server
+/// identity the caller has verified).
+pub(crate) async fn fetch_live_columns_on(
+    conn: &mut mysql_async::Conn,
+    db: &str,
+    table: &str,
+) -> Result<Option<Vec<LiveColumn>>> {
     let exists: Option<(i64,)> = conn
         .exec_first(
             "SELECT COUNT(*) FROM information_schema.TABLES \
@@ -568,7 +619,6 @@ pub async fn fetch_live_columns(
         .context("fetch_live_columns: existence check failed")?;
 
     if exists.map(|(n,)| n).unwrap_or(0) == 0 {
-        conn.disconnect().await.ok();
         return Ok(None);
     }
 
@@ -582,8 +632,6 @@ pub async fn fetch_live_columns(
         )
         .await
         .context("fetch_live_columns: COLUMNS query failed")?;
-
-    conn.disconnect().await.ok();
 
     let columns = rows
         .into_iter()

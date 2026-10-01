@@ -269,8 +269,14 @@ impl MySqlSchemaLoader {
 
         // Fetch from INFORMATION_SCHEMA only for tables absent from registry.
         for (db, table) in &needs_fetch {
-            if let Err(e) = self.load_schema(db, table).await {
-                warn!(db = %db, table = %table, error = %e, "failed to preload schema");
+            match self.load_schema(db, table).await {
+                Ok(_) => {}
+                // The connection reached another server: not a missing
+                // table, and nothing may continue on that assumption.
+                Err(e @ SourceError::Lineage { .. }) => return Err(e),
+                Err(e) => {
+                    warn!(db = %db, table = %table, error = %e, "failed to preload schema");
+                }
             }
         }
 
@@ -283,7 +289,7 @@ impl MySqlSchemaLoader {
             "schema preload complete"
         );
 
-        let mut conn = self.pool.get_conn().await.map_err(conn_error)?;
+        let mut conn = self.verified_conn().await?;
         let row_image: String = conn
             .query_first("SELECT @@binlog_row_image")
             .await
@@ -307,7 +313,7 @@ impl MySqlSchemaLoader {
         &self,
         patterns: &[String],
     ) -> SourceResult<Vec<(String, String)>> {
-        let mut conn = self.pool.get_conn().await.map_err(conn_error)?;
+        let mut conn = self.verified_conn().await?;
         let mut results = Vec::new();
 
         // Handle empty patterns = all tables
@@ -527,6 +533,24 @@ impl MySqlSchemaLoader {
         let after = cache.keys_any_generation().len();
         drop(cache);
         info!(db = %db, removed = before.saturating_sub(after), "schema cache invalidated");
+    }
+
+    /// A pooled connection that proved it is the scope's verified server:
+    /// catalog facts (which tables exist) come only from that server.
+    async fn verified_conn(&self) -> SourceResult<mysql_async::Conn> {
+        let scope = self.scope.current()?;
+        let storage::adapters::LineageDescriptor::Mysql { server_uuid } =
+            &scope.lineage().descriptor
+        else {
+            return Err(SourceError::Lineage {
+                details: "MySQL loader scoped to a non-MySQL lineage".into(),
+            });
+        };
+        let mut conn = self.pool.get_conn().await.map_err(conn_error)?;
+        super::mysql_session::verify_connection(&mut conn, server_uuid)
+            .await
+            .map_err(|e| e.into_source_error(server_uuid))?;
+        Ok(conn)
     }
 
     /// Fetch schema from INFORMATION_SCHEMA.

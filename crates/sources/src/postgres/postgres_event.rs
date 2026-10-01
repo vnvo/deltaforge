@@ -1074,6 +1074,7 @@ fn source_error_kind(e: &SourceError) -> &'static str {
         SourceError::Connect { .. } => "connect",
         SourceError::Checkpoint { .. } => "checkpoint",
         SourceError::Schema { .. } => "schema",
+        SourceError::Lineage { .. } => "lineage",
         SourceError::Incompatible { .. } => "incompatible",
         SourceError::Permission { .. } => "permission",
         SourceError::NotFound { .. } => "not_found",

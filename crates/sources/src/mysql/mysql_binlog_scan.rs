@@ -23,16 +23,11 @@
 // this allow is removed there.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use mysql_async::prelude::Queryable;
 use mysql_binlog_connector_rust::binlog_client::BinlogClient;
-use mysql_binlog_connector_rust::binlog_error::BinlogError;
-use mysql_binlog_connector_rust::binlog_parser::BinlogParser;
-use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
-use mysql_binlog_connector_rust::command::authenticator::Authenticator;
-use mysql_binlog_connector_rust::command::command_util::CommandUtil;
 use mysql_binlog_connector_rust::event::event_data::EventData;
 use mysql_binlog_connector_rust::event::event_header::EventHeader;
 use sha2::{Digest, Sha256};
@@ -41,6 +36,7 @@ use super::MySqlCheckpoint;
 use super::mysql_activation::EventIdentity;
 use super::mysql_ddl_attribution::{BarrierScopeOf, DdlEffect, classify};
 use super::mysql_schema_loader::{Live, fetch_table_schema_on};
+use super::mysql_session::{SessionError, open_replication_session};
 use super::mysql_table_schema::MySqlTableSchema;
 use crate::durable_checkpoint::{
     Intervals, WmPos, gtid_subseteq, merge_intervals,
@@ -347,57 +343,6 @@ impl Walk {
     }
 }
 
-/// Open the replication session and verify, on that exact authenticated
-/// session and before the dump command, that the server is `server_uuid`.
-/// A separate SQL connection proves nothing about which server a proxy,
-/// failover endpoint or load balancer gives the replication connection.
-/// Mirrors `BinlogClient::connect` with the identity query added.
-async fn verified_stream(
-    client: &BinlogClient,
-    server_uuid: &str,
-) -> Result<BinlogStream, ProofError> {
-    let open = |e: BinlogError| ProofError::Open(e.to_string());
-    let mut channel =
-        Authenticator::new(&client.url, client.timeout_secs, None)
-            .map_err(open)?
-            .connect()
-            .await
-            .map_err(open)?;
-    let rows =
-        CommandUtil::execute_query(&mut channel, "SELECT @@GLOBAL.server_uuid")
-            .await
-            .map_err(open)?;
-    let live = rows.first().and_then(|r| r.values.first());
-    if !live.is_some_and(|u| u.trim().eq_ignore_ascii_case(server_uuid)) {
-        let _ = channel.close().await;
-        return Err(ProofError::OtherServer(format!("{live:?}")));
-    }
-    let checksum = CommandUtil::fetch_binlog_checksum(&mut channel)
-        .await
-        .map_err(open)?;
-    CommandUtil::setup_binlog_connection(&mut channel)
-        .await
-        .map_err(open)?;
-    if client.heartbeat_interval_secs > 0 {
-        CommandUtil::enable_heartbeat(
-            &mut channel,
-            client.heartbeat_interval_secs,
-        )
-        .await
-        .map_err(open)?;
-    }
-    CommandUtil::dump_binlog(&mut channel, client)
-        .await
-        .map_err(open)?;
-    Ok(BinlogStream {
-        channel,
-        parser: BinlogParser {
-            checksum_length: checksum.get_length(),
-            table_map_event_by_table_id: HashMap::new(),
-        },
-    })
-}
-
 /// Scan the retained interval `(from, to]` (module docs). Both positions must
 /// carry the verified `lineage_hash`; `server_id` must differ from every
 /// other replication connection of this source.
@@ -489,12 +434,17 @@ pub(crate) async fn scan_interval(
 
     let mut stream = tokio::time::timeout(
         limits.max_duration,
-        verified_stream(&client, server_uuid),
+        open_replication_session(&client, server_uuid),
     )
     .await
     .map_err(|_| {
         ProofError::NotReached("timed out opening the interval".into())
-    })??;
+    })?
+    .map_err(|e| match e {
+        SessionError::OtherServer { found } => ProofError::OtherServer(found),
+        SessionError::NoIdentity(why) => ProofError::OtherServer(why),
+        SessionError::Connect(why) => ProofError::Open(why),
+    })?;
     let (mut events, mut bytes) = (0u64, 0u64);
     while !walk.reached {
         let left = limits
