@@ -217,8 +217,7 @@ impl P<'_> {
             Some(TableName { db, table: first })
         }
     }
-    fn at_end(&mut self) -> bool {
-        self.eat_punct(';');
+    fn at_end(&self) -> bool {
         self.i >= self.t.len()
     }
 }
@@ -228,9 +227,19 @@ impl P<'_> {
 pub(crate) fn classify(sql: &str, default_db: Option<&str>) -> DdlEffect {
     let lineage = DdlEffect::Barrier(BarrierScopeOf::Lineage);
     let default_db = default_db.filter(|d| !d.is_empty());
-    let Some(toks) = tokenize(sql) else {
+    let Some(mut toks) = tokenize(sql) else {
         return lineage;
     };
+    // One statement, at most one trailing `;`. Strings and comments are
+    // already consumed, so every remaining `;` is a statement separator; any
+    // other than the last token means several statements (including stored
+    // program bodies, rejected conservatively). Checked before any branch.
+    if toks.last() == Some(&Tok::Punct(';')) {
+        toks.pop();
+    }
+    if toks.contains(&Tok::Punct(';')) {
+        return lineage;
+    }
     if toks.contains(&Tok::DoubleQuoted) {
         // Under ANSI_QUOTES a double-quoted token is an identifier.
         if is_ddl_family(&toks) {
@@ -670,6 +679,83 @@ mod tests {
             ("ALTER TABLE a /* x", Some("app")),
         ] {
             assert_eq!(classify(sql, db), LINEAGE, "{sql} / {db:?}");
+        }
+    }
+
+    #[test]
+    fn several_statements_are_a_lineage_barrier_whatever_comes_first() {
+        for sql in [
+            // Non-table DDL followed by table DDL.
+            "CREATE VIEW v AS SELECT 1; ALTER TABLE orders ADD COLUMN x INT",
+            "CREATE DATABASE d; DROP TABLE orders",
+            "DROP VIEW v; DROP TABLE orders",
+            "ALTER VIEW v AS SELECT 2; ALTER TABLE orders ADD x INT",
+            "ALTER EVENT e DISABLE; ALTER TABLE orders ADD x INT",
+            "ALTER DATABASE app CHARACTER SET utf8mb4; DROP TABLE orders",
+            "DROP DATABASE shop; DROP TABLE app.orders",
+            "GRANT SELECT ON *.* TO u; ALTER TABLE orders ADD x INT",
+            "SET @a = 1; ALTER TABLE orders ADD x INT",
+            "BEGIN; ALTER TABLE orders ADD x INT",
+            // Table DDL followed by another table's DDL.
+            "CREATE TABLE t2 (id INT); ALTER TABLE customers ADD x INT",
+            "CREATE TABLE t2 LIKE t1; DROP TABLE customers",
+            "CREATE INDEX i ON orders (a); ALTER TABLE customers ADD x INT",
+            "DROP INDEX i ON orders; ALTER TABLE customers ADD COLUMN x INT",
+            "ALTER TABLE orders ADD x INT; DROP TABLE customers",
+            "ALTER TABLE orders ADD x INT; ALTER TABLE customers ADD y INT",
+            "ALTER TABLE orders RENAME TO o2; RENAME TABLE c TO d",
+            "TRUNCATE TABLE orders; ALTER TABLE customers ADD x INT",
+            "RENAME TABLE a TO b; DROP TABLE customers",
+            "DROP TABLE a; DROP TABLE b",
+            // Stored-program bodies with statement separators: conservative.
+            "CREATE PROCEDURE p() BEGIN ALTER TABLE orders ADD x INT; END",
+            // Empty statements between separators.
+            "ALTER TABLE orders ADD x INT;;",
+            ";ALTER TABLE orders ADD x INT",
+        ] {
+            assert_eq!(classify(sql, Some("app")), LINEAGE, "{sql}");
+        }
+    }
+
+    #[test]
+    fn semicolons_in_strings_and_comments_and_one_trailing_are_not_separators()
+    {
+        for (sql, want) in [
+            (
+                "ALTER TABLE orders ADD x INT COMMENT 'a; DROP TABLE b'",
+                tables(&[("app", "orders")]),
+            ),
+            (
+                "ALTER TABLE orders ADD x INT /* ; DROP TABLE b */",
+                tables(&[("app", "orders")]),
+            ),
+            (
+                "ALTER TABLE orders ADD x INT -- ; DROP TABLE b\n",
+                tables(&[("app", "orders")]),
+            ),
+            (
+                "ALTER TABLE orders ADD x INT # ; DROP TABLE b",
+                tables(&[("app", "orders")]),
+            ),
+            (
+                "ALTER TABLE `or;ders` ADD x INT",
+                tables(&[("app", "or;ders")]),
+            ),
+            (
+                "ALTER TABLE orders ADD x INT;",
+                tables(&[("app", "orders")]),
+            ),
+            (
+                "ALTER TABLE orders ADD x INT ; -- done",
+                tables(&[("app", "orders")]),
+            ),
+            (
+                "CREATE INDEX i ON orders (a);",
+                tables(&[("app", "orders")]),
+            ),
+            ("CREATE VIEW v AS SELECT ';';", DdlEffect::None),
+        ] {
+            assert_eq!(classify(sql, Some("app")), want, "{sql}");
         }
     }
 

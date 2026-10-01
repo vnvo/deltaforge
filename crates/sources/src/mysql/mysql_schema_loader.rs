@@ -779,7 +779,7 @@ pub(crate) async fn fetch_table_schema_on(
     let col_rows: Vec<Row> = conn
         .exec(
             r#"
-            SELECT 
+            SELECT
                 COLUMN_NAME,
                 COLUMN_TYPE,
                 DATA_TYPE,

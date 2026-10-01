@@ -1,13 +1,15 @@
 //! Read-only proofs over the retained binlog (design spec 7.7, 7.14, 7.15).
 //!
 //! - [`scan_interval`] reads the complete retained interval `(from, to]` on
-//!   its own replication connection and classifies every statement with the
-//!   approved DDL classifier. It succeeds only when it provably reached `to`
-//!   exactly; anything else fails closed: positions that cannot be ordered or
-//!   are out of order, another server, a purged or unreadable interval,
-//!   malformed or unsupported events (an `INCIDENT` marks a gap), a framing
-//!   error, passing `to` without reaching it, or a resource limit (a guard,
-//!   never "no DDL").
+//!   its own replication session, after proving the server's identity on
+//!   that same session before the dump command, and classifies every
+//!   statement with the approved DDL classifier. It succeeds only when it
+//!   provably reached `to` exactly; anything else fails closed: positions that
+//!   cannot be ordered or are out of order, another server, a purged or
+//!   unreadable interval, malformed or unsupported events (an `INCIDENT` marks
+//!   a gap), a framing error (incl. a transaction without a GTID in a GTID
+//!   interval), passing `to` without reaching it, or a resource limit (a
+//!   guard, never "no DDL").
 //! - [`stable_capture`] reads the server position, one table's shape and the
 //!   position again on ONE connection, after proving the server's identity on
 //!   it, and accepts only equal positions; bounded retries, then fail closed.
@@ -21,11 +23,16 @@
 // this allow is removed there.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use mysql_async::prelude::Queryable;
 use mysql_binlog_connector_rust::binlog_client::BinlogClient;
+use mysql_binlog_connector_rust::binlog_error::BinlogError;
+use mysql_binlog_connector_rust::binlog_parser::BinlogParser;
+use mysql_binlog_connector_rust::binlog_stream::BinlogStream;
+use mysql_binlog_connector_rust::command::authenticator::Authenticator;
+use mysql_binlog_connector_rust::command::command_util::CommandUtil;
 use mysql_binlog_connector_rust::event::event_data::EventData;
 use mysql_binlog_connector_rust::event::event_header::EventHeader;
 use sha2::{Digest, Sha256};
@@ -193,8 +200,11 @@ pub(crate) fn scan_digest(
     hex::encode(h.finalize())
 }
 
+const ANONYMOUS_GTID: u8 = 34;
+
 /// Event types the connector does not parse that cannot change table shapes
-/// or hide a gap.
+/// or hide a gap. ANONYMOUS_GTID only in file/position mode: a GTID scan
+/// refuses it before this list is consulted.
 fn harmless_unparsed(event_type: u8) -> bool {
     matches!(
         event_type,
@@ -226,8 +236,11 @@ impl Walk {
     fn complete_txn(&mut self) -> Result<(), ProofError> {
         self.in_explicit_txn = false;
         if self.gtid_mode {
+            // A transaction without a GTID cannot be placed in the interval.
             let Some(g) = self.current_gtid.take() else {
-                return Ok(()); // a statement outside any GTID transaction
+                return Err(ProofError::Framing(
+                    "a transaction without a GTID in a GTID interval".into(),
+                ));
             };
             let to = self.to_set.as_ref().expect("gtid mode has a target set");
             if !gtid_subseteq(&single(&g)?, to) {
@@ -310,6 +323,11 @@ impl Walk {
                 if header.event_type == 26 {
                     return Err(ProofError::Incident);
                 }
+                if header.event_type == ANONYMOUS_GTID && self.gtid_mode {
+                    return Err(ProofError::Framing(
+                        "an anonymous transaction in a GTID interval".into(),
+                    ));
+                }
                 if !harmless_unparsed(header.event_type) {
                     return Err(ProofError::UnsupportedEvent(
                         header.event_type,
@@ -329,27 +347,55 @@ impl Walk {
     }
 }
 
-/// Verify on a SQL connection that the server is `server_uuid`.
-async fn verify_server(dsn: &str, server_uuid: &str) -> Result<(), ProofError> {
-    let pool = mysql_async::Pool::new(dsn);
-    let r = async {
-        let mut conn = pool
-            .get_conn()
+/// Open the replication session and verify, on that exact authenticated
+/// session and before the dump command, that the server is `server_uuid`.
+/// A separate SQL connection proves nothing about which server a proxy,
+/// failover endpoint or load balancer gives the replication connection.
+/// Mirrors `BinlogClient::connect` with the identity query added.
+async fn verified_stream(
+    client: &BinlogClient,
+    server_uuid: &str,
+) -> Result<BinlogStream, ProofError> {
+    let open = |e: BinlogError| ProofError::Open(e.to_string());
+    let mut channel =
+        Authenticator::new(&client.url, client.timeout_secs, None)
+            .map_err(open)?
+            .connect()
             .await
-            .map_err(|e| ProofError::Open(e.to_string()))?;
-        let uuid: Option<String> = conn
-            .query_first("SELECT @@GLOBAL.server_uuid")
+            .map_err(open)?;
+    let rows =
+        CommandUtil::execute_query(&mut channel, "SELECT @@GLOBAL.server_uuid")
             .await
-            .map_err(|e| ProofError::Open(e.to_string()))?;
-        conn.disconnect().await.ok();
-        match uuid {
-            Some(u) if u.trim().eq_ignore_ascii_case(server_uuid) => Ok(()),
-            other => Err(ProofError::OtherServer(format!("{other:?}"))),
-        }
+            .map_err(open)?;
+    let live = rows.first().and_then(|r| r.values.first());
+    if !live.is_some_and(|u| u.trim().eq_ignore_ascii_case(server_uuid)) {
+        let _ = channel.close().await;
+        return Err(ProofError::OtherServer(format!("{live:?}")));
     }
-    .await;
-    pool.disconnect().await.ok();
-    r
+    let checksum = CommandUtil::fetch_binlog_checksum(&mut channel)
+        .await
+        .map_err(open)?;
+    CommandUtil::setup_binlog_connection(&mut channel)
+        .await
+        .map_err(open)?;
+    if client.heartbeat_interval_secs > 0 {
+        CommandUtil::enable_heartbeat(
+            &mut channel,
+            client.heartbeat_interval_secs,
+        )
+        .await
+        .map_err(open)?;
+    }
+    CommandUtil::dump_binlog(&mut channel, client)
+        .await
+        .map_err(open)?;
+    Ok(BinlogStream {
+        channel,
+        parser: BinlogParser {
+            checksum_length: checksum.get_length(),
+            table_map_event_by_table_id: HashMap::new(),
+        },
+    })
 }
 
 /// Scan the retained interval `(from, to]` (module docs). Both positions must
@@ -396,8 +442,6 @@ pub(crate) async fn scan_interval(
             )));
         }
     }
-    verify_server(dsn, server_uuid).await?;
-
     let gtid_mode = matches!(pt, WmPos::MysqlGtid { .. });
     let mut client = BinlogClient {
         url: dsn.to_string(),
@@ -443,13 +487,14 @@ pub(crate) async fn scan_interval(
         reached: false,
     };
 
-    let mut stream =
-        tokio::time::timeout(limits.max_duration, client.connect())
-            .await
-            .map_err(|_| {
-                ProofError::NotReached("timed out opening the interval".into())
-            })?
-            .map_err(|e| ProofError::Open(e.to_string()))?;
+    let mut stream = tokio::time::timeout(
+        limits.max_duration,
+        verified_stream(&client, server_uuid),
+    )
+    .await
+    .map_err(|_| {
+        ProofError::NotReached("timed out opening the interval".into())
+    })??;
     let (mut events, mut bytes) = (0u64, 0u64);
     while !walk.reached {
         let left = limits
@@ -690,21 +735,22 @@ mod tests {
         assert!(add_gtid(&mut s, &format!("{U}:0")).is_err());
     }
 
-    #[test]
-    fn statements_inside_a_compressed_payload_take_the_payload_position() {
-        use mysql_binlog_connector_rust::event::query_event::QueryEvent;
-        use mysql_binlog_connector_rust::event::transaction_payload_event::TransactionPayloadEvent;
-        let header = |event_type, next_event_position| EventHeader {
+    fn header(event_type: u8, next_event_position: u32) -> EventHeader {
+        EventHeader {
             timestamp: 0,
             event_type,
             server_id: 1,
             event_length: 0,
             next_event_position,
             event_flags: 0,
-        };
-        let mut walk = Walk {
-            gtid_mode: false,
-            to_set: None,
+        }
+    }
+
+    fn walk(gtid_mode: bool) -> Walk {
+        Walk {
+            gtid_mode,
+            to_set: gtid_mode
+                .then(|| parse_gtid_set(&format!("{U}:1-9")).unwrap()),
             done: GtidSet::default(),
             current_gtid: None,
             ordinal: 0,
@@ -712,18 +758,32 @@ mod tests {
             file: "binlog.000001".into(),
             statements: Vec::new(),
             reached: false,
-        };
+        }
+    }
+
+    fn query(sql: &str) -> EventData {
+        EventData::Query(
+            mysql_binlog_connector_rust::event::query_event::QueryEvent {
+                thread_id: 0,
+                exec_time: 0,
+                error_code: 0,
+                schema: "d".into(),
+                query: sql.into(),
+            },
+        )
+    }
+
+    #[test]
+    fn statements_inside_a_compressed_payload_take_the_payload_position() {
+        use mysql_binlog_connector_rust::event::transaction_payload_event::TransactionPayloadEvent;
+        let mut walk = walk(false);
         // Inner events carry no binlog position of their own.
-        let ddl = EventData::Query(QueryEvent {
-            thread_id: 0,
-            exec_time: 0,
-            error_code: 0,
-            schema: "d".into(),
-            query: "ALTER TABLE t ADD COLUMN c INT".into(),
-        });
         let payload = EventData::TransactionPayload(TransactionPayloadEvent {
             uncompressed_size: 0,
-            uncompressed_events: vec![(header(2, 0), ddl)],
+            uncompressed_events: vec![(
+                header(2, 0),
+                query("ALTER TABLE t ADD COLUMN c INT"),
+            )],
         });
         walk.event(&header(40, 4321), &payload).unwrap();
         assert_eq!(
@@ -733,6 +793,29 @@ mod tests {
                 end_pos: 4321
             }
         );
+    }
+
+    #[test]
+    fn anonymous_transactions_fail_a_gtid_scan_only() {
+        // GTID mode: an anonymous transaction cannot be placed in (from, to].
+        let mut w = walk(true);
+        assert!(matches!(
+            w.event(&header(ANONYMOUS_GTID, 100), &EventData::NotSupported),
+            Err(ProofError::Framing(_))
+        ));
+        // Nor can a statement that arrives outside any GTID transaction.
+        let mut w = walk(true);
+        assert!(matches!(
+            w.event(&header(2, 200), &query("ALTER TABLE t ADD c INT")),
+            Err(ProofError::Framing(_))
+        ));
+        // File/position mode: outer event positions order it; harmless.
+        let mut w = walk(false);
+        w.event(&header(ANONYMOUS_GTID, 100), &EventData::NotSupported)
+            .unwrap();
+        w.event(&header(2, 200), &query("ALTER TABLE t ADD c INT"))
+            .unwrap();
+        assert_eq!(w.statements.len(), 1);
     }
 
     #[test]
@@ -795,9 +878,42 @@ mod tests {
             format!("mysql://root:pw@127.0.0.1:{port}/")
         }
 
-        async fn server(gtid: bool) -> String {
+        async fn port(gtid: bool) -> u16 {
             let cell = if gtid { &GTID } else { &FILEPOS };
-            dsn_of(cell.get_or_init(|| start(gtid)).await.1)
+            cell.get_or_init(|| start(gtid)).await.1
+        }
+
+        async fn server(gtid: bool) -> String {
+            dsn_of(port(gtid).await)
+        }
+
+        /// A TCP endpoint that sends its n-th connection (from 0) to the
+        /// port `route(n)`, like a failover endpoint or load balancer.
+        async fn proxy(
+            route: impl Fn(u32) -> u16 + Send + Sync + 'static,
+        ) -> (String, Arc<AtomicU32>) {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = l.local_addr().unwrap().port();
+            let opened = Arc::new(AtomicU32::new(0));
+            let count = opened.clone();
+            tokio::spawn(async move {
+                while let Ok((mut client, _)) = l.accept().await {
+                    let to = route(count.fetch_add(1, Ordering::SeqCst));
+                    tokio::spawn(async move {
+                        if let Ok(mut server) =
+                            tokio::net::TcpStream::connect(("127.0.0.1", to))
+                                .await
+                        {
+                            let _ = tokio::io::copy_bidirectional(
+                                &mut client,
+                                &mut server,
+                            )
+                            .await;
+                        }
+                    });
+                }
+            });
+            (dsn_of(port), opened)
         }
 
         async fn sql(dsn: &str, stmts: &[&str]) {
@@ -920,6 +1036,72 @@ mod tests {
         #[ignore = "requires docker"]
         async fn file_position_scans_are_complete_exact_and_deterministic() {
             scenario(false, "scan_filepos").await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn identity_is_verified_on_the_session_that_streams() {
+            for gtid in [true, false] {
+                // A is the verified server; B another one behind the same
+                // endpoint.
+                let (a, b) = (port(gtid).await, port(!gtid).await);
+                let dsn_a = dsn_of(a);
+                let db = if gtid {
+                    "scan_route_gtid"
+                } else {
+                    "scan_route_file"
+                };
+                sql(
+                    &dsn_a,
+                    &[
+                        &format!("DROP DATABASE IF EXISTS {db}"),
+                        &format!("CREATE DATABASE {db}"),
+                    ],
+                )
+                .await;
+                let from = position(&dsn_a).await;
+                sql(&dsn_a, &[&format!("CREATE TABLE {db}.t (id INT)")]).await;
+                let to = position(&dsn_a).await;
+                let uuid_a = uuid(&dsn_a).await;
+                let direct = scan(&dsn_a, &from, &to).await.unwrap();
+                let via = |dsn: String| {
+                    let (uuid_a, from, to) =
+                        (uuid_a.clone(), from.clone(), to.clone());
+                    async move {
+                        scan_interval(
+                            &dsn,
+                            4_000_125,
+                            &uuid_a,
+                            LINEAGE,
+                            &from,
+                            &to,
+                            &ScanLimits {
+                                max_duration: Duration::from_secs(20),
+                                ..ScanLimits::default()
+                            },
+                        )
+                        .await
+                    }
+                };
+
+                // First connection to A, every later one to B: the session
+                // that streams must be the one that was verified.
+                let (dsn, opened) =
+                    proxy(move |n| if n == 0 { a } else { b }).await;
+                let r = via(dsn).await.unwrap();
+                assert_eq!(r.digest, direct.digest, "gtid={gtid}");
+                assert_eq!(opened.load(Ordering::SeqCst), 1, "gtid={gtid}");
+
+                // First connection to B: refused before any event.
+                let (dsn, opened) =
+                    proxy(move |n| if n == 0 { b } else { a }).await;
+                let r = via(dsn).await;
+                assert!(
+                    matches!(r, Err(ProofError::OtherServer(_))),
+                    "gtid={gtid}: {r:?}"
+                );
+                assert_eq!(opened.load(Ordering::SeqCst), 1, "gtid={gtid}");
+            }
         }
 
         #[tokio::test]
