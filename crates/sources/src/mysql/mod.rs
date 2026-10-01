@@ -29,6 +29,7 @@ mod mysql_errors;
 pub use mysql_errors::{LoopControl, MySqlSourceError, MySqlSourceResult};
 
 mod mysql_activation;
+mod mysql_binlog_scan;
 mod mysql_checkpoint_lineage;
 mod mysql_ddl_attribution;
 mod mysql_helpers;

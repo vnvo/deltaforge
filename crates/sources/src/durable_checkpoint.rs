@@ -229,11 +229,11 @@ pub fn binlog_file_parts(file: &str) -> Option<(String, u64)> {
 
 // ── GTID set parsing + inclusion ────────────────────────────────────────────
 
-type Intervals = Vec<(u64, u64)>;
+pub(crate) type Intervals = Vec<(u64, u64)>;
 
 /// Parse a GTID set (`"uuid:1-5:10-12,uuid2:1-3"`) into per-UUID merged
 /// intervals. Returns `None` on any malformed input.
-fn parse_gtid_set(s: &str) -> Option<BTreeMap<String, Intervals>> {
+pub(crate) fn parse_gtid_set(s: &str) -> Option<BTreeMap<String, Intervals>> {
     let mut map: BTreeMap<String, Intervals> = BTreeMap::new();
     let s = s.trim();
     if s.is_empty() {
@@ -276,7 +276,7 @@ fn parse_gtid_set(s: &str) -> Option<BTreeMap<String, Intervals>> {
     Some(map)
 }
 
-fn merge_intervals(ivs: &mut Intervals) {
+pub(crate) fn merge_intervals(ivs: &mut Intervals) {
     ivs.sort_unstable();
     let mut out: Intervals = Vec::with_capacity(ivs.len());
     for &(lo, hi) in ivs.iter() {
@@ -293,7 +293,7 @@ fn merge_intervals(ivs: &mut Intervals) {
 }
 
 /// Is every interval of `a` covered by `b` (for every UUID)?
-fn gtid_subseteq(
+pub(crate) fn gtid_subseteq(
     a: &BTreeMap<String, Intervals>,
     b: &BTreeMap<String, Intervals>,
 ) -> bool {
