@@ -277,6 +277,7 @@ async fn mysql_snapshot_resumes_after_partial_completion() -> Result<()> {
     let fake = MysqlSnapshotProgress {
         start_position: serde_json::to_string(
             &sources::mysql::MySqlCheckpoint {
+                lineage: None,
                 file,
                 pos: pos as u64,
                 gtid_set: None,

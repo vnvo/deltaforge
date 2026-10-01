@@ -60,6 +60,7 @@ async fn current_position(
         .await?
         .expect("binary log status");
     Ok(MySqlCheckpoint {
+        lineage: None,
         file: status.get("File").unwrap(),
         pos: status.get("Position").unwrap(),
         gtid_set: status
@@ -146,12 +147,27 @@ fn assert_failed_closed(r: &Replay, seeded: &MySqlCheckpoint) {
         "no row may be emitted for undecodable rows, got {:?}",
         rows.iter().map(|e| &e.after).collect::<Vec<_>>()
     );
-    // The complete checkpoint (file, position, and executed GTID set) is
-    // exactly the seeded one: nothing past the refused rows was recorded.
+    // The position (file, position, and executed GTID set) is exactly the
+    // seeded one: nothing past the refused rows was recorded. The seeded
+    // checkpoint predates lineage, so startup adopted it into the verified
+    // server lineage (only that field is added).
+    let after = r
+        .checkpoint_after
+        .as_ref()
+        .expect("the checkpoint is still stored");
     assert_eq!(
-        r.checkpoint_after.as_ref(),
-        Some(seeded),
+        (&after.file, after.pos, &after.gtid_set),
+        (&seeded.file, seeded.pos, &seeded.gtid_set),
         "the checkpoint must not advance past the refused rows"
+    );
+    assert_eq!(seeded.lineage, None);
+    let lineage = after.lineage.as_deref().expect("adopted lineage");
+    assert!(
+        lineage.len() == 32
+            && lineage
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "lineage {lineage}"
     );
 }
 

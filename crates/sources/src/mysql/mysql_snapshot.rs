@@ -116,6 +116,8 @@ pub(crate) async fn load_snapshot_progress(
 // ============================================================================
 
 pub struct SnapshotCtx<'a> {
+    /// Verified registry lineage hash stamped on the snapshot checkpoint.
+    pub checkpoint_lineage: Option<String>,
     pub dsn: &'a str,
     pub source_id: &'a str,
     pub pipeline: &'a str,
@@ -254,13 +256,14 @@ pub async fn run_snapshot(
     let num_workers =
         ctx.cfg.max_parallel_tables.min(pending.len().max(1)).max(1);
 
-    let (worker_conns, position) = acquire_locked_anchor(
+    let (worker_conns, mut position) = acquire_locked_anchor(
         ctx.dsn,
         num_workers,
         Duration::from_secs(ctx.cfg.lock_timeout_secs.max(1)),
     )
     .await
     .context("acquire locked snapshot anchor")?;
+    position.lineage = ctx.checkpoint_lineage.clone();
 
     progress.start_position = serde_json::to_string(&position)
         .context("serialize binlog position")?;
@@ -581,19 +584,26 @@ async fn capture_binlog_position(
     let file: String = row.take(0).context("binlog file")?;
     let pos: u32 = row.take(1).context("binlog pos")?;
 
+    // In GTID mode the position is the executed GTID set - also when it is
+    // EMPTY (a server that has executed no GTID transaction yet), so it stays
+    // comparable with later GTID checkpoints. Outside GTID mode, no set.
     let gtid_row: Option<Row> = conn
-        .query_first("SELECT @@GLOBAL.gtid_executed")
+        .query_first("SELECT @@GLOBAL.gtid_mode, @@GLOBAL.gtid_executed")
         .await
         .ok()
         .flatten();
-    let gtid_set = gtid_row
-        .and_then(|mut r| r.take::<Option<String>, _>(0).flatten())
-        .filter(|g| !g.is_empty());
+    let gtid_set = gtid_row.and_then(|mut r| {
+        let mode: Option<String> = r.take::<Option<String>, _>(0).flatten();
+        let set: Option<String> = r.take::<Option<String>, _>(1).flatten();
+        mode.filter(|m| m.eq_ignore_ascii_case("ON"))
+            .map(|_| set.unwrap_or_default())
+    });
 
     Ok(MySqlCheckpoint {
         file,
         pos: pos as u64,
         gtid_set,
+        lineage: None,
     })
 }
 

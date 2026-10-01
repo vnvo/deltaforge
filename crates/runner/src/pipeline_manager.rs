@@ -189,6 +189,15 @@ impl CheckpointStore for PerSinkCheckpointProxy {
     async fn list(&self) -> CheckpointResult<Vec<String>> {
         self.inner.list().await
     }
+
+    /// Forwarded so the inner store's bounded prefix listing is used (the
+    /// trait default would list every checkpoint key and filter).
+    async fn list_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> CheckpointResult<Vec<String>> {
+        self.inner.list_with_prefix(prefix).await
+    }
 }
 use deltaforge_config::{PipelineSpec, SourceCfg};
 use deltaforge_core::{SourceError, SourceHandle, SourceItem};
@@ -3387,6 +3396,76 @@ mod tests {
                 std::cmp::Ordering::Greater => CheckpointOrder::After,
             }
         })
+    }
+
+    /// Records whether the full listing (`list`) was used and which prefixes
+    /// were listed by the store itself.
+    #[derive(Default)]
+    struct ListRecordingStore {
+        inner: checkpoints::MemCheckpointStore,
+        full_lists: std::sync::atomic::AtomicUsize,
+        prefixes: parking_lot::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CheckpointStore for ListRecordingStore {
+        async fn get_raw(&self, k: &str) -> CheckpointResult<Option<Vec<u8>>> {
+            self.inner.get_raw(k).await
+        }
+        async fn put_raw(&self, k: &str, v: &[u8]) -> CheckpointResult<()> {
+            self.inner.put_raw(k, v).await
+        }
+        async fn delete(&self, k: &str) -> CheckpointResult<bool> {
+            self.inner.delete(k).await
+        }
+        async fn list(&self) -> CheckpointResult<Vec<String>> {
+            self.full_lists
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.list().await
+        }
+        async fn list_with_prefix(
+            &self,
+            prefix: &str,
+        ) -> CheckpointResult<Vec<String>> {
+            self.prefixes.lock().push(prefix.to_string());
+            self.inner.list_with_prefix(prefix).await
+        }
+    }
+
+    /// The proxy forwards prefix listings to the inner store's own (bounded)
+    /// prefix listing - for its resume fold and for callers - and never lists
+    /// every checkpoint key to filter in memory.
+    #[tokio::test]
+    async fn per_sink_proxy_forwards_prefix_listings() {
+        let store = Arc::new(ListRecordingStore {
+            inner: checkpoints::MemCheckpointStore::new().unwrap(),
+            ..Default::default()
+        });
+        store
+            .put_raw("mysql::sink::kafka", b"{\"pos\":200}")
+            .await
+            .unwrap();
+        store
+            .put_raw("mysql-archive::sink::kafka", b"{\"pos\":1}")
+            .await
+            .unwrap();
+        let proxy = PerSinkCheckpointProxy {
+            inner: store.clone(),
+            source_id: "mysql".to_string(),
+            cmp_fn: test_cmp_fn(),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
+        };
+        assert_eq!(
+            proxy.list_with_prefix("mysql::sink::").await.unwrap(),
+            ["mysql::sink::kafka"]
+        );
+        proxy.get_raw("mysql").await.unwrap();
+        assert_eq!(
+            store.full_lists.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the full checkpoint namespace was listed"
+        );
+        assert_eq!(*store.prefixes.lock(), ["mysql::sink::", "mysql::sink::"]);
     }
 
     #[tokio::test]

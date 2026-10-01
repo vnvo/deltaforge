@@ -431,6 +431,13 @@ async fn mysql_cdc_basic_events() -> Result<()> {
         assert!(e.schema_version.is_some(), "missing schema_version");
         assert!(e.schema_sequence.is_some(), "missing schema_sequence");
         assert!(e.checkpoint().is_some(), "missing checkpoint");
+        // Every checkpoint carries the verified server lineage (the schema
+        // registry scope's lineage hash), so positions from different servers
+        // are never ordered against each other.
+        let cp: MySqlCheckpoint =
+            serde_json::from_slice(e.checkpoint().unwrap().as_bytes())?;
+        let lineage = cp.lineage.expect("checkpoint without lineage");
+        assert_eq!(lineage.len(), 32, "lineage hash: {lineage}");
     }
     info!("✓ event metadata correct");
 
@@ -1200,6 +1207,7 @@ async fn stable_event_ids_are_replay_stable() -> Result<()> {
         .await?
         .expect("binary log status");
     let checkpoint = MySqlCheckpoint {
+        lineage: None,
         file: status.get("File").unwrap(),
         pos: status.get("Position").unwrap(),
         gtid_set: status
@@ -1297,6 +1305,7 @@ async fn ddl_event_ids_are_replay_stable() -> Result<()> {
         .await?
         .expect("binary log status");
     let checkpoint = MySqlCheckpoint {
+        lineage: None,
         file: status.get("File").unwrap(),
         pos: status.get("Position").unwrap(),
         gtid_set: status
@@ -1382,6 +1391,7 @@ async fn derived_event_ids_are_replay_stable() -> Result<()> {
         .await?
         .expect("binary log status");
     let checkpoint = MySqlCheckpoint {
+        lineage: None,
         file: status.get("File").unwrap(),
         pos: status.get("Position").unwrap(),
         gtid_set: status

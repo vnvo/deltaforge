@@ -17,7 +17,9 @@ use mysql_binlog_connector_rust::{
 use tracing::instrument;
 use tracing::{debug, error, info, warn};
 
-use crate::mysql::mysql_helpers::{make_checkpoint_meta, short_sql};
+use crate::mysql::mysql_helpers::{
+    checkpoint_lineage, make_checkpoint_meta, short_sql,
+};
 use crate::mysql::mysql_schema_loader::LoadedSchema;
 use crate::mysql::mysql_table_map_check::table_map_mismatch;
 use std::sync::Arc;
@@ -256,8 +258,12 @@ async fn handle_write_rows(
         // Pre-compute values shared across all rows in this event.
         let ts_ms = ts_sec_to_ms(header.timestamp);
         let event_len = header.event_length as usize;
-        let checkpoint =
-            make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid);
+        let checkpoint = make_checkpoint_meta(
+            &ctx.last_file,
+            ctx.last_pos,
+            &ctx.last_gtid,
+            checkpoint_lineage(&ctx.registry_scope),
+        );
         let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
             id: gtid.clone(),
             total_order: None,
@@ -350,8 +356,12 @@ async fn handle_update_rows(
 
         let ts_ms = ts_sec_to_ms(header.timestamp);
         let event_len = header.event_length as usize;
-        let checkpoint =
-            make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid);
+        let checkpoint = make_checkpoint_meta(
+            &ctx.last_file,
+            ctx.last_pos,
+            &ctx.last_gtid,
+            checkpoint_lineage(&ctx.registry_scope),
+        );
         let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
             id: gtid.clone(),
             total_order: None,
@@ -446,8 +456,12 @@ async fn handle_delete_rows(
 
         let ts_ms = ts_sec_to_ms(header.timestamp);
         let event_len = header.event_length as usize;
-        let checkpoint =
-            make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid);
+        let checkpoint = make_checkpoint_meta(
+            &ctx.last_file,
+            ctx.last_pos,
+            &ctx.last_gtid,
+            checkpoint_lineage(&ctx.registry_scope),
+        );
         let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
             id: gtid.clone(),
             total_order: None,
@@ -662,8 +676,12 @@ async fn emit_tx_commit(ctx: &mut RunCtx) {
     let Some(tx_id) = ctx.current_gtid.clone() else {
         return;
     };
-    let checkpoint =
-        make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid);
+    let checkpoint = make_checkpoint_meta(
+        &ctx.last_file,
+        ctx.last_pos,
+        &ctx.last_gtid,
+        checkpoint_lineage(&ctx.registry_scope),
+    );
     // Watermark and checkpoint describe the SAME commit boundary.
     let boundary = deltaforge_core::SourceBoundary {
         checkpoint,
@@ -1008,6 +1026,7 @@ async fn emit_ddl_event(
         &ctx.last_file,
         ctx.last_pos,
         &ctx.last_gtid,
+        checkpoint_lineage(&ctx.registry_scope),
     ));
     ev.transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
         id: gtid.clone(),
@@ -2255,6 +2274,7 @@ mod tests {
             "mysql-bin.000003",
             900,
             &Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5".to_string()),
+            checkpoint_lineage(&ctx.registry_scope),
         );
         assert_eq!(boundary.checkpoint.as_bytes(), expected.as_bytes());
         // Watermark is present (even for an empty tx) and represents the SAME

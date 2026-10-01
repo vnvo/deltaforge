@@ -28,8 +28,9 @@ use deltaforge_core::{
 mod mysql_errors;
 pub use mysql_errors::{LoopControl, MySqlSourceError, MySqlSourceResult};
 
+mod mysql_checkpoint_lineage;
 mod mysql_helpers;
-use mysql_helpers::prepare_client;
+use mysql_helpers::{checkpoint_lineage, prepare_client};
 
 pub mod mysql_object;
 
@@ -78,6 +79,11 @@ pub struct MySqlCheckpoint {
     pub file: String,
     pub pos: u64,
     pub gtid_set: Option<String>,
+    /// Verified registry lineage hash of the server this position belongs to
+    /// (MySQL `server_uuid`). `None` only in checkpoints written before
+    /// lineage was recorded; see [`compare_mysql_checkpoints`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -339,6 +345,24 @@ impl MySqlSource {
         )
         .await?;
 
+        // Checkpoints carry the verified lineage. Before anything reads the
+        // resume position, adopt pre-lineage per-sink checkpoints into it when
+        // that is provable; otherwise the fold fails closed on the mixed set.
+        let lineage_hash = checkpoint_lineage(&self.registry_scope)
+            .ok_or_else(|| {
+                SourceError::Other(anyhow::anyhow!(
+                    "registry scope not published after establishing it"
+                ))
+            })?;
+        mysql_checkpoint_lineage::adopt_legacy_checkpoints(
+            chkpt_store.as_ref(),
+            &self.backend,
+            &self.tenant,
+            &self.id,
+            &lineage_hash,
+        )
+        .await?;
+
         // snapshot (if configured)
         let snapshot_progress: Option<MysqlSnapshotProgress> = chkpt_store
             .get_raw(&mysql_snapshot::progress_key(&self.id))
@@ -390,6 +414,7 @@ impl MySqlSource {
                 .await?;
 
             let snapshot_ctx = mysql_snapshot::SnapshotCtx {
+                checkpoint_lineage: checkpoint_lineage(&self.registry_scope),
                 dsn: self.dsn.expose(),
                 source_id: &self.id,
                 pipeline: &self.pipeline,
@@ -707,6 +732,7 @@ impl MySqlSource {
                 .put(
                     &ctx.source_id,
                     MySqlCheckpoint {
+                        lineage: checkpoint_lineage(&ctx.registry_scope),
                         file: ctx.last_file,
                         pos: ctx.last_pos,
                         gtid_set: ctx.last_gtid,
@@ -726,24 +752,23 @@ impl MySqlSource {
 /// silently treated as an orderable position (which could select a resume point
 /// ahead of a sink and drop its events).
 pub fn compare_mysql_checkpoints(a: &[u8], b: &[u8]) -> CheckpointOrder {
-    // Delegates to the shared position comparator: GTID sets by inclusion,
-    // binlog coordinates by (base, numeric index, pos) - never lexically - and
-    // a GTID checkpoint against a file/pos one is Incomparable.
-    #[derive(serde::Deserialize)]
-    struct Cp {
-        file: String,
-        pos: u64,
-        #[serde(default)]
-        gtid_set: Option<String>,
-    }
-    let position = |raw: &[u8], which: &str| {
-        let cp: Cp = match serde_json::from_slice(raw) {
-            Ok(v) => v,
+    // Positions of different servers are never ordered: two checkpoints that
+    // both carry a lineage must carry the same one; a lineage-bearing and a
+    // legacy (pre-lineage) checkpoint are Incomparable; two legacy checkpoints
+    // keep the position-only comparison for upgrade compatibility. Positions
+    // then go to the shared comparator: GTID sets by inclusion, binlog
+    // coordinates by (base, numeric index, pos) - never lexically - and a GTID
+    // checkpoint against a file/pos one is Incomparable.
+    let parse = |raw: &[u8], which: &str| -> Option<MySqlCheckpoint> {
+        match serde_json::from_slice(raw) {
+            Ok(v) => Some(v),
             Err(e) => {
                 tracing::warn!(error = %e, "incomparable checkpoint {which}: parse failed");
-                return None;
+                None
             }
-        };
+        }
+    };
+    let position = |cp: &MySqlCheckpoint, which: &str| {
         let p = crate::durable_checkpoint::mysql_checkpoint_position(
             &cp.file,
             cp.pos,
@@ -754,7 +779,29 @@ pub fn compare_mysql_checkpoints(a: &[u8], b: &[u8]) -> CheckpointOrder {
         }
         p
     };
-    match (position(a, "a"), position(b, "b")) {
+    let (Some(ca), Some(cb)) = (parse(a, "a"), parse(b, "b")) else {
+        return CheckpointOrder::Incomparable;
+    };
+    // A lineage must be a canonical hash; two identical malformed strings
+    // are not evidence of the same server.
+    let malformed = |cp: &MySqlCheckpoint| {
+        cp.lineage
+            .as_deref()
+            .is_some_and(|l| !mysql_checkpoint_lineage::is_canonical_lineage(l))
+    };
+    if malformed(&ca) || malformed(&cb) {
+        tracing::warn!("incomparable checkpoints: malformed lineage");
+        return CheckpointOrder::Incomparable;
+    }
+    if ca.lineage != cb.lineage {
+        tracing::warn!(
+            a = ?ca.lineage,
+            b = ?cb.lineage,
+            "incomparable checkpoints: different (or missing) server lineage"
+        );
+        return CheckpointOrder::Incomparable;
+    }
+    match (position(&ca, "a"), position(&cb, "b")) {
         (Some(a), Some(b)) => {
             crate::durable_checkpoint::order_positions(&a, &b)
         }
@@ -1503,6 +1550,114 @@ mod compare_checkpoints_tests {
             compare_mysql_checkpoints(&cp("binlog", 1), &cp("binlog", 1)),
             CheckpointOrder::Incomparable
         );
+    }
+
+    const LA: &str = "0123456789abcdef0123456789abcdef";
+    const LB: &str = "fedcba9876543210fedcba9876543210";
+
+    /// Identical but malformed lineage strings never make two checkpoints
+    /// comparable.
+    #[test]
+    fn malformed_lineages_are_incomparable_even_when_identical() {
+        for bad in ["lineage-a", "0123456789ABCDEF0123456789ABCDEF", ""] {
+            let a = lcp("binlog.000010", 400, None, bad);
+            assert_eq!(
+                compare_mysql_checkpoints(&a, &a),
+                CheckpointOrder::Incomparable,
+                "{bad:?}"
+            );
+        }
+    }
+
+    fn lcp(file: &str, pos: u64, gtid: Option<&str>, lineage: &str) -> Vec<u8> {
+        serde_json::to_vec(&super::MySqlCheckpoint {
+            file: file.into(),
+            pos,
+            gtid_set: gtid.map(str::to_string),
+            lineage: Some(lineage.into()),
+        })
+        .unwrap()
+    }
+
+    /// The same coordinates on two different servers are never ordered - in
+    /// file/pos mode (identical binlog names are common) and in GTID mode.
+    #[test]
+    fn same_coordinates_on_different_lineages_are_incomparable() {
+        let u = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+        let g = format!("{u}:1-5");
+        for gtid in [None, Some(g.as_str())] {
+            let a = lcp("binlog.000010", 400, gtid, LA);
+            let b = lcp("binlog.000010", 400, gtid, LB);
+            assert_eq!(
+                compare_mysql_checkpoints(&a, &b),
+                CheckpointOrder::Incomparable,
+                "gtid {gtid:?}"
+            );
+            let later = lcp("binlog.000011", 4, gtid, LB);
+            assert_eq!(
+                compare_mysql_checkpoints(&a, &later),
+                CheckpointOrder::Incomparable,
+                "gtid {gtid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_lineage_orders_by_position() {
+        let u = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+        assert_eq!(
+            compare_mysql_checkpoints(
+                &lcp("binlog.000010", 400, None, LA),
+                &lcp("binlog.000011", 4, None, LA)
+            ),
+            CheckpointOrder::Before
+        );
+        assert_eq!(
+            compare_mysql_checkpoints(
+                &lcp("binlog.000010", 400, Some(&format!("{u}:1-9")), LA),
+                &lcp("binlog.000010", 400, Some(&format!("{u}:1-5")), LA)
+            ),
+            CheckpointOrder::After
+        );
+    }
+
+    /// A lineage-bearing checkpoint and a legacy one are never ordered; two
+    /// legacy checkpoints keep the position comparison.
+    #[test]
+    fn legacy_and_lineage_checkpoints_do_not_mix() {
+        let u = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+        let g = format!("{u}:1-5");
+        assert_eq!(
+            compare_mysql_checkpoints(
+                &lcp("binlog.000010", 400, None, LA),
+                &cp("binlog.000011", 4)
+            ),
+            CheckpointOrder::Incomparable
+        );
+        assert_eq!(
+            compare_mysql_checkpoints(
+                &gcp("binlog.000010", 400, &g),
+                &lcp("binlog.000010", 400, Some(&g), LA)
+            ),
+            CheckpointOrder::Incomparable
+        );
+        assert_eq!(
+            compare_mysql_checkpoints(
+                &cp("binlog.000010", 400),
+                &cp("binlog.000011", 4)
+            ),
+            CheckpointOrder::Before
+        );
+    }
+
+    /// Checkpoints written before lineage existed still parse.
+    #[test]
+    fn pre_lineage_checkpoint_bytes_parse_as_legacy() {
+        let cp: super::MySqlCheckpoint = serde_json::from_slice(
+            br#"{"file":"binlog.000001","pos":4,"gtid_set":null}"#,
+        )
+        .unwrap();
+        assert_eq!(cp.lineage, None);
     }
 
     #[test]

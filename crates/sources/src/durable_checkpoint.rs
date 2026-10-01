@@ -732,6 +732,7 @@ mod tests {
             file: "mysql-bin.000001".into(),
             pos: 0,
             gtid_set: Some(set.to_string()),
+            lineage: None,
         };
         let raw = serde_json::to_vec(&cp).unwrap();
         let parsed: MySqlCheckpoint = serde_json::from_slice(&raw).unwrap();

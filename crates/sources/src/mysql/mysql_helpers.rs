@@ -505,15 +505,29 @@ pub(super) async fn fetch_executed_gtid_set(
     Ok(row.and_then(|(s,)| s))
 }
 
+/// The verified registry lineage hash a new checkpoint is stamped with:
+/// the published scope's lineage (`None` only before the scope is published,
+/// which no checkpoint-writing path reaches).
+pub(crate) fn checkpoint_lineage(
+    scope: &crate::registry_scope::SharedRegistryScope,
+) -> Option<String> {
+    scope
+        .current()
+        .ok()
+        .map(|s| s.lineage().lineage_hash.clone())
+}
+
 pub(crate) fn make_checkpoint_meta(
     file: &str,
     pos: u64,
     gtid: &Option<String>,
+    lineage: Option<String>,
 ) -> CheckpointMeta {
     let cp = MySqlCheckpoint {
         file: file.to_string(),
         pos,
         gtid_set: gtid.clone(),
+        lineage,
     };
 
     let bytes = serde_json::to_vec(&cp).unwrap_or_else(|e| {
