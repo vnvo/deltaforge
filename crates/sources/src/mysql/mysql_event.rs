@@ -575,8 +575,10 @@ async fn handle_gtid(
     // coordinate - captured before it is merged into the accumulated set below.
     ctx.current_gtid = Some(gtid_str.clone());
     ctx.in_explicit_txn = false;
-    // New transaction boundary: reset the DDL message ordinal.
+    // New transaction boundary: reset the DDL message ordinal and the
+    // QueryEvent ordinal.
     ctx.message_ordinal = 0;
+    ctx.query_ordinal = 0;
 
     // Accumulate the full executed GTID set rather than storing just the last
     // transaction. MySQL needs the full set to resume correctly on reconnect.
@@ -1048,6 +1050,8 @@ async fn handle_query(
     header: &EventHeader,
     q: mysql_binlog_connector_rust::event::query_event::QueryEvent,
 ) -> SourceResult<()> {
+    // Every QueryEvent counts, as the binlog scanner numbers them.
+    ctx.query_ordinal += 1;
     let sql_upper = q.query.to_uppercase();
 
     // BEGIN opens an explicit, multi-event transaction (row events + Xid, or an
@@ -1067,6 +1071,10 @@ async fn handle_query(
         emit_tx_commit(ctx).await;
         return Ok(());
     }
+
+    // The activation records this statement implies are durable before its
+    // DDL event or its commit boundary is emitted.
+    record_query(ctx, &q).await?;
 
     // Credential-bearing account statements first: never log or emit their raw
     // SQL (it can carry a password, token, or verifier). Emit a fixed redacted DDL
@@ -1149,6 +1157,107 @@ async fn handle_query(
     // boundary) and `current_gtid` is cleared - otherwise the transaction would
     // stay open and the next GTID would fail closed.
     emit_tx_commit(ctx).await;
+    Ok(())
+}
+
+/// Persist the activation records a QueryEvent implies (spec 7.5): a `ddl`
+/// record for every table it may change, or a barrier when the statement
+/// cannot be attributed with certainty (a database barrier only for an
+/// explicit database operation, lineage-wide otherwise). Table names map to
+/// registry keys per `lower_case_table_names`; under 2 (stored as written,
+/// compared case-insensitively) a DDL's names cannot be mapped with
+/// certainty, so it is a lineage barrier. Replay re-derives identical records
+/// (`AlreadyPresent`); a conflicting record fails closed.
+async fn record_query(
+    ctx: &RunCtx,
+    q: &mysql_binlog_connector_rust::event::query_event::QueryEvent,
+) -> SourceResult<()> {
+    use super::mysql_activation::{
+        BarrierScope, EventIdentity, record_barrier, record_ddl,
+    };
+    use super::mysql_ddl_attribution::{BarrierScopeOf, DdlEffect, classify};
+
+    let default_db = Some(q.schema.as_str()).filter(|d| !d.is_empty());
+    let effect = classify(&q.query, default_db);
+    let lctn = ctx.lower_case_table_names;
+    let name = |n: &str| {
+        if lctn == 1 {
+            n.to_lowercase()
+        } else {
+            n.to_string()
+        }
+    };
+    let (tables, barrier) = match effect {
+        DdlEffect::None | DdlEffect::SameShape(_) => return Ok(()),
+        DdlEffect::Tables(_) if lctn == 2 => {
+            (Vec::new(), Some(BarrierScope::Lineage))
+        }
+        DdlEffect::Tables(tables) => (tables, None),
+        DdlEffect::Barrier(BarrierScopeOf::Lineage) => {
+            (Vec::new(), Some(BarrierScope::Lineage))
+        }
+        DdlEffect::Barrier(BarrierScopeOf::Database(db)) if lctn == 2 => {
+            let _ = db;
+            (Vec::new(), Some(BarrierScope::Lineage))
+        }
+        DdlEffect::Barrier(BarrierScopeOf::Database(db)) => {
+            (Vec::new(), Some(BarrierScope::Database { db: name(&db) }))
+        }
+    };
+
+    let fail = |what: &str, e: anyhow::Error| {
+        SourceError::Other(e.context(format!(
+            "persist the activation {what} of a QueryEvent at {}:{}",
+            ctx.last_file, ctx.last_pos
+        )))
+    };
+    let position = crate::durable_checkpoint::mysql_checkpoint_position(
+        &ctx.last_file,
+        ctx.last_pos,
+        ctx.last_gtid.as_deref(),
+    )
+    .ok_or_else(|| {
+        fail(
+            "record",
+            anyhow::anyhow!(
+                "unparseable stream position {}:{} {:?}",
+                ctx.last_file,
+                ctx.last_pos,
+                ctx.last_gtid
+            ),
+        )
+    })?;
+    let event = match &ctx.current_gtid {
+        Some(gtid) => EventIdentity::Gtid {
+            gtid: gtid.clone(),
+            ordinal: ctx.query_ordinal,
+        },
+        None => EventIdentity::FilePos {
+            file: ctx.last_file.clone(),
+            end_pos: ctx.last_pos,
+        },
+    };
+    let scope = ctx.registry_scope.current()?;
+    let backend = &ctx.registry_backend;
+    let registry = ctx.schema.registry();
+    for t in &tables {
+        let key = scope.key(&name(&t.db), &name(&t.table));
+        record_ddl(backend, registry, &key, &event, position.clone())
+            .await
+            .map_err(|e| fail("ddl record", e))?;
+    }
+    if let Some(barrier) = barrier {
+        info!(
+            source_id = %ctx.source_id,
+            scope = ?barrier,
+            sql = %short_sql(&q.query, 80),
+            "statement not attributable to tables: activation barrier"
+        );
+        let key = scope.key("", "");
+        record_barrier(backend, registry, &key, barrier, &event, position)
+            .await
+            .map_err(|e| fail("barrier", e))?;
+    }
     Ok(())
 }
 
@@ -1243,6 +1352,8 @@ mod tests {
             ),
             in_explicit_txn: true,
             message_ordinal: 0,
+            query_ordinal: 0,
+            lower_case_table_names: 0,
             checkpoint_gtid: Some("GTID-UNIT".to_string()),
             checkpoint_file: "mysql-bin.000001".to_string(),
             tables: vec!["shop.orders".to_string()],
@@ -1905,6 +2016,227 @@ mod tests {
         }
     }
 
+    const UUID: &str = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+
+    /// Establish the verified lineage scope (activation records need it) and
+    /// a real accumulated GTID set for the open transaction `UUID:5`.
+    async fn with_scope(ctx: &mut RunCtx) {
+        crate::registry_scope::establish_scope(
+            &ctx.registry_backend,
+            &ctx.registry_scope,
+            &ctx.tenant,
+            &ctx.source_id,
+            storage::adapters::LineageDescriptor::mysql(UUID).unwrap(),
+        )
+        .await
+        .unwrap();
+        ctx.last_gtid = Some(format!("{UUID}:1-5"));
+    }
+
+    async fn table_records(
+        ctx: &RunCtx,
+        db: &str,
+        table: &str,
+    ) -> Vec<crate::mysql::mysql_activation::Stored> {
+        let key = ctx.registry_scope.current().unwrap().key(db, table);
+        crate::mysql::mysql_activation::read_table(
+            &ctx.registry_backend,
+            ctx.schema.registry(),
+            &key,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn barriers(
+        ctx: &RunCtx,
+        db: &str,
+    ) -> Vec<crate::mysql::mysql_activation::Stored> {
+        let key = ctx.registry_scope.current().unwrap().key(db, "t");
+        crate::mysql::mysql_activation::read_barriers(
+            &ctx.registry_backend,
+            &key,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_ddl_records_every_table_it_changes_before_its_event() {
+        use crate::mysql::mysql_activation::{Kind, Record};
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        with_scope(&mut ctx).await;
+        ctx.query_ordinal = 0;
+        handle_query(
+            &mut ctx,
+            &make_header(),
+            query_event("RENAME TABLE orders TO other.archived"),
+        )
+        .await
+        .unwrap();
+        assert!(recv_event(&mut rx).await.is_some());
+        let position = crate::durable_checkpoint::mysql_checkpoint_position(
+            &ctx.last_file,
+            ctx.last_pos,
+            ctx.last_gtid.as_deref(),
+        )
+        .unwrap();
+        for (db, table) in [("shop", "orders"), ("other", "archived")] {
+            let recs = table_records(&ctx, db, table).await;
+            assert_eq!(recs.len(), 1, "{db}.{table}");
+            assert_eq!(
+                recs[0].record,
+                Record::new(position.clone(), Kind::Ddl)
+            );
+        }
+        // The identity is the transaction's GTID and the statement's
+        // QueryEvent ordinal (1: the first QueryEvent of the transaction).
+        let key = ctx.registry_scope.current().unwrap().key("shop", "orders");
+        let expected = crate::mysql::mysql_activation::capture_id(
+            &key.lineage_hash,
+            &crate::mysql::mysql_activation::EventIdentity::Gtid {
+                gtid: format!("{UUID}:5"),
+                ordinal: 1,
+            },
+            &crate::mysql::mysql_activation::table_stream(&key),
+            &Record::new(position, Kind::Ddl),
+        );
+        assert_eq!(
+            table_records(&ctx, "shop", "orders").await[0].capture_id,
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn replaying_a_ddl_rederives_identical_records() {
+        let (tx, _rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        with_scope(&mut ctx).await;
+        for _ in 0..2 {
+            // As the transaction's GTID event sets it on (re)delivery.
+            ctx.current_gtid = Some(format!("{UUID}:5"));
+            ctx.query_ordinal = 0;
+            handle_query(
+                &mut ctx,
+                &make_header(),
+                query_event("ALTER TABLE orders ADD COLUMN x INT"),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(table_records(&ctx, "shop", "orders").await.len(), 1);
+        // Another statement of the same transaction is another event.
+        ctx.current_gtid = Some(format!("{UUID}:5"));
+        handle_query(
+            &mut ctx,
+            &make_header(),
+            query_event("ALTER TABLE orders ADD COLUMN y INT"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(table_records(&ctx, "shop", "orders").await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_ddl_whose_record_cannot_be_persisted_is_not_emitted() {
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        let fault = Arc::new(storage::adapters::test_util::FaultBackend::new());
+        ctx.registry_backend = fault.clone();
+        with_scope(&mut ctx).await;
+        fault
+            .fail_writes_to
+            .lock()
+            .unwrap()
+            .push(crate::mysql::mysql_activation::ACTIVATION_NS.into());
+        let res = handle_query(
+            &mut ctx,
+            &make_header(),
+            query_event("ALTER TABLE orders ADD COLUMN x INT"),
+        )
+        .await;
+        assert!(res.is_err());
+        drop(ctx);
+        assert!(recv_event(&mut rx).await.is_none(), "no DDL event");
+    }
+
+    #[tokio::test]
+    async fn unattributable_statements_write_barriers_and_others_nothing() {
+        use crate::mysql::mysql_activation::{BarrierScope, Kind};
+        let (tx, _rx) = mpsc::channel::<SourceItem>(64);
+        let mut ctx = make_runctx(tx);
+        with_scope(&mut ctx).await;
+        for sql in [
+            "CREATE VIEW v AS SELECT 1",
+            "TRUNCATE TABLE orders",
+            "GRANT SELECT ON *.* TO u",
+        ] {
+            handle_query(&mut ctx, &make_header(), query_event(sql))
+                .await
+                .unwrap();
+        }
+        assert!(table_records(&ctx, "shop", "orders").await.is_empty());
+        assert!(barriers(&ctx, "shop").await.is_empty());
+
+        handle_query(
+            &mut ctx,
+            &make_header(),
+            query_event("DROP DATABASE shop"),
+        )
+        .await
+        .unwrap();
+        handle_query(
+            &mut ctx,
+            &make_header(),
+            query_event("IMPORT TABLE FROM '/tmp/a.sdi'"),
+        )
+        .await
+        .unwrap();
+        let kinds: Vec<Kind> = barriers(&ctx, "shop")
+            .await
+            .into_iter()
+            .map(|s| s.record.kind)
+            .collect();
+        assert!(kinds.contains(&Kind::Barrier {
+            scope: BarrierScope::Database { db: "shop".into() }
+        }));
+        assert!(kinds.contains(&Kind::Barrier {
+            scope: BarrierScope::Lineage
+        }));
+    }
+
+    #[tokio::test]
+    async fn table_names_follow_lower_case_table_names() {
+        use crate::mysql::mysql_activation::{BarrierScope, Kind};
+        let (tx, _rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        with_scope(&mut ctx).await;
+        ctx.lower_case_table_names = 1;
+        handle_query(
+            &mut ctx,
+            &make_header(),
+            query_event("ALTER TABLE `Shop`.`Orders` ADD x INT"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(table_records(&ctx, "shop", "orders").await.len(), 1);
+        // Stored as written but compared case-insensitively: the names cannot
+        // be mapped to keys with certainty.
+        ctx.lower_case_table_names = 2;
+        handle_query(
+            &mut ctx,
+            &make_header(),
+            query_event("ALTER TABLE Orders ADD y INT"),
+        )
+        .await
+        .unwrap();
+        assert!(barriers(&ctx, "shop").await.iter().any(|s| s.record.kind
+            == Kind::Barrier {
+                scope: BarrierScope::Lineage
+            }));
+    }
+
     #[tokio::test]
     async fn handle_query_emits_ddl_event() {
         // Every DDL keyword must be detected independently - pins each clause
@@ -1919,6 +2251,7 @@ mod tests {
         ] {
             let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
             let mut ctx = make_runctx(tx);
+            with_scope(&mut ctx).await;
             handle_query(&mut ctx, &make_header(), query_event(sql))
                 .await
                 .expect("handle_query should succeed");

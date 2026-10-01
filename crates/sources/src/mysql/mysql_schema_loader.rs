@@ -169,6 +169,11 @@ impl MySqlSchemaLoader {
     /// cache (shared via `Arc`) is preserved. Called by the run loop at a quiesced
     /// boundary once the replacement stream is confirmed, so no query is in flight
     /// against the old DSN.
+    /// The schema registry this loader registers versions in.
+    pub(crate) fn registry(&self) -> &DurableSchemaRegistry {
+        &self.registry
+    }
+
     pub(crate) fn set_dsn(&mut self, dsn: crate::credentials::ProtectedDsn) {
         self.pool = Pool::new(dsn.expose());
         self.dsn = dsn;

@@ -418,11 +418,24 @@ impl State {
             registry_history(&self.registry, &key).await.is_empty(),
             "{what}: schema recorded under the wrong server's lineage"
         );
-        for ns in ["schemas.v1.activation", "schemas.v1.activation.barrier"] {
-            assert_eq!(
-                self.backend.log_ns_max_seq(ns).await.unwrap(),
-                0,
-                "{what}: activation record in {ns}"
+        // No activation record (table stream, database or lineage barrier)
+        // under the wrong server's lineage.
+        let wrong_hash = lineage_hash(wrong);
+        for (ns, stream) in [
+            ("schemas.v1.activation", key.backend_key()),
+            (
+                "schemas.v1.activation.barrier",
+                SchemaKey::new(TENANT, id, wrong_hash.as_str(), db, "")
+                    .backend_key(),
+            ),
+            (
+                "schemas.v1.activation.barrier",
+                SchemaKey::source_prefix(TENANT, id, &wrong_hash),
+            ),
+        ] {
+            assert!(
+                self.backend.log_list(ns, &stream).await.unwrap().is_empty(),
+                "{what}: activation record under the wrong lineage in {ns}"
             );
         }
     }

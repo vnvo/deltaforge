@@ -49,6 +49,9 @@ pub(crate) enum EventIdentity {
     Gtid { gtid: String, ordinal: u32 },
     /// File/position mode: the event's binlog file and end position.
     FilePos { file: String, end_pos: u64 },
+    /// No event: the stream (re)started at this position without continuing
+    /// from its committed resume position (a discontinuity).
+    StreamStart { position: WmPos },
 }
 
 /// Where a barrier applies.
@@ -174,6 +177,13 @@ pub(crate) fn capture_id(
             lp(&mut h, file.as_bytes());
             lp(&mut h, &end_pos.to_be_bytes());
         }
+        EventIdentity::StreamStart { position } => {
+            lp(&mut h, b"start");
+            lp(
+                &mut h,
+                &serde_json::to_vec(position).expect("position serializes"),
+            );
+        }
     }
     lp(&mut h, stream.as_bytes());
     lp(&mut h, record.tag().as_bytes());
@@ -279,6 +289,37 @@ async fn validate_version(
         .into());
     }
     Ok(())
+}
+
+/// Append the `ddl` record that `event` at `position` establishes for the
+/// table `key` (spec 7.5): the shape after it is pending.
+pub(crate) async fn record_ddl(
+    backend: &ArcStorageBackend,
+    registry: &DurableSchemaRegistry,
+    key: &SchemaKey,
+    event: &EventIdentity,
+    position: WmPos,
+) -> Result<AppendStatus> {
+    let record = Record::new(position, Kind::Ddl);
+    let stream = table_stream(key);
+    let id = capture_id(&key.lineage_hash, event, &stream, &record);
+    append(backend, registry, key, ACTIVATION_NS, &stream, &id, &record).await
+}
+
+/// Append a barrier for `scope` established by `event` at `position`; `key`
+/// names the source lineage (its database and table are not used).
+pub(crate) async fn record_barrier(
+    backend: &ArcStorageBackend,
+    registry: &DurableSchemaRegistry,
+    key: &SchemaKey,
+    scope: BarrierScope,
+    event: &EventIdentity,
+    position: WmPos,
+) -> Result<AppendStatus> {
+    let stream = barrier_stream(key, &scope);
+    let record = Record::new(position, Kind::Barrier { scope });
+    let id = capture_id(&key.lineage_hash, event, &stream, &record);
+    append(backend, registry, key, BARRIER_NS, &stream, &id, &record).await
 }
 
 /// Every record of a stream, oldest first (paged). Corrupt or unsupported

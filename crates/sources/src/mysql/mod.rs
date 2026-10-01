@@ -157,6 +157,14 @@ pub(crate) struct RunCtx {
     /// **before filtering** for each DDL so a skipped DDL never renumbers a
     /// retained one.
     message_ordinal: u32,
+    /// QueryEvent ordinal within the current GTID transaction (reset at each
+    /// GTID, incremented for every QueryEvent): the event identity of the
+    /// activation records a statement establishes, as the binlog scanner
+    /// numbers them.
+    query_ordinal: u32,
+    /// The server's `lower_case_table_names` (read at startup on a verified
+    /// connection): how DDL table names map to registry keys.
+    lower_case_table_names: u8,
     /// Original checkpoint position, preserved even after a pre-connect failover
     /// adjustment clears last_gtid/last_file. Used by check_position_reachability
     /// to verify whether A's position actually exists on B.
@@ -408,6 +416,17 @@ impl MySqlSource {
             .flatten()
             .and_then(|b| serde_json::from_slice(&b).ok());
 
+        // Whether this start continues from a committed resume position: a
+        // start without one (first start, or "from end") or a snapshot (a new
+        // anchor) is a stream discontinuity (spec 7.5).
+        let committed_resume = chkpt_store
+            .get::<MySqlCheckpoint>(&self.id)
+            .await
+            .map_err(|e| SourceError::Checkpoint {
+                details: e.to_string().into(),
+            })?
+            .is_some();
+
         let needs_snapshot = match self.snapshot_cfg.mode {
             SnapshotMode::Initial => !snapshot_progress
                 .as_ref()
@@ -544,6 +563,9 @@ impl MySqlSource {
         // stream must not open on an unverified server.
         let live =
             fetch_identity_verified_as(self.dsn.expose(), &server_uuid).await?;
+        let lower_case_table_names =
+            fetch_lower_case_table_names(self.dsn.expose(), &server_uuid)
+                .await?;
 
         // A failover (stored identity != live) is reconciled below, before
         // the stream opens, against the EXACT position the stream will start
@@ -603,6 +625,8 @@ impl MySqlSource {
             current_gtid: None,
             in_explicit_txn: false,
             message_ordinal: 0,
+            query_ordinal: 0,
+            lower_case_table_names,
             checkpoint_gtid,
             checkpoint_file,
             tables: self.tables.clone(),
@@ -619,6 +643,15 @@ impl MySqlSource {
         // for the reconciler's drift diff; preload stays deferred until after.
         let resume = ResumeAt::of(&client);
         check_identity_post_reconnect(&mut ctx, Some(live), &resume).await?;
+
+        // A start that does not continue from the committed resume position
+        // invalidates positional proof for every table from here: a
+        // lineage-wide barrier at the start position, durable before the
+        // stream opens. An ordinary restart at the committed position writes
+        // none.
+        if needs_snapshot || !committed_resume {
+            record_stream_start(&ctx).await?;
+        }
 
         info!(source_id=%self.id, "connecting for binlog stream ..");
         let mut stream = connect_first_stream(&ctx, client).await?;
@@ -658,76 +691,80 @@ impl MySqlSource {
         // fatal exit paths. A fatal result (including gate-6 rotation failures) is
         // re-propagated after join and before the teardown checkpoint put.
         let loop_result: SourceResult<()> = async {
-        loop {
-            if !pause_until_resumed(&ctx.cancel, &ctx.paused, &ctx.pause_notify)
+            loop {
+                if !pause_until_resumed(
+                    &ctx.cancel,
+                    &ctx.paused,
+                    &ctx.pause_notify,
+                )
                 .await
-            {
-                info!(source_id=%ctx.source_id, "resuming ..");
-                break;
-            }
-
-            // Rotation: schedule Stage-A preflight concurrently with the stream,
-            // and apply the Stage-B swap only at a whole-transaction GTID boundary
-            // (between transactions, with an established GTID position).
-            if let Some(rt) = rotation.as_mut() {
-                rt.drive_preflight(&ctx);
-                if ctx.current_gtid.is_none() && ctx.last_gtid.is_some() {
-                    // A CloseUncertain/FailedClosed outcome returns an error from
-                    // this block (gate 6); `loop_result?` re-propagates it before the
-                    // teardown checkpoint put, so the checkpoint never advances.
-                    stream = rt.apply_at_boundary(&mut ctx, stream).await?;
+                {
+                    info!(source_id=%ctx.source_id, "resuming ..");
+                    break;
                 }
-            }
 
-            debug!(source_id=%ctx.source_id, "reading the next event ..");
-            // Idle-source wakeup: race the read against rotation activity so a
-            // rotation applies even when no binlog events are flowing.
-            let control: Result<(), LoopControl> = match rotation.as_mut() {
-                Some(rt) => tokio::select! {
-                    r = read_next_event(&mut stream, &ctx) => match r {
+                // Rotation: schedule Stage-A preflight concurrently with the stream,
+                // and apply the Stage-B swap only at a whole-transaction GTID boundary
+                // (between transactions, with an established GTID position).
+                if let Some(rt) = rotation.as_mut() {
+                    rt.drive_preflight(&ctx);
+                    if ctx.current_gtid.is_none() && ctx.last_gtid.is_some() {
+                        // A CloseUncertain/FailedClosed outcome returns an error from
+                        // this block (gate 6); `loop_result?` re-propagates it before the
+                        // teardown checkpoint put, so the checkpoint never advances.
+                        stream = rt.apply_at_boundary(&mut ctx, stream).await?;
+                    }
+                }
+
+                debug!(source_id=%ctx.source_id, "reading the next event ..");
+                // Idle-source wakeup: race the read against rotation activity so a
+                // rotation applies even when no binlog events are flowing.
+                let control: Result<(), LoopControl> = match rotation.as_mut() {
+                    Some(rt) => tokio::select! {
+                        r = read_next_event(&mut stream, &ctx) => match r {
+                            Ok((header, data)) => {
+                                advance_position(&mut ctx, &header);
+                                dispatch_event(&mut ctx, &header, data).await?;
+                                Ok(())
+                            }
+                            Err(ctrl) => Err(ctrl),
+                        },
+                        _ = rt.wait_activity() => continue,
+                    },
+                    None => match read_next_event(&mut stream, &ctx).await {
                         Ok((header, data)) => {
-                            ctx.last_pos = header.next_event_position as u64;
+                            advance_position(&mut ctx, &header);
                             dispatch_event(&mut ctx, &header, data).await?;
                             Ok(())
                         }
                         Err(ctrl) => Err(ctrl),
                     },
-                    _ = rt.wait_activity() => continue,
-                },
-                None => match read_next_event(&mut stream, &ctx).await {
-                    Ok((header, data)) => {
-                        ctx.last_pos = header.next_event_position as u64;
-                        dispatch_event(&mut ctx, &header, data).await?;
-                        Ok(())
-                    }
-                    Err(ctrl) => Err(ctrl),
-                },
-            };
+                };
 
-            match control {
-                Ok(()) => {}
-                Err(LoopControl::ReloadSchema { db, table }) => {
-                    if let (Some(d), Some(t)) = (db, table) {
-                        let _ = ctx.schema.reload_schema(&d, &t).await?;
-                    } else {
-                        let _ = ctx.schema.reload_all(&self.tables).await?;
+                match control {
+                    Ok(()) => {}
+                    Err(LoopControl::ReloadSchema { db, table }) => {
+                        if let (Some(d), Some(t)) = (db, table) {
+                            let _ = ctx.schema.reload_schema(&d, &t).await?;
+                        } else {
+                            let _ = ctx.schema.reload_all(&self.tables).await?;
+                        }
+                        match do_reconnect(&mut ctx).await? {
+                            Some(s) => stream = s,
+                            None => continue,
+                        }
                     }
-                    match do_reconnect(&mut ctx).await? {
-                        Some(s) => stream = s,
-                        None => continue,
+                    Err(LoopControl::Reconnect) => {
+                        match do_reconnect(&mut ctx).await? {
+                            Some(s) => stream = s,
+                            None => continue,
+                        }
                     }
+                    Err(LoopControl::Stop) => break,
+                    Err(LoopControl::Fail(e)) => return Err(e),
                 }
-                Err(LoopControl::Reconnect) => {
-                    match do_reconnect(&mut ctx).await? {
-                        Some(s) => stream = s,
-                        None => continue,
-                    }
-                }
-                Err(LoopControl::Stop) => break,
-                Err(LoopControl::Fail(e)) => return Err(e),
             }
-        }
-        Ok(())
+            Ok(())
         }
         .await;
 
@@ -1158,6 +1195,81 @@ impl RunCtx {
     }
 }
 
+/// `@@lower_case_table_names` of the verified server: how DDL table names map
+/// to registry keys (0: as written; 1: stored lower case; 2: compared case
+/// insensitively but stored as written).
+async fn fetch_lower_case_table_names(
+    dsn: &str,
+    expected_uuid: &str,
+) -> SourceResult<u8> {
+    use mysql_async::prelude::Queryable;
+    let mut conn =
+        open_control_connection(dsn, expected_uuid, CONTROL_CONNECT_TIMEOUT)
+            .await
+            .map_err(|e| e.into_source_error(expected_uuid))?;
+    let value: Result<Option<u8>, _> =
+        conn.query_first("SELECT @@lower_case_table_names").await;
+    conn.disconnect().await.ok();
+    match value {
+        Ok(Some(v @ 0..=2)) => Ok(v),
+        Ok(other) => Err(SourceError::Incompatible {
+            details: format!("unexpected lower_case_table_names {other:?}")
+                .into(),
+        }),
+        Err(e) => Err(SourceError::Connect {
+            details: format!("read lower_case_table_names: {e}").into(),
+        }),
+    }
+}
+
+/// The lineage-wide barrier of a stream discontinuity at the position the
+/// stream starts from (its identity is that position, so a repeated start at
+/// the same position re-derives it).
+async fn record_stream_start(ctx: &RunCtx) -> SourceResult<()> {
+    use mysql_activation::{BarrierScope, EventIdentity, record_barrier};
+    let position = crate::durable_checkpoint::mysql_checkpoint_position(
+        &ctx.last_file,
+        ctx.last_pos,
+        ctx.last_gtid.as_deref(),
+    )
+    .ok_or_else(|| SourceError::Checkpoint {
+        details: format!(
+            "unparseable start position {}:{} {:?}",
+            ctx.last_file, ctx.last_pos, ctx.last_gtid
+        )
+        .into(),
+    })?;
+    let key = ctx.registry_scope.current()?.key("", "");
+    record_barrier(
+        &ctx.registry_backend,
+        ctx.schema.registry(),
+        &key,
+        BarrierScope::Lineage,
+        &EventIdentity::StreamStart {
+            position: position.clone(),
+        },
+        position,
+    )
+    .await
+    .map_err(|e| {
+        SourceError::Other(e.context("persist the stream-start barrier"))
+    })?;
+    info!(source_id = %ctx.source_id, "stream discontinuity: activation barrier at the start position");
+    Ok(())
+}
+
+/// Advance the file/position cursor to the end of `header`'s event. The
+/// server's artificial events at the start of a dump (the format description
+/// after the fake rotate) carry no position (`0`): they never move it.
+fn advance_position(
+    ctx: &mut RunCtx,
+    header: &mysql_binlog_connector_rust::event::event_header::EventHeader,
+) {
+    if header.next_event_position != 0 {
+        ctx.last_pos = u64::from(header.next_event_position);
+    }
+}
+
 /// Connect timeout for identity-verified control connections.
 const CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -1533,6 +1645,7 @@ async fn run_failover_reconciliation(
     ctx.last_gtid = Some(resume_set.clone());
     ctx.current_gtid = None;
     ctx.message_ordinal = 0;
+    ctx.query_ordinal = 0;
     ctx.last_file = String::new();
     ctx.last_pos = 0;
 

@@ -168,6 +168,11 @@ fn encode_event(e: &EventIdentity) -> String {
         EventIdentity::FilePos { file, end_pos } => {
             format!("file\u{1d}{file}\u{1d}{end_pos}")
         }
+        // Never produced by a scan (statements always have an event).
+        EventIdentity::StreamStart { position } => format!(
+            "start\u{1d}{}",
+            serde_json::to_string(position).expect("position serializes")
+        ),
     }
 }
 
