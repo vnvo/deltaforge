@@ -99,6 +99,35 @@ pub(super) async fn dispatch_event(
     .increment(header.event_length as u64);
 
     match data {
+        // A compressed transaction (`binlog_transaction_compression = ON`):
+        // its events, in order. They have no binlog position of their own;
+        // they all end where the payload ends, so a commit inside it
+        // checkpoints at the payload's end.
+        EventData::TransactionPayload(tp) => {
+            for (h, d) in tp.uncompressed_events {
+                let inner = EventHeader {
+                    next_event_position: header.next_event_position,
+                    ..h
+                };
+                if matches!(d, EventData::TransactionPayload(_)) {
+                    return Err(SourceError::Other(anyhow::anyhow!(
+                        "a compressed transaction nested in another"
+                    )));
+                }
+                dispatch_one(ctx, &inner, d).await?;
+            }
+            Ok(())
+        }
+        other => dispatch_one(ctx, header, other).await,
+    }
+}
+
+async fn dispatch_one(
+    ctx: &mut RunCtx,
+    header: &EventHeader,
+    data: EventData,
+) -> SourceResult<()> {
+    match data {
         EventData::TableMap(tm) => handle_table_map(ctx, tm).await,
         EventData::WriteRows(wr) => handle_write_rows(ctx, header, wr).await,
         EventData::UpdateRows(ur) => handle_update_rows(ctx, header, ur).await,
