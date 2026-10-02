@@ -40,6 +40,7 @@ pub(crate) const BARRIER_NS: &str = "schemas.v1.activation.barrier";
 const FORMAT_VERSION: u32 = 1;
 const CAPTURE_DOMAIN: &[u8] = b"DeltaForge.Activation.v1\0";
 const BASELINE_DOMAIN: &[u8] = b"DeltaForge.Activation.Baseline.v1\0";
+const FORWARD_DOMAIN: &[u8] = b"DeltaForge.Activation.ForwardProof.v1\0";
 const READ_PAGE: usize = 256;
 
 /// The binlog event that establishes a record.
@@ -69,8 +70,14 @@ pub(crate) enum BarrierScope {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum Kind {
     /// The source streamed through this position with `version` verified as
-    /// the table's shape. `binds` names the `ddl` record this binding closes.
-    Observed { version: i32, binds: Option<String> },
+    /// the table's shape. `binds` names the `ddl` record this binding closes;
+    /// `proof` is the forward-proof evidence when it was established by one.
+    Observed {
+        version: i32,
+        binds: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proof: Option<ForwardProof>,
+    },
     /// A DDL affecting the table committed here; the shape after it is
     /// pending until an `observed` record binds it.
     Ddl,
@@ -93,6 +100,16 @@ pub(crate) enum Kind {
     },
     /// Positional proof is invalid for every table in `scope` from here on.
     Barrier { scope: BarrierScope },
+}
+
+/// Forward-proof evidence (spec 7.15): the shape registered as `version`
+/// was stable-captured at `to` (S) and a complete scan of (D, S], with
+/// digest `scan_digest`, found nothing that could have changed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ForwardProof {
+    pub to: WmPos,
+    pub scan_digest: String,
+    pub schema_hash: String,
 }
 
 /// One activation record.
@@ -238,6 +255,47 @@ pub(crate) fn baseline_capture_id(
     Ok(hex::encode(h.finalize()))
 }
 
+/// Deterministic capture identity of a forward-proof `observed` record:
+/// lineage, stream, the exact pending `ddl` capture identity it binds, D (its
+/// position), S, version, schema hash, proof kind and format, classifier
+/// version and the scan digest.
+pub(crate) fn forward_capture_id(
+    lineage_hash: &str,
+    stream: &str,
+    classifier_version: &str,
+    record: &Record,
+) -> Result<String> {
+    let Kind::Observed {
+        version,
+        binds: Some(ddl_id),
+        proof:
+            Some(ForwardProof {
+                to,
+                scan_digest,
+                schema_hash,
+            }),
+    } = &record.kind
+    else {
+        anyhow::bail!(
+            "forward_capture_id requires a bound, proven observed record"
+        );
+    };
+    let mut h = Sha256::new();
+    h.update(FORWARD_DOMAIN);
+    lp(&mut h, lineage_hash.as_bytes());
+    lp(&mut h, stream.as_bytes());
+    lp(&mut h, ddl_id.as_bytes());
+    lp(&mut h, &serde_json::to_vec(&record.position)?);
+    lp(&mut h, &serde_json::to_vec(to)?);
+    lp(&mut h, &version.to_be_bytes());
+    lp(&mut h, schema_hash.as_bytes());
+    lp(&mut h, b"forward-proof");
+    lp(&mut h, &record.format_version.to_be_bytes());
+    lp(&mut h, classifier_version.as_bytes());
+    lp(&mut h, scan_digest.as_bytes());
+    Ok(hex::encode(h.finalize()))
+}
+
 /// The timeline contradicts itself: the same identity with different bytes,
 /// an unsupported or corrupt record, or an `observed` version that does not
 /// exist in the table's history.
@@ -313,11 +371,54 @@ pub(crate) async fn record_ddl(
     key: &SchemaKey,
     event: &EventIdentity,
     position: WmPos,
-) -> Result<AppendStatus> {
+) -> Result<String> {
     let record = Record::new(position, Kind::Ddl);
     let stream = table_stream(key);
     let id = capture_id(&key.lineage_hash, event, &stream, &record);
+    append(backend, registry, key, ACTIVATION_NS, &stream, &id, &record)
+        .await?;
+    Ok(id)
+}
+
+/// Append the forward-proof binding of the pending `ddl` record `ddl_id` at
+/// its position D: `version` (already registered) with its evidence.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn record_forward_proof(
+    backend: &ArcStorageBackend,
+    registry: &DurableSchemaRegistry,
+    key: &SchemaKey,
+    classifier_version: &str,
+    ddl_id: &str,
+    position: WmPos,
+    version: i32,
+    proof: ForwardProof,
+) -> Result<AppendStatus> {
+    let record = Record::new(
+        position,
+        Kind::Observed {
+            version,
+            binds: Some(ddl_id.to_string()),
+            proof: Some(proof),
+        },
+    );
+    let stream = table_stream(key);
+    let id = forward_capture_id(
+        &key.lineage_hash,
+        &stream,
+        classifier_version,
+        &record,
+    )?;
     append(backend, registry, key, ACTIVATION_NS, &stream, &id, &record).await
+}
+
+/// The record that binds the `ddl` record `ddl_id`, if any.
+pub(crate) fn binding_of<'a>(
+    records: &'a [Stored],
+    ddl_id: &str,
+) -> Option<&'a Stored> {
+    records.iter().find(|s| {
+        matches!(&s.record.kind, Kind::Observed { binds: Some(b), .. } if b == ddl_id)
+    })
 }
 
 /// Append a barrier for `scope` established by `event` at `position`; `key`
@@ -579,6 +680,7 @@ mod tests {
         Kind::Observed {
             version: v,
             binds: None,
+            proof: None,
         }
     }
 
@@ -599,6 +701,7 @@ mod tests {
                 Kind::Observed {
                     version: 2,
                     binds: Some("b".into()),
+                    proof: None,
                 },
             ),
         ];
@@ -642,6 +745,7 @@ mod tests {
                 Kind::Observed {
                     version: 2,
                     binds: Some("d1".into()),
+                    proof: None,
                 },
             ),
             st("d2", g(9), Kind::Ddl),
@@ -651,6 +755,7 @@ mod tests {
                 Kind::Observed {
                     version: 1,
                     binds: Some("d2".into()),
+                    proof: None,
                 },
             ),
         ];
@@ -806,6 +911,7 @@ mod tests {
                 Kind::Observed {
                     version: 2,
                     binds: Some("d".into()),
+                    proof: None,
                 },
             ),
         ];
@@ -819,6 +925,7 @@ mod tests {
                 Kind::Observed {
                     version: 2,
                     binds: Some("other".into()),
+                    proof: None,
                 },
             ),
         ];
@@ -914,6 +1021,43 @@ mod tests {
         assert!(
             baseline_capture_id(L, "s", &Record::new(g(1), Kind::Ddl)).is_err()
         );
+    }
+
+    #[test]
+    fn forward_proof_identities_bind_the_ddl_and_every_piece_of_evidence() {
+        let r = |ddl: &str, d: u64, to: u64, v: i32, h: &str, digest: &str| {
+            Record::new(
+                g(d),
+                Kind::Observed {
+                    version: v,
+                    binds: Some(ddl.into()),
+                    proof: Some(ForwardProof {
+                        to: g(to),
+                        scan_digest: digest.into(),
+                        schema_hash: h.into(),
+                    }),
+                },
+            )
+        };
+        let id = |rec: &Record, cls: &str| {
+            forward_capture_id(L, "s", cls, rec).unwrap()
+        };
+        let base = id(&r("ddl", 3, 9, 1, "h", "d"), "c1");
+        assert_eq!(base, id(&r("ddl", 3, 9, 1, "h", "d"), "c1"));
+        for other in [
+            id(&r("other", 3, 9, 1, "h", "d"), "c1"),
+            id(&r("ddl", 4, 9, 1, "h", "d"), "c1"),
+            id(&r("ddl", 3, 8, 1, "h", "d"), "c1"),
+            id(&r("ddl", 3, 9, 2, "h", "d"), "c1"),
+            id(&r("ddl", 3, 9, 1, "x", "d"), "c1"),
+            id(&r("ddl", 3, 9, 1, "h", "x"), "c1"),
+            id(&r("ddl", 3, 9, 1, "h", "d"), "c2"),
+        ] {
+            assert_ne!(base, other);
+        }
+        // Only a bound, proven observed record has a forward identity.
+        let unbound = Record::new(g(3), obs(1));
+        assert!(forward_capture_id(L, "s", "c1", &unbound).is_err());
     }
 
     #[test]
@@ -1096,5 +1240,29 @@ mod tests {
             .map(|s| s.capture_id)
             .collect();
         assert_eq!(got, ["l", "d"]);
+    }
+}
+
+/// Test helpers shared by the activation tests of other modules.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use storage::DurableSchemaRegistry;
+    use storage::adapters::SchemaKey;
+
+    /// Every registered version of `key`, oldest first, as schema JSON text.
+    pub(crate) async fn history(
+        registry: &DurableSchemaRegistry,
+        key: &SchemaKey,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = registry.history_page(key, cursor, 256).await.unwrap();
+            out.extend(page.versions.iter().map(|v| v.schema_json.to_string()));
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => return out,
+            }
+        }
     }
 }

@@ -33,6 +33,7 @@ mod mysql_baseline;
 mod mysql_binlog_scan;
 mod mysql_checkpoint_lineage;
 mod mysql_ddl_attribution;
+mod mysql_forward_proof;
 mod mysql_helpers;
 mod mysql_session;
 use mysql_helpers::{checkpoint_lineage, prepare_client};

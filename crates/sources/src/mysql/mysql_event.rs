@@ -1240,11 +1240,24 @@ async fn record_query(
     let scope = ctx.registry_scope.current()?;
     let backend = &ctx.registry_backend;
     let registry = ctx.schema.registry();
+    // Tracked tables get a forward proof of their post-DDL shape (a DROP
+    // gets none: a later CREATE is its own DDL).
+    let prove_after = !super::mysql_ddl_attribution::is_drop_table(&q.query);
+    let mut pending = Vec::new();
     for t in &tables {
-        let key = scope.key(&name(&t.db), &name(&t.table));
-        record_ddl(backend, registry, &key, &event, position.clone())
-            .await
-            .map_err(|e| fail("ddl record", e))?;
+        let (db, table) = (name(&t.db), name(&t.table));
+        let key = scope.key(&db, &table);
+        let ddl_id =
+            record_ddl(backend, registry, &key, &event, position.clone())
+                .await
+                .map_err(|e| fail("ddl record", e))?;
+        if prove_after && ctx.allow.matches(&db, &table) {
+            pending.push(super::mysql_forward_proof::Pending {
+                db,
+                table,
+                ddl_id,
+            });
+        }
     }
     if let Some(barrier) = barrier {
         info!(
@@ -1258,6 +1271,9 @@ async fn record_query(
             .await
             .map_err(|e| fail("barrier", e))?;
     }
+    // Paused at the DDL: prove before its event is emitted and before any
+    // later event is read.
+    super::mysql_forward_proof::prove(ctx, pending).await?;
     Ok(())
 }
 

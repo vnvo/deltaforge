@@ -254,6 +254,24 @@ pub(crate) fn classify(sql: &str, default_db: Option<&str>) -> DdlEffect {
     classify_tokens(&mut p).unwrap_or(lineage)
 }
 
+/// Whether `sql` is a `DROP [TEMPORARY] TABLE[S]` statement: its tables get
+/// no forward proof (a later CREATE is its own DDL with its own proof).
+pub(crate) fn is_drop_table(sql: &str) -> bool {
+    let Some(toks) = tokenize(sql) else {
+        return false;
+    };
+    let mut p = P {
+        t: &toks,
+        i: 0,
+        default_db: None,
+    };
+    if !p.eat_kw("DROP") {
+        return false;
+    }
+    p.eat_kw("TEMPORARY");
+    p.peek_kw("TABLE") || p.peek_kw("TABLES")
+}
+
 fn is_ddl_family(toks: &[Tok]) -> bool {
     matches!(toks.first(), Some(Tok::Word(w)) if ["ALTER", "CREATE", "DROP", "RENAME", "TRUNCATE"]
         .iter()
@@ -756,6 +774,26 @@ mod tests {
             ("CREATE VIEW v AS SELECT ';';", DdlEffect::None),
         ] {
             assert_eq!(classify(sql, Some("app")), want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn drops_of_tables_are_recognized() {
+        for sql in [
+            "DROP TABLE a",
+            "drop temporary table if exists a, b",
+            "/* x */ DROP TABLES a",
+        ] {
+            assert!(is_drop_table(sql), "{sql}");
+        }
+        for sql in [
+            "ALTER TABLE a DROP COLUMN b",
+            "DROP INDEX i ON a",
+            "DROP DATABASE d",
+            "DROP VIEW v",
+            "CREATE TABLE a (id INT)",
+        ] {
+            assert!(!is_drop_table(sql), "{sql}");
         }
     }
 

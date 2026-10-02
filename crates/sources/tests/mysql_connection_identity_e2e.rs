@@ -782,6 +782,129 @@ async fn reconnect_connections_prove_the_server_file_position() {
 }
 
 // ----------------------------------------------------------------------------
+// Forward proof: every connection a live DDL's proof opens.
+// ----------------------------------------------------------------------------
+
+/// The next DDL event containing `needle`, or `None` when the stream ends.
+async fn ddl_until(
+    rx: &mut mpsc::Receiver<SourceItem>,
+    needle: &str,
+    dur: Duration,
+) -> bool {
+    let deadline = Instant::now() + dur;
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        match timeout(left, rx.recv()).await {
+            Ok(Some(SourceItem::Event(e)))
+                if e.ddl
+                    .as_ref()
+                    .is_some_and(|d| d.to_string().contains(needle)) =>
+            {
+                return true;
+            }
+            Ok(Some(_)) => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Run the source until startup settles, then stop it cleanly: a committed
+/// position to restart (and replay) from.
+async fn commit_a_position(proxy: &Proxy, st: &State, id: &str, db: &str) {
+    let r =
+        run(source(id, proxy.dsn(db), db, st, OnSchemaDrift::Adapt), st).await;
+    proxy
+        .settled_since(proxy.opened(), Duration::from_secs(3))
+        .await;
+    stop(r.handle).await;
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn forward_proof_connections_prove_the_server() {
+    init_test_tracing();
+    let (a, b) = pair(true).await;
+    let (ua, ub) = (uuid(a).await, uuid(b).await);
+    let db = "ident_forward";
+    prepare(a, db, "a").await;
+    prepare(b, db, "b").await;
+    let proxy = Proxy::start(a).await;
+    let mut column = 0u32;
+    let mut alter = || {
+        column += 1;
+        format!("ALTER TABLE {db}.t ADD COLUMN c{column} INT")
+    };
+
+    // The DDL and a later unrelated write happen while the source is
+    // stopped, so the restart replays the DDL and its proof scans a
+    // non-empty (D, S] (the capture lands after the write): the proof opens
+    // a capture connection and a scan session.
+    // A healthy replayed DDL: how many connections the restart opens until
+    // the DDL event (startup, then the proof's capture and scan).
+    let n = {
+        let st = State::new().await;
+        let id = "ident_forward_cal".to_string();
+        commit_a_position(&proxy, &st, &id, db).await;
+        let stmt = alter();
+        sql(
+            a,
+            &[
+                stmt.clone(),
+                format!("INSERT INTO {db}.t (id, src) VALUES (100, 'a')"),
+            ],
+        )
+        .await;
+        let base = proxy.opened();
+        let mut r = run(
+            source(&id, proxy.dsn(db), db, &st, OnSchemaDrift::Adapt),
+            &st,
+        )
+        .await;
+        assert!(ddl_until(&mut r.rx, &stmt, Duration::from_secs(60)).await);
+        let n = proxy.settled_since(base, Duration::from_secs(3)).await;
+        stop(r.handle).await;
+        n
+    };
+
+    for k in 0..n {
+        let what = format!("forward proof k={k}/{n}");
+        let st = State::new().await;
+        let id = format!("ident_forward_{k}");
+        commit_a_position(&proxy, &st, &id, db).await;
+        let stmt = alter();
+        sql(
+            a,
+            &[
+                stmt.clone(),
+                format!(
+                    "INSERT INTO {db}.t (id, src) VALUES ({}, 'a')",
+                    200 + k
+                ),
+            ],
+        )
+        .await;
+        let watch = DumpWatch::start(b);
+        proxy.divert(k, b, a);
+        let mut r = run(
+            source(&id, proxy.dsn(db), db, &st, OnSchemaDrift::Adapt),
+            &st,
+        )
+        .await;
+        insert(b, db, 9900 + k, "b").await;
+        assert_lineage_stop(r.handle, &what).await;
+        let rows =
+            rows_until(&mut r.rx, None, Duration::from_millis(200)).await;
+        assert!(rows.iter().all(|(_, s)| s != "b"), "{what}: {rows:?}");
+        st.assert_nothing_from(&id, db, &ua, &ub, &what).await;
+        assert!(
+            !watch.saw_dump().await,
+            "{what}: binlog dump on the wrong server"
+        );
+        proxy.all_to(a);
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Failover: genuine, and rejected by reconciliation.
 // ----------------------------------------------------------------------------
 

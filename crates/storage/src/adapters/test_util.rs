@@ -29,6 +29,9 @@ pub struct FaultBackend {
     pub kv_list_calls: std::sync::Mutex<Vec<(String, Option<String>)>>,
     /// Every write to one of these namespaces fails while it is listed.
     pub fail_writes_to: std::sync::Mutex<Vec<String>>,
+    /// `(namespace, n)`: allow `n` more writes to the namespace, fail the
+    /// next one, then clear (a crash at that write).
+    pub fail_after_writes_to: std::sync::Mutex<Option<(String, u64)>>,
 }
 
 impl Default for FaultBackend {
@@ -56,6 +59,7 @@ impl FaultBackend {
             one_shot: AtomicBool::new(false),
             kv_list_calls: std::sync::Mutex::new(Vec::new()),
             fail_writes_to: std::sync::Mutex::new(Vec::new()),
+            fail_after_writes_to: std::sync::Mutex::new(None),
         }
     }
 
@@ -77,6 +81,18 @@ impl FaultBackend {
             !self.fail_writes_to.lock().unwrap().iter().any(|n| n == ns),
             "injected write failure in namespace {ns}"
         );
+        {
+            let mut after = self.fail_after_writes_to.lock().unwrap();
+            if let Some((target, left)) = after.as_mut() {
+                if target == ns {
+                    if *left == 0 {
+                        *after = None;
+                        anyhow::bail!("injected crash at a write in {ns}");
+                    }
+                    *left -= 1;
+                }
+            }
+        }
         let left = self.writes_left.load(Ordering::SeqCst);
         if left == 0 && self.one_shot.swap(false, Ordering::SeqCst) {
             self.writes_left.store(u64::MAX, Ordering::SeqCst);
