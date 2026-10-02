@@ -146,54 +146,84 @@ async fn dump_thread_ids(root_dsn: &str) -> Result<Vec<u64>> {
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }
 
-/// Wait until at least one binlog dump thread exists; return one of its ids.
+/// How long a binlog dump thread must persist to be a replication stream.
+/// The source's interval scans (lazy schema proof) open short-lived dump
+/// sessions that end within a few seconds of the scan; a stream's persists.
+const PERSIST: Duration = Duration::from_secs(5);
+
+/// Wait until a binlog dump thread has been present for `PERSIST` (a
+/// stream, not a transient scan session); return its id.
 async fn wait_for_dump_thread(root_dsn: &str, dur: Duration) -> Result<u64> {
-    let deadline = Instant::now() + dur;
-    while Instant::now() < deadline {
-        let ids = dump_thread_ids(root_dsn).await?;
-        if let Some(id) = ids.first() {
-            return Ok(*id);
-        }
-        sleep(Duration::from_millis(200)).await;
-    }
-    anyhow::bail!("no binlog dump thread appeared within {dur:?}")
+    wait_for_stream_thread(root_dsn, None, dur).await
 }
 
-/// Wait until a binlog dump thread with an id different from `baseline` exists.
+/// Wait until a persistent dump thread other than `baseline` exists (the
+/// stream reconnected).
 async fn wait_for_dump_thread_change(
     root_dsn: &str,
     baseline: u64,
     dur: Duration,
 ) -> Result<u64> {
-    let deadline = Instant::now() + dur;
+    wait_for_stream_thread(root_dsn, Some(baseline), dur).await
+}
+
+async fn wait_for_stream_thread(
+    root_dsn: &str,
+    other_than: Option<u64>,
+    dur: Duration,
+) -> Result<u64> {
+    let deadline = Instant::now() + dur + PERSIST;
+    let mut first_seen: std::collections::HashMap<u64, Instant> =
+        std::collections::HashMap::new();
     while Instant::now() < deadline {
         let ids = dump_thread_ids(root_dsn).await?;
-        if let Some(id) = ids.iter().find(|id| **id != baseline) {
-            return Ok(*id);
+        first_seen.retain(|id, _| ids.contains(id));
+        for id in ids.iter().filter(|id| Some(**id) != other_than) {
+            let since = *first_seen.entry(*id).or_insert_with(Instant::now);
+            if since.elapsed() >= PERSIST {
+                return Ok(*id);
+            }
         }
         sleep(Duration::from_millis(200)).await;
     }
-    anyhow::bail!("binlog dump thread id did not change within {dur:?}")
+    anyhow::bail!(
+        "no persistent binlog dump thread (other than {other_than:?}) within {dur:?}"
+    )
 }
 
-/// Assert no dump thread other than `expected` appears for `dur` (no reconnect).
+/// Assert the stream did not reconnect during `dur`: `expected` stays
+/// present throughout, and every other dump thread seen meanwhile ends
+/// within `PERSIST` of appearing (a transient scan session, not a stream).
 async fn assert_dump_thread_stable(
     root_dsn: &str,
     expected: u64,
     dur: Duration,
 ) -> Result<()> {
     let deadline = Instant::now() + dur;
-    while Instant::now() < deadline {
+    let mut others: std::collections::HashMap<u64, Instant> =
+        std::collections::HashMap::new();
+    loop {
         let ids = dump_thread_ids(root_dsn).await?;
-        for id in &ids {
+        let now = Instant::now();
+        if now < deadline {
             anyhow::ensure!(
-                *id == expected,
-                "binlog dump thread changed to {id} (expected stable {expected})"
+                ids.contains(&expected),
+                "binlog dump thread {expected} went away (stream reconnected)"
             );
+        }
+        others.retain(|id, _| ids.contains(id));
+        for id in ids.iter().filter(|id| **id != expected) {
+            let since = *others.entry(*id).or_insert(now);
+            anyhow::ensure!(
+                now.duration_since(since) < PERSIST,
+                "binlog dump thread {id} persists (expected stable {expected})"
+            );
+        }
+        if now >= deadline && others.is_empty() {
+            return Ok(());
         }
         sleep(Duration::from_millis(200)).await;
     }
-    Ok(())
 }
 
 async fn wait_for_event(

@@ -32,10 +32,12 @@ use super::mysql_binlog_scan::{
     scan_interval, stable_capture,
 };
 use super::mysql_ddl_attribution::{BarrierScopeOf, DdlEffect, same_name};
+use super::mysql_selection::Timeline;
 use super::{MySqlCheckpoint, RunCtx};
 use crate::durable_checkpoint::{
     WmPos, mysql_checkpoint_position, order_positions,
 };
+use storage::adapters::SchemaKey;
 
 fn other_server(expected: &str, found: &str) -> SourceError {
     SourceError::Lineage {
@@ -103,8 +105,9 @@ struct Candidate {
     binds: Option<String>,
 }
 
-/// Establish baselines at the stream's start position for every tracked
-/// table not already proven there. Storage failures are fatal; an uncertain
+/// Establish baselines at the stream's start position (the snapshot anchor:
+/// called only after a snapshot, for the tables it copied) for every table
+/// not already proven there. Storage failures are fatal; an uncertain
 /// or failed proof only leaves the table unproven (logged).
 pub(crate) async fn establish(
     ctx: &RunCtx,
@@ -294,6 +297,155 @@ pub(crate) async fn establish(
     Ok(written)
 }
 
+/// A lazy baseline (binding ruling Round 36, Q1) for one table whose rows
+/// at the evaluation position E are not positionally proven: a stable
+/// capture of its complete shape at S, E <= S in the verified lineage, and
+/// one complete scan of (E, S] in which nothing applies to the table. The
+/// captured shape is registered and a `baseline` at E (binding the one
+/// barrier exactly at E, if any) is appended - before the rows are decoded -
+/// only if it then decides the rows (see `admit_decisive`). Anything
+/// uncertain writes nothing and returns `false`; a connection on another
+/// server or a storage failure is an error.
+pub(crate) async fn establish_at(
+    ctx: &mut RunCtx,
+    db: &str,
+    table: &str,
+    key: &SchemaKey,
+    current: &Timeline,
+) -> SourceResult<bool> {
+    let (Some(e), Some(mut e_cp)) =
+        (ctx.txn_eval.clone(), ctx.txn_eval_cp.clone())
+    else {
+        return Ok(false);
+    };
+    let lineage = key.lineage_hash.clone();
+    e_cp.lineage = Some(lineage.clone());
+    let server_uuid = ctx.expected_uuid()?;
+    let binds = match barrier_to_bind(&current.records, &current.barriers, &e) {
+        Ok(binds) => binds,
+        Err(why) => {
+            info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline");
+            return Ok(false);
+        }
+    };
+    let cap = match stable_capture(
+        ctx.dsn.expose(),
+        &server_uuid,
+        &lineage,
+        db,
+        table,
+        CAPTURE_ATTEMPTS,
+        None,
+    )
+    .await
+    {
+        Ok(cap) => cap,
+        Err(ProofError::OtherServer(found)) => {
+            return Err(other_server(&server_uuid, &found));
+        }
+        Err(err) => {
+            warn!(source_id = %ctx.source_id, %db, %table, error = ?err, "no lazy baseline: no stable capture");
+            return Ok(false);
+        }
+    };
+    let s_cp = cap.position.clone();
+    let Some(s) = mysql_checkpoint_position(
+        &s_cp.file,
+        s_cp.pos,
+        s_cp.gtid_set.as_deref(),
+    ) else {
+        return Ok(false);
+    };
+    if !matches!(
+        order_positions(&e, &s),
+        CheckpointOrder::Before | CheckpointOrder::Equal
+    ) {
+        warn!(source_id = %ctx.source_id, %db, %table, "no lazy baseline: the capture is not at or after the rows");
+        return Ok(false);
+    }
+    let report = match scan_interval(
+        ctx.dsn.expose(),
+        super::mysql_helpers::derive_server_id(&format!(
+            "{}/baseline",
+            ctx.source_id
+        )),
+        &server_uuid,
+        &lineage,
+        &e_cp,
+        &s_cp,
+        &ScanLimits::default(),
+    )
+    .await
+    {
+        Ok(report) => report,
+        Err(ProofError::OtherServer(found)) => {
+            return Err(other_server(&server_uuid, &found));
+        }
+        Err(err) => {
+            warn!(source_id = %ctx.source_id, %db, %table, error = ?err, "no lazy baseline: the interval scan failed");
+            return Ok(false);
+        }
+    };
+    if report
+        .statements
+        .iter()
+        .any(|st| affects(st, db, table, ctx.lower_case_table_names))
+    {
+        info!(source_id = %ctx.source_id, %db, %table, "no lazy baseline: a DDL or barrier after the rows");
+        return Ok(false);
+    }
+    let checkpoint = serde_json::to_vec(&e_cp)
+        .map_err(|err| SourceError::Other(err.into()))?;
+    let (version, schema_hash) = ctx
+        .schema
+        .register_captured(db, table, &cap.schema, &checkpoint)
+        .await?;
+    let stream = table_stream(key);
+    let record = Record::new(
+        e.clone(),
+        Kind::Baseline {
+            version,
+            schema_hash,
+            to: s,
+            scan_digest: report.digest,
+            binds,
+            classifier_version: CLASSIFIER_VERSION.to_string(),
+        },
+    );
+    let id = baseline_capture_id(&lineage, &stream, &record)
+        .map_err(SourceError::Other)?;
+    let proposed = Stored {
+        capture_id: id.clone(),
+        record: record.clone(),
+    };
+    if let Err(why) = super::mysql_selection::admit_decisive(
+        ctx.schema.registry(),
+        key,
+        current,
+        proposed,
+        &e,
+    )
+    .await
+    {
+        info!(source_id = %ctx.source_id, %db, %table, why, "no lazy baseline");
+        return Ok(false);
+    }
+    mysql_activation::append(
+        &ctx.registry_backend,
+        ctx.schema.registry(),
+        key,
+        mysql_activation::ACTIVATION_NS,
+        &stream,
+        &id,
+        &record,
+    )
+    .await
+    .map_err(|err| SourceError::Other(err.context("persist a baseline")))?;
+    ctx.selection.invalidate(key);
+    info!(source_id = %ctx.source_id, %db, %table, version, scanned_events = report.events, "lazy baseline established");
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,8 +562,9 @@ mod tests {
         );
     }
 
-    /// Live MySQL 8.4 (Docker): the source establishes baselines at its
-    /// start position; selection over the stored records proves them.
+    /// Live MySQL 8.4 (Docker): startup establishes nothing; a table's first
+    /// unproven rows get a lazy baseline at their evaluation position, which
+    /// selection over the stored records then proves.
     mod live {
         use super::*;
         use crate::mysql::MySqlSource;
@@ -504,14 +657,18 @@ mod tests {
             }
         }
 
-        /// Run the source on `tables` until startup is done, then stop it.
-        async fn run_once(
+        /// Run the source on `tables` (no snapshot unless `mode` says so),
+        /// execute `during` once it is streaming (phases separated by an
+        /// empty statement), then stop it. Returns the
+        /// rows it emitted and how it ended.
+        async fn run(
             st: &State,
             port: u16,
             id: &str,
             tables: &[&str],
             mode: SnapshotMode,
-        ) {
+            during: &[String],
+        ) -> (Vec<deltaforge_core::Event>, SourceResult<()>) {
             let src = MySqlSource {
                 id: id.into(),
                 dsn: dsn(port, "").as_str().into(),
@@ -532,19 +689,35 @@ mod tests {
             };
             let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
             let handle = src.run(tx, st.ckpt.clone()).await;
-            let drain =
-                tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            let rows = tokio::spawn(async move {
+                let mut rows = Vec::new();
+                while let Some(item) = rx.recv().await {
+                    if let deltaforge_core::SourceItem::Event(e) = item
+                        && e.ddl.is_none()
+                    {
+                        rows.push(e);
+                    }
+                }
+                rows
+            });
             tokio::time::sleep(Duration::from_secs(4)).await;
+            // An empty statement separates phases: the source catches up
+            // before the next one runs.
+            for phase in during.split(|s| s.is_empty()) {
+                sql(port, phase).await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
             handle.stop();
-            tokio::time::timeout(Duration::from_secs(30), handle.join)
-                .await
-                .expect("stops")
-                .expect("task")
-                .expect("source ran cleanly");
-            drain.abort();
+            let res =
+                tokio::time::timeout(Duration::from_secs(30), handle.join)
+                    .await
+                    .expect("stops")
+                    .expect("task");
+            let rows = rows.await.unwrap();
+            (rows, res)
         }
 
-        /// The table's records and its barriers, and the stored position.
+        /// The table's records and its barriers.
         async fn timeline(
             st: &State,
             db: &str,
@@ -558,7 +731,8 @@ mod tests {
         }
 
         async fn stored_position(st: &State, id: &str) -> WmPos {
-            let cp: MySqlCheckpoint = st.ckpt.get(id).await.unwrap().unwrap();
+            let cp: crate::MySqlCheckpoint =
+                st.ckpt.get(id).await.unwrap().unwrap();
             mysql_checkpoint_position(&cp.file, cp.pos, cp.gtid_set.as_deref())
                 .unwrap()
         }
@@ -580,24 +754,34 @@ mod tests {
             select(&all, at)
         }
 
+        async fn prepare(port: u16, db: &str, tables: &[&str]) {
+            let mut s = vec![
+                format!("DROP DATABASE IF EXISTS {db}"),
+                format!("CREATE DATABASE {db}"),
+            ];
+            for t in tables {
+                s.push(format!(
+                    "CREATE TABLE {db}.{t} (id INT PRIMARY KEY, v INT)"
+                ));
+            }
+            sql(port, &s).await;
+        }
+
         async fn fresh_start(gtid: bool) {
             let port = server(gtid).await;
             let db = if gtid { "base_g" } else { "base_f" };
-            sql(
-                port,
-                &[
-                    format!("DROP DATABASE IF EXISTS {db}"),
-                    format!("CREATE DATABASE {db}"),
-                    format!("CREATE TABLE {db}.t (id INT PRIMARY KEY, v INT)"),
-                ],
-            )
-            .await;
+            prepare(port, db, &["t"]).await;
             let st = state().await;
-            run_once(&st, port, db, &[&format!("{db}.t")], SnapshotMode::Never)
-                .await;
+            let t = format!("{db}.t");
+
+            // Startup alone establishes nothing.
+            let (rows, res) =
+                run(&st, port, db, &[&t], SnapshotMode::Never, &[]).await;
+            res.unwrap();
+            assert!(rows.is_empty());
             let r0 = stored_position(&st, db).await;
             let (table, barriers) = timeline(&st, db, "t").await;
-            // The start barrier and the baseline that binds it, at R0.
+            assert!(table.is_empty(), "{table:?}");
             let start: Vec<&Stored> = barriers
                 .iter()
                 .filter(|b| {
@@ -606,8 +790,37 @@ mod tests {
                 })
                 .collect();
             assert_eq!(start.len(), 1, "{barriers:?}");
+
+            // The first rows (evaluated at the start position) get a lazy
+            // baseline there, binding the start barrier.
+            let st2 = state().await;
+            let (rows, res) = run(
+                &st2,
+                port,
+                db,
+                &[&t],
+                SnapshotMode::Never,
+                &[format!("INSERT INTO {t} VALUES (1, 1)")],
+            )
+            .await;
+            res.unwrap();
+            assert_eq!(rows.len(), 1);
+            let (table, barriers) = timeline(&st2, db, "t").await;
+            assert_eq!(barriers.len(), 1, "{barriers:?}");
+            let r0 = barriers[0].record.position.clone();
             let base = baselines(&table);
             assert_eq!(base.len(), 1, "{table:?}");
+            assert_eq!(
+                order_positions(&base[0].record.position, &r0),
+                CheckpointOrder::Equal
+            );
+            let start: Vec<&Stored> = barriers
+                .iter()
+                .filter(|b| {
+                    order_positions(&b.record.position, &r0)
+                        == CheckpointOrder::Equal
+                })
+                .collect();
             let Kind::Baseline { version, binds, .. } = &base[0].record.kind
             else {
                 unreachable!()
@@ -619,146 +832,184 @@ mod tests {
             );
 
             // A restart at the committed (already proven) position adds no
-            // record.
-            run_once(&st, port, db, &[&format!("{db}.t")], SnapshotMode::Never)
-                .await;
-            let (again, barriers_again) = timeline(&st, db, "t").await;
+            // record, and its next rows reuse the proof.
+            let (rows, res) = run(
+                &st2,
+                port,
+                db,
+                &[&t],
+                SnapshotMode::Never,
+                &[format!("INSERT INTO {t} VALUES (2, 2)")],
+            )
+            .await;
+            res.unwrap();
+            assert_eq!(rows.len(), 1);
+            let (again, barriers_again) = timeline(&st2, db, "t").await;
             assert_eq!(again, table);
             assert_eq!(barriers_again, barriers);
         }
 
         #[tokio::test]
         #[ignore = "requires docker"]
-        async fn a_first_start_baseline_binds_the_start_barrier_gtid() {
+        async fn a_first_rows_baseline_binds_the_start_barrier_gtid() {
             fresh_start(true).await;
         }
 
         #[tokio::test]
         #[ignore = "requires docker"]
-        async fn a_first_start_baseline_binds_the_start_barrier_file_position()
-        {
+        async fn a_first_rows_baseline_binds_the_start_barrier_file_position() {
             fresh_start(false).await;
         }
 
+        /// A DDL of the table after its rows (in (E, S]) prevents its lazy
+        /// baseline and the source stops before those rows; another table's
+        /// earlier rows still get theirs.
         #[tokio::test]
         #[ignore = "requires docker"]
-        async fn a_ddl_or_barrier_in_the_interval_prevents_the_baseline() {
+        async fn a_later_ddl_of_the_table_prevents_its_lazy_baseline() {
             let port = server(true).await;
             let db = "base_scan";
-            sql(
-                port,
-                &[
-                    format!("DROP DATABASE IF EXISTS {db}"),
-                    format!("CREATE DATABASE {db}"),
-                    format!("CREATE TABLE {db}.seed (id INT PRIMARY KEY)"),
-                    format!("CREATE TABLE {db}.t (id INT PRIMARY KEY, v INT)"),
-                    format!("CREATE TABLE {db}.u (id INT PRIMARY KEY, v INT)"),
-                ],
-            )
-            .await;
+            prepare(port, db, &["t", "u"]).await;
             let st = state().await;
-            // A committed position whose timeline knows nothing of t and u
-            // (an upgraded deployment).
-            run_once(
-                &st,
-                port,
-                db,
-                &[&format!("{db}.seed")],
-                SnapshotMode::Never,
-            )
-            .await;
-            // Move the committed position past the first start's barrier.
-            sql(port, &["FLUSH PRIVILEGES".to_string()]).await;
-            run_once(
-                &st,
-                port,
-                db,
-                &[&format!("{db}.seed")],
-                SnapshotMode::Never,
-            )
-            .await;
-            let r0 = stored_position(&st, db).await;
-            // While stopped: a DDL on t, and an unrelated database dropped.
+            let (t, u) = (format!("{db}.t"), format!("{db}.u"));
+            run(&st, port, db, &[&t, &u], SnapshotMode::Never, &[])
+                .await
+                .1
+                .unwrap();
+            let committed = st.ckpt.get_raw(db).await.unwrap().unwrap();
+            // While stopped: u's row, t's row, then a DDL of t.
             sql(
                 port,
                 &[
-                    format!("ALTER TABLE {db}.t ADD COLUMN w INT"),
-                    format!("DROP DATABASE IF EXISTS {db}_other"),
+                    format!("INSERT INTO {u} VALUES (1, 1)"),
+                    format!("INSERT INTO {t} VALUES (1, 1)"),
+                    format!("ALTER TABLE {t} ADD COLUMN w INT"),
                 ],
             )
             .await;
-            run_once(
-                &st,
-                port,
-                db,
-                &[&format!("{db}.t"), &format!("{db}.u")],
-                SnapshotMode::Never,
-            )
-            .await;
-            let (t, tb) = timeline(&st, db, "t").await;
-            assert!(baselines(&t).is_empty(), "t changed in (R0, S]: {t:?}");
-            assert_ne!(proven(&t, &tb, &r0), Selection::Proven { version: 1 });
-            let (u, ub) = timeline(&st, db, "u").await;
-            let base = baselines(&u);
-            assert_eq!(base.len(), 1, "{u:?}");
-            // A committed restart has no barrier at R0: nothing to bind.
-            assert!(matches!(
-                base[0].record.kind,
-                Kind::Baseline { binds: None, .. }
-            ));
-            assert!(matches!(proven(&u, &ub, &r0), Selection::Proven { .. }));
-
-            // A lineage barrier while stopped: no baseline for anything new.
-            let r1 = stored_position(&st, db).await;
-            sql(port, &[
-                format!("CREATE TABLE {db}.v (id INT PRIMARY KEY)"),
-                format!(
-                    "CREATE TABLE {db}.w (id INT PRIMARY KEY) /*!50100 ENGINE=InnoDB */"
-                ),
-            ])
-            .await;
-            run_once(&st, port, db, &[&format!("{db}.v")], SnapshotMode::Never)
-                .await;
-            let (v, vb) = timeline(&st, db, "v").await;
-            assert!(baselines(&v).is_empty(), "{v:?}");
-            assert!(!matches!(proven(&v, &vb, &r1), Selection::Proven { .. }));
+            let (rows, res) =
+                run(&st, port, db, &[&t, &u], SnapshotMode::Never, &[]).await;
+            let err = format!("{:#}", res.expect_err("t's rows are refused"));
+            assert!(err.contains("no positional proof"), "{err}");
+            assert_eq!(rows.len(), 1, "only u's row");
+            assert_eq!(rows[0].source.table, "u");
+            assert_eq!(baselines(&timeline(&st, db, "u").await.0).len(), 1);
+            assert!(baselines(&timeline(&st, db, "t").await.0).is_empty());
+            assert_eq!(st.ckpt.get_raw(db).await.unwrap().unwrap(), committed);
         }
 
+        /// After a barrier (here a versioned-comment DDL, unattributable), a
+        /// table's next rows restore proof by a lazy baseline: later
+        /// authoritative evidence for that table supersedes the barrier.
         #[tokio::test]
         #[ignore = "requires docker"]
-        async fn a_snapshot_baseline_binds_the_anchor_barrier() {
+        async fn a_lazy_baseline_restores_proof_after_a_barrier() {
             let port = server(true).await;
-            let db = "base_snap";
-            sql(
-                port,
-                &[
-                    format!("DROP DATABASE IF EXISTS {db}"),
-                    format!("CREATE DATABASE {db}"),
-                    format!("CREATE TABLE {db}.t (id INT PRIMARY KEY, v INT)"),
-                    format!("INSERT INTO {db}.t VALUES (1, 1)"),
-                ],
-            )
-            .await;
+            let db = "base_barrier";
+            prepare(port, db, &["t"]).await;
             let st = state().await;
-            run_once(
+            let t = format!("{db}.t");
+            let (rows, res) = run(
                 &st,
                 port,
                 db,
-                &[&format!("{db}.t")],
-                SnapshotMode::Initial,
+                &[&t],
+                SnapshotMode::Never,
+                &[
+                    format!("INSERT INTO {t} VALUES (1, 1)"),
+                    String::new(),
+                    format!("/*!50100 ALTER TABLE {t} ADD COLUMN w INT */"),
+                    format!("INSERT INTO {t} VALUES (2, 2, 2)"),
+                ],
             )
             .await;
-            let anchor = stored_position(&st, db).await;
+            res.unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[1].after.as_ref().unwrap()["w"], 2);
             let (table, barriers) = timeline(&st, db, "t").await;
             let base = baselines(&table);
-            assert_eq!(base.len(), 1, "{table:?}");
+            assert_eq!(base.len(), 2, "{table:?}");
+            // The second baseline follows the in-stream barrier.
+            let barrier = barriers.last().unwrap();
             assert_eq!(
-                order_positions(&base[0].record.position, &anchor),
+                order_positions(
+                    &barrier.record.position,
+                    &base[1].record.position
+                ),
                 CheckpointOrder::Equal
             );
             assert!(matches!(
-                proven(&table, &barriers, &anchor),
-                Selection::Proven { .. }
+                &base[1].record.kind,
+                Kind::Baseline { binds: Some(b), .. } if *b == barrier.capture_id
+            ));
+        }
+
+        /// Stored schema history that cannot be read is corrupt: a load of it
+        /// (here by a snapshot) fails closed, never replaced by the live
+        /// catalog, and nothing is emitted.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_corrupt_stored_schema_fails_closed() {
+            let port = server(true).await;
+            let db = "base_corrupt";
+            prepare(port, db, &["t"]).await;
+            sql(port, &[format!("INSERT INTO {db}.t VALUES (1, 1)")]).await;
+            let st = state().await;
+            let t = format!("{db}.t");
+            // Establish the lineage, then store an unreadable latest version.
+            run(&st, port, db, &[&t], SnapshotMode::Never, &[])
+                .await
+                .1
+                .unwrap();
+            let key = st.scope.current().unwrap().key(db, "t");
+            st.registry
+                .register_with_checkpoint(
+                    &key,
+                    "corrupt",
+                    &serde_json::json!({ "columns": 5 }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let (rows, res) =
+                run(&st, port, db, &[&t], SnapshotMode::Always, &[]).await;
+            let err = format!("{:#}", res.expect_err("fails closed"));
+            assert!(err.contains("is unreadable"), "{err}");
+            assert!(rows.is_empty(), "{rows:?}");
+        }
+
+        /// A snapshot proves every table it copied at its anchor (they are
+        /// already enumerated and loaded): one baseline there, binding the
+        /// anchor's barrier, before any CDC rows.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_snapshot_proves_its_tables_at_the_anchor() {
+            let port = server(true).await;
+            let db = "base_snap";
+            prepare(port, db, &["t"]).await;
+            sql(port, &[format!("INSERT INTO {db}.t VALUES (1, 1)")]).await;
+            let st = state().await;
+            let t = format!("{db}.t");
+            // No CDC rows: the proof exists before any first use.
+            let (rows, res) =
+                run(&st, port, db, &[&t], SnapshotMode::Initial, &[]).await;
+            res.unwrap();
+            assert_eq!(rows.len(), 1, "the snapshot row only");
+            let (table, barriers) = timeline(&st, db, "t").await;
+            assert_eq!(barriers.len(), 1, "{barriers:?}");
+            let anchor = &barriers[0];
+            let base = baselines(&table);
+            assert_eq!(base.len(), 1, "{table:?}");
+            assert_eq!(
+                order_positions(
+                    &anchor.record.position,
+                    &base[0].record.position
+                ),
+                CheckpointOrder::Equal
+            );
+            assert!(matches!(
+                &base[0].record.kind,
+                Kind::Baseline { binds: Some(b), .. } if *b == anchor.capture_id
             ));
         }
     }

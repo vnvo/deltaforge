@@ -378,6 +378,24 @@ fn fails_closed(res: &SourceResult<()>, needle: &str) {
 /// Pacing matters: a DDL is proven forward only when no later DDL of the
 /// table precedes the source's capture, so a phase ends before a next DDL.
 #[allow(clippy::too_many_arguments)]
+/// Prove `tables` the way a running source does before a scenario that
+/// assumes it: one row each, decoded through a lazy baseline (startup
+/// establishes nothing).
+async fn prime(
+    port: u16,
+    db: &str,
+    tables: &[&str],
+    rx: &mut mpsc::Receiver<SourceItem>,
+) {
+    let s: Vec<String> = tables
+        .iter()
+        .map(|t| format!("INSERT INTO {db}.{t} (id) VALUES (-1)"))
+        .collect();
+    sql(port, "", &s).await;
+    let got = rows(rx, tables.len()).await;
+    assert_eq!(got.len(), tables.len(), "priming rows: {:?}", image(&got));
+}
+
 async fn live_then_replay(
     port: u16,
     st: &State,
@@ -389,6 +407,7 @@ async fn live_then_replay(
 ) -> (Vec<Event>, Vec<SchemaVersion>) {
     let hash = lineage_hash(port).await;
     let mut r = run(source(id, port, db, tables, st), st).await;
+    prime(port, db, tables, &mut r.rx).await;
     let before = position(port, &hash).await;
     let mut live = Vec::new();
     for (steps, n) in phases {
@@ -678,8 +697,11 @@ async fn qualified_ddl_from_another_database_is_attributed_exactly() {
 // ---------------------------------------------------------------------------
 
 /// Commit a start position for `id` (a start and a stop with no writes).
+/// Commit a position for `id` at which `t` is proven (a start, one priming
+/// row, a stop).
 async fn commit_a_position(port: u16, st: &State, id: &str, db: &str) {
-    let r = run(source(id, port, db, &["t"], st), st).await;
+    let mut r = run(source(id, port, db, &["t"], st), st).await;
+    prime(port, db, &["t"], &mut r.rx).await;
     stop(r.handle).await;
 }
 
@@ -776,19 +798,20 @@ fn full_observations(records: &[Value]) -> Vec<&Value> {
         .collect()
 }
 
-/// MINIMAL: no record can prove the shape after a barrier; the rows after
-/// it are refused.
+/// MINIMAL after a barrier: the table's next rows restore proof by a lazy
+/// baseline when nothing changes the table between them and the capture;
+/// when a DDL of the table follows them before they are read, nothing can
+/// prove them and they are refused (not emitted, checkpoint unchanged).
 #[tokio::test]
 #[ignore = "requires docker"]
-async fn a_barrier_fails_closed_without_full_metadata() {
+async fn a_barrier_is_recovered_by_a_lazy_baseline_or_fails_closed() {
     init_test_tracing();
     let db = "pm_barrier_min";
     let port = server(true, false).await;
     prepare(port, db, &[T]).await;
     let st = State::new().await;
     commit_a_position(port, &st, db, db).await;
-    let committed = st.ckpt.get_raw(db).await.unwrap().unwrap();
-    let r = run(source(db, port, db, &["t"], &st), &st).await;
+    let mut r = run(source(db, port, db, &["t"], &st), &st).await;
     sql(
         port,
         db,
@@ -799,9 +822,34 @@ async fn a_barrier_fails_closed_without_full_metadata() {
         ]),
     )
     .await;
-    let (got, res) = until_stopped(r).await;
+    let got = rows(&mut r.rx, 2).await;
+    stop(r.handle).await;
+    assert_eq!(got.len(), 2, "rows: {:?}", image(&got));
+    assert_eq!(after(&got[1], "x"), 7);
+    let committed = st.ckpt.get_raw(db).await.unwrap().unwrap();
+
+    // While stopped: a row, another barrier, a row, then a DDL of the table.
+    sql(
+        port,
+        db,
+        &stmts(&[
+            "INSERT INTO t VALUES (3, 'A3', 'B3', 8)",
+            "/*!50100 ALTER TABLE t ADD COLUMN y INT */",
+            "INSERT INTO t VALUES (4, 'A4', 'B4', 8, 9)",
+            "ALTER TABLE t ADD COLUMN z INT",
+        ]),
+    )
+    .await;
+    let (got, res) =
+        until_stopped(run(source(db, port, db, &["t"], &st), &st).await).await;
     fails_closed(&res, "binlog_row_metadata is not FULL");
-    assert_eq!(got.len(), 1, "rows: {:?}", image(&got));
+    assert_eq!(
+        got.len(),
+        1,
+        "only the row before the barrier: {:?}",
+        image(&got)
+    );
+    assert_eq!(after(&got[0], "x"), 8);
     assert_eq!(st.ckpt.get_raw(db).await.unwrap().unwrap(), committed);
 }
 
@@ -835,32 +883,49 @@ async fn a_proven_version_that_contradicts_the_rows_fails_closed() {
     assert_eq!(st.ckpt.get_raw(db).await.unwrap().unwrap(), committed);
 }
 
-/// FULL: after a barrier the live shape is captured and registered, the
-/// unique matching candidate is selected and recorded (binding the
-/// barrier) before the row is emitted; a replay reuses that record.
-#[tokio::test]
-#[ignore = "requires docker"]
-async fn full_metadata_selects_past_a_barrier_by_a_unique_match() {
+/// A versioned-comment DDL that keeps the shape: still unattributable (a
+/// lineage barrier).
+const KEEPING_BARRIER: &str = "/*!50100 ALTER TABLE t COMMENT 'c' */";
+
+/// While stopped: a row, `barrier`, two rows in separate transactions, then a
+/// DDL of the table (so no lazy baseline can prove the rows after the
+/// barrier) and a row under the new shape.
+fn rows_past_a_barrier(barrier: &str) -> Vec<String> {
+    stmts(&[
+        "INSERT INTO t VALUES (1, 'A1', 'B1')",
+        barrier,
+        "INSERT INTO t VALUES (2, 'A2', 'B2')",
+        "INSERT INTO t VALUES (3, 'A3', 'B3')",
+        "ALTER TABLE t ADD COLUMN x INT",
+        "INSERT INTO t VALUES (4, 'A4', 'B4', 9)",
+    ])
+}
+
+/// FULL: after a barrier, with no lazy baseline possible, the live shape is
+/// captured and registered, the unique matching recorded shape is selected
+/// and recorded (binding the barrier) before the row is emitted; the next
+/// transaction reuses that observation, and a replay reproduces everything.
+async fn full_past_a_barrier(db: &str, barrier: &str) {
     init_test_tracing();
-    let db = "pm_barrier_full";
     let port = server(true, true).await;
     let hash = lineage_hash(port).await;
     prepare(port, db, &[T]).await;
     let st = State::new().await;
-    let steps = stmts(&[
-        "INSERT INTO t VALUES (1, 'A1', 'B1')",
-        OPAQUE_DDL,
-        "INSERT INTO t VALUES (2, 'A2', 'B2', 7)",
-        "INSERT INTO t VALUES (3, 'A3', 'B3', 8)",
-    ]);
-    let (rows, v) =
-        live_then_replay(port, &st, db, db, &["t"], db, &[(steps, 3)]).await;
-    assert_eq!(after(&rows[1], "x"), 7);
-    assert_ne!(v[0].hash, v[1].hash);
+    commit_a_position(port, &st, db, db).await;
+    let committed = st.ckpt.get_raw(db).await.unwrap().unwrap();
+    sql(port, db, &rows_past_a_barrier(barrier)).await;
+
+    let mut r = run(source(db, port, db, &["t"], &st), &st).await;
+    let live = rows(&mut r.rx, 4).await;
+    stop(r.handle).await;
+    assert_eq!(live.len(), 4, "rows: {:?}", image(&live));
+    assert_eq!(after(&live[3], "x"), 9);
+    let v = st.decoded(db, &hash, &live).await;
+    assert_eq!(v[0].hash, v[1].hash);
+    assert_eq!(v[1].hash, v[2].hash);
+    assert_ne!(v[2].hash, v[3].hash);
     let records = st.activation(db, &hash, db, "t").await;
     let full = full_observations(&records);
-    // The next transaction is proven by that observation: no second one.
-    assert_eq!(v[1].hash, v[2].hash);
     assert_eq!(full.len(), 1, "one FULL observation: {records:?}");
     assert!(
         full[0]["binds"].is_string(),
@@ -868,29 +933,32 @@ async fn full_metadata_selects_past_a_barrier_by_a_unique_match() {
         full[0]
     );
     assert_eq!(full[0]["full"]["schema_hash"], v[1].hash.as_str());
+
+    st.ckpt.put_raw(db, &committed).await.unwrap();
+    let mut r = run(source(db, port, db, &["t"], &st), &st).await;
+    let replayed = rows(&mut r.rx, 4).await;
+    stop(r.handle).await;
+    assert_eq!(image(&replayed), image(&live), "replay decodes identically");
+    let records = st.activation(db, &hash, db, "t").await;
+    assert_eq!(full_observations(&records).len(), 1, "{records:?}");
 }
 
-/// FULL past a database barrier that leaves the table's shape unchanged:
-/// the same version is selected again.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn full_metadata_selects_past_a_barrier_by_a_unique_match() {
+    full_past_a_barrier("pm_barrier_full", KEEPING_BARRIER).await;
+}
+
+/// The same past a database barrier.
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn full_metadata_selects_past_a_database_barrier() {
-    init_test_tracing();
     let db = "pm_dbbarrier_full";
-    let port = server(true, true).await;
-    let hash = lineage_hash(port).await;
-    prepare(port, db, &[T]).await;
-    let st = State::new().await;
-    let steps = vec![
-        "INSERT INTO t VALUES (1, 'A1', 'B1')".to_string(),
-        format!("ALTER DATABASE {db} CHARACTER SET utf8mb4"),
-        "INSERT INTO t VALUES (2, 'A2', 'B2')".to_string(),
-    ];
-    let (_, v) =
-        live_then_replay(port, &st, db, db, &["t"], db, &[(steps, 2)]).await;
-    assert_eq!(v[0].hash, v[1].hash);
-    let records = st.activation(db, &hash, db, "t").await;
-    assert_eq!(full_observations(&records).len(), 1, "{records:?}");
+    full_past_a_barrier(
+        db,
+        &format!("ALTER DATABASE {db} CHARACTER SET utf8mb4"),
+    )
+    .await;
 }
 
 /// A crash after the live shape is registered but before the FULL
@@ -908,24 +976,15 @@ async fn a_full_observation_is_durable_before_its_row() {
     let st = State::over(fault.clone()).await;
     commit_a_position(port, &st, db, db).await;
     let committed = st.ckpt.get_raw(db).await.unwrap().unwrap();
+    sql(port, db, &rows_past_a_barrier(KEEPING_BARRIER)).await;
 
-    let r = run(source(db, port, db, &["t"], &st), &st).await;
     fault
         .fail_writes_to
         .lock()
         .unwrap()
         .push(ACTIVATION_NS.into());
-    sql(
-        port,
-        db,
-        &stmts(&[
-            "INSERT INTO t VALUES (1, 'A1', 'B1')",
-            OPAQUE_DDL,
-            "INSERT INTO t VALUES (2, 'A2', 'B2', 7)",
-        ]),
-    )
-    .await;
-    let (got, res) = until_stopped(r).await;
+    let (got, res) =
+        until_stopped(run(source(db, port, db, &["t"], &st), &st).await).await;
     let msg = format!("{:#}", res.expect_err("the source stops"));
     assert!(msg.contains("persist a FULL schema observation"), "{msg}");
     assert_eq!(got.len(), 1, "rows: {:?}", image(&got));
@@ -936,10 +995,9 @@ async fn a_full_observation_is_durable_before_its_row() {
 
     fault.fail_writes_to.lock().unwrap().clear();
     let mut r = run(source(db, port, db, &["t"], &st), &st).await;
-    let got = rows(&mut r.rx, 2).await;
+    let got = rows(&mut r.rx, 4).await;
     stop(r.handle).await;
-    assert_eq!(got.len(), 2);
-    assert_eq!(after(&got[1], "x"), 7);
+    assert_eq!(got.len(), 4);
     st.decoded(db, &hash, &got).await;
     assert_eq!(
         full_observations(&st.activation(db, &hash, db, "t").await).len(),
@@ -964,6 +1022,7 @@ async fn stored_evidence_is_validated_on_read() {
     prepare(port, db, &[T]).await;
     let st = State::new().await;
     let mut r = run(source(db, port, db, &["t"], &st), &st).await;
+    prime(port, db, &["t"], &mut r.rx).await;
     sql(
         port,
         db,
@@ -1038,7 +1097,6 @@ async fn rows_event_identity(gtid: bool) {
     prepare(port, db, &[T, "CREATE TABLE o (id INT PRIMARY KEY)"]).await;
     let st = State::new().await;
     commit_a_position(port, &st, db, db).await;
-    let mut r = run(source(db, port, db, &["t"], &st), &st).await;
     let compressed = |body: &[&str]| {
         let mut s = stmts(&[
             "SET SESSION binlog_transaction_compression = ON",
@@ -1048,44 +1106,28 @@ async fn rows_event_identity(gtid: bool) {
         s.push("COMMIT".into());
         s
     };
-
-    // Proven by the baseline: a compressed transaction's row is emitted.
-    sql(
-        port,
-        db,
-        &compressed(&["INSERT INTO t VALUES (1, 'A1', 'B1')"]),
-    )
-    .await;
-    let got = rows(&mut r.rx, 1).await;
-    assert_eq!(got.len(), 1, "the compressed row is emitted");
-    assert_eq!(after(&got[0], "a"), "A1");
-
-    // After a barrier: the tracked table's rows event is the second rows
-    // event of a compressed transaction (the first is untracked).
-    let mut steps = stmts(&[OPAQUE_DDL]);
+    // While stopped: a compressed row (proven); a barrier, then a
+    // compressed transaction whose second rows event is the tracked one
+    // (the first is untracked); another barrier, then a plain row; finally a
+    // DDL of the table, so no lazy baseline proves the rows after the
+    // barriers and each takes the FULL path.
+    let mut steps = compressed(&["INSERT INTO t VALUES (1, 'A1', 'B1')"]);
+    steps.push(KEEPING_BARRIER.into());
     steps.extend(compressed(&[
         "INSERT INTO o VALUES (1)",
-        "INSERT INTO t VALUES (2, 'A2', 'B2', 7)",
+        "INSERT INTO t VALUES (2, 'A2', 'B2')",
+    ]));
+    steps.extend(stmts(&[
+        "/*!50100 ALTER TABLE t COMMENT 'd' */",
+        "INSERT INTO t VALUES (3, 'A3', 'B3')",
+        "ALTER TABLE t ADD COLUMN x INT",
     ]));
     sql(port, db, &steps).await;
-    let got = rows(&mut r.rx, 1).await;
-    assert_eq!(got.len(), 1);
-    assert_eq!(after(&got[0], "x"), 7);
-
-    // After another barrier, the first rows event of a plain transaction.
-    sql(
-        port,
-        db,
-        &stmts(&[
-            "/*!50100 ALTER TABLE t ADD COLUMN y INT */",
-            "INSERT INTO t VALUES (3, 'A3', 'B3', 8, 9)",
-        ]),
-    )
-    .await;
-    let got = rows(&mut r.rx, 1).await;
+    let mut r = run(source(db, port, db, &["t"], &st), &st).await;
+    let got = rows(&mut r.rx, 3).await;
     stop(r.handle).await;
-    assert_eq!(got.len(), 1);
-    assert_eq!(after(&got[0], "y"), 9);
+    let ids: Vec<Value> = got.iter().map(|e| after(e, "id")).collect();
+    assert_eq!(ids, [1, 2, 3], "every row, the compressed ones included");
 
     let records = st.activation(db, &hash, db, "t").await;
     let events: Vec<&Value> = full_observations(&records)
@@ -1180,4 +1222,47 @@ async fn full_fallback_writes_nothing_unless_it_decides_the_row() {
         full_observations(&st.activation(db, &hash, db, "t").await).is_empty()
     );
     assert_eq!(st.ckpt.get_raw(db).await.unwrap().unwrap(), committed);
+}
+
+/// A lazy baseline is written only if it decides the rows: with a record
+/// incomparable with the rows' position in the table's timeline (here
+/// planted: another server's GTID set), the capture and scan succeed but the
+/// baseline would not prove the rows, so nothing is written and the rows are
+/// refused.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_lazy_baseline_is_written_only_if_it_decides_the_rows() {
+    init_test_tracing();
+    let db = "pm_lazy_admit";
+    let port = server(true, false).await;
+    let hash = lineage_hash(port).await;
+    prepare(port, db, &[T]).await;
+    let st = State::new().await;
+    let r = run(source(db, port, db, &["t"], &st), &st).await;
+    let incomparable = serde_json::json!({
+        "format_version": 1,
+        "position": { "MysqlGtid": {
+            "gtid_set": "4e11fa47-71ca-11e1-9e33-c80aa9429562:1-2"
+        } },
+        "kind": "ddl",
+    });
+    let key = SchemaKey::new(TENANT, db, &hash, db, "t").backend_key();
+    st.backend
+        .log_append_if_absent(
+            ACTIVATION_NS,
+            &key,
+            "planted-incomparable",
+            &serde_json::to_vec(&incomparable).unwrap(),
+        )
+        .await
+        .unwrap();
+    sql(port, db, &stmts(&["INSERT INTO t VALUES (1, 'A1', 'B1')"])).await;
+    let (got, res) = until_stopped(r).await;
+    fails_closed(&res, "no positional proof");
+    assert!(got.is_empty(), "rows: {:?}", image(&got));
+    let records = st.activation(db, &hash, db, "t").await;
+    assert!(
+        records.iter().all(|r| r["kind"] != "baseline"),
+        "no baseline written: {records:?}"
+    );
 }

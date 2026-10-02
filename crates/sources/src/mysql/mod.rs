@@ -176,6 +176,9 @@ pub(crate) struct RunCtx {
     /// before the current transaction - the stream position after the last
     /// commit boundary (or the position the stream (re)started from).
     txn_eval: Option<crate::durable_checkpoint::WmPos>,
+    /// The same position as binlog coordinates (lineage left unset): where a
+    /// lazy baseline's scan starts.
+    txn_eval_cp: Option<MySqlCheckpoint>,
     /// Validated activation timelines and row-time selections.
     selection: mysql_selection::Caches,
     /// Original checkpoint position, preserved even after a pre-connect failover
@@ -449,6 +452,8 @@ impl MySqlSource {
             SnapshotMode::Never => false,
         };
 
+        // The tables a snapshot copied: proven at its anchor below.
+        let mut snapshot_tables: Vec<(String, String)> = Vec::new();
         if needs_snapshot {
             if self.snapshot_cfg.mode == SnapshotMode::Always {
                 if let Ok(bytes) =
@@ -513,6 +518,7 @@ impl MySqlSource {
                 .await
                 .map_err(|e| SourceError::Other(e.into()))?;
 
+            snapshot_tables = tracked;
             info!(source_id = %self.id, "snapshot complete, starting binlog streaming");
         }
 
@@ -642,6 +648,7 @@ impl MySqlSource {
             rows_ordinal: 0,
             lower_case_table_names,
             txn_eval: None,
+            txn_eval_cp: None,
             selection: Default::default(),
             checkpoint_gtid,
             checkpoint_file,
@@ -673,14 +680,16 @@ impl MySqlSource {
         let mut stream = connect_first_stream(&ctx, client).await?;
         ctx.mark_transaction_boundary();
 
-        // Safe to preload now: reconciliation has run, registry reflects post-reconcile state.
-        let tracked = ctx.schema.preload(&self.tables).await?;
-        info!(source_id=%self.id, tables = tracked.len(), "schemas preloaded");
-
-        // Establish activation baselines at the start position for tracked
-        // tables whose version the timeline does not prove there, before any
-        // event is read.
-        mysql_baseline::establish(&ctx, &tracked).await?;
+        // No schema is enumerated or loaded here (except the tables a
+        // snapshot just copied): each table's version is resolved, and if
+        // needed proven by a lazy baseline, at its first rows (design spec
+        // 7.21). CDC startup work is independent of the catalog.
+        ctx.schema.check_binlog_row_image().await?;
+        // A snapshot already enumerated and loaded its tables: prove each at
+        // the anchor now (no gap until its first CDC rows).
+        if !snapshot_tables.is_empty() {
+            mysql_baseline::establish(&ctx, &snapshot_tables).await?;
+        }
 
         // Controlled credential rotation (opt-in, file-backed credentials only).
         // GTID mode is mandatory for live rotation - fail startup otherwise. The
@@ -766,11 +775,7 @@ impl MySqlSource {
                 match control {
                     Ok(()) => {}
                     Err(LoopControl::ReloadSchema { db, table }) => {
-                        if let (Some(d), Some(t)) = (db, table) {
-                            let _ = ctx.schema.reload_schema(&d, &t).await?;
-                        } else {
-                            let _ = ctx.schema.reload_all(&self.tables).await?;
-                        }
+                        apply_reload_request(&mut ctx, db, table).await?;
                         match do_reconnect(&mut ctx).await? {
                             Some(s) => {
                                 stream = s;
@@ -1217,6 +1222,12 @@ impl RunCtx {
             self.last_pos,
             self.last_gtid.as_deref(),
         );
+        self.txn_eval_cp = Some(MySqlCheckpoint {
+            file: self.last_file.clone(),
+            pos: self.last_pos,
+            gtid_set: self.last_gtid.clone(),
+            lineage: None,
+        });
     }
 
     /// The verified `server_uuid` (the published registry lineage) that every
@@ -1259,6 +1270,25 @@ async fn fetch_lower_case_table_names(
             details: format!("read lower_case_table_names: {e}").into(),
         }),
     }
+}
+
+/// A schema reload requested by the stream. Never enumerates: a named table
+/// is reloaded, any other request forgets every cached schema; the
+/// activation timelines and selections cached for them go with them.
+pub(crate) async fn apply_reload_request(
+    ctx: &mut RunCtx,
+    db: Option<String>,
+    table: Option<String>,
+) -> SourceResult<()> {
+    if let (Some(d), Some(t)) = (db, table) {
+        let _ = ctx.schema.reload_schema(&d, &t).await?;
+        let key = ctx.registry_scope.current()?.key(&d, &t);
+        ctx.selection.invalidate(&key);
+    } else {
+        ctx.schema.clear_cache().await;
+        ctx.selection.invalidate_all();
+    }
+    Ok(())
 }
 
 /// The lineage-wide barrier of a stream discontinuity at the position the

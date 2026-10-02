@@ -398,7 +398,9 @@ pub(crate) async fn scan_interval(
     let mut client = BinlogClient {
         url: dsn.to_string(),
         server_id,
-        heartbeat_interval_secs: 5,
+        // Short, so the server writes to the session soon after the scan
+        // resets it and ends its dump thread (see the walk below).
+        heartbeat_interval_secs: 1,
         timeout_secs: 30,
         ..Default::default()
     };
@@ -452,61 +454,71 @@ pub(crate) async fn scan_interval(
         SessionError::NoIdentity(why) => ProofError::OtherServer(why),
         SessionError::Connect(why) => ProofError::Open(why),
     })?;
-    let (mut events, mut bytes) = (0u64, 0u64);
-    while !walk.reached {
-        let left = limits
-            .max_duration
-            .checked_sub(started.elapsed())
-            .ok_or_else(|| ProofError::Limit("time".into()))?;
-        let (header, data) = tokio::time::timeout(left, stream.read())
-            .await
-            .map_err(|_| ProofError::Limit("time".into()))?
-            .map_err(|e| ProofError::Read(e.to_string()))?;
-        if !matches!(data, EventData::HeartBeat) {
-            events += 1;
-            bytes += u64::from(header.event_length);
-        }
-        if events > limits.max_events {
-            return Err(ProofError::Limit("events".into()));
-        }
-        if bytes > limits.max_bytes {
-            return Err(ProofError::Limit("bytes".into()));
-        }
-        walk.event(&header, &data)?;
-        if !gtid_mode
-            && !matches!(
-                data,
-                EventData::HeartBeat
-                    | EventData::Rotate(_)
-                    | EventData::FormatDescription(_)
-            )
-        {
-            // File/position mode: the end is an exact event boundary.
-            let here = mysql_checkpoint_position(
-                &walk.file,
-                u64::from(header.next_event_position),
-                None,
-            )
-            .ok_or_else(|| {
-                ProofError::Framing(format!("unparseable file {}", walk.file))
-            })?;
-            match order_positions(&here, &pt) {
-                CheckpointOrder::Equal
-                    if walk.current_gtid.is_none() && !walk.in_explicit_txn =>
-                {
-                    walk.reached = true
-                }
-                CheckpointOrder::Before | CheckpointOrder::Equal => {}
-                other => {
-                    return Err(ProofError::Overshoot(format!(
-                        "event ending at {}:{} is {other:?} the end position",
-                        walk.file, header.next_event_position
-                    )));
+    // The walk, then the session ended on every path while this scan still
+    // owns it: an abortive close (reset), so the server's next write to it -
+    // at the latest the 1 s heartbeat on an idle server - fails and its dump
+    // thread ends. No connection is ever killed by id (ids can be reused).
+    let walked: Result<(u64, u64), ProofError> = async {
+        let (mut events, mut bytes) = (0u64, 0u64);
+        while !walk.reached {
+            let left = limits
+                .max_duration
+                .checked_sub(started.elapsed())
+                .ok_or_else(|| ProofError::Limit("time".into()))?;
+            let (header, data) = tokio::time::timeout(left, stream.read())
+                .await
+                .map_err(|_| ProofError::Limit("time".into()))?
+                .map_err(|e| ProofError::Read(e.to_string()))?;
+            if !matches!(data, EventData::HeartBeat) {
+                events += 1;
+                bytes += u64::from(header.event_length);
+            }
+            if events > limits.max_events {
+                return Err(ProofError::Limit("events".into()));
+            }
+            if bytes > limits.max_bytes {
+                return Err(ProofError::Limit("bytes".into()));
+            }
+            walk.event(&header, &data)?;
+            if !gtid_mode
+                && !matches!(
+                    data,
+                    EventData::HeartBeat
+                        | EventData::Rotate(_)
+                        | EventData::FormatDescription(_)
+                )
+            {
+                // File/position mode: the end is an exact event boundary.
+                let here = mysql_checkpoint_position(
+                    &walk.file,
+                    u64::from(header.next_event_position),
+                    None,
+                )
+                .ok_or_else(|| {
+                    ProofError::Framing(format!("unparseable file {}", walk.file))
+                })?;
+                match order_positions(&here, &pt) {
+                    CheckpointOrder::Equal
+                        if walk.current_gtid.is_none() && !walk.in_explicit_txn =>
+                    {
+                        walk.reached = true
+                    }
+                    CheckpointOrder::Before | CheckpointOrder::Equal => {}
+                    other => {
+                        return Err(ProofError::Overshoot(format!(
+                            "event ending at {}:{} is {other:?} the end position",
+                            walk.file, header.next_event_position
+                        )));
+                    }
                 }
             }
         }
+        Ok((events, bytes))
     }
-    let _ = stream.close().await;
+    .await;
+    let _ = stream.abort_on_drop();
+    drop(stream);
+    let (events, bytes) = walked?;
     Ok(ScanReport {
         digest: scan_digest(&pf, &pt, &walk.statements),
         statements: walk.statements,
@@ -1183,6 +1195,81 @@ mod tests {
             )
             .await;
             assert!(matches!(r, Err(ProofError::Limit(_))), "{r:?}");
+        }
+
+        /// A finished scan leaves no dump thread on the server, also when it
+        /// fails: the scan resets its own session, and an idle server's next
+        /// heartbeat write then fails (without it the thread stays until the
+        /// server next writes a binlog event). Nothing is killed by id.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_scan_ends_its_server_session() {
+            // Own server: no other replication session may be connected.
+            let (_c, port) = start(true).await;
+            let dsn = dsn_of(port);
+            sql(
+                &dsn,
+                &["CREATE DATABASE s", "CREATE TABLE s.t (id INT PRIMARY KEY)"],
+            )
+            .await;
+            let from = position(&dsn).await;
+            sql(&dsn, &["INSERT INTO s.t VALUES (1)"]).await;
+            let to = position(&dsn).await;
+            let dumps = || async {
+                let mut c =
+                    mysql_async::Conn::from_url(dsn.as_str()).await.unwrap();
+                let n: Vec<u64> = c
+                    .query(
+                        "SELECT ID FROM information_schema.PROCESSLIST \
+                         WHERE COMMAND LIKE 'Binlog Dump%'",
+                    )
+                    .await
+                    .unwrap();
+                c.disconnect().await.ok();
+                n
+            };
+            // A complete scan, and one that fails after its session opened
+            // (a resource limit).
+            let uuid = uuid(&dsn).await;
+            for limits in [
+                ScanLimits::default(),
+                ScanLimits {
+                    max_events: 1,
+                    ..ScanLimits::default()
+                },
+            ] {
+                let r = scan_interval(
+                    &dsn, 4_000_124, &uuid, LINEAGE, &from, &to, &limits,
+                )
+                .await;
+                assert_eq!(
+                    r.is_ok(),
+                    limits.max_events > 1,
+                    "{:?}",
+                    r.map(|r| r.events)
+                );
+                let deadline =
+                    std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    let left = dumps().await;
+                    if left.is_empty() {
+                        eprintln!(
+                            "dump thread gone {} ms after the scan",
+                            5000 - deadline
+                                .saturating_duration_since(
+                                    std::time::Instant::now()
+                                )
+                                .as_millis()
+                        );
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "dump threads left behind: {left:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
         }
 
         #[tokio::test]

@@ -220,7 +220,7 @@ When running multiple DeltaForge instances against the same MySQL server, ensure
 
 DeltaForge has a built-in schema registry to track table schemas, per source. For MySQL source:
 
-- Schemas are preloaded at startup by querying `INFORMATION_SCHEMA`
+- Schemas are loaded when a table is first used, not at startup: startup work does not grow with the number of matched tables (only an initial snapshot reads the tables it copies)
 - Each schema is fingerprinted using SHA-256 for change detection
 - Events carry `schema_version` (the fingerprint of the version the row was decoded with) and `schema_sequence` (that version's registry sequence)
 - Schema-to-checkpoint correlation enables reliable replay
@@ -231,14 +231,15 @@ Schema changes (DDL) trigger automatic reload of affected table schemas.
 
 Binlog row events carry values by column position, not by name. DeltaForge decodes each rows event with the schema version proven for its position in the binlog, never simply with the table's current definition, so replaying retained binlog across a DDL (after a restart from an older checkpoint, or while catching up) puts every value under the right column. A version is proven by:
 
-- the definition recorded when the source established its start position (proven unchanged up to it);
+- the table's definition captured when its first rows without other proof arrive, and proven unchanged between those rows and the capture (no DDL of the table and no unattributable statement in between);
 - a DDL's resulting definition, captured right after the source reads the DDL and proven unchanged since;
 - with `binlog_row_metadata = FULL` and neither of the above: the single recorded definition that exactly matches the row's binlog metadata (column names, types, signedness, charsets, primary key), recorded durably before the row is emitted.
 
 When no version can be proven, the source **stops** with a schema error naming the table, emits nothing for those rows and does not advance its checkpoint. Under the default `binlog_row_metadata = MINIMAL` this happens when:
 
 - retained rows predate a DDL the source never observed (for example, a checkpoint restored from before a schema change made by an earlier deployment);
-- a statement DeltaForge cannot attribute to specific tables was executed (versioned comments such as `/*!50100 ALTER TABLE ... */`, several statements in one event, `ALTER DATABASE` or `DROP DATABASE` of a tracked database, among others): every table it may affect stays unproven until later proof for that table exists - a later DDL of the table that the source proves, or a clean start at a later restart position - or a re-snapshot;
+- a statement DeltaForge cannot attribute to specific tables was executed (versioned comments such as `/*!50100 ALTER TABLE ... */`, several statements in one event, `ALTER DATABASE` or `DROP DATABASE` of a tracked database, among others): every table it may affect stays unproven until later proof for that table exists - usually its next rows, once the source captures the table's definition and proves nothing changed it since them, or a later DDL of the table that the source proves - or a re-snapshot;
+- a table's first rows (or its first rows after an unattributable statement) are followed, before the source reads them, by a DDL of that table or another unattributable statement: the definition those rows were written under can no longer be captured (this needs the source to lag behind the database);
 - two DDLs of one table both happen before the source reads the first, with rows written between them (the definition between the two was never captured; with `binlog_row_metadata = FULL` those rows proceed only if that definition was already recorded and is the single exact match).
 
 Re-snapshot is the immediate remediation that always works.

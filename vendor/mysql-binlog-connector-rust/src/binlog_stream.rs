@@ -29,6 +29,11 @@ impl BinlogStream {
         self.parser.next(&mut cursor)
     }
 
+    /// DeltaForge patch: see [`PacketChannel::abort_on_drop`].
+    pub fn abort_on_drop(&self) -> Result<(), BinlogError> {
+        self.channel.abort_on_drop()
+    }
+
     pub async fn close(&mut self) -> Result<(), BinlogError> {
         self.channel.close().await?;
         Ok(())

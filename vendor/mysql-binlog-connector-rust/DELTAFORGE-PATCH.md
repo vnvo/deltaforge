@@ -2,8 +2,9 @@
 
 Upstream: https://github.com/apecloud/mysql-binlog-connector-rust (MIT OR
 Apache-2.0, license files kept). Used through `[patch.crates-io]` in the
-workspace manifest. Only `src/event/table_map/` changes;
-row decoding is untouched.
+workspace manifest. Changes are in `src/event/table_map/` (metadata parsing)
+and one addition in `src/network/packet_channel.rs` / `src/binlog_stream.rs`
+(abortive close); row decoding is untouched.
 
 The optional TableMap metadata (`binlog_row_metadata=FULL`) was parsed onto
 the wrong columns, which DeltaForge's schema-signature comparison (design
@@ -36,3 +37,14 @@ semantics, six added) and by DeltaForge's live test
 `mysql_signature::tests::live::a_real_table_map_matches_its_captured_schema`
 (MySQL 8.4, every supported type, composite prefixed key, invisible column,
 charset exceptions; FULL and MINIMAL).
+
+## Abortive close (`abort_on_drop`)
+
+`PacketChannel::abort_on_drop` / `BinlogStream::abort_on_drop` set
+`SO_LINGER` to zero on the connection's socket, so dropping it resets the
+connection instead of closing it gracefully. A MySQL binlog dump thread does
+not read from its connection; it notices a closed client only when a write
+fails. After a reset its next write (a heartbeat on an idle server) fails at
+once. DeltaForge's binlog interval scanner uses it to end its short-lived
+dump sessions promptly without killing any connection by id. It acts only on
+the connection it is called on.

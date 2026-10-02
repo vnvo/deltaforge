@@ -5,7 +5,8 @@
 //!
 //! 1. **Positional proof:** the unique maximal applicable activation record
 //!    (`baseline`, forward-proof `observed`, FULL `observed`) names the
-//!    version. Before any record is trusted, every piece of decisive evidence
+//!    version. Without one, a lazy baseline at the rows' position is
+//!    attempted first (`mysql_baseline::establish_at`). Before any record is trusted, every piece of decisive evidence
 //!    the table's timeline holds is validated; invalid, duplicate or
 //!    unsupported evidence fails closed. The proven version must not
 //!    contradict any comparable field of the row's TableMap.
@@ -80,6 +81,22 @@ pub(crate) struct Caches {
 }
 
 impl Caches {
+    #[cfg(test)]
+    pub(crate) fn seed_for_test(&mut self, key: &SchemaKey) {
+        self.timelines.insert(
+            key.backend_key(),
+            Arc::new(Timeline {
+                records: Vec::new(),
+                barriers: Vec::new(),
+            }),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.timelines.len() + self.selections.len()
+    }
+
     /// A record was appended for `key`.
     pub(crate) fn invalidate(&mut self, key: &SchemaKey) {
         let k = key.backend_key();
@@ -504,8 +521,16 @@ pub(crate) async fn select_for_rows(
     };
     let signature = Signature::of(tm);
     let sig_digest = signature.digest();
-    let t = timeline(ctx, &key).await?;
-    let (selection, decisive) = select_decisive(&t.all(), &row);
+    let mut t = timeline(ctx, &key).await?;
+    let (mut selection, mut decisive) = select_decisive(&t.all(), &row);
+    // No positional proof yet: a lazy baseline at the rows' position, if it
+    // can be proven and decides the rows (before any FULL fallback).
+    if let Selection::Unproven(_) = selection
+        && super::mysql_baseline::establish_at(ctx, db, table, &key, &t).await?
+    {
+        t = timeline(ctx, &key).await?;
+        (selection, decisive) = select_decisive(&t.all(), &row);
+    }
     match selection {
         Selection::Proven { version } => {
             let decisive = decisive.unwrap_or_default();
@@ -544,21 +569,24 @@ pub(crate) async fn select_for_rows(
     }
 }
 
-/// A proposed FULL observation is admitted only if, added to the current
-/// timeline, the whole timeline still validates and selection at `row`
-/// proves the observation's version with the observation itself as the
-/// decisive record. Any other decisive record at that position (an unmatched
-/// ddl or barrier, an `unknown`, an incomparable record) keeps the row
-/// unproven.
-async fn admit_full(
+/// A proposed record (a FULL observation or a lazy baseline) is admitted
+/// only if, added to the current timeline, the whole timeline still
+/// validates and selection at `row` proves the record's version with the
+/// record itself as the decisive one. Any other decisive record at that
+/// position (an unmatched ddl or barrier, an `unknown`, an incomparable
+/// record) keeps the row unproven.
+pub(crate) async fn admit_decisive(
     registry: &DurableSchemaRegistry,
     key: &SchemaKey,
     current: &Timeline,
     proposed: Stored,
     row: &WmPos,
 ) -> Result<(), String> {
-    let Kind::Observed { version, .. } = proposed.record.kind else {
-        return Err("the proposed record is not an observation".into());
+    let version = match &proposed.record.kind {
+        Kind::Observed { version, .. } | Kind::Baseline { version, .. } => {
+            *version
+        }
+        _ => return Err("the proposed record proves no version".into()),
     };
     let mut augmented = Timeline {
         records: current.records.clone(),
@@ -575,7 +603,7 @@ async fn admit_full(
             Ok(())
         }
         (selection, _) => Err(format!(
-            "the FULL observation would not resolve selection at the rows ({selection:?})"
+            "the proposed record would not resolve selection at the rows ({selection:?})"
         )),
     }
 }
@@ -713,7 +741,7 @@ async fn full_fallback(
         capture_id: id.clone(),
         record: record.clone(),
     };
-    admit_full(registry, key, t, proposed, row)
+    admit_decisive(registry, key, t, proposed, row)
         .await
         .map_err(|why| fail(db, table, &why))?;
     mysql_activation::append(
@@ -1066,7 +1094,7 @@ mod tests {
         let admit = |records: Vec<Stored>, barriers: Vec<Stored>, p: Stored| {
             let current = Timeline { records, barriers };
             let (f, row) = (&f, row.clone());
-            async move { admit_full(&f.reg, &f.key, &current, p, &row).await }
+            async move { admit_decisive(&f.reg, &f.key, &current, p, &row).await }
         };
 
         // It binds the one ddl, or the one barrier, at the row: admitted.
@@ -1131,7 +1159,7 @@ mod tests {
             records: vec![later],
             barriers: Vec::new(),
         };
-        let err = admit_full(
+        let err = admit_decisive(
             &f.reg,
             &f.key,
             &current,

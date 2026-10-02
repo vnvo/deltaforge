@@ -1380,6 +1380,7 @@ mod tests {
             rows_ordinal: 0,
             lower_case_table_names: 0,
             txn_eval: None,
+            txn_eval_cp: None,
             selection: Default::default(),
             checkpoint_gtid: Some("GTID-UNIT".to_string()),
             checkpoint_file: "mysql-bin.000001".to_string(),
@@ -2099,6 +2100,26 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// A stream reload request that names no table never enumerates: it
+    /// forgets the cached schemas and every cached timeline and selection.
+    #[tokio::test]
+    async fn an_unnamed_reload_drops_every_cached_selection() {
+        let (tx, _rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        ctx.registry_scope.publish_for_test(
+            "acme",
+            storage::adapters::LineageDescriptor::mysql(UUID).unwrap(),
+        );
+        let scope = ctx.registry_scope.current().unwrap();
+        ctx.selection.seed_for_test(&scope.key("shop", "orders"));
+        ctx.selection.seed_for_test(&scope.key("shop", "items"));
+        assert_eq!(ctx.selection.len(), 2);
+        super::super::apply_reload_request(&mut ctx, None, None)
+            .await
+            .unwrap();
+        assert_eq!(ctx.selection.len(), 0);
     }
 
     /// Give the fixture's `shop.orders` a proven schema at the rows'

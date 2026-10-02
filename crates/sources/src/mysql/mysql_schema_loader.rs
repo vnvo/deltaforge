@@ -261,10 +261,17 @@ impl MySqlSchemaLoader {
                             }
                             from_registry += 1;
                         }
+                        // Stored history that cannot be read is corrupt: never
+                        // replaced by the live catalog.
                         Err(e) => {
-                            warn!(db=%db, table=%table, error=%e,
-                                "failed to deserialize registry schema; fetching from source");
-                            needs_fetch.push(pair);
+                            return Err(SourceError::Schema {
+                                details: format!(
+                                    "stored schema of {db}.{table} (version {}) \
+                                     is unreadable: {e}",
+                                    sv.version
+                                )
+                                .into(),
+                            });
                         }
                     }
                 }
@@ -294,6 +301,13 @@ impl MySqlSchemaLoader {
             "schema preload complete"
         );
 
+        self.check_binlog_row_image().await?;
+        Ok(tables)
+    }
+
+    /// Warn when `binlog_row_image` is not FULL (before images incomplete).
+    /// One query on a verified connection, independent of the catalog.
+    pub async fn check_binlog_row_image(&self) -> SourceResult<()> {
         let mut conn = self.verified_conn().await?;
         let row_image: String = conn
             .query_first("SELECT @@binlog_row_image")
@@ -310,7 +324,7 @@ impl MySqlSchemaLoader {
             );
         }
 
-        Ok(tables)
+        Ok(())
     }
 
     /// Expand wildcard patterns to actual table list.
@@ -492,6 +506,12 @@ impl MySqlSchemaLoader {
     }
 
     /// Reload all schemas matching patterns.
+    /// Forget every cached schema; each table reloads on its next use. No
+    /// catalog enumeration.
+    pub async fn clear_cache(&self) {
+        self.cache.write().await.clear();
+    }
+
     pub async fn reload_all(
         &self,
         patterns: &[String],
