@@ -41,10 +41,12 @@ const FORMAT_VERSION: u32 = 1;
 const CAPTURE_DOMAIN: &[u8] = b"DeltaForge.Activation.v1\0";
 const BASELINE_DOMAIN: &[u8] = b"DeltaForge.Activation.Baseline.v1\0";
 const FORWARD_DOMAIN: &[u8] = b"DeltaForge.Activation.ForwardProof.v1\0";
+const FULL_DOMAIN: &[u8] = b"DeltaForge.Activation.FullProof.v1\0";
 const READ_PAGE: usize = 256;
 
 /// The binlog event that establishes a record.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
 pub(crate) enum EventIdentity {
     /// GTID mode: the transaction's `uuid:gno` and the event's ordinal in it.
     Gtid { gtid: String, ordinal: u32 },
@@ -77,6 +79,10 @@ pub(crate) enum Kind {
         binds: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         proof: Option<ForwardProof>,
+        /// FULL-metadata evidence when established by a unique signature
+        /// match at a row (spec 7.6 step 2).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        full: Option<Box<FullProof>>,
     },
     /// A DDL affecting the table committed here; the shape after it is
     /// pending until an `observed` record binds it.
@@ -97,6 +103,8 @@ pub(crate) enum Kind {
         scan_digest: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         binds: Option<String>,
+        /// The DDL classifier version the scan used.
+        classifier_version: String,
     },
     /// Positional proof is invalid for every table in `scope` from here on.
     Barrier { scope: BarrierScope },
@@ -114,6 +122,31 @@ pub(crate) struct ForwardProof {
     pub to: WmPos,
     pub scan_digest: String,
     pub schema_hash: String,
+}
+
+/// FULL-metadata evidence (Round 32): at a row whose TableMap carries FULL
+/// metadata and no positional proof, exactly one distinct complete schema
+/// among the key's versions through `high_water` (the stable-captured live
+/// shape registered first) matched its signature.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FullProof {
+    pub signature_format: String,
+    /// The rows event that established it.
+    pub row_event: EventIdentity,
+    /// The row's evaluation position (the record's position).
+    pub row_position: WmPos,
+    /// The TableMap signature it matched, and its digest.
+    pub signature: super::mysql_signature::Signature,
+    pub signature_digest: String,
+    /// The selected version's schema hash.
+    pub schema_hash: String,
+    /// The stable capture of the live shape.
+    pub live_position: WmPos,
+    pub live_schema_hash: String,
+    /// The key's highest version examined (candidates = versions 1..=hw).
+    pub high_water: i32,
+    /// Digest of every distinct candidate (schema hash) and its verdict.
+    pub candidates_digest: String,
 }
 
 /// One activation record.
@@ -234,6 +267,7 @@ pub(crate) fn baseline_capture_id(
         to,
         scan_digest,
         binds,
+        classifier_version,
     } = &record.kind
     else {
         anyhow::bail!("baseline_capture_id requires a baseline record");
@@ -248,6 +282,7 @@ pub(crate) fn baseline_capture_id(
     lp(&mut h, schema_hash.as_bytes());
     lp(&mut h, b"baseline-prescan");
     lp(&mut h, &record.format_version.to_be_bytes());
+    lp(&mut h, classifier_version.as_bytes());
     lp(&mut h, scan_digest.as_bytes());
     match binds {
         Some(barrier) => {
@@ -278,6 +313,7 @@ pub(crate) fn forward_capture_id(
                 scan_digest,
                 schema_hash,
             }),
+        full: None,
     } = &record.kind
     else {
         anyhow::bail!(
@@ -297,6 +333,40 @@ pub(crate) fn forward_capture_id(
     lp(&mut h, &record.format_version.to_be_bytes());
     lp(&mut h, classifier_version.as_bytes());
     lp(&mut h, scan_digest.as_bytes());
+    Ok(hex::encode(h.finalize()))
+}
+
+/// Deterministic capture identity of a FULL `observed` record: lineage,
+/// stream, version, the bound record (if any) and every field of its proof.
+pub(crate) fn full_capture_id(
+    lineage_hash: &str,
+    stream: &str,
+    record: &Record,
+) -> Result<String> {
+    let Kind::Observed {
+        version,
+        binds,
+        proof: None,
+        full: Some(full),
+    } = &record.kind
+    else {
+        anyhow::bail!("full_capture_id requires a FULL observed record");
+    };
+    let mut h = Sha256::new();
+    h.update(FULL_DOMAIN);
+    lp(&mut h, lineage_hash.as_bytes());
+    lp(&mut h, stream.as_bytes());
+    lp(&mut h, &serde_json::to_vec(&record.position)?);
+    lp(&mut h, &version.to_be_bytes());
+    match binds {
+        Some(b) => {
+            lp(&mut h, b"binds");
+            lp(&mut h, b.as_bytes());
+        }
+        None => lp(&mut h, b"unbound"),
+    }
+    lp(&mut h, &record.format_version.to_be_bytes());
+    lp(&mut h, &serde_json::to_vec(full)?);
     Ok(hex::encode(h.finalize()))
 }
 
@@ -402,6 +472,7 @@ pub(crate) async fn record_forward_proof(
             version,
             binds: Some(ddl_id.to_string()),
             proof: Some(proof),
+            full: None,
         },
     );
     let stream = table_stream(key);
@@ -626,6 +697,23 @@ pub(crate) enum Unproven {
 /// Positional selection for a row at `row` over the table's records and
 /// the barriers that apply to it (module docs).
 pub(crate) fn select(records: &[Stored], row: &WmPos) -> Selection {
+    select_decisive(records, row).0
+}
+
+/// [`select`], with the capture identity of the decisive record (the
+/// effective proof) when there is one.
+pub(crate) fn select_decisive(
+    records: &[Stored],
+    row: &WmPos,
+) -> (Selection, Option<String>) {
+    let (selection, decisive) = select_inner(records, row);
+    (selection, decisive.map(|d| d.capture_id.clone()))
+}
+
+fn select_inner<'a>(
+    records: &'a [Stored],
+    row: &WmPos,
+) -> (Selection, Option<&'a Stored>) {
     let mut applicable: Vec<&Stored> = Vec::new();
     for r in records {
         match order_positions(&r.record.position, row) {
@@ -634,12 +722,12 @@ pub(crate) fn select(records: &[Stored], row: &WmPos) -> Selection {
             }
             CheckpointOrder::After => {}
             CheckpointOrder::Incomparable => {
-                return Selection::Unproven(Unproven::Incomparable);
+                return (Selection::Unproven(Unproven::Incomparable), None);
             }
         }
     }
     if applicable.is_empty() {
-        return Selection::Unproven(Unproven::NoRecord);
+        return (Selection::Unproven(Unproven::NoRecord), None);
     }
     // Maximal elements: no other applicable record is strictly after them.
     let mut maximal: Vec<&Stored> = Vec::new();
@@ -652,7 +740,7 @@ pub(crate) fn select(records: &[Stored], row: &WmPos) -> Selection {
                     break;
                 }
                 CheckpointOrder::Incomparable => {
-                    return Selection::Unproven(Unproven::Incomparable);
+                    return (Selection::Unproven(Unproven::Incomparable), None);
                 }
                 CheckpointOrder::Equal | CheckpointOrder::After => {}
             }
@@ -691,6 +779,21 @@ pub(crate) fn select(records: &[Stored], row: &WmPos) -> Selection {
                             binds: Some(id), ..
                         },
                     ) if *id == a.capture_id => **b,
+                    // An observed binding closes exactly the barrier (whose
+                    // scope applies to this table: only those are read) it
+                    // carries, for this table.
+                    (
+                        Kind::Observed {
+                            binds: Some(id), ..
+                        },
+                        Kind::Barrier { .. },
+                    ) if *id == b.capture_id => **a,
+                    (
+                        Kind::Barrier { .. },
+                        Kind::Observed {
+                            binds: Some(id), ..
+                        },
+                    ) if *id == a.capture_id => **b,
                     // A baseline closes exactly the discontinuity barrier
                     // whose capture identity it carries.
                     (
@@ -705,20 +808,26 @@ pub(crate) fn select(records: &[Stored], row: &WmPos) -> Selection {
                             binds: Some(id), ..
                         },
                     ) if *id == a.capture_id => **b,
-                    _ => return Selection::Unproven(Unproven::Ambiguous),
+                    _ => {
+                        return (
+                            Selection::Unproven(Unproven::Ambiguous),
+                            None,
+                        );
+                    }
                 },
-                _ => return Selection::Unproven(Unproven::Ambiguous),
+                _ => return (Selection::Unproven(Unproven::Ambiguous), None),
             }
         }
     };
-    match &decisive.record.kind {
+    let selection = match &decisive.record.kind {
         Kind::Observed { version, .. } | Kind::Baseline { version, .. } => {
             Selection::Proven { version: *version }
         }
         Kind::Ddl => Selection::Unproven(Unproven::PendingDdl),
         Kind::Unknown => Selection::Unproven(Unproven::Unknown),
         Kind::Barrier { .. } => Selection::Unproven(Unproven::Barrier),
-    }
+    };
+    (selection, Some(decisive))
 }
 
 #[cfg(test)]
@@ -757,6 +866,7 @@ mod tests {
             version: v,
             binds: None,
             proof: None,
+            full: None,
         }
     }
 
@@ -778,6 +888,7 @@ mod tests {
                     version: 2,
                     binds: Some("b".into()),
                     proof: None,
+                    full: None,
                 },
             ),
         ];
@@ -822,6 +933,7 @@ mod tests {
                     version: 2,
                     binds: Some("d1".into()),
                     proof: None,
+                    full: None,
                 },
             ),
             st("d2", g(9), Kind::Ddl),
@@ -832,6 +944,7 @@ mod tests {
                     version: 1,
                     binds: Some("d2".into()),
                     proof: None,
+                    full: None,
                 },
             ),
         ];
@@ -869,6 +982,7 @@ mod tests {
             to: g(9),
             scan_digest: "d".into(),
             binds: binds.map(Into::into),
+            classifier_version: "ddl-attribution-v1".into(),
         }
     }
 
@@ -941,6 +1055,7 @@ mod tests {
                 to: g(9),
                 scan_digest: "d".into(),
                 binds: None,
+                classifier_version: "ddl-attribution-v1".into(),
             },
         )];
         assert_eq!(select(&recs, &g(3)), Selection::Proven { version: 4 });
@@ -988,6 +1103,7 @@ mod tests {
                     version: 2,
                     binds: Some("d".into()),
                     proof: None,
+                    full: None,
                 },
             ),
         ];
@@ -1002,6 +1118,7 @@ mod tests {
                     version: 2,
                     binds: Some("other".into()),
                     proof: None,
+                    full: None,
                 },
             ),
         ];
@@ -1076,6 +1193,7 @@ mod tests {
                     to: g(to),
                     scan_digest: d.into(),
                     binds: binds.map(Into::into),
+                    classifier_version: "ddl-attribution-v1".into(),
                 },
             )
         };
@@ -1120,6 +1238,7 @@ mod tests {
                     scan_digest: "digest".into(),
                     schema_hash: h.into(),
                 }),
+                full: None,
             },
         )
     }
@@ -1192,6 +1311,7 @@ mod tests {
                     version: 1,
                     binds: Some("ddl1".into()),
                     proof: None,
+                    full: None,
                 },
             ),
         };

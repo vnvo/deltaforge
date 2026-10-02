@@ -20,9 +20,6 @@ use tracing::{debug, error, info, warn};
 use crate::mysql::mysql_helpers::{
     checkpoint_lineage, make_checkpoint_meta, short_sql,
 };
-use crate::mysql::mysql_schema_loader::LoadedSchema;
-use crate::mysql::mysql_table_map_check::table_map_mismatch;
-use std::sync::Arc;
 
 use deltaforge_config::OUTBOX_SCHEMA_SENTINEL;
 
@@ -157,53 +154,6 @@ async fn handle_table_map(
     Ok(())
 }
 
-/// The schema to decode `tm`'s rows with, verified against the layout the
-/// binlog recorded for them.
-///
-/// Rows are decoded positionally, so decoding them with a schema of a different
-/// layout would put values under the wrong columns. A mismatch against the
-/// cached schema triggers one reload (the cache can predate a DDL that was not
-/// attributed to this table); a mismatch against the live schema fails closed
-/// before any event for these rows is emitted, so the checkpoint cannot move
-/// past them.
-async fn verified_schema(
-    ctx: &RunCtx,
-    tm: &TableMapEvent,
-) -> SourceResult<Arc<LoadedSchema>> {
-    let (db, table) = (&tm.database_name, &tm.table_name);
-    let loaded = ctx.schema.load_schema(db, table).await?;
-    if table_map_mismatch(tm, &loaded.schema.columns).is_none() {
-        return Ok(loaded);
-    }
-    let reloaded = ctx.schema.reload_schema(db, table).await?;
-    match table_map_mismatch(tm, &reloaded.schema.columns) {
-        None => Ok(reloaded),
-        Some(reason) => {
-            error!(
-                source_id = %ctx.source_id, db = %db, table = %table, %reason,
-                "binlog rows do not match the table's current schema; failing closed"
-            );
-            Err(SourceError::Schema {
-                details: format!(
-                    "table {db}.{table}: {reason}. These binlog rows were written \
-                     under a different table definition than the current one (for \
-                     example, a restart replaying rows written before a DDL). \
-                     Decoding them positionally would put values under the wrong \
-                     columns, so no event was emitted and the checkpoint was not \
-                     advanced (fail-closed). Replaying MySQL rows across a DDL is \
-                     not supported yet. Safe recovery: re-snapshot (restart once \
-                     with snapshot mode 'always'). Moving the source position \
-                     past the DDL instead intentionally abandons every retained \
-                     change between the checkpoint and the new position, for all \
-                     captured tables, and requires an operator assessment of \
-                     that data loss."
-                )
-                .into(),
-            })
-        }
-    }
-}
-
 /// Build SourceInfo for MySQL events
 fn build_source_info(
     ctx: &RunCtx,
@@ -247,11 +197,12 @@ async fn handle_write_rows(
     header: &EventHeader,
     wr: mysql_binlog_connector_rust::event::write_rows_event::WriteRowsEvent,
 ) -> SourceResult<()> {
-    if let Some(tm) = ctx.table_map.get(&wr.table_id) {
+    if let Some(tm) = ctx.table_map.get(&wr.table_id).cloned() {
+        let tm = &tm;
         if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
-        let loaded = verified_schema(ctx, tm).await?;
+        let loaded = super::mysql_selection::select_for_rows(ctx, tm).await?;
         let row_count = wr.rows.len();
         debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=row_count, "write_rows");
 
@@ -347,11 +298,12 @@ async fn handle_update_rows(
     header: &EventHeader,
     ur: mysql_binlog_connector_rust::event::update_rows_event::UpdateRowsEvent,
 ) -> SourceResult<()> {
-    if let Some(tm) = ctx.table_map.get(&ur.table_id) {
+    if let Some(tm) = ctx.table_map.get(&ur.table_id).cloned() {
+        let tm = &tm;
         if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
-        let loaded = verified_schema(ctx, tm).await?;
+        let loaded = super::mysql_selection::select_for_rows(ctx, tm).await?;
         debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=ur.rows.len(), "update_rows");
 
         let ts_ms = ts_sec_to_ms(header.timestamp);
@@ -371,7 +323,8 @@ async fn handle_update_rows(
         // with their checkpoint; shared across every row in this binlog event.
         let standalone_wm = standalone_row_watermark(ctx, &transaction);
         let fingerprint_str = loaded.fingerprint.to_string();
-        let sequence = ctx.schema.current_sequence();
+        // The selected version's own registry sequence.
+        let sequence = loaded.sequence;
 
         let mut sent = 0u64;
         // One ordinal per before/after pair - an update is a single row change,
@@ -447,11 +400,12 @@ async fn handle_delete_rows(
     header: &EventHeader,
     dr: mysql_binlog_connector_rust::event::delete_rows_event::DeleteRowsEvent,
 ) -> SourceResult<()> {
-    if let Some(tm) = ctx.table_map.get(&dr.table_id) {
+    if let Some(tm) = ctx.table_map.get(&dr.table_id).cloned() {
+        let tm = &tm;
         if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
-        let loaded = verified_schema(ctx, tm).await?;
+        let loaded = super::mysql_selection::select_for_rows(ctx, tm).await?;
         debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=dr.rows.len(), "delete_rows");
 
         let ts_ms = ts_sec_to_ms(header.timestamp);
@@ -471,7 +425,8 @@ async fn handle_delete_rows(
         // with their checkpoint; shared across every row in this binlog event.
         let standalone_wm = standalone_row_watermark(ctx, &transaction);
         let fingerprint_str = loaded.fingerprint.to_string();
-        let sequence = ctx.schema.current_sequence();
+        // The selected version's own registry sequence.
+        let sequence = loaded.sequence;
 
         let mut sent = 0u64;
         for (row_ordinal, row) in dr.rows.into_iter().enumerate() {
@@ -676,6 +631,8 @@ async fn emit_tx_commit(ctx: &mut RunCtx) {
     // Any close ends the explicit-transaction state (safe even in non-GTID mode,
     // where the early return below skips the marker).
     ctx.in_explicit_txn = false;
+    // Rows of the next transaction are evaluated at this boundary.
+    ctx.mark_transaction_boundary();
     let Some(tx_id) = ctx.current_gtid.clone() else {
         return;
     };
@@ -1169,7 +1126,7 @@ async fn handle_query(
 /// certainty, so it is a lineage barrier. Replay re-derives identical records
 /// (`AlreadyPresent`); a conflicting record fails closed.
 async fn record_query(
-    ctx: &RunCtx,
+    ctx: &mut RunCtx,
     q: &mysql_binlog_connector_rust::event::query_event::QueryEvent,
 ) -> SourceResult<()> {
     use super::mysql_activation::{
@@ -1244,6 +1201,8 @@ async fn record_query(
     // gets none: a later CREATE is its own DDL).
     let prove_after = !super::mysql_ddl_attribution::is_drop_table(&q.query);
     let mut pending = Vec::new();
+    let mut invalidated = Vec::new();
+    let barrier_written = barrier.is_some();
     for t in &tables {
         let (db, table) = (name(&t.db), name(&t.table));
         let key = scope.key(&db, &table);
@@ -1251,6 +1210,7 @@ async fn record_query(
             record_ddl(backend, registry, &key, &event, position.clone())
                 .await
                 .map_err(|e| fail("ddl record", e))?;
+        invalidated.push(key.clone());
         if prove_after && ctx.allow.matches(&db, &table) {
             pending.push(super::mysql_forward_proof::Pending {
                 db,
@@ -1274,6 +1234,15 @@ async fn record_query(
     // Paused at the DDL: prove before its event is emitted and before any
     // later event is read.
     super::mysql_forward_proof::prove(ctx, pending).await?;
+    // Selections and validated timelines read before these records are
+    // stale.
+    if barrier_written {
+        ctx.selection.invalidate_all();
+    } else {
+        for key in &invalidated {
+            ctx.selection.invalidate(key);
+        }
+    }
     Ok(())
 }
 
@@ -1370,6 +1339,8 @@ mod tests {
             message_ordinal: 0,
             query_ordinal: 0,
             lower_case_table_names: 0,
+            txn_eval: None,
+            selection: Default::default(),
             checkpoint_gtid: Some("GTID-UNIT".to_string()),
             checkpoint_file: "mysql-bin.000001".to_string(),
             tables: vec!["shop.orders".to_string()],
@@ -1456,6 +1427,8 @@ mod tests {
             rows: vec![row],
         };
 
+        prove_orders(&mut ctx).await;
+
         handle_write_rows(&mut ctx, &make_header(), ev)
             .await
             .expect("write rows should succeed");
@@ -1504,6 +1477,8 @@ mod tests {
             rows: vec![(before_row, after_row)],
         };
 
+        prove_orders(&mut ctx).await;
+
         handle_update_rows(&mut ctx, &make_header(), ev)
             .await
             .expect("update rows should succeed");
@@ -1541,6 +1516,8 @@ mod tests {
             included_columns: vec![true, true],
             rows: vec![row],
         };
+
+        prove_orders(&mut ctx).await;
 
         handle_delete_rows(&mut ctx, &make_header(), ev)
             .await
@@ -1585,6 +1562,8 @@ mod tests {
             included_columns: vec![true, true],
             rows: vec![row],
         };
+
+        prove_orders(&mut ctx).await;
 
         handle_write_rows(&mut ctx, &make_header(), ev)
             .await
@@ -1652,6 +1631,7 @@ mod tests {
                 ],
             }],
         };
+        prove_orders(&mut ctx).await;
         handle_write_rows(&mut ctx, &make_header(), ev)
             .await
             .expect("write rows should succeed");
@@ -1704,6 +1684,7 @@ mod tests {
                 ],
             }],
         };
+        prove_orders(&mut ctx).await;
         handle_write_rows(&mut ctx, &make_header(), ev)
             .await
             .expect("write rows should succeed");
@@ -1737,6 +1718,8 @@ mod tests {
             included_columns: vec![true, true],
             rows: vec![row],
         };
+
+        prove_orders(&mut ctx).await;
 
         handle_write_rows(&mut ctx, &make_header(), ev)
             .await
@@ -1790,6 +1773,7 @@ mod tests {
                 ],
             }],
         };
+        prove_orders(&mut ctx).await;
         handle_write_rows(&mut ctx, &make_header(), write_ev)
             .await
             .unwrap();
@@ -2075,6 +2059,92 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// Give the fixture's `shop.orders` a proven schema at the rows'
+    /// evaluation position: its registered shape (two nullable VARCHAR
+    /// columns, as the fixture's TableMap) and a valid baseline.
+    async fn prove_orders(ctx: &mut RunCtx) {
+        use crate::mysql::mysql_activation::{
+            ACTIVATION_NS, Kind, Record, append, baseline_capture_id,
+            table_stream,
+        };
+        use crate::mysql::mysql_table_schema::{MySqlColumn, MySqlTableSchema};
+        crate::registry_scope::establish_scope(
+            &ctx.registry_backend,
+            &ctx.registry_scope,
+            &ctx.tenant,
+            &ctx.source_id,
+            storage::adapters::LineageDescriptor::mysql(UUID).unwrap(),
+        )
+        .await
+        .unwrap();
+        // The rows' evaluation position: the fixture's own position, or a
+        // GTID position when the fixture's GTID text is a placeholder.
+        ctx.mark_transaction_boundary();
+        let comparable = ctx.txn_eval.as_ref().is_some_and(|p| {
+            crate::durable_checkpoint::order_positions(p, p)
+                == deltaforge_core::CheckpointOrder::Equal
+        });
+        if !comparable {
+            ctx.txn_eval = Some(crate::durable_checkpoint::WmPos::MysqlGtid {
+                gtid_set: format!("{UUID}:1-5"),
+            });
+        }
+        let r0 = ctx.txn_eval.clone().unwrap();
+        let col = |name: &str, ordinal| {
+            let mut c = MySqlColumn::new(
+                name,
+                "varchar(255)",
+                "varchar",
+                true,
+                ordinal,
+            );
+            c.char_octet_length = Some(255);
+            c
+        };
+        let schema = MySqlTableSchema::new(vec![col("id", 1), col("sku", 2)]);
+        let key = ctx.registry_scope.current().unwrap().key("shop", "orders");
+        // Registered under the context's scope (the fixture's loader has its
+        // own).
+        let hash = schema_registry::SourceSchema::fingerprint(&schema);
+        let version = ctx
+            .schema
+            .registry()
+            .register_with_checkpoint(
+                &key,
+                &hash,
+                &serde_json::to_value(&schema).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        let record = Record::new(
+            r0.clone(),
+            Kind::Baseline {
+                version,
+                schema_hash: hash,
+                to: r0,
+                scan_digest: "unit".into(),
+                binds: None,
+                classifier_version:
+                    crate::mysql::mysql_binlog_scan::CLASSIFIER_VERSION.into(),
+            },
+        );
+        let stream = table_stream(&key);
+        let id =
+            baseline_capture_id(&key.lineage_hash, &stream, &record).unwrap();
+        append(
+            &ctx.registry_backend,
+            ctx.schema.registry(),
+            &key,
+            ACTIVATION_NS,
+            &stream,
+            &id,
+            &record,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -2480,6 +2550,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
         let mut ctx = make_runctx(tx);
         ctx.outbox_tables = AllowList::new(&["shop.orders".to_string()]);
+        prove_orders(&mut ctx).await;
         handle_write_rows(&mut ctx, &make_header(), write())
             .await
             .expect("ok");
@@ -2496,6 +2567,7 @@ mod tests {
         let (tx2, mut rx2) = mpsc::channel::<SourceItem>(8);
         let mut ctx2 = make_runctx(tx2);
         ctx2.outbox_tables = AllowList::new(&["other.table".to_string()]);
+        prove_orders(&mut ctx2).await;
         handle_write_rows(&mut ctx2, &make_header(), write())
             .await
             .expect("ok");

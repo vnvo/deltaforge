@@ -35,7 +35,9 @@ mod mysql_checkpoint_lineage;
 mod mysql_ddl_attribution;
 mod mysql_forward_proof;
 mod mysql_helpers;
+mod mysql_selection;
 mod mysql_session;
+mod mysql_signature;
 use mysql_helpers::{checkpoint_lineage, prepare_client};
 
 pub mod mysql_object;
@@ -56,7 +58,6 @@ pub use mysql_identity::{
     MysqlIdentityError, mysql_identity_cell, mysql_identity_kind,
 };
 
-mod mysql_table_map_check;
 mod mysql_table_schema;
 use crate::mysql::mysql_helpers::{
     Opened, connect_binlog_with_retries, resolve_binlog_tail,
@@ -167,6 +168,12 @@ pub(crate) struct RunCtx {
     /// The server's `lower_case_table_names` (read at startup on a verified
     /// connection): how DDL table names map to registry keys.
     lower_case_table_names: u8,
+    /// Evaluation position of rows (spec 7.3): the executed state immediately
+    /// before the current transaction - the stream position after the last
+    /// commit boundary (or the position the stream (re)started from).
+    txn_eval: Option<crate::durable_checkpoint::WmPos>,
+    /// Validated activation timelines and row-time selections.
+    selection: mysql_selection::Caches,
     /// Original checkpoint position, preserved even after a pre-connect failover
     /// adjustment clears last_gtid/last_file. Used by check_position_reachability
     /// to verify whether A's position actually exists on B.
@@ -629,6 +636,8 @@ impl MySqlSource {
             message_ordinal: 0,
             query_ordinal: 0,
             lower_case_table_names,
+            txn_eval: None,
+            selection: Default::default(),
             checkpoint_gtid,
             checkpoint_file,
             tables: self.tables.clone(),
@@ -657,6 +666,7 @@ impl MySqlSource {
 
         info!(source_id=%self.id, "connecting for binlog stream ..");
         let mut stream = connect_first_stream(&ctx, client).await?;
+        ctx.mark_transaction_boundary();
 
         // Safe to preload now: reconciliation has run, registry reflects post-reconcile state.
         let tracked = ctx.schema.preload(&self.tables).await?;
@@ -757,13 +767,19 @@ impl MySqlSource {
                             let _ = ctx.schema.reload_all(&self.tables).await?;
                         }
                         match do_reconnect(&mut ctx).await? {
-                            Some(s) => stream = s,
+                            Some(s) => {
+                                stream = s;
+                                ctx.mark_transaction_boundary();
+                            }
                             None => continue,
                         }
                     }
                     Err(LoopControl::Reconnect) => {
                         match do_reconnect(&mut ctx).await? {
-                            Some(s) => stream = s,
+                            Some(s) => {
+                                stream = s;
+                                ctx.mark_transaction_boundary();
+                            }
                             None => continue,
                         }
                     }
@@ -1187,6 +1203,16 @@ fn mysql_server_lineage(
 }
 
 impl RunCtx {
+    /// The stream is at a transaction boundary: rows of the next transaction
+    /// are evaluated at the current position.
+    pub(crate) fn mark_transaction_boundary(&mut self) {
+        self.txn_eval = crate::durable_checkpoint::mysql_checkpoint_position(
+            &self.last_file,
+            self.last_pos,
+            self.last_gtid.as_deref(),
+        );
+    }
+
     /// The verified `server_uuid` (the published registry lineage) that every
     /// connection of this run must prove it is before it is trusted.
     pub(crate) fn expected_uuid(&self) -> SourceResult<String> {

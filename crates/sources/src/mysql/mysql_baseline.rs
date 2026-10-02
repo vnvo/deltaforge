@@ -28,8 +28,8 @@ use super::mysql_activation::{
     table_stream,
 };
 use super::mysql_binlog_scan::{
-    ProofError, ScanLimits, ScanReport, Statement, scan_interval,
-    stable_capture,
+    CLASSIFIER_VERSION, ProofError, ScanLimits, ScanReport, Statement,
+    scan_interval, stable_capture,
 };
 use super::mysql_ddl_attribution::{BarrierScopeOf, DdlEffect, same_name};
 use super::{MySqlCheckpoint, RunCtx};
@@ -267,6 +267,7 @@ pub(crate) async fn establish(
                 to: s.clone(),
                 scan_digest: report.digest.clone(),
                 binds: c.binds,
+                classifier_version: CLASSIFIER_VERSION.to_string(),
             },
         );
         let id = baseline_capture_id(&lineage, &stream, &record)

@@ -847,8 +847,12 @@ pub(crate) async fn fetch_table_schema_on(
                 COLUMN_COMMENT,
                 CHARACTER_MAXIMUM_LENGTH,
                 NUMERIC_PRECISION,
-                NUMERIC_SCALE
-            FROM INFORMATION_SCHEMA.COLUMNS
+                NUMERIC_SCALE,
+                CHARACTER_OCTET_LENGTH,
+                DATETIME_PRECISION,
+                (SELECT co.ID FROM INFORMATION_SCHEMA.COLLATIONS co
+                 WHERE co.COLLATION_NAME = c.COLLATION_NAME) AS COLLATION_ID
+            FROM INFORMATION_SCHEMA.COLUMNS c
             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
             ORDER BY ORDINAL_POSITION
             "#,
@@ -886,6 +890,14 @@ pub(crate) async fn fetch_table_schema_on(
                 .take::<Option<i64>, _>("NUMERIC_PRECISION")
                 .unwrap(),
             numeric_scale: row.take::<Option<i64>, _>("NUMERIC_SCALE").unwrap(),
+            char_octet_length: row
+                .take::<Option<i64>, _>("CHARACTER_OCTET_LENGTH")
+                .unwrap(),
+            collation_id: row.take::<Option<i64>, _>("COLLATION_ID").unwrap(),
+            datetime_precision: row
+                .take::<Option<i64>, _>("DATETIME_PRECISION")
+                .unwrap(),
+            primary_key_prefix: None,
         })
         .collect();
 
@@ -907,6 +919,28 @@ pub(crate) async fn fetch_table_schema_on(
         .into_iter()
         .map(|mut row| row.take("COLUMN_NAME").unwrap())
         .collect();
+
+    // Primary-key prefix lengths (a prefixed key part, e.g. a BLOB prefix).
+    let prefix_rows: Vec<Row> = conn
+        .exec(
+            r#"
+            SELECT COLUMN_NAME, SUB_PART
+            FROM INFORMATION_SCHEMA.STATISTICS
+            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = 'PRIMARY'
+              AND SUB_PART IS NOT NULL
+            "#,
+            (db, table),
+        )
+        .await
+        .map_err(query_error)?;
+    let mut columns = columns;
+    for mut row in prefix_rows {
+        let name: String = row.take("COLUMN_NAME").unwrap();
+        let sub_part: Option<i64> = row.take("SUB_PART").unwrap();
+        if let Some(c) = columns.iter_mut().find(|c| c.name == name) {
+            c.primary_key_prefix = sub_part;
+        }
+    }
 
     // Fetch table metadata
     let table_row: Option<Row> = conn
