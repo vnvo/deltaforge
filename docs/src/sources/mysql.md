@@ -235,13 +235,17 @@ Binlog row events carry values by column position, not by name. DeltaForge decod
 - a DDL's resulting definition, captured right after the source reads the DDL and proven unchanged since;
 - with `binlog_row_metadata = FULL` and neither of the above: the single recorded definition that exactly matches the row's binlog metadata (column names, types, signedness, charsets, primary key), recorded durably before the row is emitted.
 
-When no version can be proven, the source **stops** with a schema error naming the table, emits nothing for those rows and does not advance its checkpoint. Restart once with `snapshot.mode = always` to re-snapshot. Under the default `binlog_row_metadata = MINIMAL` this happens when:
+When no version can be proven, the source **stops** with a schema error naming the table, emits nothing for those rows and does not advance its checkpoint. Under the default `binlog_row_metadata = MINIMAL` this happens when:
 
 - retained rows predate a DDL the source never observed (for example, a checkpoint restored from before a schema change made by an earlier deployment);
-- a statement DeltaForge cannot attribute to specific tables was executed (versioned comments such as `/*!50100 ALTER TABLE ... */`, several statements in one event, `ALTER DATABASE` or `DROP DATABASE` of a tracked database, among others): every table it may affect stays unproven until a re-snapshot;
-- two DDLs of one table both happen before the source reads the first, with rows written between them (the definition between the two was never observable).
+- a statement DeltaForge cannot attribute to specific tables was executed (versioned comments such as `/*!50100 ALTER TABLE ... */`, several statements in one event, `ALTER DATABASE` or `DROP DATABASE` of a tracked database, among others): every table it may affect stays unproven until later proof for that table exists - a later DDL of the table that the source proves, or a clean start at a later restart position - or a re-snapshot;
+- two DDLs of one table both happen before the source reads the first, with rows written between them (the definition between the two was never captured; with `binlog_row_metadata = FULL` those rows proceed only if that definition was already recorded and is the single exact match).
+
+Re-snapshot is the immediate remediation that always works.
 
 **Recommended:** set `binlog_row_metadata = FULL` on the server. It removes the first two cases whenever the row's definition is still recorded, at a small cost in binlog size.
+
+Schema versions record per-column detail (character octet length, collation, fractional-seconds precision, primary-key prefix). After upgrading from a release that did not, the first capture of each table may register one new version even without a DDL; events then carry that version's `schema_version` and `schema_sequence`.
 
 ## Timeouts and Heartbeats
 
