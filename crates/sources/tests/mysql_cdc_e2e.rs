@@ -649,6 +649,115 @@ async fn mysql_cdc_checkpoint_resume() -> Result<()> {
     Ok(())
 }
 
+/// A compressed transaction (`binlog_transaction_compression = ON`) is
+/// delivered like any other: every row, then its commit boundary at the
+/// position after the transaction. Resuming from that boundary neither
+/// repeats its rows nor skips the next ones.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_cdc_compressed_transaction() -> Result<()> {
+    let (db_name, pool, dsn) = mysql_setup("compressed").await?;
+    let mut conn = pool.get_conn().await?;
+    conn.query_drop(format!("USE {}", db_name)).await?;
+    conn.query_drop(
+        "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64))",
+    )
+    .await?;
+    let tables = vec![format!("{}.orders", db_name)];
+    let ckpt_store: Arc<dyn CheckpointStore> =
+        Arc::new(MemCheckpointStore::new()?);
+
+    let (tx, mut rx) = mpsc::channel::<SourceItem>(128);
+    let src =
+        make_source("compressed", &dsn, tables.clone(), AllowList::default())
+            .await;
+    let handle = src.run(tx, ckpt_store.clone()).await;
+    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
+    sleep(Duration::from_secs(3)).await;
+
+    for stmt in [
+        "SET SESSION binlog_transaction_compression = ON",
+        "BEGIN",
+        "INSERT INTO orders VALUES (1, 'a'), (2, 'b')",
+        "UPDATE orders SET sku = 'b2' WHERE id = 2",
+        "COMMIT",
+    ] {
+        conn.query_drop(stmt).await?;
+    }
+    let status: mysql_async::Row = conn
+        .query_first("SHOW BINARY LOG STATUS")
+        .await?
+        .expect("binary log status");
+    let (file, pos, gtid_set): (String, u64, String) = (
+        status.get("File").unwrap(),
+        status.get("Position").unwrap(),
+        status.get("Executed_Gtid_Set").unwrap(),
+    );
+
+    // The rows, then the transaction's commit boundary.
+    let mut rows = Vec::new();
+    let mut commit = None;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while commit.is_none() && Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match timeout(left, rx.recv()).await {
+            Ok(Some(SourceItem::Event(e))) => rows.push(e),
+            Ok(Some(SourceItem::TxCommit { boundary, .. }))
+                if !rows.is_empty() =>
+            {
+                let deltaforge_core::CheckpointMeta::Opaque(bytes) =
+                    boundary.checkpoint;
+                commit =
+                    Some(serde_json::from_slice::<MySqlCheckpoint>(&bytes)?);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
+    handle.stop();
+    let _ = handle.join().await;
+    let ops: Vec<(Op, i64)> = rows
+        .iter()
+        .map(|e| {
+            let id = e.after.as_ref().unwrap()["id"].as_i64().unwrap();
+            (e.op, id)
+        })
+        .collect();
+    assert_eq!(ops, [(Op::Create, 1), (Op::Create, 2), (Op::Update, 2)]);
+    assert_eq!(rows[2].after.as_ref().unwrap()["sku"], "b2");
+    let commit = commit.expect("the compressed transaction's commit boundary");
+    assert_eq!((commit.file.as_str(), commit.pos), (file.as_str(), pos));
+    assert_eq!(
+        commit.gtid_set.as_deref(),
+        Some(gtid_set.replace('\n', "").as_str())
+    );
+
+    // Resume from that boundary: nothing repeated, the next row delivered.
+    ckpt_store.put("compressed", commit).await?;
+    let (tx, mut rx) = mpsc::channel::<SourceItem>(128);
+    let src =
+        make_source("compressed", &dsn, tables, AllowList::default()).await;
+    let handle = src.run(tx, ckpt_store.clone()).await;
+    wait_for_source_ready(&handle, Duration::from_secs(10)).await?;
+    sleep(Duration::from_secs(3)).await;
+    conn.query_drop("INSERT INTO orders VALUES (3, 'c')")
+        .await?;
+    let events =
+        collect_events_until(&mut rx, Duration::from_secs(15), |evts| {
+            evts.iter().any(|e| event_has_id(e, 3))
+        })
+        .await;
+    handle.stop();
+    let _ = handle.join().await;
+    mysql_drop_db(&pool, &db_name).await;
+    let ids: Vec<i64> = events
+        .iter()
+        .filter_map(|e| e.after.as_ref().and_then(|a| a["id"].as_i64()))
+        .collect();
+    assert_eq!(ids, [3], "resume repeats or skips rows");
+    Ok(())
+}
+
 /// Test reconnection after forced disconnect.
 #[tokio::test]
 #[ignore = "requires docker"]
