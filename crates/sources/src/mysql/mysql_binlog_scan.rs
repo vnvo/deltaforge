@@ -165,7 +165,8 @@ fn encode_event(e: &EventIdentity) -> String {
         EventIdentity::Gtid { gtid, ordinal } => {
             format!("gtid\u{1d}{gtid}\u{1d}{ordinal}")
         }
-        EventIdentity::FilePos { file, end_pos } => {
+        // Statements never carry a rows-event ordinal.
+        EventIdentity::FilePos { file, end_pos, .. } => {
             format!("file\u{1d}{file}\u{1d}{end_pos}")
         }
         // Never produced by a scan (statements always have an event).
@@ -266,6 +267,7 @@ impl Walk {
             _ => EventIdentity::FilePos {
                 file: self.file.clone(),
                 end_pos: header.next_event_position as u64,
+                ordinal: 0,
             },
         }
     }
@@ -745,7 +747,8 @@ mod tests {
             walk.statements[0].event,
             EventIdentity::FilePos {
                 file: "binlog.000001".into(),
-                end_pos: 4321
+                end_pos: 4321,
+                ordinal: 0,
             }
         );
     }

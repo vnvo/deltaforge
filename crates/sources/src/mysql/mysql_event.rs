@@ -98,6 +98,43 @@ pub(super) async fn dispatch_event(
     .increment(header.event_length as u64);
 
     match data {
+        // A compressed transaction: its events, in order. They have no
+        // binlog position of their own; they all end where the payload ends
+        // (as the binlog scanner numbers them).
+        EventData::TransactionPayload(tp) => {
+            for (h, d) in tp.uncompressed_events {
+                let inner = EventHeader {
+                    next_event_position: header.next_event_position,
+                    ..h
+                };
+                if matches!(d, EventData::TransactionPayload(_)) {
+                    return Err(SourceError::Other(anyhow::anyhow!(
+                        "a compressed transaction nested in another"
+                    )));
+                }
+                dispatch_one(ctx, &inner, d).await?;
+            }
+            Ok(())
+        }
+        other => dispatch_one(ctx, header, other).await,
+    }
+}
+
+async fn dispatch_one(
+    ctx: &mut RunCtx,
+    header: &EventHeader,
+    data: EventData,
+) -> SourceResult<()> {
+    if matches!(
+        data,
+        EventData::WriteRows(_)
+            | EventData::UpdateRows(_)
+            | EventData::DeleteRows(_)
+    ) {
+        // Every rows event counts, tracked table or not.
+        ctx.rows_ordinal += 1;
+    }
+    match data {
         EventData::TableMap(tm) => handle_table_map(ctx, tm).await,
         EventData::WriteRows(wr) => handle_write_rows(ctx, header, wr).await,
         EventData::UpdateRows(ur) => handle_update_rows(ctx, header, ur).await,
@@ -531,9 +568,10 @@ async fn handle_gtid(
     ctx.current_gtid = Some(gtid_str.clone());
     ctx.in_explicit_txn = false;
     // New transaction boundary: reset the DDL message ordinal and the
-    // QueryEvent ordinal.
+    // QueryEvent and rows-event ordinals.
     ctx.message_ordinal = 0;
     ctx.query_ordinal = 0;
+    ctx.rows_ordinal = 0;
 
     // Accumulate the full executed GTID set rather than storing just the last
     // transaction. MySQL needs the full set to resume correctly on reconnect.
@@ -1192,6 +1230,7 @@ async fn record_query(
         None => EventIdentity::FilePos {
             file: ctx.last_file.clone(),
             end_pos: ctx.last_pos,
+            ordinal: 0,
         },
     };
     let scope = ctx.registry_scope.current()?;
@@ -1338,6 +1377,7 @@ mod tests {
             in_explicit_txn: true,
             message_ordinal: 0,
             query_ordinal: 0,
+            rows_ordinal: 0,
             lower_case_table_names: 0,
             txn_eval: None,
             selection: Default::default(),

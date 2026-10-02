@@ -305,6 +305,7 @@ mod tests {
             event: EventIdentity::FilePos {
                 file: "b.000001".into(),
                 end_pos: 9,
+                ordinal: 0,
             },
             effect,
         }

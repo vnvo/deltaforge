@@ -343,6 +343,25 @@ async fn validate_full(
             ));
         }
     }
+    // Only FULL metadata selects by signature (MINIMAL never does).
+    if !is_full(&full.signature.table_map()) {
+        return Err(invalid(
+            key,
+            "FULL observation of a TableMap without FULL metadata",
+        ));
+    }
+    // The live shape was captured after the row, in the same lineage (the
+    // table's stream) and position mode: an earlier, other-mode or otherwise
+    // incomparable live position cannot be a post-row capture.
+    if !matches!(
+        order_positions(&full.row_position, &full.live_position),
+        CheckpointOrder::Before | CheckpointOrder::Equal
+    ) {
+        return Err(invalid(
+            key,
+            "the live capture is not at or after the row's position",
+        ));
+    }
     if full.signature.digest() != full.signature_digest {
         return Err(invalid(key, "TableMap signature digest mismatch"));
     }
@@ -606,14 +625,17 @@ async fn full_fallback(
     let (version, schema_hash) =
         unique_match(&candidates).map_err(|why| fail(db, table, &why))?;
 
+    // The rows event that establishes it: its transaction and its ordinal
+    // among that transaction's rows events.
     let row_event = match &ctx.current_gtid {
         Some(gtid) => EventIdentity::Gtid {
             gtid: gtid.clone(),
-            ordinal: 0,
+            ordinal: ctx.rows_ordinal,
         },
         None => EventIdentity::FilePos {
             file: ctx.last_file.clone(),
             end_pos: ctx.last_pos,
+            ordinal: ctx.rows_ordinal,
         },
     };
     let record = Record::new(
@@ -746,5 +768,147 @@ mod tests {
         let (_, later) =
             evaluate_candidates(&reg, &key, 2, &sig).await.unwrap();
         assert_eq!(d1, later);
+    }
+
+    const UUID: &str = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+
+    fn gtid(set: &str) -> WmPos {
+        WmPos::MysqlGtid {
+            gtid_set: format!("{UUID}:{set}"),
+        }
+    }
+
+    /// A FULL observation at `row` over the key's only version, otherwise
+    /// complete and consistent (digests and capture identity derived).
+    async fn full_observation(
+        reg: &DurableSchemaRegistry,
+        key: &SchemaKey,
+        signature: Signature,
+        row: WmPos,
+        live: WmPos,
+    ) -> Stored {
+        let (candidates, candidates_digest) =
+            evaluate_candidates(reg, key, 1, &signature).await.unwrap();
+        let (version, hash) = unique_match(&candidates).unwrap();
+        let record = Record::new(
+            row.clone(),
+            Kind::Observed {
+                version,
+                binds: None,
+                proof: None,
+                full: Some(Box::new(FullProof {
+                    signature_format: SIGNATURE_FORMAT.to_string(),
+                    row_event: EventIdentity::Gtid {
+                        gtid: format!("{UUID}:6"),
+                        ordinal: 2,
+                    },
+                    row_position: row,
+                    signature_digest: signature.digest(),
+                    signature,
+                    schema_hash: hash.clone(),
+                    live_position: live,
+                    live_schema_hash: hash,
+                    high_water: 1,
+                    candidates_digest,
+                })),
+            },
+        );
+        let capture_id =
+            full_capture_id(&key.lineage_hash, &table_stream(key), &record)
+                .unwrap();
+        Stored { capture_id, record }
+    }
+
+    #[tokio::test]
+    async fn full_evidence_needs_full_metadata_and_a_live_capture_after_the_row()
+     {
+        use mysql_binlog_connector_rust::event::table_map::table_metadata::{
+            ColumnMetadata, TableMetadata,
+        };
+        let backend: storage::ArcStorageBackend =
+            Arc::new(storage::MemoryStorageBackend::new());
+        let reg = DurableSchemaRegistry::new(backend).await.unwrap();
+        let key = SchemaKey::new(
+            "t",
+            "s",
+            "0123456789abcdef0123456789abcdef",
+            "d",
+            "x",
+        );
+        let schema = MySqlTableSchema::new(vec![MySqlColumn::new(
+            "a", "int", "int", true, 1,
+        )]);
+        reg.register_with_checkpoint(
+            &key,
+            "h1",
+            &serde_json::to_value(&schema).unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        let signature = |metadata: Option<TableMetadata>| Signature {
+            column_types: vec![3],
+            column_metas: vec![0],
+            null_bits: vec![true],
+            table_metadata: metadata,
+        };
+        let full = signature(Some(TableMetadata {
+            default_charset: None,
+            enum_and_set_default_charset: None,
+            columns: vec![ColumnMetadata {
+                column_name: Some("a".into()),
+                is_signed: Some(true),
+                ..Default::default()
+            }],
+            primary_key: Vec::new(),
+        }));
+        assert_eq!(compare(&schema, &full.table_map()), Verdict::Match);
+        let check = |stored: Stored| {
+            let t = Timeline {
+                records: vec![stored],
+                barriers: Vec::new(),
+            };
+            let (reg, key) = (&reg, &key);
+            async move { validate(reg, key, &t).await.map_err(|e| format!("{e:#}")) }
+        };
+        let row = gtid("1-5");
+
+        // A live capture at or after the row: valid.
+        for live in [gtid("1-7"), row.clone()] {
+            let s =
+                full_observation(&reg, &key, full.clone(), row.clone(), live)
+                    .await;
+            check(s).await.unwrap();
+        }
+        // Earlier, or incomparable (another server's set, another mode):
+        // never a post-row capture.
+        for live in [
+            gtid("1-3"),
+            WmPos::MysqlGtid {
+                gtid_set: "4e11fa47-71ca-11e1-9e33-c80aa9429562:1-9".into(),
+            },
+            WmPos::MysqlBinlog {
+                file_base: "mysql-bin".into(),
+                file_index: 9,
+                pos: 4,
+            },
+        ] {
+            let s =
+                full_observation(&reg, &key, full.clone(), row.clone(), live)
+                    .await;
+            let err = check(s).await.unwrap_err();
+            assert!(err.contains("not at or after the row"), "{err}");
+        }
+        // A MINIMAL signature never stands as FULL evidence.
+        let s = full_observation(
+            &reg,
+            &key,
+            signature(None),
+            row.clone(),
+            gtid("1-7"),
+        )
+        .await;
+        let err = check(s).await.unwrap_err();
+        assert!(err.contains("without FULL metadata"), "{err}");
     }
 }

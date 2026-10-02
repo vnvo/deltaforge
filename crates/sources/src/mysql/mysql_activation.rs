@@ -48,13 +48,28 @@ const READ_PAGE: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub(crate) enum EventIdentity {
-    /// GTID mode: the transaction's `uuid:gno` and the event's ordinal in it.
+    /// GTID mode: the transaction's `uuid:gno` and the event's ordinal in it
+    /// (a QueryEvent's among the transaction's QueryEvents for statement
+    /// records; a rows event's among its rows events for FULL row
+    /// identities).
     Gtid { gtid: String, ordinal: u32 },
-    /// File/position mode: the event's binlog file and end position.
-    FilePos { file: String, end_pos: u64 },
+    /// File/position mode: the event's binlog file and end position. A rows
+    /// event also carries its ordinal among the transaction's rows events
+    /// (events inside a compressed transaction share the payload's end
+    /// position); statement events carry none (0, omitted).
+    FilePos {
+        file: String,
+        end_pos: u64,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        ordinal: u32,
+    },
     /// No event: the stream (re)started at this position without continuing
     /// from its committed resume position (a discontinuity).
     StreamStart { position: WmPos },
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// Where a barrier applies.
@@ -232,10 +247,19 @@ pub(crate) fn capture_id(
             lp(&mut h, gtid.as_bytes());
             lp(&mut h, &ordinal.to_be_bytes());
         }
-        EventIdentity::FilePos { file, end_pos } => {
+        EventIdentity::FilePos {
+            file,
+            end_pos,
+            ordinal,
+        } => {
             lp(&mut h, b"filepos");
             lp(&mut h, file.as_bytes());
             lp(&mut h, &end_pos.to_be_bytes());
+            // Statement events (no ordinal) keep their identity.
+            if *ordinal != 0 {
+                lp(&mut h, b"ordinal");
+                lp(&mut h, &ordinal.to_be_bytes());
+            }
         }
         EventIdentity::StreamStart { position } => {
             lp(&mut h, b"start");
@@ -846,6 +870,30 @@ mod tests {
         }
     }
 
+    /// A rows event's ordinal distinguishes events sharing one end position
+    /// (a compressed transaction); a statement event (ordinal 0) keeps the
+    /// identity and bytes it had before the field existed.
+    #[test]
+    fn a_rows_ordinal_is_part_of_a_file_position_identity() {
+        let e = |ordinal| EventIdentity::FilePos {
+            file: "bin.000001".into(),
+            end_pos: 7,
+            ordinal,
+        };
+        let r = Record::new(g(5), Kind::Ddl);
+        let id = |ev: &EventIdentity| capture_id("l", ev, "s", &r);
+        assert_ne!(id(&e(1)), id(&e(2)));
+        assert_ne!(id(&e(0)), id(&e(1)));
+        let legacy = serde_json::json!({
+            "event": "file_pos", "file": "bin.000001", "end_pos": 7
+        });
+        assert_eq!(serde_json::to_value(e(0)).unwrap(), legacy);
+        assert_eq!(
+            serde_json::from_value::<EventIdentity>(legacy).unwrap(),
+            e(0)
+        );
+    }
+
     fn fp(pos: u64) -> WmPos {
         WmPos::MysqlBinlog {
             file_base: "bin".into(),
@@ -1154,6 +1202,7 @@ mod tests {
             &EventIdentity::FilePos {
                 file: "bin.000001".into(),
                 end_pos: 7,
+                ordinal: 0,
             },
             "s",
             &r,

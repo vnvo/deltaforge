@@ -165,6 +165,10 @@ pub(crate) struct RunCtx {
     /// activation records a statement establishes, as the binlog scanner
     /// numbers them.
     query_ordinal: u32,
+    /// Ordinal of the current rows event among its transaction's rows events
+    /// (every table, before filtering; nested order in a compressed
+    /// transaction). 0 before the first.
+    rows_ordinal: u32,
     /// The server's `lower_case_table_names` (read at startup on a verified
     /// connection): how DDL table names map to registry keys.
     lower_case_table_names: u8,
@@ -635,6 +639,7 @@ impl MySqlSource {
             in_explicit_txn: false,
             message_ordinal: 0,
             query_ordinal: 0,
+            rows_ordinal: 0,
             lower_case_table_names,
             txn_eval: None,
             selection: Default::default(),
@@ -1206,6 +1211,7 @@ impl RunCtx {
     /// The stream is at a transaction boundary: rows of the next transaction
     /// are evaluated at the current position.
     pub(crate) fn mark_transaction_boundary(&mut self) {
+        self.rows_ordinal = 0;
         self.txn_eval = crate::durable_checkpoint::mysql_checkpoint_position(
             &self.last_file,
             self.last_pos,
@@ -1679,6 +1685,7 @@ async fn run_failover_reconciliation(
     ctx.current_gtid = None;
     ctx.message_ordinal = 0;
     ctx.query_ordinal = 0;
+    ctx.rows_ordinal = 0;
     ctx.last_file = String::new();
     ctx.last_pos = 0;
 

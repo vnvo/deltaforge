@@ -1019,3 +1019,95 @@ async fn stored_evidence_is_validated_on_read() {
     assert!(msg.contains("schema activation timeline"), "{msg}");
     assert!(got.is_empty(), "rows: {:?}", image(&got));
 }
+
+// ---------------------------------------------------------------------------
+// Rows-event identity and compressed transactions
+// ---------------------------------------------------------------------------
+
+/// A FULL observation names the rows event that established it: the
+/// transaction (GTID, or file and end position) and the event's ordinal
+/// among that transaction's rows events, counted before table filtering, in
+/// nested order inside a compressed transaction, and restarting at every
+/// transaction. Compressed transactions are decoded like any other.
+async fn rows_event_identity(gtid: bool) {
+    init_test_tracing();
+    let db = if gtid { "pm_ordinal" } else { "pm_ordinal_fp" };
+    let port = server(gtid, true).await;
+    let hash = lineage_hash(port).await;
+    prepare(port, db, &[T, "CREATE TABLE o (id INT PRIMARY KEY)"]).await;
+    let st = State::new().await;
+    commit_a_position(port, &st, db, db).await;
+    let mut r = run(source(db, port, db, &["t"], &st), &st).await;
+    let compressed = |body: &[&str]| {
+        let mut s = stmts(&[
+            "SET SESSION binlog_transaction_compression = ON",
+            "BEGIN",
+        ]);
+        s.extend(stmts(body));
+        s.push("COMMIT".into());
+        s
+    };
+
+    // Proven by the baseline: a compressed transaction's row is emitted.
+    sql(
+        port,
+        db,
+        &compressed(&["INSERT INTO t VALUES (1, 'A1', 'B1')"]),
+    )
+    .await;
+    let got = rows(&mut r.rx, 1).await;
+    assert_eq!(got.len(), 1, "the compressed row is emitted");
+    assert_eq!(after(&got[0], "a"), "A1");
+
+    // After a barrier: the tracked table's rows event is the second rows
+    // event of a compressed transaction (the first is untracked).
+    let mut steps = stmts(&[OPAQUE_DDL]);
+    steps.extend(compressed(&[
+        "INSERT INTO o VALUES (1)",
+        "INSERT INTO t VALUES (2, 'A2', 'B2', 7)",
+    ]));
+    sql(port, db, &steps).await;
+    let got = rows(&mut r.rx, 1).await;
+    assert_eq!(got.len(), 1);
+    assert_eq!(after(&got[0], "x"), 7);
+
+    // After another barrier, the first rows event of a plain transaction.
+    sql(
+        port,
+        db,
+        &stmts(&[
+            "/*!50100 ALTER TABLE t ADD COLUMN y INT */",
+            "INSERT INTO t VALUES (3, 'A3', 'B3', 8, 9)",
+        ]),
+    )
+    .await;
+    let got = rows(&mut r.rx, 1).await;
+    stop(r.handle).await;
+    assert_eq!(got.len(), 1);
+    assert_eq!(after(&got[0], "y"), 9);
+
+    let records = st.activation(db, &hash, db, "t").await;
+    let events: Vec<&Value> = full_observations(&records)
+        .iter()
+        .map(|r| &r["full"]["row_event"])
+        .collect();
+    assert_eq!(events.len(), 2, "{records:?}");
+    let kind = if gtid { "gtid" } else { "file_pos" };
+    for e in &events {
+        assert_eq!(e["event"], kind, "{e}");
+    }
+    assert_eq!(events[0]["ordinal"], 2, "{}", events[0]);
+    assert_eq!(events[1]["ordinal"], 1, "{}", events[1]);
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn rows_event_identity_gtid() {
+    rows_event_identity(true).await;
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn rows_event_identity_file_position() {
+    rows_event_identity(false).await;
+}
