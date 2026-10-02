@@ -107,6 +107,10 @@ pub(crate) enum Kind {
 /// digest `scan_digest`, found nothing that could have changed it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ForwardProof {
+    /// The DDL classifier version the scan used (bound into the identity,
+    /// so the evidence can be re-verified; unsupported versions are
+    /// rejected).
+    pub classifier_version: String,
     pub to: WmPos,
     pub scan_digest: String,
     pub schema_hash: String,
@@ -257,12 +261,11 @@ pub(crate) fn baseline_capture_id(
 
 /// Deterministic capture identity of a forward-proof `observed` record:
 /// lineage, stream, the exact pending `ddl` capture identity it binds, D (its
-/// position), S, version, schema hash, proof kind and format, classifier
-/// version and the scan digest.
+/// position), S, version, schema hash, proof kind and format, the stored
+/// classifier version and the scan digest.
 pub(crate) fn forward_capture_id(
     lineage_hash: &str,
     stream: &str,
-    classifier_version: &str,
     record: &Record,
 ) -> Result<String> {
     let Kind::Observed {
@@ -270,6 +273,7 @@ pub(crate) fn forward_capture_id(
         binds: Some(ddl_id),
         proof:
             Some(ForwardProof {
+                classifier_version,
                 to,
                 scan_digest,
                 schema_hash,
@@ -387,7 +391,6 @@ pub(crate) async fn record_forward_proof(
     backend: &ArcStorageBackend,
     registry: &DurableSchemaRegistry,
     key: &SchemaKey,
-    classifier_version: &str,
     ddl_id: &str,
     position: WmPos,
     version: i32,
@@ -402,23 +405,96 @@ pub(crate) async fn record_forward_proof(
         },
     );
     let stream = table_stream(key);
-    let id = forward_capture_id(
-        &key.lineage_hash,
-        &stream,
-        classifier_version,
-        &record,
-    )?;
+    let id = forward_capture_id(&key.lineage_hash, &stream, &record)?;
     append(backend, registry, key, ACTIVATION_NS, &stream, &id, &record).await
 }
 
-/// The record that binds the `ddl` record `ddl_id`, if any.
-pub(crate) fn binding_of<'a>(
-    records: &'a [Stored],
+/// The validated forward binding of the `ddl` record `ddl_id` in `records`
+/// (the table's stream): `Ok(None)` only when nothing binds it; the bound
+/// version when exactly one record binds it and that record is complete,
+/// consistent evidence: at the DDL's exact position, carrying a forward proof
+/// from a supported classifier, whose schema hash is the registry's hash of
+/// its version, whose end S is at or after D, and whose stored capture
+/// identity re-derives from its content. Anything else - a missing or
+/// non-DDL referenced record, several bindings, any inconsistency - is a
+/// [`TimelineError`]: the caller stops instead of proving again.
+pub(crate) async fn resolve_binding(
+    registry: &DurableSchemaRegistry,
+    key: &SchemaKey,
+    records: &[Stored],
     ddl_id: &str,
-) -> Option<&'a Stored> {
-    records.iter().find(|s| {
-        matches!(&s.record.kind, Kind::Observed { binds: Some(b), .. } if b == ddl_id)
-    })
+    supported_classifier: &str,
+) -> Result<Option<i32>> {
+    let bad = |why: String| -> anyhow::Error {
+        TimelineError(format!(
+            "forward binding of ddl {ddl_id} in {}: {why}",
+            key.backend_key()
+        ))
+        .into()
+    };
+    let bindings: Vec<&Stored> = records
+        .iter()
+        .filter(|s| {
+            matches!(&s.record.kind, Kind::Observed { binds: Some(b), .. } if b == ddl_id)
+        })
+        .collect();
+    let ddl = records.iter().find(|s| s.capture_id == ddl_id);
+    let binding = match bindings.as_slice() {
+        [] => return Ok(None),
+        [one] => *one,
+        many => return Err(bad(format!("{} bindings", many.len()))),
+    };
+    let ddl = match ddl {
+        Some(d) if d.record.kind == Kind::Ddl => d,
+        Some(_) => {
+            return Err(bad("the bound record is not a ddl record".into()));
+        }
+        None => return Err(bad("the bound ddl record does not exist".into())),
+    };
+    if binding.record.position != ddl.record.position {
+        return Err(bad("the binding is not at the ddl's position".into()));
+    }
+    let Kind::Observed {
+        version,
+        proof: Some(proof),
+        ..
+    } = &binding.record.kind
+    else {
+        return Err(bad("the binding carries no forward proof".into()));
+    };
+    if proof.classifier_version != supported_classifier {
+        return Err(bad(format!(
+            "unsupported classifier version {:?}",
+            proof.classifier_version
+        )));
+    }
+    match registry.version_hash(key, *version).await? {
+        Some(hash) if hash == proof.schema_hash => {}
+        other => {
+            return Err(bad(format!(
+                "schema hash {:?} is not the registry's hash {other:?} of \
+                 version {version}",
+                proof.schema_hash
+            )));
+        }
+    }
+    if !matches!(
+        order_positions(&ddl.record.position, &proof.to),
+        CheckpointOrder::Before | CheckpointOrder::Equal
+    ) {
+        return Err(bad("the proof's end is not at or after the ddl".into()));
+    }
+    let expected = forward_capture_id(
+        &key.lineage_hash,
+        &table_stream(key),
+        &binding.record,
+    )?;
+    if expected != binding.capture_id {
+        return Err(bad(
+            "the capture identity does not match its evidence".into()
+        ));
+    }
+    Ok(Some(*version))
 }
 
 /// Append a barrier for `scope` established by `event` at `position`; `key`
@@ -1023,41 +1099,170 @@ mod tests {
         );
     }
 
+    const CLS: &str = "ddl-attribution-v1";
+
+    fn fwd(
+        ddl: &str,
+        d: WmPos,
+        to: WmPos,
+        v: i32,
+        h: &str,
+        cls: &str,
+    ) -> Record {
+        Record::new(
+            d,
+            Kind::Observed {
+                version: v,
+                binds: Some(ddl.into()),
+                proof: Some(ForwardProof {
+                    classifier_version: cls.into(),
+                    to,
+                    scan_digest: "digest".into(),
+                    schema_hash: h.into(),
+                }),
+            },
+        )
+    }
+
     #[test]
     fn forward_proof_identities_bind_the_ddl_and_every_piece_of_evidence() {
-        let r = |ddl: &str, d: u64, to: u64, v: i32, h: &str, digest: &str| {
-            Record::new(
-                g(d),
-                Kind::Observed {
-                    version: v,
-                    binds: Some(ddl.into()),
-                    proof: Some(ForwardProof {
-                        to: g(to),
-                        scan_digest: digest.into(),
-                        schema_hash: h.into(),
-                    }),
-                },
-            )
+        let r = |ddl: &str, d: u64, to: u64, v: i32, h: &str, cls: &str| {
+            fwd(ddl, g(d), g(to), v, h, cls)
         };
-        let id = |rec: &Record, cls: &str| {
-            forward_capture_id(L, "s", cls, rec).unwrap()
-        };
-        let base = id(&r("ddl", 3, 9, 1, "h", "d"), "c1");
-        assert_eq!(base, id(&r("ddl", 3, 9, 1, "h", "d"), "c1"));
+        let id = |rec: &Record| forward_capture_id(L, "s", rec).unwrap();
+        let base = id(&r("ddl", 3, 9, 1, "h", "c1"));
+        assert_eq!(base, id(&r("ddl", 3, 9, 1, "h", "c1")));
+        let mut digest = r("ddl", 3, 9, 1, "h", "c1");
+        if let Kind::Observed { proof: Some(p), .. } = &mut digest.kind {
+            p.scan_digest = "other".into();
+        }
         for other in [
-            id(&r("other", 3, 9, 1, "h", "d"), "c1"),
-            id(&r("ddl", 4, 9, 1, "h", "d"), "c1"),
-            id(&r("ddl", 3, 8, 1, "h", "d"), "c1"),
-            id(&r("ddl", 3, 9, 2, "h", "d"), "c1"),
-            id(&r("ddl", 3, 9, 1, "x", "d"), "c1"),
-            id(&r("ddl", 3, 9, 1, "h", "x"), "c1"),
-            id(&r("ddl", 3, 9, 1, "h", "d"), "c2"),
+            id(&r("other", 3, 9, 1, "h", "c1")),
+            id(&r("ddl", 4, 9, 1, "h", "c1")),
+            id(&r("ddl", 3, 8, 1, "h", "c1")),
+            id(&r("ddl", 3, 9, 2, "h", "c1")),
+            id(&r("ddl", 3, 9, 1, "x", "c1")),
+            id(&r("ddl", 3, 9, 1, "h", "c2")),
+            id(&digest),
         ] {
             assert_ne!(base, other);
         }
         // Only a bound, proven observed record has a forward identity.
         let unbound = Record::new(g(3), obs(1));
-        assert!(forward_capture_id(L, "s", "c1", &unbound).is_err());
+        assert!(forward_capture_id(L, "s", &unbound).is_err());
+    }
+
+    /// A forward binding stored under its correctly derived identity.
+    fn bound(rec: Record) -> Stored {
+        let id = forward_capture_id(L, &table_stream(&key()), &rec).unwrap();
+        Stored {
+            capture_id: id,
+            record: rec,
+        }
+    }
+
+    #[tokio::test]
+    async fn only_complete_consistent_evidence_resolves_a_forward_binding() {
+        let (_b, reg) = registry_with_versions(2).await;
+        let k = key();
+        let resolve = |recs: Vec<Stored>| {
+            let (reg, k) = (reg.clone(), k.clone());
+            async move { resolve_binding(&reg, &k, &recs, "ddl1", CLS).await }
+        };
+        let ddl = || st("ddl1", g(5), Kind::Ddl);
+        let valid = || bound(fwd("ddl1", g(5), g(9), 1, "h1", CLS));
+
+        assert_eq!(resolve(vec![ddl()]).await.unwrap(), None);
+        assert_eq!(resolve(vec![ddl(), valid()]).await.unwrap(), Some(1));
+        // S == D is a valid (empty) interval.
+        assert_eq!(
+            resolve(vec![ddl(), bound(fwd("ddl1", g(5), g(5), 1, "h1", CLS))])
+                .await
+                .unwrap(),
+            Some(1)
+        );
+
+        let mut forged = valid();
+        forged.capture_id = "forged".into();
+        let no_proof = Stored {
+            capture_id: "np".into(),
+            record: Record::new(
+                g(5),
+                Kind::Observed {
+                    version: 1,
+                    binds: Some("ddl1".into()),
+                    proof: None,
+                },
+            ),
+        };
+        let incomparable = WmPos::MysqlGtid {
+            gtid_set: format!("{V}:1-9"),
+        };
+        for (what, recs) in [
+            (
+                "another position",
+                vec![ddl(), bound(fwd("ddl1", g(6), g(9), 1, "h1", CLS))],
+            ),
+            ("no proof", vec![ddl(), no_proof]),
+            (
+                "wrong schema hash",
+                vec![ddl(), bound(fwd("ddl1", g(5), g(9), 1, "h2", CLS))],
+            ),
+            (
+                "S < D",
+                vec![ddl(), bound(fwd("ddl1", g(5), g(4), 1, "h1", CLS))],
+            ),
+            (
+                "incomparable S",
+                vec![
+                    ddl(),
+                    bound(fwd("ddl1", g(5), incomparable, 1, "h1", CLS)),
+                ],
+            ),
+            ("wrong capture identity", vec![ddl(), forged]),
+            (
+                "two bindings",
+                vec![
+                    ddl(),
+                    valid(),
+                    bound(fwd("ddl1", g(5), g(8), 1, "h1", CLS)),
+                ],
+            ),
+            ("missing ddl record", vec![valid()]),
+            (
+                "non-ddl record",
+                vec![
+                    st(
+                        "ddl1",
+                        g(5),
+                        Kind::Barrier {
+                            scope: BarrierScope::Lineage,
+                        },
+                    ),
+                    valid(),
+                ],
+            ),
+            (
+                "unsupported classifier",
+                vec![
+                    ddl(),
+                    bound(fwd(
+                        "ddl1",
+                        g(5),
+                        g(9),
+                        1,
+                        "h1",
+                        "ddl-attribution-v9",
+                    )),
+                ],
+            ),
+        ] {
+            let err = resolve(recs).await.expect_err(what);
+            assert!(
+                err.downcast_ref::<TimelineError>().is_some(),
+                "{what}: {err:#}"
+            );
+        }
     }
 
     #[test]

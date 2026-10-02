@@ -27,7 +27,7 @@
 use deltaforge_core::{CheckpointOrder, SourceError, SourceResult};
 use tracing::{info, warn};
 
-use super::mysql_activation::{self, ForwardProof, binding_of};
+use super::mysql_activation::{self, ForwardProof, resolve_binding};
 use super::mysql_baseline::affects;
 use super::mysql_binlog_scan::{
     CLASSIFIER_VERSION, ProofError, ScanLimits, scan_interval, stable_capture,
@@ -97,8 +97,25 @@ pub(crate) async fn prove(
         )
         .await
         .map_err(storage)?;
-        if binding_of(&records, &p.ddl_id).is_none() {
-            open.push(p);
+        // A binding is the proof only once validated as complete,
+        // consistent evidence; an invalid one stops here (never a fresh
+        // proof over later server state).
+        match resolve_binding(
+            ctx.schema.registry(),
+            &key,
+            &records,
+            &p.ddl_id,
+            CLASSIFIER_VERSION,
+        )
+        .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => open.push(p),
+            Err(e) => {
+                return Err(SourceError::Schema {
+                    details: format!("{e:#}").into(),
+                });
+            }
         }
     }
     if open.is_empty() {
@@ -209,11 +226,11 @@ pub(crate) async fn prove(
             &ctx.registry_backend,
             ctx.schema.registry(),
             &key,
-            CLASSIFIER_VERSION,
             &p.ddl_id,
             d.clone(),
             version,
             ForwardProof {
+                classifier_version: CLASSIFIER_VERSION.to_string(),
                 to: s.clone(),
                 scan_digest: report.digest.clone(),
                 schema_hash,
@@ -396,18 +413,25 @@ mod tests {
             recs.iter().filter(|s| s.record.kind == Kind::Ddl).collect()
         }
 
-        fn bound(recs: &[Stored], ddl: &Stored) -> Option<i32> {
-            binding_of(recs, &ddl.capture_id).map(|s| match &s.record.kind {
-                Kind::Observed { version, proof, .. } => {
-                    assert!(
-                        proof.is_some(),
-                        "a forward binding carries its proof"
-                    );
-                    assert_eq!(s.record.position, ddl.record.position);
-                    *version
-                }
-                _ => unreachable!(),
-            })
+        /// The validated forward binding of `ddl` (panics on invalid
+        /// evidence).
+        async fn bound(
+            st: &State,
+            db: &str,
+            table: &str,
+            recs: &[Stored],
+            ddl: &Stored,
+        ) -> Option<i32> {
+            let key = st.scope.current().unwrap().key(db, table);
+            resolve_binding(
+                &st.registry,
+                &key,
+                recs,
+                &ddl.capture_id,
+                CLASSIFIER_VERSION,
+            )
+            .await
+            .expect("valid binding evidence")
         }
 
         async fn prepare(port: u16, db: &str) {
@@ -438,7 +462,9 @@ mod tests {
             let recs = records(&st, db, "t").await;
             let d = ddls(&recs);
             assert_eq!(d.len(), 1, "{recs:?}");
-            let version = bound(&recs, d[0]).expect("the DDL is bound");
+            let version = bound(&st, db, "t", &recs, d[0])
+                .await
+                .expect("the DDL is bound");
             let key = st.scope.current().unwrap().key(db, "t");
             let shape = st.registry.version_hash(&key, version).await.unwrap();
             assert!(shape.is_some());
@@ -523,7 +549,11 @@ mod tests {
             let recs = records(&st, db, "t").await;
             let d = ddls(&recs);
             assert_eq!(d.len(), 1);
-            assert_eq!(bound(&recs, d[0]), None, "registered but not bound");
+            assert_eq!(
+                bound(&st, db, "t", &recs, d[0]).await,
+                None,
+                "registered but not bound"
+            );
             let registered = key_versions(&st).await;
 
             // Restart: the DDL replays, the proof repeats, registration
@@ -533,7 +563,7 @@ mod tests {
             let recs = records(&st, db, "t").await;
             let d = ddls(&recs);
             assert_eq!(d.len(), 1);
-            assert!(bound(&recs, d[0]).is_some());
+            assert!(bound(&st, db, "t", &recs, d[0]).await.is_some());
             assert_eq!(key_versions(&st).await, registered, "no new version");
             stop(r.handle).await;
         }
@@ -588,23 +618,37 @@ mod tests {
             let t = records(&st, db, "t").await;
             let td = ddls(&t);
             assert_eq!(td.len(), 2, "{t:?}");
-            assert_eq!(bound(&t, td[0]), None, "a second DDL in (D, S]");
-            assert!(bound(&t, td[1]).is_some());
+            assert_eq!(
+                bound(&st, db, "t", &t, td[0]).await,
+                None,
+                "a second DDL in (D, S]"
+            );
+            assert!(bound(&st, db, "t", &t, td[1]).await.is_some());
 
             let u = records(&st, db, "u").await;
             assert!(
-                bound(&u, ddls(&u)[0]).is_some(),
+                bound(&st, db, "u", &u, ddls(&u)[0]).await.is_some(),
                 "unrelated DDLs do not block"
             );
 
             let o = records(&st, db, "other").await;
             let od = ddls(&o);
             assert_eq!(od.len(), 3, "{o:?}"); // ALTER, DROP, CREATE
-            assert_eq!(bound(&o, od[1]), None, "a DROP gets no proof");
-            assert!(bound(&o, od[2]).is_some(), "the recreate is proven");
+            assert_eq!(
+                bound(&st, db, "other", &o, od[1]).await,
+                None,
+                "a DROP gets no proof"
+            );
+            assert!(
+                bound(&st, db, "other", &o, od[2]).await.is_some(),
+                "the recreate is proven"
+            );
 
             let x = records(&st, db, "x").await;
-            assert!(bound(&x, ddls(&x)[0]).is_some(), "the rename destination");
+            assert!(
+                bound(&st, db, "x", &x, ddls(&x)[0]).await.is_some(),
+                "the rename destination"
+            );
             stop(r.handle).await;
 
             // A lineage barrier in (D, S] leaves the DDL pending.
@@ -622,8 +666,65 @@ mod tests {
             ddl_event(&mut r.rx, "CREATE TABLE").await;
             let u = records(&st, db, "u").await;
             let ud = ddls(&u);
-            assert_eq!(bound(&u, ud[ud.len() - 1]), None, "barrier in (D, S]");
+            assert_eq!(
+                bound(&st, db, "u", &u, ud[ud.len() - 1]).await,
+                None,
+                "barrier in (D, S]"
+            );
             stop(r.handle).await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn an_invalid_binding_stops_the_replay_without_a_new_proof() {
+            let port = server(true).await;
+            let db = "fwd_invalid";
+            prepare(port, db).await;
+            let st = state(Arc::new(MemoryStorageBackend::new())).await;
+            let r = run(&st, port, db, &[&format!("{db}.t")]).await;
+            stop(r.handle).await;
+            let mut r = run(&st, port, db, &[&format!("{db}.t")]).await;
+            sql(port, &[&format!("ALTER TABLE {db}.t ADD COLUMN k INT")]).await;
+            ddl_event(&mut r.rx, "ADD COLUMN k").await;
+            r.handle.join.abort();
+
+            // A second record binding the same DDL (duplicate evidence).
+            let key = st.scope.current().unwrap().key(db, "t");
+            let stream = crate::mysql::mysql_activation::table_stream(&key);
+            let recs = records(&st, db, "t").await;
+            let binding = recs
+                .iter()
+                .find(|s| matches!(s.record.kind, Kind::Observed { .. }))
+                .unwrap();
+            st.backend
+                .log_append_if_absent(
+                    crate::mysql::mysql_activation::ACTIVATION_NS,
+                    &stream,
+                    "forged",
+                    &serde_json::to_vec(&binding.record).unwrap(),
+                )
+                .await
+                .unwrap();
+            let tampered = records(&st, db, "t").await;
+
+            // The replay stops on the invalid evidence: no new proof, no DDL
+            // event.
+            let mut r = run(&st, port, db, &[&format!("{db}.t")]).await;
+            let res =
+                tokio::time::timeout(Duration::from_secs(60), r.handle.join)
+                    .await
+                    .expect("stops")
+                    .expect("task");
+            assert!(
+                matches!(&res, Err(SourceError::Schema { details }) if details.contains("2 bindings")),
+                "{res:?}"
+            );
+            while let Ok(item) = r.rx.try_recv() {
+                if let SourceItem::Event(e) = item {
+                    assert!(e.ddl.is_none(), "the DDL event was emitted");
+                }
+            }
+            assert_eq!(records(&st, db, "t").await, tampered);
         }
     }
 }
