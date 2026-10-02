@@ -112,6 +112,11 @@ async fn lineage_hash(port: u16) -> String {
     LineageDescriptor::mysql(&u).unwrap().lineage_hash()
 }
 
+/// The `ddl` records of a stream.
+fn ddl(records: Vec<Value>) -> Vec<Value> {
+    records.into_iter().filter(|r| r["kind"] == "ddl").collect()
+}
+
 struct State {
     backend: ArcStorageBackend,
     ckpt: Arc<dyn CheckpointStore>,
@@ -295,7 +300,8 @@ async fn records_precede_events_and_replay_identically(gtid: bool) {
     assert_eq!(st.lineage_barriers(id, &hash).await.len(), 1);
     sql(port, db, &["ALTER TABLE t ADD COLUMN w INT"]).await;
     ddl_event(&mut r.rx, "ADD COLUMN w").await;
-    let recs = st.table(id, &hash, db, "t").await;
+    // The table's baseline (3b-2) precedes its DDL record.
+    let recs = ddl(st.table(id, &hash, db, "t").await);
     assert_eq!(recs.len(), 1, "{recs:?}");
     assert_eq!(recs[0]["kind"], "ddl");
     assert_eq!(recs[0]["format_version"], 1);
@@ -398,13 +404,13 @@ async fn a_ddl_whose_record_cannot_be_persisted_is_not_emitted_or_passed() {
         }
     }
     assert_eq!(st.ckpt.get_raw(id).await.unwrap().unwrap(), committed);
-    assert!(st.table(id, &hash, db, "t").await.is_empty());
+    assert!(ddl(st.table(id, &hash, db, "t").await).is_empty());
 
     // Without the fault the DDL is recorded, then emitted.
     fault.fail_writes_to.lock().unwrap().clear();
     let mut r = run(source(id, port, db, &st, SnapshotMode::Never), &st).await;
     ddl_event(&mut r.rx, "ADD COLUMN z").await;
-    assert_eq!(st.table(id, &hash, db, "t").await.len(), 1);
+    assert_eq!(ddl(st.table(id, &hash, db, "t").await).len(), 1);
     stop(r.handle).await;
 }
 

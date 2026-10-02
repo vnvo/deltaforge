@@ -29,6 +29,7 @@ mod mysql_errors;
 pub use mysql_errors::{LoopControl, MySqlSourceError, MySqlSourceResult};
 
 mod mysql_activation;
+mod mysql_baseline;
 mod mysql_binlog_scan;
 mod mysql_checkpoint_lineage;
 mod mysql_ddl_attribution;
@@ -659,6 +660,11 @@ impl MySqlSource {
         // Safe to preload now: reconciliation has run, registry reflects post-reconcile state.
         let tracked = ctx.schema.preload(&self.tables).await?;
         info!(source_id=%self.id, tables = tracked.len(), "schemas preloaded");
+
+        // Establish activation baselines at the start position for tracked
+        // tables whose version the timeline does not prove there, before any
+        // event is read.
+        mysql_baseline::establish(&ctx, &tracked).await?;
 
         // Controlled credential rotation (opt-in, file-backed credentials only).
         // GTID mode is mandatory for live rotation - fail startup otherwise. The

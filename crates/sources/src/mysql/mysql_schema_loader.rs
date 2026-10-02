@@ -447,6 +447,34 @@ impl MySqlSchemaLoader {
         Err(self.scope_changed())
     }
 
+    /// Register a shape captured elsewhere (a stable position/shape capture)
+    /// through the normal registry path, under the current verified scope,
+    /// with `checkpoint` as its binding position. Returns the version and its
+    /// registry hash. Never derived from a TableMap.
+    pub(crate) async fn register_captured(
+        &self,
+        db: &str,
+        table: &str,
+        schema: &MySqlTableSchema,
+        checkpoint: &[u8],
+    ) -> SourceResult<(i32, String)> {
+        let scope = self.current_scope()?;
+        let fingerprint = schema.fingerprint();
+        let schema_json = serde_json::to_value(schema)
+            .map_err(|e| SourceError::Other(e.into()))?;
+        let version = self
+            .registry
+            .register_with_checkpoint(
+                &scope.key(db, table),
+                &fingerprint,
+                &schema_json,
+                Some(checkpoint),
+            )
+            .await
+            .map_err(RegistryError::Storage)?;
+        Ok((version, fingerprint.to_string()))
+    }
+
     /// Force reload schema from database (bypasses cache).
     pub async fn reload_schema(
         &self,

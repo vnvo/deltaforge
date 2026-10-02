@@ -79,11 +79,17 @@ pub(crate) enum Kind {
     /// A complete read-only pre-scan proved no applicable DDL between this
     /// record's position (R0) and `to` (S), so `version` (observed at S)
     /// was in effect from R0.
+    ///
+    /// `binds` is the exact capture identity of the discontinuity barrier at
+    /// the same position that this baseline closes (`None` when there is
+    /// none); it supersedes that barrier only.
     Baseline {
         version: i32,
         schema_hash: String,
         to: WmPos,
         scan_digest: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binds: Option<String>,
     },
     /// Positional proof is invalid for every table in `scope` from here on.
     Barrier { scope: BarrierScope },
@@ -206,6 +212,7 @@ pub(crate) fn baseline_capture_id(
         schema_hash,
         to,
         scan_digest,
+        binds,
     } = &record.kind
     else {
         anyhow::bail!("baseline_capture_id requires a baseline record");
@@ -221,6 +228,13 @@ pub(crate) fn baseline_capture_id(
     lp(&mut h, b"baseline-prescan");
     lp(&mut h, &record.format_version.to_be_bytes());
     lp(&mut h, scan_digest.as_bytes());
+    match binds {
+        Some(barrier) => {
+            lp(&mut h, b"binds");
+            lp(&mut h, barrier.as_bytes());
+        }
+        None => lp(&mut h, b"unbound"),
+    }
     Ok(hex::encode(h.finalize()))
 }
 
@@ -500,6 +514,20 @@ pub(crate) fn select(records: &[Stored], row: &WmPos) -> Selection {
                             binds: Some(id), ..
                         },
                     ) if *id == a.capture_id => **b,
+                    // A baseline closes exactly the discontinuity barrier
+                    // whose capture identity it carries.
+                    (
+                        Kind::Baseline {
+                            binds: Some(id), ..
+                        },
+                        Kind::Barrier { .. },
+                    ) if *id == b.capture_id => **a,
+                    (
+                        Kind::Barrier { .. },
+                        Kind::Baseline {
+                            binds: Some(id), ..
+                        },
+                    ) if *id == a.capture_id => **b,
                     _ => return Selection::Unproven(Unproven::Ambiguous),
                 },
                 _ => return Selection::Unproven(Unproven::Ambiguous),
@@ -653,6 +681,74 @@ mod tests {
         assert_eq!(select(&recs, &g(7)), Selection::Proven { version: 1 });
     }
 
+    fn base(binds: Option<&str>) -> Kind {
+        Kind::Baseline {
+            version: 7,
+            schema_hash: "h".into(),
+            to: g(9),
+            scan_digest: "d".into(),
+            binds: binds.map(Into::into),
+        }
+    }
+
+    fn lineage_barrier() -> Kind {
+        Kind::Barrier {
+            scope: BarrierScope::Lineage,
+        }
+    }
+
+    #[test]
+    fn a_baseline_supersedes_only_the_barrier_it_binds() {
+        // The start barrier and the baseline that closes it, at one position.
+        let recs = vec![
+            st("start", g(3), lineage_barrier()),
+            st("base", g(3), base(Some("start"))),
+        ];
+        assert_eq!(select(&recs, &g(5)), Selection::Proven { version: 7 });
+        let mut rev = recs.clone();
+        rev.reverse();
+        assert_eq!(select(&rev, &g(5)), Selection::Proven { version: 7 });
+
+        // No binding, a binding to another record, or another unmatched
+        // record at that position: ambiguous, fail closed.
+        for recs in [
+            vec![
+                st("start", g(3), lineage_barrier()),
+                st("base", g(3), base(None)),
+            ],
+            vec![
+                st("start", g(3), lineage_barrier()),
+                st("base", g(3), base(Some("other"))),
+            ],
+            vec![
+                st("start", g(3), lineage_barrier()),
+                st(
+                    "db",
+                    g(3),
+                    Kind::Barrier {
+                        scope: BarrierScope::Database { db: "d".into() },
+                    },
+                ),
+                st("base", g(3), base(Some("start"))),
+            ],
+            vec![
+                st("start", g(3), Kind::Ddl),
+                st("base", g(3), base(Some("start"))),
+            ],
+        ] {
+            // In either record order (each match arm).
+            let mut rev = recs.clone();
+            rev.reverse();
+            for recs in [recs, rev] {
+                assert_eq!(
+                    select(&recs, &g(5)),
+                    Selection::Unproven(Unproven::Ambiguous),
+                    "{recs:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_baseline_proves_its_version_from_its_start() {
         let recs = vec![st(
@@ -663,6 +759,7 @@ mod tests {
                 schema_hash: "h".into(),
                 to: g(9),
                 scan_digest: "d".into(),
+                binds: None,
             },
         )];
         assert_eq!(select(&recs, &g(3)), Selection::Proven { version: 4 });
@@ -782,7 +879,12 @@ mod tests {
 
     #[test]
     fn baseline_identities_bind_boundaries_version_and_scan() {
-        let b = |from: u64, to: u64, v: i32, h: &str, d: &str| {
+        let bb = |from: u64,
+                  to: u64,
+                  v: i32,
+                  h: &str,
+                  d: &str,
+                  binds: Option<&str>| {
             Record::new(
                 g(from),
                 Kind::Baseline {
@@ -790,9 +892,11 @@ mod tests {
                     schema_hash: h.into(),
                     to: g(to),
                     scan_digest: d.into(),
+                    binds: binds.map(Into::into),
                 },
             )
         };
+        let b = |from, to, v, h, d| bb(from, to, v, h, d, Some("barrier"));
         let id = |r: &Record| baseline_capture_id(L, "s", r).unwrap();
         let base = id(&b(3, 9, 1, "h", "d"));
         assert_eq!(base, id(&b(3, 9, 1, "h", "d")));
@@ -802,6 +906,8 @@ mod tests {
             b(3, 9, 2, "h", "d"),
             b(3, 9, 1, "x", "d"),
             b(3, 9, 1, "h", "x"),
+            bb(3, 9, 1, "h", "d", None),
+            bb(3, 9, 1, "h", "d", Some("other-barrier")),
         ] {
             assert_ne!(base, id(&other));
         }
