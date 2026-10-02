@@ -17,8 +17,9 @@
 //!
 //! A baseline at the same position as the start's discontinuity barrier
 //! carries that barrier's exact capture identity (`binds`); selection lets it
-//! supersede that barrier only. Anything uncertain writes nothing: the table
-//! stays unproven at R0.
+//! supersede that barrier only. Anything uncertain writes no activation
+//! proof (a captured shape may already be registered): the table stays
+//! unproven at R0.
 
 use deltaforge_core::{CheckpointOrder, SourceError, SourceResult};
 use tracing::{info, warn};
@@ -304,8 +305,10 @@ pub(crate) async fn establish(
 /// captured shape is registered and a `baseline` at E (binding the one
 /// barrier exactly at E, if any) is appended - before the rows are decoded -
 /// only if it then decides the rows (see `admit_decisive`). Anything
-/// uncertain writes nothing and returns `false`; a connection on another
-/// server or a storage failure is an error.
+/// uncertain writes no activation proof and returns `false` (a candidate
+/// schema already registered from the capture may remain registered, as in
+/// the FULL fallback); a connection on another server or a storage failure
+/// is an error.
 pub(crate) async fn establish_at(
     ctx: &mut RunCtx,
     db: &str,

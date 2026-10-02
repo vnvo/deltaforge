@@ -34,6 +34,11 @@ impl BinlogStream {
         self.channel.abort_on_drop()
     }
 
+    /// DeltaForge patch: see [`PacketChannel::linger`].
+    pub fn linger(&self) -> Result<Option<std::time::Duration>, BinlogError> {
+        self.channel.linger()
+    }
+
     pub async fn close(&mut self) -> Result<(), BinlogError> {
         self.channel.close().await?;
         Ok(())

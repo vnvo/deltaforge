@@ -138,6 +138,33 @@ impl PacketChannel {
         Ok(())
     }
 
+    /// DeltaForge patch: the socket's `SO_LINGER` (to verify
+    /// [`Self::abort_on_drop`] is armed).
+    pub fn linger(&self) -> Result<Option<Duration>, BinlogError> {
+        #[cfg(unix)]
+        {
+            use socket2::SockRef;
+            use std::os::unix::io::BorrowedFd;
+
+            let raw_fd = self.stream.as_raw_fd();
+            let borrowed_fd = unsafe { BorrowedFd::borrow_raw(raw_fd) };
+            SockRef::from(&borrowed_fd)
+                .linger()
+                .map_err(BinlogError::IoError)
+        }
+        #[cfg(windows)]
+        {
+            use socket2::SockRef;
+            use std::os::windows::io::BorrowedSocket;
+
+            let raw_socket = self.stream.as_raw_socket();
+            let borrowed_socket = unsafe { BorrowedSocket::borrow_raw(raw_socket) };
+            SockRef::from(&borrowed_socket)
+                .linger()
+                .map_err(BinlogError::IoError)
+        }
+    }
+
     pub async fn close(&self) -> Result<(), BinlogError> {
         self.stream.shutdown(std::net::Shutdown::Both)?;
         Ok(())

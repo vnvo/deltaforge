@@ -83,6 +83,27 @@ pub(crate) async fn open_replication_session(
     client: &BinlogClient,
     expected_uuid: &str,
 ) -> Result<BinlogStream, SessionError> {
+    open_session(client, expected_uuid, false).await
+}
+
+/// [`open_replication_session`] for a short-lived reader (the interval
+/// scanner): an abortive close (`SO_LINGER` 0) is armed right after the TCP
+/// connection is established, before any other awaited step, so however the
+/// reader ends - completion, error, timeout, or its future being cancelled,
+/// even mid-open - dropping the connection resets it and the server's next
+/// write ends its dump thread. Not armable: the open fails.
+pub(crate) async fn open_replication_session_abortive(
+    client: &BinlogClient,
+    expected_uuid: &str,
+) -> Result<BinlogStream, SessionError> {
+    open_session(client, expected_uuid, true).await
+}
+
+async fn open_session(
+    client: &BinlogClient,
+    expected_uuid: &str,
+    abortive: bool,
+) -> Result<BinlogStream, SessionError> {
     // The connector's keepalive configuration type is not public; no
     // production client sets it, and silently dropping it is not an option.
     if client.keepalive_idle_secs != 0 || client.keepalive_interval_secs != 0 {
@@ -105,6 +126,13 @@ pub(crate) async fn open_replication_session(
         .connect()
         .await
         .map_err(connect)?;
+    if abortive {
+        channel.abort_on_drop().map_err(|e| {
+            SessionError::Connect(format!(
+                "cannot arm the session's abortive close: {e}"
+            ))
+        })?;
+    }
 
     let identity =
         CommandUtil::execute_query(&mut channel, "SELECT @@GLOBAL.server_uuid")

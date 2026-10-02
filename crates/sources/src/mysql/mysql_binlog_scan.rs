@@ -36,7 +36,7 @@ use super::MySqlCheckpoint;
 use super::mysql_activation::EventIdentity;
 use super::mysql_ddl_attribution::{BarrierScopeOf, DdlEffect, classify};
 use super::mysql_schema_loader::{Live, fetch_table_schema_on};
-use super::mysql_session::{SessionError, open_replication_session};
+use super::mysql_session::{SessionError, open_replication_session_abortive};
 use super::mysql_table_schema::MySqlTableSchema;
 use crate::durable_checkpoint::{
     Intervals, WmPos, gtid_subseteq, merge_intervals,
@@ -443,7 +443,7 @@ pub(crate) async fn scan_interval(
 
     let mut stream = tokio::time::timeout(
         limits.max_duration,
-        open_replication_session(&client, server_uuid),
+        open_replication_session_abortive(&client, server_uuid),
     )
     .await
     .map_err(|_| {
@@ -454,9 +454,11 @@ pub(crate) async fn scan_interval(
         SessionError::NoIdentity(why) => ProofError::OtherServer(why),
         SessionError::Connect(why) => ProofError::Open(why),
     })?;
-    // The walk, then the session ended on every path while this scan still
-    // owns it: an abortive close (reset), so the server's next write to it -
-    // at the latest the 1 s heartbeat on an idle server - fails and its dump
+    // The session's abortive close was armed right after it connected (see
+    // `open_replication_session_abortive`): however this scan ends -
+    // completion, error, timeout, or the future being cancelled or dropped -
+    // dropping it resets the connection, the server's next write to it (at
+    // the latest the 1 s heartbeat on an idle server) fails and its dump
     // thread ends. No connection is ever killed by id (ids can be reused).
     let walked: Result<(u64, u64), ProofError> = async {
         let (mut events, mut bytes) = (0u64, 0u64);
@@ -516,7 +518,6 @@ pub(crate) async fn scan_interval(
         Ok((events, bytes))
     }
     .await;
-    let _ = stream.abort_on_drop();
     drop(stream);
     let (events, bytes) = walked?;
     Ok(ScanReport {
@@ -1269,6 +1270,111 @@ mod tests {
                     );
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
+            }
+        }
+
+        /// The scanner's sessions are armed for an abortive close as soon as
+        /// they are open, before anything is read; the stream's are not.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn scan_sessions_are_armed_for_an_abortive_close_on_open() {
+            use crate::mysql::mysql_session::{
+                open_replication_session, open_replication_session_abortive,
+            };
+            let dsn = server(true).await;
+            let uuid = uuid(&dsn).await;
+            let client = BinlogClient {
+                url: dsn.clone(),
+                server_id: 4_000_126,
+                gtid_enabled: true,
+                gtid_set: position(&dsn).await.gtid_set.unwrap(),
+                timeout_secs: 30,
+                ..Default::default()
+            };
+            let scan = open_replication_session_abortive(&client, &uuid)
+                .await
+                .unwrap();
+            assert_eq!(scan.linger().unwrap(), Some(Duration::ZERO));
+            drop(scan);
+            let stream =
+                open_replication_session(&client, &uuid).await.unwrap();
+            assert_ne!(stream.linger().unwrap(), Some(Duration::ZERO));
+        }
+
+        /// A scan cancelled while it waits (its future dropped mid-read)
+        /// also leaves no dump thread: the session's abortive close was armed
+        /// right after it opened.
+        #[tokio::test]
+        #[ignore = "requires docker"]
+        async fn a_cancelled_scan_ends_its_server_session() {
+            // Own server: no other replication session may be connected.
+            let (_c, port) = start(true).await;
+            let dsn = dsn_of(port);
+            let uuid = uuid(&dsn).await;
+            let dumps = |dsn: String| async move {
+                let mut c =
+                    mysql_async::Conn::from_url(dsn.as_str()).await.unwrap();
+                let n: Vec<u64> = c
+                    .query(
+                        "SELECT ID FROM information_schema.PROCESSLIST \
+                         WHERE COMMAND LIKE 'Binlog Dump%'",
+                    )
+                    .await
+                    .unwrap();
+                c.disconnect().await.ok();
+                n
+            };
+            let from = position(&dsn).await;
+            // An end not yet executed: the scan waits for events.
+            let mut to = from.clone();
+            let set = from.gtid_set.clone().unwrap();
+            let (head, last) = set.rsplit_once('-').unwrap();
+            let n: u64 = last.parse().unwrap();
+            to.gtid_set = Some(format!("{head}-{}", n + 1000));
+            let task = tokio::spawn({
+                let (dsn, uuid, from, to) =
+                    (dsn.clone(), uuid.clone(), from, to);
+                async move {
+                    scan_interval(
+                        &dsn,
+                        4_000_125,
+                        &uuid,
+                        LINEAGE,
+                        &from,
+                        &to,
+                        &ScanLimits {
+                            max_duration: Duration::from_secs(120),
+                            ..ScanLimits::default()
+                        },
+                    )
+                    .await
+                }
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while dumps(dsn.clone()).await.is_empty() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the scan never opened"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            let cancelled = std::time::Instant::now();
+            loop {
+                let left = dumps(dsn.clone()).await;
+                if left.is_empty() {
+                    eprintln!(
+                        "dump thread gone {} ms after the cancellation",
+                        cancelled.elapsed().as_millis()
+                    );
+                    break;
+                }
+                assert!(
+                    cancelled.elapsed() < Duration::from_secs(5),
+                    "dump thread left behind: {left:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
 

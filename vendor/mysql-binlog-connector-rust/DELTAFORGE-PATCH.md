@@ -38,7 +38,7 @@ semantics, six added) and by DeltaForge's live test
 (MySQL 8.4, every supported type, composite prefixed key, invisible column,
 charset exceptions; FULL and MINIMAL).
 
-## Abortive close (`abort_on_drop`)
+## Abortive close (`abort_on_drop`, `linger`)
 
 `PacketChannel::abort_on_drop` / `BinlogStream::abort_on_drop` set
 `SO_LINGER` to zero on the connection's socket, so dropping it resets the
@@ -48,3 +48,8 @@ fails. After a reset its next write (a heartbeat on an idle server) fails at
 once. DeltaForge's binlog interval scanner uses it to end its short-lived
 dump sessions promptly without killing any connection by id. It acts only on
 the connection it is called on.
+
+`PacketChannel::linger` / `BinlogStream::linger` read the socket's
+`SO_LINGER`, so callers and tests can verify the abortive close is armed.
+DeltaForge arms it right after the TCP connection is established, before
+any other awaited step, so a cancelled open also resets the connection.
