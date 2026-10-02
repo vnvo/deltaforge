@@ -40,6 +40,7 @@ use test_common::init_test_tracing;
 const ROOT_PW: &str = "pw";
 const TENANT: &str = "acme";
 const ACTIVATION_NS: &str = "schemas.v1.activation";
+const BARRIER_NS: &str = "schemas.v1.activation.barrier";
 const T: &str =
     "CREATE TABLE t (id INT PRIMARY KEY, a VARCHAR(16), b VARCHAR(16))";
 
@@ -1110,4 +1111,73 @@ async fn rows_event_identity_gtid() {
 #[ignore = "requires docker"]
 async fn rows_event_identity_file_position() {
     rows_event_identity(false).await;
+}
+
+/// The FULL fallback writes its observation, and emits the row, only if
+/// the observation then decides the row: another unmatched record at the
+/// row's position (here an `unknown` record beside the barrier it binds)
+/// keeps the rows unproven, and nothing is written.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn full_fallback_writes_nothing_unless_it_decides_the_row() {
+    init_test_tracing();
+    let db = "pm_full_admit";
+    let port = server(true, true).await;
+    let hash = lineage_hash(port).await;
+    prepare(port, db, &[T]).await;
+    let st = State::new().await;
+    commit_a_position(port, &st, db, db).await;
+    let committed = st.ckpt.get_raw(db).await.unwrap().unwrap();
+    let r = run(source(db, port, db, &["t"], &st), &st).await;
+    sql(port, db, &stmts(&[OPAQUE_DDL])).await;
+
+    // The barrier is durable before the source reads on; plant an
+    // `unknown` record at its position in the table's stream.
+    let barriers = SchemaKey::source_prefix(TENANT, db, &hash);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let barrier: Value = loop {
+        // The first is the stream-start barrier of the first run.
+        let found: Vec<Value> = st
+            .backend
+            .log_list(BARRIER_NS, &barriers)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, b)| serde_json::from_slice::<Value>(&b).unwrap())
+            .collect();
+        if found.len() >= 2 {
+            break found.last().unwrap().clone();
+        }
+        assert!(Instant::now() < deadline, "no barrier record: {found:?}");
+        sleep(Duration::from_millis(200)).await;
+    };
+    let unknown = serde_json::json!({
+        "format_version": barrier["format_version"],
+        "position": barrier["position"],
+        "kind": "unknown",
+    });
+    let table = SchemaKey::new(TENANT, db, &hash, db, "t").backend_key();
+    st.backend
+        .log_append_if_absent(
+            ACTIVATION_NS,
+            &table,
+            "planted-unknown",
+            &serde_json::to_vec(&unknown).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    sql(
+        port,
+        db,
+        &stmts(&["INSERT INTO t VALUES (1, 'A1', 'B1', 7)"]),
+    )
+    .await;
+    let (got, res) = until_stopped(r).await;
+    fails_closed(&res, "would not resolve selection");
+    assert!(got.is_empty(), "rows: {:?}", image(&got));
+    assert!(
+        full_observations(&st.activation(db, &hash, db, "t").await).is_empty()
+    );
+    assert_eq!(st.ckpt.get_raw(db).await.unwrap().unwrap(), committed);
 }

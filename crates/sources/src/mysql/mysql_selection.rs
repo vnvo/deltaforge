@@ -334,8 +334,18 @@ async fn validate_full(
         ));
     }
     match (&full.row_event, &full.row_position) {
-        (EventIdentity::Gtid { .. }, WmPos::MysqlGtid { .. })
-        | (EventIdentity::FilePos { .. }, WmPos::MysqlBinlog { .. }) => {}
+        (EventIdentity::Gtid { ordinal, .. }, WmPos::MysqlGtid { .. })
+        | (EventIdentity::FilePos { ordinal, .. }, WmPos::MysqlBinlog { .. }) =>
+        {
+            // A rows event always has its ordinal (from 1); 0 is a
+            // statement identity, never a FULL row.
+            if *ordinal == 0 {
+                return Err(invalid(
+                    key,
+                    "FULL row event identity has no rows-event ordinal",
+                ));
+            }
+        }
         _ => {
             return Err(invalid(
                 key,
@@ -534,6 +544,42 @@ pub(crate) async fn select_for_rows(
     }
 }
 
+/// A proposed FULL observation is admitted only if, added to the current
+/// timeline, the whole timeline still validates and selection at `row`
+/// proves the observation's version with the observation itself as the
+/// decisive record. Any other decisive record at that position (an unmatched
+/// ddl or barrier, an `unknown`, an incomparable record) keeps the row
+/// unproven.
+async fn admit_full(
+    registry: &DurableSchemaRegistry,
+    key: &SchemaKey,
+    current: &Timeline,
+    proposed: Stored,
+    row: &WmPos,
+) -> Result<(), String> {
+    let Kind::Observed { version, .. } = proposed.record.kind else {
+        return Err("the proposed record is not an observation".into());
+    };
+    let mut augmented = Timeline {
+        records: current.records.clone(),
+        barriers: current.barriers.clone(),
+    };
+    augmented.records.push(proposed.clone());
+    validate(registry, key, &augmented)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    match select_decisive(&augmented.all(), row) {
+        (Selection::Proven { version: v }, Some(decisive))
+            if v == version && decisive == proposed.capture_id =>
+        {
+            Ok(())
+        }
+        (selection, _) => Err(format!(
+            "the FULL observation would not resolve selection at the rows ({selection:?})"
+        )),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn full_fallback(
     ctx: &mut RunCtx,
@@ -661,6 +707,15 @@ async fn full_fallback(
     let stream = table_stream(key);
     let id =
         full_capture_id(&lineage, &stream, &record).map_err(timeline_error)?;
+    // Nothing is written, and the row not emitted, unless this observation
+    // resolves selection at the row once it is part of the timeline.
+    let proposed = Stored {
+        capture_id: id.clone(),
+        record: record.clone(),
+    };
+    admit_full(registry, key, t, proposed, row)
+        .await
+        .map_err(|why| fail(db, table, &why))?;
     mysql_activation::append(
         &ctx.registry_backend,
         registry,
@@ -778,50 +833,23 @@ mod tests {
         }
     }
 
-    /// A FULL observation at `row` over the key's only version, otherwise
-    /// complete and consistent (digests and capture identity derived).
-    async fn full_observation(
-        reg: &DurableSchemaRegistry,
-        key: &SchemaKey,
-        signature: Signature,
-        row: WmPos,
-        live: WmPos,
-    ) -> Stored {
-        let (candidates, candidates_digest) =
-            evaluate_candidates(reg, key, 1, &signature).await.unwrap();
-        let (version, hash) = unique_match(&candidates).unwrap();
-        let record = Record::new(
-            row.clone(),
-            Kind::Observed {
-                version,
-                binds: None,
-                proof: None,
-                full: Some(Box::new(FullProof {
-                    signature_format: SIGNATURE_FORMAT.to_string(),
-                    row_event: EventIdentity::Gtid {
-                        gtid: format!("{UUID}:6"),
-                        ordinal: 2,
-                    },
-                    row_position: row,
-                    signature_digest: signature.digest(),
-                    signature,
-                    schema_hash: hash.clone(),
-                    live_position: live,
-                    live_schema_hash: hash,
-                    high_water: 1,
-                    candidates_digest,
-                })),
-            },
-        );
-        let capture_id =
-            full_capture_id(&key.lineage_hash, &table_stream(key), &record)
-                .unwrap();
-        Stored { capture_id, record }
+    fn row_event(ordinal: u32) -> EventIdentity {
+        EventIdentity::Gtid {
+            gtid: format!("{UUID}:6"),
+            ordinal,
+        }
     }
 
-    #[tokio::test]
-    async fn full_evidence_needs_full_metadata_and_a_live_capture_after_the_row()
-     {
+    /// One registered version (a single INT column `a`) and its FULL and
+    /// MINIMAL TableMap signatures.
+    struct Fixture {
+        reg: Arc<DurableSchemaRegistry>,
+        key: SchemaKey,
+        full: Signature,
+        minimal: Signature,
+    }
+
+    async fn fixture() -> Fixture {
         use mysql_binlog_connector_rust::event::table_map::table_metadata::{
             ColumnMetadata, TableMetadata,
         };
@@ -863,22 +891,87 @@ mod tests {
             primary_key: Vec::new(),
         }));
         assert_eq!(compare(&schema, &full.table_map()), Verdict::Match);
-        let check = |stored: Stored| {
-            let t = Timeline {
-                records: vec![stored],
-                barriers: Vec::new(),
-            };
-            let (reg, key) = (&reg, &key);
-            async move { validate(reg, key, &t).await.map_err(|e| format!("{e:#}")) }
+        Fixture {
+            reg,
+            key,
+            full,
+            minimal: signature(None),
+        }
+    }
+
+    /// A FULL observation at `row` over the key's only version, otherwise
+    /// complete and consistent (digests and capture identity derived).
+    async fn full_observation(
+        f: &Fixture,
+        signature: Signature,
+        row: WmPos,
+        live: WmPos,
+        event: EventIdentity,
+        binds: Option<&str>,
+    ) -> Stored {
+        let (candidates, candidates_digest) =
+            evaluate_candidates(&f.reg, &f.key, 1, &signature)
+                .await
+                .unwrap();
+        let (version, hash) = unique_match(&candidates).unwrap();
+        let record = Record::new(
+            row.clone(),
+            Kind::Observed {
+                version,
+                binds: binds.map(str::to_string),
+                proof: None,
+                full: Some(Box::new(FullProof {
+                    signature_format: SIGNATURE_FORMAT.to_string(),
+                    row_event: event,
+                    row_position: row,
+                    signature_digest: signature.digest(),
+                    signature,
+                    schema_hash: hash.clone(),
+                    live_position: live,
+                    live_schema_hash: hash,
+                    high_water: 1,
+                    candidates_digest,
+                })),
+            },
+        );
+        let capture_id = full_capture_id(
+            &f.key.lineage_hash,
+            &table_stream(&f.key),
+            &record,
+        )
+        .unwrap();
+        Stored { capture_id, record }
+    }
+
+    async fn check(f: &Fixture, records: Vec<Stored>) -> Result<(), String> {
+        let t = Timeline {
+            records,
+            barriers: Vec::new(),
         };
+        validate(&f.reg, &f.key, &t)
+            .await
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    #[tokio::test]
+    async fn full_evidence_needs_full_metadata_and_a_live_capture_after_the_row()
+     {
+        let f = fixture().await;
         let row = gtid("1-5");
+        let obs = |sig: &Signature, live: WmPos| {
+            full_observation(
+                &f,
+                sig.clone(),
+                row.clone(),
+                live,
+                row_event(1),
+                None,
+            )
+        };
 
         // A live capture at or after the row: valid.
         for live in [gtid("1-7"), row.clone()] {
-            let s =
-                full_observation(&reg, &key, full.clone(), row.clone(), live)
-                    .await;
-            check(s).await.unwrap();
+            check(&f, vec![obs(&f.full, live).await]).await.unwrap();
         }
         // Earlier, or incomparable (another server's set, another mode):
         // never a post-row capture.
@@ -893,22 +986,174 @@ mod tests {
                 pos: 4,
             },
         ] {
-            let s =
-                full_observation(&reg, &key, full.clone(), row.clone(), live)
-                    .await;
-            let err = check(s).await.unwrap_err();
+            let err =
+                check(&f, vec![obs(&f.full, live).await]).await.unwrap_err();
             assert!(err.contains("not at or after the row"), "{err}");
         }
         // A MINIMAL signature never stands as FULL evidence.
-        let s = full_observation(
-            &reg,
-            &key,
-            signature(None),
+        let err = check(&f, vec![obs(&f.minimal, gtid("1-7")).await])
+            .await
+            .unwrap_err();
+        assert!(err.contains("without FULL metadata"), "{err}");
+    }
+
+    /// A FULL row identity always names a rows event (ordinal from 1), in
+    /// GTID and in file/position mode; ordinal 0 is a statement identity.
+    #[tokio::test]
+    async fn full_row_identities_need_a_rows_event_ordinal() {
+        let f = fixture().await;
+        let binlog = |pos: u64| WmPos::MysqlBinlog {
+            file_base: "mysql-bin".into(),
+            file_index: 1,
+            pos,
+        };
+        let file_event = |ordinal: u32| EventIdentity::FilePos {
+            file: "mysql-bin.000001".into(),
+            end_pos: 150,
+            ordinal,
+        };
+        let cases = [
+            (gtid("1-5"), gtid("1-7"), row_event(0), row_event(1)),
+            (binlog(100), binlog(200), file_event(0), file_event(1)),
+        ];
+        for (row, live, zero, one) in cases {
+            let ok = full_observation(
+                &f,
+                f.full.clone(),
+                row.clone(),
+                live.clone(),
+                one,
+                None,
+            )
+            .await;
+            check(&f, vec![ok]).await.unwrap();
+            let forged =
+                full_observation(&f, f.full.clone(), row, live, zero, None)
+                    .await;
+            let err = check(&f, vec![forged]).await.unwrap_err();
+            assert!(err.contains("no rows-event ordinal"), "{err}");
+        }
+    }
+
+    /// A FULL observation is admitted only when, added to the timeline, it
+    /// is the decisive record proving its version at the row.
+    #[tokio::test]
+    async fn a_full_observation_is_admitted_only_if_it_decides_the_row() {
+        let f = fixture().await;
+        let row = gtid("1-5");
+        let at = |id: &str, position: WmPos, kind: Kind| Stored {
+            capture_id: id.into(),
+            record: Record::new(position, kind),
+        };
+        let ddl = |id: &str| at(id, row.clone(), Kind::Ddl);
+        let barrier = at(
+            "b1",
             row.clone(),
+            Kind::Barrier {
+                scope: mysql_activation::BarrierScope::Lineage,
+            },
+        );
+        let proposal = |binds: Option<&'static str>| {
+            full_observation(
+                &f,
+                f.full.clone(),
+                row.clone(),
+                gtid("1-7"),
+                row_event(1),
+                binds,
+            )
+        };
+        let admit = |records: Vec<Stored>, barriers: Vec<Stored>, p: Stored| {
+            let current = Timeline { records, barriers };
+            let (f, row) = (&f, row.clone());
+            async move { admit_full(&f.reg, &f.key, &current, p, &row).await }
+        };
+
+        // It binds the one ddl, or the one barrier, at the row: admitted.
+        admit(vec![ddl("d1")], vec![], proposal(Some("d1")).await)
+            .await
+            .unwrap();
+        admit(vec![], vec![barrier.clone()], proposal(Some("b1")).await)
+            .await
+            .unwrap();
+
+        let rejected = [
+            // A ddl plus another distinct ddl, or a barrier, at the row.
+            (
+                vec![ddl("d1"), ddl("d2")],
+                vec![],
+                proposal(Some("d1")).await,
+            ),
+            (
+                vec![ddl("d1")],
+                vec![barrier.clone()],
+                proposal(Some("d1")).await,
+            ),
+            // An `unknown` at the row.
+            (
+                vec![at("u1", row.clone(), Kind::Unknown)],
+                vec![],
+                proposal(None).await,
+            ),
+            // An earlier record incomparable with the row.
+            (
+                vec![at(
+                    "x1",
+                    WmPos::MysqlGtid {
+                        gtid_set: "4e11fa47-71ca-11e1-9e33-c80aa9429562:1-2"
+                            .into(),
+                    },
+                    Kind::Ddl,
+                )],
+                vec![],
+                proposal(None).await,
+            ),
+            // Still ambiguous once inserted: it closes nothing at the row.
+            (vec![ddl("d1")], vec![], proposal(None).await),
+        ];
+        for (records, barriers, p) in rejected {
+            let err = admit(records, barriers, p).await.unwrap_err();
+            assert!(err.contains("would not resolve selection"), "{err}");
+        }
+
+        // The version is proven, but by another record: a later valid
+        // observation decides a later row.
+        let later = full_observation(
+            &f,
+            f.full.clone(),
+            gtid("1-6"),
             gtid("1-7"),
+            row_event(1),
+            None,
         )
         .await;
-        let err = check(s).await.unwrap_err();
-        assert!(err.contains("without FULL metadata"), "{err}");
+        let current = Timeline {
+            records: vec![later],
+            barriers: Vec::new(),
+        };
+        let err = admit_full(
+            &f.reg,
+            &f.key,
+            &current,
+            proposal(None).await,
+            &gtid("1-6"),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("would not resolve selection"), "{err}");
+
+        // It would decide the row, but its own evidence is invalid (a live
+        // capture before the row): the augmented timeline does not validate.
+        let invalid = full_observation(
+            &f,
+            f.full.clone(),
+            row.clone(),
+            gtid("1-3"),
+            row_event(1),
+            None,
+        )
+        .await;
+        let err = admit(vec![], vec![], invalid).await.unwrap_err();
+        assert!(err.contains("not at or after the row"), "{err}");
     }
 }
