@@ -19,7 +19,6 @@ use mysql_async::prelude::Queryable;
 use sources::failover::identity::{
     IdentityComparison, IdentityStore, ServerIdentity,
 };
-use sources::failover::reconciler::{SchemaDelta, SchemaReconciler};
 use sources::mysql::{MySqlSource, mysql_health};
 use sources::postgres::{PostgresSource, postgres_health};
 use sources::stream_probe::{reset_streams_opened, streams_opened};
@@ -309,6 +308,30 @@ where
         }
     }
     events
+}
+
+/// The failover drift marker of `db.table` under the lineage of
+/// `server_uuid`, if its check completed.
+async fn drift_marker(
+    backend: &ArcStorageBackend,
+    source_id: &str,
+    server_uuid: &str,
+    db: &str,
+    table: &str,
+) -> Option<serde_json::Value> {
+    let hash = storage::adapters::LineageDescriptor::mysql(server_uuid)
+        .unwrap()
+        .lineage_hash();
+    let key =
+        storage::adapters::SchemaKey::new("acme", source_id, &hash, db, table)
+            .backend_key();
+    backend
+        .log_list("schemas.v1.failover.drift", &key)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(_, b)| serde_json::from_slice(&b).unwrap())
+        .next()
 }
 
 fn has_id(e: &Event, id: i64) -> bool {
@@ -626,32 +649,18 @@ async fn mysql_failover_schema_drift_detected() -> Result<()> {
         handle.stop();
         handle.join().await.ok();
 
+        // Drift is checked lazily per table. B's own schema DDL follows the
+        // failover position in its binlog, so the table's first event under
+        // the new lineage is a DDL: its shape at the failover position is
+        // unprovable, and under adapt that is recorded durably.
         let uuid_b = mysql_fetch_uuid(port_b).await;
-        let reconciler =
-            SchemaReconciler::new(Arc::clone(&registry), Arc::clone(&backend));
-        let id_a = ServerIdentity::MySql(mysql_health::MySqlServerIdentity {
-            server_uuid: uuid_a,
-        });
-        let id_b = ServerIdentity::MySql(mysql_health::MySqlServerIdentity {
-            server_uuid: uuid_b,
-        });
-        let record = reconciler
-            .already_completed("fo_drift", &id_a, &id_b)
-            .await?
-            .expect("reconciliation record must exist");
-
-        let orders = record
-            .table_results
-            .iter()
-            .find(|r| r.table == "orders")
-            .expect("orders must appear in results");
-        assert!(
-            orders.deltas.iter().any(|d| matches!(
-                d, SchemaDelta::ColumnAdded { column } if column.name == "status"
-            )),
-            "expected ColumnAdded(status), got: {:?}", orders.deltas
-        );
-        info!("✓ ColumnAdded delta recorded for 'status'");
+        let _ = uuid_a;
+        let marker = drift_marker(&backend, "fo_drift", &uuid_b, DB, "orders")
+            .await
+            .expect("the table's failover drift check is recorded");
+        assert_eq!(marker["outcome"], "adapted_unprovable", "{marker}");
+        assert!(marker["previous_schema_hash"].is_string(), "{marker}");
+        info!("✓ adapted-unprovable drift outcome recorded");
     }
 
     Ok(())
@@ -749,11 +758,16 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
 
         match timeout(Duration::from_secs(20), handle.join()).await {
             Ok(Err(e)) => {
+                // The table's first event under the new lineage is B's own
+                // DDL: its shape at the failover position cannot be proven,
+                // which halt treats like drift.
+                let msg = e.to_string();
                 assert!(
-                    e.to_string().contains("schema drift"),
+                    msg.contains("cannot be proven")
+                        && msg.contains("on_schema_drift=halt"),
                     "unexpected error: {e}"
                 );
-                info!("✓ source stopped with schema drift error");
+                info!("✓ source stopped before any write under halt");
             }
             Ok(Ok(())) => panic!(
                 "source must not succeed when schema drift detected with halt policy"

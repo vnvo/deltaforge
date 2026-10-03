@@ -1200,6 +1200,20 @@ async fn record_query(
         }
     };
 
+    // After a failover, a tracked table's first event may be this DDL: its
+    // drift policy applies before any record is written.
+    for t in &tables {
+        let (db, table) = (name(&t.db), name(&t.table));
+        if ctx.allow.matches(&db, &table) {
+            super::mysql_failover_drift::check_in_stream(
+                ctx,
+                &db,
+                &table,
+                super::mysql_failover_drift::FirstEvent::Ddl,
+            )
+            .await?;
+        }
+    }
     let fail = |what: &str, e: anyhow::Error| {
         SourceError::Other(e.context(format!(
             "persist the activation {what} of a QueryEvent at {}:{}",
@@ -1382,9 +1396,10 @@ mod tests {
             txn_eval: None,
             txn_eval_cp: None,
             selection: Default::default(),
+            failover: None,
+            drift_checked: Default::default(),
             checkpoint_gtid: Some("GTID-UNIT".to_string()),
             checkpoint_file: "mysql-bin.000001".to_string(),
-            tables: vec!["shop.orders".to_string()],
             outbox_tables: AllowList::default(),
             identity_store: IdentityStore::new(Arc::new(
                 storage::MemoryStorageBackend::new(),

@@ -47,9 +47,10 @@ If reachability cannot be determined (e.g. the health query fails transiently), 
 
 ### 2. Schema drift detection
 
-DeltaForge compares the schema last registered from the old primary against the live catalog on the new primary. Any column additions, removals, or renames are recorded as a `ReconcileRecord` in the storage backend.
+DeltaForge compares each table's schema last registered under the old primary with its schema on the new primary.
 
-If drift is found, the schema cache is invalidated so the next row event triggers a fresh load with the correct column mapping.
+- **MySQL**: per table, when the table is first used on the new primary - its first rows, a DDL of it, or a snapshot of it - not when the connection is re-established. Nothing is enumerated, so tables matched by wildcard patterns are covered. The comparison is against the table's shape at the exact failover position, proven by capturing the table and scanning the new primary's binlog. If anything between the failover position and the table's first rows could have changed the table (a DDL of the table, a statement DeltaForge cannot attribute to tables, a purged interval), or the table's first event is itself a DDL, the comparison is unprovable. The outcome is recorded durably per table, so a completed check is not repeated.
+- **PostgreSQL**: at reconnect, for the tables the source has already used; any column additions, removals, or renames are recorded as a `ReconcileRecord` in the storage backend, and the schema cache is invalidated so the next row event triggers a fresh load.
 
 ### 3. Resume
 
@@ -83,15 +84,17 @@ source:
 
 | Value | Behaviour |
 |-------|-----------|
-| `adapt` | Record drift, reload schema cache, continue streaming. Default. |
-| `halt` | Stop the source when any schema drift is detected. Requires operator intervention. |
+| `adapt` | Record drift, use the new primary's schema, continue streaming. Default. On MySQL an unprovable comparison is recorded as such and normal schema proof continues. |
+| `halt` | Stop the source when schema drift is detected (on MySQL also when drift cannot be ruled out), before anything is registered or emitted for the table. Requires operator intervention. |
 
-When `halt` fires, the reconciliation record is persisted before the source stops - you can inspect what changed before restarting:
+On MySQL the source stops at the table's first event on the new primary, with an error naming the table:
 
 ```
-schema drift detected after failover and on_schema_drift=halt.
-Verify B's schema and apply any missing migrations before restarting.
+table shop.orders after failover: schema drift since the failover (1 change(s)) and on_schema_drift=halt.
+Nothing was registered or emitted. ...
 ```
+
+On PostgreSQL the reconciliation record is persisted before the source stops, so you can inspect what changed before restarting.
 
 Use `halt` when your failover environments do not guarantee DDL sync to replicas before promotion.
 

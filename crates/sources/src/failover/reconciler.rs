@@ -223,7 +223,7 @@ pub fn reconcile_table(
     ReconcileOutcome::Reconcilable(deltas)
 }
 
-fn extract_stored_columns(v: &Value) -> Vec<ColumnSnapshot> {
+pub(crate) fn extract_stored_columns(v: &Value) -> Vec<ColumnSnapshot> {
     let pk_names: Vec<&str> = v
         .get("primary_key")
         .and_then(|pk| pk.as_array())

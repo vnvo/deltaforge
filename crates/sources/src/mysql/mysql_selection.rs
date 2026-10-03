@@ -522,6 +522,22 @@ pub(crate) async fn select_for_rows(
     let signature = Signature::of(tm);
     let sig_digest = signature.digest();
     let mut t = timeline(ctx, &key).await?;
+    // After a failover, the table's drift policy applies before anything is
+    // registered, baselined, decoded or emitted for these rows.
+    if let Some(row_cp) = ctx.txn_eval_cp.clone() {
+        let all = t.all();
+        super::mysql_failover_drift::check_in_stream(
+            ctx,
+            db,
+            table,
+            super::mysql_failover_drift::FirstEvent::Rows {
+                at: &row,
+                at_cp: &row_cp,
+                timeline: &all,
+            },
+        )
+        .await?;
+    }
     let (mut selection, mut decisive) = select_decisive(&t.all(), &row);
     // No positional proof yet: a lazy baseline at the rows' position, if it
     // can be proven and decides the rows (before any FULL fallback).

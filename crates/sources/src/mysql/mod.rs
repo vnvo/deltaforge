@@ -33,6 +33,7 @@ mod mysql_baseline;
 mod mysql_binlog_scan;
 mod mysql_checkpoint_lineage;
 mod mysql_ddl_attribution;
+mod mysql_failover_drift;
 mod mysql_forward_proof;
 mod mysql_helpers;
 mod mysql_selection;
@@ -181,12 +182,16 @@ pub(crate) struct RunCtx {
     txn_eval_cp: Option<MySqlCheckpoint>,
     /// Validated activation timelines and row-time selections.
     selection: mysql_selection::Caches,
+    /// The current lineage's failover anchor (`Some(None)`: not entered by
+    /// a failover; `None`: not loaded yet).
+    failover: Option<Option<Arc<mysql_failover_drift::FailoverAnchor>>>,
+    /// Tables whose failover drift check completed in this run.
+    drift_checked: std::collections::HashSet<String>,
     /// Original checkpoint position, preserved even after a pre-connect failover
     /// adjustment clears last_gtid/last_file. Used by check_position_reachability
     /// to verify whether A's position actually exists on B.
     checkpoint_gtid: Option<String>,
     checkpoint_file: String,
-    tables: Vec<String>,
     outbox_tables: AllowList,
     identity_store: IdentityStore,
     reconciler: SchemaReconciler,
@@ -424,6 +429,57 @@ impl MySqlSource {
         )
         .await?;
 
+        // A failover found at startup is anchored before anything is
+        // snapshotted or streamed: F is the committed (carried-over) GTID
+        // position, if this server has executed it (else unknown: every
+        // table's drift check is then unprovable). Each table's drift policy
+        // applies lazily at its first event (`mysql_failover_drift`).
+        if let IdentityComparison::Changed { previous, .. } =
+            IdentityStore::new(Arc::clone(&self.backend))
+                .compare(&self.id, &root)
+                .await
+                .map_err(SourceError::Other)?
+        {
+            let committed = chkpt_store
+                .get::<MySqlCheckpoint>(&self.id)
+                .await
+                .map_err(|e| SourceError::Checkpoint {
+                    details: e.to_string().into(),
+                })?;
+            let position = match committed.and_then(|c| c.gtid_set) {
+                Some(set) => {
+                    let mut conn = open_control_connection(
+                        self.dsn.expose(),
+                        &server_uuid,
+                        CONTROL_CONNECT_TIMEOUT,
+                    )
+                    .await
+                    .map_err(|e| e.into_source_error(&server_uuid))?;
+                    let proven =
+                        mysql_health::require_gtid_executed(&mut conn, &set)
+                            .await
+                            .is_ok();
+                    conn.disconnect().await.ok();
+                    proven.then(|| MySqlCheckpoint {
+                        file: String::new(),
+                        pos: 0,
+                        gtid_set: Some(set),
+                        lineage: Some(lineage_hash.clone()),
+                    })
+                }
+                None => None,
+            };
+            mysql_failover_drift::record_anchor(
+                &self.backend,
+                &self.tenant,
+                &self.id,
+                &mysql_registry_lineage(&previous)?.lineage_hash(),
+                position,
+            )
+            .await
+            .map_err(SourceError::Other)?;
+        }
+
         // snapshot (if configured)
         let snapshot_progress: Option<MysqlSnapshotProgress> = chkpt_store
             .get_raw(&mysql_snapshot::progress_key(&self.id))
@@ -475,6 +531,47 @@ impl MySqlSource {
                 &self.tenant,
                 self.registry_scope.clone(),
             );
+            // After a failover, each snapshotted table's drift policy
+            // applies before its schema is loaded or registered and before
+            // any snapshot row (Round 38).
+            if let Some(anchor) = mysql_failover_drift::load_anchor(
+                &self.backend,
+                &self.tenant,
+                &self.id,
+            )
+            .await
+            .map_err(SourceError::Other)?
+            {
+                let tables =
+                    snap_schema_loader.expand_patterns(&self.tables).await?;
+                let scope = self.registry_scope.current()?;
+                let lctn = fetch_lower_case_table_names(
+                    self.dsn.expose(),
+                    &server_uuid,
+                )
+                .await?;
+                let env = mysql_failover_drift::DriftEnv {
+                    backend: &self.backend,
+                    loader: &snap_schema_loader,
+                    scope: &scope,
+                    dsn: self.dsn.expose(),
+                    server_uuid: &server_uuid,
+                    source_id: &self.id,
+                    halt: self.on_schema_drift
+                        == deltaforge_config::OnSchemaDrift::Halt,
+                    lower_case_table_names: lctn,
+                };
+                for (db, table) in &tables {
+                    mysql_failover_drift::check(
+                        &env,
+                        &anchor,
+                        db,
+                        table,
+                        mysql_failover_drift::FirstEvent::Snapshot,
+                    )
+                    .await?;
+                }
+            }
             let tracked = snap_schema_loader.preload(&self.tables).await?;
 
             // Validate every table + freeze lineage + allocate the generation
@@ -650,9 +747,10 @@ impl MySqlSource {
             txn_eval: None,
             txn_eval_cp: None,
             selection: Default::default(),
+            failover: None,
+            drift_checked: Default::default(),
             checkpoint_gtid,
             checkpoint_file,
-            tables: self.tables.clone(),
             outbox_tables: self.outbox_tables.clone(),
             on_schema_drift: self.on_schema_drift.clone(),
             // Verified once above, before the stream opens.
@@ -1675,31 +1773,38 @@ async fn run_failover_reconciliation(
     conn.disconnect().await.ok();
     let record = record?;
 
-    let drifted: Vec<(String, String)> = record
-        .table_results
-        .iter()
-        .filter(|r| !r.deltas.is_empty())
-        .map(|r| (r.db.clone(), r.table.clone()))
-        .collect();
-    if !drifted.is_empty() {
-        warn!(pipeline=%ctx.pipeline, source_id=%ctx.source_id, "schema drift detected after failover");
-        if ctx.on_schema_drift == deltaforge_config::OnSchemaDrift::Halt {
-            return Err(SourceError::Other(anyhow::anyhow!(
-                "schema drift detected after failover and on_schema_drift=halt. \
-                Verify B's schema and apply any missing migrations before restarting."
-            )));
-        }
-    }
+    // Schema drift is not decided here: each table is checked lazily at its
+    // first event under the new lineage (`mysql_failover_drift`), wildcard
+    // tables included, against the shape proven at the failover position.
+    let _ = record;
 
     // Reconciled: record the lineage edge (fail closed) and publish it - from
     // here on every connection must prove it is `current`.
     sync_registry_lineage(ctx, &current).await?;
 
-    // Reload every drifted table under the new lineage before any stream
-    // opens; a failure stops here and a restart repeats it from the record.
-    for (db, table) in &drifted {
-        ctx.schema.reload_schema(db, table).await?;
-    }
+    // The failover position F for every table's lazy drift check, durable
+    // before the identity record (an earlier anchor for this lineage epoch,
+    // e.g. recorded at startup before a snapshot replaced the checkpoint,
+    // is kept). Tables are re-checked under the new lineage.
+    let previous_lineage = mysql_registry_lineage(&previous)?.lineage_hash();
+    let current_lineage =
+        ctx.registry_scope.current()?.lineage().lineage_hash.clone();
+    mysql_failover_drift::record_anchor(
+        &ctx.registry_backend,
+        &ctx.tenant,
+        &ctx.source_id,
+        &previous_lineage,
+        Some(MySqlCheckpoint {
+            file: String::new(),
+            pos: 0,
+            gtid_set: Some(resume_set.clone()),
+            lineage: Some(current_lineage),
+        }),
+    )
+    .await
+    .map_err(SourceError::Other)?;
+    ctx.failover = None;
+    ctx.drift_checked.clear();
 
     // Persist new identity only after everything above completed. Fail closed
     // if the durable write does not commit.
@@ -1753,31 +1858,9 @@ async fn failover_record(
         return Ok(record);
     }
 
-    // Schema diff - use ctx.tables (configured patterns) since the schema cache
-    // may be empty (preload is intentionally deferred until after reconciliation).
-    let mut inputs = Vec::new();
-    for pattern in &ctx.tables {
-        let parts: Vec<&str> = pattern.splitn(2, '.').collect();
-        if parts.len() != 2 || parts[1].contains('*') {
-            continue;
-        }
-        let (db, table) = (parts[0].to_owned(), parts[1].to_owned());
-        // A failed read is not "table dropped": stop (retried by reconnect).
-        let live_cols = mysql_health::fetch_live_columns_on(conn, &db, &table)
-            .await
-            .map_err(|e| SourceError::Connect {
-                details: format!(
-                    "failover live columns of {db}.{table}: {e:#}"
-                )
-                .into(),
-            })?
-            .map(|cols| cols.into_iter().map(Into::into).collect());
-        inputs.push(ReconcileInput {
-            db,
-            table,
-            live_columns: live_cols,
-        });
-    }
+    // No eager per-table schema diff (it skipped wildcard tables): drift
+    // is checked lazily per table (`mysql_failover_drift`).
+    let inputs: Vec<ReconcileInput> = Vec::new();
 
     // Diff against the last-known schemas of the lineage the source ran
     // under before this failover: the published scope while it still is

@@ -1341,10 +1341,13 @@ async fn a_failover_record_persisted_before_lineage_publication_is_resumed_halt(
     let (st, proxy, a, (_t, t), id) =
         interrupted_before_lineage_publication(OnSchemaDrift::Halt, db, 33)
             .await;
-    let ua = uuid(a).await;
-    // Every restart re-derives the drift from the stored record and halts.
+    let ut = uuid(t).await;
+    // Drift is decided lazily per table (spec 7.22): the restart completes
+    // the reconciliation, then the table's first event under the target
+    // stops the source under halt - before anything is registered or
+    // emitted for it - and, as nothing records completion, every restart
+    // stops again.
     for attempt in 0..2 {
-        let watch = DumpWatch::start(t);
         let mut r = run(
             source(&id, proxy.dsn(db), db, &st, OnSchemaDrift::Halt),
             &st,
@@ -1353,79 +1356,112 @@ async fn a_failover_record_persisted_before_lineage_publication_is_resumed_halt(
         insert(t, db, 9100 + attempt, "t").await;
         let res = stopped(r.handle).await;
         assert!(
-            matches!(&res, Err(SourceError::Other(e)) if e.to_string().contains("on_schema_drift=halt")),
+            matches!(&res, Err(SourceError::Schema { details }) if details.contains("on_schema_drift=halt")),
             "restart {attempt} halts again: {res:?}"
         );
         let rows =
             rows_until(&mut r.rx, None, Duration::from_millis(200)).await;
         assert!(rows.is_empty(), "{rows:?}");
-        assert_eq!(st.identity(&id).await, Some(ua.clone()));
-        assert!(!watch.saw_dump().await, "binlog dump while halted");
+        assert_eq!(st.identity(&id).await, Some(ut.clone()));
+        let key =
+            SchemaKey::new(TENANT, id.as_str(), lineage_hash(&ut), db, "t");
+        assert!(
+            registry_history(&st.registry, &key).await.is_empty(),
+            "nothing registered under the target while halted"
+        );
     }
     proxy.all_to(a);
 }
 
+/// After a failover, a table's drift check registers the proven shape under
+/// the new lineage at the table's first event (spec 7.22). When that write
+/// fails, the source stops before the table's rows are emitted; nothing
+/// records completion, so every restart repeats the check (and stops again)
+/// until it succeeds, and then the rows stream.
 #[tokio::test]
 #[ignore = "requires docker"]
-async fn a_failed_schema_reload_opens_no_stream_and_is_retried_on_restart() {
+async fn a_failed_drift_registration_stops_before_the_rows_and_is_retried() {
     init_test_tracing();
     let a = port(&GTID_A, true, 11).await;
-    let ua = uuid(a).await;
     let db = "ident_reload";
     prepare(a, db, "a").await;
     let proxy = Proxy::start(a).await;
     let (st, fault) = State::faulty().await;
     let id = "ident_reload";
     let r = streaming_on_a(&proxy, a, id, db, &st, OnSchemaDrift::Adapt).await;
-    let (_t, t) = promoted(34, db, true, &executed(a).await).await;
+    // A promoted replica whose binlog starts at the failover position: the
+    // table's first event under it is its rows, so the drift check proves
+    // and registers its shape.
+    let (_t, t) = start(true, 34).await;
+    sql(
+        t,
+        &[
+            format!("CREATE DATABASE {db}"),
+            format!("CREATE TABLE {db}.t (id INT PRIMARY KEY, src VARCHAR(8), b_only INT)"),
+            "RESET BINARY LOGS AND GTIDS".to_string(),
+            format!("SET GLOBAL gtid_purged = '{}'", executed(a).await),
+        ],
+    )
+    .await;
     let ut = uuid(t).await;
     let fail_registry = || {
         let mut f = fault.fail_writes_to.lock().unwrap();
         f.push("schemas.v1".into());
         f.push("schemas.v1.index".into());
     };
+    let drift_markers = |st: &State| {
+        let key = SchemaKey::new(TENANT, id, lineage_hash(&ut), db, "t")
+            .backend_key();
+        let backend = st.backend.clone();
+        async move {
+            backend
+                .log_list("schemas.v1.failover.drift", &key)
+                .await
+                .unwrap()
+                .len()
+        }
+    };
 
-    // Online failover: reconciled and published, but the reload fails.
+    // Online failover, then the table's first rows: the registration fails.
     fail_registry();
-    let watch = DumpWatch::start(t);
     proxy.all_to(t);
     proxy.sever();
     insert(t, db, 9500, "t").await;
     let mut r = r;
-    assert!(stopped(r.handle).await.is_err(), "the failed reload stops");
+    assert!(
+        stopped(r.handle).await.is_err(),
+        "the failed registration stops"
+    );
     let rows = rows_until(&mut r.rx, None, Duration::from_millis(200)).await;
     assert!(rows.iter().all(|(_, s)| s != "t"), "{rows:?}");
-    assert!(
-        !watch.saw_dump().await,
-        "a stream opened after a failed reload"
-    );
-    assert_eq!(st.identity(id).await, Some(ua.clone()));
+    assert_eq!(drift_markers(&st).await, 0, "no completion recorded");
 
-    // Restart, reload still failing: retried from the stored record before
-    // any stream opens, and stops again.
-    let watch = DumpWatch::start(t);
-    let r = run(
-        source(id, proxy.dsn(db), db, &st, OnSchemaDrift::Adapt),
-        &st,
-    )
-    .await;
-    assert!(stopped(r.handle).await.is_err(), "the retried reload stops");
-    assert!(!watch.saw_dump().await, "a stream opened before the reload");
-    assert_eq!(st.identity(id).await, Some(ua));
-
-    // Restart, reload succeeds: then it streams.
-    fault.fail_writes_to.lock().unwrap().clear();
+    // Restart, registration still failing: the check is repeated and stops.
     let mut r = run(
         source(id, proxy.dsn(db), db, &st, OnSchemaDrift::Adapt),
         &st,
     )
     .await;
     insert(t, db, 9501, "t").await;
-    let got = rows_until(&mut r.rx, Some(9501), Duration::from_secs(60)).await;
+    assert!(stopped(r.handle).await.is_err(), "the repeated check stops");
+    let rows = rows_until(&mut r.rx, None, Duration::from_millis(200)).await;
+    assert!(rows.iter().all(|(_, s)| s != "t"), "{rows:?}");
+    assert_eq!(drift_markers(&st).await, 0, "no completion recorded");
+
+    // Restart, registration succeeds: recorded once, then the rows stream.
+    fault.fail_writes_to.lock().unwrap().clear();
+    let mut r = run(
+        source(id, proxy.dsn(db), db, &st, OnSchemaDrift::Adapt),
+        &st,
+    )
+    .await;
+    insert(t, db, 9502, "t").await;
+    let got = rows_until(&mut r.rx, Some(9502), Duration::from_secs(60)).await;
     assert!(
-        got.contains(&(9501, "t".into())),
-        "streams after the reload"
+        got.contains(&(9502, "t".into())),
+        "streams after the check completes"
     );
+    assert_eq!(drift_markers(&st).await, 1);
     assert_eq!(st.identity(id).await, Some(ut));
     stop(r.handle).await;
     proxy.all_to(a);
