@@ -815,6 +815,17 @@ impl PipelineManager {
         &self,
         spec: PipelineSpec,
     ) -> Result<PipelineRuntime> {
+        self.spawn_pipeline_carrying(spec, Vec::new()).await
+    }
+
+    /// Spawn a runtime that also carries incidents a previous runtime could
+    /// not persist (they stay visible as durability-pending and keep being
+    /// retried).
+    async fn spawn_pipeline_carrying(
+        &self,
+        spec: PipelineSpec,
+        carried: Vec<deltaforge_core::IncidentDraft>,
+    ) -> Result<PipelineRuntime> {
         let pipeline_name = spec.metadata.name.clone();
         counter!("deltaforge_pipelines_total").increment(1);
 
@@ -913,15 +924,17 @@ impl PipelineManager {
             SourceCfg::Postgres(_) => vec![],
         };
 
-        let health = crate::incidents::PipelineHealth::new(
-            &pipeline_name,
-            Arc::new(crate::incidents::IncidentRecorder::new(
-                crate::incidents::IncidentStore::new(
-                    self.backend.clone(),
-                    &pipeline_name,
-                ),
-            )),
-        );
+        // Repairs pending incident audit entries and an interrupted recovery
+        // before any task starts, and carries over incidents a previous
+        // runtime could not persist.
+        let health = crate::incidents::PipelineHealth::start(
+            crate::incidents::IncidentStore::new(
+                self.backend.clone(),
+                &pipeline_name,
+            ),
+            carried,
+        )
+        .await?;
 
         let (event_tx, event_rx) = mpsc::channel::<SourceItem>(32_768);
         // Signal the source (change-driven) after each per-sink commit so it refreshes
@@ -953,24 +966,30 @@ impl PipelineManager {
             paused: src_paused,
             pause_notify: src_pause_notify,
             join: raw_join,
+            ready: src_ready,
         } = src_handle;
         let monitored_join = tokio::spawn(async move {
             let res = raw_join.await;
-            if !cancel_for_src.is_cancelled() {
-                let draft = match &res {
+            let exit = if cancel_for_src.is_cancelled() {
+                crate::incidents::TaskExit::Clean
+            } else {
+                let epoch = health_for_src.epoch();
+                crate::incidents::TaskExit::Failed(match &res {
                     Ok(r) => crate::incidents::classify_source_exit(
                         &source_id_for_src,
                         r.as_ref().map(|_| ()),
                         false,
+                        epoch,
                     ),
                     Err(_) => crate::incidents::classify_source_exit(
                         &source_id_for_src,
                         Ok(()),
                         true,
+                        epoch,
                     ),
-                };
-                health_for_src.failed(draft).await;
-            }
+                })
+            };
+            health_for_src.exit(crate::incidents::Task::Source, exit);
             match res {
                 Ok(r) => r,
                 Err(e) => Err(SourceError::Other(anyhow::anyhow!(
@@ -978,11 +997,27 @@ impl PipelineManager {
                 ))),
             }
         });
+        // The verified-running barrier: once the source reports its startup
+        // checks passed and its stream open, while the coordinator still runs
+        // and nothing has failed, the pipeline has recovered (its open
+        // unclassified incidents are resolved as `pipeline_recovered`).
+        {
+            let health = Arc::clone(&health);
+            let ready = src_ready.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = ready.wait() => health.source_ready().await,
+                    _ = cancel.cancelled() => {}
+                }
+            });
+        }
         let src_handle = SourceHandle {
             cancel: src_cancel,
             paused: src_paused,
             pause_notify: src_pause_notify,
             join: monitored_join,
+            ready: src_ready,
         };
 
         // Keep a processor handle + a by-id sink map for the replay delivery, which runs
@@ -1255,22 +1290,27 @@ impl PipelineManager {
             // the shared token on its way out; an operator stop is a clean Ok
             // after cancellation. Mark the pipeline failed in every case except
             // that clean operator stop, so /health and /ready surface it.
-            if coordinator_exit_failed(&result, cancel_check.is_cancelled()) {
+            let exit = if coordinator_exit_failed(
+                &result,
+                cancel_check.is_cancelled(),
+            ) {
                 gauge!("deltaforge_pipeline_status", "pipeline" => pname.clone())
                     .set(-1.0);
                 match &result {
-                    Err(e) => {
-                        health_for_task
-                            .failed(
-                                crate::incidents::classify_coordinator_exit(e),
-                            )
-                            .await
-                    }
+                    Err(e) => crate::incidents::TaskExit::Failed(
+                        crate::incidents::classify_coordinator_exit(
+                            e,
+                            health_for_task.epoch(),
+                        ),
+                    ),
                     // A clean stop nobody asked for: the source closed the
                     // event channel; its own exit attributes the failure.
-                    Ok(()) => health_for_task.coordinator_ended().await,
+                    Ok(()) => crate::incidents::TaskExit::ChannelClosed,
                 }
-            }
+            } else {
+                crate::incidents::TaskExit::Clean
+            };
+            health_for_task.exit(crate::incidents::Task::Coordinator, exit);
             info!(pipeline = %pname, "pipeline coordinator exited");
             result
         });
@@ -1537,6 +1577,7 @@ impl PipelineManager {
                 return;
             };
             rt.status = PipelineStatus::Stopped;
+            rt.health.shutdown();
             (
                 rt.cancel.clone(),
                 std::mem::take(&mut rt.sources),
@@ -2047,7 +2088,32 @@ impl PipelineController for PipelineManager {
         };
 
         // A failed pipeline is restarted like a stopped one: its tasks are
-        // awaited to termination, then a fresh runtime is spawned.
+        // awaited to termination, then a fresh runtime is spawned. Its
+        // incidents are flushed first; any still not durable are carried
+        // into the new runtime (visible as durability-pending, retried). A
+        // resume never acknowledges or resolves an incident.
+        let mut carried = Vec::new();
+        if failed {
+            let health = Arc::clone(
+                &self
+                    .pipelines
+                    .read()
+                    .get(name)
+                    .ok_or_else(|| {
+                        PipelineAPIError::NotFound(name.to_string())
+                    })?
+                    .health,
+            );
+            carried = health.flush().await;
+            if !carried.is_empty() {
+                tracing::warn!(
+                    pipeline = %name,
+                    pending = carried.len(),
+                    "resuming with incidents not yet durable; they stay \
+                     visible as durability-pending"
+                );
+            }
+        }
         let status = if failed {
             PipelineStatus::Stopped
         } else {
@@ -2081,7 +2147,7 @@ impl PipelineController for PipelineManager {
                     .spec
                     .clone();
                 let new_runtime = self
-                    .spawn_pipeline(spec)
+                    .spawn_pipeline_carrying(spec, carried)
                     .await
                     .map_err(PipelineAPIError::Failed)?;
                 let info = new_runtime.info();
@@ -2855,14 +2921,11 @@ mod tests {
         PipelineRuntime {
             spec,
             status: PipelineStatus::Running,
-            health: crate::incidents::PipelineHealth::new(
-                "test",
-                Arc::new(crate::incidents::IncidentRecorder::new(
-                    crate::incidents::IncidentStore::new(
-                        Arc::new(storage::MemoryStorageBackend::new()),
-                        "test",
-                    ),
-                )),
+            health: crate::incidents::PipelineHealth::new_unprepared(
+                crate::incidents::IncidentStore::new(
+                    Arc::new(storage::MemoryStorageBackend::new()),
+                    "test",
+                ),
             ),
             cancel: CancellationToken::new(),
             pause: pause_tx,
@@ -3229,6 +3292,69 @@ mod tests {
         assert_eq!(again.incident_id, rec.incident_id, "the same condition");
         assert_eq!(again.occurrences, 2);
         assert_eq!(store.list().await.unwrap().len(), 1);
+    }
+
+    /// While the state store rejects incident writes, the pipeline still
+    /// fails with its incident (durability pending); a resume flushes it and,
+    /// when it is still not durable, carries it into the new runtime, where it
+    /// stays visible and is persisted once the store accepts writes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resume_carries_an_incident_that_is_not_durable_yet() {
+        let fault = Arc::new(storage::adapters::test_util::FaultBackend::new());
+        let backend: ArcStorageBackend = fault.clone();
+        let mgr = manager_with_ckpt(
+            Arc::clone(&backend),
+            Arc::new(BackendCheckpointStore::new(Arc::clone(&backend))),
+        )
+        .await;
+        fault
+            .fail_writes_to
+            .lock()
+            .unwrap()
+            .push(crate::incidents::INCIDENTS_NS.into());
+        mgr.start_pipeline(spec_dead("pc")).await.unwrap();
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let id = loop {
+            let id = {
+                let guard = mgr.pipelines.read();
+                let rt = guard.get("pc").unwrap();
+                rt.health.blocking_incident().filter(|_| rt.is_failed())
+            };
+            if let Some(id) = id {
+                break id;
+            }
+            assert!(std::time::Instant::now() < deadline, "never failed");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        assert!(
+            mgr.pipelines
+                .read()
+                .get("pc")
+                .unwrap()
+                .health
+                .durability_pending()
+        );
+
+        mgr.resume("pc").await.expect("resume proceeds");
+        {
+            let guard = mgr.pipelines.read();
+            let rt = guard.get("pc").unwrap();
+            let carried = rt.health.known();
+            assert!(
+                carried.iter().any(|k| k.id == id && !k.durable),
+                "the incident stays visible as durability-pending"
+            );
+        }
+        fault.fail_writes_to.lock().unwrap().clear();
+        let store =
+            crate::incidents::IncidentStore::new(Arc::clone(&backend), "pc");
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while store.get(&id).await.unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "never persisted");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     // ── Blocker 1: resume awaits stopped tasks before respawning ──
@@ -4197,14 +4323,11 @@ mod tests {
         let runtime = PipelineRuntime {
             spec: sample_spec(&name),
             status: PipelineStatus::Running,
-            health: crate::incidents::PipelineHealth::new(
-                "test",
-                Arc::new(crate::incidents::IncidentRecorder::new(
-                    crate::incidents::IncidentStore::new(
-                        Arc::new(storage::MemoryStorageBackend::new()),
-                        "test",
-                    ),
-                )),
+            health: crate::incidents::PipelineHealth::new_unprepared(
+                crate::incidents::IncidentStore::new(
+                    Arc::new(storage::MemoryStorageBackend::new()),
+                    "test",
+                ),
             ),
             cancel: CancellationToken::new(),
             pause: pause_tx2,

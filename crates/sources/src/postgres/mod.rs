@@ -347,6 +347,7 @@ impl PostgresSource {
         cancel: CancellationToken,
         paused: Arc<AtomicBool>,
         pause_notify: Arc<Notify>,
+        ready: deltaforge_core::SourceReady,
     ) -> SourceResult<()> {
         // Verify the physical lineage (cluster system_identifier + database OID)
         // and establish the schema-registry scope BEFORE any registry access:
@@ -685,6 +686,9 @@ impl PostgresSource {
             None => None,
         };
 
+        // Startup checks passed and the stream is open on the verified
+        // server: the source half of the verified-running barrier.
+        ready.mark();
         info!("entering replication loop");
         // Durable delivery frontier (separate from `ctx.last_lsn`, the read position):
         // the acknowledged LSN reported to PostgreSQL as flushed, sourced only from the
@@ -1153,6 +1157,8 @@ impl Source for PostgresSource {
         let cancel_for_task = cancel.clone();
         let paused_for_task = paused.clone();
         let pause_notify_for_task = pause_notify.clone();
+        let ready = deltaforge_core::SourceReady::new();
+        let ready_for_task = ready.clone();
 
         let join = tokio::spawn(async move {
             let res = this
@@ -1162,6 +1168,7 @@ impl Source for PostgresSource {
                     cancel_for_task,
                     paused_for_task,
                     pause_notify_for_task,
+                    ready_for_task,
                 )
                 .await;
             if let Err(e) = &res {
@@ -1175,6 +1182,7 @@ impl Source for PostgresSource {
             paused,
             pause_notify,
             join,
+            ready,
         }
     }
 
