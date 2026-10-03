@@ -1,7 +1,8 @@
 //! End-to-end integration tests for the S3/Parquet sink.
 //!
 //! These tests exercise the full runner-side wiring of:
-//!   `Event` → `S3Sink` (built by `build_s3_sink`) → `WriterPool`
+//!   `Event` → legacy rolling `S3Sink` (`durability: legacy_rolling`, built
+//!   by `build_s3_sink`) → `WriterPool`
 //!   → `ParquetFileWriter` → MinIO → Parquet read-back.
 //!
 //! The schema resolver is built via `runner::schema_provider::build_arrow_schema_resolver`
@@ -21,7 +22,7 @@ use arrow_array::{
 use async_trait::async_trait;
 use ctor::dtor;
 use deltaforge_config::{
-    S3Compression, S3FileFormat, S3FileRoll, S3SinkCfg, SinkCfg,
+    S3Compression, S3Durability, S3FileFormat, S3FileRoll, S3SinkCfg, SinkCfg,
 };
 use deltaforge_core::encoding::avro_types::TypeConversionOpts;
 use deltaforge_core::{
@@ -301,7 +302,9 @@ fn s3_cfg(format: S3FileFormat, prefix: &str, max_events: u64) -> S3SinkCfg {
         },
         send_timeout_secs: 60,
         required: Some(true),
-        durability: Default::default(),
+        // This suite covers the legacy rolling sink (`build_s3_sink`); the
+        // default (`durable_v2`) is built by the durable path instead.
+        durability: S3Durability::LegacyRolling,
         filter: None,
     }
 }
