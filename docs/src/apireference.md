@@ -22,16 +22,11 @@ deltaforge --config pipelines.yaml --api-addr 0.0.0.0:9090
 GET /health
 ```
 
-Returns `ok` when the process is running and all pipelines are healthy. Returns `503` if any pipeline has entered a failed state (e.g. position lost after failover, binlog purged, unrecoverable source error). Use for Kubernetes liveness probes — a `503` indicates the process should be restarted.
+Liveness only: returns `200` while the process and its API are running, and reports how many pipelines have failed. A failed pipeline is a readiness concern (see below), not a reason to restart the process - a pipeline that stopped fail-closed would fail again after every restart.
 
-**Response:** `200 OK` — all pipelines healthy
+**Response:** `200 OK`
 ```json
-{"status": "healthy", "pipelines": 3}
-```
-
-**Response:** `503 Service Unavailable` — one or more pipelines failed
-```json
-{"status": "unhealthy", "failed_pipelines": ["orders-cdc"]}
+{"status": "healthy", "pipelines": 3, "failed_pipelines": 1}
 ```
 
 ### Readiness Probe
@@ -40,7 +35,28 @@ Returns `ok` when the process is running and all pipelines are healthy. Returns 
 GET /ready
 ```
 
-Returns pipeline states. Use for Kubernetes readiness probes.
+Use for Kubernetes readiness probes. Returns `503` while any pipeline has failed or carries a blocking incident that is open or only acknowledged (acknowledging an incident does not clear it), and names them with their incidents.
+
+**Response:** `503 Service Unavailable`
+```json
+{
+  "status": "not_ready",
+  "failed_pipelines": ["orders-cdc"],
+  "blocked_pipelines": [
+    {
+      "name": "orders-cdc",
+      "status": "failed",
+      "primary_incident": "3f9c...",
+      "durability_pending": false,
+      "store_unavailable": false,
+      "blocking_incidents": [
+        {"incident_id": "3f9c...", "reason_code": "unclassified_failure", "status": {"state": "acknowledged"}, "durable": true}
+      ],
+      "overflow_blocking": 0
+    }
+  ]
+}
+```
 
 **Response:** `200 OK`
 ```json
@@ -234,6 +250,7 @@ Resumes a paused or stopped pipeline.
 
 - **From paused** — restarts event processing immediately; source connection was kept alive.
 - **From stopped** — reconnects to the source and replays from the last saved checkpoint; any events written to the binlog/WAL while stopped are replayed in order.
+- **From failed**: restarts it like a stopped pipeline. A resume never acknowledges or resolves its incidents: an `unclassified_failure` is resolved (`pipeline_recovered`) only once the restarted pipeline has reached verified running (the source finished its startup checks and opened its stream while the coordinator runs and nothing has failed).
 
 **Response:** `200 OK`
 ```json
@@ -622,6 +639,63 @@ Returns per-sink checkpoint positions and ages.
   {"sink_id": "redis-cache", "position": {"file": "mysql-bin.000005", "pos": 11000}, "age_seconds": 2.1}
 ]
 ```
+
+---
+
+## Incidents
+
+A pipeline that stops (or cannot do something safely) records an **incident**: a structured description with a stable `reason_code`, `retryability`, `safety_state` (`halted_safe`, `halted_uncertain`, `running_degraded`), allow-listed `evidence`, `recommended_actions` and an `explanation` generated from them. Incidents never contain error text, DSNs, SQL or row values. The same condition is the same incident across retries and restarts (its `occurrences` grow); a later independent occurrence is a new one.
+
+Lifecycle: `open` -> `acknowledged` -> `resolved`. Acknowledging means an operator has seen it; the incident stays open, keeps blocking the pipeline and readiness, and is resolved only by a verified check (or a future recovery operation). Every transition is recorded in an audit log. A pipeline keeps at most 63 open incidents individually; beyond that one `incident_overflow` incident counts the rest by reason code (blocking ones first).
+
+Status (`GET /pipelines/{name}`, `GET /pipelines`, `/ready`) carries an `incidents` summary: `primary` (the blocking incident of a failed pipeline), `primary_final`, `blocking`, `overflow_blocking`, `durability_pending` (an incident is known but its durable write is still being retried - it is not yet auditable) and `store_unavailable`.
+
+### List Incidents
+
+```http
+GET /pipelines/{name}/incidents
+```
+
+Every incident of the pipeline (open, acknowledged, recently resolved, and any not yet durable), with the primary incident.
+
+### Get Incident
+
+```http
+GET /pipelines/{name}/incidents/{id}
+```
+
+**Response:** `200 OK`
+```json
+{
+  "incident_id": "3f9c...",
+  "reason_code": "unclassified_failure",
+  "component": {"kind": "source", "id": "mysql"},
+  "retryability": "auto_retry",
+  "safety_state": "halted_uncertain",
+  "cause_code": "source_connect",
+  "explanation": "source mysql failed (source_connect). The pipeline stopped; this failure is not classified yet, see the logs for details.",
+  "evidence": {},
+  "recommended_actions": ["inspect_logs"],
+  "status": {"state": "open"},
+  "blocking": true,
+  "occurrences": 2,
+  "durable": true,
+  "audit_pending": false
+}
+```
+
+### Acknowledge Incident
+
+```http
+POST /pipelines/{name}/incidents/{id}/acknowledge
+Content-Type: application/json
+
+{"asserted_actor": "alice", "reason": "investigating the source outage"}
+```
+
+Moves an open incident to `acknowledged` and records the actor, the request's peer address (`origin`) and the reason in the audit log. The API has no authenticated identity yet: `asserted_actor` is recorded as caller-supplied (`actor_verified: false`). It does not change the pipeline, its source, sinks or checkpoints, and does not resolve the incident.
+
+**Responses:** `200 OK` with the incident; `400` when a field is empty; `404` for an unknown incident; `409` when it is already resolved, or not durable yet (retry once it is).
 
 ---
 

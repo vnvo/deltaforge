@@ -243,6 +243,7 @@ mod tests {
                 },
             },
             ops: None,
+            incidents: None,
         }
     }
 
@@ -372,6 +373,141 @@ mod tests {
             payload["failed_pipelines"],
             json!(["demo"]),
             "/ready must name the failed pipeline"
+        );
+    }
+
+    /// An acknowledged blocking incident still blocks: a running pipeline
+    /// that carries one keeps the instance not ready, and /ready names it.
+    #[tokio::test]
+    async fn an_acknowledged_blocking_incident_keeps_ready_503() {
+        let mut info = sample_pipe_info();
+        info.incidents = Some(crate::pipelines::PipelineIncidents {
+            blocking: vec![json!({
+                "incident_id": "abc",
+                "reason_code": "pg_different_cluster",
+                "status": {"state": "acknowledged"},
+                "durable": true,
+            })],
+            ..Default::default()
+        });
+        let app = router(AppState {
+            controller: Arc::new(HappyController { info }),
+        });
+        let ready = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE, ready.status());
+        let payload: serde_json::Value = serde_json::from_slice(
+            &to_bytes(ready.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        let blocked = &payload["blocked_pipelines"][0];
+        assert_eq!(blocked["name"], json!("demo"));
+        assert_eq!(blocked["status"], json!("running"));
+        assert_eq!(
+            blocked["blocking_incidents"][0]["incident_id"],
+            json!("abc")
+        );
+    }
+
+    /// One acknowledgement the endpoint passed to the controller: incident
+    /// id, request, origin.
+    type SeenAck =
+        (String, crate::pipelines::AcknowledgeRequest, Option<String>);
+
+    /// Records what the acknowledgement endpoint passes to the controller.
+    #[derive(Clone, Default)]
+    struct AckController {
+        seen: Arc<parking_lot::Mutex<Vec<SeenAck>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PipelineController for AckController {
+        async fn list(&self) -> Vec<PipeInfo> {
+            vec![]
+        }
+        async fn get(&self, name: &str) -> Result<PipeInfo, PipelineAPIError> {
+            Err(PipelineAPIError::NotFound(name.to_string()))
+        }
+        async fn create(
+            &self,
+            _spec: deltaforge_config::PipelineSpec,
+        ) -> Result<PipeInfo, PipelineAPIError> {
+            unimplemented!()
+        }
+        async fn patch(
+            &self,
+            _name: &str,
+            _patch: serde_json::Value,
+        ) -> Result<PipeInfo, PipelineAPIError> {
+            unimplemented!()
+        }
+        async fn pause(&self, _: &str) -> Result<PipeInfo, PipelineAPIError> {
+            unimplemented!()
+        }
+        async fn resume(&self, _: &str) -> Result<PipeInfo, PipelineAPIError> {
+            unimplemented!()
+        }
+        async fn stop(&self, _: &str) -> Result<PipeInfo, PipelineAPIError> {
+            unimplemented!()
+        }
+        async fn delete(&self, _: &str) -> Result<(), PipelineAPIError> {
+            unimplemented!()
+        }
+        async fn acknowledge_incident(
+            &self,
+            _name: &str,
+            id: &str,
+            req: crate::pipelines::AcknowledgeRequest,
+            origin: Option<String>,
+        ) -> Result<serde_json::Value, PipelineAPIError> {
+            self.seen.lock().push((id.to_string(), req, origin));
+            Ok(json!({"incident_id": id, "status": {"state": "acknowledged"}}))
+        }
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_requires_fields_and_ignores_client_origin_headers()
+    {
+        let controller = AckController::default();
+        let app = router(AppState {
+            controller: Arc::new(controller.clone()),
+        });
+        let post = |body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/pipelines/demo/incidents/abc/acknowledge")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "203.0.113.9")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let empty = app
+            .clone()
+            .oneshot(post(json!({"asserted_actor": "alice", "reason": " "})))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::BAD_REQUEST, empty.status());
+        assert!(controller.seen.lock().is_empty());
+
+        let ok = app
+            .oneshot(post(json!({"asserted_actor": "alice", "reason": "seen"})))
+            .await
+            .unwrap();
+        assert_eq!(StatusCode::OK, ok.status());
+        let seen = controller.seen.lock();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "abc");
+        assert_eq!(seen[0].1.asserted_actor, "alice");
+        assert_eq!(
+            seen[0].2, None,
+            "the origin comes from the connection, never a client header"
         );
     }
 

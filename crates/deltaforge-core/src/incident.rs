@@ -51,6 +51,17 @@ pub enum ReasonCode {
 }
 
 impl ReasonCode {
+    /// Every reason (bounded metric label values).
+    pub const ALL: [ReasonCode; 7] = [
+        Self::PgDifferentCluster,
+        Self::PgContinuityUnproven,
+        Self::MysqlGtidPositionUnavailable,
+        Self::SchemaDriftBlocked,
+        Self::SinkAckUncertain,
+        Self::UnclassifiedFailure,
+        Self::IncidentOverflow,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::PgDifferentCluster => "pg_different_cluster",
@@ -104,6 +115,8 @@ impl Retryability {
     Copy,
     PartialEq,
     Eq,
+    PartialOrd,
+    Ord,
     Hash,
     serde::Serialize,
     serde::Deserialize,
@@ -119,6 +132,13 @@ pub enum SafetyState {
 }
 
 impl SafetyState {
+    /// Every safety state (bounded metric label values).
+    pub const ALL: [SafetyState; 3] = [
+        Self::HaltedSafe,
+        Self::HaltedUncertain,
+        Self::RunningDegraded,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::HaltedSafe => "halted_safe",
