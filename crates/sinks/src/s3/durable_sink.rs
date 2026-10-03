@@ -290,7 +290,14 @@ impl Sink for DurableS3Sink {
             .publish(watermark, objects, events.len() as u64)
             .await
             .map_err(|e| {
-                if e.is_fatal() {
+                if matches!(e, super::head::HeadError::Ambiguous(_)) {
+                    crate::incident::ack_uncertain(
+                        &self.inner.id,
+                        ctx.checkpoint.as_bytes(),
+                        1,
+                        fatal(format!("durable publish failed: {e}")),
+                    )
+                } else if e.is_fatal() {
                     fatal(format!("durable publish failed: {e}"))
                 } else {
                     SinkError::Backpressure {

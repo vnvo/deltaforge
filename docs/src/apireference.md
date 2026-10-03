@@ -648,6 +648,20 @@ A pipeline that stops (or cannot do something safely) records an **incident**: a
 
 Lifecycle: `open` -> `acknowledged` -> `resolved`. Acknowledging means an operator has seen it; the incident stays open, keeps blocking the pipeline and readiness, and is resolved only by a verified check (or a future recovery operation). Every transition is recorded in an audit log. A pipeline keeps at most 63 open incidents individually; beyond that one `incident_overflow` incident counts the rest by reason code (blocking ones first).
 
+Reason codes:
+
+| `reason_code` | Raised when | Safety | Resolved by |
+|---|---|---|---|
+| `pg_different_cluster` | A PostgreSQL source reaches another cluster (or a replaced database); refused before anything is recorded or streamed | `halted_safe` | `lineage_verified`: a later start verifies the source's own server |
+| `pg_continuity_unproven` | The replication slot cannot be shown to hold the resume position: `slot_missing`, `slot_invalidated`, `wal_lost`, or unknown (`unknown_unreachable` after up to 2 min of retries, `unknown_query_failed` at once); replication never opens | `halted_safe` | `position_verified`: a later start verifies the position |
+| `mysql_gtid_position_unavailable` | The MySQL resume position is not available: `purged`, `not_executed`, `binlog_missing`, or unknown (as above) | `halted_safe` | `position_verified` |
+| `schema_drift_blocked` | `on_schema_drift = halt` stopped at a schema change of a table | `halted_safe` | `schema_accepted`: that table is accepted at its first use in a later run (unchanged schema, or an adapt reload) |
+| `sink_ack_uncertain` | A sink write was submitted but its outcome could not be settled (a Kafka transaction commit whose outcome stays unknown; an S3 HEAD publish whose response was lost and HEAD could not be reread) | `halted_uncertain` | `sink_acknowledged`: the sink acknowledges a later batch |
+| `unclassified_failure` | Any other failure of a source, sink or the coordinator (cause code only) | `halted_uncertain` | `pipeline_recovered`: the restarted pipeline reaches verified running |
+| `incident_overflow` | More than 63 open incidents; counts the rest by reason | | |
+
+Conditions resolved by a verified start (`unclassified_failure`, `pg_different_cluster`, the two position reasons) are bound to a recovery generation: the same failure before the restarted pipeline reaches verified running updates the same incident; after a genuine recovery it is a new one.
+
 Status (`GET /pipelines/{name}`, `GET /pipelines`, `/ready`) carries an `incidents` summary: `primary` (the blocking incident of a failed pipeline), `primary_final`, `blocking`, `overflow_blocking`, `durability_pending` (an incident is known but its durable write is still being retried - it is not yet auditable) and `store_unavailable`.
 
 ### List Incidents

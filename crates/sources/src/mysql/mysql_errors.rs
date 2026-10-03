@@ -223,7 +223,7 @@ fn is_auth_error(msg: &str) -> bool {
 
 /// Check if an error message indicates the binlog position has been purged.
 /// This is unrecoverable - reconnecting will hit the same error forever.
-fn is_purged_error(msg: &str) -> bool {
+pub(crate) fn is_purged_error(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     lower.contains("purged") || lower.contains("gtid_purged")
 }

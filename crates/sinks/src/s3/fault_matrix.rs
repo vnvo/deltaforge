@@ -75,6 +75,8 @@ enum Op {
     OriginalDelete,
     /// A `list_meta` call during reconciliation (Commit 10).
     ListObjects,
+    /// A read of HEAD.
+    HeadGet,
 }
 
 fn classify_put(key: &Path) -> Op {
@@ -116,6 +118,8 @@ fn classify_get(key: &Path) -> Option<Op> {
     let k = key.to_string();
     if k.contains("/wm-") && !k.contains("/compacted/") {
         Some(Op::GetData)
+    } else if k.contains("_manifest/HEAD") {
+        Some(Op::HeadGet)
     } else {
         None
     }
@@ -146,7 +150,7 @@ struct Trigger {
 /// failpoints over an inner `ObjectStoreConditional`.
 struct FaultStore {
     inner: Arc<ObjectStoreConditional>,
-    triggers: Vec<Trigger>,
+    triggers: std::sync::Mutex<Vec<Trigger>>,
     counts: Mutex<HashMap<Op, usize>>,
     /// Fired when a hang action begins, so a test can observe the boundary and
     /// then drop the in-flight future (abrupt cancellation).
@@ -157,7 +161,7 @@ impl FaultStore {
     fn new(inner: Arc<ObjectStoreConditional>, triggers: Vec<Trigger>) -> Self {
         Self {
             inner,
-            triggers,
+            triggers: std::sync::Mutex::new(triggers),
             counts: Mutex::new(HashMap::new()),
             hang_started: Arc::new(Notify::new()),
         }
@@ -169,9 +173,20 @@ impl FaultStore {
         let cur = *n;
         *n += 1;
         self.triggers
+            .lock()
+            .unwrap()
             .iter()
             .find(|t| t.op == op && t.nth == cur)
             .map(|t| t.action)
+    }
+
+    /// Fire `action` at the next occurrence of `op` (counted from now).
+    async fn arm_next(&self, op: Op, action: Action) {
+        let nth = *self.counts.lock().await.get(&op).unwrap_or(&0);
+        self.triggers
+            .lock()
+            .unwrap()
+            .push(Trigger { op, nth, action });
     }
 
     async fn hang(&self) -> ! {
@@ -548,6 +563,72 @@ async fn head_cas_lost_response_acks_because_head_references_entry() {
     let h = read_head(&inner).await.unwrap();
     assert_eq!(h.seq, 1);
     assert!(h.head_entry_key.is_some());
+}
+
+// ── Acknowledgement uncertainty: both sides of the acceptance boundary ──────
+
+/// A failure before the HEAD CAS (the acknowledging mutation) is a definite
+/// "not written": no ambiguity, nothing acknowledged.
+#[tokio::test]
+async fn a_failure_before_the_head_cas_is_definitely_not_written() {
+    let inner = inmem();
+    let (_fs, w) =
+        genesis(&inner, vec![tr(Op::ManifestPut, 0, Action::ErrBefore)]).await;
+    let err = w
+        .publish(&wm(1), vec![tobj("orders", b"a")], 1)
+        .await
+        .unwrap_err();
+    assert!(!matches!(err, HeadError::Ambiguous(_)), "{err:?}");
+    assert_eq!(read_head(&inner).await.unwrap().seq, 0);
+}
+
+/// The HEAD CAS was submitted (and applied) but its response was lost, and
+/// HEAD cannot be reread to settle it: the outcome is unknown.
+#[tokio::test]
+async fn a_lost_head_cas_response_without_a_reread_is_ambiguous() {
+    let inner = inmem();
+    let (fs, w) =
+        genesis(&inner, vec![tr(Op::HeadCas, 0, Action::ApplyThenErr)]).await;
+    fs.arm_next(Op::HeadGet, Action::ErrBefore).await;
+    let err = w
+        .publish(&wm(1), vec![tobj("orders", b"a")], 1)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HeadError::Ambiguous(_)), "{err:?}");
+    assert!(
+        err.is_fatal(),
+        "the pipeline stops; nothing is acknowledged"
+    );
+    // It did apply: the ambiguity is real, not a definite failure.
+    assert_eq!(read_head(&inner).await.unwrap().seq, 1);
+}
+
+/// The authoritative reread settles a lost response as committed (HEAD
+/// references the entry) or as absent (HEAD unchanged: retried); neither is
+/// uncertain.
+#[tokio::test]
+async fn an_authoritative_reread_settles_the_outcome() {
+    // Committed.
+    let inner = inmem();
+    let (_fs, w) =
+        genesis(&inner, vec![tr(Op::HeadCas, 0, Action::ApplyThenErr)]).await;
+    w.publish(&wm(1), vec![tobj("orders", b"a")], 1)
+        .await
+        .unwrap();
+    assert_eq!(read_head(&inner).await.unwrap().seq, 1);
+    // Absent: every CAS attempt errors without applying; each reread shows
+    // HEAD unchanged, so the result is a definite non-acknowledgement.
+    let inner = inmem();
+    let triggers = (0..64)
+        .map(|n| tr(Op::HeadCas, n, Action::ErrBefore))
+        .collect();
+    let (_fs, w) = genesis(&inner, triggers).await;
+    let err = w
+        .publish(&wm(1), vec![tobj("orders", b"a")], 1)
+        .await
+        .unwrap_err();
+    assert!(!matches!(err, HeadError::Ambiguous(_)), "{err:?}");
+    assert_eq!(read_head(&inner).await.unwrap().seq, 0, "not acknowledged");
 }
 
 // ── Abrupt cancellation (process death), not returned errors ────────────────
