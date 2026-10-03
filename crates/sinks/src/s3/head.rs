@@ -237,6 +237,12 @@ pub enum HeadError {
     /// A data-object or manifest-entry integrity failure while publishing.
     #[error("durable: {0}")]
     Durable(String),
+    /// The HEAD compare-and-swap was submitted but its response was lost, and
+    /// HEAD could not be reread to settle whether it applied: the batch may or
+    /// may not be acknowledged downstream. Fatal (the pipeline stops; the
+    /// checkpoint is not advanced).
+    #[error("publish outcome unknown: {0}")]
+    Ambiguous(String),
 }
 
 impl HeadError {
@@ -248,6 +254,7 @@ impl HeadError {
                 | HeadError::MissingReferenced { .. }
                 | HeadError::Fenced { .. }
                 | HeadError::RecoveryRequired(_)
+                | HeadError::Ambiguous(_)
         )
     }
 }
@@ -1657,13 +1664,24 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                 Ok(PutOutcome::AlreadyExists) => unreachable!("cas_put"),
                 // Conflict or a lost/ambiguous response: reread and disambiguate.
                 Ok(PutOutcome::Conflict) | Err(_) => {
+                    // An error (not a definite rejection) leaves the CAS's
+                    // outcome unknown until HEAD is reread.
+                    let ambiguous = cas.is_err();
                     self.cas_conflicts
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let (raw, etag) = match self
                         .store
                         .get_with_etag(&hkey)
                         .await
-                        .map_err(|e| HeadError::Store(e.to_string()))?
+                        .map_err(|e| {
+                            if ambiguous {
+                                HeadError::Ambiguous(format!(
+                                    "HEAD CAS response lost and HEAD unreadable: {e}"
+                                ))
+                            } else {
+                                HeadError::Store(e.to_string())
+                            }
+                        })?
                     {
                         Some((raw, Some(etag))) => (raw, etag),
                         Some((_, None)) => {

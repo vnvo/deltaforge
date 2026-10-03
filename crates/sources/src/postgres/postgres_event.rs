@@ -525,6 +525,11 @@ async fn handle_relation(
                 }));
             }
         }
+        // First use accepted: its schema matches the durable one (or it is
+        // new).
+        ctx.drift_resolver
+            .accepted(&format!("{schema}.{table}"))
+            .await;
     }
 
     Ok(())

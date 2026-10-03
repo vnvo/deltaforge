@@ -724,37 +724,43 @@ impl Sink for KafkaSink {
             Ok(_) => {
                 // Commit transaction if exactly-once.
                 if self.transactional {
-                    if let Err(e) = self
-                        .producer
-                        .commit_transaction(std::time::Duration::from_secs(30))
-                    {
-                        let is_fatal = matches!(&e, KafkaError::Transaction(re) if re.is_fatal());
-                        counter!(
-                            "deltaforge_sink_txn_aborts_total",
-                            "pipeline" => self.pipeline.clone(),
-                            "sink" => self.id.clone(),
-                        )
-                        .increment(1);
-                        if let Err(abort_err) = self.producer.abort_transaction(
-                            std::time::Duration::from_secs(10),
-                        ) {
-                            warn!(error = %abort_err, "abort_transaction failed after commit failure");
+                    match finish_transaction(&ProducerTxn(&self.producer)) {
+                        TxnEnd::Committed => {}
+                        TxnEnd::Aborted(reason) => {
+                            // Definitely not committed: nothing visible.
+                            counter!(
+                                "deltaforge_sink_txn_aborts_total",
+                                "pipeline" => self.pipeline.clone(),
+                                "sink" => self.id.clone(),
+                            )
+                            .increment(1);
+                            return Err(SinkError::Connect {
+                                details: format!(
+                                    "commit_transaction failed and the \
+                                     transaction was aborted: {reason}"
+                                )
+                                .into(),
+                            });
                         }
-                        return Err(if is_fatal {
-                            SinkError::Fatal {
-                                details: format!(
-                                    "commit_transaction fatal: {e}"
-                                )
-                                .into(),
-                            }
-                        } else {
-                            SinkError::Connect {
-                                details: format!(
-                                    "commit_transaction failed: {e}"
-                                )
-                                .into(),
-                            }
-                        });
+                        TxnEnd::Uncertain { attempts, reason } => {
+                            let boundary = events
+                                .last()
+                                .and_then(|e| e.checkpoint())
+                                .map(|c| c.as_bytes().to_vec())
+                                .unwrap_or_default();
+                            return Err(crate::incident::ack_uncertain(
+                                &self.id,
+                                &boundary,
+                                attempts as u64,
+                                SinkError::Fatal {
+                                    details: format!(
+                                        "commit_transaction outcome unknown \
+                                         after {attempts} attempt(s): {reason}"
+                                    )
+                                    .into(),
+                                },
+                            ));
+                        }
                     }
                     counter!(
                         "deltaforge_sink_txn_commits_total",
@@ -816,6 +822,110 @@ impl Sink for KafkaSink {
                         details: format!("kafka batch error: {}", e).into(),
                     })
                 }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Transaction completion
+// =============================================================================
+
+/// What one transactional producer call reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TxnCallError {
+    /// Retriable: the outcome of a commit is unknown and the commit may be
+    /// retried.
+    Retriable(String),
+    /// The transaction must be aborted (it was not committed).
+    RequiresAbort(String),
+    /// The producer cannot continue (a commit's outcome is still unknown).
+    Fatal(String),
+    Other(String),
+}
+
+impl From<&KafkaError> for TxnCallError {
+    fn from(e: &KafkaError) -> Self {
+        match e {
+            KafkaError::Transaction(re) if re.is_fatal() => {
+                Self::Fatal(e.to_string())
+            }
+            KafkaError::Transaction(re) if re.txn_requires_abort() => {
+                Self::RequiresAbort(e.to_string())
+            }
+            KafkaError::Transaction(re) if re.is_retriable() => {
+                Self::Retriable(e.to_string())
+            }
+            _ => Self::Other(e.to_string()),
+        }
+    }
+}
+
+/// The transactional calls the completion decision needs.
+pub(crate) trait TxnOps {
+    fn commit(&self) -> Result<(), TxnCallError>;
+    fn abort(&self) -> Result<(), TxnCallError>;
+}
+
+struct ProducerTxn<'a>(&'a FutureProducer<KafkaMetricsContext>);
+
+impl TxnOps for ProducerTxn<'_> {
+    fn commit(&self) -> Result<(), TxnCallError> {
+        self.0
+            .commit_transaction(std::time::Duration::from_secs(30))
+            .map_err(|e| TxnCallError::from(&e))
+    }
+    fn abort(&self) -> Result<(), TxnCallError> {
+        self.0
+            .abort_transaction(std::time::Duration::from_secs(10))
+            .map_err(|e| TxnCallError::from(&e))
+    }
+}
+
+/// How a transaction ended, by authoritative outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TxnEnd {
+    /// The commit succeeded (possibly on a retry after an unknown outcome).
+    Committed,
+    /// It was definitely not committed (aborted).
+    Aborted(String),
+    /// Submitted, outcome unknown: neither a commit nor an abort settled it.
+    Uncertain { attempts: u32, reason: String },
+}
+
+/// Commit attempts while the outcome stays unknown (retriable errors).
+pub(crate) const COMMIT_ATTEMPTS: u32 = 3;
+
+/// Finish a transaction whose messages were all delivered. A retriable commit
+/// error leaves the outcome unknown, so the commit is retried (librdkafka
+/// makes a retried commit settle it); a commit that requires an abort is
+/// aborted, and a completed abort is a definite "not committed". A fatal
+/// error, an unknown error, or an abort that fails leave the outcome unknown:
+/// uncertain (a fatal error does not prove the commit did not apply).
+pub(crate) fn finish_transaction(ops: &dyn TxnOps) -> TxnEnd {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match ops.commit() {
+            Ok(()) => return TxnEnd::Committed,
+            Err(TxnCallError::Retriable(reason)) => {
+                if attempts < COMMIT_ATTEMPTS {
+                    warn!(%reason, attempts, "commit outcome unknown; retrying the commit");
+                    continue;
+                }
+                return TxnEnd::Uncertain { attempts, reason };
+            }
+            Err(TxnCallError::RequiresAbort(reason)) => {
+                return match ops.abort() {
+                    Ok(()) => TxnEnd::Aborted(reason),
+                    Err(abort) => TxnEnd::Uncertain {
+                        attempts,
+                        reason: format!("{reason}; abort failed: {abort:?}"),
+                    },
+                };
+            }
+            Err(TxnCallError::Fatal(reason) | TxnCallError::Other(reason)) => {
+                return TxnEnd::Uncertain { attempts, reason };
             }
         }
     }
@@ -989,6 +1099,132 @@ fn outcome_to_sink_error(outcome: RetryOutcome<KafkaRetryError>) -> SinkError {
                 details: e.to_string().into(),
             },
         },
+    }
+}
+
+#[cfg(test)]
+mod txn_end_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Scripted transactional calls: each commit/abort pops its next result.
+    struct Script {
+        commits: Mutex<Vec<Result<(), TxnCallError>>>,
+        aborts: Mutex<Vec<Result<(), TxnCallError>>>,
+    }
+
+    impl Script {
+        fn new(
+            commits: Vec<Result<(), TxnCallError>>,
+            aborts: Vec<Result<(), TxnCallError>>,
+        ) -> Self {
+            Self {
+                commits: Mutex::new(commits),
+                aborts: Mutex::new(aborts),
+            }
+        }
+    }
+
+    impl TxnOps for Script {
+        fn commit(&self) -> Result<(), TxnCallError> {
+            self.commits.lock().unwrap().remove(0)
+        }
+        fn abort(&self) -> Result<(), TxnCallError> {
+            self.aborts.lock().unwrap().remove(0)
+        }
+    }
+
+    fn retriable() -> Result<(), TxnCallError> {
+        Err(TxnCallError::Retriable("timed out".into()))
+    }
+
+    #[test]
+    fn a_commit_settles_as_committed() {
+        assert_eq!(
+            finish_transaction(&Script::new(vec![Ok(())], vec![])),
+            TxnEnd::Committed
+        );
+    }
+
+    /// Ambiguous after the commit was submitted, then settled by the retried
+    /// commit: authoritative success.
+    #[test]
+    fn an_unknown_outcome_settled_by_a_retry_is_committed() {
+        assert_eq!(
+            finish_transaction(&Script::new(
+                vec![retriable(), retriable(), Ok(())],
+                vec![]
+            )),
+            TxnEnd::Committed
+        );
+    }
+
+    /// Ambiguous after the commit was submitted and never settled: uncertain.
+    #[test]
+    fn an_unknown_outcome_never_settled_is_uncertain() {
+        let end = finish_transaction(&Script::new(
+            vec![retriable(), retriable(), retriable()],
+            vec![],
+        ));
+        assert!(
+            matches!(end, TxnEnd::Uncertain { attempts, .. } if attempts == COMMIT_ATTEMPTS),
+            "{end:?}"
+        );
+    }
+
+    /// The broker requires an abort and the abort completes: authoritative
+    /// absence, a definite failure (not uncertain).
+    #[test]
+    fn a_completed_abort_is_a_definite_failure() {
+        let end = finish_transaction(&Script::new(
+            vec![Err(TxnCallError::RequiresAbort("abortable".into()))],
+            vec![Ok(())],
+        ));
+        assert!(matches!(end, TxnEnd::Aborted(_)), "{end:?}");
+    }
+
+    /// Neither a failed abort nor a fatal error proves the commit did not
+    /// apply: uncertain.
+    #[test]
+    fn a_failed_abort_or_a_fatal_error_is_uncertain() {
+        let failed_abort = finish_transaction(&Script::new(
+            vec![Err(TxnCallError::RequiresAbort("abortable".into()))],
+            vec![Err(TxnCallError::Other("broker gone".into()))],
+        ));
+        assert!(matches!(failed_abort, TxnEnd::Uncertain { .. }));
+        let fatal = finish_transaction(&Script::new(
+            vec![Err(TxnCallError::Fatal("connection lost".into()))],
+            vec![],
+        ));
+        assert!(matches!(fatal, TxnEnd::Uncertain { .. }));
+    }
+
+    /// The incident a sink raises for an unsettled commit: sink-scoped,
+    /// halted-uncertain, the batch only as a digest.
+    #[test]
+    fn an_uncertain_commit_raises_a_sink_ack_uncertain_incident() {
+        use deltaforge_core::incident::{
+            ActionCode, Component, ReasonCode, SafetyState,
+        };
+        let err = crate::incident::ack_uncertain(
+            "kafka",
+            b"checkpoint-bytes",
+            3,
+            SinkError::Fatal {
+                details: "x".into(),
+            },
+        );
+        let d = err.draft().unwrap();
+        assert_eq!(d.reason_code, ReasonCode::SinkAckUncertain);
+        assert_eq!(d.safety_state, SafetyState::HaltedUncertain);
+        assert_eq!(d.component, Component::Sink { id: "kafka".into() });
+        assert!(d.actions.contains(&ActionCode::VerifySinkState));
+        assert!(
+            !serde_json::to_string(&d.evidence)
+                .unwrap()
+                .contains("checkpoint-bytes")
+        );
+        assert!(matches!(err.root(), SinkError::Fatal { .. }));
     }
 }
 

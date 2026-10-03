@@ -25,6 +25,7 @@ thiserror.workspace = true
 uuid.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
+metrics.workspace = true
 chrono.workspace = true
 
 rusqlite = { version = "0.38", features = ["bundled"], optional = true }

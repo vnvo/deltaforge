@@ -1277,6 +1277,12 @@ impl PipelineManager {
             );
         }
 
+        let builder = builder.incidents(
+            storage::adapters::incidents::IncidentStore::new(
+                self.backend.clone(),
+                &pipeline_name,
+            ),
+        );
         let coord = builder.build();
         let cancel_for_task = cancel.clone();
         let cancel_check = cancel.clone();

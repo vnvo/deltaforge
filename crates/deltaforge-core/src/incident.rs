@@ -489,6 +489,18 @@ pub struct IncidentDraft {
     pub discriminator: BTreeMap<String, String>,
     pub evidence: Evidence,
     pub actions: Vec<ActionCode>,
+    /// What a scoped resolver matches on (e.g. the table a schema-drift
+    /// incident is about), as an opaque digest. Not identity.
+    #[serde(default)]
+    pub resolve_scope: Option<String>,
+}
+
+/// The opaque scope key of `scope` within `component` (see
+/// [`IncidentDraft::resolve_scope`]).
+pub fn scope_key(component: &Component, scope: &str) -> String {
+    let canonical =
+        serde_json::json!({ "component": component, "scope": scope });
+    sha256_hex(&crate::canonical_json_bytes(&canonical))
 }
 
 impl IncidentDraft {
@@ -508,6 +520,7 @@ impl IncidentDraft {
             discriminator: BTreeMap::new(),
             evidence: Evidence::new(),
             actions: Vec::new(),
+            resolve_scope: None,
         }
     }
 
@@ -523,6 +536,12 @@ impl IncidentDraft {
 
     pub fn with_actions(mut self, actions: &[ActionCode]) -> Self {
         self.actions = actions.to_vec();
+        self
+    }
+
+    /// Let a scoped resolver (e.g. "this table was accepted") resolve it.
+    pub fn resolved_by_scope(mut self, scope: &str) -> Self {
+        self.resolve_scope = Some(scope_key(&self.component, scope));
         self
     }
 

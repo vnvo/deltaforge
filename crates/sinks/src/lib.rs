@@ -43,6 +43,7 @@ pub mod clickhouse;
 pub mod elasticsearch;
 pub mod filter;
 pub mod http;
+pub(crate) mod incident;
 pub mod kafka;
 pub mod nats;
 pub mod redis;

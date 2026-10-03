@@ -463,11 +463,19 @@ pub async fn fetch_server_identity(
 pub enum PositionReachability {
     /// Confirmed reachable - resume is safe.
     Reachable,
-    /// Confirmed gone - caller decides how to proceed.
-    Lost { reason: String },
-    /// Could not determine (transient connect error, empty result).
-    /// Caller should warn but not hard-fail.
-    Unknown { reason: String },
+    /// Confirmed gone: `class` is a stable reason class (`not_executed`,
+    /// `binlog_missing`).
+    Lost { class: &'static str, reason: String },
+    /// Could not determine. `transient`: a connection or I/O failure a retry
+    /// may clear; otherwise the server answered something a retry will not
+    /// change.
+    Unknown { transient: bool, reason: String },
+}
+
+/// Whether a MySQL client error is plausibly transient: anything but an error
+/// the server answered with.
+pub(crate) fn is_transient(e: &mysql_async::Error) -> bool {
+    !matches!(e, mysql_async::Error::Server(_))
 }
 
 /// Check whether a saved checkpoint is still reachable on the connected server.
@@ -484,6 +492,7 @@ pub async fn check_position_reachability(
         Ok(c) => c,
         Err(e) => {
             return Ok(PositionReachability::Unknown {
+                transient: is_transient(&e),
                 reason: format!("connect failed: {e}"),
             });
         }
@@ -515,12 +524,14 @@ pub(crate) async fn check_position_reachability_on(
                 return match is_subset {
                     Some(1) => Ok(PositionReachability::Reachable),
                     Some(0) => Ok(PositionReachability::Lost {
+                        class: "not_executed",
                         reason: format!(
                             "GTID set '{gtid}' is not a subset of @@gtid_executed \
                              on the new primary — some transactions are absent"
                         ),
                     }),
                     _ => Ok(PositionReachability::Unknown {
+                        transient: false,
                         reason: "GTID_SUBSET returned unexpected value".into(),
                     }),
                 };
@@ -528,11 +539,13 @@ pub(crate) async fn check_position_reachability_on(
             // A GTID position is never "proven" by a file name.
             Ok(None) => {
                 return Ok(PositionReachability::Unknown {
+                    transient: false,
                     reason: "GTID_SUBSET returned no row".into(),
                 });
             }
             Err(e) => {
                 return Ok(PositionReachability::Unknown {
+                    transient: is_transient(&e),
                     reason: format!("GTID_SUBSET failed: {e}"),
                 });
             }
@@ -544,6 +557,7 @@ pub(crate) async fn check_position_reachability_on(
         Ok(r) => r,
         Err(e) => {
             return Ok(PositionReachability::Unknown {
+                transient: is_transient(&e),
                 reason: format!("SHOW BINARY LOGS failed: {e}"),
             });
         }
@@ -556,6 +570,7 @@ pub(crate) async fn check_position_reachability_on(
 
     if available.is_empty() {
         return Ok(PositionReachability::Unknown {
+            transient: false,
             reason: "SHOW BINARY LOGS returned no rows".into(),
         });
     }
@@ -564,6 +579,7 @@ pub(crate) async fn check_position_reachability_on(
         Ok(PositionReachability::Reachable)
     } else {
         Ok(PositionReachability::Lost {
+            class: "binlog_missing",
             reason: format!(
                 "binlog file '{file}' not present on new primary \
                  (available: [{}])",
@@ -579,24 +595,50 @@ pub(crate) async fn check_position_reachability_on(
 pub(crate) async fn require_gtid_executed(
     conn: &mut mysql_async::Conn,
     set: &str,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<(), GtidNotProven> {
     let row: std::result::Result<Option<Option<i64>>, _> = conn
         .exec_first("SELECT GTID_SUBSET(?, @@GLOBAL.gtid_executed)", (set,))
         .await;
-    gtid_executed_outcome(row.map_err(|e| e.to_string()))
+    gtid_executed_outcome(row.map_err(|e| (is_transient(&e), e.to_string())))
+}
+
+/// Why a GTID set is not proven executed: `class` is a stable reason class
+/// (`not_executed`, `unknown_unreachable`, `unknown_query_failed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GtidNotProven {
+    pub class: &'static str,
+    pub reason: String,
+}
+
+impl std::fmt::Display for GtidNotProven {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
 }
 
 fn gtid_executed_outcome(
-    row: std::result::Result<Option<Option<i64>>, String>,
-) -> std::result::Result<(), String> {
+    row: std::result::Result<Option<Option<i64>>, (bool, String)>,
+) -> std::result::Result<(), GtidNotProven> {
+    let not = |class, reason: String| Err(GtidNotProven { class, reason });
     match row {
         Ok(Some(Some(1))) => Ok(()),
-        Ok(Some(Some(0))) => {
-            Err("not executed by the server (GTID_SUBSET = 0)".into())
+        Ok(Some(Some(0))) => not(
+            "not_executed",
+            "not executed by the server (GTID_SUBSET = 0)".into(),
+        ),
+        Ok(Some(other)) => not(
+            "unknown_query_failed",
+            format!("GTID_SUBSET returned {other:?}"),
+        ),
+        Ok(None) => {
+            not("unknown_query_failed", "GTID_SUBSET returned no row".into())
         }
-        Ok(Some(other)) => Err(format!("GTID_SUBSET returned {other:?}")),
-        Ok(None) => Err("GTID_SUBSET returned no row".into()),
-        Err(e) => Err(format!("GTID_SUBSET failed: {e}")),
+        Err((true, e)) => {
+            not("unknown_unreachable", format!("GTID_SUBSET failed: {e}"))
+        }
+        Err((false, e)) => {
+            not("unknown_query_failed", format!("GTID_SUBSET failed: {e}"))
+        }
     }
 }
 
@@ -765,14 +807,22 @@ mod tests {
     #[test]
     fn only_an_exact_gtid_subset_proves_a_resume_position() {
         assert_eq!(gtid_executed_outcome(Ok(Some(Some(1)))), Ok(()));
-        for row in [
-            Ok(Some(Some(0))),
-            Ok(Some(Some(2))),
-            Ok(Some(None)),
-            Ok(None),
-            Err("Malformed GTID set specification".to_string()),
+        for (row, class) in [
+            (Ok(Some(Some(0))), "not_executed"),
+            (Ok(Some(Some(2))), "unknown_query_failed"),
+            (Ok(Some(None)), "unknown_query_failed"),
+            (Ok(None), "unknown_query_failed"),
+            (
+                Err((false, "Malformed GTID set specification".to_string())),
+                "unknown_query_failed",
+            ),
+            (
+                Err((true, "connection reset".to_string())),
+                "unknown_unreachable",
+            ),
         ] {
-            assert!(gtid_executed_outcome(row.clone()).is_err(), "{row:?}");
+            let out = gtid_executed_outcome(row.clone());
+            assert_eq!(out.map_err(|e| e.class), Err(class), "{row:?}");
         }
     }
 

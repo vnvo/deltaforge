@@ -379,16 +379,26 @@ async fn write_marker(
     Ok(())
 }
 
-fn halt_error(db: &str, table: &str, why: &str) -> SourceError {
-    SourceError::Schema {
-        details: format!(
-            "table {db}.{table} after failover: {why} and on_schema_drift=halt. \
-             Nothing was registered or emitted. Verify the table on the new \
-             server and apply any missing migrations, or restart with \
-             on_schema_drift=adapt."
-        )
-        .into(),
-    }
+fn halt_error(
+    source_id: &str,
+    db: &str,
+    table: &str,
+    why: &str,
+) -> SourceError {
+    crate::incident_drafts::schema_drift_blocked(
+        source_id,
+        &format!("{db}.{table}"),
+        why,
+        SourceError::Schema {
+            details: format!(
+                "table {db}.{table} after failover: {why} and \
+                 on_schema_drift=halt. Nothing was registered or emitted. \
+                 Verify the table on the new server and apply any missing \
+                 migrations, or restart with on_schema_drift=adapt."
+            )
+            .into(),
+        },
+    )
 }
 
 /// The table's shape proven at F, or `None` (unprovable).
@@ -566,6 +576,7 @@ pub(crate) async fn check(
     else {
         if env.halt {
             return Err(halt_error(
+                env.source_id,
                 db,
                 table,
                 "its schema at the failover position cannot be proven",
@@ -602,6 +613,7 @@ pub(crate) async fn check(
     let drift = !deltas.is_empty();
     if drift && env.halt {
         return Err(halt_error(
+            env.source_id,
             db,
             table,
             &format!(
@@ -675,6 +687,8 @@ pub(crate) async fn check_in_stream(
         check(&env, &anchor, db, table, event).await?;
     }
     ctx.drift_checked.insert(key);
+    // The table passed its drift check: accepted.
+    ctx.drift_resolver.accepted(&format!("{db}.{table}")).await;
     Ok(())
 }
 

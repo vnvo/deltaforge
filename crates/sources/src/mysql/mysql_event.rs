@@ -52,7 +52,29 @@ pub(super) async fn read_next_event(
     {
         Ok(event) => Ok(event),
         Err(outcome) => {
-            let control = LoopControl::from_binlog_outcome(outcome);
+            // The server purged the binlog the resume position needs: the
+            // position is gone (an operator incident, not a retry).
+            let purged = matches!(
+                &outcome,
+                common::RetryOutcome::Failed(
+                    mysql_binlog_connector_rust::binlog_error::BinlogError::ConnectError(m)
+                )
+                    | common::RetryOutcome::Exhausted {
+                        last_error:
+                            mysql_binlog_connector_rust::binlog_error::BinlogError::ConnectError(m),
+                        ..
+                    } if super::mysql_errors::is_purged_error(m)
+            );
+            let mut control = LoopControl::from_binlog_outcome(outcome);
+            if purged && let LoopControl::Fail(cause) = control {
+                control = LoopControl::Fail(super::gtid_position_unavailable(
+                    &ctx.source_id,
+                    ctx.expected_uuid().ok().as_deref(),
+                    ctx.checkpoint_gtid.as_deref(),
+                    "purged",
+                    cause,
+                ));
+            }
 
             if control.is_retryable() {
                 counter!(
@@ -1399,6 +1421,11 @@ mod tests {
             selection: Default::default(),
             failover: None,
             drift_checked: Default::default(),
+            drift_resolver: crate::incident_drafts::DriftResolver::new(
+                Arc::new(storage::MemoryStorageBackend::new()),
+                "test",
+                "test",
+            ),
             checkpoint_gtid: Some("GTID-UNIT".to_string()),
             checkpoint_file: "mysql-bin.000001".to_string(),
             outbox_tables: AllowList::default(),

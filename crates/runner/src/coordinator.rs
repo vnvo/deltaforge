@@ -923,6 +923,12 @@ pub struct Coordinator<Tok> {
     /// Notified after each successful per-sink checkpoint commit so the source can
     /// refresh its WAL feedback change-driven instead of polling the checkpoint store.
     commit_notify: Option<Arc<tokio::sync::Notify>>,
+    /// The pipeline's incident store: a sink that acknowledges a batch
+    /// resolves its open acknowledgement-uncertainty incidents.
+    incidents: Option<storage::adapters::incidents::IncidentStore>,
+    /// Sinks with an open `sink_ack_uncertain` incident (read once per run).
+    uncertain_sinks:
+        tokio::sync::Mutex<Option<std::collections::HashSet<String>>>,
 }
 
 pub struct CoordinatorBuilder<Tok> {
@@ -940,6 +946,7 @@ pub struct CoordinatorBuilder<Tok> {
     replay_gate: Option<Arc<crate::replay_gate::ReplaySinkGate>>,
     quiesce_ack: Option<watch::Sender<bool>>,
     commit_notify: Option<Arc<tokio::sync::Notify>>,
+    incidents: Option<storage::adapters::incidents::IncidentStore>,
 }
 
 impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
@@ -959,11 +966,22 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             replay_gate: None,
             quiesce_ack: None,
             commit_notify: None,
+            incidents: None,
         }
     }
 
     /// Wire a notify signaled after each successful per-sink checkpoint commit, so the
     /// source can refresh WAL feedback change-driven instead of polling.
+    /// The pipeline's incident store (resolves a sink's acknowledgement
+    /// uncertainty when it acknowledges a later batch).
+    pub fn incidents(
+        mut self,
+        store: storage::adapters::incidents::IncidentStore,
+    ) -> Self {
+        self.incidents = Some(store);
+        self
+    }
+
     pub fn commit_notify(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
         self.commit_notify = Some(notify);
         self
@@ -1066,6 +1084,8 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             replay_gate: self.replay_gate,
             quiesce_ack: self.quiesce_ack,
             commit_notify: self.commit_notify,
+            incidents: self.incidents,
+            uncertain_sinks: tokio::sync::Mutex::new(None),
         }
     }
 }
@@ -1073,6 +1093,75 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
 impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
     pub fn builder(name: impl Into<String>) -> CoordinatorBuilder<Tok> {
         CoordinatorBuilder::new(name)
+    }
+
+    /// `sink_id` acknowledged a batch (its checkpoint committed): its open
+    /// `sink_ack_uncertain` incidents are settled (`sink_acknowledged`). The
+    /// open set is read once per run, so this is an in-memory check unless
+    /// the sink has one. Never fails delivery.
+    async fn sink_acknowledged(&self, sink_id: &str) {
+        use deltaforge_core::incident::{Component, ReasonCode};
+        let Some(store) = &self.incidents else {
+            return;
+        };
+        let mut open = self.uncertain_sinks.lock().await;
+        if open.is_none() {
+            match store.list().await {
+                Ok(records) => {
+                    *open = Some(
+                        records
+                            .into_iter()
+                            .filter(|r| {
+                                !r.status.is_resolved()
+                                    && r.reason_code
+                                        == ReasonCode::SinkAckUncertain
+                            })
+                            .filter_map(|r| match r.component {
+                                Component::Sink { id } => Some(id),
+                                _ => None,
+                            })
+                            .collect(),
+                    )
+                }
+                Err(e) => {
+                    warn!(
+                        pipeline = %self.pipeline_name,
+                        error = %format!("{e:#}"),
+                        "incident store unreadable; sink uncertainty stays open"
+                    );
+                    return;
+                }
+            }
+        }
+        if !open.as_mut().is_some_and(|o| o.remove(sink_id)) {
+            return;
+        }
+        drop(open);
+        let component = Component::Sink {
+            id: sink_id.to_string(),
+        };
+        match store
+            .resolve_matching(
+                ReasonCode::SinkAckUncertain,
+                &component,
+                None,
+                storage::adapters::incidents::SINK_ACKNOWLEDGED,
+            )
+            .await
+        {
+            Ok(n) if n > 0 => info!(
+                pipeline = %self.pipeline_name,
+                sink = %sink_id,
+                "sink acknowledged a batch: acknowledgement uncertainty resolved"
+            ),
+            Ok(_) => {}
+            Err(e) => warn!(
+                pipeline = %self.pipeline_name,
+                sink = %sink_id,
+                error = %format!("{e:#}"),
+                "could not resolve the sink's uncertainty; it stays open"
+            ),
+        }
     }
 
     /// Close one captured commit unit: build a replay envelope from the accumulated
@@ -2221,6 +2310,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                 match result {
                     Ok(()) => {
                         committed += 1;
+                        self.sink_acknowledged(&sink_id).await;
                         gauge!(
                             "deltaforge_sink_last_checkpoint_ts",
                             "pipeline" => self.pipeline_name.to_string(),
@@ -4756,6 +4846,92 @@ mod tests {
         assert_eq!(
             draft.cause_code,
             deltaforge_core::incident::CauseCode::SinkBackpressure
+        );
+    }
+
+    /// A sink that acknowledges a later batch settles its open
+    /// acknowledgement uncertainty (`sink_acknowledged`); another sink's stays
+    /// open.
+    #[tokio::test]
+    async fn a_sink_acknowledging_a_batch_resolves_its_uncertainty() {
+        use checkpoints::MemCheckpointStore;
+        use deltaforge_core::incident::{
+            CauseCode, Component, IncidentDraft, ReasonCode, Retryability,
+            SafetyState,
+        };
+        use storage::adapters::incidents::{
+            IncidentStatus, IncidentStore, Resolution, SINK_ACKNOWLEDGED,
+        };
+        let backend: storage::ArcStorageBackend =
+            Arc::new(storage::MemoryStorageBackend::new());
+        let incidents = IncidentStore::new(Arc::clone(&backend), "tx-test");
+        let uncertain = |sink: &str| {
+            IncidentDraft::new(
+                ReasonCode::SinkAckUncertain,
+                Component::Sink { id: sink.into() },
+                Retryability::OperatorAction,
+                SafetyState::HaltedUncertain,
+                CauseCode::SinkFatal,
+            )
+            .discriminate("batch", "b1")
+        };
+        let ours = incidents
+            .raise(&uncertain("kafka"), 1)
+            .await
+            .unwrap()
+            .record()
+            .incident_id
+            .clone();
+        let other = incidents
+            .raise(&uncertain("other"), 1)
+            .await
+            .unwrap()
+            .record()
+            .incident_id
+            .clone();
+
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
+        let coord = Coordinator::builder("tx-test")
+            .sinks(sinks)
+            .batch_config(Some(cap_cfg(1000)))
+            .commit_fn(
+                "kafka",
+                build_commit_fn(store, "src::sink::kafka".to_string()),
+            )
+            .process_fn(build_batch_processor(
+                Arc::from(vec![]),
+                "test".to_string(),
+            ))
+            .incidents(incidents.clone())
+            .build();
+        feed_and_run(
+            coord,
+            vec![
+                begin("t1"),
+                SourceItem::Event(tx_event(1, "t1", b"r1")),
+                commit("t1", b"cp-1"),
+            ],
+        )
+        .await
+        .unwrap();
+
+        match incidents.get(&ours).await.unwrap().unwrap().status {
+            IncidentStatus::Resolved {
+                by: Resolution::VerifiedRecovery { check },
+                ..
+            } => assert_eq!(check, SINK_ACKNOWLEDGED),
+            s => panic!("{s:?}"),
+        }
+        assert!(
+            !incidents
+                .get(&other)
+                .await
+                .unwrap()
+                .unwrap()
+                .status
+                .is_resolved()
         );
     }
 
