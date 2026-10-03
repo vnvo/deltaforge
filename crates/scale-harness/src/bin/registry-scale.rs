@@ -69,6 +69,10 @@ struct Args {
     /// Synthetic tables registered for the live source.
     #[arg(long, default_value_t = 100_000)]
     live_tables: u64,
+    /// Real tables created in the live database, matched by the source's
+    /// table pattern.
+    #[arg(long, default_value_t = 0)]
+    live_catalog_tables: u64,
     /// Directory for the live scenario's fresh SQLite stores.
     #[arg(long, default_value = ".")]
     live_dir: String,
@@ -320,6 +324,7 @@ async fn main() -> Result<()> {
             &scale_harness::live::LiveConfig {
                 engine,
                 tables: a.live_tables,
+                catalog_tables: a.live_catalog_tables,
                 versions: a.versions,
                 columns: a.columns,
                 seed: a.seed,

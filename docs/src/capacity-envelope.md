@@ -17,7 +17,7 @@ This page states DeltaForge's resource behaviour so operators can size a deploym
 | Dimension | Conservative starting guidance | Basis |
 |---|---|---|
 | Pipelines (source units) per instance | Unvalidated starting point: a small number (single digits); single instance only. Not a supported ceiling either way. | [unknown] scale; single-owner is [code-derived] |
-| Tables per source | Tens to low hundreds; watch metric cardinality and startup cost. The schema registry itself no longer grows startup or memory with the catalog (see [Schema registry at scale](#schema-registry-at-scale)); table discovery, the startup schema preload and per-table metrics still do | registry [measured] to 1M tables; discovery O(tables²) [code-derived], [unknown] at scale |
+| Tables per source | Tens to low hundreds; watch metric cardinality and snapshot cost. A CDC start neither enumerates the catalog nor loads schemas up front, and the schema registry and per-source schema cache are bounded (see [Schema registry at scale](#schema-registry-at-scale)); an initial snapshot's table discovery and per-table metrics still grow with the catalog | registry [measured] to 1M tables; CDC restart [measured] flat from 20 to 1,000 matched tables; snapshot discovery O(tables²) [code-derived], [unknown] at scale |
 | Memory | Provision for channel-depth × event-size + in-flight batch bytes + the schema cache budget (default 64 MiB); **no aggregate cap exists** | [code-derived] / [unknown] |
 | Throughput | Benchmark per environment; do not assume a headline number | [measured] dev-only / [unknown] |
 
@@ -111,7 +111,9 @@ Synthetic registries: *N* tables per source × 2 sources with the same table nam
 | Time to first CDC event after a restart (PostgreSQL / MySQL) | 34 ms / 21 ms | 45 ms / 21 ms |
 
 - **PostgreSQL state store** (100K tables × 2 versions × 2 sources, local container): the same operation counts as SQLite - startup 1 key read (1.4 ms), a cold lookup 1 read (p50 205 µs, p99 816 µs, network round trips), cached lookups no store access, 1 read for 64 concurrent first lookups, 0 reads of other sources. Migration of 10K tables: ~56-60 s at 1 version and ~185 s at 5 versions per table (vs ~4 s / ~14 s on SQLite); memory the same ~2.4-2.5 KB per mapped table. Registrations ran at ~250/s against ~3,600/s on SQLite.
-- **Time to first CDC event**: the source's own registry holds *N* synthetic tables (they are not in the source database); a row committed while the pipeline was stopped is timed from source start until the sink receives it. The storage calls in that window are identical at 100K and 1M tables (PostgreSQL: 12 key reads, 8 prefix-scoped checkpoint listings, 1 write, 1 schema read; MySQL: 5, 1, 1, 1) with no registry scan. This isolates the registry; it does not exercise table discovery or the startup schema preload, which still scale with the tables captured (below).
+- **Time to first CDC event**: the source's own registry holds *N* synthetic tables (they are not in the source database); a row committed while the pipeline was stopped is timed from source start until the sink receives it. The storage calls in that window are identical at 100K and 1M tables (PostgreSQL: 12 key reads, 8 prefix-scoped checkpoint listings, 1 write, 1 schema read; MySQL: 5, 1, 1, 1) with no registry scan. This isolates the registry.
+- **CDC restart against a large live catalog** [measured]: the source's table pattern matches 20 or 1,000 real tables in the database (only one of them changes). A CDC-only restart does the same work at both sizes: the same storage reads (PostgreSQL 19 key reads, 8 checkpoint listings; MySQL 12, 3) and the same number of statements on the server (PostgreSQL 9, MySQL 27); no catalog enumeration and no schema load for tables without changes. Reproduce with `cargo test -p scale-harness --test live_ttfce -- --include-ignored` or `registry-scale --live postgres,mysql --live-catalog-tables N`.
+- **Per-source schema cache**: resolved table schemas are kept within a budget (default 4,096 tables or 64 MiB per source) with least-recently-used eviction; an evicted table is rebuilt from durable history as exactly the version it resolved to, so memory follows the working set, not the catalog.
 - **Pre-upgrade schema history migration** (`deltaforge schema-migrate`) [measured]: memory grows with the number of **mapped tables**, not with history length: about 2.4-2.8 KB per mapped table (10K tables: ~39 MiB peak; 100K tables: ~243 MiB peak), unchanged between 1 and 5 versions per table and between page sizes. Time: 100K tables took ~36 s at 1 version and ~135 s at 5 versions per table. For very large catalogs, split the migration with `--tenant` / `--source` or several mapping files.
 
 ## Metric cardinality
@@ -120,7 +122,7 @@ Synthetic registries: *N* tables per source × 2 sources with the same table nam
 
 ## Table and source-unit counts
 
-- **No coded limit on tables per source or pipelines per instance** [confirmed absent]. Practical limits come from: the O(tables²) table-enumeration dedup during schema load [code-derived], the startup schema preload of every captured table [code-derived], per-table metric cardinality, and connection/slot math above. The schema registry is no longer one of them ([measured] to 1M tables per source).
+- **No coded limit on tables per source or pipelines per instance** [confirmed absent]. Practical limits come from: the O(tables²) table-enumeration dedup when a snapshot expands its table patterns [code-derived], per-table metric cardinality, and connection/slot math above. A CDC start does no per-table work (see below). The schema registry is no longer one of them ([measured] to 1M tables per source).
 - **Single-instance requirement**: run exactly one DeltaForge process against a given state store (see [Supported Deployment Envelope](deployment-support.md#topology-single-owner-per-source)) [code-derived containment].
 - **Conservative starting configuration (unvalidated, not a supported limit)**: a small number of pipelines (single digits) and tens-to-low-hundreds of tables per source is a reasonable place to start, and grow only after a soak in your environment. We have not measured enough to claim either that larger configurations are unsupported or that this range is universally safe - both directions are **[unknown]** pending benchmark.
 
@@ -133,7 +135,7 @@ Throughput is environment-dependent and is **[measured] only on a developer mach
 These are **[unknown]** and should be validated before scaling up:
 
 - Aggregate/RSS memory under sustained load (no coded cap).
-- Startup time for sources capturing many tables: pattern expansion and the startup schema preload query the source catalog per captured table (the registry itself is [measured], see above).
+- Initial snapshot time for sources capturing many tables: pattern expansion and the snapshot's schema loads query the source catalog per captured table (a CDC restart does not; see above).
 - Per-table metric cardinality at hundreds/thousands of tables.
-- O(tables²) schema-enumeration cost at large table counts.
+- O(tables²) table-pattern expansion cost of an initial snapshot at large table counts.
 - MySQL `mysql_async` control-pool sizing under many concurrent pipelines.

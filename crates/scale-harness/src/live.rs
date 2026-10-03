@@ -56,6 +56,10 @@ pub struct LiveConfig {
     pub engine: Engine,
     /// Synthetic tables registered for the live source (not in the database).
     pub tables: u64,
+    /// Real tables created in the database besides the captured one, all
+    /// matched by the source's table pattern (they never change). Startup
+    /// must not grow with them.
+    pub catalog_tables: u64,
     pub versions: u32,
     pub columns: u32,
     pub seed: u64,
@@ -65,6 +69,7 @@ pub struct LiveConfig {
 pub struct LiveReport {
     pub engine: Engine,
     pub synthetic_tables: u64,
+    pub catalog_tables: u64,
     pub versions: u32,
     pub lineage_hash: String,
     pub generation_secs: f64,
@@ -84,6 +89,10 @@ pub struct LiveReport {
     /// (an empty key means the whole namespace).
     pub enumerations: Vec<KeyRead>,
     pub reads_by_namespace: Vec<(String, usize)>,
+    /// Statements the source executed on the database server during the
+    /// timed window (pg_stat_statements / performance_schema; replication
+    /// streaming itself is not a statement).
+    pub server_statements: u64,
 }
 
 /// Records delivered row ids and wakes waiters.
@@ -213,7 +222,13 @@ async fn start_db(engine: Engine) -> Result<Db> {
                     "database system is ready to accept connections",
                 ))
                 .with_env_var("POSTGRES_PASSWORD", "pw")
-                .with_cmd(vec!["postgres", "-c", "wal_level=logical"]),
+                .with_cmd(vec![
+                    "postgres",
+                    "-c",
+                    "wal_level=logical",
+                    "-c",
+                    "shared_preload_libraries=pg_stat_statements",
+                ]),
             5432,
         ),
         Engine::Mysql => (
@@ -291,17 +306,25 @@ fn my_cdc(port: u16) -> String {
     format!("mysql://df:dfpw@127.0.0.1:{port}/app")
 }
 
-/// Create the captured table and return the database's verified lineage.
-async fn prepare(db: &Db) -> Result<LineageDescriptor> {
+/// Create the captured table and `catalog_tables` others matched by the same
+/// pattern; return the database's verified lineage.
+async fn prepare(db: &Db, catalog_tables: u64) -> Result<LineageDescriptor> {
     use mysql_async::prelude::Queryable;
     match db.engine {
         Engine::Postgres => {
             let c = pg(db.port).await?;
             c.batch_execute(
-                "CREATE TABLE app_events (id BIGINT PRIMARY KEY, v TEXT);
+                "CREATE EXTENSION pg_stat_statements;
+                 CREATE TABLE app_events (id BIGINT PRIMARY KEY, v TEXT);
                  CREATE PUBLICATION scale_pub FOR TABLE app_events;",
             )
             .await?;
+            for n in 0..catalog_tables {
+                c.batch_execute(&format!(
+                    "CREATE TABLE app_catalog_{n} (id BIGINT PRIMARY KEY, v TEXT)"
+                ))
+                .await?;
+            }
             // A slot cannot be created in a transaction that has written.
             c.batch_execute(
                 "SELECT pg_create_logical_replication_slot('scale_slot', 'pgoutput')",
@@ -334,6 +357,12 @@ async fn prepare(db: &Db) -> Result<LineageDescriptor> {
                 "CREATE TABLE app.app_events (id BIGINT PRIMARY KEY, v VARCHAR(64))",
             ] {
                 root.query_drop(q).await?;
+            }
+            for n in 0..catalog_tables {
+                root.query_drop(format!(
+                    "CREATE TABLE app.app_catalog_{n} (id BIGINT PRIMARY KEY, v VARCHAR(64))"
+                ))
+                .await?;
             }
             // Prime caching_sha2_password for the binlog connector.
             my(&my_cdc(db.port)).await?.query_drop("SELECT 1").await?;
@@ -371,6 +400,58 @@ async fn insert(db: &Db, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Forget the server's statement statistics (before the timed window).
+async fn reset_statements(db: &Db) -> Result<()> {
+    use mysql_async::prelude::Queryable;
+    match db.engine {
+        Engine::Postgres => {
+            pg(db.port)
+                .await?
+                .batch_execute("SELECT pg_stat_statements_reset()")
+                .await?;
+        }
+        Engine::Mysql => {
+            my(&my_root(db.port))
+                .await?
+                .query_drop(
+                    "TRUNCATE TABLE performance_schema.\
+                     events_statements_summary_by_user_by_event_name",
+                )
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Statements the source's user executed since [`reset_statements`] (the
+/// statistics query itself excluded).
+async fn source_statements(db: &Db) -> Result<u64> {
+    use mysql_async::prelude::Queryable;
+    Ok(match db.engine {
+        Engine::Postgres => {
+            let n: i64 = pg(db.port)
+                .await?
+                .query_one(
+                    "SELECT COALESCE(sum(calls), 0)::bigint FROM pg_stat_statements \
+                     WHERE query NOT ILIKE '%pg_stat_statements%'",
+                    &[],
+                )
+                .await?
+                .get(0);
+            n as u64
+        }
+        Engine::Mysql => my(&my_root(db.port))
+            .await?
+            .query_first::<u64, _>(
+                "SELECT CAST(COALESCE(SUM(COUNT_STAR), 0) AS UNSIGNED) \
+                 FROM performance_schema.events_statements_summary_by_user_by_event_name \
+                 WHERE USER = 'df'",
+            )
+            .await?
+            .unwrap_or(0),
+    })
+}
+
 fn source(
     db: &Db,
     registry: Arc<DurableSchemaRegistry>,
@@ -386,7 +467,7 @@ fn source(
             dsn: pg_dsn(db.port).into(),
             slot: "scale_slot".into(),
             publication: "scale_pub".into(),
-            tables: vec!["public.app_events".into()],
+            tables: vec!["public.app_*".into()],
             tenant: TENANT.into(),
             pipeline: "scale".into(),
             registry,
@@ -402,7 +483,8 @@ fn source(
         Engine::Mysql => Arc::new(sources::mysql::MySqlSource {
             id: SOURCE.into(),
             dsn: my_cdc(db.port).into(),
-            tables: vec!["app.app_events".into()],
+            // MySQL pattern expansion is SQL LIKE (`%`), not a glob.
+            tables: vec!["app.app_%".into()],
             tenant: TENANT.into(),
             pipeline: "scale".into(),
             registry,
@@ -425,7 +507,7 @@ pub async fn run(
     store: ArcStorageBackend,
 ) -> Result<LiveReport> {
     let db = start_db(cfg.engine).await?;
-    let descriptor = prepare(&db).await?;
+    let descriptor = prepare(&db, cfg.catalog_tables).await?;
 
     // Synthetic catalog for the live source's own lineage (untimed).
     let spec = FixtureSpec {
@@ -493,6 +575,7 @@ pub async fn run(
     let registry = DurableSchemaRegistry::new(backend.clone()).await?;
     let src = source(&db, registry, backend.clone());
     let sink = ProbeSink::new();
+    reset_statements(&db).await?;
     cb.reset();
     cb.record_keys(true);
     let t0 = Instant::now();
@@ -502,6 +585,7 @@ pub async fn run(
     let ops = cb.ops();
     let reads = cb.reads();
     cb.record_keys(false);
+    let server_statements = source_statements(&db).await?;
     run2.stop().await;
 
     let events_before_known = {
@@ -524,6 +608,7 @@ pub async fn run(
     Ok(LiveReport {
         engine: cfg.engine,
         synthetic_tables: cfg.tables,
+        catalog_tables: cfg.catalog_tables,
         versions: cfg.versions,
         lineage_hash,
         generation_secs,
@@ -534,5 +619,6 @@ pub async fn run(
         enumerations,
         ops,
         reads_by_namespace: by_ns.into_iter().collect(),
+        server_statements,
     })
 }
