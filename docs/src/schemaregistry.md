@@ -161,32 +161,13 @@ Tables are specified using patterns that support wildcards:
 | `db.prefix%` | Tables starting with prefix |
 | `%.table` | Table in any database |
 
-### Preloading
+### Resolution at first use
 
-At startup, the loader expands patterns and preloads all matching schemas:
-
-```rust
-let schema_loader = MySqlSchemaLoader::new(dsn, registry, tenant);
-let tracked_tables = schema_loader.preload(&["shop.orders", "shop.order_%"]).await?;
-```
-
-This ensures schemas are available before the first CDC event arrives.
+A CDC start does not enumerate the configured tables or load their schemas: each table is resolved when it is first used (its first Relation message in PostgreSQL, its first rows in MySQL), from durable history or the live catalog, and registered. Only an initial snapshot expands the table patterns and loads the tables it copies. Concurrent first uses of one table share one load.
 
 ### Caching
 
-Loaded schemas are cached to avoid repeated `INFORMATION_SCHEMA` queries:
-
-```rust
-// Fast path: return cached schema
-if let Some(cached) = cache.get(&(db, table)) {
-    return Ok(cached.clone());
-}
-
-// Slow path: fetch from database, register, cache
-let schema = fetch_schema(db, table).await?;
-let version = registry.register(...).await?;
-cache.insert((db, table), loaded_schema);
-```
+Resolved schemas are cached per source, within a bounded budget (by default 4,096 tables or 64 MiB of schema per source, whichever is reached first); beyond it the least recently used schemas are evicted (`deltaforge_source_schema_cache_evictions_total`). Eviction never changes what a table resolves to: the source keeps a small record of each table's resolved version, and an evicted table is rebuilt from durable history as exactly that version, with no catalog query. If that version cannot be read back exactly, the source stops with a schema error rather than resolving the table again. Only an explicit reload (or a DDL of the table) resolves it again.
 
 ## DDL Handling
 

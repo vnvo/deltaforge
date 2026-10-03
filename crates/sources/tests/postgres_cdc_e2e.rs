@@ -380,6 +380,65 @@ async fn postgres_loader_loads_once_and_reloads_only_tables_in_use()
     Ok(())
 }
 
+/// With a cache smaller than the working set, an evicted table comes back
+/// as exactly the version it resolved to (rebuilt from durable history, no
+/// live read), even after the live table changed; only an explicit reload
+/// resolves it again (and covers evicted tables in use).
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn postgres_evicted_schema_is_rebuilt_exactly() -> Result<()> {
+    let (db, client) = pg_setup("evict").await?;
+    for t in ["a", "b"] {
+        client
+            .execute(&format!("CREATE TABLE {t} (id INT PRIMARY KEY)"), &[])
+            .await?;
+    }
+    let (loader, _scope) = test_common::pg_scoped_loader(
+        &pg_admin_dsn(&db).await,
+        make_registry().await,
+        "acme",
+    )
+    .await?;
+    let loader =
+        loader.with_cache_budget(sources::registry_scope::CacheBudget {
+            max_entries: 1,
+            max_bytes: usize::MAX,
+        });
+
+    let first = loader.load_schema("public", "a").await?;
+    loader.load_schema("public", "b").await?;
+    assert_eq!(loader.cache_usage().await.2, 1, "a was evicted");
+    client
+        .execute("ALTER TABLE a ADD COLUMN note TEXT", &[])
+        .await?;
+
+    let fetches = loader.live_fetch_count();
+    let again = loader.load_schema("public", "a").await?;
+    assert_eq!(loader.live_fetch_count(), fetches, "no live read");
+    assert_eq!(
+        (again.registry_version, again.sequence, &again.fingerprint),
+        (first.registry_version, first.sequence, &first.fingerprint)
+    );
+    assert_eq!(again.schema.columns.len(), 1);
+
+    let mut reloaded = loader.reload_all(&[]).await?;
+    reloaded.sort();
+    assert_eq!(
+        reloaded,
+        [("public".into(), "a".into()), ("public".into(), "b".into())]
+    );
+    let fresh = loader.load_schema("public", "a").await?;
+    assert_eq!(
+        fresh.schema.columns.len(),
+        2,
+        "the reload resolved it again"
+    );
+    assert_ne!(fresh.registry_version, first.registry_version);
+
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_schema_loader() -> Result<()> {

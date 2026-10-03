@@ -50,6 +50,21 @@ type ArcSchemaCache = Arc<RwLock<ScopedCache<Arc<LoadedSchema>>>>;
 /// typed, retryable [`RegistryError::ScopeChanged`].
 const SCOPE_ATTEMPTS: usize = 3;
 
+impl crate::registry_scope::Resident for Arc<LoadedSchema> {
+    fn pin(&self) -> crate::registry_scope::PinnedVersion {
+        crate::registry_scope::PinnedVersion {
+            version: self.registry_version,
+            sequence: self.sequence,
+            fingerprint: Arc::clone(&self.fingerprint),
+        }
+    }
+
+    fn weight(&self) -> usize {
+        serde_json::to_vec(&self.schema).map_or(0, |b| b.len())
+            + self.column_names.iter().map(String::len).sum::<usize>()
+    }
+}
+
 /// Schema loader with caching and registry integration.
 ///
 /// Every registry access is qualified by the source's verified `server_uuid`
@@ -133,12 +148,80 @@ impl MySqlSchemaLoader {
         value: Arc<LoadedSchema>,
     ) -> bool {
         let mut cache = self.cache.write().await;
-        cache.insert_if_current(
+        let (_, _, evicted_before) = cache.usage();
+        let inserted = cache.insert_if_current(
             scope.generation(),
             self.scope.generation(),
             key,
             value,
-        )
+        );
+        let (_, _, evicted_after) = cache.usage();
+        if evicted_after > evicted_before {
+            counter!("deltaforge_source_schema_cache_evictions_total",
+                "pipeline" => self.tenant.clone(), "source" => "mysql")
+            .increment(evicted_after - evicted_before);
+        }
+        inserted
+    }
+
+    /// Bound the resident schemas to `budget` (the default suits most
+    /// pipelines).
+    pub fn with_cache_budget(
+        mut self,
+        budget: crate::registry_scope::CacheBudget,
+    ) -> Self {
+        self.cache = Arc::new(RwLock::new(ScopedCache::with_budget(budget)));
+        self
+    }
+
+    /// Resident schemas, their approximate bytes and evictions so far.
+    pub async fn cache_usage(&self) -> (usize, usize, u64) {
+        self.cache.read().await.usage()
+    }
+
+    /// Rebuild the table `key` resolved to earlier in this run, after its
+    /// value was evicted: exactly its pinned version, read from durable
+    /// history (index-verified) whose content has the pinned fingerprint.
+    /// `None` when the table was not resolved in this generation. A version
+    /// that cannot be rebuilt exactly fails closed: eviction never re-resolves
+    /// a table.
+    async fn rebuild_pinned(
+        &self,
+        scope: &RegistryScope,
+        key: &(String, String),
+    ) -> SourceResult<Option<Arc<LoadedSchema>>> {
+        let Some(pin) = self.cache.read().await.pinned(scope.generation(), key)
+        else {
+            return Ok(None);
+        };
+        let stored = self
+            .registry
+            .get_version(&scope.key(&key.0, &key.1), pin.version)
+            .await
+            .map_err(RegistryError::Storage)?;
+        let schema = stored
+            .and_then(|sv| {
+                serde_json::from_value::<MySqlTableSchema>(sv.schema_json).ok()
+            })
+            .filter(|schema| *schema.fingerprint() == *pin.fingerprint)
+            .ok_or_else(|| SourceError::Schema {
+                details: format!(
+                    "schema of {}.{} (version {}) was evicted from the \
+                     loader cache and cannot be rebuilt exactly from durable \
+                     history",
+                    key.0, key.1, pin.version
+                )
+                .into(),
+            })?;
+        let column_names: Arc<Vec<String>> =
+            Arc::new(schema.columns.iter().map(|c| c.name.clone()).collect());
+        Ok(Some(Arc::new(LoadedSchema {
+            schema,
+            registry_version: pin.version,
+            fingerprint: pin.fingerprint,
+            sequence: pin.sequence,
+            column_names,
+        })))
     }
 
     /// The error after the lineage kept moving for every attempt.
@@ -427,6 +510,15 @@ impl MySqlSchemaLoader {
             {
                 return Ok(cached);
             }
+            if let Some(rebuilt) = self.rebuild_pinned(&scope, &key).await? {
+                if self
+                    .cache_insert(&scope, key.clone(), rebuilt.clone())
+                    .await
+                {
+                    return Ok(rebuilt);
+                }
+                continue;
+            }
 
             let t0 = Instant::now();
             let schema = match self.fetch_schema(&scope, db, table).await? {
@@ -529,7 +621,7 @@ impl MySqlSchemaLoader {
         self.cache.write().await.clear();
     }
 
-    /// Reload the tables in use: every table resident in the cache (matching
+    /// Reload the tables in use: every table resolved in this run (matching
     /// `patterns`, when given) is fetched again from the live catalog and
     /// re-registered; other tables load on their next use. Never enumerates
     /// the catalog, so its cost follows the working set, not the catalog.
@@ -540,11 +632,7 @@ impl MySqlSchemaLoader {
         let allow = common::AllowList::new(patterns);
         let resident: Vec<(String, String)> = {
             let mut cache = self.cache.write().await;
-            let keys = cache
-                .entries_for(self.scope.generation())
-                .into_iter()
-                .map(|(key, _)| key)
-                .collect();
+            let keys = cache.tables_for(self.scope.generation());
             cache.clear();
             keys
         };

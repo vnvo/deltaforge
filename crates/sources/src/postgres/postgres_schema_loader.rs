@@ -57,6 +57,21 @@ pub struct LoadedSchema {
     pub column_names: Arc<Vec<String>>,
 }
 
+impl crate::registry_scope::Resident for LoadedSchema {
+    fn pin(&self) -> crate::registry_scope::PinnedVersion {
+        crate::registry_scope::PinnedVersion {
+            version: self.registry_version,
+            sequence: self.sequence,
+            fingerprint: Arc::clone(&self.fingerprint),
+        }
+    }
+
+    fn weight(&self) -> usize {
+        serde_json::to_vec(&*self.schema).map_or(0, |b| b.len())
+            + self.column_names.iter().map(String::len).sum::<usize>()
+    }
+}
+
 /// Schema loader with caching and registry integration.
 ///
 /// Every registry access is qualified by the source's verified lineage, taken
@@ -132,12 +147,81 @@ impl PostgresSchemaLoader {
         value: LoadedSchema,
     ) -> bool {
         let mut cache = self.cache.write().await;
-        cache.insert_if_current(
+        let (_, _, evicted_before) = cache.usage();
+        let inserted = cache.insert_if_current(
             scope.generation(),
             self.scope.generation(),
             key,
             value,
-        )
+        );
+        let (_, _, evicted_after) = cache.usage();
+        if evicted_after > evicted_before {
+            counter!("deltaforge_source_schema_cache_evictions_total",
+                "pipeline" => self.tenant.clone(), "source" => "postgres")
+            .increment(evicted_after - evicted_before);
+        }
+        inserted
+    }
+
+    /// Bound the resident schemas to `budget` (the default suits most
+    /// pipelines).
+    pub fn with_cache_budget(
+        mut self,
+        budget: crate::registry_scope::CacheBudget,
+    ) -> Self {
+        self.cache = Arc::new(RwLock::new(ScopedCache::with_budget(budget)));
+        self
+    }
+
+    /// Resident schemas, their approximate bytes and evictions so far.
+    pub async fn cache_usage(&self) -> (usize, usize, u64) {
+        self.cache.read().await.usage()
+    }
+
+    /// Rebuild the table `key` resolved to earlier in this run, after its
+    /// value was evicted: exactly its pinned version, read from durable
+    /// history (index-verified) whose content has the pinned fingerprint.
+    /// `None` when the table was not resolved in this generation. A version
+    /// that cannot be rebuilt exactly fails closed: eviction never re-resolves
+    /// a table.
+    async fn rebuild_pinned(
+        &self,
+        scope: &RegistryScope,
+        key: &(String, String),
+    ) -> SourceResult<Option<LoadedSchema>> {
+        let Some(pin) = self.cache.read().await.pinned(scope.generation(), key)
+        else {
+            return Ok(None);
+        };
+        let stored = self
+            .registry
+            .get_version(&scope.key(&key.0, &key.1), pin.version)
+            .await
+            .map_err(RegistryError::Storage)?;
+        let schema = stored
+            .and_then(|sv| {
+                serde_json::from_value::<PostgresTableSchema>(sv.schema_json)
+                    .ok()
+            })
+            .filter(|schema| *schema.fingerprint() == *pin.fingerprint)
+            .ok_or_else(|| SourceError::Schema {
+                details: format!(
+                    "schema of {}.{} (version {}) was evicted from the \
+                     loader cache and cannot be rebuilt exactly from durable \
+                     history",
+                    key.0, key.1, pin.version
+                )
+                .into(),
+            })?;
+        let column_names: Arc<Vec<String>> =
+            Arc::new(schema.columns.iter().map(|c| c.name.clone()).collect());
+        Ok(Some(LoadedSchema {
+            schema: Arc::new(schema),
+            registry_version: pin.version,
+            fingerprint: pin.fingerprint,
+            sequence: pin.sequence,
+            column_names,
+        }))
     }
 
     /// The error after the lineage kept moving for every attempt.
@@ -388,6 +472,15 @@ impl PostgresSchemaLoader {
             {
                 return Ok(cached);
             }
+            if let Some(rebuilt) = self.rebuild_pinned(&scope, &key).await? {
+                if self
+                    .cache_insert(&scope, key.clone(), rebuilt.clone())
+                    .await
+                {
+                    return Ok(rebuilt);
+                }
+                continue;
+            }
 
             let t0 = Instant::now();
             let pg_schema = match self.fetch_live(&scope, schema, table).await?
@@ -493,6 +586,20 @@ impl PostgresSchemaLoader {
             {
                 return Ok(cached);
             }
+            // An evicted table is rebuilt exactly; only if the relation no
+            // longer matches it (a changed or recreated table) is it resolved
+            // again below.
+            if let Some(rebuilt) = self.rebuild_pinned(&scope, &key).await?
+                && rebuilt.schema.matches_relation(rel)
+            {
+                if self
+                    .cache_insert(&scope, key.clone(), rebuilt.clone())
+                    .await
+                {
+                    return Ok(rebuilt);
+                }
+                continue;
+            }
 
             // 2. Live catalog, ONLY if it matches this relation identity. A live
             //    table whose OID/signature/replica differs from the retained
@@ -594,7 +701,7 @@ impl PostgresSchemaLoader {
         self.cache.write().await.clear();
     }
 
-    /// Reload the tables in use: every table resident in the cache (matching
+    /// Reload the tables in use: every table resolved in this run (matching
     /// `patterns`, when given) is fetched again from the live catalog and
     /// re-registered; other tables load on their next use. Never enumerates
     /// the catalog, so its cost follows the working set, not the catalog.
@@ -605,11 +712,7 @@ impl PostgresSchemaLoader {
         let allow = common::AllowList::new(patterns);
         let resident: Vec<(String, String)> = {
             let mut cache = self.cache.write().await;
-            let keys = cache
-                .entries_for(self.scope.generation())
-                .into_iter()
-                .map(|(key, _)| key)
-                .collect();
+            let keys = cache.tables_for(self.scope.generation());
             cache.clear();
             keys
         };
@@ -1137,6 +1240,66 @@ mod tests {
 
         fn pg(n: u64) -> LineageDescriptor {
             LineageDescriptor::postgres(n, n).unwrap()
+        }
+
+        /// An evicted table is rebuilt exactly from durable history (its
+        /// pinned version, sequence and fingerprint, no live read); a pinned
+        /// version that is gone or differs fails closed instead of being
+        /// re-resolved.
+        #[tokio::test]
+        async fn an_evicted_table_is_rebuilt_exactly_or_fails_closed() {
+            let scope = SharedRegistryScope::new("src");
+            scope.publish_for_test("acme", pg(1));
+            let l = loader(&scope).with_cache_budget(
+                crate::registry_scope::CacheBudget {
+                    max_entries: 1,
+                    max_bytes: usize::MAX,
+                },
+            );
+            let current = l.current_scope().unwrap();
+            let mut orders = loaded("id");
+            orders.registry_version = l
+                .registry
+                .register_with_checkpoint(
+                    &current.key("public", "orders"),
+                    &orders.fingerprint,
+                    &serde_json::to_value(&*orders.schema).unwrap(),
+                    None,
+                )
+                .await
+                .unwrap();
+            orders.sequence = 42;
+            assert!(l.cache_insert(&current, key(), orders.clone()).await);
+            let other = ("public".to_string(), "items".to_string());
+            assert!(l.cache_insert(&current, other.clone(), loaded("x")).await);
+            assert!(l.get_cached("public", "orders").is_none(), "evicted");
+
+            let rebuilt =
+                l.rebuild_pinned(&current, &key()).await.unwrap().unwrap();
+            assert_eq!(
+                (
+                    rebuilt.registry_version,
+                    rebuilt.sequence,
+                    &rebuilt.fingerprint
+                ),
+                (orders.registry_version, 42, &orders.fingerprint)
+            );
+            assert_eq!(rebuilt.schema, orders.schema);
+            assert_eq!(l.live_fetch_count(), 0);
+
+            // `items` was pinned to version 1, which was never registered.
+            let version = orders.registry_version;
+            l.cache_insert(&current, key(), orders).await;
+            let gone = l.rebuild_pinned(&current, &other).await.unwrap_err();
+            assert!(matches!(gone, SourceError::Schema { .. }), "{gone:?}");
+
+            // A pin whose stored version (which exists) holds other content.
+            let mut differs = loaded("other");
+            differs.registry_version = version;
+            l.cache_insert(&current, key(), differs).await;
+            l.cache_insert(&current, other, loaded("x")).await;
+            let changed = l.rebuild_pinned(&current, &key()).await.unwrap_err();
+            assert!(matches!(changed, SourceError::Schema { .. }));
         }
 
         /// The first-resolution baseline is read from durable history, not
