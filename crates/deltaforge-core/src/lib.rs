@@ -27,6 +27,9 @@ pub mod envelope;
 pub mod errors;
 pub use errors::{SinkError, SourceError};
 
+pub mod incident;
+pub use incident::{IncidentDraft, IncidentId};
+
 pub mod routing;
 pub use routing::EventRouting;
 

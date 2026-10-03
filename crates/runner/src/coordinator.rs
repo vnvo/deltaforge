@@ -443,6 +443,17 @@ pub enum TxProtocolError {
     },
 }
 
+/// A sink's delivery error, kept with the sink's id so the failure that stops
+/// the pipeline can be attributed and classified (its incident draft, if any,
+/// travels inside `error`).
+#[derive(Debug, thiserror::Error)]
+#[error("sink {sink_id} delivery failed ({kind})", kind = error.kind())]
+pub struct SinkDeliveryError {
+    pub sink_id: String,
+    #[source]
+    pub error: SinkError,
+}
+
 /// Enforces the source transaction protocol on the marker/event stream: a single
 /// transaction is open at a time, its events carry its id, and only its own
 /// commit marker (exactly once) closes it. This is the locked invariant that a
@@ -1989,6 +2000,10 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
 
         // Collect per-sink success/failure for checkpoint commits.
         // (sink_id, required, succeeded)
+        // The first failing sink's typed error (a required sink's first), kept
+        // so the failure that stops the pipeline is attributed, not folded
+        // into text.
+        let mut first_failure: Option<(bool, SinkDeliveryError)> = None;
         let mut sink_results: Vec<(String, bool, bool)> =
             Vec::with_capacity(raw_outcomes.len());
 
@@ -2116,6 +2131,17 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                         error=%e,
                         "sink delivery failed"
                     );
+                    if first_failure.as_ref().is_none_or(|(was_required, _)| {
+                        required && !was_required
+                    }) {
+                        first_failure = Some((
+                            required,
+                            SinkDeliveryError {
+                                sink_id: sink_id.clone(),
+                                error: e,
+                            },
+                        ));
+                    }
                 }
             }
         }
@@ -2141,10 +2167,14 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             required_acks,
             total_acks,
         ) {
-            anyhow::bail!(
+            let msg = format!(
                 "commit policy not satisfied: required {required_acks}/{required_total} acks, \
                  total {total_acks}"
             );
+            return Err(match first_failure {
+                Some((_, failure)) => anyhow::Error::new(failure).context(msg),
+                None => anyhow::anyhow!(msg),
+            });
         }
 
         //
@@ -4682,6 +4712,51 @@ mod tests {
             );
             Ok(deltaforge_core::BatchResult::ok())
         }
+    }
+
+    /// A required sink's failure stops the coordinator with that sink's typed
+    /// error in the chain, so the pipeline's incident is attributed to it
+    /// rather than to an anonymous commit-policy message.
+    #[tokio::test]
+    async fn a_required_sink_failure_is_attributed_to_the_sink() {
+        use checkpoints::MemCheckpointStore;
+        let sink = MockSink::new("kafka", true);
+        sink.set_fail(true);
+        let coord = tx_coord(
+            Arc::new(MemCheckpointStore::new().unwrap()),
+            Arc::clone(&sink),
+            BatchConfig {
+                max_events: Some(1),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            },
+        );
+        let err = feed_and_run(
+            coord,
+            vec![
+                begin("t1"),
+                SourceItem::Event(tx_event(1, "t1", b"r1")),
+                commit("t1", b"cp-1"),
+            ],
+        )
+        .await
+        .expect_err("a required sink failure stops the coordinator");
+        let failure = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<SinkDeliveryError>())
+            .expect("the sink's typed error is chained");
+        assert_eq!(failure.sink_id, "kafka");
+        let draft = crate::incidents::classify_coordinator_exit(&err);
+        assert_eq!(
+            draft.component,
+            deltaforge_core::incident::Component::Sink { id: "kafka".into() }
+        );
+        assert_eq!(
+            draft.cause_code,
+            deltaforge_core::incident::CauseCode::SinkBackpressure
+        );
     }
 
     #[tokio::test]
