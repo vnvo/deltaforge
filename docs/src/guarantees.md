@@ -100,6 +100,18 @@ To avoid ambiguity, here is exactly what DeltaForge guarantees about transaction
 - A single database transaction that exceeds `max_events` or `max_bytes` is still kept in one batch. The limits are exceeded rather than the transaction being split.
 - With `respect_source_tx: false`, batches are split purely by size/time limits regardless of transaction boundaries. Cross-table transaction atomicity is not preserved in this mode.
 
+### Disconnect inside a transaction (PostgreSQL)
+
+When the replication stream ends inside a transaction (the connection is closed or reset), the source reconnects to the same verified server, resumes at the end of the last transaction it handed on, abandons the cut-off transaction (an internal abort marker, never a CDC event) and receives it again from its beginning:
+
+| Mode | Disconnect inside a transaction |
+|------|---------------------------------|
+| `respect_source_tx: true` (default) | The buffered prefix is discarded; the transaction is delivered once, with one commit boundary |
+| `respect_source_tx: false` | Rows already delivered for it cannot be recalled; its replay may deliver them again (at-least-once duplicates) |
+| Either mode | The checkpoint never advances for the abandoned attempt; a process restart resumes from the durable checkpoint |
+
+Each abandoned transaction logs a warning (source, transaction, last complete position, events abandoned, whether duplicates are possible) and counts in `deltaforge_source_transaction_aborts_total`, `deltaforge_source_replayed_events_total` and `deltaforge_abandoned_tx_total{outcome="discarded"|"may_duplicate"}`; reconnects count in `deltaforge_source_reconnects_total`. Keep `respect_source_tx: true` for production. In that mode an open transaction is buffered in memory up to `max_tx_events` / `max_tx_bytes`, beyond which the `oversized_tx` policy applies.
+
 ## Initial-snapshot anchoring
 
 The initial snapshot and the CDC stream meet at a single anchor so that **no committed row is lost** across the boundary. The checks below run only when a snapshot runs; CDC-only pipelines (`snapshot.mode = never`) are unaffected.

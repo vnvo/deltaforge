@@ -146,6 +146,13 @@ pub(crate) struct RunCtx {
     pub inactivity: Duration,
     pub relation_map: HashMap<u32, RelationInfo>,
     pub last_lsn: Lsn,
+    /// Where an in-process reconnect resumes: the end of the last transaction
+    /// whose commit was handed to the coordinator (or the start position).
+    /// Never the read position, which keepalives and in-transaction messages
+    /// move: a transaction cut off mid-stream must be decoded again in full.
+    pub resume_lsn: Lsn,
+    /// Events handed to the coordinator for the open transaction.
+    pub open_tx_events: u64,
     pub current_tx_id: Option<u32>,
     pub current_tx_commit_time: Option<i64>,
     /// The current transaction's final LSN (from `BEGIN`) - the stable identity
@@ -639,6 +646,8 @@ impl PostgresSource {
             inactivity: Duration::from_secs(60),
             relation_map: HashMap::new(),
             last_lsn: start_lsn,
+            resume_lsn: start_lsn,
+            open_tx_events: 0,
             current_tx_id: None,
             current_tx_commit_time: None,
             current_final_lsn: None,
@@ -809,8 +818,47 @@ impl PostgresSource {
                         info!(source_id = %self.id, "cancelled during reconnect");
                         break;
                     }
+                    // Resume at the last commit handed on; a transaction cut
+                    // off mid-stream is abandoned here and sent again in full
+                    // (from its BEGIN) by the new stream.
+                    if let Some(xid) = ctx.current_tx_id.take() {
+                        let abandoned = std::mem::take(&mut ctx.open_tx_events);
+                        warn!(
+                            source_id = %self.id,
+                            pipeline = %self.pipeline,
+                            xid,
+                            final_lsn = ?ctx.current_final_lsn,
+                            last_complete_position = %ctx.resume_lsn,
+                            abandoned_events = abandoned,
+                            duplicates_possible =
+                                "only with batch.respect_source_tx=false",
+                            "stream ended inside a transaction: abandoning it and \
+                             replaying it in full from the last complete position"
+                        );
+                        metrics::counter!(
+                            "deltaforge_source_transaction_aborts_total",
+                            "pipeline" => self.pipeline.clone(),
+                            "source" => self.id.clone(),
+                        )
+                        .increment(1);
+                        metrics::counter!(
+                            "deltaforge_source_replayed_events_total",
+                            "pipeline" => self.pipeline.clone(),
+                            "source" => self.id.clone(),
+                        )
+                        .increment(abandoned);
+                        ctx.tx
+                            .send(SourceItem::TxAbort {
+                                tx_id: xid.to_string(),
+                            })
+                            .await
+                            .map_err(|e| SourceError::Other(e.into()))?;
+                        ctx.current_tx_commit_time = None;
+                        ctx.current_final_lsn = None;
+                    }
+                    ctx.last_lsn = ctx.resume_lsn;
                     let reconnect_config =
-                        config.clone().with_start_lsn(ctx.last_lsn);
+                        config.clone().with_start_lsn(ctx.resume_lsn);
 
                     match connect_replication_with_retries(
                         &self.id,

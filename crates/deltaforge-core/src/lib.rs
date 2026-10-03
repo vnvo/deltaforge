@@ -788,6 +788,14 @@ pub enum SourceItem {
         tx_id: String,
         boundary: SourceBoundary,
     },
+    /// The source abandoned the open transaction `tx_id` before its commit:
+    /// its stream was cut off and the transaction will be sent again in full,
+    /// from its `TxBegin`. In transaction-aligned mode the coordinator discards
+    /// the events it buffered for it, so they are delivered once, with the
+    /// replay; nothing it carried advances a checkpoint. Without transaction
+    /// alignment, events already flushed for it are delivered again with the
+    /// replay (at-least-once duplicates).
+    TxAbort { tx_id: String },
     /// A boundary carrying no data event: snapshot table-complete and
     /// snapshot-complete markers (and any future progress marker that must
     /// advance the durable watermark without a row). The coordinator applies it

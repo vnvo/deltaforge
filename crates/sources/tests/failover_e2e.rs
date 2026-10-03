@@ -23,6 +23,7 @@ use sources::mysql::{MySqlSource, mysql_health};
 use sources::postgres::{PostgresSource, postgres_health};
 use sources::stream_probe::{reset_streams_opened, streams_opened};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Instant;
 use storage::{ArcStorageBackend, MemoryStorageBackend};
 use testcontainers::{
@@ -1144,6 +1145,127 @@ async fn postgres_another_cluster_is_refused_before_anything() -> Result<()> {
     Ok(())
 }
 
+/// A TCP proxy standing in for a failover endpoint (DNS, VIP, load
+/// balancer): every new connection goes to the current target.
+struct Proxy {
+    port: u16,
+    to: Arc<AtomicU16>,
+    live: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
+}
+
+impl Proxy {
+    async fn start(to: u16) -> Self {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let target = Arc::new(AtomicU16::new(to));
+        let live = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (t, lv) = (target.clone(), live.clone());
+        tokio::spawn(async move {
+            while let Ok((mut client, _)) = l.accept().await {
+                let to = t.load(Ordering::SeqCst);
+                let task = tokio::spawn(async move {
+                    if let Ok(mut server) =
+                        tokio::net::TcpStream::connect(("127.0.0.1", to)).await
+                    {
+                        let _ = tokio::io::copy_bidirectional(
+                            &mut client,
+                            &mut server,
+                        )
+                        .await;
+                    }
+                });
+                lv.lock().unwrap().push(task.abort_handle());
+            }
+        });
+        Self {
+            port,
+            to: target,
+            live,
+        }
+    }
+
+    /// Send new connections to `to` and drop every open one.
+    fn switch_to(&self, to: u16) {
+        self.to.store(to, Ordering::SeqCst);
+        for t in self.live.lock().unwrap().drain(..) {
+            t.abort();
+        }
+    }
+}
+
+/// The endpoint moves to another cluster while the source runs: the reconnect
+/// is refused before START_REPLICATION reaches it.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn postgres_a_reconnect_to_another_cluster_is_refused() -> Result<()> {
+    init_test_tracing();
+    const DB: &str = "shop";
+    const SLOT: &str = "slot_rc";
+    const PUB: &str = "pub_rc";
+    const ID: &str = "rc";
+
+    let (_c_a, port_a) = start_postgres().await;
+    pg_create_schema(port_a, DB, SLOT, PUB).await;
+    let (_c_b, port_b) = start_postgres().await;
+    pg_create_schema(port_b, DB, "slot_unused", PUB).await;
+
+    let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let proxy = Proxy::start(port_a).await;
+
+    let src = make_pg_source(
+        ID,
+        &pg_dsn(proxy.port, DB),
+        SLOT,
+        PUB,
+        Arc::clone(&backend),
+    )
+    .await;
+    let (tx, mut rx) = mpsc::channel(64);
+    let handle = src.run(tx, Arc::clone(&ckpt)).await;
+    sleep(Duration::from_secs(4)).await;
+    pg_admin_client(port_a, DB)
+        .await
+        .execute("INSERT INTO orders VALUES (1, 'on-a')", &[])
+        .await?;
+    let evts = collect_until(&mut rx, Duration::from_secs(10), |e| {
+        e.iter().any(|x| has_id(x, 1))
+    })
+    .await;
+    assert!(evts.iter().any(|e| has_id(e, 1)));
+    let kept = Untouched::capture(&backend, &ckpt, ID, port_a).await;
+    // Any position the source holds is at or before A's current WAL end.
+    let f = parse_lsn(
+        pg_admin_client(port_a, DB)
+            .await
+            .query_one("SELECT pg_current_wal_lsn()::text", &[])
+            .await?
+            .get(0),
+    );
+
+    // B looks like a perfect continuation: same names, slot beyond F.
+    slot_beyond(port_b, DB, SLOT, f).await;
+    pg_admin_client(port_b, DB)
+        .await
+        .execute("INSERT INTO orders VALUES (2, 'on-b')", &[])
+        .await?;
+    let b_slot = slot_position(port_b, DB, SLOT).await;
+
+    reset_streams_opened();
+    proxy.switch_to(port_b);
+    refused(handle).await;
+    no_events(&mut rx).await;
+
+    assert_eq!(streams_opened(), 0, "no replication stream opened on B");
+    assert_eq!(
+        slot_position(port_b, DB, SLOT).await,
+        b_slot,
+        "B's slot never moved"
+    );
+    kept.assert_kept(&backend, &ckpt, ID).await;
+    Ok(())
+}
+
 // ============================================================================
 // R3-C2: startup identity-persistence failure must open ZERO replication streams
 //
@@ -1518,5 +1640,353 @@ async fn mysql_nongtid_startup_identity_persist_failure_opens_no_stream()
         0,
         "no binlog stream must ever be opened when identity persist fails"
     );
+    Ok(())
+}
+
+/// A port with nothing listening: connections to it are refused.
+async fn dead_port() -> u16 {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    l.local_addr().unwrap().port()
+}
+
+/// A source item reduced to what the protocol checks need.
+#[derive(Debug)]
+enum Seen {
+    Begin(String),
+    Row(i64),
+    Commit(String),
+    Abort(String),
+}
+
+/// What has been received so far.
+#[derive(Default)]
+struct Received {
+    seen: Vec<Seen>,
+    rows: usize,
+    commits: usize,
+}
+
+/// Receive items until `done` holds or `dur` passes.
+async fn recv_until(
+    rx: &mut mpsc::Receiver<SourceItem>,
+    r: &mut Received,
+    dur: Duration,
+    done: impl Fn(&Received) -> bool,
+) {
+    let deadline = Instant::now() + dur;
+    while !done(r) {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let Ok(Some(item)) = timeout(left, rx.recv()).await else {
+            return;
+        };
+        match item {
+            SourceItem::TxBegin { tx_id } => r.seen.push(Seen::Begin(tx_id)),
+            SourceItem::Event(e) => {
+                let id = e
+                    .after
+                    .as_ref()
+                    .and_then(|v| v.get("id"))
+                    .and_then(|v| v.as_i64())
+                    .expect("row id");
+                r.rows += 1;
+                r.seen.push(Seen::Row(id));
+            }
+            SourceItem::TxCommit { tx_id, .. } => {
+                r.commits += 1;
+                r.seen.push(Seen::Commit(tx_id));
+            }
+            SourceItem::TxAbort { tx_id } => r.seen.push(Seen::Abort(tx_id)),
+            SourceItem::Boundary { .. } => {}
+        }
+    }
+}
+
+/// One transaction attempt on the source stream: its id, its rows in order,
+/// and whether it ended in a commit (true) or an abort (false).
+type Attempt = (String, Vec<i64>, bool);
+
+/// Split `items` into transaction attempts, checking the protocol: every row
+/// belongs to an open transaction, and each attempt ends in its own commit or
+/// abort marker.
+fn attempts(seen: &[Seen]) -> Vec<Attempt> {
+    let mut out = Vec::new();
+    let mut open: Option<(String, Vec<i64>)> = None;
+    for i in seen {
+        match i {
+            Seen::Begin(tx_id) => {
+                assert!(
+                    open.is_none(),
+                    "begin of {tx_id} inside a transaction"
+                );
+                open = Some((tx_id.clone(), Vec::new()));
+            }
+            Seen::Row(id) => open
+                .as_mut()
+                .expect("a row outside a transaction")
+                .1
+                .push(*id),
+            Seen::Commit(tx_id) | Seen::Abort(tx_id) => {
+                let (id, rows) =
+                    open.take().expect("a marker outside a transaction");
+                assert_eq!(&id, tx_id, "the marker names the open transaction");
+                out.push((id, rows, matches!(i, Seen::Commit(_))));
+            }
+        }
+    }
+    out
+}
+
+/// Every expected transaction committed exactly once with all its rows in
+/// order, and every abandoned attempt a prefix of its transaction's replay.
+fn assert_each_committed_once(attempts: &[Attempt], expected: &[Vec<i64>]) {
+    let committed: Vec<&Attempt> = attempts.iter().filter(|a| a.2).collect();
+    assert_eq!(
+        committed.iter().map(|a| a.1.clone()).collect::<Vec<_>>(),
+        expected,
+        "each transaction committed once, rows in order, nothing lost"
+    );
+    for (id, rows, done) in attempts {
+        if !done {
+            let replay = committed
+                .iter()
+                .find(|c| &c.0 == id)
+                .expect("an abandoned transaction is replayed");
+            assert!(
+                replay.1.starts_with(rows),
+                "the abandoned attempt is a prefix of its replay"
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Cut {
+    /// Inside a large transaction.
+    Inside,
+    /// After the first transaction's last row, before its commit marker is read.
+    BeforeCommit,
+    /// Right after the first transaction's commit marker is read.
+    AfterCommit,
+}
+
+/// The stream is closed cleanly by the peer (a proxy dropping it) at `cut`.
+/// The source reconnects on its own server, resuming at the end of the last
+/// transaction it handed on: a transaction cut off is abandoned (TxAbort) and
+/// sent again from its BEGIN, a handed-on one is never sent again, and nothing
+/// is lost.
+async fn stream_closed_at(cut: Cut) -> Result<()> {
+    const DB: &str = "shop";
+    // Larger than what the replication client buffers ahead (8192 events)
+    // plus the socket buffers, so a cut lands inside it.
+    const BIG: i64 = 200_000;
+
+    let (_c, port) = start_postgres().await;
+    pg_create_schema(port, DB, "slot_cut", "pub_cut").await;
+    let proxy = Proxy::start(port).await;
+    let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let src = make_pg_source(
+        "cut",
+        &pg_dsn(proxy.port, DB),
+        "slot_cut",
+        "pub_cut",
+        Arc::clone(&backend),
+    )
+    .await;
+    // One slot: the source hands on one item at a time, so the cut lands
+    // where the test stops reading.
+    let (tx, mut rx) = mpsc::channel(1);
+    let handle = src.run(tx, Arc::clone(&ckpt)).await;
+    sleep(Duration::from_secs(4)).await;
+
+    let admin = pg_admin_client(port, DB).await;
+    admin
+        .execute(
+            "INSERT INTO orders SELECT g, 'small' FROM generate_series(1, 3) g",
+            &[],
+        )
+        .await?;
+    admin
+        .execute(
+            &format!(
+                "INSERT INTO orders SELECT g, 'big' FROM generate_series(101, {}) g",
+                100 + BIG
+            ),
+            &[],
+        )
+        .await?;
+
+    let mut r = Received::default();
+    recv_until(&mut rx, &mut r, Duration::from_secs(30), |r| match cut {
+        Cut::Inside => r.rows >= 200,
+        Cut::BeforeCommit => r.rows >= 3,
+        Cut::AfterCommit => r.commits >= 1,
+    })
+    .await;
+    proxy.switch_to(port);
+    admin
+        .execute("INSERT INTO orders VALUES (900000, 'after')", &[])
+        .await?;
+    recv_until(&mut rx, &mut r, Duration::from_secs(300), |r| {
+        r.commits >= 3
+    })
+    .await;
+
+    let all = attempts(&r.seen);
+    assert_each_committed_once(
+        &all,
+        &[(1..=3).collect(), (101..=100 + BIG).collect(), vec![900000]],
+    );
+    if matches!(cut, Cut::Inside) {
+        assert!(
+            all.iter().any(|a| !a.2),
+            "the transaction cut inside was abandoned and replayed"
+        );
+    }
+    assert!(!handle.join.is_finished(), "the source keeps running");
+    handle.stop();
+    handle.join().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn postgres_a_stream_closed_inside_a_transaction_replays_it_once()
+-> Result<()> {
+    init_test_tracing();
+    stream_closed_at(Cut::Inside).await
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn postgres_a_stream_closed_before_a_commit_loses_nothing() -> Result<()>
+{
+    init_test_tracing();
+    stream_closed_at(Cut::BeforeCommit).await
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn postgres_a_stream_closed_after_a_commit_loses_nothing() -> Result<()> {
+    init_test_tracing();
+    stream_closed_at(Cut::AfterCommit).await
+}
+
+/// The endpoint is unreachable for longer than the server-verification
+/// retries: the reconnect keeps backing off (it never fails the source and
+/// never streams unverified), resumes when the same server returns, and a stop
+/// during a later outage ends the source promptly.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn postgres_a_reconnect_outlasts_an_outage_and_stops_on_cancel()
+-> Result<()> {
+    init_test_tracing();
+    const DB: &str = "shop";
+
+    let (_c, port) = start_postgres().await;
+    pg_create_schema(port, DB, "slot_out", "pub_out").await;
+    let proxy = Proxy::start(port).await;
+    let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let src = make_pg_source(
+        "out",
+        &pg_dsn(proxy.port, DB),
+        "slot_out",
+        "pub_out",
+        Arc::clone(&backend),
+    )
+    .await;
+    let (tx, mut rx) = mpsc::channel(64);
+    let handle = src.run(tx, Arc::clone(&ckpt)).await;
+    sleep(Duration::from_secs(4)).await;
+    let admin = pg_admin_client(port, DB).await;
+
+    let dead = dead_port().await;
+    proxy.switch_to(dead);
+    admin
+        .execute("INSERT INTO orders VALUES (1, 'during')", &[])
+        .await?;
+    sleep(Duration::from_secs(20)).await;
+    assert!(
+        !handle.join.is_finished(),
+        "an outage must not fail the source"
+    );
+
+    proxy.switch_to(port);
+    let evts = collect_until(&mut rx, Duration::from_secs(90), |e| {
+        e.iter().any(|x| has_id(x, 1))
+    })
+    .await;
+    assert!(
+        evts.iter().any(|e| has_id(e, 1)),
+        "resumed after the outage"
+    );
+
+    proxy.switch_to(dead);
+    sleep(Duration::from_secs(3)).await;
+    handle.stop();
+    let joined = timeout(Duration::from_secs(10), handle.join())
+        .await
+        .expect("a stop during an outage ends the source promptly");
+    if let Err(e) = &joined {
+        assert!(
+            matches!(
+                e.downcast_ref::<SourceError>(),
+                Some(SourceError::Cancelled)
+            ),
+            "a stop is not a failure: {e:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A stop while the source is inside a transaction is a shutdown, not a
+/// disconnect: no reconnect and no abort marker; the open transaction is left
+/// to the coordinator's shutdown handling.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn postgres_a_stop_inside_a_transaction_aborts_nothing() -> Result<()> {
+    init_test_tracing();
+    const DB: &str = "shop";
+
+    let (_c, port) = start_postgres().await;
+    pg_create_schema(port, DB, "slot_stop", "pub_stop").await;
+    let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let src = make_pg_source(
+        "stop",
+        &pg_dsn(port, DB),
+        "slot_stop",
+        "pub_stop",
+        Arc::clone(&backend),
+    )
+    .await;
+    let (tx, mut rx) = mpsc::channel(1);
+    let handle = src.run(tx, Arc::clone(&ckpt)).await;
+    sleep(Duration::from_secs(4)).await;
+    pg_admin_client(port, DB)
+        .await
+        .execute(
+            "INSERT INTO orders SELECT g, 'big' FROM generate_series(1, 200000) g",
+            &[],
+        )
+        .await?;
+
+    let mut r = Received::default();
+    recv_until(&mut rx, &mut r, Duration::from_secs(30), |r| r.rows >= 200)
+        .await;
+    assert_eq!(r.commits, 0, "stopped inside the transaction");
+    reset_streams_opened();
+    handle.stop();
+    // Drain whatever the source still hands on until it closes its channel.
+    recv_until(&mut rx, &mut r, Duration::from_secs(30), |_| false).await;
+    timeout(Duration::from_secs(30), handle.join())
+        .await
+        .expect("the stop ends the source")?;
+    assert!(
+        !r.seen.iter().any(|s| matches!(s, Seen::Abort(_))),
+        "a stop never abandons a transaction"
+    );
+    assert_eq!(streams_opened(), 0, "a stop never reconnects");
     Ok(())
 }

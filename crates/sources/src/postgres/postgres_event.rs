@@ -156,6 +156,7 @@ pub(super) async fn dispatch_event(
             ctx.current_final_lsn = Some(final_lsn.to_string());
             ctx.change_ordinal = 0;
             ctx.message_ordinal = 0;
+            ctx.open_tx_events = 0;
             // Open the transaction on the coordinator's stream. tx_id matches the
             // xid stamped on this transaction's events and its TxCommit marker.
             let _ = ctx
@@ -196,6 +197,8 @@ pub(super) async fn dispatch_event(
             ctx.current_tx_commit_time = None;
             ctx.current_final_lsn = None;
             ctx.message_ordinal = 0;
+            ctx.open_tx_events = 0;
+            ctx.resume_lsn = end_lsn;
         }
         ReplicationEvent::StoppedAt { reached } => {
             info!(reached = %reached, "replication stopped at target LSN");
@@ -261,6 +264,9 @@ pub(super) async fn dispatch_event(
                 ctx.tx.send(SourceItem::Event(event)).await.map_err(|e| {
                     LoopControl::Fail(SourceError::Other(e.into()))
                 })?;
+                if transactional {
+                    ctx.open_tx_events += 1;
+                }
             }
 
             ctx.last_lsn = lsn;
@@ -1031,7 +1037,11 @@ async fn handle_truncate(
             });
         }
 
-        let _ = ctx.tx.send(SourceItem::Event(ev)).await;
+        if ctx.tx.send(SourceItem::Event(ev)).await.is_ok()
+            && ctx.current_tx_id.is_some()
+        {
+            ctx.open_tx_events += 1;
+        }
     }
 
     Ok(())
@@ -1058,6 +1068,9 @@ async fn send_event(
         Err(_) => false,
     };
     if ok {
+        if ctx.current_tx_id.is_some() {
+            ctx.open_tx_events += 1;
+        }
         let key = (Arc::clone(table_name), op);
         let ctr = ctx.counter_cache.entry(key).or_insert_with_key(|k| {
             counter!(
