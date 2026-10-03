@@ -34,6 +34,11 @@ pub enum SourceError {
     #[error("schema issues: {details}")]
     Schema { details: Cow<'static, str> },
 
+    /// The connected server is not the verified source lineage (or its
+    /// identity could not be established). Never retried.
+    #[error("source lineage error: {details}")]
+    Lineage { details: Cow<'static, str> },
+
     #[error("backpressure")]
     Backpressure,
 

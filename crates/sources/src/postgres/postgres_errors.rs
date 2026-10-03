@@ -352,6 +352,10 @@ fn is_connection_error(s: &str) -> bool {
         // "failed to fill whole buffer" instead, so cover both.
         || s.contains("early eof")
         || s.contains("failed to fill whole buffer")
+        // pgwire-replication's own UnexpectedEof when the peer closes between
+        // or inside messages ("EOF while reading backend message header" /
+        // "... payload"), e.g. a proxy or load balancer dropping the stream.
+        || s.contains("eof while reading backend message")
         || s.contains("terminating connection")
         || s.contains("administrator command")
         || s.contains("57p01")
@@ -518,6 +522,15 @@ mod tests {
             LoopControl::from_error_message("connection refused"),
             LoopControl::Reconnect
         ));
+        for eof in [
+            "io error: EOF while reading backend message header",
+            "io error: EOF while reading backend message payload",
+        ] {
+            assert!(matches!(
+                LoopControl::from_error_message(eof),
+                LoopControl::Reconnect
+            ));
+        }
         assert!(matches!(
             LoopControl::from_error_message("relation x does not exist"),
             LoopControl::ReloadSchema { .. }

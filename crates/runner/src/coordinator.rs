@@ -252,6 +252,16 @@ fn soft_limit_reached(
 /// transactions. Used on shutdown/cancel: a transaction with no commit marker
 /// was never durable at the source and is replayed on restart. Returns the
 /// batch only if whole transactions remain to flush.
+/// Drop the open (uncommitted) transaction's events from the batch: the source
+/// abandoned it and sends it again in full. The committed prefix is kept.
+fn abandon_open_tx(b: &mut BuildingBatch) -> usize {
+    let dropped = b.open_events();
+    b.raw.truncate(b.committed_len);
+    b.bytes = b.committed_bytes;
+    b.reset_approaching_warnings();
+    dropped
+}
+
 fn keep_whole_txs(mut b: BuildingBatch) -> Option<BuildingBatch> {
     b.raw.truncate(b.committed_len);
     b.bytes = b.committed_bytes;
@@ -423,6 +433,14 @@ pub enum TxProtocolError {
          was still open"
     )]
     StandaloneEventInTx { active: String },
+    #[error(
+        "abort marker for transaction {marker} does not match the open \
+         transaction {active:?}"
+    )]
+    AbortMismatch {
+        active: Option<String>,
+        marker: String,
+    },
 }
 
 /// Enforces the source transaction protocol on the marker/event stream: a single
@@ -483,6 +501,18 @@ impl TxTracker {
     /// A `TxCommit` closes the open transaction and must match it. A commit with
     /// no open transaction is a duplicate or unknown commit - rejected so it
     /// cannot advance the checkpoint twice.
+    /// A `TxAbort` abandons the open transaction; it must name it.
+    fn abort(&mut self, tx_id: &str) -> Result<(), TxProtocolError> {
+        if self.active.as_deref() != Some(tx_id) {
+            return Err(TxProtocolError::AbortMismatch {
+                active: self.active.clone(),
+                marker: tx_id.to_string(),
+            });
+        }
+        self.active = None;
+        Ok(())
+    }
+
     fn commit(&mut self, tx_id: &str) -> Result<(), TxProtocolError> {
         match &self.active {
             None => Err(TxProtocolError::CommitWithoutBegin {
@@ -1230,8 +1260,11 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         let max_events = self.batch_cfg_eff.max_events.unwrap_or(usize::MAX);
         let max_bytes = self.batch_cfg_eff.max_bytes.unwrap_or(usize::MAX);
         let max_inflight = self.batch_cfg_eff.max_inflight.unwrap_or(1);
+        // `effective` always sets this from `BatchConfig::default()` (true) when
+        // the pipeline omits it; the fallback below matches that default and
+        // must never weaken it.
         let respect_source_tx =
-            self.batch_cfg_eff.respect_source_tx.unwrap_or(false);
+            self.batch_cfg_eff.respect_source_tx.unwrap_or(true);
         let max_tx_events =
             self.batch_cfg_eff.max_tx_events.unwrap_or(usize::MAX);
         let max_tx_bytes =
@@ -1321,6 +1354,8 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         // a boundary, discarded (dropped) on cancel/shutdown/error before a boundary.
         let replay_on = coord.replay_capture.is_some();
         let mut capture_accum: Vec<Event> = Vec::new();
+        // Where the open transaction's events start in `capture_accum`.
+        let mut capture_tx_start = 0usize;
         // Full boundary record of the last commit unit actually captured. Used to
         // distinguish a genuine data-less boundary (worth capturing) from a redundant
         // snapshot-completion marker that repeats the already-captured boundary.
@@ -1474,6 +1509,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                         // Open the transaction; a second open
                                         // before a commit is a protocol error.
                                         tx_tracker.begin(&tx_id)?;
+                                        capture_tx_start = capture_accum.len();
                                     }
                                     SourceItem::Event(ev) => {
                                         // Every transactional event must belong
@@ -1580,6 +1616,31 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                             send_to_delivery(&deliver_tx, &inflight, full, "tx_commit").await?;
                                         }
                                     }
+                                    SourceItem::TxAbort { tx_id } => {
+                                        // The source abandoned the open
+                                        // transaction and sends it again from
+                                        // its beginning: drop what was buffered
+                                        // for it (never flushed: only whole
+                                        // transactions flush in this mode).
+                                        tx_tracker.abort(&tx_id)?;
+                                        let dropped = abandon_open_tx(&mut b);
+                                        capture_accum.truncate(capture_tx_start);
+                                        warn!(
+                                            pipeline = %coord.pipeline_name,
+                                            tx_id = %tx_id,
+                                            discarded_events = dropped,
+                                            duplicates = false,
+                                            "source abandoned an open transaction: its \
+                                             buffered prefix was discarded and the \
+                                             transaction is replayed atomically"
+                                        );
+                                        counter!(
+                                            "deltaforge_abandoned_tx_total",
+                                            "pipeline" => coord.pipeline_name.to_string(),
+                                            "outcome" => "discarded",
+                                        )
+                                        .increment(1);
+                                    }
                                     SourceItem::Boundary { boundary } => {
                                         // A data-less boundary (snapshot table /
                                         // full completion). Apply it to the pending
@@ -1609,6 +1670,24 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                                 }
                             } else {
                                 // Legacy path: soft-limit splitting; markers ignored.
+                                if let SourceItem::TxAbort { tx_id } = &item {
+                                    // Rows already flushed for it cannot be
+                                    // recalled: its replay may duplicate them.
+                                    warn!(
+                                        pipeline = %coord.pipeline_name,
+                                        tx_id = %tx_id,
+                                        duplicates = true,
+                                        "source abandoned an open transaction: rows \
+                                         already delivered for it may be delivered \
+                                         again by its replay (respect_source_tx=false)"
+                                    );
+                                    counter!(
+                                        "deltaforge_abandoned_tx_total",
+                                        "pipeline" => coord.pipeline_name.to_string(),
+                                        "outcome" => "may_duplicate",
+                                    )
+                                    .increment(1);
+                                }
                                 let SourceItem::Event(ev) = item else { continue; };
                                 if let Some(full) = check_and_split(&mut b, ev, max_events, max_bytes) {
                                     send_to_delivery(&deliver_tx, &inflight, full, "limits").await?;
@@ -2375,6 +2454,16 @@ mod tests {
         sink: Arc<MockSink>,
         cfg: BatchConfig,
     ) -> Coordinator<CheckpointMeta> {
+        coord_with_batch(store, sink, Some(cfg))
+    }
+
+    /// A coordinator built exactly as a pipeline builds it from its `batch`
+    /// section (`None` = no section).
+    fn coord_with_batch(
+        store: Arc<checkpoints::MemCheckpointStore>,
+        sink: Arc<MockSink>,
+        batch: Option<BatchConfig>,
+    ) -> Coordinator<CheckpointMeta> {
         let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
         let cp_fn = build_commit_fn(store, "src::sink::kafka".to_string());
         let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
@@ -2383,7 +2472,7 @@ mod tests {
             build_batch_processor(processors, "test".to_string());
         Coordinator::builder("tx-test")
             .sinks(sinks)
-            .batch_config(Some(cfg))
+            .batch_config(batch)
             .commit_fn("kafka", cp_fn)
             .process_fn(batch_processor)
             .build()
@@ -3916,6 +4005,237 @@ mod tests {
         );
     }
 
+    fn abort(tx_id: &str) -> SourceItem {
+        SourceItem::TxAbort {
+            tx_id: tx_id.into(),
+        }
+    }
+
+    /// Items through a transaction-aligned (or legacy) coordinator; the
+    /// delivered row ids in order and the per-sink checkpoint.
+    async fn deliver(
+        items: Vec<SourceItem>,
+        respect_source_tx: bool,
+        max_events: usize,
+    ) -> (Result<()>, Vec<i64>, Option<Vec<u8>>) {
+        deliver_with(
+            Some(BatchConfig {
+                max_events: Some(max_events),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(respect_source_tx),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            }),
+            items,
+        )
+        .await
+    }
+
+    async fn deliver_with(
+        batch: Option<BatchConfig>,
+        items: Vec<SourceItem>,
+    ) -> (Result<()>, Vec<i64>, Option<Vec<u8>>) {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let coord = coord_with_batch(store.clone(), Arc::clone(&sink), batch);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_pause_tx, pause_rx) =
+            tokio::sync::watch::channel(PauseState::default());
+        for item in items {
+            tx.send(item).await.unwrap();
+        }
+        drop(tx);
+        let res = coord.run(rx, cancel, pause_rx).await;
+        let cp = store.get_raw("src::sink::kafka").await.unwrap();
+        (res, sink.ids(), cp)
+    }
+
+    /// The source's stream is cut inside a transaction; the source abandons it
+    /// (TxAbort) and sends it again from its BEGIN. Transaction-aligned: the
+    /// buffered prefix is dropped, the replay is delivered once in order, and
+    /// only its commit advances the checkpoint.
+    #[tokio::test]
+    async fn an_abandoned_transaction_is_delivered_once_from_its_replay() {
+        let (res, ids, cp) = deliver(
+            vec![
+                begin("t1"),
+                SourceItem::Event(tx_event(1, "t1", b"r1")),
+                commit("t1", b"cp-1"),
+                begin("t2"),
+                SourceItem::Event(tx_event(10, "t2", b"r10")),
+                SourceItem::Event(tx_event(11, "t2", b"r11")),
+                abort("t2"),
+                begin("t2"),
+                SourceItem::Event(tx_event(10, "t2", b"r10")),
+                SourceItem::Event(tx_event(11, "t2", b"r11")),
+                SourceItem::Event(tx_event(12, "t2", b"r12")),
+                commit("t2", b"cp-2"),
+            ],
+            true,
+            1000,
+        )
+        .await;
+        res.expect("an abort followed by the replay is a valid stream");
+        assert_eq!(ids, vec![1, 10, 11, 12], "once each, in order");
+        assert_eq!(cp.as_deref(), Some(&b"cp-2"[..]));
+    }
+
+    /// With replay capture on, the abandoned attempt never enters the journal:
+    /// the transaction's envelope holds its replay only, once.
+    #[tokio::test]
+    async fn an_abandoned_transaction_is_captured_once() {
+        use checkpoints::MemCheckpointStore;
+        let journal = mem_journal();
+        let coord = cap_coord(
+            Arc::new(MemCheckpointStore::new().unwrap()),
+            MockSink::new("kafka", true),
+            cap_cfg(1000),
+            journal.clone(),
+            0,
+        );
+        feed_and_run(
+            coord,
+            vec![
+                begin("t2"),
+                SourceItem::Event(tx_event(10, "t2", b"r10")),
+                abort("t2"),
+                begin("t2"),
+                SourceItem::Event(tx_event(10, "t2", b"r10")),
+                SourceItem::Event(tx_event(11, "t2", b"r11")),
+                commit("t2", b"cp-2"),
+            ],
+        )
+        .await
+        .unwrap();
+        let envs =
+            crate::replay_journal::JournalLog::read_since(&*journal, 0, 100)
+                .await
+                .unwrap();
+        assert_eq!(envs.len(), 1);
+        let ids: Vec<i64> = envs[0]
+            .payload
+            .events
+            .iter()
+            .filter_map(|e| e.event.get("after")?.get("id")?.as_i64())
+            .collect();
+        assert_eq!(ids, vec![10, 11], "the replay only, once");
+    }
+
+    /// A transaction abandoned and replayed, as a source sends it.
+    fn abandoned_and_replayed() -> Vec<SourceItem> {
+        vec![
+            begin("t2"),
+            SourceItem::Event(tx_event(10, "t2", b"r10")),
+            SourceItem::Event(tx_event(11, "t2", b"r11")),
+            SourceItem::Event(tx_event(12, "t2", b"r12")),
+            abort("t2"),
+            begin("t2"),
+            SourceItem::Event(tx_event(10, "t2", b"r10")),
+            SourceItem::Event(tx_event(11, "t2", b"r11")),
+            SourceItem::Event(tx_event(12, "t2", b"r12")),
+            commit("t2", b"cp-2"),
+        ]
+    }
+
+    /// A pipeline that does not set `respect_source_tx` (no `batch` section,
+    /// or a section without the key, deserialized as a pipeline spec is)
+    /// respects source transactions: an abandoned prefix is discarded, never
+    /// duplicated, even when the batch size would have flushed it.
+    #[tokio::test]
+    async fn an_omitted_respect_source_tx_respects_source_transactions() {
+        let partial: BatchConfig =
+            serde_yaml::from_str("max_events: 1\nmax_ms: 60000\n").unwrap();
+        assert_eq!(partial.respect_source_tx, Some(true));
+        for batch in [None, Some(partial)] {
+            let (res, ids, cp) =
+                deliver_with(batch, abandoned_and_replayed()).await;
+            res.expect("valid stream");
+            assert_eq!(ids, vec![10, 11, 12], "delivered once");
+            assert_eq!(cp.as_deref(), Some(&b"cp-2"[..]));
+        }
+    }
+
+    /// `respect_source_tx: false` is an explicit opt-out: a prefix flushed
+    /// before the abort is delivered again by the replay (may_duplicate).
+    #[tokio::test]
+    async fn an_explicit_false_opts_into_possible_duplicates() {
+        let batch: BatchConfig = serde_yaml::from_str(
+            "respect_source_tx: false\nmax_events: 1\nmax_ms: 60000\n",
+        )
+        .unwrap();
+        let (res, ids, _) =
+            deliver_with(Some(batch), abandoned_and_replayed()).await;
+        res.expect("valid stream");
+        assert_eq!(ids, vec![10, 11, 12, 10, 11, 12]);
+    }
+
+    /// An abandoned transaction whose replay has not arrived yet advances
+    /// nothing: the checkpoint stays at the last whole transaction.
+    #[tokio::test]
+    async fn an_abandoned_transaction_advances_no_checkpoint() {
+        let (res, ids, cp) = deliver(
+            vec![
+                begin("t1"),
+                SourceItem::Event(tx_event(1, "t1", b"r1")),
+                commit("t1", b"cp-1"),
+                begin("t2"),
+                SourceItem::Event(tx_event(10, "t2", b"r10")),
+                abort("t2"),
+            ],
+            true,
+            1000,
+        )
+        .await;
+        res.expect("clean stream end");
+        assert_eq!(ids, vec![1]);
+        assert_eq!(cp.as_deref(), Some(&b"cp-1"[..]));
+    }
+
+    /// An abort must name the open transaction.
+    #[tokio::test]
+    async fn an_abort_of_another_transaction_is_a_protocol_error() {
+        for items in [vec![begin("t1"), abort("t2")], vec![abort("t1")]] {
+            let (res, ids, cp) = deliver(items, true, 1000).await;
+            let err = res.expect_err("protocol error");
+            assert!(
+                matches!(
+                    err.downcast_ref::<TxProtocolError>(),
+                    Some(TxProtocolError::AbortMismatch { .. })
+                ),
+                "{err:?}"
+            );
+            assert!(ids.is_empty() && cp.is_none());
+        }
+    }
+
+    /// Without transaction alignment rows flush by size, so a prefix of the
+    /// abandoned transaction may already be delivered; the replay delivers it
+    /// again (documented at-least-once duplicates), and no row is lost.
+    #[tokio::test]
+    async fn without_alignment_an_abandoned_prefix_is_delivered_again() {
+        let (res, ids, _) = deliver(
+            vec![
+                begin("t2"),
+                SourceItem::Event(tx_event(10, "t2", b"r10")),
+                SourceItem::Event(tx_event(11, "t2", b"r11")),
+                SourceItem::Event(tx_event(12, "t2", b"r12")),
+                abort("t2"),
+                begin("t2"),
+                SourceItem::Event(tx_event(10, "t2", b"r10")),
+                SourceItem::Event(tx_event(11, "t2", b"r11")),
+                SourceItem::Event(tx_event(12, "t2", b"r12")),
+                commit("t2", b"cp-2"),
+            ],
+            false,
+            1,
+        )
+        .await;
+        res.expect("valid stream");
+        assert_eq!(ids, vec![10, 11, 12, 10, 11, 12]);
+    }
+
     /// G4: the stream ends immediately AFTER a COMMIT. The whole transaction is
     /// flushed and the checkpoint is the commit marker's position.
     #[tokio::test]
@@ -4293,6 +4613,7 @@ mod tests {
         fail: AtomicBool,
         delivered: AtomicUsize,
         batch_sizes: std::sync::Mutex<Vec<usize>>,
+        ids: std::sync::Mutex<Vec<i64>>,
     }
 
     impl MockSink {
@@ -4303,6 +4624,7 @@ mod tests {
                 fail: AtomicBool::new(false),
                 delivered: AtomicUsize::new(0),
                 batch_sizes: std::sync::Mutex::new(Vec::new()),
+                ids: std::sync::Mutex::new(Vec::new()),
             })
         }
 
@@ -4317,6 +4639,11 @@ mod tests {
         /// Event counts of each delivered batch, in order.
         fn batch_sizes(&self) -> Vec<usize> {
             self.batch_sizes.lock().unwrap().clone()
+        }
+
+        /// The `id` of every delivered row, in delivery order.
+        fn ids(&self) -> Vec<i64> {
+            self.ids.lock().unwrap().clone()
         }
     }
 
@@ -4348,6 +4675,11 @@ mod tests {
             self.delivered
                 .fetch_add(events.len(), std::sync::atomic::Ordering::Relaxed);
             self.batch_sizes.lock().unwrap().push(events.len());
+            self.ids.lock().unwrap().extend(
+                events
+                    .iter()
+                    .filter_map(|e| e.after.as_ref()?.get("id")?.as_i64()),
+            );
             Ok(deltaforge_core::BatchResult::ok())
         }
     }

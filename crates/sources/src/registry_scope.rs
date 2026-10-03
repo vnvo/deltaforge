@@ -103,9 +103,12 @@ impl From<RegistryError> for SourceError {
             RegistryError::Storage(err) => SourceError::Other(
                 err.context("schema registry storage failure"),
             ),
+            // The connected server is not the verified lineage.
+            e @ RegistryError::LineageMismatch { .. } => SourceError::Lineage {
+                details: e.to_string().into(),
+            },
             e @ (RegistryError::NotEstablished { .. }
-            | RegistryError::ScopeChanged { .. }
-            | RegistryError::LineageMismatch { .. }) => {
+            | RegistryError::ScopeChanged { .. }) => {
                 SourceError::Incompatible {
                     details: e.to_string().into(),
                 }
@@ -638,6 +641,13 @@ mod tests {
         }
         .into();
         assert!(matches!(missing, SourceError::Incompatible { .. }));
+        let moved: SourceError = RegistryError::LineageMismatch {
+            source_id: "s".into(),
+            expected: "a".into(),
+            live: "b".into(),
+        }
+        .into();
+        assert!(matches!(moved, SourceError::Lineage { .. }));
         let ambiguous: SourceError = RegistryError::LegacyOwnershipUnproven {
             table: "t".into(),
             relation: "r".into(),

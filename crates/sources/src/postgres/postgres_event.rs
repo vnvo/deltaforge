@@ -156,6 +156,7 @@ pub(super) async fn dispatch_event(
             ctx.current_final_lsn = Some(final_lsn.to_string());
             ctx.change_ordinal = 0;
             ctx.message_ordinal = 0;
+            ctx.open_tx_events = 0;
             // Open the transaction on the coordinator's stream. tx_id matches the
             // xid stamped on this transaction's events and its TxCommit marker.
             let _ = ctx
@@ -196,6 +197,8 @@ pub(super) async fn dispatch_event(
             ctx.current_tx_commit_time = None;
             ctx.current_final_lsn = None;
             ctx.message_ordinal = 0;
+            ctx.open_tx_events = 0;
+            ctx.resume_lsn = end_lsn;
         }
         ReplicationEvent::StoppedAt { reached } => {
             info!(reached = %reached, "replication stopped at target LSN");
@@ -261,6 +264,9 @@ pub(super) async fn dispatch_event(
                 ctx.tx.send(SourceItem::Event(event)).await.map_err(|e| {
                     LoopControl::Fail(SourceError::Other(e.into()))
                 })?;
+                if transactional {
+                    ctx.open_tx_events += 1;
+                }
             }
 
             ctx.last_lsn = lsn;
@@ -290,7 +296,7 @@ async fn handle_pgoutput_message(
     // filtering one table cannot renumber later events. Protocol metadata
     // (Relation/Type/Origin/Begin/Commit) does not.
     match msg_type {
-        b'R' => handle_relation(ctx, payload),
+        b'R' => handle_relation(ctx, payload).await,
         b'I' => {
             let ordinal = ctx.change_ordinal;
             ctx.change_ordinal += 1;
@@ -351,7 +357,7 @@ async fn handle_pgoutput_message(
 ///   change made while the source was down (and re-detecting a previously
 ///   Halt-failed drift). A catalog fetch happens only for this active table, and
 ///   only when the Relation payload cannot settle the comparison on its own.
-fn handle_relation(
+async fn handle_relation(
     ctx: &mut RunCtx,
     payload: &[u8],
 ) -> Result<(), LoopControl> {
@@ -493,11 +499,17 @@ fn handle_relation(
     // First resolution this run: verify the Relation against the durably persisted
     // schema so a change made while the source was down (or a previously
     // Halt-failed drift) is caught here, before this table's rows are decoded.
-    // Deterministic and synchronous from the cached/durable schema - no catalog
-    // query.
+    // Read from durable history (single-flight per key), never from a loader
+    // cache: a cold or contended cache cannot skip it. No history = first
+    // use; unreadable history fails closed. No catalog query.
     if is_new {
-        if let Some(persisted) = ctx.schema.get_cached(&schema, &table) {
-            let persisted_signature = persisted.schema.signature();
+        let persisted = ctx
+            .schema
+            .persisted(&schema, &table)
+            .await
+            .map_err(LoopControl::Fail)?;
+        if let Some(persisted) = persisted {
+            let persisted_signature = persisted.signature();
             if let FirstResolution::Drift(detail) = verify_first_resolution(
                 &persisted_signature,
                 &relation_signature,
@@ -1025,7 +1037,11 @@ async fn handle_truncate(
             });
         }
 
-        let _ = ctx.tx.send(SourceItem::Event(ev)).await;
+        if ctx.tx.send(SourceItem::Event(ev)).await.is_ok()
+            && ctx.current_tx_id.is_some()
+        {
+            ctx.open_tx_events += 1;
+        }
     }
 
     Ok(())
@@ -1052,6 +1068,9 @@ async fn send_event(
         Err(_) => false,
     };
     if ok {
+        if ctx.current_tx_id.is_some() {
+            ctx.open_tx_events += 1;
+        }
         let key = (Arc::clone(table_name), op);
         let ctr = ctx.counter_cache.entry(key).or_insert_with_key(|k| {
             counter!(
@@ -1074,6 +1093,7 @@ fn source_error_kind(e: &SourceError) -> &'static str {
         SourceError::Connect { .. } => "connect",
         SourceError::Checkpoint { .. } => "checkpoint",
         SourceError::Schema { .. } => "schema",
+        SourceError::Lineage { .. } => "lineage",
         SourceError::Incompatible { .. } => "incompatible",
         SourceError::Permission { .. } => "permission",
         SourceError::NotFound { .. } => "not_found",

@@ -3399,8 +3399,6 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 [[package]]
 name = "mysql-binlog-connector-rust"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83ed06ab3072326bf66c2cd042c994736870c773f97c25046cf61c5ebe385413"
 dependencies = [
  "async-recursion",
  "async-std",

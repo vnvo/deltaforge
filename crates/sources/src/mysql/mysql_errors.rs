@@ -25,6 +25,9 @@ pub enum MySqlSourceError {
     #[error("checkpoint load failed: {0}")]
     Checkpoint(String),
 
+    #[error("source lineage error: {0}")]
+    Lineage(String),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -52,6 +55,9 @@ impl From<MySqlSourceError> for SourceError {
                 }
             }
             MySqlSourceError::Checkpoint(msg) => SourceError::Checkpoint {
+                details: msg.into(),
+            },
+            MySqlSourceError::Lineage(msg) => SourceError::Lineage {
                 details: msg.into(),
             },
             MySqlSourceError::Io(e) => SourceError::Io(e),

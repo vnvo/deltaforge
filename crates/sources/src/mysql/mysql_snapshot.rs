@@ -33,7 +33,7 @@ use deltaforge_core::{
     SourcePosition,
 };
 use metrics::counter;
-use mysql_async::{Conn, Opts, Pool, Row, Value, prelude::Queryable};
+use mysql_async::{Conn, Opts, Row, Value, prelude::Queryable};
 use std::collections::HashMap;
 use tokio::time::timeout;
 
@@ -116,7 +116,12 @@ pub(crate) async fn load_snapshot_progress(
 // ============================================================================
 
 pub struct SnapshotCtx<'a> {
+    /// Verified registry lineage hash stamped on the snapshot checkpoint.
+    pub checkpoint_lineage: Option<String>,
     pub dsn: &'a str,
+    /// The verified `server_uuid`: every snapshot connection (lock, workers,
+    /// position checks) proves it is this server before it is used.
+    pub expected_uuid: &'a str,
     pub source_id: &'a str,
     pub pipeline: &'a str,
     pub tenant: &'a str,
@@ -138,6 +143,7 @@ pub struct SnapshotCtx<'a> {
 /// Transient errors (connect failures, empty results) are retried - never abort.
 fn spawn_binlog_position_guard(
     dsn: crate::credentials::ProtectedDsn,
+    expected_uuid: String,
     captured_file: String,
     cancel: CancellationToken,
     abort_reason: Arc<Mutex<Option<String>>>,
@@ -152,11 +158,28 @@ fn spawn_binlog_position_guard(
                 _ = interval.tick() => {}
             }
 
-            let mut conn = match Pool::new(dsn.expose()).get_conn().await {
+            let mut conn = match super::mysql_session::open_control_connection(
+                dsn.expose(),
+                &expected_uuid,
+                Duration::from_secs(10),
+            )
+            .await
+            {
                 Ok(c) => c,
-                Err(e) => {
+                Err(super::mysql_session::SessionError::Connect(e)) => {
                     warn!(error = %e, "binlog guard: connect error, retrying");
                     continue;
+                }
+                // Another server (or no identity): its binlog list says
+                // nothing about ours. Fail closed.
+                Err(e) => {
+                    let msg = format!(
+                        "binlog guard: connection is not server {expected_uuid}: {e:?}"
+                    );
+                    warn!("{}", msg);
+                    *abort_reason.lock().unwrap() = Some(msg);
+                    cancel.cancel();
+                    return;
                 }
             };
 
@@ -224,10 +247,14 @@ pub async fn run_snapshot(
     // cannot FLUSH TABLES WITH READ LOCK) surfaces as Permission; a bad server
     // config (non-GTID, non-InnoDB, non-ROW binlog) as Incompatible. There is no
     // silent fallback to an unsafe per-worker-snapshot anchor.
-    let preflight =
-        health::run_preflight(ctx.dsn, tables, ctx.cfg.max_parallel_tables)
-            .await
-            .context("snapshot preflight")?;
+    let preflight = health::run_preflight_verified(
+        ctx.dsn,
+        ctx.expected_uuid,
+        tables,
+        ctx.cfg.max_parallel_tables,
+    )
+    .await
+    .context("snapshot preflight")?;
     preflight.emit(ctx.source_id, tables.len());
     if !preflight.hard_errors.is_empty() {
         let details = preflight.hard_errors.join("; ");
@@ -254,13 +281,15 @@ pub async fn run_snapshot(
     let num_workers =
         ctx.cfg.max_parallel_tables.min(pending.len().max(1)).max(1);
 
-    let (worker_conns, position) = acquire_locked_anchor(
+    let (worker_conns, mut position) = acquire_locked_anchor(
         ctx.dsn,
+        ctx.expected_uuid,
         num_workers,
         Duration::from_secs(ctx.cfg.lock_timeout_secs.max(1)),
     )
     .await
     .context("acquire locked snapshot anchor")?;
+    position.lineage = ctx.checkpoint_lineage.clone();
 
     progress.start_position = serde_json::to_string(&position)
         .context("serialize binlog position")?;
@@ -272,6 +301,7 @@ pub async fn run_snapshot(
     let _guard_stop = scopeguard::guard((), |_| guard_cancel.cancel());
     let _position_guard = spawn_binlog_position_guard(
         crate::credentials::ProtectedDsn::from(ctx.dsn),
+        ctx.expected_uuid.to_string(),
         position.file.clone(),
         guard_cancel.clone(),
         abort_reason.clone(),
@@ -453,7 +483,7 @@ pub async fn run_snapshot(
 
     // final synchronous position check before marking complete
     // this closes the 30s polling race window.
-    health::verify_binlog_position(ctx.dsn, &position.file)
+    health::verify_binlog_position(ctx.dsn, ctx.expected_uuid, &position.file)
         .await
         .context("post-snapshot binlog position verification")?;
 
@@ -495,15 +525,24 @@ pub async fn run_snapshot(
 /// server-side. `UNLOCK TABLES` is only the normal success path.
 async fn acquire_locked_anchor(
     dsn: &str,
+    expected_uuid: &str,
     num_workers: usize,
     timeout_dur: Duration,
 ) -> Result<(Vec<Conn>, MySqlCheckpoint)> {
     let opts = Opts::from_url(dsn).context("parse mysql dsn")?;
+    // Each connection proves it is the verified server before it is used:
+    // the anchor position and every worker's rows must come from one server.
+    let verify = |e: super::mysql_session::SessionError| {
+        anyhow::Error::new(e.into_source_error(expected_uuid))
+    };
 
     // Dedicated, non-pooled lock connection: dropping it releases FTWRL.
     let mut lock_conn = Conn::new(opts.clone())
         .await
         .context("connect lock connection")?;
+    super::mysql_session::verify_connection(&mut lock_conn, expected_uuid)
+        .await
+        .map_err(verify)?;
 
     // Bound how long FTWRL may wait on in-flight statements/metadata locks.
     let lock_wait = timeout_dur.as_secs().max(1);
@@ -525,6 +564,9 @@ async fn acquire_locked_anchor(
             let mut c = Conn::new(opts.clone())
                 .await
                 .context("connect snapshot worker")?;
+            super::mysql_session::verify_connection(&mut c, expected_uuid)
+                .await
+                .map_err(verify)?;
             c.query_drop(
                 "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
             )
@@ -581,19 +623,26 @@ async fn capture_binlog_position(
     let file: String = row.take(0).context("binlog file")?;
     let pos: u32 = row.take(1).context("binlog pos")?;
 
+    // In GTID mode the position is the executed GTID set - also when it is
+    // EMPTY (a server that has executed no GTID transaction yet), so it stays
+    // comparable with later GTID checkpoints. Outside GTID mode, no set.
     let gtid_row: Option<Row> = conn
-        .query_first("SELECT @@GLOBAL.gtid_executed")
+        .query_first("SELECT @@GLOBAL.gtid_mode, @@GLOBAL.gtid_executed")
         .await
         .ok()
         .flatten();
-    let gtid_set = gtid_row
-        .and_then(|mut r| r.take::<Option<String>, _>(0).flatten())
-        .filter(|g| !g.is_empty());
+    let gtid_set = gtid_row.and_then(|mut r| {
+        let mode: Option<String> = r.take::<Option<String>, _>(0).flatten();
+        let set: Option<String> = r.take::<Option<String>, _>(1).flatten();
+        mode.filter(|m| m.eq_ignore_ascii_case("ON"))
+            .map(|_| set.unwrap_or_default())
+    });
 
     Ok(MySqlCheckpoint {
         file,
         pos: pos as u64,
         gtid_set,
+        lineage: None,
     })
 }
 
@@ -1265,6 +1314,14 @@ mod live_anchor_tests {
     use mysql_async::prelude::Queryable;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    async fn live_uuid(dsn: &str) -> String {
+        let mut c = Conn::new(Opts::from_url(dsn).unwrap()).await.unwrap();
+        c.query_first("SELECT @@GLOBAL.server_uuid")
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
     #[tokio::test]
     #[ignore = "requires a live MySQL (set MYSQL_IT_DSN)"]
     async fn ftwrl_anchor_consistent_under_concurrent_writes() {
@@ -1309,10 +1366,14 @@ mod live_anchor_tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Establish the anchor while writes are in flight.
-        let (mut workers, position) =
-            acquire_locked_anchor(&dsn, 4, Duration::from_secs(10))
-                .await
-                .expect("acquire anchor");
+        let (mut workers, position) = acquire_locked_anchor(
+            &dsn,
+            &live_uuid(&dsn).await,
+            4,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("acquire anchor");
 
         // All worker snapshots must agree - one shared consistent view.
         let mut counts = Vec::new();
@@ -1385,10 +1446,14 @@ mod live_anchor_tests {
             .await
             .unwrap();
 
-        let (workers, _pos) =
-            acquire_locked_anchor(&dsn, 2, Duration::from_secs(10))
-                .await
-                .expect("acquire");
+        let (workers, _pos) = acquire_locked_anchor(
+            &dsn,
+            &live_uuid(&dsn).await,
+            2,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("acquire");
         drop(workers);
 
         // An external write must complete promptly - the lock is gone.
@@ -1479,7 +1544,13 @@ mod live_anchor_tests {
             .unwrap();
 
         let started = Instant::now();
-        let res = acquire_locked_anchor(&dsn, 2, Duration::from_secs(2)).await;
+        let res = acquire_locked_anchor(
+            &dsn,
+            &live_uuid(&dsn).await,
+            2,
+            Duration::from_secs(2),
+        )
+        .await;
         assert!(res.is_err(), "expected timeout while FTWRL was blocked");
         assert!(
             started.elapsed() < Duration::from_secs(15),
@@ -1489,10 +1560,14 @@ mod live_anchor_tests {
         // Release the blocker; the anchor must now succeed (no lingering lock).
         blocker.query_drop("UNLOCK TABLES").await.unwrap();
         drop(blocker);
-        let (workers, _pos) =
-            acquire_locked_anchor(&dsn, 2, Duration::from_secs(10))
-                .await
-                .expect("acquire after blocker released");
+        let (workers, _pos) = acquire_locked_anchor(
+            &dsn,
+            &live_uuid(&dsn).await,
+            2,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("acquire after blocker released");
         drop(workers);
         admin.query_drop("DROP TABLE IF EXISTS lock_to").await.ok();
     }

@@ -70,6 +70,23 @@ pub struct MySqlColumn {
     /// Numeric scale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub numeric_scale: Option<i64>,
+
+    /// Maximum length in bytes of a character column (the binlog carries
+    /// byte lengths). Absent in schemas captured by older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub char_octet_length: Option<i64>,
+
+    /// Collation id of a character column (the binlog carries ids).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collation_id: Option<i64>,
+
+    /// Fractional-seconds precision of a temporal column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datetime_precision: Option<i64>,
+
+    /// Prefix length when this column is part of the primary key by prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_key_prefix: Option<i64>,
 }
 
 impl MySqlTableSchema {
@@ -133,6 +150,10 @@ impl MySqlColumn {
             char_max_length: None,
             numeric_precision: None,
             numeric_scale: None,
+            char_octet_length: None,
+            collation_id: None,
+            datetime_precision: None,
+            primary_key_prefix: None,
         }
     }
 

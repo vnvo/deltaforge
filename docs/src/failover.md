@@ -1,13 +1,13 @@
 # Failover Handling
 
-DeltaForge detects database failover automatically and resumes streaming on the new primary without operator intervention. This page explains how detection works, what happens during reconciliation, and how to configure behaviour when the new primary has a different schema.
+DeltaForge detects a change of database server automatically. A MySQL source resumes streaming on the new primary without operator intervention when it can prove the position to continue from. A PostgreSQL source never resumes on another cluster: it stops before reading anything from it (see [PostgreSQL: another cluster is refused](#postgresql-another-cluster-is-refused)). Cross-primary PostgreSQL failover is not supported for production yet. This page explains how detection works, what happens during MySQL reconciliation, and how to configure behaviour when the new primary has a different schema.
 
 ## How Detection Works
 
 Every time the source reconnects - at startup or after a transient error - it queries the server's stable identity:
 
 - **MySQL**: `@@server_uuid` from `performance_schema.replication_group_members`
-- **PostgreSQL**: `system_identifier` from `pg_control_system()`
+- **PostgreSQL**: `system_identifier` from `pg_control_system()`, together with the database OID
 
 The result is compared against the value stored in DeltaForge's storage backend. Three outcomes are possible:
 
@@ -15,11 +15,31 @@ The result is compared against the value stored in DeltaForge's storage backend.
 |--------|---------|--------|
 | `FirstSeen` | No identity stored yet | Store and continue |
 | `Same` | Same server as before | Verify checkpoint GTID is still reachable, then continue |
-| `Changed` | Server identity differs | Run failover reconciliation |
+| `Changed` | Server identity differs | MySQL: run failover reconciliation. PostgreSQL: stop (refused) |
 
 Identity is written to the durable storage backend (SQLite or PostgreSQL), so it survives process restarts and is correctly preserved across pipeline reloads.
 
-## What Happens During Failover
+## PostgreSQL: another cluster is refused
+
+A PostgreSQL checkpoint is an LSN in one cluster's WAL history, and a replication slot is a position in that same history. A server with another `system_identifier` (an independently initialised cluster, a logical replica, a dump/restore), or the same cluster with a dropped and recreated database, has unrelated positions: an LSN that compares equal or larger there proves nothing, and resuming from it could silently skip changes.
+
+So the PostgreSQL source compares the live `system_identifier` and database OID with the ones it recorded, before it writes any lineage or identity state, takes a snapshot, creates or reads a slot position, or sends `START_REPLICATION`: at startup, again right before the stream opens, and before every reconnect. A difference stops the source with a typed lineage error, and nothing is streamed, snapshotted or recorded:
+
+```
+source lineage error: source '<id>' is bound to PostgreSQL ... but is connected to .... Its checkpoint and replication slot position belong to the first server's WAL history and are never resumed on another server; nothing was streamed, snapshotted or recorded. To capture this server, configure a new source id (it starts with a snapshot).
+```
+
+To capture the other cluster, configure a new source id; it starts with a snapshot.
+
+This is a cross-cluster check, not a check of every endpoint change:
+
+- **Different `system_identifier` (or replaced database)**: refused before anything is recorded, snapshotted or streamed.
+- **Same `system_identifier`, promotion or timeline change**: not detected by this check. A promoted physical standby keeps the cluster's `system_identifier`, so DeltaForge cannot yet tell it from the original primary, and continuity across it is **not proven safe**.
+- **Cross-primary PostgreSQL failover is therefore unsupported for production** until the continuity proof below lands.
+
+ Continuing on it after a promotion (a new timeline) requires proving that its timeline history contains the checkpoint and that a synchronized logical slot covers it; that proof is not implemented yet. Until it is, a promotion is resumed only if the slot exists on the promoted server and is healthy, and DeltaForge does not yet verify the timeline or the slot's bounds against the checkpoint: treat continuity across a PostgreSQL promotion as unverified.
+
+## What Happens During Failover (MySQL)
 
 When a `Changed` identity is detected, DeltaForge runs reconciliation before allowing any events to flow. Reconciliation is idempotent - if the process dies mid-run, it will re-execute correctly on the next startup.
 
@@ -28,7 +48,7 @@ When a `Changed` identity is detected, DeltaForge runs reconciliation before all
 DeltaForge verifies that the checkpoint position from the old primary still exists on the new primary:
 
 - **MySQL**: checks whether the GTID set from the last checkpoint is present in B's executed GTID history or purged range
-- **PostgreSQL**: checks whether the replication slot's `confirmed_flush_lsn` is reachable
+- **PostgreSQL** (same server only, on every resume): checks that the replication slot exists, is not invalidated and has not lost its WAL
 
 If the position is confirmed **lost**, the source stops immediately with an error and `/health` returns `503`. This covers two distinct cases:
 
@@ -47,9 +67,9 @@ If reachability cannot be determined (e.g. the health query fails transiently), 
 
 ### 2. Schema drift detection
 
-DeltaForge compares the schema last registered from the old primary against the live catalog on the new primary. Any column additions, removals, or renames are recorded as a `ReconcileRecord` in the storage backend.
+DeltaForge compares each table's schema last registered under the old primary with its schema on the new primary.
 
-If drift is found, the schema cache is invalidated so the next row event triggers a fresh load with the correct column mapping.
+Per table, when the table is first used on the new primary - its first rows, a DDL of it, or a snapshot of it - not when the connection is re-established. Nothing is enumerated, so tables matched by wildcard patterns are covered. The comparison is against the table's shape at the exact failover position, proven by capturing the table and scanning the new primary's binlog. If anything between the failover position and the table's first rows could have changed the table (a DDL of the table, a statement DeltaForge cannot attribute to tables, a purged interval), or the table's first event is itself a DDL, the comparison is unprovable. The outcome is recorded durably per table, so a completed check is not repeated.
 
 ### 3. Resume
 
@@ -59,11 +79,9 @@ After reconciliation, DeltaForge stores B's identity and resumes streaming. The 
 
 A subtle but critical detail: simply reconnecting at A's checkpoint position can cause data loss on its own, before reconciliation even runs.
 
-**MySQL**: B rejects A's GTID set at the protocol level with "purged required binary logs". DeltaForge detects the identity change *before* opening the binlog stream, resolves B's current binlog tail via `SHOW BINARY LOG STATUS`, and connects there instead. A's original GTID checkpoint is preserved separately for the reachability check.
+**MySQL**: DeltaForge detects the identity change *before* opening the binlog stream and continues on B only from the exact position it proved: the GTID set the stream resumes from, which B must have executed in full (checked on a connection verified to be B). It never skips to B's binlog tail. If B has not executed that set, or the source runs without GTID mode (binlog file positions are not comparable across servers), the source stops with a typed error and changes nothing; re-snapshot from B or restore the missing transactions. That proven position is also the failover position the per-table schema drift checks are anchored to.
 
-**PostgreSQL**: `START_REPLICATION` at A's LSN immediately advances the slot's `confirmed_flush_lsn` to `max(A_checkpoint, slot_lsn)`. If B's slot was created at an LSN behind A's checkpoint, any changes B committed in that gap are permanently discarded - even if you reconnect at the correct LSN afterwards. DeltaForge detects the identity change before opening the replication stream and fetches the slot's actual `confirmed_flush_lsn` to use as the start position instead.
-
-In both cases the original checkpoint is preserved for the reachability check, separate from the adjusted streaming position.
+**PostgreSQL**: no position is adjusted. Another cluster is refused before `START_REPLICATION` is sent to it (see above), so neither the checkpoint nor any slot on that server moves.
 
 ## Schema Drift Policy
 
@@ -83,15 +101,17 @@ source:
 
 | Value | Behaviour |
 |-------|-----------|
-| `adapt` | Record drift, reload schema cache, continue streaming. Default. |
-| `halt` | Stop the source when any schema drift is detected. Requires operator intervention. |
+| `adapt` | Record drift, use the new primary's schema, continue streaming. Default. On MySQL an unprovable comparison is recorded as such and normal schema proof continues. |
+| `halt` | Stop the source when schema drift is detected (on MySQL also when drift cannot be ruled out), before anything is registered or emitted for the table. Requires operator intervention. |
 
-When `halt` fires, the reconciliation record is persisted before the source stops - you can inspect what changed before restarting:
+On MySQL the source stops at the table's first event on the new primary, with an error naming the table:
 
 ```
-schema drift detected after failover and on_schema_drift=halt.
-Verify B's schema and apply any missing migrations before restarting.
+table shop.orders after failover: schema drift since the failover (1 change(s)) and on_schema_drift=halt.
+Nothing was registered or emitted. ...
 ```
+
+On PostgreSQL a cross-cluster change stops the source regardless of `on_schema_drift`; the policy applies to schema changes in the stream (and to a change made while the source was down, at each table's first Relation message).
 
 Use `halt` when your failover environments do not guarantee DDL sync to replicas before promotion.
 
@@ -108,5 +128,5 @@ Use `halt` when your failover environments do not guarantee DDL sync to replicas
 For clean automatic failover:
 
 - **MySQL**: GTID mode must be enabled (`gtid_mode=ON`, `enforce_gtid_consistency=ON`). Without GTID, DeltaForge falls back to file/position coordinates which are meaningless across servers.
-- **PostgreSQL**: The replication slot must exist on B before the pipeline connects to it. Slots are not automatically transferred during failover - use a slot-aware HA tool (e.g. Patroni with `permanent_slots`) or pre-create the slot on standbys.
-- **Both**: The CDC user must exist on B with the same privileges as on A.
+- **PostgreSQL**: continuation on another cluster is not supported (it is refused), and cross-primary failover is unsupported for production until promotion continuity is proven. After a promotion of a physical standby the logical slot must exist on the promoted server (for example PostgreSQL 17 slot synchronization, or a slot-aware HA tool such as Patroni with `permanent_slots`); see the note on unverified promotion continuity above.
+- **MySQL**: the CDC user must exist on B with the same privileges as on A.

@@ -72,13 +72,11 @@ pub mod postgres_health;
 use crate::failover::identity::{
     IdentityComparison, IdentityStore, ServerIdentity,
 };
-use crate::failover::reconciler::{ReconcileInput, SchemaReconciler};
 use crate::postgres::postgres_health::{
     PositionReachability, PostgresServerIdentity, check_position_reachability,
 };
 use crate::registry_scope::{
     RegistryError, ScopeChange, SharedRegistryScope, establish_scope,
-    previous_scope,
 };
 use storage::adapters::LineageDescriptor;
 
@@ -136,7 +134,6 @@ pub(crate) struct RunCtx {
     pub host: String,
     pub default_schema: String,
     pub dsn: crate::credentials::ProtectedDsn,
-    pub slot: String,
     pub tx: mpsc::Sender<SourceItem>,
     #[allow(dead_code)]
     pub chkpt: Arc<dyn CheckpointStore>,
@@ -149,6 +146,13 @@ pub(crate) struct RunCtx {
     pub inactivity: Duration,
     pub relation_map: HashMap<u32, RelationInfo>,
     pub last_lsn: Lsn,
+    /// Where an in-process reconnect resumes: the end of the last transaction
+    /// whose commit was handed to the coordinator (or the start position).
+    /// Never the read position, which keepalives and in-transaction messages
+    /// move: a transaction cut off mid-stream must be decoded again in full.
+    pub resume_lsn: Lsn,
+    /// Events handed to the coordinator for the open transaction.
+    pub open_tx_events: u64,
     pub current_tx_id: Option<u32>,
     pub current_tx_commit_time: Option<i64>,
     /// The current transaction's final LSN (from `BEGIN`) - the stable identity
@@ -170,12 +174,10 @@ pub(crate) struct RunCtx {
     pub repl_client: Arc<Mutex<ReplicationClient>>,
     pub outbox_prefixes: AllowList,
     pub identity_store: IdentityStore,
-    pub reconciler: SchemaReconciler,
     /// Verified-lineage registry scope (shared with the pipeline's loaders).
     pub registry_scope: SharedRegistryScope,
     /// Backend holding the durable source-lineage record.
     pub registry_backend: ArcStorageBackend,
-    pub on_schema_drift: OnSchemaDrift,
     /// Cached metrics counter handles keyed by (qualified_table_name, op).
     /// Avoids hash-lookup + key-comparison in the metrics registry per event.
     pub counter_cache: HashMap<(Arc<str>, &'static str), metrics::Counter>,
@@ -482,22 +484,16 @@ impl PostgresSource {
             &self.tenant,
             self.registry_scope.clone(),
         );
-        let tracked = schema_loader.preload(&self.tables).await?;
-        info!(tables = tracked.len(), "schemas preloaded");
-
-        for (schema, table) in &tracked {
-            if let Ok(loaded) = schema_loader.load_schema(schema, table).await {
-                if let Some(ref identity) = loaded.schema.replica_identity {
-                    if identity != "full" {
-                        warn!(
-                            schema = %schema, table = %table,
-                            replica_identity = %identity,
-                            "table does not have REPLICA IDENTITY FULL - before images will be incomplete"
-                        );
-                    }
-                }
-            }
-        }
+        // No schema is enumerated or loaded at a CDC start: each table is
+        // resolved at its first Relation (design spec 7.23). Only a snapshot
+        // expands the patterns and loads the tables it copies; the
+        // per-Relation replica-identity warning covers what the startup loop
+        // used to report.
+        let tracked = if needs_snapshot {
+            schema_loader.preload(&self.tables).await?
+        } else {
+            Vec::new()
+        };
 
         let start_lsn = if needs_snapshot {
             info!(source_id = %self.id, "starting initial snapshot");
@@ -592,34 +588,28 @@ impl PostgresSource {
 
         // Re-verify the lineage immediately before opening replication (a
         // snapshot may have run since the startup read, and the server may have
-        // failed over meanwhile). The same verified read is reused for the
-        // pre-connect LSN adjustment, the provisional row/DDL/message ids, the
-        // initial failover identity check, and the registry-scope comparison.
-        // If the lineage cannot be verified we fail closed rather than open
+        // changed meanwhile): another cluster is refused before
+        // START_REPLICATION, and a first-seen identity is persisted first. The
+        // verified read also gives the provisional row/DDL/message ids. If the
+        // lineage cannot be verified we fail closed rather than open
         // replication on an unknown server.
         let stream_lineage =
             fetch_pg_lineage_verified(self.dsn.expose()).await?;
+        refuse_server_change(
+            &self.backend,
+            &self.tenant,
+            &self.id,
+            &stream_lineage,
+        )
+        .await?;
         let system_identifier =
             stream_lineage.identity.system_identifier as u64;
-        let startup_server_identity =
-            ServerIdentity::from(stream_lineage.identity.clone());
-
-        // Adjust start_lsn BEFORE opening the replication stream.
-        // If a failover has occurred, START_REPLICATION with A's stale LSN would
-        // advance B's slot.confirmed_flush_lsn past B's uncommitted changes, making
-        // them permanently invisible even if we reconnect from the correct LSN later.
-        let start_lsn = {
-            let id_store = IdentityStore::new(Arc::clone(&self.backend));
-            pre_connect_lsn_adjust(
-                self.dsn.expose(),
-                &self.slot,
-                start_lsn,
-                &startup_server_identity,
-                &id_store,
-                &self.id,
-            )
-            .await?
-        };
+        verify_identity_before_connect(
+            &ServerIdentity::from(stream_lineage.identity.clone()),
+            &IdentityStore::new(Arc::clone(&self.backend)),
+            &self.id,
+        )
+        .await?;
 
         info!(
             source_id = %self.id, host = %components.host, slot = %self.slot,
@@ -638,7 +628,6 @@ impl PostgresSource {
         .await?;
 
         let backend = Arc::clone(&self.backend);
-        let cancel_ref = cancel.clone();
         let mut ctx = RunCtx {
             source_id: self.id.clone(),
             pipeline: self.pipeline.clone(),
@@ -646,7 +635,6 @@ impl PostgresSource {
             host: components.host.clone(),
             default_schema: "public".to_string(),
             dsn: self.dsn.clone(),
-            slot: self.slot.clone(),
             tx,
             chkpt: chkpt_store.clone(),
             cancel,
@@ -658,6 +646,8 @@ impl PostgresSource {
             inactivity: Duration::from_secs(60),
             relation_map: HashMap::new(),
             last_lsn: start_lsn,
+            resume_lsn: start_lsn,
+            open_tx_events: 0,
             current_tx_id: None,
             current_tx_commit_time: None,
             current_final_lsn: None,
@@ -667,38 +657,15 @@ impl PostgresSource {
             repl_client: Arc::new(Mutex::new(client)),
             outbox_prefixes: self.outbox_prefixes.clone(),
             identity_store: IdentityStore::new(Arc::clone(&backend)),
-            reconciler: SchemaReconciler::new(
-                Arc::clone(&self.registry),
-                Arc::clone(&backend),
-            ),
             registry_scope: self.registry_scope.clone(),
             registry_backend: Arc::clone(&backend),
-            on_schema_drift: self.on_schema_drift.clone(),
             counter_cache: HashMap::new(),
             cached_lsn: None,
         };
 
-        // Store initial server identity (FirstSeen path). Reuse the lineage
-        // already verified above rather than re-fetching it.
-        check_identity_post_reconnect(
-            &mut ctx,
-            Some((stream_lineage.descriptor, startup_server_identity)),
-        )
-        .await?;
-
-        // If failover was detected, ctx.last_lsn was reset to B's slot position.
-        // The existing stream was opened from A's stale LSN - reconnect from the correct point.
-        if ctx.last_lsn != start_lsn {
-            let reconnect_config = config.clone().with_start_lsn(ctx.last_lsn);
-            let new_client = connect_replication_with_retries(
-                &self.id,
-                reconnect_config,
-                &cancel_ref,
-                RetryPolicy::default(),
-            )
-            .await?;
-            *ctx.repl_client.lock().await = new_client;
-        }
+        // The server may have changed between the check above and the open:
+        // verify again before the first message is read.
+        check_identity_post_reconnect(&mut ctx).await?;
 
         // Controlled credential rotation (opt-in, file-backed credentials only).
         // The runtime owns the watcher/manager task (a child of the source cancel
@@ -810,8 +777,10 @@ impl PostgresSource {
                         info!(schema = %s, table = %t, "reloading schema");
                         ctx.schema.reload_schema(&s, &t).await?;
                     } else {
-                        info!("reloading all schemas");
-                        ctx.schema.reload_all(&self.tables).await?;
+                        // Never enumerates: forget every cached schema; each
+                        // table reloads at its next use.
+                        info!("clearing cached schemas");
+                        ctx.schema.clear_cache().await;
                     }
                 }
                 Err(LoopControl::SchemaDrift(drift)) => {
@@ -844,8 +813,52 @@ impl PostgresSource {
                         }
                     }
 
+                    // Never send START_REPLICATION to another cluster.
+                    if !verify_before_reconnect(&mut ctx).await? {
+                        info!(source_id = %self.id, "cancelled during reconnect");
+                        break;
+                    }
+                    // Resume at the last commit handed on; a transaction cut
+                    // off mid-stream is abandoned here and sent again in full
+                    // (from its BEGIN) by the new stream.
+                    if let Some(xid) = ctx.current_tx_id.take() {
+                        let abandoned = std::mem::take(&mut ctx.open_tx_events);
+                        warn!(
+                            source_id = %self.id,
+                            pipeline = %self.pipeline,
+                            xid,
+                            final_lsn = ?ctx.current_final_lsn,
+                            last_complete_position = %ctx.resume_lsn,
+                            abandoned_events = abandoned,
+                            duplicates_possible =
+                                "only with batch.respect_source_tx=false",
+                            "stream ended inside a transaction: abandoning it and \
+                             replaying it in full from the last complete position"
+                        );
+                        metrics::counter!(
+                            "deltaforge_source_transaction_aborts_total",
+                            "pipeline" => self.pipeline.clone(),
+                            "source" => self.id.clone(),
+                        )
+                        .increment(1);
+                        metrics::counter!(
+                            "deltaforge_source_replayed_events_total",
+                            "pipeline" => self.pipeline.clone(),
+                            "source" => self.id.clone(),
+                        )
+                        .increment(abandoned);
+                        ctx.tx
+                            .send(SourceItem::TxAbort {
+                                tx_id: xid.to_string(),
+                            })
+                            .await
+                            .map_err(|e| SourceError::Other(e.into()))?;
+                        ctx.current_tx_commit_time = None;
+                        ctx.current_final_lsn = None;
+                    }
+                    ctx.last_lsn = ctx.resume_lsn;
                     let reconnect_config =
-                        config.clone().with_start_lsn(ctx.last_lsn);
+                        config.clone().with_start_lsn(ctx.resume_lsn);
 
                     match connect_replication_with_retries(
                         &self.id,
@@ -859,7 +872,7 @@ impl PostgresSource {
                             *ctx.repl_client.lock().await = new_client;
                             ctx.retry.reset();
                             info!(source_id = %self.id, "reconnected successfully");
-                            check_identity_post_reconnect(&mut ctx, None).await?;
+                            check_identity_post_reconnect(&mut ctx).await?;
                         }
                         Err(e) => {
                             error!(
@@ -1287,62 +1300,109 @@ pub async fn establish_registry_scope(
     source_id: &str,
 ) -> SourceResult<ScopeChange> {
     let lineage = fetch_pg_lineage_verified(dsn).await?;
+    refuse_server_change(backend, tenant, source_id, &lineage).await?;
     Ok(
         establish_scope(backend, shared, tenant, source_id, lineage.descriptor)
             .await?,
     )
 }
 
-/// Bring the published registry scope in line with a lineage just verified
-/// against the live server, before any further registry access.
-///
-/// - Unchanged: nothing to do (loader caches stay warm).
-/// - A different cluster (`system_identifier` changed): a failover to another
-///   server; the new lineage is durably recorded and published, which gives it
-///   a fresh schema namespace and invalidates caches from the old lineage.
-///   Failure to persist fails closed.
-/// - Same cluster but a different database OID: the database was replaced under
-///   the running source. That is not a failover; fail closed.
-async fn sync_registry_lineage(
+/// Cross-cluster refusal: a PostgreSQL source never continues on another
+/// cluster. Its checkpoint LSN and slot position belong to one cluster's WAL
+/// history: a server with another `system_identifier`, or the same cluster
+/// with a replaced database, cannot inherit them, however comparable its LSNs
+/// look. This does NOT detect a promoted physical standby (it keeps the
+/// `system_identifier`): continuity across a promotion or timeline change is
+/// not proven here (design spec 7.24). Checked against both
+/// durable authorities (the source lineage record and the failover identity)
+/// before anything is persisted, snapshotted or streamed, and again before
+/// every replication stream opens. Recovery is a new source id, which starts
+/// with a snapshot.
+async fn refuse_server_change(
+    backend: &ArcStorageBackend,
+    tenant: &str,
+    source_id: &str,
+    live: &VerifiedPgLineage,
+) -> SourceResult<()> {
+    if let Some(record) =
+        storage::adapters::source_lineage::load(backend, tenant, source_id)
+            .await
+            .map_err(SourceError::Other)?
+        && lineage_transition(&record.current.descriptor, &live.descriptor)
+            != LineageTransition::Same
+    {
+        return Err(server_changed(
+            source_id,
+            &record.current.descriptor,
+            &live.descriptor,
+        ));
+    }
+    match IdentityStore::new(Arc::clone(backend))
+        .compare(source_id, &ServerIdentity::from(live.identity.clone()))
+        .await
+        .map_err(SourceError::Other)?
+    {
+        IdentityComparison::Changed { previous, current } => {
+            Err(server_changed(source_id, &previous, &current))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn server_changed(
+    source_id: &str,
+    expected: &impl std::fmt::Debug,
+    live: &impl std::fmt::Debug,
+) -> SourceError {
+    error!(
+        source_id, expected = ?expected, live = ?live,
+        "connected to a different PostgreSQL server; refusing to resume"
+    );
+    SourceError::Lineage {
+        details: format!(
+            "source '{source_id}' is bound to PostgreSQL {expected:?} but is \
+             connected to {live:?}. Its checkpoint and replication slot \
+             position belong to the first server's WAL history and are never \
+             resumed on another cluster; nothing was streamed, snapshotted or \
+             recorded. To capture this server, configure a new source id (it \
+             starts with a snapshot)."
+        )
+        .into(),
+    }
+}
+
+/// Check a lineage just verified against the live server against the published
+/// registry scope before any further registry access: any change (another
+/// cluster, or a replaced database) fails closed. The scope is never moved to
+/// another cluster mid-run.
+fn sync_registry_lineage(
     ctx: &RunCtx,
     live: &LineageDescriptor,
 ) -> SourceResult<()> {
     let current = ctx.registry_scope.current()?;
     let expected = &current.lineage().descriptor;
     match lineage_transition(expected, live) {
-        LineageTransition::Same => return Ok(()),
+        LineageTransition::Same => Ok(()),
         LineageTransition::ReplacedDatabase => {
-            return Err(RegistryError::LineageMismatch {
+            Err(RegistryError::LineageMismatch {
                 source_id: ctx.source_id.clone(),
                 expected: format!("{expected:?}"),
                 live: format!("{live:?}"),
             }
-            .into());
+            .into())
         }
-        LineageTransition::Failover => {}
+        LineageTransition::OtherCluster => {
+            Err(server_changed(&ctx.source_id, expected, live))
+        }
     }
-    let change = establish_scope(
-        &ctx.registry_backend,
-        &ctx.registry_scope,
-        &ctx.tenant,
-        &ctx.source_id,
-        live.clone(),
-    )
-    .await?;
-    warn!(
-        source_id = %ctx.source_id,
-        lineage = %change.scope.lineage().lineage_hash,
-        "source lineage changed; schema registry re-scoped to the new server"
-    );
-    Ok(())
 }
 
 /// How a running PostgreSQL source's verified lineage moved.
 #[derive(Debug, PartialEq, Eq)]
 enum LineageTransition {
     Same,
-    /// A different cluster: failover to another server (supported).
-    Failover,
+    /// A different cluster: never resumed (`refuse_server_change`).
+    OtherCluster,
     /// Same cluster, different database OID: the database was replaced under a
     /// running source. Not a failover; fail closed.
     ReplacedDatabase,
@@ -1366,7 +1426,7 @@ fn lineage_transition(
                 ..
             },
         ) if a == b => LineageTransition::ReplacedDatabase,
-        _ => LineageTransition::Failover,
+        _ => LineageTransition::OtherCluster,
     }
 }
 
@@ -1387,10 +1447,10 @@ mod lineage_transition_tests {
     }
 
     #[test]
-    fn different_cluster_is_a_failover() {
+    fn different_cluster_is_another_cluster() {
         assert_eq!(
             lineage_transition(&pg(1, 5), &pg(2, 5)),
-            LineageTransition::Failover
+            LineageTransition::OtherCluster
         );
     }
 
@@ -1403,34 +1463,21 @@ mod lineage_transition_tests {
     }
 }
 
-/// Resolves the cluster identity and the `start_lsn` **before** opening the
-/// replication stream. Compares the verified live identity against the durable
-/// authority and acts before any stream opens:
+/// Resolves the cluster identity **before** opening the replication stream,
+/// against the durable authority:
 ///
 /// - `FirstSeen`: persist the verified identity. A durable-write failure fails
 ///   closed here so no stream is ever opened on an unpersisted identity.
 /// - `Same`: nothing to do.
-/// - `Changed`: adjust `start_lsn` to B's slot position (the schema
-///   reconciliation runs post-connect but before any row is consumed).
+/// - `Changed`: refused (`refuse_server_change`); the start position is never
+///   moved to another cluster's slot.
 ///
-/// `START_REPLICATION` immediately advances the slot's `confirmed_flush_lsn` to
-/// `max(start_lsn, slot.confirmed_flush_lsn)`.  If we start with A's stale checkpoint
-/// LSN on a fresh B whose slot is behind that checkpoint, PostgreSQL will skip any
-/// changes B committed between its slot creation LSN and A's checkpoint - even if we
-/// reconnect from the correct LSN afterwards.
-///
-/// By fetching the correct start LSN before the first replication connection, we avoid
-/// permanently advancing the slot past unread data. `live` is the identity already
-/// verified once at startup; the comparison, persistence, and any position lookup
-/// fail closed.
-async fn pre_connect_lsn_adjust(
-    dsn: &str,
-    slot: &str,
-    start_lsn: Lsn,
+/// The comparison and the persistence fail closed.
+async fn verify_identity_before_connect(
     live: &ServerIdentity,
     id_store: &IdentityStore,
     source_id: &str,
-) -> SourceResult<Lsn> {
+) -> SourceResult<()> {
     match id_store
         .compare(source_id, live)
         .await
@@ -1443,52 +1490,59 @@ async fn pre_connect_lsn_adjust(
             id_store
                 .store(source_id, live)
                 .await
-                .map_err(SourceError::Other)?;
-            Ok(start_lsn)
+                .map_err(SourceError::Other)
         }
-        IdentityComparison::Changed { .. } => {
-            // Failover detected: use the slot's actual confirmed_flush_lsn on B.
-            // If B's slot position cannot be resolved we must NOT fall back to
-            // A's stale checkpoint LSN - doing so would advance B's slot past
-            // unread data. The identity authority is unavailable, so fail closed.
-            let slot_lsn =
-                fetch_slot_confirmed_lsn(dsn, slot).await.map_err(|e| {
-                    SourceError::Other(anyhow::anyhow!(
-                        "failover detected but could not resolve slot '{slot}' \
-                         confirmed_flush_lsn on the new server: {e}; refusing to \
-                         open replication on a stale checkpoint LSN"
-                    ))
-                })?;
-            debug!(
-                source_id = %source_id,
-                original_lsn = %start_lsn,
-                slot_lsn = %slot_lsn,
-                "pre-connect failover adjustment: using slot LSN"
-            );
-            Ok(slot_lsn)
+        IdentityComparison::Changed { previous, current } => {
+            Err(server_changed(source_id, &previous, &current))
         }
-        _ => Ok(start_lsn),
+        IdentityComparison::Same => Ok(()),
     }
 }
 
-async fn check_identity_post_reconnect(
-    ctx: &mut RunCtx,
-    prefetched: Option<(LineageDescriptor, ServerIdentity)>,
-) -> SourceResult<()> {
-    // Reuse a lineage already verified by the caller (startup), or fetch and
-    // verify one here (reconnect). Either way a live identity is required: an
-    // unverifiable identity fails closed rather than silently skipping the
-    // failover check.
-    let (descriptor, live) = match prefetched {
-        Some(pair) => pair,
-        None => {
-            let verified = fetch_pg_lineage_verified(ctx.dsn.expose()).await?;
-            (verified.descriptor, ServerIdentity::from(verified.identity))
+/// Before a reconnect sends START_REPLICATION: wait, backing off and
+/// cancellably, until the server answers with a verified lineage, then refuse
+/// another cluster. An unreachable or unverifiable server is retried like any
+/// connection failure, never streamed from. `false`: cancelled.
+async fn verify_before_reconnect(ctx: &mut RunCtx) -> SourceResult<bool> {
+    loop {
+        match fetch_pg_lineage_verified(ctx.dsn.expose()).await {
+            Ok(live) => {
+                refuse_server_change(
+                    &ctx.registry_backend,
+                    &ctx.tenant,
+                    &ctx.source_id,
+                    &live,
+                )
+                .await?;
+                sync_registry_lineage(ctx, &live.descriptor)?;
+                return Ok(true);
+            }
+            Err(e) => {
+                let delay = ctx.retry.next_backoff();
+                warn!(
+                    source_id = %ctx.source_id, error = %e,
+                    delay_ms = delay.as_millis(),
+                    "server not verifiable before reconnect; retrying"
+                );
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = ctx.cancel.cancelled() => return Ok(false),
+                }
+            }
         }
-    };
-    // Re-scope the registry to the live lineage before any registry access on
-    // this connection (fails closed on a replaced database or a persist error).
-    sync_registry_lineage(ctx, &descriptor).await?;
+    }
+}
+
+/// After a replication stream opens, before its first message is read: the
+/// server it reached must still be the source's. An unverifiable identity
+/// fails closed rather than skipping the check.
+async fn check_identity_post_reconnect(ctx: &mut RunCtx) -> SourceResult<()> {
+    let verified = fetch_pg_lineage_verified(ctx.dsn.expose()).await?;
+    let (descriptor, live) =
+        (verified.descriptor, ServerIdentity::from(verified.identity));
+    // The registry scope never moves: another lineage fails closed before any
+    // registry access on this connection.
+    sync_registry_lineage(ctx, &descriptor)?;
 
     match ctx
         .identity_store
@@ -1504,13 +1558,7 @@ async fn check_identity_post_reconnect(
         }
         IdentityComparison::Same => {}
         IdentityComparison::Changed { previous, current } => {
-            warn!(
-                source_id = %ctx.source_id,
-                prev = ?previous,
-                new = ?current,
-                "server identity changed - failover detected, reconciling"
-            );
-            run_failover_reconciliation(ctx, previous, current).await?;
+            return Err(server_changed(&ctx.source_id, &previous, &current));
         }
     }
 
@@ -1564,111 +1612,6 @@ pub(crate) async fn apply_schema_drift(
             })
         }
     }
-}
-
-async fn run_failover_reconciliation(
-    ctx: &mut RunCtx,
-    previous: ServerIdentity,
-    current: ServerIdentity,
-) -> SourceResult<()> {
-    let existing = ctx
-        .reconciler
-        .already_completed(&ctx.source_id, &previous, &current)
-        .await
-        .unwrap_or(None);
-
-    if existing.is_none() {
-        // Position reachability via slot state.
-        match check_position_reachability(ctx.dsn.expose(), &ctx.slot)
-            .await
-            .unwrap_or(PositionReachability::Unknown {
-                reason: "reachability check failed".into(),
-            }) {
-            PositionReachability::Reachable => {}
-            PositionReachability::Unknown { reason } => {
-                warn!(
-                    source_id = %ctx.source_id,
-                    %reason,
-                    "could not verify position reachability after failover - resuming anyway"
-                );
-            }
-            PositionReachability::Lost { reason } => {
-                return Err(SourceError::Other(anyhow::anyhow!(
-                    "position lost after failover: {reason}. Re-snapshot required."
-                )));
-            }
-        }
-
-        if let Ok(slot_lsn) =
-            fetch_slot_confirmed_lsn(ctx.dsn.expose(), &ctx.slot).await
-        {
-            ctx.last_lsn = slot_lsn;
-        }
-
-        // Schema diff against live catalog.
-        let tracked = ctx.schema.cached_tables();
-        let mut inputs = Vec::with_capacity(tracked.len());
-        for (schema, table) in &tracked {
-            let live_cols: Option<
-                Vec<crate::failover::reconciler::ColumnSnapshot>,
-            > = postgres_health::fetch_live_columns(
-                ctx.dsn.expose(),
-                schema,
-                table,
-            )
-            .await
-            .ok()
-            .flatten()
-            .map(|cols| cols.into_iter().map(Into::into).collect());
-            inputs.push(ReconcileInput {
-                db: schema.clone(),
-                table: table.clone(),
-                live_columns: live_cols,
-            });
-        }
-
-        // Diff against the last-known schemas of the lineage the source ran
-        // under before this failover (read explicitly from its namespace).
-        let prior =
-            previous_scope(&ctx.registry_backend, &ctx.tenant, &ctx.source_id)
-                .await?;
-        let record = ctx
-            .reconciler
-            .run(&ctx.source_id, &previous, &current, prior.as_ref(), &inputs)
-            .await
-            .map_err(SourceError::Other)?;
-
-        for result in &record.table_results {
-            if !result.deltas.is_empty() {
-                let _ =
-                    ctx.schema.reload_schema(&result.db, &result.table).await;
-            }
-        }
-
-        let has_drift =
-            record.table_results.iter().any(|r| !r.deltas.is_empty());
-        if has_drift {
-            warn!(pipeline=%ctx.pipeline, source_id=%ctx.source_id, "schema drift detected after failover");
-            if ctx.on_schema_drift == deltaforge_config::OnSchemaDrift::Halt {
-                return Err(SourceError::Other(anyhow::anyhow!(
-                    "schema drift detected after failover and on_schema_drift=halt. \
-                Verify B's schema and apply any missing migrations before restarting."
-                )));
-            }
-        }
-    }
-
-    // Persist the new identity only after reconciliation succeeds. A failure to
-    // record the new lineage must fail closed: silently discarding it would let
-    // the next reconnect re-detect the same "change" or, worse, treat a later
-    // failover as first-seen.
-    ctx.identity_store
-        .store(&ctx.source_id, &current)
-        .await
-        .map_err(SourceError::Other)?;
-
-    info!(source_id = %ctx.source_id, "failover reconciliation complete");
-    Ok(())
 }
 
 async fn fetch_slot_confirmed_lsn(
@@ -1968,10 +1911,10 @@ mod identity_fail_closed_tests {
     //! R3-C2: PostgreSQL identity/lineage authority fails closed.
     //!
     //! These exercise the real production functions (`fetch_pg_lineage_verified`,
-    //! `pre_connect_lsn_adjust`) directly. Container-backed failover behaviour is
-    //! covered by `tests/failover_e2e.rs`; here we prove that when the identity
-    //! store or the live position authority is unavailable, we refuse to open the
-    //! stream and never fall back to a stale LSN.
+    //! `verify_identity_before_connect`, `refuse_server_change`) directly.
+    //! Container-backed refusal is covered by `tests/failover_e2e.rs`; here we
+    //! prove that when the identity store is unavailable, or the server is
+    //! another one, we refuse to open the stream.
     use super::*;
     use crate::failover::identity::{IdentityStore, ServerIdentity};
     use std::sync::Arc;
@@ -2234,81 +2177,111 @@ mod identity_fail_closed_tests {
     }
 
     #[tokio::test]
-    async fn pre_connect_lsn_adjust_fails_closed_when_store_unavailable() {
+    async fn identity_check_fails_closed_when_store_unavailable() {
         // Startup: the durable identity store is down, so the identity comparison
         // cannot be made. We must fail closed rather than assume Same and proceed.
         let store = IdentityStore::new(Arc::new(IdentityStoreDown::new()));
-        let start = Lsn::from(0x1000u64);
-        let result = pre_connect_lsn_adjust(
-            UNREACHABLE_DSN,
-            "slot_a",
-            start,
-            &pg_identity(42),
-            &store,
-            "src1",
-        )
-        .await;
+        let result =
+            verify_identity_before_connect(&pg_identity(42), &store, "src1")
+                .await;
         assert!(
             result.is_err(),
-            "unavailable identity store must fail closed, not return an LSN"
+            "unavailable identity store must fail closed"
         );
     }
 
     #[tokio::test]
-    async fn pre_connect_lsn_adjust_never_falls_back_to_old_lsn_on_change() {
-        // A different identity is already recorded, so the live server is a
-        // failover target (Changed). The new server's slot position cannot be
-        // resolved (unreachable). We must NOT fall back to A's stale checkpoint
-        // LSN - doing so would advance B's slot past unread data.
+    async fn a_changed_identity_is_refused_before_connect() {
+        // A different identity is already recorded: the live server is another
+        // cluster. It is refused, never resumed from any position.
         let backend = Arc::new(MemoryStorageBackend::new());
         let store = IdentityStore::new(backend);
         store
             .store("src1", &pg_identity(111))
             .await
             .expect("seed previous identity");
-
-        let stale = Lsn::from(0xDEAD_BEEFu64);
-        let result = pre_connect_lsn_adjust(
-            UNREACHABLE_DSN,
-            "slot_a",
-            stale,
-            &pg_identity(222), // different -> Changed
-            &store,
-            "src1",
-        )
-        .await;
-        match result {
-            Err(_) => {}
-            Ok(lsn) => panic!(
-                "identity changed but position authority was unavailable; \
-                 must fail closed, instead returned {lsn}"
+        let result =
+            verify_identity_before_connect(&pg_identity(222), &store, "src1")
+                .await;
+        assert!(
+            matches!(result, Err(SourceError::Lineage { .. })),
+            "another cluster must be refused: {result:?}"
+        );
+        assert!(
+            matches!(
+                store.compare("src1", &pg_identity(111)).await.unwrap(),
+                IdentityComparison::Same
             ),
-        }
+            "the recorded identity must not move"
+        );
     }
 
     #[tokio::test]
-    async fn pre_connect_lsn_adjust_fails_closed_when_firstseen_persist_fails()
-    {
+    async fn identity_check_fails_closed_when_firstseen_persist_fails() {
         // Fresh source (FirstSeen): the identity read succeeds but the durable
         // write fails. The FirstSeen identity MUST be persisted before the stream
-        // opens, so a persist failure fails closed here - no LSN is returned and
-        // therefore no stream is ever opened.
+        // opens, so a persist failure fails closed here and no stream is ever
+        // opened.
         let store =
             IdentityStore::new(Arc::new(IdentityStoreDown::write_only_down()));
-        let start = Lsn::from(0x2000u64);
-        let result = pre_connect_lsn_adjust(
-            UNREACHABLE_DSN,
-            "slot_a",
-            start,
-            &pg_identity(99),
-            &store,
-            "src_new",
-        )
-        .await;
+        let result =
+            verify_identity_before_connect(&pg_identity(99), &store, "src_new")
+                .await;
         assert!(
             result.is_err(),
             "FirstSeen persist failure must fail closed before opening the stream"
         );
+    }
+
+    /// Either durable authority alone refuses another cluster, before
+    /// anything is written: the lineage record (another cluster or a replaced
+    /// database) and the identity store (another cluster).
+    #[tokio::test]
+    async fn another_cluster_is_refused_by_either_authority() {
+        fn live(sysid: i64, dboid: u64) -> VerifiedPgLineage {
+            VerifiedPgLineage {
+                descriptor: LineageDescriptor::postgres(sysid as u64, dboid)
+                    .unwrap(),
+                identity: PostgresServerIdentity {
+                    system_identifier: sysid,
+                },
+            }
+        }
+        let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        refuse_server_change(&backend, "acme", "src", &live(1, 5))
+            .await
+            .expect("nothing recorded: first use");
+        storage::adapters::source_lineage::establish(
+            &backend,
+            "acme",
+            "src",
+            live(1, 5).descriptor,
+        )
+        .await
+        .unwrap();
+        refuse_server_change(&backend, "acme", "src", &live(1, 5))
+            .await
+            .expect("the same server");
+        for other in [live(2, 5), live(1, 6)] {
+            let r = refuse_server_change(&backend, "acme", "src", &other).await;
+            assert!(
+                matches!(r, Err(SourceError::Lineage { .. })),
+                "{other:?} must be refused: {r:?}"
+            );
+        }
+
+        // No lineage record, only a recorded identity.
+        let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+        IdentityStore::new(Arc::clone(&backend))
+            .store("src", &pg_identity(1))
+            .await
+            .unwrap();
+        let r =
+            refuse_server_change(&backend, "acme", "src", &live(2, 5)).await;
+        assert!(matches!(r, Err(SourceError::Lineage { .. })), "{r:?}");
+        refuse_server_change(&backend, "acme", "src", &live(1, 5))
+            .await
+            .expect("the recorded identity");
     }
 
     #[tokio::test]

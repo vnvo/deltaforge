@@ -23,7 +23,7 @@ use crate::registry_scope::{
 };
 
 /// The live catalog's answer for one table.
-enum Live {
+pub(crate) enum Live {
     Found(MySqlTableSchema),
     /// The server is not the scope's lineage (described for the error).
     OtherLineage(String),
@@ -169,6 +169,11 @@ impl MySqlSchemaLoader {
     /// cache (shared via `Arc`) is preserved. Called by the run loop at a quiesced
     /// boundary once the replacement stream is confirmed, so no query is in flight
     /// against the old DSN.
+    /// The schema registry this loader registers versions in.
+    pub(crate) fn registry(&self) -> &DurableSchemaRegistry {
+        &self.registry
+    }
+
     pub(crate) fn set_dsn(&mut self, dsn: crate::credentials::ProtectedDsn) {
         self.pool = Pool::new(dsn.expose());
         self.dsn = dsn;
@@ -256,10 +261,17 @@ impl MySqlSchemaLoader {
                             }
                             from_registry += 1;
                         }
+                        // Stored history that cannot be read is corrupt: never
+                        // replaced by the live catalog.
                         Err(e) => {
-                            warn!(db=%db, table=%table, error=%e,
-                                "failed to deserialize registry schema; fetching from source");
-                            needs_fetch.push(pair);
+                            return Err(SourceError::Schema {
+                                details: format!(
+                                    "stored schema of {db}.{table} (version {}) \
+                                     is unreadable: {e}",
+                                    sv.version
+                                )
+                                .into(),
+                            });
                         }
                     }
                 }
@@ -269,8 +281,14 @@ impl MySqlSchemaLoader {
 
         // Fetch from INFORMATION_SCHEMA only for tables absent from registry.
         for (db, table) in &needs_fetch {
-            if let Err(e) = self.load_schema(db, table).await {
-                warn!(db = %db, table = %table, error = %e, "failed to preload schema");
+            match self.load_schema(db, table).await {
+                Ok(_) => {}
+                // The connection reached another server: not a missing
+                // table, and nothing may continue on that assumption.
+                Err(e @ SourceError::Lineage { .. }) => return Err(e),
+                Err(e) => {
+                    warn!(db = %db, table = %table, error = %e, "failed to preload schema");
+                }
             }
         }
 
@@ -283,7 +301,14 @@ impl MySqlSchemaLoader {
             "schema preload complete"
         );
 
-        let mut conn = self.pool.get_conn().await.map_err(conn_error)?;
+        self.check_binlog_row_image().await?;
+        Ok(tables)
+    }
+
+    /// Warn when `binlog_row_image` is not FULL (before images incomplete).
+    /// One query on a verified connection, independent of the catalog.
+    pub async fn check_binlog_row_image(&self) -> SourceResult<()> {
+        let mut conn = self.verified_conn().await?;
         let row_image: String = conn
             .query_first("SELECT @@binlog_row_image")
             .await
@@ -299,7 +324,7 @@ impl MySqlSchemaLoader {
             );
         }
 
-        Ok(tables)
+        Ok(())
     }
 
     /// Expand wildcard patterns to actual table list.
@@ -307,7 +332,7 @@ impl MySqlSchemaLoader {
         &self,
         patterns: &[String],
     ) -> SourceResult<Vec<(String, String)>> {
-        let mut conn = self.pool.get_conn().await.map_err(conn_error)?;
+        let mut conn = self.verified_conn().await?;
         let mut results = Vec::new();
 
         // Handle empty patterns = all tables
@@ -436,6 +461,34 @@ impl MySqlSchemaLoader {
         Err(self.scope_changed())
     }
 
+    /// Register a shape captured elsewhere (a stable position/shape capture)
+    /// through the normal registry path, under the current verified scope,
+    /// with `checkpoint` as its binding position. Returns the version and its
+    /// registry hash. Never derived from a TableMap.
+    pub(crate) async fn register_captured(
+        &self,
+        db: &str,
+        table: &str,
+        schema: &MySqlTableSchema,
+        checkpoint: &[u8],
+    ) -> SourceResult<(i32, String)> {
+        let scope = self.current_scope()?;
+        let fingerprint = schema.fingerprint();
+        let schema_json = serde_json::to_value(schema)
+            .map_err(|e| SourceError::Other(e.into()))?;
+        let version = self
+            .registry
+            .register_with_checkpoint(
+                &scope.key(db, table),
+                &fingerprint,
+                &schema_json,
+                Some(checkpoint),
+            )
+            .await
+            .map_err(RegistryError::Storage)?;
+        Ok((version, fingerprint.to_string()))
+    }
+
     /// Force reload schema from database (bypasses cache).
     pub async fn reload_schema(
         &self,
@@ -453,6 +506,12 @@ impl MySqlSchemaLoader {
     }
 
     /// Reload all schemas matching patterns.
+    /// Forget every cached schema; each table reloads on its next use. No
+    /// catalog enumeration.
+    pub async fn clear_cache(&self) {
+        self.cache.write().await.clear();
+    }
+
     pub async fn reload_all(
         &self,
         patterns: &[String],
@@ -529,6 +588,24 @@ impl MySqlSchemaLoader {
         info!(db = %db, removed = before.saturating_sub(after), "schema cache invalidated");
     }
 
+    /// A pooled connection that proved it is the scope's verified server:
+    /// catalog facts (which tables exist) come only from that server.
+    async fn verified_conn(&self) -> SourceResult<mysql_async::Conn> {
+        let scope = self.scope.current()?;
+        let storage::adapters::LineageDescriptor::Mysql { server_uuid } =
+            &scope.lineage().descriptor
+        else {
+            return Err(SourceError::Lineage {
+                details: "MySQL loader scoped to a non-MySQL lineage".into(),
+            });
+        };
+        let mut conn = self.pool.get_conn().await.map_err(conn_error)?;
+        super::mysql_session::verify_connection(&mut conn, server_uuid)
+            .await
+            .map_err(|e| e.into_source_error(server_uuid))?;
+        Ok(conn)
+    }
+
     /// Fetch schema from INFORMATION_SCHEMA.
     async fn fetch_schema(
         &self,
@@ -537,132 +614,12 @@ impl MySqlSchemaLoader {
         table: &str,
     ) -> SourceResult<Live> {
         let mut conn = self.pool.get_conn().await.map_err(conn_error)?;
-
-        // Prove on this same connection that the catalog belongs to the
-        // scope's lineage, so a schema read from another server can never be
-        // registered under this lineage.
-        let live_uuid: Option<String> = conn
-            .query_first("SELECT @@global.server_uuid")
-            .await
-            .map_err(|e| SourceError::Other(e.into()))?;
-        let same = match (&scope.lineage().descriptor, live_uuid.as_deref()) {
-            (
-                storage::adapters::LineageDescriptor::Mysql { server_uuid },
-                Some(live),
-            ) => server_uuid.eq_ignore_ascii_case(live.trim()),
-            _ => false,
+        let storage::adapters::LineageDescriptor::Mysql { server_uuid } =
+            &scope.lineage().descriptor
+        else {
+            return Ok(Live::OtherLineage("a non-MySQL lineage".into()));
         };
-        if !same {
-            return Ok(Live::OtherLineage(format!("{live_uuid:?}")));
-        }
-
-        // Fetch columns
-        let col_rows: Vec<Row> = conn
-            .exec(
-                r#"
-                SELECT 
-                    COLUMN_NAME,
-                    COLUMN_TYPE,
-                    DATA_TYPE,
-                    IS_NULLABLE,
-                    ORDINAL_POSITION,
-                    COLUMN_DEFAULT,
-                    EXTRA,
-                    COLUMN_COMMENT,
-                    CHARACTER_MAXIMUM_LENGTH,
-                    NUMERIC_PRECISION,
-                    NUMERIC_SCALE
-                FROM INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-                ORDER BY ORDINAL_POSITION
-                "#,
-                (db, table),
-            )
-            .await
-            .map_err(query_error)?;
-
-        if col_rows.is_empty() {
-            return Err(SourceError::Other(anyhow::anyhow!(
-                "table {}.{} not found or has no columns",
-                db,
-                table
-            )));
-        }
-
-        let columns: Vec<MySqlColumn> = col_rows
-            .into_iter()
-            .map(|mut row| MySqlColumn {
-                name: row.take("COLUMN_NAME").unwrap(),
-                column_type: row.take("COLUMN_TYPE").unwrap(),
-                data_type: row.take("DATA_TYPE").unwrap(),
-                nullable: row.take::<String, _>("IS_NULLABLE").unwrap()
-                    == "YES",
-                ordinal_position: row.take("ORDINAL_POSITION").unwrap(),
-                // nullable columns
-                default_value: row
-                    .take::<Option<String>, _>("COLUMN_DEFAULT")
-                    .unwrap(),
-                extra: row.take::<Option<String>, _>("EXTRA").unwrap(),
-                comment: row
-                    .take::<Option<String>, _>("COLUMN_COMMENT")
-                    .unwrap(),
-                char_max_length: row
-                    .take::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")
-                    .unwrap(),
-                numeric_precision: row
-                    .take::<Option<i64>, _>("NUMERIC_PRECISION")
-                    .unwrap(),
-                numeric_scale: row
-                    .take::<Option<i64>, _>("NUMERIC_SCALE")
-                    .unwrap(),
-            })
-            .collect();
-
-        // Fetch primary key
-        let pk_rows: Vec<Row> = conn
-            .exec(
-                r#"
-                SELECT COLUMN_NAME
-                FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-                WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY'
-                ORDER BY ORDINAL_POSITION
-                "#,
-                (db, table),
-            )
-            .await
-            .map_err(query_error)?;
-
-        let primary_key: Vec<String> = pk_rows
-            .into_iter()
-            .map(|mut row| row.take("COLUMN_NAME").unwrap())
-            .collect();
-
-        // Fetch table metadata
-        let table_row: Option<Row> = conn
-            .exec_first(
-                r#"
-                SELECT ENGINE, TABLE_COLLATION
-                FROM INFORMATION_SCHEMA.TABLES
-                WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-                "#,
-                (db, table),
-            )
-            .await
-            .map_err(query_error)?;
-
-        let (engine, collation) = if let Some(mut row) = table_row {
-            (row.take("ENGINE"), row.take("TABLE_COLLATION"))
-        } else {
-            (None, None)
-        };
-
-        Ok(Live::Found(MySqlTableSchema {
-            columns,
-            primary_key,
-            engine,
-            charset: None,
-            collation,
-        }))
+        fetch_table_schema_on(&mut conn, server_uuid, db, table).await
     }
 
     /// Get column names only (for backward compatibility with event handling).
@@ -868,6 +825,169 @@ fn to_api_schema(
         registry_version: loaded.registry_version,
         loaded_at: chrono::Utc::now(),
     }
+}
+
+/// Read one table's shape from INFORMATION_SCHEMA on `conn`, after proving on
+/// that same connection that the server is `expected_uuid` (so a schema read
+/// from another server is never attributed to this lineage). Shared by the
+/// loader and the stable shape capture, which must read position, shape and
+/// position on one connection.
+pub(crate) async fn fetch_table_schema_on(
+    conn: &mut mysql_async::Conn,
+    expected_uuid: &str,
+    db: &str,
+    table: &str,
+) -> SourceResult<Live> {
+    // Prove on this same connection that the catalog belongs to the
+    // scope's lineage, so a schema read from another server can never be
+    // registered under this lineage.
+    let live_uuid: Option<String> = conn
+        .query_first("SELECT @@global.server_uuid")
+        .await
+        .map_err(|e| SourceError::Other(e.into()))?;
+    let same = live_uuid
+        .as_deref()
+        .is_some_and(|live| expected_uuid.eq_ignore_ascii_case(live.trim()));
+    if !same {
+        return Ok(Live::OtherLineage(format!("{live_uuid:?}")));
+    }
+
+    // Fetch columns
+    let col_rows: Vec<Row> = conn
+        .exec(
+            r#"
+            SELECT
+                COLUMN_NAME,
+                COLUMN_TYPE,
+                DATA_TYPE,
+                IS_NULLABLE,
+                ORDINAL_POSITION,
+                COLUMN_DEFAULT,
+                EXTRA,
+                COLUMN_COMMENT,
+                CHARACTER_MAXIMUM_LENGTH,
+                NUMERIC_PRECISION,
+                NUMERIC_SCALE,
+                CHARACTER_OCTET_LENGTH,
+                DATETIME_PRECISION,
+                (SELECT co.ID FROM INFORMATION_SCHEMA.COLLATIONS co
+                 WHERE co.COLLATION_NAME = c.COLLATION_NAME) AS COLLATION_ID
+            FROM INFORMATION_SCHEMA.COLUMNS c
+            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+            ORDER BY ORDINAL_POSITION
+            "#,
+            (db, table),
+        )
+        .await
+        .map_err(query_error)?;
+
+    if col_rows.is_empty() {
+        return Err(SourceError::Other(anyhow::anyhow!(
+            "table {}.{} not found or has no columns",
+            db,
+            table
+        )));
+    }
+
+    let columns: Vec<MySqlColumn> = col_rows
+        .into_iter()
+        .map(|mut row| MySqlColumn {
+            name: row.take("COLUMN_NAME").unwrap(),
+            column_type: row.take("COLUMN_TYPE").unwrap(),
+            data_type: row.take("DATA_TYPE").unwrap(),
+            nullable: row.take::<String, _>("IS_NULLABLE").unwrap() == "YES",
+            ordinal_position: row.take("ORDINAL_POSITION").unwrap(),
+            // nullable columns
+            default_value: row
+                .take::<Option<String>, _>("COLUMN_DEFAULT")
+                .unwrap(),
+            extra: row.take::<Option<String>, _>("EXTRA").unwrap(),
+            comment: row.take::<Option<String>, _>("COLUMN_COMMENT").unwrap(),
+            char_max_length: row
+                .take::<Option<i64>, _>("CHARACTER_MAXIMUM_LENGTH")
+                .unwrap(),
+            numeric_precision: row
+                .take::<Option<i64>, _>("NUMERIC_PRECISION")
+                .unwrap(),
+            numeric_scale: row.take::<Option<i64>, _>("NUMERIC_SCALE").unwrap(),
+            char_octet_length: row
+                .take::<Option<i64>, _>("CHARACTER_OCTET_LENGTH")
+                .unwrap(),
+            collation_id: row.take::<Option<i64>, _>("COLLATION_ID").unwrap(),
+            datetime_precision: row
+                .take::<Option<i64>, _>("DATETIME_PRECISION")
+                .unwrap(),
+            primary_key_prefix: None,
+        })
+        .collect();
+
+    // Fetch primary key
+    let pk_rows: Vec<Row> = conn
+        .exec(
+            r#"
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY'
+            ORDER BY ORDINAL_POSITION
+            "#,
+            (db, table),
+        )
+        .await
+        .map_err(query_error)?;
+
+    let primary_key: Vec<String> = pk_rows
+        .into_iter()
+        .map(|mut row| row.take("COLUMN_NAME").unwrap())
+        .collect();
+
+    // Primary-key prefix lengths (a prefixed key part, e.g. a BLOB prefix).
+    let prefix_rows: Vec<Row> = conn
+        .exec(
+            r#"
+            SELECT COLUMN_NAME, SUB_PART
+            FROM INFORMATION_SCHEMA.STATISTICS
+            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = 'PRIMARY'
+              AND SUB_PART IS NOT NULL
+            "#,
+            (db, table),
+        )
+        .await
+        .map_err(query_error)?;
+    let mut columns = columns;
+    for mut row in prefix_rows {
+        let name: String = row.take("COLUMN_NAME").unwrap();
+        let sub_part: Option<i64> = row.take("SUB_PART").unwrap();
+        if let Some(c) = columns.iter_mut().find(|c| c.name == name) {
+            c.primary_key_prefix = sub_part;
+        }
+    }
+
+    // Fetch table metadata
+    let table_row: Option<Row> = conn
+        .exec_first(
+            r#"
+            SELECT ENGINE, TABLE_COLLATION
+            FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+            "#,
+            (db, table),
+        )
+        .await
+        .map_err(query_error)?;
+
+    let (engine, collation) = if let Some(mut row) = table_row {
+        (row.take("ENGINE"), row.take("TABLE_COLLATION"))
+    } else {
+        (None, None)
+    };
+
+    Ok(Live::Found(MySqlTableSchema {
+        columns,
+        primary_key,
+        engine,
+        charset: None,
+        collation,
+    }))
 }
 
 #[cfg(test)]

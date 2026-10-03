@@ -100,6 +100,28 @@ To avoid ambiguity, here is exactly what DeltaForge guarantees about transaction
 - A single database transaction that exceeds `max_events` or `max_bytes` is still kept in one batch. The limits are exceeded rather than the transaction being split.
 - With `respect_source_tx: false`, batches are split purely by size/time limits regardless of transaction boundaries. Cross-table transaction atomicity is not preserved in this mode.
 
+### Disconnect inside a transaction (PostgreSQL)
+
+When the replication stream ends inside a transaction (the connection is closed or reset), the source reconnects to the same verified server, resumes at the end of the last transaction it handed on, abandons the cut-off transaction (an internal abort marker, never a CDC event) and receives it again from its beginning:
+
+| Mode | Disconnect inside a transaction |
+|------|---------------------------------|
+| `respect_source_tx: true` (default) | The buffered prefix is discarded; the transaction is delivered once, with one commit boundary |
+| `respect_source_tx: false` | Rows already delivered for it cannot be recalled; its replay may deliver them again (at-least-once duplicates) |
+| Either mode | The checkpoint never advances for the abandoned attempt; a process restart resumes from the durable checkpoint |
+
+Each abandoned transaction logs a warning (source, transaction, last complete position, events abandoned, whether duplicates are possible). Metrics:
+
+| Metric | Meaning |
+|--------|---------|
+| `deltaforge_source_reconnects_total` | The source reconnected after a transient stream error |
+| `deltaforge_source_transaction_aborts_total` | The source found its stream interrupted inside an open transaction and abandoned it |
+| `deltaforge_source_replayed_events_total` | Events the source had already handed on for an abandoned attempt and sends again with the replay. Includes events the coordinator only buffered (never delivered) under `respect_source_tx: true`: it is not a count of downstream duplicates |
+| `deltaforge_abandoned_tx_total{outcome="discarded"}` | The coordinator discarded the abandoned attempt's buffered prefix (no duplicates) |
+| `deltaforge_abandoned_tx_total{outcome="may_duplicate"}` | `respect_source_tx: false`: part of the abandoned attempt may already have reached sinks and may be delivered again |
+
+`respect_source_tx` is `true` unless a pipeline sets it to `false`: `BatchConfig` fills every key a pipeline's `batch` section omits from its defaults (`respect_source_tx: true`), and the coordinator applies the same defaults when there is no `batch` section at all. Keep it `true` for production. In that mode an open transaction is buffered in memory up to `max_tx_events` / `max_tx_bytes`, beyond which the `oversized_tx` policy applies.
+
 ## Initial-snapshot anchoring
 
 The initial snapshot and the CDC stream meet at a single anchor so that **no committed row is lost** across the boundary. The checks below run only when a snapshot runs; CDC-only pipelines (`snapshot.mode = never`) are unaffected.
@@ -213,13 +235,13 @@ Fatal errors return `SinkError::Fatal` and are not retried. The pipeline stops a
 
 ### MySQL replay across a schema change
 
-MySQL rows are decoded by column position against the table's current schema. Before decoding each rows event, the source checks that the column layout the binlog recorded for those rows (column count, storage types, and column names when the server writes them with `binlog_row_metadata=FULL`) matches that schema. If the loaded schema may be stale it is reloaded once; if the rows still do not match - or their compatibility cannot be proven, for example an unrecognized column type or missing type metadata - the source **stops fail-closed**: it emits no event for those rows and does not advance the checkpoint, rather than put values under the wrong columns.
+MySQL rows are decoded by column position. Each rows event is decoded with the schema version proven for its position in the binlog - the definition the table had when the rows were written - not with the table's current definition, so a restart that replays rows written **before a DDL** decodes them with the old definition and the rows after it with the new one. How a version is proven is described in [Schema tracking](sources/mysql.md#rows-are-decoded-with-the-definition-in-effect-when-they-were-written). The proven version must also agree with the column layout the binlog recorded for those rows (column count, storage types and type metadata; with `binlog_row_metadata=FULL` also names, signedness, charsets and the primary key); if it does not, the source stops fail-closed.
 
-This happens when a restart replays binlog rows that were written **before a DDL** on the table (the rows are older than the table's current definition) - for example when the pipeline stopped after the DDL but before its checkpoint passed it. Replaying MySQL rows across a DDL is **not supported yet** (historical schema selection is planned).
+When no version can be proven, the source **stops fail-closed**: it emits no event for those rows and does not advance the checkpoint, rather than put values under the wrong columns. With `binlog_row_metadata=MINIMAL` (the MySQL default) this happens when retained rows predate a DDL the source never observed (for example a checkpoint older than a schema change made while an earlier deployment ran), after a statement that cannot be attributed to specific tables (a versioned-comment DDL, several statements in one event, `ALTER DATABASE` or `DROP DATABASE` of a tracked database, among others; the tables it may affect stay unproven until later proof for each exists - usually the table's next rows, once its definition is captured and proven unchanged since them, or a later DDL of the table that the source proves), and when two DDLs of one table both happen before the source reads the first, with rows between them. The source never chooses a version from the MINIMAL layout alone: two tables or columns with the same storage types cannot be told apart without names.
 
 **Recovery:** the safe default is to **re-snapshot** (restart the pipeline once with snapshot mode `always`), which rebuilds current state without decoding the retained rows. Moving the source position past the DDL instead is a manual, lossy action: it intentionally abandons every retained change between the checkpoint and the new position, for all captured tables (the binlog position is shared by the whole stream), and should only be taken after an operator assessment of that data loss.
 
-Residual limitation: with `binlog_row_metadata=MINIMAL` (the MySQL default) column names are not in the binlog, so a DDL that keeps the column count and every column's storage type (for example swapping two same-typed columns) cannot be detected. Set `binlog_row_metadata=FULL` to have names verified too.
+Set `binlog_row_metadata=FULL` to remove most of these stops: without positional proof the source then selects the one recorded definition that exactly matches the rows' metadata, and records that choice durably before emitting them. Rows whose definition was never recorded (the shape between two DDLs the source did not see separately) still stop the source; FULL lets them through only when that definition was already recorded and is the single exact match.
 
 ### S3 sink atomicity guarantees
 

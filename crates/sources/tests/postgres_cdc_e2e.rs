@@ -7,7 +7,7 @@ use checkpoints::{CheckpointStore, MemCheckpointStore};
 use common::AllowList;
 use ctor::dtor;
 use deltaforge_core::{
-    BatchContext, Event, Op, Source, SourceHandle, SourceItem,
+    BatchContext, Event, Op, Source, SourceError, SourceHandle, SourceItem,
 };
 
 use sources::postgres::{PostgresSource, pg_row_event_id};
@@ -699,6 +699,9 @@ async fn pg_schema_drift_halt_fails_closed_and_does_not_skip() -> Result<()> {
         h.join().await.ok();
     }
     let cp0 = ckpt.get_raw("halt").await?.expect("pre-drift checkpoint");
+    let _ = cp0;
+    // Everything before this position is pre-drift.
+    let before_drift = current_wal_lsn(&client).await;
 
     // Drift + a row under the changed schema (committed while streaming is down).
     client
@@ -744,26 +747,14 @@ async fn pg_schema_drift_halt_fails_closed_and_does_not_skip() -> Result<()> {
         err.contains("orders") && err.contains("on_schema_drift=adapt"),
         "typed, actionable error names the table and remediation: {err}"
     );
+    // The safety boundary (Round 43): replaying the pre-drift row 300 is
+    // allowed (at-least-once) and must use the old schema; row 301 and the
+    // drift transaction's commit are never emitted; the durable checkpoint
+    // never passes the last pre-drift transaction.
+    assert_only_pre_drift(&items, before_drift);
     assert!(
-        !items
-            .iter()
-            .any(|i| matches!(i, SourceItem::Event(e) if has_id(e, 301))),
-        "no post-drift event delivered"
-    );
-    assert!(
-        !items.iter().any(|i| matches!(i, SourceItem::Event(_))),
-        "no row event delivered from the drift transaction"
-    );
-    assert!(
-        !items
-            .iter()
-            .any(|i| matches!(i, SourceItem::TxCommit { .. })),
-        "no partial transaction delivered (no commit)"
-    );
-    assert_eq!(
-        ckpt.get_raw("halt").await?.as_deref(),
-        Some(cp0.as_slice()),
-        "checkpoint remains at the prior committed boundary"
+        checkpoint_lsn(&ckpt, "halt").await <= before_drift,
+        "checkpoint must not pass the drift"
     );
     info!("✓ halt: failed closed, no post-drift delivery, checkpoint held");
 
@@ -774,18 +765,163 @@ async fn pg_schema_drift_halt_fails_closed_and_does_not_skip() -> Result<()> {
         joined3.is_err(),
         "unchanged restart under Halt fails again rather than skipping the drift"
     );
+    assert_only_pre_drift(&items3, before_drift);
     assert!(
-        !items3.iter().any(|i| matches!(i, SourceItem::Event(_))),
-        "still no event delivered on the second attempt"
-    );
-    assert_eq!(
-        ckpt.get_raw("halt").await?.as_deref(),
-        Some(cp0.as_slice()),
-        "checkpoint still held at the prior committed boundary"
+        checkpoint_lsn(&ckpt, "halt").await <= before_drift,
+        "checkpoint still not past the drift"
     );
     info!("✓ halt: unchanged restart fails again without skipping");
 
     cleanup_repl(&client, "pub_halt", "slot_halt").await;
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
+/// `X/Y` as a number.
+fn parse_lsn(lsn: &str) -> u64 {
+    let (hi, lo) = lsn.split_once('/').expect("an LSN");
+    (u64::from_str_radix(hi, 16).unwrap() << 32)
+        | u64::from_str_radix(lo, 16).unwrap()
+}
+
+async fn current_wal_lsn(client: &tokio_postgres::Client) -> u64 {
+    let row = client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await
+        .unwrap();
+    parse_lsn(row.get::<_, &str>(0))
+}
+
+async fn checkpoint_lsn(ckpt: &Arc<dyn CheckpointStore>, id: &str) -> u64 {
+    let cp: sources::postgres::PostgresCheckpoint =
+        serde_json::from_slice(&ckpt.get_raw(id).await.unwrap().unwrap())
+            .unwrap();
+    parse_lsn(&cp.lsn)
+}
+
+/// Only rows written before the drift (row 300), decoded with the old schema,
+/// and only commits before it, were delivered: nothing of row 301 or of the
+/// drift transaction.
+fn assert_only_pre_drift(items: &[SourceItem], before_drift: u64) {
+    for item in items {
+        match item {
+            SourceItem::Event(e) => {
+                assert!(has_id(e, 300), "only the pre-drift row: {e:?}");
+                let after = e.after.as_ref().expect("an insert");
+                assert!(
+                    after.get("status").is_none(),
+                    "decoded with the old schema: {after}"
+                );
+            }
+            SourceItem::TxCommit { boundary, .. } => {
+                let deltaforge_core::CheckpointMeta::Opaque(bytes) =
+                    &boundary.checkpoint;
+                let cp: sources::postgres::PostgresCheckpoint =
+                    serde_json::from_slice(bytes).unwrap();
+                assert!(
+                    parse_lsn(&cp.lsn) <= before_drift,
+                    "a commit after the drift was emitted: {}",
+                    cp.lsn
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The first Relation of a table after a restart is checked against its
+/// durable schema even though no loader cache holds it (no startup preload):
+/// with nothing to replay, the drifted Relation comes first and halt stops
+/// before row 301, with nothing emitted and the checkpoint not past the drift.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn pg_first_resolution_drift_is_caught_with_a_cold_cache() -> Result<()> {
+    use deltaforge_config::OnSchemaDrift;
+
+    let (db, client) = pg_setup("coldcache").await?;
+    client
+        .execute(
+            "CREATE TABLE orders (id INT PRIMARY KEY, sku VARCHAR(64))",
+            &[],
+        )
+        .await?;
+    client
+        .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
+        .await?;
+    client
+        .execute(&format!("GRANT SELECT ON orders TO {PG_CDC_USER}"), &[])
+        .await?;
+    create_pub_slot(&client, "pub_cold", "slot_cold", &["orders"]).await?;
+    let (registry, backend) = shared_registry().await;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let source = || {
+        configured_source(
+            "cold",
+            &db,
+            "slot_cold",
+            "pub_cold",
+            OnSchemaDrift::Halt,
+            registry.clone(),
+            backend.clone(),
+        )
+    };
+
+    // Run 1: the table's schema is registered by its first row.
+    {
+        let (tx, mut rx) = mpsc::channel(128);
+        let h = source().await.run(tx, ckpt.clone()).await;
+        wait_ready(&h, Duration::from_secs(3)).await?;
+        client
+            .execute("INSERT INTO orders VALUES (300, 'pre')", &[])
+            .await?;
+        let ev = collect_until(&mut rx, Duration::from_secs(10), |e| {
+            e.iter().any(|x| has_id(x, 300))
+        })
+        .await;
+        assert!(ev.iter().any(|e| has_id(e, 300)));
+        h.stop();
+        h.join().await.ok();
+    }
+    // Commit a position past row 300: nothing pre-drift is replayed.
+    let before_drift = current_wal_lsn(&client).await;
+    let row = client
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await?;
+    ckpt.put_raw(
+        "cold",
+        &serde_json::to_vec(&sources::postgres::PostgresCheckpoint {
+            lsn: row.get::<_, String>(0),
+            tx_id: None,
+        })?,
+    )
+    .await?;
+    client
+        .execute("ALTER TABLE orders ADD COLUMN status VARCHAR(32)", &[])
+        .await?;
+    client
+        .execute("INSERT INTO orders VALUES (301, 'post', 'active')", &[])
+        .await?;
+
+    // Run 2: cold loader cache; the drifted Relation is the table's first.
+    let (tx, mut rx) = mpsc::channel(128);
+    let h = source().await.run(tx, ckpt.clone()).await;
+    let ready = wait_ready(&h, Duration::from_secs(10)).await;
+    let items = drain_items(&mut rx, Duration::from_secs(2)).await;
+    h.stop();
+    let joined = h.join().await;
+    assert!(ready.is_err(), "must not become ready under a halt drift");
+    let err = format!("{:?}", joined.expect_err("fails closed"));
+    assert!(
+        err.contains("orders") && err.contains("on_schema_drift=adapt"),
+        "{err}"
+    );
+    assert!(
+        !items.iter().any(|i| matches!(i, SourceItem::Event(_))),
+        "nothing emitted: {items:?}"
+    );
+    assert!(checkpoint_lsn(&ckpt, "cold").await <= before_drift);
+
+    cleanup_repl(&client, "pub_cold", "slot_cold").await;
     pg_drop_db(&db).await;
     Ok(())
 }
@@ -1002,10 +1138,15 @@ async fn pg_dropped_table_schema_mismatch_fails_closed() -> Result<()> {
         ready.is_err(),
         "source must fail closed on a dropped-table schema mismatch"
     );
-    let err = format!("{:?}", joined.expect_err("run must fail closed"));
+    // The contract is a typed schema failure before the row, with the
+    // checkpoint left at the last safe boundary - not the message wording.
+    let err = joined.expect_err("run must fail closed");
     assert!(
-        err.contains("orders") && err.contains("does not match"),
-        "error must name the table and the mismatch: {err}"
+        matches!(
+            err.downcast_ref::<SourceError>(),
+            Some(SourceError::Schema { .. })
+        ),
+        "a dropped-table mismatch must stop with a schema error: {err:?}"
     );
     assert!(
         !items

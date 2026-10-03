@@ -1,0 +1,55 @@
+# DeltaForge patch of mysql-binlog-connector-rust 0.3.3
+
+Upstream: https://github.com/apecloud/mysql-binlog-connector-rust (MIT OR
+Apache-2.0, license files kept). Used through `[patch.crates-io]` in the
+workspace manifest. Changes are in `src/event/table_map/` (metadata parsing)
+and one addition in `src/network/packet_channel.rs` / `src/binlog_stream.rs`
+(abortive close); row decoding is untouched.
+
+The optional TableMap metadata (`binlog_row_metadata=FULL`) was parsed onto
+the wrong columns, which DeltaForge's schema-signature comparison (design
+spec 7.14 #4) cannot accept. Fixes, matching MySQL's writer
+(`Table_map_log_event` metadata fields):
+
+- **Signedness:** MySQL's numeric set includes YEAR; without it every bit
+  after the first YEAR column shifted onto the next numeric column and the
+  last bits were never read. A set bit means UNSIGNED, so `is_signed` is its
+  negation (it was stored as-is).
+- **COLUMN_CHARSET / ENUM_AND_SET_COLUMN_CHARSET:** one collation per
+  eligible column in column order (character columns: string and BLOB
+  types, binary included, not ENUM/SET/JSON/GEOMETRY; ENUM/SET columns),
+  instead of columns 0, 1, 2, ...
+- **DEFAULT_CHARSET / ENUM_AND_SET_DEFAULT_CHARSET:** expanded to every
+  eligible column, applying the `(index among eligible columns, collation)`
+  exceptions.
+- **GEOMETRY_TYPE:** one subtype per GEOMETRY column, instead of columns
+  0, 1, 2, ...
+- **Primary key:** `TableMetadata::primary_key` keeps the key in key order
+  with prefix lengths (SIMPLE_PRIMARY_KEY / PRIMARY_KEY_WITH_PREFIX); the
+  per-column flags were order-less.
+- More collations or geometry types than eligible columns is an error.
+- `TableMetadata` and `DefaultCharset` derive `PartialEq`/`Eq` so a parsed
+  TableMap can be compared as part of a signature (in
+  `src/event/table_map/default_charset.rs` as well).
+
+Verified by the crate's unit tests (two updated to MySQL's signedness
+semantics, six added) and by DeltaForge's live test
+`mysql_signature::tests::live::a_real_table_map_matches_its_captured_schema`
+(MySQL 8.4, every supported type, composite prefixed key, invisible column,
+charset exceptions; FULL and MINIMAL).
+
+## Abortive close (`abort_on_drop`, `linger`)
+
+`PacketChannel::abort_on_drop` / `BinlogStream::abort_on_drop` set
+`SO_LINGER` to zero on the connection's socket, so dropping it resets the
+connection instead of closing it gracefully. A MySQL binlog dump thread does
+not read from its connection; it notices a closed client only when a write
+fails. After a reset its next write (a heartbeat on an idle server) fails at
+once. DeltaForge's binlog interval scanner uses it to end its short-lived
+dump sessions promptly without killing any connection by id. It acts only on
+the connection it is called on.
+
+`PacketChannel::linger` / `BinlogStream::linger` read the socket's
+`SO_LINGER`, so callers and tests can verify the abortive close is armed.
+DeltaForge arms it right after the TCP connection is established, before
+any other awaited step, so a cancelled open also resets the connection.

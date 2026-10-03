@@ -119,7 +119,36 @@ pub async fn run_preflight(
         .get_conn()
         .await
         .context("preflight: failed to connect")?;
+    let report = run_preflight_on(&mut conn, tables, max_parallel_tables).await;
+    conn.disconnect().await.ok();
+    report
+}
 
+/// [`run_preflight`] on a control connection verified as `expected_uuid`:
+/// the checks that gate a snapshot describe the verified server only.
+pub(crate) async fn run_preflight_verified(
+    dsn: &str,
+    expected_uuid: &str,
+    tables: &[(String, String)],
+    max_parallel_tables: usize,
+) -> Result<PreflightReport> {
+    let mut conn = super::mysql_session::open_control_connection(
+        dsn,
+        expected_uuid,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .map_err(|e| anyhow::Error::new(e.into_source_error(expected_uuid)))?;
+    let report = run_preflight_on(&mut conn, tables, max_parallel_tables).await;
+    conn.disconnect().await.ok();
+    report
+}
+
+async fn run_preflight_on(
+    conn: &mut mysql_async::Conn,
+    tables: &[(String, String)], // (db, table)
+    max_parallel_tables: usize,
+) -> Result<PreflightReport> {
     let mut report = PreflightReport {
         hard_errors: Vec::new(),
         warnings: Vec::new(),
@@ -313,7 +342,6 @@ pub async fn run_preflight(
         }
     }
 
-    conn.disconnect().await.ok();
     Ok(report)
 }
 
@@ -323,13 +351,18 @@ pub async fn run_preflight(
 /// Returns Err only on confirmed purge.
 pub async fn verify_binlog_position(
     dsn: &str,
+    expected_uuid: &str,
     captured_file: &str,
 ) -> Result<()> {
-    let pool = Pool::new(dsn);
-    let mut conn = pool
-        .get_conn()
-        .await
-        .context("final position check: failed to connect")?;
+    // Only the verified server's binlog list answers this.
+    let mut conn = super::mysql_session::open_control_connection(
+        dsn,
+        expected_uuid,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    .map_err(|e| anyhow::Error::new(e.into_source_error(expected_uuid)))
+    .context("final position check")?;
 
     let rows: Vec<Row> = conn
         .query("SHOW BINARY LOGS")
@@ -455,7 +488,18 @@ pub async fn check_position_reachability(
             });
         }
     };
+    let r = check_position_reachability_on(&mut conn, file, gtid_set).await;
+    conn.disconnect().await.ok();
+    r
+}
 
+/// [`check_position_reachability`] on an already-open connection (one whose
+/// server identity the caller has verified).
+pub(crate) async fn check_position_reachability_on(
+    conn: &mut mysql_async::Conn,
+    file: &str,
+    gtid_set: Option<&str>,
+) -> Result<PositionReachability> {
     // GTID path: ask the new primary whether it has already executed the
     // transactions in our saved set. GTID_SUBSET(saved, executed) = 1 means
     // all our transactions are present.
@@ -468,7 +512,6 @@ pub async fn check_position_reachability(
         match conn.query_first::<Row, _>(&query).await {
             Ok(Some(mut row)) => {
                 let is_subset: Option<i64> = row.take(0);
-                conn.disconnect().await.ok();
                 return match is_subset {
                     Some(1) => Ok(PositionReachability::Reachable),
                     Some(0) => Ok(PositionReachability::Lost {
@@ -482,25 +525,29 @@ pub async fn check_position_reachability(
                     }),
                 };
             }
-            Ok(None) => { /* GTID unavailable, fall through */ }
+            // A GTID position is never "proven" by a file name.
+            Ok(None) => {
+                return Ok(PositionReachability::Unknown {
+                    reason: "GTID_SUBSET returned no row".into(),
+                });
+            }
             Err(e) => {
-                warn!(error = %e, "GTID_SUBSET check failed, falling back to file check");
+                return Ok(PositionReachability::Unknown {
+                    reason: format!("GTID_SUBSET failed: {e}"),
+                });
             }
         }
     }
 
-    // File/pos fallback.
+    // File/pos position (no GTID set given).
     let rows: Vec<Row> = match conn.query("SHOW BINARY LOGS").await {
         Ok(r) => r,
         Err(e) => {
-            conn.disconnect().await.ok();
             return Ok(PositionReachability::Unknown {
                 reason: format!("SHOW BINARY LOGS failed: {e}"),
             });
         }
     };
-
-    conn.disconnect().await.ok();
 
     let available: Vec<String> = rows
         .into_iter()
@@ -523,6 +570,33 @@ pub async fn check_position_reachability(
                 available.join(", ")
             ),
         })
+    }
+}
+
+/// Require `GTID_SUBSET(set, @@GLOBAL.gtid_executed)` to be exactly 1 on
+/// `conn` (whose identity the caller verified). Anything else - 0, NULL, no
+/// row, a query error (e.g. a malformed set) - is an error carrying the reason.
+pub(crate) async fn require_gtid_executed(
+    conn: &mut mysql_async::Conn,
+    set: &str,
+) -> std::result::Result<(), String> {
+    let row: std::result::Result<Option<Option<i64>>, _> = conn
+        .exec_first("SELECT GTID_SUBSET(?, @@GLOBAL.gtid_executed)", (set,))
+        .await;
+    gtid_executed_outcome(row.map_err(|e| e.to_string()))
+}
+
+fn gtid_executed_outcome(
+    row: std::result::Result<Option<Option<i64>>, String>,
+) -> std::result::Result<(), String> {
+    match row {
+        Ok(Some(Some(1))) => Ok(()),
+        Ok(Some(Some(0))) => {
+            Err("not executed by the server (GTID_SUBSET = 0)".into())
+        }
+        Ok(Some(other)) => Err(format!("GTID_SUBSET returned {other:?}")),
+        Ok(None) => Err("GTID_SUBSET returned no row".into()),
+        Err(e) => Err(format!("GTID_SUBSET failed: {e}")),
     }
 }
 
@@ -557,7 +631,18 @@ pub async fn fetch_live_columns(
         .get_conn()
         .await
         .context("fetch_live_columns: connect failed")?;
+    let r = fetch_live_columns_on(&mut conn, db, table).await;
+    conn.disconnect().await.ok();
+    r
+}
 
+/// [`fetch_live_columns`] on an already-open connection (one whose server
+/// identity the caller has verified).
+pub(crate) async fn fetch_live_columns_on(
+    conn: &mut mysql_async::Conn,
+    db: &str,
+    table: &str,
+) -> Result<Option<Vec<LiveColumn>>> {
     let exists: Option<(i64,)> = conn
         .exec_first(
             "SELECT COUNT(*) FROM information_schema.TABLES \
@@ -568,7 +653,6 @@ pub async fn fetch_live_columns(
         .context("fetch_live_columns: existence check failed")?;
 
     if exists.map(|(n,)| n).unwrap_or(0) == 0 {
-        conn.disconnect().await.ok();
         return Ok(None);
     }
 
@@ -582,8 +666,6 @@ pub async fn fetch_live_columns(
         )
         .await
         .context("fetch_live_columns: COLUMNS query failed")?;
-
-    conn.disconnect().await.ok();
 
     let columns = rows
         .into_iter()
@@ -679,6 +761,20 @@ fn engine_hard_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_exact_gtid_subset_proves_a_resume_position() {
+        assert_eq!(gtid_executed_outcome(Ok(Some(Some(1)))), Ok(()));
+        for row in [
+            Ok(Some(Some(0))),
+            Ok(Some(Some(2))),
+            Ok(Some(None)),
+            Ok(None),
+            Err("Malformed GTID set specification".to_string()),
+        ] {
+            assert!(gtid_executed_outcome(row.clone()).is_err(), "{row:?}");
+        }
+    }
 
     #[test]
     fn file_present_in_list() {

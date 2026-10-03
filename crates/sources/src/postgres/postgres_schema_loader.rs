@@ -259,10 +259,17 @@ impl PostgresSchemaLoader {
                             }
                             from_registry += 1;
                         }
+                        // Stored history that cannot be read is corrupt: never
+                        // replaced by the live catalog.
                         Err(e) => {
-                            warn!(schema=%schema, table=%table, error=%e,
-                                "failed to deserialize registry schema; fetching from source");
-                            needs_fetch.push(pair);
+                            return Err(SourceError::Schema {
+                                details: format!(
+                                    "stored schema of {schema}.{table} \
+                                     (version {}) is unreadable: {e}",
+                                    sv.version
+                                )
+                                .into(),
+                            });
                         }
                     }
                 }
@@ -524,6 +531,42 @@ impl PostgresSchemaLoader {
             .await
             .remove(&(schema.to_string(), table.to_string()));
         self.load_schema(schema, table).await
+    }
+
+    /// The durably persisted latest schema of `schema.table` under the
+    /// current lineage, read through the registry (single-flight per key),
+    /// never from this loader's cache: `None` = never registered (first use);
+    /// unreadable stored history fails closed.
+    pub(crate) async fn persisted(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> SourceResult<Option<PostgresTableSchema>> {
+        let scope = self.current_scope()?;
+        let Some(sv) = self
+            .registry
+            .get_latest(&scope.key(schema, table))
+            .await
+            .map_err(RegistryError::Storage)?
+        else {
+            return Ok(None);
+        };
+        serde_json::from_value::<PostgresTableSchema>(sv.schema_json)
+            .map(Some)
+            .map_err(|e| SourceError::Schema {
+                details: format!(
+                    "stored schema of {schema}.{table} (version {}) is \
+                     unreadable: {e}",
+                    sv.version
+                )
+                .into(),
+            })
+    }
+
+    /// Forget every cached schema; each table reloads on its next use. No
+    /// catalog enumeration.
+    pub async fn clear_cache(&self) {
+        self.cache.write().await.clear();
     }
 
     /// Reload all schemas matching patterns.
@@ -1047,6 +1090,36 @@ mod tests {
 
         fn pg(n: u64) -> LineageDescriptor {
             LineageDescriptor::postgres(n, n).unwrap()
+        }
+
+        /// The first-resolution baseline is read from durable history, not
+        /// the cache: none means first use, a readable version is returned,
+        /// and unreadable stored history fails closed.
+        #[tokio::test]
+        async fn persisted_history_is_read_durably_and_corrupt_fails_closed() {
+            let scope = SharedRegistryScope::new("src");
+            scope.publish_for_test("acme", pg(1));
+            let l = loader(&scope);
+            assert!(l.persisted("public", "orders").await.unwrap().is_none());
+            let key = l.current_scope().unwrap().key("public", "orders");
+            let good =
+                serde_json::to_value(PostgresTableSchema::new(vec![])).unwrap();
+            l.registry
+                .register_with_checkpoint(&key, "h1", &good, None)
+                .await
+                .unwrap();
+            assert!(l.persisted("public", "orders").await.unwrap().is_some());
+            l.registry
+                .register_with_checkpoint(
+                    &key,
+                    "h2",
+                    &serde_json::json!({ "columns": 5 }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let err = l.persisted("public", "orders").await.unwrap_err();
+            assert!(format!("{err}").contains("unreadable"), "{err}");
         }
 
         /// Reviewer interleaving: a load starts under A; the lineage changes
