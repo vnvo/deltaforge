@@ -1,9 +1,9 @@
 //! Scenario: PostgreSQL primary is replaced mid-stream (failover / promotion).
 //!
-//! What it proves: DeltaForge detects the server identity change via
-//! `system_identifier` comparison, discovers the checkpoint position (LSN /
-//! replication slot) is unreachable on the new server, and halts cleanly —
-//! mirroring the MySQL UUID-based failover guard.
+//! What it proves: DeltaForge detects the cluster change via the
+//! `system_identifier` comparison and refuses it before sending
+//! `START_REPLICATION` (a PostgreSQL source never resumes on another
+//! cluster), halting cleanly.
 //!
 //! Steps:
 //!   1. Warmup: confirm DeltaForge is actively streaming on postgres-a.
@@ -11,10 +11,10 @@
 //!   3. Switch the proxy upstream to postgres-b (fresh server, different
 //!      system_identifier, no replication slot).
 //!   4. Re-enable the proxy — DeltaForge reconnects to postgres-b.
-//!   5. check_identity_post_reconnect detects system_identifier change.
-//!   6. check_position_reachability returns Lost (slot missing on postgres-b).
-//!   7. DeltaForge halts — health endpoint goes unhealthy.
-//!   8. Restore proxy to postgres-a, clear checkpoint, restart for next scenario.
+//!   5. The reconnect verifies the server first and finds another
+//!      system_identifier: refused with a lineage error.
+//!   6. DeltaForge halts: health endpoint goes unhealthy.
+//!   7. Restore proxy to postgres-a, clear checkpoint, restart for next scenario.
 //!
 //! Requires postgres-b service in docker-compose.chaos.yml.
 
@@ -36,7 +36,7 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
     crate::harness::print_scenario_banner(
         NAME,
         "Switches upstream to postgres-b (different system_identifier).",
-        "Identity change detected. Health endpoint goes unhealthy. Slot existence verified.",
+        "Cross-cluster change refused before replication. Health endpoint goes unhealthy.",
     );
     harness.setup().await?;
 
@@ -82,9 +82,8 @@ pub async fn run(harness: &Harness) -> Result<ScenarioResult> {
     harness.toxi.enable("postgres").await?;
 
     // ── Verify ────────────────────────────────────────────────────────────────
-    // DeltaForge should reconnect, run check_identity_post_reconnect, detect
-    // the system_identifier change, call check_position_reachability (which
-    // returns Lost because postgres-b has no replication slot), and halt.
+    // DeltaForge should verify the server before reconnecting, find another
+    // system_identifier, refuse it with a lineage error, and halt.
     info!(
         timeout_secs = UNHEALTHY_TIMEOUT.as_secs(),
         "step 5/5: polling health endpoint — expecting unhealthy ..."

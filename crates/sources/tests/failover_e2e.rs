@@ -13,8 +13,8 @@
 use anyhow::Result;
 use checkpoints::{CheckpointStore, MemCheckpointStore};
 use common::AllowList;
-use deltaforge_config::SnapshotCfg;
-use deltaforge_core::{Event, Source, SourceItem};
+use deltaforge_config::{SnapshotCfg, SnapshotMode};
+use deltaforge_core::{Event, Source, SourceError, SourceItem};
 use mysql_async::prelude::Queryable;
 use sources::failover::identity::{
     IdentityComparison, IdentityStore, ServerIdentity,
@@ -880,14 +880,170 @@ async fn mysql_failover_schema_drift_halt_no_drift_continues() -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// PostgreSQL: another cluster is never resumed
+//
+// A checkpoint LSN and a slot position belong to one cluster's WAL history.
+// Server B is an independently initialised cluster (another system_identifier)
+// whose WAL and slot are pushed beyond A's checkpoint, so every numeric LSN
+// check would pass. The source must stop before START_REPLICATION, a snapshot,
+// or any identity, lineage, checkpoint or slot change.
+// ============================================================================
+
+fn parse_lsn(s: &str) -> u64 {
+    let (hi, lo) = s.split_once('/').expect("lsn");
+    (u64::from_str_radix(hi, 16).unwrap() << 32)
+        | u64::from_str_radix(lo, 16).unwrap()
+}
+
+/// The LSN of a stored PostgreSQL checkpoint.
+fn checkpoint_lsn(raw: &[u8]) -> u64 {
+    let v: serde_json::Value = serde_json::from_slice(raw).unwrap();
+    parse_lsn(v["lsn"].as_str().expect("checkpoint lsn"))
+}
+
+/// `(restart_lsn, confirmed_flush_lsn)` of `slot` on the server at `port`.
+async fn slot_position(port: u16, db: &str, slot: &str) -> Option<(u64, u64)> {
+    pg_admin_client(port, db)
+        .await
+        .query_opt(
+            "SELECT restart_lsn::text, confirmed_flush_lsn::text \
+             FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .await
+        .unwrap()
+        .map(|r| (parse_lsn(r.get(0)), parse_lsn(r.get(1))))
+}
+
+/// Push the WAL of the server at `port` beyond `lsn`, then create `slot`
+/// there: its restart and confirmed positions both lie beyond `lsn`.
+async fn slot_beyond(port: u16, db: &str, slot: &str, lsn: u64) {
+    let c = pg_admin_client(port, db).await;
+    c.execute("CREATE TABLE IF NOT EXISTS wal_filler (n INT)", &[])
+        .await
+        .unwrap();
+    loop {
+        let r = c
+            .query_one("SELECT pg_current_wal_lsn()::text", &[])
+            .await
+            .unwrap();
+        if parse_lsn(r.get(0)) > lsn {
+            break;
+        }
+        c.execute("INSERT INTO wal_filler VALUES (1)", &[])
+            .await
+            .unwrap();
+        c.execute("SELECT pg_switch_wal()", &[]).await.unwrap();
+    }
+    c.execute(
+        &format!(
+            "SELECT pg_create_logical_replication_slot('{slot}', 'pgoutput')"
+        ),
+        &[],
+    )
+    .await
+    .unwrap();
+    let (restart, confirmed) = slot_position(port, db, slot).await.unwrap();
+    assert!(
+        restart > lsn && confirmed > lsn,
+        "B's slot is beyond A's LSN"
+    );
+}
+
+/// What a refused start must leave untouched.
+struct Untouched {
+    checkpoint: Option<Vec<u8>>,
+    lineage: serde_json::Value,
+    identity: ServerIdentity,
+}
+
+impl Untouched {
+    async fn capture(
+        backend: &ArcStorageBackend,
+        ckpt: &Arc<dyn CheckpointStore>,
+        id: &str,
+        port: u16,
+    ) -> Self {
+        let lineage =
+            storage::adapters::source_lineage::load(backend, "acme", id)
+                .await
+                .unwrap()
+                .expect("lineage recorded");
+        Self {
+            checkpoint: ckpt.get_raw(id).await.unwrap(),
+            lineage: serde_json::to_value(lineage).unwrap(),
+            identity: ServerIdentity::Postgres(
+                postgres_health::fetch_server_identity(&pg_dsn(port, "shop"))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            ),
+        }
+    }
+
+    async fn assert_kept(
+        &self,
+        backend: &ArcStorageBackend,
+        ckpt: &Arc<dyn CheckpointStore>,
+        id: &str,
+    ) {
+        assert_eq!(
+            ckpt.get_raw(id).await.unwrap(),
+            self.checkpoint,
+            "checkpoint changed"
+        );
+        let lineage =
+            storage::adapters::source_lineage::load(backend, "acme", id)
+                .await
+                .unwrap()
+                .expect("lineage recorded");
+        assert_eq!(
+            serde_json::to_value(lineage).unwrap(),
+            self.lineage,
+            "lineage record changed"
+        );
+        assert!(
+            matches!(
+                IdentityStore::new(Arc::clone(backend))
+                    .compare(id, &self.identity)
+                    .await
+                    .unwrap(),
+                IdentityComparison::Same
+            ),
+            "recorded identity changed"
+        );
+    }
+}
+
+/// The run's terminal error, which must be the typed lineage refusal.
+async fn refused(handle: deltaforge_core::SourceHandle) {
+    match timeout(Duration::from_secs(60), handle.join()).await {
+        Ok(Err(e)) => assert!(
+            matches!(
+                e.downcast_ref::<SourceError>(),
+                Some(SourceError::Lineage { .. })
+            ),
+            "another cluster must be refused with a lineage error: {e:?}"
+        ),
+        Ok(Ok(())) => panic!("the source must not run on another cluster"),
+        Err(_) => panic!("the source did not stop"),
+    }
+}
+
+async fn no_events(rx: &mut mpsc::Receiver<SourceItem>) {
+    let evts = collect_until(rx, Duration::from_secs(2), |_| false).await;
+    assert!(evts.is_empty(), "no event from another cluster: {evts:?}");
+}
+
 #[tokio::test]
 #[ignore = "requires docker"]
-async fn postgres_failover_streaming_resumes_after_identity_change()
--> Result<()> {
+async fn postgres_another_cluster_is_refused_before_anything() -> Result<()> {
     init_test_tracing();
     const DB: &str = "shop";
     const SLOT: &str = "slot_fo";
     const PUB: &str = "pub_fo";
+    const ID: &str = "fo";
 
     let (_c_a, port_a) = start_postgres().await;
     pg_create_schema(port_a, DB, SLOT, PUB).await;
@@ -895,15 +1051,14 @@ async fn postgres_failover_streaming_resumes_after_identity_change()
     let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
 
-    // Positive control for the stream-open seam used by the fault tests: a normal
-    // run MUST increment the counter, so a zero reading elsewhere is meaningful
-    // (not a broken/never-incremented probe).
+    // Positive control for the stream-open seam: a normal run increments it,
+    // so a zero reading below is meaningful.
     reset_streams_opened();
 
-    // run 1: A's system_identifier stored
+    // Run 1 on A: identity, lineage and a checkpoint F recorded.
     {
         let src = make_pg_source(
-            "fo",
+            ID,
             &pg_dsn(port_a, DB),
             SLOT,
             PUB,
@@ -913,9 +1068,8 @@ async fn postgres_failover_streaming_resumes_after_identity_change()
         let (tx, mut rx) = mpsc::channel(64);
         let handle = src.run(tx, Arc::clone(&ckpt)).await;
         sleep(Duration::from_secs(4)).await;
-
-        let client = pg_admin_client(port_a, DB).await;
-        client
+        pg_admin_client(port_a, DB)
+            .await
             .execute("INSERT INTO orders VALUES (1, 'on-a')", &[])
             .await?;
         let evts = collect_until(&mut rx, Duration::from_secs(10), |e| {
@@ -923,165 +1077,70 @@ async fn postgres_failover_streaming_resumes_after_identity_change()
         })
         .await;
         assert!(evts.iter().any(|e| has_id(e, 1)));
-
         handle.stop();
         handle.join().await.ok();
-        info!("✓ A's system_identifier stored");
+    }
+    assert!(streams_opened() >= 1, "positive control");
+    let kept = Untouched::capture(&backend, &ckpt, ID, port_a).await;
+    let f = checkpoint_lsn(kept.checkpoint.as_deref().expect("checkpoint F"));
+
+    // B: another cluster, same database, publication and slot name, with WAL
+    // and slot positions beyond F; a row is waiting there.
+    let (_c_b, port_b) = start_postgres().await;
+    pg_create_schema(port_b, DB, "slot_unused", PUB).await;
+    slot_beyond(port_b, DB, SLOT, f).await;
+    pg_admin_client(port_b, DB)
+        .await
+        .execute("INSERT INTO orders VALUES (2, 'on-b')", &[])
+        .await?;
+    let b_slot = slot_position(port_b, DB, SLOT).await;
+
+    // Resume from F on B: refused before any stream opens.
+    reset_streams_opened();
+    {
+        let src = make_pg_source(
+            ID,
+            &pg_dsn(port_b, DB),
+            SLOT,
+            PUB,
+            Arc::clone(&backend),
+        )
+        .await;
+        let (tx, mut rx) = mpsc::channel(64);
+        refused(src.run(tx, Arc::clone(&ckpt)).await).await;
+        no_events(&mut rx).await;
     }
 
-    // The healthy run above opened at least one replication stream.
-    assert!(
-        streams_opened() >= 1,
-        "stream-open seam must count a real open (positive control)"
+    // A snapshot start on B (no checkpoint, a slot it would create): refused
+    // before the snapshot reads a row or creates the slot.
+    let fresh: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    {
+        let mut src = make_pg_source(
+            ID,
+            &pg_dsn(port_b, DB),
+            "slot_snap",
+            PUB,
+            Arc::clone(&backend),
+        )
+        .await;
+        src.snapshot_cfg.mode = SnapshotMode::Initial;
+        let (tx, mut rx) = mpsc::channel(64);
+        refused(src.run(tx, Arc::clone(&fresh)).await).await;
+        no_events(&mut rx).await;
+    }
+
+    assert_eq!(streams_opened(), 0, "no replication stream opened on B");
+    assert_eq!(
+        slot_position(port_b, DB, SLOT).await,
+        b_slot,
+        "B's slot never moved"
     );
-
-    // primary B: fresh container → different system_identifier by construction
-    let (_c_b, port_b) = start_postgres().await;
-    pg_create_schema(port_b, DB, SLOT, PUB).await;
-
-    // run 2: Changed detected, reconciled, checkpoint reset to B's slot position,
-    //          streaming on B
-    {
-        let src = make_pg_source(
-            "fo",
-            &pg_dsn(port_b, DB),
-            SLOT,
-            PUB,
-            Arc::clone(&backend),
-        )
-        .await;
-        let (tx, mut rx) = mpsc::channel(64);
-        let handle = src.run(tx, Arc::clone(&ckpt)).await;
-        sleep(Duration::from_secs(5)).await;
-
-        let id_b = postgres_health::fetch_server_identity(&pg_dsn(port_b, DB))
-            .await?
-            .expect("system_identifier must exist");
-        let store = IdentityStore::new(Arc::clone(&backend));
-        let cmp = store.compare("fo", &ServerIdentity::Postgres(id_b)).await?;
-        assert!(
-            matches!(cmp, IdentityComparison::Same),
-            "identity must be updated to B"
-        );
-        info!("✓ identity updated to B's system_identifier");
-
-        let client = pg_admin_client(port_b, DB).await;
-        client
-            .execute("INSERT INTO orders VALUES (2, 'on-b')", &[])
-            .await?;
-        let evts = collect_until(&mut rx, Duration::from_secs(15), |e| {
-            e.iter().any(|x| has_id(x, 2))
-        })
-        .await;
-        assert!(
-            evts.iter().any(|e| has_id(e, 2)),
-            "must receive events from B"
-        );
-        info!("✓ streaming resumed on B");
-
-        handle.stop();
-        handle.join().await.ok();
-    }
-
-    Ok(())
-}
-
-// ============================================================================
-// PostgreSQL: slot absent on new primary → source stops
-// ============================================================================
-
-#[tokio::test]
-#[ignore = "requires docker"]
-async fn postgres_failover_slot_absent_stops_source() -> Result<()> {
-    init_test_tracing();
-    const DB: &str = "shop";
-    const SLOT: &str = "slot_fo_lost";
-    const PUB: &str = "pub_fo_lost";
-
-    let (_c_a, port_a) = start_postgres().await;
-    pg_create_schema(port_a, DB, SLOT, PUB).await;
-
-    let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
-    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
-
-    // run 1: A's identity stored
-    {
-        let src = make_pg_source(
-            "fo_lost",
-            &pg_dsn(port_a, DB),
-            SLOT,
-            PUB,
-            Arc::clone(&backend),
-        )
-        .await;
-        let (tx, mut rx) = mpsc::channel(64);
-        let handle = src.run(tx, Arc::clone(&ckpt)).await;
-        sleep(Duration::from_secs(4)).await;
-
-        let client = pg_admin_client(port_a, DB).await;
-        client
-            .execute("INSERT INTO orders VALUES (1, 'before')", &[])
-            .await?;
-        collect_until(&mut rx, Duration::from_secs(10), |e| {
-            e.iter().any(|x| has_id(x, 1))
-        })
-        .await;
-
-        handle.stop();
-        handle.join().await.ok();
-    }
-
-    // primary B: publication present, replication slot absent
-    let (_c_b, port_b) = start_postgres().await;
-    {
-        let root = pg_admin_client(port_b, "postgres").await;
-        root.execute(&format!("CREATE DATABASE {DB}"), &[])
-            .await
-            .ok();
-        drop(root);
-        let client = pg_admin_client(port_b, DB).await;
-        client
-            .execute("CREATE TABLE orders (id INT PRIMARY KEY, sku TEXT)", &[])
-            .await
-            .unwrap();
-        client
-            .execute("ALTER TABLE orders REPLICA IDENTITY FULL", &[])
-            .await
-            .unwrap();
-        client
-            .execute(&format!("CREATE PUBLICATION {PUB} FOR TABLE orders"), &[])
-            .await
-            .unwrap();
-        // No slot - represents a new primary where the slot was not preserved.
-    }
-
-    // run 2: Changed detected, slot absent → Lost → must stop
-    {
-        let src = make_pg_source(
-            "fo_lost",
-            &pg_dsn(port_b, DB),
-            SLOT,
-            PUB,
-            Arc::clone(&backend),
-        )
-        .await;
-        let (tx, _rx) = mpsc::channel(64);
-        let handle = src.run(tx, Arc::clone(&ckpt)).await;
-
-        match timeout(Duration::from_secs(30), handle.join()).await {
-            Ok(Err(e)) => {
-                assert!(
-                    e.to_string().contains("position lost")
-                        || e.to_string().contains("Re-snapshot"),
-                    "unexpected error: {e}"
-                );
-                info!("✓ source stopped with position-lost error");
-            }
-            Ok(Ok(())) => panic!("source must not succeed when slot is absent"),
-            Err(_) => panic!("source did not stop within timeout"),
-        }
-    }
-
+    assert!(
+        slot_position(port_b, DB, "slot_snap").await.is_none(),
+        "no slot created on B"
+    );
+    assert!(fresh.get_raw(ID).await?.is_none(), "no snapshot checkpoint");
+    kept.assert_kept(&backend, &ckpt, ID).await;
     Ok(())
 }
 
