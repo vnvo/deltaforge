@@ -382,9 +382,14 @@ async fn serve(
     if stop_requested() {
         return Ok(());
     }
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown.clone().cancelled_owned())
-        .await?;
+    // Connection info lets audited operator actions (incident
+    // acknowledgement) record the peer address as their origin.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown.clone().cancelled_owned())
+    .await?;
     info!("api server stopped");
     Ok(())
 }

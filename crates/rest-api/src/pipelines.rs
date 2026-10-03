@@ -29,6 +29,47 @@ pub struct PipeInfo {
     /// Operational status - populated by the controller, optional for backward compat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ops: Option<PipelineOpsStatus>,
+    /// Incident status - populated by the controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incidents: Option<PipelineIncidents>,
+}
+
+/// A pipeline's incident status. Incident views hold codes, allow-listed
+/// evidence and generated explanations only - never error text.
+#[derive(Clone, Serialize, Deserialize, Default, Debug)]
+pub struct PipelineIncidents {
+    /// The primary blocking incident of a failed pipeline.
+    pub primary: Option<String>,
+    /// Whether the primary is fixed (both task exits known, or the grace
+    /// period passed).
+    pub primary_final: bool,
+    /// Some incident is known only in memory: its durable write is still
+    /// being retried, so it is not yet auditable.
+    pub durability_pending: bool,
+    /// The durable incident store could not be read for this response.
+    pub store_unavailable: bool,
+    /// Open or acknowledged blocking incidents (an acknowledgement does not
+    /// clear one).
+    pub blocking: Vec<Value>,
+    /// Blocking incidents counted on the overflow incident instead of being
+    /// recorded individually.
+    pub overflow_blocking: u64,
+}
+
+impl PipelineIncidents {
+    /// Whether these incidents make the instance not ready.
+    pub fn blocks_readiness(&self) -> bool {
+        !self.blocking.is_empty() || self.overflow_blocking > 0
+    }
+}
+
+/// `POST /pipelines/{name}/incidents/{id}/acknowledge`. Both fields are
+/// required. `asserted_actor` is recorded as caller-supplied: the API has no
+/// authenticated identity.
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct AcknowledgeRequest {
+    pub asserted_actor: String,
+    pub reason: String,
 }
 
 /// Operational status fields - everything an operator needs in one response.
@@ -78,6 +119,36 @@ pub trait PipelineController: Send + Sync {
 
     /// Delete a pipeline permanently.
     async fn delete(&self, name: &str) -> Result<(), PipelineAPIError>;
+
+    // ── Incident endpoints ─────────────────────────────────────────────
+
+    /// Every incident of a pipeline (open, acknowledged, recently resolved,
+    /// and any not yet durable).
+    async fn incidents(&self, name: &str) -> Result<Value, PipelineAPIError> {
+        Err(PipelineAPIError::NotFound(name.to_string()))
+    }
+
+    /// One incident of a pipeline.
+    async fn incident(
+        &self,
+        name: &str,
+        id: &str,
+    ) -> Result<Value, PipelineAPIError> {
+        let _ = id;
+        Err(PipelineAPIError::NotFound(name.to_string()))
+    }
+
+    /// Open -> Acknowledged. Never resolves or clears the incident.
+    async fn acknowledge_incident(
+        &self,
+        name: &str,
+        id: &str,
+        req: AcknowledgeRequest,
+        origin: Option<String>,
+    ) -> Result<Value, PipelineAPIError> {
+        let _ = (id, req, origin);
+        Err(PipelineAPIError::NotFound(name.to_string()))
+    }
 
     // ── DLQ endpoints ──────────────────────────────────────────────────
 
@@ -247,6 +318,13 @@ pub fn router(state: AppState) -> Router {
         )
         // Checkpoint inspection
         .route("/pipelines/{name}/checkpoints", get(handle_checkpoints))
+        // Incidents
+        .route("/pipelines/{name}/incidents", get(handle_incidents))
+        .route("/pipelines/{name}/incidents/{id}", get(handle_incident))
+        .route(
+            "/pipelines/{name}/incidents/{id}/acknowledge",
+            post(handle_acknowledge_incident),
+        )
         .with_state(state)
 }
 
@@ -473,6 +551,51 @@ async fn handle_dlq_purge(
 
 // ── Checkpoint inspection handler ────────────────────────────────────────────
 
+async fn handle_incidents(
+    State(st): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<Value> {
+    st.controller
+        .incidents(&name)
+        .await
+        .map(Json)
+        .map_err(pipeline_error)
+}
+
+async fn handle_incident(
+    State(st): State<AppState>,
+    Path((name, id)): Path<(String, String)>,
+) -> ApiResult<Value> {
+    st.controller
+        .incident(&name, &id)
+        .await
+        .map(Json)
+        .map_err(pipeline_error)
+}
+
+async fn handle_acknowledge_incident(
+    State(st): State<AppState>,
+    Path((name, id)): Path<(String, String)>,
+    peer: Option<
+        axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    >,
+    Json(req): Json<AcknowledgeRequest>,
+) -> ApiResult<Value> {
+    if req.asserted_actor.trim().is_empty() || req.reason.trim().is_empty() {
+        return Err(pipeline_error(PipelineAPIError::BadRequest(
+            "asserted_actor and reason are required".into(),
+        )));
+    }
+    // The connection's peer address, when the server records it; never a
+    // client-supplied header.
+    let origin = peer.map(|axum::Extension(info)| info.0.ip().to_string());
+    st.controller
+        .acknowledge_incident(&name, &id, req, origin)
+        .await
+        .map(Json)
+        .map_err(pipeline_error)
+}
+
 async fn handle_checkpoints(
     State(st): State<AppState>,
     Path(name): Path<String>,
@@ -585,6 +708,7 @@ mod tests {
                 },
             },
             ops: None,
+            incidents: None,
         }
     }
 

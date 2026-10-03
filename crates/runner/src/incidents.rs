@@ -42,6 +42,7 @@ use deltaforge_core::incident::{
     ReasonCode, Retryability, SafetyState,
 };
 use deltaforge_core::{SinkError, SourceError};
+use metrics::{counter, gauge};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use storage::ArcStorageBackend;
@@ -536,6 +537,8 @@ impl IncidentStore {
                     if let Some(rec) = reopened
                         && !rec.status.is_resolved()
                     {
+                        self.count_raised(rec.reason_code);
+                        self.refresh_metrics().await;
                         return Ok(Raised::Recorded(rec));
                     }
                 }
@@ -574,6 +577,8 @@ impl IncidentStore {
                                 n,
                             )
                             .await?;
+                        self.count_raised(draft.reason_code);
+                        self.refresh_metrics().await;
                         return Ok(Raised::Overflowed(ov));
                     }
                     let mut rec = self.fresh(id.clone(), draft);
@@ -583,6 +588,8 @@ impl IncidentStore {
                             .get(&id)
                             .await?
                             .context("incident record vanished")?;
+                        self.count_raised(rec.reason_code);
+                        self.refresh_metrics().await;
                         return Ok(Raised::Recorded(rec));
                     }
                 }
@@ -762,6 +769,7 @@ impl IncidentStore {
             None => Ok(Err(LifecycleError::NotFound(id.0.clone()))),
             Some(r) => {
                 self.prune_resolved().await?;
+                self.refresh_metrics().await;
                 Ok(Ok(r))
             }
         }
@@ -970,6 +978,109 @@ impl IncidentRecorder {
             self.store.raise(draft, n).await?;
         }
         Ok(id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Views and metrics
+// ---------------------------------------------------------------------------
+
+/// The API view of a durable record: codes, allow-listed evidence and the
+/// generated explanation only.
+pub fn record_view(rec: &IncidentRecord) -> serde_json::Value {
+    serde_json::json!({
+        "incident_id": rec.incident_id,
+        "reason_code": rec.reason_code,
+        "component": rec.component,
+        "retryability": rec.retryability,
+        "safety_state": rec.safety_state,
+        "cause_code": rec.cause_code,
+        "explanation": rec.explanation(),
+        "evidence": rec.evidence,
+        "recommended_actions": rec.actions,
+        "status": rec.status,
+        "blocking": rec.is_blocking(),
+        "occurrences": rec.occurrences,
+        "first_seen_ms": rec.first_seen_ms,
+        "last_seen_ms": rec.last_seen_ms,
+        "durable": true,
+        // The latest transition's audit entry is not appended yet.
+        "audit_pending": rec.pending_audit.is_some(),
+        "transition_seq": rec.transition_seq,
+        "overflow": rec.overflow,
+    })
+}
+
+/// The API view of an incident known only in memory (its durable write is
+/// still being retried): not durable, not auditable yet.
+pub fn known_view(k: &KnownIncident) -> serde_json::Value {
+    let d = &k.draft;
+    serde_json::json!({
+        "incident_id": k.id,
+        "reason_code": d.reason_code,
+        "component": d.component,
+        "retryability": d.retryability,
+        "safety_state": d.safety_state,
+        "cause_code": d.cause_code,
+        "explanation": d.explanation(),
+        "evidence": d.evidence,
+        "recommended_actions": d.actions,
+        "status": IncidentStatus::Open,
+        "blocking": d.safety_state.is_blocking(),
+        "durable": k.durable,
+        "audit_pending": !k.durable,
+    })
+}
+
+/// Unresolved incidents by (reason, safety state): the open-incident gauge.
+/// Acknowledged incidents are still open.
+pub fn open_counts(
+    records: &[IncidentRecord],
+) -> BTreeMap<(ReasonCode, SafetyState), u64> {
+    let mut counts = BTreeMap::new();
+    for reason in ReasonCode::ALL {
+        for safety in SafetyState::ALL {
+            counts.insert((reason, safety), 0);
+        }
+    }
+    for r in records.iter().filter(|r| !r.status.is_resolved()) {
+        *counts.entry((r.reason_code, r.safety_state)).or_default() += 1;
+    }
+    counts
+}
+
+impl IncidentStore {
+    /// Set `deltaforge_incidents_open{pipeline, reason_code, safety_state}`
+    /// for every label combination (closed enums only).
+    async fn refresh_metrics(&self) {
+        let Ok(records) = self.list().await else {
+            return;
+        };
+        for ((reason, safety), n) in open_counts(&records) {
+            gauge!(
+                "deltaforge_incidents_open",
+                "pipeline" => self.pipeline.clone(),
+                "reason_code" => reason.as_str(),
+                "safety_state" => safety.as_str(),
+            )
+            .set(n as f64);
+        }
+    }
+
+    fn count_raised(&self, reason: ReasonCode) {
+        counter!(
+            "deltaforge_incidents_raised_total",
+            "pipeline" => self.pipeline.clone(),
+            "reason_code" => reason.as_str(),
+        )
+        .increment(1);
+        if reason == ReasonCode::UnclassifiedFailure {
+            counter!(
+                "deltaforge_incidents_unclassified_total",
+                "pipeline" => self.pipeline.clone(),
+            )
+            .increment(1);
+        }
     }
 }
 
@@ -1839,6 +1950,39 @@ mod tests {
         recorder.record(&degraded(1)).await.unwrap();
         let rec = recorder.store().get(&id).await.unwrap().unwrap();
         assert_eq!(rec.occurrences, 52);
+    }
+
+    #[tokio::test]
+    async fn open_counts_cover_every_label_and_count_acknowledged_as_open() {
+        let store = IncidentStore::new(backend(), "p");
+        let a = id_of(&store, &draft(1)).await;
+        let b = id_of(&store, &draft(2)).await;
+        let c = id_of(&store, &unc(0)).await;
+        store
+            .acknowledge(&a, "x", None, "y")
+            .await
+            .unwrap()
+            .unwrap();
+        store.resolve(&b, recovered()).await.unwrap().unwrap();
+        let counts = open_counts(&store.list().await.unwrap());
+        // Every (reason, safety) label pair is present: bounded and complete.
+        assert_eq!(
+            counts.len(),
+            ReasonCode::ALL.len() * SafetyState::ALL.len()
+        );
+        assert_eq!(
+            counts[&(ReasonCode::PgDifferentCluster, SafetyState::HaltedSafe)],
+            1,
+            "acknowledged counts as open, resolved does not"
+        );
+        assert_eq!(
+            counts[&(
+                ReasonCode::UnclassifiedFailure,
+                SafetyState::HaltedUncertain
+            )],
+            1
+        );
+        let _ = c;
     }
 
     // ---- recovery epoch ----------------------------------------------------

@@ -41,17 +41,45 @@ async fn readyz(State(st): State<AppState>) -> impl IntoResponse {
     // Readiness reflects pipeline health: a failed pipeline makes the instance
     // not-ready (503) and names the offender, so Kubernetes removes it from Service
     // endpoints. Otherwise 200 with the current pipeline states.
+    // A pipeline also keeps the instance not-ready while it has a blocking
+    // incident that is open or only acknowledged: an acknowledgement means an
+    // operator has seen it, not that it is safe.
     let pipelines = st.controller.list().await;
     let failed: Vec<_> = pipelines
         .iter()
         .filter(|p| p.status == "failed")
         .map(|p| p.name.clone())
         .collect();
+    let blocked: Vec<_> = pipelines
+        .iter()
+        .filter(|p| {
+            p.status == "failed"
+                || p.incidents.as_ref().is_some_and(|i| i.blocks_readiness())
+        })
+        .map(|p| {
+            let i = p.incidents.clone().unwrap_or_default();
+            serde_json::json!({
+                "name": p.name,
+                "status": p.status,
+                "primary_incident": i.primary,
+                "durability_pending": i.durability_pending,
+                "store_unavailable": i.store_unavailable,
+                "blocking_incidents": i.blocking.iter().map(|b| serde_json::json!({
+                    "incident_id": b.get("incident_id"),
+                    "reason_code": b.get("reason_code"),
+                    "status": b.get("status"),
+                    "durable": b.get("durable"),
+                })).collect::<Vec<_>>(),
+                "overflow_blocking": i.overflow_blocking,
+            })
+        })
+        .collect();
 
-    if !failed.is_empty() {
+    if !blocked.is_empty() {
         let body = serde_json::json!({
             "status": "not_ready",
             "failed_pipelines": failed,
+            "blocked_pipelines": blocked,
         });
         return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
     }
