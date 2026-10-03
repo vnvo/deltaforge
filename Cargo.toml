@@ -40,6 +40,17 @@ lru = "0.12"
 apache-avro = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# Debug builds carry no debug info. Every test binary links every
+# dependency (including prebuilt static libraries that ship their own debug
+# sections), so full debug info made each test binary ~700 MB, the target
+# directory tens of GB, and linking slow. Panic messages still report their
+# file:line (from the panic location); only backtrace frames lose line numbers.
+# For a debugger, override locally:
+#   CARGO_PROFILE_DEV_DEBUG=true CARGO_PROFILE_DEV_STRIP=none cargo build
+[profile.dev]
+debug = false
+strip = "debuginfo"
+
 [profile.release]
 lto = true
 codegen-units = 1
