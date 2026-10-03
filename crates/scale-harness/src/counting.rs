@@ -29,8 +29,9 @@ pub struct OpStat {
     pub calls: u64,
     pub bytes_returned: u64,
     /// `bytes_returned` minus the length of each returned record's
-    /// `registered_at` timestamp, when normalization is on (else equal to
-    /// `bytes_returned`). Registration time is written by the real
+    /// `registered_at` timestamp, with a registration checkpoint counted by
+    /// its bytes rather than their JSON rendering, when normalization is on
+    /// (else equal to `bytes_returned`). Registration time is written by the real
     /// registration path and serialized with a variable number of fractional
     /// digits, so equal tables in two fixtures can differ by a few bytes.
     pub bytes_returned_normalized: u64,
@@ -55,6 +56,9 @@ pub struct CountingBackend {
     record_keys: AtomicBool,
     normalize: AtomicBool,
     reads: Mutex<Vec<KeyRead>>,
+    /// Keys whose `kv_get` / prefixes whose `kv_list` are not counted
+    /// (time-driven reads).
+    uncounted: Mutex<Vec<(String, String)>>,
 }
 
 impl CountingBackend {
@@ -65,7 +69,18 @@ impl CountingBackend {
             record_keys: AtomicBool::new(false),
             normalize: AtomicBool::new(false),
             reads: Mutex::new(Vec::new()),
+            uncounted: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Stop counting `kv_get` of `ns`/`key` and `kv_list` of `ns` with prefix
+    /// `key`: for a read whose number depends on elapsed time rather than on
+    /// the work measured.
+    pub fn uncount(&self, ns: &str, key: &str) {
+        self.uncounted
+            .lock()
+            .unwrap()
+            .push((ns.to_string(), key.to_string()));
     }
 
     /// Zero every counter and forget recorded reads.
@@ -90,13 +105,23 @@ impl CountingBackend {
         if !self.normalize.load(Ordering::SeqCst) {
             return b.len();
         }
-        match serde_json::from_slice::<serde_json::Value>(b) {
-            Ok(serde_json::Value::Object(m)) => match m.get("registered_at") {
-                Some(serde_json::Value::String(ts)) => b.len() - ts.len(),
-                _ => b.len(),
-            },
-            _ => b.len(),
+        let Ok(serde_json::Value::Object(m)) =
+            serde_json::from_slice::<serde_json::Value>(b)
+        else {
+            return b.len();
+        };
+        let mut n = b.len();
+        if let Some(serde_json::Value::String(ts)) = m.get("registered_at") {
+            n -= ts.len();
         }
+        // A registration's checkpoint is stored as a JSON array of byte
+        // values; count its bytes, not their decimal rendering (whose width
+        // depends on the values, e.g. a random server UUID).
+        if let Some(serde_json::Value::Array(bytes)) = m.get("checkpoint") {
+            let rendered = serde_json::to_vec(bytes).map_or(0, |v| v.len());
+            n = n - rendered + bytes.len();
+        }
+        n
     }
 
     pub fn ops(&self) -> OpVector {
@@ -144,6 +169,14 @@ impl CountingBackend {
         })
     }
 
+    fn is_uncounted(&self, ns: &str, key: &str) -> bool {
+        self.uncounted
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(n, k)| n == ns && k == key)
+    }
+
     fn read(&self, primitive: &'static str, ns: &str, key: &str) {
         if self.record_keys.load(Ordering::SeqCst) {
             self.reads.lock().unwrap().push(KeyRead {
@@ -158,6 +191,9 @@ impl CountingBackend {
 #[async_trait]
 impl StorageBackend for CountingBackend {
     async fn kv_get(&self, ns: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        if self.is_uncounted(ns, key) {
+            return self.inner.kv_get(ns, key).await;
+        }
         self.read("kv_get", ns, key);
         let r = self.inner.kv_get(ns, key).await?;
         let (raw, norm) = self.records(r.iter().map(Vec::as_slice));
@@ -187,6 +223,11 @@ impl StorageBackend for CountingBackend {
         ns: &str,
         prefix: Option<&str>,
     ) -> Result<Vec<String>> {
+        if let Some(p) = prefix
+            && self.is_uncounted(ns, p)
+        {
+            return self.inner.kv_list(ns, prefix).await;
+        }
         self.read("kv_list", ns, prefix.unwrap_or(""));
         let r = self.inner.kv_list(ns, prefix).await?;
         self.count("kv_list", r.iter().map(String::len).sum(), 0);

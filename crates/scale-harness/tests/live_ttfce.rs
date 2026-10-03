@@ -17,6 +17,7 @@ async fn check(engine: Engine) {
             engine,
             tables: 1_000,
             catalog_tables: 0,
+            matched_tables: 0,
             versions: 2,
             columns: 8,
             seed: 42,
@@ -50,14 +51,14 @@ async fn mysql_time_to_first_event() {
     check(Engine::Mysql).await;
 }
 
-/// A CDC-only restart does the same work whatever the size of the live
-/// catalog its table pattern matches: the same storage reads (calls per
-/// primitive) and the same number of statements on the server, with 20 or
-/// 1,000 matched tables (no enumeration, no per-table schema load at
-/// startup).
+/// A CDC-only restart does the same work whatever part of the live catalog
+/// its table pattern matches: the same storage operations (calls, returned
+/// and written bytes per primitive), no registry enumeration and the same number of
+/// statements on the server, whether 20 or all 1,000 catalog tables match (no
+/// enumeration, no per-table schema load at startup).
 async fn startup_ignores_catalog_size(engine: Engine) {
     let mut runs = Vec::new();
-    for catalog_tables in [20, 1_000] {
+    for matched_tables in [20, 1_000] {
         let dir = tempfile::tempdir().unwrap();
         let store: ArcStorageBackend =
             storage::SqliteStorageBackend::open(dir.path().join("live.db"))
@@ -66,7 +67,8 @@ async fn startup_ignores_catalog_size(engine: Engine) {
             &LiveConfig {
                 engine,
                 tables: 100,
-                catalog_tables,
+                catalog_tables: 1_000,
+                matched_tables,
                 versions: 1,
                 columns: 4,
                 seed: 7,
@@ -76,28 +78,26 @@ async fn startup_ignores_catalog_size(engine: Engine) {
         .await
         .unwrap();
         println!(
-            "{engine:?} {catalog_tables} catalog tables: {:.0} ms, {} server \
+            "{engine:?} {matched_tables} matched tables: {:.0} ms, {} server \
              statements, ops {:?}",
             r.time_to_first_event_ms, r.server_statements, r.ops
         );
         assert_eq!(r.events_before_known, 0);
+        assert_eq!(r.registry_enumeration_calls, 0, "{:?}", r.enumerations);
         runs.push(r);
     }
-    // Reads compare exactly. The only write in the window is the
-    // coordinator's checkpoint commit after the known event, which may land
-    // just before or just after the window closes.
-    let reads = |r: &live::LiveReport| {
+    // Calls, normalized returned bytes and written bytes per primitive, up
+    // to the moment the known event arrived: one call reading the whole
+    // catalog would differ in bytes.
+    let work = |r: &live::LiveReport| {
         r.ops
             .iter()
-            .filter(|(p, _)| **p != "kv_put")
-            .map(|(p, s)| (*p, s.calls))
+            .map(|(p, s)| {
+                (*p, s.calls, s.bytes_returned_normalized, s.bytes_written)
+            })
             .collect::<Vec<_>>()
     };
-    assert_eq!(reads(&runs[0]), reads(&runs[1]), "storage reads grew");
-    for r in &runs {
-        let writes = r.ops.get("kv_put").map_or(0, |s| s.calls);
-        assert!(writes <= 1, "{writes} writes during the restart");
-    }
+    assert_eq!(work(&runs[0]), work(&runs[1]), "startup work grew");
     assert_eq!(
         runs[0].server_statements, runs[1].server_statements,
         "server statements grew with the catalog"

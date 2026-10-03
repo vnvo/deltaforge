@@ -158,7 +158,9 @@ impl MySqlSchemaLoader {
         let (_, _, evicted_after) = cache.usage();
         if evicted_after > evicted_before {
             counter!("deltaforge_source_schema_cache_evictions_total",
-                "pipeline" => self.tenant.clone(), "source" => "mysql")
+                "tenant" => self.tenant.clone(),
+                "source_id" => self.scope.source_id().to_string(),
+                "engine" => "mysql")
             .increment(evicted_after - evicted_before);
         }
         inserted

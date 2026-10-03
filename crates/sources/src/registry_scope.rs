@@ -192,7 +192,9 @@ pub(crate) trait Resident: Clone {
     fn weight(&self) -> usize;
 }
 
-/// How much heavyweight schema state one loader keeps resident.
+/// How much heavyweight schema state one loader keeps resident. Covers the
+/// cached values only: the compact per-table pins (and the map overhead) are
+/// not counted and are not bounded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheBudget {
     pub max_entries: usize,
@@ -500,6 +502,11 @@ impl SharedRegistryScope {
             state: Arc::default(),
             source_id: source_id.into(),
         }
+    }
+
+    /// The configured id of the source this scope belongs to.
+    pub fn source_id(&self) -> &str {
+        &self.source_id
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, ScopeState> {

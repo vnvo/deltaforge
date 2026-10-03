@@ -157,7 +157,9 @@ impl PostgresSchemaLoader {
         let (_, _, evicted_after) = cache.usage();
         if evicted_after > evicted_before {
             counter!("deltaforge_source_schema_cache_evictions_total",
-                "pipeline" => self.tenant.clone(), "source" => "postgres")
+                "tenant" => self.tenant.clone(),
+                "source_id" => self.scope.source_id().to_string(),
+                "engine" => "postgres")
             .increment(evicted_after - evicted_before);
         }
         inserted
@@ -1240,6 +1242,63 @@ mod tests {
 
         fn pg(n: u64) -> LineageDescriptor {
             LineageDescriptor::postgres(n, n).unwrap()
+        }
+
+        /// Evictions are counted with truthful bounded labels: tenant, the
+        /// configured source id and the engine.
+        #[test]
+        fn evictions_are_labelled_by_tenant_source_and_engine() {
+            use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+            let recorder = DebuggingRecorder::new();
+            let snap = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || {
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let scope = SharedRegistryScope::new("src");
+                        scope.publish_for_test("acme", pg(1));
+                        let l = loader(&scope).with_cache_budget(
+                            crate::registry_scope::CacheBudget {
+                                max_entries: 1,
+                                max_bytes: usize::MAX,
+                            },
+                        );
+                        let current = l.current_scope().unwrap();
+                        let other = ("public".to_string(), "items".to_string());
+                        l.cache_insert(&current, key(), loaded("a")).await;
+                        l.cache_insert(&current, other, loaded("b")).await;
+                    });
+            });
+            let (labels, value) = snap
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find_map(|(ck, _, _, v)| match v {
+                    DebugValue::Counter(n)
+                        if ck.key().name()
+                            == "deltaforge_source_schema_cache_evictions_total" =>
+                    {
+                        let mut labels: Vec<(String, String)> = ck
+                            .key()
+                            .labels()
+                            .map(|l| (l.key().to_string(), l.value().to_string()))
+                            .collect();
+                        labels.sort();
+                        Some((labels, n))
+                    }
+                    _ => None,
+                })
+                .expect("eviction counted");
+            assert_eq!(value, 1);
+            assert_eq!(
+                labels,
+                [
+                    ("engine".to_string(), "postgres".to_string()),
+                    ("source_id".to_string(), "src".to_string()),
+                    ("tenant".to_string(), "acme".to_string()),
+                ]
+            );
         }
 
         /// An evicted table is rebuilt exactly from durable history (its

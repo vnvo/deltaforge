@@ -56,10 +56,13 @@ pub struct LiveConfig {
     pub engine: Engine,
     /// Synthetic tables registered for the live source (not in the database).
     pub tables: u64,
-    /// Real tables created in the database besides the captured one, all
-    /// matched by the source's table pattern (they never change). Startup
-    /// must not grow with them.
+    /// Real tables created in the database besides the captured one (they
+    /// never change).
     pub catalog_tables: u64,
+    /// How many of them the source's table pattern matches (at most
+    /// `catalog_tables`). Names have equal length either way, so the
+    /// database's log positions do not depend on this.
+    pub matched_tables: u64,
     pub versions: u32,
     pub columns: u32,
     pub seed: u64,
@@ -70,6 +73,7 @@ pub struct LiveReport {
     pub engine: Engine,
     pub synthetic_tables: u64,
     pub catalog_tables: u64,
+    pub matched_tables: u64,
     pub versions: u32,
     pub lineage_hash: String,
     pub generation_secs: f64,
@@ -78,8 +82,9 @@ pub struct LiveReport {
     pub time_to_first_event_ms: f64,
     /// Events delivered in the timed run before the known event.
     pub events_before_known: usize,
-    /// Storage operations during the timed window (registry, lineage and
-    /// checkpoint namespaces together), and reads per namespace.
+    /// Storage operations from source startup until the sink received the
+    /// known event (registry, lineage and checkpoint namespaces together),
+    /// and reads per namespace.
     pub ops: OpVector,
     pub enumeration_calls: u64,
     /// Enumeration calls on schema-registry namespaces (`schemas*`,
@@ -95,10 +100,15 @@ pub struct LiveReport {
     pub server_statements: u64,
 }
 
-/// Records delivered row ids and wakes waiters.
+/// Records delivered row ids and wakes waiters. With a counter attached, it
+/// snapshots the storage operations the moment the known event arrives:
+/// exactly the work to reach the first event, before the commit that follows
+/// it (and the source's checkpoint-feedback read that the commit wakes).
 struct ProbeSink {
     ids: Mutex<Vec<i64>>,
     delivered: Notify,
+    counter: Option<Arc<CountingBackend>>,
+    ops_at_known: Mutex<Option<OpVector>>,
 }
 
 #[async_trait]
@@ -114,7 +124,16 @@ impl Sink for ProbeSink {
             let mut ids = self.ids.lock().unwrap();
             for e in events {
                 if let Some(id) = e.after.as_ref().and_then(|a| a.get("id")) {
-                    ids.push(id.as_i64().unwrap_or(-1));
+                    let id = id.as_i64().unwrap_or(-1);
+                    if id == KNOWN_ID
+                        && let Some(counter) = &self.counter
+                    {
+                        self.ops_at_known
+                            .lock()
+                            .unwrap()
+                            .get_or_insert_with(|| counter.ops());
+                    }
+                    ids.push(id);
                 }
             }
         }
@@ -125,9 +144,15 @@ impl Sink for ProbeSink {
 
 impl ProbeSink {
     fn new() -> Arc<Self> {
+        Self::counting(None)
+    }
+
+    fn counting(counter: Option<Arc<CountingBackend>>) -> Arc<Self> {
         Arc::new(Self {
             ids: Mutex::new(Vec::new()),
             delivered: Notify::new(),
+            counter,
+            ops_at_known: Mutex::new(None),
         })
     }
 
@@ -306,9 +331,18 @@ fn my_cdc(port: u16) -> String {
     format!("mysql://df:dfpw@127.0.0.1:{port}/app")
 }
 
-/// Create the captured table and `catalog_tables` others matched by the same
-/// pattern; return the database's verified lineage.
-async fn prepare(db: &Db, catalog_tables: u64) -> Result<LineageDescriptor> {
+/// Create the captured table and `catalog` others, `matched` of them matched
+/// by the source's pattern (`app_m*`; the rest `oth_m*`, same name length);
+/// return the database's verified lineage.
+async fn prepare(
+    db: &Db,
+    catalog: u64,
+    matched: u64,
+) -> Result<LineageDescriptor> {
+    let name = |n: u64| {
+        let prefix = if n < matched { "app" } else { "oth" };
+        format!("{prefix}_m{n:05}")
+    };
     use mysql_async::prelude::Queryable;
     match db.engine {
         Engine::Postgres => {
@@ -319,9 +353,10 @@ async fn prepare(db: &Db, catalog_tables: u64) -> Result<LineageDescriptor> {
                  CREATE PUBLICATION scale_pub FOR TABLE app_events;",
             )
             .await?;
-            for n in 0..catalog_tables {
+            for n in 0..catalog {
                 c.batch_execute(&format!(
-                    "CREATE TABLE app_catalog_{n} (id BIGINT PRIMARY KEY, v TEXT)"
+                    "CREATE TABLE {} (id BIGINT PRIMARY KEY, v TEXT)",
+                    name(n)
                 ))
                 .await?;
             }
@@ -358,9 +393,10 @@ async fn prepare(db: &Db, catalog_tables: u64) -> Result<LineageDescriptor> {
             ] {
                 root.query_drop(q).await?;
             }
-            for n in 0..catalog_tables {
+            for n in 0..catalog {
                 root.query_drop(format!(
-                    "CREATE TABLE app.app_catalog_{n} (id BIGINT PRIMARY KEY, v VARCHAR(64))"
+                    "CREATE TABLE app.{} (id BIGINT PRIMARY KEY, v VARCHAR(64))",
+                    name(n)
                 ))
                 .await?;
             }
@@ -507,7 +543,8 @@ pub async fn run(
     store: ArcStorageBackend,
 ) -> Result<LiveReport> {
     let db = start_db(cfg.engine).await?;
-    let descriptor = prepare(&db, cfg.catalog_tables).await?;
+    let descriptor =
+        prepare(&db, cfg.catalog_tables, cfg.matched_tables).await?;
 
     // Synthetic catalog for the live source's own lineage (untimed).
     let spec = FixtureSpec {
@@ -574,15 +611,30 @@ pub async fn run(
     // Run 2 (timed): a fresh registry, as after a process restart.
     let registry = DurableSchemaRegistry::new(backend.clone()).await?;
     let src = source(&db, registry, backend.clone());
-    let sink = ProbeSink::new();
+    let sink = ProbeSink::counting(Some(cb.clone()));
     reset_statements(&db).await?;
+    // While streaming, the PostgreSQL source rereads the sink's durable
+    // checkpoint and lists the pipeline's sink checkpoints on a timer (WAL
+    // feedback from the durable minimum): how many of those land before the
+    // known event depends on elapsed time, not on startup work. They read
+    // checkpoints only, never the catalog.
+    cb.uncount("checkpoints", &cp_key);
+    cb.uncount("checkpoints", &format!("{SOURCE}::sink::"));
     cb.reset();
     cb.record_keys(true);
+    // Returned registry records carry their registration time, whose width
+    // varies; normalized bytes leave it out so two runs compare exactly.
+    cb.normalize_timestamps(true);
     let t0 = Instant::now();
     let run2 = start(src, checkpoints.clone(), sink.clone()).await;
     sink.wait_for(KNOWN_ID, Duration::from_secs(300)).await?;
     let elapsed = t0.elapsed();
-    let ops = cb.ops();
+    let ops = sink
+        .ops_at_known
+        .lock()
+        .unwrap()
+        .clone()
+        .context("the known event was not recorded")?;
     let reads = cb.reads();
     cb.record_keys(false);
     let server_statements = source_statements(&db).await?;
@@ -609,6 +661,7 @@ pub async fn run(
         engine: cfg.engine,
         synthetic_tables: cfg.tables,
         catalog_tables: cfg.catalog_tables,
+        matched_tables: cfg.matched_tables,
         versions: cfg.versions,
         lineage_hash,
         generation_secs,

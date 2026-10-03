@@ -167,7 +167,7 @@ A CDC start does not enumerate the configured tables or load their schemas: each
 
 ### Caching
 
-Resolved schemas are cached per source, within a bounded budget (by default 4,096 tables or 64 MiB of schema per source, whichever is reached first); beyond it the least recently used schemas are evicted (`deltaforge_source_schema_cache_evictions_total`). Eviction never changes what a table resolves to: the source keeps a small record of each table's resolved version, and an evicted table is rebuilt from durable history as exactly that version, with no catalog query. If that version cannot be read back exactly, the source stops with a schema error rather than resolving the table again. Only an explicit reload (or a DDL of the table) resolves it again.
+Resolved schemas are cached per source. The resident schemas are capped at 4,096 tables or about 64 MiB of serialized schema per source, whichever is reached first (a fixed limit, not configurable); beyond it the least recently used are evicted (`deltaforge_source_schema_cache_evictions_total{tenant, source_id, engine}`). Eviction never changes what a table resolves to: the source keeps a compact record (version, sequence, fingerprint) of every table resolved since it started or last changed lineage, and an evicted table is rebuilt from durable history as exactly that version, with no catalog query. These records are not bounded and are not part of the 64 MiB. If that version cannot be read back exactly, the source stops with a schema error rather than resolving the table again. Only an explicit reload (or a DDL of the table) resolves it again.
 
 ## DDL Handling
 

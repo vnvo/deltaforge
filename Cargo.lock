@@ -5919,6 +5919,7 @@ dependencies = [
  "deltaforge-core",
  "hex",
  "metrics",
+ "metrics-util 0.19.1",
  "mysql-binlog-connector-rust",
  "mysql_async 0.36.2",
  "mysql_common 0.35.5",

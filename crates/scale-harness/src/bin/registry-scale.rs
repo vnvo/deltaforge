@@ -325,6 +325,7 @@ async fn main() -> Result<()> {
                 engine,
                 tables: a.live_tables,
                 catalog_tables: a.live_catalog_tables,
+                matched_tables: a.live_catalog_tables,
                 versions: a.versions,
                 columns: a.columns,
                 seed: a.seed,
