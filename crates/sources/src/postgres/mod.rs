@@ -482,22 +482,16 @@ impl PostgresSource {
             &self.tenant,
             self.registry_scope.clone(),
         );
-        let tracked = schema_loader.preload(&self.tables).await?;
-        info!(tables = tracked.len(), "schemas preloaded");
-
-        for (schema, table) in &tracked {
-            if let Ok(loaded) = schema_loader.load_schema(schema, table).await {
-                if let Some(ref identity) = loaded.schema.replica_identity {
-                    if identity != "full" {
-                        warn!(
-                            schema = %schema, table = %table,
-                            replica_identity = %identity,
-                            "table does not have REPLICA IDENTITY FULL - before images will be incomplete"
-                        );
-                    }
-                }
-            }
-        }
+        // No schema is enumerated or loaded at a CDC start: each table is
+        // resolved at its first Relation (design spec 7.23). Only a snapshot
+        // expands the patterns and loads the tables it copies; the
+        // per-Relation replica-identity warning covers what the startup loop
+        // used to report.
+        let tracked = if needs_snapshot {
+            schema_loader.preload(&self.tables).await?
+        } else {
+            Vec::new()
+        };
 
         let start_lsn = if needs_snapshot {
             info!(source_id = %self.id, "starting initial snapshot");
@@ -810,8 +804,10 @@ impl PostgresSource {
                         info!(schema = %s, table = %t, "reloading schema");
                         ctx.schema.reload_schema(&s, &t).await?;
                     } else {
-                        info!("reloading all schemas");
-                        ctx.schema.reload_all(&self.tables).await?;
+                        // Never enumerates: forget every cached schema; each
+                        // table reloads at its next use.
+                        info!("clearing cached schemas");
+                        ctx.schema.clear_cache().await;
                     }
                 }
                 Err(LoopControl::SchemaDrift(drift)) => {

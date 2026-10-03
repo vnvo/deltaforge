@@ -290,7 +290,7 @@ async fn handle_pgoutput_message(
     // filtering one table cannot renumber later events. Protocol metadata
     // (Relation/Type/Origin/Begin/Commit) does not.
     match msg_type {
-        b'R' => handle_relation(ctx, payload),
+        b'R' => handle_relation(ctx, payload).await,
         b'I' => {
             let ordinal = ctx.change_ordinal;
             ctx.change_ordinal += 1;
@@ -351,7 +351,7 @@ async fn handle_pgoutput_message(
 ///   change made while the source was down (and re-detecting a previously
 ///   Halt-failed drift). A catalog fetch happens only for this active table, and
 ///   only when the Relation payload cannot settle the comparison on its own.
-fn handle_relation(
+async fn handle_relation(
     ctx: &mut RunCtx,
     payload: &[u8],
 ) -> Result<(), LoopControl> {
@@ -493,11 +493,17 @@ fn handle_relation(
     // First resolution this run: verify the Relation against the durably persisted
     // schema so a change made while the source was down (or a previously
     // Halt-failed drift) is caught here, before this table's rows are decoded.
-    // Deterministic and synchronous from the cached/durable schema - no catalog
-    // query.
+    // Read from durable history (single-flight per key), never from a loader
+    // cache: a cold or contended cache cannot skip it. No history = first
+    // use; unreadable history fails closed. No catalog query.
     if is_new {
-        if let Some(persisted) = ctx.schema.get_cached(&schema, &table) {
-            let persisted_signature = persisted.schema.signature();
+        let persisted = ctx
+            .schema
+            .persisted(&schema, &table)
+            .await
+            .map_err(LoopControl::Fail)?;
+        if let Some(persisted) = persisted {
+            let persisted_signature = persisted.signature();
             if let FirstResolution::Drift(detail) = verify_first_resolution(
                 &persisted_signature,
                 &relation_signature,
