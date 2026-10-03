@@ -17,11 +17,16 @@ use tracing::{debug, error, info, warn};
 
 use checkpoints::{CheckpointStore, CheckpointStoreExt};
 use common::{AllowList, RetryPolicy, pause_until_resumed};
+use deltaforge_core::incident::{
+    ActionCode, CauseCode, Component, EvidenceKey as K, IncidentDraft,
+    ReasonCode, Retryability, SafetyState,
+};
 use deltaforge_core::{
     CheckpointOrder, Source, SourceError, SourceHandle, SourceItem,
     SourceResult,
 };
 use storage::BackendCheckpointStore;
+use storage::adapters::incidents::IncidentStore;
 
 use crate::snapshot_generation::PersistedLineage;
 use postgres_snapshot::IdentitySpec;
@@ -449,6 +454,7 @@ impl PostgresSource {
                 &config.start_lsn.to_string(),
                 &cancel,
                 REACHABILITY_RETRY_WINDOW,
+                &IncidentStore::new(Arc::clone(&self.backend), &self.pipeline),
             )
             .await?;
             config.start_lsn
@@ -1347,10 +1353,13 @@ async fn refuse_server_change(
 const REACHABILITY_RETRY_WINDOW: Duration = Duration::from_secs(120);
 
 /// Verify the slot still holds the checkpoint position before replication
-/// opens. A confirmed loss stops at once (operator action); an unknown answer
-/// is retried with backoff while it is plausibly transient and stops when the
-/// window ends or the cause is not transient. Each stop is a
-/// `pg_continuity_unproven` incident; nothing is streamed.
+/// opens. A confirmed loss or an error answer from the server stops at once;
+/// an unknown answer is retried with backoff while it is plausibly transient.
+/// While it retries, the condition is an open auto-retry
+/// `pg_continuity_unproven` incident (recorded in `incidents`); when the
+/// window ends the source stops on the same incident, which then needs an
+/// operator. Every stop is operator action; cancellation stops without one.
+/// Nothing is streamed.
 async fn verify_resume_position(
     dsn: &str,
     source_id: &str,
@@ -1358,9 +1367,11 @@ async fn verify_resume_position(
     checkpoint: &str,
     cancel: &CancellationToken,
     window: Duration,
+    incidents: &IncidentStore,
 ) -> SourceResult<()> {
     let deadline = Instant::now() + window;
     let mut delay = Duration::from_secs(1);
+    let mut retrying = None;
     loop {
         let outcome = check_position_reachability(dsn, slot)
             .await
@@ -1391,6 +1402,20 @@ async fn verify_resume_position(
             }
             PositionReachability::Unknown { transient, reason } => {
                 if transient && Instant::now() + delay < deadline {
+                    if retrying.is_none() {
+                        retrying = crate::incident_drafts::record_retrying(
+                            incidents,
+                            &continuity_unproven_draft(
+                                source_id,
+                                slot,
+                                checkpoint,
+                                "unknown_unreachable",
+                                Retryability::AutoRetry,
+                                CauseCode::SourceConnect,
+                            ),
+                        )
+                        .await;
+                    }
                     warn!(
                         source_id, slot, %reason,
                         retry_in_secs = delay.as_secs(),
@@ -1399,7 +1424,14 @@ async fn verify_resume_position(
                     );
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
-                        _ = cancel.cancelled() => return Err(SourceError::Cancelled),
+                        _ = cancel.cancelled() => {
+                            crate::incident_drafts::cancel_retrying(
+                                incidents,
+                                retrying,
+                            )
+                            .await;
+                            return Err(SourceError::Cancelled);
+                        }
                     }
                     delay = (delay * 2).min(Duration::from_secs(15));
                     continue;
@@ -1435,7 +1467,8 @@ async fn verify_resume_position(
     }
 }
 
-/// The `pg_continuity_unproven` incident around `cause`.
+/// The `pg_continuity_unproven` incident around `cause`: the source stops,
+/// so it needs an operator.
 fn continuity_unproven(
     source_id: &str,
     slot: &str,
@@ -1443,29 +1476,42 @@ fn continuity_unproven(
     class: &str,
     cause: SourceError,
 ) -> SourceError {
-    use deltaforge_core::incident::{
-        ActionCode, Component, EvidenceKey as K, IncidentDraft, ReasonCode,
-        Retryability, SafetyState,
-    };
+    let draft = continuity_unproven_draft(
+        source_id,
+        slot,
+        checkpoint,
+        class,
+        Retryability::OperatorAction,
+        cause.cause_code(),
+    );
+    SourceError::incident(draft, cause)
+}
+
+/// The `pg_continuity_unproven` draft. Its identity is the slot, checkpoint
+/// and class, never the retryability, so an automatic retry that exhausts
+/// its window stays one incident.
+fn continuity_unproven_draft(
+    source_id: &str,
+    slot: &str,
+    checkpoint: &str,
+    class: &str,
+    retryability: Retryability,
+    cause_code: CauseCode,
+) -> IncidentDraft {
     let lost = !class.starts_with("unknown_");
-    let retryability = if class == "unknown_unreachable" {
-        Retryability::AutoRetry
-    } else {
-        Retryability::OperatorAction
-    };
     let actions: &[ActionCode] = if lost {
         &[ActionCode::Resnapshot, ActionCode::UseNewSourceId]
     } else {
         &[ActionCode::VerifyEndpoint, ActionCode::InspectLogs]
     };
-    let draft = IncidentDraft::new(
+    IncidentDraft::new(
         ReasonCode::PgContinuityUnproven,
         Component::Source {
             id: source_id.to_string(),
         },
         retryability,
         SafetyState::HaltedSafe,
-        cause.cause_code(),
+        cause_code,
     )
     .discriminate("slot", slot)
     .discriminate("checkpoint", checkpoint)
@@ -1476,8 +1522,7 @@ fn continuity_unproven(
             .text(K::CheckpointPosition, checkpoint)
             .text(K::ReasonClass, class);
     })
-    .with_actions(actions);
-    SourceError::incident(draft, cause)
+    .with_actions(actions)
 }
 
 /// The PostgreSQL identity a refusal compares: cluster `system_identifier`
@@ -1539,10 +1584,6 @@ fn different_cluster_draft(
     expected: PgEndpoint,
     live: PgEndpoint,
 ) -> deltaforge_core::IncidentDraft {
-    use deltaforge_core::incident::{
-        ActionCode, CauseCode, Component, EvidenceKey as K, IncidentDraft,
-        ReasonCode, Retryability, SafetyState,
-    };
     IncidentDraft::new(
         ReasonCode::PgDifferentCluster,
         Component::Source {
@@ -2462,29 +2503,111 @@ mod identity_fail_closed_tests {
         (class, d.retryability.as_str().to_string())
     }
 
-    /// An unreachable server (a plausibly transient cause) is retried until
-    /// the window ends, then stops before replication opens.
-    #[tokio::test]
-    async fn an_unreachable_server_is_retried_then_halts() {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    fn dead_dsn() -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         drop(l);
-        let dsn = format!("host=127.0.0.1 port={port} user=u dbname=d");
+        format!("host=127.0.0.1 port={port} user=u dbname=d")
+    }
+
+    fn memory_incidents() -> IncidentStore {
+        IncidentStore::new(Arc::new(MemoryStorageBackend::new()), "p")
+    }
+
+    /// An unreachable server (a plausibly transient cause) is retried until
+    /// the window ends, then stops before replication opens. While it
+    /// retries the condition is an open auto-retry incident; the stop turns
+    /// that same incident into operator action (the injected window stands
+    /// in for the two-minute budget).
+    #[tokio::test]
+    async fn an_exhausted_retry_turns_the_same_incident_into_operator_action() {
+        let incidents = memory_incidents();
+        let dsn = dead_dsn();
         let started = Instant::now();
-        let r = verify_resume_position(
-            &dsn,
-            "src",
-            "slot",
-            "0/16B3748",
-            &CancellationToken::new(),
-            Duration::from_secs(3),
-        )
-        .await;
+        let task = {
+            let incidents = incidents.clone();
+            tokio::spawn(async move {
+                verify_resume_position(
+                    &dsn,
+                    "src",
+                    "slot",
+                    "0/16B3748",
+                    &CancellationToken::new(),
+                    Duration::from_secs(3),
+                    &incidents,
+                )
+                .await
+            })
+        };
+        let retrying = loop {
+            if let Some(rec) = incidents.list().await.unwrap().pop() {
+                break rec;
+            }
+            assert!(!task.is_finished(), "recorded while it retries");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(!task.is_finished());
+        assert_eq!(retrying.retryability.as_str(), "auto_retry");
+        assert_eq!(retrying.safety_state, SafetyState::HaltedSafe);
+
+        let r = task.await.unwrap();
         assert!(started.elapsed() >= Duration::from_secs(1), "it retried");
         assert_eq!(
             continuity_class(&r),
-            ("unknown_unreachable".into(), "auto_retry".into())
+            ("unknown_unreachable".into(), "operator_action".into())
         );
+        // The supervisor records the stop bound to the recovery epoch: the
+        // same incident, now operator action.
+        let stopped = storage::adapters::incidents::bind_epoch(
+            r.unwrap_err().draft().unwrap().clone(),
+            incidents.recovery_epoch().await.unwrap(),
+        );
+        assert_eq!(stopped.incident_id("p"), retrying.incident_id);
+        incidents.raise(&stopped, 1).await.unwrap();
+        let all = incidents.list().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].incident_id, retrying.incident_id);
+        assert_eq!(all[0].retryability.as_str(), "operator_action");
+        assert_eq!(all[0].safety_state, SafetyState::HaltedSafe);
+    }
+
+    /// Cancellation during the retry window stops promptly, without an
+    /// operator incident: the auto-retry incident is withdrawn as
+    /// `operation_cancelled`, so nothing blocks a later start.
+    #[tokio::test]
+    async fn cancellation_during_the_retry_stops_without_an_operator_incident()
+    {
+        let incidents = memory_incidents();
+        let cancel = CancellationToken::new();
+        let dsn = dead_dsn();
+        let task = {
+            let (incidents, cancel) = (incidents.clone(), cancel.clone());
+            tokio::spawn(async move {
+                verify_resume_position(
+                    &dsn,
+                    "src",
+                    "slot",
+                    "0/16B3748",
+                    &cancel,
+                    Duration::from_secs(120),
+                    &incidents,
+                )
+                .await
+            })
+        };
+        while incidents.list().await.unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        cancel.cancel();
+        let r = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("prompt")
+            .unwrap();
+        assert!(matches!(r, Err(SourceError::Cancelled)), "{r:?}");
+        crate::incident_drafts::test_util::assert_cancelled_withdrawn(
+            &incidents,
+        )
+        .await;
     }
 
     /// A server that answers with an error (not transient) stops at once.
@@ -2522,6 +2645,7 @@ mod identity_fail_closed_tests {
             "0/16B3748",
             &CancellationToken::new(),
             Duration::from_secs(30),
+            &memory_incidents(),
         )
         .await;
         assert!(started.elapsed() < Duration::from_secs(5), "no retry");

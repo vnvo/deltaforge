@@ -144,19 +144,6 @@ pub fn classify_source_exit(
     }
 }
 
-/// Bind a source's draft to the recovery epoch when a verified start settles
-/// its reason (so a recurrence after a genuine recovery is a new occurrence;
-/// before one, the same incident).
-pub fn bind_epoch(draft: IncidentDraft, epoch: u64) -> IncidentDraft {
-    if verified_start_check(draft.reason_code, &draft.component).is_some()
-        && draft.reason_code != ReasonCode::UnclassifiedFailure
-    {
-        draft.discriminate("recovery_epoch", epoch.to_string())
-    } else {
-        draft
-    }
-}
-
 /// The draft for a coordinator that failed: a sink's own draft when the
 /// failure came from one, otherwise unclassified from the error's type.
 pub fn classify_coordinator_exit(

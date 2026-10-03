@@ -743,23 +743,7 @@ impl Sink for KafkaSink {
                             });
                         }
                         TxnEnd::Uncertain { attempts, reason } => {
-                            let boundary = events
-                                .last()
-                                .and_then(|e| e.checkpoint())
-                                .map(|c| c.as_bytes().to_vec())
-                                .unwrap_or_default();
-                            return Err(crate::incident::ack_uncertain(
-                                &self.id,
-                                &boundary,
-                                attempts as u64,
-                                SinkError::Fatal {
-                                    details: format!(
-                                        "commit_transaction outcome unknown \
-                                         after {attempts} attempt(s): {reason}"
-                                    )
-                                    .into(),
-                                },
-                            ));
+                            return Err(uncertain_commit(attempts, &reason));
                         }
                     }
                     counter!(
@@ -1199,32 +1183,28 @@ mod txn_end_tests {
         assert!(matches!(fatal, TxnEnd::Uncertain { .. }));
     }
 
-    /// The incident a sink raises for an unsettled commit: sink-scoped,
-    /// halted-uncertain, the batch only as a digest.
+    /// An unsettled commit stops the pipeline but is not a
+    /// `sink_ack_uncertain` incident (no operator recovery path exists for
+    /// it yet): it is classified as an unclassified failure.
     #[test]
-    fn an_uncertain_commit_raises_a_sink_ack_uncertain_incident() {
-        use deltaforge_core::incident::{
-            ActionCode, Component, ReasonCode, SafetyState,
-        };
-        let err = crate::incident::ack_uncertain(
-            "kafka",
-            b"checkpoint-bytes",
-            3,
-            SinkError::Fatal {
-                details: "x".into(),
-            },
-        );
-        let d = err.draft().unwrap();
-        assert_eq!(d.reason_code, ReasonCode::SinkAckUncertain);
-        assert_eq!(d.safety_state, SafetyState::HaltedUncertain);
-        assert_eq!(d.component, Component::Sink { id: "kafka".into() });
-        assert!(d.actions.contains(&ActionCode::VerifySinkState));
-        assert!(
-            !serde_json::to_string(&d.evidence)
-                .unwrap()
-                .contains("checkpoint-bytes")
-        );
-        assert!(matches!(err.root(), SinkError::Fatal { .. }));
+    fn an_uncertain_commit_is_fatal_without_a_sink_ack_uncertain_incident() {
+        let err = super::uncertain_commit(3, "transaction timed out");
+        assert!(err.draft().is_none());
+        assert!(matches!(err, SinkError::Fatal { .. }));
+    }
+}
+
+/// The error for a commit whose outcome stays unknown: fatal, the checkpoint
+/// is not advanced. Not yet a `sink_ack_uncertain` incident: no read can
+/// settle a Kafka transaction outcome, so it waits for an operator recovery
+/// path (proof-bound replay); until then it is an unclassified failure.
+fn uncertain_commit(attempts: u32, reason: &str) -> SinkError {
+    SinkError::Fatal {
+        details: format!(
+            "commit_transaction outcome unknown after {attempts} \
+             attempt(s): {reason}"
+        )
+        .into(),
     }
 }
 

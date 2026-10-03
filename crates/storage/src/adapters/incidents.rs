@@ -66,8 +66,12 @@ pub const LINEAGE_VERIFIED: &str = "lineage_verified";
 pub const POSITION_VERIFIED: &str = "position_verified";
 /// The table's schema was accepted at its first use in a later run.
 pub const SCHEMA_ACCEPTED: &str = "schema_accepted";
-/// The sink acknowledged a later batch.
-pub const SINK_ACKNOWLEDGED: &str = "sink_acknowledged";
+/// An authoritative read of exactly the uncertain boundary proved the write
+/// applied.
+pub const SINK_BOUNDARY_COMMITTED: &str = "sink_boundary_committed";
+/// An authoritative read of exactly the uncertain boundary proved the write
+/// did not apply.
+pub const SINK_BOUNDARY_ABSENT: &str = "sink_boundary_absent";
 
 const RECORD_FORMAT: u32 = 2;
 const CONTROL_FORMAT: u32 = 1;
@@ -81,6 +85,9 @@ pub enum Resolution {
     VerifiedRecovery { check: String },
     /// A recovery operation changed what it was about (e.g. the source epoch).
     RecoveryOperation { operation: String },
+    /// The operation it was retrying was stopped on purpose (the pipeline was
+    /// stopped while it retried automatically): not a failure.
+    OperationCancelled,
 }
 
 /// Where an incident is in its lifecycle.
@@ -222,6 +229,13 @@ pub enum Transition {
     /// A non-blocking incident displaced by a blocking one at the limit; it
     /// is counted in the overflow incident from now on.
     Displaced,
+    /// The same condition raised with another classification (an automatic
+    /// retry that exhausted its budget now needs an operator). The record
+    /// takes the new retryability, safety state and actions.
+    Reclassified {
+        retryability: Retryability,
+        safety_state: SafetyState,
+    },
 }
 
 /// Why an acknowledgement or resolution did not apply.
@@ -293,6 +307,19 @@ pub fn verified_start_check(
             Component::Source { .. },
         ) => Some(POSITION_VERIFIED),
         _ => None,
+    }
+}
+
+/// Bind a source's draft to the recovery epoch when a verified start settles
+/// its reason (so a recurrence after a genuine recovery is a new occurrence;
+/// before one, the same incident).
+pub fn bind_epoch(draft: IncidentDraft, epoch: u64) -> IncidentDraft {
+    if verified_start_check(draft.reason_code, &draft.component).is_some()
+        && draft.reason_code != ReasonCode::UnclassifiedFailure
+    {
+        draft.discriminate("recovery_epoch", epoch.to_string())
+    } else {
+        draft
     }
 }
 
@@ -537,6 +564,48 @@ impl IncidentStore {
         }
     }
 
+    /// The automatic retry behind `id` was stopped on purpose: resolve it as
+    /// [`Resolution::OperationCancelled`], only while it is still unresolved
+    /// and `auto_retry` (a stop that needs an operator is never withdrawn).
+    /// Returns whether it was resolved.
+    pub async fn cancel_auto_retry(&self, id: &IncidentId) -> Result<bool> {
+        let rec = self
+            .transition(id, |r| {
+                if r.status.is_resolved()
+                    || r.retryability != Retryability::AutoRetry
+                {
+                    return None;
+                }
+                let mut next = r.clone();
+                next.status = IncidentStatus::Resolved {
+                    by: Resolution::OperationCancelled,
+                    at_ms: now_ms(),
+                };
+                Some((
+                    next,
+                    Transition::Resolved {
+                        by: Resolution::OperationCancelled,
+                    },
+                ))
+            })
+            .await?;
+        let resolved = rec.is_some_and(|r| {
+            r.status.is_resolved()
+                && matches!(
+                    r.status,
+                    IncidentStatus::Resolved {
+                        by: Resolution::OperationCancelled,
+                        ..
+                    }
+                )
+        });
+        if resolved {
+            self.prune_resolved().await?;
+            self.refresh_metrics().await;
+        }
+        Ok(resolved)
+    }
+
     /// Open `draft`'s incident, or count `occurrences` more of it (a resolved
     /// record of the same identity is reopened). At the limit it may displace
     /// a non-blocking incident (when it is blocking) or is counted on the
@@ -560,6 +629,10 @@ impl IncidentStore {
                             let mut next = r.clone();
                             next.status = IncidentStatus::Open;
                             next.evidence = evidence.clone();
+                            next.retryability = draft.retryability;
+                            next.safety_state = draft.safety_state;
+                            next.cause_code = draft.cause_code;
+                            next.actions = draft.actions.clone();
                             next.occurrences =
                                 next.occurrences.saturating_add(n);
                             next.last_seen_ms = now_ms();
@@ -570,6 +643,44 @@ impl IncidentStore {
                         && !rec.status.is_resolved()
                     {
                         self.count_raised(rec.reason_code);
+                        self.refresh_metrics().await;
+                        return Ok(Raised::Recorded(rec));
+                    }
+                }
+                Some((_, rec))
+                    if (rec.retryability, rec.safety_state, &rec.actions)
+                        != (
+                            draft.retryability,
+                            draft.safety_state,
+                            &draft.actions,
+                        ) =>
+                {
+                    let reclassified = self
+                        .transition(&id, |r| {
+                            if r.status.is_resolved() {
+                                return None;
+                            }
+                            let mut next = r.clone();
+                            next.retryability = draft.retryability;
+                            next.safety_state = draft.safety_state;
+                            next.cause_code = draft.cause_code;
+                            next.actions = draft.actions.clone();
+                            next.evidence = draft.evidence.clone();
+                            next.occurrences =
+                                next.occurrences.saturating_add(n);
+                            next.last_seen_ms = now_ms();
+                            Some((
+                                next,
+                                Transition::Reclassified {
+                                    retryability: draft.retryability,
+                                    safety_state: draft.safety_state,
+                                },
+                            ))
+                        })
+                        .await?;
+                    if let Some(rec) = reclassified
+                        && !rec.status.is_resolved()
+                    {
                         self.refresh_metrics().await;
                         return Ok(Raised::Recorded(rec));
                     }
@@ -941,6 +1052,11 @@ impl IncidentStore {
         }
     }
 
+    /// The current recovery epoch (what [`bind_epoch`] binds identities to).
+    pub async fn recovery_epoch(&self) -> Result<u64> {
+        Ok(self.control().await?.1.recovery_epoch)
+    }
+
     /// Repair pending audit entries and an interrupted recovery; returns the
     /// current recovery epoch. Run before a pipeline's tasks start.
     pub async fn prepare(&self) -> Result<u64> {
@@ -1144,6 +1260,7 @@ mod tests {
                 Transition::Acknowledged { .. } => "acknowledged",
                 Transition::Resolved { .. } => "resolved",
                 Transition::Displaced => "displaced",
+                Transition::Reclassified { .. } => "reclassified",
             })
             .collect()
     }
@@ -1176,6 +1293,82 @@ mod tests {
         store.raise(&draft(2), 1).await.unwrap();
         assert_eq!(store.list().await.unwrap().len(), 2);
         assert_eq!(store.audit_trail(100).await.unwrap().len(), 2);
+    }
+
+    /// A condition whose classification changes (an automatic retry that
+    /// exhausted its budget) stays one incident: the later raise reclassifies
+    /// it, as an audited transition; a repeat with the same classification
+    /// is not a transition.
+    #[tokio::test]
+    async fn a_changed_classification_reclassifies_the_same_incident() {
+        let store = IncidentStore::new(backend(), "p");
+        let mut retrying = draft(1);
+        retrying.retryability = Retryability::AutoRetry;
+        retrying.actions = vec![ActionCode::InspectLogs];
+        let a = store.raise(&retrying, 1).await.unwrap();
+        store.raise(&retrying, 1).await.unwrap();
+        let mut exhausted = draft(1);
+        exhausted.actions = vec![ActionCode::VerifyEndpoint];
+        let b = store.raise(&exhausted, 1).await.unwrap();
+        assert_eq!(a.record().incident_id, b.record().incident_id);
+        let rec = store.get(&a.record().incident_id).await.unwrap().unwrap();
+        assert_eq!(rec.retryability, Retryability::OperatorAction);
+        assert_eq!(rec.actions, [ActionCode::VerifyEndpoint]);
+        assert_eq!(rec.occurrences, 3);
+        assert_eq!(store.list().await.unwrap().len(), 1);
+        let trail = store.audit_trail(100).await.unwrap();
+        assert_eq!(kinds(&trail), ["opened", "reclassified"]);
+        assert_eq!(
+            trail[1].transition,
+            Transition::Reclassified {
+                retryability: Retryability::OperatorAction,
+                safety_state: SafetyState::HaltedSafe,
+            }
+        );
+    }
+
+    /// A resolved incident raised again reopens with the draft's current
+    /// classification, not the one it was resolved with.
+    #[tokio::test]
+    async fn a_reopened_incident_takes_the_new_classification() {
+        let store = IncidentStore::new(backend(), "p");
+        let mut retrying = draft(1);
+        retrying.retryability = Retryability::AutoRetry;
+        retrying.actions = vec![ActionCode::InspectLogs];
+        let id = id_of(&store, &retrying).await;
+        store.resolve(&id, recovered()).await.unwrap().unwrap();
+        let mut stopped = draft(1);
+        stopped.actions = vec![ActionCode::VerifyEndpoint];
+        store.raise(&stopped, 1).await.unwrap();
+        let rec = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(rec.status, IncidentStatus::Open);
+        assert_eq!(rec.retryability, Retryability::OperatorAction);
+        assert_eq!(rec.actions, [ActionCode::VerifyEndpoint]);
+    }
+
+    /// An automatic retry stopped on purpose is withdrawn as
+    /// `operation_cancelled` (no longer blocking); one that already needs an
+    /// operator is never withdrawn.
+    #[tokio::test]
+    async fn a_cancelled_auto_retry_is_withdrawn_but_operator_action_is_not() {
+        let store = IncidentStore::new(backend(), "p");
+        let mut retrying = draft(1);
+        retrying.retryability = Retryability::AutoRetry;
+        let id = id_of(&store, &retrying).await;
+        assert!(store.cancel_auto_retry(&id).await.unwrap());
+        let rec = store.get(&id).await.unwrap().unwrap();
+        assert!(matches!(
+            rec.status,
+            IncidentStatus::Resolved {
+                by: Resolution::OperationCancelled,
+                ..
+            }
+        ));
+        assert!(!rec.is_blocking());
+
+        let operator = id_of(&store, &draft(2)).await;
+        assert!(!store.cancel_auto_retry(&operator).await.unwrap());
+        assert!(store.get(&operator).await.unwrap().unwrap().is_blocking());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

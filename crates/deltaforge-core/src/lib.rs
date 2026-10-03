@@ -1029,6 +1029,18 @@ pub struct SinkBatchContext {
     pub batch_id: Option<String>,
 }
 
+/// What an authoritative read of one uncertain acknowledgement boundary
+/// proved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundaryOutcome {
+    /// The write applied: the batch is durable downstream.
+    Committed,
+    /// The write did not apply (the batch is redelivered from the checkpoint).
+    Absent,
+    /// Not decided; the uncertainty stays open.
+    Unknown,
+}
+
 #[async_trait]
 pub trait Sink: Send + Sync {
     fn id(&self) -> &str;
@@ -1062,6 +1074,17 @@ pub trait Sink: Send + Sync {
         _ctx: &SinkBatchContext,
     ) -> SinkResult<BatchResult> {
         self.send_batch(events).await
+    }
+
+    /// Settle one write this sink reported uncertain (a `sink_ack_uncertain`
+    /// incident with `evidence`) by an authoritative read of exactly that
+    /// boundary. The default proves nothing: the incident stays open. A read
+    /// that cannot decide is `Unknown`, never an error.
+    async fn settle_uncertain(
+        &self,
+        _evidence: &incident::Evidence,
+    ) -> BoundaryOutcome {
+        BoundaryOutcome::Unknown
     }
 }
 

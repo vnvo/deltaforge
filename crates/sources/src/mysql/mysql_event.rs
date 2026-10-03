@@ -1426,6 +1426,10 @@ mod tests {
                 "test",
                 "test",
             ),
+            incidents: storage::adapters::incidents::IncidentStore::new(
+                Arc::new(storage::MemoryStorageBackend::new()),
+                "test-pipeline",
+            ),
             checkpoint_gtid: Some("GTID-UNIT".to_string()),
             checkpoint_file: "mysql-bin.000001".to_string(),
             outbox_tables: AllowList::default(),
@@ -1442,6 +1446,85 @@ mod tests {
             on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
             durable_lineage: None,
         }
+    }
+
+    /// An unreachable server is retried while the resume position cannot be
+    /// verified: an open auto-retry incident. When the (injected) window ends
+    /// the source stops on the same incident, now operator action.
+    #[tokio::test]
+    async fn an_exhausted_gtid_check_turns_the_same_incident_into_operator_action()
+     {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let (tx, _rx) = mpsc::channel(1);
+        let mut ctx = make_runctx(tx);
+        ctx.dsn = format!("mysql://u:p@127.0.0.1:{port}/d").into();
+        let incidents = ctx.incidents.clone();
+        let task = tokio::spawn(async move {
+            crate::mysql::verify_gtid_position(
+                &ctx,
+                "3e11fa47-71ca-11e1-9e33-c80aa9429562",
+                Duration::from_secs(3),
+            )
+            .await
+        });
+        let retrying = loop {
+            if let Some(rec) = incidents.list().await.unwrap().pop() {
+                break rec;
+            }
+            assert!(!task.is_finished(), "recorded while it retries");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(retrying.retryability.as_str(), "auto_retry");
+
+        let err = task.await.unwrap().unwrap_err();
+        let draft = err.draft().expect("an incident");
+        assert_eq!(draft.retryability.as_str(), "operator_action");
+        let stopped = storage::adapters::incidents::bind_epoch(
+            draft.clone(),
+            incidents.recovery_epoch().await.unwrap(),
+        );
+        assert_eq!(stopped.incident_id("test-pipeline"), retrying.incident_id);
+        incidents.raise(&stopped, 1).await.unwrap();
+        let all = incidents.list().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].retryability.as_str(), "operator_action");
+    }
+
+    /// Cancellation while the GTID check retries stops promptly and
+    /// withdraws the auto-retry incident (`operation_cancelled`): an
+    /// intentional stop leaves nothing blocking.
+    #[tokio::test]
+    async fn cancellation_during_the_gtid_retry_withdraws_its_incident() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let (tx, _rx) = mpsc::channel(1);
+        let mut ctx = make_runctx(tx);
+        ctx.dsn = format!("mysql://u:p@127.0.0.1:{port}/d").into();
+        let (incidents, cancel) = (ctx.incidents.clone(), ctx.cancel.clone());
+        let task = tokio::spawn(async move {
+            crate::mysql::verify_gtid_position(
+                &ctx,
+                "3e11fa47-71ca-11e1-9e33-c80aa9429562",
+                Duration::from_secs(120),
+            )
+            .await
+        });
+        while incidents.list().await.unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        cancel.cancel();
+        let r = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("prompt")
+            .unwrap();
+        assert!(matches!(r, Err(SourceError::Cancelled)), "{r:?}");
+        crate::incident_drafts::test_util::assert_cancelled_withdrawn(
+            &incidents,
+        )
+        .await;
     }
 
     fn make_header() -> EventHeader {

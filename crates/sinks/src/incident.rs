@@ -7,16 +7,31 @@ use deltaforge_core::incident::{
 };
 use sha2::{Digest, Sha256};
 
+/// A conditional write whose outcome is unknown, named exactly: the object
+/// it swapped, the generation it was conditioned on and the content it
+/// proposed. A later authoritative read of that object settles it.
+pub(crate) struct ConditionalWrite<'a> {
+    pub object_key: &'a str,
+    /// The generation the write was conditioned on: `epoch:seq:entry`,
+    /// `entry` the hash of the entry it referenced (`genesis` when none).
+    pub expected_generation: &'a str,
+    /// Identity of the proposed content (a content hash).
+    pub content: &'a str,
+}
+
 /// The `sink_ack_uncertain` incident around `cause`: a write that may already
 /// be visible downstream was submitted, but its outcome is unknown and could
-/// not be settled by an authoritative read. Identity is the sink and the
-/// batch boundary (`boundary`: the batch's checkpoint bytes, exposed only as a
-/// digest). The pipeline stops halted-uncertain; the checkpoint is not
-/// advanced.
+/// not be settled by an authoritative read. Identity is the sink, the batch
+/// boundary (`boundary`: the batch's checkpoint bytes, exposed only as a
+/// digest) and exactly that conditional write. It is resolved
+/// only by settling this boundary ([`deltaforge_core::Sink::settle_uncertain`]),
+/// never by a later batch. The pipeline stops halted-uncertain; the
+/// checkpoint is not advanced.
 pub(crate) fn ack_uncertain(
     sink_id: &str,
     boundary: &[u8],
     attempts: u64,
+    write: ConditionalWrite<'_>,
     cause: SinkError,
 ) -> SinkError {
     let batch = hex::encode(Sha256::digest(boundary));
@@ -34,6 +49,14 @@ pub(crate) fn ack_uncertain(
         e.text(K::SinkId, sink_id)
             .digest(K::BatchBoundary, boundary, 1)
             .count(K::Attempts, attempts);
+    })
+    .discriminate("object", write.object_key)
+    .discriminate("generation", write.expected_generation)
+    .discriminate("content", write.content)
+    .with_evidence(|e| {
+        e.text(K::ObjectKey, write.object_key)
+            .text(K::ExpectedGeneration, write.expected_generation)
+            .text(K::ContentIdentity, write.content);
     })
     .with_actions(&[ActionCode::VerifySinkState]);
     SinkError::incident(draft, cause)

@@ -21,6 +21,7 @@ use common::{AllowList, RetryPolicy, pause_until_resumed};
 use storage::BackendCheckpointStore;
 
 use crate::snapshot_generation::PersistedLineage;
+use deltaforge_core::incident::{CauseCode, IncidentDraft, Retryability};
 use deltaforge_core::{
     CheckpointOrder, Source, SourceError, SourceHandle, SourceItem,
     SourceResult,
@@ -189,6 +190,9 @@ pub(crate) struct RunCtx {
     drift_checked: std::collections::HashSet<String>,
     /// Resolves this source's schema-drift incidents as tables are accepted.
     drift_resolver: crate::incident_drafts::DriftResolver,
+    /// The pipeline's incidents: a retried resume-position check is reported
+    /// here while it retries.
+    incidents: storage::adapters::incidents::IncidentStore,
     /// Original checkpoint position, preserved even after a pre-connect failover
     /// adjustment clears last_gtid/last_file. Used by check_position_reachability
     /// to verify whether A's position actually exists on B.
@@ -756,6 +760,10 @@ impl MySqlSource {
                 Arc::clone(&self.backend),
                 &self.pipeline,
                 &self.id,
+            ),
+            incidents: storage::adapters::incidents::IncidentStore::new(
+                Arc::clone(&self.backend),
+                &self.pipeline,
             ),
             checkpoint_gtid,
             checkpoint_file,
@@ -1622,17 +1630,21 @@ const REACHABILITY_RETRY_WINDOW: Duration = Duration::from_secs(120);
 
 /// Verify, on a connection proven to be `expected`, that the server has
 /// executed the checkpoint's GTID set before reading on. Fails closed: a
-/// confirmed loss stops at once; an unknown answer is retried with backoff
-/// while it is plausibly transient and stops when the window ends or the cause
-/// is not transient. Each stop is a `mysql_gtid_position_unavailable`
-/// incident.
+/// confirmed loss or an error answer stops at once; an unknown answer is
+/// retried with backoff while it is plausibly transient. While it retries,
+/// the condition is an open auto-retry `mysql_gtid_position_unavailable`
+/// incident; when the window ends the source stops on the same incident,
+/// which then needs an operator. Every stop is operator action; cancellation
+/// stops without one.
 async fn verify_gtid_position(
     ctx: &RunCtx,
     expected: &str,
+    window: Duration,
 ) -> SourceResult<()> {
-    let deadline = std::time::Instant::now() + REACHABILITY_RETRY_WINDOW;
+    let deadline = std::time::Instant::now() + window;
     let mut delay = Duration::from_secs(1);
     let gtid = ctx.checkpoint_gtid.as_deref();
+    let mut retrying = None;
     loop {
         let reach = match open_control_connection(
             ctx.dsn.expose(),
@@ -1684,6 +1696,20 @@ async fn verify_gtid_position(
             }
             PositionReachability::Unknown { transient, reason } => {
                 if transient && std::time::Instant::now() + delay < deadline {
+                    if retrying.is_none() {
+                        retrying = crate::incident_drafts::record_retrying(
+                            &ctx.incidents,
+                            &gtid_position_unavailable_draft(
+                                &ctx.source_id,
+                                Some(expected),
+                                gtid,
+                                "unknown_unreachable",
+                                Retryability::AutoRetry,
+                                CauseCode::SourceConnect,
+                            ),
+                        )
+                        .await;
+                    }
                     warn!(
                         source_id = %ctx.source_id, %reason,
                         retry_in_secs = delay.as_secs(),
@@ -1692,7 +1718,14 @@ async fn verify_gtid_position(
                     );
                     tokio::select! {
                         _ = tokio::time::sleep(delay) => {}
-                        _ = ctx.cancel.cancelled() => return Err(SourceError::Cancelled),
+                        _ = ctx.cancel.cancelled() => {
+                            crate::incident_drafts::cancel_retrying(
+                                &ctx.incidents,
+                                retrying,
+                            )
+                            .await;
+                            return Err(SourceError::Cancelled);
+                        }
                     }
                     delay = (delay * 2).min(Duration::from_secs(15));
                     continue;
@@ -1727,8 +1760,8 @@ async fn verify_gtid_position(
     }
 }
 
-/// The `mysql_gtid_position_unavailable` incident around `cause`. The GTID
-/// set is exposed only as a digest with its interval count.
+/// The `mysql_gtid_position_unavailable` incident around `cause`: the source
+/// stops, so it needs an operator.
 pub(crate) fn gtid_position_unavailable(
     source_id: &str,
     server_uuid: Option<&str>,
@@ -1736,16 +1769,33 @@ pub(crate) fn gtid_position_unavailable(
     class: &str,
     cause: SourceError,
 ) -> SourceError {
+    let draft = gtid_position_unavailable_draft(
+        source_id,
+        server_uuid,
+        gtid_set,
+        class,
+        Retryability::OperatorAction,
+        cause.cause_code(),
+    );
+    SourceError::incident(draft, cause)
+}
+
+/// The `mysql_gtid_position_unavailable` draft. The GTID set is exposed only
+/// as a digest with its interval count. Its identity is the server, GTID set
+/// and class, never the retryability, so an automatic retry that exhausts
+/// its window stays one incident.
+fn gtid_position_unavailable_draft(
+    source_id: &str,
+    server_uuid: Option<&str>,
+    gtid_set: Option<&str>,
+    class: &str,
+    retryability: Retryability,
+    cause_code: CauseCode,
+) -> IncidentDraft {
     use deltaforge_core::incident::{
-        ActionCode, Component, EvidenceKey as K, IncidentDraft, ReasonCode,
-        Retryability, SafetyState,
+        ActionCode, Component, EvidenceKey as K, ReasonCode, SafetyState,
     };
     let unknown = class.starts_with("unknown_");
-    let retryability = if class == "unknown_unreachable" {
-        Retryability::AutoRetry
-    } else {
-        Retryability::OperatorAction
-    };
     let actions: &[ActionCode] = if unknown {
         &[ActionCode::VerifyEndpoint, ActionCode::InspectLogs]
     } else {
@@ -1757,14 +1807,14 @@ pub(crate) fn gtid_position_unavailable(
     let set = gtid_set.unwrap_or("");
     let intervals =
         set.split(',').filter(|p| !p.trim().is_empty()).count() as u64;
-    let draft = IncidentDraft::new(
+    IncidentDraft::new(
         ReasonCode::MysqlGtidPositionUnavailable,
         Component::Source {
             id: source_id.to_string(),
         },
         retryability,
         SafetyState::HaltedSafe,
-        cause.cause_code(),
+        cause_code,
     )
     .discriminate("server_uuid", server_uuid.unwrap_or("-"))
     .discriminate("gtid_set", set)
@@ -1778,8 +1828,7 @@ pub(crate) fn gtid_position_unavailable(
             e.digest(K::GtidSet, set.as_bytes(), intervals);
         }
     })
-    .with_actions(actions);
-    SourceError::incident(draft, cause)
+    .with_actions(actions)
 }
 
 /// Compare the live server identity against the stored one.
@@ -1825,7 +1874,8 @@ async fn check_identity_post_reconnect(
             // Skip when there is no GTID checkpoint (file/pos mode or fresh
             // start) to avoid false positives from the file-presence fallback.
             if ctx.checkpoint_gtid.is_some() {
-                verify_gtid_position(ctx, &expected).await?;
+                verify_gtid_position(ctx, &expected, REACHABILITY_RETRY_WINDOW)
+                    .await?;
             }
         }
         IdentityComparison::Changed { previous, current } => {

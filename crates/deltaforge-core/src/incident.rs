@@ -316,6 +316,9 @@ pub enum EvidenceKey {
     BatchBoundary,
     Attempts,
     BlockingCount,
+    ObjectKey,
+    ExpectedGeneration,
+    ContentIdentity,
 }
 
 impl EvidenceKey {
@@ -339,6 +342,9 @@ impl EvidenceKey {
             Self::BatchBoundary => "batch_boundary",
             Self::Attempts => "attempts",
             Self::BlockingCount => "blocking_count",
+            Self::ObjectKey => "object_key",
+            Self::ExpectedGeneration => "expected_generation",
+            Self::ContentIdentity => "content_identity",
         }
     }
 }
@@ -444,6 +450,27 @@ impl Evidence {
 
     pub fn get(&self, key: EvidenceKey) -> Option<&EvidenceValue> {
         self.0.get(&key)
+    }
+
+    /// Whether `key` holds `value`: as text, or as the digest it was stored
+    /// as. A verifier recomputes a value and checks it here, so a digest
+    /// still identifies exactly one value.
+    pub fn holds(&self, key: EvidenceKey, value: &str) -> bool {
+        match self.0.get(&key) {
+            Some(EvidenceValue::Text { value: v }) => v == value,
+            Some(EvidenceValue::Digest { sha256, .. }) => {
+                *sha256 == sha256_hex(value.as_bytes())
+            }
+            _ => false,
+        }
+    }
+
+    /// The text held under `key`, if it was stored as text.
+    pub fn text_of(&self, key: EvidenceKey) -> Option<&str> {
+        match self.0.get(&key) {
+            Some(EvidenceValue::Text { value }) => Some(value),
+            _ => None,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -620,9 +647,19 @@ pub fn explain(
         ReasonCode::SinkAckUncertain => format!(
             "{component} submitted a write for batch {} but its outcome is \
              unknown after {} attempt(s). The checkpoint was not advanced; the \
-             batch may already be visible downstream.",
+             batch may already be visible downstream.{}",
             ev.show(K::BatchBoundary),
             ev.show(K::Attempts),
+            match ev.get(K::ObjectKey) {
+                Some(_) => format!(
+                    " The write was a compare-and-swap of {} from generation \
+                     {} to content {}.",
+                    ev.show(K::ObjectKey),
+                    ev.show(K::ExpectedGeneration),
+                    ev.show(K::ContentIdentity),
+                ),
+                None => String::new(),
+            },
         ),
         ReasonCode::IncidentOverflow => format!(
             "{component} reached its open-incident limit; {} further \

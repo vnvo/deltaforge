@@ -278,6 +278,7 @@ fn transitions(
             Transition::Acknowledged { .. } => "acknowledged",
             Transition::Resolved { .. } => "resolved",
             Transition::Displaced => "displaced",
+            Transition::Reclassified { .. } => "reclassified",
         })
         .collect()
 }
