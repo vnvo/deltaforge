@@ -1,6 +1,7 @@
 pub mod coordinator;
 pub mod dlq;
 pub mod drift_detector;
+pub mod incidents;
 pub mod pipeline_manager;
 pub mod preflight;
 pub mod replay_controller;
