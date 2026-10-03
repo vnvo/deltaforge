@@ -1260,8 +1260,11 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         let max_events = self.batch_cfg_eff.max_events.unwrap_or(usize::MAX);
         let max_bytes = self.batch_cfg_eff.max_bytes.unwrap_or(usize::MAX);
         let max_inflight = self.batch_cfg_eff.max_inflight.unwrap_or(1);
+        // `effective` always sets this from `BatchConfig::default()` (true) when
+        // the pipeline omits it; the fallback below matches that default and
+        // must never weaken it.
         let respect_source_tx =
-            self.batch_cfg_eff.respect_source_tx.unwrap_or(false);
+            self.batch_cfg_eff.respect_source_tx.unwrap_or(true);
         let max_tx_events =
             self.batch_cfg_eff.max_tx_events.unwrap_or(usize::MAX);
         let max_tx_bytes =
@@ -2451,6 +2454,16 @@ mod tests {
         sink: Arc<MockSink>,
         cfg: BatchConfig,
     ) -> Coordinator<CheckpointMeta> {
+        coord_with_batch(store, sink, Some(cfg))
+    }
+
+    /// A coordinator built exactly as a pipeline builds it from its `batch`
+    /// section (`None` = no section).
+    fn coord_with_batch(
+        store: Arc<checkpoints::MemCheckpointStore>,
+        sink: Arc<MockSink>,
+        batch: Option<BatchConfig>,
+    ) -> Coordinator<CheckpointMeta> {
         let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
         let cp_fn = build_commit_fn(store, "src::sink::kafka".to_string());
         let processors: Arc<[deltaforge_core::ArcDynProcessor]> =
@@ -2459,7 +2472,7 @@ mod tests {
             build_batch_processor(processors, "test".to_string());
         Coordinator::builder("tx-test")
             .sinks(sinks)
-            .batch_config(Some(cfg))
+            .batch_config(batch)
             .commit_fn("kafka", cp_fn)
             .process_fn(batch_processor)
             .build()
@@ -4005,20 +4018,27 @@ mod tests {
         respect_source_tx: bool,
         max_events: usize,
     ) -> (Result<()>, Vec<i64>, Option<Vec<u8>>) {
-        use checkpoints::MemCheckpointStore;
-        let store = Arc::new(MemCheckpointStore::new().unwrap());
-        let sink = MockSink::new("kafka", true);
-        let coord = tx_coord(
-            store.clone(),
-            Arc::clone(&sink),
-            BatchConfig {
+        deliver_with(
+            Some(BatchConfig {
                 max_events: Some(max_events),
                 max_ms: Some(60_000),
                 respect_source_tx: Some(respect_source_tx),
                 max_inflight: Some(1),
                 ..BatchConfig::default()
-            },
-        );
+            }),
+            items,
+        )
+        .await
+    }
+
+    async fn deliver_with(
+        batch: Option<BatchConfig>,
+        items: Vec<SourceItem>,
+    ) -> (Result<()>, Vec<i64>, Option<Vec<u8>>) {
+        use checkpoints::MemCheckpointStore;
+        let store = Arc::new(MemCheckpointStore::new().unwrap());
+        let sink = MockSink::new("kafka", true);
+        let coord = coord_with_batch(store.clone(), Arc::clone(&sink), batch);
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let cancel = tokio_util::sync::CancellationToken::new();
         let (_pause_tx, pause_rx) =
@@ -4101,6 +4121,54 @@ mod tests {
             .filter_map(|e| e.event.get("after")?.get("id")?.as_i64())
             .collect();
         assert_eq!(ids, vec![10, 11], "the replay only, once");
+    }
+
+    /// A transaction abandoned and replayed, as a source sends it.
+    fn abandoned_and_replayed() -> Vec<SourceItem> {
+        vec![
+            begin("t2"),
+            SourceItem::Event(tx_event(10, "t2", b"r10")),
+            SourceItem::Event(tx_event(11, "t2", b"r11")),
+            SourceItem::Event(tx_event(12, "t2", b"r12")),
+            abort("t2"),
+            begin("t2"),
+            SourceItem::Event(tx_event(10, "t2", b"r10")),
+            SourceItem::Event(tx_event(11, "t2", b"r11")),
+            SourceItem::Event(tx_event(12, "t2", b"r12")),
+            commit("t2", b"cp-2"),
+        ]
+    }
+
+    /// A pipeline that does not set `respect_source_tx` (no `batch` section,
+    /// or a section without the key, deserialized as a pipeline spec is)
+    /// respects source transactions: an abandoned prefix is discarded, never
+    /// duplicated, even when the batch size would have flushed it.
+    #[tokio::test]
+    async fn an_omitted_respect_source_tx_respects_source_transactions() {
+        let partial: BatchConfig =
+            serde_yaml::from_str("max_events: 1\nmax_ms: 60000\n").unwrap();
+        assert_eq!(partial.respect_source_tx, Some(true));
+        for batch in [None, Some(partial)] {
+            let (res, ids, cp) =
+                deliver_with(batch, abandoned_and_replayed()).await;
+            res.expect("valid stream");
+            assert_eq!(ids, vec![10, 11, 12], "delivered once");
+            assert_eq!(cp.as_deref(), Some(&b"cp-2"[..]));
+        }
+    }
+
+    /// `respect_source_tx: false` is an explicit opt-out: a prefix flushed
+    /// before the abort is delivered again by the replay (may_duplicate).
+    #[tokio::test]
+    async fn an_explicit_false_opts_into_possible_duplicates() {
+        let batch: BatchConfig = serde_yaml::from_str(
+            "respect_source_tx: false\nmax_events: 1\nmax_ms: 60000\n",
+        )
+        .unwrap();
+        let (res, ids, _) =
+            deliver_with(Some(batch), abandoned_and_replayed()).await;
+        res.expect("valid stream");
+        assert_eq!(ids, vec![10, 11, 12, 10, 11, 12]);
     }
 
     /// An abandoned transaction whose replay has not arrived yet advances

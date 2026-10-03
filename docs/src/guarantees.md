@@ -110,7 +110,17 @@ When the replication stream ends inside a transaction (the connection is closed 
 | `respect_source_tx: false` | Rows already delivered for it cannot be recalled; its replay may deliver them again (at-least-once duplicates) |
 | Either mode | The checkpoint never advances for the abandoned attempt; a process restart resumes from the durable checkpoint |
 
-Each abandoned transaction logs a warning (source, transaction, last complete position, events abandoned, whether duplicates are possible) and counts in `deltaforge_source_transaction_aborts_total`, `deltaforge_source_replayed_events_total` and `deltaforge_abandoned_tx_total{outcome="discarded"|"may_duplicate"}`; reconnects count in `deltaforge_source_reconnects_total`. Keep `respect_source_tx: true` for production. In that mode an open transaction is buffered in memory up to `max_tx_events` / `max_tx_bytes`, beyond which the `oversized_tx` policy applies.
+Each abandoned transaction logs a warning (source, transaction, last complete position, events abandoned, whether duplicates are possible). Metrics:
+
+| Metric | Meaning |
+|--------|---------|
+| `deltaforge_source_reconnects_total` | The source reconnected after a transient stream error |
+| `deltaforge_source_transaction_aborts_total` | The source found its stream interrupted inside an open transaction and abandoned it |
+| `deltaforge_source_replayed_events_total` | Events the source had already handed on for an abandoned attempt and sends again with the replay. Includes events the coordinator only buffered (never delivered) under `respect_source_tx: true`: it is not a count of downstream duplicates |
+| `deltaforge_abandoned_tx_total{outcome="discarded"}` | The coordinator discarded the abandoned attempt's buffered prefix (no duplicates) |
+| `deltaforge_abandoned_tx_total{outcome="may_duplicate"}` | `respect_source_tx: false`: part of the abandoned attempt may already have reached sinks and may be delivered again |
+
+`respect_source_tx` is `true` unless a pipeline sets it to `false`: `BatchConfig` fills every key a pipeline's `batch` section omits from its defaults (`respect_source_tx: true`), and the coordinator applies the same defaults when there is no `batch` section at all. Keep it `true` for production. In that mode an open transaction is buffered in memory up to `max_tx_events` / `max_tx_bytes`, beyond which the `oversized_tx` policy applies.
 
 ## Initial-snapshot anchoring
 
