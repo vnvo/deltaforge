@@ -25,6 +25,8 @@ use std::fmt;
     Copy,
     PartialEq,
     Eq,
+    PartialOrd,
+    Ord,
     Hash,
     serde::Serialize,
     serde::Deserialize,
@@ -43,6 +45,9 @@ pub enum ReasonCode {
     SinkAckUncertain,
     /// A failure no mapping classifies yet.
     UnclassifiedFailure,
+    /// The pipeline's open-incident limit was reached; this record counts the
+    /// incidents not kept individually.
+    IncidentOverflow,
 }
 
 impl ReasonCode {
@@ -56,6 +61,7 @@ impl ReasonCode {
             Self::SchemaDriftBlocked => "schema_drift_blocked",
             Self::SinkAckUncertain => "sink_ack_uncertain",
             Self::UnclassifiedFailure => "unclassified_failure",
+            Self::IncidentOverflow => "incident_overflow",
         }
     }
 }
@@ -156,9 +162,15 @@ pub enum ActionCode {
 )]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Component {
-    Source { id: String },
-    Sink { id: String },
+    Source {
+        id: String,
+    },
+    Sink {
+        id: String,
+    },
     Coordinator,
+    /// The pipeline as a whole (e.g. its incident overflow record).
+    Pipeline,
 }
 
 impl fmt::Display for Component {
@@ -167,6 +179,7 @@ impl fmt::Display for Component {
             Self::Source { id } => write!(f, "source {}", safe_or_redacted(id)),
             Self::Sink { id } => write!(f, "sink {}", safe_or_redacted(id)),
             Self::Coordinator => f.write_str("coordinator"),
+            Self::Pipeline => f.write_str("pipeline"),
         }
     }
 }
@@ -212,6 +225,8 @@ pub enum CauseCode {
     CoordinatorOther,
     /// The coordinator stopped on its own without an error.
     CoordinatorEnded,
+    /// The pipeline's incident limit (overflow accounting).
+    IncidentLimit,
 }
 
 impl CauseCode {
@@ -243,6 +258,7 @@ impl CauseCode {
             Self::TransactionProtocol => "transaction_protocol",
             Self::CoordinatorOther => "coordinator_other",
             Self::CoordinatorEnded => "coordinator_ended",
+            Self::IncidentLimit => "incident_limit",
         }
     }
 }
@@ -279,6 +295,7 @@ pub enum EvidenceKey {
     ReasonClass,
     BatchBoundary,
     Attempts,
+    BlockingCount,
 }
 
 impl EvidenceKey {
@@ -301,6 +318,7 @@ impl EvidenceKey {
             Self::ReasonClass => "reason_class",
             Self::BatchBoundary => "batch_boundary",
             Self::Attempts => "attempts",
+            Self::BlockingCount => "blocking_count",
         }
     }
 }
@@ -567,6 +585,13 @@ pub fn explain(
             ev.show(K::BatchBoundary),
             ev.show(K::Attempts),
         ),
+        ReasonCode::IncidentOverflow => format!(
+            "{component} reached its open-incident limit; {} further \
+             incident(s) are counted here instead of recorded individually \
+             ({} of them blocking).",
+            ev.show(K::Attempts),
+            ev.show(K::BlockingCount),
+        ),
         ReasonCode::UnclassifiedFailure => format!(
             "{component} failed ({}). The pipeline stopped; this failure is \
              not classified yet, see the logs for details.",
@@ -668,6 +693,7 @@ mod tests {
             EvidenceKey::ReasonClass,
             EvidenceKey::BatchBoundary,
             EvidenceKey::Attempts,
+            EvidenceKey::BlockingCount,
         ]
         .into_iter()
         .enumerate()

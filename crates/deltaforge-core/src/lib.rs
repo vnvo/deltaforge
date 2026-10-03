@@ -842,12 +842,47 @@ impl SourceItem {
 // Source Handle
 // ============================================================================
 
+/// Set once by a source when its startup checks have passed and its change
+/// stream is open on the verified server: the source half of a pipeline's
+/// verified-running barrier. Never cleared; a source that never sets it never
+/// reaches the barrier.
+#[derive(Clone, Default)]
+pub struct SourceReady(Arc<(AtomicBool, Notify)>);
+
+impl SourceReady {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mark(&self) {
+        self.0.0.store(true, Ordering::SeqCst);
+        self.0.1.notify_waiters();
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.0.0.load(Ordering::SeqCst)
+    }
+
+    /// Wait until marked (returns at once if it already is).
+    pub async fn wait(&self) {
+        loop {
+            let notified = self.0.1.notified();
+            if self.is_ready() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 /// Control handle for a running source.
 pub struct SourceHandle {
     pub cancel: CancellationToken,
     pub paused: Arc<AtomicBool>,
     pub pause_notify: Arc<Notify>,
     pub join: JoinHandle<SourceResult<()>>,
+    /// Marked when the source's startup checks passed and its stream is open.
+    pub ready: SourceReady,
 }
 
 impl SourceHandle {

@@ -357,6 +357,7 @@ impl MySqlSource {
         cancel: CancellationToken,
         paused: Arc<AtomicBool>,
         pause_notify: Arc<Notify>,
+        ready: deltaforge_core::SourceReady,
     ) -> SourceResult<()> {
         // Verify the source lineage ONCE, before any snapshot, stream, or RunCtx.
         // Fail closed if it cannot be established: a swallowed error here would
@@ -814,6 +815,9 @@ impl MySqlSource {
             None => None,
         };
 
+        // Startup checks passed and the stream is open on the verified
+        // server: the source half of the verified-running barrier.
+        ready.mark();
         info!("entering binlog read loop");
         // The loop runs inside an async block so its result can be captured and the
         // rotation runtime cancelled+joined before teardown, on both the normal and
@@ -1011,6 +1015,8 @@ impl Source for MySqlSource {
         let cancel_for_task = cancel.clone();
         let paused_for_task = paused.clone();
         let pause_notify_for_task = pause_notify.clone();
+        let ready = deltaforge_core::SourceReady::new();
+        let ready_for_task = ready.clone();
 
         let join = tokio::spawn(async move {
             let res = this
@@ -1020,6 +1026,7 @@ impl Source for MySqlSource {
                     cancel_for_task,
                     paused_for_task,
                     pause_notify_for_task,
+                    ready_for_task,
                 )
                 .await;
             if let Err(e) = &res {
@@ -1033,6 +1040,7 @@ impl Source for MySqlSource {
             paused,
             pause_notify,
             join,
+            ready,
         }
     }
 

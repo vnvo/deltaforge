@@ -4748,7 +4748,7 @@ mod tests {
             .find_map(|c| c.downcast_ref::<SinkDeliveryError>())
             .expect("the sink's typed error is chained");
         assert_eq!(failure.sink_id, "kafka");
-        let draft = crate::incidents::classify_coordinator_exit(&err);
+        let draft = crate::incidents::classify_coordinator_exit(&err, 0);
         assert_eq!(
             draft.component,
             deltaforge_core::incident::Component::Sink { id: "kafka".into() }

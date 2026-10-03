@@ -109,6 +109,7 @@ impl Source for FakeSource {
             paused,
             pause_notify,
             join,
+            ready: deltaforge_core::SourceReady::new(),
         }
     }
 
