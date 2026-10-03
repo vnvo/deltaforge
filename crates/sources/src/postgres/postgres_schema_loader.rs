@@ -70,6 +70,10 @@ pub struct PostgresSchemaLoader {
     registry: Arc<DurableSchemaRegistry>,
     scope: SharedRegistryScope,
     tenant: String,
+    /// Single-flight per table: concurrent first uses share one load.
+    flights: Arc<crate::registry_scope::LoadFlights>,
+    /// Live catalog reads made by this loader (and its clones).
+    live_fetches: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for PostgresSchemaLoader {
@@ -102,7 +106,15 @@ impl PostgresSchemaLoader {
             registry,
             scope,
             tenant: tenant.to_string(),
+            flights: Default::default(),
+            live_fetches: Default::default(),
         }
+    }
+
+    /// Live catalog reads this loader (and its clones) made so far: a
+    /// diagnostic for operation-count evidence.
+    pub fn live_fetch_count(&self) -> u64 {
+        self.live_fetches.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The established registry scope. Fails closed when none is published.
@@ -370,6 +382,12 @@ impl PostgresSchemaLoader {
             counter!("deltaforge_source_schema_cache_misses_total",
                 "pipeline" => self.tenant.clone(), "source" => "postgres")
             .increment(1);
+            let _flight = self.flights.acquire(&key).await;
+            if let Some(cached) =
+                self.cache.read().await.get(scope.generation(), &key)
+            {
+                return Ok(cached);
+            }
 
             let t0 = Instant::now();
             let pg_schema = match self.fetch_live(&scope, schema, table).await?
@@ -462,6 +480,13 @@ impl PostgresSchemaLoader {
             // 1. Cached schema, ONLY if it is THIS relation's schema. A cache entry
             //    for the same name but a different relation (e.g. a recreated
             //    table) must not be used.
+            if let Some(cached) =
+                self.cache.read().await.get(scope.generation(), &key)
+                && cached.schema.matches_relation(rel)
+            {
+                return Ok(cached);
+            }
+            let _flight = self.flights.acquire(&key).await;
             if let Some(cached) =
                 self.cache.read().await.get(scope.generation(), &key)
                 && cached.schema.matches_relation(rel)
@@ -569,13 +594,33 @@ impl PostgresSchemaLoader {
         self.cache.write().await.clear();
     }
 
-    /// Reload all schemas matching patterns.
+    /// Reload the tables in use: every table resident in the cache (matching
+    /// `patterns`, when given) is fetched again from the live catalog and
+    /// re-registered; other tables load on their next use. Never enumerates
+    /// the catalog, so its cost follows the working set, not the catalog.
     pub async fn reload_all(
         &self,
         patterns: &[String],
     ) -> SourceResult<Vec<(String, String)>> {
-        self.cache.write().await.clear();
-        self.preload(patterns).await
+        let allow = common::AllowList::new(patterns);
+        let resident: Vec<(String, String)> = {
+            let mut cache = self.cache.write().await;
+            let keys = cache
+                .entries_for(self.scope.generation())
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
+            cache.clear();
+            keys
+        };
+        let mut reloaded = Vec::new();
+        for (qualifier, table) in resident {
+            if allow.matches(&qualifier, &table) {
+                self.load_schema(&qualifier, &table).await?;
+                reloaded.push((qualifier, table));
+            }
+        }
+        Ok(reloaded)
     }
 
     /// Get cached schema (without loading from DB).
@@ -599,6 +644,8 @@ impl PostgresSchemaLoader {
         schema_name: &str,
         table_name: &str,
     ) -> SourceResult<Live> {
+        self.live_fetches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let client = self.connect().await?;
 
         let live = client

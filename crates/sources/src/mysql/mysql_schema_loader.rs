@@ -70,6 +70,10 @@ pub struct MySqlSchemaLoader {
     registry: Arc<DurableSchemaRegistry>,
     scope: SharedRegistryScope,
     tenant: String,
+    /// Single-flight per table: concurrent first uses share one load.
+    flights: Arc<crate::registry_scope::LoadFlights>,
+    /// Live catalog reads made by this loader (and its clones).
+    live_fetches: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for MySqlSchemaLoader {
@@ -103,7 +107,15 @@ impl MySqlSchemaLoader {
             registry,
             scope,
             tenant: tenant.to_string(),
+            flights: Default::default(),
+            live_fetches: Default::default(),
         }
+    }
+
+    /// Live catalog reads this loader (and its clones) made so far: a
+    /// diagnostic for operation-count evidence.
+    pub fn live_fetch_count(&self) -> u64 {
+        self.live_fetches.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The established registry scope. Fails closed when none is published.
@@ -409,6 +421,12 @@ impl MySqlSchemaLoader {
             counter!("deltaforge_source_schema_cache_misses_total",
                 "pipeline" => self.tenant.clone(), "source" => "mysql")
             .increment(1);
+            let _flight = self.flights.acquire(&key).await;
+            if let Some(cached) =
+                self.cache.read().await.get(scope.generation(), &key)
+            {
+                return Ok(cached);
+            }
 
             let t0 = Instant::now();
             let schema = match self.fetch_schema(&scope, db, table).await? {
@@ -505,22 +523,39 @@ impl MySqlSchemaLoader {
         self.load_schema(db, table).await
     }
 
-    /// Reload all schemas matching patterns.
     /// Forget every cached schema; each table reloads on its next use. No
     /// catalog enumeration.
     pub async fn clear_cache(&self) {
         self.cache.write().await.clear();
     }
 
+    /// Reload the tables in use: every table resident in the cache (matching
+    /// `patterns`, when given) is fetched again from the live catalog and
+    /// re-registered; other tables load on their next use. Never enumerates
+    /// the catalog, so its cost follows the working set, not the catalog.
     pub async fn reload_all(
         &self,
         patterns: &[String],
     ) -> SourceResult<Vec<(String, String)>> {
-        // Clear cache
-        self.cache.write().await.clear();
-
-        // Re-expand and reload
-        self.preload(patterns).await
+        let allow = common::AllowList::new(patterns);
+        let resident: Vec<(String, String)> = {
+            let mut cache = self.cache.write().await;
+            let keys = cache
+                .entries_for(self.scope.generation())
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
+            cache.clear();
+            keys
+        };
+        let mut reloaded = Vec::new();
+        for (qualifier, table) in resident {
+            if allow.matches(&qualifier, &table) {
+                self.load_schema(&qualifier, &table).await?;
+                reloaded.push((qualifier, table));
+            }
+        }
+        Ok(reloaded)
     }
 
     /// Get cached schema (without loading from DB).
@@ -613,6 +648,8 @@ impl MySqlSchemaLoader {
         db: &str,
         table: &str,
     ) -> SourceResult<Live> {
+        self.live_fetches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut conn = self.pool.get_conn().await.map_err(conn_error)?;
         let storage::adapters::LineageDescriptor::Mysql { server_uuid } =
             &scope.lineage().descriptor
@@ -692,6 +729,8 @@ impl MySqlSchemaLoader {
             registry: storage::DurableSchemaRegistry::for_testing(),
             scope,
             tenant: "test".to_string(),
+            flights: Default::default(),
+            live_fetches: Default::default(),
         }
     }
 }
@@ -781,9 +820,9 @@ impl SourceSchemaLoader for MySqlSchemaLoader {
         patterns: &[String],
     ) -> anyhow::Result<Vec<(String, String)>> {
         self.scope.current()?;
-        // Clear cache and re-preload (reuse existing preload logic)
-        self.cache.write().await.clear();
-        self.preload(patterns).await.map_err(Into::into)
+        MySqlSchemaLoader::reload_all(self, patterns)
+            .await
+            .map_err(Into::into)
     }
 
     fn lineage_established(&self) -> bool {

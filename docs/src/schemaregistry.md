@@ -212,7 +212,7 @@ Force reload schemas from the database:
 curl -X POST http://localhost:8080/pipelines/{name}/schemas/reload
 ```
 
-This clears the cache and re-fetches schemas for all tracked tables.
+This re-fetches and re-registers the schemas of the tables currently in use (cached), narrowed by the pipeline's table patterns. It never enumerates the catalog: other tables load on their next use. Concurrent first uses of a table share one load.
 
 ### List Cached Schemas
 

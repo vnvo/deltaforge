@@ -336,6 +336,50 @@ async fn drain_items(
 // TESTS
 // =============================================================================
 
+/// Concurrent first uses of one table share one live load (single-flight),
+/// and a reload refreshes only the tables in use: it never enumerates the
+/// catalog (with no configured patterns, PostgreSQL previously reloaded every
+/// base table).
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn postgres_loader_loads_once_and_reloads_only_tables_in_use()
+-> Result<()> {
+    let (db, client) = pg_setup("singleflight").await?;
+    for t in ["used", "idle_a", "idle_b"] {
+        client
+            .execute(&format!("CREATE TABLE {t} (id INT PRIMARY KEY)"), &[])
+            .await?;
+    }
+    let (loader, _scope) = test_common::pg_scoped_loader(
+        &pg_admin_dsn(&db).await,
+        make_registry().await,
+        "acme",
+    )
+    .await?;
+
+    let loads: Vec<_> = (0..16)
+        .map(|_| {
+            let loader = loader.clone();
+            tokio::spawn(
+                async move { loader.load_schema("public", "used").await },
+            )
+        })
+        .collect();
+    let mut versions = std::collections::BTreeSet::new();
+    for load in loads {
+        versions.insert(load.await??.registry_version);
+    }
+    assert_eq!(versions.len(), 1);
+    assert_eq!(loader.live_fetch_count(), 1, "one load for 16 first uses");
+
+    let reloaded = loader.reload_all(&[]).await?;
+    assert_eq!(reloaded, [("public".to_string(), "used".to_string())]);
+    assert_eq!(loader.live_fetch_count(), 2, "only the table in use");
+
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_schema_loader() -> Result<()> {

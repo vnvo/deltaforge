@@ -160,6 +160,54 @@ async fn start_source(
 // Tests
 // =============================================================================
 
+/// Concurrent first uses of one table share one live load (single-flight),
+/// and a reload refreshes only the tables in use, never enumerating the
+/// catalog.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_loader_loads_once_and_reloads_only_tables_in_use() -> Result<()>
+{
+    let (db_name, pool, dsn) = mysql_setup("singleflight").await?;
+    let mut conn = pool.get_conn().await?;
+    for t in ["used", "idle_a", "idle_b"] {
+        conn.query_drop(format!(
+            "CREATE TABLE {db_name}.{t} (id INT PRIMARY KEY)"
+        ))
+        .await?;
+    }
+    let scope = sources::registry_scope::SharedRegistryScope::new("test");
+    sources::mysql::establish_registry_scope(
+        &dsn,
+        &make_storage_backend().await,
+        &scope,
+        "acme",
+        "test",
+    )
+    .await?;
+    let loader =
+        MySqlSchemaLoader::new(&dsn, make_registry().await, "acme", scope);
+
+    let loads: Vec<_> = (0..16)
+        .map(|_| {
+            let (loader, db) = (loader.clone(), db_name.clone());
+            tokio::spawn(async move { loader.load_schema(&db, "used").await })
+        })
+        .collect();
+    let mut versions = std::collections::BTreeSet::new();
+    for load in loads {
+        versions.insert(load.await??.registry_version);
+    }
+    assert_eq!(versions.len(), 1);
+    assert_eq!(loader.live_fetch_count(), 1, "one load for 16 first uses");
+
+    let reloaded = loader.reload_all(&[format!("{db_name}.*")]).await?;
+    assert_eq!(reloaded, [(db_name.clone(), "used".to_string())]);
+    assert_eq!(loader.live_fetch_count(), 2, "only the table in use");
+
+    mysql_drop_db(&pool, &db_name).await;
+    Ok(())
+}
+
 /// Test schema loader: pattern expansion, column loading, fingerprinting, DDL detection.
 #[tokio::test]
 #[ignore = "requires docker"]

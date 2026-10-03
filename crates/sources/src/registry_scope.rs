@@ -137,6 +137,43 @@ pub fn is_lineage_unavailable(err: &anyhow::Error) -> bool {
     })
 }
 
+/// Single-flight per table for a schema loader: concurrent first uses of one
+/// `(schema, table)` share one load. A loader takes the table's flight after a
+/// cache miss and checks the cache again before loading, so only the first
+/// caller fetches and registers; the others are served from the cache it
+/// filled. Holds only the tables being loaded right now.
+#[derive(Debug, Default)]
+pub(crate) struct LoadFlights {
+    flights: std::sync::Mutex<HashMap<(String, String), Flight>>,
+}
+
+/// One table's load in progress (gone once every waiter released it).
+type Flight = std::sync::Weak<tokio::sync::Mutex<()>>;
+
+impl LoadFlights {
+    /// Wait for, then hold, the flight of `key` until the guard drops.
+    pub(crate) async fn acquire(
+        &self,
+        key: &(String, String),
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let flight = {
+            let mut flights = self.flights.lock().expect("load flights");
+            match flights.get(key).and_then(std::sync::Weak::upgrade) {
+                Some(flight) => flight,
+                None => {
+                    // Forget finished flights first: the map stays the size
+                    // of the loads in progress.
+                    flights.retain(|_, f| f.strong_count() > 0);
+                    let flight = Arc::new(tokio::sync::Mutex::new(()));
+                    flights.insert(key.clone(), Arc::downgrade(&flight));
+                    flight
+                }
+            }
+        };
+        flight.lock_owned().await
+    }
+}
+
 /// A schema-loader cache whose entries always belong to exactly one scope
 /// generation. A value may only be inserted if the generation it was produced
 /// under is still the published one, so a load that finished after a lineage
@@ -425,6 +462,31 @@ pub async fn previous_scope(
 mod tests {
     use super::*;
     use storage::MemoryStorageBackend;
+
+    /// One table's flight is exclusive while held, and finished flights are
+    /// forgotten: the map holds only the loads in progress, however many
+    /// tables were loaded.
+    #[tokio::test]
+    async fn load_flights_are_exclusive_per_table_and_forgotten_when_done() {
+        let flights = LoadFlights::default();
+        let key = |t: &str| ("s".to_string(), t.to_string());
+        let held = flights.acquire(&key("a")).await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                flights.acquire(&key("a")),
+            )
+            .await
+            .is_err(),
+            "a second load of the same table waits"
+        );
+        drop(flights.acquire(&key("b")).await);
+        drop(held);
+        for n in 0..1_000 {
+            drop(flights.acquire(&key(&n.to_string())).await);
+        }
+        assert_eq!(flights.flights.lock().unwrap().len(), 1);
+    }
 
     fn pg(sysid: u64, dboid: u64) -> LineageDescriptor {
         LineageDescriptor::postgres(sysid, dboid).unwrap()
