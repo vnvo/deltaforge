@@ -30,6 +30,13 @@ impl Sink for FilteredSink {
         self.inner.id()
     }
 
+    async fn settle_uncertain(
+        &self,
+        evidence: &deltaforge_core::incident::Evidence,
+    ) -> deltaforge_core::BoundaryOutcome {
+        self.inner.settle_uncertain(evidence).await
+    }
+
     fn required(&self) -> bool {
         self.inner.required()
     }
@@ -167,6 +174,12 @@ mod tests {
                 .push((events.len(), ctx.durable_watermark.is_some()));
             Ok(deltaforge_core::BatchResult::ok())
         }
+        async fn settle_uncertain(
+            &self,
+            _: &deltaforge_core::incident::Evidence,
+        ) -> deltaforge_core::BoundaryOutcome {
+            deltaforge_core::BoundaryOutcome::Committed
+        }
     }
 
     fn ctx_with_wm() -> SinkBatchContext {
@@ -209,6 +222,18 @@ mod tests {
     // -------------------------------------------------------------------------
     // Tests
     // -------------------------------------------------------------------------
+
+    /// A filter never hides the wrapped sink's settlement of an uncertain
+    /// boundary.
+    #[tokio::test]
+    async fn settling_an_uncertain_boundary_reaches_the_wrapped_sink() {
+        let (inner, _) = CountingSink::new("sink");
+        let sink = FilteredSink::wrap(inner, SinkFilter::default());
+        assert_eq!(
+            sink.settle_uncertain(&Default::default()).await,
+            deltaforge_core::BoundaryOutcome::Committed
+        );
+    }
 
     #[tokio::test]
     async fn exclude_synthetic_drops_synthetic_passes_source() {

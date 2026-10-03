@@ -923,12 +923,9 @@ pub struct Coordinator<Tok> {
     /// Notified after each successful per-sink checkpoint commit so the source can
     /// refresh its WAL feedback change-driven instead of polling the checkpoint store.
     commit_notify: Option<Arc<tokio::sync::Notify>>,
-    /// The pipeline's incident store: a sink that acknowledges a batch
-    /// resolves its open acknowledgement-uncertainty incidents.
+    /// The pipeline's incident store: a run starts by settling its sinks'
+    /// open acknowledgement-uncertainty incidents, each by its own boundary.
     incidents: Option<storage::adapters::incidents::IncidentStore>,
-    /// Sinks with an open `sink_ack_uncertain` incident (read once per run).
-    uncertain_sinks:
-        tokio::sync::Mutex<Option<std::collections::HashSet<String>>>,
 }
 
 pub struct CoordinatorBuilder<Tok> {
@@ -1085,7 +1082,6 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             quiesce_ack: self.quiesce_ack,
             commit_notify: self.commit_notify,
             incidents: self.incidents,
-            uncertain_sinks: tokio::sync::Mutex::new(None),
         }
     }
 }
@@ -1095,72 +1091,80 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
         CoordinatorBuilder::new(name)
     }
 
-    /// `sink_id` acknowledged a batch (its checkpoint committed): its open
-    /// `sink_ack_uncertain` incidents are settled (`sink_acknowledged`). The
-    /// open set is read once per run, so this is an in-memory check unless
-    /// the sink has one. Never fails delivery.
-    async fn sink_acknowledged(&self, sink_id: &str) {
+    /// Settle the pipeline's open `sink_ack_uncertain` incidents, each by its
+    /// own sink's authoritative read of exactly its boundary
+    /// ([`deltaforge_core::Sink::settle_uncertain`]): proven committed or
+    /// absent, that incident (and only it) is resolved. A later batch's
+    /// success settles nothing. Never fails the run: an undecided boundary,
+    /// or an unreadable store, leaves the incident open.
+    async fn settle_uncertain_sinks(&self) {
+        use deltaforge_core::BoundaryOutcome;
         use deltaforge_core::incident::{Component, ReasonCode};
+        use storage::adapters::incidents::{
+            Resolution, SINK_BOUNDARY_ABSENT, SINK_BOUNDARY_COMMITTED,
+        };
         let Some(store) = &self.incidents else {
             return;
         };
-        let mut open = self.uncertain_sinks.lock().await;
-        if open.is_none() {
-            match store.list().await {
-                Ok(records) => {
-                    *open = Some(
-                        records
-                            .into_iter()
-                            .filter(|r| {
-                                !r.status.is_resolved()
-                                    && r.reason_code
-                                        == ReasonCode::SinkAckUncertain
-                            })
-                            .filter_map(|r| match r.component {
-                                Component::Sink { id } => Some(id),
-                                _ => None,
-                            })
-                            .collect(),
-                    )
-                }
-                Err(e) => {
-                    warn!(
-                        pipeline = %self.pipeline_name,
-                        error = %format!("{e:#}"),
-                        "incident store unreadable; sink uncertainty stays open"
-                    );
-                    return;
-                }
+        let records = match store.list().await {
+            Ok(records) => records,
+            Err(e) => {
+                warn!(
+                    pipeline = %self.pipeline_name,
+                    error = %format!("{e:#}"),
+                    "incident store unreadable; sink uncertainty stays open"
+                );
+                return;
             }
-        }
-        if !open.as_mut().is_some_and(|o| o.remove(sink_id)) {
-            return;
-        }
-        drop(open);
-        let component = Component::Sink {
-            id: sink_id.to_string(),
         };
-        match store
-            .resolve_matching(
-                ReasonCode::SinkAckUncertain,
-                &component,
-                None,
-                storage::adapters::incidents::SINK_ACKNOWLEDGED,
-            )
-            .await
-        {
-            Ok(n) if n > 0 => info!(
-                pipeline = %self.pipeline_name,
-                sink = %sink_id,
-                "sink acknowledged a batch: acknowledgement uncertainty resolved"
-            ),
-            Ok(_) => {}
-            Err(e) => warn!(
-                pipeline = %self.pipeline_name,
-                sink = %sink_id,
-                error = %format!("{e:#}"),
-                "could not resolve the sink's uncertainty; it stays open"
-            ),
+        for rec in records.into_iter().filter(|r| {
+            !r.status.is_resolved()
+                && r.reason_code == ReasonCode::SinkAckUncertain
+        }) {
+            let Component::Sink { id: sink_id } = &rec.component else {
+                continue;
+            };
+            let Some(sink) = self.sinks.iter().find(|s| s.id() == sink_id)
+            else {
+                continue;
+            };
+            let check = match sink.settle_uncertain(&rec.evidence).await {
+                BoundaryOutcome::Committed => SINK_BOUNDARY_COMMITTED,
+                BoundaryOutcome::Absent => SINK_BOUNDARY_ABSENT,
+                BoundaryOutcome::Unknown => {
+                    info!(
+                        pipeline = %self.pipeline_name,
+                        sink = %sink_id,
+                        incident = %rec.incident_id.0,
+                        "acknowledgement uncertainty not settled; it stays open"
+                    );
+                    continue;
+                }
+            };
+            match store
+                .resolve(
+                    &rec.incident_id,
+                    Resolution::VerifiedRecovery {
+                        check: check.to_string(),
+                    },
+                )
+                .await
+            {
+                Ok(Ok(_)) => info!(
+                    pipeline = %self.pipeline_name,
+                    sink = %sink_id,
+                    incident = %rec.incident_id.0,
+                    check,
+                    "acknowledgement uncertainty settled by its boundary"
+                ),
+                Ok(Err(_)) => {}
+                Err(e) => warn!(
+                    pipeline = %self.pipeline_name,
+                    sink = %sink_id,
+                    error = %format!("{e:#}"),
+                    "could not resolve the settled incident; it stays open"
+                ),
+            }
         }
     }
 
@@ -1394,6 +1398,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             ));
         }
 
+        self.settle_uncertain_sinks().await;
         let coord = Arc::new(self);
 
         // Bounded channel for pipelined delivery - capacity = max_inflight.
@@ -2310,7 +2315,6 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                 match result {
                     Ok(()) => {
                         committed += 1;
-                        self.sink_acknowledged(&sink_id).await;
                         gauge!(
                             "deltaforge_sink_last_checkpoint_ts",
                             "pipeline" => self.pipeline_name.to_string(),
@@ -4734,6 +4738,10 @@ mod tests {
         delivered: AtomicUsize,
         batch_sizes: std::sync::Mutex<Vec<usize>>,
         ids: std::sync::Mutex<Vec<i64>>,
+        /// What an authoritative read proves, by the boundary's content
+        /// identity; any other boundary is undecided.
+        proves:
+            std::sync::Mutex<HashMap<String, deltaforge_core::BoundaryOutcome>>,
     }
 
     impl MockSink {
@@ -4745,7 +4753,19 @@ mod tests {
                 delivered: AtomicUsize::new(0),
                 batch_sizes: std::sync::Mutex::new(Vec::new()),
                 ids: std::sync::Mutex::new(Vec::new()),
+                proves: Default::default(),
             })
+        }
+
+        fn proves(
+            &self,
+            content: &str,
+            outcome: deltaforge_core::BoundaryOutcome,
+        ) {
+            self.proves
+                .lock()
+                .unwrap()
+                .insert(content.to_string(), outcome);
         }
 
         fn set_fail(&self, fail: bool) {
@@ -4771,6 +4791,18 @@ mod tests {
     impl deltaforge_core::Sink for MockSink {
         fn id(&self) -> &str {
             &self.id
+        }
+
+        async fn settle_uncertain(
+            &self,
+            evidence: &deltaforge_core::incident::Evidence,
+        ) -> deltaforge_core::BoundaryOutcome {
+            evidence
+                .text_of(
+                    deltaforge_core::incident::EvidenceKey::ContentIdentity,
+                )
+                .and_then(|c| self.proves.lock().unwrap().get(c).copied())
+                .unwrap_or(deltaforge_core::BoundaryOutcome::Unknown)
         }
 
         fn required(&self) -> bool {
@@ -4849,23 +4881,28 @@ mod tests {
         );
     }
 
-    /// A sink that acknowledges a later batch settles its open
-    /// acknowledgement uncertainty (`sink_acknowledged`); another sink's stays
-    /// open.
+    /// A sink's acknowledgement uncertainty is boundary-specific: a later
+    /// successful batch settles nothing (A stays open); at the start of a run
+    /// each open boundary is settled only by its own sink's authoritative
+    /// read of exactly that boundary (A' proven committed, A'' proven
+    /// absent), and settling those resolves no other boundary (C, which the
+    /// read cannot decide, and another sink's B stay open).
     #[tokio::test]
-    async fn a_sink_acknowledging_a_batch_resolves_its_uncertainty() {
+    async fn a_sink_uncertainty_is_settled_only_by_its_own_boundary() {
         use checkpoints::MemCheckpointStore;
+        use deltaforge_core::BoundaryOutcome;
         use deltaforge_core::incident::{
-            CauseCode, Component, IncidentDraft, ReasonCode, Retryability,
-            SafetyState,
+            CauseCode, Component, EvidenceKey, IncidentDraft, IncidentId,
+            ReasonCode, Retryability, SafetyState,
         };
         use storage::adapters::incidents::{
-            IncidentStatus, IncidentStore, Resolution, SINK_ACKNOWLEDGED,
+            IncidentStatus, IncidentStore, Resolution, SINK_BOUNDARY_ABSENT,
+            SINK_BOUNDARY_COMMITTED,
         };
         let backend: storage::ArcStorageBackend =
             Arc::new(storage::MemoryStorageBackend::new());
         let incidents = IncidentStore::new(Arc::clone(&backend), "tx-test");
-        let uncertain = |sink: &str| {
+        let uncertain = |sink: &str, content: &str| {
             IncidentDraft::new(
                 ReasonCode::SinkAckUncertain,
                 Component::Sink { id: sink.into() },
@@ -4873,66 +4910,100 @@ mod tests {
                 SafetyState::HaltedUncertain,
                 CauseCode::SinkFatal,
             )
-            .discriminate("batch", "b1")
+            .discriminate("content", content)
+            .with_evidence(|e| {
+                e.text(EvidenceKey::ContentIdentity, content);
+            })
         };
-        let ours = incidents
-            .raise(&uncertain("kafka"), 1)
-            .await
-            .unwrap()
-            .record()
-            .incident_id
-            .clone();
-        let other = incidents
-            .raise(&uncertain("other"), 1)
-            .await
-            .unwrap()
-            .record()
-            .incident_id
-            .clone();
+        let raise = |sink: &'static str, content: &'static str| {
+            let incidents = incidents.clone();
+            async move {
+                incidents
+                    .raise(&uncertain(sink, content), 1)
+                    .await
+                    .unwrap()
+                    .record()
+                    .incident_id
+                    .clone()
+            }
+        };
+        let a = raise("s3", "a").await;
+        let committed = raise("s3", "committed").await;
+        let absent = raise("s3", "absent").await;
+        let c = raise("s3", "c").await;
+        let b = raise("other", "committed").await;
 
-        let store = Arc::new(MemCheckpointStore::new().unwrap());
-        let sink = MockSink::new("kafka", true);
-        let sinks: Vec<ArcDynSink> = vec![Arc::clone(&sink) as ArcDynSink];
-        let coord = Coordinator::builder("tx-test")
-            .sinks(sinks)
-            .batch_config(Some(cap_cfg(1000)))
-            .commit_fn(
-                "kafka",
-                build_commit_fn(store, "src::sink::kafka".to_string()),
-            )
-            .process_fn(build_batch_processor(
-                Arc::from(vec![]),
-                "test".to_string(),
-            ))
-            .incidents(incidents.clone())
-            .build();
-        feed_and_run(
-            coord,
-            vec![
-                begin("t1"),
-                SourceItem::Event(tx_event(1, "t1", b"r1")),
-                commit("t1", b"cp-1"),
-            ],
-        )
-        .await
-        .unwrap();
-
-        match incidents.get(&ours).await.unwrap().unwrap().status {
-            IncidentStatus::Resolved {
-                by: Resolution::VerifiedRecovery { check },
-                ..
-            } => assert_eq!(check, SINK_ACKNOWLEDGED),
-            s => panic!("{s:?}"),
-        }
-        assert!(
-            !incidents
-                .get(&other)
+        let sink = MockSink::new("s3", true);
+        let run = |sink: Arc<MockSink>| {
+            let incidents = incidents.clone();
+            async move {
+                let store = Arc::new(MemCheckpointStore::new().unwrap());
+                let coord = Coordinator::builder("tx-test")
+                    .sinks(vec![sink as ArcDynSink])
+                    .batch_config(Some(cap_cfg(1000)))
+                    .commit_fn(
+                        "s3",
+                        build_commit_fn(store, "src::sink::s3".to_string()),
+                    )
+                    .process_fn(build_batch_processor(
+                        Arc::from(vec![]),
+                        "test".to_string(),
+                    ))
+                    .incidents(incidents)
+                    .build();
+                feed_and_run(
+                    coord,
+                    vec![
+                        begin("t1"),
+                        SourceItem::Event(tx_event(1, "t1", b"r1")),
+                        commit("t1", b"cp-1"),
+                    ],
+                )
                 .await
-                .unwrap()
-                .unwrap()
-                .status
-                .is_resolved()
-        );
+                .unwrap();
+            }
+        };
+        let open = |id: IncidentId| {
+            let incidents = incidents.clone();
+            async move {
+                !incidents
+                    .get(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    .is_resolved()
+            }
+        };
+        let check = |id: IncidentId| {
+            let incidents = incidents.clone();
+            async move {
+                match incidents.get(&id).await.unwrap().unwrap().status {
+                    IncidentStatus::Resolved {
+                        by: Resolution::VerifiedRecovery { check },
+                        ..
+                    } => check,
+                    s => panic!("{s:?}"),
+                }
+            }
+        };
+
+        // Nothing provable: batch B's success leaves every boundary open.
+        run(Arc::clone(&sink)).await;
+        assert_eq!(sink.delivery_count(), 1, "a later batch was acknowledged");
+        for id in [&a, &committed, &absent, &c, &b] {
+            assert!(open(id.clone()).await);
+        }
+
+        // The sink's read proves two boundaries; only they are resolved.
+        sink.proves("committed", BoundaryOutcome::Committed);
+        sink.proves("absent", BoundaryOutcome::Absent);
+        run(Arc::clone(&sink)).await;
+        assert_eq!(check(committed).await, SINK_BOUNDARY_COMMITTED);
+        assert_eq!(check(absent).await, SINK_BOUNDARY_ABSENT);
+        assert!(open(a).await);
+        assert!(open(c).await);
+        assert!(open(b).await, "another sink's boundary is not ours to read");
     }
 
     #[tokio::test]

@@ -5,10 +5,12 @@ use std::collections::HashSet;
 use deltaforge_core::SourceError;
 use deltaforge_core::incident::{
     ActionCode, CauseCode, Component, EvidenceKey as K, IncidentDraft,
-    ReasonCode, Retryability, SafetyState, scope_key,
+    IncidentId, ReasonCode, Retryability, SafetyState, scope_key,
 };
 use storage::ArcStorageBackend;
-use storage::adapters::incidents::{IncidentStore, SCHEMA_ACCEPTED};
+use storage::adapters::incidents::{
+    IncidentStore, SCHEMA_ACCEPTED, bind_epoch,
+};
 use tracing::{info, warn};
 
 /// The `schema_drift_blocked` incident around `cause`: `on_schema_drift =
@@ -44,6 +46,57 @@ pub(crate) fn schema_drift_blocked(
     ])
     .resolved_by_scope(qualified_table);
     SourceError::incident(draft, cause)
+}
+
+/// Record `draft`, a condition the source is retrying automatically, so the
+/// pipeline reports it while the source retries. It is bound to the current
+/// recovery epoch: the identity the supervisor gives the draft the source
+/// stops on, so an exhausted retry reclassifies the same incident. Returns
+/// its identity when recorded. Never fails the caller (the retry goes on;
+/// the stop is recorded by the supervisor).
+pub(crate) async fn record_retrying(
+    store: &IncidentStore,
+    draft: &IncidentDraft,
+) -> Option<IncidentId> {
+    let bound = match store.recovery_epoch().await {
+        Ok(epoch) => bind_epoch(draft.clone(), epoch),
+        Err(e) => {
+            warn!(
+                error = %format!("{e:#}"),
+                "incident store unreadable; the retry is not reported"
+            );
+            return None;
+        }
+    };
+    match store.raise(&bound, 1).await {
+        Ok(raised) => Some(raised.record().incident_id.clone()),
+        Err(e) => {
+            warn!(
+                error = %format!("{e:#}"),
+                "could not record the retrying incident"
+            );
+            None
+        }
+    }
+}
+
+/// The source stopped on purpose while retrying: withdraw its auto-retry
+/// incident (`operation_cancelled`), so an intentional stop leaves nothing
+/// blocking. Never fails the caller.
+pub(crate) async fn cancel_retrying(
+    store: &IncidentStore,
+    retrying: Option<IncidentId>,
+) {
+    let Some(id) = retrying else {
+        return;
+    };
+    if let Err(e) = store.cancel_auto_retry(&id).await {
+        warn!(
+            error = %format!("{e:#}"),
+            "could not withdraw the retrying incident; a verified start \
+             resolves it"
+        );
+    }
 }
 
 /// Resolves a source's open `schema_drift_blocked` incidents when their table
@@ -125,6 +178,28 @@ impl DriftResolver {
                 "could not resolve the drift incident; it stays open"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_util {
+    use storage::adapters::incidents::IncidentStore;
+
+    /// Exactly one incident, the auto-retry one, withdrawn as
+    /// `operation_cancelled` and no longer blocking.
+    pub(crate) async fn assert_cancelled_withdrawn(incidents: &IncidentStore) {
+        use storage::adapters::incidents::{IncidentStatus, Resolution};
+        let all = incidents.list().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].retryability.as_str(), "auto_retry");
+        assert!(matches!(
+            all[0].status,
+            IncidentStatus::Resolved {
+                by: Resolution::OperationCancelled,
+                ..
+            }
+        ));
+        assert!(!all[0].is_blocking());
     }
 }
 
