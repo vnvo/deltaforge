@@ -1783,7 +1783,7 @@ async fn run_failover_reconciliation(
     sync_registry_lineage(ctx, &current).await?;
 
     // The failover position F for every table's lazy drift check, durable
-    // before the identity record (an earlier anchor for this lineage epoch,
+    // before the identity record (an earlier anchor for this lineage transition,
     // e.g. recorded at startup before a snapshot replaced the checkpoint,
     // is kept). Tables are re-checked under the new lineage.
     let previous_lineage = mysql_registry_lineage(&previous)?.lineage_hash();

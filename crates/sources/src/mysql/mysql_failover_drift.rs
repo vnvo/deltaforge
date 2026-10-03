@@ -6,9 +6,9 @@
 //! by enumerating tables or predecessor registry keys:
 //!
 //! 1. The failover's durable anchor names the predecessor lineage, the
-//!    current lineage, the lineage epoch (the lineage record's
-//!    `established_at_ms`, so a return to an earlier server gets its own
-//!    anchor) and the exact failover position F (`None` when it could not be
+//!    current lineage, the lineage transition (the lineage record's durable
+//!    random `transition_id`, so every transition - also a return to an
+//!    earlier server - gets its own anchor, never derived from the clock) and the exact failover position F (`None` when it could not be
 //!    proven on the new server: every comparison is then unprovable).
 //! 2. The predecessor's latest version of the table is read lazily. None: a
 //!    newly observed table. Unreadable: an error.
@@ -24,7 +24,7 @@
 //!    decoded or emitted: under `halt`, drift or an unprovable comparison
 //!    stops the source and writes nothing; otherwise the proven shape is
 //!    registered, then a durable marker binds the predecessor and current
-//!    lineage, the epoch, both schema hashes and the outcome (an unprovable
+//!    lineage, the transition, both schema hashes and the outcome (an unprovable
 //!    comparison is recorded as `adapted_unprovable` and proof continues
 //!    normally). A primary-key change is a hard stop under every policy, as
 //!    in the eager reconciliation it replaces.
@@ -58,17 +58,17 @@ use crate::failover::reconciler::{
 
 pub(crate) const ANCHOR_NS: &str = "schemas.v1.failover.anchor";
 pub(crate) const MARKER_NS: &str = "schemas.v1.failover.drift";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const CAPTURE_ATTEMPTS: u32 = 5;
 
-/// A failover into the current lineage (written once per lineage epoch).
+/// A failover into the current lineage (written once per transition).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FailoverAnchor {
     pub format_version: u32,
     pub previous_lineage: String,
     pub current_lineage: String,
-    /// The current lineage record's `established_at_ms`.
-    pub epoch: i64,
+    /// The current lineage record's `transition_id`.
+    pub transition: String,
     /// F: where the stream continued on the current server, proven there.
     pub position: Option<MySqlCheckpoint>,
 }
@@ -88,7 +88,7 @@ pub(crate) struct DriftMarker {
     pub format_version: u32,
     pub previous_lineage: String,
     pub current_lineage: String,
-    pub epoch: i64,
+    pub transition: String,
     /// The predecessor's latest version compared (none: a new table).
     pub previous_schema_version: Option<i32>,
     pub previous_schema_hash: Option<String>,
@@ -129,21 +129,21 @@ pub(crate) struct DriftEnv<'a> {
     pub lower_case_table_names: u8,
 }
 
-/// One stream per lineage epoch, holding at most its one anchor (read with
+/// One stream per lineage transition, holding at most its one anchor (read with
 /// `log_latest`: no enumeration).
 fn anchor_stream(
     tenant: &str,
     source_id: &str,
     lineage: &str,
-    epoch: i64,
+    transition: &str,
 ) -> String {
     format!(
-        "{}/anchor-{epoch}",
+        "{}/anchor-{transition}",
         SchemaKey::source_prefix(tenant, source_id, lineage)
     )
 }
 
-/// The anchor of the current lineage epoch, if this lineage was entered by
+/// The anchor of the current lineage transition, if it was entered by
 /// a failover. An unreadable or inconsistent anchor fails.
 pub(crate) async fn load_anchor(
     backend: &ArcStorageBackend,
@@ -158,8 +158,8 @@ pub(crate) async fn load_anchor(
         return Ok(None);
     };
     let current = record.current.lineage_hash.clone();
-    let stream =
-        anchor_stream(tenant, source_id, &current, record.established_at_ms);
+    let transition = transition_of(&record)?;
+    let stream = anchor_stream(tenant, source_id, &current, &transition);
     let Some((_, bytes)) = backend
         .log_latest(ANCHOR_NS, &stream)
         .await
@@ -172,14 +172,14 @@ pub(crate) async fn load_anchor(
     anyhow::ensure!(
         a.format_version == FORMAT_VERSION
             && a.current_lineage == current
-            && a.epoch == record.established_at_ms,
-        "failover anchor of another format, lineage or epoch: {a:?}"
+            && a.transition == transition,
+        "failover anchor of another format, lineage or transition: {a:?}"
     );
     Ok(Some(a))
 }
 
-/// Record the failover into the current lineage epoch once. An existing
-/// anchor for the epoch is kept (the first recorded failover position is
+/// Record the failover into the current lineage transition once. An
+/// existing anchor for the transition is kept (the first recorded failover position is
 /// the failover's; a later start may already have replaced the checkpoint,
 /// e.g. by a snapshot); one naming another predecessor fails.
 pub(crate) async fn record_anchor(
@@ -207,14 +207,14 @@ pub(crate) async fn record_anchor(
         format_version: FORMAT_VERSION,
         previous_lineage: previous_lineage.to_string(),
         current_lineage: current.clone(),
-        epoch: record.established_at_ms,
+        transition: transition_of(&record)?,
         position,
     };
     let bytes = serde_json::to_vec(&anchor)?;
     backend
         .log_append_if_absent(
             ANCHOR_NS,
-            &anchor_stream(tenant, source_id, &current, anchor.epoch),
+            &anchor_stream(tenant, source_id, &current, &anchor.transition),
             "anchor",
             &bytes,
         )
@@ -224,8 +224,20 @@ pub(crate) async fn record_anchor(
     Ok(anchor)
 }
 
+/// The lineage record's durable transition identity. Every record has one
+/// once `establish` has run (older records get one on their first load);
+/// none here is never guessed from the clock.
+fn transition_of(
+    record: &storage::adapters::source_lineage::SourceLineageRecord,
+) -> anyhow::Result<String> {
+    record
+        .transition_id
+        .clone()
+        .context("the source lineage record has no transition identity")
+}
+
 fn marker_id(anchor: &FailoverAnchor) -> String {
-    format!("{}-{}", anchor.previous_lineage, anchor.epoch)
+    format!("{}-{}", anchor.previous_lineage, anchor.transition)
 }
 
 /// Whether the table's check for this failover is complete: its one marker
@@ -260,7 +272,7 @@ async fn completed(
             .map_err(|e| invalid(format!("unreadable ({e})")))?;
         if m.previous_lineage == anchor.previous_lineage
             && m.current_lineage == anchor.current_lineage
-            && m.epoch == anchor.epoch
+            && m.transition == anchor.transition
         {
             mine.push(m);
         }
@@ -344,7 +356,7 @@ async fn write_marker(
         format_version: FORMAT_VERSION,
         previous_lineage: anchor.previous_lineage.clone(),
         current_lineage: anchor.current_lineage.clone(),
-        epoch: anchor.epoch,
+        transition: anchor.transition.clone(),
         previous_schema_version,
         previous_schema_hash,
         current_schema_version,
@@ -698,15 +710,15 @@ mod tests {
         )
         .await
         .unwrap();
-        // Lineage epochs are milliseconds.
+        // Distinct timestamps are not relied on; keep them apart anyway.
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 
-    /// An anchor belongs to one lineage epoch: the first recorded failover
-    /// position is kept, another predecessor fails, and returning to an
-    /// earlier server later (a new epoch) starts without an anchor.
+    /// An anchor belongs to one lineage transition: the first recorded
+    /// failover position is kept, another predecessor fails, and a later
+    /// transition into the same lineage starts without an anchor.
     #[tokio::test]
-    async fn anchors_are_bound_to_the_lineage_epoch() {
+    async fn anchors_are_bound_to_the_lineage_transition() {
         let backend: ArcStorageBackend =
             Arc::new(storage::MemoryStorageBackend::new());
         enter(&backend, A).await;
@@ -728,7 +740,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        // B -> A -> B: B's new epoch has no anchor until one is recorded.
+        // B -> A -> B: a new transition has no anchor until one is recorded.
         enter(&backend, A).await;
         enter(&backend, B).await;
         assert!(load_anchor(&backend, "t", "s").await.unwrap().is_none());
@@ -739,6 +751,81 @@ mod tests {
         assert_eq!(
             load_anchor(&backend, "t", "s").await.unwrap(),
             Some(second)
+        );
+    }
+
+    /// Reviewer regression: A -> B with a completed table marker, B -> A,
+    /// then A -> B again with the very same `established_at_ms` as the first
+    /// A -> B. The old anchor and marker cannot satisfy the new transition:
+    /// they are bound to the first transition's durable identity, not to
+    /// the clock.
+    #[tokio::test]
+    async fn a_repeated_transition_never_reuses_an_old_anchor_or_marker() {
+        use crate::registry_scope::SharedRegistryScope;
+        let backend: ArcStorageBackend =
+            Arc::new(storage::MemoryStorageBackend::new());
+        let registry = storage::DurableSchemaRegistry::for_testing();
+        let shared = SharedRegistryScope::new("s");
+        shared.publish_for_test("t", LineageDescriptor::mysql(B).unwrap());
+        let scope = shared.current().unwrap();
+        let loader = MySqlSchemaLoader::new(
+            "mysql://none@127.0.0.1:1/none",
+            registry.clone(),
+            "t",
+            shared.clone(),
+        );
+        let env = DriftEnv {
+            backend: &backend,
+            loader: &loader,
+            scope: &scope,
+            dsn: "",
+            server_uuid: B,
+            source_id: "s",
+            halt: true,
+            lower_case_table_names: 0,
+        };
+        let key = scope.key("d", "x");
+        let previous_key = SchemaKey::new("t", "s", hash(A), "d", "x");
+
+        // 1. A -> B, and the table's check completes.
+        enter(&backend, A).await;
+        enter(&backend, B).await;
+        let first_at =
+            storage::adapters::source_lineage::load(&backend, "t", "s")
+                .await
+                .unwrap()
+                .unwrap()
+                .established_at_ms;
+        let first = record_anchor(&backend, "t", "s", &hash(A), at("1-5"))
+            .await
+            .unwrap();
+        write_marker(&backend, &key, &first, None, None, Outcome::NewTable)
+            .await
+            .unwrap();
+        assert!(completed(&env, &key, &previous_key, &first).await.unwrap());
+
+        // 2. B -> A. 3. A -> B again, at the same clock millisecond.
+        enter(&backend, A).await;
+        enter(&backend, B).await;
+        storage::adapters::test_util::rewrite_lineage_record(
+            &backend,
+            "t",
+            "s",
+            |r| r.established_at_ms = first_at,
+        )
+        .await
+        .unwrap();
+
+        // 4. Neither the old anchor nor its marker belongs to it.
+        assert!(load_anchor(&backend, "t", "s").await.unwrap().is_none());
+        let second = record_anchor(&backend, "t", "s", &hash(A), at("1-9"))
+            .await
+            .unwrap();
+        assert_ne!(second.transition, first.transition);
+        assert_eq!(second.position, at("1-9"), "not the old position");
+        assert!(
+            !completed(&env, &key, &previous_key, &second).await.unwrap(),
+            "the old marker does not complete the new transition"
         );
     }
 
@@ -774,14 +861,14 @@ mod tests {
             format_version: FORMAT_VERSION,
             previous_lineage: hash(A),
             current_lineage: key.lineage_hash.clone(),
-            epoch: 7,
+            transition: "7".repeat(32),
             position: None,
         };
         let valid = DriftMarker {
             format_version: FORMAT_VERSION,
             previous_lineage: hash(A),
             current_lineage: key.lineage_hash.clone(),
-            epoch: 7,
+            transition: "7".repeat(32),
             previous_schema_version: Some(pv),
             previous_schema_hash: Some("hp".into()),
             current_schema_version: Some(cv),
@@ -821,12 +908,12 @@ mod tests {
         };
         assert!(!check(vec![]).await.unwrap());
         assert!(check(vec![valid.clone()]).await.unwrap());
-        // Another epoch's marker is not this failover's.
-        let other_epoch = DriftMarker {
-            epoch: 8,
+        // Another transition's marker is not this failover's.
+        let other_transition = DriftMarker {
+            transition: "8".repeat(32),
             ..valid.clone()
         };
-        assert!(!check(vec![other_epoch]).await.unwrap());
+        assert!(!check(vec![other_transition]).await.unwrap());
         let unchanged_new = DriftMarker {
             outcome: Outcome::NewTable,
             ..valid.clone()

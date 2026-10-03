@@ -318,3 +318,24 @@ impl StorageBackend for FaultBackend {
         self.inner.queue_drop_oldest(ns, key, count).await
     }
 }
+
+/// Rewrite a source's stored lineage record (tests that must force a field,
+/// e.g. a repeated `established_at_ms`).
+pub async fn rewrite_lineage_record(
+    backend: &ArcStorageBackend,
+    tenant: &str,
+    source_id: &str,
+    edit: impl FnOnce(&mut super::source_lineage::SourceLineageRecord),
+) -> Result<()> {
+    let mut record = super::source_lineage::load(backend, tenant, source_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no lineage record"))?;
+    edit(&mut record);
+    backend
+        .kv_put(
+            super::source_lineage::NS,
+            &super::source_lineage::record_key(tenant, source_id),
+            &serde_json::to_vec(&record)?,
+        )
+        .await
+}

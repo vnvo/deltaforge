@@ -60,11 +60,11 @@ After reconciliation, DeltaForge stores B's identity and resumes streaming. The 
 
 A subtle but critical detail: simply reconnecting at A's checkpoint position can cause data loss on its own, before reconciliation even runs.
 
-**MySQL**: B rejects A's GTID set at the protocol level with "purged required binary logs". DeltaForge detects the identity change *before* opening the binlog stream, resolves B's current binlog tail via `SHOW BINARY LOG STATUS`, and connects there instead. A's original GTID checkpoint is preserved separately for the reachability check.
+**MySQL**: DeltaForge detects the identity change *before* opening the binlog stream and continues on B only from the exact position it proved: the GTID set the stream resumes from, which B must have executed in full (checked on a connection verified to be B). It never skips to B's binlog tail. If B has not executed that set, or the source runs without GTID mode (binlog file positions are not comparable across servers), the source stops with a typed error and changes nothing; re-snapshot from B or restore the missing transactions. That proven position is also the failover position the per-table schema drift checks are anchored to.
 
 **PostgreSQL**: `START_REPLICATION` at A's LSN immediately advances the slot's `confirmed_flush_lsn` to `max(A_checkpoint, slot_lsn)`. If B's slot was created at an LSN behind A's checkpoint, any changes B committed in that gap are permanently discarded - even if you reconnect at the correct LSN afterwards. DeltaForge detects the identity change before opening the replication stream and fetches the slot's actual `confirmed_flush_lsn` to use as the start position instead.
 
-In both cases the original checkpoint is preserved for the reachability check, separate from the adjusted streaming position.
+For PostgreSQL the original checkpoint is preserved for the reachability check, separate from the adjusted streaming position.
 
 ## Schema Drift Policy
 
