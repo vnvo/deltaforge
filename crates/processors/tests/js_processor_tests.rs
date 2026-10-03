@@ -543,6 +543,20 @@ async fn js_payload_integers_become_floats() {
 // Initialization Errors
 // ============================================================================
 
+/// Wait until the processor's worker thread has exited (it crashes on an
+/// invalid script), polling instead of assuming a fixed delay is enough.
+fn worker_exits(proc: &JsProcessor) -> bool {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if !proc.is_alive() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    false
+}
+
 #[test]
 fn js_syntax_error_fails_initialization() {
     let js = "function processBatch(events { return events; }"; // missing )
@@ -550,9 +564,8 @@ fn js_syntax_error_fails_initialization() {
     // May fail at init or when worker thread validates - either is acceptable
     // Worker thread crash makes is_alive() return false
     if let Ok(proc) = result {
-        std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(
-            !proc.is_alive(),
+            worker_exits(&proc),
             "processor should have crashed from syntax error"
         );
     }
@@ -563,9 +576,8 @@ fn js_missing_process_batch_fails_initialization() {
     let js = "function wrongName(events) { return events; }";
     let result = JsProcessor::new("missing".into(), js.into(), None);
     if let Ok(proc) = result {
-        std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(
-            !proc.is_alive(),
+            worker_exits(&proc),
             "processor should have crashed from missing function"
         );
     }
