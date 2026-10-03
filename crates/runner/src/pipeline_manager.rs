@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::coordinator::{
     Coordinator, PauseState, SchemaSensorState, build_batch_processor,
@@ -504,9 +504,10 @@ impl PipelineStatus {
 pub(crate) struct PipelineRuntime {
     pub(crate) spec: PipelineSpec,
     pub(crate) status: PipelineStatus,
-    /// Set to false by the coordinator task when it exits without cancellation
-    /// (i.e. the source died unexpectedly). Used to drive /health.
-    pub(crate) alive: Arc<AtomicBool>,
+    /// The supervised task state: Failed (with its blocking incident) as soon
+    /// as a source or coordinator task exits unexpectedly. Drives status,
+    /// /ready and resume.
+    pub(crate) health: Arc<crate::incidents::PipelineHealth>,
     pub(crate) cancel: CancellationToken,
     pub(crate) pause: watch::Sender<PauseState>,
     pub(crate) sources: Vec<SourceHandle>,
@@ -621,8 +622,14 @@ impl PipelineRuntime {
         .increment(1);
     }
 
+    /// Whether a critical task has exited unexpectedly (operator intent in
+    /// `status` notwithstanding).
+    pub(crate) fn is_failed(&self) -> bool {
+        self.status != PipelineStatus::Deleting && self.health.is_failed()
+    }
+
     pub(crate) fn info(&self) -> PipeInfo {
-        let status = if !self.alive.load(Ordering::Acquire) {
+        let status = if self.is_failed() {
             "failed"
         } else {
             self.status.as_str()
@@ -634,7 +641,8 @@ impl PipelineRuntime {
             // boundary (see PipeInfo's serialize_with), so status/API output never
             // exposes an inline DSN password.
             spec: self.spec.clone(),
-            ops: None, // populated async by controller.get()
+            ops: None,       // populated async by controller.get()
+            incidents: None, // populated async by the controller
         }
     }
 }
@@ -808,6 +816,17 @@ impl PipelineManager {
         &self,
         spec: PipelineSpec,
     ) -> Result<PipelineRuntime> {
+        self.spawn_pipeline_carrying(spec, Vec::new()).await
+    }
+
+    /// Spawn a runtime that also carries incidents a previous runtime could
+    /// not persist (they stay visible as durability-pending and keep being
+    /// retried).
+    async fn spawn_pipeline_carrying(
+        &self,
+        spec: PipelineSpec,
+        carried: Vec<deltaforge_core::IncidentDraft>,
+    ) -> Result<PipelineRuntime> {
         let pipeline_name = spec.metadata.name.clone();
         counter!("deltaforge_pipelines_total").increment(1);
 
@@ -906,7 +925,17 @@ impl PipelineManager {
             SourceCfg::Postgres(_) => vec![],
         };
 
-        let alive = Arc::new(AtomicBool::new(true));
+        // Repairs pending incident audit entries and an interrupted recovery
+        // before any task starts, and carries over incidents a previous
+        // runtime could not persist.
+        let health = crate::incidents::PipelineHealth::start(
+            crate::incidents::IncidentStore::new(
+                self.backend.clone(),
+                &pipeline_name,
+            ),
+            carried,
+        )
+        .await?;
 
         let (event_tx, event_rx) = mpsc::channel::<SourceItem>(32_768);
         // Signal the source (change-driven) after each per-sink commit so it refreshes
@@ -925,24 +954,43 @@ impl PipelineManager {
 
         let src_handle = source.run(event_tx, source_ckpt).await;
 
-        // Wrap the source JoinHandle so alive=false is set immediately when
-        // the source task dies without an explicit cancellation.  The
-        // coordinator may be blocked in a long I/O operation (Kafka flush,
-        // SQLite commit) and never return, so we cannot rely solely on the
-        // coordinator wrapper below to drive /health.
-        let alive_for_src = Arc::clone(&alive);
+        // Supervise the source task: the moment it exits without an explicit
+        // cancellation the pipeline is Failed with the source's incident (its
+        // own draft, or unclassified). The coordinator may be blocked in a long
+        // I/O operation (Kafka flush, SQLite commit) and never return, so this
+        // cannot wait for the coordinator.
+        let health_for_src = Arc::clone(&health);
+        let source_id_for_src = spec.spec.source.source_id().to_string();
         let cancel_for_src = cancel.clone();
         let SourceHandle {
             cancel: src_cancel,
             paused: src_paused,
             pause_notify: src_pause_notify,
             join: raw_join,
+            ready: src_ready,
         } = src_handle;
         let monitored_join = tokio::spawn(async move {
             let res = raw_join.await;
-            if !cancel_for_src.is_cancelled() {
-                alive_for_src.store(false, Ordering::Release);
-            }
+            let exit = if cancel_for_src.is_cancelled() {
+                crate::incidents::TaskExit::Clean
+            } else {
+                let epoch = health_for_src.epoch();
+                crate::incidents::TaskExit::Failed(match &res {
+                    Ok(r) => crate::incidents::classify_source_exit(
+                        &source_id_for_src,
+                        r.as_ref().map(|_| ()),
+                        false,
+                        epoch,
+                    ),
+                    Err(_) => crate::incidents::classify_source_exit(
+                        &source_id_for_src,
+                        Ok(()),
+                        true,
+                        epoch,
+                    ),
+                })
+            };
+            health_for_src.exit(crate::incidents::Task::Source, exit);
             match res {
                 Ok(r) => r,
                 Err(e) => Err(SourceError::Other(anyhow::anyhow!(
@@ -950,11 +998,27 @@ impl PipelineManager {
                 ))),
             }
         });
+        // The verified-running barrier: once the source reports its startup
+        // checks passed and its stream open, while the coordinator still runs
+        // and nothing has failed, the pipeline has recovered (its open
+        // unclassified incidents are resolved as `pipeline_recovered`).
+        {
+            let health = Arc::clone(&health);
+            let ready = src_ready.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = ready.wait() => health.source_ready().await,
+                    _ = cancel.cancelled() => {}
+                }
+            });
+        }
         let src_handle = SourceHandle {
             cancel: src_cancel,
             paused: src_paused,
             pause_notify: src_pause_notify,
             join: monitored_join,
+            ready: src_ready,
         };
 
         // Keep a processor handle + a by-id sink map for the replay delivery, which runs
@@ -1213,12 +1277,18 @@ impl PipelineManager {
             );
         }
 
+        let builder = builder.incidents(
+            storage::adapters::incidents::IncidentStore::new(
+                self.backend.clone(),
+                &pipeline_name,
+            ),
+        );
         let coord = builder.build();
         let cancel_for_task = cancel.clone();
         let cancel_check = cancel.clone();
         let pname = pipeline_name.clone();
 
-        let alive_for_task = Arc::clone(&alive);
+        let health_for_task = Arc::clone(&health);
 
         let join = tokio::spawn(async move {
             let result = coord.run(event_rx, cancel_for_task, pause_rx).await;
@@ -1227,11 +1297,27 @@ impl PipelineManager {
             // the shared token on its way out; an operator stop is a clean Ok
             // after cancellation. Mark the pipeline failed in every case except
             // that clean operator stop, so /health and /ready surface it.
-            if coordinator_exit_failed(&result, cancel_check.is_cancelled()) {
-                alive_for_task.store(false, Ordering::Release);
+            let exit = if coordinator_exit_failed(
+                &result,
+                cancel_check.is_cancelled(),
+            ) {
                 gauge!("deltaforge_pipeline_status", "pipeline" => pname.clone())
                     .set(-1.0);
-            }
+                match &result {
+                    Err(e) => crate::incidents::TaskExit::Failed(
+                        crate::incidents::classify_coordinator_exit(
+                            e,
+                            health_for_task.epoch(),
+                        ),
+                    ),
+                    // A clean stop nobody asked for: the source closed the
+                    // event channel; its own exit attributes the failure.
+                    Ok(()) => crate::incidents::TaskExit::ChannelClosed,
+                }
+            } else {
+                crate::incidents::TaskExit::Clean
+            };
+            health_for_task.exit(crate::incidents::Task::Coordinator, exit);
             info!(pipeline = %pname, "pipeline coordinator exited");
             result
         });
@@ -1290,7 +1376,7 @@ impl PipelineManager {
         Ok(PipelineRuntime {
             spec,
             status: PipelineStatus::Running,
-            alive,
+            health,
             cancel,
             pause: pause_tx,
             sources: vec![src_handle],
@@ -1498,6 +1584,7 @@ impl PipelineManager {
                 return;
             };
             rt.status = PipelineStatus::Stopped;
+            rt.health.shutdown();
             (
                 rt.cancel.clone(),
                 std::mem::take(&mut rt.sources),
@@ -1526,6 +1613,57 @@ impl PipelineManager {
         }
         gauge!("deltaforge_pipeline_status", "pipeline" => name.to_string())
             .set(0.0);
+    }
+
+    fn health_of(
+        &self,
+        name: &str,
+    ) -> Result<Arc<crate::incidents::PipelineHealth>, PipelineAPIError> {
+        self.pipelines
+            .read()
+            .get(name)
+            .map(|rt| Arc::clone(&rt.health))
+            .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))
+    }
+
+    /// The incident status shown with a pipeline: its primary incident, open
+    /// or acknowledged blocking incidents (durable ones and those whose write
+    /// is still being retried) and the overflow's blocking count.
+    async fn incident_status(
+        &self,
+        name: &str,
+    ) -> Option<rest_api::pipelines::PipelineIncidents> {
+        let health = self.health_of(name).ok()?;
+        let known = health.known();
+        let mut status = rest_api::pipelines::PipelineIncidents {
+            primary: health.blocking_incident().map(|id| id.0),
+            primary_final: health.primary_is_final(),
+            durability_pending: known.iter().any(|k| !k.durable),
+            ..Default::default()
+        };
+        let records = match health.store().list().await {
+            Ok(r) => r,
+            Err(_) => {
+                status.store_unavailable = true;
+                Vec::new()
+            }
+        };
+        for rec in records.iter().filter(|r| r.is_blocking()) {
+            match &rec.overflow {
+                Some(summary) => status.overflow_blocking += summary.blocking,
+                None => {
+                    status.blocking.push(crate::incidents::record_view(rec))
+                }
+            }
+        }
+        for k in known.iter().filter(|k| !k.durable) {
+            if k.draft.safety_state.is_blocking()
+                && !records.iter().any(|r| r.incident_id == k.id)
+            {
+                status.blocking.push(crate::incidents::known_view(k));
+            }
+        }
+        Some(status)
     }
 
     pub fn list_pipelines(&self) -> Vec<PipeInfo> {
@@ -1897,7 +2035,13 @@ fn authorize_replay_start(
 #[async_trait::async_trait]
 impl PipelineController for PipelineManager {
     async fn list(&self) -> Vec<PipeInfo> {
-        self.list_pipelines()
+        let infos = self.list_pipelines();
+        let mut out = Vec::with_capacity(infos.len());
+        for mut info in infos {
+            info.incidents = self.incident_status(&info.name).await;
+            out.push(info);
+        }
+        out
     }
 
     async fn get(&self, name: &str) -> Result<PipeInfo, PipelineAPIError> {
@@ -1923,8 +2067,108 @@ impl PipelineController for PipelineManager {
             uptime_seconds: Some(uptime),
             checkpoints,
         });
+        info.incidents = self.incident_status(name).await;
 
         Ok(info)
+    }
+
+    async fn incidents(&self, name: &str) -> Result<Value, PipelineAPIError> {
+        let health = self.health_of(name)?;
+        let records = health
+            .store()
+            .list()
+            .await
+            .map_err(PipelineAPIError::Failed)?;
+        let mut views: Vec<Value> =
+            records.iter().map(crate::incidents::record_view).collect();
+        for k in health.known().iter().filter(|k| !k.durable) {
+            if !records.iter().any(|r| r.incident_id == k.id) {
+                views.push(crate::incidents::known_view(k));
+            }
+        }
+        Ok(serde_json::json!({
+            "pipeline": name,
+            "primary": health.blocking_incident(),
+            "incidents": views,
+        }))
+    }
+
+    async fn incident(
+        &self,
+        name: &str,
+        id: &str,
+    ) -> Result<Value, PipelineAPIError> {
+        let health = self.health_of(name)?;
+        let id = deltaforge_core::IncidentId(id.to_string());
+        if let Some(rec) = health
+            .store()
+            .get(&id)
+            .await
+            .map_err(PipelineAPIError::Failed)?
+        {
+            return Ok(crate::incidents::record_view(&rec));
+        }
+        health
+            .known()
+            .iter()
+            .find(|k| k.id == id)
+            .map(crate::incidents::known_view)
+            .ok_or_else(|| {
+                PipelineAPIError::NotFound(format!("incident {id} of {name}"))
+            })
+    }
+
+    async fn acknowledge_incident(
+        &self,
+        name: &str,
+        id: &str,
+        req: rest_api::pipelines::AcknowledgeRequest,
+        origin: Option<String>,
+    ) -> Result<Value, PipelineAPIError> {
+        use crate::incidents::LifecycleError;
+        let health = self.health_of(name)?;
+        let id = deltaforge_core::IncidentId(id.to_string());
+        let outcome = health
+            .store()
+            .acknowledge(
+                &id,
+                &req.asserted_actor,
+                origin.as_deref(),
+                &req.reason,
+            )
+            .await
+            .map_err(PipelineAPIError::Failed)?;
+        match outcome {
+            Ok(rec) => {
+                tracing::info!(
+                    target: "audit",
+                    pipeline = %name,
+                    incident = %id,
+                    asserted_actor = %req.asserted_actor,
+                    actor_verified = false,
+                    origin = origin.as_deref().unwrap_or("unknown"),
+                    "incident acknowledged (still open; not resolved)"
+                );
+                Ok(crate::incidents::record_view(&rec))
+            }
+            Err(LifecycleError::AlreadyResolved(_)) => {
+                Err(PipelineAPIError::Conflict(format!(
+                    "incident {id} of {name} is already resolved"
+                )))
+            }
+            Err(LifecycleError::NotFound(_)) => {
+                if health.known().iter().any(|k| k.id == id) {
+                    Err(PipelineAPIError::Conflict(format!(
+                        "incident {id} of {name} is not durable yet (its \
+                         write is being retried); acknowledge it once it is"
+                    )))
+                } else {
+                    Err(PipelineAPIError::NotFound(format!(
+                        "incident {id} of {name}"
+                    )))
+                }
+            }
+        }
     }
 
     async fn create(
@@ -1999,12 +2243,46 @@ impl PipelineController for PipelineManager {
         // concurrent delete/start of the same pipeline.
         let _lifecycle = self.lifecycle.lock().await;
 
-        let status = self
-            .pipelines
-            .read()
-            .get(name)
-            .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?
-            .status;
+        let (status, failed) = {
+            let guard = self.pipelines.read();
+            let rt = guard
+                .get(name)
+                .ok_or_else(|| PipelineAPIError::NotFound(name.to_string()))?;
+            (rt.status, rt.is_failed())
+        };
+
+        // A failed pipeline is restarted like a stopped one: its tasks are
+        // awaited to termination, then a fresh runtime is spawned. Its
+        // incidents are flushed first; any still not durable are carried
+        // into the new runtime (visible as durability-pending, retried). A
+        // resume never acknowledges or resolves an incident.
+        let mut carried = Vec::new();
+        if failed {
+            let health = Arc::clone(
+                &self
+                    .pipelines
+                    .read()
+                    .get(name)
+                    .ok_or_else(|| {
+                        PipelineAPIError::NotFound(name.to_string())
+                    })?
+                    .health,
+            );
+            carried = health.flush().await;
+            if !carried.is_empty() {
+                tracing::warn!(
+                    pipeline = %name,
+                    pending = carried.len(),
+                    "resuming with incidents not yet durable; they stay \
+                     visible as durability-pending"
+                );
+            }
+        }
+        let status = if failed {
+            PipelineStatus::Stopped
+        } else {
+            status
+        };
 
         match status {
             PipelineStatus::Paused => {
@@ -2033,7 +2311,7 @@ impl PipelineController for PipelineManager {
                     .spec
                     .clone();
                 let new_runtime = self
-                    .spawn_pipeline(spec)
+                    .spawn_pipeline_carrying(spec, carried)
                     .await
                     .map_err(PipelineAPIError::Failed)?;
                 let info = new_runtime.info();
@@ -2807,7 +3085,12 @@ mod tests {
         PipelineRuntime {
             spec,
             status: PipelineStatus::Running,
-            alive: Arc::new(AtomicBool::new(true)),
+            health: crate::incidents::PipelineHealth::new_unprepared(
+                crate::incidents::IncidentStore::new(
+                    Arc::new(storage::MemoryStorageBackend::new()),
+                    "test",
+                ),
+            ),
             cancel: CancellationToken::new(),
             pause: pause_tx,
             sources: vec![],
@@ -3059,7 +3342,7 @@ mod tests {
 
         // A coordinator task that only finishes after a delay and records that it
         // finished. delete() must await this before releasing the claim.
-        let finished = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let f2 = Arc::clone(&finished);
         let join: JoinHandle<Result<()>> = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -3108,6 +3391,254 @@ mod tests {
         );
         // The pipeline is untouched and still registered.
         assert!(mgr.get_pipeline("pl").is_some());
+    }
+
+    /// A source that exits on its own fails the pipeline with its blocking
+    /// incident, recorded durably without error text; a resume restarts it;
+    /// the same condition again is the same incident, counted, not duplicated.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_source_fails_the_pipeline_with_its_incident() {
+        let mgr = PipelineManager::for_testing();
+        mgr.start_pipeline(spec_dead("pf")).await.unwrap();
+        let store =
+            crate::incidents::IncidentStore::new(mgr.backend.clone(), "pf");
+
+        async fn failed_with_incident(
+            mgr: &PipelineManager,
+            store: &crate::incidents::IncidentStore,
+        ) -> crate::incidents::IncidentRecord {
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                let id = {
+                    let guard = mgr.pipelines.read();
+                    let rt = guard.get("pf").unwrap();
+                    rt.health
+                        .blocking_incident()
+                        .filter(|_| rt.info().status == "failed")
+                };
+                if let Some(id) = id
+                    && let Some(rec) = store.get(&id).await.unwrap()
+                {
+                    return rec;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the pipeline never failed with an incident"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+
+        let rec = failed_with_incident(&mgr, &store).await;
+        assert_eq!(
+            rec.component,
+            deltaforge_core::incident::Component::Source { id: "mysql".into() }
+        );
+        assert_eq!(
+            rec.reason_code,
+            deltaforge_core::incident::ReasonCode::UnclassifiedFailure
+        );
+        assert_eq!(
+            rec.safety_state,
+            deltaforge_core::incident::SafetyState::HaltedUncertain
+        );
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(
+            !json.contains("root:root") && !json.contains("59999"),
+            "{json}"
+        );
+        assert_eq!(rec.occurrences, 1);
+
+        // A resume restarts a failed pipeline (it is not left "running").
+        mgr.resume("pf").await.expect("resume restarts it");
+        let again = failed_with_incident(&mgr, &store).await;
+        assert_eq!(again.incident_id, rec.incident_id, "the same condition");
+        assert_eq!(again.occurrences, 2);
+        assert_eq!(store.list().await.unwrap().len(), 1);
+    }
+
+    /// While the state store rejects incident writes, the pipeline still
+    /// fails with its incident (durability pending); a resume flushes it and,
+    /// when it is still not durable, carries it into the new runtime, where it
+    /// stays visible and is persisted once the store accepts writes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resume_carries_an_incident_that_is_not_durable_yet() {
+        let fault = Arc::new(storage::adapters::test_util::FaultBackend::new());
+        let backend: ArcStorageBackend = fault.clone();
+        let mgr = manager_with_ckpt(
+            Arc::clone(&backend),
+            Arc::new(BackendCheckpointStore::new(Arc::clone(&backend))),
+        )
+        .await;
+        fault
+            .fail_writes_to
+            .lock()
+            .unwrap()
+            .push(crate::incidents::INCIDENTS_NS.into());
+        mgr.start_pipeline(spec_dead("pc")).await.unwrap();
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let id = loop {
+            let id = {
+                let guard = mgr.pipelines.read();
+                let rt = guard.get("pc").unwrap();
+                rt.health.blocking_incident().filter(|_| rt.is_failed())
+            };
+            if let Some(id) = id {
+                break id;
+            }
+            assert!(std::time::Instant::now() < deadline, "never failed");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        assert!(
+            mgr.pipelines
+                .read()
+                .get("pc")
+                .unwrap()
+                .health
+                .durability_pending()
+        );
+
+        mgr.resume("pc").await.expect("resume proceeds");
+        {
+            let guard = mgr.pipelines.read();
+            let rt = guard.get("pc").unwrap();
+            let carried = rt.health.known();
+            assert!(
+                carried.iter().any(|k| k.id == id && !k.durable),
+                "the incident stays visible as durability-pending"
+            );
+        }
+        let status = PipelineController::get(&mgr, "pc")
+            .await
+            .unwrap()
+            .incidents
+            .unwrap();
+        assert!(status.durability_pending, "status says it is not durable");
+        assert!(
+            status
+                .blocking
+                .iter()
+                .any(|b| b["incident_id"] == id.0 && b["durable"] == false),
+            "and still shows it as blocking"
+        );
+        fault.fail_writes_to.lock().unwrap().clear();
+        let store =
+            crate::incidents::IncidentStore::new(Arc::clone(&backend), "pc");
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while store.get(&id).await.unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "never persisted");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// A failed pipeline exposes its incident through status and the incident
+    /// API; acknowledging it records the caller-supplied actor and origin,
+    /// keeps it open and blocking (status, readiness), and never resolves it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn incidents_are_exposed_and_acknowledgement_keeps_them_blocking() {
+        let mgr = PipelineManager::for_testing();
+        mgr.start_pipeline(spec_dead("px")).await.unwrap();
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let id = loop {
+            let info = PipelineController::get(&mgr, "px").await.unwrap();
+            let inc = info.incidents.clone().unwrap();
+            if info.status == "failed"
+                && let Some(primary) = inc.primary.clone()
+                && inc.blocking.iter().any(|b| b["incident_id"] == primary)
+            {
+                break primary;
+            }
+            assert!(std::time::Instant::now() < deadline, "never exposed");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        let listed = PipelineController::list(&mgr).await;
+        assert!(listed[0].incidents.as_ref().unwrap().blocks_readiness());
+        let one = mgr.incident("px", &id).await.unwrap();
+        assert_eq!(one["reason_code"], "unclassified_failure");
+        assert_eq!(one["durable"], true);
+        assert!(!one.to_string().contains("root:root"));
+        assert!(
+            mgr.incidents("px").await.unwrap()["incidents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["incident_id"] == id)
+        );
+
+        let acked = mgr
+            .acknowledge_incident(
+                "px",
+                &id,
+                rest_api::pipelines::AcknowledgeRequest {
+                    asserted_actor: "alice".into(),
+                    reason: "investigating".into(),
+                },
+                Some("10.1.2.3".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(acked["status"]["state"], "acknowledged");
+        assert_eq!(acked["status"]["actor_verified"], false);
+        assert_eq!(acked["status"]["origin"], "10.1.2.3");
+        assert_eq!(acked["blocking"], true, "acknowledged is still blocking");
+        let info = PipelineController::get(&mgr, "px").await.unwrap();
+        assert_eq!(info.status, "failed");
+        assert!(info.incidents.unwrap().blocks_readiness());
+        let trail =
+            crate::incidents::IncidentStore::new(mgr.backend.clone(), "px")
+                .audit_trail(100)
+                .await
+                .unwrap();
+        assert!(trail.iter().any(|e| matches!(
+            &e.transition,
+            crate::incidents::Transition::Acknowledged { asserted_actor, actor_verified: false, .. }
+                if asserted_actor == "alice"
+        )));
+
+        assert!(matches!(
+            mgr.incident("px", "nope").await,
+            Err(PipelineAPIError::NotFound(_))
+        ));
+        assert!(matches!(
+            mgr.acknowledge_incident(
+                "px",
+                "nope",
+                rest_api::pipelines::AcknowledgeRequest {
+                    asserted_actor: "a".into(),
+                    reason: "r".into(),
+                },
+                None,
+            )
+            .await,
+            Err(PipelineAPIError::NotFound(_))
+        ));
+        crate::incidents::IncidentStore::new(mgr.backend.clone(), "px")
+            .resolve(
+                &deltaforge_core::IncidentId(id.clone()),
+                crate::incidents::Resolution::VerifiedRecovery {
+                    check: "test".into(),
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            mgr.acknowledge_incident(
+                "px",
+                &id,
+                rest_api::pipelines::AcknowledgeRequest {
+                    asserted_actor: "a".into(),
+                    reason: "r".into(),
+                },
+                None,
+            )
+            .await,
+            Err(PipelineAPIError::Conflict(_))
+        ));
     }
 
     // ── Blocker 1: resume awaits stopped tasks before respawning ──
@@ -4076,7 +4607,12 @@ mod tests {
         let runtime = PipelineRuntime {
             spec: sample_spec(&name),
             status: PipelineStatus::Running,
-            alive: Arc::new(AtomicBool::new(true)),
+            health: crate::incidents::PipelineHealth::new_unprepared(
+                crate::incidents::IncidentStore::new(
+                    Arc::new(storage::MemoryStorageBackend::new()),
+                    "test",
+                ),
+            ),
             cancel: CancellationToken::new(),
             pause: pause_tx2,
             sources: vec![],

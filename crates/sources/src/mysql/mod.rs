@@ -21,6 +21,7 @@ use common::{AllowList, RetryPolicy, pause_until_resumed};
 use storage::BackendCheckpointStore;
 
 use crate::snapshot_generation::PersistedLineage;
+use deltaforge_core::incident::{CauseCode, IncidentDraft, Retryability};
 use deltaforge_core::{
     CheckpointOrder, Source, SourceError, SourceHandle, SourceItem,
     SourceResult,
@@ -187,6 +188,11 @@ pub(crate) struct RunCtx {
     failover: Option<Option<Arc<mysql_failover_drift::FailoverAnchor>>>,
     /// Tables whose failover drift check completed in this run.
     drift_checked: std::collections::HashSet<String>,
+    /// Resolves this source's schema-drift incidents as tables are accepted.
+    drift_resolver: crate::incident_drafts::DriftResolver,
+    /// The pipeline's incidents: a retried resume-position check is reported
+    /// here while it retries.
+    incidents: storage::adapters::incidents::IncidentStore,
     /// Original checkpoint position, preserved even after a pre-connect failover
     /// adjustment clears last_gtid/last_file. Used by check_position_reachability
     /// to verify whether A's position actually exists on B.
@@ -357,6 +363,7 @@ impl MySqlSource {
         cancel: CancellationToken,
         paused: Arc<AtomicBool>,
         pause_notify: Arc<Notify>,
+        ready: deltaforge_core::SourceReady,
     ) -> SourceResult<()> {
         // Verify the source lineage ONCE, before any snapshot, stream, or RunCtx.
         // Fail closed if it cannot be established: a swallowed error here would
@@ -749,6 +756,15 @@ impl MySqlSource {
             selection: Default::default(),
             failover: None,
             drift_checked: Default::default(),
+            drift_resolver: crate::incident_drafts::DriftResolver::new(
+                Arc::clone(&self.backend),
+                &self.pipeline,
+                &self.id,
+            ),
+            incidents: storage::adapters::incidents::IncidentStore::new(
+                Arc::clone(&self.backend),
+                &self.pipeline,
+            ),
             checkpoint_gtid,
             checkpoint_file,
             outbox_tables: self.outbox_tables.clone(),
@@ -814,6 +830,9 @@ impl MySqlSource {
             None => None,
         };
 
+        // Startup checks passed and the stream is open on the verified
+        // server: the source half of the verified-running barrier.
+        ready.mark();
         info!("entering binlog read loop");
         // The loop runs inside an async block so its result can be captured and the
         // rotation runtime cancelled+joined before teardown, on both the normal and
@@ -1011,6 +1030,8 @@ impl Source for MySqlSource {
         let cancel_for_task = cancel.clone();
         let paused_for_task = paused.clone();
         let pause_notify_for_task = pause_notify.clone();
+        let ready = deltaforge_core::SourceReady::new();
+        let ready_for_task = ready.clone();
 
         let join = tokio::spawn(async move {
             let res = this
@@ -1020,6 +1041,7 @@ impl Source for MySqlSource {
                     cancel_for_task,
                     paused_for_task,
                     pause_notify_for_task,
+                    ready_for_task,
                 )
                 .await;
             if let Err(e) = &res {
@@ -1033,6 +1055,7 @@ impl Source for MySqlSource {
             paused,
             pause_notify,
             join,
+            ready,
         }
     }
 
@@ -1601,6 +1624,213 @@ async fn sync_registry_lineage(
     Ok(())
 }
 
+/// How long a plausibly transient failure to verify the resume position is
+/// retried before the source stops.
+const REACHABILITY_RETRY_WINDOW: Duration = Duration::from_secs(120);
+
+/// Verify, on a connection proven to be `expected`, that the server has
+/// executed the checkpoint's GTID set before reading on. Fails closed: a
+/// confirmed loss or an error answer stops at once; an unknown answer is
+/// retried with backoff while it is plausibly transient. While it retries,
+/// the condition is an open auto-retry `mysql_gtid_position_unavailable`
+/// incident; when the window ends the source stops on the same incident,
+/// which then needs an operator. Every stop is operator action; cancellation
+/// stops without one.
+async fn verify_gtid_position(
+    ctx: &RunCtx,
+    expected: &str,
+    window: Duration,
+) -> SourceResult<()> {
+    let deadline = std::time::Instant::now() + window;
+    let mut delay = Duration::from_secs(1);
+    let gtid = ctx.checkpoint_gtid.as_deref();
+    let mut retrying = None;
+    loop {
+        let reach = match open_control_connection(
+            ctx.dsn.expose(),
+            expected,
+            CONTROL_CONNECT_TIMEOUT,
+        )
+        .await
+        {
+            Ok(mut conn) => {
+                let r = check_position_reachability_on(
+                    &mut conn,
+                    &ctx.checkpoint_file,
+                    gtid,
+                )
+                .await;
+                conn.disconnect().await.ok();
+                r.unwrap_or_else(|e| PositionReachability::Unknown {
+                    transient: false,
+                    reason: format!("{e:#}"),
+                })
+            }
+            Err(SessionError::Connect(e)) => PositionReachability::Unknown {
+                transient: true,
+                reason: e,
+            },
+            Err(e) => return Err(e.into_source_error(expected)),
+        };
+        match reach {
+            PositionReachability::Reachable => return Ok(()),
+            PositionReachability::Lost { class, reason } => {
+                error!(
+                    source_id = %ctx.source_id, %reason,
+                    "checkpoint position not available on this server; halting"
+                );
+                return Err(gtid_position_unavailable(
+                    &ctx.source_id,
+                    Some(expected),
+                    gtid,
+                    class,
+                    SourceError::Checkpoint {
+                        details: format!(
+                            "checkpoint position not available on this \
+                             server (binlog purge?): {reason}. Re-snapshot \
+                             required."
+                        )
+                        .into(),
+                    },
+                ));
+            }
+            PositionReachability::Unknown { transient, reason } => {
+                if transient && std::time::Instant::now() + delay < deadline {
+                    if retrying.is_none() {
+                        retrying = crate::incident_drafts::record_retrying(
+                            &ctx.incidents,
+                            &gtid_position_unavailable_draft(
+                                &ctx.source_id,
+                                Some(expected),
+                                gtid,
+                                "unknown_unreachable",
+                                Retryability::AutoRetry,
+                                CauseCode::SourceConnect,
+                            ),
+                        )
+                        .await;
+                    }
+                    warn!(
+                        source_id = %ctx.source_id, %reason,
+                        retry_in_secs = delay.as_secs(),
+                        "cannot verify the resume position yet; retrying \
+                         (reading stays stopped)"
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = ctx.cancel.cancelled() => {
+                            crate::incident_drafts::cancel_retrying(
+                                &ctx.incidents,
+                                retrying,
+                            )
+                            .await;
+                            return Err(SourceError::Cancelled);
+                        }
+                    }
+                    delay = (delay * 2).min(Duration::from_secs(15));
+                    continue;
+                }
+                let class = if transient {
+                    "unknown_unreachable"
+                } else {
+                    "unknown_query_failed"
+                };
+                let details = format!(
+                    "cannot verify that the server holds the resume position: \
+                     {reason}"
+                );
+                let cause = if transient {
+                    SourceError::Connect {
+                        details: details.into(),
+                    }
+                } else {
+                    SourceError::Checkpoint {
+                        details: details.into(),
+                    }
+                };
+                return Err(gtid_position_unavailable(
+                    &ctx.source_id,
+                    Some(expected),
+                    gtid,
+                    class,
+                    cause,
+                ));
+            }
+        }
+    }
+}
+
+/// The `mysql_gtid_position_unavailable` incident around `cause`: the source
+/// stops, so it needs an operator.
+pub(crate) fn gtid_position_unavailable(
+    source_id: &str,
+    server_uuid: Option<&str>,
+    gtid_set: Option<&str>,
+    class: &str,
+    cause: SourceError,
+) -> SourceError {
+    let draft = gtid_position_unavailable_draft(
+        source_id,
+        server_uuid,
+        gtid_set,
+        class,
+        Retryability::OperatorAction,
+        cause.cause_code(),
+    );
+    SourceError::incident(draft, cause)
+}
+
+/// The `mysql_gtid_position_unavailable` draft. The GTID set is exposed only
+/// as a digest with its interval count. Its identity is the server, GTID set
+/// and class, never the retryability, so an automatic retry that exhausts
+/// its window stays one incident.
+fn gtid_position_unavailable_draft(
+    source_id: &str,
+    server_uuid: Option<&str>,
+    gtid_set: Option<&str>,
+    class: &str,
+    retryability: Retryability,
+    cause_code: CauseCode,
+) -> IncidentDraft {
+    use deltaforge_core::incident::{
+        ActionCode, Component, EvidenceKey as K, ReasonCode, SafetyState,
+    };
+    let unknown = class.starts_with("unknown_");
+    let actions: &[ActionCode] = if unknown {
+        &[ActionCode::VerifyEndpoint, ActionCode::InspectLogs]
+    } else {
+        &[
+            ActionCode::Resnapshot,
+            ActionCode::RestoreMissingTransactions,
+        ]
+    };
+    let set = gtid_set.unwrap_or("");
+    let intervals =
+        set.split(',').filter(|p| !p.trim().is_empty()).count() as u64;
+    IncidentDraft::new(
+        ReasonCode::MysqlGtidPositionUnavailable,
+        Component::Source {
+            id: source_id.to_string(),
+        },
+        retryability,
+        SafetyState::HaltedSafe,
+        cause_code,
+    )
+    .discriminate("server_uuid", server_uuid.unwrap_or("-"))
+    .discriminate("gtid_set", set)
+    .discriminate("class", class)
+    .with_evidence(|e| {
+        e.text(K::SourceId, source_id).text(K::ReasonClass, class);
+        if let Some(uuid) = server_uuid {
+            e.text(K::ServerUuid, uuid);
+        }
+        if gtid_set.is_some() {
+            e.digest(K::GtidSet, set.as_bytes(), intervals);
+        }
+    })
+    .with_actions(actions)
+}
+
 /// Compare the live server identity against the stored one.
 ///
 /// - `FirstSeen`: store and continue (clean start or wiped state).
@@ -1644,41 +1874,8 @@ async fn check_identity_post_reconnect(
             // Skip when there is no GTID checkpoint (file/pos mode or fresh
             // start) to avoid false positives from the file-presence fallback.
             if ctx.checkpoint_gtid.is_some() {
-                let reach = match open_control_connection(
-                    ctx.dsn.expose(),
-                    &expected,
-                    CONTROL_CONNECT_TIMEOUT,
-                )
-                .await
-                {
-                    Ok(mut conn) => {
-                        let r = check_position_reachability_on(
-                            &mut conn,
-                            &ctx.checkpoint_file,
-                            ctx.checkpoint_gtid.as_deref(),
-                        )
-                        .await;
-                        conn.disconnect().await.ok();
-                        r.unwrap_or(PositionReachability::Unknown {
-                            reason: "reachability check failed".into(),
-                        })
-                    }
-                    Err(SessionError::Connect(e)) => {
-                        PositionReachability::Unknown { reason: e }
-                    }
-                    Err(e) => return Err(e.into_source_error(&expected)),
-                };
-                match reach {
-                    PositionReachability::Reachable
-                    | PositionReachability::Unknown { .. } => {}
-                    PositionReachability::Lost { reason } => {
-                        return Err(SourceError::Other(anyhow::anyhow!(
-                            "checkpoint GTID set no longer reachable on \
-                             this server (binlog purge?): {reason}. \
-                             Re-snapshot required."
-                        )));
-                    }
-                }
+                verify_gtid_position(ctx, &expected, REACHABILITY_RETRY_WINDOW)
+                    .await?;
             }
         }
         IdentityComparison::Changed { previous, current } => {
@@ -1841,12 +2038,25 @@ async fn failover_record(
 ) -> SourceResult<crate::failover::reconciler::ReconciliationRecord> {
     mysql_health::require_gtid_executed(conn, resume_set)
         .await
-        .map_err(|why| SourceError::Checkpoint {
-            details: format!(
-                "failover to {current:?}: the resume position {resume_set:?} \
-                 is not proven on the new server ({why}). Re-snapshot required."
+        .map_err(|why| {
+            let uuid = match current {
+                ServerIdentity::MySql(id) => Some(id.server_uuid.as_str()),
+                _ => None,
+            };
+            gtid_position_unavailable(
+                &ctx.source_id,
+                uuid,
+                Some(resume_set),
+                why.class,
+                SourceError::Checkpoint {
+                    details: format!(
+                        "failover to {current:?}: the resume position \
+                         {resume_set:?} is not proven on the new server \
+                         ({why}). Re-snapshot required."
+                    )
+                    .into(),
+                },
             )
-            .into(),
         })?;
 
     if let Some(record) = ctx

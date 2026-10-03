@@ -321,7 +321,9 @@ async fn promote_b(
 
 fn halted(ended: &Option<SourceResult<()>>, needle: &str) {
     let msg = match ended {
-        Some(Err(e)) => format!("{e:#}"),
+        // The typed cause keeps the detailed message (the incident's own
+        // display is its sanitized explanation).
+        Some(Err(e)) => e.root().to_string(),
         other => panic!("the source must stop: {other:?}"),
     };
     assert!(

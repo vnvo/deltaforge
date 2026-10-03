@@ -75,6 +75,8 @@ enum Op {
     OriginalDelete,
     /// A `list_meta` call during reconciliation (Commit 10).
     ListObjects,
+    /// A read of HEAD.
+    HeadGet,
 }
 
 fn classify_put(key: &Path) -> Op {
@@ -116,6 +118,8 @@ fn classify_get(key: &Path) -> Option<Op> {
     let k = key.to_string();
     if k.contains("/wm-") && !k.contains("/compacted/") {
         Some(Op::GetData)
+    } else if k.contains("_manifest/HEAD") {
+        Some(Op::HeadGet)
     } else {
         None
     }
@@ -146,7 +150,7 @@ struct Trigger {
 /// failpoints over an inner `ObjectStoreConditional`.
 struct FaultStore {
     inner: Arc<ObjectStoreConditional>,
-    triggers: Vec<Trigger>,
+    triggers: std::sync::Mutex<Vec<Trigger>>,
     counts: Mutex<HashMap<Op, usize>>,
     /// Fired when a hang action begins, so a test can observe the boundary and
     /// then drop the in-flight future (abrupt cancellation).
@@ -157,7 +161,7 @@ impl FaultStore {
     fn new(inner: Arc<ObjectStoreConditional>, triggers: Vec<Trigger>) -> Self {
         Self {
             inner,
-            triggers,
+            triggers: std::sync::Mutex::new(triggers),
             counts: Mutex::new(HashMap::new()),
             hang_started: Arc::new(Notify::new()),
         }
@@ -169,9 +173,20 @@ impl FaultStore {
         let cur = *n;
         *n += 1;
         self.triggers
+            .lock()
+            .unwrap()
             .iter()
             .find(|t| t.op == op && t.nth == cur)
             .map(|t| t.action)
+    }
+
+    /// Fire `action` at the next occurrence of `op` (counted from now).
+    async fn arm_next(&self, op: Op, action: Action) {
+        let nth = *self.counts.lock().await.get(&op).unwrap_or(&0);
+        self.triggers
+            .lock()
+            .unwrap()
+            .push(Trigger { op, nth, action });
     }
 
     async fn hang(&self) -> ! {
@@ -548,6 +563,215 @@ async fn head_cas_lost_response_acks_because_head_references_entry() {
     let h = read_head(&inner).await.unwrap();
     assert_eq!(h.seq, 1);
     assert!(h.head_entry_key.is_some());
+}
+
+// ── Acknowledgement uncertainty: both sides of the acceptance boundary ──────
+
+/// A failure before the HEAD CAS (the acknowledging mutation) is a definite
+/// "not written": no ambiguity, nothing acknowledged.
+#[tokio::test]
+async fn a_failure_before_the_head_cas_is_definitely_not_written() {
+    let inner = inmem();
+    let (_fs, w) =
+        genesis(&inner, vec![tr(Op::ManifestPut, 0, Action::ErrBefore)]).await;
+    let err = w
+        .publish(&wm(1), vec![tobj("orders", b"a")], 1)
+        .await
+        .unwrap_err();
+    assert!(!matches!(err, HeadError::Ambiguous(..)), "{err:?}");
+    assert_eq!(read_head(&inner).await.unwrap().seq, 0);
+}
+
+/// The HEAD CAS was submitted (and applied) but its response was lost, and
+/// HEAD cannot be reread to settle it: the outcome is unknown.
+#[tokio::test]
+async fn a_lost_head_cas_response_without_a_reread_is_ambiguous() {
+    let inner = inmem();
+    let (fs, w) =
+        genesis(&inner, vec![tr(Op::HeadCas, 0, Action::ApplyThenErr)]).await;
+    fs.arm_next(Op::HeadGet, Action::ErrBefore).await;
+    let err = w
+        .publish(&wm(1), vec![tobj("orders", b"a")], 1)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HeadError::Ambiguous(..)), "{err:?}");
+    assert!(
+        err.is_fatal(),
+        "the pipeline stops; nothing is acknowledged"
+    );
+    // It did apply: the ambiguity is real, not a definite failure.
+    assert_eq!(read_head(&inner).await.unwrap().seq, 1);
+}
+
+/// The authoritative reread settles a lost response as committed (HEAD
+/// references the entry) or as absent (HEAD unchanged: retried); neither is
+/// uncertain.
+#[tokio::test]
+async fn an_authoritative_reread_settles_the_outcome() {
+    // Committed.
+    let inner = inmem();
+    let (_fs, w) =
+        genesis(&inner, vec![tr(Op::HeadCas, 0, Action::ApplyThenErr)]).await;
+    w.publish(&wm(1), vec![tobj("orders", b"a")], 1)
+        .await
+        .unwrap();
+    assert_eq!(read_head(&inner).await.unwrap().seq, 1);
+    // Absent: every CAS attempt errors without applying; each reread shows
+    // HEAD unchanged, so the result is a definite non-acknowledgement.
+    let inner = inmem();
+    let triggers = (0..64)
+        .map(|n| tr(Op::HeadCas, n, Action::ErrBefore))
+        .collect();
+    let (_fs, w) = genesis(&inner, triggers).await;
+    let err = w
+        .publish(&wm(1), vec![tobj("orders", b"a")], 1)
+        .await
+        .unwrap_err();
+    assert!(!matches!(err, HeadError::Ambiguous(..)), "{err:?}");
+    assert_eq!(read_head(&inner).await.unwrap().seq, 0, "not acknowledged");
+}
+
+/// The incident an ambiguous publish raises (through the sink's own
+/// mapping), and how a reread of exactly its boundary settles it.
+async fn ambiguous_incident(
+    w: &DurableWriter<FaultStore>,
+    pos: u64,
+) -> deltaforge_core::incident::Evidence {
+    let err = w
+        .publish(&wm(pos), vec![tobj("orders", b"a")], 1)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HeadError::Ambiguous(..)), "{err:?}");
+    let err = super::durable_sink::publish_error("sink", &wm(pos), err);
+    err.draft().expect("sink_ack_uncertain").evidence.clone()
+}
+
+async fn settle(
+    w: &DurableWriter<FaultStore>,
+    evidence: &deltaforge_core::incident::Evidence,
+) -> deltaforge_core::BoundaryOutcome {
+    super::durable_sink::settle_on(w, evidence).await
+}
+
+/// An ambiguous publish that did apply is settled as committed by a later
+/// reread of its HEAD boundary, also by a restarted writer (a new epoch).
+#[tokio::test]
+async fn a_reread_of_the_exact_boundary_proves_an_ambiguous_publish_committed()
+{
+    use deltaforge_core::BoundaryOutcome;
+    let inner = inmem();
+    let (fs, w) =
+        genesis(&inner, vec![tr(Op::HeadCas, 0, Action::ApplyThenErr)]).await;
+    fs.arm_next(Op::HeadGet, Action::ErrBefore).await;
+    let a = ambiguous_incident(&w, 1).await;
+    // While HEAD is unreadable nothing is decided.
+    fs.arm_next(Op::HeadGet, Action::ErrBefore).await;
+    assert_eq!(settle(&w, &a).await, BoundaryOutcome::Unknown);
+    assert_eq!(settle(&w, &a).await, BoundaryOutcome::Committed);
+    let restarted = acquire(Arc::new(FaultStore::new(inner, vec![])))
+        .await
+        .unwrap();
+    let restarted_settles =
+        super::durable_sink::settle_on(&restarted, &a).await;
+    assert_eq!(restarted_settles, BoundaryOutcome::Committed);
+}
+
+/// An ambiguous publish that did not apply is settled as absent, also after
+/// a later batch B took its seq: B's success never makes A committed. Each
+/// boundary is decided by its own reread: committed A' and absent A at once.
+#[tokio::test]
+async fn each_ambiguous_boundary_is_settled_by_its_own_reread() {
+    use deltaforge_core::BoundaryOutcome;
+    let inner = inmem();
+    let (fs, w) =
+        genesis(&inner, vec![tr(Op::HeadCas, 0, Action::ErrBefore)]).await;
+    fs.arm_next(Op::HeadGet, Action::ErrBefore).await;
+    let a = ambiguous_incident(&w, 1).await;
+    assert_eq!(settle(&w, &a).await, BoundaryOutcome::Absent, "HEAD at 0");
+
+    // Batch B (another watermark) publishes at seq 1.
+    w.publish(&wm(2), vec![tobj("orders", b"b")], 1)
+        .await
+        .unwrap();
+    assert_eq!(read_head(&inner).await.unwrap().seq, 1);
+    assert_eq!(settle(&w, &a).await, BoundaryOutcome::Absent, "seq 1 is B");
+
+    // C: applied but ambiguous at seq 2.
+    fs.arm_next(Op::HeadCas, Action::ApplyThenErr).await;
+    fs.arm_next(Op::HeadGet, Action::ErrBefore).await;
+    let c = ambiguous_incident(&w, 3).await;
+    assert_ne!(a, c);
+    assert_eq!(settle(&w, &c).await, BoundaryOutcome::Committed);
+    assert_eq!(settle(&w, &a).await, BoundaryOutcome::Absent);
+}
+
+/// Absence is proven only over a complete chain back to the exact
+/// conditioned generation: evidence conditioned on an entry that is not in
+/// HEAD's history, or an entry between HEAD and the boundary missing
+/// (truncated or collected history), leaves the boundary undecided.
+#[tokio::test]
+async fn an_incomplete_chain_leaves_an_absent_boundary_undecided() {
+    use deltaforge_core::BoundaryOutcome;
+    let inner = inmem();
+    let (fs, w) =
+        genesis(&inner, vec![tr(Op::HeadCas, 0, Action::ErrBefore)]).await;
+    fs.arm_next(Op::HeadGet, Action::ErrBefore).await;
+    let a = ambiguous_incident(&w, 1).await;
+    // A conditioned generation that is not HEAD's history proves nothing.
+    let mut foreign = a.clone();
+    {
+        use deltaforge_core::incident::EvidenceKey as K;
+        let generation = a.text_of(K::ExpectedGeneration).unwrap();
+        let epoch = generation.split(':').next().unwrap();
+        foreign.text(
+            K::ExpectedGeneration,
+            &format!("{epoch}:0:{}", "ab".repeat(32)),
+        );
+    }
+    assert_eq!(settle(&w, &a).await, BoundaryOutcome::Absent);
+    assert_eq!(settle(&w, &foreign).await, BoundaryOutcome::Unknown);
+    for pos in [2, 3] {
+        w.publish(&wm(pos), vec![tobj("orders", b"b")], 1)
+            .await
+            .unwrap();
+    }
+    assert_eq!(settle(&w, &a).await, BoundaryOutcome::Absent);
+    assert_eq!(settle(&w, &foreign).await, BoundaryOutcome::Unknown);
+    // Both B's entry and A's unreferenced proposal sit at seq 1.
+    let at_seq_1: Vec<_> = inner
+        .list(&Path::from(format!("{PFX}/{PIPE}/_manifest/entries")))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.to_string().contains("/00000000000000000001-"))
+        .collect();
+    assert_eq!(at_seq_1.len(), 2);
+    for p in at_seq_1 {
+        inner.delete(&p).await.unwrap();
+    }
+    assert_eq!(settle(&w, &a).await, BoundaryOutcome::Unknown);
+}
+
+/// Evidence that names another HEAD object, or no conditional write at all
+/// (a Kafka transaction), is never decided by this sink.
+#[tokio::test]
+async fn a_boundary_of_another_object_is_not_settled() {
+    use deltaforge_core::BoundaryOutcome;
+    use deltaforge_core::incident::EvidenceKey as K;
+    let inner = inmem();
+    let (fs, w) =
+        genesis(&inner, vec![tr(Op::HeadCas, 0, Action::ApplyThenErr)]).await;
+    fs.arm_next(Op::HeadGet, Action::ErrBefore).await;
+    let a = ambiguous_incident(&w, 1).await;
+    let mut other = a.clone();
+    other.text(K::ObjectKey, "other/_manifest/HEAD");
+    assert_eq!(settle(&w, &other).await, BoundaryOutcome::Unknown);
+    let mut wrong_content = a.clone();
+    wrong_content.text(K::ContentIdentity, "00ff");
+    assert_eq!(settle(&w, &wrong_content).await, BoundaryOutcome::Absent);
+    let mut no_write = deltaforge_core::incident::Evidence::new();
+    no_write.text(K::SinkId, "sink");
+    assert_eq!(settle(&w, &no_write).await, BoundaryOutcome::Unknown);
 }
 
 // ── Abrupt cancellation (process death), not returned errors ────────────────

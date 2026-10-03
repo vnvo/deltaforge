@@ -237,7 +237,56 @@ pub enum HeadError {
     /// A data-object or manifest-entry integrity failure while publishing.
     #[error("durable: {0}")]
     Durable(String),
+    /// The HEAD compare-and-swap was submitted but its response was lost, and
+    /// HEAD could not be reread to settle whether it applied: the batch may or
+    /// may not be acknowledged downstream. Fatal (the pipeline stops; the
+    /// checkpoint is not advanced).
+    #[error("publish outcome unknown: {0}")]
+    Ambiguous(String, AmbiguousPublish),
 }
+
+/// Exactly the HEAD compare-and-swap whose outcome is unknown: the HEAD
+/// object, the generation it was conditioned on and the manifest entry it
+/// proposed. [`DurableWriter::settle_publish`] decides it later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbiguousPublish {
+    pub head_key: String,
+    pub epoch: u64,
+    /// The HEAD seq the CAS was conditioned on (it proposed `seq + 1`).
+    pub expected_seq: u64,
+    /// The hash of the entry that HEAD referenced (`None` at genesis).
+    pub expected_entry_hash: Option<String>,
+    /// The proposed entry's hash (its content identity).
+    pub entry_hash: String,
+}
+
+/// The `expected_entry` text of a genesis HEAD (no entry).
+pub const GENESIS_ENTRY: &str = "genesis";
+
+impl AmbiguousPublish {
+    /// `epoch:seq:entry` of the HEAD the CAS was conditioned on.
+    pub fn expected_generation(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.epoch,
+            self.expected_seq,
+            self.expected_entry_hash.as_deref().unwrap_or(GENESIS_ENTRY)
+        )
+    }
+}
+
+/// What an authoritative reread proved about one HEAD compare-and-swap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishOutcome {
+    /// HEAD's chain holds the proposed entry at the proposed seq.
+    Committed,
+    /// HEAD's chain holds another entry at that seq, or never reached it.
+    Absent,
+}
+
+/// How far back from HEAD a settle walks the chain before giving up (the
+/// boundary is normally HEAD itself or one entry behind it).
+const MAX_SETTLE_WALK: u64 = 1_024;
 
 impl HeadError {
     /// Fatal errors stop the pipeline; non-fatal ones are retried by replay.
@@ -248,6 +297,7 @@ impl HeadError {
                 | HeadError::MissingReferenced { .. }
                 | HeadError::Fenced { .. }
                 | HeadError::RecoveryRequired(_)
+                | HeadError::Ambiguous(..)
         )
     }
 }
@@ -1501,6 +1551,64 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
         }
     }
 
+    /// Settle an ambiguous HEAD compare-and-swap by rereading HEAD: only
+    /// when `head_key` is this writer's HEAD. The CAS was conditioned on HEAD
+    /// at `expected_seq` referencing `expected_entry` (`None` at genesis) and
+    /// proposed `entry_hash` at `expected_seq + 1`. HEAD's seq never
+    /// decreases and every later CAS extends the chain, so the chain decides
+    /// it, but only when it is complete: every link from current HEAD back
+    /// to the conditioned generation is present, consecutive and hashes to
+    /// its reference. Then the proposed entry at the proposed seq is
+    /// committed; another entry there whose predecessor is the conditioned
+    /// one, or a HEAD still at the conditioned generation, is absent.
+    /// Anything else (another HEAD, a truncated, compacted, corrupt or
+    /// overlong chain, an unreadable store) is `None`: undecided.
+    pub async fn settle_publish(
+        &self,
+        head_key: &str,
+        epoch: u64,
+        expected_seq: u64,
+        expected_entry: Option<&str>,
+        entry_hash: &str,
+    ) -> Option<PublishOutcome> {
+        let hkey = self::head_key(&self.prefix, &self.pipeline);
+        if hkey.as_ref() != head_key {
+            return None;
+        }
+        let (raw, _) = self.store.get_with_etag(&hkey).await.ok()??;
+        let cur = Head::parse(&raw).ok()?;
+        if cur.seq < expected_seq || cur.seq - expected_seq > MAX_SETTLE_WALK {
+            return None;
+        }
+        if cur.seq == expected_seq {
+            // HEAD never moved past the conditioned generation: absent only
+            // if it is still exactly that generation.
+            return (cur.head_entry_hash.as_deref() == expected_entry)
+                .then_some(PublishOutcome::Absent);
+        }
+        let target = propose_seq(expected_seq);
+        let mut link = (cur.head_entry_key?, cur.head_entry_hash?);
+        let mut seq = cur.seq;
+        loop {
+            let entry =
+                load_entry_opt(self.store.as_ref(), &link.0).await.ok()??;
+            if entry.entry_hash() != link.1 || entry.seq != seq {
+                return None;
+            }
+            if seq == target {
+                if link.1 == entry_hash && entry.epoch == epoch {
+                    return Some(PublishOutcome::Committed);
+                }
+                let prev = entry.prev.as_ref().map(|p| p.hash.as_str());
+                return (prev == expected_entry)
+                    .then_some(PublishOutcome::Absent);
+            }
+            let prev = entry.prev?;
+            link = (prev.key, prev.hash);
+            seq -= 1;
+        }
+    }
+
     /// Publish one batch and acknowledge only on success.
     ///
     /// Source-aware ordering against the current HEAD watermark decides the path:
@@ -1657,26 +1765,49 @@ impl<S: ConditionalStore + ?Sized> DurableWriter<S> {
                 Ok(PutOutcome::AlreadyExists) => unreachable!("cas_put"),
                 // Conflict or a lost/ambiguous response: reread and disambiguate.
                 Ok(PutOutcome::Conflict) | Err(_) => {
+                    // An error (not a definite rejection) leaves the CAS's
+                    // outcome unknown until HEAD is reread.
+                    let ambiguous = cas.is_err();
                     self.cas_conflicts
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let (raw, etag) = match self
-                        .store
-                        .get_with_etag(&hkey)
-                        .await
-                        .map_err(|e| HeadError::Store(e.to_string()))?
-                    {
-                        Some((raw, Some(etag))) => (raw, etag),
-                        Some((_, None)) => {
-                            return Err(HeadError::Integrity(
-                                "HEAD lost its ETag".into(),
-                            ));
-                        }
-                        None => {
-                            return Err(HeadError::Integrity(
-                                "HEAD vanished during publish".into(),
-                            ));
-                        }
-                    };
+                    let (raw, etag) =
+                        match self.store.get_with_etag(&hkey).await.map_err(
+                            |e| {
+                                if ambiguous {
+                                    HeadError::Ambiguous(
+                                        format!(
+                                            "HEAD CAS response lost and HEAD \
+                                         unreadable: {e}"
+                                        ),
+                                        AmbiguousPublish {
+                                            head_key: hkey.to_string(),
+                                            epoch: st.verified.epoch,
+                                            expected_seq: st.verified.head.seq,
+                                            expected_entry_hash: st
+                                                .verified
+                                                .head
+                                                .head_entry_hash
+                                                .clone(),
+                                            entry_hash: written.hash.clone(),
+                                        },
+                                    )
+                                } else {
+                                    HeadError::Store(e.to_string())
+                                }
+                            },
+                        )? {
+                            Some((raw, Some(etag))) => (raw, etag),
+                            Some((_, None)) => {
+                                return Err(HeadError::Integrity(
+                                    "HEAD lost its ETag".into(),
+                                ));
+                            }
+                            None => {
+                                return Err(HeadError::Integrity(
+                                    "HEAD vanished during publish".into(),
+                                ));
+                            }
+                        };
                     let cur = Head::parse(&raw)?;
 
                     // Fencing is decided FIRST, before any reference match: a higher

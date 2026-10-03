@@ -525,6 +525,11 @@ async fn handle_relation(
                 }));
             }
         }
+        // First use accepted: its schema matches the durable one (or it is
+        // new).
+        ctx.drift_resolver
+            .accepted(&format!("{schema}.{table}"))
+            .await;
     }
 
     Ok(())
@@ -1088,7 +1093,7 @@ async fn send_event(
 }
 
 fn source_error_kind(e: &SourceError) -> &'static str {
-    match e {
+    match e.root() {
         SourceError::Auth { .. } => "auth",
         SourceError::Connect { .. } => "connect",
         SourceError::Checkpoint { .. } => "checkpoint",
@@ -1102,6 +1107,7 @@ fn source_error_kind(e: &SourceError) -> &'static str {
         SourceError::Backpressure => "backpressure",
         SourceError::Cancelled => "cancelled",
         SourceError::Other(_) => "other",
+        SourceError::Incident { .. } => unreachable!("root unwraps incidents"),
     }
 }
 

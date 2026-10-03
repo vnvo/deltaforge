@@ -443,6 +443,17 @@ pub enum TxProtocolError {
     },
 }
 
+/// A sink's delivery error, kept with the sink's id so the failure that stops
+/// the pipeline can be attributed and classified (its incident draft, if any,
+/// travels inside `error`).
+#[derive(Debug, thiserror::Error)]
+#[error("sink {sink_id} delivery failed ({kind})", kind = error.kind())]
+pub struct SinkDeliveryError {
+    pub sink_id: String,
+    #[source]
+    pub error: SinkError,
+}
+
 /// Enforces the source transaction protocol on the marker/event stream: a single
 /// transaction is open at a time, its events carry its id, and only its own
 /// commit marker (exactly once) closes it. This is the locked invariant that a
@@ -912,6 +923,9 @@ pub struct Coordinator<Tok> {
     /// Notified after each successful per-sink checkpoint commit so the source can
     /// refresh its WAL feedback change-driven instead of polling the checkpoint store.
     commit_notify: Option<Arc<tokio::sync::Notify>>,
+    /// The pipeline's incident store: a run starts by settling its sinks'
+    /// open acknowledgement-uncertainty incidents, each by its own boundary.
+    incidents: Option<storage::adapters::incidents::IncidentStore>,
 }
 
 pub struct CoordinatorBuilder<Tok> {
@@ -929,6 +943,7 @@ pub struct CoordinatorBuilder<Tok> {
     replay_gate: Option<Arc<crate::replay_gate::ReplaySinkGate>>,
     quiesce_ack: Option<watch::Sender<bool>>,
     commit_notify: Option<Arc<tokio::sync::Notify>>,
+    incidents: Option<storage::adapters::incidents::IncidentStore>,
 }
 
 impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
@@ -948,11 +963,22 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             replay_gate: None,
             quiesce_ack: None,
             commit_notify: None,
+            incidents: None,
         }
     }
 
     /// Wire a notify signaled after each successful per-sink checkpoint commit, so the
     /// source can refresh WAL feedback change-driven instead of polling.
+    /// The pipeline's incident store (resolves a sink's acknowledgement
+    /// uncertainty when it acknowledges a later batch).
+    pub fn incidents(
+        mut self,
+        store: storage::adapters::incidents::IncidentStore,
+    ) -> Self {
+        self.incidents = Some(store);
+        self
+    }
+
     pub fn commit_notify(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
         self.commit_notify = Some(notify);
         self
@@ -1055,6 +1081,7 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
             replay_gate: self.replay_gate,
             quiesce_ack: self.quiesce_ack,
             commit_notify: self.commit_notify,
+            incidents: self.incidents,
         }
     }
 }
@@ -1062,6 +1089,83 @@ impl<Tok: Send + Clone + 'static> CoordinatorBuilder<Tok> {
 impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
     pub fn builder(name: impl Into<String>) -> CoordinatorBuilder<Tok> {
         CoordinatorBuilder::new(name)
+    }
+
+    /// Settle the pipeline's open `sink_ack_uncertain` incidents, each by its
+    /// own sink's authoritative read of exactly its boundary
+    /// ([`deltaforge_core::Sink::settle_uncertain`]): proven committed or
+    /// absent, that incident (and only it) is resolved. A later batch's
+    /// success settles nothing. Never fails the run: an undecided boundary,
+    /// or an unreadable store, leaves the incident open.
+    async fn settle_uncertain_sinks(&self) {
+        use deltaforge_core::BoundaryOutcome;
+        use deltaforge_core::incident::{Component, ReasonCode};
+        use storage::adapters::incidents::{
+            Resolution, SINK_BOUNDARY_ABSENT, SINK_BOUNDARY_COMMITTED,
+        };
+        let Some(store) = &self.incidents else {
+            return;
+        };
+        let records = match store.list().await {
+            Ok(records) => records,
+            Err(e) => {
+                warn!(
+                    pipeline = %self.pipeline_name,
+                    error = %format!("{e:#}"),
+                    "incident store unreadable; sink uncertainty stays open"
+                );
+                return;
+            }
+        };
+        for rec in records.into_iter().filter(|r| {
+            !r.status.is_resolved()
+                && r.reason_code == ReasonCode::SinkAckUncertain
+        }) {
+            let Component::Sink { id: sink_id } = &rec.component else {
+                continue;
+            };
+            let Some(sink) = self.sinks.iter().find(|s| s.id() == sink_id)
+            else {
+                continue;
+            };
+            let check = match sink.settle_uncertain(&rec.evidence).await {
+                BoundaryOutcome::Committed => SINK_BOUNDARY_COMMITTED,
+                BoundaryOutcome::Absent => SINK_BOUNDARY_ABSENT,
+                BoundaryOutcome::Unknown => {
+                    info!(
+                        pipeline = %self.pipeline_name,
+                        sink = %sink_id,
+                        incident = %rec.incident_id.0,
+                        "acknowledgement uncertainty not settled; it stays open"
+                    );
+                    continue;
+                }
+            };
+            match store
+                .resolve(
+                    &rec.incident_id,
+                    Resolution::VerifiedRecovery {
+                        check: check.to_string(),
+                    },
+                )
+                .await
+            {
+                Ok(Ok(_)) => info!(
+                    pipeline = %self.pipeline_name,
+                    sink = %sink_id,
+                    incident = %rec.incident_id.0,
+                    check,
+                    "acknowledgement uncertainty settled by its boundary"
+                ),
+                Ok(Err(_)) => {}
+                Err(e) => warn!(
+                    pipeline = %self.pipeline_name,
+                    sink = %sink_id,
+                    error = %format!("{e:#}"),
+                    "could not resolve the settled incident; it stays open"
+                ),
+            }
+        }
     }
 
     /// Close one captured commit unit: build a replay envelope from the accumulated
@@ -1294,6 +1398,7 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             ));
         }
 
+        self.settle_uncertain_sinks().await;
         let coord = Arc::new(self);
 
         // Bounded channel for pipelined delivery - capacity = max_inflight.
@@ -1989,6 +2094,10 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
 
         // Collect per-sink success/failure for checkpoint commits.
         // (sink_id, required, succeeded)
+        // The first failing sink's typed error (a required sink's first), kept
+        // so the failure that stops the pipeline is attributed, not folded
+        // into text.
+        let mut first_failure: Option<(bool, SinkDeliveryError)> = None;
         let mut sink_results: Vec<(String, bool, bool)> =
             Vec::with_capacity(raw_outcomes.len());
 
@@ -2116,6 +2225,17 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
                         error=%e,
                         "sink delivery failed"
                     );
+                    if first_failure.as_ref().is_none_or(|(was_required, _)| {
+                        required && !was_required
+                    }) {
+                        first_failure = Some((
+                            required,
+                            SinkDeliveryError {
+                                sink_id: sink_id.clone(),
+                                error: e,
+                            },
+                        ));
+                    }
                 }
             }
         }
@@ -2141,10 +2261,14 @@ impl<Tok: Send + Clone + 'static> Coordinator<Tok> {
             required_acks,
             total_acks,
         ) {
-            anyhow::bail!(
+            let msg = format!(
                 "commit policy not satisfied: required {required_acks}/{required_total} acks, \
                  total {total_acks}"
             );
+            return Err(match first_failure {
+                Some((_, failure)) => anyhow::Error::new(failure).context(msg),
+                None => anyhow::anyhow!(msg),
+            });
         }
 
         //
@@ -4614,6 +4738,10 @@ mod tests {
         delivered: AtomicUsize,
         batch_sizes: std::sync::Mutex<Vec<usize>>,
         ids: std::sync::Mutex<Vec<i64>>,
+        /// What an authoritative read proves, by the boundary's content
+        /// identity; any other boundary is undecided.
+        proves:
+            std::sync::Mutex<HashMap<String, deltaforge_core::BoundaryOutcome>>,
     }
 
     impl MockSink {
@@ -4625,7 +4753,19 @@ mod tests {
                 delivered: AtomicUsize::new(0),
                 batch_sizes: std::sync::Mutex::new(Vec::new()),
                 ids: std::sync::Mutex::new(Vec::new()),
+                proves: Default::default(),
             })
+        }
+
+        fn proves(
+            &self,
+            content: &str,
+            outcome: deltaforge_core::BoundaryOutcome,
+        ) {
+            self.proves
+                .lock()
+                .unwrap()
+                .insert(content.to_string(), outcome);
         }
 
         fn set_fail(&self, fail: bool) {
@@ -4651,6 +4791,18 @@ mod tests {
     impl deltaforge_core::Sink for MockSink {
         fn id(&self) -> &str {
             &self.id
+        }
+
+        async fn settle_uncertain(
+            &self,
+            evidence: &deltaforge_core::incident::Evidence,
+        ) -> deltaforge_core::BoundaryOutcome {
+            evidence
+                .text_of(
+                    deltaforge_core::incident::EvidenceKey::ContentIdentity,
+                )
+                .and_then(|c| self.proves.lock().unwrap().get(c).copied())
+                .unwrap_or(deltaforge_core::BoundaryOutcome::Unknown)
         }
 
         fn required(&self) -> bool {
@@ -4682,6 +4834,176 @@ mod tests {
             );
             Ok(deltaforge_core::BatchResult::ok())
         }
+    }
+
+    /// A required sink's failure stops the coordinator with that sink's typed
+    /// error in the chain, so the pipeline's incident is attributed to it
+    /// rather than to an anonymous commit-policy message.
+    #[tokio::test]
+    async fn a_required_sink_failure_is_attributed_to_the_sink() {
+        use checkpoints::MemCheckpointStore;
+        let sink = MockSink::new("kafka", true);
+        sink.set_fail(true);
+        let coord = tx_coord(
+            Arc::new(MemCheckpointStore::new().unwrap()),
+            Arc::clone(&sink),
+            BatchConfig {
+                max_events: Some(1),
+                max_ms: Some(60_000),
+                respect_source_tx: Some(true),
+                max_inflight: Some(1),
+                ..BatchConfig::default()
+            },
+        );
+        let err = feed_and_run(
+            coord,
+            vec![
+                begin("t1"),
+                SourceItem::Event(tx_event(1, "t1", b"r1")),
+                commit("t1", b"cp-1"),
+            ],
+        )
+        .await
+        .expect_err("a required sink failure stops the coordinator");
+        let failure = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<SinkDeliveryError>())
+            .expect("the sink's typed error is chained");
+        assert_eq!(failure.sink_id, "kafka");
+        let draft = crate::incidents::classify_coordinator_exit(&err, 0);
+        assert_eq!(
+            draft.component,
+            deltaforge_core::incident::Component::Sink { id: "kafka".into() }
+        );
+        assert_eq!(
+            draft.cause_code,
+            deltaforge_core::incident::CauseCode::SinkBackpressure
+        );
+    }
+
+    /// A sink's acknowledgement uncertainty is boundary-specific: a later
+    /// successful batch settles nothing (A stays open); at the start of a run
+    /// each open boundary is settled only by its own sink's authoritative
+    /// read of exactly that boundary (A' proven committed, A'' proven
+    /// absent), and settling those resolves no other boundary (C, which the
+    /// read cannot decide, and another sink's B stay open).
+    #[tokio::test]
+    async fn a_sink_uncertainty_is_settled_only_by_its_own_boundary() {
+        use checkpoints::MemCheckpointStore;
+        use deltaforge_core::BoundaryOutcome;
+        use deltaforge_core::incident::{
+            CauseCode, Component, EvidenceKey, IncidentDraft, IncidentId,
+            ReasonCode, Retryability, SafetyState,
+        };
+        use storage::adapters::incidents::{
+            IncidentStatus, IncidentStore, Resolution, SINK_BOUNDARY_ABSENT,
+            SINK_BOUNDARY_COMMITTED,
+        };
+        let backend: storage::ArcStorageBackend =
+            Arc::new(storage::MemoryStorageBackend::new());
+        let incidents = IncidentStore::new(Arc::clone(&backend), "tx-test");
+        let uncertain = |sink: &str, content: &str| {
+            IncidentDraft::new(
+                ReasonCode::SinkAckUncertain,
+                Component::Sink { id: sink.into() },
+                Retryability::OperatorAction,
+                SafetyState::HaltedUncertain,
+                CauseCode::SinkFatal,
+            )
+            .discriminate("content", content)
+            .with_evidence(|e| {
+                e.text(EvidenceKey::ContentIdentity, content);
+            })
+        };
+        let raise = |sink: &'static str, content: &'static str| {
+            let incidents = incidents.clone();
+            async move {
+                incidents
+                    .raise(&uncertain(sink, content), 1)
+                    .await
+                    .unwrap()
+                    .record()
+                    .incident_id
+                    .clone()
+            }
+        };
+        let a = raise("s3", "a").await;
+        let committed = raise("s3", "committed").await;
+        let absent = raise("s3", "absent").await;
+        let c = raise("s3", "c").await;
+        let b = raise("other", "committed").await;
+
+        let sink = MockSink::new("s3", true);
+        let run = |sink: Arc<MockSink>| {
+            let incidents = incidents.clone();
+            async move {
+                let store = Arc::new(MemCheckpointStore::new().unwrap());
+                let coord = Coordinator::builder("tx-test")
+                    .sinks(vec![sink as ArcDynSink])
+                    .batch_config(Some(cap_cfg(1000)))
+                    .commit_fn(
+                        "s3",
+                        build_commit_fn(store, "src::sink::s3".to_string()),
+                    )
+                    .process_fn(build_batch_processor(
+                        Arc::from(vec![]),
+                        "test".to_string(),
+                    ))
+                    .incidents(incidents)
+                    .build();
+                feed_and_run(
+                    coord,
+                    vec![
+                        begin("t1"),
+                        SourceItem::Event(tx_event(1, "t1", b"r1")),
+                        commit("t1", b"cp-1"),
+                    ],
+                )
+                .await
+                .unwrap();
+            }
+        };
+        let open = |id: IncidentId| {
+            let incidents = incidents.clone();
+            async move {
+                !incidents
+                    .get(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status
+                    .is_resolved()
+            }
+        };
+        let check = |id: IncidentId| {
+            let incidents = incidents.clone();
+            async move {
+                match incidents.get(&id).await.unwrap().unwrap().status {
+                    IncidentStatus::Resolved {
+                        by: Resolution::VerifiedRecovery { check },
+                        ..
+                    } => check,
+                    s => panic!("{s:?}"),
+                }
+            }
+        };
+
+        // Nothing provable: batch B's success leaves every boundary open.
+        run(Arc::clone(&sink)).await;
+        assert_eq!(sink.delivery_count(), 1, "a later batch was acknowledged");
+        for id in [&a, &committed, &absent, &c, &b] {
+            assert!(open(id.clone()).await);
+        }
+
+        // The sink's read proves two boundaries; only they are resolved.
+        sink.proves("committed", BoundaryOutcome::Committed);
+        sink.proves("absent", BoundaryOutcome::Absent);
+        run(Arc::clone(&sink)).await;
+        assert_eq!(check(committed).await, SINK_BOUNDARY_COMMITTED);
+        assert_eq!(check(absent).await, SINK_BOUNDARY_ABSENT);
+        assert!(open(a).await);
+        assert!(open(c).await);
+        assert!(open(b).await, "another sink's boundary is not ours to read");
     }
 
     #[tokio::test]

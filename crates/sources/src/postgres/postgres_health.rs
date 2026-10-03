@@ -586,34 +586,78 @@ pub async fn fetch_wal_level(dsn: &str) -> Result<String> {
 // Position Reachability
 // ============================================================================
 
-/// Whether a saved checkpoint is still reachable on the current server.
-///
-/// For PostgreSQL, reachability is determined by slot state rather than
-/// WAL position arithmetic — a healthy slot guarantees the LSN is reachable.
+/// Whether a saved checkpoint position is still reachable through the
+/// replication slot. A healthy slot guarantees the LSN is reachable.
 #[derive(Debug, PartialEq)]
 pub enum PositionReachability {
-    /// Confirmed reachable — slot is healthy, resume is safe.
+    /// Confirmed reachable: the slot is healthy, resume is safe.
     Reachable,
-    /// Confirmed unreachable — slot gone or invalidated.
-    Lost { reason: String },
-    /// Could not determine (transient connect error, missing row).
-    /// Caller should warn but not hard-fail.
-    Unknown { reason: String },
+    /// Confirmed unreachable: the slot is gone or invalidated, or its WAL is.
+    Lost { class: LostClass, reason: String },
+    /// Could not be determined. `transient`: a connection or I/O failure that
+    /// a retry may clear; otherwise the server answered with an error (for
+    /// example a permission error) that a retry will not.
+    Unknown { transient: bool, reason: String },
 }
 
-/// Check whether a saved LSN checkpoint is still reachable via the replication slot.
-///
-/// Unlike `verify_slot_still_healthy` (which bails on any problem), this
-/// returns a three-way result so the failover orchestrator can distinguish
-/// confirmed loss from transient uncertainty.
-///
-/// Checks in order:
-/// 1. Slot exists
-/// 2. Slot is not invalidated (`invalidation_reason` is NULL)
-/// 3. `wal_status` is not `lost`
-///
-/// `unreserved` is treated as `Reachable` with a warning — WAL is not
-/// guaranteed but hasn't been removed yet.
+/// Why a position is unreachable (stable incident reason classes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LostClass {
+    SlotMissing,
+    SlotInvalidated,
+    WalLost,
+}
+
+impl LostClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SlotMissing => "slot_missing",
+            Self::SlotInvalidated => "slot_invalidated",
+            Self::WalLost => "wal_lost",
+        }
+    }
+}
+
+/// Classify a slot from `pg_replication_slots` (`None` = no such slot).
+/// `unreserved` is reachable (WAL not guaranteed but not removed yet).
+pub fn classify_slot(
+    slot_name: &str,
+    row: Option<(Option<&str>, Option<&str>)>,
+) -> PositionReachability {
+    match row {
+        None => PositionReachability::Lost {
+            class: LostClass::SlotMissing,
+            reason: format!(
+                "replication slot '{slot_name}' does not exist on this server"
+            ),
+        },
+        Some((Some(invalidation), _)) => PositionReachability::Lost {
+            class: LostClass::SlotInvalidated,
+            reason: format!("slot '{slot_name}' invalidated: {invalidation}"),
+        },
+        Some((None, Some("lost"))) => PositionReachability::Lost {
+            class: LostClass::WalLost,
+            reason: format!(
+                "slot '{slot_name}' wal_status=lost: required WAL removed"
+            ),
+        },
+        Some((None, Some("unreserved"))) => {
+            warn!(slot = %slot_name, "slot wal_status=unreserved: WAL not guaranteed but not yet removed");
+            PositionReachability::Reachable
+        }
+        Some(_) => PositionReachability::Reachable,
+    }
+}
+
+/// Whether a PostgreSQL client error is plausibly transient: no server-side
+/// error answer (the connection failed, closed or timed out).
+pub fn is_transient(e: &tokio_postgres::Error) -> bool {
+    e.as_db_error().is_none()
+}
+
+/// Check whether a saved LSN checkpoint is still reachable via the replication
+/// slot: the slot exists, is not invalidated, and `wal_status` is not `lost`.
+/// Never fails: an undeterminable answer is [`PositionReachability::Unknown`].
 pub async fn check_position_reachability(
     dsn: &str,
     slot_name: &str,
@@ -622,6 +666,7 @@ pub async fn check_position_reachability(
         Ok(pair) => pair,
         Err(e) => {
             return Ok(PositionReachability::Unknown {
+                transient: is_transient(&e),
                 reason: format!("connect failed: {e}"),
             });
         }
@@ -630,44 +675,31 @@ pub async fn check_position_reachability(
         let _ = conn.await;
     });
 
-    let row = client
+    let row = match client
         .query_opt(
             "SELECT invalidation_reason, wal_status \
              FROM pg_replication_slots WHERE slot_name = $1",
             &[&slot_name],
         )
         .await
-        .context("check_position_reachability: query failed")?;
-
-    match row {
-        None => Ok(PositionReachability::Lost {
-            reason: format!(
-                "replication slot '{slot_name}' does not exist on this server"
-            ),
-        }),
-        Some(r) => {
-            let invalidation: Option<String> = r.get(0);
-            if let Some(reason) = invalidation {
-                return Ok(PositionReachability::Lost {
-                    reason: format!("slot '{slot_name}' invalidated: {reason}"),
-                });
-            }
-
-            let wal_status: Option<String> = r.try_get(1).ok().flatten();
-            match wal_status.as_deref() {
-                Some("lost") => Ok(PositionReachability::Lost {
-                    reason: format!(
-                        "slot '{slot_name}' wal_status=lost: required WAL removed"
-                    ),
-                }),
-                Some("unreserved") => {
-                    warn!(slot = %slot_name, "slot wal_status=unreserved after failover: WAL not guaranteed but not yet gone");
-                    Ok(PositionReachability::Reachable)
-                }
-                _ => Ok(PositionReachability::Reachable),
-            }
+    {
+        Ok(row) => row,
+        Err(e) => {
+            return Ok(PositionReachability::Unknown {
+                transient: is_transient(&e),
+                reason: format!("slot query failed: {e}"),
+            });
         }
-    }
+    };
+    let row = row.map(|r| {
+        let invalidation: Option<String> = r.get(0);
+        let wal_status: Option<String> = r.try_get(1).ok().flatten();
+        (invalidation, wal_status)
+    });
+    Ok(classify_slot(
+        slot_name,
+        row.as_ref().map(|(i, w)| (i.as_deref(), w.as_deref())),
+    ))
 }
 
 // ============================================================================
@@ -804,37 +836,20 @@ mod tests {
     // --- Failover detection ---
 
     #[test]
-    fn wal_status_lost_maps_to_position_lost() {
-        // The wal_status=lost branch should produce Lost, not Unknown.
-        // This mirrors the logic in check_position_reachability without
-        // needing a real connection.
-        let wal_status = Some("lost");
-        let reachability = match wal_status {
-            Some("lost") => PositionReachability::Lost {
-                reason: "slot wal_status=lost: required WAL removed".into(),
-            },
-            Some("unreserved") => PositionReachability::Reachable,
-            _ => PositionReachability::Reachable,
+    fn slots_are_classified_into_stable_classes() {
+        let class = |row| match classify_slot("s", row) {
+            PositionReachability::Lost { class, .. } => Some(class),
+            PositionReachability::Reachable => None,
+            other => panic!("{other:?}"),
         };
+        assert_eq!(class(None), Some(LostClass::SlotMissing));
         assert_eq!(
-            reachability,
-            PositionReachability::Lost {
-                reason: "slot wal_status=lost: required WAL removed".into(),
-            }
+            class(Some((Some("wal_removed"), Some("lost")))),
+            Some(LostClass::SlotInvalidated)
         );
-    }
-
-    #[test]
-    fn wal_status_unreserved_is_reachable_with_warning() {
-        // unreserved = WAL not guaranteed but not gone; should not block resume.
-        let wal_status = Some("unreserved");
-        let reachability = match wal_status {
-            Some("lost") => PositionReachability::Lost {
-                reason: String::new(),
-            },
-            Some("unreserved") => PositionReachability::Reachable,
-            _ => PositionReachability::Reachable,
-        };
-        assert_eq!(reachability, PositionReachability::Reachable);
+        assert_eq!(class(Some((None, Some("lost")))), Some(LostClass::WalLost));
+        assert_eq!(class(Some((None, Some("unreserved")))), None);
+        assert_eq!(class(Some((None, Some("reserved")))), None);
+        assert_eq!(class(Some((None, None))), None);
     }
 }
