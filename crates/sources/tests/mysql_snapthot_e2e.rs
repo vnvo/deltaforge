@@ -384,6 +384,111 @@ async fn mysql_an_interrupted_snapshot_restarts_in_full() -> Result<()> {
     Ok(())
 }
 
+/// A checkpoint store that refuses the write resetting snapshot progress
+/// (the empty progress record); every other operation passes through.
+struct RefusesProgressReset {
+    inner: MemCheckpointStore,
+    reset: Vec<u8>,
+}
+
+#[async_trait::async_trait]
+impl CheckpointStore for RefusesProgressReset {
+    async fn get_raw(
+        &self,
+        key: &str,
+    ) -> checkpoints::CheckpointResult<Option<Vec<u8>>> {
+        self.inner.get_raw(key).await
+    }
+    async fn put_raw(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> checkpoints::CheckpointResult<()> {
+        if bytes == self.reset.as_slice() {
+            return Err(checkpoints::CheckpointError::Database(
+                "progress reset refused".into(),
+            ));
+        }
+        self.inner.put_raw(key, bytes).await
+    }
+    async fn delete(&self, key: &str) -> checkpoints::CheckpointResult<bool> {
+        self.inner.delete(key).await
+    }
+    async fn list(&self) -> checkpoints::CheckpointResult<Vec<String>> {
+        self.inner.list().await
+    }
+}
+
+/// If the interrupted progress cannot be discarded, the snapshot stops
+/// before reading a row: it never runs with the old completed tables against
+/// a new anchor, and the interrupted record is left as it was.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_a_failed_progress_reset_stops_the_snapshot() -> Result<()> {
+    use sources::mysql::MysqlSnapshotProgress;
+    use sources::mysql::mysql_snapshot::progress_key;
+
+    let (db, pool, _dsn) = mysql_setup("snap_reset_fail").await?;
+    let mut conn = pool.get_conn().await?;
+    conn.query_drop(format!("USE {db}")).await?;
+    conn.query_drop("CREATE TABLE t (id INT PRIMARY KEY, val VARCHAR(32))")
+        .await?;
+    conn.query_drop(format!(
+        "GRANT SELECT ON {db}.t TO '{MYSQL_CDC_USER}'@'%'"
+    ))
+    .await?;
+    conn.query_drop("INSERT INTO t VALUES (1, 'a')").await?;
+
+    let store = RefusesProgressReset {
+        inner: MemCheckpointStore::new()?,
+        reset: serde_json::to_vec(&MysqlSnapshotProgress::default())?,
+    };
+    let interrupted = serde_json::to_vec(&MysqlSnapshotProgress {
+        start_position: "{}".into(),
+        done_tables: vec![format!("{db}.t")],
+        finished: false,
+    })?;
+    store
+        .put_raw(&progress_key("snap-reset-fail"), &interrupted)
+        .await?;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(store);
+
+    let src = make_source(
+        "snap-reset-fail",
+        &db,
+        vec![format!("{db}.t")],
+        SnapshotCfg {
+            mode: SnapshotMode::Initial,
+            ..Default::default()
+        },
+    )
+    .await;
+    let (tx, mut rx) = mpsc::channel(64);
+    let res = tokio::time::timeout(
+        Duration::from_secs(60),
+        src.run(tx, ckpt.clone()).await.join(),
+    )
+    .await
+    .expect("the source stops");
+    assert!(res.is_err(), "a failed reset stops the source");
+    let mut rows = 0;
+    while let Ok(item) = rx.try_recv() {
+        if matches!(item, SourceItem::Event(ref e) if matches!(e.op, Op::Read))
+        {
+            rows += 1;
+        }
+    }
+    assert_eq!(rows, 0, "no snapshot row was read");
+    assert_eq!(
+        ckpt.get_raw(&progress_key("snap-reset-fail")).await?,
+        Some(interrupted),
+        "the interrupted progress is left as it was"
+    );
+
+    mysql_drop_db(&pool, &db).await;
+    Ok(())
+}
+
 /// Snapshot uses PK-range chunking for integer PK tables.
 #[tokio::test]
 #[ignore = "requires docker"]
