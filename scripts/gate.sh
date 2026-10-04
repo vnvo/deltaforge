@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # Exact-tree gate. The suites it runs are defined in scripts/gate-suites.txt.
 #
-#   scripts/gate.sh [label]    run the full gate
-#   scripts/gate.sh --check    only check that the manifest covers every
-#                              integration test file
+#   scripts/gate.sh [label]             core merge gate
+#   scripts/gate.sh --release [label]   core gate plus the release-tier suites
+#                                       (service-backed sinks, S3 canary)
+#   scripts/gate.sh --check             only check the manifest: every
+#                                       integration test file classified once,
+#                                       no stale entry, a reason on every
+#                                       exclusion
 #
 # Steps: manifest check; fmt; clippy -D warnings (also with the `vault`
 # feature); workspace tests; every test binary built once; then the
 # `serial-pg` and `serial` suites one at a time in one lane while the
-# `parallel` suites run GATE_PARALLEL (default 3) at a time. Needs Docker.
+# `parallel` suites (and, with --release, the `release` suites) run
+# GATE_PARALLEL (default 3) at a time. Needs Docker.
 # Prints one line per step (exit code, passed / failed counts) and the git
 # tree hash before and after: a gate result is valid only when they match.
 # Results go to $GATE_DIR/<label> (default target/gate/<label>).
@@ -33,6 +38,15 @@ check_manifest() {
     [ -f "crates/${name%%/*}/tests/${name#*/}.rs" ] ||
       { echo "manifest: $name has no test file"; ok=1; }
   done
+  while read -r name; do
+    echo "manifest: excluded $name gives no reason"
+    ok=1
+  done < <(grep -E '^excluded[[:space:]]' "$MANIFEST" | awk 'NF < 3 {print $2}')
+  while read -r lane name; do
+    echo "manifest: $name has unknown lane $lane"
+    ok=1
+  done < <(grep -Ev '^\s*(#|$)' "$MANIFEST" |
+    awk '$1 !~ /^(serial-pg|serial|parallel|release|workspace|excluded)$/ {print $1, $2}')
   return $ok
 }
 
@@ -42,7 +56,12 @@ if [ "${1:-}" = "--check" ]; then
 fi
 check_manifest || exit 2
 
-LABEL=${1:-gate}
+TIER=core
+if [ "${1:-}" = "--release" ]; then
+  TIER=release
+  shift
+fi
+LABEL=${1:-$TIER}
 OUT="${GATE_DIR:-$ROOT/target/gate}/$LABEL"
 rm -rf "$OUT"
 mkdir -p "$OUT"
@@ -53,7 +72,8 @@ if [ "$free_gb" -lt 15 ]; then cargo clean >/dev/null 2>&1; fi
 docker ps -aq --filter ancestor=mysql:8.4 | xargs -r docker rm -f -v >/dev/null 2>&1
 docker rm -f -v df-it-pg >/dev/null 2>&1
 
-git add -A && echo "tree before $(git write-tree)" | tee "$OUT/summary"
+echo "tier $TIER" > "$OUT/summary"
+git add -A && echo "tree before $(git write-tree)" | tee -a "$OUT/summary"
 start=$(date +%s)
 
 summ() { # name exit-code log
@@ -90,9 +110,14 @@ run clippy-vault "$OUT/clippy-vault.log" \
 run workspace "$OUT/workspace.log" cargo test --workspace --no-fail-fast
 
 # ---- build every gated test binary once
+# The suites run concurrently: `parallel`, plus `release` in the release tier.
+concurrent() {
+  lane parallel
+  if [ "$TIER" = release ]; then lane release; fi
+}
 lane serial-pg >  "$OUT/suites"
 lane serial    >> "$OUT/suites"
-lane parallel  >> "$OUT/suites"
+concurrent     >> "$OUT/suites"
 while read -r _ args; do
   cargo test ${args%% -- *} --no-run >> "$OUT/build.log" 2>&1
 done < "$OUT/suites"
@@ -114,7 +139,7 @@ serial_lane() {
 
 serial_lane &
 serial_pid=$!
-lane parallel | xargs -P "${GATE_PARALLEL:-3}" -L 1 bash -c 'suite "$@"' _
+concurrent | xargs -P "${GATE_PARALLEL:-3}" -L 1 bash -c 'suite "$@"' _
 wait $serial_pid
 
 docker ps -aq --filter ancestor=mysql:8.4 | xargs -r docker rm -f -v >/dev/null 2>&1
@@ -123,5 +148,8 @@ echo "elapsed $(( ($(date +%s) - start) / 60 )) min" >> "$OUT/summary"
 echo "suites ok: $(grep -c 'rc=0' "$OUT/summary")" >> "$OUT/summary"
 grep -v "rc=0" "$OUT/summary" | grep "rc=" | sed 's/^/FAILED /' >> "$OUT/summary"
 grep -E "^excluded" "$MANIFEST" | awk '{print "not gated: " $2}' >> "$OUT/summary"
+if [ "$TIER" = core ]; then
+  grep -E "^release" "$MANIFEST" | awk '{print "release tier only: " $2}' >> "$OUT/summary"
+fi
 cat "$OUT/summary"
 ! grep -q "^FAILED" "$OUT/summary"

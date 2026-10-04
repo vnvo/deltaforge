@@ -22,7 +22,7 @@ use arrow_array::{
 use async_trait::async_trait;
 use ctor::dtor;
 use deltaforge_config::{
-    S3Compression, S3FileFormat, S3FileRoll, S3SinkCfg, SinkCfg,
+    S3Compression, S3Durability, S3FileFormat, S3FileRoll, S3SinkCfg, SinkCfg,
 };
 use deltaforge_core::encoding::avro_types::TypeConversionOpts;
 use deltaforge_core::{Event, Op, Sink, SourceInfo, SourcePosition};
@@ -341,7 +341,9 @@ async fn ministack_canary_parquet_roundtrip() -> Result<()> {
         },
         send_timeout_secs: 60,
         required: Some(true),
-        durability: Default::default(),
+        // Mirrors s3_e2e_tests: the legacy rolling sink (`build_s3_sink`);
+        // the default (`durable_v2`) is built by the durable path instead.
+        durability: S3Durability::LegacyRolling,
         filter: None,
     });
 
