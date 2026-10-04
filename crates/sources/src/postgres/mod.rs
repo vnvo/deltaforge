@@ -861,13 +861,23 @@ impl PostgresSource {
                         ctx.current_final_lsn = None;
                     }
                     ctx.last_lsn = ctx.resume_lsn;
-                    let reconnect_config =
-                        config.clone().with_start_lsn(ctx.resume_lsn);
+                    // The current credentials (a rotation may have replaced
+                    // the ones the source started with).
+                    let reconnect_config = postgres_helpers::build_replication_config(
+                        &postgres_helpers::parse_dsn(ctx.dsn.expose())?,
+                        &self.slot,
+                        &self.publication,
+                        ctx.resume_lsn,
+                    );
+                    let reconnect_bound = postgres_helpers::SlotBoundProof {
+                        dsn: ctx.dsn.clone(),
+                        ..slot_bound.clone()
+                    };
 
                     match connect_replication_with_retries(
                         &self.id,
                         reconnect_config,
-                        &slot_bound,
+                        &reconnect_bound,
                         &ctx.cancel,
                         ctx.retry.clone(),
                     )

@@ -466,6 +466,50 @@ async fn rotation_reconnects_on_new_password_and_dedups_baseline() -> Result<()>
     Ok(())
 }
 
+/// A stream that drops after a rotation reconnects with the rotated
+/// credentials, not the ones the source started with (the server no longer
+/// accepts those).
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_reconnect_after_rotation_uses_the_rotated_credentials() -> Result<()>
+{
+    let mut h = start_rotation_harness("rot_reconnect", 256).await?;
+    let pid_before =
+        wait_for_active_pid(&h.admin, &h.slot, Duration::from_secs(30)).await?;
+
+    h.rotate_password("rotatedpw").await?;
+    let pid_rotated = wait_for_pid_change(
+        &h.admin,
+        &h.slot,
+        pid_before,
+        Duration::from_secs(40),
+    )
+    .await?;
+
+    // Drop the rotated stream: an ordinary reconnect follows.
+    h.admin
+        .execute("SELECT pg_terminate_backend($1)", &[&pid_rotated])
+        .await?;
+    wait_for_pid_change(
+        &h.admin,
+        &h.slot,
+        pid_rotated,
+        Duration::from_secs(40),
+    )
+    .await?;
+
+    h.admin
+        .execute("INSERT INTO orders (sku) VALUES ('after-reconnect')", &[])
+        .await?;
+    assert!(
+        wait_for_event(&mut h.rx, Duration::from_secs(15)).await,
+        "CDC must continue after a reconnect that follows a rotation"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn rotation_waits_for_commit_boundary_no_loss_or_dup() -> Result<()> {
