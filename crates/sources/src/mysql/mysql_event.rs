@@ -17,10 +17,9 @@ use mysql_binlog_connector_rust::{
 use tracing::instrument;
 use tracing::{debug, error, info, warn};
 
-use crate::mysql::mysql_helpers::{make_checkpoint_meta, short_sql};
-use crate::mysql::mysql_schema_loader::LoadedSchema;
-use crate::mysql::mysql_table_map_check::table_map_mismatch;
-use std::sync::Arc;
+use crate::mysql::mysql_helpers::{
+    checkpoint_lineage, make_checkpoint_meta, short_sql,
+};
 
 use deltaforge_config::OUTBOX_SCHEMA_SENTINEL;
 
@@ -99,10 +98,9 @@ pub(super) async fn dispatch_event(
     .increment(header.event_length as u64);
 
     match data {
-        // A compressed transaction (`binlog_transaction_compression = ON`):
-        // its events, in order. They have no binlog position of their own;
-        // they all end where the payload ends, so a commit inside it
-        // checkpoints at the payload's end.
+        // A compressed transaction: its events, in order. They have no
+        // binlog position of their own; they all end where the payload ends
+        // (as the binlog scanner numbers them).
         EventData::TransactionPayload(tp) => {
             for (h, d) in tp.uncompressed_events {
                 let inner = EventHeader {
@@ -127,6 +125,15 @@ async fn dispatch_one(
     header: &EventHeader,
     data: EventData,
 ) -> SourceResult<()> {
+    if matches!(
+        data,
+        EventData::WriteRows(_)
+            | EventData::UpdateRows(_)
+            | EventData::DeleteRows(_)
+    ) {
+        // Every rows event counts, tracked table or not.
+        ctx.rows_ordinal += 1;
+    }
     match data {
         EventData::TableMap(tm) => handle_table_map(ctx, tm).await,
         EventData::WriteRows(wr) => handle_write_rows(ctx, header, wr).await,
@@ -184,53 +191,6 @@ async fn handle_table_map(
     Ok(())
 }
 
-/// The schema to decode `tm`'s rows with, verified against the layout the
-/// binlog recorded for them.
-///
-/// Rows are decoded positionally, so decoding them with a schema of a different
-/// layout would put values under the wrong columns. A mismatch against the
-/// cached schema triggers one reload (the cache can predate a DDL that was not
-/// attributed to this table); a mismatch against the live schema fails closed
-/// before any event for these rows is emitted, so the checkpoint cannot move
-/// past them.
-async fn verified_schema(
-    ctx: &RunCtx,
-    tm: &TableMapEvent,
-) -> SourceResult<Arc<LoadedSchema>> {
-    let (db, table) = (&tm.database_name, &tm.table_name);
-    let loaded = ctx.schema.load_schema(db, table).await?;
-    if table_map_mismatch(tm, &loaded.schema.columns).is_none() {
-        return Ok(loaded);
-    }
-    let reloaded = ctx.schema.reload_schema(db, table).await?;
-    match table_map_mismatch(tm, &reloaded.schema.columns) {
-        None => Ok(reloaded),
-        Some(reason) => {
-            error!(
-                source_id = %ctx.source_id, db = %db, table = %table, %reason,
-                "binlog rows do not match the table's current schema; failing closed"
-            );
-            Err(SourceError::Schema {
-                details: format!(
-                    "table {db}.{table}: {reason}. These binlog rows were written \
-                     under a different table definition than the current one (for \
-                     example, a restart replaying rows written before a DDL). \
-                     Decoding them positionally would put values under the wrong \
-                     columns, so no event was emitted and the checkpoint was not \
-                     advanced (fail-closed). Replaying MySQL rows across a DDL is \
-                     not supported yet. Safe recovery: re-snapshot (restart once \
-                     with snapshot mode 'always'). Moving the source position \
-                     past the DDL instead intentionally abandons every retained \
-                     change between the checkpoint and the new position, for all \
-                     captured tables, and requires an operator assessment of \
-                     that data loss."
-                )
-                .into(),
-            })
-        }
-    }
-}
-
 /// Build SourceInfo for MySQL events
 fn build_source_info(
     ctx: &RunCtx,
@@ -274,19 +234,24 @@ async fn handle_write_rows(
     header: &EventHeader,
     wr: mysql_binlog_connector_rust::event::write_rows_event::WriteRowsEvent,
 ) -> SourceResult<()> {
-    if let Some(tm) = ctx.table_map.get(&wr.table_id) {
+    if let Some(tm) = ctx.table_map.get(&wr.table_id).cloned() {
+        let tm = &tm;
         if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
-        let loaded = verified_schema(ctx, tm).await?;
+        let loaded = super::mysql_selection::select_for_rows(ctx, tm).await?;
         let row_count = wr.rows.len();
         debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=row_count, "write_rows");
 
         // Pre-compute values shared across all rows in this event.
         let ts_ms = ts_sec_to_ms(header.timestamp);
         let event_len = header.event_length as usize;
-        let checkpoint =
-            make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid);
+        let checkpoint = make_checkpoint_meta(
+            &ctx.last_file,
+            ctx.last_pos,
+            &ctx.last_gtid,
+            checkpoint_lineage(&ctx.registry_scope),
+        );
         let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
             id: gtid.clone(),
             total_order: None,
@@ -370,17 +335,22 @@ async fn handle_update_rows(
     header: &EventHeader,
     ur: mysql_binlog_connector_rust::event::update_rows_event::UpdateRowsEvent,
 ) -> SourceResult<()> {
-    if let Some(tm) = ctx.table_map.get(&ur.table_id) {
+    if let Some(tm) = ctx.table_map.get(&ur.table_id).cloned() {
+        let tm = &tm;
         if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
-        let loaded = verified_schema(ctx, tm).await?;
+        let loaded = super::mysql_selection::select_for_rows(ctx, tm).await?;
         debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=ur.rows.len(), "update_rows");
 
         let ts_ms = ts_sec_to_ms(header.timestamp);
         let event_len = header.event_length as usize;
-        let checkpoint =
-            make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid);
+        let checkpoint = make_checkpoint_meta(
+            &ctx.last_file,
+            ctx.last_pos,
+            &ctx.last_gtid,
+            checkpoint_lineage(&ctx.registry_scope),
+        );
         let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
             id: gtid.clone(),
             total_order: None,
@@ -390,7 +360,8 @@ async fn handle_update_rows(
         // with their checkpoint; shared across every row in this binlog event.
         let standalone_wm = standalone_row_watermark(ctx, &transaction);
         let fingerprint_str = loaded.fingerprint.to_string();
-        let sequence = ctx.schema.current_sequence();
+        // The selected version's own registry sequence.
+        let sequence = loaded.sequence;
 
         let mut sent = 0u64;
         // One ordinal per before/after pair - an update is a single row change,
@@ -466,17 +437,22 @@ async fn handle_delete_rows(
     header: &EventHeader,
     dr: mysql_binlog_connector_rust::event::delete_rows_event::DeleteRowsEvent,
 ) -> SourceResult<()> {
-    if let Some(tm) = ctx.table_map.get(&dr.table_id) {
+    if let Some(tm) = ctx.table_map.get(&dr.table_id).cloned() {
+        let tm = &tm;
         if !ctx.allow.matches(&tm.database_name, &tm.table_name) {
             return Ok(());
         }
-        let loaded = verified_schema(ctx, tm).await?;
+        let loaded = super::mysql_selection::select_for_rows(ctx, tm).await?;
         debug!(source_id=%ctx.source_id, db=%tm.database_name, table=%tm.table_name, rows=dr.rows.len(), "delete_rows");
 
         let ts_ms = ts_sec_to_ms(header.timestamp);
         let event_len = header.event_length as usize;
-        let checkpoint =
-            make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid);
+        let checkpoint = make_checkpoint_meta(
+            &ctx.last_file,
+            ctx.last_pos,
+            &ctx.last_gtid,
+            checkpoint_lineage(&ctx.registry_scope),
+        );
         let transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
             id: gtid.clone(),
             total_order: None,
@@ -486,7 +462,8 @@ async fn handle_delete_rows(
         // with their checkpoint; shared across every row in this binlog event.
         let standalone_wm = standalone_row_watermark(ctx, &transaction);
         let fingerprint_str = loaded.fingerprint.to_string();
-        let sequence = ctx.schema.current_sequence();
+        // The selected version's own registry sequence.
+        let sequence = loaded.sequence;
 
         let mut sent = 0u64;
         for (row_ordinal, row) in dr.rows.into_iter().enumerate() {
@@ -554,6 +531,7 @@ fn source_error_kind(e: &SourceError) -> &'static str {
         SourceError::Connect { .. } => "connect",
         SourceError::Checkpoint { .. } => "checkpoint",
         SourceError::Schema { .. } => "schema",
+        SourceError::Lineage { .. } => "lineage",
         SourceError::Incompatible { .. } => "incompatible",
         SourceError::Permission { .. } => "permission",
         SourceError::NotFound { .. } => "not_found",
@@ -589,8 +567,11 @@ async fn handle_gtid(
     // coordinate - captured before it is merged into the accumulated set below.
     ctx.current_gtid = Some(gtid_str.clone());
     ctx.in_explicit_txn = false;
-    // New transaction boundary: reset the DDL message ordinal.
+    // New transaction boundary: reset the DDL message ordinal and the
+    // QueryEvent and rows-event ordinals.
     ctx.message_ordinal = 0;
+    ctx.query_ordinal = 0;
+    ctx.rows_ordinal = 0;
 
     // Accumulate the full executed GTID set rather than storing just the last
     // transaction. MySQL needs the full set to resume correctly on reconnect.
@@ -688,11 +669,17 @@ async fn emit_tx_commit(ctx: &mut RunCtx) {
     // Any close ends the explicit-transaction state (safe even in non-GTID mode,
     // where the early return below skips the marker).
     ctx.in_explicit_txn = false;
+    // Rows of the next transaction are evaluated at this boundary.
+    ctx.mark_transaction_boundary();
     let Some(tx_id) = ctx.current_gtid.clone() else {
         return;
     };
-    let checkpoint =
-        make_checkpoint_meta(&ctx.last_file, ctx.last_pos, &ctx.last_gtid);
+    let checkpoint = make_checkpoint_meta(
+        &ctx.last_file,
+        ctx.last_pos,
+        &ctx.last_gtid,
+        checkpoint_lineage(&ctx.registry_scope),
+    );
     // Watermark and checkpoint describe the SAME commit boundary.
     let boundary = deltaforge_core::SourceBoundary {
         checkpoint,
@@ -1037,6 +1024,7 @@ async fn emit_ddl_event(
         &ctx.last_file,
         ctx.last_pos,
         &ctx.last_gtid,
+        checkpoint_lineage(&ctx.registry_scope),
     ));
     ev.transaction = ctx.current_gtid.as_ref().map(|gtid| Transaction {
         id: gtid.clone(),
@@ -1057,6 +1045,8 @@ async fn handle_query(
     header: &EventHeader,
     q: mysql_binlog_connector_rust::event::query_event::QueryEvent,
 ) -> SourceResult<()> {
+    // Every QueryEvent counts, as the binlog scanner numbers them.
+    ctx.query_ordinal += 1;
     let sql_upper = q.query.to_uppercase();
 
     // BEGIN opens an explicit, multi-event transaction (row events + Xid, or an
@@ -1076,6 +1066,10 @@ async fn handle_query(
         emit_tx_commit(ctx).await;
         return Ok(());
     }
+
+    // The activation records this statement implies are durable before its
+    // DDL event or its commit boundary is emitted.
+    record_query(ctx, &q).await?;
 
     // Credential-bearing account statements first: never log or emit their raw
     // SQL (it can carry a password, token, or verifier). Emit a fixed redacted DDL
@@ -1158,6 +1152,150 @@ async fn handle_query(
     // boundary) and `current_gtid` is cleared - otherwise the transaction would
     // stay open and the next GTID would fail closed.
     emit_tx_commit(ctx).await;
+    Ok(())
+}
+
+/// Persist the activation records a QueryEvent implies (spec 7.5): a `ddl`
+/// record for every table it may change, or a barrier when the statement
+/// cannot be attributed with certainty (a database barrier only for an
+/// explicit database operation, lineage-wide otherwise). Table names map to
+/// registry keys per `lower_case_table_names`; under 2 (stored as written,
+/// compared case-insensitively) a DDL's names cannot be mapped with
+/// certainty, so it is a lineage barrier. Replay re-derives identical records
+/// (`AlreadyPresent`); a conflicting record fails closed.
+async fn record_query(
+    ctx: &mut RunCtx,
+    q: &mysql_binlog_connector_rust::event::query_event::QueryEvent,
+) -> SourceResult<()> {
+    use super::mysql_activation::{
+        BarrierScope, EventIdentity, record_barrier, record_ddl,
+    };
+    use super::mysql_ddl_attribution::{BarrierScopeOf, DdlEffect, classify};
+
+    let default_db = Some(q.schema.as_str()).filter(|d| !d.is_empty());
+    let effect = classify(&q.query, default_db);
+    let lctn = ctx.lower_case_table_names;
+    let name = |n: &str| {
+        if lctn == 1 {
+            n.to_lowercase()
+        } else {
+            n.to_string()
+        }
+    };
+    let (tables, barrier) = match effect {
+        DdlEffect::None | DdlEffect::SameShape(_) => return Ok(()),
+        DdlEffect::Tables(_) if lctn == 2 => {
+            (Vec::new(), Some(BarrierScope::Lineage))
+        }
+        DdlEffect::Tables(tables) => (tables, None),
+        DdlEffect::Barrier(BarrierScopeOf::Lineage) => {
+            (Vec::new(), Some(BarrierScope::Lineage))
+        }
+        DdlEffect::Barrier(BarrierScopeOf::Database(db)) if lctn == 2 => {
+            let _ = db;
+            (Vec::new(), Some(BarrierScope::Lineage))
+        }
+        DdlEffect::Barrier(BarrierScopeOf::Database(db)) => {
+            (Vec::new(), Some(BarrierScope::Database { db: name(&db) }))
+        }
+    };
+
+    // After a failover, a tracked table's first event may be this DDL: its
+    // drift policy applies before any record is written.
+    for t in &tables {
+        let (db, table) = (name(&t.db), name(&t.table));
+        if ctx.allow.matches(&db, &table) {
+            super::mysql_failover_drift::check_in_stream(
+                ctx,
+                &db,
+                &table,
+                super::mysql_failover_drift::FirstEvent::Ddl,
+            )
+            .await?;
+        }
+    }
+    let fail = |what: &str, e: anyhow::Error| {
+        SourceError::Other(e.context(format!(
+            "persist the activation {what} of a QueryEvent at {}:{}",
+            ctx.last_file, ctx.last_pos
+        )))
+    };
+    let position = crate::durable_checkpoint::mysql_checkpoint_position(
+        &ctx.last_file,
+        ctx.last_pos,
+        ctx.last_gtid.as_deref(),
+    )
+    .ok_or_else(|| {
+        fail(
+            "record",
+            anyhow::anyhow!(
+                "unparseable stream position {}:{} {:?}",
+                ctx.last_file,
+                ctx.last_pos,
+                ctx.last_gtid
+            ),
+        )
+    })?;
+    let event = match &ctx.current_gtid {
+        Some(gtid) => EventIdentity::Gtid {
+            gtid: gtid.clone(),
+            ordinal: ctx.query_ordinal,
+        },
+        None => EventIdentity::FilePos {
+            file: ctx.last_file.clone(),
+            end_pos: ctx.last_pos,
+            ordinal: 0,
+        },
+    };
+    let scope = ctx.registry_scope.current()?;
+    let backend = &ctx.registry_backend;
+    let registry = ctx.schema.registry();
+    // Tracked tables get a forward proof of their post-DDL shape (a DROP
+    // gets none: a later CREATE is its own DDL).
+    let prove_after = !super::mysql_ddl_attribution::is_drop_table(&q.query);
+    let mut pending = Vec::new();
+    let mut invalidated = Vec::new();
+    let barrier_written = barrier.is_some();
+    for t in &tables {
+        let (db, table) = (name(&t.db), name(&t.table));
+        let key = scope.key(&db, &table);
+        let ddl_id =
+            record_ddl(backend, registry, &key, &event, position.clone())
+                .await
+                .map_err(|e| fail("ddl record", e))?;
+        invalidated.push(key.clone());
+        if prove_after && ctx.allow.matches(&db, &table) {
+            pending.push(super::mysql_forward_proof::Pending {
+                db,
+                table,
+                ddl_id,
+            });
+        }
+    }
+    if let Some(barrier) = barrier {
+        info!(
+            source_id = %ctx.source_id,
+            scope = ?barrier,
+            sql = %short_sql(&q.query, 80),
+            "statement not attributable to tables: activation barrier"
+        );
+        let key = scope.key("", "");
+        record_barrier(backend, registry, &key, barrier, &event, position)
+            .await
+            .map_err(|e| fail("barrier", e))?;
+    }
+    // Paused at the DDL: prove before its event is emitted and before any
+    // later event is read.
+    super::mysql_forward_proof::prove(ctx, pending).await?;
+    // Selections and validated timelines read before these records are
+    // stale.
+    if barrier_written {
+        ctx.selection.invalidate_all();
+    } else {
+        for key in &invalidated {
+            ctx.selection.invalidate(key);
+        }
+    }
     Ok(())
 }
 
@@ -1252,9 +1390,16 @@ mod tests {
             ),
             in_explicit_txn: true,
             message_ordinal: 0,
+            query_ordinal: 0,
+            rows_ordinal: 0,
+            lower_case_table_names: 0,
+            txn_eval: None,
+            txn_eval_cp: None,
+            selection: Default::default(),
+            failover: None,
+            drift_checked: Default::default(),
             checkpoint_gtid: Some("GTID-UNIT".to_string()),
             checkpoint_file: "mysql-bin.000001".to_string(),
-            tables: vec!["shop.orders".to_string()],
             outbox_tables: AllowList::default(),
             identity_store: IdentityStore::new(Arc::new(
                 storage::MemoryStorageBackend::new(),
@@ -1338,6 +1483,8 @@ mod tests {
             rows: vec![row],
         };
 
+        prove_orders(&mut ctx).await;
+
         handle_write_rows(&mut ctx, &make_header(), ev)
             .await
             .expect("write rows should succeed");
@@ -1386,6 +1533,8 @@ mod tests {
             rows: vec![(before_row, after_row)],
         };
 
+        prove_orders(&mut ctx).await;
+
         handle_update_rows(&mut ctx, &make_header(), ev)
             .await
             .expect("update rows should succeed");
@@ -1423,6 +1572,8 @@ mod tests {
             included_columns: vec![true, true],
             rows: vec![row],
         };
+
+        prove_orders(&mut ctx).await;
 
         handle_delete_rows(&mut ctx, &make_header(), ev)
             .await
@@ -1467,6 +1618,8 @@ mod tests {
             included_columns: vec![true, true],
             rows: vec![row],
         };
+
+        prove_orders(&mut ctx).await;
 
         handle_write_rows(&mut ctx, &make_header(), ev)
             .await
@@ -1534,6 +1687,7 @@ mod tests {
                 ],
             }],
         };
+        prove_orders(&mut ctx).await;
         handle_write_rows(&mut ctx, &make_header(), ev)
             .await
             .expect("write rows should succeed");
@@ -1586,6 +1740,7 @@ mod tests {
                 ],
             }],
         };
+        prove_orders(&mut ctx).await;
         handle_write_rows(&mut ctx, &make_header(), ev)
             .await
             .expect("write rows should succeed");
@@ -1619,6 +1774,8 @@ mod tests {
             included_columns: vec![true, true],
             rows: vec![row],
         };
+
+        prove_orders(&mut ctx).await;
 
         handle_write_rows(&mut ctx, &make_header(), ev)
             .await
@@ -1672,6 +1829,7 @@ mod tests {
                 ],
             }],
         };
+        prove_orders(&mut ctx).await;
         handle_write_rows(&mut ctx, &make_header(), write_ev)
             .await
             .unwrap();
@@ -1914,6 +2072,333 @@ mod tests {
         }
     }
 
+    const UUID: &str = "3e11fa47-71ca-11e1-9e33-c80aa9429562";
+
+    /// Establish the verified lineage scope (activation records need it) and
+    /// a real accumulated GTID set for the open transaction `UUID:5`.
+    async fn with_scope(ctx: &mut RunCtx) {
+        crate::registry_scope::establish_scope(
+            &ctx.registry_backend,
+            &ctx.registry_scope,
+            &ctx.tenant,
+            &ctx.source_id,
+            storage::adapters::LineageDescriptor::mysql(UUID).unwrap(),
+        )
+        .await
+        .unwrap();
+        ctx.last_gtid = Some(format!("{UUID}:1-5"));
+    }
+
+    async fn table_records(
+        ctx: &RunCtx,
+        db: &str,
+        table: &str,
+    ) -> Vec<crate::mysql::mysql_activation::Stored> {
+        let key = ctx.registry_scope.current().unwrap().key(db, table);
+        crate::mysql::mysql_activation::read_table(
+            &ctx.registry_backend,
+            ctx.schema.registry(),
+            &key,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn barriers(
+        ctx: &RunCtx,
+        db: &str,
+    ) -> Vec<crate::mysql::mysql_activation::Stored> {
+        let key = ctx.registry_scope.current().unwrap().key(db, "t");
+        crate::mysql::mysql_activation::read_barriers(
+            &ctx.registry_backend,
+            &key,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A stream reload request that names no table never enumerates: it
+    /// forgets the cached schemas and every cached timeline and selection.
+    #[tokio::test]
+    async fn an_unnamed_reload_drops_every_cached_selection() {
+        let (tx, _rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        ctx.registry_scope.publish_for_test(
+            "acme",
+            storage::adapters::LineageDescriptor::mysql(UUID).unwrap(),
+        );
+        let scope = ctx.registry_scope.current().unwrap();
+        ctx.selection.seed_for_test(&scope.key("shop", "orders"));
+        ctx.selection.seed_for_test(&scope.key("shop", "items"));
+        assert_eq!(ctx.selection.len(), 2);
+        super::super::apply_reload_request(&mut ctx, None, None)
+            .await
+            .unwrap();
+        assert_eq!(ctx.selection.len(), 0);
+    }
+
+    /// Give the fixture's `shop.orders` a proven schema at the rows'
+    /// evaluation position: its registered shape (two nullable VARCHAR
+    /// columns, as the fixture's TableMap) and a valid baseline.
+    async fn prove_orders(ctx: &mut RunCtx) {
+        use crate::mysql::mysql_activation::{
+            ACTIVATION_NS, Kind, Record, append, baseline_capture_id,
+            table_stream,
+        };
+        use crate::mysql::mysql_table_schema::{MySqlColumn, MySqlTableSchema};
+        crate::registry_scope::establish_scope(
+            &ctx.registry_backend,
+            &ctx.registry_scope,
+            &ctx.tenant,
+            &ctx.source_id,
+            storage::adapters::LineageDescriptor::mysql(UUID).unwrap(),
+        )
+        .await
+        .unwrap();
+        // The rows' evaluation position: the fixture's own position, or a
+        // GTID position when the fixture's GTID text is a placeholder.
+        ctx.mark_transaction_boundary();
+        let comparable = ctx.txn_eval.as_ref().is_some_and(|p| {
+            crate::durable_checkpoint::order_positions(p, p)
+                == deltaforge_core::CheckpointOrder::Equal
+        });
+        if !comparable {
+            ctx.txn_eval = Some(crate::durable_checkpoint::WmPos::MysqlGtid {
+                gtid_set: format!("{UUID}:1-5"),
+            });
+        }
+        let r0 = ctx.txn_eval.clone().unwrap();
+        let col = |name: &str, ordinal| {
+            let mut c = MySqlColumn::new(
+                name,
+                "varchar(255)",
+                "varchar",
+                true,
+                ordinal,
+            );
+            c.char_octet_length = Some(255);
+            c
+        };
+        let schema = MySqlTableSchema::new(vec![col("id", 1), col("sku", 2)]);
+        let key = ctx.registry_scope.current().unwrap().key("shop", "orders");
+        // Registered under the context's scope (the fixture's loader has its
+        // own).
+        let hash = schema_registry::SourceSchema::fingerprint(&schema);
+        let version = ctx
+            .schema
+            .registry()
+            .register_with_checkpoint(
+                &key,
+                &hash,
+                &serde_json::to_value(&schema).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        let record = Record::new(
+            r0.clone(),
+            Kind::Baseline {
+                version,
+                schema_hash: hash,
+                to: r0,
+                scan_digest: "unit".into(),
+                binds: None,
+                classifier_version:
+                    crate::mysql::mysql_binlog_scan::CLASSIFIER_VERSION.into(),
+            },
+        );
+        let stream = table_stream(&key);
+        let id =
+            baseline_capture_id(&key.lineage_hash, &stream, &record).unwrap();
+        append(
+            &ctx.registry_backend,
+            ctx.schema.registry(),
+            &key,
+            ACTIVATION_NS,
+            &stream,
+            &id,
+            &record,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_ddl_records_every_table_it_changes_before_its_event() {
+        use crate::mysql::mysql_activation::{Kind, Record};
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        with_scope(&mut ctx).await;
+        ctx.query_ordinal = 0;
+        handle_query(
+            &mut ctx,
+            &make_header(),
+            query_event("RENAME TABLE orders TO other.archived"),
+        )
+        .await
+        .unwrap();
+        assert!(recv_event(&mut rx).await.is_some());
+        let position = crate::durable_checkpoint::mysql_checkpoint_position(
+            &ctx.last_file,
+            ctx.last_pos,
+            ctx.last_gtid.as_deref(),
+        )
+        .unwrap();
+        for (db, table) in [("shop", "orders"), ("other", "archived")] {
+            let recs = table_records(&ctx, db, table).await;
+            assert_eq!(recs.len(), 1, "{db}.{table}");
+            assert_eq!(
+                recs[0].record,
+                Record::new(position.clone(), Kind::Ddl)
+            );
+        }
+        // The identity is the transaction's GTID and the statement's
+        // QueryEvent ordinal (1: the first QueryEvent of the transaction).
+        let key = ctx.registry_scope.current().unwrap().key("shop", "orders");
+        let expected = crate::mysql::mysql_activation::capture_id(
+            &key.lineage_hash,
+            &crate::mysql::mysql_activation::EventIdentity::Gtid {
+                gtid: format!("{UUID}:5"),
+                ordinal: 1,
+            },
+            &crate::mysql::mysql_activation::table_stream(&key),
+            &Record::new(position, Kind::Ddl),
+        );
+        assert_eq!(
+            table_records(&ctx, "shop", "orders").await[0].capture_id,
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn replaying_a_ddl_rederives_identical_records() {
+        let (tx, _rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        with_scope(&mut ctx).await;
+        for _ in 0..2 {
+            // As the transaction's GTID event sets it on (re)delivery.
+            ctx.current_gtid = Some(format!("{UUID}:5"));
+            ctx.query_ordinal = 0;
+            handle_query(
+                &mut ctx,
+                &make_header(),
+                query_event("ALTER TABLE orders ADD COLUMN x INT"),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(table_records(&ctx, "shop", "orders").await.len(), 1);
+        // Another statement of the same transaction is another event.
+        ctx.current_gtid = Some(format!("{UUID}:5"));
+        handle_query(
+            &mut ctx,
+            &make_header(),
+            query_event("ALTER TABLE orders ADD COLUMN y INT"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(table_records(&ctx, "shop", "orders").await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_ddl_whose_record_cannot_be_persisted_is_not_emitted() {
+        let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        let fault = Arc::new(storage::adapters::test_util::FaultBackend::new());
+        ctx.registry_backend = fault.clone();
+        with_scope(&mut ctx).await;
+        fault
+            .fail_writes_to
+            .lock()
+            .unwrap()
+            .push(crate::mysql::mysql_activation::ACTIVATION_NS.into());
+        let res = handle_query(
+            &mut ctx,
+            &make_header(),
+            query_event("ALTER TABLE orders ADD COLUMN x INT"),
+        )
+        .await;
+        assert!(res.is_err());
+        drop(ctx);
+        assert!(recv_event(&mut rx).await.is_none(), "no DDL event");
+    }
+
+    #[tokio::test]
+    async fn unattributable_statements_write_barriers_and_others_nothing() {
+        use crate::mysql::mysql_activation::{BarrierScope, Kind};
+        let (tx, _rx) = mpsc::channel::<SourceItem>(64);
+        let mut ctx = make_runctx(tx);
+        with_scope(&mut ctx).await;
+        for sql in [
+            "CREATE VIEW v AS SELECT 1",
+            "TRUNCATE TABLE orders",
+            "GRANT SELECT ON *.* TO u",
+        ] {
+            handle_query(&mut ctx, &make_header(), query_event(sql))
+                .await
+                .unwrap();
+        }
+        assert!(table_records(&ctx, "shop", "orders").await.is_empty());
+        assert!(barriers(&ctx, "shop").await.is_empty());
+
+        handle_query(
+            &mut ctx,
+            &make_header(),
+            query_event("DROP DATABASE shop"),
+        )
+        .await
+        .unwrap();
+        handle_query(
+            &mut ctx,
+            &make_header(),
+            query_event("IMPORT TABLE FROM '/tmp/a.sdi'"),
+        )
+        .await
+        .unwrap();
+        let kinds: Vec<Kind> = barriers(&ctx, "shop")
+            .await
+            .into_iter()
+            .map(|s| s.record.kind)
+            .collect();
+        assert!(kinds.contains(&Kind::Barrier {
+            scope: BarrierScope::Database { db: "shop".into() }
+        }));
+        assert!(kinds.contains(&Kind::Barrier {
+            scope: BarrierScope::Lineage
+        }));
+    }
+
+    #[tokio::test]
+    async fn table_names_follow_lower_case_table_names() {
+        use crate::mysql::mysql_activation::{BarrierScope, Kind};
+        let (tx, _rx) = mpsc::channel::<SourceItem>(8);
+        let mut ctx = make_runctx(tx);
+        with_scope(&mut ctx).await;
+        ctx.lower_case_table_names = 1;
+        handle_query(
+            &mut ctx,
+            &make_header(),
+            query_event("ALTER TABLE `Shop`.`Orders` ADD x INT"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(table_records(&ctx, "shop", "orders").await.len(), 1);
+        // Stored as written but compared case-insensitively: the names cannot
+        // be mapped to keys with certainty.
+        ctx.lower_case_table_names = 2;
+        handle_query(
+            &mut ctx,
+            &make_header(),
+            query_event("ALTER TABLE Orders ADD y INT"),
+        )
+        .await
+        .unwrap();
+        assert!(barriers(&ctx, "shop").await.iter().any(|s| s.record.kind
+            == Kind::Barrier {
+                scope: BarrierScope::Lineage
+            }));
+    }
+
     #[tokio::test]
     async fn handle_query_emits_ddl_event() {
         // Every DDL keyword must be detected independently - pins each clause
@@ -1928,6 +2413,7 @@ mod tests {
         ] {
             let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
             let mut ctx = make_runctx(tx);
+            with_scope(&mut ctx).await;
             handle_query(&mut ctx, &make_header(), query_event(sql))
                 .await
                 .expect("handle_query should succeed");
@@ -2140,6 +2626,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<SourceItem>(8);
         let mut ctx = make_runctx(tx);
         ctx.outbox_tables = AllowList::new(&["shop.orders".to_string()]);
+        prove_orders(&mut ctx).await;
         handle_write_rows(&mut ctx, &make_header(), write())
             .await
             .expect("ok");
@@ -2156,6 +2643,7 @@ mod tests {
         let (tx2, mut rx2) = mpsc::channel::<SourceItem>(8);
         let mut ctx2 = make_runctx(tx2);
         ctx2.outbox_tables = AllowList::new(&["other.table".to_string()]);
+        prove_orders(&mut ctx2).await;
         handle_write_rows(&mut ctx2, &make_header(), write())
             .await
             .expect("ok");
@@ -2284,6 +2772,7 @@ mod tests {
             "mysql-bin.000003",
             900,
             &Some("3e11fa47-71ca-11e1-9e33-c80aa9429562:1-5".to_string()),
+            checkpoint_lineage(&ctx.registry_scope),
         );
         assert_eq!(boundary.checkpoint.as_bytes(), expected.as_bytes());
         // Watermark is present (even for an empty tx) and represents the SAME

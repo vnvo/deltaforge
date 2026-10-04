@@ -11,8 +11,11 @@
 //! again, then starts a fresh source at the captured position (so the live
 //! schema is newer than the first retained row).
 //!
-//! Correct replay across a DDL requires historical schema resolution, which is
-//! not implemented for MySQL yet; until then these are fail-closed regressions.
+//! The fresh source never observed the DDL, so its activation timeline holds
+//! no positional proof for these rows, and the server's binlog row metadata is
+//! MINIMAL, so the TableMap cannot identify the version either. Correct replay
+//! needs one of the two (see `mysql_proof_matrix_e2e`); without them these are
+//! fail-closed regressions.
 //!
 //! Run with:
 //! ```bash
@@ -60,6 +63,7 @@ async fn current_position(
         .await?
         .expect("binary log status");
     Ok(MySqlCheckpoint {
+        lineage: None,
         file: status.get("File").unwrap(),
         pos: status.get("Position").unwrap(),
         gtid_set: status
@@ -133,7 +137,8 @@ fn assert_failed_closed(r: &Replay, seeded: &MySqlCheckpoint) {
         .expect_err("replaying rows across a DDL must fail closed");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("written under a different table definition"),
+        msg.contains("no positional proof of its schema at these rows")
+            && msg.contains("binlog_row_metadata is not FULL"),
         "unexpected error: {msg}"
     );
     let rows: Vec<_> = r
@@ -146,12 +151,27 @@ fn assert_failed_closed(r: &Replay, seeded: &MySqlCheckpoint) {
         "no row may be emitted for undecodable rows, got {:?}",
         rows.iter().map(|e| &e.after).collect::<Vec<_>>()
     );
-    // The complete checkpoint (file, position, and executed GTID set) is
-    // exactly the seeded one: nothing past the refused rows was recorded.
+    // The position (file, position, and executed GTID set) is exactly the
+    // seeded one: nothing past the refused rows was recorded. The seeded
+    // checkpoint predates lineage, so startup adopted it into the verified
+    // server lineage (only that field is added).
+    let after = r
+        .checkpoint_after
+        .as_ref()
+        .expect("the checkpoint is still stored");
     assert_eq!(
-        r.checkpoint_after.as_ref(),
-        Some(seeded),
+        (&after.file, after.pos, &after.gtid_set),
+        (&seeded.file, seeded.pos, &seeded.gtid_set),
         "the checkpoint must not advance past the refused rows"
+    );
+    assert_eq!(seeded.lineage, None);
+    let lineage = after.lineage.as_deref().expect("adopted lineage");
+    assert!(
+        lineage.len() == 32
+            && lineage
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "lineage {lineage}"
     );
 }
 
@@ -228,7 +248,7 @@ async fn replay_across_mid_table_add_column_fails_closed() -> Result<()> {
 }
 
 /// Positive control: replay from an older position with NO intervening DDL is
-/// unaffected by the check and decodes every row.
+/// proven by the startup baseline and decodes every row.
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn replay_without_ddl_decodes_normally() -> Result<()> {

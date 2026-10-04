@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use super::schema_key::{LineageDescriptor, encode_segment};
 use crate::ArcStorageBackend;
 
-const NS: &str = "schema_lineage";
+pub(crate) const NS: &str = "schema_lineage";
 const RECORD_VERSION: u32 = 1;
 
 /// A lineage descriptor together with its derived hash.
@@ -71,6 +71,18 @@ pub struct SourceLineageRecord {
     #[serde(default)]
     pub prior_lineage_hashes: Vec<String>,
     pub established_at_ms: i64,
+    /// A durable unique identity of the transition into `current` (128
+    /// random bits, hex), created when the record is written for a new or
+    /// changed lineage. Per-transition records (failover anchors, drift
+    /// markers) bind to it, never to the wall-clock `established_at_ms`.
+    /// Records written before it existed get one on their first load (see
+    /// [`establish`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_id: Option<String>,
+}
+
+fn new_transition_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 impl SourceLineageRecord {
@@ -98,6 +110,12 @@ impl SourceLineageRecord {
             anyhow::ensure!(
                 seen.insert(h.as_str()),
                 "duplicate prior lineage hash `{h}`"
+            );
+        }
+        if let Some(id) = &self.transition_id {
+            anyhow::ensure!(
+                is_lineage_hash(id),
+                "malformed lineage transition id `{id}`"
             );
         }
         if let Some(prev) = &self.previous {
@@ -129,7 +147,7 @@ pub struct Established {
     pub changed_from: Option<LineageRef>,
 }
 
-fn record_key(tenant: &str, source_id: &str) -> String {
+pub(crate) fn record_key(tenant: &str, source_id: &str) -> String {
     format!("{}/{}", encode_segment(tenant), encode_segment(source_id))
 }
 
@@ -154,8 +172,42 @@ pub async fn establish(
     if let Some(rec) = &existing
         && rec.current == current
     {
+        if rec.transition_id.is_some() {
+            return Ok(Established {
+                record: rec.clone(),
+                changed_from: None,
+            });
+        }
+        // Compatibility: a record written before transition ids predates
+        // every per-transition record (its transition, if any, was
+        // reconciled eagerly), so it gets a fresh id that nothing existing
+        // can name.
+        //
+        // Single-writer contract: this is a plain `kv_put`, not a
+        // compare-and-swap, like every lineage-record write here. It is
+        // correct only because lineage writers are serialized by the store
+        // gate: the server acquires the gate before any source loads or
+        // establishes lineage; one state store admits exactly one DeltaForge
+        // server; source ids are claimed uniquely within it (no two
+        // pipelines mutate one lineage key); migration commands never
+        // establish lineage; a crash leaves the gate held, so no replacement
+        // races the crashed process; upgrades stop the old process first.
+        // An out-of-contract second writer could supersede a transition id:
+        // anchors and markers written under the superseded id are then
+        // ignored rather than trusted, but an already-running losing process
+        // may, until it restarts, believe its own marker completed a check.
+        let mut record = rec.clone();
+        record.transition_id = Some(new_transition_id());
+        backend
+            .kv_put(
+                NS,
+                &record_key(tenant, source_id),
+                &serde_json::to_vec(&record)?,
+            )
+            .await
+            .context("source lineage: failed to persist the transition id")?;
         return Ok(Established {
-            record: rec.clone(),
+            record,
             changed_from: None,
         });
     }
@@ -179,6 +231,7 @@ pub async fn establish(
         previous: previous.clone(),
         prior_lineage_hashes: prior,
         established_at_ms: Utc::now().timestamp_millis(),
+        transition_id: Some(new_transition_id()),
     };
     backend
         .kv_put(
@@ -329,8 +382,60 @@ mod tests {
             previous: Some(prev.clone()),
             prior_lineage_hashes: vec![prev.lineage_hash],
             established_at_ms: 0,
+            transition_id: None,
         })
         .unwrap()
+    }
+
+    /// Every lineage transition gets its own durable random identity,
+    /// independent of the clock; a record written before identities existed
+    /// gets one on its first load, which then stays; a malformed one is
+    /// refused.
+    #[tokio::test]
+    async fn every_transition_has_a_unique_durable_identity() {
+        let b: ArcStorageBackend = Arc::new(crate::MemoryStorageBackend::new());
+        let id = |e: &Established| e.record.transition_id.clone().unwrap();
+        let first = establish(&b, "acme", "src1", pg(1, 2)).await.unwrap();
+        let again = establish(&b, "acme", "src1", pg(1, 2)).await.unwrap();
+        assert_eq!(id(&again), id(&first), "same transition, same identity");
+        let changed = establish(&b, "acme", "src1", pg(1, 3)).await.unwrap();
+        let back = establish(&b, "acme", "src1", pg(1, 2)).await.unwrap();
+        let ids = [id(&first), id(&changed), id(&back)];
+        assert!(ids.iter().all(|i| i.len() == 32));
+        assert_ne!(ids[0], ids[1]);
+        assert_ne!(ids[0], ids[2], "a return to a lineage is a new transition");
+        assert_ne!(ids[1], ids[2]);
+
+        // A record without an identity (written before it existed).
+        let legacy = load_raw(valid_record()).await.unwrap().unwrap();
+        assert!(legacy.transition_id.is_none());
+        let b2: ArcStorageBackend =
+            Arc::new(crate::MemoryStorageBackend::new());
+        b2.kv_put(
+            NS,
+            &record_key("acme", "src1"),
+            &serde_json::to_vec(&valid_record()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let upgraded = establish(&b2, "acme", "src1", pg(1, 3)).await.unwrap();
+        assert!(upgraded.changed_from.is_none());
+        let assigned = id(&upgraded);
+        assert_eq!(
+            load(&b2, "acme", "src1")
+                .await
+                .unwrap()
+                .unwrap()
+                .transition_id,
+            Some(assigned.clone()),
+            "persisted"
+        );
+        let stable = establish(&b2, "acme", "src1", pg(1, 3)).await.unwrap();
+        assert_eq!(id(&stable), assigned);
+
+        let mut bad = valid_record();
+        bad["transition_id"] = "not-hex".into();
+        assert!(load_raw(bad).await.is_err());
     }
 
     #[tokio::test]

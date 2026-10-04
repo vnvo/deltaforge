@@ -493,12 +493,32 @@ pub enum ApplyOutcome {
 ///    state is uncertain: return `CloseUncertain` and open **neither** stream.
 /// 3. Only after confirmed closure, `open_new` at the frozen position; if it fails
 ///    or times out, attempt bounded `open_old` recovery; if that also fails/times
-///    out, return `FailedClosed`.
+///    out, return `FailedClosed`. A recovered old stream reports the
+///    replacement's own failure reason (a replacement session that reached
+///    another server is an `IdentityMismatch`, not a transient open failure).
 ///
 /// **This future must be awaited to completion, not raced against a shutdown
 /// token.** Each step is internally bounded so it completes promptly. There is never
 /// a moment with two active replication streams: a second stream is opened only
 /// after `close_old` confirms the first is gone.
+/// Why a replacement stream could not be opened.
+pub trait ReplacementFailure {
+    fn reason(&self) -> RotationReject;
+}
+
+/// A plain open failure.
+impl ReplacementFailure for () {
+    fn reason(&self) -> RotationReject {
+        RotationReject::ReplacementOpenFailed
+    }
+}
+
+impl ReplacementFailure for RotationReject {
+    fn reason(&self) -> RotationReject {
+        *self
+    }
+}
+
 pub async fn apply_two_stage<RF, CF, NF, OF, EC, EN, EO>(
     timeout: Duration,
     recheck: impl FnOnce() -> RF,
@@ -511,6 +531,7 @@ where
     CF: Future<Output = Result<(), EC>>,
     NF: Future<Output = Result<(), EN>>,
     OF: Future<Output = Result<(), EO>>,
+    EN: ReplacementFailure,
 {
     // Stage B step 1: recheck the frozen boundary before touching the old stream.
     match tokio::time::timeout(timeout, recheck()).await {
@@ -532,15 +553,13 @@ where
 
     // Step 3: open replacement; any failure/timeout falls through to recovery so we
     // are never left disconnected after close_old.
-    let new_ok =
-        matches!(tokio::time::timeout(timeout, open_new()).await, Ok(Ok(())));
-    if new_ok {
-        return ApplyOutcome::Applied;
-    }
+    let reason = match tokio::time::timeout(timeout, open_new()).await {
+        Ok(Ok(())) => return ApplyOutcome::Applied,
+        Ok(Err(e)) => e.reason(),
+        Err(_timeout) => RotationReject::ReplacementOpenFailed,
+    };
     match tokio::time::timeout(timeout, open_old()).await {
-        Ok(Ok(())) => ApplyOutcome::KeptOld {
-            reason: RotationReject::ReplacementOpenFailed,
-        },
+        Ok(Ok(())) => ApplyOutcome::KeptOld { reason },
         _ => ApplyOutcome::FailedClosed,
     }
 }
@@ -782,6 +801,24 @@ mod tests {
             }
         );
         assert!(opened_old.get());
+    }
+
+    #[tokio::test]
+    async fn apply_replacement_on_another_server_is_an_identity_mismatch() {
+        let outcome = apply_two_stage(
+            short(),
+            || async { Ok(()) },
+            || async { ok() },
+            || async { Err::<(), _>(RotationReject::IdentityMismatch) },
+            || async { ok() },
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ApplyOutcome::KeptOld {
+                reason: RotationReject::IdentityMismatch
+            }
+        );
     }
 
     #[tokio::test]

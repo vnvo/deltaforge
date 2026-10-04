@@ -69,6 +69,7 @@ where
             Ok(Some(SourceItem::TxBegin { .. })) => continue,
             Ok(Some(SourceItem::TxCommit { .. })) => continue,
             Ok(Some(SourceItem::Boundary { .. })) => continue,
+            Ok(Some(SourceItem::TxAbort { .. })) => continue,
             Ok(None) | Err(_) => break,
         }
     }
@@ -158,6 +159,112 @@ async fn start_source(
 // =============================================================================
 // Tests
 // =============================================================================
+
+/// Concurrent first uses of one table share one live load (single-flight),
+/// and a reload refreshes only the tables in use, never enumerating the
+/// catalog.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_loader_loads_once_and_reloads_only_tables_in_use() -> Result<()>
+{
+    let (db_name, pool, dsn) = mysql_setup("singleflight").await?;
+    let mut conn = pool.get_conn().await?;
+    for t in ["used", "idle_a", "idle_b"] {
+        conn.query_drop(format!(
+            "CREATE TABLE {db_name}.{t} (id INT PRIMARY KEY)"
+        ))
+        .await?;
+    }
+    let scope = sources::registry_scope::SharedRegistryScope::new("test");
+    sources::mysql::establish_registry_scope(
+        &dsn,
+        &make_storage_backend().await,
+        &scope,
+        "acme",
+        "test",
+    )
+    .await?;
+    let loader =
+        MySqlSchemaLoader::new(&dsn, make_registry().await, "acme", scope);
+
+    let loads: Vec<_> = (0..16)
+        .map(|_| {
+            let (loader, db) = (loader.clone(), db_name.clone());
+            tokio::spawn(async move { loader.load_schema(&db, "used").await })
+        })
+        .collect();
+    let mut versions = std::collections::BTreeSet::new();
+    for load in loads {
+        versions.insert(load.await??.registry_version);
+    }
+    assert_eq!(versions.len(), 1);
+    assert_eq!(loader.live_fetch_count(), 1, "one load for 16 first uses");
+
+    let reloaded = loader.reload_all(&[format!("{db_name}.*")]).await?;
+    assert_eq!(reloaded, [(db_name.clone(), "used".to_string())]);
+    assert_eq!(loader.live_fetch_count(), 2, "only the table in use");
+
+    mysql_drop_db(&pool, &db_name).await;
+    Ok(())
+}
+
+/// With a cache smaller than the working set, an evicted table comes back
+/// as exactly the version it resolved to (rebuilt from durable history, no
+/// live read), even after the live table changed; only an explicit reload
+/// resolves it again.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_evicted_schema_is_rebuilt_exactly() -> Result<()> {
+    let (db_name, pool, dsn) = mysql_setup("evict").await?;
+    let mut conn = pool.get_conn().await?;
+    for t in ["a", "b"] {
+        conn.query_drop(format!(
+            "CREATE TABLE {db_name}.{t} (id INT PRIMARY KEY)"
+        ))
+        .await?;
+    }
+    let scope = sources::registry_scope::SharedRegistryScope::new("test");
+    sources::mysql::establish_registry_scope(
+        &dsn,
+        &make_storage_backend().await,
+        &scope,
+        "acme",
+        "test",
+    )
+    .await?;
+    let loader =
+        MySqlSchemaLoader::new(&dsn, make_registry().await, "acme", scope)
+            .with_cache_budget(sources::registry_scope::CacheBudget {
+                max_entries: 1,
+                max_bytes: usize::MAX,
+            });
+
+    let first = loader.load_schema(&db_name, "a").await?;
+    loader.load_schema(&db_name, "b").await?;
+    assert_eq!(loader.cache_usage().await.2, 1, "a was evicted");
+    conn.query_drop(format!("ALTER TABLE {db_name}.a ADD COLUMN note TEXT"))
+        .await?;
+
+    let fetches = loader.live_fetch_count();
+    let again = loader.load_schema(&db_name, "a").await?;
+    assert_eq!(loader.live_fetch_count(), fetches, "no live read");
+    assert_eq!(
+        (again.registry_version, again.sequence, &again.fingerprint),
+        (first.registry_version, first.sequence, &first.fingerprint)
+    );
+    assert_eq!(again.schema.columns.len(), 1);
+
+    loader.reload_all(&[]).await?;
+    let fresh = loader.load_schema(&db_name, "a").await?;
+    assert_eq!(
+        fresh.schema.columns.len(),
+        2,
+        "the reload resolved it again"
+    );
+
+    mysql_drop_db(&pool, &db_name).await;
+    Ok(())
+}
 
 /// Test schema loader: pattern expansion, column loading, fingerprinting, DDL detection.
 #[tokio::test]
@@ -431,6 +538,13 @@ async fn mysql_cdc_basic_events() -> Result<()> {
         assert!(e.schema_version.is_some(), "missing schema_version");
         assert!(e.schema_sequence.is_some(), "missing schema_sequence");
         assert!(e.checkpoint().is_some(), "missing checkpoint");
+        // Every checkpoint carries the verified server lineage (the schema
+        // registry scope's lineage hash), so positions from different servers
+        // are never ordered against each other.
+        let cp: MySqlCheckpoint =
+            serde_json::from_slice(e.checkpoint().unwrap().as_bytes())?;
+        let lineage = cp.lineage.expect("checkpoint without lineage");
+        assert_eq!(lineage.len(), 32, "lineage hash: {lineage}");
     }
     info!("✓ event metadata correct");
 
@@ -1309,6 +1423,7 @@ async fn stable_event_ids_are_replay_stable() -> Result<()> {
         .await?
         .expect("binary log status");
     let checkpoint = MySqlCheckpoint {
+        lineage: None,
         file: status.get("File").unwrap(),
         pos: status.get("Position").unwrap(),
         gtid_set: status
@@ -1406,6 +1521,7 @@ async fn ddl_event_ids_are_replay_stable() -> Result<()> {
         .await?
         .expect("binary log status");
     let checkpoint = MySqlCheckpoint {
+        lineage: None,
         file: status.get("File").unwrap(),
         pos: status.get("Position").unwrap(),
         gtid_set: status
@@ -1491,6 +1607,7 @@ async fn derived_event_ids_are_replay_stable() -> Result<()> {
         .await?
         .expect("binary log status");
     let checkpoint = MySqlCheckpoint {
+        lineage: None,
         file: status.get("File").unwrap(),
         pos: status.get("Position").unwrap(),
         gtid_set: status

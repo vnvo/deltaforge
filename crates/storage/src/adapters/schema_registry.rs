@@ -950,6 +950,42 @@ impl DurableSchemaRegistry {
             .map(|v| v.hash))
     }
 
+    /// One version of `key` by number, read through the version index (no
+    /// history scan). An index entry whose log entry is missing or disagrees
+    /// with it is a corrupt record.
+    pub async fn get_version(
+        &self,
+        key: &SchemaKey,
+        version: i32,
+    ) -> Result<Option<SchemaVersion>> {
+        let bkey = key.backend_key();
+        let Some(idx) = self.version_index(&bkey, version).await? else {
+            return Ok(None);
+        };
+        let skey = stream_key(&bkey, idx.stream);
+        let rows = self
+            .backend
+            .log_read_meta_since(V1_NS, &skey, idx.sequence.saturating_sub(1), 1)
+            .await
+            .with_context(|| {
+                format!("schema registry: failed to read version {version} of {skey}")
+            })?;
+        let corrupt = |why: &str| {
+            anyhow::Error::new(CorruptRecord(format!(
+                "schema registry: version {version} of {bkey}: {why}"
+            )))
+        };
+        let row = rows
+            .into_iter()
+            .find(|r| r.seq == idx.sequence)
+            .ok_or_else(|| corrupt("indexed entry missing"))?;
+        let v = parse_v1(&row.value, row.seq, &skey)?;
+        if v.version != version || v.hash != idx.hash {
+            return Err(corrupt("entry disagrees with its index"));
+        }
+        Ok(Some(v))
+    }
+
     /// Whether a whole-stream migration marker exists for `key`.
     pub async fn is_migrated(&self, key: &SchemaKey) -> Result<bool> {
         let Some(bytes) = self
@@ -1451,6 +1487,21 @@ mod tests {
                 None => return out,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_version_is_read_by_number_through_its_index() {
+        let (_f, b) = backend();
+        let r = reg(&b).await;
+        let k = skey("s", "lin", "t");
+        register(&r, &k, "h1").await;
+        register(&r, &k, "h2").await;
+        let v1 = r.get_version(&k, 1).await.unwrap().unwrap();
+        let v2 = r.get_version(&k, 2).await.unwrap().unwrap();
+        assert_eq!((v1.version, v1.hash.as_str()), (1, "h1"));
+        assert_eq!((v2.version, v2.hash.as_str()), (2, "h2"));
+        assert!(v1.sequence < v2.sequence);
+        assert!(r.get_version(&k, 3).await.unwrap().is_none());
     }
 
     // ---- no scan / latest-only / bounded memory ---------------------------

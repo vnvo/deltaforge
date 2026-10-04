@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+exclude = ["vendor/mysql-binlog-connector-rust"]
 
 [workspace.package]
 edition = "2024"
@@ -77,3 +78,9 @@ codegen-units = 4  # faster compile, minor perf cost
 [profile.bench]
 debug = true
 strip = false
+
+# Patched copy of the binlog parser: correct FULL TableMap metadata
+# (signedness, per-column collations, geometry types, primary-key order).
+# See vendor/mysql-binlog-connector-rust/DELTAFORGE-PATCH.md.
+[patch.crates-io]
+mysql-binlog-connector-rust = { path = "vendor/mysql-binlog-connector-rust" }

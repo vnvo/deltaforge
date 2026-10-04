@@ -50,6 +50,7 @@ tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 # Same crate as the normal dependency, plus the fault-injecting test backend.
 storage = { path = "../storage", features = ["testing"] }
 ctor = "0.6"
+metrics-util = "0.19"
 testcontainers = "0.25"
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = [

@@ -1,6 +1,6 @@
 use crc32fast::Hasher;
 use deltaforge_core::{CheckpointMeta, SourceError, SourceResult};
-use mysql_async::{Pool, Row, prelude::Queryable};
+use mysql_async::{Row, prelude::Queryable};
 use mysql_binlog_connector_rust::{
     binlog_client::BinlogClient, binlog_stream::BinlogStream,
 };
@@ -23,6 +23,7 @@ use super::{MySqlCheckpoint, MySqlSourceError, MySqlSourceResult};
 
 pub(super) async fn prepare_client(
     dsn: &str,
+    expected_uuid: &str,
     source_id: &str,
     ckpt_store: &Arc<dyn CheckpointStore>,
 ) -> MySqlSourceResult<(String, String, u64, BinlogClient)> {
@@ -85,16 +86,24 @@ pub(super) async fn prepare_client(
         }
     } else {
         info!("no previous checkpoint, reading the binlog tail ..");
-        match resolve_binlog_tail(dsn).await {
+        match resolve_binlog_tail(dsn, expected_uuid).await {
             Ok((file, pos)) => {
                 info!(source_id = %source_id, %file, %pos, "start from end (first run)");
                 client.binlog_filename = file;
                 client.binlog_position = pos as u32;
                 // Also fetch the full executed GTID set so reconnects resume
                 // from here rather than replaying the full binlog history.
-                if let Ok(Some(gtid_set)) = fetch_executed_gtid_set(dsn).await {
-                    client.gtid_enabled = true;
-                    client.gtid_set = gtid_set;
+                match fetch_executed_gtid_set(dsn, expected_uuid).await {
+                    // With GTID off the executed set is '' (not NULL): no
+                    // GTID resume position, stay on the file/position tail.
+                    Ok(Some(gtid_set)) if !gtid_set.trim().is_empty() => {
+                        client.gtid_enabled = true;
+                        client.gtid_set = gtid_set;
+                    }
+                    Err(SourceError::Lineage { details }) => {
+                        return Err(MySqlSourceError::Lineage(details.into()));
+                    }
+                    Ok(_) | Err(_) => {}
                 }
             }
             Err(e) => {
@@ -111,16 +120,30 @@ pub(super) async fn prepare_client(
     Ok((host, default_db, server_id, client))
 }
 
+/// A replication session opened by [`connect_binlog_with_retries`].
+pub(super) enum Opened {
+    /// Verified as the expected server; the dump command was issued.
+    Stream(BinlogStream),
+    /// The session reached another server (its `server_uuid`) and was closed
+    /// before the dump command: no event was read.
+    OtherServer(String),
+}
+
 /// Retry `connect_binlog`, building a new client with each attempt.
 /// Instead of calling connect_binlog directly, this wrapper should be used.
+/// Every session is verified as `expected_uuid` before its dump command;
+/// another server is reported (never retried), an unverifiable identity is a
+/// lineage error.
 pub(super) async fn connect_binlog_with_retries(
     source_id: &str,
+    expected_uuid: &str,
     make_client: impl FnMut() -> BinlogClient + Send + Clone + 'static,
     cancel: &CancellationToken,
     default_db_for_hints: &str,
     retry_policy: RetryPolicy,
-) -> SourceResult<BinlogStream> {
+) -> SourceResult<Opened> {
     let source_id = source_id.to_string();
+    let expected = expected_uuid.to_string();
     let default_db = default_db_for_hints.to_string();
     let mk = make_client.clone();
 
@@ -128,10 +151,11 @@ pub(super) async fn connect_binlog_with_retries(
         move |_| {
             let mut mk = mk.clone();
             let source_id = source_id.clone();
+            let expected = expected.clone();
             let default_db = default_db.clone();
             async move {
                 let client = mk();
-                connect_binlog(&source_id, client, &default_db).await
+                connect_binlog(&source_id, &expected, client, &default_db).await
             }
         },
         is_retryable_source_error,
@@ -153,7 +177,7 @@ pub(super) async fn connect_binlog_with_retries(
         }
         RetryOutcome::Failed(e) => e,
     });
-    if result.is_ok() {
+    if matches!(result, Ok(Opened::Stream(_))) {
         // Real stream-open seam: lets tests assert a startup fault opens zero
         // streams (identity must be resolved/persisted before we get here).
         crate::stream_probe::record_stream_opened();
@@ -180,27 +204,44 @@ fn is_retryable_source_error(e: &SourceError) -> bool {
     }
 }
 
-/// Connect to binlog with timeout.
+/// Connect to binlog with timeout, on a session verified as `expected_uuid`.
 async fn connect_binlog(
     source_id: &str,
-    mut client: BinlogClient,
+    expected_uuid: &str,
+    client: BinlogClient,
     default_db_for_hints: &str,
-) -> Result<BinlogStream, SourceError> {
+) -> Result<Opened, SourceError> {
+    use super::mysql_session::{SessionError, open_replication_session};
     debug!("connecting to binlog");
     let t0 = Instant::now();
 
-    match tokio::time::timeout(Duration::from_secs(30), client.connect()).await
+    match tokio::time::timeout(
+        Duration::from_secs(30),
+        open_replication_session(&client, expected_uuid),
+    )
+    .await
     {
         Ok(Ok(stream)) => {
             info!(
                 source_id = %source_id,
                 ms = t0.elapsed().as_millis() as u64,
-                "connected to binlog"
+                "connected to binlog (server identity verified)"
             );
-            Ok(stream)
+            Ok(Opened::Stream(stream))
         }
-        Ok(Err(e)) => {
-            let error_msg = e.to_string();
+        Ok(Err(SessionError::OtherServer { found })) => {
+            warn!(
+                source_id = %source_id,
+                expected = %expected_uuid,
+                %found,
+                "replication session reached another server; closed before the dump"
+            );
+            Ok(Opened::OtherServer(found))
+        }
+        Ok(Err(e @ SessionError::NoIdentity(_))) => {
+            Err(e.into_source_error(expected_uuid))
+        }
+        Ok(Err(SessionError::Connect(error_msg))) => {
             error!(source_id = %source_id, error = %error_msg, "binlog connect failed");
 
             if error_msg.contains("mysql_native_password") {
@@ -247,35 +288,38 @@ pub(super) fn derive_server_id(id: &str) -> u64 {
 }
 
 /// Resolve end-of-binlog with comprehensive diagnostics.
+///
+/// The position is read on a control connection verified as `expected_uuid`:
+/// it is a fact about that server only.
 pub(super) async fn resolve_binlog_tail(
     dsn: &str,
+    expected_uuid: &str,
 ) -> MySqlSourceResult<(String, u64)> {
     info!("connecting to MySQL for binlog tail resolution");
 
-    let pool = Pool::new(dsn);
-
-    // Connect with timeout
-    let mut conn =
-        match tokio::time::timeout(Duration::from_secs(10), pool.get_conn())
-            .await
-        {
-            Ok(Ok(conn)) => {
-                info!("successfully connected to MySQL");
-                conn
-            }
-            Ok(Err(e)) => {
-                error!("failed to connect to MySQL: {}", e);
-                return Err(MySqlSourceError::BinlogConnect(format!(
-                    "MySQL connection failed: {e}"
-                )));
-            }
-            Err(_) => {
-                error!("MySQL connection timed out after 10 seconds");
-                return Err(MySqlSourceError::BinlogConnect(
-                    "MySQL connection timed out".to_owned(),
-                ));
-            }
-        };
+    let mut conn = match super::mysql_session::open_control_connection(
+        dsn,
+        expected_uuid,
+        Duration::from_secs(10),
+    )
+    .await
+    {
+        Ok(conn) => {
+            info!("connected to MySQL (identity verified)");
+            conn
+        }
+        Err(super::mysql_session::SessionError::Connect(e)) => {
+            error!("failed to connect to MySQL: {}", e);
+            return Err(MySqlSourceError::BinlogConnect(format!(
+                "MySQL connection failed: {e}"
+            )));
+        }
+        Err(e) => {
+            return Err(MySqlSourceError::Lineage(format!(
+                "binlog tail resolution: {e:?} (expected {expected_uuid})"
+            )));
+        }
+    };
 
     // Who am I?
     info!("checking user privileges");
@@ -287,7 +331,7 @@ pub(super) async fn resolve_binlog_tail(
         Ok(None) => warn!("could not determine current user"),
         Err(e) => {
             error!("failed to check current user: {}", e);
-            pool.disconnect().await?;
+            conn.disconnect().await?;
             return Err(MySqlSourceError::BinlogConnect(format!(
                 "failed to check current user: {e}"
             )));
@@ -311,8 +355,6 @@ pub(super) async fn resolve_binlog_tail(
                     file, pos
                 );
                 conn.disconnect().await?;
-                pool.disconnect().await?;
-                debug!("pool.disconnect completed, returning");
                 return Ok((file, pos));
             } else {
                 warn!("SHOW BINARY LOG STATUS returned incomplete data");
@@ -346,7 +388,7 @@ pub(super) async fn resolve_binlog_tail(
                     "successfully got binlog position via legacy command: file={}, pos={}",
                     file, pos
                 );
-                pool.disconnect().await?;
+                conn.disconnect().await?;
                 return Ok((file, pos));
             } else {
                 warn!("SHOW MASTER STATUS returned incomplete data");
@@ -458,7 +500,7 @@ pub(super) async fn resolve_binlog_tail(
             .push(format!("FAIL: Failed to get MySQL version: {}", e)),
     }
 
-    pool.disconnect().await?;
+    conn.disconnect().await?;
 
     // Print diagnostics and bail
     error!("could not resolve binlog end position. Diagnostics:");
@@ -484,13 +526,19 @@ pub(crate) fn short_sql(s: &str, max: usize) -> String {
     }
 }
 
+/// `@@GLOBAL.gtid_executed`, read on a control connection verified as
+/// `expected_uuid`.
 pub(super) async fn fetch_executed_gtid_set(
     dsn: &str,
+    expected_uuid: &str,
 ) -> SourceResult<Option<String>> {
-    let pool = Pool::new(dsn);
-    let mut conn = pool.get_conn().await.map_err(|e| SourceError::Connect {
-        details: format!("mysql connect for gtid: {e}").into(),
-    })?;
+    let mut conn = super::mysql_session::open_control_connection(
+        dsn,
+        expected_uuid,
+        Duration::from_secs(10),
+    )
+    .await
+    .map_err(|e| e.into_source_error(expected_uuid))?;
 
     // Returns NULL if GTID is disabled
     let row: Option<(Option<String>,)> = conn
@@ -505,15 +553,29 @@ pub(super) async fn fetch_executed_gtid_set(
     Ok(row.and_then(|(s,)| s))
 }
 
+/// The verified registry lineage hash a new checkpoint is stamped with:
+/// the published scope's lineage (`None` only before the scope is published,
+/// which no checkpoint-writing path reaches).
+pub(crate) fn checkpoint_lineage(
+    scope: &crate::registry_scope::SharedRegistryScope,
+) -> Option<String> {
+    scope
+        .current()
+        .ok()
+        .map(|s| s.lineage().lineage_hash.clone())
+}
+
 pub(crate) fn make_checkpoint_meta(
     file: &str,
     pos: u64,
     gtid: &Option<String>,
+    lineage: Option<String>,
 ) -> CheckpointMeta {
     let cp = MySqlCheckpoint {
         file: file.to_string(),
         pos,
         gtid_set: gtid.clone(),
+        lineage,
     };
 
     let bytes = serde_json::to_vec(&cp).unwrap_or_else(|e| {

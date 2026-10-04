@@ -35,6 +35,7 @@ cargo run --release -p scale-harness --bin registry-scale -- \
 - `--backend postgres --dsn ...` runs against a PostgreSQL state store.
 - `--live` (needs Docker) adds scenario 8 on a fresh SQLite store per engine.
 - `--live-only` skips scenarios 1-7.
+- `--live-catalog-tables N` also creates *N* real tables in the live database, matched by the source's table pattern; a CDC restart must do the same work at any *N* (`tests/live_ttfce.rs` compares 20 and 1,000).
 
 ## Scenarios
 
