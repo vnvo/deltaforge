@@ -2181,6 +2181,81 @@ async fn postgres_a_slot_beyond_the_checkpoint_stops_before_streaming()
     Ok(())
 }
 
+/// The slot is advanced exactly between the pre-open proof and
+/// START_REPLICATION (it is inactive then): the pre-open proof passes and the
+/// stream opens, served from the slot's later position. Once the server
+/// accepted START_REPLICATION the slot is held, and the proof is repeated
+/// against the same F: it refuses the stream before any event is consumed,
+/// with the same incident, and the checkpoint stays F.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn postgres_a_slot_advanced_after_the_proof_is_refused_once_held()
+-> Result<()> {
+    use sources::stream_probe::hold_after_slot_proof;
+    init_test_tracing();
+    const DB: &str = "shoprace";
+    let (_c, port) = start_postgres().await;
+    pg_create_schema(port, DB, "slot_race", "pub_race").await;
+    let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let f = run_until_row_then_stop(port, DB, "race", &backend, &ckpt, 1).await;
+
+    let src = make_pg_source(
+        "race",
+        &pg_dsn(port, DB),
+        "slot_race",
+        "pub_race",
+        Arc::clone(&backend),
+    )
+    .await;
+    let (proved, release) = hold_after_slot_proof();
+    let (tx, mut rx) = mpsc::channel(64);
+    reset_streams_opened();
+    let handle = src.run(tx, Arc::clone(&ckpt)).await;
+
+    timeout(Duration::from_secs(60), proved.notified())
+        .await
+        .expect("the pre-open proof passed");
+    let admin = pg_admin_client(port, DB).await;
+    admin
+        .execute("INSERT INTO orders VALUES (2, 'b')", &[])
+        .await?;
+    admin
+        .execute(
+            "SELECT pg_replication_slot_advance('slot_race', pg_current_wal_lsn())",
+            &[],
+        )
+        .await?;
+    let (_, confirmed) = slot_position(port, DB, "slot_race").await.unwrap();
+    assert!(confirmed > f, "the slot moved past F after the proof");
+    release.notify_one();
+
+    let e = timeout(Duration::from_secs(60), handle.join())
+        .await
+        .expect("the source stops instead of streaming past its checkpoint")
+        .expect_err("the held slot beyond the checkpoint stops the source");
+    let (reason, class, _) = stopped_incident(&e);
+    assert_eq!(
+        reason,
+        deltaforge_core::incident::ReasonCode::PgContinuityUnproven
+    );
+    assert_eq!(class, "slot_beyond_checkpoint");
+    assert_eq!(streams_opened(), 1, "the stream opened, then was refused");
+    let mut events = 0;
+    while let Ok(item) = rx.try_recv() {
+        if matches!(item, SourceItem::Event(_)) {
+            events += 1;
+        }
+    }
+    assert_eq!(events, 0, "no replication event was consumed");
+    assert_eq!(
+        checkpoint_lsn(&ckpt.get_raw("race").await?.unwrap()),
+        f,
+        "the checkpoint is unchanged"
+    );
+    Ok(())
+}
+
 /// A reconnect resumes reading at the last commit handed on, which is ahead
 /// of the durable checkpoint F. The position acknowledged to the server must
 /// stay at F: if the slot's confirmed position moved to the in-memory read

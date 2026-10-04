@@ -69,6 +69,8 @@ pub struct ReplicationClient {
     stop_tx: watch::Sender<bool>,
     metrics: Arc<ReplicationMetrics>,
     join: Option<JoinHandle<std::result::Result<(), PgWireError>>>,
+    /// Fires once the server accepted START_REPLICATION (DeltaForge patch).
+    started: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 impl ReplicationClient {
@@ -95,6 +97,7 @@ impl ReplicationClient {
         let progress = Arc::new(SharedProgress::new(cfg.ack_lsn.unwrap_or(cfg.start_lsn)));
 
         let (stop_tx, stop_rx) = watch::channel(false);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
 
         let metrics = Arc::new(ReplicationMetrics::default());
 
@@ -110,6 +113,7 @@ impl ReplicationClient {
                 tx,
                 metrics_for_worker,
             );
+            worker.notify_started(started_tx);
             let res = run_worker(&mut worker, &cfg).await;
             if let Err(ref e) = res {
                 tracing::error!("replication worker terminated with error: {e}");
@@ -123,7 +127,28 @@ impl ReplicationClient {
             stop_tx,
             metrics,
             join: Some(join),
+            started: Some(started_rx),
         })
+    }
+
+    /// Wait until the server has accepted START_REPLICATION: from then on the
+    /// replication slot is held by this session (no one else can acquire or
+    /// advance it). `connect` returns before that, as connecting,
+    /// authentication and START_REPLICATION run in the background worker.
+    /// Returns the worker's error if it ended first. DeltaForge patch.
+    pub async fn wait_started(&mut self) -> Result<()> {
+        let Some(started) = self.started.take() else {
+            return Ok(());
+        };
+        if started.await.is_ok() {
+            return Ok(());
+        }
+        match self.handle_worker_shutdown().await {
+            Err(e) => Err(e),
+            Ok(_) => Err(PgWireError::Internal(
+                "replication worker ended before replication started".into(),
+            )),
+        }
     }
 
     /// Receive the next replication event.

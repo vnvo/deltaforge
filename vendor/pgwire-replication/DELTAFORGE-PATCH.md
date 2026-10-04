@@ -15,3 +15,12 @@ past what it can recover after a crash. `ack_lsn` sets that initial reported
 position independently of where reading starts; `None` keeps the upstream
 behavior. Files: `src/config.rs`, `src/client/tokio_client.rs`,
 `src/client/worker.rs`.
+
+Change: `ReplicationClient::wait_started` (with `WorkerState::notify_started`).
+`connect` returns as soon as the background worker is spawned; connecting,
+authentication and START_REPLICATION happen afterwards. A consumer that must
+verify the replication slot while it is held by its session (DeltaForge
+rereads the slot bounds after START_REPLICATION, before consuming any event)
+needs to know when the server accepted START_REPLICATION. `wait_started`
+resolves then, or returns the worker's error if it ended first. Files:
+`src/client/worker.rs`, `src/client/tokio_client.rs`.

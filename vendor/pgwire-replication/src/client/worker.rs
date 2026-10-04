@@ -133,6 +133,8 @@ pub struct WorkerState {
     stop_rx: watch::Receiver<bool>,
     out: mpsc::Sender<std::result::Result<ReplicationEvent, PgWireError>>,
     metrics: Arc<ReplicationMetrics>,
+    /// Notified once the server accepted START_REPLICATION (DeltaForge patch).
+    started: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl WorkerState {
@@ -149,7 +151,14 @@ impl WorkerState {
             stop_rx,
             out,
             metrics,
+            started: None,
         }
+    }
+
+    /// Notify `started` once the server accepts START_REPLICATION (the slot is
+    /// then held by this session). DeltaForge patch.
+    pub fn notify_started(&mut self, started: tokio::sync::oneshot::Sender<()>) {
+        self.started = Some(started);
     }
 
     /// Run the replication protocol on the given stream.
@@ -164,6 +173,9 @@ impl WorkerState {
         self.startup(&mut stream).await?;
         self.authenticate(&mut stream).await?;
         self.start_replication(&mut stream).await?;
+        if let Some(started) = self.started.take() {
+            let _ = started.send(());
+        }
         self.stream_loop(&mut stream).await
     }
 

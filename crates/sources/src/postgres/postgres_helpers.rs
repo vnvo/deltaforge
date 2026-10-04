@@ -139,6 +139,15 @@ impl SlotBoundProof {
     /// server is a retryable connect error; a slot beyond, missing or without
     /// a position is a `pg_continuity_unproven` incident (fail closed).
     pub(super) async fn prove(&self) -> SourceResult<Option<Lsn>> {
+        let Some(f) = self.durable_checkpoint().await? else {
+            return Ok(None);
+        };
+        self.check_bounds(f).await?;
+        Ok(Some(f))
+    }
+
+    /// The durable checkpoint F, read now.
+    async fn durable_checkpoint(&self) -> SourceResult<Option<Lsn>> {
         let checkpoint: Option<PostgresCheckpoint> =
             self.checkpoints.get(&self.source_id).await.map_err(|e| {
                 SourceError::Checkpoint {
@@ -148,7 +157,7 @@ impl SlotBoundProof {
         let Some(checkpoint) = checkpoint else {
             return Ok(None);
         };
-        let f = Lsn::parse(&checkpoint.lsn).map_err(|e| {
+        Lsn::parse(&checkpoint.lsn).map(Some).map_err(|e| {
             SourceError::Checkpoint {
                 details: format!(
                     "invalid checkpoint LSN '{}': {e}",
@@ -156,7 +165,14 @@ impl SlotBoundProof {
                 )
                 .into(),
             }
-        })?;
+        })
+    }
+
+    /// Require the slot's `restart_lsn` and `confirmed_flush_lsn` to be at or
+    /// before `f`. Used before a stream opens and again right after the
+    /// server accepted START_REPLICATION (the slot is then held, so it can no
+    /// longer move between the check and the stream).
+    pub(super) async fn check_bounds(&self, f: Lsn) -> SourceResult<()> {
         let bounds = read_slot_bounds(self.dsn.expose(), &self.slot)
             .await
             .map_err(|e| SourceError::Connect {
@@ -169,7 +185,7 @@ impl SlotBoundProof {
         let (class, restart, confirmed) = match bounds {
             None => ("slot_missing", None, None),
             Some((Some(r), Some(c))) if r <= f && c <= f => {
-                return Ok(Some(f));
+                return Ok(());
             }
             Some((Some(r), Some(c))) => {
                 ("slot_beyond_checkpoint", Some(r), Some(c))
@@ -232,17 +248,32 @@ pub(super) async fn connect_replication_with_retries(
     let cfg = config.clone();
     let proof = proof.clone();
 
-    let result = retry_async(
+    retry_async(
         move |_| {
             let cfg = cfg.clone();
             let source_id = source_id.clone();
             let proof = proof.clone();
             async move {
-                let cfg = match proof.prove().await? {
+                let f = proof.prove().await?;
+                crate::stream_probe::after_slot_proof().await;
+                let cfg = match f {
                     Some(f) => cfg.with_ack_lsn(f),
                     None => cfg,
                 };
-                connect_replication(&source_id, cfg).await
+                let mut client = connect_replication(&source_id, cfg).await?;
+                started(&source_id, &mut client).await?;
+                crate::stream_probe::record_stream_opened();
+                // The slot is now held by this session: prove again, against
+                // the same F the stream acknowledges, that it did not move
+                // past F between the first proof and START_REPLICATION.
+                // Nothing has been consumed from the stream yet.
+                if let Some(f) = f
+                    && let Err(e) = proof.check_bounds(f).await
+                {
+                    let _ = client.shutdown().await;
+                    return Err(e);
+                }
+                Ok(client)
             }
         },
         is_retryable_source_error,
@@ -266,13 +297,29 @@ pub(super) async fn connect_replication_with_retries(
             last_error
         }
         RetryOutcome::Failed(e) => e,
-    });
-    if result.is_ok() {
-        // Real stream-open seam: lets tests assert a startup fault opens zero
-        // streams (identity must be resolved/persisted before we get here).
-        crate::stream_probe::record_stream_opened();
+    })
+}
+
+/// Wait until the server accepted START_REPLICATION (bounded like connect).
+async fn started(
+    source_id: &str,
+    client: &mut ReplicationClient,
+) -> SourceResult<()> {
+    match tokio::time::timeout(Duration::from_secs(30), client.wait_started())
+        .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            error!(source_id = %source_id, error = %e, "START_REPLICATION failed");
+            Err(pgwire_error_to_source_error(e))
+        }
+        Err(_) => {
+            let _ = client.shutdown().await;
+            Err(SourceError::Timeout {
+                action: "start_replication".into(),
+            })
+        }
     }
-    result
 }
 
 /// Determine if a SourceError is worth retrying.
