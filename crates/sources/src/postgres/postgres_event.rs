@@ -141,7 +141,12 @@ pub(super) async fn dispatch_event(
             ..
         } => {
             debug!(wal_end = %wal_end, reply_requested, "keepalive");
-            ctx.last_lsn = wal_end;
+            // Right after START_REPLICATION the server reports the slot's
+            // confirmed position, which can be before where this stream
+            // starts reading: the read position never moves back.
+            if wal_end > ctx.last_lsn {
+                ctx.last_lsn = wal_end;
+            }
         }
         ReplicationEvent::Begin {
             final_lsn,
