@@ -169,16 +169,21 @@ async fn refresh(base: &str, index: &str) {
         .expect("refresh");
 }
 
+/// Ready once the cluster can take writes (status yellow or green), not just
+/// once it answers HTTP: a red cluster accepts the request and then times out.
 async fn wait_ready(base: &str) {
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        if let Ok(r) = reqwest::get(format!("{base}/_cluster/health")).await {
-            if r.status().is_success() {
-                return;
-            }
+        if let Ok(r) = reqwest::get(format!(
+            "{base}/_cluster/health?wait_for_status=yellow&timeout=5s"
+        ))
+        .await
+            && r.status().is_success()
+        {
+            return;
         }
         if Instant::now() > deadline {
-            panic!("elasticsearch not ready after 120s");
+            panic!("elasticsearch not ready (status yellow) after 120s");
         }
         tokio::time::sleep(Duration::from_millis(750)).await;
     }
@@ -196,6 +201,10 @@ async fn start_elasticsearch()
     .with_mapped_port(0, ES_HTTP.tcp())
     .with_env_var("discovery.type", "single-node")
     .with_env_var("xpack.security.enabled", "false")
+    // The host's free disk is not under test: without this, a host above
+    // the disk watermarks (85% / 90% used) leaves shards unassigned and every
+    // write times out.
+    .with_env_var("cluster.routing.allocation.disk.threshold_enabled", "false")
     .with_env_var("ES_JAVA_OPTS", "-Xms512m -Xmx512m")
     .start()
     .await
