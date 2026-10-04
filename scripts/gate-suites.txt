@@ -33,6 +33,7 @@ serial     scale-harness/live_ttfce         -p scale-harness --test live_ttfce
 # Live suites, run concurrently
 parallel   sources/lib                      -p sources --lib
 parallel   sources/failover_e2e             -p sources --test failover_e2e
+parallel   sources/pg_failover_topology_e2e -p sources --test pg_failover_topology_e2e
 parallel   sources/mysql_activation_e2e     -p sources --test mysql_activation_e2e
 parallel   sources/mysql_cdc_e2e            -p sources --test mysql_cdc_e2e
 parallel   sources/mysql_checkpoint_lineage_e2e -p sources --test mysql_checkpoint_lineage_e2e
