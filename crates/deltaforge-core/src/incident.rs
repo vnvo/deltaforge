@@ -332,6 +332,10 @@ pub enum EvidenceKey {
     TimelineSwitchPosition,
     WalFlushPosition,
     ReadPosition,
+    CheckpointChain,
+    CheckpointTransition,
+    RecordedChain,
+    RecordedTransition,
 }
 
 impl EvidenceKey {
@@ -365,6 +369,10 @@ impl EvidenceKey {
             Self::TimelineSwitchPosition => "timeline_switch_position",
             Self::WalFlushPosition => "wal_flush_position",
             Self::ReadPosition => "read_position",
+            Self::CheckpointChain => "checkpoint_chain",
+            Self::CheckpointTransition => "checkpoint_transition",
+            Self::RecordedChain => "recorded_chain",
+            Self::RecordedTransition => "recorded_transition",
         }
     }
 }

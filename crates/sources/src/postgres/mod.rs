@@ -2,10 +2,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU32},
-    },
+    sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
@@ -97,10 +94,15 @@ use storage::adapters::LineageDescriptor;
 pub struct PostgresCheckpoint {
     pub lsn: String,
     pub tx_id: Option<u32>,
-    /// The timeline the position was read on (absent in checkpoints written
-    /// before it was recorded).
+    /// The continuity stamp of the stream the position was read on: timeline,
+    /// chain id and transition within the chain. All absent in checkpoints
+    /// written before continuity was recorded; never partially present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeline: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition: Option<u64>,
 }
 
 // ============================================================================
@@ -198,18 +200,27 @@ pub(crate) struct RunCtx {
     pub counter_cache: HashMap<(Arc<str>, &'static str), metrics::Counter>,
     /// Cached LSN string to avoid re-formatting the same LSN on consecutive events.
     pub cached_lsn: Option<(Lsn, String)>,
-    /// The proven timeline of the open stream (0: none proven yet), shared
-    /// with the stream proof that sets it before each START_REPLICATION.
-    pub timeline: Arc<AtomicU32>,
+    /// The continuity stamp of the authoritative stream, set only when a
+    /// stream is activated (`StreamProof::activate`).
+    pub stamp: Arc<std::sync::RwLock<Option<postgres_continuity::Stamp>>>,
+    /// That stamp as checkpoint JSON members, refreshed whenever another
+    /// stream becomes authoritative (before its first event is read).
+    pub stamp_members: Arc<str>,
 }
 
 impl RunCtx {
-    /// The open stream's proven timeline, recorded in its checkpoints.
-    pub(crate) fn stream_timeline(&self) -> Option<u32> {
-        match self.timeline.load(std::sync::atomic::Ordering::Acquire) {
-            0 => None,
-            t => Some(t),
-        }
+    /// Take the stamp of the stream that just became authoritative.
+    pub(crate) fn refresh_stamp(&mut self) {
+        self.stamp_members = self
+            .stamp
+            .read()
+            .expect("not poisoned")
+            .as_ref()
+            .map_or(Arc::from(""), |s| Arc::from(s.checkpoint_members()));
+    }
+
+    fn active_stamp(&self) -> Option<postgres_continuity::Stamp> {
+        self.stamp.read().expect("not poisoned").clone()
     }
 }
 
@@ -632,7 +643,7 @@ impl PostgresSource {
             tenant: self.tenant.clone(),
             checkpoints: chkpt_store.clone(),
             backend: Arc::clone(&self.backend),
-            timeline: Arc::new(AtomicU32::new(0)),
+            active: Default::default(),
             recovery_window: REACHABILITY_RETRY_WINDOW,
             recovery_retry: Default::default(),
         };
@@ -641,6 +652,7 @@ impl PostgresSource {
             &self.id,
             config.clone(),
             &stream_proof,
+            true,
             &cancel,
             RetryPolicy::default(),
         )
@@ -685,8 +697,10 @@ impl PostgresSource {
             registry_backend: Arc::clone(&backend),
             counter_cache: HashMap::new(),
             cached_lsn: None,
-            timeline: Arc::clone(&stream_proof.timeline),
+            stamp: Arc::clone(&stream_proof.active),
+            stamp_members: Arc::from(""),
         };
+        ctx.refresh_stamp();
 
         // The server may have changed between the check above and the open:
         // verify again before the first message is read.
@@ -745,6 +759,9 @@ impl PostgresSource {
                     // it before the teardown checkpoint put, so the checkpoint never
                     // advances past the last committed transaction.
                     rt.apply_at_boundary(&mut ctx).await?;
+                    // The replacement (or the restored old stream) is the
+                    // authoritative one now, before its first event.
+                    ctx.refresh_stamp();
                 }
             }
 
@@ -904,6 +921,7 @@ impl PostgresSource {
                         &self.id,
                         reconnect_config,
                         &stream_proof.with_dsn(ctx.dsn.clone()),
+                        true,
                         &ctx.cancel,
                         ctx.retry.clone(),
                     )
@@ -911,6 +929,7 @@ impl PostgresSource {
                     {
                         Ok(new_client) => {
                             *ctx.repl_client.lock().await = new_client;
+                            ctx.refresh_stamp();
                             ctx.retry.reset();
                             info!(source_id = %self.id, "reconnected successfully");
                             check_identity_post_reconnect(&mut ctx).await?;
@@ -962,7 +981,9 @@ impl PostgresSource {
                     PostgresCheckpoint {
                         lsn: ctx.last_lsn.to_string(),
                         tx_id: None,
-                        timeline: ctx.stream_timeline(),
+                        timeline: ctx.active_stamp().map(|s| s.timeline),
+                        chain: ctx.active_stamp().map(|s| s.chain_id),
+                        transition: ctx.active_stamp().map(|s| s.transition),
                     },
                 )
                 .await;
@@ -1136,19 +1157,52 @@ async fn advance_wal_feedback(
 /// known gap: v1 checkpoints carry no lineage token, so same-lineage is assumed
 /// here. See `docs/specs/postgres-checkpoint-comparison-lineage-design.md`.
 ///
-/// Checkpoints carrying different timelines order by LSN only when the later
-/// timeline's position is strictly after the earlier one's (consistent with a
-/// descent: positions read before a switch are below its switch point, those
-/// after it above). Anything else - the same LSN, or a later timeline at a
-/// lower LSN - may belong to diverged histories and is incomparable, never
-/// equal. A checkpoint without a timeline (written before timelines were
-/// recorded) orders by LSN as before.
+/// Continuity: timeline numbers prove no ancestry (timelines 2 and 3 can both
+/// fork from 1), so checkpoints order only within one proven continuity
+/// chain. Same chain and transition: by LSN (a different timeline there is
+/// corrupt, incomparable). Same chain, different transitions: by the proven
+/// transition (a later transition at a lower LSN is corrupt, incomparable).
+/// Different chains, or a partial stamp: incomparable. A checkpoint written
+/// before continuity was recorded (no stamp) orders by LSN with another such
+/// checkpoint and with the first link (transition 0) of a chain, which was
+/// adopted from them on a single history or started fresh; never with a
+/// later transition.
 pub fn compare_pg_checkpoints(a: &[u8], b: &[u8]) -> CheckpointOrder {
     #[derive(serde::Deserialize)]
     struct Cp {
         lsn: String,
         #[serde(default)]
         timeline: Option<u32>,
+        #[serde(default)]
+        chain: Option<String>,
+        #[serde(default)]
+        transition: Option<u64>,
+    }
+
+    /// Whether two checkpoints share a proven continuity (see above).
+    fn continuity_comparable(a: &Cp, la: u64, b: &Cp, lb: u64) -> bool {
+        // `Some(None)`: no stamp (legacy); `None`: a partial stamp.
+        let stamp = |c: &Cp| match (&c.chain, c.transition, c.timeline) {
+            (Some(chain), Some(tr), Some(tl)) => {
+                Some(Some((chain.clone(), tr, tl)))
+            }
+            (None, None, None) => Some(None),
+            _ => None,
+        };
+        match (stamp(a), stamp(b)) {
+            (Some(None), Some(None)) => true,
+            (Some(None), Some(Some((_, 0, _))))
+            | (Some(Some((_, 0, _))), Some(None)) => true,
+            (Some(Some((ca, ta, tla))), Some(Some((cb, tb, tlb)))) => {
+                ca == cb
+                    && match ta.cmp(&tb) {
+                        std::cmp::Ordering::Equal => tla == tlb,
+                        std::cmp::Ordering::Less => la <= lb,
+                        std::cmp::Ordering::Greater => la >= lb,
+                    }
+            }
+            _ => false,
+        }
     }
 
     fn parse_lsn(s: &str) -> Option<u64> {
@@ -1183,15 +1237,24 @@ pub fn compare_pg_checkpoints(a: &[u8], b: &[u8]) -> CheckpointOrder {
         );
         return CheckpointOrder::Incomparable;
     };
-    if let (Some(ta), Some(tb)) = (a.timeline, b.timeline)
-        && ta != tb
-        && (ta < tb) != (la < lb)
-    {
+    if !continuity_comparable(&a, la, &b, lb) {
         tracing::warn!(
-            lsn_a = %a.lsn, timeline_a = ta, lsn_b = %b.lsn, timeline_b = tb,
-            "incomparable checkpoints: positions on different timelines"
+            lsn_a = %a.lsn, chain_a = ?a.chain, transition_a = ?a.transition,
+            timeline_a = ?a.timeline, lsn_b = %b.lsn, chain_b = ?b.chain,
+            transition_b = ?b.transition, timeline_b = ?b.timeline,
+            "incomparable checkpoints: no common proven continuity"
         );
         return CheckpointOrder::Incomparable;
+    }
+    // Same chain, different proven transitions: the transition orders them.
+    if let (Some(ta), Some(tb)) = (a.transition, b.transition)
+        && ta != tb
+    {
+        return if ta < tb {
+            CheckpointOrder::Before
+        } else {
+            CheckpointOrder::After
+        };
     }
     match la.cmp(&lb) {
         std::cmp::Ordering::Less => CheckpointOrder::Before,
@@ -1651,6 +1714,16 @@ pub(super) fn continuity_refusal(
              continuation across a timeline switch needs PostgreSQL 17 \
              failover slots. Re-snapshot required."
         ),
+        "checkpoint_chain_mismatch" => format!(
+            "checkpoint {checkpoint} carries a continuity stamp (chain {}, \
+             transition {}) that the recorded continuity (chain {}, \
+             transition {}) does not contain: it cannot be continued. \
+             Inspect the source's state; re-snapshot required.",
+            shown(ev.checkpoint_chain.clone()),
+            shown(ev.checkpoint_transition.map(|t| t.to_string())),
+            shown(ev.recorded_chain.clone()),
+            shown(ev.recorded_transition.map(|t| t.to_string())),
+        ),
         "server_in_recovery" => format!(
             "the server is a standby in recovery (timeline {live}): it can \
              switch timeline while a stream is open, so continuity of \
@@ -1705,6 +1778,16 @@ pub(super) fn continuity_refusal(
         );
         put(K::WalFlushPosition, ev.flush.map(|l| l.to_string()));
         put(K::ReadPosition, ev.start.map(|l| l.to_string()));
+        put(K::CheckpointChain, ev.checkpoint_chain.clone());
+        put(
+            K::CheckpointTransition,
+            ev.checkpoint_transition.map(|t| t.to_string()),
+        );
+        put(K::RecordedChain, ev.recorded_chain.clone());
+        put(
+            K::RecordedTransition,
+            ev.recorded_transition.map(|t| t.to_string()),
+        );
     });
     SourceError::incident(draft, cause)
 }
@@ -1747,6 +1830,10 @@ pub(super) fn continuity_unproven_draft(
     let actions: &[ActionCode] = if class == "server_in_recovery" {
         // Route the source to the writable primary.
         &[ActionCode::VerifyEndpoint, ActionCode::InspectLogs]
+    } else if class == "checkpoint_chain_mismatch" {
+        // A recovery operation may later prove a route; for now inspect and
+        // re-snapshot.
+        &[ActionCode::InspectLogs, ActionCode::Resnapshot]
     } else if lost {
         &[ActionCode::Resnapshot, ActionCode::UseNewSourceId]
     } else {
@@ -2282,7 +2369,10 @@ mod wal_feedback_tests {
 
 #[cfg(test)]
 mod compare_checkpoints_tests {
-    use super::{PostgresCheckpoint, compare_pg_checkpoints, postgres_helpers};
+    use super::{
+        PostgresCheckpoint, compare_pg_checkpoints, postgres_continuity,
+        postgres_helpers,
+    };
     use deltaforge_core::CheckpointOrder;
 
     fn cp(lsn: &str) -> Vec<u8> {
@@ -2346,56 +2436,80 @@ mod compare_checkpoints_tests {
     }
 
     #[test]
-    fn timelines_order_only_along_a_descent() {
-        let at = |lsn: &str, t: u32| {
-            format!(r#"{{"lsn":"{lsn}","tx_id":null,"timeline":{t}}}"#)
+    fn checkpoints_order_only_within_one_continuity_chain() {
+        use CheckpointOrder::*;
+        let at = |lsn: &str, chain: &str, transition: u64, timeline: u32| {
+            format!(
+                r#"{{"lsn":"{lsn}","tx_id":null,"timeline":{timeline},"chain":"{chain}","transition":{transition}}}"#
+            )
+            .into_bytes()
+        };
+        let cmp = |a: Vec<u8>, b: Vec<u8>| compare_pg_checkpoints(&a, &b);
+        // Sibling timelines: 2 (lower LSN) and 3 (higher LSN) both forked
+        // from 1. Timeline numbers prove nothing.
+        let timeline_only = |lsn: &str, timeline: u32| {
+            format!(r#"{{"lsn":"{lsn}","tx_id":null,"timeline":{timeline}}}"#)
                 .into_bytes()
         };
-        // Before and after a switch: ordered by LSN.
         assert_eq!(
-            compare_pg_checkpoints(&at("0/100", 1), &at("0/200", 2)),
-            CheckpointOrder::Before
+            cmp(timeline_only("0/100", 2), timeline_only("0/200", 3)),
+            Incomparable
         );
         assert_eq!(
-            compare_pg_checkpoints(&at("0/200", 2), &at("0/100", 1)),
-            CheckpointOrder::After
-        );
-        // The same LSN on two timelines is never the same position.
-        assert_eq!(
-            compare_pg_checkpoints(&at("0/100", 1), &at("0/100", 2)),
-            CheckpointOrder::Incomparable
-        );
-        // A later timeline below an earlier one's position: diverged.
-        assert_eq!(
-            compare_pg_checkpoints(&at("0/200", 1), &at("0/100", 2)),
-            CheckpointOrder::Incomparable
+            cmp(at("0/100", "x", 1, 2), at("0/200", "y", 1, 3)),
+            Incomparable,
+            "two chains"
         );
         assert_eq!(
-            compare_pg_checkpoints(&at("0/100", 2), &at("0/200", 1)),
-            CheckpointOrder::Incomparable
-        );
-        // Same timeline, or a legacy checkpoint without one: by LSN.
-        assert_eq!(
-            compare_pg_checkpoints(&at("0/100", 2), &at("0/100", 2)),
-            CheckpointOrder::Equal
+            cmp(at("0/100", "x", 1, 2), at("0/200", "y", 2, 3)),
+            Incomparable,
+            "two chains"
         );
         assert_eq!(
-            compare_pg_checkpoints(&cp("0/100"), &at("0/100", 2)),
-            CheckpointOrder::Equal
+            cmp(at("0/100", "x", 1, 2), at("0/200", "x", 1, 3)),
+            Incomparable,
+            "one transition on two timelines is corrupt"
         );
+        // The same chain with ordered proven transitions.
+        assert_eq!(cmp(at("0/100", "x", 1, 2), at("0/200", "x", 2, 3)), Before);
+        assert_eq!(cmp(at("0/200", "x", 2, 3), at("0/100", "x", 1, 2)), After);
+        assert_eq!(cmp(at("0/100", "x", 0, 1), at("0/100", "x", 1, 2)), Before);
+        assert_eq!(
+            cmp(at("0/200", "x", 1, 2), at("0/100", "x", 2, 3)),
+            Incomparable,
+            "a later transition below an earlier position is corrupt"
+        );
+        // Within one transition: by LSN.
+        assert_eq!(cmp(at("0/100", "x", 1, 2), at("0/100", "x", 1, 2)), Equal);
+        assert_eq!(cmp(at("0/100", "x", 1, 2), at("0/180", "x", 1, 2)), Before);
+        // Legacy (no stamp): with legacy and the first link only.
+        assert_eq!(cmp(cp("0/100"), cp("0/200")), Before);
+        assert_eq!(cmp(cp("0/100"), at("0/100", "x", 0, 1)), Equal);
+        assert_eq!(cmp(cp("0/100"), at("0/200", "x", 1, 2)), Incomparable);
     }
-
     #[test]
     fn checkpoint_meta_round_trips_with_and_without_timeline() {
         use pgwire_replication::Lsn;
         let lsn = Lsn::parse("1/2A").unwrap();
-        for (tx, tl) in [(None, None), (Some(7), None), (Some(7), Some(3))] {
-            let meta = postgres_helpers::make_checkpoint_meta(&lsn, tx, tl);
+        let stamp = postgres_continuity::Stamp {
+            chain_id: "c0ffee".into(),
+            transition: 2,
+            timeline: 3,
+        };
+        for (tx, stamp) in
+            [(None, None), (Some(7), None), (Some(7), Some(&stamp))]
+        {
+            let members =
+                stamp.map_or(String::new(), |s| s.checkpoint_members());
+            let meta =
+                postgres_helpers::make_checkpoint_meta(&lsn, tx, &members);
             let cp: PostgresCheckpoint =
                 serde_json::from_slice(meta.as_bytes()).unwrap();
             assert_eq!(cp.lsn, lsn.to_string());
             assert_eq!(cp.tx_id, tx);
-            assert_eq!(cp.timeline, tl);
+            assert_eq!(cp.timeline, stamp.map(|s| s.timeline));
+            assert_eq!(cp.chain, stamp.map(|s| s.chain_id.clone()));
+            assert_eq!(cp.transition, stamp.map(|s| s.transition));
         }
         // A checkpoint written before timelines were recorded still reads.
         let legacy: PostgresCheckpoint =

@@ -185,7 +185,7 @@ pub(super) async fn dispatch_event(
                 let checkpoint = make_checkpoint_meta(
                     &end_lsn,
                     ctx.current_tx_id,
-                    ctx.stream_timeline(),
+                    &ctx.stamp_members,
                 );
                 let boundary = boundary_for_pg_commit(
                     ctx.system_identifier,
@@ -707,7 +707,7 @@ async fn handle_insert(
     let chkpt = make_checkpoint_meta_str(
         lsn_str,
         ctx.current_tx_id,
-        ctx.stream_timeline(),
+        &ctx.stamp_members,
     );
     let mut ev = Event::new_row(
         event_id,
@@ -831,7 +831,7 @@ async fn handle_update(
     let chkpt = make_checkpoint_meta_str(
         lsn_str,
         ctx.current_tx_id,
-        ctx.stream_timeline(),
+        &ctx.stamp_members,
     );
     let mut ev = Event::new_row(
         event_id,
@@ -931,7 +931,7 @@ async fn handle_delete(
     let chkpt = make_checkpoint_meta_str(
         lsn_str,
         ctx.current_tx_id,
-        ctx.stream_timeline(),
+        &ctx.stamp_members,
     );
     let mut ev = Event::new_row(
         event_id,
@@ -1055,7 +1055,7 @@ async fn handle_truncate(
         .with_checkpoint(make_checkpoint_meta(
             &wal_lsn,
             ctx.current_tx_id,
-            ctx.stream_timeline(),
+            &ctx.stamp_members,
         ));
 
         if let Some(tx_id) = ctx.current_tx_id {

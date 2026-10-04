@@ -18,8 +18,12 @@
 //!    its `restart_lsn` and `confirmed_flush_lsn` are at or before F;
 //! 5. the server's WAL flush position is at or after F.
 //!
-//! The proven timeline is recorded durably (the continuity record) before the
-//! stream starts. A source with a checkpoint but no record (every source
+//! The proven continuity is recorded durably (the continuity record) when the
+//! stream becomes authoritative, and every checkpoint it produces carries its
+//! stamp: the record's chain id (random, created once), the transition
+//! sequence within that chain and the timeline. Timeline numbers alone prove
+//! no ancestry (timelines 2 and 3 can both fork from 1); only positions of one
+//! chain are ordered. A source with a checkpoint but no record (every source
 //! before this record existed) is adopted only on a server that has never
 //! switched timeline; otherwise an operator decides.
 //!
@@ -49,6 +53,8 @@ fn record_key(source_id: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ContinuityRecord {
     pub format: u32,
+    /// Created once, with the record; kept across proven transitions.
+    pub chain_id: String,
     pub system_identifier: u64,
     pub database_oid: u64,
     pub timeline: u32,
@@ -182,12 +188,52 @@ pub(crate) struct SessionFacts {
     pub slot: Option<SlotFacts>,
 }
 
+/// Where in a continuity chain a checkpoint was read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChainPosition {
+    pub chain_id: String,
+    pub transition: u64,
+    pub timeline: u32,
+}
+
 /// What the stream must continue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Checkpoint {
     pub lsn: Lsn,
-    /// The timeline it was written on, when the checkpoint records one.
-    pub timeline: Option<u32>,
+    /// Absent in checkpoints written before continuity was recorded.
+    pub chain: Option<ChainPosition>,
+}
+
+/// The continuity stamp of an authoritative stream: what its checkpoints
+/// carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Stamp {
+    pub chain_id: String,
+    pub transition: u64,
+    pub timeline: u32,
+}
+
+impl Stamp {
+    pub(crate) fn of(record: &ContinuityRecord) -> Self {
+        Self {
+            chain_id: record.chain_id.clone(),
+            transition: record.transition_id,
+            timeline: record.timeline,
+        }
+    }
+
+    /// The JSON members a checkpoint carries (after `tx_id`).
+    pub(crate) fn checkpoint_members(&self) -> String {
+        format!(
+            r#","timeline":{},"chain":"{}","transition":{}"#,
+            self.timeline, self.chain_id, self.transition
+        )
+    }
+}
+
+/// A new random chain id (128 bits, hex).
+pub(crate) fn new_chain_id() -> String {
+    format!("{:032x}", rand::random::<u128>())
 }
 
 /// The source's durable expectations.
@@ -196,16 +242,20 @@ pub(crate) struct Expected<'a> {
     /// `(system_identifier, database_oid)` of the source's lineage.
     pub lineage: (u64, u64),
     pub record: Option<&'a ContinuityRecord>,
-    pub checkpoint: Option<Checkpoint>,
+    pub checkpoint: Option<&'a Checkpoint>,
     /// Where the stream starts reading (at or after the checkpoint).
     pub start: Lsn,
+    /// The chain id a record created now gets.
+    pub new_chain_id: &'a str,
 }
 
 impl Expected<'_> {
-    /// The timeline the resume position belongs to.
+    /// The timeline the resume position belongs to: the checkpoint's own,
+    /// else (a checkpoint from before continuity was recorded) the record's.
     fn base_timeline(&self) -> Option<u32> {
         self.checkpoint
-            .and_then(|c| c.timeline)
+            .and_then(|c| c.chain.as_ref())
+            .map(|c| c.timeline)
             .or(self.record.map(|r| r.timeline))
     }
 }
@@ -250,6 +300,10 @@ pub(crate) struct RefusalEvidence {
     pub confirmed: Option<Lsn>,
     pub flush: Option<Lsn>,
     pub start: Option<Lsn>,
+    pub checkpoint_chain: Option<String>,
+    pub checkpoint_transition: Option<u64>,
+    pub recorded_chain: Option<String>,
+    pub recorded_transition: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,7 +316,7 @@ pub(crate) enum Refusal {
     /// `pg_continuity_unproven` with a stable class.
     Unproven {
         class: &'static str,
-        evidence: RefusalEvidence,
+        evidence: Box<RefusalEvidence>,
     },
 }
 
@@ -287,11 +341,16 @@ pub(crate) fn prove(
     }
 
     let f = expected.checkpoint.map(|c| c.lsn);
+    let chain_pos = expected.checkpoint.and_then(|c| c.chain.as_ref());
     let mut evidence = RefusalEvidence {
         recorded_timeline: expected.base_timeline(),
         live_timeline: Some(facts.timeline),
         flush: Some(facts.flush),
         start: Some(expected.start),
+        checkpoint_chain: chain_pos.map(|c| c.chain_id.clone()),
+        checkpoint_transition: chain_pos.map(|c| c.transition),
+        recorded_chain: expected.record.map(|r| r.chain_id.clone()),
+        recorded_transition: expected.record.map(|r| r.transition_id),
         ..Default::default()
     };
     if let Some(slot) = &facts.slot {
@@ -299,10 +358,37 @@ pub(crate) fn prove(
         evidence.confirmed = slot.confirmed;
     }
     let refuse = |class: &'static str, evidence: RefusalEvidence| {
-        Err(Refusal::Unproven { class, evidence })
+        Err(Refusal::Unproven {
+            class,
+            evidence: Box::new(evidence),
+        })
     };
     if facts.in_recovery {
         return refuse("server_in_recovery", evidence);
+    }
+
+    // A checkpoint stamped by a chain continues only that chain, at or before
+    // its recorded transition (an earlier transition is the predecessor the
+    // durable position still belongs to right after a promotion). An
+    // unstamped checkpoint (written before continuity was recorded) after a
+    // proven transition is the one that transition was proven at, or nothing.
+    match (chain_pos, expected.record) {
+        (Some(_), None) => return refuse("timeline_unrecorded", evidence),
+        (Some(pos), Some(r))
+            if r.chain_id != pos.chain_id
+                || pos.transition > r.transition_id =>
+        {
+            return refuse("checkpoint_chain_mismatch", evidence);
+        }
+        (None, Some(r))
+            if r.transition_id > 0
+                && f.is_some_and(|f| {
+                    r.proven_at.as_deref() != Some(f.to_string().as_str())
+                }) =>
+        {
+            return refuse("checkpoint_chain_mismatch", evidence);
+        }
+        _ => {}
     }
 
     // The timeline the resume position belongs to, and the record to keep.
@@ -394,6 +480,11 @@ pub(crate) fn prove(
         Some(r) if unchanged => r.clone(),
         _ => ContinuityRecord {
             format: RECORD_FORMAT,
+            chain_id: expected
+                .record
+                .map_or(expected.new_chain_id.to_string(), |r| {
+                    r.chain_id.clone()
+                }),
             system_identifier: facts.system_identifier,
             database_oid: facts.database_oid,
             timeline,
@@ -446,6 +537,7 @@ mod tests {
     fn record(timeline: u32) -> ContinuityRecord {
         ContinuityRecord {
             format: RECORD_FORMAT,
+            chain_id: "c".into(),
             system_identifier: 7,
             database_oid: 5,
             timeline,
@@ -454,15 +546,30 @@ mod tests {
         }
     }
 
+    static LEGACY_F: std::sync::LazyLock<Checkpoint> =
+        std::sync::LazyLock::new(|| Checkpoint {
+            lsn: Lsn::from(F),
+            chain: None,
+        });
+
     fn expected(record: Option<&ContinuityRecord>) -> Expected<'_> {
         Expected {
             lineage: (7, 5),
             record,
-            checkpoint: Some(Checkpoint {
-                lsn: lsn(F),
-                timeline: None,
-            }),
+            checkpoint: Some(&LEGACY_F),
             start: lsn(F),
+            new_chain_id: "new",
+        }
+    }
+
+    fn stamped(transition: u64, timeline: u32, chain: &str) -> Checkpoint {
+        Checkpoint {
+            lsn: lsn(F),
+            chain: Some(ChainPosition {
+                chain_id: chain.into(),
+                transition,
+                timeline,
+            }),
         }
     }
 
@@ -529,7 +636,104 @@ mod tests {
         assert!(proven.record_changed);
         assert_eq!(proven.record.timeline, 2);
         assert_eq!(proven.record.transition_id, 1);
+        assert_eq!(proven.record.chain_id, "c", "the same chain");
         assert_eq!(proven.record.proven_at, Some(lsn(F).to_string()));
+    }
+
+    /// The process dies after persisting a proven transition (record at
+    /// transition 1, timeline 2) but before any checkpoint of the new stream:
+    /// the durable checkpoint still belongs to transition 0 on timeline 1.
+    /// The restart accepts it as the preceding transition of the same chain,
+    /// proves the switch again from it and resumes on the recorded timeline
+    /// without another transition.
+    #[test]
+    fn a_crash_after_recording_a_transition_resumes_on_it() {
+        let rec = ContinuityRecord {
+            transition_id: 1,
+            proven_at: Some(lsn(F).to_string()),
+            ..record(2)
+        };
+        let mut e = expected(Some(&rec));
+        let predecessor = stamped(0, 1, "c");
+        e.checkpoint = Some(&predecessor);
+        let f = promoted(facts(2));
+        assert_eq!(
+            history_needed(&e, &f),
+            Some(2),
+            "the switch is proven again"
+        );
+        let proven = prove(&e, &f, Some(&history(F))).unwrap();
+        assert!(!proven.record_changed);
+        assert_eq!(Stamp::of(&proven.record).transition, 1);
+        assert_eq!(Stamp::of(&proven.record).timeline, 2);
+        // The same with a checkpoint from before continuity was recorded:
+        // only the position the transition was proven at.
+        e.checkpoint = Some(&LEGACY_F);
+        assert!(prove(&e, &f, None).is_ok());
+        // Immediately before or after it: no proof ties it to the chain.
+        for near in [F - 1, F + 1] {
+            let other = Checkpoint {
+                lsn: lsn(near),
+                chain: None,
+            };
+            let mut e = expected(Some(&rec));
+            e.checkpoint = Some(&other);
+            assert_eq!(
+                class(prove(&e, &f, Some(&history(F + 0x10)))),
+                "checkpoint_chain_mismatch",
+                "unstamped position {near:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_chain_refusal_carries_both_chains() {
+        let rec = ContinuityRecord {
+            transition_id: 1,
+            ..record(2)
+        };
+        let mut e = expected(Some(&rec));
+        let other_chain = stamped(1, 2, "other");
+        e.checkpoint = Some(&other_chain);
+        match prove(&e, &facts(2), None) {
+            Err(Refusal::Unproven { class, evidence }) => {
+                assert_eq!(class, "checkpoint_chain_mismatch");
+                assert_eq!(evidence.checkpoint_chain.as_deref(), Some("other"));
+                assert_eq!(evidence.checkpoint_transition, Some(1));
+                assert_eq!(evidence.recorded_chain.as_deref(), Some("c"));
+                assert_eq!(evidence.recorded_transition, Some(1));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_continues_only_its_own_chain() {
+        let rec = ContinuityRecord {
+            transition_id: 1,
+            ..record(2)
+        };
+        let mut e = expected(Some(&rec));
+        let other_chain = stamped(1, 2, "other");
+        e.checkpoint = Some(&other_chain);
+        assert_eq!(
+            class(prove(&e, &facts(2), None)),
+            "checkpoint_chain_mismatch"
+        );
+        let ahead = stamped(2, 2, "c");
+        e.checkpoint = Some(&ahead);
+        assert_eq!(
+            class(prove(&e, &facts(2), None)),
+            "checkpoint_chain_mismatch",
+            "a transition the record never proved"
+        );
+        let mine = stamped(1, 2, "c");
+        e.checkpoint = Some(&mine);
+        assert!(prove(&e, &facts(2), None).is_ok());
+        // A stamped checkpoint without its record is not legacy.
+        let mut e = expected(None);
+        e.checkpoint = Some(&mine);
+        assert_eq!(class(prove(&e, &facts(1), None)), "timeline_unrecorded");
     }
 
     #[test]
@@ -630,10 +834,8 @@ mod tests {
             ..record(2)
         };
         let mut e = expected(Some(&rec));
-        e.checkpoint = Some(Checkpoint {
-            lsn: lsn(F),
-            timeline: Some(1),
-        });
+        let checkpoint = stamped(0, 1, "c");
+        e.checkpoint = Some(&checkpoint);
         let f = promoted(facts(2));
         assert_eq!(history_needed(&e, &f), Some(2));
         assert_eq!(
@@ -649,6 +851,7 @@ mod tests {
         let proven = prove(&expected(None), &facts(1), None).unwrap();
         assert!(proven.record_changed);
         assert_eq!(proven.record.timeline, 1);
+        assert_eq!(proven.record.chain_id, "new", "a new chain");
         assert_eq!(
             class(prove(&expected(None), &facts(2), None)),
             "timeline_unrecorded"

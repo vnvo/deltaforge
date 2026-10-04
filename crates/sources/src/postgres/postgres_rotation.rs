@@ -115,12 +115,16 @@ pub(crate) async fn confirm_slot_inactive(
 /// Open a replication stream for `dsn` at `start_lsn` via the production connect
 /// path (same builder, continuity proof and retry policy as startup/reconnect):
 /// continuity of the durable checkpoint, proven on the stream's own session,
-/// is the safety boundary.
+/// is the safety boundary. The stream is activated (its continuity persisted
+/// and stamped) before it is returned; a replacement candidate
+/// (`allow_transition` false) that would change the continuity is refused
+/// before anything is persisted or stamped.
 async fn open_stream(
     dsn: &crate::credentials::ProtectedDsn,
     proof: &StreamProof,
     publication: &str,
     start_lsn: Lsn,
+    allow_transition: bool,
     cancel: &CancellationToken,
 ) -> Result<pgwire_replication::ReplicationClient, ()> {
     let components = parse_dsn(dsn.expose()).map_err(|_| ())?;
@@ -134,6 +138,7 @@ async fn open_stream(
         &proof.source_id,
         config,
         &proof.with_dsn(dsn.clone()),
+        allow_transition,
         cancel,
         RetryPolicy::default(),
     )
@@ -309,11 +314,16 @@ impl RotationRuntime {
             let publication = publication.clone();
             let cancel = cancel.clone();
             move || async move {
+                // A credential rotation never crosses a continuity
+                // transition: the old stream is closed here, and a candidate
+                // proving another chain, transition or timeline is refused
+                // (then the old credentials reopen with a full proof).
                 let client = open_stream(
                     &new_dsn,
                     &proof,
                     &publication,
                     frozen,
+                    false,
                     &cancel,
                 )
                 .await?;
@@ -335,6 +345,7 @@ impl RotationRuntime {
                     &proof,
                     &publication,
                     frozen,
+                    true,
                     &cancel,
                 )
                 .await?;

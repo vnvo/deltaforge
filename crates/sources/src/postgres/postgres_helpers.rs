@@ -1,10 +1,7 @@
 //! PostgreSQL source helper utilities.
 
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -24,9 +21,16 @@ use deltaforge_core::incident::IncidentId;
 use storage::adapters::incidents::IncidentStore;
 
 use super::postgres_continuity::{
-    Checkpoint, Expected, FailoverSlot, Proven, Refusal, SessionFacts,
-    SlotFacts, history_needed, load_record, parse_history, prove, store_record,
+    ChainPosition, Checkpoint, Expected, FailoverSlot, Proven, Refusal,
+    SessionFacts, SlotFacts, Stamp, history_needed, load_record, new_chain_id,
+    parse_history, prove, store_record,
 };
+
+/// A started stream and what its session proved; not yet authoritative.
+pub(super) struct Opened {
+    client: ReplicationClient,
+    proven: Proven,
+}
 use super::{
     AsPgEndpoint, PostgresCheckpoint, PostgresSourceError, PostgresSourceResult,
 };
@@ -142,9 +146,10 @@ pub(crate) struct StreamProof {
     pub(super) tenant: String,
     pub(super) checkpoints: Arc<dyn CheckpointStore>,
     pub(super) backend: storage::ArcStorageBackend,
-    /// The proven timeline of the open stream (0 until one is proven),
-    /// recorded in the checkpoints its events carry.
-    pub(super) timeline: Arc<AtomicU32>,
+    /// The continuity stamp of the authoritative stream (`None` until one is
+    /// activated), recorded in the checkpoints its events carry. Only
+    /// [`StreamProof::activate`] changes it.
+    pub(super) active: Arc<std::sync::RwLock<Option<Stamp>>>,
     /// A session on a server in recovery is retried like a connection
     /// failure (the endpoint may be mid-failover) for this long, then stops.
     pub(super) recovery_window: Duration,
@@ -195,22 +200,46 @@ impl StreamProof {
                 .into(),
             }
         })?;
-        Ok(Some(Checkpoint {
-            lsn,
-            timeline: checkpoint.timeline,
-        }))
+        let chain = match (
+            checkpoint.chain,
+            checkpoint.transition,
+            checkpoint.timeline,
+        ) {
+            (Some(chain_id), Some(transition), Some(timeline)) => {
+                Some(ChainPosition {
+                    chain_id,
+                    transition,
+                    timeline,
+                })
+            }
+            (None, None, None) => None,
+            (chain, transition, _) => {
+                // A partial stamp is no proof of anything: fail closed.
+                return Err(super::continuity_refusal(
+                    &self.source_id,
+                    &self.slot,
+                    Some(lsn),
+                    "checkpoint_chain_mismatch",
+                    &super::postgres_continuity::RefusalEvidence {
+                        checkpoint_chain: chain,
+                        checkpoint_transition: transition,
+                        ..Default::default()
+                    },
+                ));
+            }
+        };
+        Ok(Some(Checkpoint { lsn, chain }))
     }
 
     /// Open a stream at `cfg.start_lsn`: connect and authenticate, prove
-    /// continuity on that session, persist the proven continuity record,
-    /// then START_REPLICATION; once the server holds the slot for this
-    /// session, recheck the slot bound before anything is consumed.
-    async fn open(
-        &self,
-        cfg: ReplicationConfig,
-    ) -> SourceResult<ReplicationClient> {
+    /// continuity on that session, then START_REPLICATION; once the server
+    /// holds the slot for this session, recheck the slot bound. Returns the
+    /// started stream with what it proved; nothing is persisted and the
+    /// active stamp is not changed (see [`StreamProof::activate`]). Nothing
+    /// has been consumed from it.
+    async fn open(&self, cfg: ReplicationConfig) -> SourceResult<Opened> {
         let checkpoint = self.durable_checkpoint().await?;
-        let f = checkpoint.map(|c| c.lsn);
+        let f = checkpoint.as_ref().map(|c| c.lsn);
         let start = cfg.start_lsn;
         let cfg = match f {
             Some(f) => cfg.with_ack_lsn(f),
@@ -221,7 +250,7 @@ impl StreamProof {
         let mut client = connect_replication(&self.source_id, cfg).await?;
         let proven = match tokio::time::timeout(
             Duration::from_secs(30),
-            self.prove_on_session(&mut client, checkpoint, start),
+            self.prove_on_session(&mut client, checkpoint.as_ref(), start),
         )
         .await
         {
@@ -232,23 +261,6 @@ impl StreamProof {
                 });
             }
         };
-        if proven.record_changed {
-            store_record(&self.backend, &self.source_id, &proven.record)
-                .await
-                .map_err(|e| SourceError::Checkpoint {
-                    details: format!("{e:#}").into(),
-                })?;
-            info!(
-                source_id = %self.source_id,
-                timeline = proven.record.timeline,
-                transition_id = proven.record.transition_id,
-                checkpoint = ?proven.record.proven_at,
-                "continuity record updated"
-            );
-        }
-        self.report_failover_slot(proven.failover_slot).await;
-        self.timeline
-            .store(proven.record.timeline, Ordering::Release);
         crate::stream_probe::after_slot_proof().await;
 
         client.start().await.map_err(pgwire_error_to_source_error)?;
@@ -263,13 +275,67 @@ impl StreamProof {
             let _ = client.shutdown().await;
             return Err(e);
         }
+        Ok(Opened { client, proven })
+    }
+
+    /// Make an opened stream the authoritative one, before anything is
+    /// consumed from it: persist its proven continuity (a new record or a
+    /// proven transition), then switch the active stamp. A failed write
+    /// consumes nothing and leaves the record and the stamp as they were.
+    /// Without `allow_transition` (a credential-rotation candidate) a stream
+    /// that would change the continuity - another chain, transition or
+    /// timeline than the active stream's - is refused instead.
+    pub(super) async fn activate(
+        &self,
+        opened: Opened,
+        allow_transition: bool,
+    ) -> SourceResult<ReplicationClient> {
+        let Opened { mut client, proven } = opened;
+        let stamp = Stamp::of(&proven.record);
+        if !allow_transition {
+            let active = self.active.read().expect("not poisoned").clone();
+            if proven.record_changed || active.as_ref() != Some(&stamp) {
+                let _ = client.shutdown().await;
+                warn!(
+                    source_id = %self.source_id, ?active, proposed = ?stamp,
+                    "a credential-rotation stream would change the \
+                     continuity; refused (an ordinary reconnect proves it)"
+                );
+                return Err(SourceError::Incompatible {
+                    details: "a credential-rotation stream may not cross a \
+                              continuity transition"
+                        .into(),
+                });
+            }
+        }
+        if proven.record_changed {
+            if let Err(e) =
+                store_record(&self.backend, &self.source_id, &proven.record)
+                    .await
+            {
+                let _ = client.shutdown().await;
+                return Err(SourceError::Checkpoint {
+                    details: format!("{e:#}").into(),
+                });
+            }
+            info!(
+                source_id = %self.source_id,
+                chain_id = %proven.record.chain_id,
+                timeline = proven.record.timeline,
+                transition_id = proven.record.transition_id,
+                checkpoint = ?proven.record.proven_at,
+                "continuity record updated"
+            );
+        }
+        self.report_failover_slot(proven.failover_slot).await;
+        *self.active.write().expect("not poisoned") = Some(stamp);
         Ok(client)
     }
 
     async fn prove_on_session(
         &self,
         client: &mut ReplicationClient,
-        checkpoint: Option<Checkpoint>,
+        checkpoint: Option<&Checkpoint>,
         start: Lsn,
     ) -> SourceResult<Proven> {
         let facts = read_session_facts(client, &self.slot)
@@ -300,11 +366,13 @@ impl StreamProof {
         let record = load_record(&self.backend, &self.source_id)
             .await
             .map_err(SourceError::Other)?;
+        let new_chain = new_chain_id();
         let expected = Expected {
             lineage: (sysid, dboid),
             record: record.as_ref(),
             checkpoint,
             start,
+            new_chain_id: &new_chain,
         };
         let history = match history_needed(&expected, &facts) {
             None => None,
@@ -334,7 +402,11 @@ impl StreamProof {
             Err(Refusal::Unproven {
                 class: "server_in_recovery",
                 evidence,
-            }) => return self.in_recovery(checkpoint, evidence).await,
+            }) => {
+                return self
+                    .in_recovery(checkpoint.map(|c| c.lsn), *evidence)
+                    .await;
+            }
             Err(refusal) => refusal,
         };
         Err({
@@ -368,10 +440,9 @@ impl StreamProof {
     /// then the source stops on the same incident, now operator action.
     async fn in_recovery(
         &self,
-        checkpoint: Option<Checkpoint>,
+        f: Option<Lsn>,
         evidence: super::postgres_continuity::RefusalEvidence,
     ) -> SourceResult<Proven> {
-        let f = checkpoint.map(|c| c.lsn);
         let (since, recorded) = {
             let mut r = self.recovery_retry.lock().expect("not poisoned");
             (
@@ -641,6 +712,7 @@ pub(super) async fn connect_replication_with_retries(
     source_id: &str,
     config: ReplicationConfig,
     proof: &StreamProof,
+    allow_transition: bool,
     cancel: &CancellationToken,
     retry_policy: RetryPolicy,
 ) -> SourceResult<ReplicationClient> {
@@ -652,7 +724,10 @@ pub(super) async fn connect_replication_with_retries(
         move |_| {
             let cfg = cfg.clone();
             let proof = attempt.clone();
-            async move { proof.open(cfg).await }
+            async move {
+                let opened = proof.open(cfg).await?;
+                proof.activate(opened, allow_transition).await
+            }
         },
         is_retryable_source_error,
         Duration::from_secs(30),
@@ -1025,14 +1100,15 @@ pub(crate) fn redact_password(dsn: &str) -> String {
 /// Build checkpoint metadata from LSN.
 ///
 /// Hand-writes the JSON to avoid serde_json overhead on every event.
-/// Format: `{"lsn":"X/Y","tx_id":N|null}`, plus `"timeline":T` once the
-/// stream's timeline is proven (older checkpoints have none).
+/// Format: `{"lsn":"X/Y","tx_id":N|null}` plus `stamp`, the authoritative
+/// stream's continuity members (`Stamp::checkpoint_members`; empty before
+/// one is proven).
 pub(crate) fn make_checkpoint_meta(
     lsn: &Lsn,
     tx_id: Option<u32>,
-    timeline: Option<u32>,
+    stamp: &str,
 ) -> CheckpointMeta {
-    make_checkpoint_meta_str(&lsn.to_string(), tx_id, timeline)
+    make_checkpoint_meta_str(&lsn.to_string(), tx_id, stamp)
 }
 
 /// Build checkpoint metadata from a pre-formatted LSN string.
@@ -1040,10 +1116,10 @@ pub(crate) fn make_checkpoint_meta(
 pub(crate) fn make_checkpoint_meta_str(
     lsn_str: &str,
     tx_id: Option<u32>,
-    timeline: Option<u32>,
+    stamp: &str,
 ) -> CheckpointMeta {
     use std::fmt::Write;
-    let mut buf = String::with_capacity(64);
+    let mut buf = String::with_capacity(48 + stamp.len());
     let _ = write!(buf, r#"{{"lsn":"{}","tx_id":"#, lsn_str);
     match tx_id {
         Some(id) => {
@@ -1051,9 +1127,7 @@ pub(crate) fn make_checkpoint_meta_str(
         }
         None => buf.push_str("null"),
     }
-    if let Some(t) = timeline {
-        let _ = write!(buf, r#","timeline":{t}"#);
-    }
+    buf.push_str(stamp);
     buf.push('}');
     CheckpointMeta::from_vec(buf.into_bytes())
 }
@@ -1068,6 +1142,154 @@ pub(crate) fn pg_timestamp_to_unix_ms(pg_timestamp_us: i64) -> i64 {
 mod tests {
     use super::*;
 
+    mod activation {
+        use super::*;
+        use crate::postgres::postgres_continuity::{
+            ContinuityRecord, FailoverSlot, Proven, Stamp,
+        };
+        use storage::adapters::test_util::FaultBackend;
+
+        fn record(transition_id: u64, timeline: u32) -> ContinuityRecord {
+            ContinuityRecord {
+                format: 1,
+                chain_id: "c".into(),
+                system_identifier: 7,
+                database_oid: 5,
+                timeline,
+                transition_id,
+                proven_at: None,
+            }
+        }
+
+        /// A started stream as `open` returns it (the client is never read).
+        async fn opened(record: ContinuityRecord, changed: bool) -> Opened {
+            let cfg =
+                ReplicationConfig::new("127.0.0.1", "u", "p", "d", "s", "pub")
+                    .with_port(1);
+            Opened {
+                client: ReplicationClient::connect_gated(cfg).await.unwrap(),
+                proven: Proven {
+                    record,
+                    record_changed: changed,
+                    failover_slot: FailoverSlot::Unsupported,
+                },
+            }
+        }
+
+        fn proof_on(backend: storage::ArcStorageBackend) -> StreamProof {
+            StreamProof {
+                backend,
+                ..super::server_in_recovery::proof(Duration::from_secs(1))
+            }
+        }
+
+        fn active(p: &StreamProof) -> Option<Stamp> {
+            p.active.read().unwrap().clone()
+        }
+
+        #[tokio::test]
+        async fn a_rotation_candidate_never_crosses_a_transition() {
+            let p = proof_on(Arc::new(storage::MemoryStorageBackend::new()));
+            let old = record(0, 1);
+            store_record(&p.backend, &p.source_id, &old).await.unwrap();
+            *p.active.write().unwrap() = Some(Stamp::of(&old));
+
+            // The candidate proved a promotion (timeline 2, transition 1)
+            // while the old stream was the authoritative one.
+            let r = p.activate(opened(record(1, 2), true).await, false).await;
+            assert!(r.is_err(), "the candidate is refused");
+            assert_eq!(
+                active(&p),
+                Some(Stamp::of(&old)),
+                "the old stamp stays"
+            );
+            assert_eq!(
+                load_record(&p.backend, &p.source_id).await.unwrap(),
+                Some(old.clone()),
+                "the record stays"
+            );
+
+            // A candidate continuing the active stream is accepted.
+            assert!(
+                p.activate(opened(old.clone(), false).await, false)
+                    .await
+                    .is_ok()
+            );
+            assert_eq!(active(&p), Some(Stamp::of(&old)));
+        }
+
+        #[tokio::test]
+        async fn a_failed_record_write_activates_nothing() {
+            let backend = Arc::new(FaultBackend::new());
+            backend
+                .fail_writes_to
+                .lock()
+                .unwrap()
+                .push("failover".into());
+            let p = proof_on(backend);
+            let r = p.activate(opened(record(0, 1), true).await, true).await;
+            assert!(
+                matches!(r, Err(SourceError::Checkpoint { .. })),
+                "{:?}",
+                r.err()
+            );
+            assert_eq!(active(&p), None, "no stamp");
+            assert_eq!(
+                load_record(&p.backend, &p.source_id).await.unwrap(),
+                None
+            );
+        }
+
+        #[tokio::test]
+        async fn a_partial_continuity_stamp_fails_closed() {
+            use deltaforge_core::incident::{
+                ActionCode, EvidenceKey, EvidenceValue, ReasonCode,
+                Retryability, SafetyState,
+            };
+            let p = proof_on(Arc::new(storage::MemoryStorageBackend::new()));
+            p.checkpoints
+                .put_raw(
+                    &p.source_id,
+                    br#"{"lsn":"0/3000","tx_id":null,"chain":"c","transition":1}"#,
+                )
+                .await
+                .unwrap();
+            let err = p.durable_checkpoint().await.unwrap_err();
+            let d = err.draft().expect("an incident");
+            assert_eq!(d.reason_code, ReasonCode::PgContinuityUnproven);
+            assert_eq!(d.safety_state, SafetyState::HaltedSafe);
+            assert_eq!(d.retryability, Retryability::OperatorAction);
+            assert_eq!(
+                d.actions,
+                vec![ActionCode::InspectLogs, ActionCode::Resnapshot]
+            );
+            assert_eq!(
+                d.evidence.get(EvidenceKey::ReasonClass),
+                Some(&EvidenceValue::Text {
+                    value: "checkpoint_chain_mismatch".into()
+                })
+            );
+            assert_eq!(
+                d.evidence.get(EvidenceKey::CheckpointChain),
+                Some(&EvidenceValue::Text { value: "c".into() })
+            );
+        }
+
+        #[tokio::test]
+        async fn activation_persists_then_stamps() {
+            let p = proof_on(Arc::new(storage::MemoryStorageBackend::new()));
+            let new = record(1, 2);
+            p.activate(opened(new.clone(), true).await, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                load_record(&p.backend, &p.source_id).await.unwrap(),
+                Some(new.clone())
+            );
+            assert_eq!(active(&p), Some(Stamp::of(&new)));
+        }
+    }
+
     mod server_in_recovery {
         use super::*;
         use deltaforge_core::incident::{
@@ -1077,7 +1299,7 @@ mod tests {
             IncidentStatus, Resolution, bind_epoch,
         };
 
-        fn proof(window: Duration) -> StreamProof {
+        pub(super) fn proof(window: Duration) -> StreamProof {
             StreamProof {
                 dsn: crate::credentials::ProtectedDsn::from("host=unused"),
                 slot: "s".into(),
@@ -1088,17 +1310,14 @@ mod tests {
                     checkpoints::MemCheckpointStore::new().unwrap(),
                 ),
                 backend: Arc::new(storage::MemoryStorageBackend::new()),
-                timeline: Arc::new(AtomicU32::new(0)),
+                active: Default::default(),
                 recovery_window: window,
                 recovery_retry: Default::default(),
             }
         }
 
-        fn checkpoint() -> Option<Checkpoint> {
-            Some(Checkpoint {
-                lsn: Lsn::from(0x3000),
-                timeline: Some(1),
-            })
+        fn checkpoint() -> Option<Lsn> {
+            Some(Lsn::from(0x3000))
         }
 
         async fn records(

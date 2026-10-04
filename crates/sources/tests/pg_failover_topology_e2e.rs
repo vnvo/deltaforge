@@ -522,8 +522,12 @@ async fn a_promoted_standby_with_a_synced_slot_continues_at_the_checkpoint()
     run_until(&proxy, t.primary_port, &d, 1).await;
     sync_idle(&t, &proxy, &d).await;
     let f = d.checkpoint().await;
-    assert_eq!(f["timeline"], 1, "checkpoints carry their timeline");
+    let chain = d.record().await.unwrap()["chain_id"].clone();
     assert_eq!(d.record().await.unwrap()["timeline"], 1);
+    // Checkpoints carry their continuity stamp.
+    assert_eq!(f["timeline"], 1);
+    assert_eq!(f["chain"], chain);
+    assert_eq!(f["transition"], 0);
 
     // Committed after the checkpoint, before the failover; the synced slot
     // stays at the checkpoint.
@@ -557,9 +561,16 @@ async fn a_promoted_standby_with_a_synced_slot_continues_at_the_checkpoint()
     let record = d.record().await.unwrap();
     assert_eq!(record["timeline"], 2);
     assert_eq!(record["transition_id"], 1);
+    assert_eq!(
+        record["chain_id"], chain,
+        "the same chain, one transition on"
+    );
     handle.stop();
     handle.join().await.ok();
-    assert_eq!(d.checkpoint().await["timeline"], 2);
+    let after = d.checkpoint().await;
+    assert_eq!(after["timeline"], 2);
+    assert_eq!(after["chain"], chain);
+    assert_eq!(after["transition"], 1);
     drop(t.standby);
     Ok(())
 }
