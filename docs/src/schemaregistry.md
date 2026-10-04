@@ -158,8 +158,10 @@ Tables are specified using patterns that support wildcards:
 |---------|-------------|
 | `db.table` | Exact match |
 | `db.*` | All tables in database |
-| `db.prefix%` | Tables starting with prefix |
-| `%.table` | Table in any database |
+| `db.prefix%` / `db.prefix*` | Tables starting with prefix (the wildcard counts only as the last character; `_` is literal) |
+| `%.table` / `table` | Table in any database |
+
+The initial snapshot expands patterns to exactly the tables CDC captures.
 
 ### Resolution at first use
 
