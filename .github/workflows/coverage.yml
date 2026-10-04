@@ -28,7 +28,8 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: Generate coverage report
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        # Vendored third-party crates (vendor/) are not DeltaForge code.
+        run: cargo llvm-cov --workspace --ignore-filename-regex '/vendor/' --lcov --output-path lcov.info
 
       - name: Upload to Coveralls
         uses: coverallsapp/github-action@v2
