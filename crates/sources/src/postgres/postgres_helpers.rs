@@ -327,6 +327,48 @@ impl StreamProof {
                 "continuity record updated"
             );
         }
+        // While the chain is at transition 0, every checkpoint of the source
+        // joins it before anything is consumed.
+        if let Err(e) = super::postgres_checkpoint_chain::adopt_into_chain(
+            self.checkpoints.as_ref(),
+            &self.source_id,
+            &proven.record,
+        )
+        .await
+        {
+            let _ = client.shutdown().await;
+            return Err(match e {
+                super::postgres_checkpoint_chain::AdoptionError::Store(e) => {
+                    SourceError::Checkpoint {
+                        details: format!("{e:#}").into(),
+                    }
+                }
+                super::postgres_checkpoint_chain::AdoptionError::Refused(r) => {
+                    warn!(
+                        source_id = %self.source_id, reason = %r.reason,
+                        "stored checkpoints cannot join the continuity chain; \
+                         nothing was rewritten"
+                    );
+                    super::continuity_refusal(
+                        &self.source_id,
+                        &self.slot,
+                        None,
+                        "checkpoint_chain_mismatch",
+                        &super::postgres_continuity::RefusalEvidence {
+                            checkpoint_chain: r.checkpoint_chain,
+                            checkpoint_transition: r.checkpoint_transition,
+                            recorded_chain: Some(
+                                proven.record.chain_id.clone(),
+                            ),
+                            recorded_transition: Some(
+                                proven.record.transition_id,
+                            ),
+                            ..Default::default()
+                        },
+                    )
+                }
+            });
+        }
         self.report_failover_slot(proven.failover_slot).await;
         *self.active.write().expect("not poisoned") = Some(stamp);
         Ok(client)

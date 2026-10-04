@@ -35,6 +35,7 @@ mod postgres_errors;
 use postgres_errors::LoopControl;
 pub use postgres_errors::{PostgresSourceError, PostgresSourceResult};
 
+mod postgres_checkpoint_chain;
 mod postgres_continuity;
 mod postgres_helpers;
 use postgres_helpers::{
