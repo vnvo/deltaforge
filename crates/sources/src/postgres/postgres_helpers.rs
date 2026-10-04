@@ -20,6 +20,7 @@ use url::Url;
 use checkpoints::{CheckpointStore, CheckpointStoreExt};
 use common::{DsnComponents, RetryOutcome, RetryPolicy, retry_async};
 
+use deltaforge_core::incident::IncidentId;
 use storage::adapters::incidents::IncidentStore;
 
 use super::postgres_continuity::{
@@ -144,6 +145,18 @@ pub(crate) struct StreamProof {
     /// The proven timeline of the open stream (0 until one is proven),
     /// recorded in the checkpoints its events carry.
     pub(super) timeline: Arc<AtomicU32>,
+    /// A session on a server in recovery is retried like a connection
+    /// failure (the endpoint may be mid-failover) for this long, then stops.
+    pub(super) recovery_window: Duration,
+    pub(super) recovery_retry: Arc<std::sync::Mutex<RecoveryRetry>>,
+}
+
+/// The bounded retry of sessions on a server in recovery: when it began and
+/// its auto-retry incident.
+#[derive(Debug, Default)]
+pub(crate) struct RecoveryRetry {
+    since: Option<Instant>,
+    incident: Option<IncidentId>,
 }
 
 /// A slot's `(restart_lsn, confirmed_flush_lsn)`: `None` when the slot does
@@ -313,7 +326,18 @@ impl StreamProof {
                 Err(e) => return Err(session_error(&self.slot, e)),
             },
         };
-        prove(&expected, &facts, history.as_deref()).map_err(|refusal| {
+        let refusal = match prove(&expected, &facts, history.as_deref()) {
+            Ok(proven) => {
+                self.recovery_settled().await;
+                return Ok(proven);
+            }
+            Err(Refusal::Unproven {
+                class: "server_in_recovery",
+                evidence,
+            }) => return self.in_recovery(checkpoint, evidence).await,
+            Err(refusal) => refusal,
+        };
+        Err({
             match refusal {
                 Refusal::DifferentCluster { expected, live } => {
                     let endpoint = |(s, d): (u64, u64)| super::PgEndpoint {
@@ -339,11 +363,99 @@ impl StreamProof {
         })
     }
 
+    /// The session is on a server in recovery. Within the retry window it is
+    /// retried like a connection failure (an open `auto_retry` incident);
+    /// then the source stops on the same incident, now operator action.
+    async fn in_recovery(
+        &self,
+        checkpoint: Option<Checkpoint>,
+        evidence: super::postgres_continuity::RefusalEvidence,
+    ) -> SourceResult<Proven> {
+        let f = checkpoint.map(|c| c.lsn);
+        let (since, recorded) = {
+            let mut r = self.recovery_retry.lock().expect("not poisoned");
+            (
+                *r.since.get_or_insert_with(Instant::now),
+                r.incident.is_some(),
+            )
+        };
+        if since.elapsed() >= self.recovery_window {
+            return Err(super::continuity_refusal(
+                &self.source_id,
+                &self.slot,
+                f,
+                "server_in_recovery",
+                &evidence,
+            ));
+        }
+        if !recorded {
+            let draft = super::continuity_unproven_draft(
+                &self.source_id,
+                &self.slot,
+                &f.map_or("none".to_string(), |f| f.to_string()),
+                "server_in_recovery",
+                deltaforge_core::incident::Retryability::AutoRetry,
+                deltaforge_core::incident::CauseCode::SourceConnect,
+            );
+            let id = crate::incident_drafts::record_retrying(
+                &self.incidents(),
+                &draft,
+            )
+            .await;
+            self.recovery_retry.lock().expect("not poisoned").incident = id;
+        }
+        warn!(
+            source_id = %self.source_id,
+            "the server is in recovery (a standby); retrying until a \
+             primary answers (replication stays closed)"
+        );
+        Err(SourceError::Connect {
+            details: "the server is in recovery (a standby)".into(),
+        })
+    }
+
+    /// A proof succeeded: a retrying `server_in_recovery` incident is over.
+    async fn recovery_settled(&self) {
+        let incident = {
+            let mut r = self.recovery_retry.lock().expect("not poisoned");
+            r.since = None;
+            r.incident.take()
+        };
+        if let Some(id) = incident
+            && let Err(e) = self
+                .incidents()
+                .resolve(
+                    &id,
+                    storage::adapters::incidents::Resolution::VerifiedRecovery {
+                        check: storage::adapters::incidents::POSITION_VERIFIED
+                            .to_string(),
+                    },
+                )
+                .await
+        {
+            warn!(error = %format!("{e:#}"), "could not resolve the retrying incident");
+        }
+    }
+
+    /// Stopped on purpose while retrying: withdraw the auto-retry incident.
+    async fn recovery_cancelled(&self) {
+        let incident = {
+            let mut r = self.recovery_retry.lock().expect("not poisoned");
+            r.since = None;
+            r.incident.take()
+        };
+        crate::incident_drafts::cancel_retrying(&self.incidents(), incident)
+            .await;
+    }
+
+    fn incidents(&self) -> IncidentStore {
+        IncidentStore::new(Arc::clone(&self.backend), &self.pipeline)
+    }
+
     /// Raise (or resolve) the running-degraded incident of a PostgreSQL 17+
     /// slot that cannot continue across a failover. Never fails the stream.
     async fn report_failover_slot(&self, failover: FailoverSlot) {
-        let store =
-            IncidentStore::new(Arc::clone(&self.backend), &self.pipeline);
+        let store = self.incidents();
         match failover {
             FailoverSlot::Disabled => {
                 warn!(
@@ -535,10 +647,11 @@ pub(super) async fn connect_replication_with_retries(
     let cfg = config.clone();
     let proof = proof.clone();
 
-    retry_async(
+    let attempt = proof.clone();
+    let result = retry_async(
         move |_| {
             let cfg = cfg.clone();
-            let proof = proof.clone();
+            let proof = attempt.clone();
             async move { proof.open(cfg).await }
         },
         is_retryable_source_error,
@@ -547,8 +660,11 @@ pub(super) async fn connect_replication_with_retries(
         cancel,
         "replication_connect",
     )
-    .await
-    .map_err(|outcome| match outcome {
+    .await;
+    if matches!(result, Err(RetryOutcome::Cancelled)) {
+        proof.recovery_cancelled().await;
+    }
+    result.map_err(|outcome| match outcome {
         RetryOutcome::Cancelled => SourceError::Cancelled,
         RetryOutcome::Timeout { action } => SourceError::Timeout { action },
         RetryOutcome::Exhausted {
@@ -951,6 +1067,128 @@ pub(crate) fn pg_timestamp_to_unix_ms(pg_timestamp_us: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod server_in_recovery {
+        use super::*;
+        use deltaforge_core::incident::{
+            ActionCode, EvidenceKey, EvidenceValue, Retryability,
+        };
+        use storage::adapters::incidents::{
+            IncidentStatus, Resolution, bind_epoch,
+        };
+
+        fn proof(window: Duration) -> StreamProof {
+            StreamProof {
+                dsn: crate::credentials::ProtectedDsn::from("host=unused"),
+                slot: "s".into(),
+                source_id: "src".into(),
+                pipeline: "p".into(),
+                tenant: "t".into(),
+                checkpoints: Arc::new(
+                    checkpoints::MemCheckpointStore::new().unwrap(),
+                ),
+                backend: Arc::new(storage::MemoryStorageBackend::new()),
+                timeline: Arc::new(AtomicU32::new(0)),
+                recovery_window: window,
+                recovery_retry: Default::default(),
+            }
+        }
+
+        fn checkpoint() -> Option<Checkpoint> {
+            Some(Checkpoint {
+                lsn: Lsn::from(0x3000),
+                timeline: Some(1),
+            })
+        }
+
+        async fn records(
+            p: &StreamProof,
+        ) -> Vec<storage::adapters::incidents::IncidentRecord> {
+            p.incidents().list().await.unwrap()
+        }
+
+        #[tokio::test]
+        async fn within_the_window_it_retries_on_one_auto_retry_incident() {
+            let p = proof(Duration::from_secs(60));
+            for _ in 0..3 {
+                let r = p.in_recovery(checkpoint(), Default::default()).await;
+                assert!(
+                    matches!(r, Err(SourceError::Connect { .. })),
+                    "a retryable connection error: {r:?}"
+                );
+            }
+            let all = records(&p).await;
+            assert_eq!(all.len(), 1, "one incident across the retries");
+            assert_eq!(all[0].retryability, Retryability::AutoRetry);
+            assert_eq!(
+                all[0].evidence.get(EvidenceKey::ReasonClass),
+                Some(&EvidenceValue::Text {
+                    value: "server_in_recovery".into()
+                })
+            );
+            assert_eq!(
+                all[0].actions,
+                vec![ActionCode::VerifyEndpoint, ActionCode::InspectLogs],
+                "route the source to the primary"
+            );
+        }
+
+        #[tokio::test]
+        async fn after_the_window_it_stops_on_the_same_incident() {
+            let p = proof(Duration::from_millis(50));
+            assert!(
+                p.in_recovery(checkpoint(), Default::default())
+                    .await
+                    .is_err()
+            );
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let err = p
+                .in_recovery(checkpoint(), Default::default())
+                .await
+                .unwrap_err();
+            let draft = err.draft().expect("an incident").clone();
+            assert_eq!(draft.retryability, Retryability::OperatorAction);
+            assert_eq!(
+                draft.actions,
+                vec![ActionCode::VerifyEndpoint, ActionCode::InspectLogs]
+            );
+            // Raised by the supervisor under the same recovery epoch, it is
+            // the retrying incident, now needing an operator.
+            let store = p.incidents();
+            let epoch = store.recovery_epoch().await.unwrap();
+            store.raise(&bind_epoch(draft, epoch), 1).await.unwrap();
+            let all = records(&p).await;
+            assert_eq!(all.len(), 1);
+            assert_eq!(all[0].retryability, Retryability::OperatorAction);
+        }
+
+        #[tokio::test]
+        async fn a_stop_withdraws_and_a_proven_start_resolves_it() {
+            let p = proof(Duration::from_secs(60));
+            let _ = p.in_recovery(checkpoint(), Default::default()).await;
+            p.recovery_cancelled().await;
+            assert!(matches!(
+                records(&p).await[0].status,
+                IncidentStatus::Resolved {
+                    by: Resolution::OperationCancelled,
+                    ..
+                }
+            ));
+
+            let p = proof(Duration::from_secs(60));
+            let _ = p.in_recovery(checkpoint(), Default::default()).await;
+            p.recovery_settled().await;
+            assert!(matches!(
+                &records(&p).await[0].status,
+                IncidentStatus::Resolved {
+                    by: Resolution::VerifiedRecovery { check },
+                    ..
+                } if check == storage::adapters::incidents::POSITION_VERIFIED
+            ));
+            // The window starts again after a proven start.
+            assert!(p.recovery_retry.lock().unwrap().since.is_none());
+        }
+    }
 
     #[test]
     fn test_pg_timestamp_conversion() {

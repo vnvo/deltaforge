@@ -263,7 +263,9 @@ async fn sync_idle(t: &Topology, proxy: &Proxy, d: &Durable) {
     let mut checkpoint = d.checkpoint().await;
     loop {
         let c = admin(t.primary_port, DB).await;
-        c.execute("SELECT pg_log_standby_snapshot()", &[]).await.unwrap();
+        c.execute("SELECT pg_log_standby_snapshot()", &[])
+            .await
+            .unwrap();
         c.execute(
             "SELECT pg_logical_emit_message(false, 'df-test', 'idle', true)",
             &[],
@@ -288,11 +290,11 @@ async fn sync_idle(t: &Topology, proxy: &Proxy, d: &Durable) {
         let primary = lsn_query(t.primary_port, DB, &slot_row).await;
         let standby = lsn_query(t.standby_port, DB, &slot_row).await;
         let confirmed = |row: &Option<String>| {
-            row.as_deref().and_then(|r| r.split(' ').next()).map(String::from)
+            row.as_deref()
+                .and_then(|r| r.split(' ').next())
+                .map(String::from)
         };
-        let kept = standby
-            .as_deref()
-            .is_some_and(|r| r.ends_with(" t f"));
+        let kept = standby.as_deref().is_some_and(|r| r.ends_with(" t f"));
         if kept && confirmed(&standby) == confirmed(&primary) {
             break;
         }
@@ -711,5 +713,79 @@ async fn a_slot_without_failover_is_a_running_degraded_incident() -> Result<()>
     handle.stop();
     handle.join().await.ok();
     drop(t.standby);
+    Ok(())
+}
+
+/// An endpoint that reaches a hot standby (for example mid-failover) is not
+/// streamed from: the session is in recovery, so the source retries like a
+/// connection failure with an open `auto_retry` incident
+/// (`server_in_recovery`, recommending the writable primary) and no stream;
+/// stopping the pipeline withdraws it.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn a_standby_endpoint_is_retried_without_streaming() -> Result<()> {
+    init_test_tracing();
+    let t = start_topology("17").await;
+    create_schema(t.primary_port).await;
+    let proxy = Proxy::start(t.primary_port).await;
+    let d = Durable::new();
+    run_until(&proxy, t.primary_port, &d, 1).await;
+    // The standby holds the synchronized slot, so only the session proof
+    // can tell it is not a primary.
+    sync_idle(&t, &proxy, &d).await;
+    let f = d.checkpoint().await;
+
+    proxy.switch_to(t.standby_port);
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = source(&proxy, &d).await.run(tx, Arc::clone(&d.ckpt)).await;
+    let incidents = IncidentStore::new(Arc::clone(&d.backend), "test");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let retrying = loop {
+        let found = incidents.list().await?.into_iter().find(|r| {
+            r.reason_code == ReasonCode::PgContinuityUnproven
+                && r.evidence.get(EvidenceKey::ReasonClass)
+                    == Some(&EvidenceValue::Text {
+                        value: "server_in_recovery".into(),
+                    })
+        });
+        if let Some(r) = found {
+            break r;
+        }
+        assert!(Instant::now() < deadline, "no server_in_recovery incident");
+        sleep(Duration::from_millis(300)).await;
+    };
+    assert_eq!(retrying.retryability.as_str(), "auto_retry");
+    assert_eq!(
+        retrying.actions,
+        vec![
+            deltaforge_core::incident::ActionCode::VerifyEndpoint,
+            deltaforge_core::incident::ActionCode::InspectLogs
+        ]
+    );
+    let delivered = collect(&mut rx, Duration::from_secs(2), |_| false).await;
+    assert!(delivered.is_empty(), "nothing streamed: {delivered:?}");
+
+    handle.stop();
+    handle.join().await.ok();
+    let r = incidents
+        .list()
+        .await?
+        .into_iter()
+        .find(|r| r.incident_id == retrying.incident_id)
+        .unwrap();
+    assert!(
+        matches!(
+            r.status,
+            storage::adapters::incidents::IncidentStatus::Resolved {
+                by:
+                    storage::adapters::incidents::Resolution::OperationCancelled,
+                ..
+            }
+        ),
+        "{:?}",
+        r.status
+    );
+    assert_eq!(d.checkpoint().await, f, "the checkpoint did not move");
+    drop(t.primary);
     Ok(())
 }

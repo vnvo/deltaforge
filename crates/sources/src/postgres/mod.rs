@@ -633,6 +633,8 @@ impl PostgresSource {
             checkpoints: chkpt_store.clone(),
             backend: Arc::clone(&self.backend),
             timeline: Arc::new(AtomicU32::new(0)),
+            recovery_window: REACHABILITY_RETRY_WINDOW,
+            recovery_retry: Default::default(),
         };
 
         let client = connect_replication_with_retries(
@@ -1733,7 +1735,7 @@ pub(super) fn failover_slot_unavailable_draft(
 /// The `pg_continuity_unproven` draft. Its identity is the slot, checkpoint
 /// and class, never the retryability, so an automatic retry that exhausts
 /// its window stays one incident.
-fn continuity_unproven_draft(
+pub(super) fn continuity_unproven_draft(
     source_id: &str,
     slot: &str,
     checkpoint: &str,
@@ -1742,7 +1744,10 @@ fn continuity_unproven_draft(
     cause_code: CauseCode,
 ) -> IncidentDraft {
     let lost = !class.starts_with("unknown_");
-    let actions: &[ActionCode] = if lost {
+    let actions: &[ActionCode] = if class == "server_in_recovery" {
+        // Route the source to the writable primary.
+        &[ActionCode::VerifyEndpoint, ActionCode::InspectLogs]
+    } else if lost {
         &[ActionCode::Resnapshot, ActionCode::UseNewSourceId]
     } else {
         &[ActionCode::VerifyEndpoint, ActionCode::InspectLogs]
