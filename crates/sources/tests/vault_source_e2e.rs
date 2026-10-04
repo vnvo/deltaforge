@@ -250,6 +250,7 @@ async fn vault_kv_rotation_reconnects_postgres_and_continues_cdc() -> Result<()>
         &spec,
         dsn,
         make_registry().await,
+        sources::registry_scope::SharedRegistryScope::default(),
         make_storage_backend().await,
         resolver,
     )
