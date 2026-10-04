@@ -600,10 +600,19 @@ impl PostgresSource {
         );
 
         let config = config.with_start_lsn(start_lsn);
+        // The safety boundary of every stream this run opens: the durable
+        // checkpoint, reread before each START_REPLICATION.
+        let slot_bound = postgres_helpers::SlotBoundProof {
+            dsn: self.dsn.clone(),
+            slot: self.slot.clone(),
+            source_id: self.id.clone(),
+            checkpoints: chkpt_store.clone(),
+        };
 
         let client = connect_replication_with_retries(
             &self.id,
             config.clone(),
+            &slot_bound,
             &cancel,
             RetryPolicy::default(),
         )
@@ -858,6 +867,7 @@ impl PostgresSource {
                     match connect_replication_with_retries(
                         &self.id,
                         reconnect_config,
+                        &slot_bound,
                         &ctx.cancel,
                         ctx.retry.clone(),
                     )
@@ -1484,6 +1494,57 @@ fn continuity_unproven(
         Retryability::OperatorAction,
         cause.cause_code(),
     );
+    SourceError::incident(draft, cause)
+}
+
+/// The `pg_continuity_unproven` incident for a slot that is not at or before
+/// the durable checkpoint (`slot_beyond_checkpoint`), is missing, or reports
+/// no position: streaming would skip changes or rest on an unknown position.
+/// The slot's positions are evidence.
+pub(super) fn slot_bound_incident(
+    source_id: &str,
+    slot: &str,
+    checkpoint: &str,
+    class: &str,
+    restart: Option<String>,
+    confirmed: Option<String>,
+) -> SourceError {
+    let details = match class {
+        "slot_beyond_checkpoint" => format!(
+            "replication slot '{slot}' is beyond the durable checkpoint \
+             {checkpoint} (restart {}, confirmed {}): resuming would skip the \
+             changes in between. Re-snapshot required.",
+            restart.as_deref().unwrap_or("none"),
+            confirmed.as_deref().unwrap_or("none")
+        ),
+        "slot_missing" => format!(
+            "replication slot '{slot}' does not exist; it cannot resume from \
+             {checkpoint}. Re-snapshot required."
+        ),
+        _ => format!(
+            "replication slot '{slot}' reports no restart/confirmed position; \
+             resuming from {checkpoint} cannot be proven"
+        ),
+    };
+    let cause = SourceError::Checkpoint {
+        details: details.into(),
+    };
+    let draft = continuity_unproven_draft(
+        source_id,
+        slot,
+        checkpoint,
+        class,
+        Retryability::OperatorAction,
+        cause.cause_code(),
+    )
+    .with_evidence(|e| {
+        if let Some(r) = &restart {
+            e.text(K::SlotRestartPosition, r);
+        }
+        if let Some(c) = &confirmed {
+            e.text(K::SlotConfirmedPosition, c);
+        }
+    });
     SourceError::incident(draft, cause)
 }
 

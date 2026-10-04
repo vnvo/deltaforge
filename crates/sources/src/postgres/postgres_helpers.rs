@@ -110,21 +110,140 @@ pub(super) fn build_replication_config(
     .with_buffer_size(BUFFER_EVENTS)
 }
 
-/// Connect to replication with retries.
+/// The safety boundary of every replication stream: the source's durable
+/// checkpoint F, read from the checkpoint store immediately before each
+/// START_REPLICATION (never an in-memory read position).
+///
+/// Before a stream opens, the slot must not have moved past F
+/// (`restart_lsn <= F` and `confirmed_flush_lsn <= F`): otherwise the server
+/// would stream from the slot's position and silently skip the changes after
+/// F. The stream then acknowledges F to the server (not where it starts
+/// reading), so the slot never advances past what the source can recover
+/// after a crash. A source with no durable checkpoint yet has nothing to
+/// prove: it starts from the slot's own position.
+#[derive(Clone)]
+pub(super) struct SlotBoundProof {
+    pub(super) dsn: crate::credentials::ProtectedDsn,
+    pub(super) slot: String,
+    pub(super) source_id: String,
+    pub(super) checkpoints: Arc<dyn CheckpointStore>,
+}
+
+/// A slot's `(restart_lsn, confirmed_flush_lsn)`: `None` when the slot does
+/// not exist, a `None` position when the server reports none.
+type SlotBounds = Option<(Option<Lsn>, Option<Lsn>)>;
+
+impl SlotBoundProof {
+    /// Prove the slot is not beyond the durable checkpoint; returns that
+    /// checkpoint (the position to acknowledge), if any. A failed read of the
+    /// server is a retryable connect error; a slot beyond, missing or without
+    /// a position is a `pg_continuity_unproven` incident (fail closed).
+    pub(super) async fn prove(&self) -> SourceResult<Option<Lsn>> {
+        let checkpoint: Option<PostgresCheckpoint> =
+            self.checkpoints.get(&self.source_id).await.map_err(|e| {
+                SourceError::Checkpoint {
+                    details: format!("read the durable checkpoint: {e}").into(),
+                }
+            })?;
+        let Some(checkpoint) = checkpoint else {
+            return Ok(None);
+        };
+        let f = Lsn::parse(&checkpoint.lsn).map_err(|e| {
+            SourceError::Checkpoint {
+                details: format!(
+                    "invalid checkpoint LSN '{}': {e}",
+                    checkpoint.lsn
+                )
+                .into(),
+            }
+        })?;
+        let bounds = read_slot_bounds(self.dsn.expose(), &self.slot)
+            .await
+            .map_err(|e| SourceError::Connect {
+                details: format!(
+                    "read replication slot '{}' before streaming: {e}",
+                    self.slot
+                )
+                .into(),
+            })?;
+        let (class, restart, confirmed) = match bounds {
+            None => ("slot_missing", None, None),
+            Some((Some(r), Some(c))) if r <= f && c <= f => {
+                return Ok(Some(f));
+            }
+            Some((Some(r), Some(c))) => {
+                ("slot_beyond_checkpoint", Some(r), Some(c))
+            }
+            Some((r, c)) => ("unknown_slot_position", r, c),
+        };
+        let shown =
+            |l: Option<Lsn>| l.map_or("none".to_string(), |l| l.to_string());
+        error!(
+            source_id = %self.source_id, slot = %self.slot, checkpoint = %f,
+            restart_lsn = %shown(restart), confirmed_flush_lsn = %shown(confirmed),
+            class, "the replication slot is not at or before the durable checkpoint; \
+             refusing to stream"
+        );
+        Err(super::slot_bound_incident(
+            &self.source_id,
+            &self.slot,
+            &f.to_string(),
+            class,
+            restart.map(|l| l.to_string()),
+            confirmed.map(|l| l.to_string()),
+        ))
+    }
+}
+
+async fn read_slot_bounds(
+    dsn: &str,
+    slot: &str,
+) -> Result<SlotBounds, tokio_postgres::Error> {
+    let (client, conn) = tokio_postgres::connect(dsn, NoTls).await?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let row = client
+        .query_opt(
+            "SELECT restart_lsn::text, confirmed_flush_lsn::text \
+             FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .await?;
+    Ok(row.map(|r| {
+        let lsn = |i: usize| {
+            r.get::<_, Option<String>>(i)
+                .and_then(|s| Lsn::parse(&s).ok())
+        };
+        (lsn(0), lsn(1))
+    }))
+}
+
+/// Connect to replication with retries. Every attempt proves the slot bound
+/// first ([`SlotBoundProof`]) and acknowledges the durable checkpoint.
 pub(super) async fn connect_replication_with_retries(
     source_id: &str,
     config: ReplicationConfig,
+    proof: &SlotBoundProof,
     cancel: &CancellationToken,
     retry_policy: RetryPolicy,
 ) -> SourceResult<ReplicationClient> {
     let source_id = source_id.to_string();
     let cfg = config.clone();
+    let proof = proof.clone();
 
     let result = retry_async(
         move |_| {
             let cfg = cfg.clone();
             let source_id = source_id.clone();
-            async move { connect_replication(&source_id, cfg).await }
+            let proof = proof.clone();
+            async move {
+                let cfg = match proof.prove().await? {
+                    Some(f) => cfg.with_ack_lsn(f),
+                    None => cfg,
+                };
+                connect_replication(&source_id, cfg).await
+            }
         },
         is_retryable_source_error,
         Duration::from_secs(30),

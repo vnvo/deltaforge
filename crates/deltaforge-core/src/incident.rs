@@ -319,6 +319,8 @@ pub enum EvidenceKey {
     ObjectKey,
     ExpectedGeneration,
     ContentIdentity,
+    SlotRestartPosition,
+    SlotConfirmedPosition,
 }
 
 impl EvidenceKey {
@@ -345,6 +347,8 @@ impl EvidenceKey {
             Self::ObjectKey => "object_key",
             Self::ExpectedGeneration => "expected_generation",
             Self::ContentIdentity => "content_identity",
+            Self::SlotRestartPosition => "slot_restart_position",
+            Self::SlotConfirmedPosition => "slot_confirmed_position",
         }
     }
 }

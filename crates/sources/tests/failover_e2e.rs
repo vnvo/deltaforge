@@ -2082,6 +2082,185 @@ async fn postgres_a_dropped_slot_is_a_continuity_incident() -> Result<()> {
 
 const DB_LOST: &str = "shoplost";
 
+/// Run source `name` (slot `slot_{name}`, publication `pub_{name}`) until
+/// row `id` is handed on, stop it, and return the LSN of the checkpoint it
+/// committed (the durable resume position F).
+async fn run_until_row_then_stop(
+    port: u16,
+    db: &str,
+    name: &str,
+    backend: &ArcStorageBackend,
+    ckpt: &Arc<dyn CheckpointStore>,
+    id: i64,
+) -> u64 {
+    let src = make_pg_source(
+        name,
+        &pg_dsn(port, db),
+        &format!("slot_{name}"),
+        &format!("pub_{name}"),
+        Arc::clone(backend),
+    )
+    .await;
+    let (tx, mut rx) = mpsc::channel(64);
+    let handle = src.run(tx, Arc::clone(ckpt)).await;
+    sleep(Duration::from_secs(4)).await;
+    pg_admin_client(port, db)
+        .await
+        .execute(&format!("INSERT INTO orders VALUES ({id}, 'a')"), &[])
+        .await
+        .unwrap();
+    collect_until(&mut rx, Duration::from_secs(10), |e| {
+        e.iter().any(|x| has_id(x, id))
+    })
+    .await;
+    handle.stop();
+    handle.join().await.ok();
+    checkpoint_lsn(&ckpt.get_raw(name).await.unwrap().expect("a checkpoint"))
+}
+
+/// The slot was advanced past the committed checkpoint F while the source
+/// was stopped (a manual advance, another consumer, a promoted standby's
+/// slot): resuming at F would silently skip the changes in between. The
+/// source stops with a `pg_continuity_unproven` incident
+/// (`slot_beyond_checkpoint`) before any replication stream opens.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn postgres_a_slot_beyond_the_checkpoint_stops_before_streaming()
+-> Result<()> {
+    init_test_tracing();
+    const DB: &str = "shopbeyond";
+    let (_c, port) = start_postgres().await;
+    pg_create_schema(port, DB, "slot_beyond", "pub_beyond").await;
+    let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let f =
+        run_until_row_then_stop(port, DB, "beyond", &backend, &ckpt, 1).await;
+
+    let admin = pg_admin_client(port, DB).await;
+    admin
+        .execute("INSERT INTO orders VALUES (2, 'skipped?')", &[])
+        .await?;
+    admin
+        .execute(
+            "SELECT pg_replication_slot_advance('slot_beyond', pg_current_wal_lsn())",
+            &[],
+        )
+        .await?;
+    let (_, confirmed) = slot_position(port, DB, "slot_beyond").await.unwrap();
+    assert!(confirmed > f, "the slot is beyond the checkpoint");
+
+    let src = make_pg_source(
+        "beyond",
+        &pg_dsn(port, DB),
+        "slot_beyond",
+        "pub_beyond",
+        Arc::clone(&backend),
+    )
+    .await;
+    let (tx, _rx) = mpsc::channel(64);
+    reset_streams_opened();
+    let e = timeout(
+        Duration::from_secs(60),
+        src.run(tx, Arc::clone(&ckpt)).await.join(),
+    )
+    .await
+    .expect("the source stops instead of resuming past its checkpoint")
+    .expect_err("a slot beyond the checkpoint stops the source");
+    let (reason, class, _) = stopped_incident(&e);
+    assert_eq!(
+        reason,
+        deltaforge_core::incident::ReasonCode::PgContinuityUnproven
+    );
+    assert_eq!(class, "slot_beyond_checkpoint");
+    assert_eq!(streams_opened(), 0, "replication never opened");
+    assert_eq!(
+        checkpoint_lsn(&ckpt.get_raw("beyond").await?.unwrap()),
+        f,
+        "the checkpoint is unchanged"
+    );
+    Ok(())
+}
+
+/// A reconnect resumes reading at the last commit handed on, which is ahead
+/// of the durable checkpoint F. The position acknowledged to the server must
+/// stay at F: if the slot's confirmed position moved to the in-memory read
+/// position, a crash before the sinks commit would lose the changes in
+/// between on restart.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn postgres_a_reconnect_never_acknowledges_past_the_checkpoint()
+-> Result<()> {
+    init_test_tracing();
+    const DB: &str = "shopack";
+    let (_c, port) = start_postgres().await;
+    pg_create_schema(port, DB, "slot_ack", "pub_ack").await;
+    let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let f = run_until_row_then_stop(port, DB, "ack", &backend, &ckpt, 1).await;
+
+    // Run again from F; rows 2 and 3 are handed on but never made durable
+    // (no sink commits in this harness, so F stays the durable position).
+    let src = make_pg_source(
+        "ack",
+        &pg_dsn(port, DB),
+        "slot_ack",
+        "pub_ack",
+        Arc::clone(&backend),
+    )
+    .await;
+    let (tx, mut rx) = mpsc::channel(64);
+    let handle = src.run(tx, Arc::clone(&ckpt)).await;
+    sleep(Duration::from_secs(4)).await;
+    let admin = pg_admin_client(port, DB).await;
+    for id in [2, 3] {
+        admin
+            .execute(&format!("INSERT INTO orders VALUES ({id}, 'b')"), &[])
+            .await?;
+    }
+    collect_until(&mut rx, Duration::from_secs(10), |e| {
+        e.iter().any(|x| has_id(x, 3))
+    })
+    .await;
+
+    // Force a reconnect: end the walsender serving the slot.
+    let pid: i32 = admin
+        .query_one(
+            "SELECT active_pid FROM pg_replication_slots WHERE slot_name = 'slot_ack'",
+            &[],
+        )
+        .await?
+        .get(0);
+    admin
+        .execute("SELECT pg_terminate_backend($1)", &[&pid])
+        .await?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let row = admin
+            .query_one(
+                "SELECT active_pid FROM pg_replication_slots WHERE slot_name = 'slot_ack'",
+                &[],
+            )
+            .await?;
+        if matches!(row.get::<_, Option<i32>>(0), Some(p) if p != pid) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the source reconnected");
+        sleep(Duration::from_millis(200)).await;
+    }
+    // Let the new stream report its position (status and idle feedback).
+    sleep(Duration::from_secs(12)).await;
+    let (restart, confirmed) =
+        slot_position(port, DB, "slot_ack").await.unwrap();
+    handle.stop();
+    handle.join().await.ok();
+    assert!(
+        confirmed <= f && restart <= f,
+        "after the reconnect the slot moved past the durable checkpoint \
+         {f:X}: confirmed {confirmed:X}, restart {restart:X}"
+    );
+    Ok(())
+}
+
 /// The binlogs holding the transactions after the checkpoint were purged
 /// while the source was stopped: the resume position is unavailable. The
 /// source stops with a `mysql_gtid_position_unavailable` incident (purged).

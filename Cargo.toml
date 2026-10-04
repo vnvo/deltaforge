@@ -84,3 +84,4 @@ strip = false
 # See vendor/mysql-binlog-connector-rust/DELTAFORGE-PATCH.md.
 [patch.crates-io]
 mysql-binlog-connector-rust = { path = "vendor/mysql-binlog-connector-rust" }
+pgwire-replication = { path = "vendor/pgwire-replication" }
