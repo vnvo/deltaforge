@@ -32,6 +32,9 @@ pub struct FaultBackend {
     /// `(namespace, n)`: allow `n` more writes to the namespace, fail the
     /// next one, then clear (a crash at that write).
     pub fail_after_writes_to: std::sync::Mutex<Option<(String, u64)>>,
+    /// Yield to the scheduler after every slot read, so concurrent
+    /// read-modify-write cycles interleave as they can on a real store.
+    pub yield_after_slot_reads: AtomicBool,
 }
 
 impl Default for FaultBackend {
@@ -60,6 +63,7 @@ impl FaultBackend {
             kv_list_calls: std::sync::Mutex::new(Vec::new()),
             fail_writes_to: std::sync::Mutex::new(Vec::new()),
             fail_after_writes_to: std::sync::Mutex::new(None),
+            yield_after_slot_reads: AtomicBool::new(false),
         }
     }
 
@@ -245,7 +249,11 @@ impl StorageBackend for FaultBackend {
         ns: &str,
         key: &str,
     ) -> Result<Option<(u64, Vec<u8>)>> {
-        self.inner.slot_get(ns, key).await
+        let got = self.inner.slot_get(ns, key).await;
+        if self.yield_after_slot_reads.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        got
     }
     async fn slot_cas(
         &self,

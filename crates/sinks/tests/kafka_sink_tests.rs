@@ -1893,7 +1893,7 @@ async fn kafka_sink_exactly_once_producer_fencing() -> Result<()> {
 
     let err = result.unwrap_err();
     assert!(
-        matches!(err, deltaforge_core::SinkError::Fatal { .. }),
+        matches!(err.root(), deltaforge_core::SinkError::Fatal { .. }),
         "fenced producer should return Fatal error, got: {:?}",
         err
     );

@@ -27,6 +27,9 @@ pub mod envelope;
 pub mod errors;
 pub use errors::{SinkError, SourceError};
 
+pub mod incident;
+pub use incident::{IncidentDraft, IncidentId};
+
 pub mod routing;
 pub use routing::EventRouting;
 
@@ -839,12 +842,47 @@ impl SourceItem {
 // Source Handle
 // ============================================================================
 
+/// Set once by a source when its startup checks have passed and its change
+/// stream is open on the verified server: the source half of a pipeline's
+/// verified-running barrier. Never cleared; a source that never sets it never
+/// reaches the barrier.
+#[derive(Clone, Default)]
+pub struct SourceReady(Arc<(AtomicBool, Notify)>);
+
+impl SourceReady {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mark(&self) {
+        self.0.0.store(true, Ordering::SeqCst);
+        self.0.1.notify_waiters();
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.0.0.load(Ordering::SeqCst)
+    }
+
+    /// Wait until marked (returns at once if it already is).
+    pub async fn wait(&self) {
+        loop {
+            let notified = self.0.1.notified();
+            if self.is_ready() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 /// Control handle for a running source.
 pub struct SourceHandle {
     pub cancel: CancellationToken,
     pub paused: Arc<AtomicBool>,
     pub pause_notify: Arc<Notify>,
     pub join: JoinHandle<SourceResult<()>>,
+    /// Marked when the source's startup checks passed and its stream is open.
+    pub ready: SourceReady,
 }
 
 impl SourceHandle {
@@ -991,6 +1029,18 @@ pub struct SinkBatchContext {
     pub batch_id: Option<String>,
 }
 
+/// What an authoritative read of one uncertain acknowledgement boundary
+/// proved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundaryOutcome {
+    /// The write applied: the batch is durable downstream.
+    Committed,
+    /// The write did not apply (the batch is redelivered from the checkpoint).
+    Absent,
+    /// Not decided; the uncertainty stays open.
+    Unknown,
+}
+
 #[async_trait]
 pub trait Sink: Send + Sync {
     fn id(&self) -> &str;
@@ -1024,6 +1074,17 @@ pub trait Sink: Send + Sync {
         _ctx: &SinkBatchContext,
     ) -> SinkResult<BatchResult> {
         self.send_batch(events).await
+    }
+
+    /// Settle one write this sink reported uncertain (a `sink_ack_uncertain`
+    /// incident with `evidence`) by an authoritative read of exactly that
+    /// boundary. The default proves nothing: the incident stays open. A read
+    /// that cannot decide is `Unknown`, never an error.
+    async fn settle_uncertain(
+        &self,
+        _evidence: &incident::Evidence,
+    ) -> BoundaryOutcome {
+        BoundaryOutcome::Unknown
     }
 }
 

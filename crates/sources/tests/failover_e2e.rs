@@ -516,10 +516,13 @@ async fn mysql_failover_position_lost_stops_source() -> Result<()> {
 
         match timeout(Duration::from_secs(20), handle.join()).await {
             Ok(Err(e)) => {
+                // The incident's display is its sanitized explanation; the
+                // typed cause (in the chain) keeps the detailed message.
+                let chain = format!("{e:#}");
                 assert!(
-                    e.to_string().contains("position lost")
-                        || e.to_string().contains("Re-snapshot"),
-                    "unexpected error: {e}"
+                    chain.contains("position lost")
+                        || chain.contains("Re-snapshot"),
+                    "unexpected error: {chain}"
                 );
                 info!("✓ source stopped with position-lost error");
             }
@@ -762,11 +765,11 @@ async fn mysql_failover_schema_drift_halts_source() -> Result<()> {
                 // The table's first event under the new lineage is B's own
                 // DDL: its shape at the failover position cannot be proven,
                 // which halt treats like drift.
-                let msg = e.to_string();
+                let msg = format!("{e:#}");
                 assert!(
                     msg.contains("cannot be proven")
                         && msg.contains("on_schema_drift=halt"),
-                    "unexpected error: {e}"
+                    "unexpected error: {msg}"
                 );
                 info!("✓ source stopped before any write under halt");
             }
@@ -1022,10 +1025,10 @@ async fn refused(handle: deltaforge_core::SourceHandle) {
     match timeout(Duration::from_secs(60), handle.join()).await {
         Ok(Err(e)) => assert!(
             matches!(
-                e.downcast_ref::<SourceError>(),
-                Some(SourceError::Lineage { .. })
+                e.downcast_ref::<SourceError>().map(|e| (e.root(), e.draft().map(|d| d.reason_code))),
+                Some((SourceError::Lineage { .. }, Some(deltaforge_core::incident::ReasonCode::PgDifferentCluster)))
             ),
-            "another cluster must be refused with a lineage error: {e:?}"
+            "another cluster must be refused with a lineage incident: {e:?}"
         ),
         Ok(Ok(())) => panic!("the source must not run on another cluster"),
         Err(_) => panic!("the source did not stop"),
@@ -1988,5 +1991,165 @@ async fn postgres_a_stop_inside_a_transaction_aborts_nothing() -> Result<()> {
         "a stop never abandons a transaction"
     );
     assert_eq!(streams_opened(), 0, "a stop never reconnects");
+    Ok(())
+}
+
+/// The reason class and recommended actions of an incident a source stopped
+/// with.
+fn stopped_incident(
+    e: &anyhow::Error,
+) -> (
+    deltaforge_core::incident::ReasonCode,
+    String,
+    Vec<deltaforge_core::incident::ActionCode>,
+) {
+    use deltaforge_core::incident::{EvidenceKey, EvidenceValue};
+    let err = e.downcast_ref::<SourceError>().expect("a source error");
+    let d = err
+        .draft()
+        .unwrap_or_else(|| panic!("an incident: {err:?}"));
+    let class = match d.evidence.get(EvidenceKey::ReasonClass) {
+        Some(EvidenceValue::Text { value }) => value.clone(),
+        other => panic!("{other:?}"),
+    };
+    (d.reason_code, class, d.actions.clone())
+}
+
+/// The replication slot was dropped while the source was stopped: the resume
+/// position is gone. The source stops before replication with a
+/// `pg_continuity_unproven` incident (slot_missing) recommending a re-snapshot.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn postgres_a_dropped_slot_is_a_continuity_incident() -> Result<()> {
+    init_test_tracing();
+    let (_c, port) = start_postgres().await;
+    pg_create_schema(port, DB_LOST, "slot_lost", "pub_lost").await;
+    let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let src = make_pg_source(
+        "lost",
+        &pg_dsn(port, DB_LOST),
+        "slot_lost",
+        "pub_lost",
+        Arc::clone(&backend),
+    )
+    .await;
+    let (tx, mut rx) = mpsc::channel(64);
+    let handle = src.run(tx, Arc::clone(&ckpt)).await;
+    sleep(Duration::from_secs(4)).await;
+    pg_admin_client(port, DB_LOST)
+        .await
+        .execute("INSERT INTO orders VALUES (1, 'a')", &[])
+        .await?;
+    collect_until(&mut rx, Duration::from_secs(10), |e| {
+        e.iter().any(|x| has_id(x, 1))
+    })
+    .await;
+    handle.stop();
+    handle.join().await.ok();
+    assert!(ckpt.get_raw("lost").await?.is_some(), "a checkpoint");
+
+    pg_admin_client(port, DB_LOST)
+        .await
+        .execute("SELECT pg_drop_replication_slot('slot_lost')", &[])
+        .await?;
+    let src = make_pg_source(
+        "lost",
+        &pg_dsn(port, DB_LOST),
+        "slot_lost",
+        "pub_lost",
+        Arc::clone(&backend),
+    )
+    .await;
+    let (tx, _rx) = mpsc::channel(64);
+    reset_streams_opened();
+    let e = timeout(Duration::from_secs(60), src.run(tx, ckpt).await.join())
+        .await
+        .expect("stops")
+        .expect_err("a lost slot stops the source");
+    let (reason, class, actions) = stopped_incident(&e);
+    assert_eq!(
+        reason,
+        deltaforge_core::incident::ReasonCode::PgContinuityUnproven
+    );
+    assert_eq!(class, "slot_missing");
+    assert!(
+        actions.contains(&deltaforge_core::incident::ActionCode::Resnapshot)
+    );
+    assert_eq!(streams_opened(), 0, "replication never opened");
+    Ok(())
+}
+
+const DB_LOST: &str = "shoplost";
+
+/// The binlogs holding the transactions after the checkpoint were purged
+/// while the source was stopped: the resume position is unavailable. The
+/// source stops with a `mysql_gtid_position_unavailable` incident (purged).
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_purged_binlogs_are_a_gtid_position_incident() -> Result<()> {
+    init_test_tracing();
+    const DB: &str = "shop";
+    let (_c, port) = start_mysql().await;
+    mysql_create_schema(port, DB).await;
+    let backend: ArcStorageBackend = Arc::new(MemoryStorageBackend::new());
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let src = make_mysql_source(
+        "purged",
+        &mysql_cdc_dsn(port, DB),
+        DB,
+        Arc::clone(&backend),
+    )
+    .await;
+    let (tx, mut rx) = mpsc::channel(64);
+    let handle = src.run(tx, Arc::clone(&ckpt)).await;
+    sleep(Duration::from_secs(4)).await;
+    let pool = mysql_root_pool(port).await;
+    let mut conn = pool.get_conn().await?;
+    conn.query_drop(format!("INSERT INTO {DB}.orders VALUES (1, 'a')"))
+        .await?;
+    collect_until(&mut rx, Duration::from_secs(10), |e| {
+        e.iter().any(|x| has_id(x, 1))
+    })
+    .await;
+    handle.stop();
+    handle.join().await.ok();
+
+    // Transactions after the checkpoint, then their binlogs purged.
+    for id in 2..5 {
+        conn.query_drop(format!("INSERT INTO {DB}.orders VALUES ({id}, 'b')"))
+            .await?;
+    }
+    conn.query_drop("FLUSH BINARY LOGS").await?;
+    let current: String = conn
+        .query_first::<mysql_async::Row, _>("SHOW BINARY LOG STATUS")
+        .await?
+        .and_then(|mut r| r.take::<String, usize>(0))
+        .expect("current binlog");
+    conn.query_drop(format!("PURGE BINARY LOGS TO '{current}'"))
+        .await?;
+    drop(conn);
+
+    let src = make_mysql_source(
+        "purged",
+        &mysql_cdc_dsn(port, DB),
+        DB,
+        Arc::clone(&backend),
+    )
+    .await;
+    let (tx, _rx) = mpsc::channel(64);
+    let e = timeout(Duration::from_secs(90), src.run(tx, ckpt).await.join())
+        .await
+        .expect("stops")
+        .expect_err("purged binlogs stop the source");
+    let (reason, class, actions) = stopped_incident(&e);
+    assert_eq!(
+        reason,
+        deltaforge_core::incident::ReasonCode::MysqlGtidPositionUnavailable
+    );
+    assert_eq!(class, "purged");
+    assert!(
+        actions.contains(&deltaforge_core::incident::ActionCode::Resnapshot)
+    );
     Ok(())
 }

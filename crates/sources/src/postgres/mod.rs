@@ -17,11 +17,16 @@ use tracing::{debug, error, info, warn};
 
 use checkpoints::{CheckpointStore, CheckpointStoreExt};
 use common::{AllowList, RetryPolicy, pause_until_resumed};
+use deltaforge_core::incident::{
+    ActionCode, CauseCode, Component, EvidenceKey as K, IncidentDraft,
+    ReasonCode, Retryability, SafetyState,
+};
 use deltaforge_core::{
     CheckpointOrder, Source, SourceError, SourceHandle, SourceItem,
     SourceResult,
 };
 use storage::BackendCheckpointStore;
+use storage::adapters::incidents::IncidentStore;
 
 use crate::snapshot_generation::PersistedLineage;
 use postgres_snapshot::IdentitySpec;
@@ -151,6 +156,8 @@ pub(crate) struct RunCtx {
     /// Never the read position, which keepalives and in-transaction messages
     /// move: a transaction cut off mid-stream must be decoded again in full.
     pub resume_lsn: Lsn,
+    /// Resolves this source's schema-drift incidents as tables are accepted.
+    pub drift_resolver: crate::incident_drafts::DriftResolver,
     /// Events handed to the coordinator for the open transaction.
     pub open_tx_events: u64,
     pub current_tx_id: Option<u32>,
@@ -347,6 +354,7 @@ impl PostgresSource {
         cancel: CancellationToken,
         paused: Arc<AtomicBool>,
         pause_notify: Arc<Notify>,
+        ready: deltaforge_core::SourceReady,
     ) -> SourceResult<()> {
         // Verify the physical lineage (cluster system_identifier + database OID)
         // and establish the schema-registry scope BEFORE any registry access:
@@ -435,46 +443,20 @@ impl PostgresSource {
                 }
             }
         } else {
-            // Resuming from a checkpoint: verify the replication slot still exists
-            // before trusting the saved LSN. A dropped slot means the WAL position
-            // is permanently lost - halt rather than silently reconnecting.
-            match check_position_reachability(self.dsn.expose(), &self.slot)
-                .await
-            {
-                Ok(PositionReachability::Lost { reason }) => {
-                    error!(
-                        source_id = %self.id,
-                        slot = %self.slot,
-                        %reason,
-                        "replication slot lost - checkpoint position is unreachable, halting"
-                    );
-                    return Err(SourceError::Checkpoint {
-                        details: format!(
-                            "replication slot '{}' is gone: {reason}. \
-                             Re-snapshot required.",
-                            self.slot
-                        )
-                        .into(),
-                    });
-                }
-                Ok(PositionReachability::Unknown { reason }) => {
-                    warn!(
-                        source_id = %self.id,
-                        slot = %self.slot,
-                        %reason,
-                        "could not verify slot reachability, resuming anyway"
-                    );
-                }
-                Ok(PositionReachability::Reachable) => {}
-                Err(e) => {
-                    warn!(
-                        source_id = %self.id,
-                        slot = %self.slot,
-                        error = %e,
-                        "slot reachability check failed, resuming anyway"
-                    );
-                }
-            }
+            // Resuming from a checkpoint: the saved LSN is trusted only once
+            // the slot is verified to hold it. Fails closed: replication never
+            // opens while that is unknown; a plausibly transient cause is
+            // retried (cancellably, for a bounded time), anything else stops.
+            verify_resume_position(
+                self.dsn.expose(),
+                &self.id,
+                &self.slot,
+                &config.start_lsn.to_string(),
+                &cancel,
+                REACHABILITY_RETRY_WINDOW,
+                &IncidentStore::new(Arc::clone(&self.backend), &self.pipeline),
+            )
+            .await?;
             config.start_lsn
         };
 
@@ -647,6 +629,11 @@ impl PostgresSource {
             relation_map: HashMap::new(),
             last_lsn: start_lsn,
             resume_lsn: start_lsn,
+            drift_resolver: crate::incident_drafts::DriftResolver::new(
+                Arc::clone(&self.backend),
+                &self.pipeline,
+                &self.id,
+            ),
             open_tx_events: 0,
             current_tx_id: None,
             current_tx_commit_time: None,
@@ -685,6 +672,9 @@ impl PostgresSource {
             None => None,
         };
 
+        // Startup checks passed and the stream is open on the verified
+        // server: the source half of the verified-running barrier.
+        ready.mark();
         info!("entering replication loop");
         // Durable delivery frontier (separate from `ctx.last_lsn`, the read position):
         // the acknowledged LSN reported to PostgreSQL as flushed, sourced only from the
@@ -794,8 +784,13 @@ impl PostgresSource {
                         &ctx.schema,
                         &self.on_schema_drift,
                         &drift,
+                        &self.id,
                     )
                     .await?;
+                    // Adapted: the table's changed schema is accepted.
+                    ctx.drift_resolver
+                        .accepted(&format!("{}.{}", drift.schema, drift.table))
+                        .await;
                 }
                 Err(LoopControl::Reconnect) => {
                     let delay = ctx.retry.next_backoff();
@@ -1153,6 +1148,8 @@ impl Source for PostgresSource {
         let cancel_for_task = cancel.clone();
         let paused_for_task = paused.clone();
         let pause_notify_for_task = pause_notify.clone();
+        let ready = deltaforge_core::SourceReady::new();
+        let ready_for_task = ready.clone();
 
         let join = tokio::spawn(async move {
             let res = this
@@ -1162,6 +1159,7 @@ impl Source for PostgresSource {
                     cancel_for_task,
                     paused_for_task,
                     pause_notify_for_task,
+                    ready_for_task,
                 )
                 .await;
             if let Err(e) = &res {
@@ -1175,6 +1173,7 @@ impl Source for PostgresSource {
             paused,
             pause_notify,
             join,
+            ready,
         }
     }
 
@@ -1349,26 +1348,298 @@ async fn refuse_server_change(
     }
 }
 
+/// How long a plausibly transient failure to verify the resume position is
+/// retried before the source stops.
+const REACHABILITY_RETRY_WINDOW: Duration = Duration::from_secs(120);
+
+/// Verify the slot still holds the checkpoint position before replication
+/// opens. A confirmed loss or an error answer from the server stops at once;
+/// an unknown answer is retried with backoff while it is plausibly transient.
+/// While it retries, the condition is an open auto-retry
+/// `pg_continuity_unproven` incident (recorded in `incidents`); when the
+/// window ends the source stops on the same incident, which then needs an
+/// operator. Every stop is operator action; cancellation stops without one.
+/// Nothing is streamed.
+async fn verify_resume_position(
+    dsn: &str,
+    source_id: &str,
+    slot: &str,
+    checkpoint: &str,
+    cancel: &CancellationToken,
+    window: Duration,
+    incidents: &IncidentStore,
+) -> SourceResult<()> {
+    let deadline = Instant::now() + window;
+    let mut delay = Duration::from_secs(1);
+    let mut retrying = None;
+    loop {
+        let outcome = check_position_reachability(dsn, slot)
+            .await
+            .unwrap_or_else(|e| PositionReachability::Unknown {
+                transient: false,
+                reason: format!("{e:#}"),
+            });
+        match outcome {
+            PositionReachability::Reachable => return Ok(()),
+            PositionReachability::Lost { class, reason } => {
+                error!(
+                    source_id, slot, %reason,
+                    "resume position unreachable through the slot; halting"
+                );
+                return Err(continuity_unproven(
+                    source_id,
+                    slot,
+                    checkpoint,
+                    class.as_str(),
+                    SourceError::Checkpoint {
+                        details: format!(
+                            "replication slot '{slot}' cannot resume from \
+                             {checkpoint}: {reason}. Re-snapshot required."
+                        )
+                        .into(),
+                    },
+                ));
+            }
+            PositionReachability::Unknown { transient, reason } => {
+                if transient && Instant::now() + delay < deadline {
+                    if retrying.is_none() {
+                        retrying = crate::incident_drafts::record_retrying(
+                            incidents,
+                            &continuity_unproven_draft(
+                                source_id,
+                                slot,
+                                checkpoint,
+                                "unknown_unreachable",
+                                Retryability::AutoRetry,
+                                CauseCode::SourceConnect,
+                            ),
+                        )
+                        .await;
+                    }
+                    warn!(
+                        source_id, slot, %reason,
+                        retry_in_secs = delay.as_secs(),
+                        "cannot verify the resume position yet; retrying \
+                         (replication stays closed)"
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(delay) => {}
+                        _ = cancel.cancelled() => {
+                            crate::incident_drafts::cancel_retrying(
+                                incidents,
+                                retrying,
+                            )
+                            .await;
+                            return Err(SourceError::Cancelled);
+                        }
+                    }
+                    delay = (delay * 2).min(Duration::from_secs(15));
+                    continue;
+                }
+                error!(
+                    source_id, slot, %reason, transient,
+                    "cannot verify the resume position; halting before \
+                     replication opens"
+                );
+                let class = if transient {
+                    "unknown_unreachable"
+                } else {
+                    "unknown_query_failed"
+                };
+                let details = format!(
+                    "cannot verify that replication slot '{slot}' holds the \
+                     resume position {checkpoint}: {reason}"
+                );
+                let cause = if transient {
+                    SourceError::Connect {
+                        details: details.into(),
+                    }
+                } else {
+                    SourceError::Checkpoint {
+                        details: details.into(),
+                    }
+                };
+                return Err(continuity_unproven(
+                    source_id, slot, checkpoint, class, cause,
+                ));
+            }
+        }
+    }
+}
+
+/// The `pg_continuity_unproven` incident around `cause`: the source stops,
+/// so it needs an operator.
+fn continuity_unproven(
+    source_id: &str,
+    slot: &str,
+    checkpoint: &str,
+    class: &str,
+    cause: SourceError,
+) -> SourceError {
+    let draft = continuity_unproven_draft(
+        source_id,
+        slot,
+        checkpoint,
+        class,
+        Retryability::OperatorAction,
+        cause.cause_code(),
+    );
+    SourceError::incident(draft, cause)
+}
+
+/// The `pg_continuity_unproven` draft. Its identity is the slot, checkpoint
+/// and class, never the retryability, so an automatic retry that exhausts
+/// its window stays one incident.
+fn continuity_unproven_draft(
+    source_id: &str,
+    slot: &str,
+    checkpoint: &str,
+    class: &str,
+    retryability: Retryability,
+    cause_code: CauseCode,
+) -> IncidentDraft {
+    let lost = !class.starts_with("unknown_");
+    let actions: &[ActionCode] = if lost {
+        &[ActionCode::Resnapshot, ActionCode::UseNewSourceId]
+    } else {
+        &[ActionCode::VerifyEndpoint, ActionCode::InspectLogs]
+    };
+    IncidentDraft::new(
+        ReasonCode::PgContinuityUnproven,
+        Component::Source {
+            id: source_id.to_string(),
+        },
+        retryability,
+        SafetyState::HaltedSafe,
+        cause_code,
+    )
+    .discriminate("slot", slot)
+    .discriminate("checkpoint", checkpoint)
+    .discriminate("class", class)
+    .with_evidence(|e| {
+        e.text(K::SourceId, source_id)
+            .text(K::Slot, slot)
+            .text(K::CheckpointPosition, checkpoint)
+            .text(K::ReasonClass, class);
+    })
+    .with_actions(actions)
+}
+
+/// The PostgreSQL identity a refusal compares: cluster `system_identifier`
+/// and, when known, the database OID.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PgEndpoint {
+    system_identifier: Option<u64>,
+    database_oid: Option<u64>,
+}
+
+trait AsPgEndpoint: std::fmt::Debug {
+    fn endpoint(&self) -> PgEndpoint;
+}
+
+impl AsPgEndpoint for LineageDescriptor {
+    fn endpoint(&self) -> PgEndpoint {
+        match self {
+            LineageDescriptor::Postgres {
+                system_identifier,
+                database_oid,
+            } => PgEndpoint {
+                system_identifier: Some(*system_identifier),
+                database_oid: Some(*database_oid),
+            },
+            _ => PgEndpoint::default(),
+        }
+    }
+}
+
+impl AsPgEndpoint for ServerIdentity {
+    fn endpoint(&self) -> PgEndpoint {
+        match self {
+            ServerIdentity::Postgres(id) => PgEndpoint {
+                system_identifier: Some(id.system_identifier as u64),
+                database_oid: None,
+            },
+            _ => PgEndpoint::default(),
+        }
+    }
+}
+
+impl PgEndpoint {
+    fn canonical(&self) -> String {
+        let show =
+            |v: Option<u64>| v.map_or("-".to_string(), |v| v.to_string());
+        format!(
+            "{}:{}",
+            show(self.system_identifier),
+            show(self.database_oid)
+        )
+    }
+}
+
+/// The `pg_different_cluster` incident: the source reached another cluster
+/// (or a replaced database) and was refused before anything was recorded,
+/// snapshotted or streamed.
+fn different_cluster_draft(
+    source_id: &str,
+    expected: PgEndpoint,
+    live: PgEndpoint,
+) -> deltaforge_core::IncidentDraft {
+    IncidentDraft::new(
+        ReasonCode::PgDifferentCluster,
+        Component::Source {
+            id: source_id.to_string(),
+        },
+        Retryability::OperatorAction,
+        SafetyState::HaltedSafe,
+        CauseCode::SourceLineage,
+    )
+    .discriminate("expected", expected.canonical())
+    .discriminate("live", live.canonical())
+    .with_evidence(|e| {
+        e.text(K::SourceId, source_id);
+        if let Some(v) = expected.system_identifier {
+            e.text(K::ExpectedSystemIdentifier, &v.to_string());
+        }
+        if let Some(v) = live.system_identifier {
+            e.text(K::LiveSystemIdentifier, &v.to_string());
+        }
+        if let Some(v) = expected.database_oid {
+            e.text(K::ExpectedDatabaseOid, &v.to_string());
+        }
+        if let Some(v) = live.database_oid {
+            e.text(K::LiveDatabaseOid, &v.to_string());
+        }
+    })
+    .with_actions(&[ActionCode::VerifyEndpoint, ActionCode::UseNewSourceId])
+}
+
 fn server_changed(
     source_id: &str,
-    expected: &impl std::fmt::Debug,
-    live: &impl std::fmt::Debug,
+    expected: &impl AsPgEndpoint,
+    live: &impl AsPgEndpoint,
 ) -> SourceError {
     error!(
         source_id, expected = ?expected, live = ?live,
         "connected to a different PostgreSQL server; refusing to resume"
     );
-    SourceError::Lineage {
-        details: format!(
-            "source '{source_id}' is bound to PostgreSQL {expected:?} but is \
-             connected to {live:?}. Its checkpoint and replication slot \
-             position belong to the first server's WAL history and are never \
-             resumed on another cluster; nothing was streamed, snapshotted or \
-             recorded. To capture this server, configure a new source id (it \
-             starts with a snapshot)."
-        )
-        .into(),
-    }
+    SourceError::incident(
+        different_cluster_draft(
+            source_id,
+            expected.endpoint(),
+            live.endpoint(),
+        ),
+        SourceError::Lineage {
+            details: format!(
+                "source '{source_id}' is bound to PostgreSQL {expected:?} but \
+                 is connected to {live:?}. Its checkpoint and replication \
+                 slot position belong to the first server's WAL history and \
+                 are never resumed on another cluster; nothing was streamed, \
+                 snapshotted or recorded. To capture this server, configure a \
+                 new source id (it starts with a snapshot)."
+            )
+            .into(),
+        },
+    )
 }
 
 /// Check a lineage just verified against the live server against the published
@@ -1576,6 +1847,7 @@ pub(crate) async fn apply_schema_drift(
     loader: &PostgresSchemaLoader,
     policy: &OnSchemaDrift,
     drift: &postgres_errors::SchemaDrift,
+    source_id: &str,
 ) -> SourceResult<()> {
     match policy {
         OnSchemaDrift::Adapt => {
@@ -1600,16 +1872,21 @@ pub(crate) async fn apply_schema_drift(
                 schema = %drift.schema, table = %drift.table, change = %drift.detail,
                 "schema drift and on_schema_drift=halt; failing closed"
             );
-            Err(SourceError::Schema {
-                details: format!(
-                    "schema drift on table \"{}.{}\" ({}) and on_schema_drift=halt. \
-                     No events under the changed schema were emitted and the \
-                     checkpoint was not advanced. Review the schema change; to \
-                     continue past it, restart with on_schema_drift=adapt.",
-                    drift.schema, drift.table, drift.detail
-                )
-                .into(),
-            })
+            Err(crate::incident_drafts::schema_drift_blocked(
+                source_id,
+                &format!("{}.{}", drift.schema, drift.table),
+                &drift.detail,
+                SourceError::Schema {
+                    details: format!(
+                        "schema drift on table \"{}.{}\" ({}) and on_schema_drift=halt. \
+                         No events under the changed schema were emitted and the \
+                         checkpoint was not advanced. Review the schema change; to \
+                         continue past it, restart with on_schema_drift=adapt.",
+                        drift.schema, drift.table, drift.detail
+                    )
+                    .into(),
+                },
+            ))
         }
     }
 }
@@ -1881,15 +2158,31 @@ mod schema_drift_policy_tests {
     async fn halt_fails_closed_with_typed_actionable_error() {
         // DSN is unused on the Halt path (no reload).
         let l = loader("host=127.0.0.1 port=1 dbname=x").await;
-        let err = apply_schema_drift(&l, &OnSchemaDrift::Halt, &drift())
+        let err = apply_schema_drift(&l, &OnSchemaDrift::Halt, &drift(), "src")
             .await
             .expect_err("halt must fail closed");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("public.orders")
-                && msg.contains("on_schema_drift=adapt"),
-            "error names the table and remediation: {msg}"
+        // A schema_drift_blocked incident: evidence names the table, the
+        // recommendations include restarting with adapt; the typed cause keeps
+        // the detailed message for the logs.
+        use deltaforge_core::incident::{
+            ActionCode, EvidenceKey, EvidenceValue, ReasonCode,
+        };
+        let draft = err.draft().expect("an incident");
+        assert_eq!(draft.reason_code, ReasonCode::SchemaDriftBlocked);
+        assert_eq!(
+            draft.evidence.get(EvidenceKey::Table),
+            Some(&EvidenceValue::Text {
+                value: "public.orders".into()
+            })
         );
+        assert!(draft.actions.contains(&ActionCode::RestartWithAdapt));
+        assert!(draft.resolve_scope.is_some(), "resolved per table");
+        let deltaforge_core::SourceError::Schema { details } = err.root()
+        else {
+            panic!("typed cause: {err:?}");
+        };
+        assert!(details.contains("on_schema_drift=adapt"));
+        assert!(err.to_string().contains("public.orders"));
     }
 
     #[tokio::test]
@@ -1898,7 +2191,8 @@ mod schema_drift_policy_tests {
         // must NOT continue - it fails closed instead of proceeding with an
         // unverified schema.
         let l = loader("host=127.0.0.1 port=1 dbname=x").await;
-        let r = apply_schema_drift(&l, &OnSchemaDrift::Adapt, &drift()).await;
+        let r = apply_schema_drift(&l, &OnSchemaDrift::Adapt, &drift(), "src")
+            .await;
         assert!(
             r.is_err(),
             "adapt must fail closed when the schema reload fails"
@@ -2176,6 +2470,191 @@ mod identity_fail_closed_tests {
         );
     }
 
+    /// A `pg_different_cluster` incident around a typed lineage error, with
+    /// bounded evidence and actionable recommendations.
+    fn is_cluster_refusal(r: &SourceResult<()>) -> bool {
+        use deltaforge_core::incident::{ActionCode, ReasonCode, SafetyState};
+        let Err(e) = r else { return false };
+        let Some(d) = e.draft() else { return false };
+        matches!(e.root(), SourceError::Lineage { .. })
+            && d.reason_code == ReasonCode::PgDifferentCluster
+            && d.safety_state == SafetyState::HaltedSafe
+            && d.actions.contains(&ActionCode::UseNewSourceId)
+            && !d.evidence.is_empty()
+            && d.evidence.len()
+                <= deltaforge_core::incident::MAX_EVIDENCE_ENTRIES
+    }
+
+    fn continuity_class(r: &SourceResult<()>) -> (String, String) {
+        use deltaforge_core::incident::{EvidenceKey, EvidenceValue};
+        let d = r.as_ref().unwrap_err().draft().expect("an incident");
+        assert_eq!(
+            d.reason_code,
+            deltaforge_core::incident::ReasonCode::PgContinuityUnproven
+        );
+        assert_eq!(
+            d.safety_state,
+            deltaforge_core::incident::SafetyState::HaltedSafe
+        );
+        let class = match d.evidence.get(EvidenceKey::ReasonClass) {
+            Some(EvidenceValue::Text { value }) => value.clone(),
+            other => panic!("{other:?}"),
+        };
+        (class, d.retryability.as_str().to_string())
+    }
+
+    fn dead_dsn() -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        format!("host=127.0.0.1 port={port} user=u dbname=d")
+    }
+
+    fn memory_incidents() -> IncidentStore {
+        IncidentStore::new(Arc::new(MemoryStorageBackend::new()), "p")
+    }
+
+    /// An unreachable server (a plausibly transient cause) is retried until
+    /// the window ends, then stops before replication opens. While it
+    /// retries the condition is an open auto-retry incident; the stop turns
+    /// that same incident into operator action (the injected window stands
+    /// in for the two-minute budget).
+    #[tokio::test]
+    async fn an_exhausted_retry_turns_the_same_incident_into_operator_action() {
+        let incidents = memory_incidents();
+        let dsn = dead_dsn();
+        let started = Instant::now();
+        let task = {
+            let incidents = incidents.clone();
+            tokio::spawn(async move {
+                verify_resume_position(
+                    &dsn,
+                    "src",
+                    "slot",
+                    "0/16B3748",
+                    &CancellationToken::new(),
+                    Duration::from_secs(3),
+                    &incidents,
+                )
+                .await
+            })
+        };
+        let retrying = loop {
+            if let Some(rec) = incidents.list().await.unwrap().pop() {
+                break rec;
+            }
+            assert!(!task.is_finished(), "recorded while it retries");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(!task.is_finished());
+        assert_eq!(retrying.retryability.as_str(), "auto_retry");
+        assert_eq!(retrying.safety_state, SafetyState::HaltedSafe);
+
+        let r = task.await.unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(1), "it retried");
+        assert_eq!(
+            continuity_class(&r),
+            ("unknown_unreachable".into(), "operator_action".into())
+        );
+        // The supervisor records the stop bound to the recovery epoch: the
+        // same incident, now operator action.
+        let stopped = storage::adapters::incidents::bind_epoch(
+            r.unwrap_err().draft().unwrap().clone(),
+            incidents.recovery_epoch().await.unwrap(),
+        );
+        assert_eq!(stopped.incident_id("p"), retrying.incident_id);
+        incidents.raise(&stopped, 1).await.unwrap();
+        let all = incidents.list().await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].incident_id, retrying.incident_id);
+        assert_eq!(all[0].retryability.as_str(), "operator_action");
+        assert_eq!(all[0].safety_state, SafetyState::HaltedSafe);
+    }
+
+    /// Cancellation during the retry window stops promptly, without an
+    /// operator incident: the auto-retry incident is withdrawn as
+    /// `operation_cancelled`, so nothing blocks a later start.
+    #[tokio::test]
+    async fn cancellation_during_the_retry_stops_without_an_operator_incident()
+    {
+        let incidents = memory_incidents();
+        let cancel = CancellationToken::new();
+        let dsn = dead_dsn();
+        let task = {
+            let (incidents, cancel) = (incidents.clone(), cancel.clone());
+            tokio::spawn(async move {
+                verify_resume_position(
+                    &dsn,
+                    "src",
+                    "slot",
+                    "0/16B3748",
+                    &cancel,
+                    Duration::from_secs(120),
+                    &incidents,
+                )
+                .await
+            })
+        };
+        while incidents.list().await.unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        cancel.cancel();
+        let r = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("prompt")
+            .unwrap();
+        assert!(matches!(r, Err(SourceError::Cancelled)), "{r:?}");
+        crate::incident_drafts::test_util::assert_cancelled_withdrawn(
+            &incidents,
+        )
+        .await;
+    }
+
+    /// A server that answers with an error (not transient) stops at once.
+    #[tokio::test]
+    async fn a_server_error_answer_halts_without_retrying() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut sock, _)) = l.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                // ErrorResponse: FATAL 28000 (invalid authorization).
+                let mut body = Vec::new();
+                for (k, v) in
+                    [(b'S', "FATAL"), (b'C', "28000"), (b'M', "denied")]
+                {
+                    body.push(k);
+                    body.extend_from_slice(v.as_bytes());
+                    body.push(0);
+                }
+                body.push(0);
+                let mut msg = vec![b'E'];
+                msg.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+                msg.extend_from_slice(&body);
+                let _ = sock.write_all(&msg).await;
+            }
+        });
+        let dsn = format!("host=127.0.0.1 port={port} user=u dbname=d");
+        let started = Instant::now();
+        let r = verify_resume_position(
+            &dsn,
+            "src",
+            "slot",
+            "0/16B3748",
+            &CancellationToken::new(),
+            Duration::from_secs(30),
+            &memory_incidents(),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(5), "no retry");
+        assert_eq!(
+            continuity_class(&r),
+            ("unknown_query_failed".into(), "operator_action".into())
+        );
+    }
+
     #[tokio::test]
     async fn identity_check_fails_closed_when_store_unavailable() {
         // Startup: the durable identity store is down, so the identity comparison
@@ -2204,7 +2683,7 @@ mod identity_fail_closed_tests {
             verify_identity_before_connect(&pg_identity(222), &store, "src1")
                 .await;
         assert!(
-            matches!(result, Err(SourceError::Lineage { .. })),
+            is_cluster_refusal(&result),
             "another cluster must be refused: {result:?}"
         );
         assert!(
@@ -2264,10 +2743,7 @@ mod identity_fail_closed_tests {
             .expect("the same server");
         for other in [live(2, 5), live(1, 6)] {
             let r = refuse_server_change(&backend, "acme", "src", &other).await;
-            assert!(
-                matches!(r, Err(SourceError::Lineage { .. })),
-                "{other:?} must be refused: {r:?}"
-            );
+            assert!(is_cluster_refusal(&r), "{other:?} must be refused: {r:?}");
         }
 
         // No lineage record, only a recorded identity.
@@ -2278,7 +2754,7 @@ mod identity_fail_closed_tests {
             .unwrap();
         let r =
             refuse_server_change(&backend, "acme", "src", &live(2, 5)).await;
-        assert!(matches!(r, Err(SourceError::Lineage { .. })), "{r:?}");
+        assert!(is_cluster_refusal(&r), "{r:?}");
         refuse_server_change(&backend, "acme", "src", &live(1, 5))
             .await
             .expect("the recorded identity");

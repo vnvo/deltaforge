@@ -1190,7 +1190,10 @@ async fn failover_must_prove_the_exact_resume_set_not_the_checkpoint() {
     insert(g, db, 7000, "g").await;
     let res = stopped(r.handle).await;
     assert!(
-        matches!(res, Err(SourceError::Checkpoint { .. })),
+        matches!(
+            res.as_ref().map_err(|e| e.root()),
+            Err(SourceError::Checkpoint { .. })
+        ),
         "the unproven resume set stops the failover: {res:?}"
     );
     let rows = rows_until(&mut r.rx, None, Duration::from_millis(200)).await;
@@ -1356,7 +1359,7 @@ async fn a_failover_record_persisted_before_lineage_publication_is_resumed_halt(
         insert(t, db, 9100 + attempt, "t").await;
         let res = stopped(r.handle).await;
         assert!(
-            matches!(&res, Err(SourceError::Schema { details }) if details.contains("on_schema_drift=halt")),
+            matches!(res.as_ref().map_err(|e| e.root()), Err(SourceError::Schema { details }) if details.contains("on_schema_drift=halt")),
             "restart {attempt} halts again: {res:?}"
         );
         let rows =

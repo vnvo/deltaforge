@@ -18,8 +18,8 @@ use std::sync::Arc;
 use arrow_schema::Schema;
 use async_trait::async_trait;
 use deltaforge_core::{
-    BatchResult, CheckpointComparator, Event, Sink, SinkBatchContext,
-    SinkError, SinkResult,
+    BatchResult, BoundaryOutcome, CheckpointComparator, Event, Sink,
+    SinkBatchContext, SinkError, SinkResult,
 };
 
 use super::batch_upload::TableObject;
@@ -223,6 +223,16 @@ impl Sink for DurableS3Sink {
         &self.inner.id
     }
 
+    /// Settle an ambiguous HEAD publish by rereading exactly that HEAD: the
+    /// incident names the HEAD object, the generation the CAS was conditioned
+    /// on and the proposed entry; anything else is not decided here.
+    async fn settle_uncertain(
+        &self,
+        evidence: &deltaforge_core::incident::Evidence,
+    ) -> BoundaryOutcome {
+        settle_on(&self.inner.writer, evidence).await
+    }
+
     fn required(&self) -> bool {
         self.inner.required
     }
@@ -290,17 +300,77 @@ impl Sink for DurableS3Sink {
             .publish(watermark, objects, events.len() as u64)
             .await
             .map_err(|e| {
-                if e.is_fatal() {
-                    fatal(format!("durable publish failed: {e}"))
-                } else {
-                    SinkError::Backpressure {
-                        details: format!("durable publish retryable: {e}")
-                            .into(),
-                    }
-                }
+                publish_error(&self.inner.id, ctx.checkpoint.as_bytes(), e)
             })?;
 
         Ok(BatchResult::ok())
+    }
+}
+
+/// The sink error for a failed publish: an ambiguous HEAD CAS is a
+/// `sink_ack_uncertain` incident naming exactly that write (HEAD object,
+/// conditioned generation, proposed entry); other fatal errors stop the
+/// pipeline; the rest are retried by replay.
+pub(super) fn publish_error(
+    sink_id: &str,
+    checkpoint: &[u8],
+    e: super::head::HeadError,
+) -> SinkError {
+    if let super::head::HeadError::Ambiguous(_, write) = &e {
+        crate::incident::ack_uncertain(
+            sink_id,
+            checkpoint,
+            1,
+            crate::incident::ConditionalWrite {
+                object_key: &write.head_key,
+                expected_generation: &write.expected_generation(),
+                content: &write.entry_hash,
+            },
+            fatal(format!("durable publish failed: {e}")),
+        )
+    } else if e.is_fatal() {
+        fatal(format!("durable publish failed: {e}"))
+    } else {
+        SinkError::Backpressure {
+            details: format!("durable publish retryable: {e}").into(),
+        }
+    }
+}
+
+/// Settle an ambiguous HEAD publish by rereading exactly that HEAD: the
+/// incident's evidence names the HEAD object, the generation the CAS was
+/// conditioned on and the proposed entry. Anything else (another sink's
+/// write, a Kafka transaction, unreadable evidence) is not decided here.
+pub(super) async fn settle_on<S: ConditionalStore + ?Sized>(
+    writer: &DurableWriter<S>,
+    evidence: &deltaforge_core::incident::Evidence,
+) -> BoundaryOutcome {
+    use deltaforge_core::incident::EvidenceKey as K;
+    let (Some(head_key), Some(generation), Some(content)) = (
+        evidence.text_of(K::ObjectKey),
+        evidence.text_of(K::ExpectedGeneration),
+        evidence.text_of(K::ContentIdentity),
+    ) else {
+        return BoundaryOutcome::Unknown;
+    };
+    let mut parts = generation.splitn(3, ':');
+    let (Some(Ok(epoch)), Some(Ok(seq)), Some(entry)) = (
+        parts.next().map(str::parse::<u64>),
+        parts.next().map(str::parse::<u64>),
+        parts.next(),
+    ) else {
+        return BoundaryOutcome::Unknown;
+    };
+    let expected_entry = (entry != super::head::GENESIS_ENTRY).then_some(entry);
+    match writer
+        .settle_publish(head_key, epoch, seq, expected_entry, content)
+        .await
+    {
+        Some(super::head::PublishOutcome::Committed) => {
+            BoundaryOutcome::Committed
+        }
+        Some(super::head::PublishOutcome::Absent) => BoundaryOutcome::Absent,
+        None => BoundaryOutcome::Unknown,
     }
 }
 
