@@ -71,8 +71,12 @@ fn cleanup_ministack() {
 async fn ministack() -> &'static MinistackInfra {
     MINISTACK
         .get_or_init(|| async {
+            // Pinned (tag and digest) so the canary is reproducible.
             let container =
-                GenericImage::new("ministackorg/ministack", "latest")
+                GenericImage::new(
+                    "ministackorg/ministack",
+                    "1.4.9@sha256:9acaad157381441088506b2c2db11e790f84f6b6bd4baa46cf1acebb541c76cd",
+                )
                     .with_wait_for(WaitFor::seconds(3))
                     .with_exposed_port(MS_PORT.tcp())
                     .start()
