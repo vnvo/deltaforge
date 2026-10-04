@@ -137,7 +137,12 @@ async fn slot_active_pid(
 ) -> Result<Option<i32>> {
     let row = admin
         .query_opt(
-            "SELECT active_pid FROM pg_replication_slots WHERE slot_name = $1",
+            // Only a walsender counts: while `pg_create_logical_replication_slot`
+            // runs during snapshot anchoring, the slot is held by that ordinary
+            // backend, whose pid is not the stream's.
+            "SELECT s.active_pid FROM pg_replication_slots s \
+             JOIN pg_stat_activity a ON a.pid = s.active_pid \
+             WHERE s.slot_name = $1 AND a.backend_type = 'walsender'",
             &[&slot],
         )
         .await?;
