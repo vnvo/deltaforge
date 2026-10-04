@@ -451,17 +451,18 @@ impl MySqlSchemaLoader {
             return Ok(results);
         }
 
+        // Exactly the tables CDC captures (see `table_patterns`).
         for pattern in patterns {
-            let (db_pattern, table_pattern) = parse_pattern(pattern);
-
-            let query = build_pattern_query(&db_pattern, &table_pattern);
+            let query = build_pattern_query(pattern);
             let rows: Vec<Row> =
                 conn.query(&query).await.map_err(query_error)?;
 
             for mut row in rows {
                 let db: String = row.take("TABLE_SCHEMA").unwrap();
                 let table: String = row.take("TABLE_NAME").unwrap();
-                if !results.contains(&(db.clone(), table.clone())) {
+                if crate::table_patterns::captures(pattern, &db, &table)
+                    && !results.contains(&(db.clone(), table.clone()))
+                {
                     results.push((db, table));
                 }
             }
@@ -825,48 +826,23 @@ impl MySqlSchemaLoader {
     }
 }
 
-/// Parse a pattern into (db_pattern, table_pattern).
-fn parse_pattern(pattern: &str) -> (String, String) {
-    if let Some((db, table)) = pattern.split_once('.') {
-        (db.to_string(), table.to_string())
-    } else {
-        // Just table name, match any database
-        ("%".to_string(), pattern.to_string())
-    }
-}
-
-/// Build SQL query for pattern matching.
-fn build_pattern_query(db_pattern: &str, table_pattern: &str) -> String {
-    let db_clause = if db_pattern == "*" || db_pattern == "%" {
-        "TABLE_SCHEMA NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')".to_string()
-    } else if db_pattern.contains('%') || db_pattern.contains('_') {
-        format!("TABLE_SCHEMA LIKE '{}'", escape_like(db_pattern))
-    } else {
-        format!("TABLE_SCHEMA = '{}'", escape_sql(db_pattern))
+/// A catalog query for a superset of the tables `pattern` captures (system
+/// databases excluded unless named).
+fn build_pattern_query(pattern: &str) -> String {
+    use crate::table_patterns::{split, superset_clause};
+    let (db, table) = split(pattern);
+    let db_clause = match db {
+        None | Some("*") | Some("%") => "TABLE_SCHEMA NOT IN ('mysql', \
+             'information_schema', 'performance_schema', 'sys')"
+            .to_string(),
+        Some(db) => superset_clause("TABLE_SCHEMA", db),
     };
-
-    let table_clause = if table_pattern == "*" || table_pattern == "%" {
-        "1=1".to_string()
-    } else if table_pattern.contains('%') || table_pattern.contains('_') {
-        format!("TABLE_NAME LIKE '{}'", escape_like(table_pattern))
-    } else {
-        format!("TABLE_NAME = '{}'", escape_sql(table_pattern))
-    };
-
     format!(
         "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES \
          WHERE TABLE_TYPE = 'BASE TABLE' AND {} AND {}",
-        db_clause, table_clause
+        db_clause,
+        superset_clause("TABLE_NAME", table)
     )
-}
-
-fn escape_sql(s: &str) -> String {
-    s.replace('\'', "''")
-}
-
-fn escape_like(s: &str) -> String {
-    // For LIKE patterns, we don't escape % and _ as they're wildcards
-    s.replace('\'', "''")
 }
 
 fn conn_error(e: mysql_async::Error) -> SourceError {
@@ -1200,27 +1176,25 @@ mod tests {
         }
     }
 
+    /// Catalog queries narrow like CDC filtering: a database-less pattern
+    /// spans every database, a trailing `*` or `%` is a prefix, and `_` / `%`
+    /// inside names are literal.
     #[test]
-    fn test_parse_pattern() {
-        assert_eq!(parse_pattern("db.table"), ("db".into(), "table".into()));
-        assert_eq!(parse_pattern("db.*"), ("db".into(), "*".into()));
-        assert_eq!(parse_pattern("%.audit"), ("%".into(), "audit".into()));
-        assert_eq!(parse_pattern("table"), ("%".into(), "table".into()));
-    }
-
-    #[test]
-    fn test_build_pattern_query() {
-        let q = build_pattern_query("orders", "items");
+    fn pattern_queries_follow_cdc_filtering() {
+        let q = build_pattern_query("orders.items");
         assert!(q.contains("TABLE_SCHEMA = 'orders'"));
         assert!(q.contains("TABLE_NAME = 'items'"));
-
-        let q = build_pattern_query("orders", "*");
-        assert!(q.contains("TABLE_SCHEMA = 'orders'"));
-        assert!(q.contains("1=1"));
-
-        let q = build_pattern_query("%", "audit%");
-        assert!(q.contains("TABLE_SCHEMA NOT IN"));
-        assert!(q.contains("TABLE_NAME LIKE 'audit%'"));
+        let q = build_pattern_query("orders.*");
+        assert!(q.contains("TABLE_SCHEMA = 'orders'") && q.contains("1=1"));
+        let q = build_pattern_query("audit");
+        assert!(
+            q.contains("TABLE_SCHEMA NOT IN")
+                && q.contains("TABLE_NAME = 'audit'")
+        );
+        for p in ["shop.audit_*", "shop.audit_%"] {
+            let q = build_pattern_query(p);
+            assert!(q.contains("TABLE_NAME LIKE 'audit|_%' ESCAPE '|'"), "{q}");
+        }
     }
 
     #[tokio::test]

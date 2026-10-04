@@ -61,16 +61,18 @@ Set `spec.source.type` to `mysql` and provide a config object:
 
 ### Table Patterns
 
-The `tables` field supports flexible pattern matching using SQL LIKE syntax:
+The `tables` field takes table patterns; the initial snapshot and CDC select exactly the same tables:
 
 ```yaml
 tables:
   - shop.orders          # exact match: database "shop", table "orders"
-  - shop.order_%         # LIKE pattern: tables starting with "order_" in "shop"
+  - shop.order_%         # prefix: tables starting with "order_" in "shop" (same as shop.order_*)
   - analytics.*          # wildcard: all tables in "analytics" database
   - %.audit_log          # cross-database: "audit_log" table in any database
   # use an empty list [] to capture all user tables (excludes system schemas)
 ```
+
+A wildcard (`*` or `%`) only counts as the last character of a part (a prefix match); `_` and any other character are literal. A pattern without a qualifier matches that table name in every database/schema. The initial snapshot copies exactly the tables these patterns capture during CDC.
 
 System schemas (`mysql`, `information_schema`, `performance_schema`, `sys`) are always excluded.
 

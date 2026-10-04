@@ -91,10 +91,11 @@ source:
 </tr>
 </table>
 
-**Table patterns** support SQL LIKE syntax:
+**Table patterns** (the initial snapshot and CDC select exactly the same tables):
 - `db.table` - exact match
-- `db.prefix%` - tables matching prefix
-- `db.%` - all tables in database
+- `db.prefix%` or `db.prefix*` - tables matching the prefix (a wildcard counts only as the last character; `_` is literal)
+- `db.%` or `db.*` - all tables in database
+- `table` (no qualifier) - that table in every database/schema
 
 ### <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/postgresql/postgresql-original.svg" width="24" height="24" style="vertical-align: middle;"> PostgreSQL
 

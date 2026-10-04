@@ -416,14 +416,16 @@ impl PostgresSchemaLoader {
             return Ok(results);
         }
 
+        // Exactly the tables CDC captures (see `table_patterns`).
         for pattern in patterns {
-            let (schema_pattern, table_pattern) = parse_pattern(pattern);
-            let query = build_pattern_query(&schema_pattern, &table_pattern);
+            let query = build_pattern_query(pattern);
             let rows = client.query(&query, &[]).await.map_err(query_error)?;
 
             for row in rows {
                 let entry: (String, String) = (row.get(0), row.get(1));
-                if !results.contains(&entry) {
+                if crate::table_patterns::captures(pattern, &entry.0, &entry.1)
+                    && !results.contains(&entry)
+                {
                     results.push(entry);
                 }
             }
@@ -1077,50 +1079,24 @@ fn build_column(row: &tokio_postgres::Row) -> PostgresColumn {
     col
 }
 
-fn parse_pattern(pattern: &str) -> (String, String) {
-    pattern
-        .split_once('.')
-        .map(|(s, t)| (s.to_string(), t.to_string()))
-        .unwrap_or_else(|| ("public".to_string(), pattern.to_string()))
-}
-
-fn build_pattern_query(schema_pattern: &str, table_pattern: &str) -> String {
-    // Use LIKE only when the pattern contains a glob wildcard (*).
-    // The `_` character is common in table names and should NOT trigger
-    // LIKE matching — it's a literal underscore, not a wildcard.
-    let schema_clause = match schema_pattern {
-        "*" | "%" => "table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')".to_string(),
-        s if s.contains('*') => format!("table_schema LIKE '{}'", escape_like(s)),
-        s => format!("table_schema = '{}'", escape_sql(s)),
+/// A catalog query for a superset of the tables `pattern` captures (system
+/// schemas excluded unless named). A pattern without a schema matches every
+/// schema, as CDC filtering does.
+fn build_pattern_query(pattern: &str) -> String {
+    use crate::table_patterns::{split, superset_clause};
+    let (schema, table) = split(pattern);
+    let schema_clause = match schema {
+        None | Some("*") | Some("%") => "table_schema NOT IN ('pg_catalog', \
+             'information_schema', 'pg_toast')"
+            .to_string(),
+        Some(schema) => superset_clause("table_schema", schema),
     };
-
-    let table_clause = match table_pattern {
-        "*" | "%" => "1=1".to_string(),
-        t if t.contains('*') => {
-            format!("table_name LIKE '{}'", escape_like(t))
-        }
-        t => format!("table_name = '{}'", escape_sql(t)),
-    };
-
     format!(
         "SELECT table_schema, table_name FROM information_schema.tables \
          WHERE table_type = 'BASE TABLE' AND {} AND {}",
-        schema_clause, table_clause
+        schema_clause,
+        superset_clause("table_name", table)
     )
-}
-
-fn escape_sql(s: &str) -> String {
-    s.replace('\'', "''")
-}
-
-/// Convert a glob-style pattern (using `*` as wildcard) to a SQL LIKE pattern.
-/// Escapes SQL LIKE metacharacters (`%`, `_`) as literals, then replaces
-/// glob `*` with LIKE `%`.
-fn escape_like(s: &str) -> String {
-    s.replace('\'', "''")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-        .replace('*', "%")
 }
 
 fn query_error(e: tokio_postgres::Error) -> SourceError {
@@ -1795,37 +1771,24 @@ mod tests {
         }
     }
 
+    /// Catalog queries narrow like CDC filtering: a schema-less pattern
+    /// spans every schema, a trailing `*` or `%` is a prefix, and `_` / `%`
+    /// inside names are literal.
     #[test]
-    fn test_parse_pattern() {
-        assert_eq!(
-            parse_pattern("public.users"),
-            ("public".into(), "users".into())
-        );
-        assert_eq!(
-            parse_pattern("myschema.*"),
-            ("myschema".into(), "*".into())
-        );
-        assert_eq!(parse_pattern("%.audit"), ("%".into(), "audit".into()));
-        assert_eq!(parse_pattern("orders"), ("public".into(), "orders".into()));
-    }
-
-    #[test]
-    fn test_build_pattern_query() {
-        let q = build_pattern_query("public", "users");
+    fn pattern_queries_follow_cdc_filtering() {
+        let q = build_pattern_query("public.users");
         assert!(q.contains("table_schema = 'public'"));
         assert!(q.contains("table_name = 'users'"));
-
-        let q = build_pattern_query("public", "*");
-        assert!(q.contains("table_schema = 'public'"));
-        assert!(q.contains("1=1"));
-
-        // Glob `*` triggers LIKE; literal `%` is treated as exact match.
-        let q = build_pattern_query("*", "audit*");
-        assert!(q.contains("table_schema NOT IN"));
-        assert!(q.contains("table_name LIKE 'audit%'"));
-
-        // Literal `%` in table name — exact match, not LIKE.
-        let q = build_pattern_query("public", "audit%");
-        assert!(q.contains("table_name = 'audit%'"));
+        let q = build_pattern_query("public.*");
+        assert!(q.contains("table_schema = 'public'") && q.contains("1=1"));
+        let q = build_pattern_query("orders");
+        assert!(
+            q.contains("table_schema NOT IN")
+                && q.contains("table_name = 'orders'")
+        );
+        for p in ["public.audit_*", "public.audit_%"] {
+            let q = build_pattern_query(p);
+            assert!(q.contains("table_name LIKE 'audit|_%' ESCAPE '|'"), "{q}");
+        }
     }
 }

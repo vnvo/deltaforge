@@ -117,11 +117,13 @@ The `tables` field supports flexible pattern matching:
 ```yaml
 tables:
   - public.orders          # exact match: schema "public", table "orders"
-  - public.order_%         # LIKE pattern: tables starting with "order_"
+  - public.order_%         # prefix: tables starting with "order_" (same as public.order_*)
   - myschema.*             # wildcard: all tables in "myschema"
   - %.audit_log            # cross-schema: "audit_log" table in any schema
-  - orders                 # defaults to public schema: "public.orders"
+  - orders                 # table "orders" in every schema
 ```
+
+A wildcard (`*` or `%`) only counts as the last character of a part (a prefix match); `_` and any other character are literal. A pattern without a qualifier matches that table name in every database/schema. The initial snapshot copies exactly the tables these patterns capture during CDC.
 
 System schemas (`pg_catalog`, `information_schema`, `pg_toast`) are always excluded.
 

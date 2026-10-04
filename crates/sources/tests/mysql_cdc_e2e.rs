@@ -266,6 +266,75 @@ async fn mysql_evicted_schema_is_rebuilt_exactly() -> Result<()> {
     Ok(())
 }
 
+/// A snapshot expands its table patterns to exactly the tables CDC captures
+/// (the row allow-list): a trailing `*` or `%` is a prefix, `_` is literal,
+/// and a pattern without a database spans every database.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_snapshot_patterns_match_cdc_filtering() -> Result<()> {
+    let (db, pool, dsn) = mysql_setup("patterns").await?;
+    let (other_db, _) = test_common::mysql_create_db("patterns_2").await?;
+    let mut conn = pool.get_conn().await?;
+    for q in [
+        format!("CREATE TABLE {db}.order_a (id INT PRIMARY KEY)"),
+        format!("CREATE TABLE {db}.order_b (id INT PRIMARY KEY)"),
+        format!("CREATE TABLE {db}.orderxb (id INT PRIMARY KEY)"),
+        format!("CREATE TABLE {db}.other (id INT PRIMARY KEY)"),
+        format!("CREATE TABLE {other_db}.order_a (id INT PRIMARY KEY)"),
+    ] {
+        conn.query_drop(q).await?;
+    }
+    let scope = sources::registry_scope::SharedRegistryScope::new("test");
+    sources::mysql::establish_registry_scope(
+        &dsn,
+        &make_storage_backend().await,
+        &scope,
+        "acme",
+        "test",
+    )
+    .await?;
+    let loader =
+        MySqlSchemaLoader::new(&dsn, make_registry().await, "acme", scope);
+    let catalog = loader.expand_patterns(&[]).await?;
+    for (pattern, expected) in [
+        (
+            format!("{db}.order_*"),
+            vec![(db.clone(), "order_a"), (db.clone(), "order_b")],
+        ),
+        (
+            format!("{db}.order_%"),
+            vec![(db.clone(), "order_a"), (db.clone(), "order_b")],
+        ),
+        (
+            "order_a".to_string(),
+            vec![(db.clone(), "order_a"), (other_db.clone(), "order_a")],
+        ),
+    ] {
+        let mut got = loader
+            .expand_patterns(std::slice::from_ref(&pattern))
+            .await?;
+        got.sort();
+        let cdc = common::AllowList::new(std::slice::from_ref(&pattern));
+        let mut captured: Vec<_> = catalog
+            .iter()
+            .filter(|(d, t)| cdc.matches(d, t))
+            .cloned()
+            .collect();
+        captured.sort();
+        assert_eq!(got, captured, "{pattern}: snapshot differs from CDC");
+        let mut expected: Vec<(String, String)> = expected
+            .into_iter()
+            .map(|(d, t)| (d, t.to_string()))
+            .collect();
+        expected.sort();
+        assert_eq!(got, expected, "{pattern}");
+    }
+
+    mysql_drop_db(&pool, &other_db).await;
+    mysql_drop_db(&pool, &db).await;
+    Ok(())
+}
+
 /// Test schema loader: pattern expansion, column loading, fingerprinting, DDL detection.
 #[tokio::test]
 #[ignore = "requires docker"]

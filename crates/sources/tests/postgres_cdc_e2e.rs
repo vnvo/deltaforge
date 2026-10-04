@@ -439,6 +439,62 @@ async fn postgres_evicted_schema_is_rebuilt_exactly() -> Result<()> {
     Ok(())
 }
 
+/// A snapshot expands its table patterns to exactly the tables CDC captures
+/// (the row allow-list): a trailing `*` or `%` is a prefix, `_` is literal,
+/// and a pattern without a schema spans every schema.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn postgres_snapshot_patterns_match_cdc_filtering() -> Result<()> {
+    let (db, client) = pg_setup("patterns").await?;
+    client
+        .batch_execute(
+            "CREATE TABLE order_a (id INT PRIMARY KEY);
+             CREATE TABLE order_b (id INT PRIMARY KEY);
+             CREATE TABLE orderxb (id INT PRIMARY KEY);
+             CREATE TABLE other (id INT PRIMARY KEY);
+             CREATE SCHEMA s2;
+             CREATE TABLE s2.order_a (id INT PRIMARY KEY);",
+        )
+        .await?;
+    let (loader, _scope) = test_common::pg_scoped_loader(
+        &pg_admin_dsn(&db).await,
+        make_registry().await,
+        "acme",
+    )
+    .await?;
+    let catalog = loader.expand_patterns(&[]).await?;
+    for (pattern, expected) in [
+        (
+            "public.order_*",
+            vec![("public", "order_a"), ("public", "order_b")],
+        ),
+        (
+            "public.order_%",
+            vec![("public", "order_a"), ("public", "order_b")],
+        ),
+        ("order_a", vec![("public", "order_a"), ("s2", "order_a")]),
+    ] {
+        let mut got = loader.expand_patterns(&[pattern.to_string()]).await?;
+        got.sort();
+        let cdc = common::AllowList::new(&[pattern.to_string()]);
+        let mut captured: Vec<_> = catalog
+            .iter()
+            .filter(|(s, t)| cdc.matches(s, t))
+            .cloned()
+            .collect();
+        captured.sort();
+        assert_eq!(got, captured, "{pattern}: snapshot differs from CDC");
+        let expected: Vec<(String, String)> = expected
+            .into_iter()
+            .map(|(s, t)| (s.to_string(), t.to_string()))
+            .collect();
+        assert_eq!(got, expected, "{pattern}");
+    }
+
+    pg_drop_db(&db).await;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn postgres_schema_loader() -> Result<()> {
