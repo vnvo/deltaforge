@@ -293,7 +293,18 @@ pub async fn run_snapshot(
 
     progress.start_position = serde_json::to_string(&position)
         .context("serialize binlog position")?;
-    save_progress(&ctx.chkpt_store, ctx.source_id, &progress).await;
+    // The anchor must be durable before any row: it is what marks this run
+    // as started, so an interruption after it is detected and restarts as a
+    // new generation instead of reusing this one at another anchor. Later
+    // progress writes (completed tables, finished) can only cause extra
+    // re-reading when lost, never a skip, so they stay best effort.
+    ctx.chkpt_store
+        .put_raw(
+            &progress_key(ctx.source_id),
+            &serde_json::to_vec(&progress).context("serialize progress")?,
+        )
+        .await
+        .context("persist the snapshot anchor before reading any row")?;
 
     // spawn background position guard
     let abort_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
