@@ -237,10 +237,15 @@ async fn mysql_snapshot_never_skips_existing_rows() -> Result<()> {
     Ok(())
 }
 
-/// Snapshot resumes after a partial completion (crash recovery at table level).
+/// An interrupted snapshot is not resumed from its progress. Its completed
+/// tables were read at the interrupted run's anchor, while a resume takes a
+/// new anchor and CDC starts there, so a change to a completed table in
+/// between would be in neither the snapshot nor CDC. The resume restarts in
+/// full as a new generation: the completed table is read again and the change
+/// is delivered.
 #[tokio::test]
 #[ignore = "requires docker"]
-async fn mysql_snapshot_resumes_after_partial_completion() -> Result<()> {
+async fn mysql_an_interrupted_snapshot_restarts_in_full() -> Result<()> {
     use sources::mysql::MysqlSnapshotProgress;
     use sources::mysql::mysql_snapshot::progress_key;
 
@@ -263,9 +268,36 @@ async fn mysql_snapshot_resumes_after_partial_completion() -> Result<()> {
         }
     }
 
-    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    // A first snapshot records generation 1 in the durable store.
+    let backend = make_storage_backend().await;
+    let tables = vec![format!("{db}.table_a"), format!("{db}.table_b")];
+    let initial = || SnapshotCfg {
+        mode: SnapshotMode::Initial,
+        ..Default::default()
+    };
+    {
+        let first = make_source_on(
+            backend.clone(),
+            "snap-resume",
+            &db,
+            tables.clone(),
+            initial(),
+            Default::default(),
+        )
+        .await;
+        let (tx, mut rx) = mpsc::channel(256);
+        let handle = first.run(tx, Arc::new(MemCheckpointStore::new()?)).await;
+        collect_until(&mut rx, Duration::from_secs(30), |e| {
+            e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 6
+        })
+        .await;
+        handle.stop();
+        handle.join().await.ok();
+    }
 
-    // Seed progress directly - table_a done, table_b pending.
+    // The same generation, interrupted: its anchor is the current position,
+    // table_a is done, table_b is not.
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     let mut pos_conn = pool.get_conn().await?;
     let row: mysql_async::Row = pos_conn
         .query_first("SHOW BINARY LOG STATUS")
@@ -273,8 +305,7 @@ async fn mysql_snapshot_resumes_after_partial_completion() -> Result<()> {
         .unwrap();
     let file: String = row.get(0).unwrap();
     let pos: u32 = row.get(1).unwrap();
-
-    let fake = MysqlSnapshotProgress {
+    let interrupted = MysqlSnapshotProgress {
         start_position: serde_json::to_string(
             &sources::mysql::MySqlCheckpoint {
                 lineage: None,
@@ -286,40 +317,242 @@ async fn mysql_snapshot_resumes_after_partial_completion() -> Result<()> {
         done_tables: vec![format!("{db}.table_a")],
         finished: false,
     };
-    ckpt.put_raw(&progress_key("snap-resume"), &serde_json::to_vec(&fake)?)
+    ckpt.put_raw(
+        &progress_key("snap-resume"),
+        &serde_json::to_vec(&interrupted)?,
+    )
+    .await?;
+
+    // A change to the completed table after the interrupted anchor.
+    conn.query_drop("INSERT INTO table_a VALUES (99, 'after the anchor')")
         .await?;
 
-    // Second run — should only snapshot table_b.
-    let src = make_source(
+    let src = make_source_on(
+        backend.clone(),
         "snap-resume",
         &db,
-        vec![format!("{db}.table_a"), format!("{db}.table_b")],
+        tables,
+        initial(),
+        Default::default(),
+    )
+    .await;
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = src.run(tx, ckpt.clone()).await;
+
+    // Snapshot rows carry integers as text, binlog rows as numbers.
+    let is_row_99 =
+        |e: &Event| {
+            e.source.table == "table_a"
+                && e.after.as_ref().and_then(|a| a.get("id")).and_then(|v| {
+                    v.as_i64().or_else(|| v.as_str()?.parse().ok())
+                }) == Some(99)
+        };
+    let events = collect_until(&mut rx, Duration::from_secs(30), |e| {
+        e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 7
+            && e.iter().any(is_row_99)
+    })
+    .await;
+    handle.stop();
+    handle.join().await.ok();
+
+    assert!(
+        events.iter().any(is_row_99),
+        "the change to a completed table after the interrupted anchor was lost"
+    );
+    let reads: Vec<_> =
+        events.iter().filter(|e| matches!(e.op, Op::Read)).collect();
+    let in_table =
+        |t: &str| reads.iter().filter(|e| e.source.table == t).count();
+    assert_eq!(in_table("table_a"), 4, "the completed table is read again");
+    assert_eq!(in_table("table_b"), 3);
+    assert!(
+        reads
+            .iter()
+            .all(|e| e.source.position.snapshot_generation == Some(2)),
+        "a new generation, not the interrupted one"
+    );
+    let progress: MysqlSnapshotProgress = serde_json::from_slice(
+        &ckpt.get_raw(&progress_key("snap-resume")).await?.unwrap(),
+    )?;
+    assert!(progress.finished, "{progress:?}");
+    assert_ne!(
+        progress.start_position, interrupted.start_position,
+        "a new anchor"
+    );
+
+    mysql_drop_db(&pool, &db).await;
+    Ok(())
+}
+
+/// A checkpoint store that refuses one kind of snapshot progress write;
+/// every other operation passes through.
+struct RefusesProgressReset {
+    inner: MemCheckpointStore,
+    refuse: fn(&[u8]) -> bool,
+}
+
+#[async_trait::async_trait]
+impl CheckpointStore for RefusesProgressReset {
+    async fn get_raw(
+        &self,
+        key: &str,
+    ) -> checkpoints::CheckpointResult<Option<Vec<u8>>> {
+        self.inner.get_raw(key).await
+    }
+    async fn put_raw(
+        &self,
+        key: &str,
+        bytes: &[u8],
+    ) -> checkpoints::CheckpointResult<()> {
+        if (self.refuse)(bytes) {
+            return Err(checkpoints::CheckpointError::Database(
+                "progress reset refused".into(),
+            ));
+        }
+        self.inner.put_raw(key, bytes).await
+    }
+    async fn delete(&self, key: &str) -> checkpoints::CheckpointResult<bool> {
+        self.inner.delete(key).await
+    }
+    async fn list(&self) -> checkpoints::CheckpointResult<Vec<String>> {
+        self.inner.list().await
+    }
+}
+
+/// If the interrupted progress cannot be discarded, the snapshot stops
+/// before reading a row: it never runs with the old completed tables against
+/// a new anchor, and the interrupted record is left as it was.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_a_failed_progress_reset_stops_the_snapshot() -> Result<()> {
+    use sources::mysql::MysqlSnapshotProgress;
+    use sources::mysql::mysql_snapshot::progress_key;
+
+    let (db, pool, _dsn) = mysql_setup("snap_reset_fail").await?;
+    let mut conn = pool.get_conn().await?;
+    conn.query_drop(format!("USE {db}")).await?;
+    conn.query_drop("CREATE TABLE t (id INT PRIMARY KEY, val VARCHAR(32))")
+        .await?;
+    conn.query_drop(format!(
+        "GRANT SELECT ON {db}.t TO '{MYSQL_CDC_USER}'@'%'"
+    ))
+    .await?;
+    conn.query_drop("INSERT INTO t VALUES (1, 'a')").await?;
+
+    // Refuses the reset to the empty progress record.
+    let store = RefusesProgressReset {
+        inner: MemCheckpointStore::new()?,
+        refuse: |bytes| {
+            serde_json::from_slice::<MysqlSnapshotProgress>(bytes).is_ok_and(
+                |p| {
+                    p.start_position.is_empty()
+                        && p.done_tables.is_empty()
+                        && !p.finished
+                },
+            )
+        },
+    };
+    let interrupted = serde_json::to_vec(&MysqlSnapshotProgress {
+        start_position: "{}".into(),
+        done_tables: vec![format!("{db}.t")],
+        finished: false,
+    })?;
+    store
+        .put_raw(&progress_key("snap-reset-fail"), &interrupted)
+        .await?;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(store);
+
+    let src = make_source(
+        "snap-reset-fail",
+        &db,
+        vec![format!("{db}.t")],
         SnapshotCfg {
             mode: SnapshotMode::Initial,
             ..Default::default()
         },
     )
     .await;
-    let (tx, mut rx) = mpsc::channel(256);
-    let handle = src.run(tx, ckpt.clone()).await;
-
-    let events = collect_until(&mut rx, Duration::from_secs(30), |e| {
-        e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 3
-    })
-    .await;
-
-    let reads: Vec<_> =
-        events.iter().filter(|e| matches!(e.op, Op::Read)).collect();
-    // Should only get table_b rows (table_a was already marked done).
-    assert!(
-        reads.iter().all(|e| e.source.table == "table_b"),
-        "resume should only snapshot table_b"
+    let (tx, mut rx) = mpsc::channel(64);
+    let res = tokio::time::timeout(
+        Duration::from_secs(60),
+        src.run(tx, ckpt.clone()).await.join(),
+    )
+    .await
+    .expect("the source stops");
+    assert!(res.is_err(), "a failed reset stops the source");
+    let mut rows = 0;
+    while let Ok(item) = rx.try_recv() {
+        if matches!(item, SourceItem::Event(ref e) if matches!(e.op, Op::Read))
+        {
+            rows += 1;
+        }
+    }
+    assert_eq!(rows, 0, "no snapshot row was read");
+    assert_eq!(
+        ckpt.get_raw(&progress_key("snap-reset-fail")).await?,
+        Some(interrupted),
+        "the interrupted progress is left as it was"
     );
-    assert_eq!(reads.len(), 3);
-    info!("✓ snapshot resumed from table_b only");
 
-    handle.stop();
-    handle.join().await.ok();
+    mysql_drop_db(&pool, &db).await;
+    Ok(())
+}
+
+/// The new run's anchor is persisted before any row is read: if it cannot
+/// be, the snapshot stops without emitting a row (a later interruption must
+/// be detectable, never reuse the generation at another anchor).
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_an_unpersisted_snapshot_anchor_stops_before_any_row()
+-> Result<()> {
+    use sources::mysql::MysqlSnapshotProgress;
+
+    let (db, pool, _dsn) = mysql_setup("snap_anchor_fail").await?;
+    let mut conn = pool.get_conn().await?;
+    conn.query_drop(format!("USE {db}")).await?;
+    conn.query_drop("CREATE TABLE t (id INT PRIMARY KEY, val VARCHAR(32))")
+        .await?;
+    conn.query_drop(format!(
+        "GRANT SELECT ON {db}.t TO '{MYSQL_CDC_USER}'@'%'"
+    ))
+    .await?;
+    conn.query_drop("INSERT INTO t VALUES (1, 'a')").await?;
+
+    // Refuses the progress record that carries the new anchor.
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(RefusesProgressReset {
+        inner: MemCheckpointStore::new()?,
+        refuse: |bytes| {
+            serde_json::from_slice::<MysqlSnapshotProgress>(bytes)
+                .is_ok_and(|p| !p.start_position.is_empty() && !p.finished)
+        },
+    });
+    let src = make_source(
+        "snap-anchor-fail",
+        &db,
+        vec![format!("{db}.t")],
+        SnapshotCfg {
+            mode: SnapshotMode::Initial,
+            ..Default::default()
+        },
+    )
+    .await;
+    let (tx, mut rx) = mpsc::channel(64);
+    let res = tokio::time::timeout(
+        Duration::from_secs(60),
+        src.run(tx, ckpt).await.join(),
+    )
+    .await
+    .expect("the source stops");
+    assert!(res.is_err(), "an unpersisted anchor stops the source");
+    let mut rows = 0;
+    while let Ok(item) = rx.try_recv() {
+        if matches!(item, SourceItem::Event(ref e) if matches!(e.op, Op::Read))
+        {
+            rows += 1;
+        }
+    }
+    assert_eq!(rows, 0, "no snapshot row was read");
+
     mysql_drop_db(&pool, &db).await;
     Ok(())
 }

@@ -231,6 +231,7 @@ impl MySqlSource {
         loader: &MySqlSchemaLoader,
         tracked: &[(String, String)],
         lineage: PersistedLineage,
+        force_new: bool,
     ) -> SourceResult<SnapshotPlan> {
         use crate::identity_resolution::{
             IdentitySchemaView, resolve_identity,
@@ -288,7 +289,7 @@ impl MySqlSource {
         // Step 5: lineage is captured once by the caller and passed in. Step 6:
         // fingerprint. Step 7: allocate.
         let fingerprint = SnapshotConfigFingerprint::compute(&specs);
-        let mode = if self.snapshot_cfg.mode == SnapshotMode::Always {
+        let mode = if force_new {
             AllocationMode::ForceNew
         } else {
             AllocationMode::Resume
@@ -518,18 +519,31 @@ impl MySqlSource {
         // The tables a snapshot copied: proven at its anchor below.
         let mut snapshot_tables: Vec<(String, String)> = Vec::new();
         if needs_snapshot {
-            if self.snapshot_cfg.mode == SnapshotMode::Always {
-                if let Ok(bytes) =
-                    serde_json::to_vec(&MysqlSnapshotProgress::default())
-                {
-                    let _ = chkpt_store
-                        .put_raw(
-                            &mysql_snapshot::progress_key(&self.id),
-                            &bytes,
-                        )
-                        .await;
-                }
+            // An unfinished snapshot is never resumed from its progress: its
+            // completed tables were read at the interrupted run's anchor,
+            // while this run takes a new anchor and CDC starts there, so
+            // their changes in between would be lost. It restarts in full as
+            // a new generation (reusing the anchor needs the durable work
+            // queue). Unreadable progress fails closed.
+            let progress = mysql_snapshot::load_snapshot_progress(
+                chkpt_store.as_ref(),
+                &self.id,
+            )
+            .await
+            .map_err(SourceError::Other)?;
+            let interrupted = !progress.finished
+                && (!progress.start_position.is_empty()
+                    || !progress.done_tables.is_empty());
+            if interrupted {
+                warn!(
+                    source_id = %self.id,
+                    completed_tables = progress.done_tables.len(),
+                    "an interrupted snapshot restarts in full as a new \
+                     generation (completed tables are read again)"
+                );
             }
+            let restart =
+                interrupted || self.snapshot_cfg.mode == SnapshotMode::Always;
             info!(source_id = %self.id, "starting mysql snapshot");
 
             let snap_schema_loader = MySqlSchemaLoader::new(
@@ -588,8 +602,21 @@ impl MySqlSource {
                     &snap_schema_loader,
                     &tracked,
                     durable_lineage.clone(),
+                    restart,
                 )
                 .await?;
+            // Discard the previous progress only after the new generation is
+            // durable: a crash in between restarts again (never resumes the
+            // interrupted generation).
+            if restart {
+                let bytes =
+                    serde_json::to_vec(&MysqlSnapshotProgress::default())
+                        .map_err(|e| SourceError::Other(e.into()))?;
+                chkpt_store
+                    .put_raw(&mysql_snapshot::progress_key(&self.id), &bytes)
+                    .await
+                    .map_err(|e| SourceError::Other(e.into()))?;
+            }
 
             let snapshot_ctx = mysql_snapshot::SnapshotCtx {
                 checkpoint_lineage: checkpoint_lineage(&self.registry_scope),
