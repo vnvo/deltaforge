@@ -297,6 +297,7 @@ struct Harness {
     proj: Projected,
     rx: mpsc::Receiver<SourceItem>,
     handle: SourceHandle,
+    ckpt: Arc<dyn CheckpointStore>,
 }
 
 impl Harness {
@@ -406,7 +407,7 @@ async fn start_rotation_harness(
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
     let (tx, rx) = mpsc::channel(channel_cap);
-    let handle = src.run(tx, ckpt).await;
+    let handle = src.run(tx, Arc::clone(&ckpt)).await;
 
     Ok(Harness {
         db,
@@ -415,6 +416,7 @@ async fn start_rotation_harness(
         proj,
         rx,
         handle,
+        ckpt,
     })
 }
 
@@ -476,6 +478,23 @@ async fn a_reconnect_after_rotation_uses_the_rotated_credentials() -> Result<()>
     let mut h = start_rotation_harness("rot_reconnect", 256).await?;
     let pid_before =
         wait_for_active_pid(&h.admin, &h.slot, Duration::from_secs(30)).await?;
+    // A durable checkpoint (the slot's own position), so every later stream
+    // also proves the slot bound, on the active credentials too.
+    let confirmed: String = h
+        .admin
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots \
+             WHERE slot_name = $1",
+            &[&h.slot],
+        )
+        .await?
+        .get(0);
+    h.ckpt
+        .put_raw(
+            "pg-rot",
+            format!(r#"{{"lsn":"{confirmed}","tx_id":null}}"#).as_bytes(),
+        )
+        .await?;
 
     h.rotate_password("rotatedpw").await?;
     let pid_rotated = wait_for_pid_change(
