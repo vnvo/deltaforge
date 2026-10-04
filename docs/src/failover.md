@@ -1,6 +1,6 @@
 # Failover Handling
 
-DeltaForge detects a change of database server automatically. A MySQL source resumes streaming on the new primary without operator intervention when it can prove the position to continue from. A PostgreSQL source never resumes on another cluster: it stops before reading anything from it (see [PostgreSQL: another cluster is refused](#postgresql-another-cluster-is-refused)). Cross-primary PostgreSQL failover is not supported for production yet. This page explains how detection works, what happens during MySQL reconciliation, and how to configure behaviour when the new primary has a different schema.
+DeltaForge detects a change of database server automatically. A MySQL source resumes streaming on the new primary without operator intervention when it can prove the position to continue from. A PostgreSQL source never resumes on another cluster: it stops before reading anything from it (see [PostgreSQL: another cluster is refused](#postgresql-another-cluster-is-refused)). After a promotion of a physical standby it continues only when the promoted server provably continues its checkpoint (see [PostgreSQL: promotion continuity](#postgresql-promotion-continuity)). This page explains how detection works, what happens during MySQL reconciliation, and how to configure behaviour when the new primary has a different schema.
 
 ## How Detection Works
 
@@ -31,13 +31,36 @@ source lineage error: source '<id>' is bound to PostgreSQL ... but is connected 
 
 To capture the other cluster, configure a new source id; it starts with a snapshot.
 
-This is a cross-cluster check, not a check of every endpoint change:
+This is a cross-cluster check. A promoted physical standby keeps the cluster's `system_identifier`; continuing on it is decided by the continuity proof below.
 
-- **Different `system_identifier` (or replaced database)**: refused before anything is recorded, snapshotted or streamed.
-- **Same `system_identifier`, promotion or timeline change**: not detected by this check. A promoted physical standby keeps the cluster's `system_identifier`, so DeltaForge cannot yet tell it from the original primary, and continuity across it is **not proven safe**.
-- **Cross-primary PostgreSQL failover is therefore unsupported for production** until the continuity proof below lands.
+## PostgreSQL: promotion continuity
 
- Continuing on it after a promotion (a new timeline) requires proving that its timeline history contains the checkpoint and that a synchronized logical slot covers it; that proof is not implemented yet. Until it is, a promotion is resumed only if the slot exists on the promoted server and is healthy, and DeltaForge does not yet verify the timeline or the slot's bounds against the checkpoint: treat continuity across a PostgreSQL promotion as unverified.
+Before **every** `START_REPLICATION` (startup, reconnect and credential rotation), the source proves on the replication session that then streams - with `IDENTIFY_SYSTEM`, `TIMELINE_HISTORY` and a read of the slot on that same authenticated session - that the server continues its durable checkpoint F. All of these must hold; anything unknown stops the source:
+
+1. the same `system_identifier` and database OID, on a primary (not a server in recovery);
+2. the server is on the timeline F was written on, or on a timeline that descends from it, with that timeline's switch point at or after F **and** at or after the position the stream reads from (changes already read past the switch point are not in the new history);
+3. after a timeline switch: PostgreSQL 17 or later, and the slot is a synchronized failover slot (`failover` and `synced` true). A slot of the same name is not enough;
+4. the slot is persistent and logical, not invalidated, its WAL is not lost, and `restart_lsn` and `confirmed_flush_lsn` are at or before F;
+5. the server's WAL extends at least to F.
+
+When a stream becomes authoritative (before its first event is consumed), its proven continuity is recorded durably: a chain id created once for the source, the number of proven timeline transitions in that chain, and the timeline. Every checkpoint carries this stamp. Timeline numbers alone prove no ancestry (two standbys promoted from the same primary get sibling timelines), so checkpoints are ordered only within one chain: by LSN within a transition, by the proven transition across transitions; checkpoints of different chains, or one transition stamped with two timelines, are incomparable. A checkpoint from before this release orders only with others like it and with the first link of a chain; while the chain is at its first link, every start adopts all of the source's checkpoints (each sink's, or the single aggregate one) into the chain before anything is consumed, keeping their positions, so no later transition meets an unstamped checkpoint. A checkpoint that cannot be adopted (another chain or transition, a partial stamp, a malformed checkpoint) stops the source (`checkpoint_chain_mismatch`) with nothing rewritten. A credential rotation never crosses a transition: a replacement stream that would change the stamp is refused before anything is recorded, and the ordinary reconnect that follows proves the transition. A failed proof stops the source with a `pg_continuity_unproven` incident whose class names the condition: `timeline_not_descended`, `switch_before_checkpoint`, `switch_before_read_position`, `checkpoint_chain_mismatch`, `slot_not_synced`, `failover_unsupported_version`, `timeline_unrecorded`, `server_in_recovery`, `wal_behind_checkpoint`, `slot_not_persistent_logical`, `slot_beyond_checkpoint`, `slot_missing`, `slot_invalidated`, `wal_lost` or `unknown_slot_position`. Nothing is streamed and the checkpoint is not moved.
+
+A session on a server in recovery (`server_in_recovery`) is retried like a connection failure for up to 2 minutes, since the endpoint may be mid-failover (an open `auto_retry` incident; stopping the pipeline withdraws it), then the source stops on the same incident as operator action: route the source to the writable primary. A promoted server (no longer in recovery) continues only after the timeline and synchronized-slot proof above succeeds.
+
+> **Upgrade limitation (`timeline_unrecorded`).** Sources created before this release have checkpoints but no recorded timeline. On a server that has never switched timeline (timeline 1) the timeline is recorded automatically at the first start. On a server that has switched timeline (any earlier promotion or point-in-time recovery), the source stops with `timeline_unrecorded`: nothing on the server distinguishes that history from another one. Until the `pg-adopt-timeline` recovery operation is available, the only way forward is a re-snapshot (a new source id, or a reset of the source's checkpoint and slot). Check `SELECT timeline_id FROM pg_control_checkpoint()` before upgrading.
+
+### HA setup (PostgreSQL 17)
+
+Continuation across a promotion needs PostgreSQL 17 logical slot synchronization:
+
+- DeltaForge creates its slot as a failover slot (`failover => true`) on PostgreSQL 17. A pre-existing slot without it is reported as a running-degraded `pg_failover_slot_unavailable` incident: streaming continues on the current primary, but a promotion stops the source (`slot_not_synced`). Recreate the slot as a failover slot (or `ALTER_REPLICATION_SLOT ... (FAILOVER true)` on a replication connection) to clear it.
+- Standby: `sync_replication_slots = on`, `hot_standby_feedback = on`, `primary_slot_name` set to a physical slot on the primary, and a `dbname` in `primary_conninfo`.
+- Primary: `synchronized_standby_slots` naming that physical slot, so logical changes are sent to DeltaForge only after the standby has received them. Without it, a promotion can lose changes DeltaForge already read from the old primary, and the source then stops with `switch_before_read_position`.
+- HA tools that recreate slots on the promoted server (for example Patroni `permanent_slots` without PostgreSQL 17 synchronization) produce slots that are not `synced`; they are refused after a promotion.
+
+Before PostgreSQL 17, a timeline switch always stops the source (`failover_unsupported_version`). PostgreSQL 17 is the validated version.
+
+**Unsupported (documented residual):** a filesystem-level rewind on the same timeline that later diverges cannot be detected; nothing on the server distinguishes it from the original history.
 
 ## What Happens During Failover (MySQL)
 
@@ -128,5 +151,5 @@ Use `halt` when your failover environments do not guarantee DDL sync to replicas
 For clean automatic failover:
 
 - **MySQL**: GTID mode must be enabled (`gtid_mode=ON`, `enforce_gtid_consistency=ON`). Without GTID, DeltaForge falls back to file/position coordinates which are meaningless across servers.
-- **PostgreSQL**: continuation on another cluster is not supported (it is refused), and cross-primary failover is unsupported for production until promotion continuity is proven. After a promotion of a physical standby the logical slot must exist on the promoted server (for example PostgreSQL 17 slot synchronization, or a slot-aware HA tool such as Patroni with `permanent_slots`); see the note on unverified promotion continuity above.
+- **PostgreSQL**: continuation on another cluster is not supported (it is refused). After a promotion of a physical standby the source continues only when [promotion continuity](#postgresql-promotion-continuity) is proven, which needs PostgreSQL 17 synchronized failover slots.
 - **MySQL**: the CDC user must exist on B with the same privileges as on A.

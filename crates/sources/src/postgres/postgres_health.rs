@@ -17,6 +17,13 @@ use tracing::{debug, info, warn};
 
 const THROUGHPUT_PER_WORKER_BYTES: u64 = 20 * 1024 * 1024; // 20 MB/s
 
+/// Why a slot (`pg_replication_slots s`) was invalidated, NULL when it was
+/// not: `invalidation_reason` on PostgreSQL 17+, `conflicting` before it
+/// (read through `to_jsonb`, so a column the server lacks is NULL rather than
+/// an error).
+const INVALIDATION: &str = "COALESCE(to_jsonb(s)->>'invalidation_reason', \
+     CASE WHEN (to_jsonb(s)->>'conflicting')::boolean THEN 'conflicting' END)";
+
 /// WAL slot health from pg_replication_slots.
 #[derive(Debug, PartialEq)]
 pub enum SlotWalStatus {
@@ -130,8 +137,10 @@ pub async fn run_preflight(
     if let Some(slot) = slot_name {
         let row = client
             .query_opt(
-                "SELECT invalidation_reason \
-                    FROM pg_replication_slots WHERE slot_name = $1",
+                &format!(
+                    "SELECT {INVALIDATION} \
+                     FROM pg_replication_slots s WHERE slot_name = $1"
+                ),
                 &[&slot],
             )
             .await
@@ -335,8 +344,10 @@ pub async fn verify_slot_still_healthy(
 
     let row = client
         .query_opt(
-            "SELECT invalidation_reason FROM pg_replication_slots \
-             WHERE slot_name = $1",
+            &format!(
+                "SELECT {INVALIDATION} FROM pg_replication_slots s \
+                 WHERE slot_name = $1"
+            ),
             &[&slot_name],
         )
         .await
@@ -418,8 +429,10 @@ pub fn spawn_wal_slot_guard(
 
             let row = client
                 .query_opt(
-                    "SELECT invalidation_reason \
-                     FROM pg_replication_slots WHERE slot_name = $1",
+                    &format!(
+                        "SELECT {INVALIDATION} \
+                         FROM pg_replication_slots s WHERE slot_name = $1"
+                    ),
                     &[&slot_name],
                 )
                 .await;
@@ -677,8 +690,10 @@ pub async fn check_position_reachability(
 
     let row = match client
         .query_opt(
-            "SELECT invalidation_reason, wal_status \
-             FROM pg_replication_slots WHERE slot_name = $1",
+            &format!(
+                "SELECT {INVALIDATION}, wal_status \
+                 FROM pg_replication_slots s WHERE slot_name = $1"
+            ),
             &[&slot_name],
         )
         .await

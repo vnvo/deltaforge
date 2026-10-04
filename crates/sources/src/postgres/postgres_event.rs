@@ -141,7 +141,12 @@ pub(super) async fn dispatch_event(
             ..
         } => {
             debug!(wal_end = %wal_end, reply_requested, "keepalive");
-            ctx.last_lsn = wal_end;
+            // Right after START_REPLICATION the server reports the slot's
+            // confirmed position, which can be before where this stream
+            // starts reading: the read position never moves back.
+            if wal_end > ctx.last_lsn {
+                ctx.last_lsn = wal_end;
+            }
         }
         ReplicationEvent::Begin {
             final_lsn,
@@ -177,8 +182,11 @@ pub(super) async fn dispatch_event(
                 // Checkpoint and watermark BOTH describe this COMMIT boundary:
                 // the COMMIT record's end_lsn (never the last row/message LSN)
                 // and the frozen startup system_identifier lineage.
-                let checkpoint =
-                    make_checkpoint_meta(&end_lsn, ctx.current_tx_id);
+                let checkpoint = make_checkpoint_meta(
+                    &end_lsn,
+                    ctx.current_tx_id,
+                    &ctx.stamp_members,
+                );
                 let boundary = boundary_for_pg_commit(
                     ctx.system_identifier,
                     &end_lsn,
@@ -696,7 +704,11 @@ async fn handle_insert(
         change_ordinal,
     )?;
     let lsn_str = &ctx.cached_lsn.as_ref().unwrap().1;
-    let chkpt = make_checkpoint_meta_str(lsn_str, ctx.current_tx_id);
+    let chkpt = make_checkpoint_meta_str(
+        lsn_str,
+        ctx.current_tx_id,
+        &ctx.stamp_members,
+    );
     let mut ev = Event::new_row(
         event_id,
         source_info,
@@ -816,7 +828,11 @@ async fn handle_update(
         change_ordinal,
     )?;
     let lsn_str = &ctx.cached_lsn.as_ref().unwrap().1;
-    let chkpt = make_checkpoint_meta_str(lsn_str, ctx.current_tx_id);
+    let chkpt = make_checkpoint_meta_str(
+        lsn_str,
+        ctx.current_tx_id,
+        &ctx.stamp_members,
+    );
     let mut ev = Event::new_row(
         event_id,
         source_info,
@@ -912,7 +928,11 @@ async fn handle_delete(
         change_ordinal,
     )?;
     let lsn_str = &ctx.cached_lsn.as_ref().unwrap().1;
-    let chkpt = make_checkpoint_meta_str(lsn_str, ctx.current_tx_id);
+    let chkpt = make_checkpoint_meta_str(
+        lsn_str,
+        ctx.current_tx_id,
+        &ctx.stamp_members,
+    );
     let mut ev = Event::new_row(
         event_id,
         source_info,
@@ -1032,7 +1052,11 @@ async fn handle_truncate(
             0,
         )
         .with_tenant(ctx.tenant.clone())
-        .with_checkpoint(make_checkpoint_meta(&wal_lsn, ctx.current_tx_id));
+        .with_checkpoint(make_checkpoint_meta(
+            &wal_lsn,
+            ctx.current_tx_id,
+            &ctx.stamp_members,
+        ));
 
         if let Some(tx_id) = ctx.current_tx_id {
             ev.transaction = Some(Transaction {

@@ -37,6 +37,9 @@ pub enum ReasonCode {
     PgDifferentCluster,
     /// A PostgreSQL resume position cannot be proven available on the server.
     PgContinuityUnproven,
+    /// A PostgreSQL 17+ replication slot is not a failover slot: the source
+    /// runs, but cannot continue across a failover.
+    PgFailoverSlotUnavailable,
     /// A MySQL resume position (GTID set) is not available on the server.
     MysqlGtidPositionUnavailable,
     /// `on_schema_drift = halt` stopped on a schema change it could not accept.
@@ -52,9 +55,10 @@ pub enum ReasonCode {
 
 impl ReasonCode {
     /// Every reason (bounded metric label values).
-    pub const ALL: [ReasonCode; 7] = [
+    pub const ALL: [ReasonCode; 8] = [
         Self::PgDifferentCluster,
         Self::PgContinuityUnproven,
+        Self::PgFailoverSlotUnavailable,
         Self::MysqlGtidPositionUnavailable,
         Self::SchemaDriftBlocked,
         Self::SinkAckUncertain,
@@ -66,6 +70,7 @@ impl ReasonCode {
         match self {
             Self::PgDifferentCluster => "pg_different_cluster",
             Self::PgContinuityUnproven => "pg_continuity_unproven",
+            Self::PgFailoverSlotUnavailable => "pg_failover_slot_unavailable",
             Self::MysqlGtidPositionUnavailable => {
                 "mysql_gtid_position_unavailable"
             }
@@ -174,6 +179,7 @@ pub enum ActionCode {
     RestartWithAdapt,
     VerifySinkState,
     InspectLogs,
+    EnableFailoverSlot,
 }
 
 /// The pipeline part that raised it.
@@ -321,6 +327,15 @@ pub enum EvidenceKey {
     ContentIdentity,
     SlotRestartPosition,
     SlotConfirmedPosition,
+    RecordedTimeline,
+    LiveTimeline,
+    TimelineSwitchPosition,
+    WalFlushPosition,
+    ReadPosition,
+    CheckpointChain,
+    CheckpointTransition,
+    RecordedChain,
+    RecordedTransition,
 }
 
 impl EvidenceKey {
@@ -349,6 +364,15 @@ impl EvidenceKey {
             Self::ContentIdentity => "content_identity",
             Self::SlotRestartPosition => "slot_restart_position",
             Self::SlotConfirmedPosition => "slot_confirmed_position",
+            Self::RecordedTimeline => "recorded_timeline",
+            Self::LiveTimeline => "live_timeline",
+            Self::TimelineSwitchPosition => "timeline_switch_position",
+            Self::WalFlushPosition => "wal_flush_position",
+            Self::ReadPosition => "read_position",
+            Self::CheckpointChain => "checkpoint_chain",
+            Self::CheckpointTransition => "checkpoint_transition",
+            Self::RecordedChain => "recorded_chain",
+            Self::RecordedTransition => "recorded_transition",
         }
     }
 }
@@ -632,6 +656,12 @@ pub fn explain(
             ev.show(K::CheckpointPosition),
             ev.show(K::Slot),
             ev.show(K::ReasonClass),
+        ),
+        ReasonCode::PgFailoverSlotUnavailable => format!(
+            "{component} streams through slot {}, which is not a failover \
+             slot: it keeps running, but cannot continue on a promoted \
+             standby after a failover.",
+            ev.show(K::Slot),
         ),
         ReasonCode::MysqlGtidPositionUnavailable => format!(
             "{component} cannot resume: its GTID position {} is not available \

@@ -4060,6 +4060,46 @@ mod tests {
         assert_eq!(result, b"{\"pos\":100}");
     }
 
+    /// After a promotion (transition 1) only one sink committed before a
+    /// crash: the fold of a transition-0 and a transition-1 checkpoint of one
+    /// chain resumes from the conservative transition-0 one. Without the
+    /// transition-0 adoption the other sink would still be unstamped, and that
+    /// fold fails closed.
+    #[tokio::test]
+    async fn per_sink_proxy_folds_one_postgres_chain_across_a_transition() {
+        let proxy = |entries: &[(&str, &[u8])]| {
+            let store =
+                Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+            let entries: Vec<(String, Vec<u8>)> = entries
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_vec()))
+                .collect();
+            async move {
+                for (k, v) in entries {
+                    store.put_raw(&k, &v).await.unwrap();
+                }
+                PerSinkCheckpointProxy {
+                    inner: store,
+                    source_id: "pg".to_string(),
+                    cmp_fn: Arc::new(sources::postgres::compare_pg_checkpoints),
+                    commit_signal: Arc::new(tokio::sync::Notify::new()),
+                }
+            }
+        };
+        let t0: &[u8] = br#"{"lsn":"0/300","tx_id":null,"timeline":1,"chain":"c","transition":0}"#;
+        let t1: &[u8] = br#"{"lsn":"0/500","tx_id":null,"timeline":2,"chain":"c","transition":1}"#;
+        let p = proxy(&[("pg::sink::kafka", t1), ("pg::sink::s3", t0)]).await;
+        assert_eq!(p.get_raw("pg").await.unwrap().unwrap(), t0);
+
+        let unstamped: &[u8] = br#"{"lsn":"0/300","tx_id":null}"#;
+        let p = proxy(&[("pg::sink::kafka", t1), ("pg::sink::s3", unstamped)])
+            .await;
+        assert!(
+            p.get_raw("pg").await.is_err(),
+            "unstamped with transition 1"
+        );
+    }
+
     #[tokio::test]
     async fn per_sink_proxy_passes_through_other_keys() {
         let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());

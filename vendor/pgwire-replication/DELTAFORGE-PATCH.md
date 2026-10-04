@@ -24,3 +24,16 @@ rereads the slot bounds after START_REPLICATION, before consuming any event)
 needs to know when the server accepted START_REPLICATION. `wait_started`
 resolves then, or returns the worker's error if it ended first. Files:
 `src/client/worker.rs`, `src/client/tokio_client.rs`.
+
+Change: `ReplicationClient::connect_gated`, `simple_query`, `identify_system`,
+`timeline_history` and `start` (with `GateCommand` / `QueryRow` in the
+worker). `connect_gated` connects and authenticates like `connect`, then the
+worker waits instead of sending START_REPLICATION: queries (SQL or replication
+commands) run on that authenticated session until `start` sends
+START_REPLICATION; dropping the client first ends the session with Terminate.
+DeltaForge proves on the session that then streams which server, timeline and
+slot state it is on (IDENTIFY_SYSTEM, TIMELINE_HISTORY, the slot row) before
+the stream starts, so nothing can change between the proof and the stream.
+A server error answer leaves the session usable; any other failure ends it.
+Files: `src/client/worker.rs`, `src/client/tokio_client.rs`,
+`src/client/mod.rs`.

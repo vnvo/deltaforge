@@ -1051,6 +1051,9 @@ async fn pg_first_resolution_drift_is_caught_with_a_cold_cache() -> Result<()> {
         &serde_json::to_vec(&sources::postgres::PostgresCheckpoint {
             lsn: row.get::<_, String>(0),
             tx_id: None,
+            timeline: None,
+            chain: None,
+            transition: None,
         })?,
     )
     .await?;
@@ -1569,6 +1572,9 @@ async fn postgres_cdc_checkpoint_resume() -> Result<()> {
     create_pub_slot(&client, "pub_ckpt", "slot_ckpt", &["orders"]).await?;
 
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    // One state store across the restart, as in production (the continuity
+    // record lives beside the checkpoint it stamps).
+    let backend = make_storage_backend().await;
 
     // First run
     {
@@ -1582,6 +1588,10 @@ async fn postgres_cdc_checkpoint_resume() -> Result<()> {
             AllowList::default(),
         )
         .await;
+        let src = PostgresSource {
+            backend: backend.clone(),
+            ..src
+        };
         let handle = src.run(tx, ckpt.clone()).await;
         wait_ready(&handle, Duration::from_secs(10)).await?;
         sleep(Duration::from_secs(2)).await;
@@ -1616,6 +1626,10 @@ async fn postgres_cdc_checkpoint_resume() -> Result<()> {
             AllowList::default(),
         )
         .await;
+        let src = PostgresSource {
+            backend: backend.clone(),
+            ..src
+        };
         let handle = src.run(tx, ckpt.clone()).await;
         wait_ready(&handle, Duration::from_secs(10)).await?;
 
@@ -1688,6 +1702,9 @@ async fn pg_two_sink_restart_resumes_from_slowest_sink() -> Result<()> {
         serde_json::to_vec(&sources::postgres::PostgresCheckpoint {
             lsn: lsn.to_string(),
             tx_id: None,
+            timeline: None,
+            chain: None,
+            transition: None,
         })
         .unwrap()
     };
