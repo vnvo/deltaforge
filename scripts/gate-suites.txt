@@ -1,0 +1,82 @@
+# Exact-tree gate suite manifest (read by scripts/gate.sh).
+#
+# Every integration test file (crates/<crate>/tests/<name>.rs) must appear
+# here exactly once, by `<crate>/<name>`; `scripts/gate.sh --check` fails on a
+# file that is missing or an entry that no longer exists.
+#
+# Line format: <lane> <name> [cargo test arguments]
+#   serial-pg  run one at a time against a PostgreSQL 17 container on port
+#              55432, with DELTAFORGE_IT_PG_DSN set
+#   serial     run one at a time (timing-sensitive or fixed-port suites)
+#   parallel   run concurrently (each suite starts its own containers)
+#   workspace  no ignored tests; covered by the `cargo test --workspace` step
+#   excluded   not run by the gate; the rest of the line is the reason
+# Without an explicit `--`, gate.sh appends
+# `-- --include-ignored --test-threads=1`.
+
+# PostgreSQL state-store suites (live database via DSN)
+serial-pg  storage/lib-pg                   -p storage --lib -- --include-ignored --test-threads=1 pg_
+serial-pg  runner/replay_pg_integration     -p runner --test replay_pg_integration
+
+# Timing-sensitive or fixed-port suites
+serial     sources/mysql_rotation_e2e       -p sources --test mysql_rotation_e2e
+serial     sources/postgres_rotation_e2e    -p sources --test postgres_rotation_e2e
+serial     runner/throughput_e2e            -p runner --test throughput_e2e
+serial     runner/mysql_throughput_e2e      -p runner --test mysql_throughput_e2e
+serial     runner/reliability_soak_e2e      -p runner --test reliability_soak_e2e
+serial     scale-harness/ci_tier            -p scale-harness --test ci_tier
+serial     scale-harness/live_ttfce         -p scale-harness --test live_ttfce
+
+# Live suites, run concurrently
+parallel   sources/lib                      -p sources --lib
+parallel   sources/failover_e2e             -p sources --test failover_e2e
+parallel   sources/mysql_activation_e2e     -p sources --test mysql_activation_e2e
+parallel   sources/mysql_cdc_e2e            -p sources --test mysql_cdc_e2e
+parallel   sources/mysql_checkpoint_lineage_e2e -p sources --test mysql_checkpoint_lineage_e2e
+parallel   sources/mysql_connection_identity_e2e -p sources --test mysql_connection_identity_e2e
+parallel   sources/mysql_ddl_replay_failclosed -p sources --test mysql_ddl_replay_failclosed
+parallel   sources/mysql_failover_drift_e2e -p sources --test mysql_failover_drift_e2e
+parallel   sources/mysql_lineage_failclosed -p sources --test mysql_lineage_failclosed
+parallel   sources/mysql_proof_matrix_e2e   -p sources --test mysql_proof_matrix_e2e
+parallel   sources/mysql_snapthot_e2e       -p sources --test mysql_snapthot_e2e
+parallel   sources/postgres_cdc_e2e         -p sources --test postgres_cdc_e2e
+parallel   sources/postgres_snapshot_e2e    -p sources --test postgres_snapshot_e2e
+parallel   sources/source_credentials       -p sources --test source_credentials
+parallel   sources/txn_coordinator_e2e      -p sources --test txn_coordinator_e2e
+parallel   runner/incidents_e2e             -p runner --test incidents_e2e
+parallel   runner/kafka_outage_restart_e2e  -p runner --test kafka_outage_restart_e2e
+parallel   runner/preflight_e2e             -p runner --test preflight_e2e
+parallel   runner/s3_e2e_tests              -p runner --test s3_e2e_tests
+parallel   runner/store_gate_cli            -p runner --test store_gate_cli
+# Vault suites compile only with the `vault` feature.
+parallel   sources/vault_source_e2e         -p sources --features vault --test vault_source_e2e
+parallel   runner/vault_sink_pipeline_secrets_e2e -p runner --features vault --test vault_sink_pipeline_secrets_e2e
+parallel   secrets/vault_e2e                -p secrets --features vault --test vault_e2e
+
+# No ignored tests: run by the workspace step
+workspace  deltaforge-config/config_tests
+workspace  deltaforge-core/source_handle
+workspace  processors/filter_processor_tests
+workspace  processors/flatten_processor_tests
+workspace  processors/js_processor_tests
+workspace  runner/helm_probe_config
+workspace  runner/secret_coverage_deployment_proof
+workspace  schema-sensing/cache_hit_comparison
+workspace  secrets/leak_prevention
+workspace  sinks/http_sink_tests
+workspace  sinks/s3_local_e2e
+workspace  sinks/sink_test_common
+workspace  sources/test_common
+workspace  storage/storage_tests
+
+# Not in the gate yet (sink integration suites; each needs its service
+# container). Their non-ignored tests still run in the workspace step.
+excluded   sinks/kafka_sink_tests           sink integration suite (Kafka), not gated yet
+excluded   sinks/nats_sink_tests            sink integration suite (NATS), not gated yet
+excluded   sinks/redis_sink_tests           sink integration suite (Redis), not gated yet
+excluded   sinks/elasticsearch_sink_tests   sink integration suite (Elasticsearch), not gated yet
+excluded   sinks/clickhouse_sink_tests      sink integration suite (ClickHouse), not gated yet
+excluded   sinks/s3_minio_test              sink integration suite (MinIO), not gated yet
+excluded   sinks/avro_encoding_tests        sink integration suite (schema registry), not gated yet
+excluded   runner/avro_e2e_tests            sink integration suite (schema registry), not gated yet
+excluded   runner/s3_ministack_canary       canary against a separate S3 emulator, not gated yet
