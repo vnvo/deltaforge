@@ -100,16 +100,20 @@ async fn start_topology(version: &str) -> Topology {
         ]))
         .await
         .expect("allow physical replication");
-    admin(primary_port, "postgres")
-        .await
-        .execute("SELECT pg_reload_conf()", &[])
-        .await
-        .unwrap();
+    let root = admin(primary_port, "postgres").await;
+    root.execute("SELECT pg_reload_conf()", &[]).await.unwrap();
+    // The standby's physical slot, created once here: a pg_basebackup retry
+    // that also created it would fail forever on "already exists".
+    root.execute(
+        "SELECT pg_create_physical_replication_slot('standby_slot')",
+        &[],
+    )
+    .await
+    .unwrap();
 
-    // The standby clones the primary with pg_basebackup (creating its
-    // physical slot and recovery configuration, with a dbname in
-    // primary_conninfo for slot synchronization), then runs as the postgres
-    // user.
+    // The standby clones the primary with pg_basebackup (its recovery
+    // configuration uses the physical slot and a dbname in primary_conninfo
+    // for slot synchronization), then runs as the postgres user.
     let conninfo = format!(
         "host={primary_name} user={PG_USER} password={PG_PASS} dbname=postgres"
     );
@@ -120,7 +124,7 @@ async fn start_topology(version: &str) -> Topology {
     let script = format!(
         "set -e; D=/tmp/standby; mkdir -p $D; chown postgres $D; chmod 700 $D; \
          until gosu postgres pg_basebackup -d '{conninfo}' -D $D -R -X stream \
-           -C -S standby_slot; do rm -rf $D/*; sleep 1; done; \
+           -S standby_slot; do rm -rf $D/*; sleep 1; done; \
          exec gosu postgres postgres -D $D {args}"
     );
     let standby = GenericImage::new("postgres", version)
