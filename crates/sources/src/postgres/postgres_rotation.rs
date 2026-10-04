@@ -32,7 +32,8 @@ use crate::rotation_manager::{
 use super::RunCtx;
 use super::fetch_slot_confirmed_lsn;
 use super::postgres_helpers::{
-    build_replication_config, connect_replication_with_retries, parse_dsn,
+    SlotBoundProof, build_replication_config, connect_replication_with_retries,
+    parse_dsn,
 };
 use super::postgres_slot_owner::{
     OwnerRead, connect, fetch_identity, ownership_proven, read_owner,
@@ -112,21 +113,30 @@ pub(crate) async fn confirm_slot_inactive(
 }
 
 /// Open a replication stream for `dsn` at `start_lsn` via the production connect
-/// path (same builder and retry policy as startup/reconnect).
+/// path (same builder, slot-bound proof and retry policy as startup/reconnect):
+/// the durable checkpoint, not `start_lsn`, is the safety boundary.
 async fn open_stream(
     dsn: &str,
     source_id: &str,
     slot: &str,
     publication: &str,
     start_lsn: Lsn,
+    chkpt: &Arc<dyn CheckpointStore>,
     cancel: &CancellationToken,
 ) -> Result<pgwire_replication::ReplicationClient, ()> {
     let components = parse_dsn(dsn).map_err(|_| ())?;
     let config =
         build_replication_config(&components, slot, publication, start_lsn);
+    let proof = SlotBoundProof {
+        dsn: crate::credentials::ProtectedDsn::from(dsn),
+        slot: slot.to_string(),
+        source_id: source_id.to_string(),
+        checkpoints: Arc::clone(chkpt),
+    };
     connect_replication_with_retries(
         source_id,
         config,
+        &proof,
         cancel,
         RetryPolicy::default(),
     )
@@ -299,6 +309,7 @@ impl RotationRuntime {
             let slot = slot.clone();
             let publication = publication.clone();
             let cancel = cancel.clone();
+            let chkpt = Arc::clone(&chkpt);
             move || async move {
                 let client = open_stream(
                     new_dsn.expose(),
@@ -306,6 +317,7 @@ impl RotationRuntime {
                     &slot,
                     &publication,
                     frozen,
+                    &chkpt,
                     &cancel,
                 )
                 .await?;
@@ -322,6 +334,7 @@ impl RotationRuntime {
             let slot = slot.clone();
             let publication = publication.clone();
             let cancel = cancel.clone();
+            let chkpt = Arc::clone(&chkpt);
             move || async move {
                 let client = open_stream(
                     old_dsn.expose(),
@@ -329,6 +342,7 @@ impl RotationRuntime {
                     &slot,
                     &publication,
                     frozen,
+                    &chkpt,
                     &cancel,
                 )
                 .await?;
