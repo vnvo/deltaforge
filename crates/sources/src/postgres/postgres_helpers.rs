@@ -1,7 +1,10 @@
 //! PostgreSQL source helper utilities.
 
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -17,7 +20,15 @@ use url::Url;
 use checkpoints::{CheckpointStore, CheckpointStoreExt};
 use common::{DsnComponents, RetryOutcome, RetryPolicy, retry_async};
 
-use super::{PostgresCheckpoint, PostgresSourceError, PostgresSourceResult};
+use storage::adapters::incidents::IncidentStore;
+
+use super::postgres_continuity::{
+    Checkpoint, Expected, FailoverSlot, Proven, Refusal, SessionFacts,
+    SlotFacts, history_needed, load_record, parse_history, prove, store_record,
+};
+use super::{
+    AsPgEndpoint, PostgresCheckpoint, PostgresSourceError, PostgresSourceResult,
+};
 
 // ----------------------------- Configuration Constants -----------------------------
 
@@ -110,44 +121,49 @@ pub(super) fn build_replication_config(
     .with_buffer_size(BUFFER_EVENTS)
 }
 
-/// The safety boundary of every replication stream: the source's durable
-/// checkpoint F, read from the checkpoint store immediately before each
-/// START_REPLICATION (never an in-memory read position).
+/// The proof every replication stream passes before START_REPLICATION
+/// (startup, reconnect and credential rotation alike), on the authenticated
+/// replication session that then streams: the server, timeline and slot it
+/// shows must continue the source's durable checkpoint F, read from the
+/// checkpoint store immediately before (never an in-memory read position).
+/// See [`super::postgres_continuity`] for the conditions.
 ///
-/// Before a stream opens, the slot must not have moved past F
-/// (`restart_lsn <= F` and `confirmed_flush_lsn <= F`): otherwise the server
-/// would stream from the slot's position and silently skip the changes after
-/// F. The stream then acknowledges F to the server (not where it starts
-/// reading), so the slot never advances past what the source can recover
-/// after a crash. A source with no durable checkpoint yet has nothing to
-/// prove: it starts from the slot's own position.
+/// The stream acknowledges F to the server (not where it starts reading), so
+/// the slot never advances past what the source can recover after a crash.
+/// A source with no durable checkpoint yet has no position to prove: only its
+/// server and timeline are.
 #[derive(Clone)]
-pub(super) struct SlotBoundProof {
+pub(crate) struct StreamProof {
     pub(super) dsn: crate::credentials::ProtectedDsn,
     pub(super) slot: String,
     pub(super) source_id: String,
+    pub(super) pipeline: String,
+    pub(super) tenant: String,
     pub(super) checkpoints: Arc<dyn CheckpointStore>,
+    pub(super) backend: storage::ArcStorageBackend,
+    /// The proven timeline of the open stream (0 until one is proven),
+    /// recorded in the checkpoints its events carry.
+    pub(super) timeline: Arc<AtomicU32>,
 }
 
 /// A slot's `(restart_lsn, confirmed_flush_lsn)`: `None` when the slot does
 /// not exist, a `None` position when the server reports none.
 type SlotBounds = Option<(Option<Lsn>, Option<Lsn>)>;
 
-impl SlotBoundProof {
-    /// Prove the slot is not beyond the durable checkpoint; returns that
-    /// checkpoint (the position to acknowledge), if any. A failed read of the
-    /// server is a retryable connect error; a slot beyond, missing or without
-    /// a position is a `pg_continuity_unproven` incident (fail closed).
-    pub(super) async fn prove(&self) -> SourceResult<Option<Lsn>> {
-        let Some(f) = self.durable_checkpoint().await? else {
-            return Ok(None);
-        };
-        self.check_bounds(f).await?;
-        Ok(Some(f))
+impl StreamProof {
+    /// The same proof for a stream opened with another DSN (rotation).
+    pub(super) fn with_dsn(
+        &self,
+        dsn: crate::credentials::ProtectedDsn,
+    ) -> Self {
+        Self {
+            dsn,
+            ..self.clone()
+        }
     }
 
     /// The durable checkpoint F, read now.
-    async fn durable_checkpoint(&self) -> SourceResult<Option<Lsn>> {
+    async fn durable_checkpoint(&self) -> SourceResult<Option<Checkpoint>> {
         let checkpoint: Option<PostgresCheckpoint> =
             self.checkpoints.get(&self.source_id).await.map_err(|e| {
                 SourceError::Checkpoint {
@@ -157,7 +173,7 @@ impl SlotBoundProof {
         let Some(checkpoint) = checkpoint else {
             return Ok(None);
         };
-        Lsn::parse(&checkpoint.lsn).map(Some).map_err(|e| {
+        let lsn = Lsn::parse(&checkpoint.lsn).map_err(|e| {
             SourceError::Checkpoint {
                 details: format!(
                     "invalid checkpoint LSN '{}': {e}",
@@ -165,13 +181,214 @@ impl SlotBoundProof {
                 )
                 .into(),
             }
+        })?;
+        Ok(Some(Checkpoint {
+            lsn,
+            timeline: checkpoint.timeline,
+        }))
+    }
+
+    /// Open a stream at `cfg.start_lsn`: connect and authenticate, prove
+    /// continuity on that session, persist the proven continuity record,
+    /// then START_REPLICATION; once the server holds the slot for this
+    /// session, recheck the slot bound before anything is consumed.
+    async fn open(
+        &self,
+        cfg: ReplicationConfig,
+    ) -> SourceResult<ReplicationClient> {
+        let checkpoint = self.durable_checkpoint().await?;
+        let f = checkpoint.map(|c| c.lsn);
+        let start = cfg.start_lsn;
+        let cfg = match f {
+            Some(f) => cfg.with_ack_lsn(f),
+            None => cfg,
+        };
+        // Dropping the client before `start` ends the session without
+        // replication.
+        let mut client = connect_replication(&self.source_id, cfg).await?;
+        let proven = match tokio::time::timeout(
+            Duration::from_secs(30),
+            self.prove_on_session(&mut client, checkpoint, start),
+        )
+        .await
+        {
+            Ok(proven) => proven?,
+            Err(_) => {
+                return Err(SourceError::Timeout {
+                    action: "prove_stream_continuity".into(),
+                });
+            }
+        };
+        if proven.record_changed {
+            store_record(&self.backend, &self.source_id, &proven.record)
+                .await
+                .map_err(|e| SourceError::Checkpoint {
+                    details: format!("{e:#}").into(),
+                })?;
+            info!(
+                source_id = %self.source_id,
+                timeline = proven.record.timeline,
+                transition_id = proven.record.transition_id,
+                checkpoint = ?proven.record.proven_at,
+                "continuity record updated"
+            );
+        }
+        self.report_failover_slot(proven.failover_slot).await;
+        self.timeline
+            .store(proven.record.timeline, Ordering::Release);
+        crate::stream_probe::after_slot_proof().await;
+
+        client.start().await.map_err(pgwire_error_to_source_error)?;
+        started(&self.source_id, &mut client).await?;
+        crate::stream_probe::record_stream_opened();
+        // The slot is now held by this session: prove again, against the same
+        // F the stream acknowledges, that it did not move past F between the
+        // proof and START_REPLICATION. Nothing has been consumed yet.
+        if let Some(f) = f
+            && let Err(e) = self.check_bounds(f).await
+        {
+            let _ = client.shutdown().await;
+            return Err(e);
+        }
+        Ok(client)
+    }
+
+    async fn prove_on_session(
+        &self,
+        client: &mut ReplicationClient,
+        checkpoint: Option<Checkpoint>,
+        start: Lsn,
+    ) -> SourceResult<Proven> {
+        let facts = read_session_facts(client, &self.slot)
+            .await
+            .map_err(|e| session_error(&self.slot, e))?;
+        let lineage = storage::adapters::source_lineage::load(
+            &self.backend,
+            &self.tenant,
+            &self.source_id,
+        )
+        .await
+        .map_err(SourceError::Other)?
+        .map(|r| r.current.descriptor.endpoint());
+        let Some(super::PgEndpoint {
+            system_identifier: Some(sysid),
+            database_oid: Some(dboid),
+        }) = lineage
+        else {
+            return Err(SourceError::Lineage {
+                details: format!(
+                    "source '{}' has no recorded PostgreSQL lineage; refusing \
+                     to stream",
+                    self.source_id
+                )
+                .into(),
+            });
+        };
+        let record = load_record(&self.backend, &self.source_id)
+            .await
+            .map_err(SourceError::Other)?;
+        let expected = Expected {
+            lineage: (sysid, dboid),
+            record: record.as_ref(),
+            checkpoint,
+            start,
+        };
+        let history = match history_needed(&expected, &facts) {
+            None => None,
+            Some(timeline) => match client.timeline_history(timeline).await {
+                Ok(h) => {
+                    match parse_history(&String::from_utf8_lossy(&h.content)) {
+                        Ok(entries) => Some(entries),
+                        Err(reason) => {
+                            warn!(
+                                source_id = %self.source_id, timeline, %reason,
+                                "unreadable timeline history; continuity unproven"
+                            );
+                            None
+                        }
+                    }
+                }
+                // The server has no history for it: nothing descends.
+                Err(e) if e.is_server() => None,
+                Err(e) => return Err(session_error(&self.slot, e)),
+            },
+        };
+        prove(&expected, &facts, history.as_deref()).map_err(|refusal| {
+            match refusal {
+                Refusal::DifferentCluster { expected, live } => {
+                    let endpoint = |(s, d): (u64, u64)| super::PgEndpoint {
+                        system_identifier: Some(s),
+                        database_oid: Some(d),
+                    };
+                    super::server_changed(
+                        &self.source_id,
+                        &endpoint(expected),
+                        &endpoint(live),
+                    )
+                }
+                Refusal::Unproven { class, evidence } => {
+                    super::continuity_refusal(
+                        &self.source_id,
+                        &self.slot,
+                        checkpoint.map(|c| c.lsn),
+                        class,
+                        &evidence,
+                    )
+                }
+            }
         })
     }
 
+    /// Raise (or resolve) the running-degraded incident of a PostgreSQL 17+
+    /// slot that cannot continue across a failover. Never fails the stream.
+    async fn report_failover_slot(&self, failover: FailoverSlot) {
+        let store =
+            IncidentStore::new(Arc::clone(&self.backend), &self.pipeline);
+        match failover {
+            FailoverSlot::Disabled => {
+                warn!(
+                    source_id = %self.source_id, slot = %self.slot,
+                    "the replication slot is not a failover slot: the source \
+                     cannot continue on a promoted standby after a failover"
+                );
+                let draft = super::failover_slot_unavailable_draft(
+                    &self.source_id,
+                    &self.slot,
+                );
+                if let Err(e) = store.raise(&draft, 1).await {
+                    warn!(
+                        error = %format!("{e:#}"),
+                        "could not record the failover-slot incident"
+                    );
+                }
+            }
+            FailoverSlot::Enabled => {
+                let component = deltaforge_core::incident::Component::Source {
+                    id: self.source_id.clone(),
+                };
+                if let Err(e) = store
+                    .resolve_matching(
+                        deltaforge_core::incident::ReasonCode::PgFailoverSlotUnavailable,
+                        &component,
+                        None,
+                        storage::adapters::incidents::FAILOVER_SLOT_VERIFIED,
+                    )
+                    .await
+                {
+                    warn!(
+                        error = %format!("{e:#}"),
+                        "could not resolve the failover-slot incident"
+                    );
+                }
+            }
+            FailoverSlot::Unsupported => {}
+        }
+    }
+
     /// Require the slot's `restart_lsn` and `confirmed_flush_lsn` to be at or
-    /// before `f`. Used before a stream opens and again right after the
-    /// server accepted START_REPLICATION (the slot is then held, so it can no
-    /// longer move between the check and the stream).
+    /// before `f`, read on a control connection right after the server
+    /// accepted START_REPLICATION (the slot is then held, so it can no longer
+    /// move between the check and the stream).
     pub(super) async fn check_bounds(&self, f: Lsn) -> SourceResult<()> {
         let bounds = read_slot_bounds(self.dsn.expose(), &self.slot)
             .await
@@ -211,6 +428,76 @@ impl SlotBoundProof {
     }
 }
 
+/// A failure to read the session's facts: retried like a connection failure.
+fn session_error(slot: &str, e: PgWireError) -> SourceError {
+    SourceError::Connect {
+        details: format!(
+            "read the replication session's server, timeline and slot \
+             '{slot}' before streaming: {e}"
+        )
+        .into(),
+    }
+}
+
+/// Read what the gated replication session shows before START_REPLICATION:
+/// IDENTIFY_SYSTEM, then the database OID, server version, recovery state and
+/// slot row in one query on the same session.
+async fn read_session_facts(
+    client: &mut ReplicationClient,
+    slot: &str,
+) -> Result<SessionFacts, PgWireError> {
+    let malformed =
+        |what: &str| PgWireError::Protocol(format!("unexpected {what}"));
+    let id = client.identify_system().await?;
+    let system_identifier = id
+        .system_id
+        .parse::<u64>()
+        .map_err(|_| malformed("system identifier"))?;
+    let sql = format!(
+        "SELECT (SELECT oid FROM pg_database \
+                 WHERE datname = current_database())::text, \
+                current_setting('server_version_num'), \
+                pg_is_in_recovery()::text, \
+                (SELECT to_jsonb(s)::text FROM pg_replication_slots s \
+                 WHERE s.slot_name = '{}')",
+        slot.replace('\'', "''")
+    );
+    let rows = client.simple_query(&sql).await?;
+    let [row] = rows.as_slice() else {
+        return Err(malformed("session facts row count"));
+    };
+    let text = |i: usize| {
+        row.get(i)
+            .and_then(|v| v.as_ref())
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+    };
+    let database_oid = text(0)
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| malformed("database oid"))?;
+    let server_version_num = text(1)
+        .and_then(|s| s.parse::<u32>().ok())
+        .ok_or_else(|| malformed("server version"))?;
+    let in_recovery = match text(2).as_deref() {
+        Some("false") => false,
+        Some("true") => true,
+        _ => return Err(malformed("recovery state")),
+    };
+    let slot = match text(3) {
+        None => None,
+        Some(json) => Some(SlotFacts::from_json(
+            &serde_json::from_str(&json).map_err(|_| malformed("slot row"))?,
+        )),
+    };
+    Ok(SessionFacts {
+        system_identifier,
+        database_oid,
+        timeline: id.timeline,
+        flush: id.xlogpos,
+        server_version_num,
+        in_recovery,
+        slot,
+    })
+}
 async fn read_slot_bounds(
     dsn: &str,
     slot: &str,
@@ -235,46 +522,24 @@ async fn read_slot_bounds(
     }))
 }
 
-/// Connect to replication with retries. Every attempt proves the slot bound
-/// first ([`SlotBoundProof`]) and acknowledges the durable checkpoint.
+/// Open a replication stream with retries. Every attempt proves continuity
+/// on its own session first ([`StreamProof`]) and acknowledges the durable
+/// checkpoint.
 pub(super) async fn connect_replication_with_retries(
     source_id: &str,
     config: ReplicationConfig,
-    proof: &SlotBoundProof,
+    proof: &StreamProof,
     cancel: &CancellationToken,
     retry_policy: RetryPolicy,
 ) -> SourceResult<ReplicationClient> {
-    let source_id = source_id.to_string();
     let cfg = config.clone();
     let proof = proof.clone();
 
     retry_async(
         move |_| {
             let cfg = cfg.clone();
-            let source_id = source_id.clone();
             let proof = proof.clone();
-            async move {
-                let f = proof.prove().await?;
-                crate::stream_probe::after_slot_proof().await;
-                let cfg = match f {
-                    Some(f) => cfg.with_ack_lsn(f),
-                    None => cfg,
-                };
-                let mut client = connect_replication(&source_id, cfg).await?;
-                started(&source_id, &mut client).await?;
-                crate::stream_probe::record_stream_opened();
-                // The slot is now held by this session: prove again, against
-                // the same F the stream acknowledges, that it did not move
-                // past F between the first proof and START_REPLICATION.
-                // Nothing has been consumed from the stream yet.
-                if let Some(f) = f
-                    && let Err(e) = proof.check_bounds(f).await
-                {
-                    let _ = client.shutdown().await;
-                    return Err(e);
-                }
-                Ok(client)
-            }
+            async move { proof.open(cfg).await }
         },
         is_retryable_source_error,
         Duration::from_secs(30),
@@ -291,6 +556,7 @@ pub(super) async fn connect_replication_with_retries(
             attempts,
         } => {
             warn!(
+                source_id,
                 attempts = attempts,
                 "replication connection exhausted retries"
             );
@@ -351,7 +617,7 @@ async fn connect_replication(
 
     match tokio::time::timeout(
         Duration::from_secs(30),
-        ReplicationClient::connect(config),
+        ReplicationClient::connect_gated(config),
     )
     .await
     {
@@ -529,11 +795,7 @@ pub(super) async fn ensure_slot_and_publication(
             .unwrap_or(get_current_wal_lsn(&client).await?)
     } else {
         // Auto-create slot (safe - only requires REPLICATION privilege)
-        client
-            .batch_execute(&format!(
-                "SELECT * FROM pg_create_logical_replication_slot('{}', 'pgoutput')",
-                slot
-            ))
+        super::postgres_slot_owner::create_logical_slot(&client, slot)
             .await
             .map_err(|e| {
                 error!(error = %e, slot = %slot, "failed to create replication slot");
@@ -647,12 +909,14 @@ pub(crate) fn redact_password(dsn: &str) -> String {
 /// Build checkpoint metadata from LSN.
 ///
 /// Hand-writes the JSON to avoid serde_json overhead on every event.
-/// Format: `{"lsn":"X/Y","tx_id":N}` or `{"lsn":"X/Y","tx_id":null}`
+/// Format: `{"lsn":"X/Y","tx_id":N|null}`, plus `"timeline":T` once the
+/// stream's timeline is proven (older checkpoints have none).
 pub(crate) fn make_checkpoint_meta(
     lsn: &Lsn,
     tx_id: Option<u32>,
+    timeline: Option<u32>,
 ) -> CheckpointMeta {
-    make_checkpoint_meta_str(&lsn.to_string(), tx_id)
+    make_checkpoint_meta_str(&lsn.to_string(), tx_id, timeline)
 }
 
 /// Build checkpoint metadata from a pre-formatted LSN string.
@@ -660,16 +924,21 @@ pub(crate) fn make_checkpoint_meta(
 pub(crate) fn make_checkpoint_meta_str(
     lsn_str: &str,
     tx_id: Option<u32>,
+    timeline: Option<u32>,
 ) -> CheckpointMeta {
     use std::fmt::Write;
-    let mut buf = String::with_capacity(48);
+    let mut buf = String::with_capacity(64);
     let _ = write!(buf, r#"{{"lsn":"{}","tx_id":"#, lsn_str);
     match tx_id {
         Some(id) => {
-            let _ = write!(buf, "{}}}", id);
+            let _ = write!(buf, "{}", id);
         }
-        None => buf.push_str("null}"),
+        None => buf.push_str("null"),
     }
+    if let Some(t) = timeline {
+        let _ = write!(buf, r#","timeline":{t}"#);
+    }
+    buf.push('}');
     CheckpointMeta::from_vec(buf.into_bytes())
 }
 

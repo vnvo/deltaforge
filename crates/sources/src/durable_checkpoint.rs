@@ -675,6 +675,7 @@ mod tests {
         let cp = PostgresCheckpoint {
             lsn: lsn.to_string(),
             tx_id: tx,
+            timeline: None,
         };
         let raw = serde_json::to_vec(&cp).unwrap();
         let parsed: PostgresCheckpoint = serde_json::from_slice(&raw).unwrap();
@@ -924,6 +925,7 @@ mod tests {
         let legacy = serde_json::to_vec(&PostgresCheckpoint {
             lsn: "0/100".into(),
             tx_id: Some(1),
+            timeline: None,
         })
         .unwrap();
         let good = pg_wm(1, "0/200", Some(2), true);

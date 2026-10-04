@@ -154,16 +154,33 @@ async fn create_slot(
     client: &tokio_postgres::Client,
     slot: &str,
 ) -> Result<Lsn> {
-    let row = client
-        .query_one(
-            "SELECT lsn::text FROM \
-             pg_create_logical_replication_slot($1, 'pgoutput')",
-            &[&slot],
-        )
+    let lsn_str = create_logical_slot(client, slot)
         .await
         .context("pg_create_logical_replication_slot")?;
-    let lsn_str: String = row.get(0);
     Lsn::parse(&lsn_str).context("parse slot consistent LSN")
+}
+
+/// Create a persistent `pgoutput` slot; returns its consistent point (text).
+/// On PostgreSQL 17+ it is a failover slot, so its position is synchronized
+/// to standbys and can continue after a promotion (the continuity proof
+/// requires that after a timeline switch).
+pub(crate) async fn create_logical_slot(
+    client: &tokio_postgres::Client,
+    slot: &str,
+) -> Result<String, tokio_postgres::Error> {
+    let version: i32 = client
+        .query_one("SELECT current_setting('server_version_num')::int", &[])
+        .await?
+        .get(0);
+    let sql = if version as u32
+        >= super::postgres_continuity::FAILOVER_SLOTS_VERSION
+    {
+        "SELECT lsn::text FROM pg_create_logical_replication_slot(\
+         $1, 'pgoutput', false, false, true)"
+    } else {
+        "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')"
+    };
+    Ok(client.query_one(sql, &[&slot]).await?.get(0))
 }
 
 async fn drop_slot(client: &tokio_postgres::Client, slot: &str) -> Result<()> {

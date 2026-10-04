@@ -177,8 +177,11 @@ pub(super) async fn dispatch_event(
                 // Checkpoint and watermark BOTH describe this COMMIT boundary:
                 // the COMMIT record's end_lsn (never the last row/message LSN)
                 // and the frozen startup system_identifier lineage.
-                let checkpoint =
-                    make_checkpoint_meta(&end_lsn, ctx.current_tx_id);
+                let checkpoint = make_checkpoint_meta(
+                    &end_lsn,
+                    ctx.current_tx_id,
+                    ctx.stream_timeline(),
+                );
                 let boundary = boundary_for_pg_commit(
                     ctx.system_identifier,
                     &end_lsn,
@@ -696,7 +699,11 @@ async fn handle_insert(
         change_ordinal,
     )?;
     let lsn_str = &ctx.cached_lsn.as_ref().unwrap().1;
-    let chkpt = make_checkpoint_meta_str(lsn_str, ctx.current_tx_id);
+    let chkpt = make_checkpoint_meta_str(
+        lsn_str,
+        ctx.current_tx_id,
+        ctx.stream_timeline(),
+    );
     let mut ev = Event::new_row(
         event_id,
         source_info,
@@ -816,7 +823,11 @@ async fn handle_update(
         change_ordinal,
     )?;
     let lsn_str = &ctx.cached_lsn.as_ref().unwrap().1;
-    let chkpt = make_checkpoint_meta_str(lsn_str, ctx.current_tx_id);
+    let chkpt = make_checkpoint_meta_str(
+        lsn_str,
+        ctx.current_tx_id,
+        ctx.stream_timeline(),
+    );
     let mut ev = Event::new_row(
         event_id,
         source_info,
@@ -912,7 +923,11 @@ async fn handle_delete(
         change_ordinal,
     )?;
     let lsn_str = &ctx.cached_lsn.as_ref().unwrap().1;
-    let chkpt = make_checkpoint_meta_str(lsn_str, ctx.current_tx_id);
+    let chkpt = make_checkpoint_meta_str(
+        lsn_str,
+        ctx.current_tx_id,
+        ctx.stream_timeline(),
+    );
     let mut ev = Event::new_row(
         event_id,
         source_info,
@@ -1032,7 +1047,11 @@ async fn handle_truncate(
             0,
         )
         .with_tenant(ctx.tenant.clone())
-        .with_checkpoint(make_checkpoint_meta(&wal_lsn, ctx.current_tx_id));
+        .with_checkpoint(make_checkpoint_meta(
+            &wal_lsn,
+            ctx.current_tx_id,
+            ctx.stream_timeline(),
+        ));
 
         if let Some(tx_id) = ctx.current_tx_id {
             ev.transaction = Some(Transaction {

@@ -1051,6 +1051,7 @@ async fn pg_first_resolution_drift_is_caught_with_a_cold_cache() -> Result<()> {
         &serde_json::to_vec(&sources::postgres::PostgresCheckpoint {
             lsn: row.get::<_, String>(0),
             tx_id: None,
+            timeline: None,
         })?,
     )
     .await?;
@@ -1688,6 +1689,7 @@ async fn pg_two_sink_restart_resumes_from_slowest_sink() -> Result<()> {
         serde_json::to_vec(&sources::postgres::PostgresCheckpoint {
             lsn: lsn.to_string(),
             tx_id: None,
+            timeline: None,
         })
         .unwrap()
     };

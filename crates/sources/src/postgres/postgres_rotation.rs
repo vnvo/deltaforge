@@ -32,7 +32,7 @@ use crate::rotation_manager::{
 use super::RunCtx;
 use super::fetch_slot_confirmed_lsn;
 use super::postgres_helpers::{
-    SlotBoundProof, build_replication_config, connect_replication_with_retries,
+    StreamProof, build_replication_config, connect_replication_with_retries,
     parse_dsn,
 };
 use super::postgres_slot_owner::{
@@ -113,30 +113,27 @@ pub(crate) async fn confirm_slot_inactive(
 }
 
 /// Open a replication stream for `dsn` at `start_lsn` via the production connect
-/// path (same builder, slot-bound proof and retry policy as startup/reconnect):
-/// the durable checkpoint, not `start_lsn`, is the safety boundary.
+/// path (same builder, continuity proof and retry policy as startup/reconnect):
+/// continuity of the durable checkpoint, proven on the stream's own session,
+/// is the safety boundary.
 async fn open_stream(
-    dsn: &str,
-    source_id: &str,
-    slot: &str,
+    dsn: &crate::credentials::ProtectedDsn,
+    proof: &StreamProof,
     publication: &str,
     start_lsn: Lsn,
-    chkpt: &Arc<dyn CheckpointStore>,
     cancel: &CancellationToken,
 ) -> Result<pgwire_replication::ReplicationClient, ()> {
-    let components = parse_dsn(dsn).map_err(|_| ())?;
-    let config =
-        build_replication_config(&components, slot, publication, start_lsn);
-    let proof = SlotBoundProof {
-        dsn: crate::credentials::ProtectedDsn::from(dsn),
-        slot: slot.to_string(),
-        source_id: source_id.to_string(),
-        checkpoints: Arc::clone(chkpt),
-    };
+    let components = parse_dsn(dsn.expose()).map_err(|_| ())?;
+    let config = build_replication_config(
+        &components,
+        &proof.slot,
+        publication,
+        start_lsn,
+    );
     connect_replication_with_retries(
-        source_id,
+        &proof.source_id,
         config,
-        &proof,
+        &proof.with_dsn(dsn.clone()),
         cancel,
         RetryPolicy::default(),
     )
@@ -168,6 +165,7 @@ pub(crate) struct RotationRuntime {
     slot: String,
     publication: String,
     chkpt: Arc<dyn CheckpointStore>,
+    proof: StreamProof,
 }
 
 impl RotationRuntime {
@@ -180,6 +178,7 @@ impl RotationRuntime {
         slot: String,
         publication: String,
         chkpt: Arc<dyn CheckpointStore>,
+        proof: StreamProof,
         parent_cancel: &CancellationToken,
     ) -> SourceResult<Self> {
         Ok(Self {
@@ -193,6 +192,7 @@ impl RotationRuntime {
             slot,
             publication,
             chkpt,
+            proof,
         })
     }
 
@@ -305,19 +305,15 @@ impl RotationRuntime {
         let open_new = {
             let repl_client = Arc::clone(&repl_client);
             let new_dsn = new_dsn.clone();
-            let source_id = source_id.clone();
-            let slot = slot.clone();
+            let proof = self.proof.clone();
             let publication = publication.clone();
             let cancel = cancel.clone();
-            let chkpt = Arc::clone(&chkpt);
             move || async move {
                 let client = open_stream(
-                    new_dsn.expose(),
-                    &source_id,
-                    &slot,
+                    &new_dsn,
+                    &proof,
                     &publication,
                     frozen,
-                    &chkpt,
                     &cancel,
                 )
                 .await?;
@@ -330,19 +326,15 @@ impl RotationRuntime {
         let open_old = {
             let repl_client = Arc::clone(&repl_client);
             let old_dsn = old_dsn.clone();
-            let source_id = source_id.clone();
-            let slot = slot.clone();
+            let proof = self.proof.clone();
             let publication = publication.clone();
             let cancel = cancel.clone();
-            let chkpt = Arc::clone(&chkpt);
             move || async move {
                 let client = open_stream(
-                    old_dsn.expose(),
-                    &source_id,
-                    &slot,
+                    &old_dsn,
+                    &proof,
                     &publication,
                     frozen,
-                    &chkpt,
                     &cancel,
                 )
                 .await?;

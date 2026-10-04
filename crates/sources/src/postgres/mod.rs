@@ -2,7 +2,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32},
+    },
     time::{Duration, Instant},
 };
 
@@ -35,6 +38,7 @@ mod postgres_errors;
 use postgres_errors::LoopControl;
 pub use postgres_errors::{PostgresSourceError, PostgresSourceResult};
 
+mod postgres_continuity;
 mod postgres_helpers;
 use postgres_helpers::{
     connect_replication_with_retries, ensure_publication_exists,
@@ -93,6 +97,10 @@ use storage::adapters::LineageDescriptor;
 pub struct PostgresCheckpoint {
     pub lsn: String,
     pub tx_id: Option<u32>,
+    /// The timeline the position was read on (absent in checkpoints written
+    /// before it was recorded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline: Option<u32>,
 }
 
 // ============================================================================
@@ -190,6 +198,19 @@ pub(crate) struct RunCtx {
     pub counter_cache: HashMap<(Arc<str>, &'static str), metrics::Counter>,
     /// Cached LSN string to avoid re-formatting the same LSN on consecutive events.
     pub cached_lsn: Option<(Lsn, String)>,
+    /// The proven timeline of the open stream (0: none proven yet), shared
+    /// with the stream proof that sets it before each START_REPLICATION.
+    pub timeline: Arc<AtomicU32>,
+}
+
+impl RunCtx {
+    /// The open stream's proven timeline, recorded in its checkpoints.
+    pub(crate) fn stream_timeline(&self) -> Option<u32> {
+        match self.timeline.load(std::sync::atomic::Ordering::Acquire) {
+            0 => None,
+            t => Some(t),
+        }
+    }
 }
 
 // ============================================================================
@@ -600,19 +621,24 @@ impl PostgresSource {
         );
 
         let config = config.with_start_lsn(start_lsn);
-        // The safety boundary of every stream this run opens: the durable
-        // checkpoint, reread before each START_REPLICATION.
-        let slot_bound = postgres_helpers::SlotBoundProof {
+        // The safety boundary of every stream this run opens: continuity of
+        // the durable checkpoint, proven on each stream's own session before
+        // its START_REPLICATION.
+        let stream_proof = postgres_helpers::StreamProof {
             dsn: self.dsn.clone(),
             slot: self.slot.clone(),
             source_id: self.id.clone(),
+            pipeline: self.pipeline.clone(),
+            tenant: self.tenant.clone(),
             checkpoints: chkpt_store.clone(),
+            backend: Arc::clone(&self.backend),
+            timeline: Arc::new(AtomicU32::new(0)),
         };
 
         let client = connect_replication_with_retries(
             &self.id,
             config.clone(),
-            &slot_bound,
+            &stream_proof,
             &cancel,
             RetryPolicy::default(),
         )
@@ -657,6 +683,7 @@ impl PostgresSource {
             registry_backend: Arc::clone(&backend),
             counter_cache: HashMap::new(),
             cached_lsn: None,
+            timeline: Arc::clone(&stream_proof.timeline),
         };
 
         // The server may have changed between the check above and the open:
@@ -676,6 +703,7 @@ impl PostgresSource {
                 self.slot.clone(),
                 self.publication.clone(),
                 chkpt_store.clone(),
+                stream_proof.clone(),
                 &ctx.cancel,
             )?),
             None => None,
@@ -869,15 +897,11 @@ impl PostgresSource {
                         &self.publication,
                         ctx.resume_lsn,
                     );
-                    let reconnect_bound = postgres_helpers::SlotBoundProof {
-                        dsn: ctx.dsn.clone(),
-                        ..slot_bound.clone()
-                    };
 
                     match connect_replication_with_retries(
                         &self.id,
                         reconnect_config,
-                        &reconnect_bound,
+                        &stream_proof.with_dsn(ctx.dsn.clone()),
                         &ctx.cancel,
                         ctx.retry.clone(),
                     )
@@ -936,6 +960,7 @@ impl PostgresSource {
                     PostgresCheckpoint {
                         lsn: ctx.last_lsn.to_string(),
                         tx_id: None,
+                        timeline: ctx.stream_timeline(),
                     },
                 )
                 .await;
@@ -1108,10 +1133,20 @@ async fn advance_wal_feedback(
 /// Cross-lineage comparison (two LSNs from different PostgreSQL systems) is a
 /// known gap: v1 checkpoints carry no lineage token, so same-lineage is assumed
 /// here. See `docs/specs/postgres-checkpoint-comparison-lineage-design.md`.
+///
+/// Checkpoints carrying different timelines order by LSN only when the later
+/// timeline's position is strictly after the earlier one's (consistent with a
+/// descent: positions read before a switch are below its switch point, those
+/// after it above). Anything else - the same LSN, or a later timeline at a
+/// lower LSN - may belong to diverged histories and is incomparable, never
+/// equal. A checkpoint without a timeline (written before timelines were
+/// recorded) orders by LSN as before.
 pub fn compare_pg_checkpoints(a: &[u8], b: &[u8]) -> CheckpointOrder {
     #[derive(serde::Deserialize)]
     struct Cp {
         lsn: String,
+        #[serde(default)]
+        timeline: Option<u32>,
     }
 
     fn parse_lsn(s: &str) -> Option<u64> {
@@ -1146,6 +1181,16 @@ pub fn compare_pg_checkpoints(a: &[u8], b: &[u8]) -> CheckpointOrder {
         );
         return CheckpointOrder::Incomparable;
     };
+    if let (Some(ta), Some(tb)) = (a.timeline, b.timeline)
+        && ta != tb
+        && (ta < tb) != (la < lb)
+    {
+        tracing::warn!(
+            lsn_a = %a.lsn, timeline_a = ta, lsn_b = %b.lsn, timeline_b = tb,
+            "incomparable checkpoints: positions on different timelines"
+        );
+        return CheckpointOrder::Incomparable;
+    }
     match la.cmp(&lb) {
         std::cmp::Ordering::Less => CheckpointOrder::Before,
         std::cmp::Ordering::Equal => CheckpointOrder::Equal,
@@ -1558,6 +1603,133 @@ pub(super) fn slot_bound_incident(
     SourceError::incident(draft, cause)
 }
 
+/// The `pg_continuity_unproven` incident of a continuity proof that failed
+/// on the replication session (see `postgres_continuity`): the source stops
+/// before START_REPLICATION. Timelines, the switch point, slot bounds, the WAL
+/// flush and read positions are evidence.
+pub(super) fn continuity_refusal(
+    source_id: &str,
+    slot: &str,
+    checkpoint: Option<Lsn>,
+    class: &str,
+    ev: &postgres_continuity::RefusalEvidence,
+) -> SourceError {
+    let checkpoint = checkpoint.map_or("none".to_string(), |f| f.to_string());
+    let shown = |v: Option<String>| v.unwrap_or_else(|| "unknown".into());
+    let recorded = shown(ev.recorded_timeline.map(|t| t.to_string()));
+    let live = shown(ev.live_timeline.map(|t| t.to_string()));
+    let details = match class {
+        "timeline_unrecorded" => format!(
+            "no timeline is recorded for checkpoint {checkpoint}, and the \
+             server (timeline {live}) has switched timeline: continuity of the \
+             checkpoint cannot be proven. Adopt the current timeline \
+             explicitly after verifying it, or re-snapshot."
+        ),
+        "timeline_not_descended" => format!(
+            "the server's timeline {live} does not descend from timeline \
+             {recorded}, on which checkpoint {checkpoint} was written: it is \
+             another history. Re-snapshot required."
+        ),
+        "switch_before_checkpoint" | "switch_before_read_position" => format!(
+            "timeline {recorded} ended at {} on this server, before the \
+             position the source continues from (checkpoint {checkpoint}, \
+             read position {}): changes after the switch point are not part \
+             of this server's history. Re-snapshot required.",
+            shown(ev.switch_point.map(|l| l.to_string())),
+            shown(ev.start.map(|l| l.to_string())),
+        ),
+        "slot_not_synced" => format!(
+            "the server switched from timeline {recorded} to {live}, but slot \
+             '{slot}' is not a synchronized failover slot: its position \
+             cannot be trusted to continue checkpoint {checkpoint}. \
+             Re-snapshot required."
+        ),
+        "failover_unsupported_version" => format!(
+            "the server switched from timeline {recorded} to {live}; \
+             continuation across a timeline switch needs PostgreSQL 17 \
+             failover slots. Re-snapshot required."
+        ),
+        "server_in_recovery" => format!(
+            "the server is a standby in recovery (timeline {live}): it can \
+             switch timeline while a stream is open, so continuity of \
+             checkpoint {checkpoint} cannot be proven on it. Point the source \
+             at the primary."
+        ),
+        "wal_behind_checkpoint" => format!(
+            "the server's WAL ends at {}, before checkpoint {checkpoint}: it \
+             does not contain the source's history. Re-snapshot required.",
+            shown(ev.flush.map(|l| l.to_string())),
+        ),
+        other => format!(
+            "replication slot '{slot}' cannot continue checkpoint \
+             {checkpoint} ({other})"
+        ),
+    };
+    error!(
+        source_id, slot, checkpoint = %checkpoint, class,
+        recorded_timeline = %recorded, live_timeline = %live,
+        "continuity of the resume position is not proven; refusing to stream"
+    );
+    let cause = SourceError::Checkpoint {
+        details: details.into(),
+    };
+    let draft = continuity_unproven_draft(
+        source_id,
+        slot,
+        &checkpoint,
+        class,
+        Retryability::OperatorAction,
+        cause.cause_code(),
+    )
+    .with_evidence(|e| {
+        let mut put = |k, v: Option<String>| {
+            if let Some(v) = v {
+                e.text(k, &v);
+            }
+        };
+        put(
+            K::RecordedTimeline,
+            ev.recorded_timeline.map(|t| t.to_string()),
+        );
+        put(K::LiveTimeline, ev.live_timeline.map(|t| t.to_string()));
+        put(
+            K::TimelineSwitchPosition,
+            ev.switch_point.map(|l| l.to_string()),
+        );
+        put(K::SlotRestartPosition, ev.restart.map(|l| l.to_string()));
+        put(
+            K::SlotConfirmedPosition,
+            ev.confirmed.map(|l| l.to_string()),
+        );
+        put(K::WalFlushPosition, ev.flush.map(|l| l.to_string()));
+        put(K::ReadPosition, ev.start.map(|l| l.to_string()));
+    });
+    SourceError::incident(draft, cause)
+}
+
+/// The running-degraded `pg_failover_slot_unavailable` incident: the slot of
+/// a PostgreSQL 17+ server is not a failover slot. Resolved when a later
+/// stream proves the slot is one.
+pub(super) fn failover_slot_unavailable_draft(
+    source_id: &str,
+    slot: &str,
+) -> IncidentDraft {
+    IncidentDraft::new(
+        ReasonCode::PgFailoverSlotUnavailable,
+        Component::Source {
+            id: source_id.to_string(),
+        },
+        Retryability::OperatorAction,
+        SafetyState::RunningDegraded,
+        CauseCode::SourceIncompatible,
+    )
+    .discriminate("slot", slot)
+    .with_evidence(|e| {
+        e.text(K::SourceId, source_id).text(K::Slot, slot);
+    })
+    .with_actions(&[ActionCode::EnableFailoverSlot])
+}
+
 /// The `pg_continuity_unproven` draft. Its identity is the slot, checkpoint
 /// and class, never the retryability, so an automatic retry that exhausts
 /// its window stays one incident.
@@ -1599,13 +1771,19 @@ fn continuity_unproven_draft(
 /// The PostgreSQL identity a refusal compares: cluster `system_identifier`
 /// and, when known, the database OID.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct PgEndpoint {
+pub(super) struct PgEndpoint {
     system_identifier: Option<u64>,
     database_oid: Option<u64>,
 }
 
-trait AsPgEndpoint: std::fmt::Debug {
+pub(super) trait AsPgEndpoint: std::fmt::Debug {
     fn endpoint(&self) -> PgEndpoint;
+}
+
+impl AsPgEndpoint for PgEndpoint {
+    fn endpoint(&self) -> PgEndpoint {
+        *self
+    }
 }
 
 impl AsPgEndpoint for LineageDescriptor {
@@ -1684,7 +1862,7 @@ fn different_cluster_draft(
     .with_actions(&[ActionCode::VerifyEndpoint, ActionCode::UseNewSourceId])
 }
 
-fn server_changed(
+pub(super) fn server_changed(
     source_id: &str,
     expected: &impl AsPgEndpoint,
     live: &impl AsPgEndpoint,
@@ -2099,7 +2277,7 @@ mod wal_feedback_tests {
 
 #[cfg(test)]
 mod compare_checkpoints_tests {
-    use super::compare_pg_checkpoints;
+    use super::{PostgresCheckpoint, compare_pg_checkpoints, postgres_helpers};
     use deltaforge_core::CheckpointOrder;
 
     fn cp(lsn: &str) -> Vec<u8> {
@@ -2160,6 +2338,64 @@ mod compare_checkpoints_tests {
                 CheckpointOrder::Equal
             );
         }
+    }
+
+    #[test]
+    fn timelines_order_only_along_a_descent() {
+        let at = |lsn: &str, t: u32| {
+            format!(r#"{{"lsn":"{lsn}","tx_id":null,"timeline":{t}}}"#)
+                .into_bytes()
+        };
+        // Before and after a switch: ordered by LSN.
+        assert_eq!(
+            compare_pg_checkpoints(&at("0/100", 1), &at("0/200", 2)),
+            CheckpointOrder::Before
+        );
+        assert_eq!(
+            compare_pg_checkpoints(&at("0/200", 2), &at("0/100", 1)),
+            CheckpointOrder::After
+        );
+        // The same LSN on two timelines is never the same position.
+        assert_eq!(
+            compare_pg_checkpoints(&at("0/100", 1), &at("0/100", 2)),
+            CheckpointOrder::Incomparable
+        );
+        // A later timeline below an earlier one's position: diverged.
+        assert_eq!(
+            compare_pg_checkpoints(&at("0/200", 1), &at("0/100", 2)),
+            CheckpointOrder::Incomparable
+        );
+        assert_eq!(
+            compare_pg_checkpoints(&at("0/100", 2), &at("0/200", 1)),
+            CheckpointOrder::Incomparable
+        );
+        // Same timeline, or a legacy checkpoint without one: by LSN.
+        assert_eq!(
+            compare_pg_checkpoints(&at("0/100", 2), &at("0/100", 2)),
+            CheckpointOrder::Equal
+        );
+        assert_eq!(
+            compare_pg_checkpoints(&cp("0/100"), &at("0/100", 2)),
+            CheckpointOrder::Equal
+        );
+    }
+
+    #[test]
+    fn checkpoint_meta_round_trips_with_and_without_timeline() {
+        use pgwire_replication::Lsn;
+        let lsn = Lsn::parse("1/2A").unwrap();
+        for (tx, tl) in [(None, None), (Some(7), None), (Some(7), Some(3))] {
+            let meta = postgres_helpers::make_checkpoint_meta(&lsn, tx, tl);
+            let cp: PostgresCheckpoint =
+                serde_json::from_slice(meta.as_bytes()).unwrap();
+            assert_eq!(cp.lsn, lsn.to_string());
+            assert_eq!(cp.tx_id, tx);
+            assert_eq!(cp.timeline, tl);
+        }
+        // A checkpoint written before timelines were recorded still reads.
+        let legacy: PostgresCheckpoint =
+            serde_json::from_slice(br#"{"lsn":"0/1","tx_id":null}"#).unwrap();
+        assert_eq!(legacy.timeline, None);
     }
 
     #[test]
