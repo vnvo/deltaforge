@@ -426,11 +426,17 @@ async fn postgres_tx_intact_and_resume_from_commit() -> Result<()> {
     .await?;
 
     let store: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    // One state store across the restart, as in production (the continuity
+    // record lives beside the checkpoint it stamps).
+    let backend = test_common::make_storage_backend().await;
 
     // ── Phase 1: a single 3-row transaction must arrive as one intact batch. ──
     let batches = {
         let mut pipe = RunningPipeline::start(
-            pg_source("txc", &db, "slot_txc", "pub_txc").await,
+            sources::postgres::PostgresSource {
+                backend: backend.clone(),
+                ..pg_source("txc", &db, "slot_txc", "pub_txc").await
+            },
             store.clone(),
             "txc",
         )
@@ -465,7 +471,10 @@ async fn postgres_tx_intact_and_resume_from_commit() -> Result<()> {
 
     // ── Phase 2: restart resumes from the committed checkpoint. ──
     let mut pipe = RunningPipeline::start(
-        pg_source("txc", &db, "slot_txc", "pub_txc").await,
+        sources::postgres::PostgresSource {
+            backend: backend.clone(),
+            ..pg_source("txc", &db, "slot_txc", "pub_txc").await
+        },
         store.clone(),
         "txc",
     )
