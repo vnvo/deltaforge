@@ -210,13 +210,21 @@ impl StreamProof {
                     details: format!("read the durable checkpoint: {e}").into(),
                 }
             })? {
-                // An incomplete snapshot's durable point is its anchor, on no
-                // proven chain yet.
-                super::PgResumePosition::Snapshot { anchor } => {
+                // An incomplete snapshot's durable point is its anchor, on
+                // the history the anchor was taken on.
+                super::PgResumePosition::Snapshot { anchor, stamp } => {
                     return Ok(Some(Checkpoint {
                         lsn: anchor,
-                        chain: None,
+                        chain: stamp,
                     }));
+                }
+                // A generation start is no position: never a resume point.
+                super::PgResumePosition::Started => {
+                    return Err(SourceError::Checkpoint {
+                        details: "the durable checkpoint is a snapshot \
+                                  generation's start, not a stream position"
+                            .into(),
+                    });
                 }
                 super::PgResumePosition::Stream(cp) => cp,
             };

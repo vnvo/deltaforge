@@ -55,6 +55,28 @@ pub struct SnapshotCfg {
         deserialize_with = "deserialize_discovery_page_size"
     )]
     pub discovery_page_size: usize,
+
+    /// This source's share of the process-wide snapshot connection cap
+    /// (`--max-snapshot-connections`): every connection its snapshot opens
+    /// counts. Default: `max_parallel_tables x max_parallel_chunks + 2`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_snapshot_connections: Option<u32>,
+
+    /// How long a snapshot generation may hold its anchor (the source's
+    /// read view, and the log retained for the stream after it). A warning
+    /// incident at 80%; at the limit the generation stops and blocks
+    /// (`snapshot_anchor_unavailable`) until an explicit resnapshot.
+    #[serde(default = "default_max_anchor_age_secs")]
+    pub max_anchor_age_secs: u64,
+
+    /// Bounds of a generation's durable plan (its stored table entries),
+    /// checked during discovery: a warning incident at 80%; at either limit
+    /// discovery stops before the plan is sealed and the generation blocks
+    /// (`snapshot_bound_exceeded`).
+    #[serde(default = "default_max_plan_bytes")]
+    pub max_plan_bytes: u64,
+    #[serde(default = "default_max_plan_items")]
+    pub max_plan_items: u64,
 }
 
 /// Bounds of [`SnapshotCfg::discovery_page_size`].
@@ -71,7 +93,26 @@ impl Default for SnapshotCfg {
             max_parallel_chunks: default_parallel_chunks(),
             lock_timeout_secs: default_lock_timeout_secs(),
             discovery_page_size: default_discovery_page_size(),
+            max_snapshot_connections: None,
+            max_anchor_age_secs: default_max_anchor_age_secs(),
+            max_plan_bytes: default_max_plan_bytes(),
+            max_plan_items: default_max_plan_items(),
         }
+    }
+}
+
+impl SnapshotCfg {
+    /// This source's snapshot connection share (see
+    /// [`SnapshotCfg::max_snapshot_connections`]).
+    pub fn snapshot_connection_cap(&self) -> u32 {
+        self.max_snapshot_connections.unwrap_or_else(|| {
+            let n = self
+                .max_parallel_tables
+                .max(1)
+                .saturating_mul(self.max_parallel_chunks.max(1))
+                .saturating_add(2);
+            u32::try_from(n).unwrap_or(u32::MAX)
+        })
     }
 }
 
@@ -89,6 +130,15 @@ fn default_lock_timeout_secs() -> u64 {
 }
 fn default_discovery_page_size() -> usize {
     1_000
+}
+fn default_max_anchor_age_secs() -> u64 {
+    24 * 60 * 60
+}
+fn default_max_plan_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+fn default_max_plan_items() -> u64 {
+    1_000_000
 }
 
 fn deserialize_discovery_page_size<'de, D>(d: D) -> Result<usize, D::Error>

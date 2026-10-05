@@ -210,6 +210,21 @@ impl SnapshotPermits {
         })
     }
 
+    /// One more connection if one is free now, within the share; never
+    /// waits (the work already running continues without it).
+    pub fn try_extra(&self) -> Option<ExtraPermit> {
+        let share = self.share.clone().try_acquire_owned().ok()?;
+        let global = self.global.permits.clone().try_acquire_owned().ok()?;
+        record_permits(&self.global.permits);
+        Some(ExtraPermit {
+            _global: Released {
+                permit: Some(global),
+                released: self.global.released.clone(),
+            },
+            _share: share,
+        })
+    }
+
     pub fn pipeline(&self) -> &str {
         &self.pipeline
     }
@@ -264,6 +279,11 @@ mod tests {
         let extra = second.extra(&cancel).await.unwrap();
         assert_eq!(global.permits.available_permits(), 0);
         drop(extra);
+        assert_eq!(global.permits.available_permits(), 1);
+        // Without waiting: one free now, none after it.
+        let now = second.try_extra().unwrap();
+        assert!(second.try_extra().is_none(), "the cap is reached");
+        drop(now);
         assert_eq!(global.permits.available_permits(), 1);
     }
 

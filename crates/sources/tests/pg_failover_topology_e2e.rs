@@ -260,8 +260,10 @@ async fn wait_replayed(t: &Topology) {
 /// source stopped, the durable checkpoint at the idle position and the
 /// standby's slot persistent, synced and at the primary's position.
 async fn sync_idle(t: &Topology, proxy: &Proxy, d: &Durable) {
-    let (tx, _rx) = mpsc::channel(256);
-    let handle = source(proxy, d).await.run(tx, Arc::clone(&d.ckpt)).await;
+    let src_run = source(proxy, d).await;
+    let (tx, _rx) =
+        test_common::acked_channel(&src_run, &d.ckpt, &src_run.id, 256);
+    let handle = src_run.run(tx, Arc::clone(&d.ckpt)).await;
     let slot_row = format!(
         "SELECT concat_ws(' ', confirmed_flush_lsn, synced, temporary) \
          FROM pg_replication_slots WHERE slot_name = '{SLOT}'"
@@ -429,6 +431,7 @@ async fn source(proxy: &Proxy, d: &Durable) -> PostgresSource {
         on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
+        snapshot_cohort: Default::default(),
     }
 }
 
@@ -465,8 +468,10 @@ async fn collect(
 /// Run the source until it delivered `id` (inserted once it streams), then
 /// stop it: its durable checkpoint is then just after `id`.
 async fn run_until(proxy: &Proxy, port: u16, d: &Durable, id: i64) {
-    let (tx, mut rx) = mpsc::channel(256);
-    let handle = source(proxy, d).await.run(tx, Arc::clone(&d.ckpt)).await;
+    let src_run = source(proxy, d).await;
+    let (tx, mut rx) =
+        test_common::acked_channel(&src_run, &d.ckpt, &src_run.id, 256);
+    let handle = src_run.run(tx, Arc::clone(&d.ckpt)).await;
     sleep(Duration::from_secs(4)).await;
     insert(port, id).await;
     let got =
@@ -480,8 +485,10 @@ async fn run_until(proxy: &Proxy, port: u16, d: &Durable, id: i64) {
 /// The class of the `pg_continuity_unproven` incident a run stopped with,
 /// after delivering nothing.
 async fn refused_with(proxy: &Proxy, d: &Durable) -> String {
-    let (tx, mut rx) = mpsc::channel(256);
-    let handle = source(proxy, d).await.run(tx, Arc::clone(&d.ckpt)).await;
+    let src_run = source(proxy, d).await;
+    let (tx, mut rx) =
+        test_common::acked_channel(&src_run, &d.ckpt, &src_run.id, 256);
+    let handle = src_run.run(tx, Arc::clone(&d.ckpt)).await;
     let err = match timeout(Duration::from_secs(90), handle.join()).await {
         Ok(Err(e)) => e,
         Ok(Ok(())) => panic!("the source must not continue"),
@@ -560,8 +567,10 @@ async fn a_promoted_standby_with_a_synced_slot_continues_at_the_checkpoint()
         .kv_put("failover", &format!("pg_continuity:{SOURCE}"), &record)
         .await?;
 
-    let (tx, mut rx) = mpsc::channel(256);
-    let handle = source(&proxy, &d).await.run(tx, Arc::clone(&d.ckpt)).await;
+    let src_run = source(&proxy, &d).await;
+    let (tx, mut rx) =
+        test_common::acked_channel(&src_run, &d.ckpt, &src_run.id, 256);
+    let handle = src_run.run(tx, Arc::clone(&d.ckpt)).await;
     let got =
         collect(&mut rx, Duration::from_secs(60), |ids| ids.contains(&3)).await;
     assert_eq!(got, vec![2, 3], "exactly the changes after the checkpoint");
@@ -674,7 +683,7 @@ async fn a_slot_without_failover_is_a_running_degraded_incident() -> Result<()>
     let d = Durable::new();
     let mut src = source(&proxy, &d).await;
     src.snapshot_cfg.mode = SnapshotMode::Never;
-    let (tx, mut rx) = mpsc::channel(256);
+    let (tx, mut rx) = test_common::acked_channel(&src, &d.ckpt, &src.id, 256);
     let handle = src.run(tx, Arc::clone(&d.ckpt)).await;
     sleep(Duration::from_secs(4)).await;
     insert(t.primary_port, 1).await;
@@ -714,7 +723,7 @@ async fn a_slot_without_failover_is_a_running_degraded_incident() -> Result<()>
     d.ckpt.delete(SOURCE).await?;
     let mut src = source(&proxy, &d).await;
     src.snapshot_cfg.mode = SnapshotMode::Never;
-    let (tx, _rx) = mpsc::channel(256);
+    let (tx, _rx) = test_common::acked_channel(&src, &d.ckpt, &src.id, 256);
     let handle = src.run(tx, Arc::clone(&d.ckpt)).await;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -754,8 +763,10 @@ async fn a_standby_endpoint_is_retried_without_streaming() -> Result<()> {
     let f = d.checkpoint().await;
 
     proxy.switch_to(t.standby_port);
-    let (tx, mut rx) = mpsc::channel(256);
-    let handle = source(&proxy, &d).await.run(tx, Arc::clone(&d.ckpt)).await;
+    let src_run = source(&proxy, &d).await;
+    let (tx, mut rx) =
+        test_common::acked_channel(&src_run, &d.ckpt, &src_run.id, 256);
+    let handle = src_run.run(tx, Arc::clone(&d.ckpt)).await;
     let incidents = IncidentStore::new(Arc::clone(&d.backend), "test");
     let deadline = Instant::now() + Duration::from_secs(60);
     let retrying = loop {

@@ -27,6 +27,10 @@ use deltaforge_core::CheckpointOrder;
 type CheckpointCmpFn =
     Arc<dyn Fn(&[u8], &[u8]) -> CheckpointOrder + Send + Sync>;
 
+/// Whether opaque checkpoint bytes are a snapshot position
+/// (`Source::checkpoint_is_snapshot`).
+type IsSnapshotFn = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
+
 /// Startup/recovery error for two per-sink checkpoints the source cannot order.
 /// Carries the affected checkpoint keys so an operator can locate the corrupt or
 /// incompatible entries.
@@ -83,6 +87,9 @@ pub struct PerSinkCheckpointProxy {
     inner: Arc<dyn CheckpointStore>,
     source_id: String,
     cmp_fn: CheckpointCmpFn,
+    /// Whether a checkpoint is a snapshot position
+    /// (`Source::checkpoint_is_snapshot`).
+    is_snapshot: IsSnapshotFn,
     /// Notified by the coordinator after each per-sink checkpoint commit, so the source
     /// advances WAL feedback change-driven (on commit) rather than by fixed polling. A
     /// long fallback still re-confirms during long idle. Defaults to an unshared handle
@@ -105,11 +112,12 @@ impl PerSinkCheckpointProxy {
         source_id: String,
         source: &Arc<dyn deltaforge_core::Source>,
     ) -> Self {
-        let source = Arc::clone(source);
+        let (cmp, snap) = (Arc::clone(source), Arc::clone(source));
         Self {
             inner,
             source_id,
-            cmp_fn: Arc::new(move |a, b| source.compare_checkpoints(a, b)),
+            cmp_fn: Arc::new(move |a, b| cmp.compare_checkpoints(a, b)),
+            is_snapshot: Arc::new(move |raw| snap.checkpoint_is_snapshot(raw)),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -158,12 +166,25 @@ impl CheckpointStore for PerSinkCheckpointProxy {
             // lineage tokens exist - cross-lineage positions) returns an error
             // naming the affected keys, rather than silently skipping one and
             // resuming ahead of the sink that needs it.
+            //
+            // A sink holding a snapshot position is behind a snapshot
+            // generation, which the source classifies against its snapshot
+            // state; while any sink holds a stream position, the resume
+            // position folds only stream positions, so a lagging sink never
+            // pulls the stream back into the snapshot (snapshot design,
+            // section 6.3).
+            let mut stored = Vec::with_capacity(keys.len());
+            for k in &keys {
+                if let Some(data) = self.inner.get_raw(k).await? {
+                    stored.push((k, data));
+                }
+            }
+            if stored.iter().any(|(_, d)| !(self.is_snapshot)(d)) {
+                stored.retain(|(_, d)| !(self.is_snapshot)(d));
+            }
             let mut min_data: Option<Vec<u8>> = None;
             let mut min_key: Option<String> = None;
-            for k in &keys {
-                let Some(data) = self.inner.get_raw(k).await? else {
-                    continue;
-                };
+            for (k, data) in stored {
                 match min_data {
                     None => {
                         // Validate a lone checkpoint via self-comparison: a
@@ -4024,6 +4045,7 @@ mod tests {
             inner: store.clone(),
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
+            is_snapshot: Arc::new(|_| false),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         assert_eq!(
@@ -4046,6 +4068,7 @@ mod tests {
             inner: store,
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
+            is_snapshot: Arc::new(|_| false),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         // No per-sink checkpoints and no legacy key - fresh start.
@@ -4062,6 +4085,7 @@ mod tests {
             inner: store,
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
+            is_snapshot: Arc::new(|_| false),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         // No per-sink keys exist, so it should fall back to the legacy key.
@@ -4092,6 +4116,7 @@ mod tests {
             inner: store,
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
+            is_snapshot: Arc::new(|_| false),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
 
@@ -4122,6 +4147,7 @@ mod tests {
                     inner: store,
                     source_id: "pg".to_string(),
                     cmp_fn: Arc::new(sources::postgres::compare_pg_checkpoints),
+                    is_snapshot: Arc::new(|_| false),
                     commit_signal: Arc::new(tokio::sync::Notify::new()),
                 }
             }
@@ -4158,6 +4184,7 @@ mod tests {
                 inner: store,
                 source_id: "src".to_string(),
                 cmp_fn: Arc::new(cmp),
+                is_snapshot: Arc::new(|_| false),
                 commit_signal: Arc::new(tokio::sync::Notify::new()),
             };
             proxy
@@ -4219,6 +4246,49 @@ mod tests {
         }
     }
 
+    /// After a completed generation, a sink still holding a snapshot
+    /// position is excluded from the resume fold while another holds a
+    /// stream position; with snapshot positions only, they fold as before.
+    #[tokio::test]
+    async fn per_sink_proxy_folds_stream_positions_past_lagging_snapshot_sinks()
+    {
+        async fn fold(entries: &[&[u8]]) -> Result<Vec<u8>, ()> {
+            let store =
+                Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
+            for (i, v) in entries.iter().enumerate() {
+                store.put_raw(&format!("src::sink::s{i}"), v).await.unwrap();
+            }
+            let proxy = PerSinkCheckpointProxy {
+                inner: store,
+                source_id: "src".to_string(),
+                cmp_fn: Arc::new(sources::postgres::compare_pg_checkpoints),
+                is_snapshot: Arc::new(
+                    sources::postgres::pg_checkpoint_is_snapshot,
+                ),
+                commit_signal: Arc::new(tokio::sync::Notify::new()),
+            };
+            proxy
+                .get_raw("src")
+                .await
+                .map(|v| v.unwrap())
+                .map_err(|_| ())
+        }
+        use sources::snapshot_position::{encode_adopted, encode_chained};
+        let inc = encode_chained("c", 3, "0/300");
+        let started = encode_adopted("c", 3, "d");
+        let completing: &[u8] = br#"{"lsn":"0/300","tx_id":null,"snapshot_completed":3,"snapshot_chain":"c"}"#;
+        let cdc: &[u8] = br#"{"lsn":"0/500","tx_id":null}"#;
+        assert_eq!(
+            fold(&[&inc, completing, cdc]).await,
+            Ok(completing.to_vec())
+        );
+        assert_eq!(fold(&[&started, cdc]).await, Ok(cdc.to_vec()));
+        assert_eq!(fold(&[&inc, &inc]).await, Ok(inc.clone()));
+        // Stream positions still fail closed among themselves.
+        let foreign: &[u8] = br#"{"lsn":"0/600","tx_id":null,"timeline":2,"chain":"x","transition":1}"#;
+        assert_eq!(fold(&[&inc, cdc, foreign]).await, Err(()));
+    }
+
     #[tokio::test]
     async fn per_sink_proxy_passes_through_other_keys() {
         let store = Arc::new(checkpoints::MemCheckpointStore::new().unwrap());
@@ -4228,6 +4298,7 @@ mod tests {
             inner: store,
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
+            is_snapshot: Arc::new(|_| false),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
 
@@ -4248,6 +4319,7 @@ mod tests {
             inner: store,
             source_id: "mysql".to_string(),
             cmp_fn: test_cmp_fn(),
+            is_snapshot: Arc::new(|_| false),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
 
@@ -4325,6 +4397,7 @@ mod tests {
             inner: OrderedTestStore::with(entries),
             source_id: "src".to_string(),
             cmp_fn: test_cmp_fn(),
+            is_snapshot: Arc::new(|_| false),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         proxy
@@ -4397,6 +4470,7 @@ mod tests {
             ]),
             source_id: "src".to_string(),
             cmp_fn: test_cmp_fn(),
+            is_snapshot: Arc::new(|_| false),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         let got = proxy.get_raw("src").await.unwrap().unwrap();
@@ -4422,6 +4496,7 @@ mod tests {
             cmp_fn: Arc::new(|a: &[u8], b: &[u8]| {
                 sources::postgres::compare_pg_checkpoints(a, b)
             }),
+            is_snapshot: Arc::new(|_| false),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         let got = proxy.get_raw("pg").await.unwrap().unwrap();
@@ -4443,6 +4518,7 @@ mod tests {
             cmp_fn: Arc::new(|a: &[u8], b: &[u8]| {
                 sources::postgres::compare_pg_checkpoints(a, b)
             }),
+            is_snapshot: Arc::new(|_| false),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         let err = proxy

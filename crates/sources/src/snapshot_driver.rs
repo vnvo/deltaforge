@@ -180,6 +180,19 @@ pub struct StartInput<'a, E: EngineOrder> {
 }
 
 impl<E: EngineOrder> StartInput<'_, E> {
+    /// Whether the source's resume checkpoint is a stream position.
+    async fn streams_without_snapshot(&self) -> Result<bool, DriverError> {
+        let raw = self
+            .checkpoints
+            .get_raw(self.source_id)
+            .await
+            .map_err(|e| DriverError::Checkpoint(e.to_string()))?;
+        Ok(matches!(
+            raw.as_deref().map(|r| classify_stored(self.engine, r)),
+            Some(Some(Classified::Stream))
+        ))
+    }
+
     async fn stored(&self, sink: &str) -> Result<Option<Vec<u8>>, DriverError> {
         self.checkpoints
             .get_raw(&sink_key(self.source_id, sink))
@@ -354,7 +367,10 @@ pub async fn decide_start<E: EngineOrder>(
     let never = input.mode == SnapshotMode::Never;
     let stored = match input.store.read().await? {
         None => {
-            if never {
+            // No generation was ever allocated: mode `never`, or a source
+            // that has been streaming without a snapshot (mode `initial`
+            // snapshots only a source with no checkpoint), keeps streaming.
+            if never || input.streams_without_snapshot().await? {
                 return Ok(StartOutcome::Stream {
                     lagging: Vec::new(),
                     completed_now: None,
@@ -461,7 +477,7 @@ pub async fn decide_start<E: EngineOrder>(
 }
 
 /// The configured sinks behind a completed generation.
-async fn lagging<E: EngineOrder>(
+pub async fn lagging<E: EngineOrder>(
     input: &StartInput<'_, E>,
     control: &GenerationControl,
 ) -> Result<Vec<String>, DriverError> {
@@ -844,6 +860,43 @@ pub async fn report_start(
             );
         }
     }
+}
+
+/// Block generation `generation` until an explicit resnapshot (design
+/// section 9.2): raise `draft`, then record `blocked` (reason and incident)
+/// by control CAS. A generation already replaced, completed or blocked is
+/// left as it is. A failure to record either is returned: the next start
+/// runs the detection again before any decision.
+pub async fn block_generation(
+    store: &QueueStore,
+    incidents: &storage::adapters::incidents::IncidentStore,
+    generation: u64,
+    draft: &deltaforge_core::incident::IncidentDraft,
+) -> Result<(), DriverError> {
+    let raised = incidents.raise(draft, 1).await.map_err(|e| {
+        DriverError::Checkpoint(format!("record the incident: {e:#}"))
+    })?;
+    let Some(Stored::Current { version, control }) = store.read().await? else {
+        return Ok(());
+    };
+    if control.generation != generation
+        || control.state == State::Completed
+        || control.blocked.is_some()
+    {
+        return Ok(());
+    }
+    store
+        .block(
+            version,
+            &control,
+            crate::snapshot_queue::Blocked {
+                reason: draft.reason_code.as_str().to_string(),
+                incident: raised.record().incident_id.to_string(),
+                since_ms: chrono::Utc::now().timestamp_millis(),
+            },
+        )
+        .await?;
+    Ok(())
 }
 
 /// The incidents the generation driver's decisions raise.

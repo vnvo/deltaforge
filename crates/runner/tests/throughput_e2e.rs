@@ -329,6 +329,7 @@ async fn pg_to_kafka_backlog_drain_throughput() -> Result<()> {
         on_schema_drift: OnSchemaDrift::Adapt,
         table_options: Default::default(),
         rotation: None,
+        snapshot_cohort: Default::default(),
     };
     let src: Arc<dyn Source> = Arc::new(src);
     let commit_signal = Arc::new(tokio::sync::Notify::new());

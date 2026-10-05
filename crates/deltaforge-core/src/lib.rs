@@ -1081,6 +1081,16 @@ pub trait Source: Send + Sync {
     /// than choosing a checkpoint.
     fn compare_checkpoints(&self, a: &[u8], b: &[u8]) -> CheckpointOrder;
 
+    /// Whether a stored checkpoint is a snapshot position (an incomplete
+    /// snapshot, or a sink's start of a generation) rather than a stream
+    /// position. Snapshot positions are classified against the source's
+    /// snapshot state; the resume fold orders only stream positions when
+    /// any sink holds one (`docs/design/snapshot-durable-queue.md`, section
+    /// 6.3). Default: none is.
+    fn checkpoint_is_snapshot(&self, _raw: &[u8]) -> bool {
+        false
+    }
+
     /// The pipeline's commit policy and sink cohort, set by the runner before
     /// [`Source::run`]. Default: ignored (a source without snapshot
     /// generations).

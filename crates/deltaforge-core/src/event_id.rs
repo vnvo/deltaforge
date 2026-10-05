@@ -163,7 +163,10 @@ impl SourceLineage<'_> {
 /// value. Hashed before the value bytes so the integer `42` and the text `"42"`
 /// — and a null in a text column versus a null in an integer column — can never
 /// collide in a snapshot id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum IdentityKind {
     /// Signed integer.
     Int,

@@ -13,7 +13,6 @@ use checkpoints::{CheckpointStore, MemCheckpointStore};
 use deltaforge_config::{SnapshotCfg, SnapshotMode};
 use deltaforge_core::{Op, Source, SourceItem};
 use mysql_async::prelude::Queryable;
-use tokio::sync::mpsc;
 
 mod test_common;
 use test_common::{MYSQL_CDC_USER, pg_admin_dsn, pg_drop_db, pg_setup};
@@ -37,7 +36,12 @@ fn rss_kb() -> u64 {
 }
 
 /// Run `src` until `n` snapshot rows arrived and print the figures.
-async fn measure(engine: &str, src: impl Source, n: usize) {
+async fn measure(
+    engine: &str,
+    src: impl Source + Clone + 'static,
+    id: &str,
+    n: usize,
+) {
     sources::snapshot_probe::reset();
     let before = rss_kb();
     let peak = Arc::new(AtomicU64::new(before));
@@ -52,7 +56,7 @@ async fn measure(engine: &str, src: impl Source, n: usize) {
     };
     let chkpt: Arc<dyn CheckpointStore> =
         Arc::new(MemCheckpointStore::new().unwrap());
-    let (tx, mut rx) = mpsc::channel(8192);
+    let (tx, mut rx) = test_common::acked_channel(&src, &chkpt, id, 8192);
     let t0 = Instant::now();
     let handle = src.run(tx, chkpt).await;
     let mut reads = 0;
@@ -149,8 +153,10 @@ async fn postgres_snapshot_scale() -> Result<()> {
             on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
             table_options: Default::default(),
             rotation: None,
+            snapshot_cohort: Default::default(),
         };
-        measure("postgres", src, n).await;
+        let id = src.id.clone();
+        measure("postgres", src, &id, n).await;
         client
             .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
             .await
@@ -203,7 +209,8 @@ async fn mysql_snapshot_scale() -> Result<()> {
             table_options: Default::default(),
             rotation: None,
         };
-        measure("mysql", src, n).await;
+        let id = src.id.clone();
+        measure("mysql", src, &id, n).await;
         test_common::mysql_drop_db(&pool, &db).await;
     }
     Ok(())

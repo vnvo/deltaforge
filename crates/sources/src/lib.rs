@@ -28,6 +28,13 @@ pub mod snapshot_permits;
 pub mod snapshot_plan;
 pub mod snapshot_position;
 pub mod snapshot_probe;
+pub mod snapshot_publish;
+
+/// The pipeline's commit policy and sink cohort, as the runner set it before
+/// the source runs (`Source::set_snapshot_cohort`); a snapshot generation
+/// freezes it.
+pub type SnapshotCohortSlot =
+    std::sync::Arc<std::sync::Mutex<Option<deltaforge_core::SnapshotCohort>>>;
 pub mod snapshot_queue;
 pub mod stream_probe;
 mod table_patterns;
@@ -341,6 +348,7 @@ pub async fn build_source(
                 on_schema_drift: c.on_schema_drift.clone(),
                 table_options: c.table_options.clone(),
                 rotation,
+                snapshot_cohort: Default::default(),
             }))
         }
 

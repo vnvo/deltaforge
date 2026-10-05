@@ -977,6 +977,7 @@ mod tests {
             timeline: None,
             chain: None,
             transition: None,
+            ..Default::default()
         };
         let raw = serde_json::to_vec(&cp).unwrap();
         let parsed: PostgresCheckpoint = serde_json::from_slice(&raw).unwrap();
@@ -1230,6 +1231,7 @@ mod tests {
             timeline: None,
             chain: None,
             transition: None,
+            ..Default::default()
         })
         .unwrap();
         let good = pg_wm(1, "0/200", Some(2), true);

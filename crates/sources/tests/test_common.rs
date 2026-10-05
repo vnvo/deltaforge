@@ -42,6 +42,104 @@ pub fn init_test_tracing() {
 }
 
 // ============================================================================
+// Snapshot barriers - shared
+// ============================================================================
+
+/// The single sink a source run outside a pipeline delivers to.
+pub const TEST_SINK: &str = "test";
+
+/// One required sink, [`TEST_SINK`].
+pub fn test_cohort() -> deltaforge_core::SnapshotCohort {
+    deltaforge_core::SnapshotCohort {
+        policy: deltaforge_core::CohortPolicy::Required,
+        sinks: vec![deltaforge_core::CohortSink {
+            id: TEST_SINK.into(),
+            required: true,
+        }],
+    }
+}
+
+/// The channel to run `source` with outside a pipeline: sets its sink
+/// cohort ([`TEST_SINK`]) and returns the sender to run it with and the
+/// receiver the test reads. Every barrier is committed to the sink's
+/// per-sink checkpoint key by the runner's own barrier commit
+/// (`build_barrier_fn`: a generation start after the source's local check,
+/// a terminal with its checkpoint) and not forwarded; a refused barrier
+/// closes the channel, as a failed delivery would. Everything else is
+/// forwarded unchanged.
+pub fn acked_channel<S>(
+    source: &S,
+    ckpt: &std::sync::Arc<dyn checkpoints::CheckpointStore>,
+    source_id: &str,
+    cap: usize,
+) -> (
+    tokio::sync::mpsc::Sender<deltaforge_core::SourceItem>,
+    tokio::sync::mpsc::Receiver<deltaforge_core::SourceItem>,
+)
+where
+    S: deltaforge_core::Source + Clone + 'static,
+{
+    use deltaforge_core::{BarrierKind, SourceItem};
+    use runner::coordinator::{BarrierCommit, build_barrier_fn};
+    source.set_snapshot_cohort(test_cohort());
+    let commit = build_barrier_fn(
+        std::sync::Arc::clone(ckpt),
+        format!("{source_id}::sink::{TEST_SINK}"),
+        std::sync::Arc::new(source.clone()),
+    );
+    let (tx_in, mut rx_in) = tokio::sync::mpsc::channel(cap);
+    let (tx_out, rx_out) = tokio::sync::mpsc::channel(cap);
+    tokio::spawn(async move {
+        while let Some(item) = rx_in.recv().await {
+            match item {
+                SourceItem::Barrier { barrier } => {
+                    let c = match barrier.kind {
+                        BarrierKind::GenerationStart(s) => {
+                            BarrierCommit::Start(s)
+                        }
+                        BarrierKind::Terminal => BarrierCommit::Checkpoint(
+                            barrier.boundary.checkpoint,
+                        ),
+                    };
+                    if let Err(e) = commit(c).await {
+                        tracing::error!(error = %e, "test sink refused a barrier");
+                        return;
+                    }
+                }
+                other => {
+                    if tx_out.send(other).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    (tx_in, rx_out)
+}
+
+/// The stored snapshot control record of `source_id`: `(state, generation)`.
+pub async fn snapshot_state(
+    backend: &ArcStorageBackend,
+    source_id: &str,
+) -> Option<(String, u64)> {
+    match sources::snapshot_queue::QueueStore::new(backend.clone(), source_id)
+        .read()
+        .await
+        .ok()
+        .flatten()?
+    {
+        sources::snapshot_queue::Stored::Current { control, .. } => Some((
+            serde_json::to_value(control.state)
+                .ok()?
+                .as_str()?
+                .to_string(),
+            control.generation,
+        )),
+        sources::snapshot_queue::Stored::Legacy { .. } => None,
+    }
+}
+
+// ============================================================================
 // Random suffix - shared
 // ============================================================================
 

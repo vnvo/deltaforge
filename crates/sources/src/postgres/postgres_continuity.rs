@@ -231,6 +231,119 @@ impl Stamp {
     }
 }
 
+/// What a snapshot anchor's own session shows (a primary only): the
+/// server and the timeline its WAL is written on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AnchorFacts {
+    pub system_identifier: u64,
+    pub database_oid: u64,
+    pub timeline: u32,
+}
+
+/// Read [`AnchorFacts`] on `client`; a server in recovery fails (a snapshot
+/// anchors on a primary, whose timeline cannot change while it runs).
+pub(crate) async fn anchor_facts(
+    client: &tokio_postgres::Client,
+) -> Result<AnchorFacts> {
+    let row = client
+        .query_one(
+            "SELECT pg_is_in_recovery(), \
+                    (SELECT system_identifier FROM pg_control_system())::text, \
+                    (SELECT oid FROM pg_database \
+                      WHERE datname = current_database())::bigint, \
+                    CASE WHEN pg_is_in_recovery() THEN NULL \
+                         ELSE pg_walfile_name(pg_current_wal_lsn()) END",
+            &[],
+        )
+        .await
+        .context("read the server and timeline of the snapshot anchor")?;
+    let in_recovery: bool = row.get(0);
+    anyhow::ensure!(
+        !in_recovery,
+        "the server is in recovery: a snapshot anchors on a primary"
+    );
+    let sysid: String = row.get(1);
+    let walfile: String = row.get(3);
+    let timeline = walfile
+        .get(..8)
+        .and_then(|t| u32::from_str_radix(t, 16).ok())
+        .with_context(|| format!("unexpected WAL file name {walfile:?}"))?;
+    Ok(AnchorFacts {
+        system_identifier: sysid
+            .parse()
+            .context("parse the system identifier")?,
+        database_oid: u64::try_from(row.get::<_, i64>(2))
+            .context("database oid")?,
+        timeline,
+    })
+}
+
+/// The continuity stamp of a snapshot anchor taken between two reads of
+/// [`AnchorFacts`] (`docs/design/snapshot-durable-queue.md`, section 3.4),
+/// and the continuity record to store first when it changes:
+/// - the reads differ: the server changed or switched timeline while the
+///   anchor was taken; refused;
+/// - a record of the same server and timeline: its stamp;
+/// - otherwise, when no sink holds a stream position (nothing to order
+///   against the anchor), a new chain on this timeline; a stream position
+///   unstamped (written before continuity was recorded) still joins it on a
+///   server that never switched timeline, as the stream proof adopts one.
+///   Any other case needs the stream proof: refused.
+pub(crate) fn anchor_stamp(
+    record: Option<&ContinuityRecord>,
+    before: AnchorFacts,
+    after: AnchorFacts,
+    stream_position: Option<bool>,
+    new_chain_id: &str,
+) -> std::result::Result<(Stamp, Option<ContinuityRecord>), String> {
+    if before != after {
+        return Err(format!(
+            "the server changed or switched timeline while the snapshot \
+             anchor was taken (timeline {} then {})",
+            before.timeline, after.timeline
+        ));
+    }
+    let f = after;
+    if let Some(r) = record {
+        if (r.system_identifier, r.database_oid)
+            != (f.system_identifier, f.database_oid)
+        {
+            return Err(
+                "the continuity record belongs to another cluster or database"
+                    .into(),
+            );
+        }
+        if r.timeline == f.timeline {
+            return Ok((Stamp::of(r), None));
+        }
+    }
+    // `Some(stamped)`: a sink holds a stream position.
+    let fresh = match (record, stream_position) {
+        (_, None) => true,
+        (None, Some(false)) => f.timeline == 1,
+        _ => false,
+    };
+    if !fresh {
+        return Err(format!(
+            "the server is on timeline {}, and stream positions of another \
+             history are stored: a stream start must prove the transition \
+             before a snapshot can anchor on it (start once with snapshot \
+             mode 'initial')",
+            f.timeline
+        ));
+    }
+    let record = ContinuityRecord {
+        format: RECORD_FORMAT,
+        chain_id: new_chain_id.to_string(),
+        system_identifier: f.system_identifier,
+        database_oid: f.database_oid,
+        timeline: f.timeline,
+        transition_id: 0,
+        proven_at: None,
+    };
+    Ok((Stamp::of(&record), Some(record)))
+}
+
 /// A new random chain id (128 bits, hex).
 pub(crate) fn new_chain_id() -> String {
     format!("{:032x}", rand::random::<u128>())
@@ -989,5 +1102,85 @@ mod tests {
         assert_eq!(s.failover, None);
         assert_eq!(s.invalidation.as_deref(), Some("conflicting"));
         assert_eq!(s.restart, None);
+    }
+}
+
+#[cfg(test)]
+mod anchor_stamp_tests {
+    use super::*;
+
+    fn facts(timeline: u32) -> AnchorFacts {
+        AnchorFacts {
+            system_identifier: 7,
+            database_oid: 5,
+            timeline,
+        }
+    }
+
+    fn record(timeline: u32, transition_id: u64) -> ContinuityRecord {
+        ContinuityRecord {
+            format: RECORD_FORMAT,
+            chain_id: "c".into(),
+            system_identifier: 7,
+            database_oid: 5,
+            timeline,
+            transition_id,
+            proven_at: Some("0/10".into()),
+        }
+    }
+
+    #[test]
+    fn an_anchor_takes_the_proven_stamp_of_its_timeline() {
+        let r = record(3, 2);
+        let (stamp, store) =
+            anchor_stamp(Some(&r), facts(3), facts(3), Some(true), "n")
+                .unwrap();
+        assert_eq!(stamp, Stamp::of(&r));
+        assert!(store.is_none(), "nothing to record");
+    }
+
+    #[test]
+    fn a_timeline_switch_during_the_anchor_is_refused() {
+        assert!(anchor_stamp(None, facts(1), facts(2), None, "n").is_err());
+        let mut other = facts(1);
+        other.system_identifier = 8;
+        assert!(anchor_stamp(None, facts(1), other, None, "n").is_err());
+    }
+
+    #[test]
+    fn a_new_chain_only_when_nothing_needs_the_old_history() {
+        // A fresh source, or one whose sinks hold no stream position.
+        for record in [None, Some(record(1, 0))] {
+            let (stamp, store) =
+                anchor_stamp(record.as_ref(), facts(2), facts(2), None, "n")
+                    .unwrap();
+            let store = store.expect("a new record");
+            assert_eq!((store.chain_id.as_str(), store.timeline), ("n", 2));
+            assert_eq!(stamp, Stamp::of(&store));
+        }
+        // Unstamped stream positions join a chain only on timeline 1.
+        assert!(
+            anchor_stamp(None, facts(1), facts(1), Some(false), "n").is_ok()
+        );
+        assert!(
+            anchor_stamp(None, facts(2), facts(2), Some(false), "n").is_err()
+        );
+        // Stream positions of another proven history: the stream proves it.
+        assert!(
+            anchor_stamp(
+                Some(&record(1, 0)),
+                facts(2),
+                facts(2),
+                Some(true),
+                "n"
+            )
+            .is_err()
+        );
+        let mut foreign = record(2, 0);
+        foreign.database_oid = 9;
+        assert!(
+            anchor_stamp(Some(&foreign), facts(2), facts(2), None, "n")
+                .is_err()
+        );
     }
 }
