@@ -1075,6 +1075,14 @@ impl IncidentStore {
     pub async fn recover(&self) -> Result<Option<u64>> {
         loop {
             self.finish_recovery().await?;
+            // The control version is read before the incidents: every
+            // recovery changes it, so a recovery completed after this
+            // listing fails the CAS below and the incidents are listed
+            // again (never resolved twice from a stale listing).
+            let (version, ctl) = self.control().await?;
+            if ctl.pending_recovery.is_some() {
+                continue;
+            }
             let resolves: Vec<(IncidentId, String)> = self
                 .list()
                 .await?
@@ -1087,10 +1095,6 @@ impl IncidentStore {
                 .collect();
             if resolves.is_empty() {
                 return Ok(None);
-            }
-            let (version, ctl) = self.control().await?;
-            if ctl.pending_recovery.is_some() {
-                continue;
             }
             let to_epoch = ctl.recovery_epoch + 1;
             let next = IncidentControl {
@@ -1933,6 +1937,33 @@ mod tests {
         );
         assert_eq!(store.prepare().await.unwrap(), 1, "never advanced twice");
         assert_audit_exact(&store, &["opened", "resolved"]).await;
+    }
+
+    /// A recovery that listed the open incidents before another recovery
+    /// resolved them must not advance the epoch again from that stale list.
+    #[tokio::test]
+    async fn a_recovery_with_a_stale_listing_does_not_advance_the_epoch_again()
+    {
+        let fault = Arc::new(FaultBackend::new());
+        let b: ArcStorageBackend = fault.clone();
+        IncidentStore::new(b.clone(), "p")
+            .raise(&unc(0), 1)
+            .await
+            .unwrap();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *fault.pause_after_slot_list.lock().unwrap() =
+            Some((INCIDENTS_NS.to_string(), reached.clone(), release.clone()));
+        // B lists the incident as open, then stops there...
+        let late = IncidentStore::new(b.clone(), "p");
+        let late = tokio::spawn(async move { late.recover().await.unwrap() });
+        reached.notified().await;
+        // ...while A recovers completely.
+        let first = IncidentStore::new(b.clone(), "p");
+        assert_eq!(first.recover().await.unwrap(), Some(1));
+        release.notify_one();
+        assert_eq!(late.await.unwrap(), None, "nothing left to resolve");
+        assert_eq!(IncidentStore::new(b, "p").prepare().await.unwrap(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
