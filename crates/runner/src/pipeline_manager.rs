@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::coordinator::{
-    Coordinator, PauseState, SchemaSensorState, build_batch_processor,
-    build_commit_fn,
+    Coordinator, PauseState, SchemaSensorState, build_barrier_fn,
+    build_batch_processor, build_commit_fn,
 };
 use crate::replay_controller::{
     CoordinatorReplayDelivery, PauseIngestionControl, ReplayController,
@@ -1061,8 +1061,16 @@ impl PipelineManager {
         for sink in &sinks {
             let sink_id = sink.id().to_string();
             let cp_key = format!("{}::sink::{}", source_id, sink_id);
-            let commit_fn = build_commit_fn(self.ckpt_store.clone(), cp_key);
-            builder = builder.commit_fn(sink_id, commit_fn);
+            let commit_fn =
+                build_commit_fn(self.ckpt_store.clone(), cp_key.clone());
+            let barrier_fn = build_barrier_fn(
+                self.ckpt_store.clone(),
+                cp_key,
+                Arc::clone(&source),
+            );
+            builder = builder
+                .commit_fn(sink_id.clone(), commit_fn)
+                .barrier_fn(sink_id, barrier_fn);
         }
 
         let sensor_for_runtime = sensor.clone();

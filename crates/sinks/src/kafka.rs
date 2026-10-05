@@ -542,6 +542,17 @@ impl KafkaSink {
 
 #[async_trait]
 impl Sink for KafkaSink {
+    /// Nothing is buffered after an acknowledged batch: every record of an acknowledged batch had its delivery report (`acks=all`) before `send_batch` returned (and its transaction committed, in transactional mode), and a
+    /// barrier is delivered only after every earlier batch was acknowledged.
+    /// This sink keeps no watermark of its own.
+    async fn barrier(
+        &self,
+        _kind: &deltaforge_core::BarrierKind,
+        _ctx: &deltaforge_core::SinkBatchContext,
+    ) -> SinkResult<()> {
+        Ok(())
+    }
+
     fn id(&self) -> &str {
         &self.id
     }

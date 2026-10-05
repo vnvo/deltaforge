@@ -114,6 +114,14 @@ struct ProbeSink {
 
 #[async_trait]
 impl Sink for ProbeSink {
+    async fn barrier(
+        &self,
+        _kind: &deltaforge_core::BarrierKind,
+        _ctx: &deltaforge_core::SinkBatchContext,
+    ) -> deltaforge_core::SinkResult<()> {
+        Ok(())
+    }
+
     fn id(&self) -> &str {
         SINK
     }

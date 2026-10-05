@@ -150,6 +150,10 @@ pub enum WmPos {
         snapshot_chain: String,
         generation: u64,
         replaced_digest: String,
+        /// The legacy generations the start accepted states of, so a reader
+        /// can re-check the move from the start alone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        legacy_through: Option<u64>,
     },
 }
 // NOTE: there is deliberately no "standalone sequence" variant (the snapshot
@@ -619,15 +623,16 @@ fn flip(o: CheckpointOrder) -> CheckpointOrder {
     }
 }
 
-/// What a sink does with its own state at a generation start barrier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StartDecision {
-    /// Compare-and-swap the state read to the generation start.
-    Move,
-    /// Already in this generation or a later one of the chain: acknowledge.
-    Already,
-    /// Not a state this generation may start from.
-    Refuse,
+pub use deltaforge_core::StartDecision;
+
+/// The digest a generation start records of the durable state it replaced
+/// (`empty` for none).
+pub fn watermark_digest(prev: Option<&[u8]>) -> String {
+    use sha2::{Digest, Sha256};
+    match prev {
+        None => "empty".to_string(),
+        Some(b) => hex::encode(Sha256::digest(b)),
+    }
 }
 
 /// The generation start barrier's local check on a sink's durable watermark
@@ -851,6 +856,83 @@ impl CheckpointComparator for SourceCheckpointComparator {
             (Some(a), Some(b)) => order(&a, &b),
             _ => CheckpointOrder::Incomparable,
         }
+    }
+
+    fn generation_start(
+        &self,
+        prev: Option<&[u8]>,
+        start: &[u8],
+    ) -> (StartDecision, Option<Vec<u8>>) {
+        let Some(template) = DurableWatermark::parse(start) else {
+            return (StartDecision::Refuse, None);
+        };
+        let WmPos::SnapshotGenerationAdopted {
+            snapshot_chain,
+            generation,
+            legacy_through,
+            ..
+        } = &template.pos
+        else {
+            return (StartDecision::Refuse, None);
+        };
+        let prev_wm = match prev {
+            None => None,
+            Some(raw) => match DurableWatermark::parse(raw) {
+                Some(w) => Some(w),
+                None => return (StartDecision::Refuse, None),
+            },
+        };
+        match generation_start(
+            prev_wm.as_ref(),
+            &template.lineage,
+            snapshot_chain,
+            *generation,
+            *legacy_through,
+        ) {
+            StartDecision::Move => {
+                let recorded = DurableWatermark::new(
+                    template.lineage.clone(),
+                    WmPos::SnapshotGenerationAdopted {
+                        snapshot_chain: snapshot_chain.clone(),
+                        generation: *generation,
+                        replaced_digest: watermark_digest(prev),
+                        legacy_through: *legacy_through,
+                    },
+                );
+                (StartDecision::Move, Some(recorded.to_bytes()))
+            }
+            other => (other, None),
+        }
+    }
+
+    fn start_follows(&self, prev: Option<&[u8]>, next: &[u8]) -> bool {
+        let Some(next) = DurableWatermark::parse(next) else {
+            return false;
+        };
+        let WmPos::SnapshotGenerationAdopted {
+            snapshot_chain,
+            generation,
+            replaced_digest,
+            legacy_through,
+        } = &next.pos
+        else {
+            return false;
+        };
+        let prev_wm = match prev {
+            None => None,
+            Some(raw) => match DurableWatermark::parse(raw) {
+                Some(w) => Some(w),
+                None => return false,
+            },
+        };
+        *replaced_digest == watermark_digest(prev)
+            && generation_start(
+                prev_wm.as_ref(),
+                &next.lineage,
+                snapshot_chain,
+                *generation,
+                *legacy_through,
+            ) == StartDecision::Move
     }
 }
 
@@ -1455,6 +1537,7 @@ mod snapshot_chain_watermark_tests {
             snapshot_chain: chain.into(),
             generation,
             replaced_digest: "d".into(),
+            legacy_through: None,
         }
     }
 
@@ -1621,6 +1704,32 @@ mod snapshot_chain_watermark_tests {
         assert_eq!(decide(Some(legacy(3)), 4, Some(3)), Move);
         assert_eq!(decide(Some(legacy(3)), 4, None), Refuse);
         assert_eq!(decide(Some(legacy(5)), 6, Some(3)), Refuse);
+    }
+
+    /// A start entry follows only the exact state its digest names, and only
+    /// where the start check would move from it.
+    #[test]
+    fn a_start_follows_exactly_the_state_it_replaced() {
+        let cmp = SourceCheckpointComparator;
+        let template =
+            DurableWatermark::new(lineage(), start("c", 4)).to_bytes();
+        let prev = DurableWatermark::new(lineage(), cdc(500)).to_bytes();
+        let (decision, recorded) = cmp.generation_start(Some(&prev), &template);
+        assert_eq!(decision, Move);
+        let recorded = recorded.unwrap();
+        assert!(cmp.start_follows(Some(&prev), &recorded));
+        // Another predecessor (even an equally valid one) is not the one it
+        // replaced.
+        let other = DurableWatermark::new(lineage(), cdc(501)).to_bytes();
+        assert!(!cmp.start_follows(Some(&other), &recorded));
+        assert!(!cmp.start_follows(None, &recorded));
+        // From empty.
+        let (_, from_empty) = cmp.generation_start(None, &template);
+        assert!(cmp.start_follows(None, &from_empty.unwrap()));
+        // A predecessor it could not have started from.
+        let later =
+            DurableWatermark::new(lineage(), seq("c", 5, 0, false)).to_bytes();
+        assert_eq!(cmp.generation_start(Some(&later), &template).0, Refuse);
     }
 
     #[test]

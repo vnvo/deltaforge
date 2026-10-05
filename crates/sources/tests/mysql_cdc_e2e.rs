@@ -69,6 +69,7 @@ where
             Ok(Some(SourceItem::TxBegin { .. })) => continue,
             Ok(Some(SourceItem::TxCommit { .. })) => continue,
             Ok(Some(SourceItem::Boundary { .. })) => continue,
+            Ok(Some(SourceItem::Barrier { .. })) => continue,
             Ok(Some(SourceItem::TxAbort { .. })) => continue,
             Ok(None) | Err(_) => break,
         }

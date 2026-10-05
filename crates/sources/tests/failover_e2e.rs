@@ -1704,6 +1704,7 @@ async fn recv_until(
             }
             SourceItem::TxAbort { tx_id } => r.seen.push(Seen::Abort(tx_id)),
             SourceItem::Boundary { .. } => {}
+            SourceItem::Barrier { .. } => {}
         }
     }
 }

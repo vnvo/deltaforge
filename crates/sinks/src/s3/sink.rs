@@ -243,6 +243,34 @@ fn roll_label(reason: RollReason) -> String {
 
 #[async_trait]
 impl Sink for S3Sink {
+    /// Close and upload every open file (the weaker durability this mode
+    /// declares otherwise acknowledges buffered rows); with nothing buffered,
+    /// acknowledge without an object. A file that fails to close is
+    /// abandoned by the pool, so the barrier refuses unless every open
+    /// writer committed one.
+    async fn barrier(
+        &self,
+        _kind: &deltaforge_core::BarrierKind,
+        _ctx: &deltaforge_core::SinkBatchContext,
+    ) -> SinkResult<()> {
+        let mut pool = self.pool.lock().await;
+        let open = pool.open_writer_count();
+        let committed = pool.close_all().await;
+        self.observe_committed(&committed);
+        if committed.len() == open {
+            Ok(())
+        } else {
+            Err(SinkError::Backpressure {
+                details: format!(
+                    "{} of {open} open files failed to close at a checkpoint \
+                     barrier",
+                    open - committed.len()
+                )
+                .into(),
+            })
+        }
+    }
+
     fn id(&self) -> &str {
         &self.id
     }
@@ -621,6 +649,53 @@ mod tests {
         // Flush on shutdown to verify there's nothing left open.
         let _ = sink.flush_on_shutdown().await;
         Ok(())
+    }
+
+    /// The barrier closes every open file (nothing stays buffered behind an
+    /// acknowledged barrier); with nothing open it acknowledges without an
+    /// object.
+    #[tokio::test]
+    async fn the_barrier_closes_every_buffered_file() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let sink = build_sink(tmp.path(), RollingConfig::default()).await;
+        let ctx = deltaforge_core::SinkBatchContext {
+            checkpoint: deltaforge_core::CheckpointMeta::from_vec(
+                b"cp".to_vec(),
+            ),
+            durable_watermark: None,
+            batch_id: None,
+        };
+        let files = |dir: &std::path::Path| {
+            walk(dir).into_iter().filter(|p| p.is_file()).count()
+        };
+        sink.barrier(&deltaforge_core::BarrierKind::Terminal, &ctx)
+            .await?;
+        assert_eq!(files(tmp.path()), 0, "no object for an empty barrier");
+
+        sink.send_batch(&[
+            event_with("orders", json!({"id": 1})),
+            event_with("orders", json!({"id": 2})),
+        ])
+        .await?;
+        assert_eq!(sink.pool.lock().await.open_writer_count(), 1);
+        sink.barrier(&deltaforge_core::BarrierKind::Terminal, &ctx)
+            .await?;
+        assert_eq!(sink.pool.lock().await.open_writer_count(), 0);
+        assert_eq!(files(tmp.path()), 1, "the buffered rows are in a file");
+        Ok(())
+    }
+
+    fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(walk(&p));
+            } else {
+                out.push(p);
+            }
+        }
+        out
     }
 
     #[tokio::test]

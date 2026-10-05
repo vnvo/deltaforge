@@ -1375,6 +1375,20 @@ impl Source for MySqlSource {
         compare_mysql_checkpoints(a, b)
     }
 
+    fn checkpoint_generation_start(
+        &self,
+        prev: Option<&[u8]>,
+        start: &deltaforge_core::GenerationStart,
+    ) -> deltaforge_core::CheckpointStart {
+        let lineage = checkpoint_lineage(&self.registry_scope);
+        crate::snapshot_position::checkpoint_start(
+            &MyOrder,
+            prev,
+            lineage.as_deref(),
+            start,
+        )
+    }
+
     async fn check_durable_snapshot_startup(
         &self,
         checkpoint_store: &dyn CheckpointStore,

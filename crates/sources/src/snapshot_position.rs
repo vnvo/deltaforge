@@ -361,6 +361,45 @@ fn start_vs(d: &Adopted, c: &str, g: u64) -> CheckpointOrder {
 
 pub use crate::durable_checkpoint::StartDecision;
 
+/// The digest a start position records of the state it replaced (`empty`
+/// for none).
+pub fn replaced_digest(prev: Option<&[u8]>) -> String {
+    use sha2::{Digest, Sha256};
+    match prev {
+        None => "empty".to_string(),
+        Some(b) => hex::encode(Sha256::digest(b)),
+    }
+}
+
+/// An engine's whole start step on a stored checkpoint: the local check,
+/// and on `Move` the start checkpoint binding the replaced state's digest.
+pub fn checkpoint_start<E: EngineOrder>(
+    engine: &E,
+    prev: Option<&[u8]>,
+    lineage: Option<&str>,
+    start: &deltaforge_core::GenerationStart,
+) -> deltaforge_core::CheckpointStart {
+    use deltaforge_core::CheckpointStart;
+    match generation_start(
+        engine,
+        prev,
+        lineage,
+        &start.snapshot_chain,
+        start.generation,
+        start.legacy_through,
+    ) {
+        StartDecision::Move => CheckpointStart::Move(
+            deltaforge_core::CheckpointMeta::from_vec(encode_adopted(
+                &start.snapshot_chain,
+                start.generation,
+                &replaced_digest(prev),
+            )),
+        ),
+        StartDecision::Already => CheckpointStart::Already,
+        StartDecision::Refuse => CheckpointStart::Refuse,
+    }
+}
+
 /// The generation start barrier's local check on a sink's stored checkpoint
 /// (design section 5.4): `prev` is the exact checkpoint the sink holds
 /// (`None`: empty). Accepted previous states: empty; a legacy (chain-less)

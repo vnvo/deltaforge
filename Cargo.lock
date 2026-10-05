@@ -5833,6 +5833,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "shellexpand",
+ "sources",
  "tempfile",
  "testcontainers",
  "thiserror 1.0.69",

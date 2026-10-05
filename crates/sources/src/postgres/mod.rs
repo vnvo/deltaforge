@@ -1530,6 +1530,14 @@ impl Source for PostgresSource {
         compare_pg_checkpoints(a, b)
     }
 
+    fn checkpoint_generation_start(
+        &self,
+        prev: Option<&[u8]>,
+        start: &deltaforge_core::GenerationStart,
+    ) -> deltaforge_core::CheckpointStart {
+        crate::snapshot_position::checkpoint_start(&PgOrder, prev, None, start)
+    }
+
     async fn check_durable_snapshot_startup(
         &self,
         checkpoint_store: &dyn CheckpointStore,
