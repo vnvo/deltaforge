@@ -337,6 +337,7 @@ impl MySqlSource {
                     table,
                     identity: resolved.columns,
                     cursor_kind,
+                    signature: mysql_snapshot::mysql_schema_signature(schema),
                 });
             }
         }

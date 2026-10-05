@@ -257,3 +257,26 @@ pub(crate) fn record_boundary(bytes: usize, d: std::time::Duration) {
     BOUNDARY_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
     BOUNDARY_MICROS.fetch_add(d.as_micros() as u64, Ordering::Relaxed);
 }
+
+/// One armed hold after preparation, right before the snapshot anchor.
+static BEFORE_ANCHOR: Mutex<Option<(Arc<Notify>, Arc<Notify>)>> =
+    Mutex::new(None);
+
+/// Arm a one-shot hold in the real snapshot path: the next snapshot run
+/// notifies `reached` after preparation, right before its consistent anchor
+/// (PostgreSQL exported snapshot, MySQL read lock), then waits for
+/// `release`. Test seam: lets a test change a prepared table's schema.
+pub fn hold_before_anchor() -> (Arc<Notify>, Arc<Notify>) {
+    let gate = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    *BEFORE_ANCHOR.lock().expect("anchor hold") = Some(gate.clone());
+    gate
+}
+
+/// The hold point; a no-op unless a test armed it.
+pub(crate) async fn before_anchor() {
+    let gate = BEFORE_ANCHOR.lock().expect("anchor hold").take();
+    if let Some((reached, release)) = gate {
+        reached.notify_one();
+        release.notified().await;
+    }
+}

@@ -396,6 +396,46 @@ impl PostgresSchemaLoader {
         Ok(from_registry)
     }
 
+    /// Resolve `schema.table` from the catalog as `client`'s session sees it
+    /// (the snapshot preparation's repeatable-read session), register it and
+    /// cache it. Never answered from the cache or another connection, so a
+    /// plan prepared on one session uses one coherent catalog view.
+    pub(crate) async fn load_schema_on(
+        &self,
+        client: &tokio_postgres::Client,
+        schema: &str,
+        table: &str,
+    ) -> SourceResult<LoadedSchema> {
+        let key = (schema.to_string(), table.to_string());
+        for _ in 0..SCOPE_ATTEMPTS {
+            let scope = self.current_scope()?;
+            let pg_schema = match self
+                .fetch_live_on(client, &scope, schema, table)
+                .await?
+            {
+                Live::Found(s) => s,
+                Live::Missing => {
+                    return Err(SourceError::Schema {
+                        details: format!("table {schema}.{table} not found")
+                            .into(),
+                    });
+                }
+                Live::OtherLineage(live) => {
+                    self.lineage_moved(&scope, live)?;
+                    continue;
+                }
+            };
+            crate::snapshot_probe::record_registry_read();
+            let loaded = self
+                .register(&scope, schema, table, pg_schema, None)
+                .await?;
+            if self.cache_insert(&scope, key.clone(), loaded.clone()).await {
+                return Ok(loaded);
+            }
+        }
+        Err(self.scope_changed())
+    }
+
     /// Load full schema for a table.
     pub async fn load_schema(
         &self,
@@ -713,9 +753,21 @@ impl PostgresSchemaLoader {
         schema_name: &str,
         table_name: &str,
     ) -> SourceResult<Live> {
+        let client = self.connect().await?;
+        self.fetch_live_on(&client, scope, schema_name, table_name)
+            .await
+    }
+
+    /// [`Self::fetch_live`] on a given session (every query on `client`).
+    async fn fetch_live_on(
+        &self,
+        client: &tokio_postgres::Client,
+        scope: &RegistryScope,
+        schema_name: &str,
+        table_name: &str,
+    ) -> SourceResult<Live> {
         self.live_fetches
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let client = self.connect().await?;
 
         let live = client
             .query_opt(
@@ -778,8 +830,10 @@ impl PostgresSchemaLoader {
                 r#"
                 SELECT a.attname
                 FROM pg_index i
+                JOIN pg_class c ON c.oid = i.indrelid
+                JOIN pg_namespace n ON n.oid = c.relnamespace
                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-                WHERE i.indrelid = ($1 || '.' || $2)::regclass AND i.indisprimary
+                WHERE n.nspname = $1 AND c.relname = $2 AND i.indisprimary
                 ORDER BY array_position(i.indkey, a.attnum)
                 "#,
                 &[&schema_name, &table_name],
@@ -815,7 +869,11 @@ impl PostgresSchemaLoader {
 
         let oid = client
             .query_opt(
-                "SELECT ($1 || '.' || $2)::regclass::oid",
+                // Catalog joins, not a `::regclass` cast: a cast resolves
+                // against the latest catalog, not the session's snapshot.
+                "SELECT c.oid FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = $1 AND c.relname = $2",
                 &[&schema_name, &table_name],
             )
             .await

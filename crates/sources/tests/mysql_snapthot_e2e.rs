@@ -950,7 +950,8 @@ async fn mysql_keyless_table_rejected_before_rows() -> Result<()> {
 async fn snapshot_shape(
     n: usize,
 ) -> Result<sources::snapshot_probe::SnapshotShape> {
-    let (shape, reads, _) = snapshot_with_ddl(n, None).await?;
+    let run = snapshot_with_ddl(n, None).await?;
+    let (shape, reads) = (run.shape, run.reads);
     assert_eq!(reads, n, "every matched table's row was snapshotted");
     Ok(shape)
 }
@@ -960,12 +961,8 @@ async fn snapshot_shape(
 /// run's outcome.
 async fn snapshot_with_ddl(
     n: usize,
-    ddl: Option<&str>,
-) -> Result<(
-    sources::snapshot_probe::SnapshotShape,
-    usize,
-    Option<String>,
-)> {
+    ddl: Option<(Hold, &str)>,
+) -> Result<SnapRun> {
     use sources::snapshot_probe;
     let (db, pool, _dsn) = mysql_setup(&format!("shape{n}")).await?;
     let mut conn = pool.get_conn().await?;
@@ -999,11 +996,15 @@ async fn snapshot_with_ddl(
     )
     .await;
     let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let backend = src.backend.clone();
     let (tx, mut rx) = mpsc::channel(4096);
     snapshot_probe::reset();
-    let hold = ddl.map(|_| snapshot_probe::hold_after_discovery_page());
-    let handle = src.run(tx, ckpt).await;
-    if let (Some((reached, release)), Some(ddl)) = (&hold, ddl) {
+    let hold = ddl.map(|(when, _)| match when {
+        Hold::FirstPage => snapshot_probe::hold_after_discovery_page(),
+        Hold::BeforeAnchor => snapshot_probe::hold_before_anchor(),
+    });
+    let handle = src.run(tx, ckpt.clone()).await;
+    if let (Some((reached, release)), Some((_, ddl))) = (&hold, ddl) {
         reached.notified().await;
         conn.query_drop(ddl).await?;
         release.notify_one();
@@ -1016,10 +1017,61 @@ async fn snapshot_with_ddl(
     .await;
     let shape = snapshot_probe::shape();
     handle.stop();
-    let err = handle.join().await.err().map(|e| format!("{e:#}"));
+    // Stopping a running source ends it with `Cancelled`: not a failure.
+    let err = handle
+        .join()
+        .await
+        .err()
+        .map(|e| format!("{e:#}"))
+        .filter(|e| e != "operation cancelled");
     let reads = events.iter().filter(|e| matches!(e.op, Op::Read)).count();
+    let id = format!("shape{n}");
+    let finished = ckpt
+        .get_raw(&sources::mysql::mysql_snapshot::progress_key(&id))
+        .await?
+        .map(|b| serde_json::from_slice::<serde_json::Value>(&b).unwrap())
+        .is_some_and(|v| v["finished"] == true);
+    let generation_status = {
+        use checkpoints::SnapshotStateStore;
+        storage::adapters::BackendCheckpointStore::new(backend)
+            .get_versioned(&format!("snapshot_generation:{id}"))
+            .await
+            .ok()
+            .flatten()
+            .map(|(_, b)| {
+                serde_json::from_slice::<serde_json::Value>(&b).unwrap()["status"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+    };
     mysql_drop_db(&pool, &db).await;
-    Ok((shape, reads, err))
+    Ok(SnapRun {
+        shape,
+        reads,
+        err,
+        finished,
+        generation_status,
+    })
+}
+
+/// Where a test changes the catalog during a snapshot start.
+#[derive(Clone, Copy)]
+enum Hold {
+    /// After the first discovery page, before its tables are prepared.
+    FirstPage,
+    /// After preparation, right before the snapshot anchor.
+    BeforeAnchor,
+}
+
+struct SnapRun {
+    shape: sources::snapshot_probe::SnapshotShape,
+    reads: usize,
+    err: Option<String>,
+    /// The snapshot progress records the snapshot as finished.
+    finished: bool,
+    /// The generation record's status (`None`: no record).
+    generation_status: Option<String>,
 }
 
 /// Discovery reads the catalog in pages and each table is prepared once:
@@ -1133,12 +1185,16 @@ async fn mysql_wildcard_legacy_progress_ambiguity_is_detected() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn mysql_catalog_movement_during_discovery_fails_closed() -> Result<()> {
-    let (shape, reads, err) = snapshot_with_ddl(
+    let run = snapshot_with_ddl(
         25,
         // Sorts between myt_000 and myt_001: behind the cursor.
-        Some("CREATE TABLE myt_0005 (id INT PRIMARY KEY)"),
+        Some((
+            Hold::FirstPage,
+            "CREATE TABLE myt_0005 (id INT PRIMARY KEY)",
+        )),
     )
     .await?;
+    let (shape, reads, err) = (run.shape, run.reads, run.err);
     let err = err.expect("the snapshot stops");
     assert!(
         err.contains("changed between discovery and the snapshot anchor")
@@ -1147,5 +1203,107 @@ async fn mysql_catalog_movement_during_discovery_fails_closed() -> Result<()> {
     );
     assert_eq!(reads, 0, "before any row");
     assert_eq!(shape.fixed[6], 0, "verification did not pass");
+    Ok(())
+}
+
+/// A prepared table altered before the anchor (the plan's schema no longer
+/// matches): the anchor re-reads every planned table's shape under its read
+/// lock and stops the snapshot before any row, never finished.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_a_table_altered_before_the_anchor_stops_the_snapshot()
+-> Result<()> {
+    let run = snapshot_with_ddl(
+        25,
+        Some((
+            Hold::BeforeAnchor,
+            "ALTER TABLE myt_007 ADD COLUMN extra TEXT",
+        )),
+    )
+    .await?;
+    let err = run.err.expect("the snapshot stops");
+    assert!(
+        err.contains("the schema of") && err.contains("myt_007"),
+        "{err}"
+    );
+    assert_eq!(run.reads, 0, "before any row");
+    assert!(!run.finished, "never finished");
+    assert_ne!(run.generation_status.as_deref(), Some("completed"));
+    Ok(())
+}
+
+/// Upgrade: a snapshot generation recorded by an earlier release (no
+/// fingerprint format) whose snapshot never completed is replaced by the
+/// next generation, not refused as a configuration change.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn mysql_an_earlier_format_generation_restarts_as_the_next_one()
+-> Result<()> {
+    use checkpoints::SnapshotStateStore;
+    let (db, pool, _dsn) = mysql_setup("fpupgrade").await?;
+    let mut conn = pool.get_conn().await?;
+    conn.query_drop(format!("USE {db}")).await?;
+    conn.query_drop(
+        "CREATE TABLE up_a (id INT PRIMARY KEY); INSERT INTO up_a VALUES (1), (2);",
+    )
+    .await?;
+    conn.query_drop(format!(
+        "GRANT SELECT ON {db}.* TO '{MYSQL_CDC_USER}'@'%'"
+    ))
+    .await?;
+    let src = make_source(
+        "fpupgrade",
+        &db,
+        vec![format!("{db}.up_*")],
+        SnapshotCfg {
+            mode: SnapshotMode::Initial,
+            ..Default::default()
+        },
+    )
+    .await;
+    // Any lineage: a record of another format is replaced before the
+    // lineage is compared.
+    let lineage = sources::snapshot_generation::PersistedLineage::MysqlGtid {
+        source_uuid: [0; 16],
+    };
+    let legacy = serde_json::json!({
+        "generation": 3,
+        "lineage": lineage,
+        "status": "running",
+        "config_fingerprint": "a-format-1-fingerprint",
+    });
+    storage::adapters::BackendCheckpointStore::new(src.backend.clone())
+        .compare_and_swap(
+            "snapshot_generation:fpupgrade",
+            None,
+            &serde_json::to_vec(&legacy)?,
+        )
+        .await?;
+    let ckpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = src.run(tx, ckpt).await;
+    let events = collect_until(&mut rx, Duration::from_secs(60), |e| {
+        e.iter().filter(|x| matches!(x.op, Op::Read)).count() >= 2
+    })
+    .await;
+    handle.stop();
+    // Stopping a running source ends it with `Cancelled`: not a failure.
+    let err = handle
+        .join()
+        .await
+        .err()
+        .map(|e| format!("{e:#}"))
+        .filter(|e| e != "operation cancelled");
+    assert!(err.is_none(), "{err:?}");
+    let reads: Vec<_> =
+        events.iter().filter(|e| matches!(e.op, Op::Read)).collect();
+    assert_eq!(reads.len(), 2, "the snapshot ran");
+    assert!(
+        reads
+            .iter()
+            .all(|e| e.source.position.snapshot_generation == Some(4)),
+        "the next generation"
+    );
+    mysql_drop_db(&pool, &db).await;
     Ok(())
 }

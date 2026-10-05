@@ -608,7 +608,8 @@ async fn pg_snapshot_anchor_zero_loss_bounded_overlap() -> Result<()> {
 async fn snapshot_shape(
     n: usize,
 ) -> Result<sources::snapshot_probe::SnapshotShape> {
-    let (shape, reads, _) = snapshot_with_ddl(n, None).await?;
+    let run = snapshot_with_ddl(n, None).await?;
+    let (shape, reads) = (run.shape, run.reads);
     assert_eq!(reads, n, "every matched table's row was snapshotted");
     Ok(shape)
 }
@@ -618,12 +619,8 @@ async fn snapshot_shape(
 /// the run's outcome.
 async fn snapshot_with_ddl(
     n: usize,
-    ddl: Option<&str>,
-) -> Result<(
-    sources::snapshot_probe::SnapshotShape,
-    usize,
-    Option<String>,
-)> {
+    ddl: Option<(Hold, &str)>,
+) -> Result<SnapRun> {
     use sources::postgres::PostgresSource;
     use sources::snapshot_probe;
     let (db, client) = pg_setup(&format!("shape{n}")).await?;
@@ -665,11 +662,15 @@ async fn snapshot_with_ddl(
         rotation: None,
     };
     let chkpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let backend = src.backend.clone();
     let (tx, mut rx) = mpsc::channel(4096);
     snapshot_probe::reset();
-    let hold = ddl.map(|_| snapshot_probe::hold_after_discovery_page());
-    let handle = deltaforge_core::Source::run(&src, tx, chkpt).await;
-    if let (Some((reached, release)), Some(ddl)) = (&hold, ddl) {
+    let hold = ddl.map(|(when, _)| match when {
+        Hold::FirstPage => snapshot_probe::hold_after_discovery_page(),
+        Hold::BeforeAnchor => snapshot_probe::hold_before_anchor(),
+    });
+    let handle = deltaforge_core::Source::run(&src, tx, chkpt.clone()).await;
+    if let (Some((reached, release)), Some((_, ddl))) = (&hold, ddl) {
         reached.notified().await;
         client.batch_execute(ddl).await?;
         release.notify_one();
@@ -685,13 +686,70 @@ async fn snapshot_with_ddl(
     }
     let shape = snapshot_probe::shape();
     handle.stop();
-    let err = handle.join().await.err().map(|e| format!("{e:#}"));
+    // Stopping a running source ends it with `Cancelled`: not a failure.
+    let err = handle
+        .join()
+        .await
+        .err()
+        .map(|e| format!("{e:#}"))
+        .filter(|e| e != "operation cancelled");
+    let finished = chkpt
+        .get_raw(&progress_key(&format!("shape{n}")))
+        .await?
+        .map(|b| serde_json::from_slice::<serde_json::Value>(&b).unwrap())
+        .is_some_and(|v| v["finished"] == true);
+    let generation_status =
+        generation_status(&backend, &format!("shape{n}")).await;
     client
         .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
         .await
         .ok();
     pg_drop_db(&db).await;
-    Ok((shape, reads, err))
+    Ok(SnapRun {
+        shape,
+        reads,
+        err,
+        finished,
+        generation_status,
+    })
+}
+
+/// Where a test changes the catalog during a snapshot start.
+#[derive(Clone, Copy)]
+enum Hold {
+    /// After the first discovery page, before its tables are prepared.
+    FirstPage,
+    /// After preparation, right before the snapshot anchor.
+    BeforeAnchor,
+}
+
+struct SnapRun {
+    shape: sources::snapshot_probe::SnapshotShape,
+    reads: usize,
+    err: Option<String>,
+    /// The snapshot progress records the snapshot as finished.
+    finished: bool,
+    /// The generation record's status (`None`: no record).
+    generation_status: Option<String>,
+}
+
+async fn generation_status(
+    backend: &storage::ArcStorageBackend,
+    source_id: &str,
+) -> Option<String> {
+    use checkpoints::SnapshotStateStore;
+    let store = storage::adapters::BackendCheckpointStore::new(backend.clone());
+    store
+        .get_versioned(&format!("snapshot_generation:{source_id}"))
+        .await
+        .ok()
+        .flatten()
+        .map(|(_, b)| {
+            serde_json::from_slice::<serde_json::Value>(&b).unwrap()["status"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
 }
 
 /// Discovery reads the catalog in pages and each table is prepared once:
@@ -713,9 +771,11 @@ async fn discovery_is_paged_and_each_table_prepared_once() -> Result<()> {
         assert_eq!(s.worker_live_fetches, 0, "{s:?}");
         assert_eq!(s.max_table_tasks, 3, "{s:?}");
     }
-    // Fixed operations: identical, once each.
+    // Fixed operations: identical, once each (PostgreSQL verifies the plan
+    // in the exported row snapshot, page by page).
     assert_eq!(s25.fixed, s50.fixed);
-    assert_eq!(s25.fixed, [1, 1, 1, 1, 1, 0, 0], "{s25:?}");
+    assert_eq!(s25.fixed, [1, 1, 1, 1, 1, 0, 1], "{s25:?}");
+    assert_eq!((s25.verification_queries, s50.verification_queries), (3, 5));
     assert_eq!(s25.registry_reads, 25, "one registry read per table");
     assert_eq!(s25.frontier_tables, 25);
     // Doubling: only the per-page and per-table counters move.
@@ -799,26 +859,160 @@ async fn wildcard_legacy_progress_ambiguity_is_detected() -> Result<()> {
     Ok(())
 }
 
-/// Every discovery page reads one catalog snapshot: a table created after
-/// the first page (sorting into a later page) is not discovered, so the
-/// snapshot copies exactly the tables that existed together; a table
-/// dropped after the first page is still in that snapshot, its schema can
-/// no longer be loaded, and the snapshot stops before any row.
+/// Discovery and preparation read one catalog snapshot, and the rows are
+/// read only if the exported snapshot still shows the prepared plan:
+/// - a table created after the first page (sorting into a later page) is
+///   not discovered, so exactly the tables that existed together are copied;
+/// - a table dropped after the first page is still in the preparation
+///   snapshot, is gone in the row snapshot, and the snapshot stops before any
+///   row;
+/// - a discovered table's columns altered after the first page: the plan is
+///   the pre-change view, the row snapshot shows the change, and the
+///   snapshot stops before any row, never finished; likewise for a table
+///   altered after preparation, right before the anchor.
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn discovery_pages_share_one_catalog_snapshot() -> Result<()> {
-    let (shape, reads, _) = snapshot_with_ddl(
+    let run = snapshot_with_ddl(
         25,
-        Some("CREATE TABLE pgt_999 (id INT PRIMARY KEY); INSERT INTO pgt_999 VALUES (1);"),
+        Some((
+            Hold::FirstPage,
+            "CREATE TABLE pgt_999 (id INT PRIMARY KEY); INSERT INTO pgt_999 VALUES (1);",
+        )),
     )
     .await?;
-    assert_eq!(shape.discovered_tables, 25, "{shape:?}");
-    assert_eq!(reads, 25, "the table created mid-discovery is not copied");
+    assert_eq!(run.shape.discovered_tables, 25, "{:?}", run.shape);
+    assert_eq!(
+        run.reads, 25,
+        "the table created mid-discovery is not copied"
+    );
+    assert!(run.err.is_none() && run.finished);
 
-    let (_, reads, err) =
-        snapshot_with_ddl(25, Some("DROP TABLE pgt_020")).await?;
-    let err = err.expect("the snapshot stops");
-    assert!(err.contains("pgt_020"), "{err}");
-    assert_eq!(reads, 0, "before any row");
+    let run =
+        snapshot_with_ddl(25, Some((Hold::FirstPage, "DROP TABLE pgt_020")))
+            .await?;
+    let err = run.err.expect("the snapshot stops");
+    assert!(
+        err.contains("pgt_020") && err.contains("no longer exists"),
+        "{err}"
+    );
+    assert_eq!(run.reads, 0, "before any row");
+    assert!(!run.finished);
+
+    let run = snapshot_with_ddl(
+        25,
+        Some((Hold::FirstPage, "ALTER TABLE pgt_005 ADD COLUMN extra TEXT")),
+    )
+    .await?;
+    let err = run.err.expect("the snapshot stops");
+    assert!(
+        err.contains("pgt_005") && err.contains("schema changed"),
+        "{err}"
+    );
+    assert_eq!(run.reads, 0, "before any row");
+    assert!(!run.finished, "never finished");
+    assert_ne!(run.generation_status.as_deref(), Some("completed"));
+
+    // Altered after preparation, before the exported snapshot: the same.
+    let run = snapshot_with_ddl(
+        25,
+        Some((
+            Hold::BeforeAnchor,
+            "ALTER TABLE pgt_012 ADD COLUMN extra TEXT",
+        )),
+    )
+    .await?;
+    let err = run.err.expect("the snapshot stops");
+    assert!(
+        err.contains("pgt_012") && err.contains("schema changed"),
+        "{err}"
+    );
+    assert_eq!(run.reads, 0, "before any row");
+    assert!(!run.finished);
+    Ok(())
+}
+
+/// Upgrade: a snapshot generation recorded by an earlier release (no
+/// fingerprint format) whose snapshot never completed is not resumed - its
+/// fingerprint cannot be compared - and is not refused as a configuration
+/// change: the snapshot runs again as the next generation.
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn an_earlier_format_generation_restarts_as_the_next_one() -> Result<()> {
+    use checkpoints::SnapshotStateStore;
+    use sources::postgres::PostgresSource;
+    let (db, client) = pg_setup("fpupgrade").await?;
+    client
+        .batch_execute(
+            "CREATE TABLE up_a (id INT PRIMARY KEY); INSERT INTO up_a VALUES (1), (2); \
+             CREATE PUBLICATION pub_up FOR ALL TABLES;",
+        )
+        .await?;
+    let backend = test_common::make_storage_backend().await;
+    let legacy = serde_json::json!({
+        "generation": 3,
+        "lineage": PersistedLineage::Postgres { system_identifier: 0 },
+        "status": "running",
+        "config_fingerprint": "a-format-1-fingerprint",
+    });
+    let store = storage::adapters::BackendCheckpointStore::new(backend.clone());
+    store
+        .compare_and_swap(
+            "snapshot_generation:fpupgrade",
+            None,
+            &serde_json::to_vec(&legacy)?,
+        )
+        .await?;
+    let src = PostgresSource {
+        id: "fpupgrade".into(),
+        dsn: pg_admin_dsn(&db).await.into(),
+        slot: "slot_fpupgrade".into(),
+        publication: "pub_up".into(),
+        tables: vec!["public.up_*".into()],
+        tenant: "acme".into(),
+        pipeline: "test".into(),
+        registry: test_common::make_registry().await,
+        registry_scope: sources::registry_scope::SharedRegistryScope::default(),
+        backend,
+        outbox_prefixes: common::AllowList::default(),
+        snapshot_cfg: initial_cfg(),
+        on_schema_drift: deltaforge_config::OnSchemaDrift::Adapt,
+        table_options: Default::default(),
+        rotation: None,
+    };
+    let chkpt: Arc<dyn CheckpointStore> = Arc::new(MemCheckpointStore::new()?);
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = deltaforge_core::Source::run(&src, tx, chkpt).await;
+    let mut reads = Vec::new();
+    while reads.len() < 2 {
+        match tokio::time::timeout(Duration::from_secs(60), rx.recv()).await {
+            Ok(Some(SourceItem::Event(ev))) if ev.op == Op::Read => {
+                reads.push(ev)
+            }
+            Ok(Some(_)) => continue,
+            _ => break,
+        }
+    }
+    handle.stop();
+    // Stopping a running source ends it with `Cancelled`: not a failure.
+    let err = handle
+        .join()
+        .await
+        .err()
+        .map(|e| format!("{e:#}"))
+        .filter(|e| e != "operation cancelled");
+    assert!(err.is_none(), "{err:?}");
+    assert_eq!(reads.len(), 2, "the snapshot ran");
+    assert!(
+        reads
+            .iter()
+            .all(|e| e.source.position.snapshot_generation == Some(4)),
+        "the next generation"
+    );
+    client
+        .execute("SELECT pg_drop_replication_slot('slot_fpupgrade')", &[])
+        .await
+        .ok();
+    pg_drop_db(&db).await;
     Ok(())
 }

@@ -236,6 +236,7 @@ pub async fn run_snapshot(
     drop(names);
     preflight.emit_and_check(ctx.source_id, tables.len())?;
 
+    crate::snapshot_probe::before_anchor().await;
     // step 1: coordinator connection - export snapshot + capture LSN
     let (coord, coord_conn) = tokio_postgres::connect(ctx.dsn, NoTls)
         .await
@@ -263,6 +264,10 @@ pub async fn run_snapshot(
 
     let snapshot_id: String = row.get(0);
     crate::snapshot_probe::record_fixed(crate::snapshot_probe::FixedOp::Anchor);
+    // The rows are read in this exported snapshot: every planned table must
+    // have, in it, exactly the shape the plan was prepared from.
+    verify_plan_in_snapshot(&coord, tables, ctx.cfg.discovery_page_size)
+        .await?;
     let start_lsn = anchor;
 
     // Save start_lsn immediately - if we crash before finishing, we know
@@ -442,6 +447,132 @@ pub async fn run_snapshot(
     Ok(start_lsn)
 }
 
+/// In the exported snapshot the rows are read from, recompute every planned
+/// table's shape signature from the catalog (batched by `batch`) and require
+/// the plan's: a table altered, dropped or replaced since preparation stops
+/// the snapshot before any row is read.
+async fn verify_plan_in_snapshot(
+    coord: &tokio_postgres::Client,
+    tables: &[super::PgPlannedTable],
+    batch: usize,
+) -> Result<()> {
+    for chunk in tables.chunks(batch.max(1)) {
+        let schemas: Vec<&str> =
+            chunk.iter().map(|t| t.qualifier.as_str()).collect();
+        let names: Vec<&str> = chunk.iter().map(|t| t.table.as_str()).collect();
+        let col_rows = coord
+            .query(
+                "SELECT x.s, x.t, c.oid::int8, a.attnum::int4, a.attname::text, \
+                        a.atttypid::int8, \
+                        NOT (a.attnotnull OR (ty.typtype = 'd' AND ty.typnotnull)) \
+                 FROM unnest($1::text[], $2::text[]) AS x(s, t) \
+                 JOIN pg_namespace n ON n.nspname = x.s \
+                 JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = x.t \
+                 JOIN pg_attribute a ON a.attrelid = c.oid \
+                      AND a.attnum > 0 AND NOT a.attisdropped \
+                 JOIN pg_type ty ON ty.oid = a.atttypid",
+                &[&schemas, &names],
+            )
+            .await
+            .context("verify the plan: read column shapes")?;
+        let pk_rows = coord
+            .query(
+                "SELECT x.s, x.t, a.attname::text \
+                 FROM unnest($1::text[], $2::text[]) AS x(s, t) \
+                 JOIN pg_namespace n ON n.nspname = x.s \
+                 JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = x.t \
+                 JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary \
+                 JOIN pg_attribute a ON a.attrelid = c.oid \
+                      AND a.attnum = ANY(i.indkey) \
+                 ORDER BY x.s, x.t, array_position(i.indkey, a.attnum)",
+                &[&schemas, &names],
+            )
+            .await
+            .context("verify the plan: read primary keys")?;
+        let mut shapes: HashMap<
+            (String, String),
+            (Option<u32>, Vec<PgShapeColumn>),
+        > = HashMap::new();
+        for r in col_rows {
+            let e = shapes.entry((r.get(0), r.get(1))).or_insert_with(|| {
+                (Some(r.get::<_, i64>(2) as u32), Vec::new())
+            });
+            e.1.push((
+                r.get(3),
+                r.get(4),
+                Some(r.get::<_, i64>(5) as u32),
+                r.get(6),
+            ));
+        }
+        let mut keys: HashMap<(String, String), Vec<String>> = HashMap::new();
+        for r in pk_rows {
+            keys.entry((r.get(0), r.get(1))).or_default().push(r.get(2));
+        }
+        for planned in chunk {
+            let key = (planned.qualifier.clone(), planned.table.clone());
+            let Some((oid, cols)) = shapes.get(&key) else {
+                bail!(plan_moved(&planned.key(), "it no longer exists"));
+            };
+            let pk = keys.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+            if pg_shape_signature(*oid, cols, pk) != planned.signature {
+                bail!(plan_moved(&planned.key(), "its schema changed"));
+            }
+        }
+        crate::snapshot_probe::record_verification_page();
+    }
+    crate::snapshot_probe::record_fixed(
+        crate::snapshot_probe::FixedOp::CatalogVerification,
+    );
+    Ok(())
+}
+
+fn plan_moved(table: &str, what: &str) -> String {
+    format!(
+        "{table} changed between snapshot preparation and the snapshot \
+         anchor ({what}); no row was read - restart to plan the snapshot again"
+    )
+}
+
+/// One column of a PostgreSQL shape signature: ordinal, name, type OID,
+/// nullable (as `information_schema.columns.is_nullable` reports it).
+pub(crate) type PgShapeColumn = (i32, String, Option<u32>, bool);
+
+/// The PostgreSQL shape signature: table OID, columns by ordinal, primary
+/// key in index order.
+pub(crate) fn pg_shape_signature(
+    oid: Option<u32>,
+    columns: &[PgShapeColumn],
+    primary_key: &[String],
+) -> String {
+    let mut cols: Vec<&PgShapeColumn> = columns.iter().collect();
+    cols.sort_by_key(|c| c.0);
+    let mut s = crate::snapshot_plan::ShapeSignature::new("postgres");
+    s.num(oid.map_or(-1, i64::from)).num(cols.len() as i64);
+    for (ordinal, name, type_oid, nullable) in cols {
+        s.num(i64::from(*ordinal))
+            .text(name)
+            .num(type_oid.map_or(-1, i64::from))
+            .num(i64::from(*nullable));
+    }
+    s.num(primary_key.len() as i64);
+    for k in primary_key {
+        s.text(k);
+    }
+    s.finish()
+}
+
+/// [`pg_shape_signature`] of a loaded schema.
+pub(crate) fn pg_schema_signature(
+    schema: &crate::postgres::postgres_table_schema::PostgresTableSchema,
+) -> String {
+    let cols: Vec<PgShapeColumn> = schema
+        .columns
+        .iter()
+        .map(|c| (c.ordinal_position, c.name.clone(), c.type_oid, c.nullable))
+        .collect();
+    pg_shape_signature(schema.oid, &cols, &schema.primary_key)
+}
+
 /// The plan entry of `schema.table` with `identity`, its cursor kind from
 /// the schema `loader` resolves (as the preparation pass derives it). For
 /// driving [`run_snapshot`] directly.
@@ -457,6 +588,7 @@ pub async fn plan_table(
         table: table.to_string(),
         identity,
         cursor_kind: pg_cursor_kind(&loaded.schema),
+        signature: pg_schema_signature(&loaded.schema),
     })
 }
 

@@ -303,9 +303,12 @@ impl PostgresSource {
             crate::snapshot_probe::record_discovery_time(t.elapsed());
             let page = discovery.accept(rows)?;
             crate::snapshot_probe::after_discovery_page().await;
-            loader.warm_from_registry(&page).await?;
             for (schema, table) in page {
-                let loaded = loader.load_schema(&schema, &table).await?;
+                // On the preparation session: the schema is the one this
+                // catalog snapshot shows, like the table set and the
+                // identity kinds below.
+                let loaded =
+                    loader.load_schema_on(&client, &schema, &table).await?;
                 let s = &loaded.schema;
                 let col_names: Vec<String> =
                     s.columns.iter().map(|c| c.name.clone()).collect();
@@ -355,6 +358,7 @@ impl PostgresSource {
                         .map(|(name, kind)| IdentitySpec { name, kind })
                         .collect(),
                     cursor_kind,
+                    signature: postgres_snapshot::pg_schema_signature(s),
                 });
             }
         }

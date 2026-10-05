@@ -34,6 +34,7 @@ use deltaforge_core::{
 };
 use metrics::counter;
 use mysql_async::{Conn, Opts, Row, Value, prelude::Queryable};
+use std::collections::HashMap;
 use tokio::time::timeout;
 
 use super::mysql_identity::mysql_identity_cell;
@@ -287,6 +288,7 @@ pub(crate) async fn run_snapshot(
     let num_workers =
         ctx.cfg.max_parallel_tables.min(pending.len().max(1)).max(1);
 
+    crate::snapshot_probe::before_anchor().await;
     let (worker_conns, mut position) = acquire_locked_anchor(
         ctx.dsn,
         ctx.expected_uuid,
@@ -605,6 +607,7 @@ async fn verify_plan_under_lock(
             discovery.page_size(),
         )
         .await?;
+        let page_start = i;
         for (db, table) in discovery.accept(rows)? {
             match check.expected.get(i) {
                 Some(p) if p.qualifier == db && p.table == table => {}
@@ -618,6 +621,7 @@ async fn verify_plan_under_lock(
             }
             i += 1;
         }
+        verify_shapes(conn, &check.expected[page_start..i]).await?;
     }
     if let Some(p) = check.expected.get(i) {
         anyhow::bail!(catalog_moved(format!("{} is gone", p.key())));
@@ -625,6 +629,74 @@ async fn verify_plan_under_lock(
     crate::snapshot_probe::record_fixed(
         crate::snapshot_probe::FixedOp::CatalogVerification,
     );
+    Ok(())
+}
+
+/// Under the read lock, recompute the shape signature of each of `planned`
+/// from INFORMATION_SCHEMA and require the plan's: a table altered since
+/// preparation stops the snapshot before any row is read.
+async fn verify_shapes(
+    conn: &mut Conn,
+    planned: &[super::MyPlannedTable],
+) -> Result<()> {
+    if planned.is_empty() {
+        return Ok(());
+    }
+    let pairs = vec!["(?, ?)"; planned.len()].join(", ");
+    let params: Vec<mysql_async::Value> = planned
+        .iter()
+        .flat_map(|p| [p.qualifier.as_str().into(), p.table.as_str().into()])
+        .collect();
+    let cols: Vec<(String, String, u32, String, String, String)> = conn
+        .exec(
+            format!(
+                "SELECT TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION, COLUMN_NAME, \
+                        COLUMN_TYPE, IS_NULLABLE \
+                 FROM INFORMATION_SCHEMA.COLUMNS \
+                 WHERE (TABLE_SCHEMA, TABLE_NAME) IN ({pairs})"
+            ),
+            params.clone(),
+        )
+        .await
+        .context("verify the plan: read column shapes")?;
+    let pks: Vec<(String, String, String)> = conn
+        .exec(
+            format!(
+                "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME \
+                 FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE \
+                 WHERE CONSTRAINT_NAME = 'PRIMARY' \
+                   AND (TABLE_SCHEMA, TABLE_NAME) IN ({pairs}) \
+                 ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
+            ),
+            params,
+        )
+        .await
+        .context("verify the plan: read primary keys")?;
+    let mut shapes: HashMap<(String, String), Vec<MyShapeColumn>> =
+        HashMap::new();
+    for (db, t, ordinal, name, column_type, nullable) in cols {
+        shapes.entry((db, t)).or_default().push((
+            ordinal,
+            name,
+            column_type,
+            nullable == "YES",
+        ));
+    }
+    let mut keys: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for (db, t, name) in pks {
+        keys.entry((db, t)).or_default().push(name);
+    }
+    for p in planned {
+        let key = (p.qualifier.clone(), p.table.clone());
+        let cols = shapes.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+        let pk = keys.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+        if mysql_shape_signature(cols, pk) != p.signature {
+            anyhow::bail!(catalog_moved(format!(
+                "the schema of {} changed",
+                p.key()
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1155,6 +1227,51 @@ fn is_integer_pk(col: Option<&super::MySqlColumn>) -> bool {
 /// scan, or an unsigned row-count cursor for the full-scan fallback. Must match
 /// the worker's scan decision so the aggregator's kind agrees with the cursors it
 /// receives.
+/// One column of a MySQL shape signature: ordinal, name, `COLUMN_TYPE`,
+/// nullable (`IS_NULLABLE = 'YES'`).
+pub(crate) type MyShapeColumn = (u32, String, String, bool);
+
+/// The MySQL shape signature: columns by ordinal, primary key in key order.
+pub(crate) fn mysql_shape_signature(
+    columns: &[MyShapeColumn],
+    primary_key: &[String],
+) -> String {
+    let mut cols: Vec<&MyShapeColumn> = columns.iter().collect();
+    cols.sort_by_key(|c| c.0);
+    let mut s = crate::snapshot_plan::ShapeSignature::new("mysql");
+    s.num(cols.len() as i64);
+    for (ordinal, name, column_type, nullable) in cols {
+        s.num(i64::from(*ordinal))
+            .text(name)
+            .text(column_type)
+            .num(i64::from(*nullable));
+    }
+    s.num(primary_key.len() as i64);
+    for k in primary_key {
+        s.text(k);
+    }
+    s.finish()
+}
+
+/// [`mysql_shape_signature`] of a loaded schema.
+pub(crate) fn mysql_schema_signature(
+    schema: &super::MySqlTableSchema,
+) -> String {
+    let cols: Vec<MyShapeColumn> = schema
+        .columns
+        .iter()
+        .map(|c| {
+            (
+                c.ordinal_position,
+                c.name.clone(),
+                c.column_type.clone(),
+                c.nullable,
+            )
+        })
+        .collect();
+    mysql_shape_signature(&cols, &schema.primary_key)
+}
+
 pub(crate) fn mysql_cursor_kind(
     schema: &super::MySqlTableSchema,
 ) -> CursorKind {

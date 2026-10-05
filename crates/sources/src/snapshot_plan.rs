@@ -17,6 +17,9 @@ pub struct PlannedTable<I> {
     pub table: String,
     pub identity: I,
     pub cursor_kind: CursorKind,
+    /// The schema shape the plan was prepared from (engine-specific
+    /// signature); verified against the catalog at the snapshot anchor.
+    pub signature: String,
 }
 
 impl<I> PlannedTable<I> {
@@ -40,4 +43,37 @@ pub(crate) fn plan_bytes<I>(
                 + identity_bytes(&t.identity)
         })
         .sum()
+}
+
+/// A canonical, length-delimited SHA-256 over a table's schema shape. Each
+/// engine feeds the same fields from its loaded schema and from the catalog
+/// rows it reads at the anchor, so equal signatures mean the plan describes
+/// the catalog the rows are read from.
+pub(crate) struct ShapeSignature(sha2::Sha256);
+
+impl ShapeSignature {
+    pub(crate) fn new(engine: &str) -> Self {
+        use sha2::Digest;
+        let mut s = Self(sha2::Sha256::new());
+        s.text(engine);
+        s
+    }
+
+    pub(crate) fn text(&mut self, v: &str) -> &mut Self {
+        use sha2::Digest;
+        self.0.update((v.len() as u64).to_be_bytes());
+        self.0.update(v.as_bytes());
+        self
+    }
+
+    pub(crate) fn num(&mut self, v: i64) -> &mut Self {
+        use sha2::Digest;
+        self.0.update(v.to_be_bytes());
+        self
+    }
+
+    pub(crate) fn finish(self) -> String {
+        use sha2::Digest;
+        hex::encode(self.0.finalize())
+    }
 }

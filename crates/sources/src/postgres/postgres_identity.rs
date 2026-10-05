@@ -44,7 +44,13 @@ pub async fn resolve_identity_kinds(
                    t.typbasetype    AS base
             FROM pg_attribute a
             JOIN pg_type t ON t.oid = a.atttypid
-            WHERE a.attrelid = format('%I.%I', $1::text, $2::text)::regclass
+            WHERE a.attrelid = (
+                    -- By name in the session's snapshot (a `::regclass`
+                    -- cast reads the latest catalog instead).
+                    SELECT c.oid FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = $1::text AND c.relname = $2::text
+                  )
               AND a.attname::text = ANY($3::text[])
               AND a.attnum > 0
               AND NOT a.attisdropped
