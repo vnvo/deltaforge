@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use gate_ownership::GateOwned;
 use rest_api::PipelineController;
 use rest_api::pipelines::AcknowledgeRequest;
 use runner::pipeline_manager::PipelineManager;
@@ -42,6 +43,7 @@ async fn start_postgres() -> (ContainerAsync<GenericImage>, u16) {
         .with_wait_for(WaitFor::message_on_stderr("database system is ready"))
         .with_env_var("POSTGRES_PASSWORD", PASS)
         .with_cmd(["postgres", "-c", "wal_level=logical"])
+        .gate_owned()
         .start()
         .await
         .expect("start postgres");

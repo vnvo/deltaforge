@@ -35,7 +35,19 @@ pub struct FaultBackend {
     /// Yield to the scheduler after every slot read, so concurrent
     /// read-modify-write cycles interleave as they can on a real store.
     pub yield_after_slot_reads: AtomicBool,
+    /// One-shot: the next `slot_list` of a namespace signals `.0` with its
+    /// result in hand and waits for `.1`, so a test can run other work
+    /// between a task's listing and its next step.
+    pub pause_after_slot_list: std::sync::Mutex<Option<SlotListPause>>,
 }
+
+/// See [`FaultBackend::pause_after_slot_list`]: (namespace, reached,
+/// release).
+pub type SlotListPause = (
+    String,
+    std::sync::Arc<tokio::sync::Notify>,
+    std::sync::Arc<tokio::sync::Notify>,
+);
 
 impl Default for FaultBackend {
     fn default() -> Self {
@@ -64,6 +76,7 @@ impl FaultBackend {
             fail_writes_to: std::sync::Mutex::new(Vec::new()),
             fail_after_writes_to: std::sync::Mutex::new(None),
             yield_after_slot_reads: AtomicBool::new(false),
+            pause_after_slot_list: std::sync::Mutex::new(None),
         }
     }
 
@@ -285,7 +298,19 @@ impl StorageBackend for FaultBackend {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<SlotPage> {
-        self.inner.slot_list(ns, prefix, cursor, limit).await
+        let page = self.inner.slot_list(ns, prefix, cursor, limit).await;
+        let pause = {
+            let mut armed = self.pause_after_slot_list.lock().unwrap();
+            match armed.as_ref() {
+                Some((n, ..)) if n == ns => armed.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, reached, release)) = pause {
+            reached.notify_one();
+            release.notified().await;
+        }
+        page
     }
     async fn queue_push(
         &self,

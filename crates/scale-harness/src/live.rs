@@ -24,6 +24,7 @@ use deltaforge_core::{
     ArcDynProcessor, ArcDynSink, BatchResult, Event, Sink, SinkResult, Source,
     SourceItem,
 };
+use gate_ownership::GateOwned;
 use runner::coordinator::{
     Coordinator, PauseState, build_batch_processor, build_commit_fn,
 };
@@ -274,7 +275,11 @@ async fn start_db(engine: Engine) -> Result<Db> {
             3306,
         ),
     };
-    let container = image.start().await.context("start database container")?;
+    let container = image
+        .gate_owned()
+        .start()
+        .await
+        .context("start database container")?;
     let port = container.get_host_port_ipv4(inner).await?;
     Ok(Db {
         _container: container,

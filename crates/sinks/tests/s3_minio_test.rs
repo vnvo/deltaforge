@@ -12,6 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use arrow_array::RecordBatch;
 use ctor::dtor;
+use gate_ownership::GateOwned;
 use object_store::ObjectStoreExt;
 use object_store::path::Path;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
@@ -67,6 +68,7 @@ async fn minio() -> &'static MinioInfra {
                          minio server /data"
                     ),
                 ])
+                .gate_owned()
                 .start()
                 .await
                 .expect("start MinIO container");

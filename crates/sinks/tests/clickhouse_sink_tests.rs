@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use deltaforge_config::{ChMode, ChVersionSource, ClickHouseSinkCfg};
 use deltaforge_core::{Event, Op, Sink, SourceInfo, SourcePosition};
+use gate_ownership::GateOwned;
 use serde_json::{Value, json};
 use sinks::clickhouse::types::ColDesc;
 use sinks::clickhouse::{
@@ -167,6 +168,7 @@ async fn start_clickhouse()
         })
         .with_mapped_port(0, CH_HTTP.tcp())
         .with_env_var("CLICKHOUSE_PASSWORD", CH_PASSWORD)
+        .gate_owned()
         .start()
         .await
         .expect("start clickhouse container");

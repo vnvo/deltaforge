@@ -24,10 +24,27 @@
 # Results go to $GATE_DIR/<label> (default target/gate/<label>); the label is
 # a plain name, and an existing directory there is replaced only if a gate
 # wrote it. The gate stops if less than GATE_MIN_FREE_GB (default 15) is free
-# on the build disk; it never deletes build output itself. The only container
-# it creates (PostgreSQL for the `serial-pg` suites) carries a per-run label
-# and is removed on exit, failure or interruption. GATE_MANIFEST overrides the
-# manifest (for testing the gate itself).
+# on the build disk; it never deletes build output itself.
+#
+# Containers: every container of a run - the PostgreSQL the gate starts for
+# the `serial-pg` suites and every test container (started through
+# `gate_ownership::GateOwned`) - carries the run's labels
+# `deltaforge.gate.run=<run id>` and `deltaforge.gate.owner=<host>:<boot
+# id>:<pid>:<start time>` of the gate process. On every exit - success,
+# failure, a shell error, INT/TERM/HUP - the gate stops and waits for every
+# process it started, then removes exactly its own run's containers with
+# their anonymous volumes, and volumes carrying its run label (a SIGKILLed
+# gate cannot: the next gate reaps its run as stale). At start it also removes the resources of earlier
+# runs whose owner is provably gone (same host; another boot, or no process
+# with that pid and start time); a run of another host, of a live owner, or
+# without a readable owner is never touched. A test container created during
+# the run without the labels fails the gate (`unowned-containers`); it is
+# reported, not removed. Linux only (/proc).
+#
+# For testing the gate itself (scripts/gate-selftest.sh): GATE_MANIFEST
+# overrides the manifest, GATE_ONLY_SUITES=1 skips the static checks and the
+# workspace tests, and GATE_SELFTEST_BLOCK=<file> first runs a step that
+# blocks until interrupted.
 set -u
 ROOT=$(git rev-parse --show-toplevel)
 cd "$ROOT"
@@ -118,36 +135,103 @@ tree_hash() {
   rm -f -- "$idx"
 }
 
-# Containers this run creates carry this label; only they are removed.
+# ---- container ownership (see the header)
+RUN_LABEL=deltaforge.gate.run
+OWNER_LABEL=deltaforge.gate.owner
+[ -r /proc/$$/stat ] && [ -r /proc/sys/kernel/random/boot_id ] ||
+  die "needs /proc to identify the owner of its containers (Linux)"
+HOST=$(hostname)
+BOOT=$(cat /proc/sys/kernel/random/boot_id)
+# Field 22 of /proc/<pid>/stat (start time), counted after the `(comm)` field.
+start_time() { sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'; }
 RUN_ID="deltaforge-gate-$$-$(date +%s)"
+OWNER="$HOST:$BOOT:$$:$(start_time $$)"
 export RUN_ID
-cleanup() {
-  docker ps -aq --filter "label=deltaforge.gate.run=$RUN_ID" |
-    xargs -r docker rm -f -v >/dev/null 2>&1
+export DELTAFORGE_GATE_RUN=$RUN_ID DELTAFORGE_GATE_OWNER=$OWNER
+echo "$RUN_ID" > "$OUT/run-id"
+
+reap_run() { # run id
+  docker ps -aq --filter "label=$RUN_LABEL=$1" | xargs -r docker rm -f -v >/dev/null 2>&1
+  docker volume ls -q --filter "label=$RUN_LABEL=$1" | xargs -r docker volume rm -f >/dev/null 2>&1
 }
-kill_tree() {
-  local p
-  for p in $(pgrep -P "$1"); do
-    kill_tree "$p"
-    kill -TERM "$p" 2>/dev/null
+# Whether the owner of a run is provably gone. Anything this gate cannot
+# prove - another host, a malformed or missing owner - counts as alive.
+owner_gone() { # host:boot:pid:start
+  local host boot pid st
+  IFS=: read -r host boot pid st <<<"$1"
+  [ "$host" = "$HOST" ] && [[ $pid =~ ^[0-9]+$ && $st =~ ^[0-9]+$ ]] && [ -n "$boot" ] || return 1
+  [ "$boot" != "$BOOT" ] && return 0
+  [ "$(start_time "$pid")" != "$st" ]
+}
+reap_stale() {
+  local run owner
+  {
+    docker ps -a --filter "label=$RUN_LABEL" \
+      --format "{{.Label \"$RUN_LABEL\"}} {{.Label \"$OWNER_LABEL\"}}"
+    docker volume ls --filter "label=$RUN_LABEL" \
+      --format "{{.Label \"$RUN_LABEL\"}} {{.Label \"$OWNER_LABEL\"}}"
+  } 2>/dev/null | sort -u | while read -r run owner; do
+    [ "$run" != "$RUN_ID" ] && [ -n "$owner" ] && owner_gone "$owner" || continue
+    echo "gate: removing the containers of stale run $run (owner $owner)" >&2
+    reap_run "$run"
   done
 }
-trap cleanup EXIT
-trap 'trap - INT TERM; echo "gate: interrupted" >&2; kill_tree $$; cleanup; exit 130' INT TERM
+cleanup() { reap_run "$RUN_ID"; }
+# Stop every descendant (TERM, then KILL after GATE_STOP_SECS, default 30)
+# and wait for it, so no suite creates a container after the cleanup.
+descendants() { # (excluding the subshell listing them)
+  local p
+  for p in $(pgrep -P "$1"); do
+    [ "$p" = "$BASHPID" ] && continue
+    descendants "$p"
+    echo "$p"
+  done
+}
+stop_children() {
+  local ps i
+  ps=$(descendants $$)
+  [ -n "$ps" ] || return 0
+  kill -TERM $ps 2>/dev/null
+  for i in $(seq "${GATE_STOP_SECS:-30}"); do
+    ps=$(descendants $$)
+    [ -n "$ps" ] || break
+    sleep 1
+  done
+  ps=$(descendants $$)
+  [ -n "$ps" ] && kill -KILL $ps 2>/dev/null
+  wait 2>/dev/null
+}
+# Every exit - success, failure, a shell error, INT/TERM/HUP - runs one
+# handler: stop and wait for every descendant, then remove this run's
+# resources, then exit with the status the gate was leaving with (130 when
+# interrupted). Signals are ignored while it runs, so it runs once. SIGKILL
+# cannot be handled: its containers are reaped as stale by the next gate.
+finish() { # status
+  trap '' INT TERM HUP
+  trap - EXIT
+  stop_children
+  cleanup
+  exit "$1"
+}
+trap 'finish $?' EXIT
+trap 'echo "gate: interrupted" >&2; finish 130' INT TERM HUP
+reap_stale
 
 echo "tier $TIER" > "$OUT/summary"
 echo "tree before $(tree_hash)" | tee -a "$OUT/summary"
 start=$(date +%s)
+started_at=$(date -u +%Y-%m-%dT%H:%M:%S)
 
 summ() { # name exit-code log
   local c
   c=$(grep "^test result" "$3" 2>/dev/null | awk '{p+=$4; f+=$6} END {printf "%d passed, %d failed", p, f}')
   echo "$1 rc=$2 ($c)" >> "$OUT/summary"
 }
-run() { # name log cmd...
+run() { # name log cmd... (in the background, so a signal is handled at once)
   local name=$1 log=$2
   shift 2
-  "$@" > "$log" 2>&1
+  "$@" > "$log" 2>&1 &
+  wait $!
   summ "$name" "$?" "$log"
 }
 # One manifest suite: name, then cargo test arguments.
@@ -165,12 +249,20 @@ export -f run summ suite
 
 lane() { grep -E "^$1[[:space:]]" "$MANIFEST" | awk '{$1=""; print substr($0, 2)}'; }
 
+# Self-test only: a step that blocks until interrupted (its pid in the file).
+if [ -n "${GATE_SELFTEST_BLOCK:-}" ]; then
+  run selftest-block "$OUT/selftest-block.log" \
+    bash -c 'echo $$ > "$GATE_SELFTEST_BLOCK"; exec sleep 600'
+fi
+
 # ---- static checks and workspace tests
-run fmt "$OUT/fmt.log" cargo fmt --all -- --check
-run clippy "$OUT/clippy.log" cargo clippy --workspace --all-targets -- -D warnings
-run clippy-vault "$OUT/clippy-vault.log" \
-  cargo clippy -p sources -p runner -p secrets --features vault --all-targets -- -D warnings
-run workspace "$OUT/workspace.log" cargo test --workspace --no-fail-fast
+if [ "${GATE_ONLY_SUITES:-}" != 1 ]; then
+  run fmt "$OUT/fmt.log" cargo fmt --all -- --check
+  run clippy "$OUT/clippy.log" cargo clippy --workspace --all-targets -- -D warnings
+  run clippy-vault "$OUT/clippy-vault.log" \
+    cargo clippy -p sources -p runner -p secrets --features vault --all-targets -- -D warnings
+  run workspace "$OUT/workspace.log" cargo test --workspace --no-fail-fast
+fi
 
 # ---- build every gated test binary once
 # The suites run concurrently: `parallel`, plus `release` in the release tier.
@@ -182,7 +274,8 @@ lane serial-pg >  "$OUT/suites"
 lane serial    >> "$OUT/suites"
 concurrent     >> "$OUT/suites"
 while read -r _ args; do
-  cargo test ${args%% -- *} --no-run >> "$OUT/build.log" 2>&1
+  cargo test ${args%% -- *} --no-run >> "$OUT/build.log" 2>&1 &
+  wait $!
 done < "$OUT/suites"
 
 # PostgreSQL for the `serial-pg` suites: this run's own container, on a free
@@ -190,7 +283,7 @@ done < "$OUT/suites"
 serial_lane() {
   local pg="$RUN_ID-pg" port
   if [ -n "$(lane serial-pg)" ]; then
-    if docker run -d --name "$pg" --label "deltaforge.gate.run=$RUN_ID" \
+    if docker run -d --name "$pg" --label "$RUN_LABEL=$RUN_ID" --label "$OWNER_LABEL=$OWNER" \
       -e POSTGRES_PASSWORD=pg -p 127.0.0.1::5432 postgres:17 >/dev/null 2>"$OUT/postgres.log"; then
       port=$(docker port "$pg" 5432/tcp | head -1 | sed 's/.*://')
       for _ in $(seq 60); do
@@ -212,8 +305,22 @@ serial_lane() {
 
 serial_lane &
 serial_pid=$!
-concurrent | xargs -r -P "${GATE_PARALLEL:-3}" -L 1 bash -c 'suite "$@"' _
+concurrent | xargs -r -P "${GATE_PARALLEL:-3}" -L 1 bash -c 'suite "$@"' _ &
+concurrent_pid=$!
 wait $serial_pid
+wait $concurrent_pid
+
+# A test container of this run without the ownership labels: a start site
+# that bypasses `GateOwned`. Reported (never removed: it may be another run's).
+unowned=$(docker ps -a --filter label=org.testcontainers.managed-by=testcontainers \
+  --format "{{.ID}} {{.Label \"$RUN_LABEL\"}}" 2>/dev/null | awk 'NF == 1 {print $1}' |
+  while read -r id; do
+    created=$(docker inspect -f '{{.Created}}' "$id" 2>/dev/null)
+    [[ ${created:0:19} > "$started_at" || ${created:0:19} == "$started_at" ]] && echo "$id"
+  done | tr '\n' ' ')
+if [ -n "$unowned" ]; then
+  echo "unowned-containers rc=1 (test containers without the gate labels: $unowned)" >> "$OUT/summary"
+fi
 
 echo "tree after $(tree_hash)" >> "$OUT/summary"
 echo "elapsed $(( ($(date +%s) - start) / 60 )) min" >> "$OUT/summary"

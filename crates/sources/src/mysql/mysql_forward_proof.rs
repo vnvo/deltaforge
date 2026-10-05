@@ -258,6 +258,7 @@ mod tests {
         use checkpoints::{CheckpointStore, MemCheckpointStore};
         use deltaforge_config::{OnSchemaDrift, SnapshotCfg, SnapshotMode};
         use deltaforge_core::{Source, SourceHandle, SourceItem};
+        use gate_ownership::GateOwned;
         use mysql_async::prelude::Queryable;
         use std::sync::Arc;
         use std::time::{Duration, Instant};
@@ -291,6 +292,7 @@ mod tests {
                 ))
                 .with_env_var("MYSQL_ROOT_PASSWORD", "pw")
                 .with_cmd(cmd)
+                .gate_owned()
                 .start()
                 .await
                 .expect("start mysql");

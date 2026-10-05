@@ -28,6 +28,7 @@ use deltaforge_core::encoding::avro_types::TypeConversionOpts;
 use deltaforge_core::{
     BatchResult, Event, Op, Sink, SourceInfo, SourcePosition, Transaction,
 };
+use gate_ownership::GateOwned;
 use object_store::path::Path;
 use parquet::arrow::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::async_reader::ParquetObjectReader;
@@ -83,6 +84,7 @@ async fn minio() -> &'static MinioInfra {
                     "-c".to_string(),
                     format!("mkdir -p /data/{BUCKET} && minio server /data"),
                 ])
+                .gate_owned()
                 .start()
                 .await
                 .expect("start MinIO");

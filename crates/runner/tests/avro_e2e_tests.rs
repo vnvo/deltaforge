@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use bytes::Bytes;
 use ctor::dtor;
+use gate_ownership::GateOwned;
 use mysql_binlog_connector_rust::column::column_value::ColumnValue;
 use serde_json::json;
 use testcontainers::{
@@ -140,6 +141,7 @@ async fn start_kafka() -> ContainerAsync<GenericImage> {
         .with_env_var("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "0")
         .with_env_var("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "true")
         .with_env_var("CLUSTER_ID", "MkU3OEVBNTcwNTJENDM2Qg")
+        .gate_owned()
         .start()
         .await
         .expect("start kafka container")
@@ -170,6 +172,7 @@ async fn get_sr() -> &'static SrInfra {
                         format!("http://0.0.0.0:{SR_PORT}"),
                     )
                     .with_mapped_port(SR_PORT, SR_PORT.tcp())
+                    .gate_owned()
                     .start()
                     .await
                     .expect("start schema-registry container");

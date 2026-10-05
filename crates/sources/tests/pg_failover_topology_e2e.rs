@@ -17,6 +17,7 @@ use deltaforge_core::incident::{
     EvidenceKey, EvidenceValue, ReasonCode, SafetyState,
 };
 use deltaforge_core::{Event, Source, SourceError, SourceItem};
+use gate_ownership::GateOwned;
 use sources::postgres::PostgresSource;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
@@ -84,6 +85,7 @@ async fn start_topology(version: &str) -> Topology {
         .with_network(network.clone())
         .with_container_name(primary_name.clone())
         .with_cmd(cmd)
+        .gate_owned()
         .start()
         .await
         .expect("start the primary");
@@ -136,6 +138,7 @@ async fn start_topology(version: &str) -> Topology {
         .with_container_name(format!("df-pgtopo-standby-{tag}"))
         .with_cmd(["-c".to_string(), script])
         .with_startup_timeout(Duration::from_secs(180))
+        .gate_owned()
         .start()
         .await
         .expect("start the standby");

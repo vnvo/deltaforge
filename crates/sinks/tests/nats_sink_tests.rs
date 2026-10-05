@@ -12,6 +12,7 @@ use async_nats::jetstream::{self, stream::Config as StreamConfig};
 use ctor::dtor;
 use deltaforge_config::{EncodingCfg, EnvelopeCfg, NatsSinkCfg};
 use deltaforge_core::{Event, EventRouting, Sink};
+use gate_ownership::GateOwned;
 use serde_json::json;
 use sinks::nats::NatsSink;
 use std::collections::HashMap;
@@ -68,7 +69,11 @@ async fn get_nats_container() -> &'static ContainerAsync<GenericImage> {
                 .with_cmd(vec!["-js"])
                 .with_mapped_port(NATS_PORT, 4222.tcp());
 
-            let container = image.start().await.expect("start nats container");
+            let container = image
+                .gate_owned()
+                .start()
+                .await
+                .expect("start nats container");
             info!("NATS container started: {}", container.id());
 
             // Wait for NATS JetStream to be fully ready
@@ -892,7 +897,7 @@ async fn nats_sink_recovers_after_restart() -> Result<()> {
         .with_cmd(vec!["-js"])
         .with_mapped_port(restart_port, 4222.tcp());
 
-    let container = image.start().await?;
+    let container = image.gate_owned().start().await?;
     let url = format!("nats://127.0.0.1:{}", restart_port);
 
     wait_for_nats(&url, Duration::from_secs(30)).await?;

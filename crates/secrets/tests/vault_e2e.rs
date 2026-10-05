@@ -362,6 +362,7 @@ async fn requests_are_bounded_by_timeout_not_hung() {
 #[cfg(test)]
 mod live {
     use super::*;
+    use gate_ownership::GateOwned;
     use testcontainers::{
         ContainerAsync, GenericImage, ImageExt, core::WaitFor,
         runners::AsyncRunner,
@@ -374,7 +375,11 @@ mod live {
             .with_wait_for(WaitFor::message_on_stdout("Vault server started!"))
             .with_env_var("VAULT_DEV_ROOT_TOKEN_ID", ROOT)
             .with_env_var("VAULT_DEV_LISTEN_ADDRESS", "0.0.0.0:8200");
-        let container = image.start().await.expect("start vault dev container");
+        let container = image
+            .gate_owned()
+            .start()
+            .await
+            .expect("start vault dev container");
         let port = container
             .get_host_port_ipv4(8200)
             .await

@@ -41,6 +41,7 @@ use deltaforge_config::{
 use deltaforge_core::{
     ArcDynProcessor, ArcDynSink, Source, SourceHandle, SourceItem,
 };
+use gate_ownership::GateOwned;
 use mysql_async::prelude::Queryable;
 use rdkafka::Message;
 use rdkafka::config::ClientConfig;
@@ -114,7 +115,7 @@ async fn start_kafka() -> (ContainerAsync<GenericImage>, String) {
         .with_env_var("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "true")
         .with_env_var("CLUSTER_ID", "MkU3OEVBNTcwNTJENDM2Qg")
         .with_mapped_port(kp, kp.tcp());
-    let container = image.start().await.expect("start kafka");
+    let container = image.gate_owned().start().await.expect("start kafka");
     let brokers = format!("localhost:{kp}");
     wait_for_kafka(&brokers, Duration::from_secs(60)).await;
     (container, brokers)
@@ -221,7 +222,7 @@ async fn start_mysql() -> (ContainerAsync<GenericImage>, u16) {
             "--enforce-gtid-consistency=ON",
             "--binlog-checksum=NONE",
         ]);
-    let c = image.start().await.expect("start mysql");
+    let c = image.gate_owned().start().await.expect("start mysql");
     let port = c.get_host_port_ipv4(3306).await.expect("mysql port");
     // Give MySQL a moment past the readiness banner to accept connections.
     tokio::time::sleep(Duration::from_secs(3)).await;

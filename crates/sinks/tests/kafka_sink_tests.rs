@@ -13,6 +13,7 @@ use deltaforge_config::{EncodingCfg, EnvelopeCfg, KafkaSinkCfg};
 use deltaforge_core::{
     Event, EventRouting, Op, Sink, SourceInfo, SourcePosition,
 };
+use gate_ownership::GateOwned;
 use rdkafka::Message;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
@@ -93,7 +94,7 @@ async fn get_kafka_container() -> &'static ContainerAsync<GenericImage> {
                 .with_env_var("CLUSTER_ID", "MkU3OEVBNTcwNTJENDM2Qg")
                 .with_mapped_port(KAFKA_PORT, KAFKA_PORT.tcp());
 
-            let container = image.start().await.expect("start kafka container");
+            let container = image.gate_owned().start().await.expect("start kafka container");
             info!("Kafka container started: {}", container.id());
 
             // Wait for Kafka to be fully ready
@@ -1177,7 +1178,7 @@ async fn kafka_sink_recovers_after_restart() -> Result<()> {
         .with_env_var("CLUSTER_ID", "NkU3OEVBNTcwNTJENDM2Qg")
         .with_mapped_port(restart_port, restart_port.tcp());
 
-    let container = image.start().await?;
+    let container = image.gate_owned().start().await?;
     let brokers = format!("localhost:{}", restart_port);
 
     wait_for_kafka(&brokers, Duration::from_secs(60)).await?;

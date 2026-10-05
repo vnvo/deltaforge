@@ -16,6 +16,7 @@ use common::AllowList;
 use ctor::dtor;
 use deltaforge_config::{OnSchemaDrift, SnapshotCfg, SnapshotMode};
 use deltaforge_core::{Event, Source, SourceHandle, SourceItem};
+use gate_ownership::GateOwned;
 use mysql_async::prelude::Queryable;
 use serde_json::Value;
 use sources::MySqlSource;
@@ -70,6 +71,7 @@ async fn start(gtid: bool) -> Server {
         ))
         .with_env_var("MYSQL_ROOT_PASSWORD", ROOT_PW)
         .with_cmd(cmd)
+        .gate_owned()
         .start()
         .await
         .expect("start mysql");

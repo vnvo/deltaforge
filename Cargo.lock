@@ -2353,6 +2353,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "gate-ownership"
+version = "0.1.0"
+dependencies = [
+ "testcontainers",
+ "tokio",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5028,6 +5036,7 @@ dependencies = [
  "deltaforge-core",
  "flate2",
  "futures",
+ "gate-ownership",
  "hex",
  "hmac 0.12.1",
  "metrics",
@@ -5274,6 +5283,7 @@ dependencies = [
  "clap",
  "deltaforge-config",
  "deltaforge-core",
+ "gate-ownership",
  "hex",
  "mysql_async 0.36.2",
  "runner",
@@ -5427,6 +5437,7 @@ name = "secrets"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "gate-ownership",
  "reqwest",
  "serde",
  "serde_json",
@@ -5807,6 +5818,7 @@ dependencies = [
  "deltaforge-core",
  "flate2",
  "futures",
+ "gate-ownership",
  "hex",
  "metrics",
  "metrics-util 0.19.1",
@@ -5916,6 +5928,7 @@ dependencies = [
  "ctor",
  "deltaforge-config",
  "deltaforge-core",
+ "gate-ownership",
  "hex",
  "metrics",
  "metrics-util 0.19.1",
